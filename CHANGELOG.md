@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Messages are parsed and built through `zerocopy` views (`noise::wire`) instead of
   hand-written offsets.
 - `data_path` benchmark (copying versus in-place round trip).
+- `scripts/e2e/linux.sh` (`just e2e`): interop test against kernel WireGuard in two containers.
 - `Tunn::set_preshared_key` and `Tunn::set_persistent_keepalive`. The UAPI updates existing
   peers in place (endpoint, keepalive, preshared key, allowed IPs including
   `replace_allowed_ips`) instead of panicking.
@@ -54,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - UAPI `set`: settings of one peer section no longer leak into the next section.
+- UAPI `get` reports `last_handshake_time_*` as wall-clock Unix time, as `wg` expects, instead
+  of the age of the handshake ("56 years ago").
+- CLI: `WG_SUDO=1` is accepted again (any boolish value).
 - Re-binding the listen port now unregisters the previous UDP sockets; the old sockets were
   leaked because their events were cleared under the wrong fd.
 - The UAPI socket is bound at `/var/run/wireguard/<name>.sock` without a doubled slash.

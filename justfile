@@ -34,6 +34,11 @@ cross:
     cargo-zigbuild clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
     cargo clippy -p boringtun --all-targets --features ffi-bindings --target x86_64-pc-windows-gnu
 
+# Interop against kernel WireGuard in two containers (needs docker and the wireguard module).
+e2e:
+    cargo build -p boringtun-cli --release --locked
+    scripts/e2e/linux.sh
+
 # Integration tests need root, a TUN device and docker.
 integration:
     sudo -E cargo test -p boringtun --features device --locked -- --ignored

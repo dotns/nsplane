@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
 
 const SOCK_DIR: &str = "/var/run/wireguard";
 
@@ -149,6 +150,15 @@ impl Device {
     }
 }
 
+/// Unix time of a handshake that happened `elapsed` before `now`.
+fn last_handshake_unix(elapsed: Duration, now: SystemTime) -> (u64, u32) {
+    let at = now
+        .checked_sub(elapsed)
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    (at.as_secs(), at.subsec_nanos())
+}
+
 #[allow(unused_must_use)]
 fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     // get command requires an empty line, but there is no reason to be religious about it
@@ -186,9 +196,11 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "allowed_ip={ip}/{cidr}");
         }
 
-        if let Some(time) = p.time_since_last_handshake() {
-            writeln!(writer, "last_handshake_time_sec={}", time.as_secs());
-            writeln!(writer, "last_handshake_time_nsec={}", time.subsec_nanos());
+        if let Some(elapsed) = p.time_since_last_handshake() {
+            // The UAPI reports the wall-clock time of the handshake, not its age.
+            let (secs, nsecs) = last_handshake_unix(elapsed, SystemTime::now());
+            writeln!(writer, "last_handshake_time_sec={secs}");
+            writeln!(writer, "last_handshake_time_nsec={nsecs}");
         }
 
         let (_, tx_bytes, rx_bytes, ..) = p.tunnel.stats();
@@ -340,5 +352,17 @@ fn apply_peer_update(d: &mut Device, update: PeerUpdate) -> i32 {
             tracing::error!(message = "Failed to update peer", error = ?e);
             ENOSPC
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_handshake_is_reported_as_unix_time() {
+        let now = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_100, 500);
+        let (secs, nsecs) = last_handshake_unix(Duration::new(100, 0), now);
+        assert_eq!((secs, nsecs), (1_700_000_000, 500));
     }
 }

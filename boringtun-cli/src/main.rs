@@ -55,7 +55,7 @@ struct Args {
     log: PathBuf,
 
     /// Do not drop sudo privileges
-    #[arg(long, env = "WG_SUDO")]
+    #[arg(long, env = "WG_SUDO", value_parser = clap::builder::BoolishValueParser::new())]
     disable_drop_privileges: bool,
 
     /// Disable connected UDP sockets to each peer
