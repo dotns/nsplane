@@ -1,6 +1,10 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
+use super::wire::{COOKIE_REPLY, CookieReplyMsg};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
-use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
+use crate::noise::{
+    COOKIE_REPLY_SZ, HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError,
+};
+use zerocopy::FromBytes;
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
@@ -177,34 +181,29 @@ impl RateLimiter {
         mac1: &[u8],
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < super::COOKIE_REPLY_SZ {
+        let Ok((msg, _)) = CookieReplyMsg::mut_from_prefix(&mut *dst) else {
             return Err(WireGuardError::DestinationBufferTooSmall);
-        }
-
-        let (message_type, rest) = dst.split_at_mut(4);
-        let (receiver_index, rest) = rest.split_at_mut(4);
-        let (nonce, rest) = rest.split_at_mut(24);
-        let (encrypted_cookie, _) = rest.split_at_mut(16 + 16);
+        };
 
         // msg.message_type = 3
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::COOKIE_REPLY.to_le_bytes());
+        msg.message_type = COOKIE_REPLY.into();
         // msg.receiver_index = little_endian(initiator.sender_index)
-        receiver_index.copy_from_slice(&idx.to_le_bytes());
-        nonce.copy_from_slice(&self.nonce()[..]);
+        msg.receiver_index = idx.into();
+        msg.nonce = self.nonce();
 
         let cipher = XChaCha20Poly1305::new(&self.cookie_key);
 
-        let iv = GenericArray::from_slice(nonce);
+        let iv = GenericArray::from_slice(&msg.nonce);
 
-        encrypted_cookie[..16].copy_from_slice(&cookie);
+        msg.encrypted_cookie[..16].copy_from_slice(&cookie);
         let tag = cipher
-            .encrypt_in_place_detached(iv, mac1, &mut encrypted_cookie[..16])
+            .encrypt_in_place_detached(iv, mac1, &mut msg.encrypted_cookie[..16])
             .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
 
-        encrypted_cookie[16..].copy_from_slice(&tag);
+        msg.encrypted_cookie[16..].copy_from_slice(&tag);
 
-        Ok(&mut dst[..super::COOKIE_REPLY_SZ])
+        Ok(&mut dst[..COOKIE_REPLY_SZ])
     }
 
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed

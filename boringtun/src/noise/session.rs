@@ -1,12 +1,13 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::PacketData;
 use super::handshake::chacha20_poly1305_key;
+use super::wire::{DATA, DataHeader};
 use crate::noise::errors::WireGuardError;
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce};
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
+use zerocopy::FromBytes;
 
 pub(super) struct Session {
     pub(crate) receiving_index: u32,
@@ -33,6 +34,13 @@ pub(super) const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 /// A key never encrypts or accepts this many messages, so its nonce cannot repeat
 /// (`Reject-After-Messages`, 2^64 - 2^13 - 1).
 pub(super) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
+
+/// The AEAD nonce for a message counter: 32 zero bits, then the little-endian counter.
+fn nonce(counter: u64) -> Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_le_bytes());
+    Nonce::assume_unique_for_key(nonce)
+}
 
 /// Length of a plaintext of `len` bytes after padding to a multiple of 16.
 const fn padded_len(len: usize) -> usize {
@@ -212,17 +220,23 @@ impl Session {
         ret
     }
 
-    /// src - an IP packet from the interface
-    /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
-    /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(
+    /// Seals the plaintext in `buf[DATA_OFFSET..DATA_OFFSET + len]` in place and writes the
+    /// data header in front of it; returns the datagram, a prefix of `buf`.
+    ///
+    /// The plaintext is zero-padded to a multiple of 16 bytes as far as `buf` has room behind
+    /// it; `buf` needs at least `DATA_OFFSET + len + AEAD_SIZE` bytes.
+    pub(super) fn seal_in_place<'a>(
         &self,
-        src: &[u8],
-        dst: &'a mut [u8],
+        buf: &'a mut [u8],
+        len: usize,
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
-            return Err(WireGuardError::DestinationBufferTooSmall);
-        }
+        let room = buf
+            .len()
+            .checked_sub(DATA_OFFSET + AEAD_SIZE)
+            .filter(|&room| room >= len)
+            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+        // The spec pads the plaintext with zeros to a multiple of 16 bytes.
+        let padded_len = padded_len(len).min(room);
 
         // Never hand out a counter at or past Reject-After-Messages: the nonce must not repeat.
         let sending_key_counter = self
@@ -232,73 +246,63 @@ impl Session {
             })
             .map_err(|_| WireGuardError::ConnectionExpired)?;
 
-        let (message_type, rest) = dst.split_at_mut(4);
-        let (receiver_index, rest) = rest.split_at_mut(4);
-        let (counter, data) = rest.split_at_mut(8);
+        let (header, payload) = DataHeader::mut_from_prefix(&mut *buf)
+            .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
+        header.message_type = DATA.into();
+        header.receiver_index = self.sending_index.into();
+        header.counter = sending_key_counter.into();
 
-        message_type.copy_from_slice(&super::DATA.to_le_bytes());
-        receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
-        counter.copy_from_slice(&sending_key_counter.to_le_bytes());
+        payload[len..padded_len].fill(0);
+        let tag = self
+            .sender
+            .seal_in_place_separate_tag(
+                nonce(sending_key_counter),
+                Aad::empty(),
+                &mut payload[..padded_len],
+            )
+            .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
+        payload[padded_len..padded_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
 
-        // The spec pads the plaintext with zeros to a multiple of 16 bytes, as far as the
-        // buffer allows.
-        let padded_len = padded_len(src.len()).min(data.len() - AEAD_SIZE);
-        let n = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            data[..src.len()].copy_from_slice(src);
-            data[src.len()..padded_len].fill(0);
-            self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut data[..padded_len],
-                )
-                .map(|tag| {
-                    data[padded_len..padded_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    padded_len + AEAD_SIZE
-                })
-                .map_err(|_| WireGuardError::DestinationBufferTooSmall)?
-        };
-
-        Ok(&mut dst[..DATA_OFFSET + n])
+        Ok(&mut buf[..DATA_OFFSET + padded_len + AEAD_SIZE])
     }
 
-    /// packet - a data packet we received from the network
-    /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
-    ///       dst will always take less space than src
-    /// return the size of the encapsulated packet on success
-    pub(super) fn receive_packet_data<'a>(
+    /// src - an IP packet from the interface
+    /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
+    /// returns the formatted packet
+    pub(super) fn format_packet_data<'a>(
         &self,
-        packet: &PacketData<'_>,
+        src: &[u8],
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
+        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
-        if packet.receiver_idx != self.receiving_index {
+        dst[DATA_OFFSET..DATA_OFFSET + src.len()].copy_from_slice(src);
+        self.seal_in_place(dst, src.len())
+    }
+
+    /// Opens the encrypted packet and tag in `ciphertext` in place; returns the plaintext, a
+    /// prefix of `ciphertext`.
+    pub(super) fn open_in_place<'a>(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        if receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(packet.counter)?;
+        self.receiving_counter_quick_check(counter)?;
 
-        let ret = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-            self.receiver
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut dst[..ct_len],
-                )
-                .map_err(|_| WireGuardError::InvalidAeadTag)?
-        };
+        let plaintext = self
+            .receiver
+            .open_in_place(nonce(counter), Aad::empty(), ciphertext)
+            .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(packet.counter)?;
-        Ok(ret)
+        self.receiving_counter_mark(counter)?;
+        Ok(plaintext)
     }
 
     /// Whether the sending key reached Reject-After-Messages and must not be used again.

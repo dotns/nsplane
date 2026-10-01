@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cookie replies no longer move the peer's endpoint (roaming).
 
 ### Added
+- Zero-copy data path: `Tunn::encapsulate_in_place` seals a packet where it was read (behind
+  `DATA_HEADER_SZ` bytes of header room) and `Tunn::decapsulate_in_place` decrypts transport
+  data inside the receive buffer. The device reads TUN packets straight into the
+  encapsulation buffer and decrypts UDP datagrams in place. `encapsulate`/`decapsulate` remain
+  as copying wrappers.
+- Messages are parsed and built through `zerocopy` views (`noise::wire`) instead of
+  hand-written offsets.
+- `data_path` benchmark (copying versus in-place round trip).
 - `Tunn::set_preshared_key` and `Tunn::set_persistent_keepalive`. The UAPI updates existing
   peers in place (endpoint, keepalive, preshared key, allowed IPs including
   `replace_allowed_ips`) instead of panicking.

@@ -1,7 +1,10 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
+use super::wire::{HANDSHAKE_INIT, HANDSHAKE_RESP, HandshakeInitMsg, HandshakeRespMsg};
+use super::{
+    HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ, HandshakeInit, HandshakeResponse, PacketCookieReply,
+};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
@@ -16,6 +19,7 @@ use rand_core::OsRng;
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
+use zerocopy::FromBytes;
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
@@ -774,15 +778,17 @@ impl Handshake {
         &mut self,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < super::HANDSHAKE_INIT_SZ {
+        let Ok((msg, _)) = HandshakeInitMsg::mut_from_prefix(&mut *dst) else {
             return Err(WireGuardError::DestinationBufferTooSmall);
-        }
-
-        let (message_type, rest) = dst.split_at_mut(4);
-        let (sender_index, rest) = rest.split_at_mut(4);
-        let (unencrypted_ephemeral, rest) = rest.split_at_mut(32);
-        let (encrypted_static, rest) = rest.split_at_mut(32 + 16);
-        let (encrypted_timestamp, _) = rest.split_at_mut(12 + 16);
+        };
+        let HandshakeInitMsg {
+            message_type,
+            sender_index,
+            unencrypted_ephemeral,
+            encrypted_static,
+            encrypted_timestamp,
+            macs: _,
+        } = msg;
 
         let local_index = self.inc_index();
 
@@ -795,9 +801,9 @@ impl Handshake {
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
+        *message_type = HANDSHAKE_INIT.into();
         // msg.sender_index = little_endian(initiator.sender_index)
-        sender_index.copy_from_slice(&local_index.to_le_bytes());
+        *sender_index = local_index.into();
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
         unencrypted_ephemeral
             .copy_from_slice(x25519::PublicKey::from(&ephemeral_private).as_bytes());
@@ -847,14 +853,14 @@ impl Handshake {
             }),
         );
 
-        Ok(self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_INIT_SZ]))
+        Ok(self.append_mac1_and_mac2(local_index, &mut dst[..HANDSHAKE_INIT_SZ]))
     }
 
     fn format_handshake_response<'a>(
         &mut self,
         dst: &'a mut [u8],
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
-        if dst.len() < super::HANDSHAKE_RESP_SZ {
+        if dst.len() < HANDSHAKE_RESP_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -870,22 +876,28 @@ impl Handshake {
             return Err(WireGuardError::UnexpectedPacket);
         };
 
-        let (message_type, rest) = dst.split_at_mut(4);
-        let (sender_index, rest) = rest.split_at_mut(4);
-        let (receiver_index, rest) = rest.split_at_mut(4);
-        let (unencrypted_ephemeral, rest) = rest.split_at_mut(32);
-        let (encrypted_nothing, _) = rest.split_at_mut(16);
+        let Ok((msg, _)) = HandshakeRespMsg::mut_from_prefix(&mut *dst) else {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        };
+        let HandshakeRespMsg {
+            message_type,
+            sender_index,
+            receiver_index,
+            unencrypted_ephemeral,
+            encrypted_nothing,
+            macs: _,
+        } = msg;
 
         // responder.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
+        *message_type = HANDSHAKE_RESP.into();
         // msg.sender_index = little_endian(responder.sender_index)
-        sender_index.copy_from_slice(&local_index.to_le_bytes());
+        *sender_index = local_index.into();
         // msg.receiver_index = little_endian(initiator.sender_index)
-        receiver_index.copy_from_slice(&peer_index.to_le_bytes());
+        *receiver_index = peer_index.into();
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
         unencrypted_ephemeral
             .copy_from_slice(x25519::PublicKey::from(&ephemeral_private).as_bytes());
@@ -937,7 +949,7 @@ impl Handshake {
         let temp2 = b2s_hmac(&temp1, &[0x01]);
         let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
 
-        let dst = self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_RESP_SZ]);
+        let dst = self.append_mac1_and_mac2(local_index, &mut dst[..HANDSHAKE_RESP_SZ]);
 
         Ok((dst, Session::new(local_index, peer_index, temp2, temp3)))
     }

@@ -10,6 +10,7 @@ pub mod rate_limiter;
 
 mod session;
 mod timers;
+mod wire;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -82,16 +83,20 @@ pub struct Tunn {
     rate_limiter: Arc<RateLimiter>,
 }
 
-type MessageType = u32;
-const HANDSHAKE_INIT: MessageType = 1;
-const HANDSHAKE_RESP: MessageType = 2;
-const COOKIE_REPLY: MessageType = 3;
-const DATA: MessageType = 4;
+use wire::{
+    COOKIE_REPLY, CookieReplyMsg, DATA, DataHeader, HANDSHAKE_INIT, HANDSHAKE_RESP,
+    HandshakeInitMsg, HandshakeRespMsg,
+};
+use zerocopy::FromBytes;
 
-const HANDSHAKE_INIT_SZ: usize = 148;
-const HANDSHAKE_RESP_SZ: usize = 92;
-const COOKIE_REPLY_SZ: usize = 64;
-const DATA_OVERHEAD_SZ: usize = 32;
+const HANDSHAKE_INIT_SZ: usize = size_of::<HandshakeInitMsg>();
+const HANDSHAKE_RESP_SZ: usize = size_of::<HandshakeRespMsg>();
+const COOKIE_REPLY_SZ: usize = size_of::<CookieReplyMsg>();
+/// Size of the header in front of the encrypted packet of a data message.
+pub const DATA_HEADER_SZ: usize = size_of::<DataHeader>();
+/// Size of the AEAD tag behind the encrypted packet of a data message.
+const AEAD_TAG_SZ: usize = 16;
+const DATA_OVERHEAD_SZ: usize = DATA_HEADER_SZ + AEAD_TAG_SZ;
 
 #[derive(Debug)]
 /// A parsed handshake initiation message.
@@ -148,10 +153,11 @@ fn array_at<const N: usize>(src: &[u8], offset: usize) -> Option<&[u8; N]> {
     src.get(offset..offset.checked_add(N)?)?.try_into().ok()
 }
 
-fn u32_le_at(src: &[u8], offset: usize) -> Result<u32, WireGuardError> {
-    array_at(src, offset)
-        .map(|b| u32::from_le_bytes(*b))
-        .ok_or(WireGuardError::InvalidPacket)
+/// Views all of `src` as a message of type `T`.
+fn message<T: FromBytes + zerocopy::KnownLayout + zerocopy::Immutable>(
+    src: &[u8],
+) -> Result<&T, WireGuardError> {
+    T::ref_from_bytes(src).map_err(|_| WireGuardError::InvalidPacket)
 }
 
 impl Tunn {
@@ -159,34 +165,46 @@ impl Tunn {
     /// Parses a datagram into a WireGuard message without copying.
     pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet<'_>, WireGuardError> {
         // Checks the type, as well as the reserved zero fields
-        let packet_type = u32_le_at(src, 0)?;
-        let field = |from: usize, to: usize| src.get(from..to).ok_or(WireGuardError::InvalidPacket);
+        let packet_type = array_at::<4>(src, 0)
+            .map(|b| u32::from_le_bytes(*b))
+            .ok_or(WireGuardError::InvalidPacket)?;
 
         Ok(match (packet_type, src.len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
-                sender_idx: u32_le_at(src, 4)?,
-                unencrypted_ephemeral: array_at(src, 8).ok_or(WireGuardError::InvalidPacket)?,
-                encrypted_static: field(40, 88)?,
-                encrypted_timestamp: field(88, 116)?,
-            }),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32_le_at(src, 4)?,
-                receiver_idx: u32_le_at(src, 8)?,
-                unencrypted_ephemeral: array_at(src, 12).ok_or(WireGuardError::InvalidPacket)?,
-                encrypted_nothing: field(44, 60)?,
-            }),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
-                receiver_idx: u32_le_at(src, 4)?,
-                nonce: field(8, 32)?,
-                encrypted_cookie: field(32, 64)?,
-            }),
-            (DATA, DATA_OVERHEAD_SZ..) => Packet::PacketData(PacketData {
-                receiver_idx: u32_le_at(src, 4)?,
-                counter: array_at(src, 8)
-                    .map(|b| u64::from_le_bytes(*b))
-                    .ok_or(WireGuardError::InvalidPacket)?,
-                encrypted_encapsulated_packet: field(16, src.len())?,
-            }),
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => {
+                let msg: &HandshakeInitMsg = message(src)?;
+                Packet::HandshakeInit(HandshakeInit {
+                    sender_idx: msg.sender_index.get(),
+                    unencrypted_ephemeral: &msg.unencrypted_ephemeral,
+                    encrypted_static: &msg.encrypted_static,
+                    encrypted_timestamp: &msg.encrypted_timestamp,
+                })
+            }
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => {
+                let msg: &HandshakeRespMsg = message(src)?;
+                Packet::HandshakeResponse(HandshakeResponse {
+                    sender_idx: msg.sender_index.get(),
+                    receiver_idx: msg.receiver_index.get(),
+                    unencrypted_ephemeral: &msg.unencrypted_ephemeral,
+                    encrypted_nothing: &msg.encrypted_nothing,
+                })
+            }
+            (COOKIE_REPLY, COOKIE_REPLY_SZ) => {
+                let msg: &CookieReplyMsg = message(src)?;
+                Packet::PacketCookieReply(PacketCookieReply {
+                    receiver_idx: msg.receiver_index.get(),
+                    nonce: &msg.nonce,
+                    encrypted_cookie: &msg.encrypted_cookie,
+                })
+            }
+            (DATA, DATA_OVERHEAD_SZ..) => {
+                let (header, encrypted) =
+                    DataHeader::ref_from_prefix(src).map_err(|_| WireGuardError::InvalidPacket)?;
+                Packet::PacketData(PacketData {
+                    receiver_idx: header.receiver_index.get(),
+                    counter: header.counter.get(),
+                    encrypted_encapsulated_packet: encrypted,
+                })
+            }
             _ => return Err(WireGuardError::InvalidPacket),
         })
     }
@@ -278,6 +296,21 @@ impl Tunn {
     /// otherwise `WireGuardError::DestinationBufferTooSmall` is returned. The plaintext is
     /// padded to a multiple of 16 bytes when dst has room for up to 15 more bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        let Some(payload) = dst.get_mut(DATA_HEADER_SZ..DATA_HEADER_SZ + src.len()) else {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        };
+        payload.copy_from_slice(src);
+        self.encapsulate_in_place(dst, src.len())
+    }
+
+    /// Encapsulates the IP packet in `buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len]` without
+    /// copying it: the packet is sealed where it lies and the data header is written in front.
+    ///
+    /// Read packets from the TUN interface directly into `buf[DATA_HEADER_SZ..]`. `buf` needs
+    /// `DATA_HEADER_SZ + len + 16` bytes, plus up to 15 bytes of padding room, and at least
+    /// 148 bytes in case a handshake initiation is returned instead (the packet is then
+    /// queued until the handshake completes).
+    pub fn encapsulate_in_place<'a>(&mut self, buf: &'a mut [u8], len: usize) -> TunnResult<'a> {
         let current = self.current % N_SESSIONS;
         // A sending key that is worn out (Reject-After-Messages) is dropped, so the packet is
         // queued and a handshake starts, as if there were no session.
@@ -290,23 +323,62 @@ impl Tunn {
 
         if let Some(session) = &self.sessions[current] {
             // Send the packet using an established session
-            let packet = match session.format_packet_data(src, dst) {
+            let packet = match session.seal_in_place(buf, len) {
                 Ok(packet) => packet,
                 Err(e) => return TunnResult::Err(e),
             };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if len > 0 {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += src.len();
+            self.tx_bytes += len;
             return TunnResult::WriteToNetwork(packet);
         }
 
         // If there is no session, queue the packet for future retry
-        self.queue_packet(src);
+        let Some(packet) = buf.get(DATA_HEADER_SZ..DATA_HEADER_SZ + len) else {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        };
+        self.queue_packet(packet);
         // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        self.format_handshake_initiation(buf, false)
+    }
+
+    /// Decapsulates the datagram in `buf[..len]`. Transport data is decrypted in place, so the
+    /// returned IP packet is a slice of `buf`; handshake messages are answered into `buf`.
+    ///
+    /// `buf` should be at least 148 bytes long. As with [`Tunn::decapsulate`], call again with
+    /// `len == 0` after `TunnResult::WriteToNetwork` to flush queued packets.
+    pub fn decapsulate_in_place<'a>(
+        &mut self,
+        src_addr: Option<SocketAddr>,
+        buf: &'a mut [u8],
+        len: usize,
+    ) -> TunnResult<'a> {
+        let Some(datagram) = buf.get(..len) else {
+            return TunnResult::Err(WireGuardError::InvalidPacket);
+        };
+        if datagram.is_empty() {
+            // Indicates a repeated call
+            return self.send_queued_packet(buf);
+        }
+
+        // Transport data: decrypt where it lies.
+        if let Ok(Packet::PacketData(data)) = Self::parse_incoming_packet(datagram) {
+            let (receiver_idx, counter) = (data.receiver_idx, data.counter);
+            return self
+                .handle_data_in_place(receiver_idx, counter, &mut buf[DATA_HEADER_SZ..len])
+                .unwrap_or_else(TunnResult::from);
+        }
+
+        // Handshake messages are small: copy them out, so the reply can be written to `buf`.
+        let mut message = [0u8; HANDSHAKE_INIT_SZ];
+        let Some(message) = message.get_mut(..len) else {
+            return TunnResult::Err(WireGuardError::InvalidPacket);
+        };
+        message.copy_from_slice(datagram);
+        self.decapsulate(src_addr, message, buf)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -333,8 +405,11 @@ impl Tunn {
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
-                dst[..cookie.len()].copy_from_slice(cookie);
-                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+                let Some(reply) = dst.get_mut(..cookie.len()) else {
+                    return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+                };
+                reply.copy_from_slice(cookie);
+                return TunnResult::WriteToNetwork(reply);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
             _ => unreachable!(),
@@ -450,7 +525,21 @@ impl Tunn {
         packet: &PacketData<'_>,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        let r_idx = packet.receiver_idx as usize;
+        let ciphertext = dst
+            .get_mut(..packet.encrypted_encapsulated_packet.len())
+            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+        ciphertext.copy_from_slice(packet.encrypted_encapsulated_packet);
+        self.handle_data_in_place(packet.receiver_idx, packet.counter, ciphertext)
+    }
+
+    /// Decrypts the encrypted packet and tag in `ciphertext` in place.
+    fn handle_data_in_place<'a>(
+        &mut self,
+        receiver_idx: u32,
+        counter: u64,
+        ciphertext: &'a mut [u8],
+    ) -> Result<TunnResult<'a>, WireGuardError> {
+        let r_idx = receiver_idx as usize;
         let idx = r_idx % N_SESSIONS;
 
         // Get the (probably) right session
@@ -460,7 +549,7 @@ impl Tunn {
                 tracing::trace!(message = "No current session available", remote_idx = r_idx);
                 WireGuardError::NoCurrentSession
             })?;
-            session.receive_packet_data(packet, dst)?
+            session.open_in_place(receiver_idx, counter, ciphertext)?
         };
 
         self.set_current_session(r_idx);
@@ -1064,5 +1153,108 @@ mod tests {
         for _ in 0..1000 {
             assert!(timers::handshake_jitter() <= Duration::from_millis(333));
         }
+    }
+
+    /// Reads `packet` into a buffer laid out for `encapsulate_in_place`.
+    fn in_place_buffer(packet: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 2048];
+        buf[DATA_HEADER_SZ..DATA_HEADER_SZ + packet.len()].copy_from_slice(packet);
+        buf
+    }
+
+    #[test]
+    fn in_place_round_trip_does_not_copy() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet_with_payload(&[1, 2, 3]);
+
+        let mut buf = in_place_buffer(&sent);
+        let buf_start = buf.as_ptr();
+        let TunnResult::WriteToNetwork(datagram) =
+            my_tun.encapsulate_in_place(&mut buf, sent.len())
+        else {
+            panic!("expected a data packet");
+        };
+        // Sealed where it was read: the datagram starts at the buffer itself.
+        assert_eq!(datagram.as_ptr(), buf_start);
+        let len = datagram.len();
+
+        let TunnResult::WriteToTunnelV4(received, _) =
+            their_tun.decapsulate_in_place(None, &mut buf, len)
+        else {
+            panic!("expected an IPv4 packet");
+        };
+        // Opened where it arrived: the plaintext sits right behind the data header.
+        assert_eq!(received.as_ptr(), buf_start.wrapping_add(DATA_HEADER_SZ));
+        assert_eq!(received, &sent[..]);
+    }
+
+    #[test]
+    fn in_place_and_copying_paths_interoperate() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet();
+
+        // in-place -> copying
+        let mut buf = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(datagram) =
+            my_tun.encapsulate_in_place(&mut buf, sent.len())
+        else {
+            unreachable!();
+        };
+        let datagram = datagram.to_vec();
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &datagram, &mut dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == &sent[..]
+        ));
+
+        // copying -> in-place
+        let TunnResult::WriteToNetwork(datagram) = their_tun.encapsulate(&sent, &mut dst) else {
+            unreachable!();
+        };
+        let len = datagram.len();
+        let mut buf = vec![0u8; 2048];
+        buf[..len].copy_from_slice(datagram);
+        assert!(matches!(
+            my_tun.decapsulate_in_place(None, &mut buf, len),
+            TunnResult::WriteToTunnelV4(p, _) if p == &sent[..]
+        ));
+    }
+
+    #[test]
+    fn in_place_without_session_queues_and_handshakes() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let sent = create_ipv4_udp_packet();
+        let mut buf = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(init) = my_tun.encapsulate_in_place(&mut buf, sent.len())
+        else {
+            panic!("expected a handshake initiation");
+        };
+        assert!(matches!(
+            Tunn::parse_incoming_packet(init),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        assert_eq!(my_tun.packet_queue.len(), 1);
+
+        // The responder answers an initiation that arrived in its receive buffer.
+        let len = init.len();
+        let mut their_buf = vec![0u8; 2048];
+        their_buf[..len].copy_from_slice(init);
+        assert!(matches!(
+            their_tun.decapsulate_in_place(None, &mut their_buf, len),
+            TunnResult::WriteToNetwork(p)
+                if matches!(Tunn::parse_incoming_packet(p), Ok(Packet::HandshakeResponse(_)))
+        ));
+    }
+
+    #[test]
+    fn in_place_rejects_a_buffer_without_room_for_the_tag() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet();
+        let mut buf = in_place_buffer(&sent);
+        buf.truncate(DATA_HEADER_SZ + sent.len() + 15);
+        assert!(matches!(
+            my_tun.encapsulate_in_place(&mut buf, sent.len()),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
     }
 }

@@ -34,6 +34,7 @@ ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 aws-lc-rs = "1.18.1"
 subtle = "2.6.1"
+zerocopy = { version = "0.8.59", features = ["derive"] }
 x25519-dalek = { version = "2.0.1", features = [
     "reusable_secrets",
     "static_secrets",
@@ -64,4 +65,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bench]]
 name = "crypto_benches"
+harness = false
+
+[[bench]]
+name = "data_path"
 harness = false
