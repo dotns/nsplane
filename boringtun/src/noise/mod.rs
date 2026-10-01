@@ -18,7 +18,7 @@ use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,14 +260,35 @@ impl Tunn {
         }
     }
 
+    /// Replaces the preshared key. Established sessions keep working; the next handshake
+    /// uses the new key.
+    pub const fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.handshake.set_preshared_key(preshared_key);
+    }
+
+    /// Sets the persistent keepalive interval in seconds; `None` or `Some(0)` disables it.
+    pub fn set_persistent_keepalive(&mut self, interval: Option<u16>) {
+        self.timers.set_persistent_keepalive(interval);
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns `TunnResult`.
     ///
     /// Size of dst should be at least `src.len()` + 32, and no less than 148 bytes,
-    /// otherwise `WireGuardError::DestinationBufferTooSmall` is returned.
+    /// otherwise `WireGuardError::DestinationBufferTooSmall` is returned. The plaintext is
+    /// padded to a multiple of 16 bytes when dst has room for up to 15 more bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
-        let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        let current = self.current % N_SESSIONS;
+        // A sending key that is worn out (Reject-After-Messages) is dropped, so the packet is
+        // queued and a handshake starts, as if there were no session.
+        if self.sessions[current]
+            .as_ref()
+            .is_some_and(session::Session::is_exhausted)
+        {
+            self.sessions[current] = None;
+        }
+
+        if let Some(session) = &self.sessions[current] {
             // Send the packet using an established session
             let packet = match session.format_packet_data(src, dst) {
                 Ok(packet) => packet,
@@ -296,7 +317,7 @@ impl Tunn {
     /// packet is processed.
     pub fn decapsulate<'a>(
         &mut self,
-        src_addr: Option<IpAddr>,
+        src_addr: Option<SocketAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
@@ -473,6 +494,7 @@ impl Tunn {
                 if starting_new_handshake {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
+                self.timers.new_handshake_jitter();
                 self.timer_tick(TimerName::TimeLastPacketSent);
                 TunnResult::WriteToNetwork(packet)
             }
@@ -776,7 +798,8 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::MockClock::advance(REKEY_TIMEOUT);
+        // Retries wait REKEY_TIMEOUT plus up to 333 ms of jitter.
+        mock_instant::MockClock::advance(REKEY_TIMEOUT + Duration::from_millis(334));
         update_timer_results_in_handshake(&mut my_tun);
     }
 
@@ -802,5 +825,244 @@ mod tests {
         };
         let recv_packet_buf = recv;
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    fn current_session(tun: &Tunn) -> &session::Session {
+        tun.sessions[tun.current % N_SESSIONS]
+            .as_ref()
+            .expect("an established session")
+    }
+
+    fn is_handshake_init(result: &TunnResult<'_>) -> bool {
+        matches!(
+            result,
+            TunnResult::WriteToNetwork(p)
+                if matches!(Tunn::parse_incoming_packet(p), Ok(Packet::HandshakeInit(_)))
+        )
+    }
+
+    #[test]
+    fn rekey_after_messages_starts_a_handshake() {
+        // Both the initiator and the responder rekey once their sending key is worn out.
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        for tun in [&mut my_tun, &mut their_tun] {
+            current_session(tun).set_sending_counter(session::REKEY_AFTER_MESSAGES);
+            assert!(is_handshake_init(&tun.update_timers(&mut dst)));
+        }
+    }
+
+    #[test]
+    fn exhausted_session_queues_the_packet_and_handshakes() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        current_session(&my_tun).set_sending_counter(session::REJECT_AFTER_MESSAGES);
+        let mut dst = vec![0u8; 2048];
+        let packet = create_ipv4_udp_packet();
+        assert!(is_handshake_init(&my_tun.encapsulate(&packet, &mut dst)));
+        assert_eq!(my_tun.packet_queue.len(), 1);
+    }
+
+    fn create_ipv4_udp_packet_with_payload(payload: &[u8]) -> Vec<u8> {
+        let header =
+            etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5).udp(5678, 23);
+        let mut packet = Vec::<u8>::with_capacity(header.size(payload.len()));
+        header.write(&mut packet, payload).unwrap();
+        packet
+    }
+
+    #[test]
+    fn data_packets_are_padded_to_a_multiple_of_16() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet_with_payload(&[7]);
+        assert_eq!(sent.len(), 29);
+
+        let mut dst = vec![0u8; 2048];
+        let TunnResult::WriteToNetwork(encrypted) = my_tun.encapsulate(&sent, &mut dst) else {
+            unreachable!();
+        };
+        // header (16) + plaintext padded to 32 + tag (16)
+        assert_eq!(encrypted.len(), 16 + 32 + 16);
+
+        let encrypted = encrypted.to_vec();
+        let mut their_dst = vec![0u8; 2048];
+        let TunnResult::WriteToTunnelV4(received, _) =
+            their_tun.decapsulate(None, &encrypted, &mut their_dst)
+        else {
+            unreachable!();
+        };
+        // The receiver strips the padding using the IP length field.
+        assert_eq!(received, &sent[..]);
+    }
+
+    /// Runs a full handshake, initiated by `initiator`; returns whether it completed.
+    fn rehandshake(initiator: &mut Tunn, responder: &mut Tunn) -> bool {
+        // The responder rejects initiations whose timestamp does not advance.
+        #[cfg(feature = "mock-instant")]
+        mock_instant::MockClock::advance(Duration::from_millis(1));
+        let mut dst = vec![0u8; 2048];
+        let TunnResult::WriteToNetwork(init) =
+            initiator.format_handshake_initiation(&mut dst, true)
+        else {
+            return false;
+        };
+        let init = init.to_vec();
+        let TunnResult::WriteToNetwork(resp) = responder.decapsulate(None, &init, &mut dst) else {
+            return false;
+        };
+        let resp = resp.to_vec();
+        matches!(
+            initiator.decapsulate(None, &resp, &mut dst),
+            TunnResult::WriteToNetwork(_)
+        )
+    }
+
+    #[test]
+    fn preshared_key_change_applies_to_the_next_handshake() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+
+        // Only one side knows the new key: the handshake cannot complete.
+        my_tun.set_preshared_key(Some([7; 32]));
+        assert!(!rehandshake(&mut my_tun, &mut their_tun));
+
+        their_tun.set_preshared_key(Some([7; 32]));
+        assert!(rehandshake(&mut my_tun, &mut their_tun));
+    }
+
+    #[test]
+    fn preshared_key_change_keeps_the_live_session() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        my_tun.set_preshared_key(Some([7; 32]));
+
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let TunnResult::WriteToNetwork(data) = my_tun.encapsulate(&packet, &mut dst) else {
+            unreachable!();
+        };
+        let data = data.to_vec();
+        let mut their_dst = vec![0u8; 2048];
+        assert!(matches!(
+            their_tun.decapsulate(None, &data, &mut their_dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+    }
+
+    #[test]
+    fn persistent_keepalive_can_be_changed() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        assert_eq!(my_tun.persistent_keepalive(), None);
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(my_tun.persistent_keepalive(), Some(25));
+        my_tun.set_persistent_keepalive(None);
+        assert_eq!(my_tun.persistent_keepalive(), None);
+    }
+
+    /// Advances the clock and runs the timers, as the device does every 250 ms; nothing may be
+    /// due.
+    #[cfg(feature = "mock-instant")]
+    fn advance(d: Duration, tuns: &mut [&mut Tunn]) {
+        mock_instant::MockClock::advance(d);
+        let mut dst = vec![0u8; 2048];
+        for tun in tuns {
+            assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+        }
+    }
+
+    /// Sends one data packet from `from` to `to`.
+    #[cfg(feature = "mock-instant")]
+    fn send_data(from: &mut Tunn, to: &mut Tunn) {
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let TunnResult::WriteToNetwork(data) = from.encapsulate(&packet, &mut dst) else {
+            panic!("expected a data packet");
+        };
+        let data = data.to_vec();
+        assert!(matches!(
+            to.decapsulate(None, &data, &mut dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+    }
+
+    fn is_keepalive(result: &TunnResult<'_>) -> bool {
+        matches!(result, TunnResult::WriteToNetwork(p) if p.len() == 32)
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn passive_keepalive_is_timed_from_the_received_data() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+
+        // A long idle period, then the peer sends data.
+        advance(Duration::from_secs(60), &mut [&mut my_tun, &mut their_tun]);
+        send_data(&mut their_tun, &mut my_tun);
+
+        // The keepalive is due KEEPALIVE_TIMEOUT after the data, not right away.
+        advance(Duration::from_secs(9), &mut [&mut my_tun]);
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn handshake_after_unanswered_data_is_timed_from_the_sent_data() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+
+        // A long idle period, then we send data the peer does not answer.
+        advance(Duration::from_secs(60), &mut [&mut my_tun, &mut their_tun]);
+        let packet = create_ipv4_udp_packet();
+        assert!(matches!(
+            my_tun.encapsulate(&packet, &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // The handshake is due KEEPALIVE_TIMEOUT + REKEY_TIMEOUT after the data.
+        advance(Duration::from_secs(14), &mut [&mut my_tun]);
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(is_handshake_init(&my_tun.update_timers(&mut dst)));
+    }
+
+    #[test]
+    fn persistent_keepalive_is_sent_when_enabled() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        my_tun.set_persistent_keepalive(Some(25));
+        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn persistent_keepalive_is_not_sent_while_traffic_flows() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        my_tun.set_persistent_keepalive(Some(25));
+        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+
+        // Data out, keepalive back, every 10 s: the 25 s interval never elapses.
+        for _ in 0..4 {
+            advance(Duration::from_secs(10), &mut [&mut my_tun]);
+            send_data(&mut my_tun, &mut their_tun);
+            let TunnResult::WriteToNetwork(keepalive) = their_tun.encapsulate(&[], &mut dst) else {
+                panic!("expected a keepalive");
+            };
+            let keepalive = keepalive.to_vec();
+            assert!(matches!(
+                my_tun.decapsulate(None, &keepalive, &mut dst),
+                TunnResult::Done
+            ));
+        }
+
+        // Once the tunnel is idle for the interval, the keepalive is sent.
+        advance(Duration::from_secs(24), &mut [&mut my_tun]);
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+    }
+
+    #[test]
+    fn handshake_retry_jitter_is_at_most_333ms() {
+        for _ in 0..1000 {
+            assert!(timers::handshake_jitter() <= Duration::from_millis(333));
+        }
     }
 }

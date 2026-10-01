@@ -19,17 +19,42 @@ impl std::str::FromStr for KeyBytes {
             }
             43 | 44 => {
                 // Try to parse as base64
-                if let Ok(decoded_key) = base64::engine::general_purpose::STANDARD.decode(s) {
-                    if decoded_key.len() == internal.len() {
-                        internal[..].copy_from_slice(&decoded_key);
-                    } else {
-                        return Err("Illegal character in key");
-                    }
+                let engine = if s.len() == 43 {
+                    base64::engine::general_purpose::STANDARD_NO_PAD
+                } else {
+                    base64::engine::general_purpose::STANDARD
+                };
+                let decoded_key = engine.decode(s).map_err(|_| "Illegal character in key")?;
+                if decoded_key.len() != internal.len() {
+                    return Err("Illegal key size");
                 }
+                internal.copy_from_slice(&decoded_key);
             }
             _ => return Err("Illegal key size"),
         }
 
         Ok(Self(internal))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_malformed_base64_keys() {
+        // 44 characters, but not valid base64: must not turn into an all-zero key.
+        assert!("!".repeat(44).parse::<KeyBytes>().is_err());
+        assert!("?".repeat(43).parse::<KeyBytes>().is_err());
+    }
+
+    #[test]
+    fn parses_base64_and_hex_keys() {
+        let base64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+        let hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let expected: [u8; 32] = std::array::from_fn(|i| u8::try_from(i + 1).unwrap());
+        assert_eq!(base64.parse::<KeyBytes>().unwrap().0, expected);
+        assert_eq!(hex.parse::<KeyBytes>().unwrap().0, expected);
+        assert_eq!(base64[..43].parse::<KeyBytes>().unwrap().0, expected);
     }
 }

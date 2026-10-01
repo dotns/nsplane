@@ -543,6 +543,12 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key);
     }
 
+    /// Replaces the preshared key. Handshakes already in flight keep the old key; the next
+    /// handshake uses the new one.
+    pub(crate) const fn set_preshared_key(&mut self, preshared_key: Option<[u8; KEY_LEN]>) {
+        self.params.preshared_key = preshared_key;
+    }
+
     pub(super) fn receive_handshake_initialization<'a>(
         &mut self,
         packet: &HandshakeInit<'_>,

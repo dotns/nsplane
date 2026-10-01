@@ -5,7 +5,8 @@ use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, W
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
 use portable_atomic::{AtomicU64, Ordering};
-use std::net::IpAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
@@ -23,6 +24,14 @@ const COOKIE_NONCE_SIZE: usize = 24;
 
 /// How often should reset count in seconds
 const RESET_PERIOD: u64 = 1;
+
+/// The device-wide handshake budget is this many times the per-source limit. It is a backstop
+/// against floods spread over many source addresses.
+const GLOBAL_LIMIT_FACTOR: u64 = 10;
+
+/// Upper bound on the number of sources tracked per reset period. Sources beyond it are
+/// treated as being under load.
+const MAX_TRACKED_SOURCES: usize = 4096;
 
 type Cookie = [u8; COOKIE_SIZE];
 
@@ -45,9 +54,12 @@ pub struct RateLimiter {
     nonce_ctr: AtomicU64,
     mac1_key: [u8; 32],
     cookie_key: Key,
+    /// Handshakes per second and source address before cookies are required
     limit: u64,
-    /// The counter since last reset
+    /// Handshakes since last reset, from all sources
     count: AtomicU64,
+    /// Handshakes since last reset, per source address
+    per_source: Mutex<HashMap<IpAddr, u64>>,
     /// The time last reset was performed on this rate limiter
     last_reset: Mutex<Instant>,
 }
@@ -75,6 +87,7 @@ impl RateLimiter {
             cookie_key: b2s_hash(LABEL_COOKIE, public_key.as_bytes()).into(),
             limit,
             count: AtomicU64::new(0),
+            per_source: Mutex::new(HashMap::new()),
             last_reset: Mutex::new(Instant::now()),
         }
     }
@@ -92,25 +105,39 @@ impl RateLimiter {
         let mut last_reset_time = self.last_reset.lock();
         if current_time.duration_since(*last_reset_time).as_secs() >= RESET_PERIOD {
             self.count.store(0, Ordering::SeqCst);
+            self.per_source.lock().clear();
             *last_reset_time = current_time;
         }
     }
 
-    /// Compute the correct cookie value based on the current secret value and the source IP
-    fn current_cookie(&self, addr: IpAddr) -> Cookie {
-        let mut addr_bytes = [0u8; 16];
+    /// Compute the correct cookie value based on the current secret value and the source
+    /// address, IP and port, as the whitepaper requires.
+    fn current_cookie(&self, addr: SocketAddr) -> Cookie {
+        let mut addr_bytes = [0u8; 18];
 
-        match addr {
-            IpAddr::V4(a) => addr_bytes[..4].copy_from_slice(&a.octets()[..]),
-            IpAddr::V6(a) => addr_bytes[..].copy_from_slice(&a.octets()[..]),
-        }
+        let ip_len = match addr.ip() {
+            IpAddr::V4(a) => {
+                addr_bytes[..4].copy_from_slice(&a.octets());
+                4
+            }
+            IpAddr::V6(a) => {
+                addr_bytes[..16].copy_from_slice(&a.octets());
+                16
+            }
+        };
+        addr_bytes[ip_len..ip_len + 2].copy_from_slice(&addr.port().to_be_bytes());
 
-        // The current cookie for a given IP is the MAC(responder.changing_secret_every_two_minutes, initiator.ip_address)
+        // The current cookie for a given address is
+        // MAC(responder.changing_secret_every_two_minutes, initiator.ip_address || initiator.port)
         // First we derive the secret from the current time, the value of cur_counter would change with time.
         let cur_counter = Instant::now().duration_since(self.start_time).as_secs() / COOKIE_REFRESH;
 
         // Next we derive the cookie
-        b2s_keyed_mac_16_2(&self.secret_key, &cur_counter.to_le_bytes(), &addr_bytes)
+        b2s_keyed_mac_16_2(
+            &self.secret_key,
+            &cur_counter.to_le_bytes(),
+            &addr_bytes[..ip_len + 2],
+        )
     }
 
     fn nonce(&self) -> [u8; COOKIE_NONCE_SIZE] {
@@ -119,8 +146,28 @@ impl RateLimiter {
         b2s_mac_24(&self.nonce_key, &ctr.to_le_bytes())
     }
 
-    fn is_under_load(&self) -> bool {
-        self.count.fetch_add(1, Ordering::SeqCst) >= self.limit
+    /// Counts a handshake from `src` and returns whether it must carry a valid cookie.
+    ///
+    /// Only sources that exceed their own budget are asked for cookies, so one flooding source
+    /// does not push every other peer into cookie mode. The device-wide count is a backstop for
+    /// floods from many sources; without a source address only the device-wide `limit` applies.
+    fn is_under_load(&self, src: Option<IpAddr>) -> bool {
+        let total = self.count.fetch_add(1, Ordering::SeqCst);
+        let Some(ip) = src else {
+            return total >= self.limit;
+        };
+        if total >= self.limit.saturating_mul(GLOBAL_LIMIT_FACTOR) {
+            return true;
+        }
+
+        let mut per_source = self.per_source.lock();
+        if !per_source.contains_key(&ip) && per_source.len() >= MAX_TRACKED_SOURCES {
+            return true;
+        }
+        let count = per_source.entry(ip).or_insert(0);
+        let previous = *count;
+        *count += 1;
+        previous >= self.limit
     }
 
     pub(crate) fn format_cookie_reply<'a>(
@@ -163,7 +210,7 @@ impl RateLimiter {
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed
     pub fn verify_packet<'a, 'b>(
         &self,
-        src_addr: Option<IpAddr>,
+        src_addr: Option<SocketAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
     ) -> Result<Packet<'a>, TunnResult<'b>> {
@@ -181,7 +228,7 @@ impl RateLimiter {
                 return Err(TunnResult::Err(WireGuardError::InvalidMac));
             }
 
-            if self.is_under_load() {
+            if self.is_under_load(src_addr.map(|a| a.ip())) {
                 let Some(addr) = src_addr else {
                     return Err(TunnResult::Err(WireGuardError::UnderLoad));
                 };
@@ -200,5 +247,112 @@ impl RateLimiter {
         }
 
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x25519::{PublicKey, StaticSecret};
+
+    struct Initiator {
+        tunn: Tunn,
+    }
+
+    impl Initiator {
+        fn new(responder: &PublicKey) -> Self {
+            let tunn = Tunn::new(
+                StaticSecret::random_from_rng(OsRng),
+                *responder,
+                None,
+                None,
+                OsRng.next_u32() >> 8,
+                None,
+            );
+            Self { tunn }
+        }
+
+        fn handshake_init(&mut self) -> Vec<u8> {
+            let mut dst = [0u8; 256];
+            match self.tunn.format_handshake_initiation(&mut dst, true) {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("expected a handshake initiation, got {other:?}"),
+            }
+        }
+    }
+
+    fn responder(limit: u64) -> (RateLimiter, PublicKey) {
+        let public = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        (RateLimiter::new(&public, limit), public)
+    }
+
+    fn is_cookie_reply(result: &Result<Packet<'_>, TunnResult<'_>>) -> bool {
+        matches!(result, Err(TunnResult::WriteToNetwork(_)))
+    }
+
+    #[test]
+    fn cookie_is_bound_to_source_port() {
+        let (limiter, public) = responder(0);
+        let mut initiator = Initiator::new(&public);
+        let mut dst = [0u8; 256];
+        let addr = SocketAddr::from(([192, 0, 2, 1], 1000));
+        let same_ip_other_port = SocketAddr::from(([192, 0, 2, 1], 2000));
+
+        // Under load: the first initiation is answered with a cookie.
+        let init = initiator.handshake_init();
+        let Err(TunnResult::WriteToNetwork(cookie_reply)) =
+            limiter.verify_packet(Some(addr), &init, &mut dst)
+        else {
+            panic!("expected a cookie reply");
+        };
+        let cookie_reply = cookie_reply.to_vec();
+        let mut scratch = [0u8; 256];
+        assert!(matches!(
+            initiator
+                .tunn
+                .decapsulate(None, &cookie_reply, &mut scratch),
+            TunnResult::Done
+        ));
+
+        // The initiation now carries a valid mac2 for `addr` only.
+        let init = initiator.handshake_init();
+        assert!(limiter.verify_packet(Some(addr), &init, &mut dst).is_ok());
+        assert!(is_cookie_reply(&limiter.verify_packet(
+            Some(same_ip_other_port),
+            &init,
+            &mut dst
+        )));
+    }
+
+    #[test]
+    fn flooding_source_does_not_put_other_sources_into_cookie_mode() {
+        let (limiter, public) = responder(2);
+        let mut flooder = Initiator::new(&public);
+        let mut honest = Initiator::new(&public);
+        let mut dst = [0u8; 256];
+        let flooder_ip = SocketAddr::from(([192, 0, 2, 1], 1000));
+        let honest_ip = SocketAddr::from(([192, 0, 2, 2], 1000));
+
+        for _ in 0..2 {
+            let init = flooder.handshake_init();
+            assert!(
+                limiter
+                    .verify_packet(Some(flooder_ip), &init, &mut dst)
+                    .is_ok()
+            );
+        }
+        let init = flooder.handshake_init();
+        assert!(is_cookie_reply(&limiter.verify_packet(
+            Some(flooder_ip),
+            &init,
+            &mut dst
+        )));
+
+        let init = honest.handshake_init();
+        assert!(
+            limiter
+                .verify_packet(Some(honest_ip), &init, &mut dst)
+                .is_ok()
+        );
     }
 }

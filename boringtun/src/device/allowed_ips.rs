@@ -11,7 +11,6 @@ use std::iter::FromIterator;
 use std::net::IpAddr;
 
 /// A trie of IP/cidr addresses
-#[derive(Default)]
 pub struct AllowedIps<D> {
     ips: IpNetworkTable<D>,
 }
@@ -25,6 +24,12 @@ impl<'a, D> FromIterator<(&'a AllowedIP, D)> for AllowedIps<D> {
         }
 
         allowed_ips
+    }
+}
+
+impl<D> Default for AllowedIps<D> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

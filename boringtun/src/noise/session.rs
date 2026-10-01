@@ -27,6 +27,18 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// Once a key has encrypted this many messages, a new handshake is started
+/// (`Rekey-After-Messages`, 2^60).
+pub(super) const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
+/// A key never encrypts or accepts this many messages, so its nonce cannot repeat
+/// (`Reject-After-Messages`, 2^64 - 2^13 - 1).
+pub(super) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
+
+/// Length of a plaintext of `len` bytes after padding to a multiple of 16.
+const fn padded_len(len: usize) -> usize {
+    len.next_multiple_of(16)
+}
+
 /// Where encrypted data resides in a data packet
 const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
@@ -34,10 +46,10 @@ const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
-const N_WORDS: usize = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+const N_WORDS: usize = 128; // Reorder up to 64*128 = 8192 packets, like Linux and wireguard-go
 const N_BITS: u64 = WORD_SIZE * N_WORDS as u64;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
@@ -45,6 +57,16 @@ struct ReceivingKeyCounterValidator {
     /// Used to estimate packet loss
     receive_cnt: u64,
     bitmap: [u64; N_WORDS],
+}
+
+impl Default for ReceivingKeyCounterValidator {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            receive_cnt: 0,
+            bitmap: [0; N_WORDS],
+        }
+    }
 }
 
 impl ReceivingKeyCounterValidator {
@@ -84,6 +106,9 @@ impl ReceivingKeyCounterValidator {
     /// Returns true if the counter was not yet received, and is not too far back
     #[inline]
     const fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(WireGuardError::InvalidCounter);
+        }
         if counter >= self.next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -103,7 +128,7 @@ impl ReceivingKeyCounterValidator {
     /// decryption something changed)
     #[inline]
     fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
-        if counter + N_BITS < self.next {
+        if counter >= REJECT_AFTER_MESSAGES || counter + N_BITS < self.next {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
         }
@@ -199,7 +224,13 @@ impl Session {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
+        // Never hand out a counter at or past Reject-After-Messages: the nonce must not repeat.
+        let sending_key_counter = self
+            .sending_key_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                (c < REJECT_AFTER_MESSAGES).then_some(c + 1)
+            })
+            .map_err(|_| WireGuardError::ConnectionExpired)?;
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
@@ -209,20 +240,23 @@ impl Session {
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
+        // The spec pads the plaintext with zeros to a multiple of 16 bytes, as far as the
+        // buffer allows.
+        let padded_len = padded_len(src.len()).min(data.len() - AEAD_SIZE);
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
+            data[src.len()..padded_len].fill(0);
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..padded_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[padded_len..padded_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    padded_len + AEAD_SIZE
                 })
                 .map_err(|_| WireGuardError::DestinationBufferTooSmall)?
         };
@@ -265,6 +299,21 @@ impl Session {
         // After decryption is done, check counter again, and mark as received
         self.receiving_counter_mark(packet.counter)?;
         Ok(ret)
+    }
+
+    /// Whether the sending key reached Reject-After-Messages and must not be used again.
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.sending_counter() >= REJECT_AFTER_MESSAGES
+    }
+
+    /// Number of messages encrypted with the sending key so far.
+    pub(super) fn sending_counter(&self) -> u64 {
+        self.sending_key_counter.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sending_counter(&self, counter: u64) {
+        self.sending_key_counter.store(counter, Ordering::Relaxed);
     }
 
     /// Returns the estimated downstream packet loss for this session
@@ -325,5 +374,39 @@ mod tests {
         assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    }
+
+    #[test]
+    fn refuses_to_send_at_reject_after_messages() {
+        let session = Session::new(1, 2, [1; 32], [2; 32]);
+        session
+            .sending_key_counter
+            .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
+        let mut dst = [0u8; 64];
+        assert!(matches!(
+            session.format_packet_data(&[], &mut dst),
+            Err(WireGuardError::ConnectionExpired)
+        ));
+        // The counter must not move past the limit, so it can never wrap around.
+        assert_eq!(
+            session.sending_key_counter.load(Ordering::Relaxed),
+            REJECT_AFTER_MESSAGES
+        );
+    }
+
+    #[test]
+    fn rejects_received_counters_at_reject_after_messages() {
+        let mut c = ReceivingKeyCounterValidator::default();
+        assert!(c.will_accept(REJECT_AFTER_MESSAGES).is_err());
+        assert!(c.mark_did_receive(REJECT_AFTER_MESSAGES).is_err());
+        assert!(c.will_accept(REJECT_AFTER_MESSAGES - 1).is_ok());
+    }
+
+    #[test]
+    fn replay_window_tolerates_8192_reordered_packets() {
+        let mut c = ReceivingKeyCounterValidator::default();
+        assert!(c.mark_did_receive(8000).is_ok());
+        assert!(c.mark_did_receive(5).is_ok());
+        assert!(c.mark_did_receive(5).is_err());
     }
 }

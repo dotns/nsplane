@@ -24,3 +24,15 @@ modules with SAFETY comments (ADR `2026-10-01-unsafe-code-in-boringtun`), no CI
   replaced with `saturating_sub`.
 - Building `aws-lc-sys` for `x86_64-pc-windows-*` requires NASM on the build host.
 - `kqueue.rs`/`tun_darwin.rs` are invisible to Linux builds; use `just cross`.
+
+## 2026-10-01 22:30 [progress]
+
+Phase D done: F1-F10 re-implemented with failing tests first (no gotatun code copied).
+`device::PeerTable` extracted to make peer updates testable. `just check` and `just cross` pass.
+
+## 2026-10-01 22:30 [pitfall]
+
+- With `mock-instant`, timer ticks use the time of the last `update_timers` call; tests must
+  call `update_timers` after advancing the clock, as the device does every 250 ms.
+- Re-handshake tests need the mock clock to advance, or the responder rejects the initiation
+  timestamp as a replay.

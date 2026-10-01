@@ -3,12 +3,12 @@
 
 use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
-use super::{AllowedIP, Device, Error, SocketAddr};
+use super::{AllowedIP, Device, Error, PeerUpdate, SocketAddr};
 use crate::device::Action;
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
-use libc::{EADDRINUSE, EINVAL, EIO, EPROTO, SIGINT, SIGTERM};
+use libc::{EADDRINUSE, EINVAL, EIO, ENOSPC, EPROTO, SIGINT, SIGTERM};
 use std::fs::{create_dir, remove_file};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -164,8 +164,9 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         writeln!(writer, "fwmark={fwmark}");
     }
 
-    for (k, p) in &d.peers {
-        let p = p.lock();
+    for (k, peer) in d.peers.iter() {
+        let allowed_ips = d.peers.allowed_ips(peer);
+        let p = peer.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
 
         if let Some(ref key) = p.preshared_key() {
@@ -181,7 +182,7 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "endpoint={addr}");
         }
 
-        for (ip, cidr) in p.allowed_ips() {
+        for (ip, cidr) in allowed_ips {
             writeln!(writer, "allowed_ip={ip}/{cidr}");
         }
 
@@ -272,77 +273,52 @@ fn api_set_peer(
     pub_key: x25519::PublicKey,
 ) -> i32 {
     let mut cmd = String::new();
+    // Every `public_key` line starts a fresh section: settings never leak into the next peer.
+    let mut update = PeerUpdate::new(pub_key);
 
-    let mut remove = false;
-    let mut replace_ips = false;
-    let mut endpoint = None;
-    let mut keepalive = None;
-    let mut public_key = pub_key;
-    let mut preshared_key = None;
-    let mut allowed_ips: Vec<AllowedIP> = vec![];
     while reader.read_line(&mut cmd).is_ok() {
         cmd.pop(); // remove newline if any
         if cmd.is_empty() {
-            d.update_peer(
-                public_key,
-                remove,
-                replace_ips,
-                endpoint,
-                allowed_ips.as_slice(),
-                keepalive,
-                preshared_key,
-            );
-            allowed_ips.clear(); //clear the vector content after update
-            return 0; // Done
+            return apply_peer_update(d, update);
         }
         {
-            let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
-            if parsed_cmd.len() != 2 {
+            let Some((key, val)) = cmd.split_once('=') else {
                 return EPROTO;
-            }
-            let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+            };
             match key {
                 "remove" => match val.parse::<bool>() {
-                    Ok(true) => remove = true,
-                    Ok(false) => remove = false,
+                    Ok(remove) => update.remove = remove,
                     Err(_) => return EINVAL,
                 },
                 "preshared_key" => match val.parse::<KeyBytes>() {
-                    Ok(key_bytes) => preshared_key = Some(key_bytes.0),
+                    Ok(key_bytes) => update.preshared_key = Some(key_bytes.0),
                     Err(_) => return EINVAL,
                 },
                 "endpoint" => match val.parse::<SocketAddr>() {
-                    Ok(addr) => endpoint = Some(addr),
+                    Ok(addr) => update.endpoint = Some(addr),
                     Err(_) => return EINVAL,
                 },
                 "persistent_keepalive_interval" => match val.parse::<u16>() {
-                    Ok(interval) => keepalive = Some(interval),
+                    Ok(interval) => update.persistent_keepalive = Some(interval),
                     Err(_) => return EINVAL,
                 },
                 "replace_allowed_ips" => match val.parse::<bool>() {
-                    Ok(true) => replace_ips = true,
-                    Ok(false) => replace_ips = false,
+                    Ok(replace) => update.replace_allowed_ips = replace,
                     Err(_) => return EINVAL,
                 },
                 "allowed_ip" => match val.parse::<AllowedIP>() {
-                    Ok(ip) => allowed_ips.push(ip),
+                    Ok(ip) => update.allowed_ips.push(ip),
                     Err(_) => return EINVAL,
                 },
                 "public_key" => {
                     // Indicates a new peer section. Commit changes for current peer, and continue to next peer
-                    d.update_peer(
-                        public_key,
-                        remove,
-                        replace_ips,
-                        endpoint,
-                        allowed_ips.as_slice(),
-                        keepalive,
-                        preshared_key,
-                    );
-                    allowed_ips.clear(); //clear the vector content after update
-                    match val.parse::<KeyBytes>() {
-                        Ok(key_bytes) => public_key = key_bytes.0.into(),
-                        Err(_) => return EINVAL,
+                    let Ok(key_bytes) = val.parse::<KeyBytes>() else {
+                        return EINVAL;
+                    };
+                    let next = PeerUpdate::new(key_bytes.0.into());
+                    let status = apply_peer_update(d, std::mem::replace(&mut update, next));
+                    if status != 0 {
+                        return status;
                     }
                 }
                 "protocol_version" => match val.parse::<u32>() {
@@ -355,4 +331,14 @@ fn api_set_peer(
         cmd.clear();
     }
     0
+}
+
+fn apply_peer_update(d: &mut Device, update: PeerUpdate) -> i32 {
+    match d.update_peer(update) {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(message = "Failed to update peer", error = ?e);
+            ENOSPC
+        }
+    }
 }

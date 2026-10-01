@@ -12,6 +12,7 @@ pub mod drop_privileges;
 mod integration_tests;
 /// Per-peer state of a device.
 pub mod peer;
+mod peer_table;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -29,9 +30,8 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
-use std::collections::HashMap;
 use std::io::{self, Write as _};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,11 +43,10 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
-use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
+use peer_table::{PeerTable, PeerTableError, PeerUpdate};
 use poll::{EventPoll, EventRef, WaitResult};
-use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use tun::TunSocket;
 
@@ -171,10 +170,7 @@ pub struct Device {
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
 
-    peers: HashMap<x25519::PublicKey, Arc<Mutex<Peer>>>,
-    peers_by_ip: AllowedIps<Arc<Mutex<Peer>>>,
-    peers_by_idx: HashMap<u32, Arc<Mutex<Peer>>>,
-    next_index: IndexLfsr,
+    peers: PeerTable,
 
     config: DeviceConfig,
 
@@ -194,7 +190,7 @@ impl std::fmt::Debug for Device {
             .field("listen_port", &self.listen_port)
             .field("fwmark", &self.fwmark)
             .field("iface", &self.iface)
-            .field("peers", &self.peers.len())
+            .field("peers", &self.peers)
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -341,80 +337,18 @@ impl Drop for DeviceHandle {
 }
 
 impl Device {
-    const fn next_index(&mut self) -> Option<u32> {
-        self.next_index.next()
-    }
-
-    fn remove_peer(&mut self, pub_key: &x25519::PublicKey) {
-        if let Some(peer) = self.peers.remove(pub_key) {
-            // Found a peer to remove, now purge all references to it:
-            {
-                let p = peer.lock();
-                p.shutdown_endpoint(); // close open udp socket and free the closure
-                self.peers_by_idx.remove(&p.index());
+    /// Applies one UAPI peer section.
+    fn update_peer(&mut self, update: PeerUpdate) -> Result<(), PeerTableError> {
+        let Some((private_key, _)) = self.key_pair.as_ref() else {
+            if update.remove {
+                self.peers.remove(&update.public_key);
+                return Ok(());
             }
-            self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(&peer, p));
-
-            tracing::info!("Peer removed");
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn update_peer(
-        &mut self,
-        pub_key: x25519::PublicKey,
-        remove: bool,
-        _replace_ips: bool,
-        endpoint: Option<SocketAddr>,
-        allowed_ips: &[AllowedIP],
-        keepalive: Option<u16>,
-        preshared_key: Option<[u8; 32]>,
-    ) {
-        if remove {
-            // Completely remove a peer
-            return self.remove_peer(&pub_key);
-        }
-
-        // Update an existing peer
-        if self.peers.contains_key(&pub_key) {
-            // We already have a peer, we need to merge the existing config into the newly created one
-            tracing::error!(
-                "Modifying existing peers is not yet supported. Remove and add again instead."
-            );
-            return;
-        }
-
-        let Some(device_key_pair) = self.key_pair.as_ref() else {
             tracing::error!("Private key must be set before adding peers");
-            return;
+            return Ok(());
         };
-        let device_private_key = device_key_pair.0.clone();
-        let Some(next_index) = self.next_index() else {
-            tracing::error!("Too many peers created");
-            return;
-        };
-
-        let tunn = Tunn::new(
-            device_private_key,
-            pub_key,
-            preshared_key,
-            keepalive,
-            next_index,
-            None,
-        );
-
-        let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
-
-        let peer = Arc::new(Mutex::new(peer));
-        self.peers.insert(pub_key, Arc::clone(&peer));
-        self.peers_by_idx.insert(next_index, Arc::clone(&peer));
-
-        for AllowedIP { addr, cidr } in allowed_ips {
-            self.peers_by_ip.insert(*addr, *cidr, Arc::clone(&peer));
-        }
-
-        tracing::info!("Peer added");
+        self.peers
+            .apply(update, private_key, self.rate_limiter.as_ref())
     }
 
     /// Creates the TUN interface `name` and registers the event handlers.
@@ -439,10 +373,7 @@ impl Device {
             fwmark: None,
             key_pair: None,
             listen_port: 0,
-            next_index: IndexLfsr::default(),
-            peers: HashMap::new(),
-            peers_by_idx: HashMap::new(),
-            peers_by_ip: AllowedIps::new(),
+            peers: PeerTable::default(),
             udp4: None,
             udp6: None,
             cleanup_paths: Vec::new(),
@@ -488,7 +419,7 @@ impl Device {
             }
         }
 
-        for peer in self.peers.values() {
+        for peer in self.peers.peers() {
             peer.lock().shutdown_endpoint();
         }
 
@@ -538,7 +469,7 @@ impl Device {
 
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
-        for peer in self.peers.values_mut() {
+        for peer in self.peers.peers() {
             peer.lock().tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
@@ -560,7 +491,7 @@ impl Device {
         }
 
         // Then on all currently connected sockets
-        for peer in self.peers.values() {
+        for peer in self.peers.peers() {
             if let Some(ref sock) = peer.lock().endpoint().conn {
                 sock.set_mark(mark)?;
             }
@@ -571,8 +502,6 @@ impl Device {
 
     fn clear_peers(&mut self) {
         self.peers.clear();
-        self.peers_by_idx.clear();
-        self.peers_by_ip.clear();
     }
 
     fn register_notifiers(&mut self) -> Result<(), Error> {
@@ -605,14 +534,12 @@ impl Device {
         self.queue.new_periodic_event(
             // Execute the timed function of every peer in the list
             Box::new(|d, t| {
-                let peer_map = &d.peers;
-
                 let (Some(udp4), Some(udp6)) = (d.udp4.as_ref(), d.udp6.as_ref()) else {
                     return Action::Continue;
                 };
 
                 // Go over each peer and invoke the timer function
-                for peer in peer_map.values() {
+                for peer in d.peers.peers() {
                     let mut p = peer.lock();
                     let endpoint = p.endpoint().addr;
                     let Some(endpoint_addr) = endpoint else {
@@ -678,7 +605,7 @@ impl Device {
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
-                        match rate_limiter.verify_packet(Some(addr.ip()), packet, &mut t.dst_buf) {
+                        match rate_limiter.verify_packet(Some(addr), packet, &mut t.dst_buf) {
                             Ok(packet) => packet,
                             Err(TunnResult::WriteToNetwork(cookie)) => {
                                 let _ = udp.send_to(cookie, addr);
@@ -695,10 +622,11 @@ impl Device {
                                     d.peers.get(&x25519::PublicKey::from(hh.peer_static_public))
                                 })
                         }
-                        Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::HandshakeResponse(p) => d.peers.by_index(p.receiver_idx),
+                        Packet::PacketCookieReply(p) => d.peers.by_index(p.receiver_idx),
+                        Packet::PacketData(p) => d.peers.by_index(p.receiver_idx),
                     };
+                    let roams = roams_endpoint(&parsed_packet);
 
                     let Some(peer) = peer else {
                         continue;
@@ -718,13 +646,13 @@ impl Device {
                             flush = true;
                             let _ = udp.send_to(packet, addr);
                         }
-                        TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                        TunnResult::WriteToTunnelV4(packet, src) => {
+                            if d.peers.routes_to(src.into(), peer) {
                                 t.iface.write4(packet);
                             }
                         }
-                        TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                        TunnResult::WriteToTunnelV6(packet, src) => {
+                            if d.peers.routes_to(src.into(), peer) {
                                 t.iface.write6(packet);
                             }
                         }
@@ -739,14 +667,20 @@ impl Device {
                         }
                     }
 
-                    // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
-                    if d.config.use_connected_socket
-                        && let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark)
-                        && let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
-                    {
-                        tracing::error!(message = "Failed to register connected socket", error = ?e);
+                    // This packet was OK, that means we want to create a connected socket for
+                    // this peer. Cookie replies are not authenticated by the peer's keys and never
+                    // move the endpoint.
+                    if roams {
+                        p.set_endpoint(addr);
+                        if d.config.use_connected_socket
+                            && let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark)
+                            && let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, addr)
+                        {
+                            tracing::error!(
+                                message = "Failed to register connected socket",
+                                error = ?e
+                            );
+                        }
                     }
 
                     iter -= 1;
@@ -764,12 +698,12 @@ impl Device {
         &self,
         peer: Arc<Mutex<Peer>>,
         udp: socket2::Socket,
-        peer_addr: IpAddr,
+        peer_addr: SocketAddr,
     ) -> Result<(), Error> {
         let udp = UdpSocket::from(udp);
         self.queue.new_event(
             udp.as_raw_fd(),
-            Box::new(move |_, t| {
+            Box::new(move |d, t| {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
@@ -792,13 +726,13 @@ impl Device {
                             flush = true;
                             let _ = udp.send(packet);
                         }
-                        TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                        TunnResult::WriteToTunnelV4(packet, src) => {
+                            if d.peers.routes_to(src.into(), &peer) {
                                 iface.write4(packet);
                             }
                         }
-                        TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                        TunnResult::WriteToTunnelV6(packet, src) => {
+                            if d.peers.routes_to(src.into(), &peer) {
                                 iface.write6(packet);
                             }
                         }
@@ -840,7 +774,6 @@ impl Device {
                     return Action::Continue;
                 };
 
-                let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
                     let src = match iface.read(&mut t.src_buf[..mtu]) {
                         Ok(src) => src,
@@ -862,7 +795,7 @@ impl Device {
                         continue;
                     };
 
-                    let mut peer = match peers.find(dst_addr) {
+                    let mut peer = match d.peers.by_destination(dst_addr) {
                         Some(peer) => peer.lock(),
                         None => continue,
                     };
@@ -897,56 +830,29 @@ impl Device {
     }
 }
 
-/// A basic linear-feedback shift register implemented as xorshift, used to
-/// distribute peer indexes across the 24-bit address space reserved for peer
-/// identification.
-/// The purpose is to obscure the total number of peers using the system and to
-/// ensure it requires a non-trivial amount of processing power and/or samples
-/// to guess other peers' indices. Anything more ambitious than this is wasted
-/// with only 24 bits of space.
-#[derive(Debug)]
-struct IndexLfsr {
-    initial: u32,
-    lfsr: u32,
-    mask: u32,
+/// Whether an authenticated packet moves the peer's endpoint to its source address.
+///
+/// Cookie replies are encrypted with a key derived from the peer's public key only, so they do
+/// not prove that the sender holds the peer's private key; they never cause roaming.
+const fn roams_endpoint(packet: &Packet<'_>) -> bool {
+    !matches!(packet, Packet::PacketCookieReply(_))
 }
 
-impl IndexLfsr {
-    /// Generate a random 24-bit nonzero integer
-    fn random_index() -> u32 {
-        const LFSR_MAX: u32 = 0x00ff_ffff; // 24-bit seed
-        loop {
-            let i = OsRng.next_u32() & LFSR_MAX;
-            if i > 0 {
-                // LFSR seed must be non-zero
-                return i;
-            }
-        }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::Tunn;
 
-    /// Generate the next value in the pseudorandom sequence, or `None` once the sequence
-    /// is exhausted.
-    const fn next(&mut self) -> Option<u32> {
-        // 24-bit polynomial for randomness. This is arbitrarily chosen to
-        // inject bitflips into the value.
-        const LFSR_POLY: u32 = 0x00d8_0000; // 24-bit polynomial
-        let value = self.lfsr - 1; // lfsr will never have value of 0
-        let next = (self.lfsr >> 1) ^ ((0u32.wrapping_sub(self.lfsr & 1u32)) & LFSR_POLY);
-        if next == self.initial {
-            return None;
-        }
-        self.lfsr = next;
-        Some(value ^ self.mask)
-    }
-}
+    #[test]
+    fn cookie_replies_do_not_roam() {
+        let mut reply = [0u8; 64];
+        reply[0] = 3;
+        let packet = Tunn::parse_incoming_packet(&reply).unwrap();
+        assert!(!roams_endpoint(&packet));
 
-impl Default for IndexLfsr {
-    fn default() -> Self {
-        let seed = Self::random_index();
-        Self {
-            initial: seed,
-            lfsr: seed,
-            mask: Self::random_index(),
-        }
+        let mut data = [0u8; 32];
+        data[0] = 4;
+        let packet = Tunn::parse_incoming_packet(&data).unwrap();
+        assert!(roams_endpoint(&packet));
     }
 }

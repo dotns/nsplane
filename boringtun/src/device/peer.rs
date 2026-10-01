@@ -7,7 +7,7 @@ use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 
-use crate::device::{AllowedIps, Error};
+use crate::device::Error;
 use crate::noise::{Tunn, TunnResult};
 
 #[derive(Default, Debug)]
@@ -24,19 +24,17 @@ impl std::fmt::Debug for Peer {
         f.debug_struct("Peer")
             .field("index", &self.index)
             .field("endpoint", &self.endpoint)
-            .field("allowed_ips", &self.allowed_ips)
             .finish_non_exhaustive()
     }
 }
 
-/// A peer of a device: its tunnel, endpoint and allowed IPs.
+/// A peer of a device: its tunnel and endpoint. Allowed IPs live in the device's routing table.
 pub struct Peer {
     /// The associated tunnel struct
     pub(crate) tunnel: Tunn,
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
-    allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
 }
 
@@ -69,11 +67,10 @@ impl FromStr for AllowedIP {
 
 impl Peer {
     /// Creates a peer around `tunnel`.
-    pub fn new(
+    pub const fn new(
         tunnel: Tunn,
         index: u32,
         endpoint: Option<SocketAddr>,
-        allowed_ips: &[AllowedIP],
         preshared_key: Option<[u8; 32]>,
     ) -> Self {
         Self {
@@ -83,9 +80,20 @@ impl Peer {
                 addr: endpoint,
                 conn: None,
             }),
-            allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
         }
+    }
+
+    /// Replaces the preshared key; the next handshake uses it.
+    pub const fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.preshared_key = preshared_key;
+        self.tunnel.set_preshared_key(preshared_key);
+    }
+
+    /// Sets the persistent keepalive interval in seconds; `0` disables it.
+    pub fn set_persistent_keepalive(&mut self, interval: u16) {
+        self.tunnel
+            .set_persistent_keepalive((interval > 0).then_some(interval));
     }
 
     /// Runs the timers of the tunnel; see [`Tunn::update_timers`].
@@ -169,16 +177,6 @@ impl Peer {
         drop(endpoint);
 
         Ok(udp_conn)
-    }
-
-    /// Returns whether `addr` is inside one of the peer's allowed IPs.
-    pub fn is_allowed_ip<I: Into<IpAddr>>(&self, addr: I) -> bool {
-        self.allowed_ips.find(addr.into()).is_some()
-    }
-
-    /// Iterates over the allowed IPs as `(address, prefix length)`.
-    pub fn allowed_ips(&self) -> impl Iterator<Item = (IpAddr, u8)> + '_ {
-        self.allowed_ips.iter().map(|((), ip, cidr)| (ip, cidr))
     }
 
     /// Time since the current session was established.
