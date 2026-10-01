@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, reason = "integration test")]
 
 //! Command-line parsing of the daemon binary.
+#![cfg(unix)]
 
 use std::process::Command;
 

@@ -4,8 +4,8 @@
 use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::peer_table::{PeerTable, PeerTableError, PeerUpdate};
+use super::unix::Action;
 use super::{Device, Error, uapi};
-use crate::device::Action;
 use crate::x25519;
 use libc::{EIO, SIGINT, SIGTERM};
 use std::fs::{create_dir, remove_file};

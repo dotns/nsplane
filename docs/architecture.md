@@ -19,8 +19,17 @@ userspace WireGuard implementation. The upstream remote is kept for merges.
   - `session`: transport-data AEAD and the anti-replay window.
   - `rate_limiter`: mac1/mac2 verification and cookie replies under load.
   - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry).
-- `device` (feature `device`): event loop, TUN, UDP sockets, peer table (cryptokey
-  routing via `AllowedIps`), and the cross-platform `wg` UAPI.
+- `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
+  and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
+- `device` (feature `device`): TUN, UDP sockets, peer table, and the `wg` UAPI.
+  - Shared: `PeerTable` (peers by key, session index and allowed IP; cryptokey routing),
+    `uapi` (get/set over any `BufRead`/`Write`), and the per-packet functions
+    `receive_datagram`, `send_from_tun`, `update_timers`.
+  - `unix`: epoll (Linux) or kqueue (macOS) event loop with N threads, TUN via
+    `/dev/net/tun` or utun, UAPI on `/var/run/wireguard/<name>.sock`.
+  - `windows`: blocking threads (Wintun reader, one reader per UDP socket, timers, UAPI
+    named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`) around a
+    `RwLock`ed state; Ctrl-C stops the device.
 - `ffi` / `jni` (features `ffi-bindings` / `jni-bindings`): C ABI and Android bindings
   over `noise`.
 

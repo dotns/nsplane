@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cookie replies no longer move the peer's endpoint (roaming).
 
 ### Added
+- Windows support for the `device` feature and the CLI: Wintun interface (`wintun.dll` next
+  to the executable), one blocking thread per task (Wintun, UDP sockets, timers, UAPI), and
+  the UAPI on the named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`
+  restricted to SYSTEM and Administrators, as `wg.exe` expects. Ctrl-C stops the device.
+- The UAPI (`device::uapi`) and the per-packet logic are shared by the Unix and Windows
+  devices.
 - Zero-copy data path: `Tunn::encapsulate_in_place` seals a packet where it was read (behind
   `DATA_HEADER_SZ` bytes of header room) and `Tunn::decapsulate_in_place` decrypts transport
   data inside the receive buffer. The device reads TUN packets straight into the

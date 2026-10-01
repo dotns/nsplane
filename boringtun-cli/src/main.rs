@@ -3,13 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::{Context as _, bail};
-use boringtun::device::drop_privileges::drop_privileges;
+use anyhow::Context as _;
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::Parser;
-use daemonize::{Daemonize, Outcome};
-use std::fs::File;
-use std::os::unix::net::UnixDatagram;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::Level;
@@ -24,6 +21,7 @@ struct Args {
     interface_name: String,
 
     /// Run and log in the foreground
+    #[cfg(unix)]
     #[arg(short, long)]
     foreground: bool,
 
@@ -47,14 +45,17 @@ struct Args {
     uapi_fd: i32,
 
     /// File descriptor for an already-existing TUN device
+    #[cfg(unix)]
     #[arg(long, env = "WG_TUN_FD", default_value_t = -1, allow_negative_numbers = true)]
     tun_fd: i32,
 
     /// Log file
+    #[cfg(unix)]
     #[arg(short, long, env = "WG_LOG_FILE", default_value = "/tmp/boringtun.out")]
     log: PathBuf,
 
     /// Do not drop sudo privileges
+    #[cfg(unix)]
     #[arg(long, env = "WG_SUDO", value_parser = clap::builder::BoolishValueParser::new())]
     disable_drop_privileges: bool,
 
@@ -94,6 +95,7 @@ fn check_tun_name(v: &str) -> Result<String, String> {
     reason = "CLI output boundary"
 )]
 mod output {
+    #[cfg(unix)]
     pub(crate) fn info(msg: &str) {
         println!("{msg}");
     }
@@ -105,6 +107,7 @@ mod output {
 
 /// Key material lives in this process: never write it to a core file, and log panics.
 fn harden_process() {
+    #[cfg(unix)]
     let _ = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0);
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -125,7 +128,41 @@ fn main() -> ExitCode {
     }
 }
 
+const fn device_config(args: &Args) -> DeviceConfig {
+    DeviceConfig {
+        n_threads: args.threads,
+        #[cfg(target_os = "linux")]
+        uapi_fd: args.uapi_fd,
+        use_connected_socket: !args.disable_connected_udp,
+        #[cfg(target_os = "linux")]
+        use_multi_queue: !args.disable_multi_queue,
+    }
+}
+
+/// Runs the device in the foreground, logging to the terminal; Ctrl-C stops it.
+#[cfg(windows)]
 fn run(args: &Args) -> anyhow::Result<()> {
+    let log_level: Level = args.verbosity.parse().context("Invalid verbosity value")?;
+    tracing_subscriber::fmt()
+        .pretty()
+        .with_max_level(log_level)
+        .init();
+
+    let mut device_handle = DeviceHandle::new(&args.interface_name, device_config(args))
+        .context("Failed to initialize tunnel")?;
+    tracing::info!("BoringTun started successfully");
+    device_handle.wait();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run(args: &Args) -> anyhow::Result<()> {
+    use anyhow::bail;
+    use boringtun::device::drop_privileges::drop_privileges;
+    use daemonize::{Daemonize, Outcome};
+    use std::fs::File;
+    use std::os::unix::net::UnixDatagram;
+
     let tun_fd = args.tun_fd.to_string();
     let tun_name = if args.tun_fd >= 0 {
         tun_fd.as_str()
@@ -175,16 +212,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
     }
 
-    let config = DeviceConfig {
-        n_threads: args.threads,
-        #[cfg(target_os = "linux")]
-        uapi_fd: args.uapi_fd,
-        use_connected_socket: !args.disable_connected_udp,
-        #[cfg(target_os = "linux")]
-        use_multi_queue: !args.disable_multi_queue,
-    };
-
-    let mut device_handle = match DeviceHandle::new(tun_name, config) {
+    let mut device_handle = match DeviceHandle::new(tun_name, device_config(args)) {
         Ok(d) => d,
         Err(e) => {
             // Notify parent that tunnel initialization failed

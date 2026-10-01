@@ -1,3 +1,7 @@
+[default]
+# Windows SDDL security descriptor strings (`BA` = built-in Administrators)
+extend-ignore-re = ["\"O:SY[^\"]*\""]
+
 [default.extend-words]
 # Mullvad's traffic-analysis defense, mentioned in docs
 DAITA = "DAITA"
