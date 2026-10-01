@@ -6,7 +6,7 @@ edition = "2021"
 license = "BSD-3-Clause"
 name = "boringtun-cli"
 readme = "../README.md"
-repository = "https://github.com/cloudflare/boringtun"
+repository = "https://github.com/dotns/nstun"
 version = "0.7.1"
 
 [dependencies]

@@ -1,108 +1,106 @@
-![boringtun logo banner](./banner.png)
+# nstun
 
-# BoringTun
+nstun is the WireGuard<sup>®</sup> dependency for dotns projects. It is a fork of
+[cloudflare/boringtun](https://github.com/cloudflare/boringtun), and we build our
+own changes on top of it.
 
-## Warning
-Boringtun is currently undergoing a restructuring. You should probably not rely on or link to 
-the master branch right now. Instead you should use the crates.io page.
+Upstream boringtun is a userspace implementation of the WireGuard protocol, written
+in Rust for portability and speed. nstun tracks it closely and adds whatever dotns
+needs on top.
 
-- boringtun: [![crates.io](https://img.shields.io/crates/v/boringtun.svg)](https://crates.io/crates/boringtun)
-- boringtun-cli [![crates.io](https://img.shields.io/crates/v/boringtun-cli.svg)](https://crates.io/crates/boringtun-cli)
+## Repository layout
 
-**BoringTun** is an implementation of the [WireGuard<sup>®</sup>](https://www.wireguard.com/) protocol designed for portability and speed.
+| Path             | Crate           | Description                                                                 |
+| ---------------- | --------------- | --------------------------------------------------------------------------- |
+| `boringtun/`     | `boringtun`     | Protocol library: Noise handshake, sessions, timers, and the optional `device` layer (TUN + UDP) |
+| `boringtun-cli/` | `boringtun-cli` | Userspace WireGuard daemon for Linux and macOS, configured through `wg`      |
 
-**BoringTun** is successfully deployed on millions of [iOS](https://apps.apple.com/us/app/1-1-1-1-faster-internet/id1423538627) and [Android](https://play.google.com/store/apps/details?id=com.cloudflare.onedotonedotonedotone&hl=en_US) consumer devices as well as thousands of Cloudflare Linux servers. 
+The crate names are still the upstream names, which keeps merges from upstream
+simple.
 
-The project consists of two parts:
+### Library features
 
-* The executable `boringtun-cli`, a [userspace WireGuard](https://www.wireguard.com/xplatform/) 
-  implementation for Linux and macOS.
-* The library `boringtun` that can be used to implement fast and efficient WireGuard client apps on various platforms, including iOS and Android. It implements the underlying WireGuard protocol, without the network or tunnel stacks, those can be implemented in a platform idiomatic way.
+| Feature        | Purpose                                                    |
+| -------------- | ---------------------------------------------------------- |
+| *(none)*       | Protocol only, with no network or TUN stack (`noise` module) |
+| `device`       | Userspace device: TUN interface, UDP sockets, `wg` UAPI    |
+| `ffi-bindings` | C ABI (`boringtun/src/wireguard_ffi.h`)                    |
+| `jni-bindings` | Java/Android JNI bindings                                  |
+| `mock-instant` | Mocks `Instant` for deterministic timer tests              |
 
-### Installation
+## Using nstun as a dependency
 
-You can install this project using `cargo`:
+Pin a commit so that builds are reproducible:
 
+```toml
+[dependencies]
+boringtun = { git = "https://github.com/dotns/nstun", rev = "<commit>" }
+# with the userspace device layer:
+# boringtun = { git = "https://github.com/dotns/nstun", rev = "<commit>", features = ["device"] }
 ```
-cargo install boringtun-cli
+
+For local co-development, override it with a path dependency:
+
+```toml
+[patch."https://github.com/dotns/nstun"]
+boringtun = { path = "../nstun/boringtun" }
 ```
 
-### Building
+## Building
 
-- Library only: `cargo build --lib --no-default-features --release [--target $(TARGET_TRIPLE)]`
-- Executable: `cargo build --bin boringtun-cli --release [--target $(TARGET_TRIPLE)]`
+```bash
+# Library only
+cargo build -p boringtun --lib --release
 
-By default the executable is placed in the `./target/release` folder. You can copy it to a desired location manually, or install it using `cargo install --bin boringtun --path .`.
+# Library with the device layer
+cargo build -p boringtun --lib --features device --release
 
-### Running
+# CLI daemon
+cargo build -p boringtun-cli --release
+```
 
-As per the specification, to start a tunnel use:
+Run a userspace tunnel and configure it with the standard `wg` tooling:
 
-`boringtun-cli [-f/--foreground] INTERFACE-NAME`
+```bash
+sudo setcap cap_net_admin+epi target/release/boringtun-cli
+target/release/boringtun-cli [-f] wg0
+wg setconf wg0 /path/to/wg0.conf
+```
 
-The tunnel can then be configured using [wg](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg.8), as a regular WireGuard tunnel, or any other tool.
+## Testing
 
-It is also possible to use with [wg-quick](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg-quick.8) by setting the environment variable `WG_QUICK_USERSPACE_IMPLEMENTATION` to `boringtun`. For example:
+```bash
+cargo test -p boringtun
+```
 
-`sudo WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun-cli WG_SUDO=1 wg-quick up CONFIGURATION`
+The device integration tests need `sudo` (to create TUN interfaces) and Docker.
 
-### Testing
+## Syncing with upstream
 
-Testing this project has a few requirements:
+| Remote     | URL                                       | Branch   |
+| ---------- | ----------------------------------------- | -------- |
+| `origin`   | `https://github.com/dotns/nstun`          | `main`   |
+| `upstream` | `https://github.com/cloudflare/boringtun` | `master` |
 
-- `sudo`: required to create tunnels. When you run `cargo test` you'll be prompted for your password.
-- Docker: you can install it [here](https://www.docker.com/get-started). If you are on Ubuntu/Debian you can run `apt-get install docker.io`.
+```bash
+git remote add upstream https://github.com/cloudflare/boringtun   # once
+git fetch upstream
+git merge upstream/master        # resolve conflicts, run tests, then push main
+```
 
-## Supported platforms
+Guidelines for our changes:
 
-Target triple                 |Binary|Library|
-------------------------------|:----:|------|
-x86_64-unknown-linux-gnu      |  ✓   | ✓    |
-aarch64-unknown-linux-gnu     |  ✓   | ✓    |
-armv7-unknown-linux-gnueabihf |  ✓   | ✓    |
-x86_64-apple-darwin           |  ✓   | ✓    |
-x86_64-pc-windows-msvc        |      | ✓    |
-aarch64-apple-ios             |      | ✓    |
-armv7-apple-ios               |      | ✓    |
-armv7s-apple-ios              |      | ✓    |
-aarch64-linux-android         |      | ✓    |
-arm-linux-androideabi         |      | ✓    |
-
-<sub>Other platforms may be added in the future</sub>
-
-#### Linux
-
-`x86-64`, `aarch64` and `armv7` architectures are supported. The behaviour should be identical to that of [wireguard-go](https://git.zx2c4.com/wireguard-go/about/), with the following difference:
-
-`boringtun` will drop privileges when started. When privileges are dropped it is not possible to set `fwmark`. If `fwmark` is required, such as when using `wg-quick`, run with `--disable-drop-privileges` or set the environment variable `WG_SUDO=1`.
-
-You will need to give the executable the `CAP_NET_ADMIN` capability using: `sudo setcap cap_net_admin+epi boringtun`. sudo is not needed.
-
-#### macOS
-
-The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wireguard-go/about/). Specifically the interface name must be `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select the lowest available. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
-
----
-
-#### FFI bindings
-
-The library exposes a set of C ABI bindings, those are defined in the `wireguard_ffi.h` header file. The C bindings can be used with C/C++, Swift (using a bridging header) or C# (using [DLLImport](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute?view=netcore-2.2) with [CallingConvention](https://docs.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.dllimportattribute.callingconvention?view=netcore-2.2) set to `Cdecl`).
-
-#### JNI bindings
-
-The library exposes a set of Java Native Interface bindings, those are defined in `src/jni.rs`.
+- Keep changes small and localized, so that upstream merges stay cheap.
+- Put new functionality in new modules or behind feature flags rather than
+  rewriting upstream code paths where possible.
+- Send generic fixes upstream when they are not dotns-specific.
 
 ## License
 
-The project is licensed under the [3-Clause BSD License](https://opensource.org/licenses/BSD-3-Clause).
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the 3-Clause BSD License, shall be licensed as above, without any additional terms or conditions.
-
-If you want to contribute to this project, please read our [`CONTRIBUTING.md`].
-
-[`CONTRIBUTING.md`]: https://github.com/cloudflare/.github/blob/master/CONTRIBUTING.md
+BSD 3-Clause, inherited from upstream. See [LICENSE.md](LICENSE.md). The original
+copyright notices must be retained.
 
 ---
-<sub><sub><sub><sub>WireGuard is a registered trademark of Jason A. Donenfeld. BoringTun is not sponsored or endorsed by Jason A. Donenfeld.</sub></sub></sub></sub>
+
+<sub>WireGuard is a registered trademark of Jason A. Donenfeld. nstun is not sponsored
+or endorsed by Jason A. Donenfeld or Cloudflare.</sub>
