@@ -13,6 +13,7 @@ mod integration_tests;
 /// Per-peer state of a device.
 pub mod peer;
 mod peer_table;
+mod uapi;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -43,7 +44,7 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{DATA_HEADER_SZ, Packet, Tunn, TunnResult};
 use crate::x25519;
-use peer::{AllowedIP, Peer};
+use peer::Peer;
 use peer_table::{PeerTable, PeerTableError, PeerUpdate, SharedPeer};
 use poll::{EventPoll, EventRef, WaitResult};
 use socket2::{Domain, Protocol, Type};
@@ -538,30 +539,10 @@ impl Device {
                 let (Some(udp4), Some(udp6)) = (d.udp4.as_ref(), d.udp6.as_ref()) else {
                     return Action::Continue;
                 };
-
-                // Go over each peer and invoke the timer function
-                for peer in d.peers.peers() {
-                    let mut p = peer.lock();
-                    let endpoint = p.endpoint().addr;
-                    let Some(endpoint_addr) = endpoint else {
-                        continue;
-                    };
-
-                    match p.update_timers(&mut t.dst_buf[..]) {
-                        TunnResult::Done => {}
-                        TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            p.shutdown_endpoint(); // close open udp socket
-                        }
-                        TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
-                        TunnResult::WriteToNetwork(packet) => {
-                            let udp = if endpoint_addr.is_ipv4() { udp4 } else { udp6 };
-                            let _ = udp.send_to(packet, endpoint_addr);
-                        }
-                        TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
-                            tracing::error!("Unexpected result from update_timers");
-                        }
-                    }
-                }
+                update_timers(&d.peers, &mut t.dst_buf, |addr, packet| {
+                    let udp = if addr.is_ipv4() { udp4 } else { udp6 };
+                    let _ = udp.send_to(packet, addr);
+                });
                 Action::Continue
             }),
             std::time::Duration::from_millis(250),
@@ -587,11 +568,13 @@ impl Device {
         }
     }
 
-    /// Moves `peer`'s endpoint to `addr` and, if enabled, connects a socket to it.
-    fn roam(&self, peer: &SharedPeer, p: &Peer, addr: SocketAddr) {
-        p.set_endpoint(addr);
-        if self.config.use_connected_socket
-            && let Ok(sock) = p.connect_endpoint(self.listen_port, self.fwmark)
+    /// Connects a socket to `peer`'s new endpoint `addr`, if enabled.
+    fn connect_peer(&self, peer: &SharedPeer, addr: SocketAddr) {
+        if !self.config.use_connected_socket {
+            return;
+        }
+        let sock = peer.lock().connect_endpoint(self.listen_port, self.fwmark);
+        if let Ok(sock) = sock
             && let Err(e) = self.register_conn_handler(Arc::clone(peer), sock, addr)
         {
             tracing::error!(message = "Failed to register connected socket", error = ?e);
@@ -612,79 +595,29 @@ impl Device {
                     return Action::Continue;
                 };
 
+                let ctx = ListenContext {
+                    peers: &d.peers,
+                    private_key,
+                    public_key,
+                    rate_limiter,
+                };
+
                 // Loop while we have packets on the anonymous connection
                 while let Ok((len, addr)) = udp.recv_from(&mut t.src_buf) {
                     let send = |packet: &[u8]| {
                         let _ = udp.send_to(packet, addr);
                     };
-                    let data_index = match Tunn::parse_incoming_packet(&t.src_buf[..len]) {
-                        Ok(Packet::PacketData(data)) => Some(data.receiver_idx),
-                        Ok(_) => None,
-                        Err(_) => continue,
-                    };
-
-                    if let Some(index) = data_index {
-                        // Transport data names its session: find the peer and decrypt in place.
-                        let Some(peer) = d.peers.by_index(index) else {
-                            continue;
-                        };
-                        let mut p = peer.lock();
-                        let result = p
-                            .tunnel
-                            .decapsulate_in_place(Some(addr), &mut t.src_buf, len);
-                        let Some(flush) = deliver(&d.peers, &t.iface, peer, result, &send) else {
-                            continue;
-                        };
-                        if flush {
-                            flush_queue(&mut p.tunnel, &mut t.dst_buf, &send);
-                        }
-                        d.roam(peer, &p, addr);
-                    } else {
-                        // The rate limiter initially checks mac1 and mac2, and optionally asks to
-                        // send a cookie
-                        let packet = &t.src_buf[..len];
-                        let parsed_packet =
-                            match rate_limiter.verify_packet(Some(addr), packet, &mut t.dst_buf) {
-                                Ok(packet) => packet,
-                                Err(TunnResult::WriteToNetwork(cookie)) => {
-                                    send(cookie);
-                                    continue;
-                                }
-                                Err(_) => continue,
-                            };
-
-                        let peer = match &parsed_packet {
-                            Packet::HandshakeInit(p) => {
-                                parse_handshake_anon(private_key, public_key, p)
-                                    .ok()
-                                    .and_then(|hh| {
-                                        d.peers.get(&x25519::PublicKey::from(hh.peer_static_public))
-                                    })
-                            }
-                            Packet::HandshakeResponse(p) => d.peers.by_index(p.receiver_idx),
-                            Packet::PacketCookieReply(p) => d.peers.by_index(p.receiver_idx),
-                            Packet::PacketData(_) => None,
-                        };
-                        let roams = roams_endpoint(&parsed_packet);
-                        let Some(peer) = peer else {
-                            continue;
-                        };
-
-                        let mut p = peer.lock();
-                        let result = p
-                            .tunnel
-                            .handle_verified_packet(parsed_packet, &mut t.dst_buf);
-                        let Some(flush) = deliver(&d.peers, &t.iface, peer, result, &send) else {
-                            continue;
-                        };
-                        if flush {
-                            flush_queue(&mut p.tunnel, &mut t.dst_buf, &send);
-                        }
-                        // Cookie replies are not authenticated by the peer's keys and never
-                        // move the endpoint.
-                        if roams {
-                            d.roam(peer, &p, addr);
-                        }
+                    let roamed = receive_datagram(
+                        &ctx,
+                        &t.iface,
+                        &mut t.src_buf,
+                        &mut t.dst_buf,
+                        len,
+                        addr,
+                        &send,
+                    );
+                    if let Some(peer) = roamed {
+                        d.connect_peer(peer, addr);
                     }
 
                     iter -= 1;
@@ -773,43 +706,152 @@ impl Device {
                         }
                     };
 
-                    let packet = &t.dst_buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len];
-                    let Some(dst_addr) = Tunn::dst_address(packet) else {
-                        continue;
-                    };
-
-                    let mut peer = match d.peers.by_destination(dst_addr) {
-                        Some(peer) => peer.lock(),
-                        None => continue,
-                    };
-
-                    match peer.tunnel.encapsulate_in_place(&mut t.dst_buf, len) {
-                        TunnResult::Done => {}
-                        TunnResult::Err(e) => {
-                            tracing::error!(message = "Encapsulate error", error = ?e);
+                    send_from_tun(&d.peers, &mut t.dst_buf, len, |peer, packet| {
+                        let endpoint = peer.endpoint();
+                        if let Some(conn) = endpoint.conn.as_ref() {
+                            // Prefer to send using the connected socket
+                            let _ = (&*conn).write(packet);
+                        } else if let Some(addr) = endpoint.addr {
+                            let udp = if addr.is_ipv4() { udp4 } else { udp6 };
+                            let _ = udp.send_to(packet, addr);
+                        } else {
+                            tracing::error!("No endpoint");
                         }
-                        TunnResult::WriteToNetwork(packet) => {
-                            let mut endpoint = peer.endpoint_mut();
-                            if let Some(conn) = endpoint.conn.as_mut() {
-                                // Prefer to send using the connected socket
-                                let _ = conn.write(packet);
-                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _ = udp4.send_to(packet, addr);
-                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _ = udp6.send_to(packet, addr);
-                            } else {
-                                tracing::error!("No endpoint");
-                            }
-                        }
-                        TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
-                            tracing::error!("Unexpected result from encapsulate");
-                        }
-                    }
+                    });
                 }
                 Action::Continue
             }),
         )?;
         Ok(())
+    }
+}
+
+/// Keys and limits for answering datagrams that arrive on the listen sockets.
+struct ListenContext<'a> {
+    peers: &'a PeerTable,
+    private_key: &'a x25519::StaticSecret,
+    public_key: &'a x25519::PublicKey,
+    rate_limiter: &'a RateLimiter,
+}
+
+/// Handles a datagram from `addr` that arrived on a listen socket and sits in `buf[..len]`.
+///
+/// Transport data is decrypted in place; handshake messages are answered through `send`, using
+/// `scratch` for the reply. Returns the peer whose endpoint moved to `addr`, if any.
+fn receive_datagram<'p>(
+    ctx: &ListenContext<'p>,
+    iface: &TunSocket,
+    buf: &mut [u8],
+    scratch: &mut [u8],
+    len: usize,
+    addr: SocketAddr,
+    send: &impl Fn(&[u8]),
+) -> Option<&'p SharedPeer> {
+    let data_index = match Tunn::parse_incoming_packet(buf.get(..len)?) {
+        Ok(Packet::PacketData(data)) => Some(data.receiver_idx),
+        Ok(_) => None,
+        Err(_) => return None,
+    };
+
+    if let Some(index) = data_index {
+        // Transport data names its session: find the peer and decrypt in place.
+        let peer = ctx.peers.by_index(index)?;
+        let mut p = peer.lock();
+        let result = p.tunnel.decapsulate_in_place(Some(addr), buf, len);
+        if deliver(ctx.peers, iface, peer, result, send)? {
+            flush_queue(&mut p.tunnel, scratch, send);
+        }
+        p.set_endpoint(addr);
+        return Some(peer);
+    }
+
+    // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
+    let parsed_packet = match ctx
+        .rate_limiter
+        .verify_packet(Some(addr), &buf[..len], scratch)
+    {
+        Ok(packet) => packet,
+        Err(TunnResult::WriteToNetwork(cookie)) => {
+            send(cookie);
+            return None;
+        }
+        Err(_) => return None,
+    };
+
+    let peer = match &parsed_packet {
+        Packet::HandshakeInit(p) => parse_handshake_anon(ctx.private_key, ctx.public_key, p)
+            .ok()
+            .and_then(|hh| {
+                ctx.peers
+                    .get(&x25519::PublicKey::from(hh.peer_static_public))
+            }),
+        Packet::HandshakeResponse(p) => ctx.peers.by_index(p.receiver_idx),
+        Packet::PacketCookieReply(p) => ctx.peers.by_index(p.receiver_idx),
+        Packet::PacketData(_) => None,
+    }?;
+    let roams = roams_endpoint(&parsed_packet);
+
+    let mut p = peer.lock();
+    let result = p.tunnel.handle_verified_packet(parsed_packet, scratch);
+    // `scratch` holds the reply; queued packets are flushed through the receive buffer.
+    if deliver(ctx.peers, iface, peer, result, send)? {
+        flush_queue(&mut p.tunnel, buf, send);
+    }
+    // Cookie replies are not authenticated by the peer's keys and never move the endpoint.
+    if !roams {
+        return None;
+    }
+    p.set_endpoint(addr);
+    Some(peer)
+}
+
+/// Encapsulates the IP packet that was read into `buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len]`
+/// for the peer it is routed to, and hands the datagram to `send`.
+fn send_from_tun(peers: &PeerTable, buf: &mut [u8], len: usize, send: impl FnOnce(&Peer, &[u8])) {
+    let Some(dst_addr) = buf
+        .get(DATA_HEADER_SZ..DATA_HEADER_SZ + len)
+        .and_then(Tunn::dst_address)
+    else {
+        return;
+    };
+    let Some(peer) = peers.by_destination(dst_addr) else {
+        return;
+    };
+    let mut peer = peer.lock();
+
+    match peer.tunnel.encapsulate_in_place(buf, len) {
+        TunnResult::Done => {}
+        TunnResult::Err(e) => {
+            tracing::error!(message = "Encapsulate error", error = ?e);
+        }
+        TunnResult::WriteToNetwork(packet) => send(&peer, packet),
+        TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
+            tracing::error!("Unexpected result from encapsulate");
+        }
+    }
+}
+
+/// Runs the timers of every peer; handshakes and keepalives that are due go to `send`
+/// together with the peer's endpoint.
+fn update_timers(peers: &PeerTable, scratch: &mut [u8], send: impl Fn(SocketAddr, &[u8])) {
+    for peer in peers.peers() {
+        let mut p = peer.lock();
+        let endpoint = p.endpoint().addr;
+        let Some(endpoint_addr) = endpoint else {
+            continue;
+        };
+
+        match p.update_timers(scratch) {
+            TunnResult::Done => {}
+            TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                p.shutdown_endpoint(); // close open udp socket
+            }
+            TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
+            TunnResult::WriteToNetwork(packet) => send(endpoint_addr, packet),
+            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
+                tracing::error!("Unexpected result from update_timers");
+            }
+        }
     }
 }
 

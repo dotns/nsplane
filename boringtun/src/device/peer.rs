@@ -106,10 +106,6 @@ impl Peer {
         self.endpoint.read()
     }
 
-    pub(crate) fn endpoint_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Endpoint> {
-        self.endpoint.write()
-    }
-
     /// Closes the connected socket, if any.
     pub fn shutdown_endpoint(&self) {
         let conn = self.endpoint.write().conn.take();
