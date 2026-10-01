@@ -8,15 +8,21 @@ use std::ops::Deref;
 /// a) Read access is frequent, and has to be very fast, so we want to hold it indefinitely
 /// b) Write access is very rare (think less than once per second) and can be a bit slower
 /// c) A thread that holds a read lock, can ask for an upgrade to a write lock, cooperatively asking other threads to yield their locks
-pub struct Lock<T: ?Sized> {
+pub(super) struct Lock<T: ?Sized> {
     wants_write: (Mutex<bool>, Condvar),
     inner: RwLock<T>, // Although parking lot lock is upgradable, it does not allow a two staged mark + lock upgrade
 }
 
+impl<T: ?Sized> std::fmt::Debug for Lock<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lock").finish_non_exhaustive()
+    }
+}
+
 impl<T> Lock<T> {
     /// New lock
-    pub fn new(user_data: T) -> Lock<T> {
-        Lock {
+    pub(super) const fn new(user_data: T) -> Self {
+        Self {
             wants_write: (Mutex::new(false), Condvar::new()),
             inner: RwLock::new(user_data),
         }
@@ -25,8 +31,8 @@ impl<T> Lock<T> {
 
 impl<T: ?Sized> Lock<T> {
     /// Acquire a read lock
-    pub fn read(&self) -> LockReadGuard<T> {
-        let (ref lock, ref cvar) = &self.wants_write;
+    pub(super) fn read(&self) -> LockReadGuard<'_, T> {
+        let (lock, cvar) = &self.wants_write;
         let mut wants_write = lock.lock();
         while *wants_write {
             // We have a writer and we want to wait for it to go away
@@ -40,12 +46,12 @@ impl<T: ?Sized> Lock<T> {
     }
 }
 
-pub struct LockReadGuard<'a, T: 'a + ?Sized> {
+pub(super) struct LockReadGuard<'a, T: 'a + ?Sized> {
     wants_write: &'a (Mutex<bool>, Condvar),
     inner: RwLockReadGuard<'a, T>,
 }
 
-impl<'a, T: ?Sized> LockReadGuard<'a, T> {
+impl<T: ?Sized> LockReadGuard<'_, T> {
     /// Perform a closure on a mutable reference of the inner locked value.
     ///
     /// # Parameters
@@ -54,17 +60,17 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
     /// this can be used to tell other threads to yield their read locks temporarily. It will be passed
     /// an immutable reference to the inner value.
     ///
-    /// `mut_func` - A closure that will run once write access is gained. It iwll be passed a mutable reference
+    /// `mut_func` - A closure that will run once write access is gained. It will be passed a mutable reference
     /// to the inner value.
     ///
-    pub fn try_writeable<U, P: FnOnce(&T), F: FnOnce(&mut T) -> U>(
+    pub(super) fn try_writable<U, P: FnOnce(&T), F: FnOnce(&mut T) -> U>(
         &mut self,
         prep_func: P,
         mut_func: F,
     ) -> Option<U> {
         // First tell everyone that we want to write now, this will prevent any new reader from starting until we are done.
         {
-            let &(ref lock, cvar) = &self.wants_write;
+            let &(lock, cvar) = &self.wants_write;
             let mut wants_write = lock.lock();
 
             RwLockReadGuard::unlocked(&mut self.inner, move || {
@@ -90,7 +96,7 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
         }));
 
         // Finally signal other threads
-        let (ref lock, ref cvar) = &self.wants_write;
+        let (lock, cvar) = &self.wants_write;
         let mut wants_write = lock.lock();
         *wants_write = false;
         cvar.notify_all();
@@ -99,7 +105,7 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
     }
 }
 
-impl<'a, T: ?Sized> Deref for LockReadGuard<'a, T> {
+impl<T: ?Sized> Deref for LockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {

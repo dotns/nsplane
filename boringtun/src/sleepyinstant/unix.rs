@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use nix::sys::time::TimeSpec;
-use nix::time::{clock_gettime, ClockId};
+use nix::time::{ClockId, clock_gettime};
 
 #[cfg(any(
     target_os = "macos",
@@ -27,12 +27,16 @@ pub(crate) struct Instant {
 
 impl Instant {
     pub(crate) fn now() -> Self {
-        // std::time::Instant unwraps as well, so feel safe doing so here
-        let t = clock_gettime(CLOCK_ID).unwrap();
+        // std::time::Instant panics as well: the clock is always available on these targets.
+        #[allow(
+            clippy::expect_used,
+            reason = "INVARIANT: the monotonic clock always exists"
+        )]
+        let t = clock_gettime(CLOCK_ID).expect("INVARIANT: the monotonic clock always exists");
         Self { t }
     }
 
-    fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
+    fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
         const NANOSECOND: nix::libc::c_long = 1_000_000_000;
         let (tv_sec, tv_nsec) = if self.t.tv_nsec() < earlier.t.tv_nsec() {
             (
@@ -49,11 +53,14 @@ impl Instant {
         if tv_sec < 0 {
             None
         } else {
-            Some(Duration::new(tv_sec as _, tv_nsec as _))
+            Some(Duration::new(
+                u64::try_from(tv_sec).ok()?,
+                u32::try_from(tv_nsec).ok()?,
+            ))
         }
     }
 
-    pub(crate) fn duration_since(&self, earlier: Instant) -> Duration {
+    pub(crate) fn duration_since(&self, earlier: Self) -> Duration {
         self.checked_duration_since(earlier)
             .unwrap_or(Duration::ZERO)
     }

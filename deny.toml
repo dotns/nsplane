@@ -1,0 +1,40 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # daemonize is unmaintained and has no replacement without `unsafe` fork code in the CLI.
+    # Revisit by 2027-03-31.
+    { id = "RUSTSEC-2025-0069", reason = "no maintained safe alternative; CLI-only" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { crate = "openssl", reason = "pma-rust Lock 2: rustls/aws-lc-rs only" },
+    { crate = "openssl-sys", reason = "pma-rust Lock 2: rustls/aws-lc-rs only" },
+    { crate = "native-tls", reason = "pma-rust Lock 2: rustls/aws-lc-rs only" },
+    { crate = "ring", reason = "crypto backend is aws-lc-rs" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

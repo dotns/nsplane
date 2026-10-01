@@ -18,10 +18,10 @@ pub struct AllowedIps<D> {
 
 impl<'a, D> FromIterator<(&'a AllowedIP, D)> for AllowedIps<D> {
     fn from_iter<I: IntoIterator<Item = (&'a AllowedIP, D)>>(iter: I) -> Self {
-        let mut allowed_ips = AllowedIps::new();
+        let mut allowed_ips = Self::new();
 
         for (ip, data) in iter {
-            allowed_ips.insert(ip.addr, ip.cidr as u32, data);
+            allowed_ips.insert(ip.addr, ip.cidr, data);
         }
 
         allowed_ips
@@ -29,34 +29,39 @@ impl<'a, D> FromIterator<(&'a AllowedIP, D)> for AllowedIps<D> {
 }
 
 impl<D> AllowedIps<D> {
+    /// Creates an empty table.
     pub fn new() -> Self {
         Self {
             ips: IpNetworkTable::new(),
         }
     }
 
+    /// Removes all entries.
     pub fn clear(&mut self) {
         self.ips = IpNetworkTable::new();
     }
 
-    pub fn insert(&mut self, key: IpAddr, cidr: u32, data: D) -> Option<D> {
+    /// Inserts `data` for `key/cidr` and returns the value previously stored for that network.
+    /// A `cidr` longer than the address is ignored and yields `None`.
+    pub fn insert(&mut self, key: IpAddr, cidr: u8, data: D) -> Option<D> {
         // These are networks, it doesn't make sense for host bits to be set, so
         // use new_truncate().
-        self.ips.insert(
-            IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length"),
-            data,
-        )
+        let network = IpNetwork::new_truncate(key, cidr).ok()?;
+        self.ips.insert(network, data)
     }
 
+    /// Returns the value of the longest prefix that contains `key`.
     pub fn find(&self, key: IpAddr) -> Option<&D> {
         self.ips.longest_match(key).map(|(_net, data)| data)
     }
 
+    /// Removes every entry whose value matches `predicate`.
     pub fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
         self.ips.retain(|_, v| !predicate(v));
     }
 
-    pub fn iter(&self) -> Iter<D> {
+    /// Iterates over `(value, network address, prefix length)`.
+    pub fn iter(&self) -> Iter<'_, D> {
         Iter(
             self.ips
                 .iter()
@@ -66,7 +71,33 @@ impl<D> AllowedIps<D> {
     }
 }
 
+/// Iterator over the entries of an [`AllowedIps`] table.
 pub struct Iter<'a, D: 'a>(VecDeque<(&'a D, IpAddr, u8)>);
+
+impl<D> std::fmt::Debug for Iter<'_, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Iter")
+            .field("remaining", &self.0.len())
+            .finish()
+    }
+}
+
+impl<'a, D> IntoIterator for &'a AllowedIps<D> {
+    type Item = (&'a D, IpAddr, u8);
+    type IntoIter = Iter<'a, D>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<D> std::fmt::Debug for AllowedIps<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.iter().map(|(_, ip, cidr)| format!("{ip}/{cidr}")))
+            .finish()
+    }
+}
 
 impl<'a, D> Iterator for Iter<'a, D> {
     type Item = (&'a D, IpAddr, u8);
@@ -80,7 +111,7 @@ mod tests {
     use super::*;
 
     fn build_allowed_ips() -> AllowedIps<char> {
-        let mut map: AllowedIps<char> = Default::default();
+        let mut map: AllowedIps<char> = AllowedIps::default();
         map.insert(IpAddr::from([127, 0, 0, 1]), 32, '1');
         map.insert(IpAddr::from([45, 25, 15, 1]), 30, '6');
         map.insert(IpAddr::from([127, 0, 15, 1]), 16, '2');
@@ -175,7 +206,7 @@ mod tests {
     #[test]
     fn test_allowed_ips_v4_kernel_compatibility() {
         // Test case from wireguard-go
-        let mut map: AllowedIps<char> = Default::default();
+        let mut map: AllowedIps<char> = AllowedIps::default();
 
         map.insert(IpAddr::from([192, 168, 4, 0]), 24, 'a');
         map.insert(IpAddr::from([192, 168, 4, 4]), 32, 'b');
@@ -232,9 +263,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, reason = "verbatim wireguard-go test vector")]
     fn test_allowed_ips_v6_kernel_compatibility() {
         // Test case from wireguard-go
-        let mut map: AllowedIps<char> = Default::default();
+        let mut map: AllowedIps<char> = AllowedIps::default();
 
         map.insert(
             IpAddr::from([
@@ -366,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_allowed_ips_iter_zero_leaf_bits() {
-        let mut map: AllowedIps<char> = Default::default();
+        let mut map: AllowedIps<char> = AllowedIps::default();
         map.insert(IpAddr::from([10, 111, 0, 1]), 32, '1');
         map.insert(IpAddr::from([10, 111, 0, 2]), 32, '2');
         map.insert(IpAddr::from([10, 111, 0, 3]), 32, '3');

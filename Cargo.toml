@@ -1,5 +1,58 @@
 [workspace]
+resolver = "3"
 members = ["boringtun", "boringtun-cli"]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.95"
+authors = [
+    "Noah Kennedy <nkennedy@cloudflare.com>",
+    "Andy Grover <agrover@cloudflare.com>",
+    "Jeff Hiner <jhiner@cloudflare.com>",
+    "dotns",
+]
+license = "BSD-3-Clause"
+repository = "https://github.com/dotns/nstun"
+readme = "README.md"
+keywords = ["vpn", "wireguard"]
+categories = ["network-programming", "cryptography"]
+
+# Lock 4: deny-warnings policy lives here, not on the command line.
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -2 }
+# The library owns FFI and syscall code, so `forbid` is not possible workspace-wide.
+# `boringtun-cli` forbids unsafe code at its crate root; see docs/decisions.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Lock 6
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Pedantic lints with poor signal-to-noise
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+# Nursery lint with frequent false positives on lock guards held deliberately.
+significant_drop_tightening = "allow"
+# Conflicts with rustc's `unreachable_pub` for items in private modules.
+redundant_pub_crate = "allow"
+# Transitive duplicates (e.g. windows-sys) are outside our control.
+multiple_crate_versions = "allow"
 
 [profile.release]
 lto = true        # Enable full link-time optimization.

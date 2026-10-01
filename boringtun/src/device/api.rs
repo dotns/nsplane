@@ -8,35 +8,28 @@ use crate::device::Action;
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
-use libc::*;
+use libc::{EADDRINUSE, EINVAL, EIO, EPROTO, SIGINT, SIGTERM};
 use std::fs::{create_dir, remove_file};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 
-const SOCK_DIR: &str = "/var/run/wireguard/";
+const SOCK_DIR: &str = "/var/run/wireguard";
 
 fn create_sock_dir() {
     let _ = create_dir(SOCK_DIR); // Create the directory if it does not exist
 
     if let Ok((saved_uid, saved_gid)) = get_saved_ids() {
-        unsafe {
-            let c_path = std::ffi::CString::new(SOCK_DIR).unwrap();
-            // The directory is under the root user, but we want to be able to
-            // delete the files there when we exit, so we need to change the owner
-            chown(
-                c_path.as_bytes_with_nul().as_ptr() as _,
-                saved_uid,
-                saved_gid,
-            );
-        }
+        // The directory is under the root user, but we want to be able to
+        // delete the files there when we exit, so we need to change the owner
+        let _ = std::os::unix::fs::chown(SOCK_DIR, Some(saved_uid), Some(saved_gid));
     }
 }
 
 impl Device {
     /// Register the api handler for this Device. The api handler receives stream connections on a Unix socket
-    /// with a known path: /var/run/wireguard/{tun_name}.sock.
+    /// with a known path: /`var/run/wireguard/{tun_name}.sock`.
     pub fn register_api_handler(&mut self) -> Result<(), Error> {
         let path = format!("{}/{}.sock", SOCK_DIR, self.iface.name()?);
 
@@ -52,9 +45,8 @@ impl Device {
             api_listener.as_raw_fd(),
             Box::new(move |d, _| {
                 // This is the closure that listens on the api unix socket
-                let (api_conn, _) = match api_listener.accept() {
-                    Ok(conn) => conn,
-                    _ => return Action::Continue,
+                let Ok((api_conn, _)) = api_listener.accept() else {
+                    return Action::Continue;
                 };
 
                 let mut reader = BufReader::new(&api_conn);
@@ -69,7 +61,7 @@ impl Device {
                         _ => EIO,
                     };
                     // The protocol requires to return an error code as the response, or zero on success
-                    writeln!(writer, "errno={}\n", status).ok();
+                    writeln!(writer, "errno={status}\n").ok();
                 }
                 Action::Continue // Indicates the worker thread should continue as normal
             }),
@@ -79,7 +71,11 @@ impl Device {
         self.register_api_signal_handlers()
     }
 
+    /// Serves the UAPI over an inherited, already connected stream socket.
     pub fn register_api_fd(&mut self, fd: i32) -> Result<(), Error> {
+        #[allow(unsafe_code, reason = "adopting an inherited file descriptor")]
+        // SAFETY: the caller hands over ownership of `fd` (`WG_UAPI_FD`), an open stream socket
+        // that nothing else in the process uses.
         let io_file = unsafe { UnixStream::from_raw_fd(fd) };
 
         self.queue.new_event(
@@ -99,7 +95,7 @@ impl Device {
                         _ => EIO,
                     };
                     // The protocol requires to return an error code as the response, or zero on success
-                    writeln!(writer, "errno={}\n", status).ok();
+                    writeln!(writer, "errno={status}\n").ok();
                 } else {
                     // The remote side is likely closed; we should trigger an exit.
                     d.trigger_exit();
@@ -165,10 +161,10 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     }
 
     if let Some(fwmark) = d.fwmark {
-        writeln!(writer, "fwmark={}", fwmark);
+        writeln!(writer, "fwmark={fwmark}");
     }
 
-    for (k, p) in d.peers.iter() {
+    for (k, p) in &d.peers {
         let p = p.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
 
@@ -177,15 +173,16 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         }
 
         if let Some(keepalive) = p.persistent_keepalive() {
-            writeln!(writer, "persistent_keepalive_interval={}", keepalive);
+            writeln!(writer, "persistent_keepalive_interval={keepalive}");
         }
 
-        if let Some(ref addr) = p.endpoint().addr {
-            writeln!(writer, "endpoint={}", addr);
+        let endpoint = p.endpoint().addr;
+        if let Some(addr) = endpoint {
+            writeln!(writer, "endpoint={addr}");
         }
 
         for (ip, cidr) in p.allowed_ips() {
-            writeln!(writer, "allowed_ip={}/{}", ip, cidr);
+            writeln!(writer, "allowed_ip={ip}/{cidr}");
         }
 
         if let Some(time) = p.time_since_last_handshake() {
@@ -195,84 +192,77 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
 
         let (_, tx_bytes, rx_bytes, ..) = p.tunnel.stats();
 
-        writeln!(writer, "rx_bytes={}", rx_bytes);
-        writeln!(writer, "tx_bytes={}", tx_bytes);
+        writeln!(writer, "rx_bytes={rx_bytes}");
+        writeln!(writer, "tx_bytes={tx_bytes}");
     }
     0
 }
 
-fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
-    d.try_writeable(
-        |device| device.trigger_yield(),
-        |device| {
-            device.cancel_yield();
+fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<'_, Device>) -> i32 {
+    d.try_writable(super::Device::trigger_yield, |device| {
+        device.cancel_yield();
 
-            let mut cmd = String::new();
+        let mut cmd = String::new();
 
-            while reader.read_line(&mut cmd).is_ok() {
-                cmd.pop(); // remove newline if any
-                if cmd.is_empty() {
-                    return 0; // Done
-                }
-                {
-                    let parsed_cmd: Vec<&str> = cmd.split('=').collect();
-                    if parsed_cmd.len() != 2 {
-                        return EPROTO;
-                    }
-
-                    let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
-
-                    match key {
-                        "private_key" => match val.parse::<KeyBytes>() {
-                            Ok(key_bytes) => {
-                                device.set_key(x25519::StaticSecret::from(key_bytes.0))
-                            }
-                            Err(_) => return EINVAL,
-                        },
-                        "listen_port" => match val.parse::<u16>() {
-                            Ok(port) => match device.open_listen_socket(port) {
-                                Ok(()) => {}
-                                Err(_) => return EADDRINUSE,
-                            },
-                            Err(_) => return EINVAL,
-                        },
-                        #[cfg(any(
-                            target_os = "android",
-                            target_os = "fuchsia",
-                            target_os = "linux"
-                        ))]
-                        "fwmark" => match val.parse::<u32>() {
-                            Ok(mark) => match device.set_fwmark(mark) {
-                                Ok(()) => {}
-                                Err(_) => return EADDRINUSE,
-                            },
-                            Err(_) => return EINVAL,
-                        },
-                        "replace_peers" => match val.parse::<bool>() {
-                            Ok(true) => device.clear_peers(),
-                            Ok(false) => {}
-                            Err(_) => return EINVAL,
-                        },
-                        "public_key" => match val.parse::<KeyBytes>() {
-                            // Indicates a new peer section
-                            Ok(key_bytes) => {
-                                return api_set_peer(
-                                    reader,
-                                    device,
-                                    x25519::PublicKey::from(key_bytes.0),
-                                )
-                            }
-                            Err(_) => return EINVAL,
-                        },
-                        _ => return EINVAL,
-                    }
-                }
-                cmd.clear();
+        while reader.read_line(&mut cmd).is_ok() {
+            cmd.pop(); // remove newline if any
+            if cmd.is_empty() {
+                return 0; // Done
             }
+            {
+                let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+                if parsed_cmd.len() != 2 {
+                    return EPROTO;
+                }
 
-            0
-        },
-    )
+                let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+
+                match key {
+                    "private_key" => match val.parse::<KeyBytes>() {
+                        Ok(key_bytes) => {
+                            device.set_key(&x25519::StaticSecret::from(key_bytes.0));
+                        }
+                        Err(_) => return EINVAL,
+                    },
+                    "listen_port" => match val.parse::<u16>() {
+                        Ok(port) => match device.open_listen_socket(port) {
+                            Ok(()) => {}
+                            Err(_) => return EADDRINUSE,
+                        },
+                        Err(_) => return EINVAL,
+                    },
+                    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                    "fwmark" => match val.parse::<u32>() {
+                        Ok(mark) => match device.set_fwmark(mark) {
+                            Ok(()) => {}
+                            Err(_) => return EADDRINUSE,
+                        },
+                        Err(_) => return EINVAL,
+                    },
+                    "replace_peers" => match val.parse::<bool>() {
+                        Ok(true) => device.clear_peers(),
+                        Ok(false) => {}
+                        Err(_) => return EINVAL,
+                    },
+                    "public_key" => match val.parse::<KeyBytes>() {
+                        // Indicates a new peer section
+                        Ok(key_bytes) => {
+                            return api_set_peer(
+                                reader,
+                                device,
+                                x25519::PublicKey::from(key_bytes.0),
+                            );
+                        }
+                        Err(_) => return EINVAL,
+                    },
+                    _ => return EINVAL,
+                }
+            }
+            cmd.clear();
+        }
+
+        0
+    })
     .unwrap_or(EIO)
 }
 

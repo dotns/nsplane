@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Breaking: replace `ring` with `aws-lc-rs` for ChaCha20-Poly1305, and with `subtle` for
   constant-time comparisons. `ring` is no longer a dependency.
+- Edition 2024, MSRV 1.95, workspace-wide lint policy (warnings denied, clippy pedantic and
+  nursery, no `unwrap`/`expect`/`panic` in runtime code).
+- Breaking: `Tunn::encapsulate` and the session code return
+  `WireGuardError::DestinationBufferTooSmall` instead of panicking on short buffers.
+- Breaking: `AllowedIps::insert` takes the prefix length as `u8`.
+- CLI: argument parsing uses clap derive; core dumps are disabled at startup and panics are
+  logged.
+
+### Fixed
+- Re-binding the listen port now unregisters the previous UDP sockets; the old sockets were
+  leaked because their events were cleared under the wrong fd.
+- The UAPI socket is bound at `/var/run/wireguard/<name>.sock` without a doubled slash.
+- In daemon mode the log writer thread is started after the fork, so logs are written.
+- JNI: `x25519_key_to_hex`/`x25519_key_to_base64` no longer leak the string.
+- FFI/JNI: NULL tunnel pointers and short buffers return an error instead of crashing.
+- TUN devices close their fd on every error path (Linux and macOS).
+- `Debug` output redacts preshared keys, chaining keys, and cookies.
 
 ## [0.7.1] - 2026-05-01
 

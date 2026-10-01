@@ -1,0 +1,7 @@
+[default.extend-words]
+# Mullvad's traffic-analysis defense, mentioned in docs
+DAITA = "DAITA"
+
+[default.extend-identifiers]
+# libc `msghdr` field
+msg_controllen = "msg_controllen"

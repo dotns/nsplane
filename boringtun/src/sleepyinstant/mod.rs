@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Attempts to provide the same functionality as std::time::Instant, except it
+//! Attempts to provide the same functionality as `std::time::Instant`, except it
 //! uses a timer which accounts for time when the system is asleep
 use std::time::Duration;
 
@@ -35,13 +35,13 @@ use unix as inner;
 /// system.
 ///
 #[derive(Clone, Copy, Debug)]
-pub struct Instant {
+pub(crate) struct Instant {
     t: inner::Instant,
 }
 
 impl Instant {
     /// Returns an instant corresponding to "now".
-    pub fn now() -> Self {
+    pub(crate) fn now() -> Self {
         Self {
             t: inner::Instant::now(),
         }
@@ -53,12 +53,12 @@ impl Instant {
     /// # Panics
     ///
     /// panics when `earlier` was later than `self`.
-    pub fn duration_since(&self, earlier: Instant) -> Duration {
+    pub(crate) fn duration_since(&self, earlier: Self) -> Duration {
         self.t.duration_since(earlier.t)
     }
 
     /// Returns the amount of time elapsed since this instant was created.
-    pub fn elapsed(&self) -> Duration {
+    pub(crate) fn elapsed(&self) -> Duration {
         Self::now().duration_since(*self)
     }
 }

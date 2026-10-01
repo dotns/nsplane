@@ -1,4 +1,6 @@
-pub(crate) struct KeyBytes(pub [u8; 32]);
+use base64::Engine as _;
+
+pub(crate) struct KeyBytes(pub(crate) [u8; 32]);
 
 impl std::str::FromStr for KeyBytes {
     type Err = &'static str;
@@ -17,7 +19,7 @@ impl std::str::FromStr for KeyBytes {
             }
             43 | 44 => {
                 // Try to parse as base64
-                if let Ok(decoded_key) = base64::decode(s) {
+                if let Ok(decoded_key) = base64::engine::general_purpose::STANDARD.decode(s) {
                     if decoded_key.len() == internal.len() {
                         internal[..].copy_from_slice(&decoded_key);
                     } else {
@@ -28,6 +30,6 @@ impl std::str::FromStr for KeyBytes {
             _ => return Err("Illegal key size"),
         }
 
-        Ok(KeyBytes(internal))
+        Ok(Self(internal))
     }
 }

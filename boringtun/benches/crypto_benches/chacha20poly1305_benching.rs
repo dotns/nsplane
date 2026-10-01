@@ -1,7 +1,7 @@
 use aead::{AeadInPlace, KeyInit};
+use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use criterion::{BenchmarkId, Criterion, Throughput};
 use rand_core::{OsRng, RngCore};
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
 fn chacha20poly1305_aws_lc_rs(key_bytes: &[u8], buf: &mut [u8]) {
     let len = buf.len();
@@ -17,7 +17,7 @@ fn chacha20poly1305_aws_lc_rs(key_bytes: &[u8], buf: &mut [u8]) {
         )
         .unwrap();
 
-    buf[n..].copy_from_slice(tag.as_ref())
+    buf[n..].copy_from_slice(tag.as_ref());
 }
 
 fn chacha20poly1305_rustcrypto(key_bytes: &[u8], buf: &mut [u8]) {
@@ -34,7 +34,7 @@ fn chacha20poly1305_rustcrypto(key_bytes: &[u8], buf: &mut [u8]) {
     buf[n..].copy_from_slice(tag.as_ref());
 }
 
-pub fn bench_chacha20poly1305(c: &mut Criterion) {
+pub(crate) fn bench_chacha20poly1305(c: &mut Criterion) {
     let mut group = c.benchmark_group("chacha20poly1305");
 
     group.sample_size(1000);
@@ -49,7 +49,7 @@ pub fn bench_chacha20poly1305(c: &mut Criterion) {
                 let mut key = [0; 32];
                 let mut buf = vec![0; i + 16];
 
-                let mut rng = OsRng::default();
+                let mut rng = OsRng;
 
                 rng.fill_bytes(&mut key);
                 rng.fill_bytes(&mut buf);
@@ -65,7 +65,7 @@ pub fn bench_chacha20poly1305(c: &mut Criterion) {
                 let mut key = [0; 32];
                 let mut buf = vec![0; i + 16];
 
-                let mut rng = OsRng::default();
+                let mut rng = OsRng;
 
                 rng.fill_bytes(&mut key);
                 rng.fill_bytes(&mut buf);

@@ -4,25 +4,32 @@
 // This module contains some integration tests for boringtun
 // Those tests require docker and sudo privileges to run
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::used_underscore_binding,
+    clippy::needless_pass_by_value,
+    reason = "test scaffolding"
+)]
 mod tests {
     use crate::device::{DeviceConfig, DeviceHandle};
     use crate::x25519::{PublicKey, StaticSecret};
-    use base64::encode as base64encode;
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use hex::encode;
     use rand_core::OsRng;
-    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
-    static NEXT_IP: AtomicUsize = AtomicUsize::new(0xc0000200); // Use 192.0.2.0/24 for those tests, we might use more than 256 addresses though, usize must be >=32 bits on all supported platforms
+    static NEXT_IP: AtomicUsize = AtomicUsize::new(0xc000_0200); // Use 192.0.2.0/24 for those tests, we might use more than 256 addresses though, usize must be >=32 bits on all supported platforms
     static NEXT_IP_V6: AtomicUsize = AtomicUsize::new(0); // Use the 2001:db8:: address space, append this atomic counter for bottom 32 bits
 
     fn next_ip() -> IpAddr {
@@ -78,15 +85,15 @@ mod tests {
                     .ok();
 
                 std::fs::remove_file(name).ok();
-                std::fs::remove_file(format!("{}.ngx", name)).ok();
+                std::fs::remove_file(format!("{name}.ngx")).ok();
             }
         }
     }
 
     impl Peer {
         /// Create a new peer with a given endpoint and a list of allowed IPs
-        fn new(endpoint: SocketAddr, allowed_ips: Vec<AllowedIp>) -> Peer {
-            Peer {
+        fn new(endpoint: SocketAddr, allowed_ips: Vec<AllowedIp>) -> Self {
+            Self {
                 key: StaticSecret::random_from_rng(OsRng),
                 endpoint,
                 allowed_ips,
@@ -110,13 +117,13 @@ mod tests {
             // The local endpoint port is the remote listen port
             let _ = writeln!(conf, "ListenPort = {}", self.endpoint.port());
             // HACK: this should consume the key so it can't be reused instead of cloning and serializing
-            let _ = writeln!(conf, "PrivateKey = {}", base64encode(self.key.to_bytes()));
+            let _ = writeln!(conf, "PrivateKey = {}", BASE64.encode(self.key.to_bytes()));
 
             // We are the peer
             let _ = writeln!(conf, "[Peer]");
-            let _ = writeln!(conf, "PublicKey = {}", base64encode(local_key.as_bytes()));
-            let _ = writeln!(conf, "AllowedIPs = {}", local_addr);
-            let _ = write!(conf, "Endpoint = 127.0.0.1:{}", local_port);
+            let _ = writeln!(conf, "PublicKey = {}", BASE64.encode(local_key.as_bytes()));
+            let _ = writeln!(conf, "AllowedIPs = {local_addr}");
+            let _ = write!(conf, "Endpoint = 127.0.0.1:{local_port}");
 
             conf
         }
@@ -145,7 +152,7 @@ mod tests {
             let peer_config_file = temp_path();
             std::fs::write(&peer_config_file, peer_config).unwrap();
             let nginx_config = self.gen_nginx_conf();
-            let nginx_config_file = format!("{}.ngx", peer_config_file);
+            let nginx_config_file = format!("{peer_config_file}.ngx");
             std::fs::write(&nginx_config_file, nginx_config).unwrap();
 
             Command::new("docker")
@@ -161,9 +168,9 @@ mod tests {
                     "-p", // Open port for the endpoint
                     &format!("{0}:{0}/udp", self.endpoint.port()),
                     "-v", // Map the generated WireGuard config file
-                    &format!("{}:/wireguard/wg.conf", peer_config_file),
+                    &format!("{peer_config_file}:/wireguard/wg.conf"),
                     "-v", // Map the nginx config file
-                    &format!("{}:/etc/nginx/conf.d/default.conf", nginx_config_file),
+                    &format!("{nginx_config_file}:/etc/nginx/conf.d/default.conf"),
                     "--rm", // Cleanup
                     "--name",
                     &peer_config_file[5..],
@@ -180,7 +187,7 @@ mod tests {
             for _i in 0..5 {
                 let res = std::net::TcpStream::connect(http_addr);
                 if let Err(err) = res {
-                    println!("failed to connect: {:?}", err);
+                    println!("failed to connect: {err:?}");
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue;
                 }
@@ -255,8 +262,8 @@ mod tests {
 
     impl WGHandle {
         /// Create a new interface for the tunnel with the given address
-        fn init(addr_v4: IpAddr, addr_v6: IpAddr) -> WGHandle {
-            WGHandle::init_with_config(
+        fn init(addr_v4: IpAddr, addr_v6: IpAddr) -> Self {
+            Self::init_with_config(
                 addr_v4,
                 addr_v6,
                 DeviceConfig {
@@ -271,11 +278,11 @@ mod tests {
         }
 
         /// Create a new interface for the tunnel with the given address
-        fn init_with_config(addr_v4: IpAddr, addr_v6: IpAddr, config: DeviceConfig) -> WGHandle {
+        fn init_with_config(addr_v4: IpAddr, addr_v6: IpAddr, config: DeviceConfig) -> Self {
             // Generate a new name, utun100+ should work on macOS and Linux
             let name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
             let _device = DeviceHandle::new(&name, config).unwrap();
-            WGHandle {
+            Self {
                 _device,
                 name,
                 addr_v4,
@@ -410,24 +417,24 @@ mod tests {
         fn wg_set(&self, setting: &str) -> String {
             let path = format!("/var/run/wireguard/{}.sock", self.name);
             let mut socket = UnixStream::connect(path).unwrap();
-            write!(socket, "set=1\n{}\n\n", setting).unwrap();
+            write!(socket, "set=1\n{setting}\n\n").unwrap();
 
             let mut ret = String::new();
             socket.read_to_string(&mut ret).unwrap();
             ret
         }
 
-        /// Assign a listen_port to the interface
+        /// Assign a `listen_port` to the interface
         fn wg_set_port(&self, port: u16) -> String {
-            self.wg_set(&format!("listen_port={}", port))
+            self.wg_set(&format!("listen_port={port}"))
         }
 
-        /// Assign a private_key to the interface
+        /// Assign a `private_key` to the interface
         fn wg_set_key(&self, key: StaticSecret) -> String {
             self.wg_set(&format!("private_key={}", encode(key.to_bytes())))
         }
 
-        /// Assign a peer to the interface (with public_key, endpoint and a series of nallowed_ip)
+        /// Assign a peer to the interface (with `public_key`, endpoint and a series of `nallowed_ip`)
         fn wg_set_peer(
             &self,
             key: &PublicKey,
@@ -436,7 +443,7 @@ mod tests {
         ) -> String {
             let mut req = format!("public_key={}\nendpoint={}", encode(key.as_bytes()), ep);
             for AllowedIp { ip, cidr } in allowed_ips {
-                let _ = write!(req, "\nallowed_ip={}/{}", ip, cidr);
+                let _ = write!(req, "\nallowed_ip={ip}/{cidr}");
             }
 
             self.wg_set(&req)
@@ -463,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     /// Test if wireguard starts and creates a unix socket that we can read from
     fn test_wireguard_get() {
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
@@ -472,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     /// Test if wireguard starts and creates a unix socket that we can use to set settings
     fn test_wireguard_set() {
         let port = next_port();
@@ -540,7 +547,7 @@ mod tests {
 
     /// Test if wireguard can handle simple ipv4 connections, don't use a connected socket
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     fn test_wg_start_ipv4_non_connected() {
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(OsRng);
@@ -566,7 +573,7 @@ mod tests {
 
         // Create a new peer whose endpoint is on this machine
         let mut peer = Peer::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
             vec![AllowedIp {
                 ip: next_ip(),
                 cidr: 32,
@@ -587,7 +594,7 @@ mod tests {
 
     /// Test if wireguard can handle simple ipv4 connections
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     fn test_wg_start_ipv4() {
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(OsRng);
@@ -602,7 +609,7 @@ mod tests {
 
         // Create a new peer whose endpoint is on this machine
         let mut peer = Peer::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
             vec![AllowedIp {
                 ip: next_ip(),
                 cidr: 32,
@@ -622,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     /// Test if wireguard can handle simple ipv6 connections
     fn test_wg_start_ipv6() {
         let port = next_port();
@@ -637,7 +644,7 @@ mod tests {
         assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
 
         let mut peer = Peer::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
             vec![AllowedIp {
                 ip: next_ip_v6(),
                 cidr: 128,
@@ -658,7 +665,7 @@ mod tests {
 
     /// Test if wireguard can handle connection with an ipv6 endpoint
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint() {
         let port = next_port();
@@ -673,10 +680,7 @@ mod tests {
         assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
 
         let mut peer = Peer::new(
-            SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                next_port(),
-            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), next_port()),
             vec![AllowedIp {
                 ip: next_ip_v6(),
                 cidr: 128,
@@ -697,7 +701,7 @@ mod tests {
 
     /// Test if wireguard can handle connection with an ipv6 endpoint
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint_not_connected() {
         let port = next_port();
@@ -723,10 +727,7 @@ mod tests {
         assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
 
         let mut peer = Peer::new(
-            SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                next_port(),
-            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), next_port()),
             vec![AllowedIp {
                 ip: next_ip_v6(),
                 cidr: 128,
@@ -747,7 +748,7 @@ mod tests {
 
     /// Test many concurrent connections
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     fn test_wg_concurrent() {
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(OsRng);
@@ -763,7 +764,7 @@ mod tests {
         for _ in 0..5 {
             // Create a new peer whose endpoint is on this machine
             let mut peer = Peer::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
                 vec![AllowedIp {
                     ip: next_ip(),
                     cidr: 32,
@@ -798,7 +799,7 @@ mod tests {
 
     /// Test many concurrent connections
     #[test]
-    #[ignore]
+    #[ignore = "needs root, a TUN device and docker"]
     fn test_wg_concurrent_v6() {
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(OsRng);
@@ -814,7 +815,7 @@ mod tests {
         for _ in 0..5 {
             // Create a new peer whose endpoint is on this machine
             let mut peer = Peer::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
                 vec![AllowedIp {
                     ip: next_ip_v6(),
                     cidr: 128,

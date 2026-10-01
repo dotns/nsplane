@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::PacketData;
+use super::handshake::chacha20_poly1305_key;
 use crate::noise::errors::WireGuardError;
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce};
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
-pub struct Session {
+pub(super) struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
     receiver: LessSafeKey,
@@ -17,7 +18,7 @@ pub struct Session {
 }
 
 impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Session: {}<- ->{}",
@@ -33,8 +34,8 @@ const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
-const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
-const N_BITS: u64 = WORD_SIZE * N_WORDS;
+const N_WORDS: usize = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+const N_BITS: u64 = WORD_SIZE * N_WORDS as u64;
 
 #[derive(Debug, Clone, Default)]
 struct ReceivingKeyCounterValidator {
@@ -43,20 +44,20 @@ struct ReceivingKeyCounterValidator {
     next: u64,
     /// Used to estimate packet loss
     receive_cnt: u64,
-    bitmap: [u64; N_WORDS as usize],
+    bitmap: [u64; N_WORDS],
 }
 
 impl ReceivingKeyCounterValidator {
-    #[inline(always)]
-    fn set_bit(&mut self, idx: u64) {
+    #[inline]
+    const fn set_bit(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         let bit = (bit_idx % WORD_SIZE) as usize;
         self.bitmap[word] |= 1 << bit;
     }
 
-    #[inline(always)]
-    fn clear_bit(&mut self, idx: u64) {
+    #[inline]
+    const fn clear_bit(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         let bit = (bit_idx % WORD_SIZE) as usize;
@@ -64,16 +65,16 @@ impl ReceivingKeyCounterValidator {
     }
 
     /// Clear the word that contains idx
-    #[inline(always)]
-    fn clear_word(&mut self, idx: u64) {
+    #[inline]
+    const fn clear_word(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         self.bitmap[word] = 0;
     }
 
     /// Returns true if bit is set, false otherwise
-    #[inline(always)]
-    fn check_bit(&self, idx: u64) -> bool {
+    #[inline]
+    const fn check_bit(&self, idx: u64) -> bool {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         let bit = (bit_idx % WORD_SIZE) as usize;
@@ -81,8 +82,8 @@ impl ReceivingKeyCounterValidator {
     }
 
     /// Returns true if the counter was not yet received, and is not too far back
-    #[inline(always)]
-    fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
+    #[inline]
+    const fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
         if counter >= self.next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -91,16 +92,16 @@ impl ReceivingKeyCounterValidator {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
         }
-        if !self.check_bit(counter) {
-            Ok(())
-        } else {
+        if self.check_bit(counter) {
             Err(WireGuardError::DuplicateCounter)
+        } else {
+            Ok(())
         }
     }
 
     /// Marks the counter as received, and returns true if it is still good (in case during
     /// decryption something changed)
-    #[inline(always)]
+    #[inline]
     fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
         if counter + N_BITS < self.next {
             // Drop if too far back
@@ -124,12 +125,10 @@ impl ReceivingKeyCounterValidator {
         // Packets where dropped, or maybe reordered, skip them and mark unused
         if counter - self.next >= N_BITS {
             // Too far ahead, clear all the bits
-            for c in self.bitmap.iter_mut() {
-                *c = 0;
-            }
+            self.bitmap.fill(0);
         } else {
             let mut i = self.next;
-            while i % WORD_SIZE != 0 && i < counter {
+            while !i.is_multiple_of(WORD_SIZE) && i < counter {
                 // Clear until i aligned to word size
                 self.clear_bit(i);
                 i += 1;
@@ -157,20 +156,18 @@ impl Session {
         peer_index: u32,
         receiving_key: [u8; 32],
         sending_key: [u8; 32],
-    ) -> Session {
-        Session {
+    ) -> Self {
+        Self {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            receiver: chacha20_poly1305_key(&receiving_key),
+            sender: chacha20_poly1305_key(&sending_key),
             sending_key_counter: AtomicU64::new(0),
-            receiving_key_counter: Mutex::new(Default::default()),
+            receiving_key_counter: Mutex::new(ReceivingKeyCounterValidator::default()),
         }
     }
 
-    pub(super) fn local_index(&self) -> usize {
+    pub(super) const fn local_index(&self) -> usize {
         self.receiving_index as usize
     }
 
@@ -193,12 +190,16 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
-            panic!("The destination buffer is too small");
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
@@ -223,10 +224,10 @@ impl Session {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     src.len() + AEAD_SIZE
                 })
-                .unwrap()
+                .map_err(|_| WireGuardError::DestinationBufferTooSmall)?
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        Ok(&mut dst[..DATA_OFFSET + n])
     }
 
     /// packet - a data packet we received from the network
@@ -235,13 +236,12 @@ impl Session {
     /// return the size of the encapsulated packet on success
     pub(super) fn receive_packet_data<'a>(
         &self,
-        packet: PacketData,
+        packet: &PacketData<'_>,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
-            // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
         if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     #[test]
     fn test_replay_counter() {
-        let mut c: ReceivingKeyCounterValidator = Default::default();
+        let mut c = ReceivingKeyCounterValidator::default();
 
         assert!(c.mark_did_receive(0).is_ok());
         assert!(c.mark_did_receive(0).is_err());

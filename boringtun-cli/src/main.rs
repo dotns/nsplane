@@ -1,16 +1,77 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#![forbid(unsafe_code)]
+
+use anyhow::{Context as _, bail};
 use boringtun::device::drop_privileges::drop_privileges;
 use boringtun::device::{DeviceConfig, DeviceHandle};
-use clap::builder::PossibleValuesParser;
-use clap::{Arg, ArgAction, Command};
+use clap::Parser;
 use daemonize::{Daemonize, Outcome};
 use std::fs::File;
 use std::os::unix::net::UnixDatagram;
-use std::process::exit;
+use std::path::PathBuf;
+use std::process::ExitCode;
 use tracing::Level;
 
+/// Userspace WireGuard daemon.
+#[derive(Debug, Parser)]
+#[command(name = "boringtun", version, about)]
+#[allow(clippy::struct_excessive_bools, reason = "CLI flags")]
+struct Args {
+    /// The name of the created interface
+    #[arg(value_parser = check_tun_name)]
+    interface_name: String,
+
+    /// Run and log in the foreground
+    #[arg(short, long)]
+    foreground: bool,
+
+    /// Number of OS threads to use
+    #[arg(short, long, env = "WG_THREADS", default_value_t = 4)]
+    threads: usize,
+
+    /// Log verbosity
+    #[arg(
+        short,
+        long,
+        env = "WG_LOG_LEVEL",
+        default_value = "error",
+        value_parser = ["error", "info", "debug", "trace"],
+    )]
+    verbosity: String,
+
+    /// File descriptor for the user API
+    #[cfg(target_os = "linux")]
+    #[arg(long, env = "WG_UAPI_FD", default_value_t = -1, allow_negative_numbers = true)]
+    uapi_fd: i32,
+
+    /// File descriptor for an already-existing TUN device
+    #[arg(long, env = "WG_TUN_FD", default_value_t = -1, allow_negative_numbers = true)]
+    tun_fd: i32,
+
+    /// Log file
+    #[arg(short, long, env = "WG_LOG_FILE", default_value = "/tmp/boringtun.out")]
+    log: PathBuf,
+
+    /// Do not drop sudo privileges
+    #[arg(long, env = "WG_SUDO")]
+    disable_drop_privileges: bool,
+
+    /// Disable connected UDP sockets to each peer
+    #[arg(long)]
+    disable_connected_udp: bool,
+
+    /// Disable using multiple queues for the tunnel interface
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    disable_multi_queue: bool,
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(clippy::unnecessary_wraps, reason = "clap value parser signature")
+)]
 fn check_tun_name(v: &str) -> Result<String, String> {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     {
@@ -26,119 +87,67 @@ fn check_tun_name(v: &str) -> Result<String, String> {
     }
 }
 
-fn main() {
-    let matches = Command::new("boringtun")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author("Vlad Krasnov <vlad@cloudflare.com>")
-        .args(&[
-            Arg::new("INTERFACE_NAME")
-                .required(true)
-                .value_parser(check_tun_name)
-                .help("The name of the created interface"),
-            Arg::new("foreground")
-                .long("foreground")
-                .short('f')
-                .action(ArgAction::SetTrue)
-                .help("Run and log in the foreground"),
-            Arg::new("threads")
-                .long("threads")
-                .short('t')
-                .env("WG_THREADS")
-                .help("Number of OS threads to use")
-                .default_value("4"),
-            Arg::new("verbosity")
-                .long("verbosity")
-                .short('v')
-                .env("WG_LOG_LEVEL")
-                .value_parser(PossibleValuesParser::new([
-                    "error", "info", "debug", "trace",
-                ]))
-                .help("Log verbosity")
-                .default_value("error"),
-            Arg::new("uapi-fd")
-                .long("uapi-fd")
-                .env("WG_UAPI_FD")
-                .help("File descriptor for the user API")
-                .default_value("-1"),
-            Arg::new("tun-fd")
-                .long("tun-fd")
-                .env("WG_TUN_FD")
-                .help("File descriptor for an already-existing TUN device")
-                .default_value("-1"),
-            Arg::new("log")
-                .long("log")
-                .short('l')
-                .env("WG_LOG_FILE")
-                .help("Log file")
-                .default_value("/tmp/boringtun.out"),
-            Arg::new("disable-drop-privileges")
-                .long("disable-drop-privileges")
-                .env("WG_SUDO")
-                .action(ArgAction::SetTrue)
-                .help("Do not drop sudo privileges"),
-            Arg::new("disable-connected-udp")
-                .long("disable-connected-udp")
-                .action(ArgAction::SetTrue)
-                .help("Disable connected UDP sockets to each peer"),
-            #[cfg(target_os = "linux")]
-            Arg::new("disable-multi-queue")
-                .long("disable-multi-queue")
-                .action(ArgAction::SetTrue)
-                .help("Disable using multiple queues for the tunnel interface"),
-        ])
-        .get_matches();
-
-    let background = !matches.get_flag("foreground");
-    #[cfg(target_os = "linux")]
-    let uapi_fd: i32 = matches
-        .get_one::<String>("uapi-fd")
-        .unwrap()
-        .parse()
-        .expect("Invalid uapi-fd value");
-    let tun_fd: isize = matches
-        .get_one::<String>("tun-fd")
-        .unwrap()
-        .parse()
-        .expect("Invalid tun-fd value");
-    let mut tun_name = matches
-        .get_one::<String>("INTERFACE_NAME")
-        .unwrap()
-        .as_str();
-    if tun_fd >= 0 {
-        tun_name = matches.get_one::<String>("tun-fd").unwrap().as_str();
+/// Terminal output of the CLI; everything else goes through `tracing`.
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI output boundary"
+)]
+mod output {
+    pub(crate) fn info(msg: &str) {
+        println!("{msg}");
     }
-    let n_threads: usize = matches
-        .get_one::<String>("threads")
-        .unwrap()
-        .parse()
-        .expect("Invalid threads value");
-    let log_level: Level = matches
-        .get_one::<String>("verbosity")
-        .unwrap()
-        .parse()
-        .expect("Invalid verbosity value");
+
+    pub(crate) fn error(msg: &str) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Key material lives in this process: never write it to a core file, and log panics.
+fn harden_process() {
+    let _ = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0);
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(panic = %info, %backtrace, "panic");
+    }));
+}
+
+fn main() -> ExitCode {
+    harden_process();
+    let args = Args::parse();
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = ?e, "BoringTun failed");
+            output::error(&format!("BoringTun failed: {e:#}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: &Args) -> anyhow::Result<()> {
+    let tun_fd = args.tun_fd.to_string();
+    let tun_name = if args.tun_fd >= 0 {
+        tun_fd.as_str()
+    } else {
+        args.interface_name.as_str()
+    };
+    let log_level: Level = args.verbosity.parse().context("Invalid verbosity value")?;
 
     // Create a socketpair to communicate between forked processes
-    let (sock1, sock2) = UnixDatagram::pair().unwrap();
+    let (sock1, sock2) = UnixDatagram::pair().context("socketpair")?;
     let _ = sock1.set_nonblocking(true);
 
     let _guard;
 
-    if background {
-        let log = matches.get_one::<String>("log").unwrap();
-
-        let log_file =
-            File::create(log).unwrap_or_else(|_| panic!("Could not create log file {}", log));
-
-        let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
-
-        _guard = guard;
-
+    if args.foreground {
         tracing_subscriber::fmt()
+            .pretty()
             .with_max_level(log_level)
-            .with_writer(non_blocking)
-            .with_ansi(false)
             .init();
+    } else {
+        let log_file = File::create(&args.log)
+            .with_context(|| format!("Could not create log file {}", args.log.display()))?;
 
         let daemonize = Daemonize::new().working_directory("/tmp");
 
@@ -146,62 +155,57 @@ fn main() {
             Outcome::Parent(Ok(_)) => {
                 let mut b = [0u8; 1];
                 if sock2.recv(&mut b).is_ok() && b[0] == 1 {
-                    println!("BoringTun started successfully");
-                    exit(0);
-                } else {
-                    eprintln!("BoringTun failed to start");
-                    exit(1);
+                    output::info("BoringTun started successfully");
+                    return Ok(());
                 }
+                bail!("BoringTun failed to start");
             }
-            Outcome::Parent(Err(e)) => {
-                eprintln!("BoringTun failed to fork: {e}");
-                exit(1);
+            Outcome::Parent(Err(e)) => bail!("BoringTun failed to fork: {e}"),
+            Outcome::Child(Ok(_)) => {
+                // The log writer thread must be started after the fork: threads do not survive it.
+                let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+                _guard = guard;
+                tracing_subscriber::fmt()
+                    .with_max_level(log_level)
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .init();
             }
-            Outcome::Child(Ok(_)) => tracing::info!("BoringTun started successfully"),
-            Outcome::Child(Err(e)) => {
-                tracing::error!(error = ?e);
-                exit(1);
-            }
+            Outcome::Child(Err(e)) => bail!("BoringTun failed to daemonize: {e}"),
         }
-    } else {
-        tracing_subscriber::fmt()
-            .pretty()
-            .with_max_level(log_level)
-            .init();
     }
 
     let config = DeviceConfig {
-        n_threads,
+        n_threads: args.threads,
         #[cfg(target_os = "linux")]
-        uapi_fd,
-        use_connected_socket: !matches.get_flag("disable-connected-udp"),
+        uapi_fd: args.uapi_fd,
+        use_connected_socket: !args.disable_connected_udp,
         #[cfg(target_os = "linux")]
-        use_multi_queue: !matches.get_flag("disable-multi-queue"),
+        use_multi_queue: !args.disable_multi_queue,
     };
 
-    let mut device_handle: DeviceHandle = match DeviceHandle::new(tun_name, config) {
+    let mut device_handle = match DeviceHandle::new(tun_name, config) {
         Ok(d) => d,
         Err(e) => {
             // Notify parent that tunnel initialization failed
-            tracing::error!(message = "Failed to initialize tunnel", error=?e);
-            sock1.send(&[0]).unwrap();
-            exit(1);
+            let _ = sock1.send(&[0]);
+            return Err(e).context("Failed to initialize tunnel");
         }
     };
 
-    if !matches.get_flag("disable-drop-privileges") {
-        if let Err(error) = drop_privileges() {
-            tracing::error!(?error, "Failed to drop privileges");
-            sock1.send(&[0]).unwrap();
-            exit(1);
-        }
+    if !args.disable_drop_privileges
+        && let Err(e) = drop_privileges()
+    {
+        let _ = sock1.send(&[0]);
+        return Err(e).context("Failed to drop privileges");
     }
 
     // Notify parent that tunnel initialization succeeded
-    sock1.send(&[1]).unwrap();
+    let _ = sock1.send(&[1]);
     drop(sock1);
 
     tracing::info!("BoringTun started successfully");
 
     device_handle.wait();
+    Ok(())
 }

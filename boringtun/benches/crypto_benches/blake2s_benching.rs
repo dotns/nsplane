@@ -1,9 +1,9 @@
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use criterion::{BenchmarkId, Criterion, Throughput};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
-pub fn bench_blake2s_hash(c: &mut Criterion) {
+pub(crate) fn bench_blake2s_hash(c: &mut Criterion) {
     let mut group = c.benchmark_group("blake2s_hash");
 
     group.sample_size(1000);
@@ -25,7 +25,7 @@ pub fn bench_blake2s_hash(c: &mut Criterion) {
     group.finish();
 }
 
-pub fn bench_blake2s_hmac(c: &mut Criterion) {
+pub(crate) fn bench_blake2s_hmac(c: &mut Criterion) {
     let mut group = c.benchmark_group("blake2s_hmac");
 
     group.sample_size(1000);
@@ -58,7 +58,7 @@ pub fn bench_blake2s_hmac(c: &mut Criterion) {
     group.finish();
 }
 
-pub fn bench_blake2s_keyed(c: &mut Criterion) {
+pub(crate) fn bench_blake2s_keyed(c: &mut Criterion) {
     let mut group = c.benchmark_group("blake2s_keyed_mac");
 
     group.sample_size(1000);

@@ -1,0 +1,5 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+doc-valid-idents = ["WireGuard", "BoringTun", "IPv4", "IPv6", "TAI64N", "Tai64N", "UAPI", "JNI", "FFI", "Wintun", ".."]

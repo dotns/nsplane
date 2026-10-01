@@ -1,14 +1,22 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+//! Linux TUN device (`/dev/net/tun`).
+#![allow(unsafe_code, reason = "TUN ioctls and raw fd I/O")]
+
 use super::Error;
-use libc::*;
+use libc::{
+    F_GETFL, F_SETFL, IF_NAMESIZE, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, IFNAMSIZ, O_NONBLOCK,
+    O_RDWR, SIOCGIFMTU, c_int, c_short, c_uchar, fcntl, ioctl, open, read, sockaddr, sockaddr_in,
+    write,
+};
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 const TUNSETIFF: u64 = 0x4004_54ca;
 
 #[repr(C)]
+#[allow(dead_code, reason = "mirrors the C union layout")]
 union IfrIfru {
     ifru_addr: sockaddr,
     ifru_addr_v4: sockaddr_in,
@@ -31,129 +39,141 @@ union IfrIfru {
 }
 
 #[repr(C)]
-pub struct ifreq {
+#[allow(non_camel_case_types)]
+struct ifreq {
     ifr_name: [c_uchar; IFNAMSIZ],
     ifr_ifru: IfrIfru,
 }
 
-#[derive(Default, Debug)]
-pub struct TunSocket {
-    fd: RawFd,
-    name: String,
+impl ifreq {
+    fn new(name: &str, ifru: IfrIfru) -> Result<Self, Error> {
+        let iface_name = name.as_bytes();
+        let mut ifr = Self {
+            ifr_name: [0; IFNAMSIZ],
+            ifr_ifru: ifru,
+        };
+        if iface_name.len() >= ifr.ifr_name.len() {
+            return Err(Error::InvalidTunnelName);
+        }
+        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+        Ok(ifr)
+    }
 }
 
-impl Drop for TunSocket {
-    fn drop(&mut self) {
-        unsafe { close(self.fd) };
-    }
+#[derive(Debug)]
+/// A Linux TUN interface.
+pub struct TunSocket {
+    fd: OwnedFd,
+    name: String,
 }
 
 impl AsRawFd for TunSocket {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 impl TunSocket {
     fn write(&self, buf: &[u8]) -> usize {
-        match unsafe { write(self.fd, buf.as_ptr() as _, buf.len() as _) } {
-            -1 => 0,
-            n => n as usize,
-        }
+        // SAFETY: `buf` is valid for reads of `buf.len()` bytes.
+        let n = unsafe { write(self.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        usize::try_from(n).unwrap_or(0)
     }
 
-    pub fn new(name: &str) -> Result<TunSocket, Error> {
+    /// Opens the TUN interface `name`, or adopts the fd if `name` is a number.
+    pub fn new(name: &str) -> Result<Self, Error> {
         // If the provided name appears to be a FD, use that.
-        let provided_fd = name.parse::<i32>();
-        if let Ok(fd) = provided_fd {
-            return Ok(TunSocket {
+        if let Ok(fd) = name.parse::<RawFd>() {
+            // SAFETY: the caller passes the number of an open TUN fd that it hands over to us.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            return Ok(Self {
                 fd,
                 name: name.to_string(),
             });
         }
 
-        let fd = match unsafe { open(b"/dev/net/tun\0".as_ptr() as _, O_RDWR) } {
+        // SAFETY: the path is a valid NUL-terminated string.
+        let fd = match unsafe { open(c"/dev/net/tun".as_ptr(), O_RDWR) } {
             -1 => return Err(Error::Socket(io::Error::last_os_error())),
-            fd => fd,
+            // SAFETY: `open` returned a new fd that nothing else owns.
+            fd => unsafe { OwnedFd::from_raw_fd(fd) },
         };
-        let iface_name = name.as_bytes();
-        let mut ifr = ifreq {
-            ifr_name: [0; IFNAMSIZ],
-            ifr_ifru: IfrIfru {
-                ifru_flags: (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE) as _,
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the TUN flags fit in a c_short"
+        )]
+        let ifr = ifreq::new(
+            name,
+            IfrIfru {
+                ifru_flags: (IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE) as c_short,
             },
-        };
+        )?;
 
-        if iface_name.len() >= ifr.ifr_name.len() {
-            return Err(Error::InvalidTunnelName);
-        }
-
-        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
-
-        if unsafe { ioctl(fd, TUNSETIFF as _, &ifr) } < 0 {
+        // SAFETY: TUNSETIFF reads an `ifreq` that lives for the duration of the call.
+        if unsafe { ioctl(fd.as_raw_fd(), TUNSETIFF as _, &raw const ifr) } < 0 {
             return Err(Error::IOCtl(io::Error::last_os_error()));
         }
 
         let name = name.to_string();
-        Ok(TunSocket { fd, name })
+        Ok(Self { fd, name })
     }
 
-    pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
-        match unsafe { fcntl(self.fd, F_GETFL) } {
+    /// Switches the fd to non-blocking mode.
+    pub fn set_non_blocking(self) -> Result<Self, Error> {
+        // SAFETY: fcntl on an owned fd without pointer arguments.
+        match unsafe { fcntl(self.as_raw_fd(), F_GETFL) } {
             -1 => Err(Error::FCntl(io::Error::last_os_error())),
-            flags => match unsafe { fcntl(self.fd, F_SETFL, flags | O_NONBLOCK) } {
+            // SAFETY: as above.
+            flags => match unsafe { fcntl(self.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } {
                 -1 => Err(Error::FCntl(io::Error::last_os_error())),
                 _ => Ok(self),
             },
         }
     }
 
+    /// The interface name.
     pub fn name(&self) -> Result<String, Error> {
         Ok(self.name.clone())
     }
 
     /// Get the current MTU value
     pub fn mtu(&self) -> Result<usize, Error> {
-        let provided_fd = self.name.parse::<i32>();
-        if provided_fd.is_ok() {
+        if self.name.parse::<RawFd>().is_ok() {
             return Ok(1500);
         }
 
-        let fd = match unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_IP) } {
-            -1 => return Err(Error::Socket(io::Error::last_os_error())),
-            fd => fd,
-        };
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .map_err(Error::Socket)?;
+        let mut ifr = ifreq::new(&self.name, IfrIfru { ifru_mtu: 0 })?;
+        debug_assert_eq!(IF_NAMESIZE, IFNAMSIZ);
 
-        let name = self.name()?;
-        let iface_name: &[u8] = name.as_ref();
-        let mut ifr = ifreq {
-            ifr_name: [0; IF_NAMESIZE],
-            ifr_ifru: IfrIfru { ifru_mtu: 0 },
-        };
-
-        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
-
-        if unsafe { ioctl(fd, SIOCGIFMTU as _, &ifr) } < 0 {
+        // SAFETY: SIOCGIFMTU writes into the `ifreq` that lives for the duration of the call.
+        if unsafe { ioctl(sock.as_raw_fd(), SIOCGIFMTU as _, &raw mut ifr) } < 0 {
             return Err(Error::IOCtl(io::Error::last_os_error()));
         }
 
-        unsafe { close(fd) };
-
-        Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
+        // SAFETY: SIOCGIFMTU initialized the `ifru_mtu` member.
+        let mtu = unsafe { ifr.ifr_ifru.ifru_mtu };
+        usize::try_from(mtu).map_err(|_| Error::IOCtl(io::Error::from(io::ErrorKind::InvalidData)))
     }
 
+    /// Writes an IPv4 packet; returns the number of bytes written.
     pub fn write4(&self, src: &[u8]) -> usize {
         self.write(src)
     }
 
+    /// Writes an IPv6 packet; returns the number of bytes written.
     pub fn write6(&self, src: &[u8]) -> usize {
         self.write(src)
     }
 
+    /// Reads one packet into `dst`.
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
-        match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
-            -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
-            n => Ok(&mut dst[..n as usize]),
-        }
+        // SAFETY: `dst` is valid for writes of `dst.len()` bytes.
+        let n = unsafe { read(self.as_raw_fd(), dst.as_mut_ptr().cast(), dst.len()) };
+        usize::try_from(n).map_or_else(
+            |_| Err(Error::IfaceRead(io::Error::last_os_error())),
+            |n| Ok(&mut dst[..n]),
+        )
     }
 }

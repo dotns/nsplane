@@ -29,9 +29,10 @@ type Cookie = [u8; COOKIE_SIZE];
 /// There are two places where WireGuard requires "randomness" for cookies
 /// * The 24 byte nonce in the cookie massage - here the only goal is to avoid nonce reuse
 /// * A secret value that changes every two minutes
+///
 /// Because the main goal of the cookie is simply for a party to prove ownership of an IP address
 /// we can relax the randomness definition a bit, in order to avoid locking, because using less
-/// resources is the main goal of any DoS prevention mechanism.
+/// resources is the main goal of any `DoS` prevention mechanism.
 /// In order to avoid locking and calls to rand we derive pseudo random values using the AEAD and
 /// some counters.
 pub struct RateLimiter {
@@ -51,11 +52,21 @@ pub struct RateLimiter {
     last_reset: Mutex<Instant>,
 }
 
+impl std::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimiter")
+            .field("limit", &self.limit)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RateLimiter {
+    /// Creates a rate limiter for our `public_key` that allows `limit` handshakes per second.
     pub fn new(public_key: &crate::x25519::PublicKey, limit: u64) -> Self {
         let mut secret_key = [0u8; 16];
         OsRng.fill_bytes(&mut secret_key);
-        RateLimiter {
+        Self {
             nonce_key: Self::rand_bytes(),
             secret_key,
             start_time: Instant::now(),
@@ -171,9 +182,8 @@ impl RateLimiter {
             }
 
             if self.is_under_load() {
-                let addr = match src_addr {
-                    None => return Err(TunnResult::Err(WireGuardError::UnderLoad)),
-                    Some(addr) => addr,
+                let Some(addr) = src_addr else {
+                    return Err(TunnResult::Err(WireGuardError::UnderLoad));
                 };
 
                 // Only given an address can we validate mac2

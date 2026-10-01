@@ -1,7 +1,7 @@
 use criterion::{BatchSize, Criterion};
 use rand_core::OsRng;
 
-pub fn bench_x25519_shared_key(c: &mut Criterion) {
+pub(crate) fn bench_x25519_shared_key(c: &mut Criterion) {
     let mut group = c.benchmark_group("x25519_shared_key");
 
     group.sample_size(1000);
@@ -21,9 +21,11 @@ pub fn bench_x25519_shared_key(c: &mut Criterion) {
         let rng = aws_lc_rs::rand::SystemRandom::new();
 
         let peer_public_key = {
-            let peer_private_key =
-                aws_lc_rs::agreement::EphemeralPrivateKey::generate(&aws_lc_rs::agreement::X25519, &rng)
-                    .unwrap();
+            let peer_private_key = aws_lc_rs::agreement::EphemeralPrivateKey::generate(
+                &aws_lc_rs::agreement::X25519,
+                &rng,
+            )
+            .unwrap();
             peer_private_key.compute_public_key().unwrap()
         };
         let peer_public_key_alg = &aws_lc_rs::agreement::X25519;
@@ -33,17 +35,20 @@ pub fn bench_x25519_shared_key(c: &mut Criterion) {
 
         b.iter_batched(
             || {
-                aws_lc_rs::agreement::EphemeralPrivateKey::generate(&aws_lc_rs::agreement::X25519, &rng)
-                    .unwrap()
+                aws_lc_rs::agreement::EphemeralPrivateKey::generate(
+                    &aws_lc_rs::agreement::X25519,
+                    &rng,
+                )
+                .unwrap()
             },
             |my_private_key| {
                 aws_lc_rs::agreement::agree_ephemeral(
                     my_private_key,
-                    &my_public_key,
+                    my_public_key,
                     aws_lc_rs::error::Unspecified,
                     |_key_material| Ok(()),
                 )
-                .unwrap()
+                .unwrap();
             },
             BatchSize::SmallInput,
         );

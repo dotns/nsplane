@@ -1,17 +1,18 @@
 [package]
 name = "boringtun"
 description = "an implementation of the WireGuard® protocol designed for portability and speed"
-version = "0.7.1"
-authors = [
-    "Noah Kennedy <nkennedy@cloudflare.com>",
-    "Andy Grover <agrover@cloudflare.com>",
-    "Jeff Hiner <jhiner@cloudflare.com>",
-]
-license = "BSD-3-Clause"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "../README.md"
-repository = "https://github.com/dotns/nstun"
-documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
-edition = "2018"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = []
@@ -24,7 +25,6 @@ mock-instant = ["mock_instant"]
 [dependencies]
 base64 = "0.22"
 hex = "0.4"
-untrusted = "0.9.0"
 libc = "0.2"
 parking_lot = "0.12"
 portable-atomic = { version = "1.13.1", features = ["fallback"] }

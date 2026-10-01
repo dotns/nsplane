@@ -1,8 +1,11 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+/// Errors of the protocol state machine.
 pub mod errors;
+/// The `Noise_IKpsk2` handshake.
 pub mod handshake;
+/// `mac1`/`mac2` verification and cookie replies under load.
 pub mod rate_limiter;
 
 mod session;
@@ -15,7 +18,6 @@ use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
-use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,29 +40,36 @@ const IPV6_IP_SZ: usize = 16;
 const IP_LEN_SZ: usize = 2;
 
 const MAX_QUEUE_DEPTH: usize = 256;
-/// number of sessions in the ring, better keep a PoT
+/// number of sessions in the ring, better keep a `PoT`
 const N_SESSIONS: usize = 8;
 
 #[derive(Debug)]
+/// What the caller has to do after feeding a packet to a [`Tunn`].
 pub enum TunnResult<'a> {
+    /// Nothing to do.
     Done,
+    /// The packet was rejected.
     Err(WireGuardError),
+    /// Send the buffer to the peer.
     WriteToNetwork(&'a mut [u8]),
+    /// Write the IPv4 packet with the given source to the TUN interface.
     WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
+    /// Write the IPv6 packet with the given source to the TUN interface.
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
 }
 
-impl<'a> From<WireGuardError> for TunnResult<'a> {
-    fn from(err: WireGuardError) -> TunnResult<'a> {
+impl From<WireGuardError> for TunnResult<'_> {
+    fn from(err: WireGuardError) -> Self {
         TunnResult::Err(err)
     }
 }
 
 /// Tunnel represents a point-to-point WireGuard connection
+#[derive(Debug)]
 pub struct Tunn {
     /// The handshake currently in progress
     handshake: handshake::Handshake,
-    /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
+    /// The `N_SESSIONS` most recent sessions, index is session id modulo `N_SESSIONS`
     sessions: [Option<session::Session>; N_SESSIONS],
     /// Index of most recently used session
     current: usize,
@@ -85,6 +94,7 @@ const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 
 #[derive(Debug)]
+/// A parsed handshake initiation message.
 pub struct HandshakeInit<'a> {
     sender_idx: u32,
     unencrypted_ephemeral: &'a [u8; 32],
@@ -93,22 +103,28 @@ pub struct HandshakeInit<'a> {
 }
 
 #[derive(Debug)]
+/// A parsed handshake response message.
 pub struct HandshakeResponse<'a> {
     sender_idx: u32,
+    /// Index of the initiator's handshake this message answers.
     pub receiver_idx: u32,
     unencrypted_ephemeral: &'a [u8; 32],
     encrypted_nothing: &'a [u8],
 }
 
 #[derive(Debug)]
+/// A parsed cookie reply message.
 pub struct PacketCookieReply<'a> {
+    /// Index of the handshake this cookie belongs to.
     pub receiver_idx: u32,
     nonce: &'a [u8],
     encrypted_cookie: &'a [u8],
 }
 
 #[derive(Debug)]
+/// A parsed transport data message.
 pub struct PacketData<'a> {
+    /// Index of the receiving session.
     pub receiver_idx: u32,
     counter: u64,
     encrypted_encapsulated_packet: &'a [u8],
@@ -117,74 +133,77 @@ pub struct PacketData<'a> {
 /// Describes a packet from network
 #[derive(Debug)]
 pub enum Packet<'a> {
+    /// Handshake initiation.
     HandshakeInit(HandshakeInit<'a>),
+    /// Handshake response.
     HandshakeResponse(HandshakeResponse<'a>),
+    /// Cookie reply.
     PacketCookieReply(PacketCookieReply<'a>),
+    /// Transport data.
     PacketData(PacketData<'a>),
 }
 
-impl Tunn {
-    #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
-        if src.len() < 4 {
-            return Err(WireGuardError::InvalidPacket);
-        }
+/// Borrows `N` bytes of `src` starting at `offset`.
+fn array_at<const N: usize>(src: &[u8], offset: usize) -> Option<&[u8; N]> {
+    src.get(offset..offset.checked_add(N)?)?.try_into().ok()
+}
 
+fn u32_le_at(src: &[u8], offset: usize) -> Result<u32, WireGuardError> {
+    array_at(src, offset)
+        .map(|b| u32::from_le_bytes(*b))
+        .ok_or(WireGuardError::InvalidPacket)
+}
+
+impl Tunn {
+    #[inline]
+    /// Parses a datagram into a WireGuard message without copying.
+    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet<'_>, WireGuardError> {
         // Checks the type, as well as the reserved zero fields
-        let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
+        let packet_type = u32_le_at(src, 0)?;
+        let field = |from: usize, to: usize| src.get(from..to).ok_or(WireGuardError::InvalidPacket);
 
         Ok(match (packet_type, src.len()) {
             (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                    .expect("length already checked above"),
-                encrypted_static: &src[40..88],
-                encrypted_timestamp: &src[88..116],
+                sender_idx: u32_le_at(src, 4)?,
+                unencrypted_ephemeral: array_at(src, 8).ok_or(WireGuardError::InvalidPacket)?,
+                encrypted_static: field(40, 88)?,
+                encrypted_timestamp: field(88, 116)?,
             }),
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("length already checked above"),
-                encrypted_nothing: &src[44..60],
+                sender_idx: u32_le_at(src, 4)?,
+                receiver_idx: u32_le_at(src, 8)?,
+                unencrypted_ephemeral: array_at(src, 12).ok_or(WireGuardError::InvalidPacket)?,
+                encrypted_nothing: field(44, 60)?,
             }),
             (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                nonce: &src[8..32],
-                encrypted_cookie: &src[32..64],
+                receiver_idx: u32_le_at(src, 4)?,
+                nonce: field(8, 32)?,
+                encrypted_cookie: field(32, 64)?,
             }),
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                encrypted_encapsulated_packet: &src[16..],
+            (DATA, DATA_OVERHEAD_SZ..) => Packet::PacketData(PacketData {
+                receiver_idx: u32_le_at(src, 4)?,
+                counter: array_at(src, 8)
+                    .map(|b| u64::from_le_bytes(*b))
+                    .ok_or(WireGuardError::InvalidPacket)?,
+                encrypted_encapsulated_packet: field(16, src.len())?,
             }),
             _ => return Err(WireGuardError::InvalidPacket),
         })
     }
 
-    pub fn is_expired(&self) -> bool {
+    /// Returns whether the tunnel gave up on handshakes and needs to be recreated.
+    pub const fn is_expired(&self) -> bool {
         self.handshake.is_expired()
     }
 
+    /// Returns the destination address of an IP packet.
     pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
-        if packet.is_empty() {
-            return None;
-        }
-
-        match packet[0] >> 4 {
+        match packet.first()? >> 4 {
             4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    [IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                Some(IpAddr::from(addr_bytes))
+                array_at::<IPV4_IP_SZ>(packet, IPV4_DST_IP_OFF).map(|a| IpAddr::from(*a))
             }
             6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    [IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                Some(IpAddr::from(addr_bytes))
+                array_at::<IPV6_IP_SZ>(packet, IPV6_DST_IP_OFF).map(|a| IpAddr::from(*a))
             }
             _ => None,
         }
@@ -201,7 +220,7 @@ impl Tunn {
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
-        Tunn {
+        Self {
             handshake: Handshake::new(
                 static_private,
                 static_public,
@@ -242,16 +261,18 @@ impl Tunn {
     }
 
     /// Encapsulate a single packet from the tunnel interface.
-    /// Returns TunnResult.
+    /// Returns `TunnResult`.
     ///
-    /// # Panics
-    /// Panics if dst buffer is too small.
-    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
+    /// Size of dst should be at least `src.len()` + 32, and no less than 148 bytes,
+    /// otherwise `WireGuardError::DestinationBufferTooSmall` is returned.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = match session.format_packet_data(src, dst) {
+                Ok(packet) => packet,
+                Err(e) => return TunnResult::Err(e),
+            };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -268,10 +289,10 @@ impl Tunn {
     }
 
     /// Receives a UDP datagram from the network and parses it.
-    /// Returns TunnResult.
+    /// Returns `TunnResult`.
     ///
-    /// If the result is of type TunnResult::WriteToNetwork, should repeat the call with empty datagram,
-    /// until TunnResult::Done is returned. If batch processing packets, it is OK to defer until last
+    /// If the result is of type `TunnResult::WriteToNetwork`, should repeat the call with empty datagram,
+    /// until `TunnResult::Done` is returned. If batch processing packets, it is OK to defer until last
     /// packet is processed.
     pub fn decapsulate<'a>(
         &mut self,
@@ -303,21 +324,21 @@ impl Tunn {
 
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
-        packet: Packet,
+        packet: Packet<'_>,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         match packet {
-            Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
-            Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
-            Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            Packet::HandshakeInit(p) => self.handle_handshake_init(&p, dst),
+            Packet::HandshakeResponse(p) => self.handle_handshake_response(&p, dst),
+            Packet::PacketCookieReply(p) => self.handle_cookie_reply(&p),
+            Packet::PacketData(p) => self.handle_data(&p, dst),
         }
         .unwrap_or_else(TunnResult::from)
     }
 
     fn handle_handshake_init<'a>(
         &mut self,
-        p: HandshakeInit,
+        p: &HandshakeInit<'_>,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         tracing::debug!(
@@ -342,7 +363,7 @@ impl Tunn {
 
     fn handle_handshake_response<'a>(
         &mut self,
-        p: HandshakeResponse,
+        p: &HandshakeResponse<'_>,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         tracing::debug!(
@@ -353,7 +374,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = session.format_packet_data(&[], dst)?;
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -370,7 +391,7 @@ impl Tunn {
 
     fn handle_cookie_reply<'a>(
         &mut self,
-        p: PacketCookieReply,
+        p: &PacketCookieReply<'_>,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         tracing::debug!(
             message = "Received cookie_reply",
@@ -405,7 +426,7 @@ impl Tunn {
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
     fn handle_data<'a>(
         &mut self,
-        packet: PacketData,
+        packet: &PacketData<'_>,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
@@ -428,7 +449,7 @@ impl Tunn {
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
-    /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
+    /// Formats a new handshake initiation message and store it in dst. If `force_resend` is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
     pub fn format_handshake_initiation<'a>(
         &mut self,
@@ -460,36 +481,29 @@ impl Tunn {
     }
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
-    /// Returns the truncated packet and the source IP as TunnResult
+    /// Returns the truncated packet and the source IP as `TunnResult`
     fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => return TunnResult::Done, // This is keepalive, and not an error
-            _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    [IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                (
-                    u16::from_be_bytes(len_bytes) as usize,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    [IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                (
-                    u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
-                    IpAddr::from(addr_bytes),
-                )
-            }
+            _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => match (
+                array_at::<IP_LEN_SZ>(packet, IPV4_LEN_OFF),
+                array_at::<IPV4_IP_SZ>(packet, IPV4_SRC_IP_OFF),
+            ) {
+                (Some(len), Some(addr)) => {
+                    (usize::from(u16::from_be_bytes(*len)), IpAddr::from(*addr))
+                }
+                _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            },
+            _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => match (
+                array_at::<IP_LEN_SZ>(packet, IPV6_LEN_OFF),
+                array_at::<IPV6_IP_SZ>(packet, IPV6_SRC_IP_OFF),
+            ) {
+                (Some(len), Some(addr)) => (
+                    usize::from(u16::from_be_bytes(*len)) + IPV6_MIN_HEADER_SIZE,
+                    IpAddr::from(*addr),
+                ),
+                _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            },
             _ => return TunnResult::Err(WireGuardError::InvalidPacket),
         };
 
@@ -540,6 +554,10 @@ impl Tunn {
         self.packet_queue.pop_front()
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the loss estimate is approximate"
+    )]
     fn estimate_loss(&self) -> f32 {
         let session_idx = self.current;
 
@@ -557,7 +575,7 @@ impl Tunn {
                     1.0 - received as f32 / expected as f32
                 };
 
-                cur_avg += loss * weight;
+                cur_avg = f32::mul_add(loss, weight, cur_avg);
                 total_weight += weight;
                 weight /= 3.0;
             }
@@ -613,11 +631,10 @@ mod tests {
         let mut dst = vec![0u8; 2048];
         let handshake_init = tun.format_handshake_initiation(&mut dst, false);
         assert!(matches!(handshake_init, TunnResult::WriteToNetwork(_)));
-        let handshake_init = if let TunnResult::WriteToNetwork(sent) = handshake_init {
-            sent
-        } else {
+        let TunnResult::WriteToNetwork(sent) = handshake_init else {
             unreachable!();
         };
+        let handshake_init = sent;
 
         handshake_init.into()
     }
@@ -627,11 +644,10 @@ mod tests {
         let handshake_resp = tun.decapsulate(None, handshake_init, &mut dst);
         assert!(matches!(handshake_resp, TunnResult::WriteToNetwork(_)));
 
-        let handshake_resp = if let TunnResult::WriteToNetwork(sent) = handshake_resp {
-            sent
-        } else {
+        let TunnResult::WriteToNetwork(sent) = handshake_resp else {
             unreachable!();
         };
+        let handshake_resp = sent;
 
         handshake_resp.into()
     }
@@ -641,11 +657,10 @@ mod tests {
         let keepalive = tun.decapsulate(None, handshake_resp, &mut dst);
         assert!(matches!(keepalive, TunnResult::WriteToNetwork(_)));
 
-        let keepalive = if let TunnResult::WriteToNetwork(sent) = keepalive {
-            sent
-        } else {
+        let TunnResult::WriteToNetwork(sent) = keepalive else {
             unreachable!();
         };
+        let keepalive = sent;
 
         keepalive.into()
     }
@@ -680,11 +695,10 @@ mod tests {
         let mut dst = vec![0u8; 2048];
         let result = tun.update_timers(&mut dst);
         assert!(matches!(result, TunnResult::WriteToNetwork(_)));
-        let packet_data = if let TunnResult::WriteToNetwork(data) = result {
-            data
-        } else {
+        let TunnResult::WriteToNetwork(data) = result else {
             unreachable!();
         };
+        let packet_data = data;
         let packet = Tunn::parse_incoming_packet(packet_data).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
     }
@@ -763,7 +777,7 @@ mod tests {
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
         mock_instant::MockClock::advance(REKEY_TIMEOUT);
-        update_timer_results_in_handshake(&mut my_tun)
+        update_timer_results_in_handshake(&mut my_tun);
     }
 
     #[test]
@@ -776,19 +790,17 @@ mod tests {
 
         let data = my_tun.encapsulate(&sent_packet_buf, &mut my_dst);
         assert!(matches!(data, TunnResult::WriteToNetwork(_)));
-        let data = if let TunnResult::WriteToNetwork(sent) = data {
-            sent
-        } else {
+        let TunnResult::WriteToNetwork(sent) = data else {
             unreachable!();
         };
+        let data = sent;
 
         let data = their_tun.decapsulate(None, data, &mut their_dst);
         assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
-        let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = data {
-            recv
-        } else {
+        let TunnResult::WriteToTunnelV4(recv, _addr) = data else {
             unreachable!();
         };
+        let recv_packet_buf = recv;
         assert_eq!(sent_packet_buf, recv_packet_buf);
     }
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, reason = "benchmark harness")]
+
 use blake2s_benching::{bench_blake2s_hash, bench_blake2s_hmac, bench_blake2s_keyed};
 use chacha20poly1305_benching::bench_chacha20poly1305;
 use x25519_public_key_benching::bench_x25519_public_key;

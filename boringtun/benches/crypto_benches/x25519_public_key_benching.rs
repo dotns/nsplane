@@ -1,7 +1,7 @@
 use criterion::Criterion;
 use rand_core::OsRng;
 
-pub fn bench_x25519_public_key(c: &mut Criterion) {
+pub(crate) fn bench_x25519_public_key(c: &mut Criterion) {
     let mut group = c.benchmark_group("x25519_public_key");
 
     group.sample_size(1000);
@@ -19,9 +19,11 @@ pub fn bench_x25519_public_key(c: &mut Criterion) {
         let rng = aws_lc_rs::rand::SystemRandom::new();
 
         b.iter(|| {
-            let my_private_key =
-                aws_lc_rs::agreement::EphemeralPrivateKey::generate(&aws_lc_rs::agreement::X25519, &rng)
-                    .unwrap();
+            let my_private_key = aws_lc_rs::agreement::EphemeralPrivateKey::generate(
+                &aws_lc_rs::agreement::X25519,
+                &rng,
+            )
+            .unwrap();
             my_private_key.compute_public_key().unwrap()
         });
     });
