@@ -26,6 +26,8 @@ userspace WireGuard implementation. The upstream remote is kept for merges.
 
 ## Crypto
 
-- ChaCha20-Poly1305 (transport data, handshake fields): `ring`.
+- ChaCha20-Poly1305 (transport data, handshake fields): `aws-lc-rs` (`aws-lc-sys` C/asm core,
+  the pma-rust pre-sanctioned crypto exception).
+- Constant-time comparisons: `subtle`.
 - XChaCha20-Poly1305 (cookies), BLAKE2s, HMAC: RustCrypto.
 - X25519: `x25519-dalek`.

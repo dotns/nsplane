@@ -10,7 +10,7 @@ mod tests {
     use base64::encode as base64encode;
     use hex::encode;
     use rand_core::OsRng;
-    use ring::rand::{SecureRandom, SystemRandom};
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Breaking: replace `ring` with `aws-lc-rs` for ChaCha20-Poly1305, and with `subtle` for
+  constant-time comparisons. `ring` is no longer a dependency.
+
 ## [0.7.1] - 2026-05-01
 
 ### Security
