@@ -19,6 +19,10 @@
 //! - **Conntrack and port map** ([`conntrack`], [`port_map`]): a bounded
 //!   connection table and the DNAT/SNAT filter that publishes local services,
 //!   as an `nsplane_core::PacketFilter`.
+//! - **Filter order**: the core's filter chain is installed from the wire side
+//!   to the local side (inbound in install order, outbound in reverse); the
+//!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
+//!   the port map see overlay IPv6 in both directions.
 //! - **Checksums** ([`checksum`]): RFC 1624 incremental checksum updates for
 //!   rewritten words, addresses and pseudo-headers, plus the UDP zero
 //!   checksum rule.
