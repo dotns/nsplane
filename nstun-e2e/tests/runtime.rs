@@ -3,7 +3,6 @@
 //! shutdown.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 use nstun::x25519::{PublicKey, StaticSecret};
 use nstun::{AllowedIp, EngineError, Event, Peer};
@@ -13,10 +12,8 @@ use nstun_e2e::{
 use nstun_packet::{PacketBuf, Path};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
-/// A little more than the interval of the core's timer tick.
-const TICK: Duration = Duration::from_millis(300);
 const SOURCE_NOT_ALLOWED: &str = "source not allowed";
 const NO_ROUTE: &str = "no route";
 /// A tunnel address no node owns.
@@ -278,20 +275,33 @@ async fn inject_outbound_is_encrypted_and_delivered_by_the_peer() -> TestResult 
 }
 
 #[tokio::test]
-async fn force_handshake_completes_a_new_handshake() -> TestResult {
+async fn force_handshake_completes_a_handshake_on_the_given_path() -> TestResult {
     let (mut a, mut b) = channel_pair(Options::default());
-    introduce(&a, &b, None).await?;
-    transfer(&a, &mut b, Family::V4, 64).await?;
-    let peer_b = a.peer_of(&b).await?;
-    // The tunnel stamps a new session with the time of its last timer tick, and the core
-    // only reports a handshake whose stamp is newer than the current session's.
-    sleep(TICK).await;
-
-    let mut events = a.subscribe().await?;
-    a.handle.force_handshake(peer_b, None).await?;
-    events
-        .expect(|e| matches!(e, Event::HandshakeCompleted { peer, .. } if *peer == peer_b))
+    // `a` knows no path to `b` until the forced handshake gives it one. Only the first
+    // handshake is forced: a repeated initiation carries a timestamp from boringtun's clock,
+    // which stands still under `mock-instant`, and the responder rejects it as a replay.
+    a.handle
+        .add_or_update_peer(Peer {
+            path: None,
+            ..b.as_peer(a.path.transport)
+        })
         .await?;
+    b.handle
+        .add_or_update_peer(a.as_peer(b.path.transport))
+        .await?;
+    let peer_b = a.peer_of(&b).await?;
+    let path = b.as_peer(a.path.transport).path.ok_or("no path")?;
+    let mut events = a.subscribe().await?;
+
+    a.handle.force_handshake(peer_b, Some(path)).await?;
+    events
+        .expect(|e| {
+            matches!(e, Event::HandshakeCompleted { peer, path: Some(p), .. } if *peer == peer_b && *p == path)
+        })
+        .await?;
+    let stats = a.handle.peer_stats(peer_b).await?.ok_or("unknown peer")?;
+    assert_eq!(stats.path, Some(path));
+    assert!(stats.last_handshake.is_some());
     transfer(&a, &mut b, Family::V4, 64).await?;
     transfer(&b, &mut a, Family::V6, 64).await?;
     Ok(())

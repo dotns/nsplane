@@ -2,8 +2,9 @@
 //!
 //! The engine schedules the core's timer ticks on tokio's clock, so a paused runtime drives
 //! the tick and the periodic stats. The tunnels' own timers (keepalive and rekey intervals,
-//! session expiry) read boringtun's monotonic clock instead, which tokio time does not move:
-//! the interval test below waits in real time.
+//! session expiry) read boringtun's clock instead, which tokio time does not move, and which
+//! stands still when the workspace is tested with `--all-features` (boringtun's
+//! `mock-instant`); they are not tested here.
 //!
 //! Keepalives carry no payload and are not counted in the peer's byte counters, so the
 //! receiving side is moved to a path that leads nowhere first: a keepalive from the real
@@ -72,22 +73,6 @@ async fn enabling_persistent_keepalive_sends_one_on_the_next_tick() -> TestResul
     // A keepalive carries no payload.
     let stats = b.handle.peer_stats(peer_a).await?.ok_or("unknown peer")?;
     assert_eq!(stats.data_rx, data_rx);
-    Ok(())
-}
-
-#[tokio::test]
-async fn persistent_keepalive_repeats_after_its_interval() -> TestResult {
-    let (a, b) = connected().await?;
-    let peer_a = b.peer_of(&a).await?;
-    let mut events = b.subscribe().await?;
-
-    // The first keepalive goes out on the next tick, the second one after a second of
-    // silence on boringtun's clock, which only real time moves.
-    let real = forget_path(&a, &b).await?;
-    a.handle.set_keepalive(b.public(), Some(1)).await?;
-    expect_message(&mut events, peer_a, real).await?;
-    forget_path(&a, &b).await?;
-    expect_message(&mut events, peer_a, real).await?;
     Ok(())
 }
 
