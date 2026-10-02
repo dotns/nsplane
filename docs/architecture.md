@@ -11,6 +11,7 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane-packet` | `crates/nsplane-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
 | `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
+| `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
 | `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
@@ -18,6 +19,7 @@ This page describes what is on `main`. The target design and roadmap are in
 ```text
 nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
 nsplane-packet ────────► nsplane-core, nsplane
+nsplane-core, nsplane-packet ─► nsplane-acl
 ```
 
 ## nsplane-noise
@@ -103,11 +105,28 @@ new `UdpTransport` and install it with `EngineHandle::set_transport`. On Unix,
 builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops privileges to
 `SUDO_UID`/`SUDO_GID`, and runs until SIGINT or SIGTERM.
 
+## nsplane-acl
+
+`AclEngine` holds the compiled `AclPolicy` (host aliases, accept-only rules, built-in tests)
+behind an `ArcSwapOption`: evaluation takes no lock, `load` compiles and runs the policy's
+tests and swaps it in atomically, and a rejected policy leaves the previous one in effect.
+With no policy loaded every request is denied. `merge_layered` combines a local and remote
+policies with per-rule provenance; `apply_deny_scope` removes rules reaching forbidden
+CIDRs before compilation, so matching stays accept-only.
+
+`AclFilter` is a `PacketFilter` for the engine's filter chain. Inbound packets become
+`AccessRequest`s whose principal (a WireGuard key or a terminate binding with a tunnel IP)
+comes from a `PeerIdentity`; anything not accepted is dropped with a `reasons` constant.
+Non-first IPv4 fragments follow the outcome of their first fragment, and outbound TCP/UDP
+packets record reply allowances (with an idle timeout) so replies to flows the local side
+opened pass. `FlowTracker` placed after it counts packets and bytes per flow in a bounded
+table.
+
 ## Unsafe code
 
 `unsafe` lives only in `nsplane-tun`'s platform
 modules (`unix`, `linux`, `darwin`, and loading Wintun in `windows`), each with SAFETY
-comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-uapi` and `nsplane-cli` declare
+comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-uapi` and `nsplane-cli` declare
 `#![forbid(unsafe_code)]`. See `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 ## Crypto
