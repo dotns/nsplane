@@ -19,6 +19,7 @@ mod filter;
 mod peer;
 mod peer_table;
 mod policy;
+pub mod reasons;
 mod types;
 
 pub use crate::core::Core;

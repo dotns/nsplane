@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{Net, ip4, udp4};
-use nsplane_core::{CoreConfig, Event, PacketBuf, PacketFilter, PeerId, Verdict};
+use nsplane_core::{CoreConfig, Event, PacketBuf, PacketFilter, PeerId, Verdict, reasons};
 use nsplane_packet::checksum;
 
 /// Calls seen by a [`Fixed`] filter.
@@ -234,7 +234,7 @@ fn spoofed_sources_are_dropped_before_the_filters() {
         net.take_events(1),
         [Event::Dropped {
             peer: Some(b_to_a),
-            reason: "source not allowed"
+            reason: reasons::SOURCE_NOT_ALLOWED
         }]
     );
     assert_eq!(calls.get(), (0, 0));

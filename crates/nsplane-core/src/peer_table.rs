@@ -115,19 +115,13 @@ impl PeerTable {
             return;
         }
 
-        // A handshake that reaches a tunnel is counted by the gate and again by the tunnel, so
-        // the shared limiter allows twice the configured rate.
-        let gate = Arc::new(RateLimiter::new(
-            &public_key,
-            self.handshake_rate_limit.saturating_mul(2),
-        ));
+        let gate = Arc::new(RateLimiter::new(&public_key, self.handshake_rate_limit));
         for peer in &mut self.peers {
             peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&gate)),
             );
-            peer.reset_rx_session();
         }
 
         self.key = Some(OwnKey {

@@ -82,6 +82,8 @@ pub(super) struct Timers {
     pub(super) handshake_init_sent: Duration,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
+    /// Number of sessions established so far; never reset.
+    handshakes: u64,
 }
 
 impl Timers {
@@ -99,6 +101,7 @@ impl Timers {
             handshake_jitter: Duration::ZERO,
             handshake_init_sent: Duration::ZERO,
             should_reset_rr: reset_rr,
+            handshakes: 0,
         }
     }
 
@@ -178,6 +181,7 @@ impl Tunn {
         self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
+        self.timers.handshakes += 1;
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -403,6 +407,15 @@ impl Tunn {
         } else {
             None
         }
+    }
+
+    /// Number of handshakes completed by this tunnel, as initiator or responder.
+    ///
+    /// Monotonic: it grows by one whenever a new session is established (the point where
+    /// [`Tunn::time_since_last_handshake`] restarts), so a caller comparing it with the last
+    /// value it saw detects every completed handshake, even several between two looks.
+    pub const fn handshake_count(&self) -> u64 {
+        self.timers.handshakes
     }
 
     /// The persistent keepalive interval in seconds.

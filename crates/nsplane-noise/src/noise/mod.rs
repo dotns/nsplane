@@ -418,7 +418,14 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
-    pub(crate) fn handle_verified_packet<'a>(
+    /// Handles a datagram that already passed the mac1/mac2 (and cookie) checks, e.g. a
+    /// [`Packet`] returned by [`RateLimiter::verify_packet`] on the caller's limiter.
+    ///
+    /// This entry point does no rate limiting and never answers with a cookie reply: a
+    /// caller that has not verified the datagram must use [`Tunn::decapsulate`] instead.
+    /// Repeat calls to drain queued packets go through [`Tunn::decapsulate`] with an empty
+    /// datagram.
+    pub fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet<'_>,
         dst: &'a mut [u8],
@@ -1026,6 +1033,18 @@ mod tests {
 
         their_tun.set_preshared_key(Some([7; 32]));
         assert!(rehandshake(&mut my_tun, &mut their_tun));
+    }
+
+    #[test]
+    fn handshake_count_grows_by_one_per_completed_handshake() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        assert_eq!(my_tun.handshake_count(), 0);
+        assert_eq!(their_tun.handshake_count(), 0);
+
+        assert!(rehandshake(&mut my_tun, &mut their_tun));
+        assert!(rehandshake(&mut my_tun, &mut their_tun));
+        assert_eq!(my_tun.handshake_count(), 2);
+        assert_eq!(their_tun.handshake_count(), 2);
     }
 
     #[test]
