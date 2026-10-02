@@ -20,7 +20,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-noise/`  | `nsplane-noise`  | Protocol library: Noise handshake, sessions, timers (`noise`); no I/O |
 | `crates/nsplane-packet/` | `nsplane-packet` | Packet buffers, IP header views and shared value types; no I/O |
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
-| `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, and the `AclFilter` and `FlowTracker` packet filters |
+| `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, per-source rule namespaces, directed grants, outbound rules and app pinholes, and the `AclFilter` and `FlowTracker` packet filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp (TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
@@ -40,8 +40,9 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 
 Runnable programs in [`examples/`](examples/README.md) (package `nsplane-examples`, not
 published) show how the crates fit together: TUN and netstack nodes, a hybrid local side, an
-ACL gateway, host bridges by fd or channels, events and stats, and a single-port relay with
-its client transport over UDP and WebSocket over TLS. Every example has `--help`:
+ACL gateway, app sessions on ACL namespaces and pinholes, host bridges by fd or channels,
+events and stats, and a single-port relay with its client transport over UDP and WebSocket
+over TLS. Every example has `--help`:
 
 ```bash
 cargo run -p nsplane-examples --bin udp_pair       # quick start, no root
