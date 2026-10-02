@@ -9,6 +9,22 @@
 //! (a Wintun adapter; a reader thread feeds the source, so there is no fd). On every
 //! other target the crate is empty for now.
 //!
+//! Raw fds (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
+//! (a parent process, the CLI's `--tun-fd` and `--uapi-fd`) so that callers need no
+//! `unsafe`. Either call takes ownership: the fd must be one the process inherited or
+//! otherwise owns, nothing else may use or close it afterwards, and it is closed when
+//! the returned value drops. A negative number or one that is not an open fd is
+//! rejected without adopting anything.
+//!
+//! MTU: `TunSource`'s `mtu` watch follows the interface MTU. On Linux/Android and
+//! macOS/iOS, `Tun::split` queries the MTU (`SIOCGIFMTU`) and spawns a tokio task that
+//! polls it every `MTU_POLL_INTERVAL` (1 s) and publishes changes; periodic polling
+//! needs neither netlink nor a routing socket. The task ends when the source and every
+//! receiver are dropped, the device fd is closed, or the interface is gone. An adopted
+//! fd whose interface name cannot be queried (not a TUN device) is not watched: its MTU
+//! stays the value it was adopted with. On Windows the MTU is read once when the
+//! Wintun adapter opens and is not watched.
+//!
 //! `unsafe` is confined to the platform modules that perform syscalls (`unix`,
 //! `linux`, `darwin`) and to loading the Wintun library (`windows`); see
 //! `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
@@ -45,6 +61,13 @@ mod windows;
     target_os = "macos",
     target_os = "ios"
 ))]
-pub use tun::{Tun, TunSink, TunSource};
+pub use tun::{MTU_POLL_INTERVAL, Tun, TunSink, TunSource};
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+pub use unix::adopt_fd;
 #[cfg(windows)]
 pub use windows::{Tun, TunSink, TunSource};
