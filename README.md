@@ -19,9 +19,9 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-noise/`  | `nsplane-noise`  | Protocol library: Noise handshake, sessions, timers (`noise`); no I/O |
 | `crates/nsplane-packet/` | `nsplane-packet` | Packet buffers, IP header views and shared value types; no I/O |
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
-| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
+| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
-| `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket listener |
+| `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
 
@@ -114,8 +114,9 @@ supported.
 
 - `wintun.dll` (from <https://www.wintun.net/>, matching the architecture) must sit next to
   the executable, which runs elevated.
-- `nsplane-uapi` has no Windows listener (named pipe) yet; embedders configure the engine
-  through `EngineHandle` or `Uapi::handle_request`.
+- `nsplane-uapi` listens on the named pipe
+  `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` with the default security
+  descriptor; the path and descriptor are not yet verified on a real Windows host.
 
 ## Quality gates
 
