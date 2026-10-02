@@ -32,3 +32,4 @@ pub mod translate;
 pub use table::{
     LanPrefix, PeerMapping, SelfMapping, TableError, TranslationTable, TranslationTableBuilder,
 };
+pub use translate::{Translator, TranslatorStats};
