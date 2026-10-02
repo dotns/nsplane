@@ -21,11 +21,21 @@ tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+tracing = "0.1.40"
+
 [target.'cfg(windows)'.dependencies]
 # JUSTIFICATION: Wintun is the only userspace TUN driver on Windows; the bindings load the
 # signed wintun.dll at runtime (docs/decisions/2026-10-01-wintun.md).
 wintun-bindings = "0.7.40"
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+futures-core = "0.3.32"
+nsplane-netstack = { path = "../nsplane-netstack", version = "0.8.0" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
-tokio = { version = "1.53.1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[[bench]]
+name = "offload"
+harness = false
