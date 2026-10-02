@@ -320,7 +320,7 @@ CHECKS FAIL
 
 ### Status file
 
-`--status-file <PATH>` is rewritten every second (via `<PATH>.tmp` and a rename):
+`--status-file <PATH>` is rewritten every second (via a temporary `<PATH>.<pid>.<n>.tmp` and a rename):
 
 ```json
 {

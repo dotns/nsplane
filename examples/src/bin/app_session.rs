@@ -12,8 +12,8 @@
 //!   allowed, app kind `transfer` allowed; B restricts its outbound traffic to A to port
 //!   7). A session adds `app:<id>` with the peer as member on both sides, the receiver A
 //!   opens an inbound pinhole on its app port and the sender B an outbound one; a
-//!   generated file (1 MiB and a bit) crosses an in-tunnel TCP connection and its SHA-256
-//!   is verified. No peer is added and no handshake runs, the echo still works, and once
+//!   generated file (1 MiB and a bit) crosses an in-tunnel TCP connection, acknowledged by
+//!   the receiver every 32 KiB, and its SHA-256 is verified. No peer is added and no handshake runs, the echo still works, and once
 //!   the session ends only `app:<id>` is gone: a new connection to the app port is
 //!   dropped (`acl denied`, printed as a `DROP` line).
 //! - `b` not-permitted: A's `quick` no longer allows `transfer`, so A's pinhole is refused
@@ -173,13 +173,25 @@ const FILE_LEN: usize = (1 << 20) + 4321;
 const SLOW_FILE_LEN: usize = 4 << 20;
 /// Bytes per write of a transfer.
 const CHUNK: usize = 16 << 10;
+/// Bytes a sender has in flight before the receiver acknowledges them.
+///
+/// The netstack's TCP has no congestion control and a window of about 690 KiB, so an
+/// unbounded sender bursts far more than a loopback UDP socket buffers (208 KiB by
+/// default). When the receiving engine is slow to drain it (a loaded host), the kernel
+/// drops datagrams and TCP recovers only through its retransmission timeout, which
+/// starts at 1 s and doubles. Acknowledging every 32 KiB keeps a burst (about 25
+/// datagrams) well inside the socket buffer.
+const WINDOW: usize = 32 << 10;
 /// Pause between the writes of the slow transfer.
 const SLOW_PACE: Duration = Duration::from_millis(10);
 /// How long a connection attempt that should be dropped gets.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// How long an echo check retries.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a transfer may take.
+/// How long a transfer may take: connecting (the handshake and SYN retransmissions), then
+/// one round trip per [`WINDOW`], plus up to four retransmission timeouts of one segment
+/// (1 + 2 + 4 + 8 s) if datagrams are lost anyway. The unloaded transfer takes
+/// milliseconds; a timeout names the wait each end was in.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The safety-net lifetime of a pinhole.
 const PINHOLE_LIFETIME: Duration = Duration::from_secs(300);
@@ -843,57 +855,115 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// How far one end of a transfer got, for the message of a transfer that times out.
+#[derive(Debug)]
+struct Progress {
+    /// What the end waits for now.
+    stage: Mutex<&'static str>,
+    /// Payload bytes moved so far.
+    bytes: AtomicUsize,
+}
+
+impl Progress {
+    fn new(stage: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            stage: Mutex::new(stage),
+            bytes: AtomicUsize::new(0),
+        })
+    }
+
+    fn enter(&self, stage: &'static str) {
+        *self.stage.lock().unwrap_or_else(PoisonError::into_inner) = stage;
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Display for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = *self.stage.lock().unwrap_or_else(PoisonError::into_inner);
+        write!(f, "{stage} at {} bytes", self.bytes())
+    }
+}
+
 /// The receiving end of a transfer.
 struct Receiver {
-    received: Arc<AtomicUsize>,
+    progress: Arc<Progress>,
     task: JoinHandle<anyhow::Result<(usize, [u8; 32])>>,
 }
 
-/// Receives one file from the first connection on `conns`: its length and SHA-256.
-fn receive(mut conns: mpsc::Receiver<TcpConnection>) -> Receiver {
-    let received = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&received);
+/// Receives one file of `len` bytes from the first connection on `conns`: its length and
+/// SHA-256. Every [`WINDOW`] bytes and at the end of the file it acknowledges the bytes
+/// received so far (big-endian `u64`).
+fn receive(mut conns: mpsc::Receiver<TcpConnection>, len: usize) -> Receiver {
+    let progress = Progress::new("waiting for the connection");
+    let counter = Arc::clone(&progress);
     let task = tokio::spawn(async move {
-        let mut conn = timeout(TRANSFER_TIMEOUT, conns.recv())
-            .await
-            .context("no connection on the app port")?
-            .context("the app port closed")?;
+        let mut conn = conns.recv().await.context("the app port closed")?;
+        counter.enter("reading");
         let mut hasher = Sha256::new();
         let mut buf = vec![0; CHUNK];
+        let mut acked = 0;
         loop {
             let n = conn.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            counter.fetch_add(n, Ordering::Relaxed);
+            let total = counter.bytes.fetch_add(n, Ordering::Relaxed) + n;
+            if total - acked >= WINDOW || total == len {
+                conn.write_all(&(total as u64).to_be_bytes()).await?;
+                acked = total;
+            }
         }
+        counter.enter("closing");
         conn.shutdown().await?;
-        Ok((counter.load(Ordering::Relaxed), hasher.finalize().into()))
+        counter.enter("done");
+        Ok((counter.bytes(), hasher.finalize().into()))
     });
-    Receiver { received, task }
+    Receiver { progress, task }
 }
 
-/// Sends `data` over a new TCP connection to `target`, pausing `pace` between writes;
-/// returns once the receiver closed its end.
+/// Sends `data` over a new TCP connection to `target`, [`WINDOW`] bytes per
+/// acknowledgement and pausing `pace` between writes; returns once the receiver closed its
+/// end.
 async fn send(
     stack: NetStackHandle,
     target: SocketAddr,
     data: Arc<Vec<u8>>,
     pace: Option<Duration>,
+    progress: Arc<Progress>,
 ) -> anyhow::Result<()> {
-    let mut conn = timeout(CHECK_TIMEOUT, stack.connect_tcp(target))
+    progress.enter("connecting");
+    let mut conn = stack
+        .connect_tcp(target)
         .await
-        .with_context(|| format!("connecting to {target} timed out"))??;
-    for chunk in data.chunks(CHUNK) {
-        conn.write_all(chunk).await?;
-        if let Some(pace) = pace {
-            sleep(pace).await;
+        .with_context(|| format!("cannot connect to {target}"))?;
+    for window in data.chunks(WINDOW) {
+        progress.enter("writing");
+        for chunk in window.chunks(CHUNK) {
+            conn.write_all(chunk).await?;
+            progress.bytes.fetch_add(chunk.len(), Ordering::Relaxed);
+            if let Some(pace) = pace {
+                sleep(pace).await;
+            }
         }
+        progress.enter("waiting for an acknowledgement");
+        let mut ack = [0; 8];
+        conn.read_exact(&mut ack).await?;
+        let (acked, sent) = (u64::from_be_bytes(ack), progress.bytes());
+        ensure!(
+            acked == sent as u64,
+            "the receiver acknowledged {acked} of {sent} bytes"
+        );
     }
+    progress.enter("waiting for the receiver to close");
     conn.shutdown().await?;
     let mut rest = Vec::new();
     conn.read_to_end(&mut rest).await?;
+    progress.enter("done");
     Ok(())
 }
 
@@ -905,17 +975,29 @@ async fn transfer(
     data: Arc<Vec<u8>>,
     digest: [u8; 32],
 ) -> anyhow::Result<()> {
-    let receiver = receive(conns);
+    let receiver = receive(conns, data.len());
     let started = Instant::now();
-    timeout(
-        TRANSFER_TIMEOUT,
-        send(from.stack.clone(), target, Arc::clone(&data), None),
-    )
-    .await
-    .context("the transfer timed out")??;
-    let (len, got) = timeout(TRANSFER_TIMEOUT, receiver.task)
-        .await
-        .context("the receiver timed out")???;
+    let sender = Progress::new("starting");
+    let sent = send(
+        from.stack.clone(),
+        target,
+        Arc::clone(&data),
+        None,
+        Arc::clone(&sender),
+    );
+    let abort = receiver.task.abort_handle();
+    let received = async { receiver.task.await? };
+    let result = timeout(TRANSFER_TIMEOUT, async { tokio::try_join!(sent, received) }).await;
+    let Ok(result) = result else {
+        abort.abort();
+        bail!(
+            "the transfer timed out after {}ms: sender {}, receiver {}",
+            started.elapsed().as_millis(),
+            sender,
+            receiver.progress
+        );
+    };
+    let ((), (len, got)) = result?;
     ensure!(
         len == data.len() && got == digest,
         "received {len} of {} bytes, sha256 {}",
@@ -1082,15 +1164,16 @@ async fn revoke(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
     on_a.pinhole(&b.principal(), Direction::Inbound, APP_PORT)?;
     let mut on_b = Session::open(b, &session, a.member()?)?;
     on_b.pinhole(&a.principal(), Direction::Outbound, APP_PORT)?;
-    let receiver = receive(a.apps.listen(APP_PORT));
+    let receiver = receive(a.apps.listen(APP_PORT), SLOW_FILE_LEN);
     let target = SocketAddr::new(a.addr(v6), APP_PORT);
     let sender = tokio::spawn(send(
         b.stack.clone(),
         target,
         file(SLOW_FILE_LEN),
         Some(SLOW_PACE),
+        Progress::new("starting"),
     ));
-    let result = revoke_mid_transfer(a, b, &on_a, &receiver.received).await;
+    let result = revoke_mid_transfer(a, b, &on_a, &receiver.progress).await;
     sender.abort();
     receiver.task.abort();
     result
@@ -1100,10 +1183,10 @@ async fn revoke_mid_transfer(
     a: &Node,
     b: &Node,
     on_a: &Session,
-    received: &AtomicUsize,
+    received: &Progress,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
-    while received.load(Ordering::Relaxed) < SLOW_FILE_LEN / 16 {
+    while received.bytes() < SLOW_FILE_LEN / 16 {
         ensure!(
             started.elapsed() < TRANSFER_TIMEOUT,
             "the transfer does not start"
@@ -1117,12 +1200,12 @@ async fn revoke_mid_transfer(
     ensure!(a.acl.pinhole_stats().revoked == revoked + 1);
     out::line(format_args!(
         "REVOKED a {APP_KIND} at {} bytes",
-        received.load(Ordering::Relaxed)
+        received.bytes()
     ));
     sleep(Duration::from_secs(1)).await;
-    let settled = received.load(Ordering::Relaxed);
+    let settled = received.bytes();
     sleep(Duration::from_millis(1500)).await;
-    let last = received.load(Ordering::Relaxed);
+    let last = received.bytes();
     ensure!(
         last == settled && last < SLOW_FILE_LEN,
         "the transfer goes on: {settled} then {last} of {SLOW_FILE_LEN} bytes"
