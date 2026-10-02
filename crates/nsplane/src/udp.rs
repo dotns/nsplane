@@ -17,6 +17,9 @@ use crate::transport::Transport;
 /// segmented send.
 const MAX_SEND: usize = 65_507;
 
+/// The socket buffer size [`UdpTransport::bind`] requests for both directions.
+const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
+
 /// A [`Transport`] over one UDP socket.
 ///
 /// Bound to `[::]:port` the socket is dual-stack: IPv4 peers are reported in
@@ -61,6 +64,20 @@ const MAX_SEND: usize = 65_507;
 /// offload support. Either way the datagrams, their order, sizes, paths and ECN marks are
 /// the same.
 ///
+/// Socket buffers: [`bind`](Self::bind) requests 4 MiB for both the receive (`SO_RCVBUF`)
+/// and the send buffer (`SO_SNDBUF`), so a burst does not overflow the receive queue
+/// before the engine reads it, as it does with Linux's default of 208 KiB on a loaded
+/// host. The kernel grants what its limits allow: Linux clamps the
+/// request to `net.core.rmem_max` / `net.core.wmem_max` without an error (raise those
+/// sysctls for the full size; `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE`, which bypass them with
+/// `CAP_NET_ADMIN`, are not used). [`set_recv_buffer_size`](Self::set_recv_buffer_size)
+/// and [`set_send_buffer_size`](Self::set_send_buffer_size) change the sizes later;
+/// [`recv_buffer_size`](Self::recv_buffer_size) and
+/// [`send_buffer_size`](Self::send_buffer_size) report what the kernel says, which on
+/// Linux is twice the granted request (the kernel reserves the extra half for its
+/// bookkeeping). Windows, macOS and the BSDs take the same options through the same calls,
+/// with their own limits (macOS: `kern.ipc.maxsockbuf`) and without the doubling.
+///
 /// Windows: a datagram larger than the receive buffer is truncated as on other
 /// platforms, although `recvfrom` reports it as `WSAEMSGSIZE`; its sender is peeked
 /// before the receive. ICMP port-unreachable errors, which Windows reports on a later
@@ -83,12 +100,17 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    /// Binds a non-blocking UDP socket to `addr`, with segmentation offload on.
+    /// Binds a non-blocking UDP socket to `addr`, with segmentation offload on and
+    /// 4 MiB requested for both socket buffers.
     ///
     /// For the IPv6 unspecified address (`[::]:port`) the socket is dual-stack
     /// (`IPV6_V6ONLY` off). If IPv6 is unavailable on the host, it binds `0.0.0.0:port`
     /// instead and serves IPv4 only; [`local_addr`](Self::local_addr) tells which. Any
     /// other address is bound exactly.
+    ///
+    /// The socket buffers get what the kernel grants of the request (see the
+    /// [type documentation](Self)); a failure to size them is logged and does not fail
+    /// the bind.
     ///
     /// # Panics
     ///
@@ -104,6 +126,21 @@ impl UdpTransport {
             _ => bind_socket(addr)?,
         };
         socket.set_nonblocking(true)?;
+        // Before `quinn-udp` sets the socket up: on Apple platforms it caches `SO_SNDBUF`.
+        for (option, result) in [
+            (
+                "SO_RCVBUF",
+                socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+            (
+                "SO_SNDBUF",
+                socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+        ] {
+            if let Err(e) = result {
+                tracing::debug!(message = "Default socket buffer not set", option, error = ?e);
+            }
+        }
         let socket = UdpSocket::from_std(socket.into())?;
         let local = socket.local_addr()?;
         let state = UdpSocketState::new(UdpSockRef::from(&socket));
@@ -141,6 +178,40 @@ impl UdpTransport {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn set_fwmark(&self, mark: u32) -> io::Result<()> {
         socket2::SockRef::from(&self.socket).set_mark(mark)
+    }
+
+    /// Requests a receive buffer (`SO_RCVBUF`) of `bytes`; the kernel may grant less (see
+    /// the [type documentation](Self)). [`recv_buffer_size`](Self::recv_buffer_size) tells
+    /// what it granted.
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        socket2::SockRef::from(&self.socket).set_recv_buffer_size(bytes)
+    }
+
+    /// Requests a send buffer (`SO_SNDBUF`) of `bytes`; the kernel may grant less (see the
+    /// [type documentation](Self)). [`send_buffer_size`](Self::send_buffer_size) tells what
+    /// it granted.
+    pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        // Through `quinn-udp`, which caches the size on Apple platforms.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let state = Some(&self.state);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = self.state.as_ref();
+        let Some(state) = state else {
+            return socket2::SockRef::from(&self.socket).set_send_buffer_size(bytes);
+        };
+        state.set_send_buffer_size(UdpSockRef::from(&self.socket), bytes)
+    }
+
+    /// The receive buffer size the kernel reports (`SO_RCVBUF`): on Linux twice the
+    /// granted request.
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.socket).recv_buffer_size()
+    }
+
+    /// The send buffer size the kernel reports (`SO_SNDBUF`): on Linux twice the granted
+    /// request.
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.socket).send_buffer_size()
     }
 
     /// Turns segmentation offload on (the default) or off; see the
@@ -764,6 +835,80 @@ mod tests {
         let a = bind(1, "127.0.0.1:0");
         a.set_fwmark(0x5157).unwrap();
         assert_eq!(socket2::SockRef::from(&a.socket).mark().unwrap(), 0x5157);
+    }
+
+    /// Linux's default socket buffer size (`net.core.rmem_default`), as reported.
+    const OLD_DEFAULT: usize = 212_992;
+
+    /// What the kernel reports for a request of `requested` bytes: on Linux the request
+    /// clamped to the sysctl `max` and doubled; `None` elsewhere or when unreadable.
+    fn granted(requested: usize, max: &str) -> Option<usize> {
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            return None;
+        }
+        let max: usize = std::fs::read_to_string(format!("/proc/sys/net/core/{max}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(2 * requested.min(max))
+    }
+
+    #[tokio::test]
+    async fn default_socket_buffers() {
+        let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let a = bind(1, "127.0.0.1:0");
+        for (effective, before, max) in [
+            (a.recv_buffer_size(), plain.recv_buffer_size(), "rmem_max"),
+            (a.send_buffer_size(), plain.send_buffer_size(), "wmem_max"),
+        ] {
+            let (effective, before) = (effective.unwrap(), before.unwrap());
+            match granted(DEFAULT_SOCKET_BUFFER, max) {
+                Some(granted) => {
+                    assert_eq!(effective, granted, "{max}");
+                    if granted > OLD_DEFAULT {
+                        assert!(effective > OLD_DEFAULT, "{max}");
+                    }
+                }
+                None => assert!(effective > 0 && effective >= before, "{max}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_buffer_setters() {
+        let a = bind(1, "[::]:0");
+        let mut previous = [0; 2];
+        for bytes in [64 << 10, 1 << 20] {
+            a.set_recv_buffer_size(bytes).unwrap();
+            a.set_send_buffer_size(bytes).unwrap();
+            let effective = [a.recv_buffer_size().unwrap(), a.send_buffer_size().unwrap()];
+            for ((effective, previous), max) in
+                effective.iter().zip(previous).zip(["rmem_max", "wmem_max"])
+            {
+                match granted(bytes, max) {
+                    Some(granted) => assert_eq!(*effective, granted, "{max}"),
+                    None => assert!(*effective > previous, "{max}"),
+                }
+            }
+            previous = effective;
+        }
+    }
+
+    /// A burst of 512 datagrams of 1420 bytes sent before the receiver reads fits into the
+    /// default receive buffer, with offload on and off.
+    #[tokio::test]
+    async fn burst_fits_default_buffer() {
+        for offload in [true, false] {
+            let a = bind(1, "127.0.0.1:0");
+            let b = bind(2, "127.0.0.1:0");
+            a.set_offload(offload).unwrap();
+            b.set_offload(offload).unwrap();
+            let datagrams: Vec<_> = (0..512).map(|seq| numbered(seq, 1420)).collect();
+            send_all(&a, &batch(b.local_addr(), Ecn::NotEct, &datagrams)).await;
+            let received = recv_batches(&b, datagrams.len()).await.concat();
+            check(&received, &datagrams, a.local_addr(), Ecn::NotEct);
+        }
     }
 
     /// Datagram number `seq` of `len` bytes, different from its neighbours.
