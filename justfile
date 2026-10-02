@@ -42,3 +42,7 @@ test-windows:
 e2e:
     cargo build -p boringtun-cli --release --locked
     scripts/e2e/linux.sh
+
+# Library-level e2e: nstun-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
+e2e-lib:
+    scripts/e2e/lib.sh

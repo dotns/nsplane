@@ -1,0 +1,28 @@
+[package]
+name = "nstun-e2e"
+description = "End-to-end tests of the nstun data plane: engines talking to each other and to kernel WireGuard"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nstun = { path = "../nstun", version = "0.8.0" }
+nstun-core = { path = "../nstun-core", version = "0.8.0" }
+nstun-packet = { path = "../nstun-packet", version = "0.8.0" }
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
+
+[dev-dependencies]
+nstun-uapi = { path = "../nstun-uapi", version = "0.8.0" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nstun-tun = { path = "../nstun-tun", version = "0.8.0" }

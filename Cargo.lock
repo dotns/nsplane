@@ -860,6 +860,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nstun-e2e"
+version = "0.8.0"
+dependencies = [
+ "nstun",
+ "nstun-core",
+ "nstun-packet",
+ "nstun-tun",
+ "nstun-uapi",
+ "tokio",
+]
+
+[[package]]
 name = "nstun-packet"
 version = "0.8.0"
 dependencies = [
