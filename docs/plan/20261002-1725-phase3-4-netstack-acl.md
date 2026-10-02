@@ -100,3 +100,9 @@ nsplane repository only; `/srv/dotns/ns` read-only. New dependencies allowed: `s
 thiserror, futures-core if present, ...). Anything else is a yellow.
 
 ## Annotations
+- 2026-10-02: user added workstream 3D: a root `examples/` package (`nsplane-examples`,
+  publish = false) with runnable examples for every feature and `just e2e-examples`
+  running them over the design's presentation x transport matrix (TUN, netstack, fd/channel
+  bridge x UDP, relay UDP, relay WSS). Relay WSS is a real WebSocket over TLS; the user
+  approved `tokio-tungstenite`, `tungstenite`, `tokio-rustls`/`rustls` (aws-lc-rs),
+  `rustls-pki-types`, `rcgen` for the examples package only. 3D starts after 3A merges.
