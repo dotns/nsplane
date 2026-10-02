@@ -3,7 +3,7 @@
 default: check
 
 # Run every gate.
-check: fmt clippy test doc-test deny shear typos msrv
+check: fmt clippy test doc-test deny shear typos msrv examples
 
 fmt:
     cargo fmt --all --check
@@ -29,6 +29,10 @@ typos:
 msrv:
     cargo hack check --workspace --rust-version --all-features --locked
 
+# Build every example binary.
+examples:
+    cargo build -p nsplane-examples --bins --locked
+
 # Cross-target clippy: macOS through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
 cross:
     cargo-zigbuild clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
@@ -46,3 +50,7 @@ e2e:
 # Library-level e2e: nsplane-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
 e2e-lib:
     scripts/e2e/lib.sh
+
+# Examples e2e: the example binaries as the design's scenarios in containers, against each other and kernel WireGuard (needs docker and the wireguard module).
+e2e-examples:
+    scripts/e2e/examples.sh
