@@ -1,0 +1,554 @@
+//! Engines on real TUN devices, and interop with kernel WireGuard.
+//!
+//! Every test needs root (`CAP_NET_ADMIN`) and `/dev/net/tun`, and the interop test needs a
+//! kernel WireGuard peer in another container, so all of them are `#[ignore]`d. They run
+//! with `--ignored --test-threads=1` inside the containers `scripts/e2e/lib.sh` (`just
+//! e2e-lib`) sets up; the interop test reads its parameters from the `NSPLANE_E2E_LIB_*`
+//! variables that script sets.
+#![cfg(target_os = "linux")]
+
+use std::collections::BTreeSet;
+use std::io::{self, Write as _};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::process::{Command, Output};
+use std::time::{Duration, SystemTime};
+
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{AllowedIp, EngineBuilder, EngineHandle, Event, Peer, PeerStats, UdpTransport};
+use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, udp};
+use nsplane_packet::{Ecn, FiveTuple, IpPacket, Path, PeerId, TransportId, UdpHeader, protocol};
+use nsplane_tun::Tun;
+use nsplane_uapi::{Uapi, UapiListener};
+use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
+use tokio::time::{Instant, sleep, timeout, timeout_at};
+
+/// Upper bound for one external command (`ip`, `wg`, `ping`).
+const COMMAND_WAIT: Duration = Duration::from_secs(30);
+/// Upper bound for the kernel peer's first handshake: it retries every 5 seconds.
+const KERNEL_HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
+/// How long a handshake that must fail is given to complete anyway.
+const MISMATCH_WINDOW: Duration = Duration::from_secs(2);
+/// The interface name of the interop test.
+const IFACE: &str = "nsplane0";
+/// The UDP payload size of the large packets.
+const LARGE: usize = 1300;
+
+/// Logs a test step; the output shows with `--nocapture`.
+fn step(message: &str) -> TestResult {
+    writeln!(io::stderr(), "== {message}")?;
+    Ok(())
+}
+
+/// Runs `program` with `args` on a blocking thread, so the engine and the UAPI keep
+/// serving, and returns its output whatever its exit status.
+async fn run(program: &str, args: &[&str]) -> TestResult<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    let line = format!("{program} {}", args.join(" "));
+    match timeout(
+        COMMAND_WAIT,
+        tokio::task::spawn_blocking(move || command.output()),
+    )
+    .await
+    {
+        Ok(output) => Ok(output??),
+        Err(_) => Err(format!("`{line}` did not finish within {COMMAND_WAIT:?}").into()),
+    }
+}
+
+/// Runs `program` with `args`, which must succeed, and returns its standard output.
+async fn ok(program: &str, args: &[&str]) -> TestResult<String> {
+    let output = run(program, args).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{program} {}` failed with {}: {}{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Runs `ip` with the whitespace-separated `args`, which must succeed.
+async fn ip(args: &str) -> TestResult {
+    ok("ip", &args.split_whitespace().collect::<Vec<_>>()).await?;
+    Ok(())
+}
+
+/// Gives `iface` the addresses `v4` and `v6` (with prefix lengths), without duplicate
+/// address detection, and brings it up.
+async fn configure_iface(iface: &str, v4: &str, v6: &str) -> TestResult {
+    ip(&format!("addr add {v4} dev {iface}")).await?;
+    ip(&format!("-6 addr add {v6} dev {iface} nodad")).await?;
+    ip(&format!("link set dev {iface} mtu 1420 up")).await
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> TestResult<u64> {
+    Ok(SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs())
+}
+
+/// A UDP datagram sent by the kernel from a socket on a TUN device reaches the peer engine
+/// intact, and the peer's reply arrives back on that socket, for IPv4 and IPv6 with a
+/// 1300-byte payload.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN and /dev/net/tun; run by `just e2e-lib`"]
+async fn tun_carries_socket_datagrams_both_ways() -> TestResult {
+    let tun = Tun::create("nsplane-e2e%d")?;
+    let name = tun.name()?;
+    let (source, sink) = tun.split()?;
+    let id = TransportId::new(1);
+    let transport = UdpTransport::bind(id, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let addr = transport.local_addr();
+    let secret = StaticSecret::from([1; 32]);
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .private_key(secret.clone())
+        .build();
+    let handle = engine.handle();
+
+    // The peer engine (seed 2: 10.0.0.2, fd00::2) uses channels as its source and sink.
+    let peer_id = TransportId::new(2);
+    let peer_transport = UdpTransport::bind(peer_id, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let peer_addr = peer_transport.local_addr();
+    let mut peer = Node::new(2, peer_id, peer_addr, peer_transport, Options::default());
+
+    let (tun4, tun6) = (
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+    );
+    handle.add_or_update_peer(peer.as_peer(id)).await?;
+    peer.handle
+        .add_or_update_peer(Peer {
+            allowed_ips: vec![
+                AllowedIp {
+                    addr: IpAddr::V4(tun4),
+                    cidr: 32,
+                },
+                AllowedIp {
+                    addr: IpAddr::V6(tun6),
+                    cidr: 128,
+                },
+            ],
+            path: Some(Path {
+                transport: peer_id,
+                addr,
+                ecn: Ecn::NotEct,
+            }),
+            ..Peer::new(PublicKey::from(&secret))
+        })
+        .await?;
+    configure_iface(&name, &format!("{tun4}/24"), &format!("{tun6}/64")).await?;
+    let from_tun = peer
+        .handle
+        .peer_id(PublicKey::from(&secret))
+        .await?
+        .ok_or("the peer engine does not know the TUN engine")?;
+
+    for family in [Family::V4, Family::V6] {
+        step(&format!("{family:?} through {name}"))?;
+        let (local, remote) = match family {
+            Family::V4 => (IpAddr::V4(tun4), IpAddr::V4(peer.ip4)),
+            Family::V6 => (IpAddr::V6(tun6), IpAddr::V6(peer.ip6)),
+        };
+        let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
+        let local = socket.local_addr()?;
+        let remote = SocketAddr::new(remote, 9);
+        let data = payload(LARGE);
+
+        // Kernel -> TUN -> engine -> peer engine -> peer sink.
+        socket.send_to(&data, remote).await?;
+        let (from, packet) = peer.expect_delivery().await?;
+        if from != from_tun {
+            return Err(format!("{family:?} packet attributed to {from:?}").into());
+        }
+        let ip = IpPacket::parse(&packet)?;
+        let expected = FiveTuple {
+            src: local.ip(),
+            dst: remote.ip(),
+            protocol: protocol::UDP,
+            src_port: local.port(),
+            dst_port: remote.port(),
+        };
+        if ip.five_tuple() != Some(expected) {
+            return Err(format!("{family:?} packet is {:?}", ip.five_tuple()).into());
+        }
+        let (_, delivered) = UdpHeader::parse(ip.payload())?;
+        if delivered != data.as_slice() {
+            return Err(format!("{family:?} payload changed in transit").into());
+        }
+
+        // Peer engine -> engine -> TUN -> kernel -> socket.
+        peer.send(&udp(remote, local, &data)).await?;
+        let mut buf = vec![0; 2 * LARGE];
+        let (len, sender) = timeout(WAIT, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| format!("no {family:?} reply on {local} within {WAIT:?}"))??;
+        if sender != remote || buf[..len] != data[..] {
+            return Err(format!("{family:?} reply of {len} bytes from {sender}").into());
+        }
+    }
+    Ok(())
+}
+
+/// The parameters of the interop test, set by `scripts/e2e/lib.sh`.
+#[derive(Debug)]
+struct Interop {
+    /// File with this side's private key (`wg genkey`).
+    private_key: String,
+    /// File with the preshared key both sides use.
+    psk: String,
+    /// The kernel peer's public key (base64).
+    peer_pub: String,
+    /// The kernel peer's address.
+    peer_endpoint: SocketAddr,
+    /// The port this side listens on; the kernel peer's endpoint.
+    listen_port: u16,
+    /// This side's tunnel addresses, with prefix lengths.
+    addr_v4: String,
+    addr_v6: String,
+    /// The kernel peer's tunnel addresses.
+    peer_v4: Ipv4Addr,
+    peer_v6: Ipv6Addr,
+}
+
+/// The variable `NSPLANE_E2E_LIB_<name>`, which must be set.
+fn var(name: &str) -> TestResult<String> {
+    let key = format!("NSPLANE_E2E_LIB_{name}");
+    std::env::var(&key).map_err(|_| {
+        format!("{key} is not set: run this test through scripts/e2e/lib.sh (`just e2e-lib`)")
+            .into()
+    })
+}
+
+impl Interop {
+    fn from_env() -> TestResult<Self> {
+        Ok(Self {
+            private_key: var("PRIVATE_KEY")?,
+            psk: var("PSK")?,
+            peer_pub: var("PEER_PUB")?,
+            peer_endpoint: var("PEER_ENDPOINT")?.parse()?,
+            listen_port: var("LISTEN_PORT")?.parse()?,
+            addr_v4: var("ADDR_V4")?,
+            addr_v6: var("ADDR_V6")?,
+            peer_v4: var("PEER_V4")?.parse()?,
+            peer_v6: var("PEER_V6")?.parse()?,
+        })
+    }
+
+    /// The kernel peer's addresses as a `wg set ... allowed-ips` argument.
+    fn peer_allowed_ips_arg(&self) -> String {
+        format!("{}/32,{}/128", self.peer_v4, self.peer_v6)
+    }
+
+    /// The kernel peer's addresses as single-host allowed IPs.
+    const fn peer_allowed_ips(&self) -> [AllowedIp; 2] {
+        [
+            AllowedIp {
+                addr: IpAddr::V4(self.peer_v4),
+                cidr: 32,
+            },
+            AllowedIp {
+                addr: IpAddr::V6(self.peer_v6),
+                cidr: 128,
+            },
+        ]
+    }
+
+    /// `wg set <iface> peer <peer> <args>`, which must succeed.
+    async fn set_peer(&self, args: &[&str]) -> TestResult {
+        let mut all = vec!["set", IFACE, "peer", &self.peer_pub];
+        all.extend_from_slice(args);
+        ok("wg", &all).await?;
+        Ok(())
+    }
+
+    /// The single `<peer>\t<value>` line of `wg show <iface> <field>`, as its value.
+    async fn show(&self, field: &str) -> TestResult<String> {
+        let out = ok("wg", &["show", IFACE, field]).await?;
+        let mut lines = out.lines();
+        match (lines.next().and_then(|l| l.split_once('\t')), lines.next()) {
+            (Some((peer, value)), None) if peer == self.peer_pub => Ok(value.to_owned()),
+            _ => Err(format!("`wg show {IFACE} {field}`: {out:?}").into()),
+        }
+    }
+
+    /// Pings the kernel peer's `family` address with `size` bytes of payload.
+    async fn ping(&self, family: Family, size: usize) -> TestResult<bool> {
+        let dst = match family {
+            Family::V4 => IpAddr::V4(self.peer_v4),
+            Family::V6 => IpAddr::V6(self.peer_v6),
+        };
+        let (dst, size) = (dst.to_string(), size.to_string());
+        let output = run("ping", &["-c", "3", "-W", "2", "-s", &size, &dst]).await?;
+        Ok(output.status.success())
+    }
+
+    /// Pings the kernel peer, which must answer.
+    async fn expect_ping(&self, family: Family, size: usize) -> TestResult {
+        if !self.ping(family, size).await? {
+            return Err(format!("{family:?} ping of {size} bytes got no reply").into());
+        }
+        Ok(())
+    }
+}
+
+/// The engine's only peer.
+async fn the_peer(handle: &EngineHandle) -> TestResult<PeerStats> {
+    match <[PeerStats; 1]>::try_from(handle.peers().await?) {
+        Ok([peer]) => Ok(peer),
+        Err(peers) => Err(format!("expected one peer, got {peers:?}").into()),
+    }
+}
+
+/// How many handshakes completed within `window`.
+async fn handshakes(
+    events: &mut broadcast::Receiver<Event>,
+    window: Duration,
+) -> TestResult<usize> {
+    let deadline = Instant::now() + window;
+    let mut count = 0;
+    loop {
+        match timeout_at(deadline, events.recv()).await {
+            Ok(Ok(Event::HandshakeCompleted { .. })) => count += 1,
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => return Err("engine stopped".into()),
+            Err(_) => return Ok(count),
+        }
+    }
+}
+
+/// How many handshake messages the engine rejected.
+async fn rejected_handshakes(handle: &EngineHandle) -> TestResult<u64> {
+    let counters = handle.drop_counters().await?;
+    Ok(counters.get("handshake rejected").copied().unwrap_or(0))
+}
+
+/// Polls the engine's only peer until `done` holds for it, for at most `within`.
+async fn wait_for_peer(
+    handle: &EngineHandle,
+    within: Duration,
+    what: &str,
+    mut done: impl FnMut(&PeerStats) -> bool,
+) -> TestResult<PeerStats> {
+    let deadline = Instant::now() + within;
+    loop {
+        let peer = the_peer(handle).await?;
+        if done(&peer) {
+            return Ok(peer);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{what} within {within:?}: {peer:?}").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Configures the engine with one `wg set` over the UAPI socket and checks the handle's view.
+async fn configure(env: &Interop, handle: &EngineHandle) -> TestResult<PeerId> {
+    let allowed = env.peer_allowed_ips_arg();
+    let port = env.listen_port.to_string();
+    let endpoint = env.peer_endpoint.to_string();
+    ok(
+        "wg",
+        &[
+            "set",
+            IFACE,
+            "private-key",
+            &env.private_key,
+            "listen-port",
+            &port,
+            "peer",
+            &env.peer_pub,
+            "preshared-key",
+            &env.psk,
+            "allowed-ips",
+            &allowed,
+            "endpoint",
+            &endpoint,
+        ],
+    )
+    .await?;
+    let peer = the_peer(handle).await?;
+    assert_eq!(peer.allowed_ips, env.peer_allowed_ips());
+    assert_eq!(peer.path.map(|p| p.addr), Some(env.peer_endpoint));
+    assert!(peer.preshared_key.is_some());
+    assert!(handle.private_key().await?.is_some());
+    Ok(peer.peer)
+}
+
+/// Waits for the handshake the kernel peer initiates: this side sends nothing yet, so the
+/// kernel's persistent keepalive is what starts it.
+///
+/// Keepalives cannot be observed here: the peer counters count only the IP packets inside
+/// data messages, not keepalives or handshake messages.
+async fn kernel_initiates(handle: &EngineHandle) -> TestResult {
+    wait_for_peer(
+        handle,
+        KERNEL_HANDSHAKE_WAIT,
+        "no handshake from the kernel",
+        |p| p.last_handshake.is_some(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// A handshake with a mismatched preshared key fails; restoring the key repairs it.
+async fn psk_mismatch_and_repair(
+    env: &Interop,
+    handle: &EngineHandle,
+    events: &mut broadcast::Receiver<Event>,
+    id: PeerId,
+) -> TestResult {
+    let wrong = std::env::temp_dir().join("nsplane-e2e-lib-wrong.psk");
+    let wrong_key = ok("wg", &["genpsk"]).await?;
+    std::fs::write(&wrong, &wrong_key)?;
+    let wrong = wrong.to_str().ok_or("temporary path is not UTF-8")?;
+    env.set_peer(&["preshared-key", wrong]).await?;
+    assert_eq!(env.show("preshared-keys").await?, wrong_key.trim());
+    let before = the_peer(handle).await?;
+    let rejected = rejected_handshakes(handle).await?;
+    handshakes(events, Duration::ZERO).await?;
+    handle.force_handshake(id, None).await?;
+    let completed = handshakes(events, MISMATCH_WINDOW).await?;
+    let after = the_peer(handle).await?;
+    // The kernel answered the initiation; its response failed to authenticate here.
+    assert!(
+        rejected_handshakes(handle).await? > rejected,
+        "no handshake response rejected"
+    );
+    assert_eq!(
+        completed, 0,
+        "handshake with a wrong preshared key completed"
+    );
+    assert!(
+        after.last_handshake >= before.last_handshake,
+        "{before:?} {after:?}"
+    );
+
+    step("restoring the preshared key repairs it")?;
+    env.set_peer(&["preshared-key", &env.psk]).await?;
+    handle.force_handshake(id, None).await?;
+    if handshakes(events, WAIT).await? == 0 {
+        return Err("no handshake after restoring the preshared key".into());
+    }
+    env.expect_ping(Family::V4, 56).await
+}
+
+/// `wg set ... allowed-ips` replaces the peer's allowed IPs in `wg show`, in the handle and
+/// in the routing of traffic.
+async fn replace_allowed_ips(env: &Interop, handle: &EngineHandle) -> TestResult {
+    let v4_only = format!("{}/32", env.peer_v4);
+    env.set_peer(&["allowed-ips", &v4_only]).await?;
+    assert_eq!(env.show("allowed-ips").await?, v4_only);
+    assert_eq!(
+        the_peer(handle).await?.allowed_ips,
+        [env.peer_allowed_ips()[0]]
+    );
+    env.expect_ping(Family::V4, 56).await?;
+    assert!(
+        !env.ping(Family::V6, 56).await?,
+        "IPv6 still routed to the peer"
+    );
+
+    let allowed = env.peer_allowed_ips_arg();
+    env.set_peer(&["allowed-ips", &allowed]).await?;
+    let shown: BTreeSet<String> = env
+        .show("allowed-ips")
+        .await?
+        .split(' ')
+        .map(str::to_owned)
+        .collect();
+    let expected: BTreeSet<String> = allowed.split(',').map(str::to_owned).collect();
+    assert_eq!(shown, expected);
+    assert_eq!(the_peer(handle).await?.allowed_ips, env.peer_allowed_ips());
+    env.expect_ping(Family::V6, 56).await
+}
+
+/// A persistent keepalive set with `wg set` reaches `wg show` and the handle.
+///
+/// That the keepalives make the counters grow cannot be checked: the peer counters count
+/// only the IP packets inside data messages, so keepalives leave them unchanged.
+async fn persistent_keepalive(env: &Interop, handle: &EngineHandle) -> TestResult {
+    env.set_peer(&["persistent-keepalive", "1"]).await?;
+    assert_eq!(env.show("persistent-keepalive").await?, "1");
+    assert_eq!(the_peer(handle).await?.persistent_keepalive, Some(1));
+    Ok(())
+}
+
+/// `wg show` reports the configuration, and the latest handshake as recent wall-clock
+/// time (the test started at Unix time `started`).
+async fn wg_show(env: &Interop, started: u64) -> TestResult {
+    let latest: u64 = env.show("latest-handshakes").await?.parse()?;
+    let now = unix_now()?;
+    assert!(
+        latest + 1 >= started && latest <= now,
+        "latest handshake at {latest}, test ran {started}..={now}"
+    );
+    let show = ok("wg", &["show", IFACE]).await?;
+    writeln!(io::stderr(), "{show}")?;
+    let public = ok("sh", &["-c", &format!("wg pubkey < {}", env.private_key)]).await?;
+    for expected in [
+        format!("interface: {IFACE}"),
+        format!("public key: {}", public.trim()),
+        format!("listening port: {}", env.listen_port),
+        format!("peer: {}", env.peer_pub),
+        "preshared key: (hidden)".to_owned(),
+        format!("endpoint: {}", env.peer_endpoint),
+        "latest handshake: ".to_owned(),
+        "transfer: ".to_owned(),
+        "persistent keepalive: every 1 second".to_owned(),
+    ] {
+        assert!(show.contains(&expected), "`wg show` lacks {expected:?}");
+    }
+    Ok(())
+}
+
+/// An engine on a TUN device, configured only with `wg`, against kernel WireGuard: the
+/// kernel's handshake, pings in every flavour, a preshared key mismatch and
+/// its repair, replacing allowed IPs, persistent keepalive, and `wg show`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a kernel WireGuard peer; run by `just e2e-lib`"]
+async fn kernel_wireguard_interop() -> TestResult {
+    let env = Interop::from_env()?;
+    let started = unix_now()?;
+
+    let tun = Tun::create(IFACE)?;
+    let (source, sink) = tun.split()?;
+    let engine = EngineBuilder::new(source, sink).build();
+    let handle = engine.handle();
+    let uapi = Uapi::new(handle.clone());
+    let listener = UapiListener::bind(IFACE)?;
+    let server = tokio::spawn(async move { uapi.serve(listener).await });
+    configure_iface(IFACE, &env.addr_v4, &env.addr_v6).await?;
+    let mut events = handle.subscribe().await?;
+
+    step("configure over the UAPI socket")?;
+    let id = configure(&env, &handle).await?;
+    step("the kernel peer initiates a handshake")?;
+    kernel_initiates(&handle).await?;
+    step("ping the kernel peer: IPv4, IPv6, 1300 bytes")?;
+    for family in [Family::V4, Family::V6] {
+        for size in [56, LARGE] {
+            env.expect_ping(family, size).await?;
+        }
+    }
+    step("a mismatched preshared key fails the handshake")?;
+    psk_mismatch_and_repair(&env, &handle, &mut events, id).await?;
+    step("replace allowed IPs")?;
+    replace_allowed_ips(&env, &handle).await?;
+    step("persistent keepalive")?;
+    persistent_keepalive(&env, &handle).await?;
+    step("wg show")?;
+    wg_show(&env, started).await?;
+
+    server.abort();
+    drop(engine);
+    Ok(())
+}

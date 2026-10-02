@@ -159,43 +159,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boringtun"
-version = "0.8.0"
-dependencies = [
- "aead",
- "aws-lc-rs",
- "blake2",
- "chacha20poly1305",
- "criterion",
- "etherparse",
- "hmac",
- "mock_instant",
- "nix",
- "parking_lot",
- "portable-atomic",
- "rand_core",
- "subtle",
- "tracing",
- "x25519-dalek",
- "zerocopy",
-]
-
-[[package]]
-name = "boringtun-cli"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "clap",
- "nix",
- "nstun",
- "nstun-tun",
- "nstun-uapi",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,45 +734,82 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstun"
+name = "nsplane"
 version = "0.8.0"
 dependencies = [
  "nix",
- "nstun-core",
- "nstun-packet",
+ "nsplane-core",
+ "nsplane-packet",
  "socket2",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "nstun-core"
+name = "nsplane-cli"
 version = "0.8.0"
 dependencies = [
- "boringtun",
+ "anyhow",
+ "clap",
+ "nix",
+ "nsplane",
+ "nsplane-tun",
+ "nsplane-uapi",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "nsplane-core"
+version = "0.8.0"
+dependencies = [
  "criterion",
  "ip_network",
  "ip_network_table",
  "mock_instant",
- "nstun-packet",
+ "nsplane-noise",
+ "nsplane-packet",
  "rand_core",
  "tracing",
 ]
 
 [[package]]
-name = "nstun-e2e"
+name = "nsplane-e2e"
 version = "0.8.0"
 dependencies = [
- "nstun",
- "nstun-core",
- "nstun-packet",
- "nstun-tun",
- "nstun-uapi",
+ "nsplane",
+ "nsplane-core",
+ "nsplane-packet",
+ "nsplane-tun",
+ "nsplane-uapi",
  "tokio",
 ]
 
 [[package]]
-name = "nstun-packet"
+name = "nsplane-noise"
+version = "0.8.0"
+dependencies = [
+ "aead",
+ "aws-lc-rs",
+ "blake2",
+ "chacha20poly1305",
+ "criterion",
+ "etherparse",
+ "hmac",
+ "mock_instant",
+ "nix",
+ "parking_lot",
+ "portable-atomic",
+ "rand_core",
+ "subtle",
+ "tracing",
+ "x25519-dalek",
+ "zerocopy",
+]
+
+[[package]]
+name = "nsplane-packet"
 version = "0.8.0"
 dependencies = [
  "bytes",
@@ -818,23 +818,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstun-tun"
+name = "nsplane-tun"
 version = "0.8.0"
 dependencies = [
  "libc",
- "nstun",
- "nstun-packet",
+ "nsplane",
+ "nsplane-packet",
  "tokio",
  "wintun-bindings",
 ]
 
 [[package]]
-name = "nstun-uapi"
+name = "nsplane-uapi"
 version = "0.8.0"
 dependencies = [
  "base64",
  "hex",
- "nstun",
+ "nsplane",
  "tokio",
  "tracing",
 ]

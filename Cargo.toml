@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["boringtun", "boringtun-cli", "nstun-packet", "nstun-core", "nstun", "nstun-tun", "nstun-uapi", "nstun-e2e"]
+members = [
+    "crates/nsplane-noise",
+    "crates/nsplane-cli",
+    "crates/nsplane-packet",
+    "crates/nsplane-core",
+    "crates/nsplane",
+    "crates/nsplane-tun",
+    "crates/nsplane-uapi",
+    "crates/nsplane-e2e",
+]
 
 [workspace.package]
 version = "0.8.0"
@@ -13,7 +22,7 @@ authors = [
     "dotns",
 ]
 license = "BSD-3-Clause"
-repository = "https://github.com/dotns/nstun"
+repository = "https://github.com/dotns/nsplane"
 readme = "README.md"
 keywords = ["vpn", "wireguard"]
 categories = ["network-programming", "cryptography"]
@@ -26,7 +35,7 @@ smallvec = "1.16.2"
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }
 # The TUN crate owns syscall code, so `forbid` is not possible workspace-wide.
-# `boringtun-cli` forbids unsafe code at its crate root; see docs/decisions.
+# `nsplane-cli` forbids unsafe code at its crate root; see docs/decisions.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"

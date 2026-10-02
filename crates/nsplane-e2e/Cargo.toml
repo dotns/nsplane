@@ -1,0 +1,28 @@
+[package]
+name = "nsplane-e2e"
+description = "End-to-end tests of the nsplane data plane: engines talking to each other and to kernel WireGuard"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nsplane = { path = "../nsplane", version = "0.8.0" }
+nsplane-core = { path = "../nsplane-core", version = "0.8.0" }
+nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
+
+[dev-dependencies]
+nsplane-uapi = { path = "../nsplane-uapi", version = "0.8.0" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nsplane-tun = { path = "../nsplane-tun", version = "0.8.0" }
