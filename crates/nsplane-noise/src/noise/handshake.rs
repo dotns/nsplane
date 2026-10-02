@@ -7,7 +7,6 @@ use super::{
 };
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
-#[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
 use aead::{Aead, Payload};
@@ -20,9 +19,6 @@ use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
 use zerocopy::FromBytes;
-
-#[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
 
 pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
 pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
@@ -507,11 +503,9 @@ impl Handshake {
         !matches!(self.state, HandshakeState::None | HandshakeState::Expired)
     }
 
-    pub(crate) const fn timer(&self) -> Option<Instant> {
-        match self.state {
-            HandshakeState::InitSent(HandshakeInitSentState { time_sent, .. }) => Some(time_sent),
-            _ => None,
-        }
+    /// Whether a handshake initiation is waiting for its response.
+    pub(crate) const fn is_init_sent(&self) -> bool {
+        matches!(self.state, HandshakeState::InitSent(_))
     }
 
     pub(crate) fn set_expired(&mut self) {

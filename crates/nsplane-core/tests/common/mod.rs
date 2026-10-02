@@ -12,8 +12,8 @@
 //! with [`Net::set_interceptor`], and inspect everything the cores produced through the
 //! per-core logs [`Net::delivered`], [`Net::events`] and [`Net::transmits`].
 //!
-//! Time only moves with [`Net::advance`], which moves the `mock_instant` clock that nsplane-noise
-//! runs on and the harness clock `net.now` by the same amount, then runs every core's timers.
+//! Time only moves with [`Net::advance`], which moves the harness clock `net.now`, the only
+//! clock the cores (and their tunnels' timers) run on, then runs every core's timers.
 
 #![allow(
     dead_code,
@@ -24,7 +24,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use mock_instant::MockClock;
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{
     AllowedIp, ConfigChange, Core, CoreConfig, Ecn, Event, Input, Output, PacketBuf, Path,
@@ -371,9 +370,8 @@ impl Net {
         panic!("the network did not settle");
     }
 
-    /// Moves both clocks forward by `d`, runs the timers of every core and pumps.
+    /// Moves the harness clock forward by `d`, runs the timers of every core and pumps.
     pub fn advance(&mut self, d: Duration) {
-        MockClock::advance(d);
         self.now += d;
         for core in &mut self.cores {
             core.handle_timeout(self.now);

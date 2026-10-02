@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
-use nsplane_noise::noise::Tunn;
 use nsplane_noise::noise::rate_limiter::RateLimiter;
+use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::{PublicKey, StaticSecret};
 use nsplane_packet::PeerId;
 use rand_core::{OsRng, RngCore};
@@ -114,19 +115,13 @@ impl PeerTable {
             return;
         }
 
-        // A handshake that reaches a tunnel is counted by the gate and again by the tunnel, so
-        // the shared limiter allows twice the configured rate.
-        let gate = Arc::new(RateLimiter::new(
-            &public_key,
-            self.handshake_rate_limit.saturating_mul(2),
-        ));
+        let gate = Arc::new(RateLimiter::new(&public_key, self.handshake_rate_limit));
         for peer in &mut self.peers {
             peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&gate)),
             );
-            peer.reset_rx_session();
         }
 
         self.key = Some(OwnKey {
@@ -146,8 +141,13 @@ impl PeerTable {
         self.key.as_ref().map(|k| &*k.gate)
     }
 
-    /// Adds the peer, or updates it in place if its public key is known.
-    pub(crate) fn apply(&mut self, config: &PeerConfig) -> Result<PeerId, PeerTableError> {
+    /// Adds the peer, or updates it in place if its public key is known. A new peer's tunnel
+    /// runs its timers on the clock of `now`.
+    pub(crate) fn apply(
+        &mut self,
+        config: &PeerConfig,
+        now: Instant,
+    ) -> Result<PeerId, PeerTableError> {
         // An all-zero key means "no preshared key" in the UAPI.
         let preshared_key = config.preshared_key.map(|k| (k != [0; 32]).then_some(k));
 
@@ -176,14 +176,20 @@ impl PeerTable {
                 .next()
                 .ok_or(PeerTableError::IndicesExhausted)?;
             let preshared_key = preshared_key.flatten();
-            let tunnel = Tunn::new(
+            let mut tunnel = Tunn::new(
                 own.private.clone(),
                 config.public_key,
                 preshared_key,
-                config.persistent_keepalive.filter(|&k| k > 0),
+                None,
                 index,
                 Some(Arc::clone(&own.gate)),
             );
+            // Start the timers at `now`, so whatever the tunnel does before its first timer
+            // tick is timed on the core's clock. A fresh tunnel without a persistent
+            // keepalive has nothing due; the keepalive is enabled afterwards.
+            let started = tunnel.update_timers_at(now, &mut []);
+            debug_assert!(matches!(started, TunnResult::Done), "{started:?}");
+            tunnel.set_persistent_keepalive(config.persistent_keepalive.filter(|&k| k > 0));
             let peer = Peer::new(tunnel, config.public_key, index, config.path, preshared_key);
             self.next_id = next_id;
             self.ids.push(id);
@@ -342,7 +348,6 @@ impl Default for IndexLfsr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsplane_noise::noise::TunnResult;
     use nsplane_packet::{Ecn, Path, TransportId};
 
     fn key() -> PublicKey {
@@ -366,7 +371,7 @@ mod tests {
     fn add(table: &mut PeerTable, peer: PublicKey, ips: &[&str]) -> PeerId {
         let mut config = PeerConfig::new(peer);
         config.allowed_ips = ips.iter().copied().map(net).collect();
-        table.apply(&config).unwrap()
+        table.apply(&config, Instant::now()).unwrap()
     }
 
     #[test]
@@ -412,7 +417,7 @@ mod tests {
         config.persistent_keepalive = Some(25);
         config.preshared_key = Some([7; 32]);
         config.allowed_ips = vec![net("10.0.1.0/24")];
-        assert_eq!(table.apply(&config), Ok(id));
+        assert_eq!(table.apply(&config, Instant::now()), Ok(id));
 
         let p = table.peer(id).unwrap();
         assert_eq!(p.index(), index, "the peer keeps its sessions");
@@ -435,7 +440,7 @@ mod tests {
         let mut config = PeerConfig::new(a);
         config.replace_allowed_ips = true;
         config.allowed_ips = vec![net("10.0.2.0/24")];
-        table.apply(&config).unwrap();
+        table.apply(&config, Instant::now()).unwrap();
 
         assert_eq!(table.allowed_ips(id), vec![net("10.0.2.0/24")]);
         assert!(table.by_destination(ip("10.0.0.1")).is_none());
@@ -457,11 +462,11 @@ mod tests {
         let a = key();
         let mut config = PeerConfig::new(a);
         config.preshared_key = Some([7; 32]);
-        let id = table.apply(&config).unwrap();
+        let id = table.apply(&config, Instant::now()).unwrap();
 
         let mut config = PeerConfig::new(a);
         config.preshared_key = Some([0; 32]);
-        table.apply(&config).unwrap();
+        table.apply(&config, Instant::now()).unwrap();
         assert_eq!(table.peer(id).unwrap().preshared_key(), None);
     }
 
@@ -503,7 +508,7 @@ mod tests {
         assert!(table.key_pair().is_none());
         assert!(table.rate_limiter().is_none());
         assert_eq!(
-            table.apply(&PeerConfig::new(key())),
+            table.apply(&PeerConfig::new(key()), Instant::now()),
             Err(PeerTableError::NoPrivateKey)
         );
     }
@@ -527,7 +532,7 @@ mod tests {
             table
                 .peer(id)
                 .unwrap()
-                .time_since_last_handshake()
+                .time_since_last_handshake(Instant::now())
                 .is_none()
         );
     }
@@ -547,7 +552,10 @@ mod tests {
         peer.set_path(path);
         peer.add_data_rx(100);
         let mut dst = [0u8; 256];
-        assert!(!matches!(peer.update_timers(&mut dst), TunnResult::Err(_)));
+        assert!(!matches!(
+            peer.update_timers(Instant::now(), &mut dst),
+            TunnResult::Err(_)
+        ));
         for (_, peer) in table.iter_mut() {
             peer.add_data_rx(20);
         }

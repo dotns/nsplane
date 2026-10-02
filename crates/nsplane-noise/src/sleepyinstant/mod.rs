@@ -56,11 +56,6 @@ impl Instant {
     pub(crate) fn duration_since(&self, earlier: Self) -> Duration {
         self.t.duration_since(earlier.t)
     }
-
-    /// Returns the amount of time elapsed since this instant was created.
-    pub(crate) fn elapsed(&self) -> Duration {
-        Self::now().duration_since(*self)
-    }
 }
 
 #[cfg(test)]
@@ -72,6 +67,6 @@ mod tests {
         let sleep_time = Duration::from_millis(10);
         let start = Instant::now();
         std::thread::sleep(sleep_time);
-        assert!(start.elapsed() >= sleep_time);
+        assert!(Instant::now().duration_since(start) >= sleep_time);
     }
 }

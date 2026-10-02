@@ -1,7 +1,6 @@
 //! Configuration changes on live cores: removing peers, allowed IPs, preshared keys, the
 //! private key, peer stats and forced handshakes.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
@@ -12,7 +11,7 @@ use std::time::Duration;
 
 use common::{Net, ip4, udp4};
 use nsplane_core::x25519::StaticSecret;
-use nsplane_core::{AllowedIp, ConfigChange, CoreConfig, Event, Output, Path};
+use nsplane_core::{AllowedIp, ConfigChange, CoreConfig, Event, Output, Path, reasons};
 use rand_core::OsRng;
 
 fn handshakes(events: &[Event]) -> usize {
@@ -55,10 +54,10 @@ fn removed_peer_gets_no_traffic_and_a_new_id_when_added_again() {
     assert_eq!(net.cores[0].peer_id(&peer), None);
     assert_eq!(net.cores[0].peer_stats(old), None);
     net.ping4(0, 1, b"to nobody");
-    assert_eq!(dropped(&net.take_events(0)), ["no route"]);
+    assert_eq!(dropped(&net.take_events(0)), [reasons::NO_ROUTE]);
     net.ping4(1, 0, b"from nobody");
     assert_eq!(net.take_delivered(0), Vec::new());
-    assert_eq!(dropped(&net.take_events(0)), ["unknown session"]);
+    assert_eq!(dropped(&net.take_events(0)), [reasons::UNKNOWN_SESSION]);
 
     tick(&mut net);
     net.add_peer(0, 1);
@@ -81,7 +80,10 @@ fn remove_all_peers() {
     assert_eq!(net.cores[0].peers().count(), 0);
     net.ping4(0, 1, b"gone");
     net.ping4(0, 2, b"gone");
-    assert_eq!(dropped(&net.take_events(0)), ["no route", "no route"]);
+    assert_eq!(
+        dropped(&net.take_events(0)),
+        [reasons::NO_ROUTE, reasons::NO_ROUTE]
+    );
     assert_eq!(net.take_transmits(0), Vec::new());
 }
 
@@ -102,7 +104,7 @@ fn set_allowed_ips_replaces_ranges() {
     );
     assert_eq!(net.cores[0].peer_stats(to_1).unwrap().allowed_ips, [range]);
     net.ping4(0, 1, b"old range");
-    assert_eq!(dropped(&net.take_events(0)), ["no route"]);
+    assert_eq!(dropped(&net.take_events(0)), [reasons::NO_ROUTE]);
     let packet = udp4(ip4(0), inside, b"new range");
     net.send_local(0, &packet);
     net.pump();
@@ -221,7 +223,7 @@ fn set_private_key_clears_sessions_and_handshakes_with_the_new_key() {
 
     // Core 1 does not know the new key yet.
     let packet = net.ping4(0, 1, b"new key");
-    assert_eq!(dropped(&net.take_events(1)), ["unknown peer"]);
+    assert_eq!(dropped(&net.take_events(1)), [reasons::UNKNOWN_PEER]);
 
     net.configure(1, ConfigChange::RemovePeer(old_key));
     net.add_peer(1, 0);

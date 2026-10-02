@@ -231,8 +231,12 @@ async fn peer_stats_reflect_configuration_and_counters() -> TestResult {
     assert_eq!(stats.preshared_key, Some(PSK));
     assert_eq!(stats.persistent_keepalive, Some(25));
     assert_eq!(stats.data_rx, 20 + 8 + 200);
-    // The tunnel counts the plaintext packets in both directions.
-    assert_eq!((stats.rx, stats.tx), (20 + 8 + 200, 20 + 8 + 100));
+    assert_eq!(stats.data_tx, 20 + 8 + 100);
+    // The wire counters also count the handshake and the WireGuard overhead.
+    assert!(
+        stats.rx > stats.data_rx && stats.tx > stats.data_tx,
+        "{stats:?}"
+    );
     assert!(stats.last_handshake.is_some_and(|age| age < WAIT));
     let peers = a.handle.peers().await?;
     assert_eq!(
@@ -277,9 +281,7 @@ async fn inject_outbound_is_encrypted_and_delivered_by_the_peer() -> TestResult 
 #[tokio::test]
 async fn force_handshake_completes_a_handshake_on_the_given_path() -> TestResult {
     let (mut a, mut b) = channel_pair(Options::default());
-    // `a` knows no path to `b` until the forced handshake gives it one. Only the first
-    // handshake is forced: a repeated initiation carries a timestamp from nsplane-noise's clock,
-    // which stands still under `mock-instant`, and the responder rejects it as a replay.
+    // `a` knows no path to `b` until the forced handshake gives it one.
     a.handle
         .add_or_update_peer(Peer {
             path: None,
@@ -304,6 +306,13 @@ async fn force_handshake_completes_a_handshake_on_the_given_path() -> TestResult
     assert!(stats.last_handshake.is_some());
     transfer(&a, &mut b, Family::V4, 64).await?;
     transfer(&b, &mut a, Family::V6, 64).await?;
+
+    // A second forced handshake rekeys the established session.
+    a.handle.force_handshake(peer_b, None).await?;
+    events
+        .expect(|e| matches!(e, Event::HandshakeCompleted { peer, .. } if *peer == peer_b))
+        .await?;
+    transfer(&a, &mut b, Family::V4, 64).await?;
     Ok(())
 }
 

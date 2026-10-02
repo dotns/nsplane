@@ -24,6 +24,7 @@ pub use events::{
 };
 pub use handle::{EngineError, EngineHandle, Peer};
 pub use io::{PacketSink, PacketSource};
+pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
