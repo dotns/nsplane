@@ -463,6 +463,37 @@ pub fn channel_pair(options: Options) -> (Node<ChannelTransport>, Node<ChannelTr
     )
 }
 
+/// Two nodes (seeds 1 and 2) linked by a [`ChannelTransport`] pair, not yet peers, with
+/// `configure` adding settings to the engine builder of each, given its seed.
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub fn channel_pair_with(
+    options: Options,
+    mut configure: impl FnMut(
+        u8,
+        EngineBuilder<ChannelSource, ChannelSink>,
+    ) -> EngineBuilder<ChannelSource, ChannelSink>,
+) -> TestResult<(Node<ChannelTransport>, Node<ChannelTransport>)> {
+    let a = (
+        TransportId::new(1),
+        SocketAddr::from(([192, 0, 2, 1], 1000)),
+    );
+    let b = (
+        TransportId::new(2),
+        SocketAddr::from(([192, 0, 2, 2], 2000)),
+    );
+    let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
+    let node_a = Node::with_builder(1, a.0, a.1, options, |builder| {
+        configure(1, builder.transport(link_a))
+    })?;
+    let node_b = Node::with_builder(2, b.0, b.1, options, |builder| {
+        configure(2, builder.transport(link_b))
+    })?;
+    Ok((node_a, node_b))
+}
+
 /// Two nodes (seeds 1 and 2) on [`UdpTransport`]s bound to `ip` with OS-chosen ports, not
 /// yet peers.
 ///

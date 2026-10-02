@@ -65,13 +65,18 @@
 //! and as usual its `node4`, `node6` and the `lan6` prefixes behind it (for
 //! the inbound source check).
 //!
-//! The core runs its filters in the same order in both directions. When used
-//! with `nsplane-acl`, register the ACL filter **before** the translator: the
-//! ACL then evaluates inbound packets in their tunnel-side IPv6 form, with
-//! the peer's real `node4`/`node6`/`lan6` addresses that policies and source
-//! assertions name, before they are translated to node-local aliases (which
-//! differ per node). Outbound, the ACL then sees the local view (IPv4 aliases
-//! and `alias6`), so outbound rules for translated traffic must name those.
+//! The core's filter chain is an onion: filters are installed from the wire
+//! side to the local side, decrypted packets run through them in install
+//! order and local packets in reverse. Install the translator **last**, next
+//! to the local side; the recommended stack is
+//! `[AclFilter, PortMap, Translator]`. The ACL and the `PortMap` then see
+//! tunnel-side IPv6 in both directions: inbound before the translator maps
+//! the peer's real `node4`/`node6`/`lan6` addresses (which policies and
+//! source assertions name) to node-local aliases (which differ per node),
+//! outbound after it has mapped the local view back. Policies need no rules
+//! for the IPv4 aliases, and the ACL's stateful-reply tracking matches the
+//! replies of translated flows, because it records and looks up the same
+//! IPv6 five-tuple both ways.
 
 mod fragment;
 mod icmp;
