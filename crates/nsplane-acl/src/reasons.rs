@@ -1,6 +1,7 @@
 //! The drop reasons of [`AclFilter`](crate::AclFilter).
 //!
-//! The core reports them in `Event::Dropped` for packets the filter drops.
+//! The core reports them in `Event::Dropped` for packets the filter drops,
+//! inbound and (for [`OUTBOUND`]) outbound.
 
 /// The policy has no rule accepting the packet.
 pub const DENIED: &str = "acl denied";
@@ -14,3 +15,10 @@ pub const PROTOCOL: &str = "acl protocol";
 pub const FRAGMENT: &str = "acl fragment without first";
 /// The packet is not a well-formed IP packet or its transport header is truncated.
 pub const MALFORMED: &str = "acl malformed";
+/// The packet goes from a namespace member to another peer that shares no
+/// namespace with it, and no directed grant accepts it.
+pub const CROSS_NAMESPACE: &str = "acl cross namespace";
+/// An outbound packet to an outbound-restricted peer matches no outbound rule
+/// and no reply allowance (or is not TCP/UDP while other protocols are not
+/// allowed).
+pub const OUTBOUND: &str = "acl outbound denied";
