@@ -16,8 +16,9 @@ use std::time::Duration;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
-    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, Ecn, Engine, EngineBuilder, EngineError, EngineHandle,
-    Event, PacketBuf, Path, Peer, PeerId, Transport, TransportError, TransportId,
+    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, Ecn, Engine, EngineBuilder,
+    EngineError, EngineHandle, Event, PacketBuf, Path, Peer, PeerId, Transport, TransportError,
+    TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
