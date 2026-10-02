@@ -113,3 +113,7 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   WireGuard clients are part of the e2e matrix. 3D writes
   `docs/decisions/2026-10-02-single-port-relay.md` as Proposed (shared wire contract with
   ns and nsgw).
+- 2026-10-02: user approved `ed25519-dalek` 2.x and `ciborium` 0.2 for the examples package
+  so the single-port control messages carry ns's signed envelope / CBOR payloads unchanged;
+  only the framing (WireGuard-undefined type + version) differs. Plain WireGuard servers
+  must keep working with the extension off by discovery (no reply -> plain WireGuard).
