@@ -3,7 +3,7 @@
 default: check
 
 # Run every gate.
-check: fmt clippy test doc-test deny shear typos msrv
+check: fmt clippy test doc-test deny shear typos msrv examples
 
 fmt:
     cargo fmt --all --check
@@ -28,6 +28,10 @@ typos:
 
 msrv:
     cargo hack check --workspace --rust-version --all-features --locked
+
+# Build every example binary.
+examples:
+    cargo build -p nsplane-examples --bins --locked
 
 # Cross-target clippy: macOS through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
 cross:
