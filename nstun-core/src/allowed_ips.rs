@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 
 /// A trie of IP/cidr addresses
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
 pub(crate) struct AllowedIps<D> {
     ips: IpNetworkTable<D>,
 }
@@ -21,7 +20,6 @@ impl<D> Default for AllowedIps<D> {
 
 impl<D> AllowedIps<D> {
     /// Creates an empty table.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn new() -> Self {
         Self {
             ips: IpNetworkTable::new(),
@@ -29,14 +27,12 @@ impl<D> AllowedIps<D> {
     }
 
     /// Removes all entries.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn clear(&mut self) {
         self.ips = IpNetworkTable::new();
     }
 
     /// Inserts `data` for `key/cidr` and returns the value previously stored for that network.
     /// A `cidr` longer than the address is ignored and yields `None`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn insert(&mut self, key: IpAddr, cidr: u8, data: D) -> Option<D> {
         // These are networks, it doesn't make sense for host bits to be set, so
         // use new_truncate().
@@ -45,19 +41,16 @@ impl<D> AllowedIps<D> {
     }
 
     /// Returns the value of the longest prefix that contains `key`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn find(&self, key: IpAddr) -> Option<&D> {
         self.ips.longest_match(key).map(|(_net, data)| data)
     }
 
     /// Removes every entry whose value matches `predicate`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
         self.ips.retain(|_, v| !predicate(v));
     }
 
     /// Iterates over `(value, network address, prefix length)`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn iter(&self) -> Iter<'_, D> {
         Iter(
             self.ips
@@ -69,7 +62,6 @@ impl<D> AllowedIps<D> {
 }
 
 /// Iterator over the entries of an [`AllowedIps`] table.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
 pub(crate) struct Iter<'a, D: 'a>(VecDeque<(&'a D, IpAddr, u8)>);
 
 impl<D> std::fmt::Debug for Iter<'_, D> {

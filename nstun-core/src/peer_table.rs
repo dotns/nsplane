@@ -18,7 +18,6 @@ use crate::types::{AllowedIp, PeerConfig};
 
 /// Why a [`PeerConfig`] could not be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
 pub(crate) enum PeerTableError {
     /// No private key is set, so no tunnel can be created.
     NoPrivateKey,
@@ -29,7 +28,6 @@ pub(crate) enum PeerTableError {
 }
 
 /// The own key pair and the handshake gate derived from it.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
 struct OwnKey {
     private: StaticSecret,
     public: PublicKey,
@@ -43,7 +41,10 @@ struct OwnKey {
 /// Peers are reachable by id, by public key, by the session index in received messages, and by
 /// allowed IP (cryptokey routing). Allowed IPs exist only in the routing table, so a range that
 /// a newer peer claims is moved away from its previous owner. Peer ids are never reused.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
+#[allow(
+    dead_code,
+    reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
+)]
 pub(crate) struct PeerTable {
     peers: BTreeMap<PeerId, Peer>,
     by_key: HashMap<PublicKey, PeerId>,
@@ -63,10 +64,13 @@ impl std::fmt::Debug for PeerTable {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
+)]
 impl PeerTable {
     /// Creates an empty table without a private key. `handshake_rate_limit` is the number of
     /// handshakes per second the gate tolerates before replying with cookies.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn new(handshake_rate_limit: u64) -> Self {
         Self {
             peers: BTreeMap::new(),
@@ -82,7 +86,6 @@ impl PeerTable {
 
     /// Sets the own private key, re-keys every peer (clearing its sessions) and replaces the
     /// handshake gate. Setting the current key again changes nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn set_private_key(&mut self, private_key: StaticSecret) {
         let public_key = PublicKey::from(&private_key);
 
@@ -105,19 +108,16 @@ impl PeerTable {
     }
 
     /// The own key pair, if set.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn key_pair(&self) -> Option<(&StaticSecret, &PublicKey)> {
         self.key.as_ref().map(|k| (&k.private, &k.public))
     }
 
     /// The handshake gate for the own key, if set.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn rate_limiter(&self) -> Option<&RateLimiter> {
         self.key.as_ref().map(|k| &k.gate)
     }
 
     /// Adds the peer, or updates it in place if its public key is known.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn apply(&mut self, config: &PeerConfig) -> Result<PeerId, PeerTableError> {
         // An all-zero key means "no preshared key" in the UAPI.
         let preshared_key = config.preshared_key.map(|k| (k != [0; 32]).then_some(k));
@@ -174,7 +174,6 @@ impl PeerTable {
     }
 
     /// Removes a peer and returns its id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn remove(&mut self, public_key: &PublicKey) -> Option<PeerId> {
         let id = self.by_key.remove(public_key)?;
         // Found a peer to remove, now purge all references to it:
@@ -188,7 +187,6 @@ impl PeerTable {
     }
 
     /// Removes all peers.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn clear(&mut self) {
         self.peers.clear();
         self.by_key.clear();
@@ -197,44 +195,37 @@ impl PeerTable {
     }
 
     /// The peer with this public key.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn get(&self, public_key: &PublicKey) -> Option<PeerId> {
         self.by_key.get(public_key).copied()
     }
 
     /// The peer with this id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn peer(&self, id: PeerId) -> Option<&Peer> {
         self.peers.get(&id)
     }
 
     /// The peer with this id, mutably.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn peer_mut(&mut self, id: PeerId) -> Option<&mut Peer> {
         self.peers.get_mut(&id)
     }
 
     /// The peer that owns the session index in a received message (`receiver_idx`).
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn by_index(&self, receiver_idx: u32) -> Option<PeerId> {
         self.by_index.get(&(receiver_idx >> 8)).copied()
     }
 
     /// The peer to send a packet for `dst` to (cryptokey routing).
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn by_destination(&self, dst: IpAddr) -> Option<PeerId> {
         self.by_ip.find(dst).copied()
     }
 
     /// Whether `peer` may send packets from `src`: the longest allowed-IP match of `src`
     /// across all peers must be `peer` itself.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn routes_to(&self, src: IpAddr, peer: PeerId) -> bool {
         self.by_ip.find(src) == Some(&peer)
     }
 
     /// The allowed IPs of `peer`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn allowed_ips(&self, peer: PeerId) -> Vec<AllowedIp> {
         self.by_ip
             .iter()
@@ -244,19 +235,16 @@ impl PeerTable {
     }
 
     /// All peers with their ids, in id order.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (PeerId, &Peer)> {
         self.peers.iter().map(|(&id, peer)| (id, peer))
     }
 
     /// All peers with their ids, mutably, in id order.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (PeerId, &mut Peer)> {
         self.peers.iter_mut().map(|(&id, peer)| (id, peer))
     }
 
     /// Number of peers.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     pub(crate) fn len(&self) -> usize {
         self.peers.len()
     }
@@ -270,7 +258,6 @@ impl PeerTable {
 /// to guess other peers' indices. Anything more ambitious than this is wasted
 /// with only 24 bits of space.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
 struct IndexLfsr {
     initial: u32,
     lfsr: u32,
@@ -279,7 +266,6 @@ struct IndexLfsr {
 
 impl IndexLfsr {
     /// Generate a random 24-bit nonzero integer
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     fn random_index() -> u32 {
         const LFSR_MAX: u32 = 0x00ff_ffff; // 24-bit seed
         loop {
@@ -293,7 +279,6 @@ impl IndexLfsr {
 
     /// Generate the next value in the pseudorandom sequence, or `None` once the sequence
     /// is exhausted.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Core in subtask C2"))]
     const fn next(&mut self) -> Option<u32> {
         // 24-bit polynomial for randomness. This is arbitrarily chosen to
         // inject bitflips into the value.
