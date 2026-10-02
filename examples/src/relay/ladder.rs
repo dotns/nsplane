@@ -210,10 +210,15 @@ impl Ladder {
                 to_relay: 0,
             },
         );
-        match active {
-            Active::Direct => vec![Command::ForceHandshake(peer)],
-            Active::Relay => vec![Command::SetPath(key, self.path(relay))],
+        // The engine starts from the relay either way: off the ladder the peer may have
+        // roamed to a direct address already, and the engine only asks the policy about
+        // messages from a path other than the current one, so the direct path would never
+        // be confirmed.
+        let mut commands = vec![Command::SetPath(key, self.path(relay))];
+        if active == Active::Direct {
+            commands.push(Command::ForceHandshake(peer));
         }
+        commands
     }
 
     /// Takes `peer` off the ladder; it goes back to its relay endpoint.
@@ -473,7 +478,15 @@ mod tests {
         let (ladder, _) = ladder(Pin::Auto);
         let t0 = Instant::now();
         let commands = ladder.engage(PEER, KEY, addr(RELAY), vec![addr(DIRECT)], t0);
-        assert_eq!(commands, vec![Command::ForceHandshake(PEER)]);
+        // The engine path is reset to the relay so the first direct message reaches the
+        // policy even if the peer roamed to the direct address before it was engaged.
+        assert_eq!(
+            commands,
+            vec![
+                Command::SetPath(KEY, path(RELAY)),
+                Command::ForceHandshake(PEER)
+            ]
+        );
         assert_eq!(select(&ladder, MessageKind::HandshakeInit, t0), DIRECT);
         assert_eq!(select(&ladder, MessageKind::Data, t0), DIRECT);
         assert_eq!(
