@@ -117,7 +117,7 @@ fn udp_policy(a: &AclNode, b: &AclNode, port: u16) -> AclPolicy {
     policy(vec![rule(&src, &format!("{}:{port}", b.ip4), Some("udp"))])
 }
 
-fn v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
+const fn v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(ip), port)
 }
 
