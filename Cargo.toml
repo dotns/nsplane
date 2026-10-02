@@ -11,6 +11,7 @@ members = [
     "crates/nsplane-uapi",
     "crates/nsplane-e2e",
     "crates/nsplane-acl",
+    "examples",
 ]
 
 [workspace.package]
