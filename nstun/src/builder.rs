@@ -112,7 +112,8 @@ impl<Src: PacketSource, Snk: PacketSink, T: Transport> EngineBuilder<Src, Snk, T
     }
 
     /// Sets the capacity of each internal packet queue (local packets, received datagrams,
-    /// datagrams to transmit, packets to deliver); at least 1.
+    /// datagrams to transmit, packets to deliver) and of the datagrams waiting for room in
+    /// the transmit queue; at least 1.
     #[must_use]
     pub fn queue_capacity(mut self, capacity: usize) -> Self {
         self.queue_capacity = capacity.max(1);

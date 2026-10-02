@@ -19,7 +19,8 @@ pub use builder::EngineBuilder;
 pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use engine::Engine;
 pub use events::{
-    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSPORT_CLOSED, Event,
+    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
+    Event,
 };
 pub use handle::{EngineError, EngineHandle, Peer};
 pub use io::{PacketSink, PacketSource};
