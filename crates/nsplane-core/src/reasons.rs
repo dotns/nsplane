@@ -43,3 +43,6 @@ pub const NO_TRANSPORT: &str = "no transport";
 pub const TRANSMIT_FULL: &str = "transmit full";
 /// Emitted by the driver: a datagram was dropped because the transport has shut down.
 pub const TRANSPORT_CLOSED: &str = "transport closed";
+/// Emitted by the driver: a datagram queued for a transport was dropped because the
+/// transport was removed.
+pub const TRANSPORT_REMOVED: &str = "transport removed";

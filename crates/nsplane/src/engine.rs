@@ -21,6 +21,7 @@ use tokio::time::{Instant, Sleep, sleep_until};
 
 use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
+    DROP_TRANSPORT_REMOVED,
 };
 use crate::handle::{Command, EngineHandle, TransportError};
 use crate::io::{PacketSink, PacketSource};
@@ -50,18 +51,27 @@ const MAX_DATAGRAM: usize = 65535;
 /// is a boxed [`DynTransport`]).
 ///
 /// Backpressure: a full sink queue drops the decrypted packet and counts it under
-/// [`crate::DROP_SINK_FULL`]. Each transport has its own transmit queue; when it is full,
-/// that transport's datagrams wait in the owner task, in order, while datagrams to other
-/// transports keep going to their own queues, so they never queue behind a slow transport. The waiting datagrams of a transport are bounded by the queue
-/// capacity: a datagram caused by a received datagram or a timer that finds them at the
+/// [`crate::DROP_SINK_FULL`]. Each transport has its own transmit queue and its own backlog
+/// in the owner task: when the queue is full, that transport's datagrams wait in the
+/// backlog, in order, while datagrams to other transports keep going to their own queues,
+/// so they never queue behind a slow transport. Each backlog is bounded by the queue
+/// capacity: a datagram caused by a local packet, a received datagram or a timer (including
+/// the timers run by [`EngineHandle::resume`]) that finds its transport's backlog at the
 /// bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
-/// local packets or handle calls always wait, so local packets are held back, never dropped:
-/// the owner stops reading local packets while any transport has waiting datagrams (which
-/// transport a local packet leads to is only known once the core has handled it), which in
-/// turn holds back the source. Received datagrams, timers and handle calls are still served
-/// meanwhile. A transport that never drains therefore holds back local packets until it
-/// closes (its waiting datagrams are then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or
-/// is removed with [`EngineHandle::remove_transport`].
+/// handle calls always wait and may take a backlog past the bound. The owner stops reading
+/// local packets only while at least one transport is installed and every installed
+/// transport's backlog is at the bound (which transport a local packet leads to is only
+/// known once the core has handled it), which in turn holds back the source. So an engine
+/// with one transport holds back its local packets instead of dropping them, while with
+/// several transports a stalled one never holds back local packets for the others: those
+/// for the stalled one are dropped once its backlog is full. With no transport installed,
+/// local reads never pause. Received datagrams, timers and handle calls are served
+/// meanwhile. A transport that never drains keeps its backlog until it closes (the backlog
+/// is then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or is removed with
+/// [`EngineHandle::remove_transport`], which counts every datagram still queued for it
+/// (being sent, in its transmit queue or in its backlog) under
+/// [`crate::DROP_TRANSPORT_REMOVED`]. [`EngineHandle::replace_transport`] moves all of them,
+/// in order, to the new transport instead.
 ///
 /// Buffers: datagrams are received into one reusable 64 KiB buffer and copied into an
 /// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. Datagram buffers
@@ -230,6 +240,44 @@ impl Drop for Task {
     }
 }
 
+/// What a stopped transmit task hands back: its queue and the datagram it was sending.
+type Unsent = (mpsc::Receiver<Datagram>, Option<Datagram>);
+
+/// A transport's transmit task, stopped through a signal so that it hands back the datagrams
+/// it did not send; aborted when dropped.
+struct Transmitter {
+    /// `None` once the stop was signalled.
+    stop: Option<oneshot::Sender<()>>,
+    /// Resolves to `None` when the task ended on its own (the transport or the engine is
+    /// gone), having dropped its queue.
+    task: JoinHandle<Option<Unsent>>,
+}
+
+impl Transmitter {
+    /// Stops the task and returns the datagrams it did not send, oldest first.
+    async fn stop(mut self) -> VecDeque<Datagram> {
+        if let Some(stop) = self.stop.take() {
+            // The task may have ended already.
+            let _ = stop.send(());
+        }
+        let mut unsent = VecDeque::new();
+        // Nothing comes back from a task that ended on its own or failed.
+        if let Ok(Some((mut queue, sending))) = (&mut self.task).await {
+            unsent.extend(sending);
+            while let Ok(datagram) = queue.try_recv() {
+                unsent.push_back(datagram);
+            }
+        }
+        unsent
+    }
+}
+
+impl Drop for Transmitter {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// A datagram and the path to send it on.
 type Datagram = (Path, PacketBuf);
 /// Waits for room in the transmit queue.
@@ -243,7 +291,7 @@ type Start = Box<
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
             watch::Receiver<bool>,
-        ) -> (Task, Task)
+        ) -> (Task, Transmitter)
         + Send,
 >;
 
@@ -260,13 +308,17 @@ impl NewTransport {
             id: transport.id(),
             start: Box::new(move |datagrams, queue, recycle, suspended| {
                 let transport = Arc::new(transport);
+                let (stop, stopped) = oneshot::channel();
                 (
                     Task::spawn(receive(
                         Arc::clone(&transport),
                         datagrams,
                         suspended.clone(),
                     )),
-                    Task::spawn(transmit(transport, queue, recycle, suspended)),
+                    Transmitter {
+                        stop: Some(stop),
+                        task: tokio::spawn(transmit(transport, queue, recycle, suspended, stopped)),
+                    },
                 )
             }),
         }
@@ -282,7 +334,7 @@ struct TransportSlot {
     /// Armed while `pending` is not empty.
     flush: Option<Reserve>,
     receive: Task,
-    transmit: Task,
+    transmit: Transmitter,
 }
 
 impl TransportSlot {
@@ -312,11 +364,14 @@ impl TransportSlot {
         Ok(())
     }
 
-    /// Stops both tasks and returns the waiting datagrams.
-    async fn stop(self) -> VecDeque<Datagram> {
+    /// Stops both tasks and returns every datagram still queued for the transport, oldest
+    /// first: the one being sent, the transmit queue's, then the waiting ones.
+    async fn stop(mut self) -> VecDeque<Datagram> {
+        self.flush = None;
         self.receive.stop().await;
-        self.transmit.stop().await;
-        self.pending
+        let mut unsent = self.transmit.stop().await;
+        unsent.append(&mut self.pending);
+        unsent
     }
 }
 
@@ -369,8 +424,9 @@ impl Owner {
         loop {
             self.arm_timer();
             let wake = poll_fn(|cx| self.poll_wake(cx)).await;
-            // Datagrams caused by the network or a timer may overflow the waiting datagrams.
-            let droppable = matches!(wake, Wake::Datagram(_) | Wake::Timer);
+            // Datagrams caused by local packets, the network or a timer may overflow the
+            // waiting datagrams.
+            let droppable = matches!(wake, Wake::Local(_) | Wake::Datagram(_) | Wake::Timer);
             match wake {
                 Wake::Command(None) => break,
                 Wake::Command(Some(command)) => {
@@ -464,14 +520,17 @@ impl Owner {
         Poll::Pending
     }
 
-    /// Polls the source queue, unless datagrams are waiting for a transmit queue.
+    /// Polls the source queue, unless every installed transport's waiting datagrams are at
+    /// the bound.
     fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
-        let waiting = self
-            .transports
-            .values()
-            .any(|slot| !slot.pending.is_empty());
+        let bound = self.queue_capacity;
+        let full = !self.transports.is_empty()
+            && self
+                .transports
+                .values()
+                .all(|slot| slot.pending.len() >= bound);
         match &mut self.local {
-            Some(local) if !waiting => local.poll_recv(cx).map(Wake::Local),
+            Some(local) if !full => local.poll_recv(cx).map(Wake::Local),
             _ => Poll::Pending,
         }
     }
@@ -548,7 +607,7 @@ impl Owner {
             Command::ReplaceTransport(transport, reply) => {
                 let result = match self.transports.remove(&transport.id) {
                     Some(old) => {
-                        // The waiting datagrams go out on the new transport.
+                        // The datagrams queued for the old transport go out on the new one.
                         let pending = old.stop().await;
                         let slot = self.start_transport(transport.start, pending);
                         self.transports.insert(transport.id, slot);
@@ -581,7 +640,7 @@ impl Owner {
         ControlFlow::Continue(())
     }
 
-    /// Stops and removes transport `id`; its waiting datagrams are dropped.
+    /// Stops and removes transport `id`; the datagrams still queued for it are dropped.
     async fn remove_transport(&mut self, id: TransportId) -> Result<(), TransportError> {
         let old = self
             .transports
@@ -589,7 +648,7 @@ impl Owner {
             .ok_or(TransportError::Unknown(id))?;
         for (_, data) in old.stop().await {
             self.core.recycle(data);
-            self.dropped(None, DROP_NO_TRANSPORT);
+            self.dropped(None, DROP_TRANSPORT_REMOVED);
         }
         Ok(())
     }
@@ -802,24 +861,53 @@ async fn receive<T: Transport>(
     }
 }
 
-/// Sends queued datagrams until the transport closes; returns the buffers for reuse.
+/// Runs `future` unless `stop` fires first; `None` when stopped.
+async fn unless_stopped<F: Future>(
+    stop: &mut oneshot::Receiver<()>,
+    future: F,
+) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    poll_fn(|cx| {
+        if Pin::new(&mut *stop).poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await
+}
+
+/// Sends queued datagrams until the transport closes; returns the buffers for reuse. Once
+/// `stop` fires, hands back its queue and the datagram it was sending, if any.
 async fn transmit<T: Transport>(
     transport: Arc<T>,
     mut queue: mpsc::Receiver<Datagram>,
     recycle: mpsc::Sender<PacketBuf>,
     mut suspended: watch::Receiver<bool>,
-) {
-    while let Some((path, data)) = queue.recv().await {
-        if !running(&mut suspended).await {
-            return;
-        }
-        match transport.send(data.as_packet(), &path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                tracing::debug!("Transport closed for sending");
-                return;
+    mut stop: oneshot::Receiver<()>,
+) -> Option<Unsent> {
+    loop {
+        let Some(next) = unless_stopped(&mut stop, queue.recv()).await else {
+            return Some((queue, None));
+        };
+        let (path, data) = next?;
+        let sent = unless_stopped(&mut stop, async {
+            // `None` once the engine is gone.
+            if running(&mut suspended).await {
+                Some(transport.send(data.as_packet(), &path).await)
+            } else {
+                None
             }
-            Err(e) => tracing::debug!(message = "Transport send error", error = ?e),
+        })
+        .await;
+        match sent {
+            None => return Some((queue, Some((path, data)))),
+            Some(None) => return None,
+            Some(Some(Ok(()))) => {}
+            Some(Some(Err(e))) if e.kind() == io::ErrorKind::BrokenPipe => {
+                tracing::debug!("Transport closed for sending");
+                return None;
+            }
+            Some(Some(Err(e))) => tracing::debug!(message = "Transport send error", error = ?e),
         }
         // A full recycle queue just drops the buffer.
         let _ = recycle.try_send(data);
