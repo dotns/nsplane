@@ -18,6 +18,11 @@
 //! --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24
 //! --peer <PUBKEY>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32+10.1.0.2/32
 //! --echo-port 7`
+//!
+//! [`Splitter`]: nsplane::Splitter
+//! [`Splitter::misrouted`]: nsplane::Splitter::misrouted
+//! [`MergeSource`]: nsplane::MergeSource
+//! [`NetStack`]: nsplane_netstack::NetStack
 
 #[cfg(unix)]
 mod unix {

@@ -31,6 +31,17 @@
 //! Usage: `sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key <KEY>
 //! --address 10.0.0.1/24 --peer <PUBKEY>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32
 //! --identity <PUBKEY>=10.0.0.2 --policy examples/policies/acl_gateway.json --echo-port 7`
+//!
+//! [`AclEngine`]: nsplane_acl::AclEngine
+//! [`AclEngine::load`]: nsplane_acl::AclEngine::load
+//! [`AclFilter`]: nsplane_acl::AclFilter
+//! [`AclFilter::stats`]: nsplane_acl::AclFilter::stats
+//! [`AclFilter::with_config`]: nsplane_acl::AclFilter::with_config
+//! [`AclFilterConfig::stateful_replies`]: nsplane_acl::AclFilterConfig::stateful_replies
+//! [`AclPolicy`]: nsplane_acl::AclPolicy
+//! [`FlowTracker`]: nsplane_acl::FlowTracker
+//! [`PeerIdentityMap`]: nsplane_acl::PeerIdentityMap
+//! [`SourceAssertion`]: nsplane_acl::SourceAssertion
 
 #[cfg(unix)]
 mod unix {

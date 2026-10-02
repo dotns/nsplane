@@ -23,6 +23,11 @@
 //! Usage: `sudo cargo run -p nsplane-examples --bin fd_bridge -- --mode fd --private-key
 //! <KEY> --address 10.0.0.1/24 --peer <PUBKEY>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32
 //! --echo-port 7`
+//!
+//! [`ChannelSource`]: nsplane::ChannelSource
+//! [`ChannelSource::new`]: nsplane::ChannelSource::new
+//! [`ChannelSink`]: nsplane::ChannelSink
+//! [`ChannelSink::new`]: nsplane::ChannelSink::new
 
 #[cfg(unix)]
 mod unix {
