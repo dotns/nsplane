@@ -278,18 +278,17 @@ impl PacketFilter for PortMap {
             return self.icmp_error(peer, packet, true);
         };
         let flow = match self.conntrack.lookup(&tuple, Some(info.tcp_flags)) {
-            Some(found) if found.direction == FlowDirection::Original => {
-                if found.flow.peer != peer {
-                    return dropped(reasons::WRONG_PEER);
-                }
-                found.flow
-            }
+            Some(found) if found.direction == FlowDirection::Original => found.flow,
             _ => match self.new_flow(peer, tuple, info.tcp_flags) {
                 Ok(Some(flow)) => flow,
                 Ok(None) => return Verdict::Accept,
                 Err(reason) => return dropped(reason),
             },
         };
+        // Also covers a concurrent insert of the same tuple by another peer.
+        if flow.peer != peer {
+            return dropped(reasons::WRONG_PEER);
+        }
         verdict(rewrite::endpoint(
             packet.as_packet_mut(),
             info.l4,
