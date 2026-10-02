@@ -36,18 +36,20 @@
 //!
 //! # Place in the filter chain
 //!
-//! The core runs its filters in the same order in both directions: the first
-//! filter sees decrypted packets first on inbound and local packets first on
-//! outbound. A `PortMap` needs to see the packets of a flow with the same
-//! addresses in both directions, so **no filter that rewrites addresses may
-//! run before it**. With the `Translator`, install the `PortMap` before it:
-//! inbound, the `PortMap` sees the packet as it came out of the tunnel and
+//! The core's filter chain is an onion: filters are installed from the wire
+//! side to the local side, decrypted packets run through them in install
+//! order and local packets in reverse. The recommended stack is
+//! `[AclFilter, PortMap, Translator]`. A `PortMap` needs to see the packets
+//! of a flow with the same addresses in both directions, and with this order
+//! it sits between the tunnel and the `Translator` both ways: inbound, it sees
+//! the packet as it came out of the tunnel (and the ACL accepted it) and
 //! DNATs it before the `Translator` runs; outbound, it SNATs the local reply
-//! before the `Translator` runs. Rules therefore name tunnel-side addresses
-//! (`listen`, e.g. this node's `node6`) and a `target` of the same family
-//! (e.g. `node6` on another port, or `[::1]`); 4 <-> 6 translation of a
-//! published service is not done here. Filters that only drop (the ACL) may
-//! run before or after it; before it, they judge the `listen` address.
+//! after the `Translator` has run, right before the ACL. Rules
+//! therefore name tunnel-side addresses (`listen`, e.g. this node's `node6`)
+//! and a `target` of the same family (e.g. `node6` on another port, or
+//! `[::1]`); 4 <-> 6 translation of a published service is not done here. The
+//! ACL, closest to the wire, judges the `listen` address inbound and the
+//! reply after SNAT outbound, so it sees overlay IPv6 in both directions.
 //!
 //! Replacing the rules ([`PortMap::set_rules`]) is atomic and removes the
 //! recorded flows of every rule that is gone or changed (target or allowed

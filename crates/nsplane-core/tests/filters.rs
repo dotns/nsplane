@@ -6,8 +6,8 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use common::{Net, ip4, udp4};
 use nsplane_core::{CoreConfig, Event, PacketBuf, PacketFilter, PeerId, Verdict, reasons};
@@ -148,18 +148,78 @@ fn the_first_verdict_other_than_accept_ends_the_chain() {
         let filters = vec![first, second, third];
         let mut net = net_with_filters(0, filters);
 
+        // Outbound runs the chain in reverse: third, then second.
         net.ping4(0, 1, b"outbound");
-        assert_eq!(first_calls.get(), (0, 1), "{stop:?}");
+        assert_eq!(first_calls.get(), (0, 0), "{stop:?}");
         assert_eq!(second_calls.get(), (0, 1), "{stop:?}");
-        assert_eq!(third_calls.get(), (0, 0), "{stop:?}");
+        assert_eq!(third_calls.get(), (0, 1), "{stop:?}");
         assert_eq!(net.take_delivered(1), [], "{stop:?}");
 
+        // Inbound runs it in install order: first, then second.
         net.ping4(1, 0, b"inbound");
-        assert_eq!(first_calls.get(), (1, 1), "{stop:?}");
+        assert_eq!(first_calls.get(), (1, 0), "{stop:?}");
         assert_eq!(second_calls.get(), (1, 1), "{stop:?}");
-        assert_eq!(third_calls.get(), (0, 0), "{stop:?}");
+        assert_eq!(third_calls.get(), (0, 1), "{stop:?}");
         assert_eq!(net.take_delivered(0), [], "{stop:?}");
     }
+}
+
+/// Records its name in a shared log on every call.
+#[derive(Debug)]
+struct Named {
+    name: &'static str,
+    log: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+}
+
+impl PacketFilter for Named {
+    fn inbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+        self.log.lock().unwrap().push(("inbound", self.name));
+        Verdict::Accept
+    }
+
+    fn outbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+        self.log.lock().unwrap().push(("outbound", self.name));
+        Verdict::Accept
+    }
+}
+
+#[test]
+fn the_chain_is_onion_ordered() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let filters = ["wire", "middle", "local"]
+        .into_iter()
+        .map(|name| {
+            Box::new(Named {
+                name,
+                log: Arc::clone(&log),
+            }) as Box<dyn PacketFilter>
+        })
+        .collect();
+    let mut net = net_with_filters(0, filters);
+
+    // Install order goes from the wire side to the local side: local packets meet the chain
+    // from the local end, decrypted packets from the wire end.
+    net.ping4(0, 1, b"outbound");
+    assert_ne!(net.take_delivered(1), []);
+    assert_eq!(
+        std::mem::take(&mut *log.lock().unwrap()),
+        [
+            ("outbound", "local"),
+            ("outbound", "middle"),
+            ("outbound", "wire")
+        ]
+    );
+
+    net.ping4(1, 0, b"inbound");
+    assert_ne!(net.take_delivered(0), []);
+    assert_eq!(
+        std::mem::take(&mut *log.lock().unwrap()),
+        [
+            ("inbound", "wire"),
+            ("inbound", "middle"),
+            ("inbound", "local")
+        ]
+    );
 }
 
 /// Rewrites the UDP destination port of outbound IPv4 packets and decrements the TTL of

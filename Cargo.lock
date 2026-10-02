@@ -1109,6 +1109,7 @@ dependencies = [
  "nsplane",
  "nsplane-acl",
  "nsplane-core",
+ "nsplane-nat",
  "nsplane-netstack",
  "nsplane-packet",
  "nsplane-tun",

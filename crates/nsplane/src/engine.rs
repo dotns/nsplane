@@ -23,6 +23,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED,
 };
+use crate::fragment::Fragmenter;
 use crate::handle::{Command, EngineHandle, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -154,6 +155,7 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) transports: Vec<NewTransport>,
     pub(crate) queue_capacity: usize,
     pub(crate) event_capacity: usize,
+    pub(crate) fragmenter: Option<Fragmenter>,
 }
 
 /// Spawns the owner task and the I/O tasks.
@@ -193,6 +195,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         drops: BTreeMap::new(),
         mtu,
         mtu_changes: Some(mtu_changes),
+        fragmenter: parts.fragmenter,
         tasks: vec![
             Task::spawn(watch_mtu(mtu_watch, mtu_tx, suspended.subscribe())),
             Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
@@ -410,6 +413,8 @@ struct Owner {
     mtu: u16,
     /// MTU changes of the source; `None` once the source dropped its watch's sender.
     mtu_changes: Option<mpsc::Receiver<u16>>,
+    /// Keeps local packets within `mtu`, if installed.
+    fragmenter: Option<Fragmenter>,
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
@@ -449,7 +454,10 @@ impl Owner {
                 }
                 // The owner keeps a sender, so the queue never closes.
                 Wake::Datagram(None) => {}
-                Wake::Local(Some(packet)) => self.core.handle_input(Input::Local { packet }, now()),
+                Wake::Local(Some(packet)) => match &mut self.fragmenter {
+                    Some(fragmenter) => fragmenter.handle(&mut self.core, packet, self.mtu, now()),
+                    None => self.core.handle_input(Input::Local { packet }, now()),
+                },
                 Wake::Local(None) => self.local = None,
                 Wake::Mtu(Some(mtu)) => {
                     if mtu != self.mtu {
