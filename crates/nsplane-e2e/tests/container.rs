@@ -8,30 +8,39 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
+use std::future::{Future, poll_fn};
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use futures_core::Stream;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use nsplane::x25519::{PublicKey, StaticSecret};
-use nsplane::{AllowedIp, EngineBuilder, EngineHandle, Event, Peer, PeerStats, UdpTransport};
+use nsplane::{
+    AllowedIp, Engine, EngineBuilder, EngineHandle, Event, PacketSink, PacketSource, Peer,
+    PeerStats, UdpTransport,
+};
 use nsplane_acl::{
     AclAction, AclEngine, AclFilter, AclPolicy, AclRule, PeerIdentityMap, SourceAssertion, reasons,
     wg_peer_anchor,
 };
-use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, udp};
+use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, serve_udp_echo, udp};
+use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, TcpConnection};
 use nsplane_packet::{Ecn, FiveTuple, IpPacket, Path, PeerId, TransportId, UdpHeader, protocol};
 use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener, udp_transport};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener, udp_transport};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 /// Upper bound for one external command (`ip`, `wg`, `ping`).
@@ -65,6 +74,20 @@ const CONNECT_WAIT: Duration = Duration::from_secs(10);
 const DENIED_WINDOW: Duration = Duration::from_millis(500);
 /// The UDP payload size of the large packets.
 const LARGE: usize = 1300;
+/// The interface name of the TUN throughput test.
+const BULK_IFACE: &str = "nsplane3";
+/// The port the netstack echoes TCP on, and the one the kernel peer's bulk transfers go to.
+const ECHO_PORT: u16 = 7;
+const BULK_PORT: u16 = 9000;
+/// Bytes the kernel peer sends through each TCP echo, and in each UDP echo datagram.
+const TCP_ECHO_LEN: usize = 256 * 1024;
+const UDP_ECHO_LEN: usize = 1200;
+/// Upper bound for one echo request to the kernel peer: it gives up after 10 seconds.
+const ECHO_WAIT: Duration = Duration::from_secs(20);
+/// Bytes of one bulk transfer from the kernel peer.
+const BULK_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound for one bulk transfer: the kernel peer gives up after 120 seconds.
+const BULK_WAIT: Duration = Duration::from_secs(150);
 
 /// Logs a test step; the output shows with `--nocapture`.
 fn step(message: &str) -> TestResult {
@@ -1091,4 +1114,242 @@ async fn kernel_peer_through_acl_filter() -> TestResult {
     drop(engine);
     step("reset the kernel peer's session for the tests after this one")?;
     env.reset_kernel_peer().await
+}
+
+/// The 32-byte key in base64 `key` (a key file's contents or `wg` output).
+async fn key_bytes(key: &str) -> TestResult<[u8; 32]> {
+    let hex = key_hex(key).await?;
+    let mut bytes = [0; 32];
+    for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    Ok(bytes)
+}
+
+/// An engine on `source` and `sink` that listens on this side's port and knows the kernel
+/// peer (key, preshared key, allowed IPs, endpoint) through its handle, with a handshake
+/// this side initiated, so the test needs no particular state of the kernel peer.
+async fn kernel_peer_engine<Src: PacketSource, Snk: PacketSink>(
+    env: &Interop,
+    source: Src,
+    sink: Snk,
+) -> TestResult<(Engine, EngineHandle)> {
+    let private = key_bytes(&std::fs::read_to_string(&env.private_key)?).await?;
+    let engine = EngineBuilder::new(source, sink)
+        .transport(udp_transport(env.listen_port)?)
+        .private_key(StaticSecret::from(private))
+        .build()?;
+    let handle = engine.handle();
+    let key = PublicKey::from(key_bytes(&env.peer_pub).await?);
+    handle
+        .add_or_update_peer(Peer {
+            allowed_ips: env.peer_allowed_ips().to_vec(),
+            preshared_key: Some(key_bytes(&std::fs::read_to_string(&env.psk)?).await?),
+            path: Some(Path {
+                transport: TRANSPORT_ID,
+                addr: env.peer_endpoint,
+                ecn: Ecn::NotEct,
+            }),
+            ..Peer::new(key)
+        })
+        .await?;
+    let id = handle
+        .peer_id(key)
+        .await?
+        .ok_or("the engine does not know the kernel peer")?;
+    handle.force_handshake(id, None).await?;
+    wait_for_peer(&handle, WAIT, "no handshake with the kernel", |p| {
+        p.last_handshake.is_some()
+    })
+    .await?;
+    Ok((engine, handle))
+}
+
+/// Shuts `engine` down, which frees its port (and removes its TUN device), and resets the
+/// kernel peer's session so that it initiates the next handshake for the tests after this
+/// one.
+async fn stop_engine(env: &Interop, engine: Engine, handle: &EngineHandle) -> TestResult {
+    handle.shutdown().await?;
+    drop(engine);
+    env.reset_kernel_peer().await
+}
+
+/// Echoes every byte of `conn` until EOF, then shuts its write half down.
+async fn echo_tcp(conn: TcpConnection) -> io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(conn);
+    tokio::io::copy(&mut reader, &mut writer).await?;
+    writer.shutdown().await
+}
+
+/// Accepts every inbound TCP connection of `stack`: those to [`BULK_PORT`] go to the
+/// returned receiver, all others are echoed, each on its own task, until the stack stops.
+fn serve_tcp(stack: &NetStackHandle) -> mpsc::UnboundedReceiver<TcpConnection> {
+    let mut incoming = stack.incoming_tcp();
+    let (bulk, accepted) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(conn) = poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)).await {
+            if conn.local_addr().port() == BULK_PORT {
+                // The test may have stopped listening.
+                let _ = bulk.send(conn);
+            } else {
+                tokio::spawn(echo_tcp(conn));
+            }
+        }
+    });
+    accepted
+}
+
+/// Makes the kernel peer send `len` bytes to `target` over `proto` (`tcp` or `udp`, one
+/// datagram) and checks that exactly those bytes came back.
+async fn kernel_echo(env: &Interop, proto: &str, target: SocketAddr, len: usize) -> TestResult {
+    let sent = payload(len);
+    let echoed = env.kernel_dir.join("netstack-echo.data");
+    match std::fs::remove_file(&echoed) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    std::fs::write(env.kernel_dir.join("netstack-echo.payload"), &sent)?;
+    let request = format!("{proto} {} {} {len}\n", target.ip(), target.port());
+    let status = env
+        .kernel_request("netstack-echo", &request, "netstack-echo.result", ECHO_WAIT)
+        .await?;
+    let echoed = std::fs::read(&echoed)?;
+    if status.trim() != "0" || echoed != sent {
+        return Err(format!(
+            "{proto} echo from {target}: {} of {len} bytes, exit status {}",
+            echoed.len(),
+            status.trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reads `reader` until [`BULK_BYTES`] arrived or it ends, and returns the byte count.
+async fn count_bytes(mut reader: impl AsyncRead + Unpin) -> TestResult<u64> {
+    let mut buf = vec![0; 64 * 1024];
+    let mut total = 0;
+    while total < BULK_BYTES {
+        let len = reader.read(&mut buf).await?;
+        if len == 0 {
+            break;
+        }
+        total += u64::try_from(len)?;
+    }
+    Ok(total)
+}
+
+/// Makes the kernel peer send [`BULK_BYTES`] over TCP to `target`, where `received` reads
+/// them and closes the connection, and logs the throughput the kernel peer measured.
+async fn kernel_bulk(
+    env: &Interop,
+    target: SocketAddr,
+    what: &str,
+    received: impl Future<Output = TestResult<u64>>,
+) -> TestResult {
+    let request = format!("{} {} {BULK_BYTES}\n", target.ip(), target.port());
+    let (answer, received) = tokio::join!(
+        env.kernel_request("netstack-bulk", &request, "netstack-bulk.result", BULK_WAIT),
+        timeout(BULK_WAIT, received),
+    );
+    let received = received.map_err(|_| format!("{what}: no transfer within {BULK_WAIT:?}"))??;
+    let answer = answer?;
+    let (status, nanos) = match answer.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [status, nanos] => (status.parse::<i32>()?, nanos.parse::<u128>()?),
+        _ => return Err(format!("netstack-bulk.result: {answer:?}").into()),
+    };
+    if status != 0 || received != BULK_BYTES {
+        return Err(
+            format!("{what}: {received} of {BULK_BYTES} bytes, exit status {status}").into(),
+        );
+    }
+    // Tenths of MiB/s, in integers.
+    let tenths = u128::from(BULK_BYTES) * 10_000_000_000 / (nanos.max(1) << 20);
+    step(&format!(
+        "throughput {what}: {} MiB in {}.{:03} s, {}.{} MiB/s",
+        BULK_BYTES >> 20,
+        nanos / 1_000_000_000,
+        nanos % 1_000_000_000 / 1_000_000,
+        tenths / 10,
+        tenths % 10
+    ))
+}
+
+/// A node whose local side is a netstack (no TUN device), with the kernel peer configured
+/// through the engine handle: the kernel peer's TCP and UDP echoes through the stack come
+/// back byte-exact over IPv4 and IPv6, and a bulk TCP transfer from the kernel peer arrives
+/// complete (its throughput is logged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a kernel WireGuard peer; run by `just e2e-lib`"]
+async fn netstack_only_node_against_kernel_wireguard() -> TestResult {
+    let env = Interop::from_env()?;
+    let mut addresses = Vec::new();
+    for addr in [&env.addr_v4, &env.addr_v6] {
+        let (ip, prefix) = addr.split_once('/').ok_or("address without prefix")?;
+        addresses.push((ip.parse::<IpAddr>()?, prefix.parse::<u8>()?));
+    }
+    let local: Vec<IpAddr> = addresses.iter().map(|&(ip, _)| ip).collect();
+    let (stack, stack_handle) = NetStack::new(NetStackConfig::new(addresses, DEFAULT_MTU));
+    let mut bulk = serve_tcp(&stack_handle);
+    let mut flows = serve_udp_echo(&stack_handle);
+    let (source, sink) = stack.split();
+
+    step("netstack node: this side initiates the handshake")?;
+    let (engine, handle) = kernel_peer_engine(&env, source, sink).await?;
+    for (family, ip, peer) in [
+        (Family::V4, local[0], IpAddr::V4(env.peer_v4)),
+        (Family::V6, local[1], IpAddr::V6(env.peer_v6)),
+    ] {
+        step(&format!(
+            "the kernel peer's {family:?} TCP and UDP echo through the stack"
+        ))?;
+        let target = SocketAddr::new(ip, ECHO_PORT);
+        kernel_echo(&env, "tcp", target, TCP_ECHO_LEN).await?;
+        kernel_echo(&env, "udp", target, UDP_ECHO_LEN).await?;
+        let (remote, flow_local) = timeout(WAIT, flows.recv())
+            .await?
+            .ok_or("UDP echo server stopped")?;
+        if remote.ip() != peer || flow_local != target {
+            return Err(format!("{family:?} UDP flow {remote} -> {flow_local}").into());
+        }
+    }
+
+    step("bulk TCP from the kernel peer into the netstack")?;
+    let received = async {
+        let conn = bulk.recv().await.ok_or("TCP server stopped")?;
+        count_bytes(conn).await
+    };
+    let target = SocketAddr::new(local[0], BULK_PORT);
+    kernel_bulk(&env, target, "kernel -> netstack", received).await?;
+    let stats = stack_handle.stats();
+    writeln!(io::stderr(), "{stats:?}")?;
+
+    stop_engine(&env, engine, &handle).await
+}
+
+/// A node on a TUN device, with the kernel peer configured through the engine handle: a
+/// bulk TCP transfer from the kernel peer to a socket on the TUN address arrives complete
+/// (its throughput is logged, for comparison with the netstack node's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a kernel WireGuard peer; run by `just e2e-lib`"]
+async fn tun_node_bulk_tcp_from_kernel_wireguard() -> TestResult {
+    let env = Interop::from_env()?;
+    let tun = Tun::create(BULK_IFACE)?;
+    let (source, sink) = tun.split()?;
+    configure_iface(BULK_IFACE, &env.addr_v4, &env.addr_v6).await?;
+    let local4: Ipv4Addr = env.addr_v4.split('/').next().unwrap_or_default().parse()?;
+    let listener = TcpListener::bind((local4, BULK_PORT)).await?;
+
+    step("TUN node: this side initiates the handshake")?;
+    let (engine, handle) = kernel_peer_engine(&env, source, sink).await?;
+    step("bulk TCP from the kernel peer into the TUN node")?;
+    let received = async {
+        let (stream, _) = listener.accept().await?;
+        count_bytes(stream).await
+    };
+    let target = SocketAddr::from((local4, BULK_PORT));
+    kernel_bulk(&env, target, "kernel -> TUN", received).await?;
+
+    drop(listener);
+    stop_engine(&env, engine, &handle).await
 }
