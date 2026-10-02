@@ -205,8 +205,8 @@ pub enum Event {
     ///
     /// Emitted exactly once per completed handshake, on both sides, also when several
     /// handshakes complete between two timer ticks: on the initiator when it accepts the
-    /// handshake response, on the responder when it accepts a handshake initiation and
-    /// answers it (before the initiator confirms the session with its first data message).
+    /// handshake response, on the responder when the initiator confirms the new session with
+    /// its first data message (usually the keepalive answering the response).
     HandshakeCompleted {
         /// The peer.
         peer: PeerId,

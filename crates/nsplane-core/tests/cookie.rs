@@ -100,7 +100,6 @@ fn each_initiation_counts_once() {
     assert_eq!(answered.len() as u64, LIMIT, "{replies:?}");
     assert!(answered.iter().all(|t| t.data[0] == 2), "{replies:?}");
     assert!(is_cookie_reply(last), "{replies:?}");
-    assert_eq!(handshakes(&net.take_events(1)) as u64, LIMIT);
 }
 
 /// Under load, the initiator gets a cookie reply from the responder's gate, retries with mac2,

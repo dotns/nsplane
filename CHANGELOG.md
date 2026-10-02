@@ -70,8 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-core` verifies and rate-limits each handshake message once with the shared gate,
   so `handshake_rate_limit` is the real per-source rate (it used to allow twice that).
 - `nsplane-core` emits `Event::HandshakeCompleted` once per completed handshake, including
-  several within one timer tick; the responder always reports it when it answers the
-  initiation (the first handshake used to wait for the initiator's first data message).
+  several within one timer tick. The responder reports it when the initiator's first data
+  message confirms the session.
 - Breaking (CLI): `boringtun-cli` is a Linux/macOS development tool. It runs in the
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;

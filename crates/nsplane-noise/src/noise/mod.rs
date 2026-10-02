@@ -560,6 +560,7 @@ impl Tunn {
         };
 
         self.set_current_session(r_idx);
+        self.timer_tick_session_confirmed(r_idx);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
@@ -1041,10 +1042,14 @@ mod tests {
         assert_eq!(my_tun.handshake_count(), 0);
         assert_eq!(their_tun.handshake_count(), 0);
 
-        assert!(rehandshake(&mut my_tun, &mut their_tun));
-        assert!(rehandshake(&mut my_tun, &mut their_tun));
-        assert_eq!(my_tun.handshake_count(), 2);
-        assert_eq!(their_tun.handshake_count(), 2);
+        for count in 1..=2 {
+            assert!(rehandshake(&mut my_tun, &mut their_tun));
+            assert_eq!(my_tun.handshake_count(), count);
+            // The responder counts the handshake once the initiator confirms it.
+            assert_eq!(their_tun.handshake_count(), count - 1);
+            send_data(&mut my_tun, &mut their_tun);
+            assert_eq!(their_tun.handshake_count(), count);
+        }
     }
 
     #[test]
