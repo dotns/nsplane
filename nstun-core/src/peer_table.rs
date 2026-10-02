@@ -3,7 +3,8 @@
 
 //! The peers of the core, indexed by peer id, public key, session index and allowed IP.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -37,15 +38,39 @@ struct OwnKey {
     gate: Arc<RateLimiter>,
 }
 
+/// Hashes a session index with one multiplication. Session indices are random and chosen by the
+/// table itself, so they need no keyed hash; the multiplication spreads them over all bits.
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexHasher(u64);
+
+impl Hasher for IndexHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// The peers of the core.
 ///
 /// Peers are reachable by id, by public key, by the session index in received messages, and by
 /// allowed IP (cryptokey routing). Allowed IPs exist only in the routing table, so a range that
 /// a newer peer claims is moved away from its previous owner. Peer ids are never reused.
 pub(crate) struct PeerTable {
-    peers: BTreeMap<PeerId, Peer>,
+    /// Ids of the peers, ascending: ids are handed out in order, so a new peer goes last.
+    ids: Vec<PeerId>,
+    /// The peers, at the position of their id in `ids`.
+    peers: Vec<Peer>,
     by_key: HashMap<PublicKey, PeerId>,
-    by_index: HashMap<u32, PeerId>,
+    by_index: HashMap<u32, PeerId, BuildHasherDefault<IndexHasher>>,
     by_ip: AllowedIps<PeerId>,
     next_index: IndexLfsr,
     next_id: u32,
@@ -66,9 +91,10 @@ impl PeerTable {
     /// handshakes per second the gate tolerates before replying with cookies.
     pub(crate) fn new(handshake_rate_limit: u64) -> Self {
         Self {
-            peers: BTreeMap::new(),
+            ids: Vec::new(),
+            peers: Vec::new(),
             by_key: HashMap::new(),
-            by_index: HashMap::new(),
+            by_index: HashMap::default(),
             by_ip: AllowedIps::new(),
             next_index: IndexLfsr::default(),
             next_id: 1,
@@ -94,12 +120,13 @@ impl PeerTable {
             &public_key,
             self.handshake_rate_limit.saturating_mul(2),
         ));
-        for peer in self.peers.values_mut() {
+        for peer in &mut self.peers {
             peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&gate)),
             );
+            peer.reset_rx_session();
         }
 
         self.key = Some(OwnKey {
@@ -125,7 +152,7 @@ impl PeerTable {
         let preshared_key = config.preshared_key.map(|k| (k != [0; 32]).then_some(k));
 
         let id = if let Some(&id) = self.by_key.get(&config.public_key) {
-            if let Some(p) = self.peers.get_mut(&id) {
+            if let Some(p) = self.peer_mut(id) {
                 if let Some(path) = config.path {
                     p.set_path(path);
                 }
@@ -159,7 +186,8 @@ impl PeerTable {
             );
             let peer = Peer::new(tunnel, config.public_key, index, config.path, preshared_key);
             self.next_id = next_id;
-            self.peers.insert(id, peer);
+            self.ids.push(id);
+            self.peers.push(peer);
             self.by_key.insert(config.public_key, id);
             self.by_index.insert(index, id);
             tracing::info!("Peer added");
@@ -179,7 +207,9 @@ impl PeerTable {
     pub(crate) fn remove(&mut self, public_key: &PublicKey) -> Option<PeerId> {
         let id = self.by_key.remove(public_key)?;
         // Found a peer to remove, now purge all references to it:
-        if let Some(peer) = self.peers.remove(&id) {
+        if let Ok(i) = self.ids.binary_search(&id) {
+            self.ids.remove(i);
+            let peer = self.peers.remove(i);
             self.by_index.remove(&peer.index());
         }
         self.by_ip.remove(&|p: &PeerId| *p == id);
@@ -190,6 +220,7 @@ impl PeerTable {
 
     /// Removes all peers.
     pub(crate) fn clear(&mut self) {
+        self.ids.clear();
         self.peers.clear();
         self.by_key.clear();
         self.by_index.clear();
@@ -203,12 +234,14 @@ impl PeerTable {
 
     /// The peer with this id.
     pub(crate) fn peer(&self, id: PeerId) -> Option<&Peer> {
-        self.peers.get(&id)
+        let i = self.ids.binary_search(&id).ok()?;
+        self.peers.get(i)
     }
 
     /// The peer with this id, mutably.
     pub(crate) fn peer_mut(&mut self, id: PeerId) -> Option<&mut Peer> {
-        self.peers.get_mut(&id)
+        let i = self.ids.binary_search(&id).ok()?;
+        self.peers.get_mut(i)
     }
 
     /// The peer that owns the session index in a received message (`receiver_idx`).
@@ -238,16 +271,16 @@ impl PeerTable {
 
     /// All peers with their ids, in id order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (PeerId, &Peer)> {
-        self.peers.iter().map(|(&id, peer)| (id, peer))
+        self.ids.iter().copied().zip(&self.peers)
     }
 
     /// All peers with their ids, mutably, in id order.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (PeerId, &mut Peer)> {
-        self.peers.iter_mut().map(|(&id, peer)| (id, peer))
+        self.ids.iter().copied().zip(&mut self.peers)
     }
 
     /// Number of peers.
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.peers.len()
     }
 }

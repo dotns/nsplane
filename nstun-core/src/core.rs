@@ -120,6 +120,8 @@ impl Core {
 
         let mut buf = self.pool.get(BUF_SIZE);
         for (id, peer) in self.peers.iter_mut() {
+            // The timers may expire sessions or start a handshake.
+            peer.reset_rx_session();
             buf.set_len(BUF_SIZE);
             match peer.update_timers(&mut buf.with_headroom_mut()[HEADROOM..]) {
                 TunnResult::Done => peer.expired = false,
@@ -238,6 +240,7 @@ impl Core {
         if let Some(path) = path {
             p.set_path(path);
         }
+        p.reset_rx_session();
 
         let mut buf = self.pool.get(BUF_SIZE);
         buf.set_len(BUF_SIZE);
@@ -358,7 +361,14 @@ impl Core {
         let Some(peer) = self.peers.peer_mut(id) else {
             return;
         };
-        let before = peer.time_since_last_handshake();
+        // Only transport data on a new session, or after the sessions may have changed, can
+        // complete a handshake: data on the established session leaves the clock alone.
+        let new_session = peer.is_new_session(receiver_idx);
+        let before = if new_session {
+            peer.time_since_last_handshake()
+        } else {
+            None
+        };
         let len = data.len();
         let (plain_len, src) = match peer.tunnel.decapsulate_in_place(
             Some(path.addr),
@@ -377,13 +387,17 @@ impl Core {
                 return;
             }
         };
+        let completed = new_session && {
+            peer.set_rx_session(receiver_idx);
+            new_handshake(before, peer.time_since_last_handshake())
+        };
 
         let kind = if src.is_some() {
             MessageKind::Data
         } else {
             MessageKind::Keepalive
         };
-        self.authenticated(id, path, kind, before);
+        self.authenticated(id, path, kind, completed);
 
         let Some(src) = src else {
             return;
@@ -486,6 +500,7 @@ impl Core {
             return self.pool.put(reply);
         };
 
+        p.reset_rx_session();
         let before = p.time_since_last_handshake();
         let reply_len = match p.tunnel.decapsulate(
             Some(path.addr),
@@ -504,10 +519,11 @@ impl Core {
                 return self.pool.put(reply);
             }
         };
+        let completed = new_handshake(before, p.time_since_last_handshake());
 
         let Some(reply_len) = reply_len else {
             self.pool.put(reply);
-            return self.authenticated(id, path, kind, before);
+            return self.authenticated(id, path, kind, completed);
         };
         reply.set_len(reply_len);
         let reply_kind = message_kind(reply.as_packet());
@@ -518,7 +534,7 @@ impl Core {
             return;
         }
 
-        self.authenticated(id, path, kind, before);
+        self.authenticated(id, path, kind, completed);
         self.transmit(id, reply_kind, reply);
         self.flush_queue(id);
     }
@@ -559,7 +575,11 @@ impl Core {
             .encapsulate_in_place(&mut packet.with_headroom_mut()[start..], len)
         {
             TunnResult::WriteToNetwork(datagram) => datagram.len(),
-            TunnResult::Done => return self.pool.put(packet),
+            TunnResult::Done => {
+                // Queued behind a handshake in progress.
+                peer.reset_rx_session();
+                return self.pool.put(packet);
+            }
             TunnResult::Err(e) => {
                 tracing::debug!(message = "Encapsulate error", error = ?e);
                 self.pool.put(packet);
@@ -577,6 +597,10 @@ impl Core {
             .copy_within(start..start + sealed_len, HEADROOM);
         packet.set_len(sealed_len);
         let kind = message_kind(packet.as_packet());
+        if kind == MessageKind::HandshakeInit {
+            // Queued, and a handshake starts.
+            peer.reset_rx_session();
+        }
         self.transmit(id, kind, packet);
     }
 
@@ -609,22 +633,14 @@ impl Core {
     }
 
     /// Records an authenticated message of `kind` from `peer` on `path`: reports a new
-    /// handshake and a new source, and lets the policy decide about roaming. `before` is the
-    /// time since the last handshake before the message was processed.
-    fn authenticated(
-        &mut self,
-        id: PeerId,
-        path: Path,
-        kind: MessageKind,
-        before: Option<Duration>,
-    ) {
+    /// handshake if the message `completed` one and a new source, and lets the policy decide
+    /// about roaming.
+    fn authenticated(&mut self, id: PeerId, path: Path, kind: MessageKind, completed: bool) {
         let Some(peer) = self.peers.peer_mut(id) else {
             return;
         };
 
-        // A new session makes the time since the last handshake shrink (or appear).
-        let after = peer.time_since_last_handshake();
-        if after.is_some_and(|after| before.is_none_or(|before| after < before)) {
+        if completed {
             peer.expired = false;
             let rtt = (kind == MessageKind::HandshakeResponse)
                 .then(|| peer.tunnel.stats().4)
@@ -714,6 +730,12 @@ fn message_kind(datagram: &[u8]) -> MessageKind {
         Ok(Packet::PacketData(_)) if datagram.len() == KEEPALIVE_SZ => MessageKind::Keepalive,
         Ok(Packet::PacketData(_)) | Err(_) => MessageKind::Data,
     }
+}
+
+/// Whether a message established a new session, from the time since the last handshake
+/// before and after it was processed: a new session makes that time shrink (or appear).
+fn new_handshake(before: Option<Duration>, after: Option<Duration>) -> bool {
+    after.is_some_and(|after| before.is_none_or(|before| after < before))
 }
 
 /// Whether an authenticated message of this kind may move the peer's path.
