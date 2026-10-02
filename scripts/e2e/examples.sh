@@ -5,6 +5,10 @@
 #
 # Matrix cells (`cell <row> <transport> <case>...`) and scenarios (`scenario <name>`) record
 # PASS/FAIL; the run ends with the matrix and the scenario list and fails if anything failed.
+# Rows: TUN, netstack, bridge(fd), bridge(channel); columns: direct UDP, and the single-port
+# relay (relay_server) over UDP and over WSS with the direct path blocked. Scenarios add
+# native kernel WireGuard through the relay, NAT hole punching behind MASQUERADE routers,
+# the direct/relay ladder and plain WireGuard servers under the relay extension.
 # Needs docker and the `wireguard` kernel module on the host; nothing on the host is
 # reconfigured. The release example binaries are built in the dev image unless
 # NSPLANE_E2E_EX_BIN_DIR names a directory holding them.
@@ -20,12 +24,13 @@ NET=$PREFIX-net
 IMG=$PREFIX-image
 LABEL=nsplane-e2e-ex=$PREFIX
 LABELS=(--label ai-agent=true --label "$LABEL")
-EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats)
+EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server)
 PORT=51820
+WSS_PORT=8443
 
 cleanup() {
   docker ps -aq --filter "label=$LABEL" | xargs -r docker rm -f >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
+  docker network ls -q --filter "label=$LABEL" | xargs -r docker network rm >/dev/null 2>&1 || true
   docker image rm "$IMG" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -55,18 +60,31 @@ ctr() { echo "$PREFIX-$CASE-$1"; }
 X() { local c; c=$(ctr "$1"); shift; docker exec "$c" bash -c "$*"; }
 # put <ctr> <path>: writes stdin to a file in the container, atomically.
 put() { docker exec -i "$(ctr "$1")" bash -c "cat > $2.tmp && mv $2.tmp $2"; }
-# start <name>...: a container per name with a fresh key pair in /k (private) and /p (public).
+# start_on <network> <name> [docker run args]...: a container on <network> with a fresh key
+# pair in /k (private) and /p (public).
+start_on() {
+  local net=$1 name=$2; shift 2
+  docker run -d --rm "${LABELS[@]}" --label "nsplane-e2e-ex-case=$CASE" --name "$(ctr "$name")" \
+    --network "$net" --cap-add NET_ADMIN --device /dev/net/tun -e NO_COLOR=1 \
+    --sysctl net.ipv6.conf.all.disable_ipv6=0 "$@" "${MOUNTS[@]}" "$IMG" sleep infinity >/dev/null
+  X "$name" 'umask 077; wg genkey > /k; wg pubkey < /k > /p'
+}
+# start <name>...: a container per name on the shared network.
 start() {
   local name
-  for name in "$@"; do
-    docker run -d --rm "${LABELS[@]}" --label "nsplane-e2e-ex-case=$CASE" --name "$(ctr "$name")" \
-      --network "$NET" --cap-add NET_ADMIN --device /dev/net/tun -e NO_COLOR=1 \
-      --sysctl net.ipv6.conf.all.disable_ipv6=0 "${MOUNTS[@]}" "$IMG" sleep infinity >/dev/null
-    X "$name" 'umask 077; wg genkey > /k; wg pubkey < /k > /p'
-  done
+  for name in "$@"; do start_on "$NET" "$name"; done
 }
 pub() { X "$1" 'cat /p'; }
 ip_of() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(ctr "$1")"; }
+# ip_on <ctr> <network>: the container's address on one of its networks.
+ip_on() { docker inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$(ctr "$1")"; }
+# case_net <name>: creates an internal network of the current case and prints its name.
+case_net() {
+  local net
+  net=$(ctr "$1")
+  docker network create --internal "${LABELS[@]}" --label "nsplane-e2e-ex-case=$CASE" "$net" >/dev/null
+  echo "$net"
+}
 # The containers of the current case: dump their logs and status files, then remove them.
 case_containers() { docker ps -aq --filter "label=nsplane-e2e-ex-case=$CASE" --filter "label=$LABEL"; }
 dump() {
@@ -77,7 +95,11 @@ dump() {
       echo "-- wg show"; wg show all 2>&1; echo "-- ip addr"; ip -brief addr' 2>&1 | sed 's/^/  /' || true
   done
 }
-remove_case() { case_containers | xargs -r docker rm -f >/dev/null 2>&1 || true; }
+remove_case() {
+  case_containers | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker network ls -q --filter "label=nsplane-e2e-ex-case=$CASE" --filter "label=$LABEL" \
+    | xargs -r docker network rm >/dev/null 2>&1 || true
+}
 
 # --- helpers: nodes ---------------------------------------------------------------------
 # node <ctr> <example> <args>...: starts an example detached with the container's key and a
@@ -294,6 +316,359 @@ case_channel_tun() {
   ping_check a 10.0.0.2; ping_check b 10.0.0.1
 }
 
+# --- helpers: relay ---------------------------------------------------------------------
+# Overlay: 10.0.0.254 is the relay's own engine.
+
+# mkey <ctr>...: a machine key in /m, its public key in /m.pub.
+mkey() {
+  local name
+  for name in "$@"; do X "$name" 'relay_server gen-machine-key /m > /m.pub'; done
+}
+# relay_conf <pinned>... [+ <static>...]: a relay config pinning the machine keys of the
+# containers before `+` and relaying to the ones after it at their <ip>:$PORT.
+relay_conf() {
+  local name static=0 entries=()
+  for name in "$@"; do
+    if [ "$name" = + ]; then static=1; continue; fi
+    if [ "$static" -eq 0 ]; then
+      entries+=("$(jq -nc --arg m "$(X "$name" 'cat /m.pub')" --arg w "$(pub "$name")" \
+        '{pin: {machine_key: $m, wg_public_key: $w}}')")
+    else
+      entries+=("$(jq -nc --arg w "$(pub "$name")" --arg e "$(ip_of "$name"):$PORT" \
+        '{static: {wg_public_key: $w, endpoint: $e}}')")
+    fi
+  done
+  printf '%s\n' "${entries[@]}" \
+    | jq -s '{machine_keys: map(.pin // empty), static_targets: map(.static // empty)}'
+}
+# relay_up <ctr> [args]...: relay_server with /relay.json (on stdin), own engine 10.0.0.254.
+relay_up() {
+  local name=$1; shift
+  put "$name" /relay.json
+  node "$name" relay_server --address 10.0.0.254/24 --config /relay.json "$@"
+  wait_status "$name" relay_server '.extra.relay.counters'
+}
+# relay_counter <ctr> <counter>: one of the relay's counters now.
+relay_counter() { X "$1" 'cat /relay_server.json' | jq ".extra.relay.counters.$2"; }
+# relay_client <transport> <relay ip>: sets CLIENT (the node flags of relay-udp or relay-wss)
+# and RELAY_EP (the endpoint of peers reached through the relay).
+CLIENT=()
+RELAY_EP=
+relay_client() {
+  case $1 in
+    relay-udp)
+      RELAY_EP=$2:$PORT
+      CLIENT=(--transport relay --relay "$RELAY_EP" --machine-key-file /m) ;;
+    relay-wss)
+      RELAY_EP=$2:$WSS_PORT
+      CLIENT=(--transport wss --relay-url "wss://relay.example:$WSS_PORT/" --relay-addr "$RELAY_EP"
+        --relay-ca /relay.pem --machine-key-file /m) ;;
+    *) echo "unknown relay transport '$1'"; return 1 ;;
+  esac
+}
+# capable <ctr> <example> <endpoint>: the node discovered the endpoint as a capable relay.
+capable() {
+  wait_status "$1" "$2" ".extra.relay.endpoints[\"$3\"].state == \"capable\"" 30
+  echo "  ok  $1: relay $3 capable"
+}
+# block <ctr> <ip>...: drops everything between the container and the addresses.
+block() {
+  local name=$1 ip; shift
+  for ip in "$@"; do X "$name" "iptables -I INPUT -s $ip -j DROP; iptables -I OUTPUT -d $ip -j DROP"; done
+}
+# echo_rounds <ctr> <ip> <port> <rounds> <file>: TCP and UDP echo rounds run inside the
+# container in the background; the number of failed ones goes to <file> at the end.
+echo_rounds() {
+  docker exec -d "$(ctr "$1")" bash -c "f=0; for i in \$(seq 1 $4); do for p in TCP4 UDP4; do
+      s=e\$i\$RANDOM; o=\$(printf %s \$s | timeout 4 socat -t 1 - \$p:$2:$3) || true
+      [ \"\$o\" = \"\$s\" ] || f=\$((f+1)); done; done; echo \$f > $5.tmp; mv $5.tmp $5"
+}
+# wait_file <ctr> <path> [secs]: waits until the file exists and prints it.
+wait_file() {
+  local i
+  for i in $(seq 1 $(( ${3:-30} * 2 ))); do
+    X "$1" "cat $2 2>/dev/null" && return 0
+    sleep 0.5
+  done
+  echo "no $2 in $1" >&2; return 1
+}
+
+# --- cases: relay columns ---------------------------------------------------------------
+# relay_pair <transport> <example> [args]...: the example under test (a, 10.0.0.1) and a
+# tun_node (b, 10.0.0.2) reach each other only through relay_server (r): both are pinned
+# and register, their peer endpoint is the relay, direct traffic between them is dropped.
+# Example checks and echo on a, socat both ways, ping where a has a TUN; the relay's
+# counters (and with WSS both carriers' counters) show the traffic went through it.
+relay_pair() {
+  local transport=$1 bin=$2; shift 2
+  start r a b
+  local a_pub b_pub r_ip a_ip b_ip
+  a_pub=$(pub a); b_pub=$(pub b); r_ip=$(ip_of r); a_ip=$(ip_of a); b_ip=$(ip_of b)
+  mkey a b
+  local wss=()
+  [ "$transport" = relay-wss ] && wss=(--wss-listen "$r_ip:$WSS_PORT" --wss-cert-out /relay.pem)
+  relay_conf a b | relay_up r "${wss[@]}"
+  if [ "$transport" = relay-wss ]; then
+    X r 'cat /relay.pem' | put a /relay.pem
+    X r 'cat /relay.pem' | put b /relay.pem
+  fi
+  block a "$b_ip"; block b "$a_ip"
+  relay_client "$transport" "$r_ip"
+  echo_server b
+  node b tun_node "${CLIENT[@]}" --address 10.0.0.2/24 --peer "$a_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.1/32"
+  capable b tun_node "$RELAY_EP"
+  node a "$bin" "$@" "${CLIENT[@]}" --address 10.0.0.1/24 --peer "$b_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.2/32" \
+    --echo-port 7 --check tcp:10.0.0.2:7 --check udp:10.0.0.2:7
+  capable a "$bin" "$RELAY_EP"
+  checks_pass a "$bin"
+  echo_check b tcp 10.0.0.1 7; echo_check b udp 10.0.0.1 7
+  if [ "$bin" != netstack_node ]; then
+    echo_check a tcp 10.0.0.2 7; echo_check a udp 10.0.0.2 7
+    ping_check a 10.0.0.2; ping_check b 10.0.0.1
+  fi
+  wait_status r relay_server '.extra.relay.counters | .forwarded > 0 and .registrations >= 2 and .dropped_ambiguous == 0' 5
+  echo "  ok  r: forwarded $(relay_counter r forwarded), registrations $(relay_counter r registrations), 0 ambiguous"
+  wait_status a "$bin" ".peers[0].endpoint == \"$RELAY_EP\"" 5
+  wait_status b tun_node ".peers[0].endpoint == \"$RELAY_EP\"" 5
+  echo "  ok  a, b: the peer's endpoint is the relay $RELAY_EP"
+  if [ "$transport" = relay-wss ]; then
+    wait_status r relay_server '.extra.wss | .connections == 2 and .rx > 0 and .tx > 0' 5
+    wait_status a "$bin" '.extra.wss | .connected and .tx > 0 and .rx > 0' 5
+    wait_status b tun_node '.extra.wss | .connected and .tx > 0 and .rx > 0' 5
+    echo "  ok  r, a, b: datagrams carried over WSS"
+  fi
+}
+case_relay_tun() { relay_pair "$1" tun_node; }
+case_relay_netstack() { relay_pair "$1" netstack_node; }
+case_relay_fd() { relay_pair "$1" fd_bridge --mode fd; }
+case_relay_channel() { relay_pair "$1" fd_bridge --mode channel; }
+
+# --- scenarios: relay -------------------------------------------------------------------
+# native_wg <keepalive 0|1>: relay r, provider tun_node p (pinned, registered, 10.0.0.1),
+# native kernel WireGuard k (10.0.0.2, a static target of the relay) with p behind the
+# relay and the relay's own engine as peers, both at the relay's one port; direct traffic
+# between k and p is dropped. With keepalive k initiates, without it k stays silent.
+native_wg() {
+  start r p k
+  local p_pub k_pub r_pub r_ip p_ip k_ip keepalive=
+  p_pub=$(pub p); k_pub=$(pub k); r_pub=$(pub r); r_ip=$(ip_of r); p_ip=$(ip_of p); k_ip=$(ip_of k)
+  [ "$1" -eq 1 ] && keepalive="persistent-keepalive 2"
+  mkey p
+  relay_conf p + k | relay_up r --peer "$k_pub,allowed-ips=10.0.0.2/32" --echo-port 7
+  block p "$k_ip"; block k "$p_ip"
+  echo_server k
+  local checks=()
+  [ "$1" -eq 0 ] && checks=(--check tcp:10.0.0.2:7 --check udp:10.0.0.2:7)
+  node p tun_node --transport relay --relay "$r_ip:$PORT" --machine-key-file /m --address 10.0.0.1/24 \
+    --peer "$k_pub,endpoint=$r_ip:$PORT,allowed-ips=10.0.0.2/32" --echo-port 7 "${checks[@]}"
+  capable p tun_node "$r_ip:$PORT"
+  wait_status r relay_server '.extra.relay.counters.registrations >= 1' 10
+  X k "ip link add wg0 type wireguard
+    wg set wg0 private-key /k listen-port $PORT \
+      peer $p_pub allowed-ips 10.0.0.1/32 endpoint $r_ip:$PORT $keepalive \
+      peer $r_pub allowed-ips 10.0.0.254/32 endpoint $r_ip:$PORT $keepalive
+    ip addr add 10.0.0.2/24 dev wg0; ip link set wg0 up"
+}
+
+# Native client -> relay -> provider, and the relay's own engine on the same port at once.
+scenario_native_wg() {
+  native_wg 1
+  echo_check k tcp 10.0.0.1 7; echo_check k udp 10.0.0.1 7
+  ping_check k 10.0.0.1; ping_check p 10.0.0.2
+  echo_check k tcp 10.0.0.254 7; echo_check k udp 10.0.0.254 7
+  echo "  -- coexistence: the provider and the relay's own engine concurrently"
+  local own fwd
+  own=$(relay_counter r own_engine); fwd=$(relay_counter r forwarded)
+  echo_rounds k 10.0.0.1 7 20 /rounds-provider
+  echo_rounds k 10.0.0.254 7 20 /rounds-relay
+  local provider relay
+  provider=$(wait_file k /rounds-provider 120); relay=$(wait_file k /rounds-relay 120)
+  [ "$provider" = 0 ] || { echo "  FAIL k: $provider of 40 echo rounds to the provider failed"; return 1; }
+  [ "$relay" = 0 ] || { echo "  FAIL k: $relay of 40 echo rounds to the relay's engine failed"; return 1; }
+  echo "  ok  k: 40/40 echo rounds each to the provider and to the relay's engine"
+  wait_status r relay_server ".extra.relay.counters | .own_engine > $own and .forwarded > $fwd and .dropped_ambiguous == 0" 5
+  echo "  ok  r: own_engine $own -> $(relay_counter r own_engine), forwarded $fwd -> $(relay_counter r forwarded), 0 ambiguous"
+  X k 'wg show wg0 latest-handshakes' | awk '$2 == 0 { exit 1 }'
+  echo "  ok  k: handshakes with both peers"
+}
+
+# Provider -> relay -> native client: the native client never sends first, the provider's
+# checks open the session through the relay's static target.
+scenario_native_wg_reverse() {
+  native_wg 0
+  checks_pass p tun_node
+  X k "wg show wg0 latest-handshakes" | grep -F "$(pub p)" | awk '$2 == 0 { exit 1 }'
+  echo "  ok  k: handshake initiated by the provider"
+  echo_check k tcp 10.0.0.1 7; echo_check k udp 10.0.0.1 7
+  ping_check p 10.0.0.2; ping_check k 10.0.0.1
+  wait_status r relay_server ".extra.relay.counters | .forwarded > 0 and .dropped_ambiguous == 0" 5
+  wait_status r relay_server ".extra.relay.targets | any(.source == \"$(ip_of k):$PORT\")" 5
+  echo "  ok  r: forwarded $(relay_counter r forwarded) to the static target, 0 ambiguous"
+}
+
+# ladder <example> <nat 0|1>: nodes a (the example, 10.0.0.1) and b (tun_node, 10.0.0.2)
+# with the relay as the peer endpoint and each other's reflexive address (copied by the
+# harness from --reflexive-out to --peer-candidates) as direct candidate. The direct path
+# goes up first, blocking it falls back to the relay, unblocking returns to direct; echo in
+# every phase. With nat each node sits on its own internal network behind a router doing
+# MASQUERADE, the relay on the shared network, and the routers block the direct path.
+ladder() {
+  local bin=$1 nat=$2
+  start r
+  local r_ip a_ip b_ip ra_pub rb_pub
+  r_ip=$(ip_of r)
+  if [ "$nat" -eq 1 ]; then
+    local name net
+    for name in a b; do
+      net=$(case_net "net-$name")
+      start_on "$NET" "r$name" --sysctl net.ipv4.ip_forward=1
+      docker network connect "$net" "$(ctr "r$name")"
+      local subnet out gw
+      subnet=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$net")
+      out=$(X "r$name" "ip -o route get $r_ip" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+      # Unsolicited datagrams to the router are dropped, as a NAT does, so they leave no
+      # conntrack entry that would make the router remap the node's port.
+      X "r$name" "iptables -t nat -A POSTROUTING -s $subnet -o $out -j MASQUERADE
+        iptables -A INPUT -i $out -p udp -j DROP"
+      start_on "$net" "$name"
+      gw=$(ip_on "r$name" "$net")
+      X "$name" "ip route replace default via $gw"
+    done
+    ra_pub=$(ip_on ra "$NET"); rb_pub=$(ip_on rb "$NET")
+  else
+    start a b
+    a_ip=$(ip_of a); b_ip=$(ip_of b)
+  fi
+  local a_pub b_pub
+  a_pub=$(pub a); b_pub=$(pub b)
+  mkey a b
+  relay_conf a b | relay_up r
+  local client=(--transport relay --relay "$r_ip:$PORT" --machine-key-file /m --peer-candidates /candidates.json
+    --reflexive-out /reflexive.json --probe-backoff-ms 500 --register-interval-ms 5000
+    --reflexive-interval-ms 5000 --direct-timeout-ms 2000 --direct-probe-interval-ms 3000)
+  echo_server b
+  node a "$bin" "${client[@]}" --address 10.0.0.1/24 --peer "$b_pub,endpoint=$r_ip:$PORT,allowed-ips=10.0.0.2/32,keepalive=1" \
+    --echo-port 7
+  node b tun_node "${client[@]}" --address 10.0.0.2/24 --peer "$a_pub,endpoint=$r_ip:$PORT,allowed-ips=10.0.0.1/32,keepalive=1"
+  local a_refl b_refl
+  a_refl=$(wait_file a /reflexive.json | jq -r .reflexive); b_refl=$(wait_file b /reflexive.json | jq -r .reflexive)
+  echo "  ok  reflexive: a $a_refl, b $b_refl"
+  if [ "$nat" -eq 1 ]; then
+    [ "${a_refl%:*}" = "$ra_pub" ] && [ "${b_refl%:*}" = "$rb_pub" ] \
+      || { echo "  FAIL reflexive addresses are not the routers' ($ra_pub, $rb_pub)"; return 1; }
+    echo "  ok  the reflexive addresses are the routers' public addresses"
+  fi
+  jq -n --arg k "$b_pub" --arg e "$b_refl" '{($k): [$e]}' | put a /candidates.json
+  jq -n --arg k "$a_pub" --arg e "$a_refl" '{($k): [$e]}' | put b /candidates.json
+
+  echo "  -- direct"
+  wait_status a "$bin" ".extra.paths[\"$b_pub\"] | .active == \"direct\" and .confirmed" 30
+  wait_status b tun_node ".extra.paths[\"$a_pub\"] | .active == \"direct\" and .confirmed" 30
+  wait_status a "$bin" ".peers[0].endpoint == \"$b_refl\"" 5
+  echo "  ok  a, b: direct path active and confirmed (a -> $b_refl)"
+  ladder_echo "$bin"
+
+  echo "  -- direct blocked"
+  if [ "$nat" -eq 1 ]; then
+    X ra "iptables -I FORWARD -d $rb_pub -j DROP; iptables -I FORWARD -s $rb_pub -j DROP"
+    X rb "iptables -I FORWARD -d $ra_pub -j DROP; iptables -I FORWARD -s $ra_pub -j DROP"
+  else
+    block a "$b_ip"; block b "$a_ip"
+  fi
+  wait_status a "$bin" ".extra.paths[\"$b_pub\"] | .active == \"relay\" and .to_relay >= 1" 30
+  wait_status b tun_node ".extra.paths[\"$a_pub\"] | .active == \"relay\" and .to_relay >= 1" 30
+  echo "  ok  a, b: fell back to the relay"
+  local fwd
+  fwd=$(relay_counter r forwarded)
+  ladder_echo "$bin"
+  wait_status r relay_server ".extra.relay.counters.forwarded > $fwd" 5
+  echo "  ok  r: forwarded $fwd -> $(relay_counter r forwarded)"
+
+  echo "  -- direct unblocked"
+  if [ "$nat" -eq 1 ]; then
+    X ra "iptables -D FORWARD -d $rb_pub -j DROP; iptables -D FORWARD -s $rb_pub -j DROP"
+    X rb "iptables -D FORWARD -d $ra_pub -j DROP; iptables -D FORWARD -s $ra_pub -j DROP"
+  else
+    X a "iptables -F INPUT; iptables -F OUTPUT"; X b "iptables -F INPUT; iptables -F OUTPUT"
+  fi
+  wait_status a "$bin" ".extra.paths[\"$b_pub\"] | .active == \"direct\" and .confirmed and .to_direct >= 1" 30
+  wait_status b tun_node ".extra.paths[\"$a_pub\"] | .active == \"direct\" and .confirmed and .to_direct >= 1" 30
+  echo "  ok  a, b: back on the direct path"
+  ladder_echo "$bin"
+}
+# ladder_echo <example of a>: echo b -> a, and a -> b where a has a kernel stack.
+ladder_echo() {
+  echo_check b tcp 10.0.0.1 7; echo_check b udp 10.0.0.1 7
+  if [ "$1" != netstack_node ]; then echo_check a tcp 10.0.0.2 7; echo_check a udp 10.0.0.2 7; fi
+}
+scenario_ladder_tun() { ladder tun_node 0; }
+scenario_ladder_netstack() { ladder netstack_node 0; }
+scenario_nat_hole_punch() { ladder tun_node 1; }
+
+# Plain WireGuard compatibility: a tun_node n with the relay extension whose --relay is a
+# plain kernel WireGuard server s. The server drops the control messages (captured on s,
+# never answered), n backs off and stops after the bounded attempts, the handshake is as
+# fast as without the extension and the tunnel works. Restarted with a real relay r as
+# --relay, n discovers it as capable, registers and reaches the relay's own engine.
+scenario_plain_wg_compat() {
+  start s n r
+  local s_pub n_pub r_pub s_ip n_ip r_ip
+  s_pub=$(pub s); n_pub=$(pub n); r_pub=$(pub r); s_ip=$(ip_of s); n_ip=$(ip_of n); r_ip=$(ip_of r)
+  mkey n
+  docker exec -d "$(ctr s)" bash -c "exec tcpdump -i any -n -U --immediate-mode -w /capture.pcap udp port $PORT > /tcpdump.log 2>&1"
+  wait_log s tcpdump 'listening on' 10
+  # No keepalive: the node initiates, so its handshake latency is measured.
+  X s "ip link add wg0 type wireguard
+    wg set wg0 private-key /k listen-port $PORT peer $n_pub allowed-ips 10.0.0.1/32 endpoint $n_ip:$PORT
+    ip addr add 10.0.0.2/24 dev wg0; ip link set wg0 up"
+  echo_server s
+  local attempts=4 backoff=500
+  node n tun_node --transport relay --relay "$s_ip:$PORT" --machine-key-file /m --probe-backoff-ms "$backoff" \
+    --probe-attempts "$attempts" --address 10.0.0.1/24 --peer "$s_pub,endpoint=$s_ip:$PORT,allowed-ips=10.0.0.2/32" \
+    --check tcp:10.0.0.2:7 --check udp:10.0.0.2:7
+  local ep=".extra.relay.endpoints[\"$s_ip:$PORT\"]"
+  wait_status n tun_node "$ep.state == \"probing\"" 5
+  echo "  ok  n: $s_ip:$PORT probing"
+  checks_pass n tun_node
+  # Handshake latency on the capture: from the node's first datagram (control or WireGuard)
+  # to the server's handshake response.
+  local first response ms
+  first=$(X s "tcpdump -r /capture.pcap -n -tt -c 1 'src host $n_ip and udp dst port $PORT' 2>/dev/null" | awk '{print $1}')
+  response=$(X s "tcpdump -r /capture.pcap -n -tt -c 1 'src host $s_ip and udp src port $PORT and udp[8] = 2' 2>/dev/null" | awk '{print $1}')
+  ms=$(awk -v a="$first" -v b="$response" 'BEGIN { if (a == "" || b == "") print -1; else printf "%d", (b - a) * 1000 }')
+  [ "$ms" -ge 0 ] && [ "$ms" -lt 2000 ] || { echo "  FAIL n: no handshake within 2 s of the first datagram ($first -> $response)"; return 1; }
+  echo "  ok  n: handshake response $ms ms after the node's first datagram"
+  echo_check n tcp 10.0.0.2 7; echo_check n udp 10.0.0.2 7
+  ping_check n 10.0.0.2; ping_check s 10.0.0.1
+  wait_status n tun_node "$ep | .state == \"stopped\" and .attempts == $attempts and .control_answered == 0" 20
+  echo "  ok  n: $s_ip:$PORT stopped after $attempts unanswered attempts"
+  sleep 3
+  local times answers
+  times=$(X s "tcpdump -r /capture.pcap -n -tt 'dst host $s_ip and udp dst port $PORT and udp[8] >= 0xf0' 2>/dev/null" | awk '{print $1}')
+  answers=$(X s "tcpdump -r /capture.pcap -n 'src host $s_ip and udp src port $PORT and udp[8] >= 0xf0' 2>/dev/null" | wc -l)
+  [ "$(echo "$times" | grep -c .)" -eq "$attempts" ] \
+    || { echo "  FAIL s: captured $(echo "$times" | grep -c .) control messages, want $attempts"; return 1; }
+  [ "$answers" -eq 0 ] || { echo "  FAIL s: answered $answers control messages"; return 1; }
+  # The gaps between the probes double (500, 1000, 2000 ms).
+  echo "$times" | awk 'NR > 1 { gap = $1 - prev; if (NR > 2 && gap < 1.6 * last) bad = 1; if (NR == 2 && gap < 0.4) bad = 1; last = gap } { prev = $1 } END { exit bad }' \
+    || { echo "  FAIL s: probe gaps do not back off: $(echo "$times" | tr '\n' ' ')"; return 1; }
+  echo "  ok  s: received $attempts control messages with doubling gaps, answered none"
+
+  echo "  -- the same node with a real relay as --relay"
+  node_stop n tun_node
+  relay_conf n | relay_up r --peer "$n_pub,allowed-ips=10.0.0.1/32" --echo-port 7
+  node n tun_node --transport relay --relay "$r_ip:$PORT" --machine-key-file /m --address 10.0.0.1/24 \
+    --peer "$s_pub,endpoint=$s_ip:$PORT,allowed-ips=10.0.0.2/32" \
+    --peer "$r_pub,endpoint=$r_ip:$PORT,allowed-ips=10.0.0.254/32" \
+    --check tcp:10.0.0.2:7 --check tcp:10.0.0.254:7 --check udp:10.0.0.254:7
+  capable n tun_node "$r_ip:$PORT"
+  wait_status n tun_node ".extra.relay.reflexive == \"$n_ip:$PORT\"" 10
+  wait_status r relay_server '.extra.relay.counters.registrations >= 1' 10
+  echo "  ok  n: registered with the relay, reflexive $n_ip:$PORT"
+  checks_pass n tun_node
+  echo_check n tcp 10.0.0.2 7; ping_check n 10.0.0.2
+}
+
 # --- scenarios --------------------------------------------------------------------------
 # self_check <example> <summary>: a self-checking example exits 0 with its summary line.
 self_check() {
@@ -372,10 +747,22 @@ cell tun udp tun_pair tun_kernel
 cell netstack udp netstack_pair netstack_kernel
 cell fd udp fd_kernel
 cell channel udp channel_tun
+for transport in relay-udp relay-wss; do
+  cell tun "$transport" relay_tun
+  cell netstack "$transport" relay_netstack
+  cell fd "$transport" relay_fd
+  cell channel "$transport" relay_channel
+done
 scenario udp_pair
 scenario events_stats
 scenario hybrid
 scenario acl_gateway
+scenario native_wg
+scenario native_wg_reverse
+scenario ladder_tun
+scenario ladder_netstack
+scenario nat_hole_punch
+scenario plain_wg_compat
 
 report
 if [ "$FAILED" -ne 0 ]; then echo "FAIL"; exit 1; fi
