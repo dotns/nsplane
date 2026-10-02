@@ -10,29 +10,42 @@
 //! the test ends of its packet source and sink, constructors for linked pairs of nodes, and
 //! [`Events`] for asserting on engine events. Every expectation is bounded by [`WAIT`] or
 //! [`QUIET`] and fails with an error instead of hanging.
+//!
+//! [`StackNode`] is a node whose local side is an `nsplane_netstack::NetStack` instead of
+//! the test channels, with echo servers for its TCP connections and UDP flows.
 
 use std::error::Error;
 use std::fmt;
+use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::time::Duration;
+
+use futures_core::Stream;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, ChannelTransport, Engine, EngineBuilder, EngineHandle,
-    Peer, Transport, UdpTransport,
+    PacketSource, Peer, Transport, UdpTransport,
 };
 use nsplane_core::Event;
+use nsplane_netstack::{
+    NetStack, NetStackConfig, NetStackHandle, NetStackSource, TcpConnection, UdpFlow,
+};
 use nsplane_packet::checksum::{
     ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
 use nsplane_packet::{Ecn, PacketBuf, Path, PeerId, TransportId, protocol};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 
 /// Upper bound for anything that is expected to happen.
 pub const WAIT: Duration = Duration::from_secs(5);
+/// Upper bound for a TCP connection setup or a bulk transfer through a netstack.
+pub const TRANSFER: Duration = Duration::from_secs(30);
 /// How long to watch for something that is expected not to happen.
 pub const QUIET: Duration = Duration::from_millis(300);
 /// MTU of every node's packet source.
@@ -499,4 +512,236 @@ pub async fn introduce_with<T: Transport>(
         })
         .await?;
     Ok(())
+}
+
+/// One engine whose local side is a [`NetStack`] holding the node's tunnel addresses.
+///
+/// The stack is the engine's whole local side: what the engine decrypts goes into the
+/// stack and what the stack emits is encrypted to the peers. [`StackNode::stack`] opens and
+/// accepts connections and flows.
+pub struct StackNode {
+    /// The running engine; dropping it stops the engine and with it the stack.
+    pub engine: Engine,
+    /// A handle to the engine.
+    pub handle: EngineHandle,
+    /// The application side of the node's stack.
+    pub stack: NetStackHandle,
+    /// The node's private key.
+    pub secret: StaticSecret,
+    /// The node's tunnel IPv4 address, also the stack's.
+    pub ip4: Ipv4Addr,
+    /// The node's tunnel IPv6 address, also the stack's.
+    pub ip6: Ipv6Addr,
+    /// The node's own transport id and the address its peers reach it on.
+    pub path: Path,
+}
+
+impl fmt::Debug for StackNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StackNode")
+            .field("public", &self.public())
+            .field("ip4", &self.ip4)
+            .field("ip6", &self.ip6)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StackNode {
+    /// Builds a node with key seed `seed` on `transport`, reachable at `addr`, whose stack
+    /// runs with `mtu`.
+    ///
+    /// The seed also picks the tunnel addresses `10.0.0.<seed>` and `fd00::<seed>`, which
+    /// are the stack's addresses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn new<T: Transport>(
+        seed: u8,
+        id: TransportId,
+        addr: SocketAddr,
+        transport: T,
+        mtu: u16,
+    ) -> TestResult<Self> {
+        Self::with_source(seed, id, addr, transport, mtu, |source| source)
+    }
+
+    /// Builds a node like [`StackNode::new`], with `wrap` turning the stack's egress into
+    /// the source the engine reads (to observe the packets the stack emits, say).
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn with_source<T: Transport, S: PacketSource>(
+        seed: u8,
+        id: TransportId,
+        addr: SocketAddr,
+        transport: T,
+        mtu: u16,
+        wrap: impl FnOnce(NetStackSource) -> S,
+    ) -> TestResult<Self> {
+        let ip4 = Ipv4Addr::new(10, 0, 0, seed);
+        let ip6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed));
+        let (stack, handle) = NetStack::new(NetStackConfig::new(
+            vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)],
+            mtu,
+        ));
+        let (source, sink) = stack.split();
+        let engine = EngineBuilder::new(wrap(source), sink)
+            .private_key(StaticSecret::from([seed; 32]))
+            .transport(transport)
+            .build()?;
+        Ok(Self {
+            handle: engine.handle(),
+            engine,
+            stack: handle,
+            secret: StaticSecret::from([seed; 32]),
+            ip4,
+            ip6,
+            path: Path {
+                transport: id,
+                addr,
+                ecn: Ecn::NotEct,
+            },
+        })
+    }
+
+    /// The node's public key.
+    pub fn public(&self) -> PublicKey {
+        PublicKey::from(&self.secret)
+    }
+
+    /// This node as a peer of a node that reaches it over its transport `via`: both tunnel
+    /// addresses as /32 and /128 allowed IPs and the node's address as the path.
+    pub fn as_peer(&self, via: TransportId) -> Peer {
+        Peer {
+            allowed_ips: vec![
+                AllowedIp {
+                    addr: IpAddr::V4(self.ip4),
+                    cidr: 32,
+                },
+                AllowedIp {
+                    addr: IpAddr::V6(self.ip6),
+                    cidr: 128,
+                },
+            ],
+            path: Some(Path {
+                transport: via,
+                ..self.path
+            }),
+            ..Peer::new(self.public())
+        }
+    }
+
+    /// The node's tunnel address of `family` with `port`.
+    pub const fn socket_addr(&self, family: Family, port: u16) -> SocketAddr {
+        match family {
+            Family::V4 => SocketAddr::new(IpAddr::V4(self.ip4), port),
+            Family::V6 => SocketAddr::new(IpAddr::V6(self.ip6), port),
+        }
+    }
+}
+
+/// Two stack nodes (seeds 1 and 2) linked by a [`ChannelTransport`] pair and introduced to
+/// each other, with `wrap` applied to both stacks' egress (see [`StackNode::with_source`]).
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub async fn stack_pair_with<S: PacketSource>(
+    mtu: u16,
+    wrap: impl Fn(NetStackSource) -> S,
+) -> TestResult<(StackNode, StackNode)> {
+    let a = (
+        TransportId::new(1),
+        SocketAddr::from(([192, 0, 2, 1], 1000)),
+    );
+    let b = (
+        TransportId::new(2),
+        SocketAddr::from(([192, 0, 2, 2], 2000)),
+    );
+    let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
+    let a = StackNode::with_source(1, a.0, a.1, link_a, mtu, &wrap)?;
+    let b = StackNode::with_source(2, b.0, b.1, link_b, mtu, &wrap)?;
+    a.handle
+        .add_or_update_peer(b.as_peer(a.path.transport))
+        .await?;
+    b.handle
+        .add_or_update_peer(a.as_peer(b.path.transport))
+        .await?;
+    Ok((a, b))
+}
+
+/// Two stack nodes like [`stack_pair_with`], with the stacks' egress read unchanged.
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub async fn stack_pair(mtu: u16) -> TestResult<(StackNode, StackNode)> {
+    stack_pair_with(mtu, |source| source).await
+}
+
+/// The next item of `stream` within `within`; fails if the stream ends.
+pub async fn next_within<S: Stream + Unpin>(
+    stream: &mut S,
+    within: Duration,
+) -> TestResult<S::Item> {
+    timeout(within, poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)))
+        .await
+        .map_err(|_| format!("no stream item within {within:?}"))?
+        .ok_or_else(|| "stream ended".into())
+}
+
+/// Echoes every byte of `conn` until EOF, then shuts its write half down.
+async fn echo_tcp(conn: TcpConnection) -> io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(conn);
+    tokio::io::copy(&mut reader, &mut writer).await?;
+    writer.shutdown().await
+}
+
+/// Echoes every datagram of `flow` back on the flow until the stack stops.
+async fn echo_udp(mut flow: UdpFlow) -> io::Result<()> {
+    let reply = flow.reply_handle();
+    while let Some(datagram) = flow.recv().await {
+        reply.send(&datagram).await?;
+    }
+    Ok(())
+}
+
+/// Accepts every inbound TCP connection of `stack` and echoes it (see `echo_tcp`) on its
+/// own task until the stack stops. An echo that fails shows as missing or truncated data
+/// on the client.
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub fn serve_tcp_echo(stack: &NetStackHandle) {
+    let mut incoming = stack.incoming_tcp();
+    tokio::spawn(async move {
+        while let Some(conn) = poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)).await {
+            tokio::spawn(echo_tcp(conn));
+        }
+    });
+}
+
+/// Accepts every inbound UDP flow of `stack` and echoes its datagrams on the flow, each
+/// flow on its own task, until the stack stops.
+///
+/// Reports each accepted flow as `(remote, local)` on the returned receiver.
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub fn serve_udp_echo(stack: &NetStackHandle) -> mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)> {
+    let mut incoming = stack.incoming_udp();
+    let (flows, accepted) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(flow) = poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)).await {
+            // The test may have stopped listening; the echo still runs.
+            let _ = flows.send((flow.peer_addr(), flow.local_addr()));
+            tokio::spawn(echo_udp(flow));
+        }
+    });
+    accepted
 }
