@@ -127,3 +127,10 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   carriers and ladder rules. Workstream 3E adds the ACL namespaces, outbound rules and an
   `app_session` example after 3D. Open for the docs owner: `ns/rendezvous.md` §2 and
   `ns/apps.md` §1 still list the rendezvous client / app session interface under nsplane.
+- 2026-10-02: application authorization (user, option c): an app namespace never widens a
+  peer's permissions by itself; app traffic to an existing peer passes only through a
+  pinhole (one peer, direction, protocol, destination port, expiry) that the peer's source
+  namespace must permit for that app kind (`allow_app_pinholes`, default deny; Quick
+  allows, NSD decides). The pinhole closes automatically when the session ends (guard
+  dropped) or expires; revoking the permission closes it. Wire format of the NSD-side
+  permission is an ns/NSD contract, not decided here.

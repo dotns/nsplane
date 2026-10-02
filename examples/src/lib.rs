@@ -10,4 +10,5 @@
 pub mod echo;
 pub mod node;
 pub mod out;
+pub mod relay;
 pub mod status;
