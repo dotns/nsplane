@@ -10,6 +10,10 @@
 //! the initial ones and [`EngineHandle`] adds, removes and replaces them at runtime.
 //! [`DynTransport`] is the object-safe form of [`Transport`] for code that has to hold
 //! transports of different types in one place.
+//!
+//! For a hybrid local side (a TUN device next to a userspace netstack), [`Splitter`]
+//! routes delivered packets to one of several sinks and [`MergeSource`] merges several
+//! sources fairly into one.
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +23,8 @@ mod engine;
 pub mod events;
 mod handle;
 mod io;
+mod merge;
+mod splitter;
 mod transport;
 mod udp;
 
@@ -31,10 +37,12 @@ pub use events::{
 };
 pub use handle::{EngineError, EngineHandle, Peer, TransportError};
 pub use io::{PacketSink, PacketSource};
+pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
 };
+pub use splitter::Splitter;
 pub use transport::{BoxFuture, DynTransport, Transport};
 pub use udp::UdpTransport;
