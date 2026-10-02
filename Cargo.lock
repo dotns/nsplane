@@ -846,6 +846,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nstun-tun"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "nstun",
+ "nstun-packet",
+ "tokio",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
