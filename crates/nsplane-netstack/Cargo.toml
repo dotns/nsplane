@@ -1,0 +1,27 @@
+[package]
+name = "nsplane-netstack"
+description = "User-space TCP/IP stack for nsplane on smoltcp: TCP and UDP endpoints behind the packet source/sink traits"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures-core = "0.3.32"
+nsplane = { path = "../nsplane", version = "0.8.0" }
+nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1.40"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["io-util", "macros", "rt", "sync", "time"] }

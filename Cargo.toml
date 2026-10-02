@@ -6,6 +6,7 @@ members = [
     "crates/nsplane-packet",
     "crates/nsplane-core",
     "crates/nsplane",
+    "crates/nsplane-netstack",
     "crates/nsplane-tun",
     "crates/nsplane-uapi",
     "crates/nsplane-e2e",
