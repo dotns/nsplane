@@ -78,3 +78,14 @@ ADR `2026-10-02-rename-nsplane` records the candidates checked, the crate scheme
 (`nsplane-noise`, `nsplane-core`, `nsplane`, `nsplane-tun`, ...) and the timing: executed
 as its own task after the Phase 1 BKD campaign merges D and E. The docs-site nstun pages
 were rewritten from `docs/design.md`.
+
+## 2026-10-02 14:50 [progress]
+
+Phase 1 workstream D done: the `nstun` Engine facade (`EngineBuilder`, `Engine`,
+`EngineHandle`, broadcast events, bounded transmit backlog and engine drop counters),
+`nstun-uapi` (the `wg` UAPI over an engine, Unix socket listener), `boringtun-cli` on the
+engine (tokio runtime, `--tun-fd`, `--uapi-fd`, `--disable-connected-udp` and
+`--disable-multi-queue` removed, privilege drop via `SUDO_UID`/`SUDO_GID`), and the deletion
+of `boringtun::device`, the `device` feature, its dependencies and `just integration`.
+`just e2e` passes unchanged against kernel WireGuard. README, CHANGELOG, architecture and
+the unsafe/Wintun ADRs updated; ADR `2026-10-02-async-engine-replaces-sync-device` added.

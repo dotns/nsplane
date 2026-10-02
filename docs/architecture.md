@@ -10,10 +10,20 @@ userspace WireGuard implementation. The upstream remote is kept for merges.
 
 | Crate | Path | Role |
 |---|---|---|
-| `boringtun` | `boringtun/` | Library: the Noise protocol state machine (`noise`), plus the optional userspace device (`device`), C FFI (`ffi`), and JNI (`jni`) |
-| `boringtun-cli` | `boringtun-cli/` | Daemon that runs a `device` on a TUN interface and exposes the `wg` UAPI |
+| `boringtun` | `boringtun/` | The Noise protocol state machine (`noise`), C FFI (`ffi`), and JNI (`jni`); no I/O |
+| `nstun-packet` | `nstun-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
+| `nstun-core` | `nstun-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
+| `nstun` | `nstun/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
+| `nstun-tun` | `nstun-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
+| `nstun-uapi` | `nstun-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
+| `boringtun-cli` | `boringtun-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
 
-## Library layers
+```text
+boringtun (noise) ─► nstun-core ─► nstun ─► nstun-tun, nstun-uapi ─► boringtun-cli
+nstun-packet ─────► nstun-core, nstun
+```
+
+## boringtun
 
 - `noise`: transport-agnostic protocol core. `Tunn` owns the handshake, the session ring,
   the timers, and the per-peer packet queue. It never does I/O: callers pass datagrams in
@@ -24,17 +34,86 @@ userspace WireGuard implementation. The upstream remote is kept for merges.
   - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry).
 - `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
   and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
-- `device` (feature `device`): TUN, UDP sockets, peer table, and the `wg` UAPI.
-  - Shared: `PeerTable` (peers by key, session index and allowed IP; cryptokey routing),
-    `uapi` (get/set over any `BufRead`/`Write`), and the per-packet functions
-    `receive_datagram`, `send_from_tun`, `update_timers`.
-  - `unix`: epoll (Linux) or kqueue (macOS) event loop with N threads, TUN via
-    `/dev/net/tun` or utun, UAPI on `/var/run/wireguard/<name>.sock`.
-  - `windows`: blocking threads (Wintun reader, one reader per UDP socket, timers, UAPI
-    named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`) around a
-    `RwLock`ed state; Ctrl-C stops the device.
 - `ffi` / `jni` (features `ffi-bindings` / `jni-bindings`): C ABI and Android bindings
   over `noise`.
+
+## nstun-core
+
+`Core` performs no I/O and keeps no clock of its own. A driver feeds it `Input`s (local
+packets, received datagrams, configuration changes) with `handle_input`, calls
+`handle_timeout` when `poll_timeout` is due, and drains `poll_output`: datagrams to
+transmit, packets to deliver, and events. Packets go through in place: a local packet is
+sealed in its own buffer and leaves as the transmit, a datagram is opened in its buffer and
+leaves as the delivery; buffers come back through `recycle`. Peers are looked up by key,
+session index and allowed IP (cryptokey routing). Path selection and roaming are delegated
+to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
+`PacketFilter`s.
+
+## nstun (driver)
+
+One owner task owns the `Core` and loops: it waits for a handle command, a local packet, a
+received datagram or the core's next timeout, feeds the core and drains its outputs. Four
+I/O tasks surround it, each connected through a bounded queue (1024 packets by default):
+
+```text
+PacketSource ─► source task ─┐                       ┌─► transmit task ─► Transport::send
+                             ├─► owner task (Core) ──┤
+Transport::recv ─► recv task ┘          ▲            └─► sink task ─► PacketSink
+                                        │
+                          EngineHandle commands (64)
+```
+
+The core is never shared, so there are no locks on the data path.
+
+- `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
+  stats, injection, shutdown) and returns their replies.
+- Events are published on a `broadcast` channel (`EngineHandle::subscribe`); publishing never
+  blocks, and a lagging subscriber loses the oldest events.
+- Drops are counted per reason (`EngineHandle::drop_counters`) and published as events.
+
+Backpressure:
+
+- Local packets are never dropped by the engine: when the transmit queue is full, datagrams
+  wait in the owner task and the owner stops reading local packets until they have moved to
+  the queue, which holds back the source.
+- Datagrams caused by received datagrams or timers that find the waiting datagrams at the
+  queue capacity are dropped (`DROP_TRANSMIT_FULL`).
+- A full sink queue drops the decrypted packet (`DROP_SINK_FULL`); a closed sink or
+  transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
+  datagrams are dropped with `DROP_NO_TRANSPORT`.
+- An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
+
+`UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
+`ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
+and embedders.
+
+## nstun-tun
+
+`Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one, and `Tun::split`
+yields a `TunSource` and a `TunSink` registered with the tokio reactor.
+
+- `linux`: `/dev/net/tun` (Linux, Android), raw IP packets.
+- `darwin` and `utun`: the utun control socket (macOS, iOS), packets framed by a 4-byte
+  address-family header.
+- `unix`: non-blocking fd I/O shared by both.
+- `windows`: a Wintun adapter; a reader thread feeds the source.
+
+## nstun-uapi and the CLI
+
+`Uapi` answers `get=1` and `set=1` over an `EngineHandle`; `listen_port` and `fwmark` bind a
+new `UdpTransport` and install it with `EngineHandle::set_transport`. On Unix,
+`UapiListener` binds `/var/run/wireguard/<iface>.sock`. Windows has no listener yet.
+
+`boringtun-cli` builds a tokio multi-thread runtime (`--threads` workers), creates the TUN,
+builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops privileges to
+`SUDO_UID`/`SUDO_GID`, and runs until SIGINT or SIGTERM.
+
+## Unsafe code
+
+`unsafe` lives only in `boringtun`'s `ffi` and `jni` modules and in `nstun-tun`'s platform
+modules (`unix`, `linux`, `darwin`, and loading Wintun in `windows`), each with SAFETY
+comments. `nstun-packet`, `nstun-core`, `nstun`, `nstun-uapi` and `boringtun-cli` declare
+`#![forbid(unsafe_code)]`. See `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 ## Crypto
 
@@ -43,3 +122,9 @@ userspace WireGuard implementation. The upstream remote is kept for merges.
 - Constant-time comparisons: `subtle`.
 - XChaCha20-Poly1305 (cookies), BLAKE2s, HMAC: RustCrypto.
 - X25519: `x25519-dalek`.
+
+## Testing
+
+`just check` runs the unit and integration tests of every crate (the engine against
+in-memory channels). `just e2e` (`scripts/e2e/linux.sh`) runs `boringtun-cli` against kernel
+WireGuard in two containers.

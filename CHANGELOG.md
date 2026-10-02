@@ -5,7 +5,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nstun-packet`: packet buffers with header room (`PacketBuf`, `PacketPool`,
+  `PacketBatch`), IP/TCP/UDP/ICMP header views and the shared value types (`PeerId`,
+  `TransportId`, `Path`, `Ecn`). No I/O, no `unsafe`.
+- `nstun-core`: sans-I/O WireGuard engine core over `boringtun::noise`. `Core` takes inputs
+  (local packets, datagrams, configuration changes), exposes `poll_timeout`/`handle_timeout`
+  and yields outputs (datagrams to transmit, packets to deliver, events). Peers, cryptokey
+  routing, a pluggable `PathPolicy` (`StandardRoaming`) and `PacketFilter` chain.
+- `nstun`: tokio driver. `EngineBuilder` builds an `Engine` on a `PacketSource`, a
+  `PacketSink` and a `Transport` (`UdpTransport`: dual-stack, fwmark, ECN); one owner task
+  drives the core, I/O tasks feed it through bounded queues. `EngineHandle` changes peers,
+  the private key and the transport at runtime, reads stats and drop counters, and
+  `subscribe`s to `Event`s on a broadcast channel. Engine-side drops are counted as
+  `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_NO_TRANSPORT`, `DROP_TRANSMIT_FULL` and
+  `DROP_TRANSPORT_CLOSED`. In-memory `ChannelSource`/`ChannelSink`/`ChannelTransport` for
+  tests and embedders.
+- `nstun-tun`: TUN devices as packet sources and sinks: Linux and Android
+  (`/dev/net/tun`), macOS and iOS (utun), Windows (Wintun). `Tun::create`, `Tun::from_fd`
+  (Unix) and `Tun::split`.
+- `nstun-uapi`: the `wg` UAPI (`get=1`/`set=1`) over an `EngineHandle`, including
+  `listen_port` and `fwmark` rebinding the UDP transport; `UapiListener` binds
+  `/var/run/wireguard/<iface>.sock` on Unix.
+
 ### Changed
+- Breaking (CLI): `boringtun-cli` runs on the async engine (`nstun`, `nstun-tun`,
+  `nstun-uapi`) on a tokio multi-thread runtime with `--threads` workers; SIGTERM stops it
+  as well as SIGINT. The UDP socket is bound to an ephemeral port at startup until
+  `wg set ... listen-port` rebinds it. Removed flags: `--tun-fd`/`WG_TUN_FD` and
+  `--uapi-fd`/`WG_UAPI_FD` (adopting a raw fd needs `unsafe`, which the CLI forbids; the
+  library keeps `nstun_tun::Tun::from_fd`), `--disable-connected-udp` and
+  `--disable-multi-queue` (they configured the synchronous device only). The privilege drop
+  reads `SUDO_UID`/`SUDO_GID` instead of `getlogin`.
 - Breaking: replace `ring` with `aws-lc-rs` for ChaCha20-Poly1305, and with `subtle` for
   constant-time comparisons. `ring` is no longer a dependency.
 - Edition 2024, MSRV 1.95, workspace-wide lint policy (warnings denied, clippy pedantic and
@@ -17,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;
   core dumps are disabled at startup and panics are logged.
+
+### Removed
+- Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
+  Windows event loops, UDP sockets, UAPI). Use `nstun`, `nstun-tun` and `nstun-uapi`.
+  `boringtun` no longer depends on `socket2`, `thiserror`, `wintun-bindings`, `windows-sys`,
+  `ip_network` or `ip_network_table`, nor on the `nix` `user` feature.
+- `just integration` and the upstream integration tests that ran against the device.
 
 ### Security
 - Cookies (mac2) cover the source port as well as the IP, as the whitepaper requires.
@@ -62,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0-333 ms of jitter.
 
 ### Fixed
+- The deleted `device/tun_linux.rs` passed an `ifreq` of the wrong size to the TUN ioctls;
+  `nstun-tun` uses the kernel's 40-byte `ifreq`.
 - UAPI `set`: settings of one peer section no longer leak into the next section.
 - UAPI `get` reports `last_handshake_time_*` as wall-clock Unix time, as `wg` expects, instead
   of the age of the handshake ("56 years ago").
