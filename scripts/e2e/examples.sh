@@ -24,7 +24,7 @@ NET=$PREFIX-net
 IMG=$PREFIX-image
 LABEL=nsplane-e2e-ex=$PREFIX
 LABELS=(--label ai-agent=true --label "$LABEL")
-EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server)
+EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server app_session)
 PORT=51820
 WSS_PORT=8443
 
@@ -679,6 +679,19 @@ self_check() {
 }
 scenario_udp_pair() { self_check udp_pair 'CHECKS PASS'; }
 scenario_events_stats() { self_check events_stats 'STEPS PASS'; }
+scenario_app_session() { self_check app_session 'CHECKS PASS'; }
+
+# app_session with node A on a TUN next to its netstack: host traffic to the session-only
+# peer's address is dropped by the outbound rule while the app's transfer works.
+scenario_app_session_tun() {
+  start a
+  run_fg a app_session --tun nsp-app --status /app_session.json
+  X a "grep -q '^STEP tun-outbound PASS\$' /app_session.log"
+  X a "grep -q '^CHECKS PASS\$' /app_session.log"
+  echo "  ok  a: app_session --tun exit 0, STEP tun-outbound PASS, CHECKS PASS"
+  wait_status a app_session '.extra.acl.outbound_denied > 0' 5
+  echo "  ok  a: extra.acl.outbound_denied > 0"
+}
 
 # hybrid vs kernel WireGuard: a socat service on the TUN side and the netstack echo are both
 # reachable from the kernel peer; nothing is misrouted.
@@ -755,6 +768,8 @@ for transport in relay-udp relay-wss; do
 done
 scenario udp_pair
 scenario events_stats
+scenario app_session
+scenario app_session_tun
 scenario hybrid
 scenario acl_gateway
 scenario native_wg
