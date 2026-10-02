@@ -50,3 +50,7 @@ e2e:
 # Library-level e2e: nsplane-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
 e2e-lib:
     scripts/e2e/lib.sh
+
+# Examples e2e: the example binaries as the design's scenarios in containers, against each other and kernel WireGuard (needs docker and the wireguard module).
+e2e-examples:
+    scripts/e2e/examples.sh
