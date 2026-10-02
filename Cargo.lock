@@ -1109,6 +1109,7 @@ dependencies = [
  "nsplane",
  "nsplane-acl",
  "nsplane-core",
+ "nsplane-nat",
  "nsplane-netstack",
  "nsplane-packet",
  "nsplane-tun",
@@ -1148,6 +1149,16 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nsplane-nat"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "nsplane-core",
+ "nsplane-packet",
+ "thiserror",
 ]
 
 [[package]]
