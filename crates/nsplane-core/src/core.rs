@@ -372,8 +372,12 @@ impl Core {
         let Some((id, plain_len)) = self.open(path, &mut data, receiver_idx) else {
             return self.pool.put(data);
         };
-        // The plaintext lies behind the data header: move the packet start past it.
-        data.advance(DATA_HEADER_SZ);
+        // The plaintext lies behind the data header: move the packet start past it. A
+        // decrypted datagram is longer than its header, so this does not fail.
+        if data.advance(DATA_HEADER_SZ).is_err() {
+            self.pool.put(data);
+            return self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
+        }
         data.set_len(plain_len);
         let mut packet = data;
 
@@ -571,17 +575,17 @@ impl Core {
             return self.pool.put(packet);
         };
         let len = packet.len();
-        if packet.headroom() < DATA_HEADER_SZ {
-            // E.g. a slice of a shared buffer: copy it to a pooled buffer with headroom.
-            let mut copy = self.pool.get((len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
-            copy.set_len(len);
-            copy.as_packet_mut().copy_from_slice(packet.as_packet());
-            self.pool.put(mem::replace(&mut packet, copy));
-        }
         // The datagram is sealed in place with its data header in the headroom, so it starts
         // where it is written. The tail needs room for the tag and the padding, or for a
         // handshake initiation if the packet is queued instead.
-        packet.reserve_front(DATA_HEADER_SZ);
+        if packet.reserve_front(DATA_HEADER_SZ).is_err() {
+            // E.g. a slice of a shared buffer: copy it behind the data header of a pooled
+            // buffer.
+            let mut copy = self.pool.get((len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+            copy.set_len(DATA_HEADER_SZ + len);
+            copy.as_packet_mut()[DATA_HEADER_SZ..].copy_from_slice(packet.as_packet());
+            self.pool.put(mem::replace(&mut packet, copy));
+        }
         packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
         let sealed_len = match peer
             .tunnel

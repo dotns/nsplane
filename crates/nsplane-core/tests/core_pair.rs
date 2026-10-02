@@ -205,10 +205,10 @@ fn steady_state_reuses_buffers() {
 /// receive buffer.
 fn tight_buf(packet: &[u8], headroom: usize) -> PacketBuf {
     let mut buf = PacketBuf::with_capacity(headroom + packet.len());
-    buf.reserve_front(buf.headroom());
+    buf.reserve_front(buf.headroom()).unwrap();
     buf.set_len(headroom + packet.len());
     buf.as_packet_mut()[headroom..].copy_from_slice(packet);
-    buf.advance(headroom);
+    buf.advance(headroom).unwrap();
     buf
 }
 
