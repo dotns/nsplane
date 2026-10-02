@@ -257,12 +257,14 @@ pub enum Event {
     PeerStats {
         /// The peer.
         peer: PeerId,
-        /// Bytes received on the wire, as counted by the tunnel.
+        /// Bytes received on the wire (handshakes, keepalives, data); see [`PeerStats::rx`].
         rx: u64,
-        /// Bytes sent on the wire, as counted by the tunnel.
+        /// Bytes sent on the wire (handshakes, keepalives, data); see [`PeerStats::tx`].
         tx: u64,
         /// Decrypted payload bytes delivered.
         data_rx: u64,
+        /// Plaintext payload bytes sealed for the peer.
+        data_tx: u64,
         /// Time since the last completed handshake.
         last_handshake: Option<Duration>,
     },
@@ -303,12 +305,19 @@ pub struct PeerStats {
     pub preshared_key: Option<[u8; 32]>,
     /// Persistent keepalive interval in seconds, if enabled.
     pub persistent_keepalive: Option<u16>,
-    /// Bytes received on the wire, as counted by the tunnel.
+    /// Bytes received on the wire (handshakes, keepalives, data): the full datagram of every
+    /// handshake initiation, handshake response and transport data message accepted from the
+    /// peer. Cookie replies and datagrams dropped before authentication are not counted.
     pub rx: u64,
-    /// Bytes sent on the wire, as counted by the tunnel.
+    /// Bytes sent on the wire (handshakes, keepalives, data): the full datagram of every
+    /// handshake initiation, handshake response and transport data message transmitted to the
+    /// peer. Cookie replies are not counted.
     pub tx: u64,
-    /// Decrypted payload bytes delivered.
+    /// Decrypted payload bytes delivered: IP packets that passed the inbound filters.
     pub data_rx: u64,
+    /// Plaintext payload bytes sealed for the peer: IP packets before encapsulation, after the
+    /// outbound filters.
+    pub data_tx: u64,
     /// Time since the last completed handshake.
     pub last_handshake: Option<Duration>,
 }
@@ -325,6 +334,7 @@ impl fmt::Debug for PeerStats {
             .field("rx", &self.rx)
             .field("tx", &self.tx)
             .field("data_rx", &self.data_rx)
+            .field("data_tx", &self.data_tx)
             .field("last_handshake", &self.last_handshake)
             .finish()
     }

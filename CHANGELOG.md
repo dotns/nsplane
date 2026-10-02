@@ -72,6 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-core` emits `Event::HandshakeCompleted` once per completed handshake, including
   several within one timer tick. The responder reports it when the initiator's first data
   message confirms the session.
+- Breaking: `PeerStats::rx`/`tx` and `Event::PeerStats::rx`/`tx` (and with them the UAPI
+  `rx_bytes`/`tx_bytes` and `wg show` transfer) count bytes on the wire, like kernel
+  WireGuard: whole handshake, keepalive and data datagrams accepted from or sent to the
+  peer, without cookie replies. They used to count IP payload only. The payload is in
+  `data_rx` and the new `data_tx` (plaintext sealed for the peer).
 - Breaking (CLI): `boringtun-cli` is a Linux/macOS development tool. It runs in the
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;

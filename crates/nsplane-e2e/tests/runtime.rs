@@ -231,8 +231,12 @@ async fn peer_stats_reflect_configuration_and_counters() -> TestResult {
     assert_eq!(stats.preshared_key, Some(PSK));
     assert_eq!(stats.persistent_keepalive, Some(25));
     assert_eq!(stats.data_rx, 20 + 8 + 200);
-    // The tunnel counts the plaintext packets in both directions.
-    assert_eq!((stats.rx, stats.tx), (20 + 8 + 200, 20 + 8 + 100));
+    assert_eq!(stats.data_tx, 20 + 8 + 100);
+    // The wire counters also count the handshake and the WireGuard overhead.
+    assert!(
+        stats.rx > stats.data_rx && stats.tx > stats.data_tx,
+        "{stats:?}"
+    );
     assert!(stats.last_handshake.is_some_and(|age| age < WAIT));
     let peers = a.handle.peers().await?;
     assert_eq!(
