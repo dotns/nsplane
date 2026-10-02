@@ -839,9 +839,11 @@ dependencies = [
 name = "nsplane-e2e"
 version = "0.8.0"
 dependencies = [
+ "futures-core",
  "nix",
  "nsplane",
  "nsplane-core",
+ "nsplane-netstack",
  "nsplane-packet",
  "nsplane-tun",
  "nsplane-uapi",
