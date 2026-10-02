@@ -12,9 +12,11 @@ use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::engine::{
-    AccessRequest, AclEngine, MemberVerdict, Membership, ReplyDependency, Snapshot, SourceAssertion,
+    AccessRequest, AclEngine, MemberVerdict, Membership, PinholeMatch, ReplyDependency, Snapshot,
+    SourceAssertion,
 };
 use crate::net::Protocol;
+use crate::pinhole::Direction;
 use crate::reasons;
 
 // ── Peer identity ─────────────────────────────────────────────────────────────
@@ -156,8 +158,8 @@ pub struct AclFilterStats {
     /// Outbound packets to outbound-restricted peers accepted as replies to
     /// accepted inbound flows.
     pub outbound_replies: u64,
-    /// Reply-table entries removed because what they depended on (a grant)
-    /// is gone.
+    /// Reply-table entries removed because what they depended on (a grant or
+    /// a pinhole) is gone.
     pub reply_revoked: u64,
 }
 
@@ -263,9 +265,17 @@ struct FragmentTable {
 /// allowances (local -> remote, recorded by accepted inbound packets from
 /// outbound-restricted peers). Eviction scans for the least recently seen
 /// entry, O(capacity) and only when full.
+///
+/// `pending` remembers the dependency of inbound flows accepted through a
+/// grant, a pinhole or a dependent allowance, keyed by the packet's tuple:
+/// the inbound allowance recorded when the flow leaves again (forwarded to
+/// another peer, or answered by the local node) inherits it, so it is revoked
+/// with the grant or pinhole even towards an unrestricted peer. Same bounds
+/// as `entries`; an evicted or idle entry is dropped silently.
 #[derive(Debug, Default)]
 struct ReplyTable {
     entries: HashMap<ReplyKey, ReplyEntry>,
+    pending: HashMap<FiveTuple, ReplyEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -431,8 +441,11 @@ impl Inner {
         };
         if self.config.stateful_replies
             && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Reply))
-            && self.reply_match(snapshot, peer, false, &tuple).is_some()
+            && let Some(allowance) = self.reply_match(snapshot, peer, false, &tuple)
         {
+            if let Some(dependency) = allowance.dependency {
+                self.record_pending(tuple, dependency);
+            }
             return Outcome::Reply;
         }
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
@@ -467,12 +480,22 @@ impl Inner {
                 Outcome::Denied
             };
         };
-        let dependency = match snapshot.evaluate_member(&request, principal, membership) {
+        let verdict =
+            snapshot.evaluate_member(&request, principal, membership, || self.engine.now());
+        let dependency = match verdict {
             MemberVerdict::Rule { .. } => None,
             MemberVerdict::Grant(id) => Some(ReplyDependency::Grant(id)),
+            MemberVerdict::Pinhole(id) => Some(ReplyDependency::Pinhole(id)),
+            MemberVerdict::PinholeExpired => {
+                self.engine.expire_pinholes();
+                return Outcome::Denied;
+            }
             MemberVerdict::Denied => return Outcome::Denied,
             MemberVerdict::CrossNamespace => return Outcome::CrossNamespace,
         };
+        if let Some(dependency) = &dependency {
+            self.record_pending(tuple, dependency.clone());
+        }
         if membership.outbound_restricted() {
             self.record_reply(peer, true, reversed(tuple), dependency);
         }
@@ -537,13 +560,19 @@ impl Inner {
             bump(&self.counters.reply_expired);
             return None;
         }
-        if entry
+        let revoked = entry
             .dependency
             .as_ref()
-            .is_some_and(|dependency| !snapshot.is_live(dependency))
-        {
+            .filter(|dependency| !snapshot.is_live(dependency, || self.engine.now()));
+        if let Some(revoked) = revoked {
+            let pinhole = matches!(revoked, ReplyDependency::Pinhole(_));
             table.entries.remove(&key);
+            drop(table);
             bump(&self.counters.reply_revoked);
+            if pinhole {
+                // The pinhole may only have expired: sweep it.
+                self.engine.expire_pinholes();
+            }
             return None;
         }
         entry.last_seen = now;
@@ -552,7 +581,7 @@ impl Inner {
 
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
         let snapshot = self.engine.snapshot();
-        let principal = if snapshot.has_outbound_restrictions() {
+        let principal = if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
             self.identity
                 .assertion(peer)
                 .map(|source| source.source_anchor())
@@ -566,15 +595,44 @@ impl Inner {
         let Ok(packet) = IpPacket::parse(bytes) else {
             return membership.map_or(Outcome::OutboundAccepted, |_| Outcome::OutboundDenied);
         };
-        let Some(membership) = membership else {
+        let (Some(principal), Some(membership)) = (principal.as_deref(), membership) else {
             if let Some(tuple) = packet.five_tuple() {
-                self.track_outbound(peer, tuple, &packet, None);
+                // Accepted anyway; an outbound pinhole still owns the replies.
+                let dependency = principal
+                    .as_deref()
+                    .and_then(|principal| self.outbound_pinhole(&snapshot, principal, &tuple));
+                self.track_outbound(peer, tuple, &packet, dependency);
             }
             return Outcome::OutboundAccepted;
         };
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(&snapshot, peer, membership, packet)
+            self.evaluate_outbound(&snapshot, peer, principal, membership, packet)
         })
+    }
+
+    /// The open outbound pinhole of `principal` for `tuple`, as a reply
+    /// dependency. Sweeps expired pinholes when only those match.
+    fn outbound_pinhole(
+        &self,
+        snapshot: &Snapshot,
+        principal: &str,
+        tuple: &FiveTuple,
+    ) -> Option<ReplyDependency> {
+        let protocol = Protocol::from_ip_number(tuple.protocol)?;
+        match snapshot.match_pinhole(
+            principal,
+            Direction::Outbound,
+            protocol,
+            tuple.dst_port,
+            || self.engine.now(),
+        ) {
+            PinholeMatch::Open(id) => Some(ReplyDependency::Pinhole(id)),
+            PinholeMatch::Expired => {
+                self.engine.expire_pinholes();
+                None
+            }
+            PinholeMatch::Absent => None,
+        }
     }
 
     /// Evaluate an outbound packet to an outbound-restricted peer.
@@ -582,6 +640,7 @@ impl Inner {
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
+        principal: &str,
         membership: &Membership,
         packet: &IpPacket<'_>,
     ) -> Outcome {
@@ -601,6 +660,10 @@ impl Inner {
         }
         if snapshot.outbound_rule_accepts(membership, protocol, tuple.dst_port) {
             self.track_outbound(peer, tuple, packet, None);
+            return Outcome::OutboundAccepted;
+        }
+        if let Some(dependency) = self.outbound_pinhole(snapshot, principal, &tuple) {
+            self.track_outbound(peer, tuple, packet, Some(dependency));
             return Outcome::OutboundAccepted;
         }
         Outcome::OutboundDenied
@@ -637,6 +700,21 @@ impl Inner {
         dependency: Option<ReplyDependency>,
     ) {
         let mut table = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        // An inbound allowance inherits the dependency of the inbound flow it
+        // continues: the same tuple forwarded to another peer, or the reply of
+        // the local node.
+        let dependency = match dependency {
+            None if !outbound && !table.pending.is_empty() => [tuple, reversed(tuple)]
+                .iter()
+                .find_map(|tuple| {
+                    table.pending.get(tuple).filter(|pending| {
+                        now.duration_since(pending.last_seen) <= self.config.reply_idle_timeout
+                    })
+                })
+                .and_then(|pending| pending.dependency.clone()),
+            dependency => dependency,
+        };
         let key = ReplyKey {
             peer,
             outbound,
@@ -657,8 +735,34 @@ impl Inner {
         table.entries.insert(
             key,
             ReplyEntry {
-                last_seen: Instant::now(),
+                last_seen: now,
                 dependency,
+            },
+        );
+    }
+
+    /// Remember that the inbound flow `tuple` depends on `dependency`.
+    fn record_pending(&self, tuple: FiveTuple, dependency: ReplyDependency) {
+        if !self.config.stateful_replies {
+            return;
+        }
+        let mut table = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
+        let capacity = self.config.reply_capacity.max(1);
+        if !table.pending.contains_key(&tuple) && table.pending.len() >= capacity {
+            let oldest = table
+                .pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(tuple, _)| *tuple);
+            if let Some(oldest) = oldest {
+                table.pending.remove(&oldest);
+            }
+        }
+        table.pending.insert(
+            tuple,
+            ReplyEntry {
+                last_seen: Instant::now(),
+                dependency: Some(dependency),
             },
         );
     }
@@ -1777,5 +1881,348 @@ mod tests {
             (stats.accepted, stats.denied, stats.replies, stats.no_policy),
             (2, 2, 1, 1)
         );
+    }
+
+    #[test]
+    fn grant_revocation_covers_replies_through_unrestricted_peers() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        engine
+            .store_namespace("nsd:c", namespace(&[C], None))
+            .unwrap();
+        engine
+            .store_grant(
+                "a-to-c",
+                Grant {
+                    from: GrantEnd::Peer(principal(A)),
+                    to: GrantEnd::Namespace("nsd:c".into()),
+                    proto: Some("tcp".to_owned()),
+                    ports: Some("443".to_owned()),
+                },
+            )
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, c) = (peer_addr(A), peer_addr(C));
+        let request = || tcp_packet(a, 4000, c, 443);
+        let reply = || tcp_packet(c, 443, a, 4000);
+
+        // A hub forwards A -> C under the grant and C's replies back to A.
+        assert_eq!(inbound(&f, A, request()), Verdict::Accept);
+        assert_eq!(outbound(&f, C, request()), Verdict::Accept);
+        assert_eq!(inbound(&f, C, reply()), Verdict::Accept);
+        assert_eq!(outbound(&f, A, reply()), Verdict::Accept);
+        assert_eq!(inbound(&f, A, request()), Verdict::Accept);
+        assert_eq!((f.stats().accepted, f.stats().replies), (1, 2));
+
+        // The replies in both directions depend on the grant.
+        assert!(engine.remove_grant("a-to-c"));
+        assert_eq!(inbound(&f, C, reply()), drop(reasons::CROSS_NAMESPACE));
+        assert_eq!(inbound(&f, A, request()), drop(reasons::CROSS_NAMESPACE));
+        assert_eq!(f.stats().reply_revoked, 2);
+    }
+
+    // ── pinholes ──────────────────────────────────────────────────────────
+
+    use crate::pinhole::{Direction, PinholeGuard, PinholeSpec};
+    use std::time::Instant;
+
+    /// Sessions and kinds: `app:s1` holds `E` (session-only) and `A`; `A` is
+    /// also in `quick`, which allows "transfer" pinholes.
+    fn pinhole_engine(
+        app_outbound: Option<Vec<OutboundRule>>,
+    ) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let handle = Arc::clone(&clock);
+        let engine = Arc::new(AclEngine::with_clock(move || *handle.lock().unwrap()));
+        let mut quick = namespace(&[A], None);
+        quick.allow_app_pinholes.insert("transfer".to_owned());
+        engine.store_namespace("quick", quick).unwrap();
+        engine
+            .store_namespace(
+                "app:s1",
+                NamespacePolicy {
+                    members: members(&[A, E]),
+                    outbound: app_outbound,
+                    ..NamespacePolicy::default()
+                },
+            )
+            .unwrap();
+        (engine, clock)
+    }
+
+    fn open(
+        engine: &Arc<AclEngine>,
+        clock: &Mutex<Instant>,
+        peer: PeerId,
+        direction: Direction,
+        dst_port: u16,
+    ) -> PinholeGuard {
+        let expires_at = *clock.lock().unwrap() + Duration::from_secs(60);
+        engine
+            .open_pinhole(
+                "app:s1",
+                PinholeSpec {
+                    peer: principal(peer),
+                    kind: "transfer".to_owned(),
+                    protocol: Protocol::Tcp,
+                    direction,
+                    dst_port,
+                    expires_at,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn session_only_peer_works_only_through_its_inbound_pinhole() {
+        let (engine, clock) = pinhole_engine(Some(Vec::new()));
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (e, a, local) = (peer_addr(E), peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            drop(reasons::DENIED)
+        );
+
+        let guard = open(&engine, &clock, E, Direction::Inbound, 9000);
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            Verdict::Accept
+        );
+        // Only that protocol, port, direction and the local node.
+        assert_eq!(
+            inbound(&f, E, udp_packet(e, 4000, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9001)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, a, 9000)),
+            drop(reasons::CROSS_NAMESPACE)
+        );
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 5000, e, 9000)),
+            drop(reasons::OUTBOUND)
+        );
+        // The reply of the opened flow, and the flow continuing.
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 9000, e, 4000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            Verdict::Accept
+        );
+
+        std::mem::drop(guard);
+        assert_eq!(engine.pinhole_stats().closed, 1);
+        // New flows are dropped, the opened flow's allowances are revoked.
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4001, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 9000, e, 4000)),
+            drop(reasons::OUTBOUND)
+        );
+        let stats = f.stats();
+        assert_eq!(
+            (stats.accepted, stats.replies, stats.outbound_replies),
+            (1, 1, 1)
+        );
+        assert_eq!(stats.reply_revoked, 2);
+    }
+
+    #[test]
+    fn outbound_pinhole_to_a_restricted_peer() {
+        let (engine, clock) = pinhole_engine(Some(Vec::new()));
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (e, local) = (peer_addr(E), addr(LOCAL));
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 5000, e, 7000)),
+            drop(reasons::OUTBOUND)
+        );
+
+        let guard = open(&engine, &clock, E, Direction::Outbound, 7000);
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 5000, e, 7000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, E, udp_packet(local, 5000, e, 7000)),
+            drop(reasons::OUTBOUND)
+        );
+        // No reverse rule: the peer cannot open flows to the local port 7000.
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 7000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 7000, local, 5000)),
+            Verdict::Accept
+        );
+
+        guard.close();
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 5001, e, 7000)),
+            drop(reasons::OUTBOUND)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 7000, local, 5000)),
+            drop(reasons::DENIED)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.replies, stats.reply_revoked), (1, 1));
+        assert_eq!(stats.outbound_denied, 3);
+    }
+
+    #[test]
+    fn pinhole_revocation_covers_replies_through_unrestricted_peers() {
+        let (engine, clock) = pinhole_engine(None);
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (e, local) = (peer_addr(E), addr(LOCAL));
+
+        // Outbound pinhole: outbound is accepted anyway, the replies depend
+        // on the pinhole.
+        let out = open(&engine, &clock, E, Direction::Outbound, 7000);
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 5000, e, 7000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 7000, local, 5000)),
+            Verdict::Accept
+        );
+        // Inbound pinhole: the local node's replies are accepted anyway, and
+        // the flow continuing depends on the pinhole.
+        let into = open(&engine, &clock, E, Direction::Inbound, 9000);
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 9000, e, 4000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            Verdict::Accept
+        );
+        assert_eq!((f.stats().accepted, f.stats().replies), (1, 2));
+
+        std::mem::drop((out, into));
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 7000, local, 5000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().reply_revoked, 2);
+        assert_eq!(engine.pinhole_stats().closed, 2);
+    }
+
+    #[test]
+    fn source_member_keeps_its_rules_around_a_pinhole() {
+        let (engine, clock) = pinhole_engine(None);
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        let ssh = || tcp_packet(a, 4000, local, 22);
+        let transfer = || tcp_packet(a, 4000, local, 9000);
+        assert_eq!(inbound(&f, A, ssh()), Verdict::Accept);
+        assert_eq!(inbound(&f, A, transfer()), drop(reasons::DENIED));
+
+        let guard = open(&engine, &clock, A, Direction::Inbound, 9000);
+        assert_eq!(inbound(&f, A, ssh()), Verdict::Accept);
+        assert_eq!(inbound(&f, A, transfer()), Verdict::Accept);
+        std::mem::drop(guard);
+        assert_eq!(inbound(&f, A, ssh()), Verdict::Accept);
+        assert_eq!(inbound(&f, A, transfer()), drop(reasons::DENIED));
+        // Outbound stays unrestricted throughout.
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 9999)),
+            Verdict::Accept
+        );
+    }
+
+    #[test]
+    fn permission_revoked_mid_session_closes_the_pinhole() {
+        let (engine, clock) = pinhole_engine(None);
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        let guard = open(&engine, &clock, A, Direction::Inbound, 9000);
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 9000)),
+            Verdict::Accept
+        );
+        // quick stops allowing "transfer".
+        engine
+            .store_namespace("quick", namespace(&[A], None))
+            .unwrap();
+        assert!(!guard.is_open());
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4001, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(engine.pinhole_stats().revoked, 1);
+        std::mem::drop(guard);
+        assert_eq!(engine.pinhole_stats().closed, 0);
+    }
+
+    #[test]
+    fn expired_pinholes_stop_flows_without_sleeping() {
+        let (engine, clock) = pinhole_engine(Some(Vec::new()));
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (e, local) = (peer_addr(E), addr(LOCAL));
+        let guard = open(&engine, &clock, E, Direction::Inbound, 9000);
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4000, local, 9000)),
+            Verdict::Accept
+        );
+
+        *clock.lock().unwrap() += Duration::from_secs(60);
+        // The established flow's reply allowance is revoked, the pinhole is
+        // swept once and new flows are dropped.
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 9000, e, 4000)),
+            drop(reasons::OUTBOUND)
+        );
+        assert_eq!(
+            inbound(&f, E, tcp_packet(e, 4001, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        assert!(!guard.is_open());
+        std::mem::drop(guard);
+        let stats = engine.pinhole_stats();
+        assert_eq!((stats.expired, stats.closed), (1, 0));
+        assert_eq!(f.stats().reply_revoked, 1);
+    }
+
+    #[test]
+    fn namespace_removal_closes_pinholes() {
+        let (engine, clock) = pinhole_engine(None);
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        let guard = open(&engine, &clock, A, Direction::Inbound, 9000);
+        assert!(engine.remove_namespace("app:s1"));
+        assert!(!guard.is_open());
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 9000)),
+            drop(reasons::DENIED)
+        );
+        // Other namespaces are unaffected.
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(engine.pinhole_stats().namespace_removed, 1);
     }
 }

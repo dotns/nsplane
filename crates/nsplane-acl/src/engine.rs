@@ -1,9 +1,12 @@
 //! Access requests, compiled policies and the shared [`AclEngine`] with its
-//! namespaces and grants.
+//! namespaces, grants and pinholes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use arc_swap::{ArcSwap, Guard};
 use tracing::{debug, warn};
@@ -16,6 +19,10 @@ use crate::{
     },
     namespace::{Grant, GrantEnd, NamespaceId, NamespacePolicy},
     net::{IpNet, Protocol},
+    pinhole::{
+        Direction, Pinhole, PinholeCounters, PinholeError, PinholeGuard, PinholeId, PinholeSpec,
+        PinholeStats,
+    },
     policy::{AclPolicy, AclTest},
 };
 
@@ -389,13 +396,26 @@ impl CompiledPolicy {
 // ── Namespaces, grants and the engine snapshot ────────────────────────────────
 
 /// What a reply allowance depends on. An allowance whose dependency is gone
-/// from the current [`Snapshot`] is revoked on its next lookup.
-///
-/// Kept open for more kinds of dependencies (app pinholes).
+/// from the current [`Snapshot`] (or, for a pinhole, expired) is revoked on
+/// its next lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReplyDependency {
     /// A directed grant, by id.
     Grant(Arc<str>),
+    /// An app pinhole.
+    Pinhole(PinholeId),
+}
+
+/// The open pinhole matching a flow, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinholeMatch {
+    /// An open pinhole matches.
+    Open(PinholeId),
+    /// Only expired pinholes match: the flow is not accepted, and the caller
+    /// sweeps them ([`AclEngine::expire_pinholes`]).
+    Expired,
+    /// No pinhole matches.
+    Absent,
 }
 
 /// The outcome of evaluating an inbound request from a namespace member.
@@ -408,6 +428,11 @@ pub(crate) enum MemberVerdict {
     },
     /// Accepted by the directed grant with this id.
     Grant(Arc<str>),
+    /// Accepted by an inbound pinhole.
+    Pinhole(PinholeId),
+    /// Nothing accepts the request, but an expired inbound pinhole matched:
+    /// denied, and the caller sweeps expired pinholes.
+    PinholeExpired,
     /// Nothing accepts the request.
     Denied,
     /// The destination is another peer sharing no namespace with the source,
@@ -503,6 +528,11 @@ impl Membership {
         self.namespaces.binary_search(id).is_ok()
     }
 
+    /// The source (non-app) namespaces.
+    fn sources(&self) -> impl Iterator<Item = &NamespaceId> {
+        self.namespaces.iter().filter(|id| !id.is_app())
+    }
+
     /// Whether outbound traffic to the principal is restricted.
     pub(crate) const fn outbound_restricted(&self) -> bool {
         self.outbound_restricted
@@ -524,11 +554,15 @@ pub(crate) struct Snapshot {
     namespaces: BTreeMap<NamespaceId, Arc<CompiledNamespace>>,
     /// Principal -> its namespaces (derived from `namespaces`).
     memberships: HashMap<String, Membership>,
-    /// Member addresses with their principal, longest prefix first (derived).
+    /// Member host addresses (`/32`, `/128`) with their principal (derived).
+    hosts: HashMap<IpAddr, String>,
+    /// The other member addresses with their principal, longest prefix first
+    /// (derived).
     addresses: Vec<(IpNet, String)>,
     /// Whether some principal is outbound-restricted (derived).
     outbound_restrictions: bool,
     grants: BTreeMap<String, Arc<CompiledGrant>>,
+    pinholes: BTreeMap<PinholeId, Arc<Pinhole>>,
 }
 
 impl Snapshot {
@@ -557,25 +591,69 @@ impl Snapshot {
         self.memberships.get(principal)
     }
 
-    /// Whether `dependency` still exists in this snapshot.
-    pub(crate) fn is_live(&self, dependency: &ReplyDependency) -> bool {
+    /// Whether any pinhole is stored (open or expired but not yet swept).
+    pub(crate) fn has_pinholes(&self) -> bool {
+        !self.pinholes.is_empty()
+    }
+
+    /// Whether `dependency` still exists in this snapshot; a pinhole must also
+    /// be unexpired at `now()`.
+    pub(crate) fn is_live(
+        &self,
+        dependency: &ReplyDependency,
+        now: impl FnOnce() -> Instant,
+    ) -> bool {
         match dependency {
             ReplyDependency::Grant(id) => self.grants.contains_key(&**id),
+            ReplyDependency::Pinhole(id) => self
+                .pinholes
+                .get(id)
+                .is_some_and(|pinhole| pinhole.is_open_at(now())),
         }
+    }
+
+    /// The pinhole of `principal` opening `direction` flows of `protocol` to
+    /// `port`. The clock is read only when a pinhole matches.
+    pub(crate) fn match_pinhole(
+        &self,
+        principal: &str,
+        direction: Direction,
+        protocol: Protocol,
+        port: u16,
+        now: impl Fn() -> Instant,
+    ) -> PinholeMatch {
+        let mut at = None;
+        let mut found = PinholeMatch::Absent;
+        for pinhole in self.pinholes.values() {
+            if !pinhole.matches(principal, direction, protocol, port) {
+                continue;
+            }
+            if pinhole.is_open_at(*at.get_or_insert_with(&now)) {
+                return PinholeMatch::Open(pinhole.id);
+            }
+            found = PinholeMatch::Expired;
+        }
+        found
     }
 
     /// The member owning `ip` (longest prefix), with its namespaces.
     fn member_at(&self, ip: IpAddr) -> Option<(&str, &Membership)> {
-        let (_, principal) = self.addresses.iter().find(|(net, _)| net.contains(&ip))?;
+        // A host address is always the longest prefix.
+        let principal = match self.hosts.get(&ip) {
+            Some(principal) => principal,
+            None => &self.addresses.iter().find(|(net, _)| net.contains(&ip))?.1,
+        };
         Some((principal, self.memberships.get(principal)?))
     }
 
     /// Evaluate an inbound `request` from `principal`, a namespace member.
+    /// `now` is read only when a pinhole matches.
     pub(crate) fn evaluate_member(
         &self,
         request: &AccessRequest,
         principal: &str,
         membership: &Membership,
+        now: impl Fn() -> Instant,
     ) -> MemberVerdict {
         let dst = self.member_at(request.dst_ip);
         let mut common = false;
@@ -596,7 +674,18 @@ impl Snapshot {
             }
         }
         let Some((dst_principal, dst_membership)) = dst else {
-            return MemberVerdict::Denied;
+            // Pinholes open the local node only.
+            return match self.match_pinhole(
+                principal,
+                Direction::Inbound,
+                request.protocol,
+                request.dst_port,
+                now,
+            ) {
+                PinholeMatch::Open(id) => MemberVerdict::Pinhole(id),
+                PinholeMatch::Expired => MemberVerdict::PinholeExpired,
+                PinholeMatch::Absent => MemberVerdict::Denied,
+            };
         };
         let granted = self.grants.values().find(|grant| {
             grant_end_matches(&grant.grant.from, principal, membership)
@@ -624,30 +713,6 @@ impl Snapshot {
             .filter_map(|id| self.namespaces.get(id)?.outbound.as_deref())
             .flatten()
             .any(|rule| rule.matches(protocol, port))
-    }
-
-    fn evaluate(&self, request: &AccessRequest) -> AclDecision {
-        let principal = request.source.source_anchor();
-        let Some(membership) = self.membership(&principal) else {
-            return self.evaluate_default(request);
-        };
-        let (allowed, matched_rule_index, reason) = match self
-            .evaluate_member(request, &principal, membership)
-        {
-            MemberVerdict::Rule { namespace, index } => (
-                true,
-                Some(index),
-                format!("accepted by namespace {namespace} rule {index}"),
-            ),
-            MemberVerdict::Grant(id) => (true, None, format!("accepted by grant {id}")),
-            MemberVerdict::Denied => (false, None, "denied: no matching accept rule".to_owned()),
-            MemberVerdict::CrossNamespace => (false, None, "denied: cross namespace".to_owned()),
-        };
-        AclDecision {
-            allowed,
-            matched_rule_index,
-            reason,
-        }
     }
 
     fn evaluate_default(&self, request: &AccessRequest) -> AclDecision {
@@ -700,16 +765,97 @@ impl Snapshot {
                 .then_with(|| a_principal.cmp(b_principal))
         });
         addresses.dedup();
+        let mut hosts = HashMap::new();
+        addresses.retain(|(net, principal)| {
+            let host = net.prefix_len() == if net.network().is_ipv4() { 32 } else { 128 };
+            if host {
+                // Sorted by principal: the smallest one owns a shared address.
+                hosts
+                    .entry(net.network())
+                    .or_insert_with(|| principal.clone());
+            }
+            !host
+        });
         self.outbound_restrictions = memberships.values().any(|m| m.outbound_restricted);
         self.memberships = memberships;
+        self.hosts = hosts;
         self.addresses = addresses;
+    }
+
+    /// Whether `peer` may hold a pinhole of `kind` in `app_namespace`
+    /// (`source_gated`: it held a source namespace when the pinhole opened).
+    fn pinhole_permission(
+        &self,
+        app_namespace: &NamespaceId,
+        peer: &str,
+        kind: &str,
+        source_gated: bool,
+    ) -> Result<(), PinholeError> {
+        let membership = self.membership(peer).filter(|m| m.contains(app_namespace));
+        let Some(membership) = membership else {
+            return Err(PinholeError::NotMember);
+        };
+        let mut sources = membership.sources().peekable();
+        if sources.peek().is_none() {
+            // A session-only peer is governed by its own pinholes, unless it
+            // has lost the source namespace that permitted the pinhole.
+            return if source_gated {
+                Err(PinholeError::NotPermitted)
+            } else {
+                Ok(())
+            };
+        }
+        let permitted = sources.any(|id| {
+            self.namespaces
+                .get(id)
+                .is_some_and(|ns| ns.source.allow_app_pinholes.contains(kind))
+        });
+        if permitted {
+            Ok(())
+        } else {
+            Err(PinholeError::NotPermitted)
+        }
+    }
+
+    /// Remove the pinholes expired at `now`; returns how many.
+    fn sweep_pinholes(&mut self, now: Instant) -> u64 {
+        let before = self.pinholes.len();
+        self.pinholes.retain(|_, pinhole| pinhole.is_open_at(now));
+        (before - self.pinholes.len()) as u64
+    }
+
+    /// After a namespace change, remove the pinholes whose app namespace is
+    /// gone or that are no longer permitted; returns how many of each.
+    fn recheck_pinholes(&mut self) -> (u64, u64) {
+        let (mut namespace_removed, mut revoked) = (0, 0);
+        let mut pinholes = std::mem::take(&mut self.pinholes);
+        pinholes.retain(|_, pinhole| {
+            if !self.namespaces.contains_key(&pinhole.app_namespace) {
+                namespace_removed += 1;
+                return false;
+            }
+            let permitted = self
+                .pinhole_permission(
+                    &pinhole.app_namespace,
+                    &pinhole.spec.peer,
+                    &pinhole.spec.kind,
+                    pinhole.source_gated,
+                )
+                .is_ok();
+            if !permitted {
+                revoked += 1;
+            }
+            permitted
+        });
+        self.pinholes = pinholes;
+        (namespace_removed, revoked)
     }
 }
 
 // ── AclEngine ─────────────────────────────────────────────────────────────────
 
-/// Shared ACL engine: the default [`CompiledPolicy`], rule namespaces and
-/// directed grants.
+/// Shared ACL engine: the default [`CompiledPolicy`], rule namespaces,
+/// directed grants and app pinholes.
 ///
 /// Fail-closed: until a policy or namespace is loaded (and after
 /// [`clear`](Self::clear) with no namespace stored) every request is denied.
@@ -722,12 +868,29 @@ impl Snapshot {
 /// [`clear`](Self::clear), [`policy`](Self::policy),
 /// [`is_allowed`](Self::is_allowed)) applies to principals that are members
 /// of no namespace. [`evaluate`](Self::evaluate) evaluates a request with
-/// namespaces and grants, as [`AclFilter`](crate::AclFilter) does for inbound
-/// packets. See the crate docs for the namespace model.
-#[derive(Debug, Default)]
+/// namespaces, grants and pinholes, as [`AclFilter`](crate::AclFilter) does
+/// for inbound packets. See the crate docs for the namespace model and
+/// pinholes.
 pub struct AclEngine {
     snapshot: ArcSwap<Snapshot>,
     writer: Mutex<()>,
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    pinholes: PinholeCounters,
+}
+
+impl Default for AclEngine {
+    fn default() -> Self {
+        Self::with_clock(Instant::now)
+    }
+}
+
+impl fmt::Debug for AclEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AclEngine")
+            .field("snapshot", &self.snapshot)
+            .field("pinhole_stats", &self.pinhole_stats())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AclEngine {
@@ -735,6 +898,18 @@ impl AclEngine {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An engine with no policy loaded whose pinhole expiry follows `clock`
+    /// instead of [`Instant::now`]; e.g. `|| tokio::time::Instant::now().into_std()`
+    /// to follow paused tokio time in tests.
+    pub fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self {
+            snapshot: ArcSwap::default(),
+            writer: Mutex::default(),
+            clock: Box::new(clock),
+            pinholes: PinholeCounters::default(),
+        }
     }
 
     /// Compile `policy` and make it the active default policy.
@@ -796,7 +971,33 @@ impl AclEngine {
     /// decision [`AclFilter`](crate::AclFilter) applies to a new inbound flow;
     /// the filter's reply table is not consulted.
     pub fn evaluate(&self, request: &AccessRequest) -> AclDecision {
-        self.snapshot.load().evaluate(request)
+        let snapshot = self.snapshot.load();
+        let principal = request.source.source_anchor();
+        let Some(membership) = snapshot.membership(&principal) else {
+            return snapshot.evaluate_default(request);
+        };
+        let verdict = snapshot.evaluate_member(request, &principal, membership, || self.now());
+        let (allowed, matched_rule_index, reason) = match verdict {
+            MemberVerdict::Rule { namespace, index } => (
+                true,
+                Some(index),
+                format!("accepted by namespace {namespace} rule {index}"),
+            ),
+            MemberVerdict::Grant(id) => (true, None, format!("accepted by grant {id}")),
+            MemberVerdict::Pinhole(id) => (true, None, format!("accepted by pinhole {id}")),
+            MemberVerdict::PinholeExpired | MemberVerdict::Denied => {
+                if verdict == MemberVerdict::PinholeExpired {
+                    self.expire_pinholes();
+                }
+                (false, None, "denied: no matching accept rule".to_owned())
+            }
+            MemberVerdict::CrossNamespace => (false, None, "denied: cross namespace".to_owned()),
+        };
+        AclDecision {
+            allowed,
+            matched_rule_index,
+            reason,
+        }
     }
 
     /// Compile `policy` and store it as namespace `id`, replacing only that
@@ -822,16 +1023,21 @@ impl AclEngine {
         self.publish(|snapshot| {
             snapshot.namespaces.insert(id, compiled);
             snapshot.reindex();
+            self.recheck_pinholes(snapshot);
         });
         Ok(())
     }
 
     /// Remove namespace `id`. Returns whether it existed.
+    ///
+    /// Removing an app namespace closes its pinholes; removing a source
+    /// namespace revokes the pinholes it permitted.
     pub fn remove_namespace(&self, id: &str) -> bool {
         self.publish(|snapshot| {
             let removed = snapshot.namespaces.remove(id).is_some();
             if removed {
                 snapshot.reindex();
+                self.recheck_pinholes(snapshot);
             }
             removed
         })
@@ -853,11 +1059,21 @@ impl AclEngine {
 
     /// Store a directed grant under `id`, replacing any grant with that id.
     ///
-    /// Returns [`Error::InvalidPolicy`] for an invalid protocol or port syntax;
-    /// the previous state then stays in effect. Reply allowances that depend
-    /// on a grant survive its replacement under the same id.
+    /// Returns [`Error::InvalidPolicy`] for an invalid protocol or port syntax,
+    /// or when an end is an app namespace (app access goes only through
+    /// pinholes); the previous state then stays in effect. Reply allowances
+    /// that depend on a grant survive its replacement under the same id.
     pub fn store_grant(&self, id: impl Into<String>, grant: Grant) -> Result<(), Error> {
         let id = id.into();
+        for end in [&grant.from, &grant.to] {
+            if let GrantEnd::Namespace(ns) = end
+                && ns.is_app()
+            {
+                return Err(Error::InvalidPolicy(format!(
+                    "grant '{id}' cannot name app namespace '{ns}'"
+                )));
+            }
+        }
         let ports = CompiledPorts::compile(
             grant.proto.as_deref(),
             grant.ports.as_deref(),
@@ -891,18 +1107,135 @@ impl AclEngine {
             .collect()
     }
 
+    /// Open a pinhole in app namespace `app_namespace` for `spec`: one peer,
+    /// one direction, one protocol and one destination port, until the
+    /// returned guard is dropped or `spec.expires_at` passes.
+    ///
+    /// The namespace must be a stored app namespace with `spec.peer` as a
+    /// member, and `spec.expires_at` must be in the future per the engine
+    /// clock. When the peer is a member of at least one source (non-app)
+    /// namespace, one of them must list `spec.kind` in
+    /// [`allow_app_pinholes`](NamespacePolicy::allow_app_pinholes); a peer
+    /// only in app namespaces is governed by its own pinholes. On error
+    /// nothing changes.
+    pub fn open_pinhole(
+        self: &Arc<Self>,
+        app_namespace: impl Into<NamespaceId>,
+        spec: PinholeSpec,
+    ) -> Result<PinholeGuard, PinholeError> {
+        let app_namespace = app_namespace.into();
+        let id = self.publish(|snapshot| {
+            if !snapshot.namespaces.contains_key(&app_namespace) {
+                return Err(PinholeError::UnknownNamespace);
+            }
+            if !app_namespace.is_app() {
+                return Err(PinholeError::NotAppNamespace);
+            }
+            if !snapshot
+                .membership(&spec.peer)
+                .is_some_and(|m| m.contains(&app_namespace))
+            {
+                return Err(PinholeError::NotMember);
+            }
+            if spec.expires_at <= self.now() {
+                return Err(PinholeError::Expired);
+            }
+            let source_gated = snapshot
+                .membership(&spec.peer)
+                .is_some_and(|m| m.sources().next().is_some());
+            if let Err(err) =
+                snapshot.pinhole_permission(&app_namespace, &spec.peer, &spec.kind, source_gated)
+            {
+                PinholeCounters::add(&self.pinholes.not_permitted, 1);
+                return Err(err);
+            }
+            let id = PinholeId::new(self.pinholes.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+            snapshot.pinholes.insert(
+                id,
+                Arc::new(Pinhole {
+                    id,
+                    app_namespace,
+                    spec,
+                    source_gated,
+                }),
+            );
+            PinholeCounters::add(&self.pinholes.opened, 1);
+            Ok(id)
+        })?;
+        debug!(pinhole = %id, "ACL pinhole opened");
+        Ok(PinholeGuard::new(self, id))
+    }
+
+    /// Remove the pinholes that have reached their expiry; returns how many.
+    ///
+    /// Evaluation treats an expired pinhole as closed immediately; this sweep
+    /// (or the next update of the engine, or the filter seeing the expired
+    /// pinhole) removes it and counts it in [`PinholeStats::expired`].
+    pub fn expire_pinholes(&self) -> usize {
+        let now = self.now();
+        let snapshot = self.snapshot.load();
+        if snapshot.pinholes.values().all(|p| p.is_open_at(now)) {
+            return 0;
+        }
+        drop(snapshot);
+        let (expired, ()) = self.publish_swept(|_| ());
+        usize::try_from(expired).unwrap_or(usize::MAX)
+    }
+
+    /// The pinhole counters.
+    pub fn pinhole_stats(&self) -> PinholeStats {
+        self.pinholes.stats()
+    }
+
+    /// The engine clock.
+    pub(crate) fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    pub(crate) fn is_pinhole_open(&self, id: PinholeId) -> bool {
+        self.snapshot
+            .load()
+            .is_live(&ReplyDependency::Pinhole(id), || self.now())
+    }
+
+    pub(crate) fn close_pinhole(&self, id: PinholeId) {
+        if !self.snapshot.load().pinholes.contains_key(&id) {
+            return;
+        }
+        let closed = self.publish(|snapshot| snapshot.pinholes.remove(&id).is_some());
+        if closed {
+            PinholeCounters::add(&self.pinholes.closed, 1);
+            debug!(pinhole = %id, "ACL pinhole closed");
+        }
+    }
+
+    fn recheck_pinholes(&self, snapshot: &mut Snapshot) {
+        let (namespace_removed, revoked) = snapshot.recheck_pinholes();
+        PinholeCounters::add(&self.pinholes.namespace_removed, namespace_removed);
+        PinholeCounters::add(&self.pinholes.revoked, revoked);
+    }
+
     /// The current snapshot: one lock-free load.
     pub(crate) fn snapshot(&self) -> Guard<Arc<Snapshot>> {
         self.snapshot.load()
     }
 
     /// Apply `update` to a copy of the current snapshot and publish it.
+    /// Expired pinholes are swept first.
     fn publish<T>(&self, update: impl FnOnce(&mut Snapshot) -> T) -> T {
+        self.publish_swept(update).1
+    }
+
+    /// [`publish`](Self::publish), also returning how many expired pinholes
+    /// were swept.
+    fn publish_swept<T>(&self, update: impl FnOnce(&mut Snapshot) -> T) -> (u64, T) {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut next = Snapshot::clone(&self.snapshot.load());
+        let expired = next.sweep_pinholes(self.now());
+        PinholeCounters::add(&self.pinholes.expired, expired);
         let out = update(&mut next);
         self.snapshot.store(Arc::new(next));
-        out
+        (expired, out)
     }
 }
 
@@ -1932,5 +2265,310 @@ mod tests {
                 assert!(reader.join().unwrap() > 0);
             }
         });
+    }
+
+    #[test]
+    fn grants_cannot_name_app_namespaces() {
+        let engine = AclEngine::new();
+        for (from, to) in [
+            (
+                GrantEnd::Namespace("app:s1".into()),
+                GrantEnd::Peer(anchor(2)),
+            ),
+            (
+                GrantEnd::Peer(anchor(1)),
+                GrantEnd::Namespace("app:s1".into()),
+            ),
+        ] {
+            let grant = Grant {
+                from,
+                to,
+                proto: None,
+                ports: None,
+            };
+            assert!(matches!(
+                engine.store_grant("g", grant),
+                Err(crate::Error::InvalidPolicy(_))
+            ));
+        }
+        assert_eq!(engine.grants(), Vec::new());
+    }
+
+    // ── pinholes ──────────────────────────────────────────────────────────
+
+    /// An engine whose clock is moved by hand, with the clock handle.
+    fn manual_engine() -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let handle = Arc::clone(&clock);
+        let engine = AclEngine::with_clock(move || *handle.lock().unwrap());
+        (Arc::new(engine), clock)
+    }
+
+    fn advance(clock: &Mutex<Instant>, secs: u64) {
+        *clock.lock().unwrap() += Duration::from_secs(secs);
+    }
+
+    fn now(clock: &Mutex<Instant>) -> Instant {
+        *clock.lock().unwrap()
+    }
+
+    /// A namespace of `members` without rules, allowing pinholes of `kinds`.
+    fn source(members: &[(u8, &str)], kinds: &[&str]) -> NamespacePolicy {
+        NamespacePolicy {
+            policy: AclPolicy::default(),
+            allow_app_pinholes: kinds.iter().map(ToString::to_string).collect(),
+            ..ns(members, 0)
+        }
+    }
+
+    /// An app namespace of `members`.
+    fn app(members: &[(u8, &str)]) -> NamespacePolicy {
+        source(members, &[])
+    }
+
+    fn spec(peer: u8, port: u16, expires_at: Instant) -> PinholeSpec {
+        PinholeSpec {
+            peer: anchor(peer),
+            kind: "transfer".to_owned(),
+            protocol: Protocol::Tcp,
+            direction: Direction::Inbound,
+            dst_port: port,
+            expires_at,
+        }
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn open_pinhole_errors() {
+        let (engine, clock) = manual_engine();
+        engine
+            .store_namespace(
+                "nsd:a",
+                source(&[(1, "fd00::1"), (3, "fd00::3")], &["chat"]),
+            )
+            .unwrap();
+        engine
+            .store_namespace("nsd:b", source(&[(3, "fd00::3")], &["transfer"]))
+            .unwrap();
+        engine
+            .store_namespace(
+                "app:s1",
+                app(&[(1, "fd00::1"), (2, "fd00::2"), (3, "fd00::3")]),
+            )
+            .unwrap();
+        let later = now(&clock) + Duration::from_secs(60);
+        let open = |ns: &str, spec| engine.open_pinhole(ns, spec).map(|guard| guard.id());
+
+        assert_eq!(
+            open("app:none", spec(2, 80, later)),
+            Err(PinholeError::UnknownNamespace)
+        );
+        assert_eq!(
+            open("nsd:a", spec(1, 80, later)),
+            Err(PinholeError::NotAppNamespace)
+        );
+        assert_eq!(
+            open("app:s1", spec(4, 80, later)),
+            Err(PinholeError::NotMember)
+        );
+        assert_eq!(
+            open("app:s1", spec(2, 80, now(&clock))),
+            Err(PinholeError::Expired)
+        );
+        // Peer 1's only source namespace does not allow "transfer".
+        assert_eq!(
+            open("app:s1", spec(1, 80, later)),
+            Err(PinholeError::NotPermitted)
+        );
+        assert_eq!(engine.pinhole_stats().not_permitted, 1);
+        assert!(engine.snapshot().pinholes.is_empty());
+        // Peer 3 is permitted by one of its source namespaces; peer 2 is a
+        // session-only peer.
+        let guard = engine.open_pinhole("app:s1", spec(3, 80, later)).unwrap();
+        let session = engine.open_pinhole("app:s1", spec(2, 80, later)).unwrap();
+        assert_ne!(guard.id(), session.id());
+        assert!(guard.is_open() && session.is_open());
+        assert_eq!(
+            engine.pinhole_stats(),
+            PinholeStats {
+                opened: 2,
+                not_permitted: 1,
+                ..PinholeStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn guard_closes_and_evaluation_follows() {
+        let (engine, clock) = manual_engine();
+        engine
+            .store_namespace("app:s1", app(&[(2, "fd00::2")]))
+            .unwrap();
+        let later = now(&clock) + Duration::from_secs(60);
+        let request = key_req(2, "fd00::99", 80, Protocol::Tcp);
+        assert!(!engine.evaluate(&request).allowed);
+
+        let guard = engine.open_pinhole("app:s1", spec(2, 80, later)).unwrap();
+        let d = engine.evaluate(&request);
+        assert!(d.allowed);
+        assert_eq!(d.reason, format!("accepted by pinhole {}", guard.id()));
+        // Only that port, protocol and direction, and only to the local node.
+        assert!(
+            !engine
+                .evaluate(&key_req(2, "fd00::99", 81, Protocol::Tcp))
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(&key_req(2, "fd00::99", 80, Protocol::Udp))
+                .allowed
+        );
+        engine
+            .store_namespace("nsd:x", ns(&[(5, "fd00::5")], 22))
+            .unwrap();
+        assert!(
+            !engine
+                .evaluate(&key_req(2, "fd00::5", 80, Protocol::Tcp))
+                .allowed
+        );
+
+        guard.close();
+        assert!(!engine.evaluate(&request).allowed);
+        assert_eq!(engine.pinhole_stats().closed, 1);
+    }
+
+    #[test]
+    fn pinholes_expire_with_the_engine_clock() {
+        let (engine, clock) = manual_engine();
+        engine
+            .store_namespace("app:s1", app(&[(2, "fd00::2")]))
+            .unwrap();
+        let request = key_req(2, "fd00::99", 80, Protocol::Tcp);
+        let short = engine
+            .open_pinhole("app:s1", spec(2, 80, now(&clock) + Duration::from_secs(10)))
+            .unwrap();
+        let long = engine
+            .open_pinhole("app:s1", spec(2, 81, now(&clock) + Duration::from_secs(30)))
+            .unwrap();
+        assert_eq!(engine.expire_pinholes(), 0);
+
+        advance(&clock, 10);
+        // Absent immediately, swept by the evaluation that sees it.
+        assert!(!short.is_open());
+        assert!(!engine.evaluate(&request).allowed);
+        assert_eq!(engine.pinhole_stats().expired, 1);
+        assert_eq!(engine.expire_pinholes(), 0);
+        assert!(long.is_open());
+
+        // Swept by the next mutation.
+        advance(&clock, 20);
+        engine.clear();
+        assert_eq!(engine.pinhole_stats().expired, 2);
+        assert_eq!(engine.expire_pinholes(), 0);
+
+        // Dropping guards of expired pinholes counts nothing more.
+        drop((short, long));
+        assert_eq!(
+            engine.pinhole_stats(),
+            PinholeStats {
+                opened: 2,
+                expired: 2,
+                ..PinholeStats::default()
+            }
+        );
+
+        let third = engine
+            .open_pinhole("app:s1", spec(2, 80, now(&clock) + Duration::from_secs(5)))
+            .unwrap();
+        advance(&clock, 5);
+        assert_eq!(engine.expire_pinholes(), 1);
+        assert!(!third.is_open());
+        assert_eq!(engine.pinhole_stats().expired, 3);
+    }
+
+    #[test]
+    fn namespace_changes_close_pinholes() {
+        let (engine, clock) = manual_engine();
+        let later = now(&clock) + Duration::from_secs(60);
+        engine
+            .store_namespace("nsd:a", source(&[(1, "fd00::1")], &["transfer"]))
+            .unwrap();
+        engine
+            .store_namespace("nsd:b", source(&[(3, "fd00::3")], &["transfer"]))
+            .unwrap();
+        engine
+            .store_namespace("app:s1", app(&[(1, "fd00::1"), (2, "fd00::2")]))
+            .unwrap();
+        engine
+            .store_namespace("app:s2", app(&[(2, "fd00::2"), (3, "fd00::3")]))
+            .unwrap();
+
+        // Removing the app namespace closes its pinholes only.
+        let s1 = engine.open_pinhole("app:s1", spec(2, 80, later)).unwrap();
+        let s2 = engine.open_pinhole("app:s2", spec(2, 80, later)).unwrap();
+        assert!(engine.remove_namespace("app:s1"));
+        assert!(!s1.is_open());
+        assert!(s2.is_open());
+        assert_eq!(engine.pinhole_stats().namespace_removed, 1);
+
+        // The app namespace dropping the peer revokes its pinhole.
+        engine
+            .store_namespace("app:s1", app(&[(1, "fd00::1"), (2, "fd00::2")]))
+            .unwrap();
+        let peer1 = engine.open_pinhole("app:s1", spec(1, 80, later)).unwrap();
+        engine
+            .store_namespace("app:s1", app(&[(2, "fd00::2")]))
+            .unwrap();
+        assert!(!peer1.is_open());
+        assert_eq!(engine.pinhole_stats().revoked, 1);
+
+        // The source namespace no longer allowing the kind revokes it.
+        let peer3 = engine.open_pinhole("app:s2", spec(3, 80, later)).unwrap();
+        engine
+            .store_namespace("nsd:b", source(&[(3, "fd00::3")], &["transfer", "chat"]))
+            .unwrap();
+        assert!(peer3.is_open());
+        engine
+            .store_namespace("nsd:b", source(&[(3, "fd00::3")], &["chat"]))
+            .unwrap();
+        assert!(!peer3.is_open());
+
+        // Dropped from its only source namespace: revoked, although a
+        // session-only peer could open a new one.
+        engine
+            .store_namespace("nsd:b", source(&[(3, "fd00::3")], &["transfer"]))
+            .unwrap();
+        let peer3 = engine.open_pinhole("app:s2", spec(3, 80, later)).unwrap();
+        engine
+            .store_namespace("nsd:b", source(&[(4, "fd00::4")], &["transfer"]))
+            .unwrap();
+        assert!(!peer3.is_open());
+        assert!(s2.is_open());
+        assert_eq!(
+            engine.pinhole_stats(),
+            PinholeStats {
+                opened: 5,
+                namespace_removed: 1,
+                revoked: 3,
+                ..PinholeStats::default()
+            }
+        );
+        drop((s1, s2, peer1, peer3));
+        assert_eq!(engine.pinhole_stats().closed, 1);
+    }
+
+    #[test]
+    fn guard_outliving_its_engine_is_harmless() {
+        let (engine, clock) = manual_engine();
+        engine
+            .store_namespace("app:s1", app(&[(2, "fd00::2")]))
+            .unwrap();
+        let guard = engine
+            .open_pinhole("app:s1", spec(2, 80, now(&clock) + Duration::from_secs(5)))
+            .unwrap();
+        drop(engine);
+        assert!(!guard.is_open());
+        guard.close();
     }
 }
