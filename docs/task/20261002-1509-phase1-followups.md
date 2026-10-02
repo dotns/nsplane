@@ -76,6 +76,9 @@ added); item 1 is open. Still open:
 11. **Silent drop on transport removal** (found in Phase 2): datagrams already in a
     removed transport's transmit queue are dropped without a counted reason; count them.
 
+Status after Phase 3 (plan `20261002-1725-phase3-4-netstack-acl`): items 10 and 11 are
+fixed by workstream 3C (per-transport backpressure, `DROP_TRANSPORT_REMOVED`).
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 
