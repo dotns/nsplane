@@ -48,15 +48,35 @@ fn help_lists_the_supported_flags() {
         "WG_LOG_LEVEL",
         "--disable-drop-privileges",
         "WG_SUDO",
+        "--tun-fd",
+        "WG_TUN_FD",
+        "--uapi-fd",
+        "WG_UAPI_FD",
     ] {
         assert!(help.contains(flag), "--help does not list {flag}: {help}");
     }
-    for removed in [
-        "--tun-fd",
-        "--uapi-fd",
-        "--disable-connected-udp",
-        "--disable-multi-queue",
-    ] {
+    for removed in ["--disable-connected-udp", "--disable-multi-queue"] {
         assert!(!help.contains(removed), "--help still lists {removed}");
+    }
+}
+
+#[test]
+fn a_closed_fd_fails_startup() {
+    // Never an open fd: far above any descriptor limit.
+    let closed = i32::MAX.to_string();
+    for (flag, env) in [("--tun-fd", "WG_TUN_FD"), ("--uapi-fd", "WG_UAPI_FD")] {
+        let by_flag = Command::new(env!("CARGO_BIN_EXE_nsplane-cli"))
+            .args([flag, &closed, "nsplane-clitest"])
+            .output()
+            .expect("run nsplane-cli");
+        let by_env = run_with_env(&[(env, &closed)]);
+        for output in [by_flag, by_env] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{flag}: {stderr}");
+            assert!(
+                stderr.contains(&format!("Invalid {flag} {closed}")),
+                "{flag}: {stderr}"
+            );
+        }
     }
 }

@@ -1,30 +1,54 @@
 //! Configuration of an engine before it starts.
 
+use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{CoreConfig, PacketFilter, PathPolicy, StandardRoaming};
+use nsplane_packet::TransportId;
 
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, NewTransport};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
-use crate::udp::UdpTransport;
 
 /// Default capacity of the internal packet queues, in packets.
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// Default capacity of the event channel, in events.
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
-/// Builds an [`Engine`] on a packet source, a packet sink and an optional transport.
+/// Why [`EngineBuilder::build`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildError {
+    /// No transport was added with [`EngineBuilder::transport`].
+    NoTransport,
+    /// Two transports share this id.
+    DuplicateTransport(TransportId),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoTransport => f.write_str("the engine has no transport"),
+            Self::DuplicateTransport(id) => {
+                write!(f, "transport {} was added more than once", id.get())
+            }
+        }
+    }
+}
+
+impl Error for BuildError {}
+
+/// Builds an [`Engine`] on a packet source, a packet sink and one or more transports.
 ///
-/// Defaults: no transport (call [`EngineBuilder::transport`]; the type parameter defaults
-/// to [`UdpTransport`]), no private key, [`StandardRoaming`], no filters, no periodic stats,
-/// queues of 1024 packets and an event channel of 1024 events.
-pub struct EngineBuilder<Src, Snk, T = UdpTransport> {
+/// Defaults: no private key, [`StandardRoaming`], no filters, no periodic stats, queues of
+/// 1024 packets and an event channel of 1024 events. At least one transport must be added
+/// with [`EngineBuilder::transport`].
+pub struct EngineBuilder<Src, Snk> {
     source: Src,
     sink: Snk,
-    transport: Option<T>,
+    transports: Vec<NewTransport>,
     private_key: Option<StaticSecret>,
     policy: Box<dyn PathPolicy>,
     filters: Vec<Box<dyn PacketFilter>>,
@@ -33,10 +57,11 @@ pub struct EngineBuilder<Src, Snk, T = UdpTransport> {
     event_capacity: usize,
 }
 
-impl<Src, Snk, T> fmt::Debug for EngineBuilder<Src, Snk, T> {
+impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let transports: Vec<_> = self.transports.iter().map(|t| t.id).collect();
         f.debug_struct("EngineBuilder")
-            .field("transport", &self.transport.is_some())
+            .field("transports", &transports)
             .field("private_key", &self.private_key.is_some())
             .field("filters", &self.filters.len())
             .field("stats_interval", &self.stats_interval)
@@ -53,7 +78,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         Self {
             source,
             sink,
-            transport: None,
+            transports: Vec::new(),
             private_key: None,
             policy: Box::new(StandardRoaming),
             filters: Vec::new(),
@@ -62,25 +87,16 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             event_capacity: DEFAULT_EVENT_CAPACITY,
         }
     }
-}
 
-impl<Src: PacketSource, Snk: PacketSink, T: Transport> EngineBuilder<Src, Snk, T> {
-    /// Sets the transport, which fixes the engine's transport type.
+    /// Adds a transport; call it once per transport. Every transport needs its own
+    /// [`Transport::id`].
     ///
-    /// Without one, the engine drops every datagram it would transmit and counts it under
-    /// [`crate::DROP_NO_TRANSPORT`] until [`crate::EngineHandle::set_transport`] installs one.
-    pub fn transport<U: Transport>(self, transport: U) -> EngineBuilder<Src, Snk, U> {
-        EngineBuilder {
-            source: self.source,
-            sink: self.sink,
-            transport: Some(transport),
-            private_key: self.private_key,
-            policy: self.policy,
-            filters: self.filters,
-            stats_interval: self.stats_interval,
-            queue_capacity: self.queue_capacity,
-            event_capacity: self.event_capacity,
-        }
+    /// Transports of different types can be mixed, and more can be added, removed or
+    /// replaced at runtime with [`crate::EngineHandle::add_transport`] and its siblings.
+    #[must_use]
+    pub fn transport<T: Transport>(mut self, transport: T) -> Self {
+        self.transports.push(NewTransport::new(transport));
+        self
     }
 
     /// Sets the own private key.
@@ -129,10 +145,25 @@ impl<Src: PacketSource, Snk: PacketSink, T: Transport> EngineBuilder<Src, Snk, T
 
     /// Spawns the engine's tasks and returns the running engine.
     ///
+    /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
+    /// was added and with [`BuildError::DuplicateTransport`] when two share an id.
+    ///
     /// # Panics
     ///
     /// Panics when called outside a tokio runtime.
-    pub fn build(self) -> Engine<T> {
+    pub fn build(self) -> Result<Engine, BuildError> {
+        if self.transports.is_empty() {
+            return Err(BuildError::NoTransport);
+        }
+        let mut ids = BTreeSet::new();
+        if let Some(id) = self
+            .transports
+            .iter()
+            .map(|t| t.id)
+            .find(|id| !ids.insert(*id))
+        {
+            return Err(BuildError::DuplicateTransport(id));
+        }
         let core = CoreConfig {
             private_key: self.private_key.clone(),
             policy: self.policy,
@@ -140,14 +171,14 @@ impl<Src: PacketSource, Snk: PacketSink, T: Transport> EngineBuilder<Src, Snk, T
             stats_interval: self.stats_interval,
             ..CoreConfig::default()
         };
-        engine::spawn(engine::Parts {
+        Ok(engine::spawn(engine::Parts {
             core,
             private_key: self.private_key,
             source: self.source,
             sink: self.sink,
-            transport: self.transport,
+            transports: self.transports,
             queue_capacity: self.queue_capacity,
             event_capacity: self.event_capacity,
-        })
+        }))
     }
 }

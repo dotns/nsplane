@@ -10,16 +10,16 @@
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, Engine, EngineBuilder, EngineHandle, PacketBuf, PeerId,
-    PeerStats, UdpTransport,
+    PeerStats,
 };
-use nsplane_uapi::Uapi;
+use nsplane_uapi::{Uapi, udp_transport};
 use tokio::io::BufReader;
 use tokio::sync::{mpsc, watch};
 
 /// One engine with its UAPI and the test ends of its source and sink.
 struct Node {
     _engine: Engine,
-    handle: EngineHandle<UdpTransport>,
+    handle: EngineHandle,
     uapi: Uapi,
     _local: mpsc::Sender<PacketBuf>,
     _mtu: watch::Sender<u16>,
@@ -27,13 +27,17 @@ struct Node {
 }
 
 impl Node {
-    async fn new() -> Self {
+    fn new() -> Self {
         let (source, local, mtu) = ChannelSource::new(16, 1420);
         let (sink, delivered) = ChannelSink::new(16);
-        let engine = EngineBuilder::new(source, sink).build();
+        let transport = udp_transport(0).unwrap();
+        let port = transport.local_addr().port();
+        let engine = EngineBuilder::new(source, sink)
+            .transport(transport)
+            .build()
+            .unwrap();
         let handle = engine.handle();
-        let uapi = Uapi::new(handle.clone());
-        uapi.bind_transport(0).await.unwrap();
+        let uapi = Uapi::with_listen_port(handle.clone(), port);
         Self {
             _engine: engine,
             handle,
@@ -87,7 +91,7 @@ fn udp_socket() -> std::net::UdpSocket {
 
 #[tokio::test]
 async fn set_then_get_round_trips() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (private, _) = key(1);
     let (_, peer) = key(2);
     let peer_hex = hex_pub(&peer);
@@ -123,7 +127,7 @@ async fn set_then_get_round_trips() {
 
 #[tokio::test]
 async fn listen_port_rebinds_the_transport() {
-    let node = Node::new().await;
+    let node = Node::new();
     let initial = node.request("get=1\n\n").await;
     // The initial transport has an ephemeral port.
     assert!(!initial.contains("listen_port=0\n"));
@@ -156,7 +160,7 @@ async fn listen_port_rebinds_the_transport() {
 
 #[tokio::test]
 async fn settings_do_not_leak_into_the_next_peer_section() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (private, _) = key(1);
     let (_, a) = key(2);
     let (_, b) = key(3);
@@ -181,7 +185,7 @@ async fn settings_do_not_leak_into_the_next_peer_section() {
 
 #[tokio::test]
 async fn malformed_requests_are_rejected() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (_, peer) = key(2);
     let peer_hex = hex_pub(&peer);
     assert_eq!(node.request("set=1\nbogus\n\n").await, "errno=71\n\n");
@@ -225,7 +229,7 @@ async fn malformed_requests_are_rejected() {
 
 #[tokio::test]
 async fn remove_peer_and_update_only() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (private, _) = key(1);
     let (_, a) = key(2);
     let (_, b) = key(3);
@@ -254,7 +258,7 @@ async fn remove_peer_and_update_only() {
 
 #[tokio::test]
 async fn replace_peers() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (private, _) = key(1);
     let (_, a) = key(2);
     let (_, b) = key(3);
@@ -276,7 +280,7 @@ async fn replace_peers() {
 
 #[tokio::test]
 async fn replace_allowed_ips() {
-    let node = Node::new().await;
+    let node = Node::new();
     let (private, _) = key(1);
     let (_, a) = key(2);
     let a_hex = hex_pub(&a);
@@ -320,7 +324,7 @@ async fn replace_allowed_ips() {
 
 #[tokio::test]
 async fn a_stopped_engine_reports_eio() {
-    let node = Node::new().await;
+    let node = Node::new();
     node.handle.shutdown().await.unwrap();
     assert_eq!(node.request("get=1\n\n").await, "errno=5\n\n");
     let (private, _) = key(1);
@@ -331,6 +335,23 @@ async fn a_stopped_engine_reports_eio() {
     );
 }
 
+/// Reads one response, up to and including the empty line after `errno`.
+#[cfg(unix)]
+async fn response(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> String {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        let done = line == "\n" && out.contains("errno=");
+        out.push_str(&line);
+        if done {
+            return out;
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn serves_requests_over_a_unix_socket() {
@@ -338,22 +359,8 @@ async fn serves_requests_over_a_unix_socket() {
     use std::time::Duration;
 
     use nsplane_uapi::UapiListener;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
-
-    /// Reads one response, up to and including the empty line after `errno`.
-    async fn response(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> String {
-        let mut out = String::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
-            let done = line == "\n" && out.contains("errno=");
-            out.push_str(&line);
-            if done {
-                return out;
-            }
-        }
-    }
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -366,7 +373,7 @@ async fn serves_requests_over_a_unix_socket() {
     // A stale socket file is replaced.
     std::fs::write(&path, b"").unwrap();
 
-    let node = Node::new().await;
+    let node = Node::new();
     let listener = UapiListener::bind_path(&path).unwrap();
     assert_eq!(listener.path(), path);
     let uapi = node.uapi.clone();
@@ -405,6 +412,57 @@ async fn serves_requests_over_a_unix_socket() {
         .unwrap();
     assert!(!path.exists());
     std::fs::remove_dir(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serves_a_connected_stream() {
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let node = Node::new();
+    let (client, server) = UnixStream::pair().unwrap();
+    let uapi = node.uapi.clone();
+    let served = tokio::spawn(async move { uapi.serve_stream(server).await });
+
+    let (private, _) = key(1);
+    let (_, peer) = key(2);
+    let peer_hex = hex_pub(&peer);
+    let (reader, mut writer) = client.into_split();
+    let mut reader = BufReader::new(reader);
+    writer
+        .write_all(
+            format!(
+                "set=1\nprivate_key={private}\npublic_key={peer_hex}\n\
+                 endpoint=192.0.2.1:51820\nallowed_ip=10.0.0.0/24\n\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response(&mut reader).await, "errno=0\n\n");
+    writer.write_all(b"get=1\n\n").await.unwrap();
+    let reply = response(&mut reader).await;
+    assert!(
+        reply.starts_with(&format!("private_key={private}\n")),
+        "{reply}"
+    );
+    assert!(
+        reply.contains(&format!("public_key={peer_hex}\n")),
+        "{reply}"
+    );
+    assert!(reply.contains("endpoint=192.0.2.1:51820\n"), "{reply}");
+    assert!(reply.contains("allowed_ip=10.0.0.0/24\n"), "{reply}");
+    assert!(reply.ends_with("errno=0\n\n"), "{reply}");
+
+    // Closing the client ends the server side.
+    drop((reader, writer));
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[cfg(unix)]

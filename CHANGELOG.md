@@ -38,8 +38,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nstun-uapi`: the `wg` UAPI (`get=1`/`set=1`) over an `EngineHandle`, including
   `listen_port` and `fwmark` rebinding the UDP transport; `UapiListener` binds
   `/var/run/wireguard/<iface>.sock` on Unix.
+- `nsplane`: one engine runs several transports of different types at once (e.g. direct UDP
+  next to a relay), keyed by the new `Transport::id`. `EngineHandle::add_transport`,
+  `remove_transport` and `replace_transport` change them at runtime and fail with the typed
+  `TransportError` (`Stopped`, `Duplicate`, `Unknown`). `DynTransport` (with `BoxFuture`) is
+  the object-safe form of `Transport`; `Box<dyn DynTransport>` is a `Transport`. Each
+  transport has its own transmit queue and waiting datagrams, so a slow transport does not
+  delay another's datagrams; a datagram whose path names no installed transport is dropped
+  under `DROP_NO_TRANSPORT`.
+- `nsplane-uapi`: `udp_transport(port)` binds the UAPI's transport for the engine builder,
+  and `Uapi::with_listen_port` serves an engine built with it.
+- `nsplane-tun` (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
+  without `unsafe` at the call site (ownership moves to the returned value; a negative or
+  closed fd is rejected), and `Tun` implements `AsFd`. The `TunSource` MTU follows the
+  interface MTU: on Linux/Android and macOS/iOS `Tun::split` starts a task that polls
+  `SIOCGIFMTU` every `MTU_POLL_INTERVAL` (1 s); on Windows the MTU is read once and not
+  watched.
+- `nsplane-uapi` (Unix): `Uapi::serve_stream` serves the UAPI on one already-connected
+  `UnixStream`.
+- `nsplane-uapi` (Windows): `UapiListener` listens on a named pipe,
+  `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` (`pipe_path`, as
+  wireguard-windows uses) or any pipe name (`bind_path`), so `Uapi::serve` works on Windows
+  too. The pipe keeps the default security descriptor (see `UapiListener::bind`).
+- CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
+  serves the UAPI on an already-connected Unix stream socket next to the standard socket;
+  the daemon takes ownership of both fds.
 
 ### Changed
+- Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
+  transport type parameter. `EngineBuilder::transport` adds a transport and may be called
+  several times; `EngineBuilder::build` returns `Result<Engine, BuildError>` and fails with
+  `BuildError::NoTransport` without a transport and `BuildError::DuplicateTransport` when
+  two share an id. `EngineHandle::set_transport` is replaced by
+  `EngineHandle::replace_transport`, which needs a transport with the same id installed.
+  `UdpTransport::id` and `ChannelTransport::id` are now `Transport::id`.
+- Breaking: `nsplane-uapi` installs its transport with `add_transport` the first time and
+  `replace_transport` afterwards; `Uapi::handle` returns a non-generic `EngineHandle`.
 - Breaking: the project is renamed **nsplane** (`github.com/dotns/nsplane`) and every crate
   lives under `crates/`: `boringtun` → `nsplane-noise`, `boringtun-cli` → `nsplane-cli`
   (binary `nsplane-cli`), `nstun` → `nsplane`, `nstun-core` → `nsplane-core`,
@@ -52,10 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking (CLI): `boringtun-cli` runs on the async engine (`nstun`, `nstun-tun`,
   `nstun-uapi`) on a tokio multi-thread runtime with `--threads` workers; SIGTERM stops it
   as well as SIGINT. The UDP socket is bound to an ephemeral port at startup until
-  `wg set ... listen-port` rebinds it. Removed flags: `--tun-fd`/`WG_TUN_FD` and
-  `--uapi-fd`/`WG_UAPI_FD` (adopting a raw fd needs `unsafe`, which the CLI forbids; the
-  library keeps `nstun_tun::Tun::from_fd`), `--disable-connected-udp` and
-  `--disable-multi-queue` (they configured the synchronous device only). The privilege drop
+  `wg set ... listen-port` rebinds it. Removed flags: `--disable-connected-udp` and
+  `--disable-multi-queue` (they configured the synchronous device only); `--tun-fd` and
+  `--uapi-fd` are kept on top of `nsplane-tun`'s safe fd adoption. The privilege drop
   reads `SUDO_UID`/`SUDO_GID` instead of `getlogin`.
 - Breaking: replace `ring` with `aws-lc-rs` for ChaCha20-Poly1305, and with `subtle` for
   constant-time comparisons. `ring` is no longer a dependency.
