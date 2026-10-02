@@ -118,6 +118,15 @@ the roaming check in steady state and the duplicate peer lookup on send made no
 measurable difference. Further gains need a leaner dispatch (e.g. a batched data-path
 entry point), which belongs with the Phase 5 batching work.
 
+Dispatch trim (same follow-up, second pass): the roaming check is skipped for a data
+message that completes no handshake and comes from the current path, `send` reuses its peer
+borrow for `transmit`, and handshake and configuration handling stay out of line so
+`handle_input` keeps a small frame. Instructions per round trip: 64 B core 5208 -> 5126
+(device-equivalent 4431: +17.5 % -> +15.7 %); 1420 B 20222 -> 20146 (+3.8 % -> +3.4 %).
+Wall clock on a host at load ~85 (absolute numbers about twice the quiet ones): 64 B core
+1219 / 1113 ns vs device-equivalent 1083 / 1010 ns (+12.6 % / +10.2 %); 1420 B 3.15 / 3.02 us
+vs 3.15 / 2.90 us (+0.0 % / +4.3 %). The 64 B target is still not met.
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 
