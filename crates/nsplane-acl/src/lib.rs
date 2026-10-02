@@ -220,19 +220,25 @@
 //! # Performance
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
-//! packet (IPv6 TCP, new inbound flows; one run in the dev image, x86-64):
+//! packet (IPv6 TCP; "new flow": the source port changes with every packet,
+//! "established": one five-tuple repeated; one run in the dev image, x86-64):
 //!
-//! | Scenario | Inbound | Outbound |
-//! | --- | --- | --- |
-//! | No namespaces (default policy, 3 rules) | 71 ns | 116 ns |
-//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 468 ns | 543 ns |
-//! | same, through a grant (peer to peer) | 675 ns | |
-//! | same, through an inbound pinhole | 557 ns | |
-//! | same, outbound-restricted peer (outbound rule) | | 579 ns |
+//! | Scenario | New flow | Established | Outbound |
+//! | --- | --- | --- | --- |
+//! | No namespaces (default policy, 3 rules) | 155 ns | 63 ns | 86 ns |
+//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 186 ns | 50 ns | 90 ns |
+//! | same, through a grant (peer to peer) | 37 us | 257 ns | |
+//! | same, outbound-restricted peer (outbound rule) | | | 152 ns |
+//! | Bypass (a namespace accepting everything) | 46 ns | 45 ns | 72 ns |
 //!
-//! Once any namespace is stored, the remaining overhead is mostly resolving
-//! the peer's principal (its identity and source anchor) per packet; member
-//! destination addresses resolve through a hash map for host addresses.
+//! Before the hook every packet was a new flow: 71 ns (default policy),
+//! 669 ns (namespaces), 1.75 us (grant, established), 937 ns (bypass peer),
+//! 580/623 ns outbound. An established flow costs the snapshot load, the
+//! packet parse and one flow-table lookup under its lock; a bypass peer
+//! still goes through the reply check and its cached principal. A new flow
+//! accepted through a grant or a pinhole records a pending dependency, and
+//! once that table is full (`reply_capacity`) each one scans it for the
+//! oldest entry (tens of microseconds; as before the hook).
 //!
 //! [`Instant::now`]: std::time::Instant::now
 
