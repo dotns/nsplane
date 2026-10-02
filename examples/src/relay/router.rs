@@ -23,6 +23,10 @@
 //! Routes expire after [`SESSION_TTL`] without traffic and learned sources after
 //! [`LEARNED_SOURCE_TTL`] without a registration or traffic from them; both tables are
 //! bounded and evictions are counted.
+//!
+//! WebSocket connections are sources like UDP addresses: [`Router::connect_ws`] notes a
+//! connection's peer address (the observed address of its reflexive requests) and
+//! [`Router::disconnect_ws`] forgets its learned sources and routes when it closes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -322,6 +326,7 @@ pub struct Router {
     replay: ReplayGuard,
     counters: Counters,
     last_prune: Option<Instant>,
+    ws_peers: HashMap<u64, SocketAddr>,
 }
 
 impl Router {
@@ -352,6 +357,26 @@ impl Router {
             replay: ReplayGuard::new(),
             counters: Counters::default(),
             last_prune: None,
+            ws_peers: HashMap::new(),
+        }
+    }
+
+    /// Notes the WebSocket connection `id` from `peer`.
+    pub fn connect_ws(&mut self, id: u64, peer: SocketAddr) {
+        self.ws_peers.insert(id, peer);
+    }
+
+    /// Forgets the closed WebSocket connection `id`: targets learned on it and routes from
+    /// or to it.
+    pub fn disconnect_ws(&mut self, id: u64) {
+        let source = Source::Ws(id);
+        self.ws_peers.remove(&id);
+        self.routes
+            .retain(|&(_, from), route| from != source && route.to != source);
+        for target in &mut self.targets {
+            if target.learned.is_some_and(|(learned, _)| learned == source) {
+                target.learned = None;
+            }
         }
     }
 
@@ -667,8 +692,9 @@ impl Router {
     }
 
     fn reflexive(&self, payload: &[u8], from: Source, unix_now: u64) -> Result<Action, DropReason> {
-        let Source::Udp(observed) = from else {
-            return Err(DropReason::Invalid);
+        let observed = match from {
+            Source::Udp(addr) => addr,
+            Source::Ws(id) => *self.ws_peers.get(&id).ok_or(DropReason::Invalid)?,
         };
         let request = open_reflexive_request(payload, unix_now).map_err(|e| reason(&e))?;
         let (_, pin) = self.pinned(&request.payload.peer_key_pub)?;
@@ -1016,6 +1042,51 @@ mod tests {
         assert_eq!(
             route(&mut router, &request, udp(10)),
             Action::Drop(DropReason::UnknownTarget)
+        );
+    }
+
+    #[test]
+    fn websocket_sources_relay_and_are_forgotten_on_close() {
+        let mut router = router();
+        let machine = MachineKey::generate();
+        router.set_targets(vec![pinned(B, &machine)]);
+        let ws = Source::Ws(7);
+        router.connect_ws(7, "127.0.0.1:4000".parse().unwrap());
+
+        // A reflexive request on the connection observes its peer address.
+        let mut pending = PendingNonces::new();
+        let nonce = pending.issue(Instant::now());
+        let request =
+            build_reflexive_request(&machine_id(&machine.public()), &machine, public(B), nonce)
+                .unwrap();
+        let Action::Reply(frame) = route(&mut router, &request, ws) else {
+            panic!("no reply");
+        };
+        let (_, payload) = wire::decode_control(&frame).unwrap();
+        let response = pending.accept(payload, Instant::now()).unwrap();
+        assert_eq!(response.observed_addr, "127.0.0.1:4000".parse().unwrap());
+
+        // Registered on the connection: UDP initiations to B are forwarded to it.
+        assert_eq!(register(&mut router, B, &machine, ws), Action::Handled);
+        let (init, response) = handshake(A, B, 1 << 8);
+        assert_eq!(route(&mut router, &init, udp(20)), Action::Forward(ws));
+        assert_eq!(route(&mut router, &response, ws), Action::Forward(udp(20)));
+        assert_eq!(router.routes(Instant::now()).len(), 2);
+
+        // Closing the connection forgets the learned source and its routes.
+        router.disconnect_ws(7);
+        assert_eq!(router.targets(Instant::now())[0].source, None);
+        assert_eq!(router.routes(Instant::now()), Vec::new());
+        assert_eq!(
+            route(&mut router, &init, udp(20)),
+            Action::Drop(DropReason::UnknownTarget)
+        );
+        let request =
+            build_reflexive_request(&machine_id(&machine.public()), &machine, public(B), nonce)
+                .unwrap();
+        assert_eq!(
+            route(&mut router, &request, ws),
+            Action::Drop(DropReason::Invalid)
         );
     }
 

@@ -17,17 +17,26 @@
 //! `gen-machine-key <path>` writes a machine key file for a node and prints its public key.
 //! The status file's `extra.relay` holds the counters, routes and targets.
 //!
+//! `--wss-listen <ip:port>` adds a WebSocket-over-TLS listener feeding the same router: one
+//! binary message per datagram, so UDP and WSS clients relay to each other and reach the
+//! own engine. Its certificate is self-signed at start for `--wss-name` and the listen
+//! address, and written to `--wss-cert-out` for clients to pin (`--relay-ca`). The status
+//! file's `extra.wss` holds the connection counters.
+//!
 //! APIs shown: a wrapping [`Transport`] over [`UdpTransport`], [`EngineBuilder::transport`]
-//! with a custom transport, and the relay modules (`relay::router`, `relay::server`).
+//! with a custom transport, and the relay modules (`relay::router`, `relay::server`,
+//! `relay::wss::server`).
 //!
 //! Usage: `cargo run -p nsplane-examples --bin relay_server -- --private-key <KEY>
 //! --listen 0.0.0.0:51820 --address 10.0.0.1/24 --config relay.json
-//! --peer <PUBKEY>,allowed-ips=10.0.0.2/32 --echo-port 7`
+//! --peer <PUBKEY>,allowed-ips=10.0.0.2/32 --echo-port 7 --wss-listen 0.0.0.0:8443
+//! --wss-cert-out relay.pem`
 //!
 //! [`Transport`]: nsplane::Transport
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -48,6 +57,8 @@ use nsplane_examples::relay::router::{MachinePin, Router, Source, TargetConfig, 
 use nsplane_examples::relay::server::{
     RelayConfig, RelayServerTransport, split_pair, status_json, watch_config,
 };
+use nsplane_examples::relay::wss::server::{WsHub, bind};
+use nsplane_examples::relay::wss::{DEFAULT_NAME, ServerCert};
 use nsplane_examples::status::Status;
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig};
 
@@ -92,6 +103,18 @@ struct Args {
     /// Identifier carried in reflexive responses
     #[arg(long, value_name = "ID", default_value = "relay")]
     gateway_id: String,
+
+    /// Also accept WebSocket-over-TLS clients on this TCP address
+    #[arg(long, value_name = "IP:PORT")]
+    wss_listen: Option<SocketAddr>,
+
+    /// DNS name of the self-signed WSS certificate (the listen address is added as an IP name)
+    #[arg(long, value_name = "NAME", default_value = DEFAULT_NAME)]
+    wss_name: String,
+
+    /// Write the WSS certificate (PEM) to this file, for clients to pin
+    #[arg(long, value_name = "PATH", requires = "wss_listen")]
+    wss_cert_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,7 +179,9 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     init_logging(&args.node.log)?;
     if args.node.transport.transport != TransportKind::Udp {
-        bail!("relay_server always runs its own relay transport; --transport relay is for nodes");
+        bail!(
+            "relay_server always runs its own relay transport; --transport relay|wss is for nodes"
+        );
     }
 
     let private_key = args.node.private_key()?;
@@ -180,12 +205,29 @@ async fn main() -> anyhow::Result<ExitCode> {
         watch_config(path.clone(), base, Arc::clone(&router), config_text);
     }
 
+    let transport = RelayServerTransport::new(udp, Arc::clone(&router));
+    let (transport, hub) = if let Some(wss_listen) = args.wss_listen {
+        let cert = ServerCert::generate(&args.wss_name, &[wss_listen.ip()])?;
+        if let Some(path) = &args.wss_cert_out {
+            std::fs::write(path, &cert.pem)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        let ws = WsHub::new(Arc::clone(&router));
+        let (addr, _) = bind(wss_listen, cert.server_tls()?, Arc::clone(&ws))
+            .await
+            .with_context(|| format!("cannot listen on {wss_listen}"))?;
+        tracing::info!(%addr, name = %args.wss_name, "wss listener started");
+        (transport.with_ws(Arc::clone(&ws)), Some(ws))
+    } else {
+        (transport, None)
+    };
+
     let addresses = args.address.iter().map(|ip| (ip.addr, ip.cidr)).collect();
     let (stack, stack_handle) = NetStack::new(NetStackConfig::new(addresses, args.mtu));
     let (source, sink) = stack.split();
     let engine = EngineBuilder::new(source, sink)
         .private_key(private_key)
-        .transport(RelayServerTransport::new(udp, Arc::clone(&router)))
+        .transport(transport)
         .policy(Box::new(StandardRoaming))
         .build()
         .context("cannot build the engine")?;
@@ -196,6 +238,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         Status::new(path, engine.handle(), listen).extra(move |extra| {
             let router = router.lock().unwrap_or_else(PoisonError::into_inner);
             extra.insert("relay".to_owned(), status_json(&router, Instant::now()));
+            if let Some(hub) = &hub {
+                extra.insert("wss".to_owned(), hub.status_json());
+            }
         })
     });
     node::run(engine, &args.echo, Backend::NetStack(stack_handle), status).await

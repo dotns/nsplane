@@ -14,7 +14,9 @@
 //! reflexive request is the discovery probe). A capable relay gets a `register_source`
 //! every [`RELAY_REGISTER_INTERVAL`] and a reflexive request every
 //! [`REFLEXIVE_GATHER_INTERVAL`], from the same socket as WireGuard. Until then the node
-//! sends it nothing but WireGuard.
+//! sends it nothing but WireGuard. A capable endpoint that leaves its reflexive requests
+//! unanswered for [`DEMOTE_AFTER`] reflexive intervals is demoted and probed again with
+//! the same bounded backoff.
 //!
 //! [`RelayClient`] ties it together for an engine: [`RelayClient::new`] builds the
 //! transport and the [`LadderPolicy`], [`RelayClient::start`] runs the driver that feeds
@@ -53,6 +55,8 @@ const TICK: Duration = Duration::from_millis(100);
 const CANDIDATES_POLL: Duration = Duration::from_secs(1);
 /// Most addresses [`Activity`] tracks.
 const MAX_ACTIVITY: usize = 4096;
+/// Reflexive intervals without an answer after which a capable endpoint is demoted.
+pub const DEMOTE_AFTER: u32 = 3;
 
 /// The probing timers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +137,8 @@ pub struct EndpointInfo {
     pub rate_limited: u64,
     /// This node's address as the endpoint last saw it.
     pub reflexive: Option<SocketAddr>,
+    /// Times it was capable and stopped answering.
+    pub demotions: u32,
 }
 
 #[derive(Debug)]
@@ -140,6 +146,7 @@ struct Endpoint {
     info: EndpointInfo,
     next_probe: Instant,
     next_register: Instant,
+    last_answer: Instant,
     nonces: PendingNonces,
     window: (Instant, u32),
 }
@@ -179,9 +186,11 @@ impl Prober {
                         control_answered: 0,
                         rate_limited: 0,
                         reflexive: None,
+                        demotions: 0,
                     },
                     next_probe: now,
                     next_register: now,
+                    last_answer: now,
                     nonces: PendingNonces::new(),
                     window: (now, 0),
                 });
@@ -222,6 +231,15 @@ impl Prober {
                     due.push((info.addr, Probe::Reflexive(endpoint.nonces.issue(now))));
                 }
                 EndpointState::Capable => {
+                    let silent = now.saturating_duration_since(endpoint.last_answer);
+                    if silent >= timers.reflexive_interval.saturating_mul(DEMOTE_AFTER) {
+                        info.state = EndpointState::Probing;
+                        info.attempts = 0;
+                        info.demotions += 1;
+                        endpoint.next_probe = now;
+                        tracing::info!(endpoint = %info.addr, silent_ms = silent.as_millis(), "capable endpoint stopped answering, probing again");
+                        continue;
+                    }
                     if now >= endpoint.next_register
                         && admit(
                             &mut endpoint.window,
@@ -265,6 +283,7 @@ impl Prober {
             return None;
         };
         let response = endpoint.nonces.accept(payload, now).ok()?;
+        endpoint.last_answer = now;
         let info = &mut endpoint.info;
         info.control_answered += 1;
         info.reflexive = Some(response.observed_addr);
@@ -275,6 +294,18 @@ impl Prober {
             endpoint.next_probe = now + self.timers.reflexive_interval;
         }
         Some(response.observed_addr)
+    }
+
+    /// Probes `addr` again from the start, now (a carrier to it reconnected). Its counters
+    /// are kept.
+    pub fn restart(&mut self, addr: SocketAddr, now: Instant) {
+        if let Some(endpoint) = self.endpoints.iter_mut().find(|e| e.info.addr == addr) {
+            endpoint.info.state = EndpointState::Unknown;
+            endpoint.info.attempts = 0;
+            endpoint.next_probe = now;
+            endpoint.next_register = now;
+            endpoint.last_answer = now;
+        }
     }
 
     /// Whether `addr` is a capable endpoint.
@@ -584,6 +615,12 @@ impl RelayClient {
         lock(&self.state.prober).endpoints()
     }
 
+    /// Discovers the relay endpoint `addr` again from the start, now (see
+    /// [`Prober::restart`]).
+    pub fn rediscover(&self, addr: SocketAddr) {
+        lock(&self.state.prober).restart(addr, Instant::now());
+    }
+
     /// The ladder.
     pub const fn ladder(&self) -> &Arc<Ladder> {
         &self.ladder
@@ -601,7 +638,7 @@ impl RelayClient {
     ///  "dropped_invalid": 0, "dropped_control": 0,
     ///  "endpoints": {"<ip:port>": {"state": "capable", "attempts": 1, "control_sent": 3,
     ///                              "control_answered": 2, "rate_limited": 0,
-    ///                              "reflexive": "ip:port"}}}
+    ///                              "reflexive": "ip:port", "demotions": 0}}}
     /// ```
     pub fn relay_json(&self) -> Value {
         let endpoints: Map<String, Value> = self
@@ -617,6 +654,7 @@ impl RelayClient {
                         "control_answered": e.control_answered,
                         "rate_limited": e.rate_limited,
                         "reflexive": e.reflexive.map(|addr| addr.to_string()),
+                        "demotions": e.demotions,
                     }),
                 )
             })
@@ -875,6 +913,47 @@ mod tests {
         prober.set_endpoints(&[addr(2)], t0);
         prober.set_endpoints(&[addr(1), addr(2)], t0);
         assert_eq!(prober.endpoints()[0].state, EndpointState::Unknown);
+    }
+
+    #[test]
+    fn a_silent_capable_endpoint_is_demoted_and_probed_again() {
+        let t0 = Instant::now();
+        let mut prober = Prober::new(&[addr(1)], ProbeTimers::default(), t0);
+        let nonce = nonce_of(prober.poll(t0)[0].1);
+        prober.on_control(addr(1), &reply(nonce), t0);
+        assert!(prober.is_capable(addr(1)));
+        // Two reflexive intervals unanswered: still capable.
+        for secs in 0..60 {
+            prober.poll(t0 + Duration::from_secs(secs));
+        }
+        assert!(prober.is_capable(addr(1)));
+        // The third: demoted, then probed again with the backoff.
+        prober.poll(t0 + Duration::from_secs(60));
+        let info = prober.endpoints()[0];
+        assert_eq!(
+            (info.state, info.attempts, info.demotions),
+            (EndpointState::Probing, 0, 1)
+        );
+        let mut sent_at = Vec::new();
+        for ms in (60_000..100_000).step_by(100) {
+            for (_, probe) in prober.poll(t0 + Duration::from_millis(ms)) {
+                assert!(matches!(probe, Probe::Reflexive(_)));
+                sent_at.push(ms / 1000 - 60);
+            }
+        }
+        assert_eq!(sent_at, vec![0, 1, 3, 7, 15]);
+        assert_eq!(prober.endpoints()[0].state, EndpointState::Stopped);
+
+        // A restart (the carrier reconnected) probes it right away.
+        let later = t0 + Duration::from_secs(100);
+        prober.restart(addr(1), later);
+        assert_eq!(prober.endpoints()[0].state, EndpointState::Unknown);
+        let nonce = nonce_of(prober.poll(later)[0].1);
+        assert_eq!(
+            prober.on_control(addr(1), &reply(nonce), later),
+            Some(addr(4000))
+        );
+        assert!(prober.is_capable(addr(1)));
     }
 
     #[test]
