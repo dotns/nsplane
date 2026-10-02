@@ -600,11 +600,13 @@ pub async fn run(
             }
         }
     }
-    if let Some(status) = &status {
-        status.write().await?;
-    }
+    // Stop the periodic writer first, so the final snapshot is the last one written.
     if let Some(writer) = writer {
         writer.abort();
+        let _ = writer.await;
+    }
+    if let Some(status) = &status {
+        status.write().await?;
     }
     checks.abort();
     let _ = handle.shutdown().await;
