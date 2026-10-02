@@ -22,6 +22,7 @@ The package `nsplane-examples` is not published.
 | [`events_stats`](#events_stats) | Events, peer stats, drop counters, suspend/resume, MTU | no |
 | [`relay_server`](#relay_server) | A single-port relay with its own WireGuard engine, over UDP and WSS | no |
 | [`relay_transport`](#relay_transport) | Relay discovery and the direct/relay path ladder, in-process | no |
+| [`app_session`](#app_session) | App sessions on ACL namespaces: a file transfer through source-gated pinholes | no (`--tun`: yes) |
 
 ## Examples
 
@@ -259,6 +260,32 @@ authenticates. Status:
 | `.extra.wss.dropped.{disconnected,queue_full,text,oversized,no_route}` | drops by reason |
 | `.extra.wss.{url,relay}` | the URL and the relay's address |
 
+### app_session
+
+App sessions on `nsplane-acl` rule namespaces, in one process on loopback UDP with netstacks
+(no root). Every node has its own `AclEngine` and `AclFilter`, principals are WireGuard keys,
+and an in-process mailbox stands in for the rendezvous. A session adds an `app:<id>`
+namespace with the peer as member, opens pinholes on the app port (`open_pinhole`) and sends
+a generated file over in-tunnel TCP, verified by SHA-256; ending the session drops the
+guards and removes the namespace. Prints `STEP <name> PASS|FAIL` for `a` (reuse: existing
+peers in `quick`, no new peer or handshake), `b` (not-permitted: `quick` no longer allows
+`transfer`), `c` (revoke: `transfer` removed mid-transfer closes the pinhole), `d`
+(session-only peers with `outbound: Some([])`: only the app port passes, then the peer is
+removed), `e` (cross-namespace through a hub, opened in one direction by a directed grant),
+then `CHECKS PASS` (exit 0) or `CHECKS FAIL` (exit 1). With `--tun <NAME>` (Linux, needs
+`CAP_NET_ADMIN`) node A also runs a TUN next to its netstack and `STEP tun-outbound` checks
+that host traffic to a session-only peer is dropped (`acl outbound denied`). Status
+(`--status`, node A at the end): `extra.acl` (filter counters and namespaces) and
+`extra.pinhole_stats`.
+
+Flags: `--step <a|b|c|d|e|all>` (default `all`), `--ipv6`, `--tun <NAME>`, `--status <PATH>`,
+`--log <FILTER>` (default `warn`).
+
+```sh
+cargo run -p nsplane-examples --bin app_session
+sudo cargo run -p nsplane-examples --bin app_session -- --tun nsp-app --status app_session.json
+```
+
 ## Shared flags
 
 ### Node (`NodeArgs`)
@@ -337,7 +364,8 @@ Scenarios: `udp_pair`, `events_stats` (self-checks), `hybrid`, `acl_gateway` (ag
 WireGuard), `native_wg`, `native_wg_reverse` (native kernel WireGuard through the relay, in
 both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
 `nat_hole_punch` (the ladder behind MASQUERADE routers), `plain_wg_compat` (the relay
-extension against a plain WireGuard server). The run ends with the matrix and the scenario
+extension against a plain WireGuard server), `app_session` (self-checks), `app_session_tun`
+(`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status). The run ends with the matrix and the scenario
 list and fails if anything failed.
 
 | Variable | Meaning |
