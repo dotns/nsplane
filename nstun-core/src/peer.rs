@@ -20,6 +20,9 @@ pub(crate) struct Peer {
     data_rx: u64,
     /// Whether the core reported the current expiry of the tunnel's sessions.
     pub(crate) expired: bool,
+    /// Receiver index of the last transport data checked for a completed handshake, while
+    /// no handshake is pending; `None` when the next transport data must be checked.
+    rx_session: Option<u32>,
 }
 
 impl std::fmt::Debug for Peer {
@@ -48,6 +51,7 @@ impl Peer {
             preshared_key,
             data_rx: 0,
             expired: false,
+            rx_session: None,
         }
     }
 
@@ -86,6 +90,24 @@ impl Peer {
     /// Decrypted payload bytes delivered from this peer.
     pub(crate) const fn data_rx(&self) -> u64 {
         self.data_rx
+    }
+
+    /// Whether transport data for `receiver_idx` may complete a handshake: it arrives on a new
+    /// session (a new session has a new local index), or a handshake may have changed the
+    /// sessions since the last check.
+    pub(crate) fn is_new_session(&self, receiver_idx: u32) -> bool {
+        self.rx_session != Some(receiver_idx)
+    }
+
+    /// Records that transport data for `receiver_idx` was checked for a completed handshake.
+    pub(crate) const fn set_rx_session(&mut self, receiver_idx: u32) {
+        self.rx_session = Some(receiver_idx);
+    }
+
+    /// Makes the next transport data check for a completed handshake: the sessions of the
+    /// tunnel may change (a handshake message, a handshake initiation, timers, a new key).
+    pub(crate) const fn reset_rx_session(&mut self) {
+        self.rx_session = None;
     }
 
     /// Time since the current session was established.
