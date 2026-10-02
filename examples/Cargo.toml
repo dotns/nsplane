@@ -1,6 +1,6 @@
 [package]
 name = "nsplane-examples"
-description = "Runnable examples of the nsplane data plane: UDP, TUN and netstack nodes"
+description = "Runnable examples of the nsplane data plane: UDP, TUN, netstack, hybrid and ACL nodes"
 publish = false
 version.workspace = true
 authors.workspace = true
@@ -21,14 +21,17 @@ base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-core = "0.3.32"
 nsplane = { path = "../crates/nsplane", version = "0.8.0" }
+nsplane-acl = { path = "../crates/nsplane-acl", version = "0.8.0" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
+nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde_json = "1.0.149"
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3.19"
 
 [target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
 nsplane-tun = { path = "../crates/nsplane-tun", version = "0.8.0" }
 nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.8.0" }
 
