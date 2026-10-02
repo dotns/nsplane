@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["boringtun", "boringtun-cli", "nstun-packet"]
+members = ["boringtun", "boringtun-cli", "nstun-packet", "nstun", "nstun-tun"]
 
 [workspace.package]
 version = "0.8.0"
