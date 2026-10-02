@@ -188,9 +188,11 @@
 //!   principal (an `Arc<str>`, no allocation per packet) and flags
 //!   (outbound-restricted, pinholes, bypass) under both generations.
 //! - **Flow verdict cache.** The reply table also holds, per peer, direction
-//!   and five-tuple, the verdict of a TCP or UDP flow's first packet
-//!   (accepted with its grant or pinhole dependency, or dropped with its
-//!   reason) under both generations: one table, one lock, one capacity
+//!   and five-tuple, the verdict of a namespace member's TCP or UDP flow's
+//!   first packet (accepted with its grant or pinhole dependency, or dropped
+//!   with its reason; a peer under the default policy is evaluated on every
+//!   packet, as a few rules cost less than the cache) under both
+//!   generations: one table, one lock, one capacity
 //!   ([`AclFilterConfig::reply_capacity`]). A hit under other generations is
 //!   evaluated again, so a change applies to the very next packet; an
 //!   accepted verdict that depends on a pinhole is also checked against the
@@ -199,7 +201,9 @@
 //!   peer). A reply allowance for the same key takes precedence, as the reply
 //!   check comes first. When the table is full, cached verdicts are flushed
 //!   (counted in [`AclFilterStats::verdict_evictions`]) before an allowance
-//!   is evicted, so allowances behave as without the cache.
+//!   is evicted, so allowances behave as without the cache. The tables keep
+//!   their entries in recency order, so evicting the least recently seen
+//!   allowance or pending dependency (or the oldest fragment) is O(1).
 //! - **Bypass.** On every update the engine computes the principals whose
 //!   inbound flows are all accepted by a rule (a common source namespace
 //!   with an accept rule from `*` to `*:*` for TCP and UDP for every
@@ -248,6 +252,7 @@ mod differential;
 pub mod engine;
 mod filter;
 mod flow;
+mod lru;
 pub mod matcher;
 pub mod merge;
 pub mod namespace;

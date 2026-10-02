@@ -311,6 +311,23 @@ impl CompiledPolicy {
     /// Returns `allowed = true` only when an explicit accept rule matches.
     /// If no rule matches, the result is a default deny.
     pub fn is_allowed(&self, request: &AccessRequest) -> AclDecision {
+        self.matched_rule(request).map_or_else(
+            || AclDecision {
+                allowed: false,
+                matched_rule_index: None,
+                reason: "denied: no matching accept rule".to_owned(),
+            },
+            |idx| AclDecision {
+                allowed: true,
+                matched_rule_index: Some(idx),
+                reason: format!("accepted by rule {idx}"),
+            },
+        )
+    }
+
+    /// The index of the first rule accepting `request`, without building an
+    /// [`AclDecision`] (the data path).
+    pub(crate) fn matched_rule(&self, request: &AccessRequest) -> Option<usize> {
         for (idx, rule) in self.compiled_rules.iter().enumerate() {
             if rule.matches(request) {
                 debug!(
@@ -321,11 +338,7 @@ impl CompiledPolicy {
                     rule = idx,
                     "ACL accept"
                 );
-                return AclDecision {
-                    allowed: true,
-                    matched_rule_index: Some(idx),
-                    reason: format!("accepted by rule {idx}"),
-                };
+                return Some(idx);
             }
         }
 
@@ -338,11 +351,7 @@ impl CompiledPolicy {
             proto = ?request.protocol,
             "ACL deny: no matching rule"
         );
-        AclDecision {
-            allowed: false,
-            matched_rule_index: None,
-            reason: "denied: no matching accept rule".to_owned(),
-        }
+        None
     }
 
     /// Whether every TCP and UDP request is accepted, whatever its source,
@@ -718,7 +727,7 @@ impl Snapshot {
             let Some(namespace) = self.namespaces.get(id) else {
                 continue;
             };
-            if let Some(index) = namespace.rules.is_allowed(request).matched_rule_index {
+            if let Some(index) = namespace.rules.matched_rule(request) {
                 return MemberVerdict::Rule {
                     namespace: id.clone(),
                     index,

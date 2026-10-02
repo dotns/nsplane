@@ -2,9 +2,7 @@
 //! inbound packets and the outbound rules of restricted peers.
 
 use std::collections::HashMap;
-use std::collections::hash_map::{Entry, RandomState};
 use std::fmt;
-use std::hash::{BuildHasher, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -14,9 +12,10 @@ use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::engine::{
-    AccessRequest, AclEngine, MemberVerdict, Membership, PinholeMatch, ReplyDependency, Snapshot,
+    AccessRequest, AclEngine, MemberVerdict, PinholeMatch, ReplyDependency, Snapshot,
     SourceAssertion,
 };
+use crate::lru::{FlowHash, LruMap};
 use crate::net::Protocol;
 use crate::pinhole::Direction;
 use crate::reasons;
@@ -297,12 +296,11 @@ struct FragmentKey {
     id: u16,
 }
 
-/// First-fragment outcomes in insertion order (`seq`); eviction scans for the
-/// smallest sequence, which is O(capacity) but only happens when full.
+/// First-fragment outcomes in insertion order; when full, the oldest is
+/// evicted (O(1)).
 #[derive(Debug, Default)]
 struct FragmentTable {
-    entries: HashMap<FragmentKey, (Outcome, u64)>,
-    next_seq: u64,
+    entries: LruMap<FragmentKey, Outcome>,
 }
 
 /// The flow table, behind one lock: for each peer, direction and tuple
@@ -322,8 +320,8 @@ struct FragmentTable {
 /// Bounds: allowances and verdicts share `reply_capacity`. When full, cached
 /// verdicts make room first (all of them are flushed, counted in
 /// `verdict_evictions`), so an allowance is evicted (the least recently seen,
-/// O(capacity) and only when full) exactly when the table holds allowances
-/// only, as without the cache. A new verdict is not cached when the table is
+/// in O(1): the entries are kept in recency order) exactly when the table
+/// holds allowances only, as without the cache. A new verdict is not cached when the table is
 /// full and fewer than an eighth of it are verdicts.
 ///
 /// `pending` remembers the dependency of inbound flows accepted through a
@@ -337,80 +335,11 @@ struct FragmentTable {
 /// `peers` caches the resolved peers, bounded by `reply_capacity` too.
 #[derive(Debug, Default)]
 struct FlowTable {
-    entries: HashMap<EntryKey, FlowEntry, FlowHash>,
+    entries: LruMap<EntryKey, FlowEntry>,
     /// How many of `entries` are cached verdicts.
     verdicts: usize,
-    pending: HashMap<FiveTuple, ReplyEntry, FlowHash>,
+    pending: LruMap<FiveTuple, ReplyEntry>,
     peers: HashMap<PeerId, Arc<PeerInfo>, FlowHash>,
-}
-
-/// The hasher of the flow table: a multiply-rotate hash over 64-bit words
-/// with a random seed per table, several times faster than `SipHash` on a
-/// five-tuple. Not cryptographic; the seed keeps remote peers from choosing
-/// colliding tuples.
-#[derive(Debug, Clone, Copy)]
-struct FlowHash(u64);
-
-impl Default for FlowHash {
-    fn default() -> Self {
-        Self(RandomState::new().hash_one(0_u8))
-    }
-}
-
-impl BuildHasher for FlowHash {
-    type Hasher = FlowHasher;
-
-    fn build_hasher(&self) -> FlowHasher {
-        FlowHasher(self.0)
-    }
-}
-
-struct FlowHasher(u64);
-
-impl FlowHasher {
-    const fn mix(&mut self, word: u64) {
-        self.0 = (self.0 ^ word)
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(29);
-    }
-}
-
-impl Hasher for FlowHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let (words, rest) = bytes.as_chunks::<8>();
-        for word in words {
-            self.mix(u64::from_le_bytes(*word));
-        }
-        let mut word = [0; 8];
-        word[..rest.len()].copy_from_slice(rest);
-        self.mix(u64::from_le_bytes(word));
-    }
-
-    fn write_u8(&mut self, n: u8) {
-        self.mix(n.into());
-    }
-
-    fn write_u16(&mut self, n: u16) {
-        self.mix(n.into());
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.mix(n.into());
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.mix(n);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.mix(n as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        // Spread the high bits the multiplication produced to the low ones
-        // the table indexes with.
-        self.0 ^ (self.0 >> 32)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -479,13 +408,24 @@ struct PeerInfo {
     source: Option<SourceAssertion>,
     /// The source anchor of `source`.
     principal: Option<Arc<str>>,
-    /// Outbound traffic to the peer is restricted.
-    restricted: bool,
+    /// How the policy governs the peer.
+    governed: Governed,
     /// Some pinhole belongs to the peer.
     pinholes: bool,
     /// Every new inbound TCP or UDP flow of the peer is accepted without a
     /// dependency or an outbound allowance, so its evaluation is skipped.
     bypass: bool,
+}
+
+/// How the policy governs a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Governed {
+    /// In no namespace: the default policy.
+    Default,
+    /// A namespace member, outbound unrestricted.
+    Member,
+    /// A namespace member, outbound-restricted.
+    Restricted,
 }
 
 impl PeerInfo {
@@ -498,12 +438,15 @@ impl PeerInfo {
         let source = identity.assertion(peer);
         let principal: Option<Arc<str>> = source.as_ref().map(|s| s.source_anchor().into());
         let principal_str = principal.as_deref();
+        let membership = principal_str.and_then(|principal| snapshot.membership(principal));
         Self {
             generation: snapshot.generation(),
             identity: generation,
-            restricted: principal_str
-                .and_then(|principal| snapshot.membership(principal))
-                .is_some_and(Membership::outbound_restricted),
+            governed: match membership {
+                None => Governed::Default,
+                Some(membership) if membership.outbound_restricted() => Governed::Restricted,
+                Some(_) => Governed::Member,
+            },
             pinholes: principal_str.is_some_and(|principal| snapshot.has_pinholes_of(principal)),
             bypass: source.is_some() && snapshot.bypasses(principal_str),
             source,
@@ -532,7 +475,7 @@ impl PeerInfo {
 /// **Per-flow hook**: with a versioned identity
 /// ([`PeerIdentity::generation`] non-zero, e.g. a [`PeerIdentityMap`]), the
 /// filter caches each peer's resolved principal and the verdict of each TCP or
-/// UDP flow's first packet, tagged with the engine's
+/// UDP flow's first packet from a namespace member, tagged with the engine's
 /// [generation](AclEngine::generation) and the identity generation; later
 /// packets of the flow reuse it until either changes. Peers whose policy
 /// accepts everything skip the evaluation altogether (see the crate docs on
@@ -746,6 +689,15 @@ impl Inner {
                     self.sweep_if(sweep);
                     return Outcome::Accepted;
                 }
+                if info.governed == Governed::Default {
+                    // The default policy: a few rules and no side effects,
+                    // cheaper to evaluate under this lock than to cache.
+                    let (verdict, _) =
+                        self.evaluate_new(snapshot, info.source.clone(), None, tuple, protocol);
+                    drop(table);
+                    self.sweep_if(sweep);
+                    return verdict.outcome;
+                }
                 Some(Arc::clone(info))
             }
         };
@@ -848,7 +800,7 @@ impl Inner {
             // A principal in no namespace: the default policy.
             let outcome = match snapshot.default_policy() {
                 None => Outcome::NoPolicy,
-                Some(policy) if policy.is_allowed(&request).allowed => Outcome::Accepted,
+                Some(policy) if policy.matched_rule(&request).is_some() => Outcome::Accepted,
                 Some(_) => Outcome::Denied,
             };
             return (FlowVerdict::new(outcome), true);
@@ -930,14 +882,11 @@ impl Inner {
         identity: u64,
         sweep: &mut bool,
     ) -> Option<Hit> {
-        let Entry::Occupied(mut slot) = table.entries.entry(key) else {
-            return None;
-        };
-        match slot.get_mut() {
+        match table.entries.get_mut(&key)? {
             FlowEntry::Allowance(allowance) => {
                 let now = Instant::now();
                 if now.duration_since(allowance.last_seen) > self.config.reply_idle_timeout {
-                    slot.remove();
+                    table.entries.remove(&key);
                     bump(&self.counters.reply_expired);
                     return None;
                 }
@@ -948,12 +897,14 @@ impl Inner {
                 if let Some(revoked) = revoked {
                     // The pinhole may only have expired: sweep it.
                     *sweep = matches!(revoked, ReplyDependency::Pinhole(_));
-                    slot.remove();
+                    table.entries.remove(&key);
                     bump(&self.counters.reply_revoked);
                     return None;
                 }
                 allowance.last_seen = now;
-                Some(Hit::Allowance(allowance.dependency.clone()))
+                let dependency = allowance.dependency.clone();
+                table.entries.touch(&key);
+                Some(Hit::Allowance(dependency))
             }
             FlowEntry::Verdict(cached) => {
                 // Only a pinhole can close without a generation change: it
@@ -968,7 +919,7 @@ impl Inner {
                 if valid {
                     return Some(Hit::Verdict(cached.verdict.clone()));
                 }
-                slot.remove();
+                table.entries.remove(&key);
                 table.verdicts -= 1;
                 None
             }
@@ -1013,12 +964,11 @@ impl Inner {
             .fragments
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entry = if last {
+        if last {
             table.entries.remove(&key)
         } else {
             table.entries.get(&key).copied()
-        };
-        entry.map(|(outcome, _)| outcome)
+        }
     }
 
     fn record_fragment(&self, key: FragmentKey, outcome: Outcome) {
@@ -1027,20 +977,13 @@ impl Inner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let capacity = self.config.fragment_capacity.max(1);
-        if !table.entries.contains_key(&key) && table.entries.len() >= capacity {
-            let oldest = table
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, seq))| *seq)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                table.entries.remove(&oldest);
-                bump(&self.counters.fragment_evictions);
-            }
+        if !table.entries.contains_key(&key)
+            && table.entries.len() >= capacity
+            && table.entries.pop_oldest().is_some()
+        {
+            bump(&self.counters.fragment_evictions);
         }
-        let seq = table.next_seq;
-        table.next_seq += 1;
-        table.entries.insert(key, (outcome, seq));
+        table.entries.insert(key, outcome);
     }
 
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
@@ -1050,7 +993,7 @@ impl Inner {
         // `None`: an unrestricted peer without pinholes.
         let info = if identity != 0 {
             let info = self.cached_peer(&mut table, &snapshot, peer, identity);
-            (info.restricted || info.pinholes).then(|| Arc::clone(info))
+            (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
         } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
             Some(Arc::new(PeerInfo::resolve(
                 &*self.identity,
@@ -1061,7 +1004,9 @@ impl Inner {
         } else {
             None
         };
-        let restricted = info.as_ref().is_some_and(|info| info.restricted);
+        let restricted = info
+            .as_ref()
+            .is_some_and(|info| info.governed == Governed::Restricted);
         let Ok(packet) = IpPacket::parse(bytes) else {
             return if restricted {
                 Outcome::OutboundDenied
@@ -1264,33 +1209,20 @@ impl Inner {
             last_seen: now,
             dependency,
         };
-        if let Some(entry) = table.entries.get_mut(&key) {
-            if matches!(entry, FlowEntry::Verdict(_)) {
-                table.verdicts -= 1;
-            }
-            *entry = FlowEntry::Allowance(allowance);
-            return;
-        }
         let capacity = self.config.reply_capacity.max(1);
-        if table.entries.len() >= capacity && table.verdicts > 0 {
-            self.flush_verdicts(table);
-        }
-        if table.entries.len() >= capacity {
-            let oldest = table
-                .entries
-                .iter()
-                .filter_map(|(key, entry)| match entry {
-                    FlowEntry::Allowance(allowance) => Some((key, allowance.last_seen)),
-                    FlowEntry::Verdict(_) => None,
-                })
-                .min_by_key(|(_, last_seen)| *last_seen)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                table.entries.remove(&oldest);
+        if !table.entries.contains_key(&key) && table.entries.len() >= capacity {
+            if table.verdicts > 0 {
+                self.flush_verdicts(table);
+            }
+            // Only allowances are left: the oldest is the least recently seen.
+            if table.entries.len() >= capacity && table.entries.pop_oldest().is_some() {
                 bump(&self.counters.reply_evictions);
             }
         }
-        table.entries.insert(key, FlowEntry::Allowance(allowance));
+        let old = table.entries.insert(key, FlowEntry::Allowance(allowance));
+        if matches!(old, Some(FlowEntry::Verdict(_))) {
+            table.verdicts -= 1;
+        }
     }
 
     /// Remember that the inbound flow `tuple` depends on `dependency`.
@@ -1299,16 +1231,11 @@ impl Inner {
             return;
         }
         let capacity = self.config.reply_capacity.max(1);
-        if !table.pending.contains_key(&tuple) && table.pending.len() >= capacity {
-            let oldest = table
-                .pending
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .map(|(tuple, _)| *tuple);
-            if let Some(oldest) = oldest {
-                table.pending.remove(&oldest);
-                bump(&self.counters.pending_evictions);
-            }
+        if !table.pending.contains_key(&tuple)
+            && table.pending.len() >= capacity
+            && table.pending.pop_oldest().is_some()
+        {
+            bump(&self.counters.pending_evictions);
         }
         table.pending.insert(
             tuple,

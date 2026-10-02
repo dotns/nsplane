@@ -206,7 +206,8 @@ increases on every published change (default policy, namespaces, grants, pinhole
 closed, swept or revoked, `clear_all`), and a versioned `PeerIdentity`
 (`PeerIdentity::generation`, bumped by `PeerIdentityMap`) on every identity change. The
 filter caches per peer its resolved principal and flags, and per peer, direction and
-five-tuple the verdict of a TCP/UDP flow's first packet, in the reply table (one lock, one
+five-tuple the verdict of a namespace member's TCP/UDP flow's first packet (the default
+policy is cheaper to evaluate than to cache), in the reply table (one lock, one
 capacity, cached verdicts flushed first when full), both tagged with the two generations: a
 hit under other generations is evaluated again, so a change applies to the very next
 packet, and a verdict accepted through a pinhole is also checked against the pinhole's

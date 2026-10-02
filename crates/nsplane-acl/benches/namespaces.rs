@@ -8,6 +8,9 @@
 //! - `bypass`: one namespace of 64 members accepting everything (a Quick-style namespace), so its
 //!   members bypass the evaluation.
 //!
+//! `floor` measures what every packet pays before the filter's tables: parsing the five-tuple
+//! and loading the engine snapshot.
+//!
 //! Inbound benches open a new flow with every packet (the source port changes), so each one is
 //! evaluated against the policy; `*_established` benches repeat one five-tuple, the established
 //! flow the filter's verdict cache serves. Outbound benches repeat one five-tuple.
@@ -24,7 +27,7 @@ use nsplane_acl::{
     Protocol, SourceAssertion, wg_peer_anchor,
 };
 use nsplane_core::{PacketFilter, Verdict};
-use nsplane_packet::{PacketBuf, PeerId};
+use nsplane_packet::{IpPacket, PacketBuf, PeerId};
 
 const NAMESPACES: u16 = 8;
 const MEMBERS: u16 = 64;
@@ -333,6 +336,20 @@ fn bench_namespaces(c: &mut Criterion) {
     );
     let outbound = tcp(LOCAL, 443, member_addr, 40000);
     bench_packet(c, "bypass/outbound", &filter, member, false, &outbound);
+
+    // (d) The floor every filtered packet pays: parsing its five-tuple, and one load of the
+    // engine's snapshot (what `generation` reads).
+    c.bench_function("floor/five_tuple", |b| {
+        b.iter(|| {
+            IpPacket::parse(std::hint::black_box(inbound.as_packet()))
+                .ok()
+                .and_then(|packet| packet.five_tuple())
+        });
+    });
+    let engine = bypass_engine();
+    c.bench_function("floor/snapshot", |b| {
+        b.iter(|| std::hint::black_box(&engine).generation());
+    });
 }
 
 criterion_group!(namespaces, bench_namespaces);
