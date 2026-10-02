@@ -9,6 +9,7 @@
 mod channel;
 mod io;
 mod transport;
+mod udp;
 
 pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use io::{PacketSink, PacketSource};
@@ -16,3 +17,4 @@ pub use nstun_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
 };
 pub use transport::Transport;
+pub use udp::UdpTransport;
