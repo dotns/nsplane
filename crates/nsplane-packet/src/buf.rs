@@ -196,14 +196,34 @@ impl PacketPool {
         PacketBuf::from_storage(storage)
     }
 
+    /// Returns a packet of `len` bytes, reusing an idle buffer if any.
+    ///
+    /// The packet bytes are unspecified: a reused buffer keeps the bytes it already held
+    /// and zero-fills only the bytes it never initialized, so getting the same length again
+    /// writes nothing. Use it for a buffer that is written to before it is read, e.g. one a
+    /// handshake message is formatted into.
+    pub fn get_len(&mut self, len: usize) -> PacketBuf {
+        let needed = HEADROOM + len;
+        let mut buf = self
+            .free
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(needed));
+        // Shrinking truncates, growing zero-fills only the new bytes.
+        buf.resize(needed, 0);
+        PacketBuf {
+            buf,
+            start: HEADROOM,
+            shared: false,
+        }
+    }
+
     /// Returns a buffer to the pool, or drops it if the pool already holds `max_free`.
     ///
-    /// Buffers created by [`PacketBuf::from_shared`] are always dropped.
+    /// Buffers created by [`PacketBuf::from_shared`] are always dropped. A pooled buffer keeps
+    /// its bytes for [`get_len`](Self::get_len).
     pub fn put(&mut self, buf: PacketBuf) {
         if !buf.shared && self.free.len() < self.max_free {
-            let mut storage = buf.buf;
-            storage.clear();
-            self.free.push(storage);
+            self.free.push(buf.buf);
         }
     }
 
@@ -513,6 +533,51 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(buf.with_headroom_mut(), [0; HEADROOM]);
         assert_eq!(buf.with_headroom_mut().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn get_len_keeps_initialized_bytes() {
+        let mut pool = PacketPool::new(1);
+        let mut buf = pool.get_len(100);
+        assert_eq!(buf.len(), 100);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert!(buf.as_packet().iter().all(|&b| b == 0));
+        let ptr = buf.as_packet().as_ptr();
+        buf.as_packet_mut().fill(7);
+        buf.advance(10).unwrap();
+        pool.put(buf);
+
+        // Same allocation, packet start reset, old bytes kept.
+        let buf = pool.get_len(50);
+        assert_eq!(buf.as_packet().as_ptr(), ptr);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert_eq!(buf.as_packet(), [7; 50]);
+        pool.put(buf);
+
+        // Truncated bytes count as never initialized: growing zero-fills them.
+        let buf = pool.get_len(60);
+        assert_eq!(&buf.as_packet()[..50], [7; 50]);
+        assert_eq!(&buf.as_packet()[50..], [0; 10]);
+        pool.put(buf);
+
+        // `get` still hands out an empty packet with zeroed headroom.
+        let mut buf = pool.get(16);
+        assert!(buf.is_empty());
+        assert_eq!(buf.with_headroom_mut(), [0; HEADROOM]);
+        assert_eq!(pool.free_len(), 0);
+    }
+
+    #[test]
+    fn get_len_drops_shared_and_allocates_when_empty() {
+        let mut pool = PacketPool::new(2);
+        let mut whole = BytesMut::new();
+        whole.extend_from_slice(&[0; 64]);
+        pool.put(PacketBuf::from_shared(whole, 0, 64).unwrap());
+        assert_eq!(pool.free_len(), 0);
+
+        let buf = pool.get_len(2048);
+        assert_eq!(buf.len(), 2048);
+        assert!(buf.capacity() >= 2048);
     }
 
     #[test]
