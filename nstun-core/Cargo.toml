@@ -27,4 +27,9 @@ tracing = "0.1.40"
 mock-instant = ["boringtun/mock-instant"]
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 mock_instant = "0.3"
+
+[[bench]]
+name = "data_path"
+harness = false
