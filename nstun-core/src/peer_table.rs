@@ -41,10 +41,6 @@ struct OwnKey {
 /// Peers are reachable by id, by public key, by the session index in received messages, and by
 /// allowed IP (cryptokey routing). Allowed IPs exist only in the routing table, so a range that
 /// a newer peer claims is moved away from its previous owner. Peer ids are never reused.
-#[allow(
-    dead_code,
-    reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-)]
 pub(crate) struct PeerTable {
     peers: BTreeMap<PeerId, Peer>,
     by_key: HashMap<PublicKey, PeerId>,
@@ -64,10 +60,6 @@ impl std::fmt::Debug for PeerTable {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-)]
 impl PeerTable {
     /// Creates an empty table without a private key. `handshake_rate_limit` is the number of
     /// handshakes per second the gate tolerates before replying with cookies.

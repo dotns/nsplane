@@ -812,6 +812,7 @@ dependencies = [
  "boringtun",
  "ip_network",
  "ip_network_table",
+ "mock_instant",
  "nstun-packet",
  "rand_core",
  "tracing",
