@@ -10,7 +10,8 @@
 //!
 //! [`Uapi::handle_request`] serves one request over any async reader and writer. On Unix,
 //! [`UapiListener`] binds the standard socket `/var/run/wireguard/<iface>.sock` that the
-//! `wg` tool talks to, and [`Uapi::serve`] accepts connections on it. Windows has no
+//! `wg` tool talks to, [`Uapi::serve`] accepts connections on it, and
+//! [`Uapi::serve_stream`] serves a single already-connected stream. Windows has no
 //! listener yet (no named pipe); the protocol core still works there.
 //!
 //! ```no_run

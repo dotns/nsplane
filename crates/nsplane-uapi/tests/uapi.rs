@@ -335,6 +335,23 @@ async fn a_stopped_engine_reports_eio() {
     );
 }
 
+/// Reads one response, up to and including the empty line after `errno`.
+#[cfg(unix)]
+async fn response(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> String {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        let done = line == "\n" && out.contains("errno=");
+        out.push_str(&line);
+        if done {
+            return out;
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn serves_requests_over_a_unix_socket() {
@@ -342,22 +359,8 @@ async fn serves_requests_over_a_unix_socket() {
     use std::time::Duration;
 
     use nsplane_uapi::UapiListener;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
-
-    /// Reads one response, up to and including the empty line after `errno`.
-    async fn response(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> String {
-        let mut out = String::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
-            let done = line == "\n" && out.contains("errno=");
-            out.push_str(&line);
-            if done {
-                return out;
-            }
-        }
-    }
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -409,6 +412,57 @@ async fn serves_requests_over_a_unix_socket() {
         .unwrap();
     assert!(!path.exists());
     std::fs::remove_dir(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serves_a_connected_stream() {
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    let node = Node::new();
+    let (client, server) = UnixStream::pair().unwrap();
+    let uapi = node.uapi.clone();
+    let served = tokio::spawn(async move { uapi.serve_stream(server).await });
+
+    let (private, _) = key(1);
+    let (_, peer) = key(2);
+    let peer_hex = hex_pub(&peer);
+    let (reader, mut writer) = client.into_split();
+    let mut reader = BufReader::new(reader);
+    writer
+        .write_all(
+            format!(
+                "set=1\nprivate_key={private}\npublic_key={peer_hex}\n\
+                 endpoint=192.0.2.1:51820\nallowed_ip=10.0.0.0/24\n\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response(&mut reader).await, "errno=0\n\n");
+    writer.write_all(b"get=1\n\n").await.unwrap();
+    let reply = response(&mut reader).await;
+    assert!(
+        reply.starts_with(&format!("private_key={private}\n")),
+        "{reply}"
+    );
+    assert!(
+        reply.contains(&format!("public_key={peer_hex}\n")),
+        "{reply}"
+    );
+    assert!(reply.contains("endpoint=192.0.2.1:51820\n"), "{reply}");
+    assert!(reply.contains("allowed_ip=10.0.0.0/24\n"), "{reply}");
+    assert!(reply.ends_with("errno=0\n\n"), "{reply}");
+
+    // Closing the client ends the server side.
+    drop((reader, writer));
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[cfg(unix)]

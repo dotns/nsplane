@@ -105,7 +105,7 @@ impl Uapi {
                 Some(Ok((stream, _))) => {
                     while connections.try_join_next().is_some() {}
                     let uapi = self.clone();
-                    connections.spawn(async move { uapi.serve_connection(stream).await });
+                    connections.spawn(async move { uapi.serve_stream(stream).await });
                 }
                 Some(Err(e)) => {
                     tracing::warn!(message = "Failed to accept a UAPI connection", error = ?e);
@@ -114,8 +114,14 @@ impl Uapi {
         }
     }
 
-    /// Serves requests on `stream` until the client closes it or a request fails.
-    async fn serve_connection(&self, stream: UnixStream) {
+    /// Serves requests on one connected `stream`, request after request, until the client
+    /// closes it or a request fails; then the stream is closed.
+    ///
+    /// [`Uapi::serve`] runs this for every accepted connection. Call it directly for a
+    /// connection that did not come from a [`UapiListener`], such as a socket inherited
+    /// from a parent process (the CLI's `--uapi-fd`). It does not watch the engine: once
+    /// the engine stops, the next request is answered with an error and the stream closes.
+    pub async fn serve_stream(&self, stream: UnixStream) {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         loop {
