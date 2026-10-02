@@ -1151,6 +1151,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-nat"
+version = "0.8.0"
+dependencies = [
+ "nsplane-packet",
+ "thiserror",
+]
+
+[[package]]
 name = "nsplane-netstack"
 version = "0.8.0"
 dependencies = [
