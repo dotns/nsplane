@@ -96,6 +96,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flows the local side opened and reports drops under the `reasons` constants, with
   counters in `AclFilterStats`. `FlowTracker` is a pass-through `PacketFilter` counting
   packets and bytes per flow in a bounded table.
+- `nsplane-acl`: rule namespaces per peer source (`namespace` module: `NamespaceId`,
+  `NamespaceMember`, `NamespacePolicy`, `OutboundRule`). `AclEngine::store_namespace`,
+  `remove_namespace`, `namespaces` and `memberships` change one namespace at a time; the
+  default policy applies only to principals in no namespace. Traffic between peers of
+  different namespaces is dropped as `reasons::CROSS_NAMESPACE` unless a directed `Grant`
+  (`store_grant`, `remove_grant`, `grants`) accepts it. The engine state (default policy,
+  namespaces, grants, pinholes) is one snapshot swapped atomically; `clear_all` removes it
+  all.
+- `nsplane-acl`: opt-in outbound rules (`NamespacePolicy::outbound`, union across a peer's
+  namespaces); outbound packets to a restricted peer pass only by rule, outbound pinhole or
+  reply allowance, else `reasons::OUTBOUND`. Reply allowances that depend on a removed
+  grant or closed pinhole are revoked on their next lookup. New `AclFilterStats` counters
+  `cross_namespace`, `outbound_denied`, `outbound_replies`, `reply_revoked`.
+- `nsplane-acl`: source-gated app pinholes (`pinhole` module). `AclEngine::open_pinhole`
+  opens one peer, direction, protocol and port in an app namespace when a source namespace
+  allows the app kind (`allow_app_pinholes`), else `PinholeError::NotPermitted`; the
+  `PinholeGuard` closes it on drop. Pinholes expire on the engine clock
+  (`AclEngine::with_clock`, `expire_pinholes`) and are counted per close reason in
+  `PinholeStats`. A `namespaces` bench (`cargo bench -p nsplane-acl --bench namespaces`).
+- `nsplane-e2e`: `acl_namespaces` tests namespaces, grants, outbound rules and pinholes
+  under running engines.
+- `nsplane-examples`: `app_session`, a file transfer through pinholes between existing
+  peers and between session-only peers (not-permitted, revoke, cross-namespace and, with
+  `--tun`, TUN outbound steps); `just e2e-examples` scenarios `app_session` and
+  `app_session_tun`.
 - `nsplane-examples` (`examples/`, not published): runnable examples on the public APIs,
   each with `--help` — `udp_pair`, `tun_node`, `netstack_node`, `hybrid`, `acl_gateway`,
   `fd_bridge`, `events_stats` — sharing node, echo/check and status-file flags. See

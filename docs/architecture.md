@@ -142,12 +142,14 @@ builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops priv
 
 ## nsplane-acl
 
-`AclEngine` holds the compiled `AclPolicy` (host aliases, accept-only rules, built-in tests)
-behind an `ArcSwapOption`: evaluation takes no lock, `load` compiles and runs the policy's
-tests and swaps it in atomically, and a rejected policy leaves the previous one in effect.
-With no policy loaded every request is denied. `merge_layered` combines a local and remote
-policies with per-rule provenance; `apply_deny_scope` removes rules reaching forbidden
-CIDRs before compilation, so matching stays accept-only.
+`AclEngine` holds its whole state (the compiled default `AclPolicy`, the rule namespaces,
+the directed grants and the open pinholes) as one immutable snapshot behind an `ArcSwap`:
+writers serialize on a mutex and publish a new snapshot, and evaluation takes one lock-free
+load per packet. `load` compiles and runs the policy's tests and swaps it in atomically, and
+a rejected update leaves the previous state in effect. With nothing loaded every request is
+denied; `clear_all` removes everything in one swap. `merge_layered` combines a local and
+remote policies with per-rule provenance; `apply_deny_scope` removes rules reaching
+forbidden CIDRs before compilation, so matching stays accept-only.
 
 `AclFilter` is a `PacketFilter` for the engine's filter chain. Inbound packets become
 `AccessRequest`s whose principal (a WireGuard key or a terminate binding with a tunnel IP)
@@ -156,6 +158,54 @@ Non-first IPv4 fragments follow the outcome of their first fragment, and outboun
 packets record reply allowances (with an idle timeout) so replies to flows the local side
 opened pass. `FlowTracker` placed after it counts packets and bytes per flow in a bounded
 table.
+
+**Namespaces.** A node holds peers from several sources (NSDs, the Quick allow list, app
+sessions); each source is a rule namespace (`NamespaceId`: `nsd:<uuid>`, `quick`, or an app
+namespace `app:<session>`) stored with `store_namespace` and replaced or removed on its own.
+A `NamespacePolicy` names its members by principal (the peer's `source_anchor`, e.g.
+`key:<hex>`) with their tunnel addresses, its accept rules (an `AclPolicy`), optional
+`outbound` rules and the app kinds allowed to open pinholes (`allow_app_pinholes`). App
+namespaces never widen permissions: they carry no accept rules, allow no pinholes and no
+grant names them. The default policy applies only to principals that are members of no
+namespace, so a node without namespaces behaves as before. An inbound packet from member
+`P` to address `d` is evaluated after the reply table:
+
+1. `d` resolves to a member peer `Q` by longest address match; otherwise it is local, and
+   the local node is in every namespace.
+2. A rule of any namespace common to `P` (its non-app namespaces) and `d` accepts it.
+3. When `d` is another peer, a directed `Grant` (from `P` or one of its namespaces to `Q` or
+   one of its namespaces, with protocol and ports) accepts it; grants are one-way.
+4. When `d` is local, an open inbound pinhole of `P` for the protocol and port accepts it.
+5. Otherwise it is dropped with `reasons::CROSS_NAMESPACE` (`d` is a peer sharing no
+   namespace with `P`) or `reasons::DENIED`.
+
+**Outbound.** Outbound traffic is unrestricted by default. A peer is outbound-restricted
+only when it is in at least one namespace and every one of them sets `outbound` (union: one
+unrestricted namespace keeps it unrestricted). Outbound packets to a restricted peer pass
+when they match an outbound rule, an open outbound pinhole or the reply allowance of an
+inbound flow from that peer the filter accepted; anything else is dropped with
+`reasons::OUTBOUND`.
+
+**Pinholes.** An app session reaches a peer only through pinholes in its app namespace:
+`open_pinhole` opens one peer, direction, protocol and destination port until a
+caller-chosen `expires_at`, and returns a `PinholeGuard`. The app namespace must contain the
+peer, and when the peer is in any source namespace one of them must list the app kind in
+`allow_app_pinholes` (else `PinholeError::NotPermitted`). A pinhole closes when its guard is
+dropped, when it expires on the engine clock (`Instant::now`, or `AclEngine::with_clock`;
+`expire_pinholes` sweeps), when its namespace is removed, on `clear_all`, or when it is
+revoked (the peer left the app namespace or its source namespaces no longer allow the app
+kind); `PinholeStats` counts each reason.
+
+Reply allowances recorded for flows accepted through a grant or a pinhole depend on it.
+Removal is lazy: once the grant or pinhole is gone from the current snapshot, a dependent
+allowance is removed on its next lookup (`AclFilterStats::reply_revoked`) and the flow's
+packets are evaluated from scratch. The full rules and per-packet bench numbers (`cargo
+bench -p nsplane-acl --bench namespaces`) are in the crate docs
+(`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes* and *Performance*).
+
+nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the
+pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
+through this API. `examples/src/bin/app_session.rs` shows a file transfer on it.
 
 ## Unsafe code
 
