@@ -22,7 +22,7 @@ const NO_ROUTE: &str = "no route";
 /// A tunnel address no node owns.
 const SPOOFED: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 99);
 
-fn net(addr: Ipv4Addr, cidr: u8) -> AllowedIp {
+const fn net(addr: Ipv4Addr, cidr: u8) -> AllowedIp {
     AllowedIp {
         addr: IpAddr::V4(addr),
         cidr,
@@ -124,7 +124,7 @@ async fn removed_peers_carry_no_traffic() -> TestResult {
 
     a.handle.remove_peer(b.public()).await?;
     assert_eq!(a.handle.peer_id(b.public()).await?, None);
-    assert!(a.handle.peers().await?.is_empty());
+    assert_eq!(a.handle.peers().await?, Vec::new());
 
     a.send(&a.packet_to(&b, Family::V4, b"to nobody")).await?;
     b.expect_no_delivery().await?;
@@ -144,7 +144,7 @@ async fn remove_all_peers_empties_the_peer_list() -> TestResult {
     assert_eq!(a.handle.peers().await?.len(), 2);
 
     a.handle.remove_all_peers().await?;
-    assert!(a.handle.peers().await?.is_empty());
+    assert_eq!(a.handle.peers().await?, Vec::new());
     assert_eq!(a.handle.peer_id(b.public()).await?, None);
     assert_eq!(a.handle.peer_id(other).await?, None);
     a.send(&a.packet_to(&b, Family::V4, b"to nobody")).await?;

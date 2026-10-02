@@ -93,7 +93,8 @@ async fn persistent_keepalive_repeats_after_its_interval() -> TestResult {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn stats_follow_the_paused_clock() -> TestResult {
-    let interval = Duration::from_secs(60);
+    let before = Duration::from_secs(59);
+    let interval = before + Duration::from_secs(1);
     let (a, b) = channel_pair(Options {
         stats_interval: Some(interval),
     });
@@ -102,7 +103,7 @@ async fn stats_follow_the_paused_clock() -> TestResult {
     let mut events = a.subscribe().await?;
     let stats = |e: &Event| matches!(e, Event::PeerStats { peer, .. } if *peer == peer_b);
 
-    advance(interval - Duration::from_secs(1)).await;
+    advance(before).await;
     events.expect_none(stats).await?;
     advance(Duration::from_secs(1)).await;
     events.expect(stats).await?;
