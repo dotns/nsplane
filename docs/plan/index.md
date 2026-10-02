@@ -33,3 +33,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261001-1859-fork-baseline Fork baseline: pma-rust, aws-lc-rs, gotatun-inspired fixes**](20261001-1859-fork-baseline.md) `2026-10-01`
 - [-] [**20261002-1024-data-plane-core Complete data plane: transport, netstack and ACL inside nstun**](20261002-1024-data-plane-core.md) `2026-10-02`
+- [ ] [**20261002-1535-phase2-engine Phase 2: multi-transport engine, engine-driven timers, follow-up fixes**](20261002-1535-phase2-engine.md) `2026-10-02`
