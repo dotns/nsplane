@@ -1,7 +1,6 @@
 //! Two cores on the fake clock: handshake, data in both directions, keepalives, drops and
 //! buffer reuse.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
@@ -10,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use common::{Net, ip4, packet_buf, udp4};
-use nsplane_core::{Event, Input, Output, PacketBuf};
+use nsplane_core::{Event, Input, Output, PacketBuf, reasons};
 
 /// Start of the buffer behind `buf`, to tell allocations apart.
 fn base(buf: &mut PacketBuf) -> *const u8 {
@@ -93,6 +92,47 @@ fn keepalives_are_not_delivered() {
     assert_eq!(net.take_delivered(1), Vec::new());
 }
 
+/// Two handshakes completed at the same time, within one timer tick, are both reported on
+/// both sides.
+#[test]
+fn every_handshake_within_a_tick_is_reported() {
+    let mut net = Net::new(2);
+    net.handshake(0, 1);
+    net.handshake(0, 1);
+
+    assert_eq!(handshakes(&net.take_events(0)).len(), 2);
+    assert_eq!(handshakes(&net.take_events(1)).len(), 2);
+}
+
+/// A handshake initiation the peer's tunnel refuses (here a replay) is dropped with
+/// `HANDSHAKE_REJECTED` and completes nothing.
+#[test]
+fn replayed_initiation_is_rejected() {
+    let mut net = Net::new(2);
+    let (a_to_b, b_to_a) = (net.peer_id(0, 1), net.peer_id(1, 0));
+    net.cores[0].force_handshake(a_to_b, None, net.now);
+    let Some(Output::Transmit { data: init, .. }) = net.cores[0].poll_output() else {
+        panic!("expected an initiation");
+    };
+    let init = init.as_packet().to_vec();
+
+    let arrival = net.paths[0];
+    net.receive(1, arrival, packet_buf(&init));
+    drop(net.drain());
+    net.clear_logs();
+    net.receive(1, arrival, packet_buf(&init));
+    drop(net.drain());
+
+    assert_eq!(
+        net.take_events(1),
+        [Event::Dropped {
+            peer: Some(b_to_a),
+            reason: reasons::HANDSHAKE_REJECTED
+        }]
+    );
+    assert_eq!(net.take_transmits(1), Vec::new());
+}
+
 #[test]
 fn packets_without_a_route_are_dropped() {
     let mut net = Net::new(2);
@@ -103,7 +143,7 @@ fn packets_without_a_route_are_dropped() {
         net.take_events(0),
         [Event::Dropped {
             peer: None,
-            reason: "no route"
+            reason: reasons::NO_ROUTE
         }]
     );
     assert_eq!(net.take_transmits(0), Vec::new());
