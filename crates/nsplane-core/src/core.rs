@@ -55,6 +55,8 @@ pub struct Core {
     pool: PacketPool,
     outputs: VecDeque<Output>,
     schedule: Option<Schedule>,
+    /// The `now` of the latest call that passed the time.
+    now: Option<Instant>,
 }
 
 impl fmt::Debug for Core {
@@ -83,6 +85,7 @@ impl Core {
             pool: PacketPool::new(config.pool_size),
             outputs: VecDeque::new(),
             schedule: None,
+            now: None,
         }
     }
 
@@ -93,9 +96,9 @@ impl Core {
     pub fn handle_input(&mut self, input: Input<'_>, now: Instant) {
         self.start_schedule(now);
         match input {
-            Input::Datagram { path, data } => self.receive(path, data),
+            Input::Datagram { path, data } => self.receive(path, data, now),
             Input::Local { packet } => self.send(packet, true),
-            Input::Config(change) => self.configure(change),
+            Input::Config(change) => self.configure(change, now),
         }
     }
 
@@ -123,7 +126,7 @@ impl Core {
             // The timers may expire sessions or start a handshake.
             peer.reset_rx_session();
             buf.set_len(BUF_SIZE);
-            match peer.update_timers(&mut buf.with_headroom_mut()[HEADROOM..]) {
+            match peer.update_timers(now, &mut buf.with_headroom_mut()[HEADROOM..]) {
                 TunnResult::Done => peer.expired = false,
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
                     if !mem::replace(&mut peer.expired, true) {
@@ -161,7 +164,7 @@ impl Core {
         let mut schedule = schedule;
         if now >= schedule.rate_limiter_reset {
             if let Some(gate) = self.peers.rate_limiter() {
-                gate.reset_count();
+                gate.reset_count_at(now);
             }
             schedule.rate_limiter_reset = now + RATE_LIMITER_RESET;
         }
@@ -169,13 +172,13 @@ impl Core {
             && now >= due
         {
             for (peer, p) in self.peers.iter() {
-                let (last_handshake, tx, rx, ..) = p.tunnel.stats();
+                let (_, tx, rx, ..) = p.tunnel.stats();
                 self.outputs.push_back(Output::Event(Event::PeerStats {
                     peer,
                     rx: rx as u64,
                     tx: tx as u64,
                     data_rx: p.data_rx(),
-                    last_handshake,
+                    last_handshake: p.time_since_last_handshake(now),
                 }));
             }
             schedule.stats = Some(now + interval);
@@ -199,10 +202,12 @@ impl Core {
         self.peers.iter().map(|(id, _)| id)
     }
 
-    /// Configuration and counters of `peer`.
+    /// Configuration and counters of `peer`; the time since its last handshake is measured
+    /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
         let p = self.peers.peer(peer)?;
-        let (last_handshake, tx, rx, ..) = p.tunnel.stats();
+        let (_, tx, rx, ..) = p.tunnel.stats();
+        let last_handshake = self.now.and_then(|now| p.time_since_last_handshake(now));
         Some(PeerStats {
             peer,
             public_key: *p.public_key(),
@@ -275,6 +280,7 @@ impl Core {
 
     /// Starts the timer schedule on the first call that passes the time.
     fn start_schedule(&mut self, now: Instant) -> Schedule {
+        self.now = Some(now);
         *self.schedule.get_or_insert_with(|| Schedule {
             tick: now + TICK,
             rate_limiter_reset: now + RATE_LIMITER_RESET,
@@ -287,7 +293,7 @@ impl Core {
     /// Peers cannot be added without a private key; such a change is reported as
     /// `Event::Dropped { peer: None, reason: "no private key" }`. Changes to unknown peers are
     /// ignored.
-    fn configure(&mut self, change: ConfigChange) {
+    fn configure(&mut self, change: ConfigChange, now: Instant) {
         let config = match change {
             ConfigChange::SetPrivateKey(key) => {
                 self.peers.set_private_key(key);
@@ -330,7 +336,7 @@ impl Core {
                 ..PeerConfig::new(peer)
             },
         };
-        if let Err(e) = self.peers.apply(&config) {
+        if let Err(e) = self.peers.apply(&config, now) {
             let reason = match e {
                 PeerTableError::NoPrivateKey => "no private key",
                 PeerTableError::IndicesExhausted => "no free session index",
@@ -341,20 +347,20 @@ impl Core {
     }
 
     /// Handles a datagram from `path`.
-    fn receive(&mut self, path: Path, data: &mut PacketBuf) {
+    fn receive(&mut self, path: Path, data: &mut PacketBuf, now: Instant) {
         let data_index = match Tunn::parse_incoming_packet(data.as_packet()) {
             Ok(Packet::PacketData(p)) => Some(p.receiver_idx),
             Ok(_) => None,
             Err(_) => return self.dropped(None, "invalid packet"),
         };
         match data_index {
-            Some(index) => self.receive_data(path, data, index),
-            None => self.receive_handshake(path, data.as_packet()),
+            Some(index) => self.receive_data(path, data, index, now),
+            None => self.receive_handshake(path, data.as_packet(), now),
         }
     }
 
     /// Decrypts transport data in place and delivers it.
-    fn receive_data(&mut self, path: Path, data: &mut PacketBuf, receiver_idx: u32) {
+    fn receive_data(&mut self, path: Path, data: &mut PacketBuf, receiver_idx: u32, now: Instant) {
         let Some(id) = self.peers.by_index(receiver_idx) else {
             return self.dropped(None, "unknown session");
         };
@@ -365,7 +371,7 @@ impl Core {
         // complete a handshake: data on the established session leaves the clock alone.
         let new_session = peer.is_new_session(receiver_idx);
         let before = if new_session {
-            peer.time_since_last_handshake()
+            peer.time_since_last_handshake(now)
         } else {
             None
         };
@@ -389,7 +395,7 @@ impl Core {
         };
         let completed = new_session && {
             peer.set_rx_session(receiver_idx);
-            new_handshake(before, peer.time_since_last_handshake())
+            new_handshake(before, peer.time_since_last_handshake(now))
         };
 
         let kind = if src.is_some() {
@@ -437,7 +443,7 @@ impl Core {
     }
 
     /// Verifies a handshake message, finds its peer and lets the peer's tunnel answer it.
-    fn receive_handshake(&mut self, path: Path, datagram: &[u8]) {
+    fn receive_handshake(&mut self, path: Path, datagram: &[u8], now: Instant) {
         let (Some((private, public)), Some(gate)) =
             (self.peers.key_pair(), self.peers.rate_limiter())
         else {
@@ -501,7 +507,7 @@ impl Core {
         };
 
         p.reset_rx_session();
-        let before = p.time_since_last_handshake();
+        let before = p.time_since_last_handshake(now);
         let reply_len = match p.tunnel.decapsulate(
             Some(path.addr),
             message,
@@ -519,7 +525,7 @@ impl Core {
                 return self.pool.put(reply);
             }
         };
-        let completed = new_handshake(before, p.time_since_last_handshake());
+        let completed = new_handshake(before, p.time_since_last_handshake(now));
 
         let Some(reply_len) = reply_len else {
             self.pool.put(reply);

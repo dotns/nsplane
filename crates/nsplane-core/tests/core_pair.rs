@@ -1,7 +1,6 @@
 //! Two cores on the fake clock: handshake, data in both directions, keepalives, drops and
 //! buffer reuse.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;

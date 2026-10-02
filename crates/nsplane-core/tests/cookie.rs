@@ -1,7 +1,6 @@
 //! The handshake gate under load: cookie replies, the mac2 retry through the gate and the
 //! peer's tunnel, the rate limiter reset, and garbage datagrams.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
