@@ -1,7 +1,6 @@
 //! Configuration changes on live cores: removing peers, allowed IPs, preshared keys, the
 //! private key, peer stats and forced handshakes.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;

@@ -1,7 +1,6 @@
 //! Roaming: the standard policy adopting new paths, cookie replies that never roam, and custom
 //! path policies.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;

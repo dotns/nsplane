@@ -6,13 +6,10 @@ use crate::noise::{
 };
 use zerocopy::FromBytes;
 
-#[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
 use portable_atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
-#[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 
 use aead::generic_array::GenericArray;
@@ -64,8 +61,9 @@ pub struct RateLimiter {
     count: AtomicU64,
     /// Handshakes since last reset, per source address
     per_source: Mutex<HashMap<IpAddr, u64>>,
-    /// The time last reset was performed on this rate limiter
-    last_reset: Mutex<Instant>,
+    /// The time last reset was performed on this rate limiter, on the clock of the caller of
+    /// `reset_count_at`; `None` until its first call
+    last_reset: Mutex<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for RateLimiter {
@@ -92,7 +90,7 @@ impl RateLimiter {
             limit,
             count: AtomicU64::new(0),
             per_source: Mutex::new(HashMap::new()),
-            last_reset: Mutex::new(Instant::now()),
+            last_reset: Mutex::new(None),
         }
     }
 
@@ -102,15 +100,27 @@ impl RateLimiter {
         key
     }
 
-    /// Reset packet count (ideally should be called with a period of 1 second)
+    /// Reset packet count (ideally should be called with a period of 1 second), on the crate
+    /// clock (`std::time::Instant::now()`); see [`RateLimiter::reset_count_at`].
     pub fn reset_count(&self) {
+        self.reset_count_at(std::time::Instant::now());
+    }
+
+    /// Reset packet count if a reset period passed since the last reset at `now` (ideally
+    /// should be called with a period of 1 second).
+    ///
+    /// The first call always resets. Callers must pass instants from one clock: mixing this
+    /// method with [`RateLimiter::reset_count`] is only sound if `now` comes from the crate
+    /// clock. A `now` before the last reset resets nothing.
+    pub fn reset_count_at(&self, now: std::time::Instant) {
         // The rate limiter is not very accurate, but at the scale we care about it doesn't matter much
-        let current_time = Instant::now();
         let mut last_reset_time = self.last_reset.lock();
-        if current_time.duration_since(*last_reset_time).as_secs() >= RESET_PERIOD {
+        if last_reset_time
+            .is_none_or(|last| now.saturating_duration_since(last).as_secs() >= RESET_PERIOD)
+        {
             self.count.store(0, Ordering::SeqCst);
             self.per_source.lock().clear();
-            *last_reset_time = current_time;
+            *last_reset_time = Some(now);
         }
     }
 
