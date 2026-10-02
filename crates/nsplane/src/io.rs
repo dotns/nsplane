@@ -16,6 +16,11 @@ pub trait PacketSource: Send + 'static {
     fn recv(&mut self) -> impl Future<Output = io::Result<PacketBuf>> + Send;
 
     /// The current local MTU; the receiver observes every later change.
+    ///
+    /// The engine calls this once when it starts and watches the receiver: every change to
+    /// a different value is published as `Event::MtuChanged` and reported by
+    /// [`EngineHandle::mtu`](crate::EngineHandle::mtu). Dropping the sender ends the
+    /// watching; the engine keeps the last value.
     fn mtu(&self) -> watch::Receiver<u16>;
 }
 

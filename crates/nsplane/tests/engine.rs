@@ -1005,3 +1005,28 @@ async fn transports_replaced_while_suspended_start_suspended() {
     assert_eq!(b.expect_delivery().await.1, packet);
     exchange(&mut a, &mut b).await;
 }
+
+#[tokio::test]
+async fn mtu_is_kept_once_the_source_watch_closes() {
+    let (source, _local, mtu) = ChannelSource::new(4, 1420);
+    let (sink, _delivered) = ChannelSink::new(4);
+    let (transport, _other) = link(4);
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()
+        .unwrap();
+    let handle = engine.handle();
+    let mut events = handle.subscribe().await.unwrap();
+    assert_eq!(handle.mtu().await.unwrap(), 1420);
+
+    mtu.send(1280).unwrap();
+    assert_eq!(
+        expect_event(&mut events, |e| matches!(e, Event::MtuChanged { .. })).await,
+        Event::MtuChanged { mtu: 1280 }
+    );
+    drop(mtu);
+    sleep(QUIET).await;
+    assert_eq!(handle.mtu().await.unwrap(), 1280);
+    handle.shutdown().await.unwrap();
+    assert_eq!(handle.mtu().await, Err(EngineError));
+}

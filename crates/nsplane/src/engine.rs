@@ -79,6 +79,14 @@ const MAX_DATAGRAM: usize = 65535;
 /// due handshakes start, before normal operation continues. Peers and sessions are kept
 /// across a suspension, and transports added or replaced while suspended start suspended.
 ///
+/// MTU: the engine takes [`PacketSource::mtu`] when it starts and a small task, gated by
+/// the suspension like the I/O tasks, forwards every change of that watch to the owner task.
+/// The owner keeps the last value it saw ([`EngineHandle::mtu`]) and publishes
+/// `Event::MtuChanged` when a forwarded value differs from it, so a value sent again does not
+/// publish. Changes made while suspended collapse into the latest value, published once
+/// after [`EngineHandle::resume`] if it differs. Once the source drops its sender, the
+/// engine stops watching and keeps the last value.
+///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
 /// keeps running without it; other I/O errors are logged and the task continues.
 ///
@@ -148,6 +156,9 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let (deliver, deliver_rx) = mpsc::channel(capacity);
     let (events, _) = broadcast::channel(parts.event_capacity);
     let (suspended, _) = watch::channel(false);
+    let (mtu_tx, mtu_changes) = mpsc::channel(1);
+    let mut mtu_watch = parts.source.mtu();
+    let mtu = *mtu_watch.borrow_and_update();
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.
@@ -170,7 +181,10 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         timer: Box::pin(sleep_until(deadline)),
         events,
         drops: BTreeMap::new(),
+        mtu,
+        mtu_changes: Some(mtu_changes),
         tasks: vec![
+            Task::spawn(watch_mtu(mtu_watch, mtu_tx, suspended.subscribe())),
             Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
             Task::spawn(write_sink(parts.sink, deliver_rx, suspended.subscribe())),
         ],
@@ -311,6 +325,7 @@ enum Wake {
     Command(Option<Command>),
     Datagram(Option<Datagram>),
     Local(Option<PacketBuf>),
+    Mtu(Option<u16>),
     /// Room in the transmit queue of a transport with waiting datagrams.
     Flush(TransportId, Option<OwnedPermit<Datagram>>),
     Timer,
@@ -336,7 +351,11 @@ struct Owner {
     timer: Pin<Box<Sleep>>,
     events: broadcast::Sender<Event>,
     drops: BTreeMap<&'static str, u64>,
-    /// The source and sink tasks.
+    /// The last MTU of the source.
+    mtu: u16,
+    /// MTU changes of the source; `None` once the source dropped its watch's sender.
+    mtu_changes: Option<mpsc::Receiver<u16>>,
+    /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
     /// Alternates which of local packets and datagrams is polled first.
@@ -376,6 +395,13 @@ impl Owner {
                 Wake::Datagram(None) => {}
                 Wake::Local(Some(packet)) => self.core.handle_input(Input::Local { packet }, now()),
                 Wake::Local(None) => self.local = None,
+                Wake::Mtu(Some(mtu)) => {
+                    if mtu != self.mtu {
+                        self.mtu = mtu;
+                        self.event(Event::MtuChanged { mtu });
+                    }
+                }
+                Wake::Mtu(None) => self.mtu_changes = None,
                 Wake::Flush(id, permit) => {
                     // No permit: the transmit queue closed, and moving drops the datagrams.
                     if let Some(permit) = permit
@@ -426,6 +452,11 @@ impl Owner {
             if let Poll::Ready(wake) = self.poll_local(cx) {
                 return Poll::Ready(wake);
             }
+        }
+        if let Some(changes) = &mut self.mtu_changes
+            && let Poll::Ready(mtu) = changes.poll_recv(cx)
+        {
+            return Poll::Ready(Wake::Mtu(mtu));
         }
         if self.timer.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Wake::Timer);
@@ -512,17 +543,7 @@ impl Owner {
                 let _ = reply.send(result);
             }
             Command::RemoveTransport(id, reply) => {
-                let result = match self.transports.remove(&id) {
-                    Some(old) => {
-                        for (_, data) in old.stop().await {
-                            self.core.recycle(data);
-                            self.dropped(None, DROP_NO_TRANSPORT);
-                        }
-                        Ok(())
-                    }
-                    None => Err(TransportError::Unknown(id)),
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(self.remove_transport(id).await);
             }
             Command::ReplaceTransport(transport, reply) => {
                 let result = match self.transports.remove(&transport.id) {
@@ -546,6 +567,9 @@ impl Owner {
                 self.resume();
                 let _ = reply.send(());
             }
+            Command::Mtu(reply) => {
+                let _ = reply.send(self.mtu);
+            }
             Command::Subscribe(reply) => {
                 let _ = reply.send(self.events.subscribe());
             }
@@ -555,6 +579,19 @@ impl Owner {
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
         }
         ControlFlow::Continue(())
+    }
+
+    /// Stops and removes transport `id`; its waiting datagrams are dropped.
+    async fn remove_transport(&mut self, id: TransportId) -> Result<(), TransportError> {
+        let old = self
+            .transports
+            .remove(&id)
+            .ok_or(TransportError::Unknown(id))?;
+        for (_, data) in old.stop().await {
+            self.core.recycle(data);
+            self.dropped(None, DROP_NO_TRANSPORT);
+        }
+        Ok(())
     }
 
     /// Suspends every I/O task and the owner's own polling, unless already suspended.
@@ -678,6 +715,24 @@ impl Owner {
 /// Waits while the engine is suspended; `false` once the engine is gone.
 async fn running(suspended: &mut watch::Receiver<bool>) -> bool {
     suspended.wait_for(|suspended| !suspended).await.is_ok()
+}
+
+/// Forwards every change of the source's MTU watch to the owner until the sender is dropped.
+/// Changes while suspended collapse into the latest value, forwarded after resuming.
+async fn watch_mtu(
+    mut mtu: watch::Receiver<u16>,
+    changes: mpsc::Sender<u16>,
+    mut suspended: watch::Receiver<bool>,
+) {
+    while mtu.changed().await.is_ok() {
+        if !running(&mut suspended).await {
+            return;
+        }
+        let value = *mtu.borrow_and_update();
+        if changes.send(value).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Reads local packets into the owner's queue until the source closes.
