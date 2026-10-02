@@ -18,7 +18,7 @@ use nsplane::{AllowedIp, EngineBuilder, EngineHandle, Event, Peer, PeerStats, Ud
 use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, udp};
 use nsplane_packet::{Ecn, FiveTuple, IpPacket, Path, PeerId, TransportId, UdpHeader, protocol};
 use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener};
+use nsplane_uapi::{Uapi, UapiListener, udp_transport};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
@@ -110,7 +110,7 @@ async fn tun_carries_socket_datagrams_both_ways() -> TestResult {
     let engine = EngineBuilder::new(source, sink)
         .transport(transport)
         .private_key(secret.clone())
-        .build();
+        .build()?;
     let handle = engine.handle();
 
     // The peer engine (seed 2: 10.0.0.2, fd00::2) uses channels as its source and sink.
@@ -521,9 +521,13 @@ async fn kernel_wireguard_interop() -> TestResult {
 
     let tun = Tun::create(IFACE)?;
     let (source, sink) = tun.split()?;
-    let engine = EngineBuilder::new(source, sink).build();
+    let transport = udp_transport(0)?;
+    let port = transport.local_addr().port();
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()?;
     let handle = engine.handle();
-    let uapi = Uapi::new(handle.clone());
+    let uapi = Uapi::with_listen_port(handle.clone(), port);
     let listener = UapiListener::bind(IFACE)?;
     let server = tokio::spawn(async move { uapi.serve(listener).await });
     configure_iface(IFACE, &env.addr_v4, &env.addr_v6).await?;

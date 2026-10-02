@@ -27,8 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nstun-uapi`: the `wg` UAPI (`get=1`/`set=1`) over an `EngineHandle`, including
   `listen_port` and `fwmark` rebinding the UDP transport; `UapiListener` binds
   `/var/run/wireguard/<iface>.sock` on Unix.
+- `nsplane`: one engine runs several transports of different types at once (e.g. direct UDP
+  next to a relay), keyed by the new `Transport::id`. `EngineHandle::add_transport`,
+  `remove_transport` and `replace_transport` change them at runtime and fail with the typed
+  `TransportError` (`Stopped`, `Duplicate`, `Unknown`). `DynTransport` (with `BoxFuture`) is
+  the object-safe form of `Transport`; `Box<dyn DynTransport>` is a `Transport`. Each
+  transport has its own transmit queue and waiting datagrams, so a slow transport does not
+  delay another's datagrams; a datagram whose path names no installed transport is dropped
+  under `DROP_NO_TRANSPORT`.
+- `nsplane-uapi`: `udp_transport(port)` binds the UAPI's transport for the engine builder,
+  and `Uapi::with_listen_port` serves an engine built with it.
 
 ### Changed
+- Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
+  transport type parameter. `EngineBuilder::transport` adds a transport and may be called
+  several times; `EngineBuilder::build` returns `Result<Engine, BuildError>` and fails with
+  `BuildError::NoTransport` without a transport and `BuildError::DuplicateTransport` when
+  two share an id. `EngineHandle::set_transport` is replaced by
+  `EngineHandle::replace_transport`, which needs a transport with the same id installed.
+  `UdpTransport::id` and `ChannelTransport::id` are now `Transport::id`.
+- Breaking: `nsplane-uapi` installs its transport with `add_transport` the first time and
+  `replace_transport` afterwards; `Uapi::handle` returns a non-generic `EngineHandle`.
 - Breaking: the project is renamed **nsplane** (`github.com/dotns/nsplane`) and every crate
   lives under `crates/`: `boringtun` → `nsplane-noise`, `boringtun-cli` → `nsplane-cli`
   (binary `nsplane-cli`), `nstun` → `nsplane`, `nstun-core` → `nsplane-core`,

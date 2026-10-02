@@ -13,7 +13,7 @@ use clap::Parser;
 use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
 use nsplane::EngineBuilder;
 use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener};
+use nsplane_uapi::{Uapi, UapiListener, udp_transport};
 use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
@@ -124,12 +124,14 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
     let name = tun.name().context("Failed to read the tunnel name")?;
     let (source, sink) = tun.split().context("Failed to initialize tunnel")?;
 
-    let engine = EngineBuilder::new(source, sink).build();
+    let transport = udp_transport(0).context("Failed to bind the UDP socket")?;
+    let port = transport.local_addr().port();
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()
+        .context("Failed to start the engine")?;
     let handle = engine.handle();
-    let uapi = Uapi::new(engine.handle());
-    uapi.bind_transport(0)
-        .await
-        .context("Failed to bind the UDP socket")?;
+    let uapi = Uapi::with_listen_port(engine.handle(), port);
     let listener = UapiListener::bind(&name).context("Failed to bind the UAPI socket")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("Failed to watch SIGINT")?;
     let mut terminate = signal(SignalKind::terminate()).context("Failed to watch SIGTERM")?;
