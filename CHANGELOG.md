@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport has its own transmit queue and waiting datagrams, so a slow transport does not
   delay another's datagrams; a datagram whose path names no installed transport is dropped
   under `DROP_NO_TRANSPORT`.
+- `nsplane`: `EngineHandle::suspend` and `resume` pause the engine without tearing it down
+  (e.g. while the host sleeps): no source, sink or transport I/O and no timers run, peers
+  and sessions are kept, and handle calls still work. They publish `Event::Suspended` and
+  `Event::Resumed`; resuming runs the core's timers once with the current time.
+- `nsplane`: the engine watches `PacketSource::mtu` and publishes `Event::MtuChanged` once
+  per change; `EngineHandle::mtu` returns the last observed value. Changes made while
+  suspended are published once after resuming if the value differs.
 - `nsplane-uapi`: `udp_transport(port)` binds the UAPI's transport for the engine builder,
   and `Uapi::with_listen_port` serves an engine built with it.
 - `nsplane-tun` (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
