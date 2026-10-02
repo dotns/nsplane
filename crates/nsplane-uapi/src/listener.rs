@@ -1,16 +1,11 @@
 //! The Unix socket the `wg` tool connects to.
 
 use std::fs;
-use std::future::{Future, poll_fn};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::task::Poll;
 
-use tokio::io::BufReader;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast::error::RecvError;
-use tokio::task::JoinSet;
 
 use crate::uapi::Uapi;
 
@@ -60,6 +55,12 @@ impl UapiListener {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Waits for the next client and returns the read and write halves of its connection.
+    pub(crate) async fn accept(&self) -> io::Result<(OwnedReadHalf, OwnedWriteHalf)> {
+        let (stream, _) = self.listener.accept().await?;
+        Ok(stream.into_split())
+    }
 }
 
 impl Drop for UapiListener {
@@ -80,40 +81,6 @@ fn create_sock_dir() {
 }
 
 impl Uapi {
-    /// Accepts connections on `listener` and serves each on its own task, request after
-    /// request, until the engine shuts down.
-    ///
-    /// On return, and when this future is dropped, the connection tasks are aborted and
-    /// the socket file is removed.
-    pub async fn serve(&self, listener: UapiListener) -> io::Result<()> {
-        let mut events = self.handle().subscribe().await.map_err(io::Error::other)?;
-        let mut stopped = pin!(async move {
-            // The event channel closes when the engine stops.
-            while !matches!(events.recv().await, Err(RecvError::Closed)) {}
-        });
-        let mut connections = JoinSet::new();
-        loop {
-            let accepted = poll_fn(|cx| {
-                if stopped.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(None);
-                }
-                listener.listener.poll_accept(cx).map(Some)
-            })
-            .await;
-            match accepted {
-                None => return Ok(()),
-                Some(Ok((stream, _))) => {
-                    while connections.try_join_next().is_some() {}
-                    let uapi = self.clone();
-                    connections.spawn(async move { uapi.serve_stream(stream).await });
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(message = "Failed to accept a UAPI connection", error = ?e);
-                }
-            }
-        }
-    }
-
     /// Serves requests on one connected `stream`, request after request, until the client
     /// closes it or a request fails; then the stream is closed.
     ///
@@ -122,17 +89,7 @@ impl Uapi {
     /// from a parent process (the CLI's `--uapi-fd`). It does not watch the engine: once
     /// the engine stops, the next request is answered with an error and the stream closes.
     pub async fn serve_stream(&self, stream: UnixStream) {
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        loop {
-            match self.handle_request(&mut reader, &mut writer).await {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(e) => {
-                    tracing::debug!(message = "UAPI connection failed", error = ?e);
-                    return;
-                }
-            }
-        }
+        let (reader, writer) = stream.into_split();
+        self.serve_connection(reader, writer).await;
     }
 }
