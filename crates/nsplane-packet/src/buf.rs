@@ -1,5 +1,7 @@
 //! Packet buffers with reserved headroom, a buffer pool, and fixed-size batches.
 
+use std::fmt;
+
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 
@@ -9,6 +11,18 @@ pub const HEADROOM: usize = 32;
 
 /// Maximum number of packets in a [`PacketBatch`].
 pub const MAX_BATCH: usize = 64;
+
+/// A requested range does not fit the packet or its headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundsError;
+
+impl fmt::Display for BoundsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("range out of bounds")
+    }
+}
+
+impl std::error::Error for BoundsError {}
 
 /// An IP packet with reserved headroom in front of it.
 ///
@@ -58,20 +72,20 @@ impl PacketBuf {
     /// with [`headroom()`](Self::headroom). A [`PacketPool`] drops such buffers instead of
     /// pooling them, so they never pin the larger shared allocation.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + len > buf.len()`.
-    pub fn from_shared(mut buf: BytesMut, offset: usize, len: usize) -> Self {
-        assert!(
-            len <= buf.len() && offset <= buf.len() - len,
-            "from_shared range out of bounds"
-        );
-        buf.truncate(offset + len);
-        Self {
+    /// Returns [`BoundsError`] if `offset + len` overflows or exceeds `buf.len()`.
+    pub fn from_shared(mut buf: BytesMut, offset: usize, len: usize) -> Result<Self, BoundsError> {
+        let end = offset.checked_add(len).ok_or(BoundsError)?;
+        if end > buf.len() {
+            return Err(BoundsError);
+        }
+        buf.truncate(end);
+        Ok(Self {
             buf,
             start: offset,
             shared: true,
-        }
+        })
     }
 
     /// The packet bytes.
@@ -103,23 +117,26 @@ impl PacketBuf {
     /// Drops the first `n` packet bytes by moving the packet start forward, without
     /// copying: the headroom grows by `n` and the packet shrinks by `n`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `n > len()`.
-    pub fn advance(&mut self, n: usize) {
-        assert!(n <= self.len(), "advance past the end of the packet");
+    /// Returns [`BoundsError`] if `n > len()`; the packet is left unchanged.
+    pub fn advance(&mut self, n: usize) -> Result<(), BoundsError> {
+        if n > self.len() {
+            return Err(BoundsError);
+        }
         self.start += n;
+        Ok(())
     }
 
     /// Grows the packet at the front by `n` bytes taken from the headroom, without
     /// copying; the exposed bytes keep whatever they held.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `n > headroom()`.
-    pub fn reserve_front(&mut self, n: usize) {
-        assert!(n <= self.start, "reserve_front beyond the headroom");
-        self.start -= n;
+    /// Returns [`BoundsError`] if `n > headroom()`; the packet is left unchanged.
+    pub fn reserve_front(&mut self, n: usize) -> Result<(), BoundsError> {
+        self.start = self.start.checked_sub(n).ok_or(BoundsError)?;
+        Ok(())
     }
 
     /// Whether the packet is empty.
@@ -369,18 +386,18 @@ mod tests {
         assert_eq!(buf.headroom(), HEADROOM);
         let ptr = buf.as_packet().as_ptr();
 
-        buf.advance(2);
+        buf.advance(2).unwrap();
         assert_eq!(buf.as_packet(), [3, 4, 5, 6]);
         assert_eq!(buf.len(), 4);
         assert_eq!(buf.headroom(), HEADROOM + 2);
         assert_eq!(buf.as_packet().as_ptr(), ptr.wrapping_add(2));
 
-        buf.reserve_front(2);
+        buf.reserve_front(2).unwrap();
         assert_eq!(buf.as_packet(), packet);
         assert_eq!(buf.headroom(), HEADROOM);
         assert_eq!(buf.as_packet().as_ptr(), ptr);
 
-        buf.reserve_front(HEADROOM);
+        buf.reserve_front(HEADROOM).unwrap();
         assert_eq!(buf.headroom(), 0);
         assert_eq!(buf.len(), HEADROOM + packet.len());
         assert_eq!(&buf.as_packet()[HEADROOM..], packet);
@@ -390,27 +407,32 @@ mod tests {
     #[test]
     fn advance_whole_packet_is_empty() {
         let mut buf = PacketBuf::from_packet(&[1, 2, 3]);
-        buf.advance(3);
+        buf.advance(3).unwrap();
         assert!(buf.is_empty());
         assert_eq!(buf.headroom(), HEADROOM + 3);
     }
 
     #[test]
-    #[should_panic = "advance past the end"]
-    fn advance_beyond_len_panics() {
-        PacketBuf::from_packet(&[1, 2, 3]).advance(4);
+    fn advance_beyond_len_fails_unchanged() {
+        let mut buf = PacketBuf::from_packet(&[1, 2, 3]);
+        assert_eq!(buf.advance(4), Err(BoundsError));
+        assert_eq!(buf.as_packet(), [1, 2, 3]);
+        assert_eq!(buf.headroom(), HEADROOM);
     }
 
     #[test]
-    #[should_panic = "reserve_front beyond the headroom"]
-    fn reserve_front_beyond_headroom_panics() {
-        PacketBuf::from_packet(&[1]).reserve_front(HEADROOM + 1);
+    fn reserve_front_beyond_headroom_fails_unchanged() {
+        let mut buf = PacketBuf::from_packet(&[1]);
+        assert_eq!(buf.reserve_front(HEADROOM + 1), Err(BoundsError));
+        assert_eq!(buf.as_packet(), [1]);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert_eq!(BoundsError.to_string(), "range out of bounds");
     }
 
     #[test]
     fn set_len_into_bytes_freeze_after_advance() {
         let mut buf = PacketBuf::from_packet(&[1, 2, 3, 4]);
-        buf.advance(1);
+        buf.advance(1).unwrap();
         assert!(buf.capacity() >= 3);
         buf.set_len(5);
         assert_eq!(buf.as_packet(), [2, 3, 4, 0, 0]);
@@ -424,7 +446,7 @@ mod tests {
     #[test]
     fn with_headroom_mut_after_advance() {
         let mut buf = PacketBuf::from_packet(&[1, 2, 3, 4]);
-        buf.advance(3);
+        buf.advance(3).unwrap();
         let headroom = buf.headroom();
         let whole = buf.with_headroom_mut();
         assert_eq!(whole.len(), headroom + 1);
@@ -438,14 +460,14 @@ mod tests {
         let base = whole.as_ptr();
         let first = whole.split_to(40);
 
-        let buf = PacketBuf::from_shared(first, 8, 16);
+        let buf = PacketBuf::from_shared(first, 8, 16).unwrap();
         assert_eq!(buf.headroom(), 8);
         assert_eq!(buf.len(), 16);
         assert_eq!(buf.as_packet(), (8..24u8).collect::<Vec<_>>());
         assert_eq!(buf.as_packet().as_ptr(), base.wrapping_add(8));
         assert_eq!(&buf.freeze()[..], (8..24u8).collect::<Vec<_>>());
 
-        let mut second = PacketBuf::from_shared(whole, 0, 10);
+        let mut second = PacketBuf::from_shared(whole, 0, 10).unwrap();
         assert_eq!(second.headroom(), 0);
         assert_eq!(second.as_packet(), (40..50u8).collect::<Vec<_>>());
         assert_eq!(second.as_packet().as_ptr(), base.wrapping_add(40));
@@ -453,11 +475,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "from_shared range out of bounds"]
-    fn from_shared_out_of_bounds_panics() {
+    fn from_shared_out_of_bounds_fails() {
         let mut whole = BytesMut::new();
         whole.extend_from_slice(&[0; 8]);
-        let _ = PacketBuf::from_shared(whole, 4, 5);
+        assert!(PacketBuf::from_shared(whole.clone(), 4, 4).is_ok());
+        assert_eq!(
+            PacketBuf::from_shared(whole.clone(), 4, 5).unwrap_err(),
+            BoundsError
+        );
+        assert_eq!(
+            PacketBuf::from_shared(whole.clone(), usize::MAX, 1).unwrap_err(),
+            BoundsError
+        );
+        assert_eq!(
+            PacketBuf::from_shared(whole, 1, usize::MAX).unwrap_err(),
+            BoundsError
+        );
     }
 
     #[test]
@@ -465,13 +498,13 @@ mod tests {
         let mut pool = PacketPool::new(4);
         let mut whole = BytesMut::new();
         whole.extend_from_slice(&[0; 64]);
-        pool.put(PacketBuf::from_shared(whole, 0, 64));
+        pool.put(PacketBuf::from_shared(whole, 0, 64).unwrap());
         assert_eq!(pool.free_len(), 0);
 
         let mut buf = pool.get(1500);
         let ptr = buf.with_headroom_mut().as_ptr();
         buf.set_len(10);
-        buf.advance(4);
+        buf.advance(4).unwrap();
         pool.put(buf);
         assert_eq!(pool.free_len(), 1);
 
