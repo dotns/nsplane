@@ -42,7 +42,3 @@ test-windows:
 e2e:
     cargo build -p boringtun-cli --release --locked
     scripts/e2e/linux.sh
-
-# Integration tests need root, a TUN device and docker.
-integration:
-    sudo -E cargo test -p boringtun --features device --locked -- --ignored

@@ -171,8 +171,6 @@ dependencies = [
  "etherparse",
  "hex",
  "hmac",
- "ip_network",
- "ip_network_table",
  "jni",
  "libc",
  "mock_instant",
@@ -180,13 +178,9 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rand_core",
- "socket2 0.4.10",
  "subtle",
- "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
- "windows-sys",
- "wintun-bindings",
  "x25519-dalek",
  "zerocopy",
 ]
@@ -846,7 +840,7 @@ dependencies = [
  "nix",
  "nstun-core",
  "nstun-packet",
- "socket2 0.6.5",
+ "socket2",
  "tokio",
  "tracing",
 ]
@@ -1237,16 +1231,6 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "socket2"
-version = "0.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -1359,7 +1343,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.5",
+ "socket2",
  "tokio-macros",
  "windows-sys",
 ]

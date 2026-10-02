@@ -7,10 +7,6 @@
 //!
 //! <code>git clone <https://github.com/cloudflare/boringtun.git></code>
 
-#[cfg(feature = "device")]
-/// Userspace WireGuard device: TUN interface, UDP sockets, peers and the `wg` UAPI.
-pub mod device;
-
 #[cfg(feature = "ffi-bindings")]
 pub mod ffi;
 #[cfg(feature = "jni-bindings")]
@@ -22,7 +18,7 @@ pub mod noise;
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
 
-#[cfg(any(feature = "device", feature = "ffi-bindings"))]
+#[cfg(feature = "ffi-bindings")]
 pub(crate) mod serialization;
 
 /// Re-export of the x25519 types
