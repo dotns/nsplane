@@ -18,6 +18,7 @@ use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
 use crate::filter::{PacketFilter, Verdict};
 use crate::peer_table::{PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
+use crate::reasons;
 use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, PeerStats};
 
 /// Interval of the peer timers, as in the device.
@@ -55,6 +56,8 @@ pub struct Core {
     pool: PacketPool,
     outputs: VecDeque<Output>,
     schedule: Option<Schedule>,
+    /// The `now` of the latest call that passed the time.
+    now: Option<Instant>,
 }
 
 impl fmt::Debug for Core {
@@ -83,6 +86,7 @@ impl Core {
             pool: PacketPool::new(config.pool_size),
             outputs: VecDeque::new(),
             schedule: None,
+            now: None,
         }
     }
 
@@ -95,7 +99,7 @@ impl Core {
         match input {
             Input::Datagram { path, data } => self.receive(path, data),
             Input::Local { packet } => self.send(packet, true),
-            Input::Config(change) => self.configure(change),
+            Input::Config(change) => self.configure(change, now),
         }
     }
 
@@ -120,10 +124,14 @@ impl Core {
 
         let mut buf = self.pool.get(BUF_SIZE);
         for (id, peer) in self.peers.iter_mut() {
-            // The timers may expire sessions or start a handshake.
-            peer.reset_rx_session();
             buf.set_len(BUF_SIZE);
-            match peer.update_timers(&mut buf.with_headroom_mut()[HEADROOM..]) {
+            let result = peer.update_timers(now, &mut buf.with_headroom_mut()[HEADROOM..]);
+            let completed = peer.take_completed_handshakes();
+            if completed > 0 {
+                peer.expired = false;
+                handshakes_completed(&mut self.outputs, id, completed, None, None);
+            }
+            match result {
                 TunnResult::Done => peer.expired = false,
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
                     if !mem::replace(&mut peer.expired, true) {
@@ -161,7 +169,7 @@ impl Core {
         let mut schedule = schedule;
         if now >= schedule.rate_limiter_reset {
             if let Some(gate) = self.peers.rate_limiter() {
-                gate.reset_count();
+                gate.reset_count_at(now);
             }
             schedule.rate_limiter_reset = now + RATE_LIMITER_RESET;
         }
@@ -169,13 +177,13 @@ impl Core {
             && now >= due
         {
             for (peer, p) in self.peers.iter() {
-                let (last_handshake, tx, rx, ..) = p.tunnel.stats();
+                let (_, tx, rx, ..) = p.tunnel.stats();
                 self.outputs.push_back(Output::Event(Event::PeerStats {
                     peer,
                     rx: rx as u64,
                     tx: tx as u64,
                     data_rx: p.data_rx(),
-                    last_handshake,
+                    last_handshake: p.time_since_last_handshake(now),
                 }));
             }
             schedule.stats = Some(now + interval);
@@ -199,10 +207,12 @@ impl Core {
         self.peers.iter().map(|(id, _)| id)
     }
 
-    /// Configuration and counters of `peer`.
+    /// Configuration and counters of `peer`; the time since its last handshake is measured
+    /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
         let p = self.peers.peer(peer)?;
-        let (last_handshake, tx, rx, ..) = p.tunnel.stats();
+        let (_, tx, rx, ..) = p.tunnel.stats();
+        let last_handshake = self.now.and_then(|now| p.time_since_last_handshake(now));
         Some(PeerStats {
             peer,
             public_key: *p.public_key(),
@@ -240,7 +250,6 @@ impl Core {
         if let Some(path) = path {
             p.set_path(path);
         }
-        p.reset_rx_session();
 
         let mut buf = self.pool.get(BUF_SIZE);
         buf.set_len(BUF_SIZE);
@@ -275,6 +284,7 @@ impl Core {
 
     /// Starts the timer schedule on the first call that passes the time.
     fn start_schedule(&mut self, now: Instant) -> Schedule {
+        self.now = Some(now);
         *self.schedule.get_or_insert_with(|| Schedule {
             tick: now + TICK,
             rate_limiter_reset: now + RATE_LIMITER_RESET,
@@ -285,9 +295,9 @@ impl Core {
     /// Applies a configuration change.
     ///
     /// Peers cannot be added without a private key; such a change is reported as
-    /// `Event::Dropped { peer: None, reason: "no private key" }`. Changes to unknown peers are
-    /// ignored.
-    fn configure(&mut self, change: ConfigChange) {
+    /// `Event::Dropped { peer: None, reason: reasons::NO_PRIVATE_KEY }`. Changes to unknown
+    /// peers are ignored.
+    fn configure(&mut self, change: ConfigChange, now: Instant) {
         let config = match change {
             ConfigChange::SetPrivateKey(key) => {
                 self.peers.set_private_key(key);
@@ -330,11 +340,11 @@ impl Core {
                 ..PeerConfig::new(peer)
             },
         };
-        if let Err(e) = self.peers.apply(&config) {
+        if let Err(e) = self.peers.apply(&config, now) {
             let reason = match e {
-                PeerTableError::NoPrivateKey => "no private key",
-                PeerTableError::IndicesExhausted => "no free session index",
-                PeerTableError::IdsExhausted => "no free peer id",
+                PeerTableError::NoPrivateKey => reasons::NO_PRIVATE_KEY,
+                PeerTableError::IndicesExhausted => reasons::NO_FREE_SESSION_INDEX,
+                PeerTableError::IdsExhausted => reasons::NO_FREE_PEER_ID,
             };
             self.dropped(None, reason);
         }
@@ -345,7 +355,7 @@ impl Core {
         let data_index = match Tunn::parse_incoming_packet(data.as_packet()) {
             Ok(Packet::PacketData(p)) => Some(p.receiver_idx),
             Ok(_) => None,
-            Err(_) => return self.dropped(None, "invalid packet"),
+            Err(_) => return self.dropped(None, reasons::INVALID_PACKET),
         };
         match data_index {
             Some(index) => self.receive_data(path, data, index),
@@ -356,18 +366,10 @@ impl Core {
     /// Decrypts transport data in place and delivers it.
     fn receive_data(&mut self, path: Path, data: &mut PacketBuf, receiver_idx: u32) {
         let Some(id) = self.peers.by_index(receiver_idx) else {
-            return self.dropped(None, "unknown session");
+            return self.dropped(None, reasons::UNKNOWN_SESSION);
         };
         let Some(peer) = self.peers.peer_mut(id) else {
             return;
-        };
-        // Only transport data on a new session, or after the sessions may have changed, can
-        // complete a handshake: data on the established session leaves the clock alone.
-        let new_session = peer.is_new_session(receiver_idx);
-        let before = if new_session {
-            peer.time_since_last_handshake()
-        } else {
-            None
         };
         let len = data.len();
         let (plain_len, src) = match peer.tunnel.decapsulate_in_place(
@@ -380,17 +382,14 @@ impl Core {
             TunnResult::WriteToTunnelV6(packet, src) => (packet.len(), Some(IpAddr::V6(src))),
             TunnResult::Err(e) => {
                 tracing::debug!(message = "Decapsulate error", error = ?e);
-                return self.dropped(Some(id), "decapsulate error");
+                return self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
             }
             TunnResult::WriteToNetwork(_) => {
                 tracing::debug!("Unexpected result from decapsulate");
                 return;
             }
         };
-        let completed = new_session && {
-            peer.set_rx_session(receiver_idx);
-            new_handshake(before, peer.time_since_last_handshake())
-        };
+        let completed = peer.take_completed_handshakes();
 
         let kind = if src.is_some() {
             MessageKind::Data
@@ -403,7 +402,7 @@ impl Core {
             return;
         };
         if !self.peers.routes_to(src, id) {
-            return self.dropped(Some(id), "source not allowed");
+            return self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
         }
 
         // The plaintext lies behind the data header: hand the caller's buffer on and move
@@ -436,18 +435,20 @@ impl Core {
         self.outputs.push_back(Output::Deliver { from: id, packet });
     }
 
-    /// Verifies a handshake message, finds its peer and lets the peer's tunnel answer it.
+    /// Verifies a handshake message with the handshake gate, finds its peer and lets the
+    /// peer's tunnel answer it. The gate counts each message once; the tunnel does not verify
+    /// or count it again.
     fn receive_handshake(&mut self, path: Path, datagram: &[u8]) {
         let (Some((private, public)), Some(gate)) =
             (self.peers.key_pair(), self.peers.rate_limiter())
         else {
-            return self.dropped(None, "no private key");
+            return self.dropped(None, reasons::NO_PRIVATE_KEY);
         };
 
         // Handshake messages are small: copy them out, so the reply can go to a pooled buffer.
         let mut message = [0u8; HANDSHAKE_INIT_SZ];
         let Some(message) = message.get_mut(..datagram.len()) else {
-            return self.dropped(None, "invalid packet");
+            return self.dropped(None, reasons::INVALID_PACKET);
         };
         message.copy_from_slice(datagram);
 
@@ -468,7 +469,7 @@ impl Core {
             }
             Err(_) => {
                 self.pool.put(reply);
-                return self.dropped(None, "invalid handshake");
+                return self.dropped(None, reasons::INVALID_HANDSHAKE);
             }
         };
 
@@ -494,32 +495,29 @@ impl Core {
         };
         let Some(id) = peer else {
             self.pool.put(reply);
-            return self.dropped(None, "unknown peer");
+            return self.dropped(None, reasons::UNKNOWN_PEER);
         };
         let Some(p) = self.peers.peer_mut(id) else {
             return self.pool.put(reply);
         };
 
-        p.reset_rx_session();
-        let before = p.time_since_last_handshake();
-        let reply_len = match p.tunnel.decapsulate(
-            Some(path.addr),
-            message,
-            &mut reply.with_headroom_mut()[HEADROOM..],
-        ) {
+        let reply_len = match p
+            .tunnel
+            .handle_verified_packet(packet, &mut reply.with_headroom_mut()[HEADROOM..])
+        {
             TunnResult::Done => None,
             TunnResult::WriteToNetwork(packet) => Some(packet.len()),
             TunnResult::Err(e) => {
                 tracing::debug!(message = "Handshake error", error = ?e);
                 self.pool.put(reply);
-                return self.dropped(Some(id), "handshake rejected");
+                return self.dropped(Some(id), reasons::HANDSHAKE_REJECTED);
             }
             TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
-                tracing::debug!("Unexpected result from decapsulate");
+                tracing::debug!("Unexpected result from handle_verified_packet");
                 return self.pool.put(reply);
             }
         };
-        let completed = new_handshake(before, p.time_since_last_handshake());
+        let completed = p.take_completed_handshakes();
 
         let Some(reply_len) = reply_len else {
             self.pool.put(reply);
@@ -527,13 +525,6 @@ impl Core {
         };
         reply.set_len(reply_len);
         let reply_kind = message_kind(reply.as_packet());
-        if reply_kind == MessageKind::CookieReply {
-            // The tunnel is under load and asks for a cookie: nothing was authenticated.
-            self.outputs
-                .push_back(Output::Transmit { path, data: reply });
-            return;
-        }
-
         self.authenticated(id, path, kind, completed);
         self.transmit(id, reply_kind, reply);
         self.flush_queue(id);
@@ -545,7 +536,7 @@ impl Core {
             Tunn::dst_address(packet.as_packet()).and_then(|dst| self.peers.by_destination(dst))
         else {
             self.pool.put(packet);
-            return self.dropped(None, "no route");
+            return self.dropped(None, reasons::NO_ROUTE);
         };
 
         if filter {
@@ -577,13 +568,12 @@ impl Core {
             TunnResult::WriteToNetwork(datagram) => datagram.len(),
             TunnResult::Done => {
                 // Queued behind a handshake in progress.
-                peer.reset_rx_session();
                 return self.pool.put(packet);
             }
             TunnResult::Err(e) => {
                 tracing::debug!(message = "Encapsulate error", error = ?e);
                 self.pool.put(packet);
-                return self.dropped(Some(id), "encapsulate error");
+                return self.dropped(Some(id), reasons::ENCAPSULATE_ERROR);
             }
             TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
                 tracing::debug!("Unexpected result from encapsulate");
@@ -597,10 +587,6 @@ impl Core {
             .copy_within(start..start + sealed_len, HEADROOM);
         packet.set_len(sealed_len);
         let kind = message_kind(packet.as_packet());
-        if kind == MessageKind::HandshakeInit {
-            // Queued, and a handshake starts.
-            peer.reset_rx_session();
-        }
         self.transmit(id, kind, packet);
     }
 
@@ -632,26 +618,21 @@ impl Core {
         }
     }
 
-    /// Records an authenticated message of `kind` from `peer` on `path`: reports a new
-    /// handshake if the message `completed` one and a new source, and lets the policy decide
-    /// about roaming.
-    fn authenticated(&mut self, id: PeerId, path: Path, kind: MessageKind, completed: bool) {
+    /// Records an authenticated message of `kind` from `peer` on `path`: reports the
+    /// handshakes the message `completed` and a new source, and lets the policy decide about
+    /// roaming.
+    fn authenticated(&mut self, id: PeerId, path: Path, kind: MessageKind, completed: u64) {
         let Some(peer) = self.peers.peer_mut(id) else {
             return;
         };
 
-        if completed {
+        if completed > 0 {
             peer.expired = false;
             let rtt = (kind == MessageKind::HandshakeResponse)
                 .then(|| peer.tunnel.stats().4)
                 .flatten()
                 .map(|ms| Duration::from_millis(u64::from(ms)));
-            self.outputs
-                .push_back(Output::Event(Event::HandshakeCompleted {
-                    peer: id,
-                    path: Some(path),
-                    rtt,
-                }));
+            handshakes_completed(&mut self.outputs, id, completed, Some(path), rtt);
         }
 
         // Cookie replies are not authenticated by the peer's keys and never move the path.
@@ -716,7 +697,7 @@ fn transmit(
         pool.put(data);
         outputs.push_back(Output::Event(Event::Dropped {
             peer: Some(peer),
-            reason: "no path",
+            reason: reasons::NO_PATH,
         }));
     }
 }
@@ -732,10 +713,17 @@ fn message_kind(datagram: &[u8]) -> MessageKind {
     }
 }
 
-/// Whether a message established a new session, from the time since the last handshake
-/// before and after it was processed: a new session makes that time shrink (or appear).
-fn new_handshake(before: Option<Duration>, after: Option<Duration>) -> bool {
-    after.is_some_and(|after| before.is_none_or(|before| after < before))
+/// Reports `count` handshakes of `peer` completed on `path` with this `rtt`.
+fn handshakes_completed(
+    outputs: &mut VecDeque<Output>,
+    peer: PeerId,
+    count: u64,
+    path: Option<Path>,
+    rtt: Option<Duration>,
+) {
+    for _ in 0..count {
+        outputs.push_back(Output::Event(Event::HandshakeCompleted { peer, path, rtt }));
+    }
 }
 
 /// Whether an authenticated message of this kind may move the peer's path.
@@ -786,7 +774,7 @@ mod tests {
             core.poll_output(),
             Some(Output::Event(Event::Dropped {
                 peer: None,
-                reason: "no private key"
+                reason: reasons::NO_PRIVATE_KEY
             }))
         ));
         assert!(core.poll_output().is_none());
