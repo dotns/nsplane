@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["boringtun", "boringtun-cli"]
+members = ["boringtun", "boringtun-cli", "nstun-packet"]
 
 [workspace.package]
 version = "0.8.0"
@@ -17,6 +17,10 @@ repository = "https://github.com/dotns/nstun"
 readme = "README.md"
 keywords = ["vpn", "wireguard"]
 categories = ["network-programming", "cryptography"]
+
+[workspace.dependencies]
+bytes = "1.12.1"
+smallvec = "1.16.2"
 
 # Lock 4: deny-warnings policy lives here, not on the command line.
 [workspace.lints.rust]
