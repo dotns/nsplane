@@ -106,3 +106,10 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   bridge x UDP, relay UDP, relay WSS). Relay WSS is a real WebSocket over TLS; the user
   approved `tokio-tungstenite`, `tungstenite`, `tokio-rustls`/`rustls` (aws-lc-rs),
   `rustls-pki-types`, `rcgen` for the examples package only. 3D starts after 3A merges.
+- 2026-10-02: user chose a single-port relay for the examples: one UDP socket carries native
+  WireGuard to the relay's own engine, blind relaying (mac1 target match, receiver-index
+  routes) and control messages (source registration, reflexive probe) in WireGuard's
+  undefined message-type range (never the reserved bytes of types 1-4). Native kernel
+  WireGuard clients are part of the e2e matrix. 3D writes
+  `docs/decisions/2026-10-02-single-port-relay.md` as Proposed (shared wire contract with
+  ns and nsgw).
