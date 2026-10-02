@@ -646,9 +646,13 @@ impl Drop for Daemon {
 /// number (`--tun-fd`, `--uapi-fd`), against kernel WireGuard: configured only over that
 /// stream, it pings the kernel peer, reports the handshake and the traffic over the same
 /// stream, and exits cleanly on SIGTERM.
+///
+/// Its name sorts after `kernel_wireguard_interop`, so with `--test-threads=1` it runs
+/// second: that test needs the kernel peer to initiate, which it does not while a session
+/// made here is still fresh. This test initiates itself and needs no particular state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a kernel WireGuard peer and nsplane-cli; run by `just e2e-lib`"]
-async fn cli_with_inherited_fds() -> TestResult {
+async fn kernel_wireguard_interop_through_the_cli() -> TestResult {
     let env = Interop::from_env()?;
     let cli = std::env::var("NSPLANE_E2E_LIB_CLI").map_err(|_| {
         "NSPLANE_E2E_LIB_CLI is not set: run this test through scripts/e2e/lib.sh (`just e2e-lib`)"
