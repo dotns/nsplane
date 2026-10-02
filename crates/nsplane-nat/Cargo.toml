@@ -15,5 +15,6 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+nsplane-core = { version = "0.8.0", path = "../nsplane-core" }
 nsplane-packet = { version = "0.8.0", path = "../nsplane-packet" }
 thiserror = "2.0.21"
