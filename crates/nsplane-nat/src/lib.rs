@@ -37,3 +37,4 @@ pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};
 pub use table::{
     LanPrefix, PeerMapping, SelfMapping, TableError, TranslationTable, TranslationTableBuilder,
 };
+pub use translate::{Translator, TranslatorStats};
