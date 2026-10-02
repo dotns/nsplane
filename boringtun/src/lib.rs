@@ -7,19 +7,11 @@
 //!
 //! <code>git clone <https://github.com/cloudflare/boringtun.git></code>
 
-#[cfg(feature = "ffi-bindings")]
-pub mod ffi;
-#[cfg(feature = "jni-bindings")]
-/// JNI bindings for Android.
-pub mod jni;
 /// The transport-agnostic WireGuard protocol state machine.
 pub mod noise;
 
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
-
-#[cfg(feature = "ffi-bindings")]
-pub(crate) mod serialization;
 
 /// Re-export of the x25519 types
 pub mod x25519 {

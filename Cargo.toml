@@ -25,7 +25,7 @@ smallvec = "1.16.2"
 # Lock 4: deny-warnings policy lives here, not on the command line.
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }
-# The library owns FFI and syscall code, so `forbid` is not possible workspace-wide.
+# The TUN crate owns syscall code, so `forbid` is not possible workspace-wide.
 # `boringtun-cli` forbids unsafe code at its crate root; see docs/decisions.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

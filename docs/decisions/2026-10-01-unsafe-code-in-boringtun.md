@@ -22,6 +22,7 @@ Until 2026-10-02 the TUN devices and the epoll/kqueue event loops lived in
   `#![forbid(unsafe_code)]`.
 - In `boringtun`, only `ffi` and `jni` opt out with a module-level
   `#![allow(unsafe_code, reason = "...")]`; `noise` has no `unsafe`.
+  ffi/jni removed 2026-10-02: the library crate has no `unsafe` left.
 - In `nstun-tun`, the platform modules `unix`, `linux` and `darwin` opt out at module level;
   `windows` allows a single statement (loading the Wintun library).
 - Every `unsafe` block carries a `// SAFETY:` comment.
