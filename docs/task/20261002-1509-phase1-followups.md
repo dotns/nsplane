@@ -87,6 +87,46 @@ fixed by workstream 3C (per-transport backpressure, `DROP_TRANSPORT_REMOVED`).
     `lib.sh` default to fixed prefixes, so concurrent runs remove each other's containers;
     derive the default from the PID as `examples.sh` does.
 
+Status of item 1 after Phase 5 workstream 5C (follow-up #1, 2026-10-02): the rx buffer swap,
+both `copy_within` shifts and the `set_len(BUF_SIZE)` zero-fills on the timer, queue-flush
+and handshake-reply paths are gone. `Input::Datagram` takes the datagram by value and the
+core delivers the plaintext in the same buffer (`advance` past the data header); local
+packets are sealed in place with the data header in their headroom (pooled copy only when
+the headroom is smaller than the data header); `PacketPool::get_len` reuses pooled bytes
+without re-zeroing them. Measured with `cargo bench -p nsplane-core --bench data_path`
+(release, criterion mean; shared 32-core host, so the absolute numbers move between runs):
+
+| run | size | raw `Tunn` | device-equivalent | core | core vs device |
+| --- | --- | --- | --- | --- | --- |
+| before, run 1 | 64 B | 486 ns | 561 ns | 562 ns | +0.1 % (noisy) |
+| before, run 2 | 64 B | 365 ns | 471 ns | 550 ns | +16.8 % |
+| before, run 1 | 1420 B | 1.22 us | 1.29 us | 1.37 us | +5.8 % |
+| before, run 2 | 1420 B | 1.17 us | 1.32 us | 1.39 us | +5.2 % |
+| after, run 1 | 64 B | 359 ns | 471 ns | 535 ns | +13.6 % |
+| after, run 2 | 64 B | 409 ns | 476 ns | 530 ns | +11.4 % |
+| after, run 1 | 1420 B | 1.16 us | 1.27 us | 1.33 us | +5.1 % |
+| after, run 2 | 1420 B | 1.19 us | 1.73 us | 1.83 us | (host load) |
+
+Instruction counts per round trip (callgrind, independent of the host load): 64 B core
+5404 -> 5207 (device-equivalent 4431, raw 3078: core vs device +22.0 % -> +17.5 %);
+1420 B core 20795 -> 20225 (device-equivalent 19476: +6.8 % -> +3.8 %). The 1420 B target
+holds; the 10 % target at 64 B is not reached. The remaining ~780 instructions per round
+trip are the core's own dispatch rather than buffer handling: `handle_input` (~460: input
+dispatch, data-header parsing, session-index and peer lookups, the output queue),
+`transmit` (~85), `authenticated` (~60) and the extra allowed-IP wrapper (~45). Skipping
+the roaming check in steady state and the duplicate peer lookup on send made no
+measurable difference. Further gains need a leaner dispatch (e.g. a batched data-path
+entry point), which belongs with the Phase 5 batching work.
+
+Dispatch trim (same follow-up, second pass): the roaming check is skipped for a data
+message that completes no handshake and comes from the current path, `send` reuses its peer
+borrow for `transmit`, and handshake and configuration handling stay out of line so
+`handle_input` keeps a small frame. Instructions per round trip: 64 B core 5208 -> 5126
+(device-equivalent 4431: +17.5 % -> +15.7 %); 1420 B 20222 -> 20146 (+3.8 % -> +3.4 %).
+Wall clock on a host at load ~85 (absolute numbers about twice the quiet ones): 64 B core
+1219 / 1113 ns vs device-equivalent 1083 / 1010 ns (+12.6 % / +10.2 %); 1420 B 3.15 / 3.02 us
+vs 3.15 / 2.90 us (+0.0 % / +4.3 %). The 64 B target is still not met.
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 

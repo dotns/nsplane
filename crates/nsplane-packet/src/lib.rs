@@ -10,7 +10,7 @@ pub mod checksum;
 mod ip;
 mod types;
 
-pub use buf::{HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool};
+pub use buf::{BoundsError, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool};
 pub use ip::{
     FiveTuple, Fragment, IcmpHeader, IpPacket, Ipv4Header, Ipv6Header, Malformed, TcpHeader,
     UdpHeader, protocol,

@@ -74,17 +74,15 @@ fn pump(cores: &mut [Core; 2], now: Instant) -> usize {
         if in_flight.is_empty() {
             return delivered;
         }
-        for (from, mut data) in in_flight {
+        for (from, data) in in_flight {
             let from_path = path(u8::try_from(from).unwrap());
-            let to = &mut cores[1 - from];
-            to.handle_input(
+            cores[1 - from].handle_input(
                 Input::Datagram {
                     path: from_path,
-                    data: &mut data,
+                    data,
                 },
                 now,
             );
-            to.recycle(data);
         }
     }
 }
@@ -179,8 +177,8 @@ fn encapsulate(tx: &mut Core, buf: PacketBuf, now: Instant) -> PacketBuf {
     data
 }
 
-/// Opens `data` on `rx`, recycles the delivered packet and leaves a pooled buffer in `data`.
-fn decapsulate(rx: &mut Core, data: &mut PacketBuf, now: Instant) {
+/// Opens `data` on `rx` and returns the delivered packet.
+fn decapsulate(rx: &mut Core, data: PacketBuf, now: Instant) -> PacketBuf {
     rx.handle_input(
         Input::Datagram {
             path: path(0),
@@ -191,7 +189,7 @@ fn decapsulate(rx: &mut Core, data: &mut PacketBuf, now: Instant) {
     let Some(Output::Deliver { packet, .. }) = rx.poll_output() else {
         panic!("decapsulate");
     };
-    rx.recycle(packet);
+    packet
 }
 
 fn bench_data_path(c: &mut Criterion) {
@@ -255,10 +253,9 @@ fn bench_data_path(c: &mut Criterion) {
             b.iter(|| {
                 let mut buf = slot.take().unwrap();
                 fill(&mut buf, p);
-                let mut data = encapsulate(&mut tx, buf, now);
-                decapsulate(&mut rx, &mut data, now);
-                // The buffer the receiver left behind carries the next packet.
-                slot = Some(data);
+                let data = encapsulate(&mut tx, buf, now);
+                // The delivered packet's buffer carries the next packet.
+                slot = Some(decapsulate(&mut rx, data, now));
             });
         });
 
@@ -290,10 +287,7 @@ fn bench_data_path(c: &mut Criterion) {
                         fill(&mut buf, p);
                         encapsulate(&mut tx, buf, now)
                     },
-                    |mut data| {
-                        decapsulate(&mut rx, &mut data, now);
-                        data
-                    },
+                    |data| decapsulate(&mut rx, data, now),
                     BatchSize::SmallInput,
                 );
             },
