@@ -134,3 +134,13 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   allows, NSD decides). The pinhole closes automatically when the session ends (guard
   dropped) or expires; revoking the permission closes it. Wire format of the NSD-side
   permission is an ns/NSD contract, not decided here.
+- 2026-10-02: ACL cost (3E bench: default policy 71/116 ns in/out; 8 namespaces x 64
+  members + grants + 16 pinholes 468-675 ns inbound) -> user: the ACL should work as a
+  hook, not a full evaluation on every packet. Scheduled for the Phase 5 performance
+  workstream: (1) no AclFilter installed = zero cost (already true); (2) per-peer bypass
+  precomputed on every policy store (peers whose effective policy is allow-all, e.g. Quick
+  pairs, skip evaluation); (3) a flow verdict cache keyed by peer + five-tuple + policy
+  generation, unified with the stateful-reply table, so only the first packet of a flow
+  runs the full evaluation; invalidated by generation bump (store/remove namespace, grant,
+  pinhole close, clear_all). Targets: established flow <= 50 ns, bypass peer <= 10 ns,
+  verdicts identical to full evaluation (differential test).
