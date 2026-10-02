@@ -117,3 +117,13 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   so the single-port control messages carry ns's signed envelope / CBOR payloads unchanged;
   only the framing (WireGuard-undefined type + version) differs. Plain WireGuard servers
   must keep working with the extension off by discovery (no reply -> plain WireGuard).
+- 2026-10-02: layer split for application mode, decided with the user against the docs site
+  (`ns/next.md` §5, `ns/apps.md`, `ns/rendezvous.md`): nsplane provides the mechanics
+  (engine peers, in-tunnel connections via netstack/Splitter, ACL enforcement per source
+  namespace with cross-namespace default deny and directed grants, outbound rules for
+  restricted namespaces such as `app:*`, the 4<->6 translation filter); ns keeps the
+  `/quick/v2` rendezvous client, the `app:<session>` PeerSource lifecycle, `kind`
+  dispatch, third-party app access, the pairing/transfer state machines, the RelayClient
+  carriers and ladder rules. Workstream 3E adds the ACL namespaces, outbound rules and an
+  `app_session` example after 3D. Open for the docs owner: `ns/rendezvous.md` §2 and
+  `ns/apps.md` §1 still list the rendezvous client / app session interface under nsplane.
