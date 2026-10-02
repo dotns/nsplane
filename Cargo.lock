@@ -866,6 +866,7 @@ dependencies = [
  "nstun",
  "nstun-core",
  "nstun-packet",
+ "nstun-uapi",
  "tokio",
 ]
 

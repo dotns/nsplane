@@ -20,3 +20,6 @@ nstun = { path = "../nstun", version = "0.8.0" }
 nstun-core = { path = "../nstun-core", version = "0.8.0" }
 nstun-packet = { path = "../nstun-packet", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
+
+[dev-dependencies]
+nstun-uapi = { path = "../nstun-uapi", version = "0.8.0" }
