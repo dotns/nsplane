@@ -831,9 +831,11 @@ name = "nstun"
 version = "0.8.0"
 dependencies = [
  "nix",
+ "nstun-core",
  "nstun-packet",
  "socket2 0.6.5",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
