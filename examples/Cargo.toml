@@ -25,6 +25,7 @@ ed25519-dalek = "2.2.0"
 futures-core = "0.3.32"
 nsplane = { path = "../crates/nsplane", version = "0.8.0" }
 nsplane-acl = { path = "../crates/nsplane-acl", version = "0.8.0" }
+nsplane-core = { path = "../crates/nsplane-core", version = "0.8.0" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
 nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }

@@ -11,6 +11,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
@@ -26,6 +28,10 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::echo::{Backend, EchoArgs};
+use crate::relay::client::{ClientConfig, ProbeTimers, RelayClient};
+use crate::relay::envelope::MachineKey;
+use crate::relay::ladder::{LadderTimers, Pin};
+use crate::relay::server::lock;
 use crate::status::Status;
 
 /// The id of the UDP transport `--transport udp` installs.
@@ -89,6 +95,10 @@ impl NodeArgs {
 pub enum TransportKind {
     /// Plain UDP on `--listen`.
     Udp,
+    /// UDP on `--listen` with the single-port relay extensions: capability discovery of
+    /// the `--relay` endpoints, registration, reflexive address, and the direct/relay
+    /// path ladder.
+    Relay,
 }
 
 /// Transport options, flattened into [`NodeArgs`].
@@ -97,6 +107,70 @@ pub struct TransportArgs {
     /// Transport to run
     #[arg(long, value_enum, default_value_t = TransportKind::Udp)]
     pub transport: TransportKind,
+
+    /// Relay endpoint to discover (`--transport relay`), repeatable
+    #[arg(long = "relay", value_name = "IP:PORT")]
+    pub relays: Vec<SocketAddr>,
+
+    /// Ed25519 machine key file (`--transport relay`; `relay_server gen-machine-key`)
+    #[arg(long, value_name = "PATH", required_if_eq("transport", "relay"))]
+    pub machine_key_file: Option<PathBuf>,
+
+    /// JSON `{"<wg pubkey b64>": ["ip:port", ...]}` of direct candidates, polled every second
+    #[arg(long, value_name = "FILE")]
+    pub peer_candidates: Option<PathBuf>,
+
+    /// Write this node's reflexive address as JSON to this file
+    #[arg(long, value_name = "FILE")]
+    pub reflexive_out: Option<PathBuf>,
+
+    /// Path of peers reached through a relay: direct first with relay fallback, or pinned
+    #[arg(long, value_enum, default_value_t = Pin::Auto)]
+    pub pin: Pin,
+
+    /// Wait after the first unanswered relay probe, doubled per attempt
+    #[arg(long, value_name = "MS", default_value_t = 1000)]
+    pub probe_backoff_ms: u64,
+
+    /// Relay probes before an endpoint that never answered is stopped
+    #[arg(long, value_name = "N", default_value_t = 5)]
+    pub probe_attempts: u32,
+
+    /// Source registration interval with a capable relay
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub register_interval_ms: u64,
+
+    /// Reflexive request interval with a capable relay
+    #[arg(long, value_name = "MS", default_value_t = 20_000)]
+    pub reflexive_interval_ms: u64,
+
+    /// Time a direct path has to authenticate before the relay is used
+    #[arg(long, value_name = "MS", default_value_t = 5000)]
+    pub direct_timeout_ms: u64,
+
+    /// Interval of direct probes while on the relay
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub direct_probe_interval_ms: u64,
+}
+
+/// Relay clients built by [`TransportArgs::transports`], until [`build_engine`] starts
+/// them and [`run`] reports them in the status file.
+static RELAY_CLIENTS: Mutex<Vec<(SocketAddr, RelayClient)>> = Mutex::new(Vec::new());
+
+/// The relay client of the transport bound to `listen`.
+fn relay_client_at(listen: SocketAddr) -> Option<RelayClient> {
+    lock(&RELAY_CLIENTS)
+        .iter()
+        .find(|(addr, _)| *addr == listen)
+        .map(|(_, client)| client.clone())
+}
+
+/// The relay client of the engine with WireGuard public key `key`.
+fn relay_client_of(key: &PublicKey) -> Option<RelayClient> {
+    lock(&RELAY_CLIENTS)
+        .iter()
+        .find(|(_, client)| client.public_key() == Some(key.to_bytes()))
+        .map(|(_, client)| client.clone())
 }
 
 /// What [`TransportArgs::transports`] installed.
@@ -112,7 +186,10 @@ impl TransportArgs {
     /// Installs the chosen transport(s) and the path policy on `builder`.
     ///
     /// UDP: one [`UdpTransport`] with id [`UDP_TRANSPORT`] bound to `listen`, and
-    /// [`StandardRoaming`].
+    /// [`StandardRoaming`]. Relay: the same socket wrapped in the extension-aware
+    /// [`ExtTransport`](crate::relay::client::ExtTransport), and the
+    /// [`LadderPolicy`](crate::relay::ladder::LadderPolicy); [`build_engine`] starts its
+    /// driver.
     pub fn transports<Src: PacketSource, Snk: PacketSink>(
         &self,
         builder: EngineBuilder<Src, Snk>,
@@ -129,7 +206,47 @@ impl TransportArgs {
                 let builder = builder.transport(udp).policy(Box::new(StandardRoaming));
                 Ok((builder, transports))
             }
+            TransportKind::Relay => {
+                let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
+                    .with_context(|| format!("cannot bind UDP {listen}"))?;
+                let transports = Transports {
+                    default: UDP_TRANSPORT,
+                    listen: udp.local_addr(),
+                };
+                let (client, ext, policy) = RelayClient::new(udp, self.client_config()?);
+                lock(&RELAY_CLIENTS).push((transports.listen, client));
+                let builder = builder.transport(ext).policy(Box::new(policy));
+                Ok((builder, transports))
+            }
         }
+    }
+
+    /// The relay client options of `--transport relay`.
+    pub fn client_config(&self) -> anyhow::Result<ClientConfig> {
+        let path = self
+            .machine_key_file
+            .as_ref()
+            .ok_or_else(|| anyhow!("--machine-key-file is required with --transport relay"))?;
+        let machine_key = MachineKey::load(path)
+            .with_context(|| format!("cannot read the machine key {}", path.display()))?;
+        Ok(ClientConfig {
+            relays: self.relays.clone(),
+            machine_key,
+            pin: self.pin,
+            probe: ProbeTimers {
+                backoff: Duration::from_millis(self.probe_backoff_ms),
+                attempts: self.probe_attempts,
+                register_interval: Duration::from_millis(self.register_interval_ms),
+                reflexive_interval: Duration::from_millis(self.reflexive_interval_ms),
+                ..ProbeTimers::default()
+            },
+            ladder: LadderTimers {
+                direct_timeout: Duration::from_millis(self.direct_timeout_ms),
+                probe_interval: Duration::from_millis(self.direct_probe_interval_ms),
+            },
+            peer_candidates: self.peer_candidates.clone(),
+            reflexive_out: self.reflexive_out.clone(),
+        })
     }
 }
 
@@ -144,6 +261,8 @@ pub struct Node {
 
 /// Builds the engine of a node example: the private key, the transports and path policy of
 /// `args`, on `source` and `sink`. Peers are added afterwards with [`configure_peers`].
+///
+/// With `--transport relay` it also starts the relay client's driver for the `--peer`s.
 pub fn build_engine<Src: PacketSource, Snk: PacketSink>(
     source: Src,
     sink: Snk,
@@ -160,9 +279,21 @@ pub fn build_engine_with<Src: PacketSource, Snk: PacketSink>(
     args: &NodeArgs,
     configure: impl FnOnce(EngineBuilder<Src, Snk>) -> EngineBuilder<Src, Snk>,
 ) -> anyhow::Result<Node> {
-    let builder = configure(EngineBuilder::new(source, sink)).private_key(args.private_key()?);
+    let private_key = args.private_key()?;
+    let public_key = PublicKey::from(&private_key);
+    let builder = configure(EngineBuilder::new(source, sink)).private_key(private_key);
     let (builder, transports) = args.transport.transports(builder, args.listen)?;
     let engine = builder.build().context("cannot build the engine")?;
+    if args.transport.transport == TransportKind::Relay
+        && let Some(client) = relay_client_at(transports.listen)
+    {
+        let peers = args
+            .peer
+            .iter()
+            .map(|peer| (peer.public_key.to_bytes(), peer.endpoint))
+            .collect();
+        client.start(engine.handle(), public_key.to_bytes(), peers);
+    }
     Ok(Node { engine, transports })
 }
 
@@ -335,6 +466,9 @@ fn resolve(endpoint: &str) -> anyhow::Result<SocketAddr> {
 /// Waits for Ctrl-C, for the engine to stop, or, with `--exit-after-checks`, for the
 /// checks to finish. Writes a last status snapshot before returning when `status` is set.
 /// The exit code is a failure iff a check failed.
+///
+/// With `--transport relay` the status gets `extra.relay` (endpoints, reflexive address)
+/// and `extra.paths` (the ladder) of the relay client.
 pub async fn run(
     engine: Engine,
     echo: &EchoArgs,
@@ -342,6 +476,17 @@ pub async fn run(
     status: Option<Status>,
 ) -> anyhow::Result<ExitCode> {
     let handle = engine.handle();
+    let client = handle
+        .public_key()
+        .await?
+        .and_then(|key| relay_client_of(&key));
+    let status = match (status, client) {
+        (Some(status), Some(client)) => Some(status.extra(move |extra| {
+            extra.insert("relay".to_owned(), client.relay_json());
+            extra.insert("paths".to_owned(), client.paths_json());
+        })),
+        (status, _) => status,
+    };
     let writer = status.as_ref().map(Status::spawn);
     echo.serve(&backend).await?;
     let checks = echo.clone();
