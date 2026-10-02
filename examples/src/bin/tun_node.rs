@@ -8,7 +8,9 @@
 //! finish with `--exit-after-checks`. Needs root (or `CAP_NET_ADMIN`).
 //!
 //! APIs shown: `nsplane_tun::Tun::create` and `Tun::split` as the engine's packet source
-//! and sink, `nsplane_uapi::Uapi::with_listen_port`, `UapiListener::bind` and `Uapi::serve`,
+//! and sink, `nsplane_uapi::Uapi::with_listen_port` (`--transport udp`) and
+//! `Uapi::with_external_transport` (`--transport relay|wss`), `UapiListener::bind` and
+//! `Uapi::serve`,
 //! and the shared node assembly (`build_engine`, `configure_peers`).
 //!
 //! Usage: `sudo cargo run -p nsplane-examples --bin tun_node -- --private-key <KEY>
@@ -29,13 +31,15 @@ mod unix {
     use nsplane::AllowedIp;
     use nsplane_examples::echo::{Backend, EchoArgs};
     use nsplane_examples::node::{
-        self, NodeArgs, UDP_TRANSPORT, build_engine, configure_peers, init_logging, parse_cidr,
+        self, NodeArgs, TransportKind, UDP_TRANSPORT, build_engine, configure_peers, init_logging,
+        parse_cidr,
     };
     use nsplane_examples::status::Status;
     use nsplane_tun::Tun;
     use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
 
-    // `wg set listen-port` rebinds the UAPI's transport, so the node's UDP transport is it.
+    // `wg set listen-port` rebinds the UAPI's transport, so the node's UDP transport is it;
+    // a relay or WSS transport under that id is left alone.
     const _: () = assert!(UDP_TRANSPORT.get() == TRANSPORT_ID.get());
 
     /// The default interface name: Linux names it freely, macOS needs `utun[N]`.
@@ -189,7 +193,13 @@ mod unix {
         let handle = node.engine.handle();
         configure_peers(&handle, &args.node.peer).await?;
 
-        let uapi = Uapi::with_listen_port(handle.clone(), node.transports.listen.port());
+        let port = node.transports.listen.port();
+        let uapi = match args.node.transport.transport {
+            TransportKind::Udp => Uapi::with_listen_port(handle.clone(), port),
+            TransportKind::Relay | TransportKind::Wss => {
+                Uapi::with_external_transport(handle.clone(), port)
+            }
+        };
         let listener = UapiListener::bind(&name).context("cannot bind the UAPI socket")?;
         let socket = listener.path().display().to_string();
         tokio::spawn(async move {
