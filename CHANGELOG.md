@@ -141,6 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over WSS; kernel WireGuard peers in the UDP column) and scenarios (hybrid, ACL gateway,
   native WireGuard through the relay, the path ladder, NAT hole punching, plain WireGuard
   compatibility). The e2e image adds `socat`, `iptables` and `tcpdump`.
+- `nsplane-packet`: `PacketBuf::headroom` and fallible `advance`, `reserve_front`, `from_shared`
+  returning `BoundsError` instead of panicking.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their

@@ -104,3 +104,12 @@ nsplane repository only; `/srv/dotns/ns` and `/srv/dotns/docs` read-only. Depend
 `quinn-udp` (pre-approved) and crates already in Cargo.lock; anything else is a yellow.
 
 ## Annotations
+- 2026-10-02: the Fragmenter cannot sit after the filter chain (the core encrypts right
+  after its outbound filters and a filter returns one verdict per packet). It runs on the
+  engine's local path before the core: IPv6 > MTU -> ICMPv6 PTB to the local side; IPv4
+  above the ceiling -> frag-needed (DF) or IPv4 fragments that the Translator turns into IPv6
+  fragments (RFC 7915 5.1.1). Additive API: `EngineBuilder::fragmenter(FragmentConfig)` with an
+  optional "translated destination" predicate (only translated IPv4 pays the 28-byte
+  overhead) and `Core::route(dst)` for delivering locally generated ICMP; both added by 5A.
+  Callers put a peer's alias4/32 and lan4 prefixes in its allowed IPs (core routes before the
+  filters).
