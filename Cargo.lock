@@ -811,6 +811,7 @@ version = "0.8.0"
 dependencies = [
  "bytes",
  "smallvec",
+ "zerocopy",
 ]
 
 [[package]]
