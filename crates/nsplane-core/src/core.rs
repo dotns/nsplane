@@ -296,6 +296,8 @@ impl Core {
     /// Peers cannot be added without a private key; such a change is reported as
     /// `Event::Dropped { peer: None, reason: reasons::NO_PRIVATE_KEY }`. Changes to unknown
     /// peers are ignored.
+    // Rare: out of line, so the data path that shares `handle_input` keeps a small frame.
+    #[inline(never)]
     fn configure(&mut self, change: ConfigChange, now: Instant) {
         let config = match change {
             ConfigChange::SetPrivateKey(key) => {
@@ -441,7 +443,10 @@ impl Core {
         } else {
             MessageKind::Keepalive
         };
-        self.authenticated(id, path, kind, completed);
+        // Steady state (no completed handshake, same source) has nothing to report or adopt.
+        if completed > 0 || !peer.path().is_some_and(|current| same_route(&current, &path)) {
+            self.authenticated(id, path, kind, completed);
+        }
 
         let src = src?;
         if !self.peers.routes_to(src, id) {
@@ -454,6 +459,8 @@ impl Core {
     /// Verifies a handshake message with the handshake gate, finds its peer and lets the
     /// peer's tunnel answer it. The gate counts each message once; the tunnel does not verify
     /// or count it again.
+    // Rare: out of line, so the data path that shares `handle_input` keeps a small frame.
+    #[inline(never)]
     fn receive_handshake(&mut self, path: Path, datagram: &[u8]) {
         let (Some((private, public)), Some(gate)) =
             (self.peers.key_pair(), self.peers.rate_limiter())
@@ -609,7 +616,15 @@ impl Core {
 
         packet.set_len(sealed_len);
         let kind = message_kind(packet.as_packet());
-        self.transmit(id, kind, packet);
+        transmit(
+            &mut self.outputs,
+            &mut self.pool,
+            self.policy.as_ref(),
+            id,
+            peer,
+            kind,
+            packet,
+        );
     }
 
     /// Transmits the packets the tunnel of `peer` queued while it had no session.
