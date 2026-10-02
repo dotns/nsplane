@@ -13,7 +13,8 @@ use crate::engine::{self, Engine, NewTransport};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
 
-/// Default capacity of the internal packet queues, in packets.
+/// Default capacity of the internal packet queues, in packets: 1.5x the high-water mark of a
+/// single bulk TCP flow (see "Queue depths" in docs/architecture.md).
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// Default capacity of the event channel, in events.
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
