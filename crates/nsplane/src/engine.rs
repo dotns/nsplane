@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{ConfigChange, Core, CoreConfig, Event, Input, Output};
-use nsplane_packet::{PacketBuf, Path, PeerId};
+use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
 use tokio::sync::{broadcast, oneshot};
@@ -22,10 +22,9 @@ use tokio::time::{Instant, Sleep, sleep_until};
 use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
 };
-use crate::handle::{Command, EngineHandle};
+use crate::handle::{Command, EngineHandle, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
-use crate::udp::UdpTransport;
 
 /// Capacity of the command queue from the handles to the owner task.
 const COMMAND_CAPACITY: usize = 64;
@@ -36,18 +35,33 @@ const MAX_DATAGRAM: usize = 65535;
 ///
 /// One owner task owns the [`Core`] and loops: it waits for a handle command, a local packet,
 /// a received datagram or the core's next timeout, feeds the core and drains its outputs.
-/// Four I/O tasks surround it, each connected through a bounded queue: the source task
-/// ([`PacketSource::recv`]), the transport receive task ([`Transport::recv`]), the transmit
-/// task ([`Transport::send`]) and the sink task ([`PacketSink::send`]). The core is never
-/// shared, so there are no locks on the data path.
+/// I/O tasks surround it, each connected through a bounded queue: the source task
+/// ([`PacketSource::recv`]), the sink task ([`PacketSink::send`]) and, for every transport,
+/// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The core
+/// is never shared, so there are no locks on the data path.
+///
+/// Transports: the engine runs any number of transports, keyed by [`Transport::id`]. Every
+/// transport's received datagrams feed the core through one queue, so a peer's
+/// authenticated traffic may arrive on any of them (the [`PathPolicy`] decides whether its
+/// path follows). A datagram to transmit goes to the transport named by its
+/// [`Path::transport`]; when none is installed under that id, it is dropped and counted
+/// under [`crate::DROP_NO_TRANSPORT`]. Each transport's tasks are spawned for its concrete
+/// type when it is added, so no datagram goes through a boxed future (unless the transport
+/// is a boxed [`DynTransport`]).
 ///
 /// Backpressure: a full sink queue drops the decrypted packet and counts it under
-/// [`crate::DROP_SINK_FULL`]. When the transmit queue is full, datagrams wait in the owner
-/// task and the owner stops reading local packets until every waiting datagram has moved to
-/// the queue, which in turn holds back the source. The waiting datagrams are bounded by the
-/// queue capacity: a datagram caused by a received datagram or a timer that finds them at
-/// the bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
-/// local packets or handle calls always wait, so local packets are held back, never dropped.
+/// [`crate::DROP_SINK_FULL`]. Each transport has its own transmit queue; when it is full,
+/// that transport's datagrams wait in the owner task, in order, while datagrams to other
+/// transports keep going to their own queues, so they never queue behind a slow transport. The waiting datagrams of a transport are bounded by the queue
+/// capacity: a datagram caused by a received datagram or a timer that finds them at the
+/// bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
+/// local packets or handle calls always wait, so local packets are held back, never dropped:
+/// the owner stops reading local packets while any transport has waiting datagrams (which
+/// transport a local packet leads to is only known once the core has handled it), which in
+/// turn holds back the source. Received datagrams, timers and handle calls are still served
+/// meanwhile. A transport that never drains therefore holds back local packets until it
+/// closes (its waiting datagrams are then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or
+/// is removed with [`EngineHandle::remove_transport`].
 ///
 /// Buffers: datagrams are received into one reusable 64 KiB buffer and copied into an
 /// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. Datagram buffers
@@ -61,12 +75,15 @@ const MAX_DATAGRAM: usize = 65535;
 /// The engine runs until [`EngineHandle::shutdown`]. Dropping the `Engine` aborts every task
 /// at once, so keep it alive (typically by awaiting [`Engine::wait`]) for as long as the
 /// engine should run; handles alone do not keep it running.
-pub struct Engine<T: Transport = UdpTransport> {
-    handle: EngineHandle<T>,
+///
+/// [`PathPolicy`]: nsplane_core::PathPolicy
+/// [`DynTransport`]: crate::DynTransport
+pub struct Engine {
+    handle: EngineHandle,
     owner: Option<JoinHandle<()>>,
 }
 
-impl<T: Transport> fmt::Debug for Engine<T> {
+impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Engine")
             .field("handle", &self.handle)
@@ -74,9 +91,9 @@ impl<T: Transport> fmt::Debug for Engine<T> {
     }
 }
 
-impl<T: Transport> Engine<T> {
+impl Engine {
     /// A new handle to this engine.
-    pub fn handle(&self) -> EngineHandle<T> {
+    pub fn handle(&self) -> EngineHandle {
         self.handle.clone()
     }
 
@@ -91,7 +108,7 @@ impl<T: Transport> Engine<T> {
     }
 }
 
-impl<T: Transport> Drop for Engine<T> {
+impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
             owner.abort();
@@ -100,20 +117,19 @@ impl<T: Transport> Drop for Engine<T> {
 }
 
 /// Everything [`spawn`] needs, collected by the builder.
-pub(crate) struct Parts<Src, Snk, T> {
+pub(crate) struct Parts<Src, Snk> {
     pub(crate) core: CoreConfig,
     pub(crate) private_key: Option<StaticSecret>,
     pub(crate) source: Src,
     pub(crate) sink: Snk,
-    pub(crate) transport: Option<T>,
+    /// At least one, with unique ids.
+    pub(crate) transports: Vec<NewTransport>,
     pub(crate) queue_capacity: usize,
     pub(crate) event_capacity: usize,
 }
 
 /// Spawns the owner task and the I/O tasks.
-pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink, T: Transport>(
-    parts: Parts<Src, Snk, T>,
-) -> Engine<T> {
+pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) -> Engine {
     let capacity = parts.queue_capacity;
     let (command_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
     let (local_tx, local) = mpsc::channel(capacity);
@@ -139,9 +155,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink, T: Transport>(
         recycled,
         recycle_tx,
         deliver,
-        transport: None,
-        pending: VecDeque::new(),
-        flush: None,
+        transports: BTreeMap::new(),
         timer: Box::pin(sleep_until(deadline)),
         events,
         drops: BTreeMap::new(),
@@ -152,7 +166,10 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink, T: Transport>(
         queue_capacity: capacity,
         local_first: false,
     };
-    owner.transport = parts.transport.map(|t| owner.start_transport(t));
+    for transport in parts.transports {
+        let slot = owner.start_transport(transport.start, VecDeque::new());
+        owner.transports.insert(transport.id, slot);
+    }
 
     Engine {
         handle: EngineHandle::new(command_tx),
@@ -192,35 +209,102 @@ type Datagram = (Path, PacketBuf);
 /// Waits for room in the transmit queue.
 type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
 
-/// The installed transport: its transmit queue and its two tasks.
+/// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
+/// its transmit queue and the queue returning transmitted buffers.
+type Start = Box<
+    dyn FnOnce(
+            mpsc::Sender<Datagram>,
+            mpsc::Receiver<Datagram>,
+            mpsc::Sender<PacketBuf>,
+        ) -> (Task, Task)
+        + Send,
+>;
+
+/// A transport on its way to the owner task, erased to its id and the spawning of its tasks,
+/// which stay generic over its type.
+pub(crate) struct NewTransport {
+    pub(crate) id: TransportId,
+    start: Start,
+}
+
+impl NewTransport {
+    pub(crate) fn new<T: Transport>(transport: T) -> Self {
+        Self {
+            id: transport.id(),
+            start: Box::new(move |datagrams, queue, recycle| {
+                let transport = Arc::new(transport);
+                (
+                    Task::spawn(receive(Arc::clone(&transport), datagrams)),
+                    Task::spawn(transmit(transport, queue, recycle)),
+                )
+            }),
+        }
+    }
+}
+
+/// An installed transport: its transmit queue, the datagrams waiting for room in it and its
+/// two tasks.
 struct TransportSlot {
     queue: mpsc::Sender<Datagram>,
+    /// Datagrams waiting for room in the transmit queue, oldest first.
+    pending: VecDeque<Datagram>,
+    /// Armed while `pending` is not empty.
+    flush: Option<Reserve>,
     receive: Task,
     transmit: Task,
 }
 
 impl TransportSlot {
-    async fn stop(self) {
+    /// Queues `datagram`, or adds it to the waiting datagrams when the queue is full or
+    /// others are waiting. With `droppable`, a datagram that finds `bound` datagrams waiting
+    /// is rejected; a closed queue rejects every datagram. Returns the rejected buffer and
+    /// the reason.
+    fn transmit(
+        &mut self,
+        datagram: Datagram,
+        droppable: bool,
+        bound: usize,
+    ) -> Result<(), (PacketBuf, &'static str)> {
+        let datagram = if self.pending.is_empty() {
+            match self.queue.try_send(datagram) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(datagram)) => datagram,
+                Err(TrySendError::Closed((_, data))) => return Err((data, DROP_TRANSPORT_CLOSED)),
+            }
+        } else {
+            datagram
+        };
+        if droppable && self.pending.len() >= bound {
+            return Err((datagram.1, DROP_TRANSMIT_FULL));
+        }
+        self.pending.push_back(datagram);
+        Ok(())
+    }
+
+    /// Stops both tasks and returns the waiting datagrams.
+    async fn stop(self) -> VecDeque<Datagram> {
         self.receive.stop().await;
         self.transmit.stop().await;
+        self.pending
     }
 }
 
 /// What woke the owner task.
-enum Wake<T> {
-    Command(Option<Command<T>>),
+enum Wake {
+    Command(Option<Command>),
     Datagram(Option<Datagram>),
     Local(Option<PacketBuf>),
-    Flush(Option<OwnedPermit<Datagram>>),
+    /// Room in the transmit queue of a transport with waiting datagrams.
+    Flush(TransportId, Option<OwnedPermit<Datagram>>),
     Timer,
 }
 
 /// The state of the owner task.
-struct Owner<T> {
+struct Owner {
     core: Core,
     /// The last private key given to the engine.
     private_key: Option<StaticSecret>,
-    commands: mpsc::Receiver<Command<T>>,
+    commands: mpsc::Receiver<Command>,
     /// Local packets; `None` once the source task has stopped.
     local: Option<mpsc::Receiver<PacketBuf>>,
     datagrams: mpsc::Receiver<Datagram>,
@@ -231,11 +315,7 @@ struct Owner<T> {
     /// Cloned into every transmit task.
     recycle_tx: mpsc::Sender<PacketBuf>,
     deliver: mpsc::Sender<(PeerId, PacketBuf)>,
-    transport: Option<TransportSlot>,
-    /// Datagrams waiting for room in the transmit queue, oldest first.
-    pending: VecDeque<Datagram>,
-    /// Armed while `pending` is not empty.
-    flush: Option<Reserve>,
+    transports: BTreeMap<TransportId, TransportSlot>,
     timer: Pin<Box<Sleep>>,
     events: broadcast::Sender<Event>,
     drops: BTreeMap<&'static str, u64>,
@@ -246,7 +326,7 @@ struct Owner<T> {
     local_first: bool,
 }
 
-impl<T: Transport> Owner<T> {
+impl Owner {
     async fn run(mut self) {
         loop {
             self.arm_timer();
@@ -277,14 +357,17 @@ impl<T: Transport> Owner<T> {
                 Wake::Datagram(None) => {}
                 Wake::Local(Some(packet)) => self.core.handle_input(Input::Local { packet }, now()),
                 Wake::Local(None) => self.local = None,
-                Wake::Flush(permit) => {
+                Wake::Flush(id, permit) => {
                     // No permit: the transmit queue closed, and moving drops the datagrams.
                     if let Some(permit) = permit
-                        && let Some(datagram) = self.pending.pop_front()
+                        && let Some(datagram) = self
+                            .transports
+                            .get_mut(&id)
+                            .and_then(|slot| slot.pending.pop_front())
                     {
                         permit.send(datagram);
                     }
-                    self.move_pending();
+                    self.move_pending(id);
                 }
                 Wake::Timer => self.core.handle_timeout(now()),
             }
@@ -293,15 +376,17 @@ impl<T: Transport> Owner<T> {
         self.stop().await;
     }
 
-    fn poll_wake(&mut self, cx: &mut Context<'_>) -> Poll<Wake<T>> {
+    fn poll_wake(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
         if let Poll::Ready(command) = self.commands.poll_recv(cx) {
             return Poll::Ready(Wake::Command(command));
         }
-        if let Some(flush) = &mut self.flush
-            && let Poll::Ready(permit) = flush.as_mut().poll(cx)
-        {
-            self.flush = None;
-            return Poll::Ready(Wake::Flush(permit.ok()));
+        for (id, slot) in &mut self.transports {
+            if let Some(flush) = &mut slot.flush
+                && let Poll::Ready(permit) = flush.as_mut().poll(cx)
+            {
+                slot.flush = None;
+                return Poll::Ready(Wake::Flush(*id, permit.ok()));
+            }
         }
         self.local_first = !self.local_first;
         if self.local_first {
@@ -325,10 +410,14 @@ impl<T: Transport> Owner<T> {
         Poll::Pending
     }
 
-    /// Polls the source queue, unless datagrams are waiting for the transmit queue.
-    fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake<T>> {
+    /// Polls the source queue, unless datagrams are waiting for a transmit queue.
+    fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
+        let waiting = self
+            .transports
+            .values()
+            .any(|slot| !slot.pending.is_empty());
         match &mut self.local {
-            Some(local) if self.pending.is_empty() => local.poll_recv(cx).map(Wake::Local),
+            Some(local) if !waiting => local.poll_recv(cx).map(Wake::Local),
             _ => Poll::Pending,
         }
     }
@@ -343,7 +432,7 @@ impl<T: Transport> Owner<T> {
     }
 
     /// Handles a command; breaks with the reply channel on shutdown.
-    async fn command(&mut self, command: Command<T>) -> ControlFlow<oneshot::Sender<()>> {
+    async fn command(&mut self, command: Command) -> ControlFlow<oneshot::Sender<()>> {
         // Replies are best effort: the caller may have stopped waiting.
         match command {
             Command::Config(change, reply) => {
@@ -389,15 +478,42 @@ impl<T: Transport> Owner<T> {
                 self.drain(false);
                 let _ = reply.send(());
             }
-            Command::SetTransport(transport, reply) => {
-                // The armed flush waits on the old transmit queue.
-                self.flush = None;
-                if let Some(old) = self.transport.take() {
-                    old.stop().await;
-                }
-                self.transport = Some(self.start_transport(transport));
-                self.drain(false);
-                let _ = reply.send(());
+            Command::AddTransport(transport, reply) => {
+                let result = if self.transports.contains_key(&transport.id) {
+                    Err(TransportError::Duplicate(transport.id))
+                } else {
+                    let slot = self.start_transport(transport.start, VecDeque::new());
+                    self.transports.insert(transport.id, slot);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            Command::RemoveTransport(id, reply) => {
+                let result = match self.transports.remove(&id) {
+                    Some(old) => {
+                        for (_, data) in old.stop().await {
+                            self.core.recycle(data);
+                            self.dropped(None, DROP_NO_TRANSPORT);
+                        }
+                        Ok(())
+                    }
+                    None => Err(TransportError::Unknown(id)),
+                };
+                let _ = reply.send(result);
+            }
+            Command::ReplaceTransport(transport, reply) => {
+                let result = match self.transports.remove(&transport.id) {
+                    Some(old) => {
+                        // The waiting datagrams go out on the new transport.
+                        let pending = old.stop().await;
+                        let slot = self.start_transport(transport.start, pending);
+                        self.transports.insert(transport.id, slot);
+                        self.drain(false);
+                        Ok(())
+                    }
+                    None => Err(TransportError::Unknown(transport.id)),
+                };
+                let _ = reply.send(result);
             }
             Command::Subscribe(reply) => {
                 let _ = reply.send(self.events.subscribe());
@@ -410,20 +526,27 @@ impl<T: Transport> Owner<T> {
         ControlFlow::Continue(())
     }
 
-    /// Spawns the receive and transmit tasks of `transport`.
-    fn start_transport(&self, transport: T) -> TransportSlot {
-        let transport = Arc::new(transport);
+    /// Spawns the receive and transmit tasks of a transport, with `pending` datagrams
+    /// waiting for its transmit queue.
+    fn start_transport(&self, start: Start, pending: VecDeque<Datagram>) -> TransportSlot {
         let (queue, transmit_rx) = mpsc::channel(self.queue_capacity);
+        let (receive, transmit) = start(
+            self.datagram_tx.clone(),
+            transmit_rx,
+            self.recycle_tx.clone(),
+        );
         TransportSlot {
             queue,
-            receive: Task::spawn(receive(Arc::clone(&transport), self.datagram_tx.clone())),
-            transmit: Task::spawn(transmit(transport, transmit_rx, self.recycle_tx.clone())),
+            pending,
+            flush: None,
+            receive,
+            transmit,
         }
     }
 
     /// Stops every I/O task and waits until they are gone.
     async fn stop(&mut self) {
-        if let Some(transport) = self.transport.take() {
+        for (_, transport) in std::mem::take(&mut self.transports) {
             transport.stop().await;
         }
         for task in self.tasks.drain(..) {
@@ -445,45 +568,32 @@ impl<T: Transport> Owner<T> {
         while let Ok(buf) = self.recycled.try_recv() {
             self.core.recycle(buf);
         }
-        if self.flush.is_none()
-            && !self.pending.is_empty()
-            && let Some(transport) = &self.transport
-        {
-            self.flush = Some(Box::pin(transport.queue.clone().reserve_owned()));
-        }
-    }
-
-    fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
-        let Some(transport) = &self.transport else {
-            self.core.recycle(data);
-            return self.dropped(None, DROP_NO_TRANSPORT);
-        };
-        if !self.pending.is_empty() {
-            return self.wait((path, data), droppable);
-        }
-        match transport.queue.try_send((path, data)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(datagram)) => self.wait(datagram, droppable),
-            Err(TrySendError::Closed((_, data))) => {
-                self.core.recycle(data);
-                self.dropped(None, DROP_TRANSPORT_CLOSED);
+        for slot in self.transports.values_mut() {
+            if slot.flush.is_none() && !slot.pending.is_empty() {
+                slot.flush = Some(Box::pin(slot.queue.clone().reserve_owned()));
             }
         }
     }
 
-    /// Adds a datagram to the waiting datagrams; with `droppable`, drops it when they are at
-    /// the queue capacity.
-    fn wait(&mut self, datagram: Datagram, droppable: bool) {
-        if droppable && self.pending.len() >= self.queue_capacity {
-            self.core.recycle(datagram.1);
-            return self.dropped(None, DROP_TRANSMIT_FULL);
+    /// Sends a datagram on the transport its path names.
+    fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
+        let result = match self.transports.get_mut(&path.transport) {
+            Some(slot) => slot.transmit((path, data), droppable, self.queue_capacity),
+            None => Err((data, DROP_NO_TRANSPORT)),
+        };
+        if let Err((data, reason)) = result {
+            self.core.recycle(data);
+            self.dropped(None, reason);
         }
-        self.pending.push_back(datagram);
     }
 
-    /// Moves waiting datagrams to the transmit queue until it is full, in order.
-    fn move_pending(&mut self) {
-        for (path, data) in std::mem::take(&mut self.pending) {
+    /// Moves the waiting datagrams of transport `id` to its transmit queue until it is full,
+    /// in order.
+    fn move_pending(&mut self, id: TransportId) {
+        let Some(slot) = self.transports.get_mut(&id) else {
+            return;
+        };
+        for (path, data) in std::mem::take(&mut slot.pending) {
             self.transmit(path, data, false);
         }
     }

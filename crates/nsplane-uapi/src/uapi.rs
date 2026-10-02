@@ -38,34 +38,49 @@ struct NetState {
 /// at a time.
 ///
 /// `listen_port=N` binds a dual-stack `[::]:N` transport (0 picks a free port) and installs
-/// it; repeating the current port is a no-op. `fwmark=M` rebinds the transport on its
+/// it with [`EngineHandle::add_transport`] the first time and
+/// [`EngineHandle::replace_transport`] afterwards; repeating the current port is a no-op. `fwmark=M` rebinds the transport on its
 /// current port with the mark (Linux and Android only; 0 removes it). Rebinding on the
 /// port the current transport holds first moves the engine to a temporary ephemeral
 /// transport to release the port.
 #[derive(Debug, Clone)]
 pub struct Uapi {
-    handle: EngineHandle<UdpTransport>,
+    handle: EngineHandle,
     net: Arc<Mutex<NetState>>,
 }
 
 impl Uapi {
     /// A UAPI over `handle`, with no transport bound yet (see [`Uapi::bind_transport`]).
-    pub fn new(handle: EngineHandle<UdpTransport>) -> Self {
+    pub fn new(handle: EngineHandle) -> Self {
         Self {
             handle,
             net: Arc::new(Mutex::new(NetState::default())),
         }
     }
 
+    /// A UAPI over `handle`, whose engine already runs the UAPI's transport (id
+    /// [`TRANSPORT_ID`], as [`udp_transport`] binds it) on `port`.
+    ///
+    /// Use it for an engine built with that transport, since an engine needs one to build.
+    pub fn with_listen_port(handle: EngineHandle, port: u16) -> Self {
+        Self {
+            handle,
+            net: Arc::new(Mutex::new(NetState {
+                port: Some(port),
+                fwmark: None,
+            })),
+        }
+    }
+
     /// The engine handle requests are applied to.
-    pub const fn handle(&self) -> &EngineHandle<UdpTransport> {
+    pub const fn handle(&self) -> &EngineHandle {
         &self.handle
     }
 
     /// Binds the transport to `port` (0 picks a free port) as `listen_port=` does, and
     /// returns the bound port.
     ///
-    /// Use it to give a new engine its initial transport.
+    /// Use it to add the UAPI's transport to an engine that runs without it.
     pub async fn bind_transport(&self, port: u16) -> io::Result<u16> {
         let mut net = self.net.lock().await;
         let fwmark = net.fwmark;
@@ -236,27 +251,30 @@ impl Uapi {
         check_fwmark_support(fwmark)?;
         if port != 0 && net.port == Some(port) {
             // The current transport holds the port: move to a temporary one to release it.
-            let parked = bind(0)?;
+            let parked = udp_transport(0)?;
             net.port = Some(parked.local_addr().port());
-            self.install(parked).await?;
+            self.install(parked, true).await?;
         }
-        let transport = bind(port)?;
+        let transport = udp_transport(port)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(mark) = fwmark {
             transport.set_fwmark(mark)?;
         }
         let bound = transport.local_addr().port();
-        self.install(transport).await?;
+        self.install(transport, net.port.is_some()).await?;
         net.port = Some(bound);
         net.fwmark = fwmark;
         Ok(())
     }
 
-    async fn install(&self, transport: UdpTransport) -> io::Result<()> {
-        self.handle
-            .set_transport(transport)
-            .await
-            .map_err(io::Error::other)
+    /// Adds `transport` to the engine, or replaces the one already `installed`.
+    async fn install(&self, transport: UdpTransport, installed: bool) -> io::Result<()> {
+        let result = if installed {
+            self.handle.replace_transport(transport).await
+        } else {
+            self.handle.add_transport(transport).await
+        };
+        result.map_err(io::Error::other)
     }
 }
 
@@ -326,8 +344,14 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option
     Ok(Some(line))
 }
 
-/// Binds a dual-stack transport to `port`.
-fn bind(port: u16) -> io::Result<UdpTransport> {
+/// Binds the UAPI's transport: id [`TRANSPORT_ID`] on a dual-stack `[::]:port` (0 picks a
+/// free port), as `listen_port=` does.
+///
+/// Hand it to [`EngineBuilder::transport`] and the built engine's handle to
+/// [`Uapi::with_listen_port`] with its port.
+///
+/// [`EngineBuilder::transport`]: nsplane::EngineBuilder::transport
+pub fn udp_transport(port: u16) -> io::Result<UdpTransport> {
     UdpTransport::bind(TRANSPORT_ID, (Ipv6Addr::UNSPECIFIED, port).into())
 }
 
