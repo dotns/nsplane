@@ -932,6 +932,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-core",
  "nsplane",
+ "nsplane-core",
  "nsplane-netstack",
  "nsplane-noise",
  "nsplane-tun",

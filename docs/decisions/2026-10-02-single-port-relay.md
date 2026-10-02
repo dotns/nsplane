@@ -136,6 +136,36 @@ Deviations:
   target). It cannot register a NAT source or learn its reflexive address, and so cannot
   be a relayed target behind NAT or hole-punch, because it never sends control messages.
 
+## Implementation in the examples
+
+`relay::router` (sans-I/O demux), `relay::server` (the relay's wrapping transport and
+configuration), `relay::client` (discovery, registration, the node's extension-aware
+transport) and `relay::ladder` (the path policy); binaries `relay_server` and
+`relay_transport`. Choices within the rules above:
+
+- Configuration: `{"machine_keys": [{"machine_key": b64, "wg_public_key": b64}],
+  "static_targets": [{"wg_public_key": b64, "endpoint": "ip:port"}]}`, re-read on change
+  (polled every second). A `machine_keys` entry pins the machine allowed to register the
+  WireGuard key; its machine id is the standard base64 of the Ed25519 public key, and
+  nodes sign with that id. A `static_targets` entry relays to a fixed endpoint, for native
+  WireGuard peers that cannot register. A reflexive request is answered only for a pinned
+  machine's WireGuard key.
+- Discovery: ns has no registration ack, so the discovery probe is a reflexive request;
+  an endpoint becomes capable with the first accepted `0xF3`. `register_source` is sent
+  only after that (right away, then every 30 s), so an endpoint that is not known to be
+  capable never receives a registration. Probes back off 1, 2, 4, 8, 16 s; after five
+  unanswered ones the endpoint is stopped until it is reconfigured. At most four control
+  messages per endpoint and second.
+- Own-engine indices: the relay notes the sender index of every handshake its own engine
+  sends; a relay route on such an index is ambiguous (rule 4).
+- Bounds, as nsgw: 4096 routes and 1024 routes of unanswered initiations (least recently
+  used evicted, counted), 128 relayed initiations and 16 control messages per source and
+  second (the control limit applies before verification). Routes expire after 180 s
+  without traffic, learned sources after 90 s without a registration or traffic from them.
+- Control failures map to counters: bad or foreign signature and a machine id other than
+  the pinned one count as `bad_signature`, a seen nonce or a stale timestamp as `replay`,
+  no pinned target as `unknown_target`, anything malformed as `invalid`.
+
 ## Consequences
 
 - One port to open and advertise per relay; the relay is a WireGuard node and a relay at

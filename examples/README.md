@@ -71,21 +71,84 @@ Subscribes to engine events and prints handshakes, roaming, drops and periodic s
 cargo run -p nsplane-examples --bin events_stats -- --help
 ```
 
-### relay_server (planned)
+### relay_server
 
-A relay that forwards datagrams between peers that cannot reach each other directly.
-
-```sh
-cargo run -p nsplane-examples --bin relay_server -- --help
-```
-
-### relay_transport (planned)
-
-A node whose transport is the relay (UDP or WSS) instead of direct UDP.
+A single-port relay that is also a WireGuard node. One UDP socket carries WireGuard to the
+relay's own engine (netstack with `--address`, echo with `--echo-port`), WireGuard between
+other peers relayed blindly by mac1 and receiver index, and the relay's control messages
+(`register_source`, reflexive address). The design is in
+`docs/decisions/2026-10-02-single-port-relay.md`. No root.
 
 ```sh
-cargo run -p nsplane-examples --bin relay_transport -- --help
+cargo run -p nsplane-examples --bin relay_server -- gen-machine-key a.machine   # prints the public key
+cargo run -p nsplane-examples --bin relay_server -- --private-key-file r.key --listen 0.0.0.0:51820 \
+  --address 10.0.0.1/24 --config relay.json --peer <A_PUB>,allowed-ips=10.0.0.2/32 --echo-port 7 \
+  --status-file relay.status.json
 ```
+
+Targets (the WireGuard keys it relays to) come from `--target <MACHINE_PUB>=<WG_PUB>`,
+`--static-target <WG_PUB>=<IP:PORT>` and `--config`, re-read within a second of a change:
+
+```json
+{"machine_keys": [{"machine_key": "<ed25519 public b64>", "wg_public_key": "<b64>"}],
+ "static_targets": [{"wg_public_key": "<b64>", "endpoint": "192.0.2.7:51820"}]}
+```
+
+A pinned target's source is learned from its `register_source`, signed by that machine key
+(machine id: the key's base64), fresh and not replayed; a static target (a native WireGuard
+peer, which cannot register) is at a fixed endpoint. Status `extra.relay`:
+
+| JSON path | Meaning |
+|---|---|
+| `.extra.relay.counters.own_engine` | datagrams handed to the own engine |
+| `.extra.relay.counters.forwarded` | datagrams relayed |
+| `.extra.relay.counters.control_rx` / `control_tx` | control frames received / reflexive replies sent |
+| `.extra.relay.counters.registrations` | accepted `register_source` |
+| `.extra.relay.counters.route_evictions` | routes evicted by the table bounds |
+| `.extra.relay.counters.dropped_{ambiguous,unknown_target,invalid,rate_limited,replay,bad_signature}` | drops by reason |
+| `.extra.relay.routes[]` | `{receiver_index, from, to, idle_secs, confirmed}` |
+| `.extra.relay.targets[]` | `{wg_public_key, machine_key, source, learned_secs_ago}` |
+
+### relay_transport
+
+The relay's client side, in one process on loopback (no root): a relay (router and own
+engine), nodes A and B with the extension-aware transport and the direct-first path
+ladder, and a plain WireGuard peer. A gate on A's socket blocks the direct path to show
+direct -> relay -> direct. Prints `STEP <name> PASS|FAIL` for `discovery`, `relay-engine`,
+`direct-first`, `direct-checks`, `block`, `unblock`, `plain-endpoint`, then `STEPS PASS`.
+
+```sh
+cargo run -p nsplane-examples --bin relay_transport -- --carrier udp
+```
+
+Every node example runs the same client with `--transport relay`:
+
+| Flag | Meaning |
+|---|---|
+| `--relay <IP:PORT>` | relay endpoint to discover, repeatable |
+| `--machine-key-file <PATH>` | Ed25519 machine key (`relay_server gen-machine-key`); required |
+| `--peer-candidates <FILE>` | `{"<wg pubkey b64>": ["ip:port", ...]}` direct candidates, polled every second |
+| `--reflexive-out <FILE>` | writes `{"reflexive": "ip:port", "relay": "ip:port", "unix_ms": N}` |
+| `--pin <auto\|direct\|relay>` | path of peers reached through a relay, default `auto` |
+| `--probe-backoff-ms`, `--probe-attempts` | discovery backoff (1000 ms doubling) and attempts (5) |
+| `--register-interval-ms`, `--reflexive-interval-ms` | cadence with a capable relay (30000, 20000) |
+| `--direct-timeout-ms`, `--direct-probe-interval-ms` | ladder fallback time (5000) and direct probes on the relay (30000) |
+
+An endpoint is extension-capable only after a reflexive reply that echoes an outstanding
+nonce; until then the node sends it nothing but WireGuard, and an endpoint that never
+answers is stopped after the last attempt. A peer whose `--peer` endpoint is a capable
+relay and that has candidates goes on the ladder: direct first, the relay when direct does
+not authenticate in time or stops answering, back to direct when a periodic probe
+authenticates. Status:
+
+| JSON path | Meaning |
+|---|---|
+| `.extra.relay.endpoints["<ip:port>"].state` | `unknown`, `probing`, `capable` or `stopped` |
+| `.extra.relay.endpoints["<ip:port>"].{attempts,control_sent,control_answered,rate_limited,reflexive}` | per-endpoint counters |
+| `.extra.relay.reflexive`, `.extra.relay.reflexive_from` | learned reflexive address and the relay that reported it |
+| `.extra.relay.{dropped_invalid,dropped_control}` | datagrams the transport dropped |
+| `.extra.paths["<peer pubkey b64>"].active` | `direct` or `relay` |
+| `.extra.paths["<peer pubkey b64>"].{confirmed,direct,relay,candidates,to_direct,to_relay}` | ladder state and transition counters |
 
 ## Shared flags
 
