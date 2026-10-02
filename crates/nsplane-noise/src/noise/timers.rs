@@ -82,6 +82,11 @@ pub(super) struct Timers {
     pub(super) handshake_init_sent: Duration,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
+    /// Number of completed handshakes so far; never reset.
+    handshakes: u64,
+    /// Local index of the session we established as responder that the initiator has not
+    /// confirmed with a data message yet.
+    unconfirmed_session: Option<usize>,
 }
 
 impl Timers {
@@ -99,6 +104,8 @@ impl Timers {
             handshake_jitter: Duration::ZERO,
             handshake_init_sent: Duration::ZERO,
             should_reset_rr: reset_rr,
+            handshakes: 0,
+            unconfirmed_session: None,
         }
     }
 
@@ -178,6 +185,20 @@ impl Tunn {
         self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
+        if is_initiator {
+            self.timers.handshakes += 1;
+        } else {
+            self.timers.unconfirmed_session = Some(session_idx);
+        }
+    }
+
+    /// Counts the handshake that established session `session_idx` as responder once the
+    /// initiator confirms it with its first data message.
+    pub(super) fn timer_tick_session_confirmed(&mut self, session_idx: usize) {
+        if self.timers.unconfirmed_session == Some(session_idx) {
+            self.timers.unconfirmed_session = None;
+            self.timers.handshakes += 1;
+        }
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -403,6 +424,16 @@ impl Tunn {
         } else {
             None
         }
+    }
+
+    /// Number of handshakes completed by this tunnel, as initiator or responder.
+    ///
+    /// Monotonic: it grows by one when the initiator accepts a handshake response, and when
+    /// the responder receives the first data message (or keepalive) on the session it
+    /// established, which confirms the handshake. A caller comparing it with the last value
+    /// it saw detects every completed handshake, even several between two looks.
+    pub const fn handshake_count(&self) -> u64 {
+        self.timers.handshakes
     }
 
     /// The persistent keepalive interval in seconds.
