@@ -130,6 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;
   core dumps are disabled at startup and panics are logged.
+- `nsplane`: backpressure is per transport: each transport has its own transmit queue and
+  bounded backlog, and the engine stops reading local packets only while every installed
+  transport's backlog is full, so a stalled transport (e.g. a relay) no longer holds back
+  peers on other transports; its own local packets are dropped under `DROP_TRANSMIT_FULL`
+  instead. `remove_transport` counts the datagrams still queued for the transport under the
+  new `DROP_TRANSPORT_REMOVED` (`nsplane_core::reasons::TRANSPORT_REMOVED`) instead of
+  dropping them silently; `replace_transport` carries them over to the new transport in
+  order.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and

@@ -128,8 +128,15 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
     }
 
     /// Sets the capacity of each internal packet queue (local packets, received datagrams,
-    /// datagrams to transmit, packets to deliver) and of the datagrams waiting for room in
-    /// the transmit queue; at least 1.
+    /// each transport's datagrams to transmit, packets to deliver) and the bound of each
+    /// transport's backlog of datagrams waiting for room in its transmit queue; at least 1.
+    ///
+    /// A datagram caused by a local packet, a received datagram or a timer that finds its
+    /// transport's backlog at the bound is dropped under [`crate::DROP_TRANSMIT_FULL`];
+    /// datagrams caused by handle calls wait regardless. Local reads pause only while every
+    /// installed transport's backlog is at the bound, so a single transport holds back the
+    /// source instead of dropping local packets, and a stalled transport never holds back
+    /// local packets for the others. See [`Engine`] for the whole rule.
     #[must_use]
     pub fn queue_capacity(mut self, capacity: usize) -> Self {
         self.queue_capacity = capacity.max(1);
