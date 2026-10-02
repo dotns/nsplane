@@ -73,6 +73,22 @@ docker exec -d -e B_PEER="peer $A_PUB preshared-key /psk allowed-ips 10.9.1.1/32
   echo $status > /kernel/connect.tmp; mv /kernel/connect.tmp /kernel/connect.result; fi
   if [ -e /kernel/reset ]; then rm /kernel/reset; wg set wg0 peer "$A_PUB" remove; wg set wg0 $B_PEER
   touch /kernel/reset.done; fi; sleep 0.05; done'
+# The netstack and throughput tests make b drive traffic into a: each /kernel/netstack-echo
+# (`<tcp|udp> <host> <port> <len>`) sends /kernel/netstack-echo.payload to <host>:<port> and
+# writes the first <len> bytes back to /kernel/netstack-echo.data, with the exit status in
+# /kernel/netstack-echo.result. Each /kernel/netstack-bulk (`<host> <port> <bytes>`) sends
+# <bytes> zeros over TCP and waits for a to close; /kernel/netstack-bulk.result holds the
+# exit status and the nanoseconds it took.
+docker exec -d "$PREFIX-b" bash -c 'while :; do if [ -e /kernel/netstack-echo ]; then
+  read -r proto host port len < /kernel/netstack-echo; rm /kernel/netstack-echo; status=0
+  timeout 10 bash -c "exec 3<>/dev/$proto/$host/$port; cat /kernel/netstack-echo.payload >&3 &
+    head -c $len <&3 > /kernel/netstack-echo.data; wait" || status=$?
+  echo $status > /kernel/netstack-echo.tmp; mv /kernel/netstack-echo.tmp /kernel/netstack-echo.result; fi
+  if [ -e /kernel/netstack-bulk ]; then read -r host port bytes < /kernel/netstack-bulk
+  rm /kernel/netstack-bulk; status=0; start=$(date +%s%N)
+  timeout 120 bash -c "exec 3<>/dev/tcp/$host/$port; head -c $bytes /dev/zero >&3; cat <&3 > /dev/null" || status=$?
+  echo "$status $(( $(date +%s%N) - start ))" > /kernel/netstack-bulk.tmp
+  mv /kernel/netstack-bulk.tmp /kernel/netstack-bulk.result; fi; sleep 0.05; done'
 
 echo "== nsplane-e2e container tests in a"
 docker exec \

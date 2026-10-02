@@ -16,8 +16,10 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+futures-core = "0.3.32"
 nsplane = { path = "../nsplane", version = "0.8.0" }
 nsplane-core = { path = "../nsplane-core", version = "0.8.0" }
+nsplane-netstack = { path = "../nsplane-netstack", version = "0.8.0" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
 
