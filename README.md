@@ -89,13 +89,20 @@ wg setconf wg0 /path/to/wg0.conf
 | `-t`, `--threads`           | `WG_THREADS`   | Tokio runtime worker threads (default 4)                  |
 | `-v`, `--verbosity`         | `WG_LOG_LEVEL` | `error` (default), `info`, `debug` or `trace`             |
 | `--disable-drop-privileges` | `WG_SUDO`      | Keep root; otherwise switch to `SUDO_UID`/`SUDO_GID` after setup |
+| `--tun-fd <FD>`             | `WG_TUN_FD`    | Adopt this already-open TUN fd instead of creating the interface |
+| `--uapi-fd <FD>`            | `WG_UAPI_FD`   | Also serve the UAPI on this already-connected Unix stream socket |
 
 - The UAPI listens on `/var/run/wireguard/<name>.sock`.
 - The UDP socket is bound to an ephemeral port at startup; `wg set <name> listen-port <port>`
   rebinds it.
-- `--tun-fd`/`WG_TUN_FD` and `--uapi-fd`/`WG_UAPI_FD` are gone: adopting a raw fd needs
-  `unsafe`, which the CLI forbids (the library keeps `nsplane_tun::Tun::from_fd`).
-  `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
+- `--tun-fd` and `--uapi-fd` take fds inherited from a parent process (FD_CLOEXEC cleared).
+  The daemon takes ownership of both and closes them on exit; a closed or invalid fd fails
+  startup. An adopted TUN fd starts with MTU 1420 and then follows the interface MTU. The
+  interface name stays required: the UAPI socket is named after the adopted device's name
+  when it can be queried, else after `<interface_name>`.
+- `--uapi-fd` serves one client connection next to the standard socket, which is still
+  bound; the daemon keeps running when that connection ends.
+- `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 
 It does not daemonize, so `wg-quick` with `WG_QUICK_USERSPACE_IMPLEMENTATION` is not
