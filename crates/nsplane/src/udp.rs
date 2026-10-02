@@ -1016,7 +1016,8 @@ mod tests {
         let ecns = [Ecn::NotEct, Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
         let mut batch = Vec::new();
         let mut expected: [Vec<(Ecn, Vec<u8>)>; 2] = Default::default();
-        for seq in 0..200 {
+        // Few enough to sit in a small (Wine) receive buffer until read.
+        for seq in 0..MAX_BATCH {
             // Runs of a few datagrams, then a change of receiver, mark or size.
             let to = (seq / 7) % 2;
             let ecn = ecns[(seq / 5) % 4];
