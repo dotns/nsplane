@@ -1,6 +1,6 @@
 # nstun - Plan Index
 
-> Updated: 2026-10-01
+> Updated: 2026-10-02
 
 ## Usage
 
@@ -32,3 +32,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 ## Plans
 
 - [x] [**20261001-1859-fork-baseline Fork baseline: pma-rust, aws-lc-rs, gotatun-inspired fixes**](20261001-1859-fork-baseline.md) `2026-10-01`
+- [-] [**20261002-1024-data-plane-core Complete data plane: transport, netstack and ACL inside nstun**](20261002-1024-data-plane-core.md) `2026-10-02`

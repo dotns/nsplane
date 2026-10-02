@@ -55,3 +55,11 @@ ns consumes nstun as a library; the CLI is a Linux/macOS development tool. Task
 `20261002-1008-cli-dev-tool`: the CLI runs in the foreground only and no longer builds on
 other targets; `daemonize` and its advisory waiver are gone (ADR superseded). The Windows
 `device` layer stays in the library as a fallback.
+
+## 2026-10-02 10:50 [decision]
+
+Plan `20261002-1024-data-plane-core` approved: nstun becomes the complete data plane with
+a sans-I/O core (`nstun-core`), a tokio driver (`nstun`), platform I/O (`nstun-tun`), an
+in-process netstack, and the ACL; `boringtun::device` is deleted after Phase 1. Architecture
+reviewed against firezone connlib, tailscale tstun/wgengine, gotatun, NepTUN, wireguard-go,
+netbird, EasyTier and the userspace-stack crates. Phase 1 is executed as a BKD campaign.

@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-10-01
+> Updated: 2026-10-02
 
 ## Usage
 
@@ -35,3 +35,4 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261001-1859-fork-baseline Fork baseline: pma-rust, aws-lc-rs, gotatun-inspired fixes**](20261001-1859-fork-baseline.md) `P1`
 - [x] [**20261002-1008-cli-dev-tool Reduce the CLI to a Linux/macOS development tool**](20261002-1008-cli-dev-tool.md) `P2`
+- [-] [**20261002-1020-data-plane-core Complete data plane: transport, netstack and ACL inside nstun**](20261002-1020-data-plane-core.md) `P1`
