@@ -110,8 +110,9 @@ Changes adopted into the proposal below:
    hosts that own their event loop; no locks on the hot path, which removes ns's whole
    class of "lock held across await" hazards. Cost: batching and crypto workers must be
    designed at the driver boundary instead of falling out of async tasks.
-2. **Buffer pool** (firezone `bufferpool`): `PacketBuf` comes from a pool and returns on
-   drop; header room stays. Avoids the per-packet `Vec` the current ns loops allocate.
+2. **Buffers on `bytes`**: `PacketBuf` wraps a `BytesMut` with header room in front; the
+   driver keeps a pool of `BytesMut` buffers and reuses them (firezone shows why: the
+   per-packet `Vec` in ns's loops costs an allocation per packet). No hand-written pool.
 3. **ECN/DSCP carried on `Path`/`Transmit`** (firezone, rustguard): cheap now, hard later.
 4. **Offload is two layers** (firezone `tun-offload` + `socket-factory`, tstun, rustguard):
    Linux TUN virtio-net header GSO/GRO on the local side and UDP GSO/GRO on the network side.
@@ -127,9 +128,12 @@ Changes adopted into the proposal below:
 8. **smoltcp 0.14** for `nstun-netstack`, porting ns's driver; `ipstack` evaluated and not
    chosen (own TCP implementation, no ICMP, less MSS/window control).
 
-License handling: firezone is Apache-2.0, so vendoring a small piece (e.g. the buffer pool)
-with its notice would be allowed, but the default remains design-only re-implementation so
-nstun stays plain BSD-3-Clause. gotatun (MPL) and EasyTier (LGPL) are design-only.
+License handling (decided 2026-10-02): **no code is copied or vendored from any reference
+project**, whatever its license; every reference is design-only. Where a mature crate
+exists for a building block, use the crate instead of writing or copying one: the buffer
+type is `bytes` (`BytesMut`/`Bytes`, 1.12.x), pooling is `BytesMut` reuse plus an
+off-the-shelf object pool if measurements show it pays. Code that ns owns (`acl`,
+`netstack`) may be moved into nstun in Phases 3-4 because it is the same owner.
 
 ### Gaps between nstun's device layer and what ns needs
 
@@ -322,11 +326,15 @@ Estimated size: Phase 1 about 4.5k lines (half moved), Phase 2 about 1.5k, Phase
 Workstreams build against these names so they can proceed in parallel; changing them is a
 scope change that goes through L1.
 
-- `nstun_packet::PacketBuf`: owned buffer with `HEADROOM = 32` bytes in front of the IP
-  packet (`DATA_HEADER_SZ` 16 + 16 spare for future transports); `as_packet()`,
+- `nstun_packet::PacketBuf`: a `bytes::BytesMut` with `HEADROOM = 32` bytes in front of
+  the IP packet (`DATA_HEADER_SZ` 16 + 16 spare for future transports); `as_packet()`,
   `as_packet_mut()`, `with_headroom_mut()` for the sealer, `len()`, `set_len()`,
-  `from_packet(&[u8])`. `PacketPool::get(capacity)` hands out `PacketBuf`s that return on
-  drop. `PacketBatch`: small vector of `PacketBuf` (cap `MAX_BATCH = 64`).
+  `from_packet(&[u8])`, `into_bytes()`/`freeze()` for channel hand-off.
+  `PacketPool::get(capacity)` hands out `PacketBuf`s backed by reused `BytesMut`
+  allocations (plain `BytesMut::with_capacity` plus reuse; a third-party object-pool crate
+  only if the `data_path` bench shows the allocator is the bottleneck). `PacketBatch`:
+  `smallvec` of `PacketBuf` (cap `MAX_BATCH = 64`). Dependencies for `nstun-packet`:
+  `bytes`, `zerocopy`, `smallvec`; nothing copied from other projects.
 - `nstun_packet` views: `Ipv4Header`, `Ipv6Header`, `UdpHeader`, `TcpHeader`,
   `IcmpHeader` as zerocopy `Ref`s; `IpPacket::parse(&[u8]) -> Result<IpPacket, Malformed>`
   with `src()`, `dst()`, `protocol()`, `five_tuple()`, `fragment()`; checksum helpers.
@@ -400,6 +408,8 @@ scripts extended. ns is read-only for this plan.
 
 ## Annotations
 
+- 2026-10-02: no code is copied from reference projects; use mature crates (`bytes`) for
+  buffers instead of a vendored or hand-written pool.
 - 2026-10-02: user confirmed `boringtun::device` is deleted after Phase 1 and that the
   work is split into phases; asked for a second architecture review against comparable
   GitHub projects. Review added above; the core became sans-I/O as a result.
