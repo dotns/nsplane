@@ -70,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
   serves the UAPI on an already-connected Unix stream socket next to the standard socket;
   the daemon takes ownership of both fds.
+- `nsplane-acl`: accept-only ACL policy engine (ported policy model, layered merge with
+  per-rule provenance, deny scope). `AclEngine` swaps the compiled policy atomically on
+  `load` (a rejected policy keeps the previous one) and is fail-closed: with no policy
+  loaded every request is denied. `AclFilter` is a `PacketFilter` that evaluates inbound
+  packets against the engine with each peer's principal from a `PeerIdentity` (e.g.
+  `PeerIdentityMap`), gates IPv4 fragments on their first fragment, accepts replies to
+  flows the local side opened and reports drops under the `reasons` constants, with
+  counters in `AclFilterStats`. `FlowTracker` is a pass-through `PacketFilter` counting
+  packets and bytes per flow in a bounded table.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their

@@ -10,6 +10,7 @@ members = [
     "crates/nsplane-tun",
     "crates/nsplane-uapi",
     "crates/nsplane-e2e",
+    "crates/nsplane-acl",
 ]
 
 [workspace.package]
