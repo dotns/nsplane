@@ -6,13 +6,25 @@
 
 #![forbid(unsafe_code)]
 
+mod builder;
 mod channel;
+mod engine;
+pub mod events;
+mod handle;
 mod io;
 mod transport;
 mod udp;
 
+pub use builder::EngineBuilder;
 pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
+pub use engine::Engine;
+pub use events::{
+    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
+    Event,
+};
+pub use handle::{EngineError, EngineHandle, Peer};
 pub use io::{PacketSink, PacketSource};
+pub use nstun_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
 pub use nstun_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
 };

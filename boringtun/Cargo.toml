@@ -16,7 +16,6 @@ workspace = true
 
 [features]
 default = []
-device = ["socket2", "thiserror", "dep:wintun-bindings", "dep:windows-sys"]
 jni-bindings = ["ffi-bindings", "jni"]
 ffi-bindings = ["tracing-subscriber"]
 # mocks std::time::Instant with mock_instant
@@ -30,8 +29,6 @@ parking_lot = "0.12"
 portable-atomic = { version = "1.13.1", features = ["fallback"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
-ip_network = "0.4.1"
-ip_network_table = "0.2.0"
 aws-lc-rs = "1.18.1"
 subtle = "2.6.1"
 zerocopy = { version = "0.8.59", features = ["derive"] }
@@ -46,28 +43,9 @@ blake2 = "0.10"
 hmac = "0.12"
 jni = { version = "0.19.0", optional = true }
 mock_instant = { version = "0.3", optional = true }
-socket2 = { version = "0.4.7", features = ["all"], optional = true }
-thiserror = { version = "2", optional = true }
-
-[target.'cfg(windows)'.dependencies]
-# JUSTIFICATION: Wintun is the only userspace TUN driver on Windows; the bindings load the
-# signed wintun.dll at runtime (docs/decisions/2026-10-01-wintun.md).
-wintun-bindings = { version = "0.7.40", optional = true }
-windows-sys = { version = "0.61.2", optional = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_IO",
-    "Win32_System_Pipes",
-] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = [
-    "time",
-    "user",
-] }
+nix = { version = "0.31", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 etherparse = "0.13"
