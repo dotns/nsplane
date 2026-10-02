@@ -56,6 +56,21 @@
 //! principals that are members of no namespace, exactly as before namespaces
 //! existed.
 //!
+//! **Fail-closed with namespaces.** "No policy" means:
+//!
+//! - A principal in no namespace, while no default policy is loaded, has its
+//!   new inbound flows dropped with [`reasons::NO_POLICY`] (replies to flows
+//!   the local side opened still pass while anything else is loaded).
+//! - A principal that is a member of a namespace is governed by its
+//!   namespaces' rules, plus grants and pinholes, whether or not a default
+//!   policy is loaded.
+//! - When nothing at all is loaded (no default policy and no namespace),
+//!   every inbound packet, replies included, is dropped with
+//!   [`reasons::NO_POLICY`].
+//! - [`AclEngine::clear`] removes only the default policy;
+//!   [`AclEngine::clear_all`] is the emergency stop that removes the default
+//!   policy, every namespace, grant and pinhole in one atomic swap.
+//!
 //! The principal of a peer is its [`SourceAssertion::source_anchor`]. An
 //! inbound packet from a namespace member `P` to address `d` is evaluated
 //! after the reply table, in this order:
@@ -137,6 +152,7 @@
 //! - `expired`: the engine clock reached `expires_at`, the safety net for a
 //!   session that crashed without dropping its guard.
 //! - `namespace_removed`: the app namespace was removed.
+//! - `cleared`: [`AclEngine::clear_all`] removed everything.
 //! - `revoked`: the peer left the app namespace, or its source namespaces no
 //!   longer allow the app kind (a source namespace changed or was removed,
 //!   including a peer dropped from its last source namespace when the pinhole

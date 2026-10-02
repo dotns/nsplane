@@ -2225,4 +2225,88 @@ mod tests {
         );
         assert_eq!(engine.pinhole_stats().namespace_removed, 1);
     }
+
+    #[test]
+    fn clear_all_is_an_emergency_stop() {
+        let (engine, clock) = pinhole_engine(Some(Vec::new()));
+        engine.load(test_policy()).unwrap();
+        engine
+            .store_namespace("nsd:b", namespace(&[B], None))
+            .unwrap();
+        engine
+            .store_grant(
+                "a-to-b",
+                Grant {
+                    from: GrantEnd::Peer(principal(A)),
+                    to: GrantEnd::Peer(principal(B)),
+                    proto: Some("tcp".to_owned()),
+                    ports: Some("443".to_owned()),
+                },
+            )
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, b, e, local) = (peer_addr(A), peer_addr(B), peer_addr(E), addr(LOCAL));
+        let (remote, v4_local) = (addr("10.0.0.1"), addr("10.0.0.2"));
+
+        // A reply allowance of a flow the local side opened.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(v4_local, 40000, remote, 9999)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(remote, 9999, v4_local, 40000)),
+            Verdict::Accept
+        );
+        // A flow through a pinhole and one through a grant.
+        let guard = open(&engine, &clock, E, Direction::Inbound, 9000);
+        let pinholed = || tcp_packet(e, 4000, local, 9000);
+        assert_eq!(inbound(&f, E, pinholed()), Verdict::Accept);
+        assert_eq!(
+            outbound(&f, E, tcp_packet(local, 9000, e, 4000)),
+            Verdict::Accept
+        );
+        let granted = || tcp_packet(a, 4000, b, 443);
+        assert_eq!(inbound(&f, A, granted()), Verdict::Accept);
+        assert_eq!(outbound(&f, B, granted()), Verdict::Accept);
+
+        engine.clear_all();
+        assert!(!engine.is_loaded());
+        assert!(engine.namespaces().is_empty() && engine.grants().is_empty());
+        assert!(!guard.is_open());
+        for (peer, packet) in [
+            (PEER, tcp_packet(remote, 9999, v4_local, 40000)),
+            (E, pinholed()),
+            (A, granted()),
+            (B, tcp_packet(b, 443, a, 4000)),
+            (A, tcp_packet(a, 4000, local, 22)),
+        ] {
+            assert_eq!(inbound(&f, peer, packet), drop(reasons::NO_POLICY));
+        }
+        assert_eq!(f.stats().no_policy, 5);
+
+        // Dropping the guard afterwards is a no-op.
+        std::mem::drop(guard);
+        assert_eq!(
+            engine.pinhole_stats(),
+            crate::PinholeStats {
+                opened: 1,
+                cleared: 1,
+                ..crate::PinholeStats::default()
+            }
+        );
+
+        // Later updates work as usual.
+        engine
+            .store_namespace("nsd:b", namespace(&[B], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, B, tcp_packet(b, 4000, local, 22)),
+            Verdict::Accept
+        );
+        engine.load(test_policy()).unwrap();
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(remote, 4000, v4_local, 80)),
+            Verdict::Accept
+        );
+    }
 }

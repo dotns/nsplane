@@ -94,7 +94,7 @@ pub enum PinholeError {
     Expired,
 }
 
-/// Pinhole counters of an [`AclEngine`](crate::AclEngine), in pinholes.
+/// Pinhole counters of an [`AclEngine`], in pinholes.
 ///
 /// Every opened pinhole is eventually counted under exactly one close reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,6 +110,8 @@ pub struct PinholeStats {
     /// Pinholes closed because the peer left the app namespace or its source
     /// namespaces no longer allow the app kind.
     pub revoked: u64,
+    /// Pinholes closed by [`AclEngine::clear_all`].
+    pub cleared: u64,
     /// Open requests refused with [`PinholeError::NotPermitted`].
     pub not_permitted: u64,
 }
@@ -122,6 +124,7 @@ pub(crate) struct PinholeCounters {
     pub(crate) expired: AtomicU64,
     pub(crate) namespace_removed: AtomicU64,
     pub(crate) revoked: AtomicU64,
+    pub(crate) cleared: AtomicU64,
     pub(crate) not_permitted: AtomicU64,
 }
 
@@ -138,6 +141,7 @@ impl PinholeCounters {
             expired: load(&self.expired),
             namespace_removed: load(&self.namespace_removed),
             revoked: load(&self.revoked),
+            cleared: load(&self.cleared),
             not_permitted: load(&self.not_permitted),
         }
     }

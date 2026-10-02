@@ -858,7 +858,11 @@ impl Snapshot {
 /// directed grants and app pinholes.
 ///
 /// Fail-closed: until a policy or namespace is loaded (and after
-/// [`clear`](Self::clear) with no namespace stored) every request is denied.
+/// [`clear`](Self::clear) with no namespace stored, or after
+/// [`clear_all`](Self::clear_all)) every request is denied. A principal in
+/// no namespace is denied while no default policy is loaded; a namespace
+/// member is governed by its namespaces (plus grants and pinholes) either
+/// way.
 /// The whole state is one immutable snapshot: writers serialize on a mutex
 /// and publish a new snapshot atomically, readers take one lock-free load, so
 /// the engine can be shared through an `Arc` and queried per packet while
@@ -912,7 +916,9 @@ impl AclEngine {
         }
     }
 
-    /// Compile `policy` and make it the active default policy.
+    /// Compile `policy` and make it the active default policy, which applies
+    /// to principals in no namespace (namespace members are governed by their
+    /// namespaces whether or not a default policy is loaded).
     ///
     /// On error (invalid policy or failed built-in tests) the previously
     /// loaded policy, if any, stays in effect.
@@ -929,19 +935,46 @@ impl AclEngine {
         }
     }
 
-    /// Make an already compiled policy the active default policy.
+    /// Make an already compiled policy the active default policy (see
+    /// [`load`](Self::load)).
     pub fn store(&self, policy: Arc<CompiledPolicy>) {
         self.publish(|snapshot| snapshot.default = Some(policy));
     }
 
-    /// Unload the default policy. Principals in no namespace return to
-    /// fail-closed; namespaces and grants stay.
+    /// Unload the default policy only. Principals in no namespace return to
+    /// fail-closed (their new flows are dropped with
+    /// [`reasons::NO_POLICY`](crate::reasons::NO_POLICY) by the filter);
+    /// namespaces, grants and pinholes stay, and their members are evaluated
+    /// as before. See [`clear_all`](Self::clear_all) to remove everything.
     pub fn clear(&self) {
         self.publish(|snapshot| snapshot.default = None);
     }
 
+    /// Emergency stop: remove the default policy and every namespace, grant
+    /// and pinhole in one atomic snapshot swap, so the engine is unloaded and
+    /// the filter drops every inbound packet, replies included, with
+    /// [`reasons::NO_POLICY`](crate::reasons::NO_POLICY).
+    ///
+    /// Open pinholes are counted in [`PinholeStats::cleared`] (pinholes
+    /// already expired are counted as expired); their guards become no-ops.
+    /// Later updates ([`load`](Self::load),
+    /// [`store_namespace`](Self::store_namespace), ...) work as usual.
+    pub fn clear_all(&self) {
+        let cleared = self.publish(|snapshot| {
+            let cleared = snapshot.pinholes.len() as u64;
+            *snapshot = Snapshot::default();
+            cleared
+        });
+        PinholeCounters::add(&self.pinholes.cleared, cleared);
+        warn!(
+            pinholes = cleared,
+            "ACL cleared: every policy, namespace, grant and pinhole removed"
+        );
+    }
+
     /// Whether the default policy is loaded or at least one namespace is
-    /// stored.
+    /// stored. When `false`, the filter drops every inbound packet, replies
+    /// included, with [`reasons::NO_POLICY`](crate::reasons::NO_POLICY).
     pub fn is_loaded(&self) -> bool {
         self.snapshot.load().is_loaded()
     }
