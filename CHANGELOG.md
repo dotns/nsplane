@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   watched.
 - `nsplane-uapi` (Unix): `Uapi::serve_stream` serves the UAPI on one already-connected
   `UnixStream`.
+- `nsplane-uapi` (Windows): `UapiListener` listens on a named pipe,
+  `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` (`pipe_path`, as
+  wireguard-windows uses) or any pipe name (`bind_path`), so `Uapi::serve` works on Windows
+  too. The pipe keeps the default security descriptor (see `UapiListener::bind`).
 - CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
   serves the UAPI on an already-connected Unix stream socket next to the standard socket;
   the daemon takes ownership of both fds.
