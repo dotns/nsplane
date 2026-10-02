@@ -16,6 +16,7 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
 | `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
+| `nsplane-examples` | `examples/` | Not published: runnable example binaries on the public APIs (`src/bin/`) and their shared node code (`src/lib.rs`), including the single-port relay and its UDP and WSS client transports |
 
 ```text
 nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
@@ -175,4 +176,6 @@ comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-n
 
 `just check` runs the unit and integration tests of every crate (the engine against
 in-memory channels). `just e2e` (`scripts/e2e/linux.sh`) runs `nsplane-cli` against kernel
-WireGuard in two containers.
+WireGuard in two containers. `just e2e-examples` (`scripts/e2e/examples.sh`) runs the
+`nsplane-examples` binaries in containers as a matrix of local sides and transports plus
+relay scenarios, against each other and kernel WireGuard (see `examples/README.md`).
