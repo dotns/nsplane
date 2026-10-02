@@ -1,10 +1,17 @@
 //! Timers over an in-memory channel transport.
 //!
 //! The engine schedules the core's timer ticks on tokio's clock, so a paused runtime drives
-//! the tick and the periodic stats. The tunnels' own timers (keepalive and rekey intervals,
-//! session expiry) read boringtun's clock instead, which tokio time does not move, and which
-//! stands still when the workspace is tested with `--all-features` (boringtun's
-//! `mock-instant`); they are not tested here.
+//! the tick and the periodic stats.
+//!
+//! Known limitation (Phase 1): the persistent-keepalive interval, rekey after 120 s, session
+//! expiry after 540 s (`Event::SessionExpired`) and re-handshake on an established session via
+//! `force_handshake` are not tested at engine level. The tunnel timers read boringtun's own
+//! clock (boringtun/src/noise/timers.rs), not the engine's tokio clock: nstun-core calls
+//! `update_timers` without a time (nstun-core/src/core.rs), and under `--all-features` the
+//! `mock-instant` feature of nstun-core (nstun-core/Cargo.toml) freezes that clock, so the
+//! TAI64N timestamp of a re-handshake does not advance (boringtun/src/noise/handshake.rs).
+//! They are covered at core level by nstun-core/tests/timers.rs. Planned fix (Phase 2): pass
+//! the engine's `now` into the tunnel timers, then add the engine-level timer tests here.
 //!
 //! Keepalives carry no payload and are not counted in the peer's byte counters, so the
 //! receiving side is moved to a path that leads nowhere first: a keepalive from the real
