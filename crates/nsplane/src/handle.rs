@@ -74,6 +74,8 @@ pub(crate) enum Command {
     AddTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
     RemoveTransport(TransportId, oneshot::Sender<Result<(), TransportError>>),
     ReplaceTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
+    Suspend(oneshot::Sender<()>),
+    Resume(oneshot::Sender<()>),
     Subscribe(oneshot::Sender<broadcast::Receiver<Event>>),
     DropCounters(oneshot::Sender<BTreeMap<&'static str, u64>>),
     Shutdown(oneshot::Sender<()>),
@@ -259,6 +261,28 @@ impl EngineHandle {
         let transport = NewTransport::new(transport);
         self.call(|tx| Command::ReplaceTransport(transport, tx))
             .await?
+    }
+
+    /// Suspends the engine, for example while the host sleeps or the network is down.
+    ///
+    /// Until [`EngineHandle::resume`], no source, sink or transport I/O runs (an operation
+    /// already in progress may complete; datagrams that arrive stay in the socket's buffer)
+    /// and no timer fires. Peers and sessions are kept, and handle calls still work: the
+    /// datagrams they cause wait, within the engine's queue bounds, and go out after
+    /// resuming. Transports added or replaced meanwhile start suspended. Publishes
+    /// `Event::Suspended`; suspending a suspended engine does nothing.
+    pub async fn suspend(&self) -> Result<(), EngineError> {
+        self.call(Command::Suspend).await
+    }
+
+    /// Resumes a suspended engine.
+    ///
+    /// Publishes `Event::Resumed`, then runs the core's timers once with the current time,
+    /// so sessions that expired while suspended expire and due handshakes and keepalives
+    /// start; then normal operation continues. Resuming an engine that is not suspended
+    /// does nothing.
+    pub async fn resume(&self) -> Result<(), EngineError> {
+        self.call(Command::Resume).await
     }
 
     /// Subscribes to the engine's events; see [`crate::events`] for the delivery semantics.

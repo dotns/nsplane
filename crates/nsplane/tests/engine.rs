@@ -948,3 +948,60 @@ async fn shutdown_is_clean() {
     // The other engine keeps running.
     assert_eq!(b.handle.peers().await.unwrap().len(), 1);
 }
+
+const fn is_suspension(event: &Event) -> bool {
+    matches!(event, Event::Suspended | Event::Resumed)
+}
+
+#[tokio::test]
+async fn suspend_and_resume_are_idempotent() {
+    let (mut a, mut b) = peered().await;
+    exchange(&mut a, &mut b).await;
+    let mut events = a.handle.subscribe().await.unwrap();
+
+    a.handle.suspend().await.unwrap();
+    a.handle.suspend().await.unwrap();
+    a.handle.resume().await.unwrap();
+    a.handle.resume().await.unwrap();
+    assert!(matches!(
+        expect_event(&mut events, is_suspension).await,
+        Event::Suspended
+    ));
+    assert!(matches!(
+        expect_event(&mut events, is_suspension).await,
+        Event::Resumed
+    ));
+    assert!(
+        timeout(QUIET, expect_event(&mut events, is_suspension))
+            .await
+            .is_err(),
+        "a second transition was published"
+    );
+    exchange(&mut a, &mut b).await;
+
+    a.handle.shutdown().await.unwrap();
+    assert_eq!(a.handle.suspend().await, Err(EngineError));
+    assert_eq!(a.handle.resume().await, Err(EngineError));
+}
+
+#[tokio::test]
+async fn transports_replaced_while_suspended_start_suspended() {
+    let (mut a, mut b) = peered().await;
+    exchange(&mut a, &mut b).await;
+
+    a.handle.suspend().await.unwrap();
+    let (ta, tb) = link(64);
+    a.handle.replace_transport(ta).await.unwrap();
+    b.handle.replace_transport(tb).await.unwrap();
+    // Handle calls still run; the datagram they cause waits for the resume.
+    let packet = ipv4(IP_A, IP_B, b"held");
+    a.handle
+        .inject_outbound(PacketBuf::from_packet(&packet))
+        .await
+        .unwrap();
+    b.expect_no_delivery().await;
+
+    a.handle.resume().await.unwrap();
+    assert_eq!(b.expect_delivery().await.1, packet);
+    exchange(&mut a, &mut b).await;
+}
