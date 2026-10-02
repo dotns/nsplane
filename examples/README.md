@@ -18,6 +18,8 @@ The package `nsplane-examples` is not published.
 | [`netstack_node`](#netstack_node) | A node whose local side is a userspace TCP/IP stack | no |
 | [`hybrid`](#hybrid) | A TUN device and a netstack behind one engine (`Splitter`, `MergeSource`) | yes |
 | [`acl_gateway`](#acl_gateway) | A TUN node filtered by a reloadable ACL policy | yes |
+| [`translate_node`](#translate_node) | Local IPv4 to peers reached over IPv6 only (`Translator`, RFC 7915) | yes |
+| [`port_map`](#port_map) | Local services published to peers through DNAT/SNAT (`PortMap`, `Conntrack`) | yes |
 | [`fd_bridge`](#fd_bridge) | The engine on a TUN handed over by a host: by fd or by packet channels | yes |
 | [`events_stats`](#events_stats) | Events, peer stats, drop counters, suspend/resume, MTU | no |
 | [`relay_server`](#relay_server) | A single-port relay with its own WireGuard engine, over UDP and WSS | no |
@@ -89,6 +91,49 @@ peer identity `10.0.0.2` to the gateway `10.0.0.1` and denies everything else (e
 
 ```sh
 sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --identity <B_PUB>=10.0.0.2 --policy examples/policies/acl_gateway.json --echo-port 7
+```
+
+### translate_node
+
+A TUN node with an `nsplane-nat` `Translator`: local IPv4 packets to a peer leave as IPv6 in
+the tunnel and the peer's IPv6 replies arrive as IPv4. Every peer owns a /127 IPv6 group,
+`node6` (native) and `node4` (its IPv4 side); `--map` names them and the local aliases:
+IPv4 to `alias4` becomes IPv6 to `node4`, and `alias6` is rewritten to and from `node6`.
+`--self <SELF4>=<NODE4>` maps this node's IPv4 address to its own `node4` (`self4/32` is
+added to the interface unless an `--address` covers it). `--lan <LAN4>=<LAN6>[@<PUBKEY>]`
+pairs an IPv4 prefix with an IPv6 /96 (the IPv4 address in the low 32 bits); without `@`
+the LAN is behind this node, whose hosts route the aliases through it (IP forwarding on).
+Each mapped peer's allowed IPs get its `alias4/32`, `alias6`, `node4`, `node6` and the LAN
+prefixes behind it, since the core routes and checks sources before the filter runs; the
+interface gets the routes. Status: `extra.translate` (translated, rewritten and dropped
+counters per direction). Needs root.
+
+Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
+`--self <SELF4>=<NODE4>`, `--map <PUBKEY>,node6=<IPv6>,node4=<IPv6>[,alias4=<IPv4>][,alias6=<IPv6>]`
+(repeatable), `--lan <IPv4>/<len>=<IPv6>/96[@<PUBKEY>]` (repeatable).
+
+```sh
+sudo cargo run -p nsplane-examples --bin translate_node -- --private-key-file a.key --self 10.200.0.1=fd00:a::1:1 --peer <B_PUB>,endpoint=192.0.2.2:51820 --map <B_PUB>,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2 --lan 192.168.50.0/24=fd00:1::/96
+```
+
+### port_map
+
+A TUN node with an `nsplane-nat` `PortMap`: each `--publish` maps a tunnel-facing address and
+port to a local service. A peer's packet to `listen` is rewritten to `target` (DNAT) and its
+flow recorded in a bounded `Conntrack`; the service's replies are rewritten back to come
+from `listen` (SNAT). With `@<PUBKEY>` only that peer may use the rule, other peers' packets
+to `listen` are dropped. `listen` and `target` are of the same family (e.g. an interface
+address and the `--echo-port` on it). Idle flows expire after the conntrack timeouts.
+Status: `extra.port_map` (`rules`, `conntrack` counters: `entries`, `inserted`, `expired`,
+`evicted`, `removed`, `hits`, `misses`). Needs root.
+
+Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
+`--publish <tcp|udp>:<listen>=<target>[@<PUBKEY>]` (repeatable, IPv6 in brackets),
+`--tcp-established-timeout`, `--tcp-transitory-timeout`, `--udp-timeout`, `--icmp-timeout`
+(seconds; defaults 300, 30, 30, 30), `--max-flows` (default 65536).
+
+```sh
+sudo cargo run -p nsplane-examples --bin port_map -- --private-key-file a.key --address fd00:b::1/64 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=fd00:b::2/128 --echo-port 7 --publish 'tcp:[fd00:b::1]:8007=[fd00:b::1]:7@<B_PUB>' --udp-timeout 5
 ```
 
 ### fd_bridge
@@ -365,8 +410,12 @@ WireGuard), `native_wg`, `native_wg_reverse` (native kernel WireGuard through th
 both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
 `nat_hole_punch` (the ladder behind MASQUERADE routers), `plain_wg_compat` (the relay
 extension against a plain WireGuard server), `app_session` (self-checks), `app_session_tun`
-(`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status). The run ends with the matrix and the scenario
-list and fails if anything failed.
+(`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status),
+`translate_node` (an IPv4-only client container on the node's LAN reaches an IPv6-only
+kernel WireGuard peer through its `alias4`: ping, TCP and UDP echo), `port_map` (a kernel
+WireGuard peer reaches the echo service through the listen port, a rule for another peer
+refuses it, an idle UDP flow expires after `--udp-timeout`). The run ends with the matrix
+and the scenario list and fails if anything failed.
 
 | Variable | Meaning |
 |---|---|
