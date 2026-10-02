@@ -62,14 +62,17 @@ impl DstMatcher {
             HostMatcher::Any => true,
             HostMatcher::Cidr(net) => net.contains(&ip),
         };
-        if !host_ok {
-            return false;
-        }
-        match &self.ports {
-            PortMatcher::Any => true,
-            PortMatcher::Single(p) => port == *p,
-            PortMatcher::Range(lo, hi) => port >= *lo && port <= *hi,
-            PortMatcher::List(ports) => ports.contains(&port),
+        host_ok && self.ports.matches(port)
+    }
+}
+
+impl PortMatcher {
+    pub(crate) fn matches(&self, port: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Single(p) => port == *p,
+            Self::Range(lo, hi) => port >= *lo && port <= *hi,
+            Self::List(ports) => ports.contains(&port),
         }
     }
 }
@@ -152,7 +155,8 @@ fn parse_host(s: &str, hosts: &HashMap<String, IpNet>) -> Result<HostMatcher, Er
     Err(Error::UnknownAlias(s.to_owned()))
 }
 
-fn parse_ports(s: &str) -> Result<PortMatcher, String> {
+/// Parse a port matcher: `*`, `22`, `80,443` or `8000-8999`.
+pub(crate) fn parse_ports(s: &str) -> Result<PortMatcher, String> {
     if s == "*" {
         return Ok(PortMatcher::Any);
     }
