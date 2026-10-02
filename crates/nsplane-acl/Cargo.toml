@@ -1,0 +1,24 @@
+[package]
+name = "nsplane-acl"
+description = "Accept-only ACL policy engine and packet filters for nsplane"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap = "1.7.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.21"
+tracing = "0.1.40"
+
+[dev-dependencies]
+serde_json = "1.0.149"
