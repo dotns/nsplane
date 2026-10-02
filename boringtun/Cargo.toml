@@ -23,7 +23,7 @@ ffi-bindings = ["tracing-subscriber"]
 mock-instant = ["mock_instant"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 libc = "0.2"
 parking_lot = "0.12"
