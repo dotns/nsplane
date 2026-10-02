@@ -241,9 +241,11 @@ impl EngineHandle {
     /// Removes the transport with id `id`.
     ///
     /// Its tasks are stopped and the transport is dropped before this returns, so its socket
-    /// is closed. Its datagrams waiting for transmission are dropped and counted under
-    /// [`crate::DROP_NO_TRANSPORT`], as is every later datagram to a path on `id`. Fails with
-    /// [`TransportError::Unknown`] when no transport with that id is installed.
+    /// is closed. Every datagram still queued for it (being sent, in its transmit queue or
+    /// waiting for room in it) is dropped and counted under [`crate::DROP_TRANSPORT_REMOVED`];
+    /// every later datagram to a path on `id` is dropped and counted under
+    /// [`crate::DROP_NO_TRANSPORT`]. Fails with [`TransportError::Unknown`] when no transport
+    /// with that id is installed.
     pub async fn remove_transport(&self, id: TransportId) -> Result<(), TransportError> {
         self.call(|tx| Command::RemoveTransport(id, tx)).await?
     }
@@ -252,7 +254,9 @@ impl EngineHandle {
     ///
     /// The old transport's tasks are stopped and the transport is dropped before this
     /// returns, so its socket is closed; then the new transport's tasks are spawned.
-    /// Datagrams waiting for transmission go out on the new transport. Fails with
+    /// Every datagram still queued for the old transport (being sent, in its transmit queue,
+    /// then waiting for room in it) goes out on the new transport, in order, ahead of later
+    /// ones; none is dropped. Fails with
     /// [`TransportError::Unknown`] when no transport with that id is installed; `transport`
     /// is then dropped.
     pub async fn replace_transport<T: Transport>(
@@ -309,7 +313,7 @@ impl EngineHandle {
     /// Includes every `Event::Dropped` reason of the core and the engine's own reasons
     /// ([`crate::DROP_SINK_FULL`], [`crate::DROP_SINK_CLOSED`],
     /// [`crate::DROP_NO_TRANSPORT`], [`crate::DROP_TRANSPORT_CLOSED`],
-    /// [`crate::DROP_TRANSMIT_FULL`]).
+    /// [`crate::DROP_TRANSPORT_REMOVED`], [`crate::DROP_TRANSMIT_FULL`]).
     pub async fn drop_counters(&self) -> Result<BTreeMap<&'static str, u64>, EngineError> {
         self.call(Command::DropCounters).await
     }

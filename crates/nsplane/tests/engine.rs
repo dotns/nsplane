@@ -16,7 +16,7 @@ use std::time::Duration;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
-    DROP_SINK_FULL, DROP_TRANSMIT_FULL, Ecn, Engine, EngineBuilder, EngineError, EngineHandle,
+    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, Ecn, Engine, EngineBuilder, EngineError, EngineHandle,
     Event, PacketBuf, Path, Peer, PeerId, Transport, TransportError, TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
@@ -845,6 +845,7 @@ async fn transports_are_added_removed_and_replaced() {
 
 #[tokio::test]
 async fn stalled_transport_does_not_hold_back_another() {
+    const IP_C: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
     let (ta, tb) = link(64);
     let (ta, gate) = Tapped::new(ta);
     let (tb, _gate_b) = Tapped::new(tb);
@@ -859,23 +860,16 @@ async fn stalled_transport_does_not_hold_back_another() {
     // `a` also reaches `c` on its second link (transport 3).
     let (ta2, tc) = second_link();
     a.handle.add_transport(ta2).await.unwrap();
-    let c = node(
+    let mut c = node(
         3,
-        Ipv4Addr::new(10, 0, 0, 3),
+        IP_C,
         "192.0.2.12:2000".parse().unwrap(),
         TransportId::new(4),
         tc,
         &options,
     );
     a.handle
-        .add_or_update_peer(Peer {
-            path: Some(Path {
-                transport: TransportId::new(3),
-                addr: c.addr,
-                ecn: Ecn::NotEct,
-            }),
-            ..c.as_peer(TransportId::new(3))
-        })
+        .add_or_update_peer(c.as_peer(TransportId::new(3)))
         .await
         .unwrap();
     c.handle
@@ -889,9 +883,11 @@ async fn stalled_transport_does_not_hold_back_another() {
         })
         .await
         .unwrap();
+    a.send(IP_C, b"hello").await;
+    assert_eq!(c.expect_delivery().await.1, ipv4(IP_A, IP_C, b"hello"));
 
-    // Transport 1 stops draining: its queue fills, datagrams wait in `a` and hold back the
-    // source.
+    // Transport 1 stops draining: its queue and backlog fill, and the local packets to `b`
+    // beyond them are dropped instead of holding back the source.
     gate.send(false).unwrap();
     let local = a.local.clone();
     let sender = tokio::spawn(async move {
@@ -900,26 +896,104 @@ async fn stalled_transport_does_not_hold_back_another() {
             local.send(packet).await.unwrap();
         }
     });
-    sleep(QUIET).await;
-    assert!(!sender.is_finished(), "the source was not held back");
+    // Local packets to `c` on transport 3 keep going meanwhile.
+    for i in 0..5u8 {
+        a.send(IP_C, &[i]).await;
+        assert_eq!(c.expect_delivery().await.1, ipv4(IP_A, IP_C, &[i]));
+    }
+    timeout(WAIT, sender)
+        .await
+        .expect("the source was held back")
+        .unwrap();
+    a.send(IP_C, b"after").await;
+    assert_eq!(c.expect_delivery().await.1, ipv4(IP_A, IP_C, b"after"));
+    eventually(|| async { a.drops(DROP_TRANSMIT_FULL).await > 0 }).await;
 
-    // A handshake with `c` on transport 3 still completes meanwhile.
+    // Once transport 1 drains, at most the datagram being sent, the transmit queue and the
+    // backlog arrive, in order.
+    gate.send(true).unwrap();
+    let mut delivered = Vec::new();
+    while let Ok(Some((_, packet))) = timeout(QUIET, b.delivered.recv()).await {
+        delivered.push(packet.as_packet().to_vec());
+    }
+    assert!(
+        (1..=5).contains(&delivered.len()),
+        "delivered {}",
+        delivered.len()
+    );
+    let mut sent = (0..20u8).map(|i| ipv4(IP_A, IP_B, &[i]));
+    for packet in &delivered {
+        assert!(sent.any(|p| p == *packet), "out of order: {packet:?}");
+    }
+}
+
+/// Two peered nodes on one link that `a` sends through `gate`, with `queued` datagrams
+/// injected for `b` while the gate is closed: one being sent, two in the transmit queue and
+/// the rest waiting for room in it.
+async fn queued_behind_a_closed_gate(queued: u8) -> (Node, Node, watch::Sender<bool>) {
+    let (ta, tb) = link(64);
+    let (ta, gate) = Tapped::new(ta);
+    let (tb, _gate_b) = Tapped::new(tb);
+    let options = Options {
+        queue_capacity: 2,
+        sink_capacity: 64,
+    };
+    let (mut a, mut b) = nodes(ta, tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    gate.send(false).unwrap();
+    for i in 0..queued {
+        let packet = PacketBuf::from_packet(&ipv4(IP_A, IP_B, &[i]));
+        a.handle.inject_outbound(packet).await.unwrap();
+    }
+    // Lets the transmit task take its datagram.
+    sleep(QUIET).await;
+    (a, b, gate)
+}
+
+#[tokio::test]
+async fn removed_transport_counts_its_queued_datagrams() {
+    const QUEUED: u8 = 8;
+    let (a, mut b, _gate) = queued_behind_a_closed_gate(QUEUED).await;
     let mut events = a.handle.subscribe().await.unwrap();
-    let to_c = a.peer_of(&c).await;
-    a.handle.force_handshake(to_c, None).await.unwrap();
-    let event = expect_event(
+
+    a.handle
+        .remove_transport(TransportId::new(1))
+        .await
+        .unwrap();
+    let counters = a.handle.drop_counters().await.unwrap();
+    assert_eq!(
+        counters.get(DROP_TRANSPORT_REMOVED),
+        Some(&u64::from(QUEUED))
+    );
+    assert_eq!(counters.get(DROP_NO_TRANSPORT), None);
+    let dropped = expect_event(
         &mut events,
-        |e| matches!(e, Event::HandshakeCompleted { peer, .. } if *peer == to_c),
+        |e| matches!(e, Event::Dropped { reason, .. } if *reason == DROP_TRANSPORT_REMOVED),
     )
     .await;
-    assert!(is_handshake(&event));
+    assert!(matches!(dropped, Event::Dropped { peer: None, .. }));
+    b.expect_no_delivery().await;
 
-    // Once transport 1 drains, the held-back packets arrive in order.
-    gate.send(true).unwrap();
-    timeout(WAIT, sender).await.unwrap().unwrap();
-    for i in 0..20u8 {
+    // Later datagrams to the removed transport are not queued for it.
+    a.send(IP_B, b"lost").await;
+    eventually(|| async { a.drops(DROP_NO_TRANSPORT).await == 1 }).await;
+    assert_eq!(a.drops(DROP_TRANSPORT_REMOVED).await, u64::from(QUEUED));
+}
+
+#[tokio::test]
+async fn replaced_transport_carries_over_its_queued_datagrams() {
+    const QUEUED: u8 = 8;
+    let (a, mut b, _gate) = queued_behind_a_closed_gate(QUEUED).await;
+
+    let (ta, tb) = link(64);
+    b.handle.replace_transport(tb).await.unwrap();
+    a.handle.replace_transport(ta).await.unwrap();
+    for i in 0..QUEUED {
         assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, &[i]));
     }
+    b.expect_no_delivery().await;
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
 }
 
