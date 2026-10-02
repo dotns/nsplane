@@ -34,3 +34,4 @@ Each task is a single line linking to its detail file. All detailed information 
 ## Tasks
 
 - [x] [**20261001-1859-fork-baseline Fork baseline: pma-rust, aws-lc-rs, gotatun-inspired fixes**](20261001-1859-fork-baseline.md) `P1`
+- [x] [**20261002-1008-cli-dev-tool Reduce the CLI to a Linux/macOS development tool**](20261002-1008-cli-dev-tool.md) `P2`

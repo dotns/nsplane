@@ -48,3 +48,10 @@ Windows host with the Wintun driver.
 - A clap derive `bool` flag only accepts `true`/`false` from its env var; use
   `BoolishValueParser` to keep `WG_SUDO=1` working.
 - Under wine, `wintun.dll` cannot load, so the Windows device stops at adapter creation.
+
+## 2026-10-02 10:20 [decision]
+
+ns consumes nstun as a library; the CLI is a Linux/macOS development tool. Task
+`20261002-1008-cli-dev-tool`: the CLI runs in the foreground only and no longer builds on
+other targets; `daemonize` and its advisory waiver are gone (ADR superseded). The Windows
+`device` layer stays in the library as a fallback.

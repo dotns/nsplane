@@ -1,6 +1,6 @@
 # ADR: Accept the unmaintained `daemonize` crate in the CLI
 
-Status   : Accepted
+Status   : Superseded 2026-10-02 (the CLI no longer daemonizes; `daemonize` was removed)
 Date     : 2026-10-01
 Sunset   : 2027-03-31
 

@@ -29,7 +29,7 @@ A 'umask 077; wg genkey > /k; wg pubkey < /k > /p'; B 'umask 077; wg genkey > /k
 A_PUB=$(A 'cat /p'); B_PUB=$(B 'cat /p')
 
 echo "== start nstun in a"
-A 'WG_SUDO=1 WG_LOG_LEVEL=info boringtun -f wg0 > /log 2>&1 &'
+A 'WG_SUDO=1 WG_LOG_LEVEL=info boringtun wg0 > /log 2>&1 &'
 for i in $(seq 1 50); do A 'test -S /var/run/wireguard/wg0.sock' && break; sleep 0.1; done
 A "wg set wg0 private-key /k listen-port 51820 peer $B_PUB allowed-ips 10.9.0.2/32,fd00::2/128 endpoint $B_IP:51820"
 A 'ip addr add 10.9.0.1/24 dev wg0; ip addr add fd00::1/64 dev wg0; ip link set wg0 up'

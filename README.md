@@ -22,7 +22,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | Path             | Crate           | Description                                                                 |
 | ---------------- | --------------- | --------------------------------------------------------------------------- |
 | `boringtun/`     | `boringtun`     | Protocol library: Noise handshake, sessions, timers, and the optional `device` layer (TUN + UDP) |
-| `boringtun-cli/` | `boringtun-cli` | Userspace WireGuard daemon for Linux, macOS and Windows, configured through `wg` |
+| `boringtun-cli/` | `boringtun-cli` | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 
 The crate names are still the upstream names, which keeps merges from upstream
 simple.
@@ -71,26 +71,29 @@ cargo build -p boringtun --lib --features device --release
 cargo build -p boringtun-cli --release
 ```
 
-### Running on Linux and macOS
+### Development CLI (Linux and macOS)
 
-Run a userspace tunnel and configure it with the standard `wg` tooling:
+`boringtun-cli` runs a userspace tunnel in the foreground and logs to stderr; Ctrl-C stops
+it. Run it in a separate terminal (or tmux) and configure it with the standard `wg` tooling:
 
 ```bash
 sudo setcap cap_net_admin+epi target/release/boringtun-cli
-target/release/boringtun-cli [-f] wg0
+target/release/boringtun-cli -v info wg0
 wg setconf wg0 /path/to/wg0.conf
 ```
 
-### Running on Windows
+It does not daemonize, so `wg-quick` with `WG_QUICK_USERSPACE_IMPLEMENTATION` is not
+supported.
 
-- Put `wintun.dll` (from <https://www.wintun.net/>, matching the architecture) next to
-  `boringtun-cli.exe`.
-- Run from an elevated prompt: `boringtun-cli.exe wg0`. The daemon stays in the foreground;
-  Ctrl-C stops it.
-- Configure it with `wg.exe` (shipped with WireGuard for Windows), which talks to the named
-  pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\wg0`.
-- Addresses and routes are set with the usual Windows tools (`netsh`, `New-NetIPAddress`).
-- On Windows, `--threads` and `--disable-connected-udp` have no effect.
+### Windows (library)
+
+The `device` feature also builds on Windows, on top of Wintun:
+
+- `wintun.dll` (from <https://www.wintun.net/>, matching the architecture) must sit next to
+  the executable, which runs elevated.
+- `wg.exe` configures it through the named pipe
+  `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`.
+- `DeviceConfig::n_threads` and `use_connected_socket` have no effect on Windows.
 
 ## Quality gates
 
@@ -99,7 +102,7 @@ There is no CI; run the gates locally before pushing (see `docs/decisions/`):
 ```bash
 just check          # fmt, clippy for every feature, nextest, doctests, deny, shear, typos, MSRV
 just cross          # clippy for aarch64-apple-darwin (zig) and x86_64-pc-windows-gnu (mingw)
-just test-windows   # Windows unit tests under wine
+just test-windows   # library unit tests for Windows under wine
 just e2e            # interop with kernel WireGuard in two containers (docker)
 just integration    # upstream integration tests (root, TUN, docker; reconfigures the host)
 ```

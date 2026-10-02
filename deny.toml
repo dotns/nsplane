@@ -4,11 +4,6 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # daemonize is unmaintained and has no replacement without `unsafe` fork code in the CLI.
-    # Revisit by 2027-03-31.
-    { id = "RUSTSEC-2025-0069", reason = "no maintained safe alternative; CLI-only" },
-]
 
 [licenses]
 version = 2
