@@ -89,8 +89,7 @@ mod unix {
         if let Some(fd) = args.child_fd {
             return child(&args, fd).await;
         }
-        let tun = Tun::create(&args.tun.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun.tun_name))?;
+        let tun = node::create_tun(&args.tun.tun_name, &args.node)?;
         let name = tun.name().unwrap_or_else(|_| args.tun.tun_name.clone());
         configure_tun(&name, &args.tun.address, args.tun.mtu, &args.node.peer)?;
         match args.mode {
@@ -141,12 +140,13 @@ mod unix {
         let tun = Tun::from_raw_fd(fd, args.tun.mtu)
             .with_context(|| format!("cannot adopt TUN fd {fd}"))?;
         let name = tun.name().context("the inherited fd is no TUN device")?;
+        let offload = node::offload_mode(tun.offload());
         let (source, sink) = tun.split().context("cannot open the TUN device")?;
         let node = build_engine(source, sink, &args.node)?;
         let handle = node.engine.handle();
         configure_peers(&handle, &args.node.peer).await?;
         let socket = serve_uapi(handle.clone(), &name, node.transports.listen.port())?;
-        tracing::info!(interface = %name, fd, listen = %node.transports.listen, uapi = %socket, "engine started on the inherited TUN fd");
+        tracing::info!(interface = %name, fd, %offload, listen = %node.transports.listen, uapi = %socket, "engine started on the inherited TUN fd");
         let status = args
             .node
             .status_file
