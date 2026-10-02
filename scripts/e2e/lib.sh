@@ -63,6 +63,16 @@ B 'ip addr add 10.9.1.2/24 dev wg0; ip addr add fd00:1::2/64 dev wg0; ip link se
 # /kernel/request with `wg show wg0 transfer` in /kernel/transfer.
 docker exec -d "$PREFIX-b" bash -c 'while :; do if [ -e /kernel/request ]; then rm /kernel/request
   wg show wg0 transfer > /kernel/transfer.tmp; mv /kernel/transfer.tmp /kernel/transfer; fi; sleep 0.05; done'
+# The ACL test asks b to connect to a through the tunnel: b answers each /kernel/connect
+# (`tcp <port>` or `udp <port>`) by sending `hello` to 10.9.1.1:<port>, with the exit status
+# in /kernel/connect.result. Each /kernel/reset drops b's session with a and re-adds the peer
+# as configured above, so b initiates the next handshake; /kernel/reset.done answers it.
+docker exec -d -e B_PEER="peer $A_PUB preshared-key /psk allowed-ips 10.9.1.1/32,fd00:1::1/128 endpoint $A_IP:51820 persistent-keepalive 2" \
+  -e A_PUB="$A_PUB" "$PREFIX-b" bash -c 'while :; do if [ -e /kernel/connect ]; then read -r proto port < /kernel/connect
+  rm /kernel/connect; status=0; timeout 3 bash -c "exec 3<>/dev/$proto/10.9.1.1/$port; printf hello >&3" || status=$?
+  echo $status > /kernel/connect.tmp; mv /kernel/connect.tmp /kernel/connect.result; fi
+  if [ -e /kernel/reset ]; then rm /kernel/reset; wg set wg0 peer "$A_PUB" remove; wg set wg0 $B_PEER
+  touch /kernel/reset.done; fi; sleep 0.05; done'
 
 echo "== nsplane-e2e container tests in a"
 docker exec \
