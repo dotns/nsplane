@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Accept-only ACL policy engine for nsplane.
+//! Accept-only ACL policy engine and packet filters for nsplane.
 //!
 //! Evaluates per-connection access requests against an [`AclPolicy`]. The
 //! model is **accept-only with default deny**: rules can only grant access to
@@ -21,19 +21,40 @@
 //!   threads and swaps it atomically on reload. It is fail-closed: with no
 //!   policy loaded every request is denied, and a rejected reload keeps the
 //!   previous policy in effect.
+//! - **Packet filter** ([`AclFilter`]): a sans-I/O
+//!   [`PacketFilter`](nsplane_core::PacketFilter) that evaluates inbound
+//!   packets against the engine, with the principal of each peer resolved by
+//!   a [`PeerIdentity`] (for example a [`PeerIdentityMap`]). It gates IPv4
+//!   fragments on their first fragment and accepts replies to flows the local
+//!   side opened (stateful replies, not a conntrack/NAT). Drop reasons are in
+//!   [`reasons`].
+//! - **Flow tracker** ([`FlowTracker`]): a pass-through
+//!   [`PacketFilter`](nsplane_core::PacketFilter) counting packets and bytes
+//!   per [`FlowKey`] in a bounded table.
+//!
+//! The filters are `Clone` and clones share their state: box one clone into
+//! the engine and keep another to read [`AclFilter::stats`] or
+//! [`FlowTracker::flows`].
 
 pub mod deny_scope;
 pub mod engine;
+mod filter;
+mod flow;
 pub mod matcher;
 pub mod merge;
 pub mod net;
 pub mod policy;
+pub mod reasons;
+#[cfg(test)]
+mod test_packets;
 
 pub use deny_scope::{DenyScope, DenyScopeOutcome, DropReason, DroppedRule, apply_deny_scope};
 pub use engine::{
     AccessRequest, AclDecision, AclEngine, AclTestFailure, CompiledPolicy, SourceAssertion,
     TerminateBinding, wg_peer_anchor,
 };
+pub use filter::{AclFilter, AclFilterConfig, AclFilterStats, PeerIdentity, PeerIdentityMap};
+pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{
     MergeStats, MergedPolicy, PolicyLayers, RemotePolicy, RuleProvenance, acl_rule_key,
     acl_test_key, merge_layered,
