@@ -19,7 +19,9 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
-use crate::events::{DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSPORT_CLOSED};
+use crate::events::{
+    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
+};
 use crate::handle::{Command, EngineHandle};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -40,9 +42,12 @@ const MAX_DATAGRAM: usize = 65535;
 /// shared, so there are no locks on the data path.
 ///
 /// Backpressure: a full sink queue drops the decrypted packet and counts it under
-/// [`crate::DROP_SINK_FULL`]. A full transmit queue never drops: datagrams wait in the owner
-/// task and the owner stops reading local packets until the queue has room again, which in
-/// turn holds back the source.
+/// [`crate::DROP_SINK_FULL`]. When the transmit queue is full, datagrams wait in the owner
+/// task and the owner stops reading local packets until every waiting datagram has moved to
+/// the queue, which in turn holds back the source. The waiting datagrams are bounded by the
+/// queue capacity: a datagram caused by a received datagram or a timer that finds them at
+/// the bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
+/// local packets or handle calls always wait, so local packets are held back, never dropped.
 ///
 /// Buffers: datagrams are received into one reusable 64 KiB buffer and copied into an
 /// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. Datagram buffers
@@ -246,6 +251,8 @@ impl<T: Transport> Owner<T> {
         loop {
             self.arm_timer();
             let wake = poll_fn(|cx| self.poll_wake(cx)).await;
+            // Datagrams caused by the network or a timer may overflow the waiting datagrams.
+            let droppable = matches!(wake, Wake::Datagram(_) | Wake::Timer);
             match wake {
                 Wake::Command(None) => break,
                 Wake::Command(Some(command)) => {
@@ -281,7 +288,7 @@ impl<T: Transport> Owner<T> {
                 }
                 Wake::Timer => self.core.handle_timeout(now()),
             }
-            self.drain();
+            self.drain(droppable);
         }
         self.stop().await;
     }
@@ -344,7 +351,7 @@ impl<T: Transport> Owner<T> {
                     self.private_key = Some(key.clone());
                 }
                 self.core.handle_input(Input::Config(change), now());
-                self.drain();
+                self.drain(false);
                 let _ = reply.send(());
             }
             Command::PeerId(key, reply) => {
@@ -369,17 +376,17 @@ impl<T: Transport> Owner<T> {
             }
             Command::InjectInbound(peer, packet, reply) => {
                 self.core.inject_inbound(peer, packet);
-                self.drain();
+                self.drain(false);
                 let _ = reply.send(());
             }
             Command::InjectOutbound(packet, reply) => {
                 self.core.inject_outbound(packet, now());
-                self.drain();
+                self.drain(false);
                 let _ = reply.send(());
             }
             Command::ForceHandshake(peer, path, reply) => {
                 self.core.force_handshake(peer, path, now());
-                self.drain();
+                self.drain(false);
                 let _ = reply.send(());
             }
             Command::SetTransport(transport, reply) => {
@@ -389,7 +396,7 @@ impl<T: Transport> Owner<T> {
                     old.stop().await;
                 }
                 self.transport = Some(self.start_transport(transport));
-                self.drain();
+                self.drain(false);
                 let _ = reply.send(());
             }
             Command::Subscribe(reply) => {
@@ -425,11 +432,12 @@ impl<T: Transport> Owner<T> {
     }
 
     /// Routes the core's outputs, returns transmitted buffers to the core and arms the
-    /// flush of waiting datagrams.
-    fn drain(&mut self) {
+    /// flush of waiting datagrams. With `droppable`, datagrams to transmit may overflow the
+    /// waiting datagrams.
+    fn drain(&mut self, droppable: bool) {
         while let Some(output) = self.core.poll_output() {
             match output {
-                Output::Transmit { path, data } => self.transmit(path, data),
+                Output::Transmit { path, data } => self.transmit(path, data, droppable),
                 Output::Deliver { from, packet } => self.deliver(from, packet),
                 Output::Event(event) => self.event(event),
             }
@@ -445,17 +453,17 @@ impl<T: Transport> Owner<T> {
         }
     }
 
-    fn transmit(&mut self, path: Path, data: PacketBuf) {
+    fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
         let Some(transport) = &self.transport else {
             self.core.recycle(data);
             return self.dropped(None, DROP_NO_TRANSPORT);
         };
         if !self.pending.is_empty() {
-            return self.pending.push_back((path, data));
+            return self.wait((path, data), droppable);
         }
         match transport.queue.try_send((path, data)) {
             Ok(()) => {}
-            Err(TrySendError::Full(datagram)) => self.pending.push_back(datagram),
+            Err(TrySendError::Full(datagram)) => self.wait(datagram, droppable),
             Err(TrySendError::Closed((_, data))) => {
                 self.core.recycle(data);
                 self.dropped(None, DROP_TRANSPORT_CLOSED);
@@ -463,10 +471,20 @@ impl<T: Transport> Owner<T> {
         }
     }
 
+    /// Adds a datagram to the waiting datagrams; with `droppable`, drops it when they are at
+    /// the queue capacity.
+    fn wait(&mut self, datagram: Datagram, droppable: bool) {
+        if droppable && self.pending.len() >= self.queue_capacity {
+            self.core.recycle(datagram.1);
+            return self.dropped(None, DROP_TRANSMIT_FULL);
+        }
+        self.pending.push_back(datagram);
+    }
+
     /// Moves waiting datagrams to the transmit queue until it is full, in order.
     fn move_pending(&mut self) {
         for (path, data) in std::mem::take(&mut self.pending) {
-            self.transmit(path, data);
+            self.transmit(path, data, false);
         }
     }
 

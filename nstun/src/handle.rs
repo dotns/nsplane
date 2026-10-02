@@ -222,7 +222,8 @@ impl<T: Transport> EngineHandle<T> {
     ///
     /// Includes every `Event::Dropped` reason of the core and the engine's own reasons
     /// ([`crate::DROP_SINK_FULL`], [`crate::DROP_SINK_CLOSED`],
-    /// [`crate::DROP_NO_TRANSPORT`], [`crate::DROP_TRANSPORT_CLOSED`]).
+    /// [`crate::DROP_NO_TRANSPORT`], [`crate::DROP_TRANSPORT_CLOSED`],
+    /// [`crate::DROP_TRANSMIT_FULL`]).
     pub async fn drop_counters(&self) -> Result<BTreeMap<&'static str, u64>, EngineError> {
         self.call(Command::DropCounters).await
     }

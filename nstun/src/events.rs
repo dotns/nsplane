@@ -23,5 +23,8 @@ pub const DROP_SINK_FULL: &str = "sink full";
 pub const DROP_SINK_CLOSED: &str = "sink closed";
 /// A datagram was dropped because the engine has no transport.
 pub const DROP_NO_TRANSPORT: &str = "no transport";
+/// A datagram caused by a received datagram or a timer was dropped because the transmit
+/// queue and the datagrams waiting for it were full.
+pub const DROP_TRANSMIT_FULL: &str = "transmit full";
 /// A datagram was dropped because the transport has shut down.
 pub const DROP_TRANSPORT_CLOSED: &str = "transport closed";

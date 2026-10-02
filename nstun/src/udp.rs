@@ -20,7 +20,7 @@ use crate::transport::Transport;
 /// read from its `recvmsg` control message (`IP_RECVTOS`, `IPV6_RECVTCLASS`) and
 /// reported in [`Path::ecn`]; on send, `to.ecn` is set per datagram with an `IP_TOS` or
 /// `IPV6_TCLASS` control message on `sendmsg`, so no socket-wide state changes. On other
-/// platforms (macOS, iOS, Windows) received datagrams report [`Ecn::NotEct`] and `to.ecn`
+/// platforms (macOS, iOS, Windows) received datagrams report [`Ecn::NotEct`](nstun_packet::Ecn::NotEct) and `to.ecn`
 /// is ignored.
 ///
 /// Windows: a datagram larger than the receive buffer is truncated as on other

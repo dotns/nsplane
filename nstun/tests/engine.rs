@@ -16,9 +16,10 @@ use std::time::Duration;
 use nstun::x25519::{PublicKey, StaticSecret};
 use nstun::{
     AllowedIp, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT, DROP_SINK_FULL,
-    Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event, PacketBuf, Path, Peer, PeerId,
-    Transport, TransportId,
+    DROP_TRANSMIT_FULL, Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event, PacketBuf,
+    Path, Peer, PeerId, Transport, TransportId,
 };
+use nstun_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, sleep, timeout};
 
@@ -507,7 +508,7 @@ const KEEPALIVE_SZ: usize = 32;
 /// A transport that counts the keepalives it sends and whose sends wait while its gate is
 /// closed.
 struct Tapped {
-    inner: ChannelTransport,
+    inner: Arc<ChannelTransport>,
     open: watch::Receiver<bool>,
     keepalives: Arc<AtomicUsize>,
 }
@@ -517,7 +518,7 @@ impl Tapped {
     fn new(inner: ChannelTransport) -> (Self, watch::Sender<bool>) {
         let (gate, open) = watch::channel(true);
         let tapped = Self {
-            inner,
+            inner: Arc::new(inner),
             open,
             keepalives: Arc::default(),
         };
@@ -572,6 +573,85 @@ async fn full_transmit_queue_holds_back_the_source() {
         assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, &[i]));
     }
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
+}
+
+/// A handshake initiation from `initiator` to `responder`.
+fn initiation(initiator: StaticSecret, responder: PublicKey) -> Vec<u8> {
+    let mut tunn = Tunn::new(initiator, responder, None, None, 0, None);
+    let mut buf = [0; 148];
+    match tunn.format_handshake_initiation(&mut buf, false) {
+        TunnResult::WriteToNetwork(data) => data.to_vec(),
+        _ => panic!("no initiation"),
+    }
+}
+
+#[tokio::test]
+async fn transmit_backlog_is_bounded() {
+    const FLOOD: u8 = 20;
+    let (ta, tb) = link(64);
+    let (ta, gate) = Tapped::new(ta);
+    let (tb, _gate_b) = Tapped::new(tb);
+    // The test sends on `b`'s link end too.
+    let tb_end = Arc::clone(&tb.inner);
+    let options = Options {
+        queue_capacity: 2,
+        sink_capacity: 64,
+    };
+    let (mut a, mut b) = nodes(ta, tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+    for seed in 0..FLOOD {
+        let peer = Peer::new(PublicKey::from(&secret(100 + seed)));
+        a.handle.add_or_update_peer(peer).await.unwrap();
+    }
+    let mut events = a.handle.subscribe().await.unwrap();
+
+    // `a` answers every initiation, but nothing leaves it any more: one response waits in
+    // the transmit task, two in the transmit queue and two in the owner; the rest are
+    // dropped.
+    gate.send(false).unwrap();
+    let to_a = Path {
+        transport: b.transport,
+        addr: a.addr,
+        ecn: Ecn::NotEct,
+    };
+    for seed in 0..FLOOD {
+        let datagram = initiation(secret(100 + seed), a.public());
+        tb_end.send(&datagram, &to_a).await.unwrap();
+    }
+    let dropped = expect_event(
+        &mut events,
+        |e| matches!(e, Event::Dropped { reason, .. } if *reason == DROP_TRANSMIT_FULL),
+    )
+    .await;
+    assert!(matches!(dropped, Event::Dropped { peer: None, .. }));
+    eventually(|| async { a.drops(DROP_TRANSMIT_FULL).await >= u64::from(FLOOD) - 5 }).await;
+    assert_eq!(
+        a.handle.peers().await.unwrap().len(),
+        usize::from(FLOOD) + 1
+    );
+
+    // Local packets are held back behind the waiting responses, not dropped.
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..20u8 {
+            let packet = PacketBuf::from_packet(&ipv4(IP_A, IP_B, &[i]));
+            local.send(packet).await.unwrap();
+        }
+    });
+    sleep(QUIET).await;
+    assert!(!sender.is_finished(), "the source was not held back");
+
+    gate.send(true).unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    for i in 0..20u8 {
+        assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, &[i]));
+    }
+    let counters = a.handle.drop_counters().await.unwrap();
+    assert_eq!(
+        counters.keys().copied().collect::<Vec<_>>(),
+        [DROP_TRANSMIT_FULL]
+    );
 }
 
 #[tokio::test]
