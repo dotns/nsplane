@@ -79,6 +79,14 @@ added); item 1 is open. Still open:
 Status after Phase 3 (plan `20261002-1725-phase3-4-netstack-acl`): items 10 and 11 are
 fixed by workstream 3C (per-transport backpressure, `DROP_TRANSPORT_REMOVED`).
 
+12. **UAPI listen-port rebinding** (found in 3D): on `tun_node`, `wg set <if> listen-port`
+    makes nsplane-uapi replace the transport it manages with plain UDP, which drops a
+    relay/WSS transport configured for that id; UAPI should rebind only a UDP transport it
+    owns and leave other transports alone.
+13. **Fixed e2e container prefixes** (found in Phase 3+4): `scripts/e2e/linux.sh` and
+    `lib.sh` default to fixed prefixes, so concurrent runs remove each other's containers;
+    derive the default from the PID as `examples.sh` does.
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 
