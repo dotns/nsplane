@@ -292,17 +292,15 @@ impl Net {
         packet
     }
 
-    /// Feeds a datagram to core `i` as if it arrived on `arrival`; the buffer the core leaves
-    /// in its place goes back to its pool.
-    pub fn receive(&mut self, i: usize, arrival: Path, mut data: PacketBuf) {
+    /// Feeds a datagram to core `i` as if it arrived on `arrival`.
+    pub fn receive(&mut self, i: usize, arrival: Path, data: PacketBuf) {
         self.cores[i].handle_input(
             Input::Datagram {
                 path: arrival,
-                data: &mut data,
+                data,
             },
             self.now,
         );
-        self.cores[i].recycle(data);
     }
 
     /// Installs a function that sees every datagram in flight from now on.
