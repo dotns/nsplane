@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use common::{Net, ip4, packet_buf, udp4};
+use nsplane_core::noise::DATA_HEADER_SZ;
 use nsplane_core::{Event, Input, Output, PacketBuf, reasons};
 
 /// Start of the buffer behind `buf`, to tell allocations apart.
@@ -157,49 +158,91 @@ fn steady_state_reuses_buffers() {
     net.clear_logs();
     let now = net.now;
 
-    // Outbound: the local packet is sealed in its own buffer.
+    // Outbound: the datagram is sealed in place, its data header written in the headroom.
     let send = |net: &mut Net| {
         let mut packet = packet_buf(&udp4(ip4(0), ip4(1), b"steady"));
         let local = base(&mut packet);
+        let start = packet.as_packet().as_ptr();
         net.cores[0].handle_input(Input::Local { packet }, now);
         let Some(Output::Transmit { mut data, .. }) = net.cores[0].poll_output() else {
             panic!("expected a transmit");
         };
         assert_eq!(base(&mut data), local);
+        assert_eq!(
+            data.as_packet().as_ptr(),
+            start.wrapping_sub(DATA_HEADER_SZ)
+        );
         data
     };
 
-    // Inbound: the datagram is opened in its buffer and delivered from it.
-    let mut datagram = send(&mut net);
+    // Inbound: the datagram is opened in place and delivered in its own buffer.
+    for _ in 0..2 {
+        let mut datagram = send(&mut net);
+        let wire = base(&mut datagram);
+        let start = datagram.as_packet().as_ptr();
+        let arrival = net.paths[0];
+        net.cores[1].handle_input(
+            Input::Datagram {
+                path: arrival,
+                data: datagram,
+            },
+            now,
+        );
+        let Some(Output::Deliver { mut packet, .. }) = net.cores[1].poll_output() else {
+            panic!("expected a deliver");
+        };
+        assert_eq!(base(&mut packet), wire);
+        assert_eq!(
+            packet.as_packet().as_ptr(),
+            start.wrapping_add(DATA_HEADER_SZ)
+        );
+        assert_eq!(packet.as_packet(), udp4(ip4(0), ip4(1), b"steady"));
+        net.cores[1].recycle(packet);
+    }
+}
+
+/// `packet` in a buffer with only `headroom` bytes in front of it, like a slice of a shared
+/// receive buffer.
+fn tight_buf(packet: &[u8], headroom: usize) -> PacketBuf {
+    let mut buf = PacketBuf::with_capacity(headroom + packet.len());
+    buf.reserve_front(buf.headroom());
+    buf.set_len(headroom + packet.len());
+    buf.as_packet_mut()[headroom..].copy_from_slice(packet);
+    buf.advance(headroom);
+    buf
+}
+
+#[test]
+fn tight_headroom_is_handled() {
+    let mut net = Net::new(2);
+    net.ping4(0, 1, b"warm up");
+    net.ping4(1, 0, b"warm up");
+    net.clear_logs();
+    let now = net.now;
+
+    // Too little headroom for the data header: the packet is sealed in a copy.
+    let ip = udp4(ip4(0), ip4(1), b"tight");
+    let mut local = tight_buf(&ip, DATA_HEADER_SZ - 1);
+    let local_base = base(&mut local);
+    net.cores[0].handle_input(Input::Local { packet: local }, now);
+    let Some(Output::Transmit { mut data, .. }) = net.cores[0].poll_output() else {
+        panic!("expected a transmit");
+    };
+    assert_ne!(base(&mut data), local_base);
+
+    // No headroom at all: opening only shrinks the datagram, so it still happens in place.
+    let mut datagram = tight_buf(data.as_packet(), 0);
+    let start = datagram.as_packet().as_ptr();
     let wire = base(&mut datagram);
     let arrival = net.paths[0];
-    net.cores[1].handle_input(
-        Input::Datagram {
-            path: arrival,
-            data: &mut datagram,
-        },
-        now,
-    );
+    net.receive(1, arrival, datagram);
     let Some(Output::Deliver { mut packet, .. }) = net.cores[1].poll_output() else {
         panic!("expected a deliver");
     };
-    let delivered = base(&mut packet);
-    assert_eq!(delivered, wire);
-    assert_ne!(base(&mut datagram), wire, "the caller got a fresh buffer");
-
-    // A recycled buffer is what the next datagram is swapped for.
-    net.cores[1].recycle(packet);
-    let mut datagram = send(&mut net);
-    net.cores[1].handle_input(
-        Input::Datagram {
-            path: arrival,
-            data: &mut datagram,
-        },
-        now,
+    assert_eq!(base(&mut packet), wire);
+    assert_eq!(
+        packet.as_packet().as_ptr(),
+        start.wrapping_add(DATA_HEADER_SZ)
     );
-    assert_eq!(base(&mut datagram), delivered);
-    assert!(matches!(
-        net.cores[1].poll_output(),
-        Some(Output::Deliver { .. })
-    ));
+    assert_eq!(packet.as_packet(), ip);
 }

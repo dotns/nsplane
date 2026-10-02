@@ -142,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native WireGuard through the relay, the path ladder, NAT hole punching, plain WireGuard
   compatibility). The e2e image adds `socat`, `iptables` and `tcpdump`.
 - `nsplane-packet`: `PacketBuf::advance`, `reserve_front`, `headroom`, `from_shared`.
+- `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
+  re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
@@ -201,6 +203,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `DROP_TRANSPORT_REMOVED` (`nsplane_core::reasons::TRANSPORT_REMOVED`) instead of
   dropping them silently; `replace_transport` carries them over to the new transport in
   order.
+- Breaking: `nsplane-core`'s `Input::Datagram` takes the datagram by value
+  (`data: PacketBuf`) and `Input` loses its lifetime parameter. The core consumes the
+  datagram: a packet it carries is decrypted in place and delivered in the same buffer
+  (no buffer swap, no copy), any other datagram's buffer goes to the core's pool. Callers no
+  longer recycle the datagram after `handle_input`. Local packets are sealed in place with
+  the data header in their headroom (copied into a pooled buffer only when the headroom is
+  smaller than the data header), and the timers, queue flushes and handshake replies no
+  longer zero-fill their buffers on every use.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and

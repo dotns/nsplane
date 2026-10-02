@@ -93,9 +93,9 @@ impl Core {
 
     /// Processes one input; the results are queued for [`Core::poll_output`].
     ///
-    /// A datagram may be decrypted in place: when it carries a packet to deliver, `data` is
-    /// swapped for a pooled buffer and the packet travels on in `Output::Deliver`.
-    pub fn handle_input(&mut self, input: Input<'_>, now: Instant) {
+    /// A datagram is consumed: when it carries a packet to deliver, it is decrypted in place
+    /// and its buffer travels on in `Output::Deliver`; otherwise the buffer goes to the pool.
+    pub fn handle_input(&mut self, input: Input, now: Instant) {
         self.start_schedule(now);
         match input {
             Input::Datagram { path, data } => self.receive(path, data),
@@ -123,9 +123,8 @@ impl Core {
             return;
         }
 
-        let mut buf = self.pool.get(BUF_SIZE);
+        let mut buf = self.pool.get_len(BUF_SIZE);
         for (id, peer) in self.peers.iter_mut() {
-            buf.set_len(BUF_SIZE);
             let result = peer.update_timers(now, &mut buf.with_headroom_mut()[HEADROOM..]);
             let completed = peer.take_completed_handshakes();
             if completed > 0 {
@@ -149,7 +148,7 @@ impl Core {
                     let len = packet.len();
                     buf.set_len(len);
                     let kind = message_kind(buf.as_packet());
-                    let data = mem::replace(&mut buf, self.pool.get(BUF_SIZE));
+                    let data = mem::replace(&mut buf, self.pool.get_len(BUF_SIZE));
                     transmit(
                         &mut self.outputs,
                         &mut self.pool,
@@ -252,8 +251,7 @@ impl Core {
             p.set_path(path);
         }
 
-        let mut buf = self.pool.get(BUF_SIZE);
-        buf.set_len(BUF_SIZE);
+        let mut buf = self.pool.get_len(BUF_SIZE);
         match p
             .tunnel
             .format_handshake_initiation(&mut buf.with_headroom_mut()[HEADROOM..], true)
@@ -352,70 +350,32 @@ impl Core {
     }
 
     /// Handles a datagram from `path`.
-    fn receive(&mut self, path: Path, data: &mut PacketBuf) {
+    fn receive(&mut self, path: Path, data: PacketBuf) {
         let data_index = match Tunn::parse_incoming_packet(data.as_packet()) {
             Ok(Packet::PacketData(p)) => Some(p.receiver_idx),
             Ok(_) => None,
-            Err(_) => return self.dropped(None, reasons::INVALID_PACKET),
+            Err(_) => {
+                self.pool.put(data);
+                return self.dropped(None, reasons::INVALID_PACKET);
+            }
         };
-        match data_index {
-            Some(index) => self.receive_data(path, data, index),
-            None => self.receive_handshake(path, data.as_packet()),
+        if let Some(index) = data_index {
+            self.receive_data(path, data, index);
+        } else {
+            self.receive_handshake(path, data.as_packet());
+            self.pool.put(data);
         }
     }
 
-    /// Decrypts transport data in place and delivers it.
-    fn receive_data(&mut self, path: Path, data: &mut PacketBuf, receiver_idx: u32) {
-        let Some(id) = self.peers.by_index(receiver_idx) else {
-            return self.dropped(None, reasons::UNKNOWN_SESSION);
+    /// Decrypts transport data in place and delivers it in the datagram's buffer.
+    fn receive_data(&mut self, path: Path, mut data: PacketBuf, receiver_idx: u32) {
+        let Some((id, plain_len)) = self.open(path, &mut data, receiver_idx) else {
+            return self.pool.put(data);
         };
-        let Some(peer) = self.peers.peer_mut(id) else {
-            return;
-        };
-        let len = data.len();
-        let (plain_len, src) = match peer.tunnel.decapsulate_in_place(
-            Some(path.addr),
-            &mut data.with_headroom_mut()[HEADROOM..],
-            len,
-        ) {
-            TunnResult::Done => (0, None),
-            TunnResult::WriteToTunnelV4(packet, src) => (packet.len(), Some(IpAddr::V4(src))),
-            TunnResult::WriteToTunnelV6(packet, src) => (packet.len(), Some(IpAddr::V6(src))),
-            TunnResult::Err(e) => {
-                tracing::debug!(message = "Decapsulate error", error = ?e);
-                return self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
-            }
-            TunnResult::WriteToNetwork(_) => {
-                tracing::debug!("Unexpected result from decapsulate");
-                return;
-            }
-        };
-        peer.add_rx(len as u64);
-        let completed = peer.take_completed_handshakes();
-
-        let kind = if src.is_some() {
-            MessageKind::Data
-        } else {
-            MessageKind::Keepalive
-        };
-        self.authenticated(id, path, kind, completed);
-
-        let Some(src) = src else {
-            return;
-        };
-        if !self.peers.routes_to(src, id) {
-            return self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
-        }
-
-        // The plaintext lies behind the data header: hand the caller's buffer on and move
-        // the packet to the start of it.
-        let fresh = self.pool.get(data.capacity());
-        let mut packet = mem::replace(data, fresh);
-        let start = HEADROOM + DATA_HEADER_SZ;
-        packet
-            .with_headroom_mut()
-            .copy_within(start..start + plain_len, HEADROOM);
-        packet.set_len(plain_len);
+        // The plaintext lies behind the data header: move the packet start past it.
+        data.advance(DATA_HEADER_SZ);
+        data.set_len(plain_len);
+        let mut packet = data;
 
         for filter in &self.filters {
             match filter.inbound(id, &mut packet) {
@@ -437,6 +397,56 @@ impl Core {
         self.outputs.push_back(Output::Deliver { from: id, packet });
     }
 
+    /// Decrypts transport data in place; returns the peer and the plaintext length if the
+    /// datagram carries a packet to deliver.
+    fn open(
+        &mut self,
+        path: Path,
+        data: &mut PacketBuf,
+        receiver_idx: u32,
+    ) -> Option<(PeerId, usize)> {
+        let Some(id) = self.peers.by_index(receiver_idx) else {
+            self.dropped(None, reasons::UNKNOWN_SESSION);
+            return None;
+        };
+        let peer = self.peers.peer_mut(id)?;
+        let len = data.len();
+        let (plain_len, src) =
+            match peer
+                .tunnel
+                .decapsulate_in_place(Some(path.addr), data.as_packet_mut(), len)
+            {
+                TunnResult::Done => (0, None),
+                TunnResult::WriteToTunnelV4(packet, src) => (packet.len(), Some(IpAddr::V4(src))),
+                TunnResult::WriteToTunnelV6(packet, src) => (packet.len(), Some(IpAddr::V6(src))),
+                TunnResult::Err(e) => {
+                    tracing::debug!(message = "Decapsulate error", error = ?e);
+                    self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
+                    return None;
+                }
+                TunnResult::WriteToNetwork(_) => {
+                    tracing::debug!("Unexpected result from decapsulate");
+                    return None;
+                }
+            };
+        peer.add_rx(len as u64);
+        let completed = peer.take_completed_handshakes();
+
+        let kind = if src.is_some() {
+            MessageKind::Data
+        } else {
+            MessageKind::Keepalive
+        };
+        self.authenticated(id, path, kind, completed);
+
+        let src = src?;
+        if !self.peers.routes_to(src, id) {
+            self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
+            return None;
+        }
+        Some((id, plain_len))
+    }
+
     /// Verifies a handshake message with the handshake gate, finds its peer and lets the
     /// peer's tunnel answer it. The gate counts each message once; the tunnel does not verify
     /// or count it again.
@@ -454,8 +464,7 @@ impl Core {
         };
         message.copy_from_slice(datagram);
 
-        let mut reply = self.pool.get(BUF_SIZE);
-        reply.set_len(BUF_SIZE);
+        let mut reply = self.pool.get_len(BUF_SIZE);
         let packet = match gate.verify_packet(
             Some(path.addr),
             message,
@@ -562,14 +571,21 @@ impl Core {
             return self.pool.put(packet);
         };
         let len = packet.len();
-        // The datagram is sealed from the headroom on and then moved up by the data header,
-        // so the packet needs room for the header, the tag and the padding, or for a handshake
-        // initiation if the packet is queued instead.
-        packet.set_len((len + DATA_HEADER_SZ + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
-        let start = HEADROOM - DATA_HEADER_SZ;
+        if packet.headroom() < DATA_HEADER_SZ {
+            // E.g. a slice of a shared buffer: copy it to a pooled buffer with headroom.
+            let mut copy = self.pool.get((len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+            copy.set_len(len);
+            copy.as_packet_mut().copy_from_slice(packet.as_packet());
+            self.pool.put(mem::replace(&mut packet, copy));
+        }
+        // The datagram is sealed in place with its data header in the headroom, so it starts
+        // where it is written. The tail needs room for the tag and the padding, or for a
+        // handshake initiation if the packet is queued instead.
+        packet.reserve_front(DATA_HEADER_SZ);
+        packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
         let sealed_len = match peer
             .tunnel
-            .encapsulate_in_place(&mut packet.with_headroom_mut()[start..], len)
+            .encapsulate_in_place(packet.as_packet_mut(), len)
         {
             TunnResult::WriteToNetwork(datagram) => datagram.len(),
             TunnResult::Done => {
@@ -587,10 +603,6 @@ impl Core {
             }
         };
 
-        // The datagram starts in the headroom: move it to the start of the packet.
-        packet
-            .with_headroom_mut()
-            .copy_within(start..start + sealed_len, HEADROOM);
         packet.set_len(sealed_len);
         let kind = message_kind(packet.as_packet());
         self.transmit(id, kind, packet);
@@ -602,8 +614,7 @@ impl Core {
             return;
         };
         loop {
-            let mut buf = self.pool.get(BUF_SIZE);
-            buf.set_len(BUF_SIZE);
+            let mut buf = self.pool.get_len(BUF_SIZE);
             let TunnResult::WriteToNetwork(packet) =
                 peer.tunnel
                     .decapsulate(None, &[], &mut buf.with_headroom_mut()[HEADROOM..])

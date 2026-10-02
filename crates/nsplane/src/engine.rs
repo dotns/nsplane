@@ -437,15 +437,9 @@ impl Owner {
                         return;
                     }
                 }
-                Wake::Datagram(Some((path, mut data))) => {
-                    self.core.handle_input(
-                        Input::Datagram {
-                            path,
-                            data: &mut data,
-                        },
-                        now(),
-                    );
-                    self.core.recycle(data);
+                Wake::Datagram(Some((path, data))) => {
+                    self.core
+                        .handle_input(Input::Datagram { path, data }, now());
                 }
                 // The owner keeps a sender, so the queue never closes.
                 Wake::Datagram(None) => {}
