@@ -31,3 +31,32 @@ fn boolean_environment_variables_accept_1() {
         );
     }
 }
+
+#[test]
+fn help_lists_the_supported_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_boringtun-cli"))
+        .arg("--help")
+        .output()
+        .expect("run boringtun-cli");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "<INTERFACE_NAME>",
+        "--threads",
+        "WG_THREADS",
+        "--verbosity",
+        "WG_LOG_LEVEL",
+        "--disable-drop-privileges",
+        "WG_SUDO",
+    ] {
+        assert!(help.contains(flag), "--help does not list {flag}: {help}");
+    }
+    for removed in [
+        "--tun-fd",
+        "--uapi-fd",
+        "--disable-connected-udp",
+        "--disable-multi-queue",
+    ] {
+        assert!(!help.contains(removed), "--help still lists {removed}");
+    }
+}

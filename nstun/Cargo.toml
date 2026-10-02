@@ -15,9 +15,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+nstun-core = { path = "../nstun-core", version = "0.8.0" }
 nstun-packet = { path = "../nstun-packet", version = "0.8.0" }
 socket2 = { version = "0.6.5", features = ["all"] }
-tokio = { version = "1.53.1", features = ["net", "sync"] }
+tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
+tracing = "0.1.40"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["net", "uio"] }
