@@ -161,3 +161,19 @@ fn peer_json(peer: &PeerStats) -> Value {
         "persistent_keepalive": peer.persistent_keepalive,
     })
 }
+
+/// The drop counters of a netstack, for an `extra.netstack` object.
+pub fn netstack_json(stack: &nsplane_netstack::NetStackHandle) -> Value {
+    let stats = stack.stats();
+    json!({
+        "malformed": stats.malformed,
+        "no_address": stats.no_address,
+        "unsupported": stats.unsupported,
+        "syn_refused": stats.syn_refused,
+        "tcp_not_accepted": stats.tcp_not_accepted,
+        "udp_queue_full": stats.udp_queue_full,
+        "udp_flow_limit": stats.udp_flow_limit,
+        "udp_not_accepted": stats.udp_not_accepted,
+        "egress_full": stats.egress_full,
+    })
+}

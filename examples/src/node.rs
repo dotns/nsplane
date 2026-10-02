@@ -7,9 +7,9 @@
 
 use std::fmt;
 use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 use std::path::{Path as FsPath, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -268,9 +268,20 @@ pub fn build_engine<Src: PacketSource, Snk: PacketSink>(
     sink: Snk,
     args: &NodeArgs,
 ) -> anyhow::Result<Node> {
+    build_engine_with(source, sink, args, |builder| builder)
+}
+
+/// Like [`build_engine`], with `configure` applied to the builder first (packet filters,
+/// stats interval, queue sizes, ...).
+pub fn build_engine_with<Src: PacketSource, Snk: PacketSink>(
+    source: Src,
+    sink: Snk,
+    args: &NodeArgs,
+    configure: impl FnOnce(EngineBuilder<Src, Snk>) -> EngineBuilder<Src, Snk>,
+) -> anyhow::Result<Node> {
     let private_key = args.private_key()?;
     let public_key = PublicKey::from(&private_key);
-    let builder = EngineBuilder::new(source, sink).private_key(private_key);
+    let builder = configure(EngineBuilder::new(source, sink)).private_key(private_key);
     let (builder, transports) = args.transport.transports(builder, args.listen)?;
     let engine = builder.build().context("cannot build the engine")?;
     if args.transport.transport == TransportKind::Relay
@@ -518,4 +529,180 @@ pub async fn run(
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The default TUN interface name: Linux names it freely, macOS needs `utun[N]`.
+pub const DEFAULT_TUN_NAME: &str = if cfg!(target_os = "macos") {
+    "utun"
+} else {
+    "nsp0"
+};
+
+/// The TUN options of a TUN node, flattened into its arguments.
+#[derive(Debug, Clone, Args)]
+pub struct TunArgs {
+    /// Name of the TUN interface (macOS: `utun` or `utunN`)
+    #[arg(long, value_name = "NAME", default_value = DEFAULT_TUN_NAME)]
+    pub tun_name: String,
+
+    /// Address of the interface with its prefix, repeatable
+    #[arg(long, value_name = "CIDR", value_parser = parse_cidr)]
+    pub address: Vec<AllowedIp>,
+
+    /// MTU of the interface
+    #[arg(long, value_name = "N", default_value_t = 1420)]
+    pub mtu: u16,
+}
+
+/// `addr/cidr`.
+pub fn cidr(ip: &AllowedIp) -> String {
+    format!("{}/{}", ip.addr, ip.cidr)
+}
+
+/// The first `bits` bits of `addr`, as a number of its family's width.
+fn masked(addr: IpAddr, bits: u8) -> u128 {
+    let (value, width) = match addr {
+        IpAddr::V4(v4) => (u128::from(v4.to_bits()), 32),
+        IpAddr::V6(v6) => (v6.to_bits(), 128),
+    };
+    let bits = u32::from(bits.min(width));
+    if bits == 0 {
+        0
+    } else {
+        value >> (u32::from(width) - bits)
+    }
+}
+
+/// Whether the network `net` contains all of `ip`.
+pub fn covers(net: &AllowedIp, ip: &AllowedIp) -> bool {
+    net.addr.is_ipv4() == ip.addr.is_ipv4()
+        && net.cidr <= ip.cidr
+        && masked(net.addr, net.cidr) == masked(ip.addr, net.cidr)
+}
+
+/// Whether the network `net` contains the address `addr`.
+pub fn contains(net: &AllowedIp, addr: IpAddr) -> bool {
+    let cidr = if addr.is_ipv4() { 32 } else { 128 };
+    covers(net, &AllowedIp { addr, cidr })
+}
+
+/// The peers' allowed IPs that no interface address's connected prefix covers: the routes
+/// a TUN interface with `addresses` needs.
+pub fn tun_routes(addresses: &[AllowedIp], peers: &[PeerSpec]) -> Vec<AllowedIp> {
+    let mut routes: Vec<AllowedIp> = Vec::new();
+    for ip in peers.iter().flat_map(|peer| &peer.allowed_ips) {
+        if !addresses.iter().any(|net| covers(net, ip)) && !routes.contains(ip) {
+            routes.push(*ip);
+        }
+    }
+    routes
+}
+
+/// Configures the TUN interface `name` like `tun_node`: its `addresses`, `mtu`, link state
+/// and the routes to `peers` (see [`tun_routes`]).
+///
+/// Linux runs `ip`; a "File exists" error (already configured) is fine. Other systems
+/// print the `ifconfig` / `route` commands to run instead.
+pub fn configure_tun(
+    name: &str,
+    addresses: &[AllowedIp],
+    mtu: u16,
+    peers: &[PeerSpec],
+) -> anyhow::Result<()> {
+    let routes = tun_routes(addresses, peers);
+    if cfg!(target_os = "linux") {
+        for address in addresses {
+            ip(&["address", "add", &cidr(address), "dev", name])?;
+        }
+        ip(&["link", "set", "dev", name, "mtu", &mtu.to_string(), "up"])?;
+        for route in &routes {
+            ip(&["route", "add", &cidr(route), "dev", name])?;
+        }
+        return Ok(());
+    }
+    let mut commands = Vec::new();
+    for address in addresses {
+        if address.addr.is_ipv4() {
+            commands.push(format!(
+                "ifconfig {name} inet {} {} alias",
+                cidr(address),
+                address.addr
+            ));
+        } else {
+            commands.push(format!("ifconfig {name} inet6 {} alias", cidr(address)));
+        }
+    }
+    commands.push(format!("ifconfig {name} mtu {mtu} up"));
+    for net in addresses.iter().chain(&routes) {
+        let family = if net.addr.is_ipv4() {
+            "-inet"
+        } else {
+            "-inet6"
+        };
+        commands.push(format!(
+            "route -q -n add {family} {} -interface {name}",
+            cidr(net)
+        ));
+    }
+    crate::out::line(format_args!("Configure the interface with:"));
+    for command in commands {
+        crate::out::line(format_args!("  sudo {command}"));
+    }
+    Ok(())
+}
+
+/// Runs `ip <args>`; a "File exists" error (already configured) is fine.
+fn ip(args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .context("cannot run `ip`")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || stderr.contains("File exists") {
+        tracing::info!(command = format!("ip {}", args.join(" ")), "configured");
+        Ok(())
+    } else {
+        bail!("`ip {}` failed: {}", args.join(" "), stderr.trim())
+    }
+}
+
+/// Serves the UAPI of `handle`'s engine on the standard socket of interface `name`.
+///
+/// `wg show <name>` and `wg set <name> ...` then work; `listen_port` is the port of the
+/// [`UDP_TRANSPORT`]. Returns the socket path.
+#[cfg(unix)]
+pub fn serve_uapi(handle: EngineHandle, name: &str, listen_port: u16) -> anyhow::Result<String> {
+    use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
+
+    // `wg set listen-port` rebinds the UAPI's transport, so the node's UDP transport is it.
+    const _: () = assert!(UDP_TRANSPORT.get() == TRANSPORT_ID.get());
+
+    let uapi = Uapi::with_listen_port(handle, listen_port);
+    let listener = UapiListener::bind(name).context("cannot bind the UAPI socket")?;
+    let socket = listener.path().display().to_string();
+    tokio::spawn(async move {
+        if let Err(e) = uapi.serve(listener).await {
+            tracing::warn!(error = %e, "UAPI server failed");
+        }
+    });
+    Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_cover() {
+        let net = parse_cidr("10.0.0.1/24").unwrap();
+        assert!(covers(&net, &parse_cidr("10.0.0.2/32").unwrap()));
+        assert!(!covers(&net, &parse_cidr("10.0.1.2/32").unwrap()));
+        assert!(!covers(&net, &parse_cidr("10.0.0.0/16").unwrap()));
+        assert!(!covers(&net, &parse_cidr("fd00::1/128").unwrap()));
+        assert!(contains(&net, "10.0.0.200".parse().unwrap()));
+        assert!(!contains(&net, "fd00::1".parse().unwrap()));
+        let v6 = parse_cidr("fd00::1/64").unwrap();
+        assert!(contains(&v6, "fd00::2".parse().unwrap()));
+        assert!(covers(&parse_cidr("0.0.0.0/0").unwrap(), &net));
+    }
 }

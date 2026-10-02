@@ -39,36 +39,65 @@ checks run on the userspace stack.
 cargo run -p nsplane-examples --bin netstack_node -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 --check tcp:10.0.0.1:7 --exit-after-checks
 ```
 
-### hybrid (planned)
+### hybrid
 
-A TUN device and a netstack side by side behind one engine (`Splitter`, `MergeSource`).
+A TUN device and a userspace netstack behind one engine: a `Splitter` routes each delivered
+packet by destination (inside a `--tun-address` prefix to the TUN, anything else to the
+netstack), a `MergeSource` merges both sides' packets. Echo and checks run on the netstack.
+Status: `extra.splitter.misrouted`, `extra.netstack`. Needs root.
+
+Flags: node, echo and check flags, `--tun-name <NAME>` (default `nsp0`), `--tun-address <CIDR>`
+(repeatable), `--stack-address <CIDR>` (repeatable, required), `--mtu <N>` (default 1420).
 
 ```sh
-sudo cargo run -p nsplane-examples --bin hybrid -- --help
+sudo cargo run -p nsplane-examples --bin hybrid -- --private-key-file a.key --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32+10.1.0.2/32 --echo-port 7
 ```
 
-### acl_gateway (planned)
+### acl_gateway
 
-A node that filters forwarded traffic with `nsplane-acl` and reports its counters.
+A TUN node with an `nsplane-acl` `AclFilter` and a `FlowTracker`: inbound packets pass only as
+the JSON `--policy` allows for the peer's `--identity`; replies to connections the gateway
+opens always pass (stateful replies). The policy file is re-read every second and swapped in
+atomically (`policy reloaded (N rules)`; a broken file keeps the previous policy); before the
+first valid policy everything inbound is dropped. Status: `extra.acl` (filter counters,
+`policy_loaded`, `rules`, `reloads`, `reload_errors`) and `extra.flows`. Needs root.
+
+Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
+`--policy <PATH>`, `--identity <WG_PUBKEY>=<IP|key>` (repeatable). The sample
+[`policies/acl_gateway.json`](policies/acl_gateway.json) allows TCP and UDP port 7 from the
+peer identity `10.0.0.2` to the gateway `10.0.0.1` and denies everything else (e.g. TCP 8).
 
 ```sh
-cargo run -p nsplane-examples --bin acl_gateway -- --help
+sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --identity <B_PUB>=10.0.0.2 --policy examples/policies/acl_gateway.json --echo-port 7
 ```
 
-### fd_bridge (planned)
+### fd_bridge
 
-A host bridge: the engine on an adopted TUN fd, as mobile platforms hand it over.
+A host bridge as mobile platforms do it. The host creates and configures the TUN; with
+`--mode fd` (default) it clears `FD_CLOEXEC` on the TUN fd and re-executes itself with
+`--child-fd <N>`, and the child adopts the fd (`Tun::from_raw_fd`) and runs the engine; with
+`--mode channel` the host pumps packets between the TUN and an engine on `ChannelSource` /
+`ChannelSink` and forwards MTU changes. Echo and checks run on the kernel stack. Needs root.
+
+Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
+`--mode <fd|channel>`, `--child-fd <N>` (internal, set by the parent).
 
 ```sh
-cargo run -p nsplane-examples --bin fd_bridge -- --help
+sudo cargo run -p nsplane-examples --bin fd_bridge -- --mode channel --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --echo-port 7
 ```
 
-### events_stats (planned)
+### events_stats
 
-Subscribes to engine events and prints handshakes, roaming, drops and periodic stats.
+Two engines over loopback UDP on netstacks (no root). Prints every engine event (`EVENT ...`),
+peer stats (`STATS ...`) and drop counters (`DROPS ...`), and runs self-checked steps:
+`handshake` (checks pass, counters grow), `suspend` (a check fails, counters frozen), `resume`
+(a new handshake, the check passes), `mtu` (lowering a merged channel source's MTU yields
+`MtuChanged` and `EngineHandle::mtu`), `drop` (a datagram to an unowned address counts as
+`no route`). Each prints `STEP <name> PASS|FAIL`; the run ends with `STEPS PASS` (exit 0) or
+`STEPS FAIL` (exit 1).
 
 ```sh
-cargo run -p nsplane-examples --bin events_stats -- --help
+cargo run -p nsplane-examples --bin events_stats
 ```
 
 ### relay_server
