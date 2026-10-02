@@ -138,6 +138,27 @@ peer, which cannot register) is at a fixed endpoint. Status `extra.relay`:
 | `.extra.relay.routes[]` | `{receiver_index, from, to, idle_secs, confirmed}` |
 | `.extra.relay.targets[]` | `{wg_public_key, machine_key, source, learned_secs_ago}` |
 
+`--wss-listen <IP:PORT>` adds a WebSocket-over-TLS listener feeding the same router: each
+binary message carries one datagram (the same bytes as on UDP), so WSS and UDP clients relay
+to each other and reach the own engine. The certificate is self-signed at start for
+`--wss-name` (default `relay.example`) plus the listen address as an IP name, and written to
+`--wss-cert-out <PATH>` for clients to pin. Text, oversized (> 65535 bytes) and non-WireGuard,
+non-control messages are dropped and counted; pings are answered; a closed connection's
+learned sources and routes are forgotten. A WSS connection shows up as `ws:<id>` in
+`routes[]` and `targets[].source`.
+
+```sh
+cargo run -p nsplane-examples --bin relay_server -- --private-key-file r.key --listen 0.0.0.0:51820 \
+  --address 10.0.0.1/24 --config relay.json --wss-listen 0.0.0.0:8443 --wss-cert-out relay.pem
+```
+
+| JSON path | Meaning |
+|---|---|
+| `.extra.wss.connections` | open WSS connections |
+| `.extra.wss.{accepted,handshake_failures,closed}` | connections accepted, failed TLS/WebSocket handshakes, closed |
+| `.extra.wss.{rx,tx,pings}` | datagrams received / sent over WSS, pings answered |
+| `.extra.wss.dropped_{text,oversized,invalid,queue_full,closed}` | drops by reason |
+
 ### relay_transport
 
 The relay's client side, in one process on loopback (no root): a relay (router and own
@@ -145,9 +166,13 @@ engine), nodes A and B with the extension-aware transport and the direct-first p
 ladder, and a plain WireGuard peer. A gate on A's socket blocks the direct path to show
 direct -> relay -> direct. Prints `STEP <name> PASS|FAIL` for `discovery`, `relay-engine`,
 `direct-first`, `direct-checks`, `block`, `unblock`, `plain-endpoint`, then `STEPS PASS`.
+With `--carrier wss` A and B reach the relay only over WebSocket over TLS (a pinned
+certificate generated at start); the direct path stays UDP, and the extra step `wss-carrier`
+checks both connections carried datagrams.
 
 ```sh
 cargo run -p nsplane-examples --bin relay_transport -- --carrier udp
+cargo run -p nsplane-examples --bin relay_transport -- --carrier wss
 ```
 
 Every node example runs the same client with `--transport relay`:
@@ -163,6 +188,27 @@ Every node example runs the same client with `--transport relay`:
 | `--register-interval-ms`, `--reflexive-interval-ms` | cadence with a capable relay (30000, 20000) |
 | `--direct-timeout-ms`, `--direct-probe-interval-ms` | ladder fallback time (5000) and direct probes on the relay (30000) |
 
+`--transport wss` is the same client with the relay reached over WebSocket over TLS; UDP on
+`--listen` still carries the direct paths and any other `--relay`. The relay's address
+(below) is added to the endpoints and is the `endpoint=` of peers reached through it.
+Datagrams to it while the connection is down are dropped and counted; the connection
+reconnects with backoff (250 ms doubling to 5 s) and discovery restarts on every connect,
+so the node registers again right away.
+
+| Flag | Meaning |
+|---|---|
+| `--relay-url <wss://host[:port]/>` | WebSocket URL; the host is the TLS server name (SNI); required |
+| `--relay-ca <PEM>` | the relay's certificate (`relay_server --wss-cert-out`), the only one trusted; required |
+| `--relay-addr <IP:PORT>` | connect here instead of resolving the URL host |
+| `--machine-key-file <PATH>` | as for `--transport relay`; required |
+
+```sh
+cargo run -p nsplane-examples --bin netstack_node -- --private-key-file a.key --address 10.0.0.2/24 \
+  --transport wss --relay-url wss://relay.example:8443/ --relay-addr 192.0.2.1:8443 \
+  --relay-ca relay.pem --machine-key-file a.machine \
+  --peer <RELAY_PUB>,endpoint=192.0.2.1:8443,allowed-ips=10.0.0.1/32
+```
+
 An endpoint is extension-capable only after a reflexive reply that echoes an outstanding
 nonce; until then the node sends it nothing but WireGuard, and an endpoint that never
 answers is stopped after the last attempt. A peer whose `--peer` endpoint is a capable
@@ -173,11 +219,15 @@ authenticates. Status:
 | JSON path | Meaning |
 |---|---|
 | `.extra.relay.endpoints["<ip:port>"].state` | `unknown`, `probing`, `capable` or `stopped` |
-| `.extra.relay.endpoints["<ip:port>"].{attempts,control_sent,control_answered,rate_limited,reflexive}` | per-endpoint counters |
+| `.extra.relay.endpoints["<ip:port>"].{attempts,control_sent,control_answered,rate_limited,reflexive,demotions}` | per-endpoint counters; `demotions`: times a capable endpoint stopped answering for three reflexive intervals and was probed again |
 | `.extra.relay.reflexive`, `.extra.relay.reflexive_from` | learned reflexive address and the relay that reported it |
 | `.extra.relay.{dropped_invalid,dropped_control}` | datagrams the transport dropped |
 | `.extra.paths["<peer pubkey b64>"].active` | `direct` or `relay` |
 | `.extra.paths["<peer pubkey b64>"].{confirmed,direct,relay,candidates,to_direct,to_relay}` | ladder state and transition counters |
+| `.extra.wss.{connected,reconnects,connect_failures}` | `--transport wss`: connection up, reconnects after the first connect, failed attempts |
+| `.extra.wss.{tx,rx,drops}` | datagrams sent / received over the connection, dropped |
+| `.extra.wss.dropped.{disconnected,queue_full,text,oversized,no_route}` | drops by reason |
+| `.extra.wss.{url,relay}` | the URL and the relay's address |
 
 ## Shared flags
 

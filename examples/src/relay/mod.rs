@@ -10,7 +10,8 @@
 //! On top of the contract: [`router`] is the relay's sans-I/O demultiplexer and
 //! [`server`] its wrapping transport and configuration; [`client`] is the node side
 //! (capability discovery, registration, the extension-aware transport) and [`ladder`] the
-//! direct-first, relay-fallback path policy.
+//! direct-first, relay-fallback path policy. [`wss`] carries the same datagrams over
+//! WebSocket over TLS.
 
 pub mod client;
 pub mod envelope;
@@ -20,3 +21,4 @@ pub mod messages;
 pub mod router;
 pub mod server;
 pub mod wire;
+pub mod wss;

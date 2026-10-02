@@ -17,11 +17,18 @@
 //! - `unblock`: the gate opens, both return to direct, checks pass;
 //! - `plain-endpoint`: P was probed, backed off and stopped, and WireGuard to it works.
 //!
-//! APIs shown: custom [`Transport`]s wrapping [`UdpTransport`] (relay, extension-aware
-//! client, a test gate), a custom [`PathPolicy`] (`relay::ladder::LadderPolicy`),
-//! [`EngineHandle::force_handshake`] and [`EngineHandle::set_path`] driven by it.
+//! With `--carrier wss` the relay also listens for WebSocket over TLS (a certificate
+//! generated at start, pinned by the nodes) and A and B reach it only that way: their
+//! relay endpoint is the WSS listener, registration binds their keys to their connections,
+//! and the direct path stays UDP. The same steps run, plus `wss-carrier`: both nodes are
+//! connected and datagrams crossed the connections both ways.
 //!
-//! Usage: `cargo run -p nsplane-examples --bin relay_transport -- --carrier udp`
+//! APIs shown: custom [`Transport`]s wrapping [`UdpTransport`] (relay, extension-aware
+//! client, a test gate) and the WSS carrier (`relay::wss`), a custom [`PathPolicy`]
+//! (`relay::ladder::LadderPolicy`), [`EngineHandle::force_handshake`] and
+//! [`EngineHandle::set_path`] driven by it.
+//!
+//! Usage: `cargo run -p nsplane-examples --bin relay_transport -- --carrier udp|wss`
 //!
 //! [`Transport`]: nsplane::Transport
 //! [`PathPolicy`]: nsplane::PathPolicy
@@ -51,6 +58,11 @@ use nsplane_examples::relay::envelope::MachineKey;
 use nsplane_examples::relay::ladder::{Active, LadderTimers, Pin};
 use nsplane_examples::relay::router::{MachinePin, Router, TargetConfig, machine_id};
 use nsplane_examples::relay::server::RelayServerTransport;
+use nsplane_examples::relay::wss::client::{
+    WssConfig, WssStats, WssTransport, rediscover_on_connect,
+};
+use nsplane_examples::relay::wss::server::{WsHub, bind};
+use nsplane_examples::relay::wss::{DEFAULT_NAME, ServerCert, client_tls};
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle};
 
 /// How the nodes reach the relay.
@@ -58,6 +70,8 @@ use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle};
 enum Carrier {
     /// The relay's UDP port.
     Udp,
+    /// WebSocket over TLS to the relay's WSS listener.
+    Wss,
 }
 
 /// Single-port relay, extension discovery and the direct/relay path ladder, in-process.
@@ -196,16 +210,18 @@ struct Node {
     client: RelayClient,
     gate: Arc<Mutex<Vec<SocketAddr>>>,
     machine: MachineKey,
+    wss: Option<Arc<WssStats>>,
 }
 
-async fn node(
+/// Builds the node's engine on `transport` with the relay client and the ladder.
+async fn node_on<T: Transport>(
     args: &Args,
     relays: Vec<SocketAddr>,
     address: &str,
     key: StaticSecret,
+    transport: T,
+    listen: SocketAddr,
 ) -> anyhow::Result<Node> {
-    let udp = UdpTransport::bind(UDP_TRANSPORT, loopback()).context("cannot bind a node")?;
-    let listen = udp.local_addr();
     let gate = Arc::new(Mutex::new(Vec::new()));
     let machine = MachineKey::generate();
     let config = ClientConfig {
@@ -228,7 +244,7 @@ async fn node(
     };
     let (client, ext, policy) = RelayClient::new(
         Gate {
-            inner: udp,
+            inner: transport,
             blocked: Arc::clone(&gate),
         },
         config,
@@ -239,7 +255,38 @@ async fn node(
         client,
         gate,
         machine,
+        wss: None,
     })
+}
+
+/// A node whose relay endpoints are reached over UDP.
+async fn node(
+    args: &Args,
+    relays: Vec<SocketAddr>,
+    address: &str,
+    key: StaticSecret,
+) -> anyhow::Result<Node> {
+    let udp = UdpTransport::bind(UDP_TRANSPORT, loopback()).context("cannot bind a node")?;
+    let listen = udp.local_addr();
+    node_on(args, relays, address, key, udp, listen).await
+}
+
+/// A node that reaches the relay of `wss` over WSS and everything else over UDP.
+async fn wss_node(
+    args: &Args,
+    wss: WssConfig,
+    relays: Vec<SocketAddr>,
+    address: &str,
+    key: StaticSecret,
+) -> anyhow::Result<Node> {
+    let udp = UdpTransport::bind(UDP_TRANSPORT, loopback()).context("cannot bind a node")?;
+    let listen = udp.local_addr();
+    let transport = WssTransport::connect(UDP_TRANSPORT, wss, Some(udp));
+    let (relay, stats) = (transport.relay(), transport.stats());
+    let mut node = node_on(args, relays, address, key, transport, listen).await?;
+    rediscover_on_connect(node.client.clone(), &stats, relay);
+    node.wss = Some(stats);
+    Ok(node)
 }
 
 /// Polls `condition` every 100 ms until it holds or `limit` passes.
@@ -297,6 +344,9 @@ fn endpoint_state(node: &Node, addr: SocketAddr) -> Option<EndpointState> {
 /// Everything the steps act on.
 struct Lab {
     router: Arc<Mutex<Router>>,
+    hub: Option<Arc<WsHub>>,
+    /// Where the nodes reach the relay: its UDP socket or its WSS listener.
+    relay_endpoint: SocketAddr,
     relay: Host,
     plain: Host,
     a: Node,
@@ -342,10 +392,27 @@ async fn start(args: &Args) -> anyhow::Result<Lab> {
         "relay".into(),
         relay_addr,
     )));
+    let transport = RelayServerTransport::new(relay_udp, Arc::clone(&router));
+    let (transport, wss) = if args.carrier == Carrier::Wss {
+        let cert = ServerCert::generate(DEFAULT_NAME, &[loopback().ip()])?;
+        let hub = WsHub::new(Arc::clone(&router));
+        let (listen, _) = bind(loopback(), cert.server_tls()?, Arc::clone(&hub))
+            .await
+            .context("cannot bind the WSS listener")?;
+        let config = WssConfig::new(
+            format!("wss://{DEFAULT_NAME}:{}/", listen.port()),
+            DEFAULT_NAME.try_into()?,
+            listen,
+            client_tls(cert.pem.as_bytes())?,
+        );
+        (transport.with_ws(Arc::clone(&hub)), Some((hub, config)))
+    } else {
+        (transport, None)
+    };
     let relay = host(
         relay_key,
         "10.77.0.1/24",
-        RelayServerTransport::new(relay_udp, Arc::clone(&router)),
+        transport,
         relay_addr,
         Box::new(StandardRoaming),
     )
@@ -361,14 +428,32 @@ async fn start(args: &Args) -> anyhow::Result<Lab> {
         Box::new(StandardRoaming),
     )
     .await?;
-    let a = node(
-        args,
-        vec![relay_addr, plain_addr],
-        "10.77.0.2/24",
-        generate_key(),
-    )
-    .await?;
-    let b = node(args, vec![relay_addr], "10.77.0.3/24", generate_key()).await?;
+    let (a, b, hub, relay_endpoint) = match wss {
+        None => {
+            let a = node(
+                args,
+                vec![relay_addr, plain_addr],
+                "10.77.0.2/24",
+                generate_key(),
+            )
+            .await?;
+            let b = node(args, vec![relay_addr], "10.77.0.3/24", generate_key()).await?;
+            (a, b, None, relay_addr)
+        }
+        Some((hub, config)) => {
+            let endpoint = config.relay;
+            let a = wss_node(
+                args,
+                config.clone(),
+                vec![endpoint, plain_addr],
+                "10.77.0.2/24",
+                generate_key(),
+            )
+            .await?;
+            let b = wss_node(args, config, vec![endpoint], "10.77.0.3/24", generate_key()).await?;
+            (a, b, Some(hub), endpoint)
+        }
+    };
     let pins: Vec<TargetConfig> = [&a, &b]
         .iter()
         .map(|n| TargetConfig {
@@ -386,6 +471,8 @@ async fn start(args: &Args) -> anyhow::Result<Lab> {
         .set_targets(pins);
     Ok(Lab {
         router,
+        hub,
+        relay_endpoint,
         relay,
         plain,
         a,
@@ -397,6 +484,7 @@ async fn start(args: &Args) -> anyhow::Result<Lab> {
 /// the direct candidates and starts the relay clients.
 async fn connect(lab: &Lab) -> anyhow::Result<()> {
     let (relay, plain, a, b) = (&lab.relay, &lab.plain, &lab.a, &lab.b);
+    let endpoint = lab.relay_endpoint;
     configure_peers(
         &relay.engine.handle(),
         &[
@@ -411,13 +499,13 @@ async fn connect(lab: &Lab) -> anyhow::Result<()> {
     )
     .await?;
     let a_peers = [
-        peer(relay.public, Some(relay.listen), "10.77.0.1/32", None)?,
-        peer(b.host.public, Some(relay.listen), "10.77.0.3/32", Some(1))?,
+        peer(relay.public, Some(endpoint), "10.77.0.1/32", None)?,
+        peer(b.host.public, Some(endpoint), "10.77.0.3/32", Some(1))?,
         peer(plain.public, Some(plain.listen), "10.77.0.9/32", None)?,
     ];
     let b_peers = [
-        peer(relay.public, Some(relay.listen), "10.77.0.1/32", None)?,
-        peer(a.host.public, Some(relay.listen), "10.77.0.2/32", Some(1))?,
+        peer(relay.public, Some(endpoint), "10.77.0.1/32", None)?,
+        peer(a.host.public, Some(endpoint), "10.77.0.2/32", Some(1))?,
     ];
     // The control plane: each node's socket is a direct candidate of the other.
     a.client.set_candidates(HashMap::from([(
@@ -446,7 +534,7 @@ async fn connect(lab: &Lab) -> anyhow::Result<()> {
 /// Runs the steps; returns whether all passed.
 async fn steps(lab: &Lab, limit: Duration) -> anyhow::Result<bool> {
     let (a, b) = (&lab.a, &lab.b);
-    let (relay_addr, plain_addr) = (lab.relay.listen, lab.plain.listen);
+    let (relay_addr, plain_addr) = (lab.relay_endpoint, lab.plain.listen);
     let mut all = true;
 
     let capable = wait_for(limit, || {
@@ -514,6 +602,15 @@ async fn steps(lab: &Lab, limit: Duration) -> anyhow::Result<bool> {
         .is_some_and(|e| e.attempts == PROBE_ATTEMPTS && e.control_answered == 0);
     let passed = checks(&a.host, "10.77.0.9", limit).await?;
     step("plain-endpoint", stopped && backed_off && passed, &mut all);
+
+    if let Some(hub) = &lab.hub {
+        let carried = [&a.wss, &b.wss].iter().all(|stats| {
+            stats
+                .as_ref()
+                .is_some_and(|s| s.connected() && s.tx() > 0 && s.rx() > 0)
+        });
+        step("wss-carrier", carried && hub.connections() == 2, &mut all);
+    }
     Ok(all)
 }
 
@@ -521,7 +618,6 @@ async fn steps(lab: &Lab, limit: Duration) -> anyhow::Result<bool> {
 async fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
     init_logging(&args.log)?;
-    let Carrier::Udp = args.carrier;
     let lab = start(&args).await?;
     connect(&lab).await?;
     let all = steps(&lab, Duration::from_secs(args.step_timeout)).await?;

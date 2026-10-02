@@ -166,6 +166,30 @@ transport) and `relay::ladder` (the path policy); binaries `relay_server` and
   the pinned one count as `bad_signature`, a seen nonce or a stale timestamp as `replay`,
   no pinned target as `unknown_target`, anything malformed as `invalid`.
 
+## WebSocket carrier
+
+Where UDP is blocked, the same datagrams travel over WebSocket over TLS (WSS) to a TCP
+listener of the relay (`relay_server --wss-listen`; `relay::wss`).
+
+- Framing: one binary WebSocket message carries exactly one datagram, the bytes it would
+  have on UDP (WireGuard or a framed control message). Text messages, messages over
+  65535 bytes and payloads that classify as neither are dropped and counted; pings are
+  answered.
+- Routing: each connection is a source of the same router as the UDP socket, so UDP and
+  WSS clients relay to each other and reach the own engine, under the rules above. A
+  `register_source` received on a connection binds the WireGuard key to that connection; a
+  reflexive request on it observes the connection's TCP peer address. Closing a connection
+  forgets the sources learned on it and its routes. The own engine sees a connection as a
+  path whose address is the TCP peer address.
+- TLS: rustls with the aws-lc-rs provider. The examples' relay self-signs a certificate at
+  start for a DNS name plus the listen address; clients pin that certificate and trust
+  nothing else, with SNI from the URL host.
+- Client: the node's transport sends datagrams for the relay's address over the
+  connection and everything else over its UDP socket, so discovery, registration and the
+  direct-first ladder are unchanged, with WSS as the relay carrier. It reconnects with
+  bounded exponential backoff, drops (and counts) what is sent while disconnected, and
+  restarts discovery after every connect, so a restarted relay learns the node at once.
+
 ## Consequences
 
 - One port to open and advertise per relay; the relay is a WireGuard node and a relay at

@@ -7,6 +7,10 @@
 //! inside the loop, and everything else is dropped and counted. What the own engine
 //! sends goes out unchanged (its handshake sender indices are noted for the router).
 //!
+//! With a [`WsHub`] ([`RelayServerTransport::with_ws`]) the loop also routes the
+//! datagrams of the hub's WebSocket connections, and datagrams for a connection (forwarded,
+//! control replies, the own engine's sends to its peer address) leave on it.
+//!
 //! [`UdpTransport`]: nsplane::UdpTransport
 
 use std::io;
@@ -23,6 +27,8 @@ use tokio::task::JoinHandle;
 
 use super::envelope::unix_now_secs;
 use super::router::{Action, MachinePin, Router, Source, TargetConfig, machine_id};
+use super::wss::fill;
+use super::wss::server::{Inbound, WsHub};
 use crate::node::{decode_key, encode_key};
 
 /// How often [`watch_config`] polls the configuration file.
@@ -41,19 +47,79 @@ pub type SharedRouter = Arc<Mutex<Router>>;
 pub struct RelayServerTransport<T> {
     inner: T,
     router: SharedRouter,
+    ws: Option<Arc<WsHub>>,
+}
+
+/// What the receive loop got.
+enum Received {
+    Udp(io::Result<(usize, Path)>),
+    Ws(Inbound),
 }
 
 impl<T: Transport> RelayServerTransport<T> {
     /// Routes the datagrams `inner` receives through `router`.
     pub const fn new(inner: T, router: SharedRouter) -> Self {
-        Self { inner, router }
+        Self {
+            inner,
+            router,
+            ws: None,
+        }
     }
 
-    /// Sends a datagram the router produced; failures are logged, not returned, so one
-    /// unreachable destination does not stop the receive loop.
-    async fn send_logged(&self, datagram: &[u8], to: &Path, what: &str) {
-        if let Err(e) = self.inner.send(datagram, to).await {
-            tracing::debug!(to = %to.addr, error = %e, "relay {what} not sent");
+    /// Also routes the datagrams of `hub`'s WebSocket connections (a hub of the same
+    /// router).
+    #[must_use]
+    pub fn with_ws(mut self, hub: Arc<WsHub>) -> Self {
+        self.ws = Some(hub);
+        self
+    }
+
+    /// Sends a datagram the router produced to `to`; failures are logged, not returned, so
+    /// one unreachable destination does not stop the receive loop.
+    async fn deliver(&self, datagram: &[u8], to: Source, path: &Path, what: &str) {
+        match (to, &self.ws) {
+            (Source::Udp(addr), _) => {
+                let to = Path { addr, ..*path };
+                if let Err(e) = self.inner.send(datagram, &to).await {
+                    tracing::debug!(to = %to.addr, error = %e, "relay {what} not sent");
+                }
+            }
+            (Source::Ws(id), Some(hub)) => hub.send_to(id, datagram),
+            (Source::Ws(id), None) => {
+                tracing::debug!(id, "relay {what} to a connection without a hub");
+            }
+        }
+    }
+
+    /// The next datagram from the socket or a connection, with its path and source.
+    async fn next(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path, Source)> {
+        let Some(hub) = &self.ws else {
+            let (len, path) = self.inner.recv(buf).await?;
+            return Ok((len, path, Source::Udp(path.addr)));
+        };
+        loop {
+            let received = tokio::select! {
+                udp = self.inner.recv(buf) => Received::Udp(udp),
+                inbound = hub.next_inbound() => Received::Ws(inbound),
+            };
+            match received {
+                Received::Udp(udp) => {
+                    let (len, path) = udp?;
+                    return Ok((len, path, Source::Udp(path.addr)));
+                }
+                Received::Ws(inbound) => {
+                    let Some(len) = fill(buf, &inbound.data) else {
+                        hub.count_oversized();
+                        continue;
+                    };
+                    let path = Path {
+                        transport: self.inner.id(),
+                        addr: inbound.peer,
+                        ecn: Ecn::NotEct,
+                    };
+                    return Ok((len, path, Source::Ws(inbound.id)));
+                }
+            }
         }
     }
 }
@@ -65,37 +131,38 @@ impl<T: Transport> Transport for RelayServerTransport<T> {
 
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
         loop {
-            let (len, path) = self.inner.recv(buf).await?;
+            let (len, path, source) = self.next(buf).await?;
             let unix_now = unix_now_secs().unwrap_or_default();
-            let action = lock(&self.router).route(
-                buf.as_packet(),
-                Source::Udp(path.addr),
-                Instant::now(),
-                unix_now,
-            );
+            let action =
+                lock(&self.router).route(buf.as_packet(), source, Instant::now(), unix_now);
             match action {
                 Action::OwnEngine => return Ok((len, path)),
-                Action::Forward(Source::Udp(addr)) => {
-                    let to = Path { addr, ..path };
-                    self.send_logged(buf.as_packet(), &to, "forward").await;
+                Action::Forward(to) => {
+                    self.deliver(buf.as_packet(), to, &path, "forward").await;
                 }
                 Action::Reply(frame) => {
-                    let to = Path {
+                    let path = Path {
                         ecn: Ecn::NotEct,
                         ..path
                     };
-                    self.send_logged(&frame, &to, "control reply").await;
+                    self.deliver(&frame, source, &path, "control reply").await;
                 }
                 Action::Drop(reason) => {
-                    tracing::trace!(from = %path.addr, reason = reason.as_str(), "relay drop");
+                    tracing::trace!(from = %source, reason = reason.as_str(), "relay drop");
                 }
-                Action::Forward(Source::Ws(_)) | Action::Handled => {}
+                Action::Handled => {}
             }
         }
     }
 
     async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
         lock(&self.router).note_own_send(datagram, Instant::now());
+        if let Some(hub) = &self.ws
+            && let Some(id) = hub.conn_at(to.addr)
+        {
+            hub.send_to(id, datagram);
+            return Ok(());
+        }
         self.inner.send(datagram, to).await
     }
 }
@@ -180,7 +247,13 @@ impl RelayConfig {
 }
 
 /// Parses `<left>=<right>`, the form of the relay's `--target` and `--static-target`.
+///
+/// A base64 32-byte key ends in one `=` of padding, so after such a key the separator is
+/// the second `=` of `==`.
 pub fn split_pair(text: &str) -> anyhow::Result<(&str, &str)> {
+    if let Some(pos) = text.find("==") {
+        return Ok((&text[..=pos], &text[pos + 2..]));
+    }
     text.split_once('=')
         .ok_or_else(|| anyhow!("`{text}` is not `<key>=<value>`"))
 }
@@ -307,5 +380,16 @@ mod tests {
         assert!(RelayConfig::parse(r#"{"bogus": 1}"#).is_err());
         let bad = r#"{"machine_keys": [{"machine_key": "eA==", "wg_public_key": "eA=="}]}"#;
         assert!(RelayConfig::parse(bad).unwrap().targets().is_err());
+    }
+
+    #[test]
+    fn pairs_split_after_padded_keys() {
+        let (machine, wg) = (encode_key(&[7; 32]), encode_key(&[8; 32]));
+        let pair = format!("{machine}={wg}");
+        assert_eq!(split_pair(&pair).unwrap(), (machine.as_str(), wg.as_str()));
+        let pair = format!("{wg}=192.0.2.7:51820");
+        assert_eq!(split_pair(&pair).unwrap(), (wg.as_str(), "192.0.2.7:51820"));
+        assert_eq!(split_pair("a=b").unwrap(), ("a", "b"));
+        assert!(split_pair("ab").is_err());
     }
 }

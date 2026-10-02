@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -32,6 +32,8 @@ use crate::relay::client::{ClientConfig, ProbeTimers, RelayClient};
 use crate::relay::envelope::MachineKey;
 use crate::relay::ladder::{LadderTimers, Pin};
 use crate::relay::server::lock;
+use crate::relay::wss::client::{WssConfig, WssStats, WssTransport, rediscover_on_connect};
+use crate::relay::wss::{WssUrl, client_tls_file};
 use crate::status::Status;
 
 /// The id of the UDP transport `--transport udp` installs.
@@ -99,6 +101,9 @@ pub enum TransportKind {
     /// the `--relay` endpoints, registration, reflexive address, and the direct/relay
     /// path ladder.
     Relay,
+    /// `relay` with the relay reached over WebSocket over TLS (`--relay-url`); UDP on
+    /// `--listen` carries the direct paths and the other `--relay` endpoints.
+    Wss,
 }
 
 /// Transport options, flattened into [`NodeArgs`].
@@ -112,9 +117,27 @@ pub struct TransportArgs {
     #[arg(long = "relay", value_name = "IP:PORT")]
     pub relays: Vec<SocketAddr>,
 
-    /// Ed25519 machine key file (`--transport relay`; `relay_server gen-machine-key`)
-    #[arg(long, value_name = "PATH", required_if_eq("transport", "relay"))]
+    /// Ed25519 machine key file (`--transport relay|wss`; `relay_server gen-machine-key`)
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_if_eq_any([("transport", "relay"), ("transport", "wss")])
+    )]
     pub machine_key_file: Option<PathBuf>,
+
+    /// The relay's WebSocket URL (`--transport wss`): `wss://<host>[:<port>]/`; the host is
+    /// the TLS server name
+    #[arg(long, value_name = "URL", required_if_eq("transport", "wss"))]
+    pub relay_url: Option<String>,
+
+    /// PEM certificate of the relay, the only one trusted (`--transport wss`;
+    /// `relay_server --wss-cert-out`)
+    #[arg(long, value_name = "PEM", required_if_eq("transport", "wss"))]
+    pub relay_ca: Option<PathBuf>,
+
+    /// Address to connect to instead of resolving the `--relay-url` host (`--transport wss`)
+    #[arg(long, value_name = "IP:PORT")]
+    pub relay_addr: Option<SocketAddr>,
 
     /// JSON `{"<wg pubkey b64>": ["ip:port", ...]}` of direct candidates, polled every second
     #[arg(long, value_name = "FILE")]
@@ -157,6 +180,10 @@ pub struct TransportArgs {
 /// them and [`run`] reports them in the status file.
 static RELAY_CLIENTS: Mutex<Vec<(SocketAddr, RelayClient)>> = Mutex::new(Vec::new());
 
+/// The WSS carriers built by [`TransportArgs::transports`], by the local address of the
+/// node's UDP socket, for the status file.
+static WSS_CARRIERS: Mutex<Vec<(SocketAddr, Arc<WssStats>)>> = Mutex::new(Vec::new());
+
 /// The relay client of the transport bound to `listen`.
 fn relay_client_at(listen: SocketAddr) -> Option<RelayClient> {
     lock(&RELAY_CLIENTS)
@@ -165,12 +192,21 @@ fn relay_client_at(listen: SocketAddr) -> Option<RelayClient> {
         .map(|(_, client)| client.clone())
 }
 
-/// The relay client of the engine with WireGuard public key `key`.
-fn relay_client_of(key: &PublicKey) -> Option<RelayClient> {
+/// The relay client of the engine with WireGuard public key `key`, and the local address
+/// of its transport.
+fn relay_client_of(key: &PublicKey) -> Option<(SocketAddr, RelayClient)> {
     lock(&RELAY_CLIENTS)
         .iter()
         .find(|(_, client)| client.public_key() == Some(key.to_bytes()))
-        .map(|(_, client)| client.clone())
+        .cloned()
+}
+
+/// The WSS carrier of the transport bound to `listen`.
+fn wss_carrier_at(listen: SocketAddr) -> Option<Arc<WssStats>> {
+    lock(&WSS_CARRIERS)
+        .iter()
+        .find(|(addr, _)| *addr == listen)
+        .map(|(_, stats)| Arc::clone(stats))
 }
 
 /// What [`TransportArgs::transports`] installed.
@@ -189,7 +225,9 @@ impl TransportArgs {
     /// [`StandardRoaming`]. Relay: the same socket wrapped in the extension-aware
     /// [`ExtTransport`](crate::relay::client::ExtTransport), and the
     /// [`LadderPolicy`](crate::relay::ladder::LadderPolicy); [`build_engine`] starts its
-    /// driver.
+    /// driver. WSS: like relay, over a [`WssTransport`] to `--relay-url` that keeps the
+    /// UDP socket for every other address, with the relay's address added to the
+    /// endpoints; discovery restarts on every (re)connect.
     pub fn transports<Src: PacketSource, Snk: PacketSink>(
         &self,
         builder: EngineBuilder<Src, Snk>,
@@ -218,7 +256,45 @@ impl TransportArgs {
                 let builder = builder.transport(ext).policy(Box::new(policy));
                 Ok((builder, transports))
             }
+            TransportKind::Wss => {
+                let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
+                    .with_context(|| format!("cannot bind UDP {listen}"))?;
+                let transports = Transports {
+                    default: UDP_TRANSPORT,
+                    listen: udp.local_addr(),
+                };
+                let wss = WssTransport::connect(UDP_TRANSPORT, self.wss_config()?, Some(udp));
+                let (relay, stats) = (wss.relay(), wss.stats());
+                let mut config = self.client_config()?;
+                if !config.relays.contains(&relay) {
+                    config.relays.push(relay);
+                }
+                let (client, ext, policy) = RelayClient::new(wss, config);
+                rediscover_on_connect(client.clone(), &stats, relay);
+                lock(&RELAY_CLIENTS).push((transports.listen, client));
+                lock(&WSS_CARRIERS).push((transports.listen, stats));
+                let builder = builder.transport(ext).policy(Box::new(policy));
+                Ok((builder, transports))
+            }
         }
+    }
+
+    /// The carrier options of `--transport wss`.
+    pub fn wss_config(&self) -> anyhow::Result<WssConfig> {
+        let (Some(url), Some(ca)) = (&self.relay_url, &self.relay_ca) else {
+            bail!("--relay-url and --relay-ca are required with --transport wss");
+        };
+        let url = WssUrl::parse(url)?;
+        let relay = match self.relay_addr {
+            Some(addr) => addr,
+            None => url.resolve()?,
+        };
+        Ok(WssConfig::new(
+            url.url.clone(),
+            url.server_name()?,
+            relay,
+            client_tls_file(ca)?,
+        ))
     }
 
     /// The relay client options of `--transport relay`.
@@ -226,7 +302,7 @@ impl TransportArgs {
         let path = self
             .machine_key_file
             .as_ref()
-            .ok_or_else(|| anyhow!("--machine-key-file is required with --transport relay"))?;
+            .ok_or_else(|| anyhow!("--machine-key-file is required with --transport relay|wss"))?;
         let machine_key = MachineKey::load(path)
             .with_context(|| format!("cannot read the machine key {}", path.display()))?;
         Ok(ClientConfig {
@@ -262,7 +338,7 @@ pub struct Node {
 /// Builds the engine of a node example: the private key, the transports and path policy of
 /// `args`, on `source` and `sink`. Peers are added afterwards with [`configure_peers`].
 ///
-/// With `--transport relay` it also starts the relay client's driver for the `--peer`s.
+/// With `--transport relay|wss` it also starts the relay client's driver for the `--peer`s.
 pub fn build_engine<Src: PacketSource, Snk: PacketSink>(
     source: Src,
     sink: Snk,
@@ -284,8 +360,10 @@ pub fn build_engine_with<Src: PacketSource, Snk: PacketSink>(
     let builder = configure(EngineBuilder::new(source, sink)).private_key(private_key);
     let (builder, transports) = args.transport.transports(builder, args.listen)?;
     let engine = builder.build().context("cannot build the engine")?;
-    if args.transport.transport == TransportKind::Relay
-        && let Some(client) = relay_client_at(transports.listen)
+    if matches!(
+        args.transport.transport,
+        TransportKind::Relay | TransportKind::Wss
+    ) && let Some(client) = relay_client_at(transports.listen)
     {
         let peers = args
             .peer
@@ -467,8 +545,9 @@ fn resolve(endpoint: &str) -> anyhow::Result<SocketAddr> {
 /// checks to finish. Writes a last status snapshot before returning when `status` is set.
 /// The exit code is a failure iff a check failed.
 ///
-/// With `--transport relay` the status gets `extra.relay` (endpoints, reflexive address)
-/// and `extra.paths` (the ladder) of the relay client.
+/// With `--transport relay|wss` the status gets `extra.relay` (endpoints, reflexive
+/// address) and `extra.paths` (the ladder) of the relay client; with `--transport wss`
+/// also `extra.wss` (the carrier, see [`WssStats::status_json`]).
 pub async fn run(
     engine: Engine,
     echo: &EchoArgs,
@@ -481,10 +560,16 @@ pub async fn run(
         .await?
         .and_then(|key| relay_client_of(&key));
     let status = match (status, client) {
-        (Some(status), Some(client)) => Some(status.extra(move |extra| {
-            extra.insert("relay".to_owned(), client.relay_json());
-            extra.insert("paths".to_owned(), client.paths_json());
-        })),
+        (Some(status), Some((listen, client))) => {
+            let wss = wss_carrier_at(listen);
+            Some(status.extra(move |extra| {
+                extra.insert("relay".to_owned(), client.relay_json());
+                extra.insert("paths".to_owned(), client.paths_json());
+                if let Some(wss) = &wss {
+                    extra.insert("wss".to_owned(), wss.status_json());
+                }
+            }))
+        }
         (status, _) => status,
     };
     let writer = status.as_ref().map(Status::spawn);
