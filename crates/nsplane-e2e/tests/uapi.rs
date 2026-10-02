@@ -8,11 +8,10 @@ use std::time::SystemTime;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, Engine, EngineBuilder, EngineHandle, PeerStats,
-    UdpTransport,
 };
 use nsplane_e2e::{Family, MTU, QUIET, TestResult, WAIT, payload, udp4, udp6};
 use nsplane_packet::{PacketBuf, PeerId};
-use nsplane_uapi::{TRANSPORT_ID, Uapi};
+use nsplane_uapi::{TRANSPORT_ID, Uapi, udp_transport};
 use tokio::io::BufReader;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
@@ -105,7 +104,7 @@ fn parse(reply: &str) -> TestResult<Config> {
 /// One engine configured through its UAPI, with the test ends of its source and sink.
 struct Node {
     _engine: Engine,
-    handle: EngineHandle<UdpTransport>,
+    handle: EngineHandle,
     uapi: Uapi,
     local: mpsc::Sender<PacketBuf>,
     delivered: mpsc::Receiver<(PeerId, PacketBuf)>,
@@ -118,15 +117,19 @@ struct Node {
 }
 
 impl Node {
-    /// An engine with neither a private key nor a transport; the seed picks the key the UAPI
-    /// sets and the tunnel addresses `10.0.0.<seed>` and `fd00::<seed>`.
-    fn new(seed: u8) -> Self {
+    /// An engine with no private key and the UAPI's transport on a free port; the seed picks
+    /// the key the UAPI sets and the tunnel addresses `10.0.0.<seed>` and `fd00::<seed>`.
+    fn new(seed: u8) -> TestResult<Self> {
         let (source, local, mtu) = ChannelSource::new(1024, MTU);
         let (sink, delivered) = ChannelSink::new(1024);
-        let engine = EngineBuilder::new(source, sink).build();
+        let transport = udp_transport(0)?;
+        let port = transport.local_addr().port();
+        let engine = EngineBuilder::new(source, sink)
+            .transport(transport)
+            .build()?;
         let handle = engine.handle();
-        Self {
-            uapi: Uapi::new(handle.clone()),
+        Ok(Self {
+            uapi: Uapi::with_listen_port(handle.clone(), port),
             handle,
             _engine: engine,
             local,
@@ -136,7 +139,7 @@ impl Node {
             ip4: Ipv4Addr::new(10, 0, 0, seed),
             ip6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed)),
             port: 0,
-        }
+        })
     }
 
     fn public(&self) -> PublicKey {
@@ -250,7 +253,7 @@ async fn transfer(from: &Node, to: &mut Node, family: Family) -> TestResult {
 
 /// Two nodes (seeds 1 and 2) configured as peers of each other through `set=1` only.
 async fn pair() -> TestResult<(Node, Node)> {
-    let (mut a, mut b) = (Node::new(1), Node::new(2));
+    let (mut a, mut b) = (Node::new(1)?, Node::new(2)?);
     a.configure().await?;
     b.configure().await?;
     a.set(&b.peer_section()).await?;

@@ -4,7 +4,8 @@
 #
 # Each side runs in its own network namespace on a dedicated docker network; nothing on the
 # host is reconfigured. Needs docker and the `wireguard` kernel module on the host. The test
-# binary is built in the dev image unless NSPLANE_E2E_LIB_BIN names one.
+# binary is built in the dev image unless NSPLANE_E2E_LIB_BIN names one, and so is the
+# release nsplane-cli binary unless NSPLANE_E2E_LIB_CLI names one.
 #
 #   scripts/e2e/lib.sh
 set -euo pipefail
@@ -28,12 +29,22 @@ if [ -z "${NSPLANE_E2E_LIB_BIN:-}" ]; then
 fi
 BIN=$NSPLANE_E2E_LIB_BIN
 if [ ! -x "$BIN" ]; then echo "no container test binary: '$BIN'"; exit 1; fi
+if [ -z "${NSPLANE_E2E_LIB_CLI:-}" ]; then
+  echo "== build nsplane-cli in $DEV_IMAGE"
+  NSPLANE_E2E_LIB_CLI=$(docker run --rm "${LABELS[@]}" --name "$PREFIX-build" -v "$PWD:$PWD" -w "$PWD" \
+    -v nstun-cargo-registry:/usr/local/cargo/registry "$DEV_IMAGE" \
+    cargo build -p nsplane-cli --release --locked --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "nsplane-cli" and .executable != null) | .executable')
+fi
+CLI=$NSPLANE_E2E_LIB_CLI
+if [ ! -x "$CLI" ]; then echo "no nsplane-cli binary: '$CLI'"; exit 1; fi
 
 docker build -q "${LABELS[@]}" -t "$IMG" scripts/e2e >/dev/null
 docker network create "${LABELS[@]}" "$NET" >/dev/null
 run() { docker run -d --rm "${LABELS[@]}" --name "$1" --network "$NET" --cap-add NET_ADMIN \
   --device /dev/net/tun --sysctl net.ipv6.conf.all.disable_ipv6=0 \
-  -v "$BIN":/usr/local/bin/nsplane-e2e-container:ro "$IMG" sleep infinity >/dev/null; }
+  -v "$BIN":/usr/local/bin/nsplane-e2e-container:ro -v "$CLI":/usr/local/bin/nsplane-cli:ro \
+  "$IMG" sleep infinity >/dev/null; }
 run "$PREFIX-a"; run "$PREFIX-b"
 A() { docker exec "$PREFIX-a" bash -c "$*"; }
 B() { docker exec "$PREFIX-b" bash -c "$*"; }
@@ -58,6 +69,7 @@ docker exec \
   -e NSPLANE_E2E_LIB_ADDR_V6=fd00:1::1/64 \
   -e NSPLANE_E2E_LIB_PEER_V4=10.9.1.2 \
   -e NSPLANE_E2E_LIB_PEER_V6=fd00:1::2 \
+  -e NSPLANE_E2E_LIB_CLI=/usr/local/bin/nsplane-cli \
   "$PREFIX-a" nsplane-e2e-container --ignored --test-threads=1 --nocapture
 echo "== wg show (b)"
 B 'wg show wg0' | sed 's/^/  /'

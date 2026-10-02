@@ -138,8 +138,8 @@ impl Drop for Shared {
 pub struct TunSource {
     /// Declared before `_shared` so the channel closes before the session shuts down.
     packets: mpsc::Receiver<PacketBuf>,
-    /// Kept alive so receivers never observe a closed channel; Phase 1 has no MTU
-    /// watcher, so the value never changes.
+    /// Kept alive so receivers never observe a closed channel; the adapter MTU is not
+    /// watched on Windows, so the value never changes.
     mtu: watch::Sender<u16>,
     _shared: Arc<Shared>,
 }
@@ -156,7 +156,8 @@ impl PacketSource for TunSource {
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
     }
 
-    /// The adapter MTU; it never changes in Phase 1.
+    /// The adapter MTU read at [`Tun::create`]. It is not watched on Windows (that
+    /// would need IP Helper notifications), so it never changes.
     fn mtu(&self) -> watch::Receiver<u16> {
         self.mtu.subscribe()
     }

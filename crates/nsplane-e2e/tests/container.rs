@@ -3,22 +3,27 @@
 //! Every test needs root (`CAP_NET_ADMIN`) and `/dev/net/tun`, and the interop test needs a
 //! kernel WireGuard peer in another container, so all of them are `#[ignore]`d. They run
 //! with `--ignored --test-threads=1` inside the containers `scripts/e2e/lib.sh` (`just
-//! e2e-lib`) sets up; the interop test reads its parameters from the `NSPLANE_E2E_LIB_*`
-//! variables that script sets.
+//! e2e-lib`) sets up; the interop tests read their parameters from the `NSPLANE_E2E_LIB_*`
+//! variables that script sets, including the `nsplane-cli` binary (`NSPLANE_E2E_LIB_CLI`).
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::process::{Command, Output};
+use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::time::{Duration, SystemTime};
 
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{AllowedIp, EngineBuilder, EngineHandle, Event, Peer, PeerStats, UdpTransport};
 use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, udp};
 use nsplane_packet::{Ecn, FiveTuple, IpPacket, Path, PeerId, TransportId, UdpHeader, protocol};
 use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener};
+use nsplane_uapi::{Uapi, UapiListener, udp_transport};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
@@ -31,6 +36,8 @@ const KERNEL_HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
 const MISMATCH_WINDOW: Duration = Duration::from_secs(2);
 /// The interface name of the interop test.
 const IFACE: &str = "nsplane0";
+/// The interface name of the CLI interop test.
+const CLI_IFACE: &str = "nsplane1";
 /// The UDP payload size of the large packets.
 const LARGE: usize = 1300;
 
@@ -110,7 +117,7 @@ async fn tun_carries_socket_datagrams_both_ways() -> TestResult {
     let engine = EngineBuilder::new(source, sink)
         .transport(transport)
         .private_key(secret.clone())
-        .build();
+        .build()?;
     let handle = engine.handle();
 
     // The peer engine (seed 2: 10.0.0.2, fd00::2) uses channels as its source and sink.
@@ -521,9 +528,13 @@ async fn kernel_wireguard_interop() -> TestResult {
 
     let tun = Tun::create(IFACE)?;
     let (source, sink) = tun.split()?;
-    let engine = EngineBuilder::new(source, sink).build();
+    let transport = udp_transport(0)?;
+    let port = transport.local_addr().port();
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()?;
     let handle = engine.handle();
-    let uapi = Uapi::new(handle.clone());
+    let uapi = Uapi::with_listen_port(handle.clone(), port);
     let listener = UapiListener::bind(IFACE)?;
     let server = tokio::spawn(async move { uapi.serve(listener).await });
     configure_iface(IFACE, &env.addr_v4, &env.addr_v6).await?;
@@ -550,5 +561,157 @@ async fn kernel_wireguard_interop() -> TestResult {
 
     server.abort();
     drop(engine);
+    Ok(())
+}
+
+/// The 32-byte key in base64 `key` (a key file's contents or `wg` output) in the UAPI's
+/// hex form.
+async fn key_hex(key: &str) -> TestResult<String> {
+    let script = format!(
+        "printf %s '{}' | base64 -d | od -An -v -tx1 | tr -d ' \\n'",
+        key.trim()
+    );
+    let hex = ok("sh", &["-c", &script]).await?;
+    if hex.len() != 64 {
+        return Err(format!("{key:?} is not a base64 32-byte key").into());
+    }
+    Ok(hex)
+}
+
+/// Sends `request` on the UAPI stream and reads the response, up to and including the
+/// empty line after `errno`.
+async fn uapi_request(
+    stream: &mut BufReader<tokio::net::UnixStream>,
+    request: &str,
+) -> TestResult<String> {
+    stream.get_mut().write_all(request.as_bytes()).await?;
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        let len = timeout(WAIT, stream.read_line(&mut line))
+            .await
+            .map_err(|_| format!("no UAPI response within {WAIT:?}: {out:?}"))??;
+        if len == 0 {
+            return Err(format!("UAPI stream closed: {out:?}").into());
+        }
+        let done = line == "\n" && out.contains("errno=");
+        out.push_str(&line);
+        if done {
+            return Ok(out);
+        }
+    }
+}
+
+/// The numeric `field` of a UAPI `get=1` response.
+fn uapi_field(response: &str, field: &str) -> TestResult<u64> {
+    let value = response
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix('='))
+        .ok_or_else(|| format!("no {field} in {response:?}"))?;
+    Ok(value.parse()?)
+}
+
+/// A running `nsplane-cli`, killed when dropped before it exited.
+struct Daemon(Child);
+
+impl Daemon {
+    /// Sends SIGTERM and waits for the exit, for at most [`COMMAND_WAIT`].
+    async fn terminate(&mut self) -> TestResult<ExitStatus> {
+        kill(Pid::from_raw(i32::try_from(self.0.id())?), Signal::SIGTERM)?;
+        let deadline = Instant::now() + COMMAND_WAIT;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    format!("nsplane-cli still runs {COMMAND_WAIT:?} after SIGTERM").into(),
+                );
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// `nsplane-cli` on a TUN device and a UAPI stream that the test opens and hands over by
+/// number (`--tun-fd`, `--uapi-fd`), against kernel WireGuard: configured only over that
+/// stream, it pings the kernel peer, reports the handshake and the traffic over the same
+/// stream, and exits cleanly on SIGTERM.
+///
+/// Its name sorts after `kernel_wireguard_interop`, so with `--test-threads=1` it runs
+/// second: that test needs the kernel peer to initiate, which it does not while a session
+/// made here is still fresh. This test initiates itself and needs no particular state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a kernel WireGuard peer and nsplane-cli; run by `just e2e-lib`"]
+async fn kernel_wireguard_interop_through_the_cli() -> TestResult {
+    let env = Interop::from_env()?;
+    let cli = std::env::var("NSPLANE_E2E_LIB_CLI").map_err(|_| {
+        "NSPLANE_E2E_LIB_CLI is not set: run this test through scripts/e2e/lib.sh (`just e2e-lib`)"
+    })?;
+    let private = key_hex(&std::fs::read_to_string(&env.private_key)?).await?;
+    let psk = key_hex(&std::fs::read_to_string(&env.psk)?).await?;
+    let peer = key_hex(&env.peer_pub).await?;
+
+    let tun = Tun::create(CLI_IFACE)?;
+    configure_iface(CLI_IFACE, &env.addr_v4, &env.addr_v6).await?;
+    let (parent, child) = std::os::unix::net::UnixStream::pair()?;
+    // The child inherits both fds by number.
+    fcntl(tun.as_fd(), FcntlArg::F_SETFD(FdFlag::empty()))?;
+    fcntl(child.as_fd(), FcntlArg::F_SETFD(FdFlag::empty()))?;
+    let tun_fd = tun.as_fd().as_raw_fd().to_string();
+    let uapi_fd = child.as_raw_fd().to_string();
+    step("start nsplane-cli with --tun-fd and --uapi-fd")?;
+    let mut daemon = Daemon(
+        Command::new(&cli)
+            .args(["--disable-drop-privileges", "--tun-fd", &tun_fd])
+            .args(["--uapi-fd", &uapi_fd, "-v", "debug", CLI_IFACE])
+            .spawn()?,
+    );
+    // The child owns its copies now.
+    drop((tun, child));
+    parent.set_nonblocking(true)?;
+    let mut uapi = BufReader::new(tokio::net::UnixStream::from_std(parent)?);
+
+    step("configure over --uapi-fd")?;
+    let request = format!(
+        "set=1\nprivate_key={private}\nlisten_port={}\npublic_key={peer}\npreshared_key={psk}\n\
+         endpoint={}\nallowed_ip={}/32\nallowed_ip={}/128\npersistent_keepalive_interval=25\n\n",
+        env.listen_port, env.peer_endpoint, env.peer_v4, env.peer_v6
+    );
+    let reply = uapi_request(&mut uapi, &request).await?;
+    if reply != "errno=0\n\n" {
+        return Err(format!("set=1 over --uapi-fd: {reply:?}").into());
+    }
+    step("ping the kernel peer through nsplane-cli: IPv4, IPv6, 1300 bytes")?;
+    for family in [Family::V4, Family::V6] {
+        for size in [56, LARGE] {
+            env.expect_ping(family, size).await?;
+        }
+    }
+    step("get=1 over --uapi-fd reports the handshake and the traffic")?;
+    let reply = uapi_request(&mut uapi, "get=1\n\n").await?;
+    if !reply.ends_with("errno=0\n\n") {
+        return Err(format!("get=1 over --uapi-fd: {reply:?}").into());
+    }
+    for field in ["last_handshake_time_sec", "rx_bytes", "tx_bytes"] {
+        if uapi_field(&reply, field)? == 0 {
+            return Err(format!("{field} is 0: {reply:?}").into());
+        }
+    }
+
+    step("SIGTERM stops nsplane-cli")?;
+    let status = daemon.terminate().await?;
+    if !status.success() {
+        return Err(format!("nsplane-cli exited with {status}").into());
+    }
     Ok(())
 }
