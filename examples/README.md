@@ -297,6 +297,7 @@ sudo cargo run -p nsplane-examples --bin app_session -- --tun nsp-app --status a
 | `--peer <SPEC>` | repeatable; `<base64 pubkey>[,endpoint=<host:port>][,allowed-ips=<cidr>[+<cidr>...]][,keepalive=<secs>][,psk-file=<path>]` |
 | `--status-file <PATH>` | write a JSON status snapshot every second |
 | `--log <FILTER>` | stderr log filter, default `info` (e.g. `nsplane=debug,info`) |
+| `--no-offload` | turn segmentation offload off (on by default): TUN nodes (`tun_node`, `fd_bridge`, `acl_gateway`) open a plain TUN device, and the UDP socket runs without GSO/GRO. The startup log names the modes in use: `offload=tso,uso` / `offload=off` for the TUN, `udp_offload=gso,gro` / `udp_offload=off` for UDP |
 | `--transport <udp\|relay\|wss>` | transport to run, default `udp`; `relay` and `wss` take the flags under [relay_transport](#relay_transport) |
 
 ### Echo and checks (`EchoArgs`)
@@ -347,7 +348,7 @@ on `netstack_node`.
 design's "presentation x transport" scenarios, each node in its own container, against each
 other and against kernel WireGuard. It needs docker and the `wireguard` kernel module on the
 host; nothing on the host is reconfigured. The containers use `scripts/e2e/Dockerfile`
-(`wireguard-tools`, `socat`, `iptables`, `tcpdump`).
+(`wireguard-tools`, `socat`, `iptables`, `tcpdump`, `iperf3`).
 
 The matrix has 12 cells; each lists its cases, whose ids are `<row>/<column>/<case>`. In the
 UDP column the peers are the same example or kernel WireGuard; in the relay columns the node
@@ -365,8 +366,13 @@ WireGuard), `native_wg`, `native_wg_reverse` (native kernel WireGuard through th
 both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
 `nat_hole_punch` (the ladder behind MASQUERADE routers), `plain_wg_compat` (the relay
 extension against a plain WireGuard server), `app_session` (self-checks), `app_session_tun`
-(`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status). The run ends with the matrix and the scenario
-list and fails if anything failed.
+(`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status),
+`offload_fallback` (`tun_node --no-offload` against kernel WireGuard: the checks of
+`tun_kernel` on the plain TUN device and UDP without GSO/GRO), `offload_iperf` (`tun_node`
+against kernel WireGuard with offload on and with `--no-offload`: 5 s iperf3 runs of TCP and
+UDP in both directions; passes when every run moved data and prints the Mbit/s of all 8
+runs, UDP loss reported but not gated). The run ends with the matrix and the scenario list
+and fails if anything failed.
 
 | Variable | Meaning |
 |---|---|
