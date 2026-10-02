@@ -27,6 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
+| `examples/`              | `nsplane-examples` | Runnable examples (not published); see [examples/README.md](examples/README.md) |
 
 ### `nsplane-noise` features
 
@@ -34,6 +35,23 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | -------------- | ---------------------------------------------------------- |
 | *(none)*       | Protocol only, with no network or TUN stack (`noise` module) |
 | `mock-instant` | Mocks `Instant` for deterministic timer tests              |
+
+## Examples
+
+Runnable programs in [`examples/`](examples/README.md) (package `nsplane-examples`, not
+published) show how the crates fit together: TUN and netstack nodes, a hybrid local side, an
+ACL gateway, host bridges by fd or channels, events and stats, and a single-port relay with
+its client transport over UDP and WebSocket over TLS. Every example has `--help`:
+
+```bash
+cargo run -p nsplane-examples --bin udp_pair       # quick start, no root
+cargo run -p nsplane-examples --bin <name> -- --help
+```
+
+`just e2e-examples` runs them in containers as a matrix of local sides (TUN, netstack,
+bridge by fd, bridge by channel) and transports (UDP, relay over UDP, relay over WSS) plus
+scenarios, against each other and kernel WireGuard; see
+[examples/README.md](examples/README.md#end-to-end).
 
 ## Using nsplane as a dependency
 
@@ -130,6 +148,7 @@ just check          # fmt, clippy for every feature, nextest, doctests, deny, sh
 just cross          # clippy for aarch64-apple-darwin (zig) and x86_64-pc-windows-gnu (mingw)
 just test-windows   # library unit tests for Windows under wine
 just e2e            # interop with kernel WireGuard in two containers (docker)
+just e2e-examples   # the examples as e2e scenarios in containers (docker)
 ```
 
 ## License
