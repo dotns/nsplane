@@ -18,7 +18,7 @@ pub const MALFORMED: &str = "acl malformed";
 /// The packet goes from a namespace member to another peer that shares no
 /// namespace with it, and no directed grant accepts it.
 pub const CROSS_NAMESPACE: &str = "acl cross namespace";
-/// An outbound packet to an outbound-restricted peer matches no outbound rule
-/// and no reply allowance (or is not TCP/UDP while other protocols are not
-/// allowed).
+/// An outbound packet to an outbound-restricted peer matches no outbound rule,
+/// no open outbound pinhole and no reply allowance (or is not TCP/UDP while
+/// other protocols are not allowed).
 pub const OUTBOUND: &str = "acl outbound denied";
