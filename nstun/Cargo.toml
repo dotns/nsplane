@@ -1,0 +1,22 @@
+[package]
+name = "nstun"
+description = "Tokio driver for the nstun data plane: local-side and network-side I/O traits"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nstun-packet = { path = "../nstun-packet", version = "0.8.0" }
+tokio = { version = "1.53.1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
