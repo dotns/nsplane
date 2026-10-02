@@ -141,7 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over WSS; kernel WireGuard peers in the UDP column) and scenarios (hybrid, ACL gateway,
   native WireGuard through the relay, the path ladder, NAT hole punching, plain WireGuard
   compatibility). The e2e image adds `socat`, `iptables` and `tcpdump`.
-- `nsplane-packet`: `PacketBuf::advance`, `reserve_front`, `headroom`, `from_shared`.
+- `nsplane-packet`: `PacketBuf::headroom` and fallible `advance`, `reserve_front`, `from_shared`
+  returning `BoundsError` instead of panicking.
 - `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
   re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
 
