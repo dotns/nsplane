@@ -18,6 +18,8 @@ pub(crate) struct Peer {
     preshared_key: Option<[u8; 32]>,
     /// Decrypted payload bytes delivered from this peer.
     data_rx: u64,
+    /// Whether the core reported the current expiry of the tunnel's sessions.
+    pub(crate) expired: bool,
 }
 
 impl std::fmt::Debug for Peer {
@@ -45,6 +47,7 @@ impl Peer {
             path,
             preshared_key,
             data_rx: 0,
+            expired: false,
         }
     }
 
@@ -61,19 +64,11 @@ impl Peer {
     }
 
     /// Runs the timers of the tunnel; see [`Tunn::update_timers`].
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         self.tunnel.update_timers(dst)
     }
 
     /// The current path.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn path(&self) -> Option<Path> {
         self.path
     }
@@ -84,55 +79,31 @@ impl Peer {
     }
 
     /// Counts `bytes` of decrypted payload delivered from this peer.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn add_data_rx(&mut self, bytes: u64) {
         self.data_rx = self.data_rx.saturating_add(bytes);
     }
 
     /// Decrypted payload bytes delivered from this peer.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn data_rx(&self) -> u64 {
         self.data_rx
     }
 
     /// Time since the current session was established.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) fn time_since_last_handshake(&self) -> Option<Duration> {
         self.tunnel.time_since_last_handshake()
     }
 
     /// The persistent keepalive interval in seconds.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn persistent_keepalive(&self) -> Option<u16> {
         self.tunnel.persistent_keepalive()
     }
 
     /// The preshared key, if set.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn preshared_key(&self) -> Option<&[u8; 32]> {
         self.preshared_key.as_ref()
     }
 
     /// The public key of the peer.
-    #[allow(
-        dead_code,
-        reason = "used by Core in subtask C2; on the 1.95 MSRV `expect(dead_code)` marks the items it uses live, so it cannot be fulfilled on both toolchains"
-    )]
     pub(crate) const fn public_key(&self) -> &PublicKey {
         &self.public_key
     }
