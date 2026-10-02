@@ -1,0 +1,25 @@
+[package]
+name = "nstun-uapi"
+description = "The wg cross-platform configuration protocol (UAPI) over an nstun engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22"
+hex = "0.4"
+nstun = { path = "../nstun", version = "0.8.0" }
+tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync"] }
+tracing = "0.1.40"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
