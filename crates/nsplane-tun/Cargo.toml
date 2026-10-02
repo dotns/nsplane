@@ -27,5 +27,10 @@ libc = "0.2"
 wintun-bindings = "0.7.40"
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "sync", "time"] }
+
+[[bench]]
+name = "offload"
+harness = false

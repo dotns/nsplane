@@ -1197,6 +1197,7 @@ dependencies = [
 name = "nsplane-tun"
 version = "0.8.0"
 dependencies = [
+ "criterion",
  "libc",
  "nsplane",
  "nsplane-packet",
