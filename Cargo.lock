@@ -753,6 +753,8 @@ name = "nsplane-acl"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
+ "nsplane-core",
+ "nsplane-packet",
  "serde",
  "serde_json",
  "thiserror",
