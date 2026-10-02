@@ -46,13 +46,13 @@ const MAX_DATAGRAM: usize = 65535;
 /// path follows). A datagram to transmit goes to the transport named by its
 /// [`Path::transport`]; when none is installed under that id, it is dropped and counted
 /// under [`crate::DROP_NO_TRANSPORT`]. Each transport's tasks are spawned for its concrete
-/// type when it is added, so no datagram goes through a boxed future.
+/// type when it is added, so no datagram goes through a boxed future (unless the transport
+/// is a boxed [`DynTransport`]).
 ///
 /// Backpressure: a full sink queue drops the decrypted packet and counts it under
 /// [`crate::DROP_SINK_FULL`]. Each transport has its own transmit queue; when it is full,
 /// that transport's datagrams wait in the owner task, in order, while datagrams to other
-/// transports keep going to their own queues, so a slow transport never delays another
-/// transport's datagrams. The waiting datagrams of a transport are bounded by the queue
+/// transports keep going to their own queues, so they never queue behind a slow transport. The waiting datagrams of a transport are bounded by the queue
 /// capacity: a datagram caused by a received datagram or a timer that finds them at the
 /// bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
 /// local packets or handle calls always wait, so local packets are held back, never dropped:
@@ -77,6 +77,7 @@ const MAX_DATAGRAM: usize = 65535;
 /// engine should run; handles alone do not keep it running.
 ///
 /// [`PathPolicy`]: nsplane_core::PathPolicy
+/// [`DynTransport`]: crate::DynTransport
 pub struct Engine {
     handle: EngineHandle,
     owner: Option<JoinHandle<()>>,
