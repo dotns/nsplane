@@ -55,11 +55,11 @@ pub enum Family {
 }
 
 /// A UDP header and `payload`, with the length set and the checksum field zeroed.
-fn udp_segment(payload: &[u8]) -> Vec<u8> {
+fn udp_segment(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let len = u16::try_from(8 + payload.len()).unwrap_or(u16::MAX);
     let mut segment = Vec::with_capacity(8 + payload.len());
-    segment.extend_from_slice(&SRC_PORT.to_be_bytes());
-    segment.extend_from_slice(&DST_PORT.to_be_bytes());
+    segment.extend_from_slice(&src_port.to_be_bytes());
+    segment.extend_from_slice(&dst_port.to_be_bytes());
     segment.extend_from_slice(&len.to_be_bytes());
     segment.extend_from_slice(&[0, 0]);
     segment.extend_from_slice(payload);
@@ -78,8 +78,18 @@ fn set_udp_checksum(segment: &mut [u8], sum: u16) {
 ///
 /// Panics if `payload` does not fit into one IPv4 packet.
 pub fn udp4(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    udp4_ports(src, SRC_PORT, dst, DST_PORT, payload)
+}
+
+fn udp4_ports(
+    src: Ipv4Addr,
+    src_port: u16,
+    dst: Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     assert!(payload.len() <= MAX_PAYLOAD, "payload too large");
-    let mut segment = udp_segment(payload);
+    let mut segment = udp_segment(src_port, dst_port, payload);
     let sum = transport_checksum_v4(src, dst, protocol::UDP, &segment);
     set_udp_checksum(&mut segment, sum);
 
@@ -102,8 +112,18 @@ pub fn udp4(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
 ///
 /// Panics if `payload` does not fit into one IPv6 packet without a jumbogram.
 pub fn udp6(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
+    udp6_ports(src, SRC_PORT, dst, DST_PORT, payload)
+}
+
+fn udp6_ports(
+    src: Ipv6Addr,
+    src_port: u16,
+    dst: Ipv6Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     assert!(payload.len() <= MAX_PAYLOAD, "payload too large");
-    let mut segment = udp_segment(payload);
+    let mut segment = udp_segment(src_port, dst_port, payload);
     let sum = transport_checksum_v6(src, dst, protocol::UDP, &segment);
     set_udp_checksum(&mut segment, sum);
 
@@ -116,6 +136,21 @@ pub fn udp6(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
     packet.extend_from_slice(&dst.octets());
     packet.extend_from_slice(&segment);
     packet
+}
+
+/// A UDP packet from `src` to `dst` (addresses and ports) with valid checksums.
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` are of different IP versions or `payload` does not fit into
+/// one packet.
+pub fn udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    assert_eq!(src.is_ipv4(), dst.is_ipv4(), "mixed IP versions");
+    match (src.ip(), dst.ip()) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => udp4_ports(s, src.port(), d, dst.port(), payload),
+        (IpAddr::V6(s), IpAddr::V6(d)) => udp6_ports(s, src.port(), d, dst.port(), payload),
+        _ => unreachable!("versions checked above"),
+    }
 }
 
 /// A recognisable payload of `len` bytes.
