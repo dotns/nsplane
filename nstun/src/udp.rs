@@ -23,6 +23,11 @@ use crate::transport::Transport;
 /// platforms (macOS, iOS, Windows) received datagrams report [`Ecn::NotEct`] and `to.ecn`
 /// is ignored.
 ///
+/// Windows: a datagram larger than the receive buffer is truncated as on other
+/// platforms, although `recvfrom` reports it as `WSAEMSGSIZE`; its sender is peeked
+/// before the receive. ICMP port-unreachable errors, which Windows reports on a later
+/// receive as `WSAECONNRESET`, are skipped and receiving continues.
+///
 /// The transport never closes: it lives as long as its socket.
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -266,6 +271,7 @@ mod other {
     use super::UdpTransport;
 
     impl UdpTransport {
+        #[cfg(not(windows))]
         pub(super) async fn recv_from(
             &self,
             packet: &mut [u8],
@@ -281,6 +287,64 @@ mod other {
             _ecn: Ecn,
         ) -> io::Result<()> {
             self.socket.send_to(datagram, to).await.map(drop)
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    //! `recv_from` mapped to the transport contract: truncation instead of `WSAEMSGSIZE`
+    //! and no `WSAECONNRESET`.
+
+    use std::io;
+    use std::net::SocketAddr;
+
+    use nstun_packet::Ecn;
+
+    use super::UdpTransport;
+
+    /// `WSAEMSGSIZE`: the datagram did not fit; the buffer holds its first bytes and the
+    /// rest is discarded.
+    const WSAEMSGSIZE: i32 = 10040;
+
+    impl UdpTransport {
+        /// Receives one datagram, truncating it to `packet`.
+        ///
+        /// A truncated `recvfrom` fails without reporting the sender, so the sender is
+        /// peeked first. With several tasks receiving on the same transport, another task
+        /// may take the peeked datagram in between, and a truncated datagram is then
+        /// attributed to the wrong sender; datagrams that fit are always attributed
+        /// correctly. `WSAECONNRESET` (an ICMP port-unreachable for an earlier send) is
+        /// transient for an unconnected socket: it is skipped and receiving continues,
+        /// which needs no `SIO_UDP_CONNRESET` ioctl and so no unsafe code. A truncated
+        /// datagram whose sender could not be peeked is dropped.
+        pub(super) async fn recv_from(
+            &self,
+            packet: &mut [u8],
+        ) -> io::Result<(usize, SocketAddr, Ecn)> {
+            loop {
+                self.socket.readable().await?;
+                let sender = match self.socket.try_peek_sender() {
+                    Ok(addr) => Some(addr),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => None,
+                    Err(e) => return Err(e),
+                };
+                match self.socket.try_recv_from(packet) {
+                    Ok((len, addr)) => return Ok((len, addr, Ecn::NotEct)),
+                    Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
+                        if let Some(addr) = sender {
+                            return Ok((packet.len(), addr, Ecn::NotEct));
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionReset
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
 }
@@ -373,6 +437,24 @@ mod tests {
                 .all(|&b| b == 0xAA)
         );
         assert_eq!(path.addr, a.local_addr());
+    }
+
+    /// An ICMP port-unreachable for an earlier send must not fail a later receive
+    /// (Windows reports it as `WSAECONNRESET`).
+    #[tokio::test]
+    async fn port_unreachable_does_not_fail_recv() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        let closed = bind(3, "127.0.0.1:0").local_addr();
+        a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
+            .await
+            .unwrap();
+        b.send(DATAGRAM, &path_to(a.local_addr(), Ecn::NotEct))
+            .await
+            .unwrap();
+        let (buf, path) = recv(&a, 1500).await;
+        assert_eq!(buf.as_packet(), DATAGRAM);
+        assert_eq!(path.addr, b.local_addr());
     }
 
     #[tokio::test]

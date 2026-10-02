@@ -853,6 +853,7 @@ dependencies = [
  "nstun",
  "nstun-packet",
  "tokio",
+ "wintun-bindings",
 ]
 
 [[package]]

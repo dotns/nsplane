@@ -21,6 +21,11 @@ tokio = { version = "1.53.1", features = ["net", "sync"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# JUSTIFICATION: Wintun is the only userspace TUN driver on Windows; the bindings load the
+# signed wintun.dll at runtime (docs/decisions/2026-10-01-wintun.md).
+wintun-bindings = "0.7.40"
+
 [dev-dependencies]
 nstun-packet = { path = "../nstun-packet", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "sync", "time"] }
