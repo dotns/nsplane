@@ -20,6 +20,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-noise/`  | `nsplane-noise`  | Protocol library: Noise handshake, sessions, timers (`noise`); no I/O |
 | `crates/nsplane-packet/` | `nsplane-packet` | Packet buffers, IP header views and shared value types; no I/O |
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
+| `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, and the `AclFilter` and `FlowTracker` packet filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp (TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
