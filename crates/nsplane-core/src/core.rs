@@ -444,7 +444,11 @@ impl Core {
             MessageKind::Keepalive
         };
         // Steady state (no completed handshake, same source) has nothing to report or adopt.
-        if completed > 0 || !peer.path().is_some_and(|current| same_route(&current, &path)) {
+        if completed > 0
+            || !peer
+                .path()
+                .is_some_and(|current| same_route(&current, &path))
+        {
             self.authenticated(id, path, kind, completed);
         }
 
