@@ -14,6 +14,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -168,11 +169,14 @@ pub struct Options {
 }
 
 /// One engine with the test ends of its packet source and sink.
+///
+/// `T` is the type of the transport the node is reached on; helpers that link two nodes
+/// take nodes of one type.
 pub struct Node<T: Transport> {
     /// The running engine; dropping it stops the engine.
-    pub engine: Engine<T>,
+    pub engine: Engine,
     /// A handle to the engine.
-    pub handle: EngineHandle<T>,
+    pub handle: EngineHandle,
     /// Feeds the engine's packet source.
     pub local: mpsc::Sender<PacketBuf>,
     /// Receives what the engine's sink delivers, with the peer it came from.
@@ -187,6 +191,7 @@ pub struct Node<T: Transport> {
     pub ip6: Ipv6Addr,
     /// The node's own transport id and the address its peers reach it on.
     pub path: Path,
+    transport: PhantomData<fn() -> T>,
 }
 
 impl<T: Transport> fmt::Debug for Node<T> {
@@ -215,16 +220,39 @@ impl<T: Transport> Node<T> {
         transport: T,
         options: Options,
     ) -> Self {
+        match Self::with_builder(seed, id, addr, options, |builder| {
+            builder.transport(transport)
+        }) {
+            Ok(node) => node,
+            Err(e) => unreachable!("an engine with one transport builds: {e}"),
+        }
+    }
+
+    /// Builds a node like [`Node::new`], with `configure` adding the transports (any number,
+    /// of any types) and further settings to the engine builder. `id` and `addr` are the
+    /// node's own [`Node::path`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn with_builder(
+        seed: u8,
+        id: TransportId,
+        addr: SocketAddr,
+        options: Options,
+        configure: impl FnOnce(
+            EngineBuilder<ChannelSource, ChannelSink>,
+        ) -> EngineBuilder<ChannelSource, ChannelSink>,
+    ) -> TestResult<Self> {
         let (source, local, mtu) = ChannelSource::new(CAPACITY, MTU);
         let (sink, delivered) = ChannelSink::new(CAPACITY);
-        let mut builder = EngineBuilder::new(source, sink)
-            .transport(transport)
-            .private_key(StaticSecret::from([seed; 32]));
+        let mut builder =
+            EngineBuilder::new(source, sink).private_key(StaticSecret::from([seed; 32]));
         if let Some(interval) = options.stats_interval {
             builder = builder.stats_interval(interval);
         }
-        let engine = builder.build();
-        Self {
+        let engine = configure(builder).build()?;
+        Ok(Self {
             handle: engine.handle(),
             engine,
             local,
@@ -238,7 +266,8 @@ impl<T: Transport> Node<T> {
                 addr,
                 ecn: Ecn::NotEct,
             },
-        }
+            transport: PhantomData,
+        })
     }
 
     /// The node's public key.
