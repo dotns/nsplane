@@ -13,6 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -20,12 +21,16 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{AllowedIp, EngineBuilder, EngineHandle, Event, Peer, PeerStats, UdpTransport};
+use nsplane_acl::{
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, PeerIdentityMap, SourceAssertion, reasons,
+    wg_peer_anchor,
+};
 use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, udp};
 use nsplane_packet::{Ecn, FiveTuple, IpPacket, Path, PeerId, TransportId, UdpHeader, protocol};
 use nsplane_tun::Tun;
 use nsplane_uapi::{Uapi, UapiListener, udp_transport};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
@@ -48,6 +53,16 @@ const TRANSFER_TOLERANCE: u64 = 2 * 2 * 32 + 148;
 const IFACE: &str = "nsplane0";
 /// The interface name of the CLI interop test.
 const CLI_IFACE: &str = "nsplane1";
+/// The interface name of the ACL test.
+const ACL_IFACE: &str = "nsplane2";
+/// The port the ACL test's policy allows, and one it does not.
+const ALLOWED: u16 = 7000;
+const DENIED: u16 = 7001;
+/// Upper bound for one connect request to the kernel peer: it gives up after 3 seconds.
+const CONNECT_WAIT: Duration = Duration::from_secs(10);
+/// How long a connection the ACL drops is given to arrive anyway, after the kernel peer
+/// gave up on it.
+const DENIED_WINDOW: Duration = Duration::from_millis(500);
 /// The UDP payload size of the large packets.
 const LARGE: usize = 1300;
 
@@ -376,6 +391,59 @@ impl Interop {
             [_, rx, tx] if !out.trim().contains('\n') => Ok((rx.parse()?, tx.parse()?)),
             _ => Err(format!("`wg show wg0 transfer`: {out:?}").into()),
         }
+    }
+
+    /// Creates `request` with `content` in the shared directory (through a rename, so the
+    /// kernel peer never reads it half written) and returns the contents of `answer` once the
+    /// kernel peer wrote it, for at most `within`.
+    async fn kernel_request(
+        &self,
+        request: &str,
+        content: &str,
+        answer: &str,
+        within: Duration,
+    ) -> TestResult<String> {
+        let answer = self.kernel_dir.join(answer);
+        match std::fs::remove_file(&answer) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let tmp = self.kernel_dir.join(format!("{request}.req"));
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, self.kernel_dir.join(request))?;
+        let deadline = Instant::now() + within;
+        loop {
+            match std::fs::read_to_string(&answer) {
+                Ok(out) => return Ok(out),
+                Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    return Err(format!("no answer to {request} within {within:?}: {e}").into());
+                }
+            }
+        }
+    }
+
+    /// Makes the kernel peer send `hello` to this side's IPv4 address on `port` over `proto`
+    /// (`tcp` or `udp`) and returns the exit status of its attempt.
+    async fn kernel_connect(&self, proto: &str, port: u16) -> TestResult<i32> {
+        let status = self
+            .kernel_request(
+                "connect",
+                &format!("{proto} {port}\n"),
+                "connect.result",
+                CONNECT_WAIT,
+            )
+            .await?;
+        Ok(status.trim().parse()?)
+    }
+
+    /// Drops the kernel peer's session with this side, so that it initiates the next
+    /// handshake as at the start.
+    async fn reset_kernel_peer(&self) -> TestResult {
+        self.kernel_request("reset", "", "reset.done", WAIT).await?;
+        Ok(())
     }
 
     /// Pings the kernel peer's `family` address with `size` bytes of payload.
@@ -839,4 +907,188 @@ async fn kernel_wireguard_interop_through_the_cli() -> TestResult {
         return Err(format!("nsplane-cli exited with {status}").into());
     }
     Ok(())
+}
+
+/// Waits for `Event::Dropped` with `reason`.
+async fn expect_dropped(events: &mut broadcast::Receiver<Event>, reason: &str) -> TestResult {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match timeout_at(deadline, events.recv()).await {
+            Ok(Ok(Event::Dropped { reason: r, .. })) if r == reason => return Ok(()),
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => return Err("engine stopped".into()),
+            Err(_) => return Err(format!("no drop for {reason:?} within {WAIT:?}").into()),
+        }
+    }
+}
+
+/// An accept rule from `src` to `dst` for TCP and UDP.
+fn accept(src: &str, dst: String) -> AclRule {
+    AclRule {
+        action: AclAction::Accept,
+        src: vec![src.to_owned()],
+        dst: vec![dst],
+        proto: None,
+    }
+}
+
+/// The kernel peer's TCP connection to [`ALLOWED`] on `local4` carries its data; the one to
+/// [`DENIED`] never connects and counts as a denial.
+async fn acl_tcp(
+    env: &Interop,
+    local4: Ipv4Addr,
+    filter: &AclFilter,
+    events: &mut broadcast::Receiver<Event>,
+) -> TestResult {
+    step("TCP to the allowed port connects and carries data")?;
+    let tcp_allowed = TcpListener::bind((local4, ALLOWED)).await?;
+    let tcp_denied = TcpListener::bind((local4, DENIED)).await?;
+    let status = env.kernel_connect("tcp", ALLOWED).await?;
+    if status != 0 {
+        return Err(format!("TCP to {ALLOWED} failed with exit status {status}").into());
+    }
+    let (mut stream, from) = timeout(WAIT, tcp_allowed.accept())
+        .await
+        .map_err(|_| format!("no TCP connection on {ALLOWED} within {WAIT:?}"))??;
+    let mut data = Vec::new();
+    timeout(WAIT, stream.read_to_end(&mut data))
+        .await
+        .map_err(|_| format!("TCP stream from {from} did not end within {WAIT:?}"))??;
+    if from.ip() != IpAddr::V4(env.peer_v4) || data != b"hello" {
+        return Err(format!("TCP from {from}: {data:?}").into());
+    }
+
+    step("TCP to the denied port never connects")?;
+    let denied_before = filter.stats().denied;
+    let status = env.kernel_connect("tcp", DENIED).await?;
+    if status == 0 {
+        return Err(format!("TCP to {DENIED} connected").into());
+    }
+    if let Ok(accepted) = timeout(DENIED_WINDOW, tcp_denied.accept()).await {
+        return Err(format!("TCP connection on {DENIED}: {accepted:?}").into());
+    }
+    expect_dropped(events, reasons::DENIED).await?;
+    assert!(
+        filter.stats().denied > denied_before,
+        "no TCP denial counted"
+    );
+    Ok(())
+}
+
+/// The kernel peer's UDP datagram to [`ALLOWED`] on `local4` arrives; the one to
+/// [`DENIED`] does not and counts as a denial.
+async fn acl_udp(
+    env: &Interop,
+    local4: Ipv4Addr,
+    filter: &AclFilter,
+    events: &mut broadcast::Receiver<Event>,
+) -> TestResult {
+    step("UDP to the allowed port arrives, to the denied port it does not")?;
+    let udp_allowed = UdpSocket::bind((local4, ALLOWED)).await?;
+    let udp_denied = UdpSocket::bind((local4, DENIED)).await?;
+    let mut buf = [0; 64];
+    let status = env.kernel_connect("udp", ALLOWED).await?;
+    let (len, from) = timeout(WAIT, udp_allowed.recv_from(&mut buf))
+        .await
+        .map_err(|_| format!("no UDP datagram on {ALLOWED} within {WAIT:?}"))??;
+    if status != 0 || from.ip() != IpAddr::V4(env.peer_v4) || buf[..len] != *b"hello" {
+        return Err(format!("UDP from {from} (status {status}): {:?}", &buf[..len]).into());
+    }
+    // Later drops are the UDP one: the TCP attempt is over.
+    while events.try_recv().is_ok() {}
+    let denied_before = filter.stats().denied;
+    env.kernel_connect("udp", DENIED).await?;
+    if let Ok(received) = timeout(DENIED_WINDOW, udp_denied.recv_from(&mut buf)).await {
+        return Err(format!("UDP datagram on {DENIED}: {received:?}").into());
+    }
+    expect_dropped(events, reasons::DENIED).await?;
+    let stats = filter.stats();
+    writeln!(io::stderr(), "{stats:?}")?;
+    assert!(
+        stats.denied > denied_before,
+        "no UDP denial counted: {stats:?}"
+    );
+    assert!(stats.accepted >= 2, "{stats:?}");
+    Ok(())
+}
+
+/// An engine on a TUN device with an `AclFilter` that lets the kernel peer's key reach
+/// [`ALLOWED`] on this side and nothing else: the kernel peer's TCP connection and UDP
+/// datagram to [`ALLOWED`] arrive at sockets here, those to [`DENIED`] are dropped with
+/// `reasons::DENIED` before they reach the kernel.
+///
+/// This side initiates the handshake, so the test needs no particular state of the kernel
+/// peer; at the end it resets the kernel peer's session so that the kernel initiates again
+/// for the tests after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a kernel WireGuard peer; run by `just e2e-lib`"]
+async fn kernel_peer_through_acl_filter() -> TestResult {
+    let env = Interop::from_env()?;
+    let acl = Arc::new(AclEngine::new());
+    let identities = Arc::new(PeerIdentityMap::new());
+    let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&identities));
+
+    let tun = Tun::create(ACL_IFACE)?;
+    let (source, sink) = tun.split()?;
+    let engine = EngineBuilder::new(source, sink)
+        .transport(udp_transport(env.listen_port)?)
+        .filter(Box::new(filter.clone()))
+        .build()?;
+    let handle = engine.handle();
+    let uapi = Uapi::with_listen_port(handle.clone(), env.listen_port);
+    let listener = UapiListener::bind(ACL_IFACE)?;
+    let server = tokio::spawn(async move { uapi.serve(listener).await });
+    configure_iface(ACL_IFACE, &env.addr_v4, &env.addr_v6).await?;
+    let mut events = handle.subscribe().await?;
+
+    step("configure over the UAPI socket, with a policy for the kernel peer's key")?;
+    let allowed = env.peer_allowed_ips_arg();
+    let endpoint = env.peer_endpoint.to_string();
+    ok(
+        "wg",
+        &[
+            "set",
+            ACL_IFACE,
+            "private-key",
+            &env.private_key,
+            "peer",
+            &env.peer_pub,
+            "preshared-key",
+            &env.psk,
+            "allowed-ips",
+            &allowed,
+            "endpoint",
+            &endpoint,
+        ],
+    )
+    .await?;
+    let peer = the_peer(&handle).await?;
+    let key = peer.public_key.to_bytes();
+    identities.insert(peer.peer, SourceAssertion::WgPeerKey { pubkey: key });
+    let local4: Ipv4Addr = env.addr_v4.split('/').next().unwrap_or_default().parse()?;
+    let local6: Ipv6Addr = env.addr_v6.split('/').next().unwrap_or_default().parse()?;
+    let src = wg_peer_anchor(&key);
+    acl.load(AclPolicy {
+        acls: vec![
+            accept(&src, format!("{local4}:{ALLOWED}")),
+            accept(&src, format!("{local6}:{ALLOWED}")),
+        ],
+        ..AclPolicy::default()
+    })?;
+
+    step("this side initiates the handshake")?;
+    handle.force_handshake(peer.peer, None).await?;
+    wait_for_peer(&handle, WAIT, "no handshake with the kernel", |p| {
+        p.last_handshake.is_some()
+    })
+    .await?;
+
+    acl_tcp(&env, local4, &filter, &mut events).await?;
+    acl_udp(&env, local4, &filter, &mut events).await?;
+
+    server.abort();
+    handle.shutdown().await?;
+    drop(engine);
+    step("reset the kernel peer's session for the tests after this one")?;
+    env.reset_kernel_peer().await
 }
