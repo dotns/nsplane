@@ -1,5 +1,8 @@
 # nstun Architecture
 
+This page describes what is on `main`. The target design and roadmap are in
+[design.md](design.md).
+
 nstun is the dotns fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun), a
 userspace WireGuard implementation. The upstream remote is kept for merges.
 

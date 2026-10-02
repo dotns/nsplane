@@ -63,3 +63,10 @@ a sans-I/O core (`nstun-core`), a tokio driver (`nstun`), platform I/O (`nstun-t
 in-process netstack, and the ACL; `boringtun::device` is deleted after Phase 1. Architecture
 reviewed against firezone connlib, tailscale tstun/wgengine, gotatun, NepTUN, wireguard-go,
 netbird, EasyTier and the userspace-stack crates. Phase 1 is executed as a BKD campaign.
+
+## 2026-10-02 13:10 [progress]
+
+Added `docs/design.md`, the one-page design overview (position in the NS architecture,
+non-goals, principles, crate map, engine model, roadmap, decisions). Plan
+`20261002-1024-data-plane-core` aligned with the NS next-architecture page: 4↔6
+translation and fragmentation in Phase 5, both ns data planes in Phase 6, workstream E.

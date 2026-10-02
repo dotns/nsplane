@@ -315,8 +315,8 @@ Each phase is one PMA task with its own tests; the engine is usable after Phase 
 | 2 | `Transport` with several transports per engine, `PathPolicy`, `PacketFilter` chain with `Handled`, injection, `force_handshake`, `suspend`/`resume`. | in-memory two-transport tests (relay-like path + direct path, roam/no-roam policies); e2e unchanged |
 | 3 | `nstun-netstack`; `Splitter`; netstack-only e2e (no TUN) against kernel WireGuard: TCP echo and UDP echo through the stack. | new e2e script; throughput bench TUN vs netstack |
 | 4 | `nstun-acl`: filter + connection API, fragment gate, flow tracker, policy tests ported. | ported ns policy tests; filter tests on synthetic packets |
-| 5 | Offload and optional pieces: Linux TUN virtio-net GSO/GRO, UDP GSO/GRO transport, optional crypto worker pool in the driver, `nstun-nat` (conntrack, DNAT/SNAT, reverse NAT). | iperf in the e2e containers before/after; ns TUN-mode parity tests |
-| 6 | ns migration (in ns): `tunnel-wg` on the engine, then evaluate `quick-runtime`. | ns test suite, `just qa` |
+| 5 | `nstun-nat`: stateless 4↔6 translation filter (`alias4 ↔ node6` embedding, `lan4 ↔ lan6`, incremental checksums), IPv6 fragmentation and ICMPv6 Packet Too Big handled once in the engine after translation, conntrack + DNAT/SNAT for service publishing; offload: Linux TUN virtio-net GSO/GRO, UDP GSO/GRO transport, optional crypto worker pool in the driver. | translation vectors; fragmentation tests shared by TUN and netstack; iperf in the e2e containers before/after; ns TUN-mode parity tests |
+| 6 | ns migration (in ns, per the NS next-architecture plan phases C and D): both `tunnel-wg` and `quick-runtime` data planes move onto the engine; ns keeps `PeerSource`s, the merged peer table, registry and relay clients, names, ladder rules, presentation and features. | ns test suite, `just qa` |
 
 Estimated size: Phase 1 about 4.5k lines (half moved), Phase 2 about 1.5k, Phase 3 about
 2k (mostly moved from ns), Phase 4 about 3k (moved), Phase 5 about 2.5k.
@@ -360,8 +360,9 @@ scope change that goes through L1.
 | C | `nstun-core` (sans-I/O engine, core-vs-core tests, moved `PeerTable`, `data_path`-style bench) | `nstun-core/`, `Cargo.toml` members | P merged |
 | B | platform I/O: `nstun-tun` (Linux, macOS, Windows, fd adoption; ported from `boringtun/src/device/{tun_linux,tun_darwin,windows/tun}.rs`), `nstun` driver traits, `UdpTransport`, channel transports | `nstun-tun/`, `nstun/src/{io,transport,udp,channel}.rs`, `Cargo.toml` members | P merged |
 | D | engine facade: `Engine`/`EngineBuilder`/`EngineHandle`, events, `nstun-uapi`, `boringtun-cli` on the engine, delete `boringtun/src/device`, e2e and justfile updates, docs | `nstun/src/{engine,builder,handle,events}.rs`, `nstun-uapi/`, `boringtun-cli/`, `boringtun/src/{lib.rs,device/**}`, `scripts/`, `justfile`, `README.md`, `CHANGELOG.md`, `docs/` | C and B merged |
+| E | `nstun-e2e`: library-level end-to-end tests (two engines over channel transports and against kernel WireGuard), added by L1 during the campaign | `nstun-e2e/`, `Cargo.toml` members, `justfile` | D merged |
 
-Merge order P → (C, B in parallel) → D. Phases 2-5 are later campaigns.
+Merge order P → (C, B in parallel) → D → E. Phases 2-5 are later campaigns.
 
 ## Risks
 
@@ -411,6 +412,10 @@ scripts extended. ns is read-only for this plan.
 
 ## Annotations
 
+- 2026-10-02: aligned with the NS next-architecture page (docs site `ns/next`): one
+  engine per node, 4↔6 translation and fragmentation/PTB belong to the engine (Phase 5),
+  Phase 6 migrates both ns data planes. L1 added workstream E (library e2e). The campaign
+  runs in auto mode since round ~20. Overview: `docs/design.md`.
 - 2026-10-02: gate 1 confirmed (`proceed`): four L2s P/C/B/D, value types moved to
   `nstun-packet` with re-exports so C and B run in parallel.
 - 2026-10-02: no code is copied from reference projects; use mature crates (`bytes`) for
