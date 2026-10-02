@@ -427,3 +427,26 @@ scripts extended. ns is read-only for this plan.
   work is split into phases; asked for a second architecture review against comparable
   GitHub projects. Review added above; the core became sans-I/O as a result.
 - 2026-10-02: renamed to nsplane; crates live under crates/
+- 2026-10-02: design input for Phase 5 (and follow-up #1 of task
+  `20261002-1509-phase1-followups`) from Tailscale's "We're making Tailscale faster"
+  (2026-09-22, https://tailscale.com/blog/making-tailscale-faster; design only):
+  1. After a large GRO read, packets stay where they landed and are tracked by offset;
+     many small packets share one allocation instead of each being copied into its own
+     64 KiB buffer (~5% faster). For nsplane: on receive (UDP GRO -> decrypt -> TUN),
+     split the read buffer into `Bytes`/`BytesMut` slices that share the allocation and
+     decrypt in place (output only shrinks, no headroom needed); on send (TUN GSO ->
+     encrypt -> UDP GSO), encrypt straight into the segment offsets of the UDP GSO send
+     buffer, so the encryption write is the only copy. This interacts with the fixed
+     `HEADROOM` of `PacketBuf` and with the O(1) front-adjust proposed in follow-up #1;
+     design them together.
+  2. Queue depths were reduced after measuring that most capacity went unused, lowering
+     latency and memory. For nsplane: add high-water-mark counters to the engine's
+     bounded queues (`queue_capacity`, transmit backlog, sink/source channels), measure
+     under e2e/iperf, then set the defaults from data.
+  3. `writev` hands several pieces of packet data to the kernel in one call without
+     joining them first. For nsplane: write the virtio-net header and the packet to the
+     TUN with `writev` instead of reserving headroom for the header or copying.
+  4. Multi-queue processing for routers/exit nodes: lanes scaled to CPU cores, per-flow
+     ordering kept. For nsplane: decide together with the optional crypto worker pool
+     whether to shard `Core` by peer or hash flows to workers; the single owner task is
+     the current limit.

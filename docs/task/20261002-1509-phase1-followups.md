@@ -19,6 +19,9 @@ for Phase 1 and must be fixed in a later task. Items 1-4 change `boringtun`,
    an O(1) `PacketBuf` front-adjust (removes the two 16-byte `copy_within` shifts), dropping
    the rx buffer swap, keeping lengths in the pool (no `set_len` zero-fill). Fit with the
    Phase 5 batching/GSO work.
+   Design input: plan `20261002-1024-data-plane-core`, annotation of 2026-10-02 on
+   Tailscale's zero-copy receive path (slices sharing one GRO read, encrypting straight
+   into the UDP GSO buffer, `writev` for the virtio-net header, measured queue depths).
 2. **boringtun handshake API.** `nstun-core` gates handshakes with its own `RateLimiter`
    (shared with every `Tunn`, built with `handshake_rate_limit * 2` to offset the double
    count) because `Tunn::handle_verified_packet` is `pub(crate)`. Expose a
