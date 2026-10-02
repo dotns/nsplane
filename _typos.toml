@@ -5,6 +5,8 @@ extend-ignore-re = ["\"O:SY[^\"]*\""]
 [default.extend-words]
 # Mullvad's traffic-analysis defense, mentioned in docs
 DAITA = "DAITA"
+# RFC 3168 ECN-Capable Transport codepoint
+ect = "ect"
 
 [default.extend-identifiers]
 # libc `msghdr` field
