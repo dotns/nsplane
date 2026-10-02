@@ -45,9 +45,5 @@ etherparse = "0.13"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
-name = "crypto_benches"
-harness = false
-
-[[bench]]
 name = "data_path"
 harness = false
