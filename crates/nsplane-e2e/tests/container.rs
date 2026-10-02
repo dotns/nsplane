@@ -214,6 +214,58 @@ async fn tun_carries_socket_datagrams_both_ways() -> TestResult {
     Ok(())
 }
 
+/// Waits for `Event::MtuChanged { mtu }`; the TUN watcher polls the interface MTU every
+/// second, so it is due well within [`WAIT`].
+async fn expect_mtu_changed(events: &mut broadcast::Receiver<Event>, mtu: u16) -> TestResult {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match timeout_at(deadline, events.recv()).await {
+            Ok(Ok(Event::MtuChanged { mtu: changed })) if changed == mtu => return Ok(()),
+            Ok(Ok(Event::MtuChanged { mtu: changed })) => {
+                return Err(format!("MTU changed to {changed}, expected {mtu}").into());
+            }
+            Ok(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => return Err("engine stopped".into()),
+            Err(_) => return Err(format!("no MTU change to {mtu} within {WAIT:?}").into()),
+        }
+    }
+}
+
+/// `ip link set mtu` on the TUN device reaches the engine on it: each change publishes
+/// `Event::MtuChanged` and `EngineHandle::mtu` follows.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN and /dev/net/tun; run by `just e2e-lib`"]
+async fn tun_mtu_changes_reach_the_engine() -> TestResult {
+    let tun = Tun::create("nsplane-mtu%d")?;
+    let name = tun.name()?;
+    let initial = tun.mtu();
+    let (source, sink) = tun.split()?;
+    let transport = UdpTransport::bind(
+        TransportId::new(1),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    )?;
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()?;
+    let handle = engine.handle();
+    let mut events = handle.subscribe().await?;
+    if handle.mtu().await? != initial {
+        return Err(format!("initial MTU {} instead of {initial}", handle.mtu().await?).into());
+    }
+
+    for mtu in [1280, 1400] {
+        step(&format!("MTU {mtu} on {name}"))?;
+        ip(&format!("link set dev {name} mtu {mtu}")).await?;
+        expect_mtu_changed(&mut events, mtu).await?;
+        let current = handle.mtu().await?;
+        if current != mtu {
+            return Err(format!("mtu() is {current} after a change to {mtu}").into());
+        }
+    }
+    handle.shutdown().await?;
+    Ok(())
+}
+
 /// The parameters of the interop test, set by `scripts/e2e/lib.sh`.
 #[derive(Debug)]
 struct Interop {

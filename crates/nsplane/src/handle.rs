@@ -76,6 +76,7 @@ pub(crate) enum Command {
     ReplaceTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
     Suspend(oneshot::Sender<()>),
     Resume(oneshot::Sender<()>),
+    Mtu(oneshot::Sender<u16>),
     Subscribe(oneshot::Sender<broadcast::Receiver<Event>>),
     DropCounters(oneshot::Sender<BTreeMap<&'static str, u64>>),
     Shutdown(oneshot::Sender<()>),
@@ -283,6 +284,17 @@ impl EngineHandle {
     /// does nothing.
     pub async fn resume(&self) -> Result<(), EngineError> {
         self.call(Command::Resume).await
+    }
+
+    /// The MTU of the packet source, as last observed by the engine.
+    ///
+    /// The engine watches [`crate::PacketSource::mtu`] and publishes `Event::MtuChanged`
+    /// once for every change, after which this returns the new value. While suspended,
+    /// changes are not observed: this keeps returning the value from before the suspension,
+    /// and the latest value is published once after [`EngineHandle::resume`] if it
+    /// differs. Once the source drops its watch's sender, the last value stays.
+    pub async fn mtu(&self) -> Result<u16, EngineError> {
+        self.call(Command::Mtu).await
     }
 
     /// Subscribes to the engine's events; see [`crate::events`] for the delivery semantics.
