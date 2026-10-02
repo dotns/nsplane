@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::PublicKey;
@@ -67,9 +67,9 @@ impl Peer {
             .set_persistent_keepalive((interval > 0).then_some(interval));
     }
 
-    /// Runs the timers of the tunnel; see [`Tunn::update_timers`].
-    pub(crate) fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        self.tunnel.update_timers(dst)
+    /// Runs the timers of the tunnel at `now`; see [`Tunn::update_timers_at`].
+    pub(crate) fn update_timers<'a>(&mut self, now: Instant, dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.tunnel.update_timers_at(now, dst)
     }
 
     /// The current path.
@@ -110,9 +110,9 @@ impl Peer {
         self.rx_session = None;
     }
 
-    /// Time since the current session was established.
-    pub(crate) fn time_since_last_handshake(&self) -> Option<Duration> {
-        self.tunnel.time_since_last_handshake()
+    /// Time from the establishment of the current session to `now`.
+    pub(crate) fn time_since_last_handshake(&self, now: Instant) -> Option<Duration> {
+        self.tunnel.time_since_last_handshake_at(now)
     }
 
     /// The persistent keepalive interval in seconds.

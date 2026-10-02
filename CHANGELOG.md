@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_NO_TRANSPORT`, `DROP_TRANSMIT_FULL` and
   `DROP_TRANSPORT_CLOSED`. In-memory `ChannelSource`/`ChannelSink`/`ChannelTransport` for
   tests and embedders.
+- `nsplane-noise`: `Tunn::update_timers_at(now, dst)`, `Tunn::time_since_last_handshake_at(now)`
+  and `RateLimiter::reset_count_at(now)` run the timers on the caller's clock; the
+  no-argument variants use `std::time::Instant::now()`.
 - `nstun-tun`: TUN devices as packet sources and sinks: Linux and Android
   (`/dev/net/tun`), macOS and iOS (utun), Windows (Wintun). `Tun::create`, `Tun::from_fd`
   (Unix) and `Tun::split`.
@@ -53,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking: `Tunn::encapsulate` and the session code return
   `WireGuardError::DestinationBufferTooSmall` instead of panicking on short buffers.
 - Breaking: `AllowedIps::insert` takes the prefix length as `u8`.
+- `nsplane-core` drives every tunnel's timers (handshake retries, keepalives, rekey, session
+  expiry, the rate limiter reset) and `last_handshake` with the `now` it is given instead
+  of nsplane-noise's own clock.
 - Breaking (CLI): `boringtun-cli` is a Linux/macOS development tool. It runs in the
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;
@@ -64,6 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `boringtun` no longer depends on `socket2`, `thiserror`, `wintun-bindings`, `windows-sys`,
   `ip_network` or `ip_network_table`, nor on the `nix` `user` feature.
 - `just integration` and the upstream integration tests that ran against the device.
+- Breaking: the `mock-instant` features of `nsplane-noise` and `nsplane-core`; tests drive
+  the timers through the `_at` methods and the core's `now` instead.
 
 ### Security
 - Cookies (mac2) cover the source port as well as the IP, as the whitepaper requires.

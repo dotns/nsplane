@@ -8,7 +8,6 @@
 /// The transport-agnostic WireGuard protocol state machine.
 pub mod noise;
 
-#[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
 
 /// Re-export of the x25519 types
