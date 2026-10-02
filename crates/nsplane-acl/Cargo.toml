@@ -23,4 +23,9 @@ thiserror = "2.0.21"
 tracing = "0.1.40"
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 serde_json = "1.0.149"
+
+[[bench]]
+name = "namespaces"
+harness = false

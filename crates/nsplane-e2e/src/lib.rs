@@ -32,7 +32,7 @@ use nsplane::{
 };
 use nsplane_core::Event;
 use nsplane_netstack::{
-    NetStack, NetStackConfig, NetStackHandle, NetStackSource, TcpConnection, UdpFlow,
+    NetStack, NetStackConfig, NetStackHandle, NetStackSink, NetStackSource, TcpConnection, UdpFlow,
 };
 use nsplane_packet::checksum::{
     ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
@@ -607,6 +607,46 @@ impl StackNode {
         })
     }
 
+    /// Builds a node like [`StackNode::new`], with `configure` adding the transports (any
+    /// number, of any types) and further settings, such as packet filters, to the engine
+    /// builder. `id` and `addr` are the node's own [`StackNode::path`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn with_builder(
+        seed: u8,
+        id: TransportId,
+        addr: SocketAddr,
+        mtu: u16,
+        configure: impl FnOnce(
+            EngineBuilder<NetStackSource, NetStackSink>,
+        ) -> EngineBuilder<NetStackSource, NetStackSink>,
+    ) -> TestResult<Self> {
+        let ip4 = Ipv4Addr::new(10, 0, 0, seed);
+        let ip6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed));
+        let (stack, handle) = NetStack::new(NetStackConfig::new(
+            vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)],
+            mtu,
+        ));
+        let (source, sink) = stack.split();
+        let builder = EngineBuilder::new(source, sink).private_key(StaticSecret::from([seed; 32]));
+        let engine = configure(builder).build()?;
+        Ok(Self {
+            handle: engine.handle(),
+            engine,
+            stack: handle,
+            secret: StaticSecret::from([seed; 32]),
+            ip4,
+            ip6,
+            path: Path {
+                transport: id,
+                addr,
+                ecn: Ecn::NotEct,
+            },
+        })
+    }
+
     /// The node's public key.
     pub fn public(&self) -> PublicKey {
         PublicKey::from(&self.secret)
@@ -632,6 +672,11 @@ impl StackNode {
             }),
             ..Peer::new(self.public())
         }
+    }
+
+    /// Subscribes to the engine's events from now on.
+    pub async fn subscribe(&self) -> TestResult<Events> {
+        Ok(Events(self.handle.subscribe().await?))
     }
 
     /// The node's tunnel address of `family` with `port`.
