@@ -65,11 +65,6 @@ impl UdpTransport {
         Ok(Self { id, local, socket })
     }
 
-    /// This transport's id, reported in every received [`Path::transport`].
-    pub const fn id(&self) -> TransportId {
-        self.id
-    }
-
     /// The bound address (with the OS-chosen port when bound to port 0).
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
@@ -97,6 +92,10 @@ impl UdpTransport {
 }
 
 impl Transport for UdpTransport {
+    fn id(&self) -> TransportId {
+        self.id
+    }
+
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
         buf.set_len(buf.capacity());
         let (len, addr, ecn) = self

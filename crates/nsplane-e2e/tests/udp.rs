@@ -40,7 +40,7 @@ async fn standard_roaming_follows_a_new_source_address() -> TestResult {
     let moved = UdpTransport::bind(b.path.transport, SocketAddr::new(localhost, 0))?;
     let new_addr = moved.local_addr();
     assert_ne!(new_addr, b.path.addr);
-    b.handle.set_transport(moved).await?;
+    b.handle.replace_transport(moved).await?;
 
     transfer(&b, &mut a, Family::V4, 64).await?;
     events
