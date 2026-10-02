@@ -46,6 +46,8 @@ mod unix;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+mod offload;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod darwin;
