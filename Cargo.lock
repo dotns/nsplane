@@ -771,6 +771,7 @@ dependencies = [
 name = "nsplane-e2e"
 version = "0.8.0"
 dependencies = [
+ "nix",
  "nsplane",
  "nsplane-core",
  "nsplane-packet",

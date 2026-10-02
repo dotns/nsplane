@@ -19,9 +19,9 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-noise/`  | `nsplane-noise`  | Protocol library: Noise handshake, sessions, timers (`noise`); no I/O |
 | `crates/nsplane-packet/` | `nsplane-packet` | Packet buffers, IP header views and shared value types; no I/O |
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
-| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
+| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
-| `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket listener |
+| `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
 
@@ -89,13 +89,20 @@ wg setconf wg0 /path/to/wg0.conf
 | `-t`, `--threads`           | `WG_THREADS`   | Tokio runtime worker threads (default 4)                  |
 | `-v`, `--verbosity`         | `WG_LOG_LEVEL` | `error` (default), `info`, `debug` or `trace`             |
 | `--disable-drop-privileges` | `WG_SUDO`      | Keep root; otherwise switch to `SUDO_UID`/`SUDO_GID` after setup |
+| `--tun-fd <FD>`             | `WG_TUN_FD`    | Adopt this already-open TUN fd instead of creating the interface |
+| `--uapi-fd <FD>`            | `WG_UAPI_FD`   | Also serve the UAPI on this already-connected Unix stream socket |
 
 - The UAPI listens on `/var/run/wireguard/<name>.sock`.
 - The UDP socket is bound to an ephemeral port at startup; `wg set <name> listen-port <port>`
   rebinds it.
-- `--tun-fd`/`WG_TUN_FD` and `--uapi-fd`/`WG_UAPI_FD` are gone: adopting a raw fd needs
-  `unsafe`, which the CLI forbids (the library keeps `nsplane_tun::Tun::from_fd`).
-  `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
+- `--tun-fd` and `--uapi-fd` take fds inherited from a parent process (FD_CLOEXEC cleared).
+  The daemon takes ownership of both and closes them on exit; a closed or invalid fd fails
+  startup. An adopted TUN fd starts with MTU 1420 and then follows the interface MTU. The
+  interface name stays required: the UAPI socket is named after the adopted device's name
+  when it can be queried, else after `<interface_name>`.
+- `--uapi-fd` serves one client connection next to the standard socket, which is still
+  bound; the daemon keeps running when that connection ends.
+- `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 
 It does not daemonize, so `wg-quick` with `WG_QUICK_USERSPACE_IMPLEMENTATION` is not
@@ -107,8 +114,9 @@ supported.
 
 - `wintun.dll` (from <https://www.wintun.net/>, matching the architecture) must sit next to
   the executable, which runs elevated.
-- `nsplane-uapi` has no Windows listener (named pipe) yet; embedders configure the engine
-  through `EngineHandle` or `Uapi::handle_request`.
+- `nsplane-uapi` listens on the named pipe
+  `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` with the default security
+  descriptor; the path and descriptor are not yet verified on a real Windows host.
 
 ## Quality gates
 
