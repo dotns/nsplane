@@ -7,7 +7,8 @@ use std::time::SystemTime;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    AllowedIp, ChannelSink, ChannelSource, Engine, EngineBuilder, EngineHandle, PeerStats,
+    AllowedIp, ChannelSink, ChannelSource, ChannelTransport, Engine, EngineBuilder, EngineHandle,
+    PeerStats, Transport,
 };
 use nsplane_e2e::{Family, MTU, QUIET, TestResult, WAIT, payload, udp4, udp6};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -120,16 +121,28 @@ impl Node {
     /// An engine with no private key and the UAPI's transport on a free port; the seed picks
     /// the key the UAPI sets and the tunnel addresses `10.0.0.<seed>` and `fd00::<seed>`.
     fn new(seed: u8) -> TestResult<Self> {
-        let (source, local, mtu) = ChannelSource::new(1024, MTU);
-        let (sink, delivered) = ChannelSink::new(1024);
         let transport = udp_transport(0)?;
         let port = transport.local_addr().port();
+        Self::with_transport(seed, transport, |handle| {
+            Uapi::with_listen_port(handle, port)
+        })
+    }
+
+    /// Like [`Node::new`], with the engine on `transport` and the UAPI that `uapi` builds
+    /// over its handle.
+    fn with_transport<T: Transport>(
+        seed: u8,
+        transport: T,
+        uapi: impl FnOnce(EngineHandle) -> Uapi,
+    ) -> TestResult<Self> {
+        let (source, local, mtu) = ChannelSource::new(1024, MTU);
+        let (sink, delivered) = ChannelSink::new(1024);
         let engine = EngineBuilder::new(source, sink)
             .transport(transport)
             .build()?;
         let handle = engine.handle();
         Ok(Self {
-            uapi: Uapi::with_listen_port(handle.clone(), port),
+            uapi: uapi(handle.clone()),
             handle,
             _engine: engine,
             local,
@@ -190,12 +203,16 @@ impl Node {
     /// The `set=1` peer section that makes this node a peer: preshared key, loopback
     /// endpoint, both tunnel addresses and a persistent keepalive.
     fn peer_section(&self) -> String {
+        self.peer_section_at(SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)))
+    }
+
+    /// [`Node::peer_section`] with the endpoint `endpoint`.
+    fn peer_section_at(&self, endpoint: SocketAddr) -> String {
         format!(
-            "public_key={}\npreshared_key={}\nendpoint=127.0.0.1:{}\nallowed_ip={}/32\n\
+            "public_key={}\npreshared_key={}\nendpoint={endpoint}\nallowed_ip={}/32\n\
              allowed_ip={}/128\npersistent_keepalive_interval={KEEPALIVE}\n",
             hex(self.public().as_bytes()),
             hex(&PSK),
-            self.port,
             self.ip4,
             self.ip6,
         )
@@ -519,5 +536,127 @@ async fn get_and_set_over_a_unix_socket() -> TestResult {
     a.handle.shutdown().await?;
     timeout(WAIT, server).await???;
     assert!(!path.exists());
+    Ok(())
+}
+
+/// A UAPI socket serving `node`'s UAPI, removed when dropped.
+#[cfg(unix)]
+struct Socket {
+    path: std::path::PathBuf,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+#[cfg(unix)]
+impl Socket {
+    /// Serves `node`'s UAPI on a socket named after `name`.
+    fn serve(node: &Node, name: &str) -> TestResult<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "nsplane-e2e-uapi-{name}-{}.sock",
+            std::process::id()
+        ));
+        let listener = nsplane_uapi::UapiListener::bind_path(&path)?;
+        let uapi = node.uapi.clone();
+        let server = tokio::spawn(async move { uapi.serve(listener).await });
+        Ok(Self { path, server })
+    }
+
+    /// Sends `request` on a new connection and returns the parsed response.
+    async fn request(&self, request: &str) -> TestResult<Config> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = timeout(WAIT, tokio::net::UnixStream::connect(&self.path)).await??;
+        stream.write_all(request.as_bytes()).await?;
+        // A failed request ends the connection; a served one waits for the next request.
+        let mut out = Vec::new();
+        let mut buf = [0; 4096];
+        while !out.ends_with(b"\n\n") {
+            let n = timeout(WAIT, stream.read(&mut buf)).await??;
+            if n == 0 {
+                return Err("connection closed".into());
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        parse(&String::from_utf8(out)?)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.server.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listen_port_rebinds_an_owned_udp_transport() -> TestResult {
+    let (mut a, mut b) = pair().await?;
+    transfer(&a, &mut b, Family::V4).await?;
+    let socket = Socket::serve(&a, "owned")?;
+    let old = a.port;
+
+    // The repeated port is a no-op, a new one moves a to a new socket.
+    let reply = socket
+        .request(&format!("set=1\nlisten_port={old}\n\n"))
+        .await?;
+    assert_eq!(reply.errno, 0);
+    assert_eq!(socket.request("get=1\n\n").await?.listen_port, Some(old));
+    assert_eq!(socket.request("set=1\nlisten_port=0\n\n").await?.errno, 0);
+    let config = socket.request("get=1\n\n").await?;
+    a.port = config.listen_port.ok_or("no listen port")?;
+    assert_ne!(a.port, old);
+
+    // b follows a to its new port and traffic flows both ways over it.
+    b.set(&a.peer_section()).await?;
+    transfer(&a, &mut b, Family::V4).await?;
+    transfer(&b, &mut a, Family::V6).await?;
+    assert_eq!(
+        b.peer(a.public()).await?.path.map(|path| path.addr),
+        Some(SocketAddr::from((Ipv4Addr::LOCALHOST, a.port)))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listen_port_leaves_an_external_transport_alone() -> TestResult {
+    const PORT: u16 = 51820;
+    let addr = |seed: u8| SocketAddr::from(([192, 0, 2, seed], 1000));
+    let (one, two) = ChannelTransport::pair(1024, (TRANSPORT_ID, addr(1)), (TRANSPORT_ID, addr(2)));
+    let external = |handle: EngineHandle| Uapi::with_external_transport(handle, PORT);
+    let mut a = Node::with_transport(1, one, external)?;
+    let mut b = Node::with_transport(2, two, external)?;
+    for (node, other, endpoint) in [(&a, &b, addr(2)), (&b, &a, addr(1))] {
+        node.set(&format!("private_key={}\n", hex(&node.secret.to_bytes())))
+            .await?;
+        node.set(&other.peer_section_at(endpoint)).await?;
+    }
+    transfer(&a, &mut b, Family::V4).await?;
+    let socket = Socket::serve(&a, "external")?;
+
+    // The reported settings are no-ops; others fail with EADDRINUSE and change nothing.
+    for (request, errno) in [
+        (format!("set=1\nlisten_port={PORT}\n\n"), 0),
+        ("set=1\nfwmark=0\n\n".to_owned(), 0),
+        (format!("set=1\nlisten_port={}\n\n", PORT + 1), 98),
+        ("set=1\nlisten_port=0\n\n".to_owned(), 98),
+        ("set=1\nfwmark=7\n\n".to_owned(), 98),
+    ] {
+        assert_eq!(socket.request(&request).await?.errno, errno, "{request:?}");
+        assert_eq!(
+            socket.request("get=1\n\n").await?.listen_port,
+            Some(PORT),
+            "{request:?}"
+        );
+    }
+
+    // The channel transport still carries the tunnel both ways.
+    transfer(&a, &mut b, Family::V4).await?;
+    transfer(&b, &mut a, Family::V6).await?;
+    assert_eq!(
+        a.peer(b.public()).await?.path.map(|path| path.addr),
+        Some(addr(2))
+    );
     Ok(())
 }

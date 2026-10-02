@@ -1,13 +1,24 @@
-//! The default network-side transport: one tokio UDP socket.
+//! The default network-side transport: one tokio UDP socket driven through `quinn-udp`,
+//! with segmentation offload.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use nsplane_packet::{PacketBuf, Path, TransportId};
+use nsplane_packet::{Ecn, PacketBuf, Path, TransportId};
+use quinn_udp::{EcnCodepoint, Transmit, UdpSockRef, UdpSocketState};
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 use crate::transport::Transport;
+
+/// The most bytes one send carries: the largest IPv4 UDP payload, so also the limit of a
+/// segmented send.
+const MAX_SEND: usize = 65_507;
+
+/// The socket buffer size [`UdpTransport::bind`] requests for both directions.
+const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 
 /// A [`Transport`] over one UDP socket.
 ///
@@ -16,12 +27,56 @@ use crate::transport::Transport;
 /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`). On an IPv4 socket, sending to an IPv6
 /// address fails with [`io::ErrorKind::InvalidInput`].
 ///
-/// ECN: on Linux and Android the TOS / traffic class byte of each received datagram is
-/// read from its `recvmsg` control message (`IP_RECVTOS`, `IPV6_RECVTCLASS`) and
-/// reported in [`Path::ecn`]; on send, `to.ecn` is set per datagram with an `IP_TOS` or
-/// `IPV6_TCLASS` control message on `sendmsg`, so no socket-wide state changes. On other
-/// platforms (macOS, iOS, Windows) received datagrams report [`Ecn::NotEct`](nsplane_packet::Ecn::NotEct) and `to.ecn`
-/// is ignored.
+/// The socket is driven through `quinn-udp`, which also sets it up: IP fragmentation is
+/// off (`IP_PMTUDISC_PROBE` and `IPV6_DONTFRAG` on Linux and Android, `IP_DONTFRAG` or
+/// `IP_DONTFRAGMENT` elsewhere), so a datagram larger than the interface MTU fails to send
+/// instead of leaving in fragments. Where `quinn-udp` cannot set the socket up on other
+/// platforms than Linux and Android (Wine lacks some IPv4 options), the transport sends with
+/// plain `send_to` instead: without ECN marks and segmentation, fragmenting as the OS
+/// does by default.
+///
+/// ECN: on send, `to.ecn` is set per datagram with an `IP_TOS` / `IPV6_TCLASS` (Windows:
+/// `IP_ECN` / `IPV6_ECN`) control message, so no socket-wide state changes; Windows sets it
+/// only where its Winsock provider supports ECN (Wine does not). On Linux and Android the
+/// mark of each received datagram is read from its control message and reported in
+/// [`Path::ecn`]; on other platforms (macOS, iOS, the BSDs, Windows) received datagrams
+/// report [`Ecn::NotEct`].
+///
+/// Segmentation offload is on by default and turned off with
+/// [`set_offload`](Self::set_offload):
+/// - Receive (Linux and Android, `UDP_GRO`): the kernel may coalesce datagrams of one sender
+///   into one read, a train of equally sized datagrams of which the last may be shorter.
+///   [`recv_batch`](Transport::recv_batch) hands out each one as a slice of the read
+///   ([`PacketBuf::from_shared`]) with [`HEADROOM`](nsplane_packet::HEADROOM) bytes in
+///   front, where the engine opens it in place. The first datagram of a read is not
+///   copied; the others are moved apart within the read buffer to make that room (one
+///   move per train, no allocation). [`recv`](Transport::recv) copies one datagram into
+///   the caller's buffer and keeps the rest of the train for the next receive.
+/// - Send (Linux and Android `UDP_SEGMENT`, Windows USO):
+///   [`send_batch`](Transport::send_batch) sends a run of consecutive datagrams to the same
+///   address with the same ECN mark and of the same size (the last may be shorter) as one
+///   segmented send, up to the kernel's segment limit and 64 KiB, copying the run into one
+///   buffer. Datagrams that start no run are sent one by one. Where segmentation is not
+///   available, or a segmented send fails with `EIO` or `EINVAL` (a device without
+///   segmentation support), sending falls back to one datagram per send.
+///
+/// With offload off every datagram takes one system call in both directions, as without
+/// offload support. Either way the datagrams, their order, sizes, paths and ECN marks are
+/// the same.
+///
+/// Socket buffers: [`bind`](Self::bind) requests 4 MiB for both the receive (`SO_RCVBUF`)
+/// and the send buffer (`SO_SNDBUF`), so a burst does not overflow the receive queue
+/// before the engine reads it, as it does with Linux's default of 208 KiB on a loaded
+/// host. The kernel grants what its limits allow: Linux clamps the
+/// request to `net.core.rmem_max` / `net.core.wmem_max` without an error (raise those
+/// sysctls for the full size; `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE`, which bypass them with
+/// `CAP_NET_ADMIN`, are not used). [`set_recv_buffer_size`](Self::set_recv_buffer_size)
+/// and [`set_send_buffer_size`](Self::set_send_buffer_size) change the sizes later;
+/// [`recv_buffer_size`](Self::recv_buffer_size) and
+/// [`send_buffer_size`](Self::send_buffer_size) report what the kernel says, which on
+/// Linux is twice the granted request (the kernel reserves the extra half for its
+/// bookkeeping). Windows, macOS and the BSDs take the same options through the same calls,
+/// with their own limits (macOS: `kern.ipc.maxsockbuf`) and without the doubling.
 ///
 /// Windows: a datagram larger than the receive buffer is truncated as on other
 /// platforms, although `recvfrom` reports it as `WSAEMSGSIZE`; its sender is peeked
@@ -34,15 +89,28 @@ pub struct UdpTransport {
     id: TransportId,
     local: SocketAddr,
     socket: UdpSocket,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    state: UdpSocketState,
+    /// `None` where `quinn-udp` could not set the socket up.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    state: Option<UdpSocketState>,
+    offload: AtomicBool,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    rx: std::sync::Mutex<linux::Rx>,
 }
 
 impl UdpTransport {
-    /// Binds a non-blocking UDP socket to `addr`.
+    /// Binds a non-blocking UDP socket to `addr`, with segmentation offload on and
+    /// 4 MiB requested for both socket buffers.
     ///
     /// For the IPv6 unspecified address (`[::]:port`) the socket is dual-stack
     /// (`IPV6_V6ONLY` off). If IPv6 is unavailable on the host, it binds `0.0.0.0:port`
     /// instead and serves IPv4 only; [`local_addr`](Self::local_addr) tells which. Any
     /// other address is bound exactly.
+    ///
+    /// The socket buffers get what the kernel grants of the request (see the
+    /// [type documentation](Self)); a failure to size them is logged and does not fail
+    /// the bind.
     ///
     /// # Panics
     ///
@@ -58,11 +126,47 @@ impl UdpTransport {
             _ => bind_socket(addr)?,
         };
         socket.set_nonblocking(true)?;
+        // Before `quinn-udp` sets the socket up: on Apple platforms it caches `SO_SNDBUF`.
+        for (option, result) in [
+            (
+                "SO_RCVBUF",
+                socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+            (
+                "SO_SNDBUF",
+                socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+        ] {
+            if let Err(e) = result {
+                tracing::debug!(message = "Default socket buffer not set", option, error = ?e);
+            }
+        }
         let socket = UdpSocket::from_std(socket.into())?;
         let local = socket.local_addr()?;
+        let state = UdpSocketState::new(UdpSockRef::from(&socket));
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        linux::enable_ecn(&socket, local)?;
-        Ok(Self { id, local, socket })
+        let state = state?;
+        // Receive timestamps are not used, and their control message would crowd out the
+        // ECN mark of a coalesced read from `quinn-udp`'s control buffer.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        nix::sys::socket::setsockopt(
+            &socket,
+            nix::sys::socket::sockopt::ReceiveTimestampns,
+            &false,
+        )?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = state
+            .inspect_err(|e| tracing::debug!(message = "Plain UDP sends", error = ?e))
+            .ok();
+        Ok(Self {
+            id,
+            local,
+            socket,
+            state,
+            offload: AtomicBool::new(true),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            rx: std::sync::Mutex::default(),
+        })
     }
 
     /// The bound address (with the OS-chosen port when bound to port 0).
@@ -74,6 +178,61 @@ impl UdpTransport {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn set_fwmark(&self, mark: u32) -> io::Result<()> {
         socket2::SockRef::from(&self.socket).set_mark(mark)
+    }
+
+    /// Requests a receive buffer (`SO_RCVBUF`) of `bytes`; the kernel may grant less (see
+    /// the [type documentation](Self)). [`recv_buffer_size`](Self::recv_buffer_size) tells
+    /// what it granted.
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        socket2::SockRef::from(&self.socket).set_recv_buffer_size(bytes)
+    }
+
+    /// Requests a send buffer (`SO_SNDBUF`) of `bytes`; the kernel may grant less (see the
+    /// [type documentation](Self)). [`send_buffer_size`](Self::send_buffer_size) tells what
+    /// it granted.
+    pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        // Through `quinn-udp`, which caches the size on Apple platforms.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let state = Some(&self.state);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = self.state.as_ref();
+        let Some(state) = state else {
+            return socket2::SockRef::from(&self.socket).set_send_buffer_size(bytes);
+        };
+        state.set_send_buffer_size(UdpSockRef::from(&self.socket), bytes)
+    }
+
+    /// The receive buffer size the kernel reports (`SO_RCVBUF`): on Linux twice the
+    /// granted request.
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.socket).recv_buffer_size()
+    }
+
+    /// The send buffer size the kernel reports (`SO_SNDBUF`): on Linux twice the granted
+    /// request.
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        socket2::SockRef::from(&self.socket).send_buffer_size()
+    }
+
+    /// Turns segmentation offload on (the default) or off; see the
+    /// [type documentation](Self). Takes effect for the next receive and send; datagrams
+    /// the kernel already coalesced are still split correctly.
+    pub fn set_offload(&self, enabled: bool) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.state.gro_segments() > 1 {
+            nix::sys::socket::setsockopt(
+                &self.socket,
+                nix::sys::socket::sockopt::UdpGroSegment,
+                &enabled,
+            )?;
+        }
+        self.offload.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether segmentation offload is on.
+    pub fn offload(&self) -> bool {
+        self.offload.load(Ordering::Relaxed)
     }
 
     /// Maps `addr` to the socket's address family.
@@ -89,6 +248,57 @@ impl UdpTransport {
             _ => Ok(addr),
         }
     }
+
+    /// The path of a datagram received from `addr` with mark `ecn`.
+    fn path(&self, addr: SocketAddr, ecn: Ecn) -> Path {
+        Path {
+            transport: self.id,
+            addr: unmap(addr),
+            ecn,
+        }
+    }
+
+    /// The most datagrams one send may carry right now.
+    fn max_segments(&self) -> usize {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let state = Some(&self.state);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = self.state.as_ref();
+        match state {
+            Some(state) if self.offload() => state.max_gso_segments(),
+            _ => 1,
+        }
+    }
+
+    /// Sends `contents` to `to`: one datagram, or with `segment_size` a train of datagrams
+    /// of that size (the last may be shorter).
+    async fn send_segments(
+        &self,
+        contents: &[u8],
+        segment_size: Option<usize>,
+        to: &Path,
+    ) -> io::Result<()> {
+        let destination = self.target(to.addr)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let state = Some(&self.state);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = self.state.as_ref();
+        let Some(state) = state else {
+            return self.socket.send_to(contents, destination).await.map(drop);
+        };
+        let transmit = Transmit {
+            destination,
+            ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
+            contents,
+            segment_size,
+            src_ip: None,
+        };
+        self.socket
+            .async_io(Interest::WRITABLE, || {
+                state.try_send(UdpSockRef::from(&self.socket), &transmit)
+            })
+            .await
+    }
 }
 
 impl Transport for UdpTransport {
@@ -97,24 +307,77 @@ impl Transport for UdpTransport {
     }
 
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
-        buf.set_len(buf.capacity());
-        let (len, addr, ecn) = self
-            .recv_from(buf.as_packet_mut())
-            .await
-            .inspect_err(|_| buf.set_len(0))?;
-        buf.set_len(len);
-        let path = Path {
-            transport: self.id,
-            addr: unmap(addr),
-            ecn,
-        };
-        Ok((len, path))
+        self.recv_datagram(buf).await
     }
 
     async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
-        let target = self.target(to.addr)?;
-        self.send_to(datagram, target, to.ecn).await
+        self.send_segments(datagram, None, to).await
     }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn recv_batch(
+        &self,
+        buf: &mut PacketBuf,
+        datagrams: &mut std::collections::VecDeque<(Path, PacketBuf)>,
+    ) -> io::Result<()> {
+        self.recv_datagrams(buf, datagrams).await
+    }
+
+    async fn send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+    ) -> io::Result<()> {
+        // One buffer for the runs of this batch; encrypting into it directly would save
+        // the copy.
+        let mut train = Vec::new();
+        while let Some((to, first)) = datagrams.get(*sent) {
+            let run = run_len(&datagrams[*sent..], self.max_segments());
+            let result = if run == 1 {
+                self.send_segments(first.as_packet(), None, to).await
+            } else {
+                train.clear();
+                for (_, datagram) in &datagrams[*sent..*sent + run] {
+                    train.extend_from_slice(datagram.as_packet());
+                }
+                self.send_segments(&train, Some(first.len()), to).await
+            };
+            *sent += run;
+            result?;
+        }
+        Ok(())
+    }
+}
+
+/// How many datagrams from the start of `datagrams` go out in one send of at most
+/// `max_segments`: the first one, and the ones after it with the same address and ECN mark
+/// and the first one's size, up to one shorter one that ends the run, while the run fits
+/// into [`MAX_SEND`] bytes. `0` for no datagrams.
+fn run_len(datagrams: &[(Path, PacketBuf)], max_segments: usize) -> usize {
+    let Some(((to, first), rest)) = datagrams.split_first() else {
+        return 0;
+    };
+    let size = first.len();
+    let mut run = 1;
+    let mut total = size;
+    for (path, datagram) in rest {
+        let len = datagram.len();
+        if run == max_segments
+            || path.addr != to.addr
+            || path.ecn != to.ecn
+            || len == 0
+            || len > size
+            || total + len > MAX_SEND
+        {
+            break;
+        }
+        run += 1;
+        total += len;
+        if len < size {
+            break;
+        }
+    }
+    run
 }
 
 /// Creates a dual-stack IPv6 socket bound to `addr`.
@@ -145,148 +408,194 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
-    //! `recvmsg` / `sendmsg` with TOS and traffic class control messages.
+    //! Receiving through `quinn-udp`, with generic receive offload: one read may return a
+    //! train of datagrams of one sender, all of one size (the stride) but the last.
 
-    use std::io::{self, IoSlice, IoSliceMut};
-    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-    use std::os::fd::AsRawFd;
+    use std::collections::VecDeque;
+    use std::io::{self, IoSliceMut};
+    use std::sync::{MutexGuard, PoisonError};
 
-    use nix::sys::socket::{
-        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, sendmsg,
-    };
-    use nsplane_packet::Ecn;
-    use socket2::SockRef;
+    use bytes::BytesMut;
+    use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH, PacketBuf, Path};
+    use quinn_udp::{RecvMeta, UdpSockRef};
     use tokio::io::Interest;
-    use tokio::net::UdpSocket;
 
     use super::UdpTransport;
 
-    /// Control-message buffer, aligned for `cmsghdr`; holds one TOS or traffic class
-    /// message (24 bytes on 64-bit targets) with room to spare.
-    #[repr(C, align(8))]
-    struct CmsgBuf([u8; 64]);
+    /// Bytes one coalesced read may fill: the largest datagram, and the most the kernel
+    /// coalesces into one read.
+    const READ: usize = 1 << 16;
 
-    /// Asks for the TOS (IPv4, including IPv4-mapped peers of a dual-stack socket) and
-    /// traffic class (IPv6) of every received datagram.
-    pub(super) fn enable_ecn(socket: &UdpSocket, local: SocketAddr) -> io::Result<()> {
-        let socket = SockRef::from(socket);
-        socket.set_recv_tos_v4(true)?;
-        if local.is_ipv6() {
-            socket.set_recv_tclass_v6(true)?;
-        }
-        Ok(())
+    /// What the receiving side keeps between receives.
+    #[derive(Debug, Default)]
+    pub(super) struct Rx {
+        /// Storage for coalesced reads; every read takes its datagrams off the front, so
+        /// they share the allocation, which is freed once all of them are dropped.
+        buf: BytesMut,
+        /// Datagrams read but not handed out yet, oldest first.
+        pending: VecDeque<(Path, PacketBuf)>,
     }
 
     impl UdpTransport {
-        pub(super) async fn recv_from(
-            &self,
-            packet: &mut [u8],
-        ) -> io::Result<(usize, SocketAddr, Ecn)> {
-            let fd = self.socket.as_raw_fd();
-            self.socket
-                .async_io(Interest::READABLE, || {
-                    let mut iov = [IoSliceMut::new(&mut *packet)];
-                    let mut cmsg = CmsgBuf([0; 64]);
-                    let msg = recvmsg::<SockaddrStorage>(
-                        fd,
-                        &mut iov,
-                        Some(&mut cmsg.0),
-                        MsgFlags::empty(),
-                    )?;
-                    let addr = msg.address.as_ref().and_then(socket_addr).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "datagram without source")
-                    })?;
-                    // A truncated control buffer only loses the ECN mark.
-                    let ecn =
-                        msg.cmsgs()
-                            .ok()
-                            .into_iter()
-                            .flatten()
-                            .fold(Ecn::NotEct, |ecn, cmsg| match cmsg {
-                                ControlMessageOwned::Ipv4Tos(tos) => Ecn::from_bits(tos),
-                                ControlMessageOwned::Ipv6TClass(tclass) => {
-                                    u8::try_from(tclass & 0xFF).map_or(ecn, Ecn::from_bits)
-                                }
-                                _ => ecn,
-                            });
-                    Ok((msg.bytes, addr, ecn))
-                })
-                .await
+        fn rx(&self) -> MutexGuard<'_, Rx> {
+            self.rx.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
-        pub(super) async fn send_to(
-            &self,
-            datagram: &[u8],
-            to: SocketAddr,
-            ecn: Ecn,
-        ) -> io::Result<()> {
-            let fd = self.socket.as_raw_fd();
-            let dest = SockaddrStorage::from(to);
-            let tos = ecn.to_bits();
-            let tclass = i32::from(tos);
-            // IPv4 and IPv4-mapped destinations take IP_TOS, even on an IPv6 socket.
-            let cmsg = match to {
-                _ if ecn == Ecn::NotEct => None,
-                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
-                    Some(ControlMessage::Ipv6TClass(&tclass))
+        /// [`Transport::recv`](crate::Transport::recv).
+        pub(super) async fn recv_datagram(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+            loop {
+                let next = self.rx().pending.pop_front();
+                if let Some((path, datagram)) = next {
+                    let len = datagram.len().min(buf.capacity());
+                    buf.set_len(len);
+                    buf.as_packet_mut()
+                        .copy_from_slice(&datagram.as_packet()[..len]);
+                    return Ok((len, path));
                 }
-                _ => Some(ControlMessage::Ipv4Tos(&tos)),
-            };
-            self.socket
-                .async_io(Interest::WRITABLE, || {
-                    sendmsg(
-                        fd,
-                        &[IoSlice::new(datagram)],
-                        cmsg.as_slice(),
-                        MsgFlags::empty(),
-                        Some(&dest),
-                    )
-                    .map_err(io::Error::from)
+                if !self.offload() {
+                    return self.read_into(buf).await;
+                }
+                self.read_coalesced().await?;
+            }
+        }
+
+        /// [`Transport::recv_batch`](crate::Transport::recv_batch).
+        pub(super) async fn recv_datagrams(
+            &self,
+            buf: &mut PacketBuf,
+            datagrams: &mut VecDeque<(Path, PacketBuf)>,
+        ) -> io::Result<()> {
+            let capacity = buf.capacity();
+            loop {
+                let room = MAX_BATCH.saturating_sub(datagrams.len());
+                {
+                    let mut rx = self.rx();
+                    if room == 0 || !rx.pending.is_empty() {
+                        let ready = room.min(rx.pending.len());
+                        for (path, mut datagram) in rx.pending.drain(..ready) {
+                            if datagram.len() > capacity {
+                                datagram.set_len(capacity);
+                            }
+                            datagrams.push_back((path, datagram));
+                        }
+                        return Ok(());
+                    }
+                }
+                if !self.offload() {
+                    let (len, path) = self.read_into(buf).await?;
+                    datagrams.push_back((path, PacketBuf::from_packet(&buf.as_packet()[..len])));
+                    return Ok(());
+                }
+                self.read_coalesced().await?;
+            }
+        }
+
+        /// Reads into `buf` under the [`recv`](crate::Transport::recv) buffer contract.
+        /// Datagrams after the first of a train (coalesced before offload was turned off)
+        /// are copied to the pending queue.
+        async fn read_into(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+            buf.set_len(buf.capacity());
+            let meta = self
+                .socket
+                .async_io(Interest::READABLE, || {
+                    let mut meta = [RecvMeta::default()];
+                    let mut bufs = [IoSliceMut::new(buf.as_packet_mut())];
+                    self.state
+                        .recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    Ok(meta[0])
                 })
                 .await
-                .map(drop)
+                .inspect_err(|_| buf.set_len(0))?;
+            let path = self.path(meta.addr, ecn(&meta));
+            let len = meta.stride.min(meta.len);
+            if len > 0 && len < meta.len {
+                let mut rx = self.rx();
+                for datagram in buf.as_packet()[len..meta.len].chunks(len) {
+                    rx.pending
+                        .push_back((path, PacketBuf::from_packet(datagram)));
+                }
+            }
+            buf.set_len(len);
+            Ok((len, path))
+        }
+
+        /// Reads one datagram or train into the shared storage and queues its datagrams,
+        /// each a zero-copy slice of the storage with [`HEADROOM`] bytes in front.
+        ///
+        /// The read lands [`HEADROOM`] bytes into the storage, so its first datagram stays
+        /// where it was read. The core opens a datagram in place behind exactly
+        /// [`HEADROOM`] bytes, so the later datagrams of a train are moved apart within the
+        /// storage to make that room: one move per train and no allocation. Once the core
+        /// opens at any headroom, they can be sliced where they were read.
+        async fn read_coalesced(&self) -> io::Result<()> {
+            // A full read spread into the most datagrams the kernel coalesces.
+            let room = HEADROOM + READ + self.state.gro_segments() * HEADROOM;
+            self.socket
+                .async_io(Interest::READABLE, || {
+                    let mut rx = self.rx();
+                    let rx = &mut *rx;
+                    if rx.buf.len() < room {
+                        // Reuses the allocation once every slice of it is gone. Twice the
+                        // room, so small datagrams take many reads per refill.
+                        rx.buf.clear();
+                        rx.buf.resize(2 * room, 0);
+                    }
+                    let mut meta = [RecvMeta::default()];
+                    let mut bufs = [IoSliceMut::new(&mut rx.buf[HEADROOM..HEADROOM + READ])];
+                    self.state
+                        .recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    let meta = meta[0];
+                    let path = self.path(meta.addr, ecn(&meta));
+                    let stride = meta.stride.clamp(1, READ);
+                    let count = meta.len.div_ceil(stride).max(1);
+                    if (count + 1) * HEADROOM + meta.len > rx.buf.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "more coalesced datagrams than announced",
+                        ));
+                    }
+                    let len = |i: usize| stride.min(meta.len - i * stride);
+                    // Last first: datagram `i` moves `i * HEADROOM` bytes up.
+                    for i in (1..count).rev() {
+                        let from = HEADROOM + i * stride;
+                        rx.buf.copy_within(from..from + len(i), from + i * HEADROOM);
+                    }
+                    for i in 0..count {
+                        let slot = rx.buf.split_to(HEADROOM + len(i));
+                        let datagram = PacketBuf::from_shared(slot, HEADROOM, len(i))
+                            .map_err(io::Error::other)?;
+                        rx.pending.push_back((path, datagram));
+                    }
+                    Ok(())
+                })
+                .await
         }
     }
 
-    fn socket_addr(addr: &SockaddrStorage) -> Option<SocketAddr> {
-        addr.as_sockaddr_in()
-            .map(|v4| SocketAddrV4::from(*v4).into())
-            .or_else(|| {
-                addr.as_sockaddr_in6()
-                    .map(|v6| SocketAddrV6::from(*v6).into())
-            })
+    /// The ECN mark of a read.
+    fn ecn(meta: &RecvMeta) -> Ecn {
+        meta.ecn
+            .map_or(Ecn::NotEct, |ecn| Ecn::from_bits(ecn as u8))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-mod other {
-    //! Plain `recv_from` / `send_to`: no ECN.
+impl UdpTransport {
+    /// [`Transport::recv`] without receive offload: one datagram per call, no ECN.
+    async fn recv_datagram(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        buf.set_len(buf.capacity());
+        let (len, addr) = self
+            .recv_from(buf.as_packet_mut())
+            .await
+            .inspect_err(|_| buf.set_len(0))?;
+        buf.set_len(len);
+        Ok((len, self.path(addr, Ecn::NotEct)))
+    }
 
-    use std::io;
-    use std::net::SocketAddr;
-
-    use nsplane_packet::Ecn;
-
-    use super::UdpTransport;
-
-    impl UdpTransport {
-        #[cfg(not(windows))]
-        pub(super) async fn recv_from(
-            &self,
-            packet: &mut [u8],
-        ) -> io::Result<(usize, SocketAddr, Ecn)> {
-            let (len, addr) = self.socket.recv_from(packet).await?;
-            Ok((len, addr, Ecn::NotEct))
-        }
-
-        pub(super) async fn send_to(
-            &self,
-            datagram: &[u8],
-            to: SocketAddr,
-            _ecn: Ecn,
-        ) -> io::Result<()> {
-            self.socket.send_to(datagram, to).await.map(drop)
-        }
+    /// Receives one datagram with plain `recv_from`, truncated to `packet`.
+    #[cfg(not(windows))]
+    async fn recv_from(&self, packet: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(packet).await
     }
 }
 
@@ -297,8 +606,6 @@ mod windows {
 
     use std::io;
     use std::net::SocketAddr;
-
-    use nsplane_packet::Ecn;
 
     use super::UdpTransport;
 
@@ -317,10 +624,7 @@ mod windows {
         /// transient for an unconnected socket: it is skipped and receiving continues,
         /// which needs no `SIO_UDP_CONNRESET` ioctl and so no unsafe code. A truncated
         /// datagram whose sender could not be peeked is dropped.
-        pub(super) async fn recv_from(
-            &self,
-            packet: &mut [u8],
-        ) -> io::Result<(usize, SocketAddr, Ecn)> {
+        pub(super) async fn recv_from(&self, packet: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             loop {
                 self.socket.readable().await?;
                 let sender = match self.socket.try_peek_sender() {
@@ -330,10 +634,10 @@ mod windows {
                     Err(e) => return Err(e),
                 };
                 match self.socket.try_recv_from(packet) {
-                    Ok((len, addr)) => return Ok((len, addr, Ecn::NotEct)),
+                    Ok(received) => return Ok(received),
                     Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
                         if let Some(addr) = sender {
-                            return Ok((packet.len(), addr, Ecn::NotEct));
+                            return Ok((packet.len(), addr));
                         }
                     }
                     Err(e)
@@ -351,7 +655,8 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsplane_packet::{Ecn, HEADROOM};
+    use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH};
+    use std::collections::VecDeque;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -530,5 +835,379 @@ mod tests {
         let a = bind(1, "127.0.0.1:0");
         a.set_fwmark(0x5157).unwrap();
         assert_eq!(socket2::SockRef::from(&a.socket).mark().unwrap(), 0x5157);
+    }
+
+    /// Linux's default socket buffer size (`net.core.rmem_default`), as reported.
+    const OLD_DEFAULT: usize = 212_992;
+
+    /// What the kernel reports for a request of `requested` bytes: on Linux the request
+    /// clamped to the sysctl `max` and doubled; `None` elsewhere or when unreadable.
+    fn granted(requested: usize, max: &str) -> Option<usize> {
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            return None;
+        }
+        let max: usize = std::fs::read_to_string(format!("/proc/sys/net/core/{max}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(2 * requested.min(max))
+    }
+
+    #[tokio::test]
+    async fn default_socket_buffers() {
+        let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let a = bind(1, "127.0.0.1:0");
+        for (effective, before, max) in [
+            (a.recv_buffer_size(), plain.recv_buffer_size(), "rmem_max"),
+            (a.send_buffer_size(), plain.send_buffer_size(), "wmem_max"),
+        ] {
+            let (effective, before) = (effective.unwrap(), before.unwrap());
+            match granted(DEFAULT_SOCKET_BUFFER, max) {
+                Some(granted) => {
+                    assert_eq!(effective, granted, "{max}");
+                    if granted > OLD_DEFAULT {
+                        assert!(effective > OLD_DEFAULT, "{max}");
+                    }
+                }
+                None => assert!(effective > 0 && effective >= before, "{max}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_buffer_setters() {
+        let a = bind(1, "[::]:0");
+        let mut previous = [0; 2];
+        for bytes in [64 << 10, 1 << 20] {
+            a.set_recv_buffer_size(bytes).unwrap();
+            a.set_send_buffer_size(bytes).unwrap();
+            let effective = [a.recv_buffer_size().unwrap(), a.send_buffer_size().unwrap()];
+            for ((effective, previous), max) in
+                effective.iter().zip(previous).zip(["rmem_max", "wmem_max"])
+            {
+                match granted(bytes, max) {
+                    Some(granted) => assert_eq!(*effective, granted, "{max}"),
+                    None => assert!(*effective > previous, "{max}"),
+                }
+            }
+            previous = effective;
+        }
+    }
+
+    /// A burst of 512 datagrams of 1420 bytes sent before the receiver reads fits into the
+    /// default receive buffer, with offload on and off.
+    #[tokio::test]
+    async fn burst_fits_default_buffer() {
+        for offload in [true, false] {
+            let a = bind(1, "127.0.0.1:0");
+            let b = bind(2, "127.0.0.1:0");
+            a.set_offload(offload).unwrap();
+            b.set_offload(offload).unwrap();
+            let datagrams: Vec<_> = (0..512).map(|seq| numbered(seq, 1420)).collect();
+            send_all(&a, &batch(b.local_addr(), Ecn::NotEct, &datagrams)).await;
+            let received = recv_batches(&b, datagrams.len()).await.concat();
+            check(&received, &datagrams, a.local_addr(), Ecn::NotEct);
+        }
+    }
+
+    /// Datagram number `seq` of `len` bytes, different from its neighbours.
+    fn numbered(seq: usize, len: usize) -> Vec<u8> {
+        (0..=u8::MAX).cycle().skip(seq % 256).take(len).collect()
+    }
+
+    /// `count` numbered datagrams of `size` bytes, then one shorter one if `size > 1`.
+    fn train(size: usize, count: usize) -> Vec<Vec<u8>> {
+        let mut datagrams: Vec<_> = (0..count).map(|seq| numbered(seq, size)).collect();
+        if size > 1 {
+            datagrams.push(numbered(count, size / 2));
+        }
+        datagrams
+    }
+
+    fn batch(to: SocketAddr, ecn: Ecn, datagrams: &[Vec<u8>]) -> Vec<(Path, PacketBuf)> {
+        datagrams
+            .iter()
+            .map(|datagram| (path_to(to, ecn), PacketBuf::from_packet(datagram)))
+            .collect()
+    }
+
+    async fn send_all(transport: &UdpTransport, batch: &[(Path, PacketBuf)]) {
+        let mut sent = 0;
+        transport.send_batch(batch, &mut sent).await.unwrap();
+        assert_eq!(sent, batch.len());
+    }
+
+    /// Receives `count` datagrams with `recv_batch`; returns what each call appended.
+    async fn recv_batches(transport: &UdpTransport, count: usize) -> Vec<Vec<(Path, PacketBuf)>> {
+        let mut buf = PacketBuf::with_capacity(65_535);
+        let mut calls = Vec::new();
+        let mut received = 0;
+        while received < count {
+            let mut datagrams = VecDeque::new();
+            timeout(
+                Duration::from_secs(5),
+                transport.recv_batch(&mut buf, &mut datagrams),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!datagrams.is_empty() && datagrams.len() <= MAX_BATCH);
+            received += datagrams.len();
+            calls.push(datagrams.into());
+        }
+        assert_eq!(received, count);
+        calls
+    }
+
+    /// Checks that `received` holds exactly `expected`, in order, from `from` with `ecn`
+    /// where the platform reports it.
+    fn check(received: &[(Path, PacketBuf)], expected: &[Vec<u8>], from: SocketAddr, ecn: Ecn) {
+        let ecn = if cfg!(any(target_os = "linux", target_os = "android")) {
+            ecn
+        } else {
+            Ecn::NotEct
+        };
+        assert_eq!(received.len(), expected.len());
+        for ((path, datagram), expected) in received.iter().zip(expected) {
+            assert_eq!(datagram.as_packet(), expected.as_slice());
+            assert_eq!(path.addr, from);
+            assert_eq!(path.ecn, ecn);
+        }
+    }
+
+    /// Whether both ends coalesce: `from` sends segmented, `to` receives coalesced.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn coalescing(from: &UdpTransport, to: &UdpTransport) -> bool {
+        from.max_segments() > 1 && to.offload() && to.state.gro_segments() > 1
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const fn coalescing(_: &UdpTransport, _: &UdpTransport) -> bool {
+        false
+    }
+
+    #[test]
+    fn runs_split_at_path_ecn_and_size_changes() {
+        let a: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:1".parse().unwrap();
+        let datagram = |to, ecn, len| (path_to(to, ecn), PacketBuf::from_packet(&vec![0; len]));
+        let datagrams = [
+            datagram(a, Ecn::NotEct, 100),
+            datagram(a, Ecn::NotEct, 100),
+            datagram(a, Ecn::NotEct, 60), // shorter: ends the run
+            datagram(a, Ecn::NotEct, 60),
+            datagram(a, Ecn::Ect0, 60), // other ECN
+            datagram(b, Ecn::Ect0, 60), // other address
+            datagram(b, Ecn::Ect0, 80), // longer
+            datagram(b, Ecn::Ect0, 0),  // empty
+            datagram(b, Ecn::Ect0, 0),
+        ];
+        let runs = |max_segments| {
+            let mut runs = Vec::new();
+            let mut start = 0;
+            while start < datagrams.len() {
+                let run = run_len(&datagrams[start..], max_segments);
+                runs.push(run);
+                start += run;
+            }
+            runs
+        };
+        assert_eq!(runs(64), [3, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(runs(2), [2, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(runs(1), [1; 9]);
+        assert_eq!(run_len(&[], 64), 0);
+
+        // A run stops before it outgrows one send.
+        let big: Vec<_> = (0..64).map(|_| datagram(a, Ecn::NotEct, 1420)).collect();
+        assert_eq!(run_len(&big, 64), MAX_SEND / 1420);
+    }
+
+    /// Senders bound to `send_on` send segmented trains of every size to a plain socket
+    /// bound to `recv_on`, which gets them as separate datagrams.
+    async fn segmented_to_plain(send_on: &str, recv_on: &str, seen_as_ip: &str) {
+        let sender = bind(1, send_on);
+        let plain = tokio::net::UdpSocket::bind(recv_on).await.unwrap();
+        let from = seen_as(&sender, seen_as_ip);
+        for size in [1, 1279, 1280, 1420] {
+            let datagrams = train(size, 10);
+            let batch = batch(plain.local_addr().unwrap(), Ecn::NotEct, &datagrams);
+            if sender.max_segments() > 1 {
+                assert_eq!(run_len(&batch, sender.max_segments()), batch.len());
+            }
+            send_all(&sender, &batch).await;
+            let mut buf = [0; 2048];
+            for expected in &datagrams {
+                let (len, addr) = timeout(Duration::from_secs(5), plain.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&buf[..len], expected.as_slice(), "size {size}");
+                assert_eq!(unmap(addr), from);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn segmented_send_ipv4() {
+        segmented_to_plain("127.0.0.1:0", "127.0.0.1:0", "127.0.0.1").await;
+    }
+
+    #[tokio::test]
+    async fn segmented_send_ipv6() {
+        segmented_to_plain("[::1]:0", "[::1]:0", "::1").await;
+    }
+
+    #[tokio::test]
+    async fn segmented_send_dual_stack() {
+        segmented_to_plain("[::]:0", "127.0.0.1:0", "127.0.0.1").await;
+        segmented_to_plain("[::]:0", "[::1]:0", "::1").await;
+    }
+
+    #[tokio::test]
+    async fn burst_from_plain_socket_keeps_boundaries() {
+        let receiver = bind(1, "127.0.0.1:0");
+        let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let datagrams: Vec<_> = (0..100).map(|seq| numbered(seq, 1 + seq * 13)).collect();
+        for datagram in &datagrams {
+            plain
+                .send_to(datagram, receiver.local_addr())
+                .await
+                .unwrap();
+        }
+        let received: Vec<_> = recv_batches(&receiver, datagrams.len()).await.concat();
+        check(
+            &received,
+            &datagrams,
+            plain.local_addr().unwrap(),
+            Ecn::NotEct,
+        );
+    }
+
+    /// `from` sends a segmented train of each size with ECT(0) to `to`, which receives it
+    /// in one read where both ends coalesce: slices of one buffer, [`HEADROOM`] apart.
+    async fn segmented_to_coalesced(
+        from: &UdpTransport,
+        from_addr: SocketAddr,
+        to: &UdpTransport,
+        to_addr: SocketAddr,
+    ) {
+        for size in [1, 1279, 1280, 1420] {
+            let datagrams = train(size, 20);
+            send_all(from, &batch(to_addr, Ecn::Ect0, &datagrams)).await;
+            let calls = recv_batches(to, datagrams.len()).await;
+            if coalescing(from, to) {
+                assert_eq!(calls.len(), 1, "size {size}: one coalesced read");
+                for pair in calls[0].windows(2) {
+                    let (first, next) = (pair[0].1.as_packet(), pair[1].1.as_packet());
+                    assert_eq!(pair[1].1.headroom(), HEADROOM);
+                    assert_eq!(
+                        first.as_ptr().addr() + size + HEADROOM,
+                        next.as_ptr().addr()
+                    );
+                }
+            }
+            check(&calls.concat(), &datagrams, from_addr, Ecn::Ect0);
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesced_receive_ipv4() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
+    }
+
+    #[tokio::test]
+    async fn coalesced_receive_ipv6() {
+        let a = bind(1, "[::1]:0");
+        let b = bind(2, "[::1]:0");
+        segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
+    }
+
+    #[tokio::test]
+    async fn coalesced_receive_dual_stack() {
+        let dual = bind(1, "[::]:0");
+        let v4 = bind(2, "127.0.0.1:0");
+        let v6 = bind(3, "[::1]:0");
+        let dual_v4 = seen_as(&dual, "127.0.0.1");
+        let dual_v6 = seen_as(&dual, "::1");
+        segmented_to_coalesced(&v4, v4.local_addr(), &dual, dual_v4).await;
+        segmented_to_coalesced(&dual, dual_v4, &v4, v4.local_addr()).await;
+        segmented_to_coalesced(&v6, v6.local_addr(), &dual, dual_v6).await;
+        segmented_to_coalesced(&dual, dual_v6, &v6, v6.local_addr()).await;
+    }
+
+    /// `recv` hands out a coalesced train one datagram at a time.
+    #[tokio::test]
+    async fn recv_splits_coalesced_train() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        let datagrams = train(1280, 10);
+        send_all(&a, &batch(b.local_addr(), Ecn::Ect1, &datagrams)).await;
+        let mut received = Vec::new();
+        for _ in &datagrams {
+            let (buf, path) = recv(&b, 1500).await;
+            received.push((path, buf));
+        }
+        check(&received, &datagrams, a.local_addr(), Ecn::Ect1);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_reaches_each_receiver_in_order() {
+        let sender = bind(1, "[::]:0");
+        let v4 = bind(2, "127.0.0.1:0");
+        let v6 = bind(3, "[::1]:0");
+        let ecns = [Ecn::NotEct, Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
+        let mut batch = Vec::new();
+        let mut expected: [Vec<(Ecn, Vec<u8>)>; 2] = Default::default();
+        // Few enough to sit in a small (Wine) receive buffer until read.
+        for seq in 0..MAX_BATCH {
+            // Runs of a few datagrams, then a change of receiver, mark or size.
+            let to = (seq / 7) % 2;
+            let ecn = ecns[(seq / 5) % 4];
+            let len = if seq % 11 == 10 { 700 } else { 1280 };
+            let datagram = numbered(seq, len);
+            let addr = [v4.local_addr(), v6.local_addr()][to];
+            batch.push((path_to(addr, ecn), PacketBuf::from_packet(&datagram)));
+            expected[to].push((ecn, datagram));
+        }
+        send_all(&sender, &batch).await;
+        for (receiver, expected, ip) in
+            [(&v4, &expected[0], "127.0.0.1"), (&v6, &expected[1], "::1")]
+        {
+            let received = recv_batches(receiver, expected.len()).await.concat();
+            for ((path, datagram), (ecn, bytes)) in received.iter().zip(expected) {
+                check(
+                    &[(*path, datagram.clone())],
+                    std::slice::from_ref(bytes),
+                    seen_as(&sender, ip),
+                    *ecn,
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn offload_off_sends_and_receives_one_datagram_per_call() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        assert!(a.offload());
+        a.set_offload(false).unwrap();
+        b.set_offload(false).unwrap();
+        assert!(!a.offload());
+        assert_eq!(a.max_segments(), 1);
+        let datagrams = train(1280, 20);
+        let batch = batch(b.local_addr(), Ecn::Ce, &datagrams);
+        assert_eq!(run_len(&batch, a.max_segments()), 1);
+        send_all(&a, &batch).await;
+        let calls = recv_batches(&b, datagrams.len()).await;
+        assert!(calls.iter().all(|call| call.len() == 1));
+        check(&calls.concat(), &datagrams, a.local_addr(), Ecn::Ce);
+
+        // Back on, segmented again.
+        a.set_offload(true).unwrap();
+        b.set_offload(true).unwrap();
+        segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
     }
 }
