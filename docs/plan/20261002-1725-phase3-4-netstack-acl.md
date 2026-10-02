@@ -1,6 +1,6 @@
 # 20261002-1725-phase3-4-netstack-acl Phases 3 and 4: netstack, ACL, transport backpressure
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-02 17:25
 - **approvedAt**: 2026-10-02 17:25 (user: run the roadmap to the end)
 - **relatedTask**: 20261002-1020-data-plane-core, 20261002-1509-phase1-followups
@@ -144,3 +144,9 @@ thiserror, futures-core if present, ...). Anything else is a yellow.
   runs the full evaluation; invalidated by generation bump (store/remove namespace, grant,
   pinhole close, clear_all). Targets: established flow <= 50 ns, bypass peer <= 10 ns,
   verdicts identical to full evaluation (differential test).
+- 2026-10-02: completed (campaign `nsplane-p34-202610021723`). Merges into main: 3C 7e7139c,
+  3B 0e10b0d, 3A 688e585, 3D 3a5f74c, 3E c35429e. main gate green (605 tests), linux.sh,
+  lib.sh (7 container tests) and e2e-examples (full presentation x transport matrix plus all
+  scenarios incl. app_session/app_session_tun) PASS; data_path 64 B 540 ns, 1420 B 1.37 us
+  (flat vs Phase 2). Carried into Phase 5: ACL per-flow hook and per-peer bypass, per-PeerId
+  principal caching, a counter for pending-dependency evictions.
