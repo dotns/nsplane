@@ -9,9 +9,9 @@
 //! tick. Long waits advance the clock one tick at a time, so the engines run every tick in
 //! between as they would in real time.
 //!
-//! Keepalives carry no payload and are not counted in the peer's byte counters, so the
-//! receiving side is moved to a path that leads nowhere first: a keepalive from the real
-//! address is then reported as `Event::Authenticated`.
+//! Keepalives are observed as `Event::Authenticated`, which marks each one as it arrives; the
+//! peer's wire counters see them too, but only at the periodic stats. The receiving side is
+//! moved to a path that leads nowhere first, so a keepalive from the real address is reported.
 
 use std::net::SocketAddr;
 use std::time::Duration;
