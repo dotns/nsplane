@@ -160,13 +160,14 @@ impl fmt::Debug for ConfigChange {
 
 /// Input to the core.
 #[derive(Debug)]
-pub enum Input<'a> {
+pub enum Input {
     /// A datagram from a transport, with the path it arrived on.
     Datagram {
         /// Path the datagram arrived on.
         path: Path,
-        /// The datagram; the core may decrypt it in place.
-        data: &'a mut PacketBuf,
+        /// The datagram, consumed by the core: a packet it carries is decrypted in place and
+        /// delivered in the same buffer; otherwise the buffer goes to the core's pool.
+        data: PacketBuf,
     },
     /// A local packet (TUN read, netstack egress, injection) to encrypt.
     Local {
