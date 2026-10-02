@@ -1,7 +1,8 @@
 //! Two engines over [`UdpTransport`]s on the loopback interface, with segmentation offload
 //! on and off: a bulk transfer of several flows (IPv4 and IPv6 packets around the MTU) in
 //! both directions at once arrives intact and in order per flow, and the engines' counters
-//! agree with each other and with what was sent.
+//! agree with each other and with what was sent. Bursts of [`WINDOW`] packets each way rely
+//! on the transport's default socket buffers.
 
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -15,9 +16,10 @@ use tokio::time::{Instant, sleep, timeout};
 const FLOWS: usize = 4;
 /// Packets per direction, spread round robin over the flows.
 const PACKETS: usize = 4096;
-/// Packets per direction in flight at once: a few send batches, well within the socket
-/// buffers, so loopback drops nothing.
-const WINDOW: usize = 128;
+/// Packets per direction in flight at once: more than Linux's default 208 KiB receive
+/// buffer holds, well within the transport's default socket buffers, so loopback drops
+/// nothing.
+const WINDOW: usize = 512;
 /// IPv4 and IPv6 header plus UDP header of the packets.
 const V4_HEADERS: usize = 28;
 const V6_HEADERS: usize = 48;
@@ -27,6 +29,8 @@ fn node(seed: u8, ip: IpAddr, offload: bool) -> io::Result<Node<UdpTransport>> {
     let transport = UdpTransport::bind(id, SocketAddr::new(ip, 0))?;
     transport.set_offload(offload)?;
     assert_eq!(transport.offload(), offload);
+    let (recv, send) = (transport.recv_buffer_size()?, transport.send_buffer_size()?);
+    writeln!(io::stderr(), "socket buffers: receive {recv}, send {send}")?;
     let addr = transport.local_addr();
     Ok(Node::new(seed, id, addr, transport, Options::default()))
 }
