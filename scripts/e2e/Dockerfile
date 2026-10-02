@@ -6,3 +6,7 @@ RUN apt-get update \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends socat \
  && rm -rf /var/lib/apt/lists/*
+# iptables, tcpdump: blocked paths, NAT routers and captures of the relay scenarios.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables tcpdump \
+ && rm -rf /var/lib/apt/lists/*
