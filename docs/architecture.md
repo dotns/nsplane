@@ -141,7 +141,7 @@ builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops priv
 
 `unsafe` lives only in `nsplane-tun`'s platform
 modules (`unix`, `linux`, `darwin`, and loading Wintun in `windows`), each with SAFETY
-comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-uapi` and `nsplane-cli` declare
+comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-netstack`, `nsplane-uapi` and `nsplane-cli` declare
 `#![forbid(unsafe_code)]`. See `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 ## Crypto
