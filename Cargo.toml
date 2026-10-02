@@ -15,12 +15,7 @@ members = [
 version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
-authors = [
-    "Noah Kennedy <nkennedy@cloudflare.com>",
-    "Andy Grover <agrover@cloudflare.com>",
-    "Jeff Hiner <jhiner@cloudflare.com>",
-    "dotns",
-]
+authors = ["dotns"]
 license = "BSD-3-Clause"
 repository = "https://github.com/dotns/nsplane"
 readme = "README.md"

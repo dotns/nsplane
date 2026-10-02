@@ -1,6 +1,6 @@
 # 20261002-1529-repo-cleanup-layout Remove unused files and move crates under `crates/`
 
-- **status**: pending
+- **status**: completed
 - **priority**: P2
 - **owner**: (unassigned)
 - **createdAt**: 2026-10-02 15:29

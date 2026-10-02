@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/var/run/wireguard/<iface>.sock` on Unix.
 
 ### Changed
+- Breaking: the project is renamed **nsplane** (`github.com/dotns/nsplane`) and every crate
+  lives under `crates/`: `boringtun` → `nsplane-noise`, `boringtun-cli` → `nsplane-cli`
+  (binary `nsplane-cli`), `nstun` → `nsplane`, `nstun-core` → `nsplane-core`,
+  `nstun-packet` → `nsplane-packet`, `nstun-tun` → `nsplane-tun`, `nstun-uapi` →
+  `nsplane-uapi`, `nstun-e2e` → `nsplane-e2e`. The e2e scripts read `NSPLANE_E2E_*` and
+  `NSPLANE_E2E_LIB_*`. Removed with it: the C FFI and JNI bindings (`ffi-bindings` and
+  `jni-bindings` features, `wireguard_ffi.h`, the `staticlib`/`cdylib` crate types), the
+  upstream crypto primitive benches, and the upstream banner and logo images. Copyright,
+  origin and trademark notices live in `LICENSE.md`.
 - Breaking (CLI): `boringtun-cli` runs on the async engine (`nstun`, `nstun-tun`,
   `nstun-uapi`) on a tokio multi-thread runtime with `--threads` workers; SIGTERM stops it
   as well as SIGINT. The UDP socket is bound to an ephemeral port at startup until
