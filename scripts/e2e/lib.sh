@@ -11,11 +11,12 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 PREFIX=${NSPLANE_E2E_LIB_PREFIX:-nsplane-e2e-lib}
 NET=$PREFIX-net
+VOL=$PREFIX-kernel
 IMG=$PREFIX-image
 DEV_IMAGE=${NSPLANE_E2E_LIB_DEV_IMAGE:-ai-agent/nstun-dev}
 LABEL=${NSPLANE_E2E_LIB_LABEL:-nsplane-e2e-lib=true}
 LABELS=(--label "$LABEL" --label ai-agent=true)
-cleanup() { docker rm -f "$PREFIX-build" "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$PREFIX-build" "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker volume rm "$VOL" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 
@@ -31,8 +32,9 @@ if [ ! -x "$BIN" ]; then echo "no container test binary: '$BIN'"; exit 1; fi
 
 docker build -q "${LABELS[@]}" -t "$IMG" scripts/e2e >/dev/null
 docker network create "${LABELS[@]}" "$NET" >/dev/null
+docker volume create "${LABELS[@]}" "$VOL" >/dev/null
 run() { docker run -d --rm "${LABELS[@]}" --name "$1" --network "$NET" --cap-add NET_ADMIN \
-  --device /dev/net/tun --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+  --device /dev/net/tun --sysctl net.ipv6.conf.all.disable_ipv6=0 -v "$VOL":/kernel \
   -v "$BIN":/usr/local/bin/nsplane-e2e-container:ro "$IMG" sleep infinity >/dev/null; }
 run "$PREFIX-a"; run "$PREFIX-b"
 A() { docker exec "$PREFIX-a" bash -c "$*"; }
@@ -46,6 +48,10 @@ PSK=$(B 'umask 077; wg genpsk | tee /psk'); A "umask 077; echo $PSK > /psk"
 echo "== kernel wireguard in b (persistent keepalive: b initiates the first handshake)"
 B "ip link add wg0 type wireguard; wg set wg0 private-key /k listen-port 51820 peer $A_PUB preshared-key /psk allowed-ips 10.9.1.1/32,fd00:1::1/128 endpoint $A_IP:51820 persistent-keepalive 2"
 B 'ip addr add 10.9.1.2/24 dev wg0; ip addr add fd00:1::2/64 dev wg0; ip link set wg0 up'
+# The test in a reads the kernel's counters through the shared /kernel: b answers each
+# /kernel/request with `wg show wg0 transfer` in /kernel/transfer.
+docker exec -d "$PREFIX-b" bash -c 'while :; do if [ -e /kernel/request ]; then rm /kernel/request
+  wg show wg0 transfer > /kernel/transfer.tmp; mv /kernel/transfer.tmp /kernel/transfer; fi; sleep 0.05; done'
 
 echo "== nsplane-e2e container tests in a"
 docker exec \
@@ -58,6 +64,7 @@ docker exec \
   -e NSPLANE_E2E_LIB_ADDR_V6=fd00:1::1/64 \
   -e NSPLANE_E2E_LIB_PEER_V4=10.9.1.2 \
   -e NSPLANE_E2E_LIB_PEER_V6=fd00:1::2 \
+  -e NSPLANE_E2E_LIB_KERNEL_DIR=/kernel \
   "$PREFIX-a" nsplane-e2e-container --ignored --test-threads=1 --nocapture
 echo "== wg show (b)"
 B 'wg show wg0' | sed 's/^/  /'
