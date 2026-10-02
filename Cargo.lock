@@ -874,6 +874,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-examples"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures-core",
+ "nsplane",
+ "nsplane-netstack",
+ "nsplane-tun",
+ "nsplane-uapi",
+ "rand_core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nsplane-netstack"
 version = "0.8.0"
 dependencies = [
