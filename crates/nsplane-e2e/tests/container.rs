@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output};
 use std::time::{Duration, SystemTime};
 
@@ -34,6 +35,15 @@ const COMMAND_WAIT: Duration = Duration::from_secs(30);
 const KERNEL_HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
 /// How long a handshake that must fail is given to complete anyway.
 const MISMATCH_WINDOW: Duration = Duration::from_secs(2);
+/// How much our counters' growth may differ from the kernel's over the counter window.
+///
+/// Each end of the window reads our counters, then the kernel's through
+/// [`Interop::kernel_transfer`] (container b answers within about 50 ms), so the two reads
+/// are well under a second apart. Between the reads and on the wire at either read can be at
+/// most two of our persistent keepalives (every second) and one of the kernel's (every two
+/// seconds), 32 bytes each; both ends of the window add their error, and at most one
+/// handshake message (initiation, 148 bytes) can be in flight across the window.
+const TRANSFER_TOLERANCE: u64 = 2 * 2 * 32 + 148;
 /// The interface name of the interop test.
 const IFACE: &str = "nsplane0";
 /// The interface name of the CLI interop test.
@@ -223,6 +233,9 @@ struct Interop {
     /// The kernel peer's tunnel addresses.
     peer_v4: Ipv4Addr,
     peer_v6: Ipv6Addr,
+    /// Directory shared with the kernel peer's container: creating `request` there makes it
+    /// write `wg show wg0 transfer` to `transfer`.
+    kernel_dir: PathBuf,
 }
 
 /// The variable `NSPLANE_E2E_LIB_<name>`, which must be set.
@@ -246,6 +259,7 @@ impl Interop {
             addr_v6: var("ADDR_V6")?,
             peer_v4: var("PEER_V4")?.parse()?,
             peer_v6: var("PEER_V6")?.parse()?,
+            kernel_dir: var("KERNEL_DIR")?.into(),
         })
     }
 
@@ -283,6 +297,32 @@ impl Interop {
         match (lines.next().and_then(|l| l.split_once('\t')), lines.next()) {
             (Some((peer, value)), None) if peer == self.peer_pub => Ok(value.to_owned()),
             _ => Err(format!("`wg show {IFACE} {field}`: {out:?}").into()),
+        }
+    }
+
+    /// The kernel peer's `(rx, tx)` for this side, from `wg show wg0 transfer` in its
+    /// container.
+    async fn kernel_transfer(&self) -> TestResult<(u64, u64)> {
+        let transfer = self.kernel_dir.join("transfer");
+        match std::fs::remove_file(&transfer) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        std::fs::write(self.kernel_dir.join("request"), "")?;
+        let deadline = Instant::now() + WAIT;
+        let out = loop {
+            match std::fs::read_to_string(&transfer) {
+                Ok(out) => break out,
+                Err(e) if e.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => return Err(format!("no kernel transfer within {WAIT:?}: {e}").into()),
+            }
+        };
+        let fields: Vec<&str> = out.trim().split('\t').collect();
+        match fields.as_slice() {
+            [_, rx, tx] if !out.trim().contains('\n') => Ok((rx.parse()?, tx.parse()?)),
+            _ => Err(format!("`wg show wg0 transfer`: {out:?}").into()),
         }
     }
 
@@ -392,9 +432,6 @@ async fn configure(env: &Interop, handle: &EngineHandle) -> TestResult<PeerId> {
 
 /// Waits for the handshake the kernel peer initiates: this side sends nothing yet, so the
 /// kernel's persistent keepalive is what starts it.
-///
-/// Keepalives cannot be observed here: the peer counters count only the IP packets inside
-/// data messages, not keepalives or handshake messages.
 async fn kernel_initiates(handle: &EngineHandle) -> TestResult {
     wait_for_peer(
         handle,
@@ -479,13 +516,46 @@ async fn replace_allowed_ips(env: &Interop, handle: &EngineHandle) -> TestResult
 }
 
 /// A persistent keepalive set with `wg set` reaches `wg show` and the handle.
-///
-/// That the keepalives make the counters grow cannot be checked: the peer counters count
-/// only the IP packets inside data messages, so keepalives leave them unchanged.
 async fn persistent_keepalive(env: &Interop, handle: &EngineHandle) -> TestResult {
     env.set_peer(&["persistent-keepalive", "1"]).await?;
     assert_eq!(env.show("persistent-keepalive").await?, "1");
     assert_eq!(the_peer(handle).await?.persistent_keepalive, Some(1));
+    Ok(())
+}
+
+/// Our wire-byte counters grow like the kernel's `wg show wg0 transfer` in the other
+/// direction (kernel rx like our tx, kernel tx like our rx) while pings flow, within
+/// [`TRANSFER_TOLERANCE`].
+///
+/// Only the growth over a window is compared: the kernel also counts what never reached this
+/// side's counters, its initiations sent before this side listened and its response to the
+/// initiation with the wrong preshared key.
+async fn counters_match_kernel_transfer(env: &Interop, handle: &EngineHandle) -> TestResult {
+    let ours = the_peer(handle).await?;
+    let (kernel_rx, kernel_tx) = env.kernel_transfer().await?;
+    for family in [Family::V4, Family::V6] {
+        env.expect_ping(family, LARGE).await?;
+    }
+    let ours_after = the_peer(handle).await?;
+    let (kernel_rx_after, kernel_tx_after) = env.kernel_transfer().await?;
+
+    let (rx, tx) = (ours_after.rx - ours.rx, ours_after.tx - ours.tx);
+    let (k_rx, k_tx) = (kernel_rx_after - kernel_rx, kernel_tx_after - kernel_tx);
+    writeln!(
+        io::stderr(),
+        "ours: rx +{rx} tx +{tx}; kernel: rx +{k_rx} tx +{k_tx}"
+    )?;
+    // Three pings of 1300 bytes per family, each way.
+    let pings = 2 * 3 * u64::try_from(LARGE)?;
+    assert!(rx > pings && tx > pings, "ours: rx +{rx} tx +{tx}");
+    assert!(
+        k_rx.abs_diff(tx) <= TRANSFER_TOLERANCE,
+        "kernel rx +{k_rx}, our tx +{tx}"
+    );
+    assert!(
+        k_tx.abs_diff(rx) <= TRANSFER_TOLERANCE,
+        "kernel tx +{k_tx}, our rx +{rx}"
+    );
     Ok(())
 }
 
@@ -519,7 +589,8 @@ async fn wg_show(env: &Interop, started: u64) -> TestResult {
 
 /// An engine on a TUN device, configured only with `wg`, against kernel WireGuard: the
 /// kernel's handshake, pings in every flavour, a preshared key mismatch and
-/// its repair, replacing allowed IPs, persistent keepalive, and `wg show`.
+/// its repair, replacing allowed IPs, persistent keepalive, the byte counters against the
+/// kernel's, and `wg show`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a kernel WireGuard peer; run by `just e2e-lib`"]
 async fn kernel_wireguard_interop() -> TestResult {
@@ -556,6 +627,8 @@ async fn kernel_wireguard_interop() -> TestResult {
     replace_allowed_ips(&env, &handle).await?;
     step("persistent keepalive")?;
     persistent_keepalive(&env, &handle).await?;
+    step("counters match the kernel's transfer")?;
+    counters_match_kernel_transfer(&env, &handle).await?;
     step("wg show")?;
     wg_show(&env, started).await?;
 

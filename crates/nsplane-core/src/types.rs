@@ -201,27 +201,51 @@ pub enum Output {
 /// An event reported by the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A handshake with `peer` completed.
+    /// A handshake with `peer` completed: a new session was established.
+    ///
+    /// Emitted exactly once per completed handshake, on both sides, also when several
+    /// handshakes complete between two timer ticks: on the initiator when it accepts the
+    /// handshake response, on the responder when the initiator confirms the new session with
+    /// its first data message (usually the keepalive answering the response).
     HandshakeCompleted {
         /// The peer.
         peer: PeerId,
-        /// Path the handshake completed on, if known.
+        /// Path the message that completed the handshake arrived on, as received (ECN mark
+        /// included); `None` if the completion was noticed outside a received message.
         path: Option<Path>,
-        /// Round-trip time of the handshake, if measured.
+        /// Round-trip time from sending the handshake initiation to receiving its response;
+        /// only the initiator measures it (always `None` on the responder). Measured on the
+        /// real clock, not on the `now` passed to the core.
         rtt: Option<Duration>,
     },
-    /// An authenticated message from `peer` arrived on `from`.
+    /// An authenticated message from `peer` arrived on a path that is not the peer's current
+    /// path (or the peer has none); paths are compared on transport and address only.
+    ///
+    /// Authenticated messages are handshake initiations and responses the peer's tunnel
+    /// accepted and transport data (keepalives included) that decrypted, even if its source
+    /// address is then not allowed. Cookie replies never count. Messages on the current path
+    /// emit nothing.
     Authenticated {
         /// The peer.
         peer: PeerId,
-        /// Path the message arrived on.
+        /// Path the message arrived on, as received (ECN mark included).
         from: Path,
     },
-    /// `path` became the current path of `peer`.
+    /// `path` became the current path of `peer` by roaming.
+    ///
+    /// Emitted right after an [`Event::Authenticated`] when the [`PathPolicy`] adopts its
+    /// path; the peer then sends on it. Path changes by configuration or
+    /// [`Core::force_handshake`] emit nothing.
+    ///
+    /// [`PathPolicy`]: crate::PathPolicy
+    /// [`Core::force_handshake`]: crate::Core::force_handshake
     PathAdopted {
         /// The peer.
         peer: PeerId,
-        /// The new path.
+        /// The new path: the arrival path with its ECN mark replaced by [`Ecn::NotEct`], as
+        /// stored for the peer.
+        ///
+        /// [`Ecn::NotEct`]: crate::Ecn::NotEct
         path: Path,
     },
     /// The sessions with `peer` expired.
@@ -233,12 +257,14 @@ pub enum Event {
     PeerStats {
         /// The peer.
         peer: PeerId,
-        /// Bytes received on the wire, as counted by the tunnel.
+        /// Bytes received on the wire (handshakes, keepalives, data); see [`PeerStats::rx`].
         rx: u64,
-        /// Bytes sent on the wire, as counted by the tunnel.
+        /// Bytes sent on the wire (handshakes, keepalives, data); see [`PeerStats::tx`].
         tx: u64,
         /// Decrypted payload bytes delivered.
         data_rx: u64,
+        /// Plaintext payload bytes sealed for the peer.
+        data_tx: u64,
         /// Time since the last completed handshake.
         last_handshake: Option<Duration>,
     },
@@ -246,8 +272,21 @@ pub enum Event {
     Dropped {
         /// The peer the packet came from or was routed to, if known.
         peer: Option<PeerId>,
-        /// Static description of why the packet was dropped.
+        /// Static description of why the packet was dropped: one of [`crate::reasons`], or
+        /// a reason of a [`PacketFilter`](crate::PacketFilter).
         reason: &'static str,
+    },
+    /// The driver suspended the engine: no I/O runs and no timers fire until
+    /// [`Event::Resumed`]. Emitted by the driver (`nsplane`), never by the core.
+    Suspended,
+    /// The driver resumed the engine after [`Event::Suspended`]. Emitted by the driver
+    /// (`nsplane`), never by the core.
+    Resumed,
+    /// The MTU of the local packet source changed. Emitted by the driver (`nsplane`), never
+    /// by the core.
+    MtuChanged {
+        /// The new MTU of the packet source, in bytes.
+        mtu: u16,
     },
 }
 
@@ -266,12 +305,19 @@ pub struct PeerStats {
     pub preshared_key: Option<[u8; 32]>,
     /// Persistent keepalive interval in seconds, if enabled.
     pub persistent_keepalive: Option<u16>,
-    /// Bytes received on the wire, as counted by the tunnel.
+    /// Bytes received on the wire (handshakes, keepalives, data): the full datagram of every
+    /// handshake initiation, handshake response and transport data message accepted from the
+    /// peer. Cookie replies and datagrams dropped before authentication are not counted.
     pub rx: u64,
-    /// Bytes sent on the wire, as counted by the tunnel.
+    /// Bytes sent on the wire (handshakes, keepalives, data): the full datagram of every
+    /// handshake initiation, handshake response and transport data message transmitted to the
+    /// peer. Cookie replies are not counted.
     pub tx: u64,
-    /// Decrypted payload bytes delivered.
+    /// Decrypted payload bytes delivered: IP packets that passed the inbound filters.
     pub data_rx: u64,
+    /// Plaintext payload bytes sealed for the peer: IP packets before encapsulation, after the
+    /// outbound filters.
+    pub data_tx: u64,
     /// Time since the last completed handshake.
     pub last_handshake: Option<Duration>,
 }
@@ -288,6 +334,7 @@ impl fmt::Debug for PeerStats {
             .field("rx", &self.rx)
             .field("tx", &self.tx)
             .field("data_rx", &self.data_rx)
+            .field("data_tx", &self.data_tx)
             .field("last_handshake", &self.last_handshake)
             .finish()
     }

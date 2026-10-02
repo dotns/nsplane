@@ -15,7 +15,7 @@ use nsplane_core::{ConfigChange, Core, CoreConfig, Event, Input, Output};
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
@@ -68,6 +68,16 @@ const MAX_DATAGRAM: usize = 65535;
 /// the core is done with, buffers rejected by a full sink and transmitted buffers (returned
 /// by the transmit task over a bounded queue, dropped when it is full) go back to the core's
 /// pool with [`Core::recycle`]. Delivered packets are owned by the sink.
+///
+/// Suspension: [`EngineHandle::suspend`] pauses the engine without tearing it down. While
+/// suspended, every I/O task waits before its next read or write (one already in progress
+/// may complete), so datagrams that arrive stay in the socket's buffer, and the owner task
+/// polls neither its queues nor the core's timer: no I/O runs and no timer fires. Handle
+/// calls are still served; the datagrams they cause wait in the transmit queues and the
+/// waiting datagrams (within their bounds) until [`EngineHandle::resume`], which runs the
+/// core's timers once with the current time, so sessions that expired meanwhile expire and
+/// due handshakes start, before normal operation continues. Peers and sessions are kept
+/// across a suspension, and transports added or replaced while suspended start suspended.
 ///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
 /// keeps running without it; other I/O errors are logged and the task continues.
@@ -137,6 +147,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let (recycle_tx, recycled) = mpsc::channel(capacity);
     let (deliver, deliver_rx) = mpsc::channel(capacity);
     let (events, _) = broadcast::channel(parts.event_capacity);
+    let (suspended, _) = watch::channel(false);
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.
@@ -160,11 +171,12 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         events,
         drops: BTreeMap::new(),
         tasks: vec![
-            Task::spawn(read_source(parts.source, local_tx)),
-            Task::spawn(write_sink(parts.sink, deliver_rx)),
+            Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
+            Task::spawn(write_sink(parts.sink, deliver_rx, suspended.subscribe())),
         ],
         queue_capacity: capacity,
         local_first: false,
+        suspended,
     };
     for transport in parts.transports {
         let slot = owner.start_transport(transport.start, VecDeque::new());
@@ -210,12 +222,13 @@ type Datagram = (Path, PacketBuf);
 type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
 
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
-/// its transmit queue and the queue returning transmitted buffers.
+/// its transmit queue, the queue returning transmitted buffers and the suspension state.
 type Start = Box<
     dyn FnOnce(
             mpsc::Sender<Datagram>,
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
+            watch::Receiver<bool>,
         ) -> (Task, Task)
         + Send,
 >;
@@ -231,11 +244,15 @@ impl NewTransport {
     pub(crate) fn new<T: Transport>(transport: T) -> Self {
         Self {
             id: transport.id(),
-            start: Box::new(move |datagrams, queue, recycle| {
+            start: Box::new(move |datagrams, queue, recycle, suspended| {
                 let transport = Arc::new(transport);
                 (
-                    Task::spawn(receive(Arc::clone(&transport), datagrams)),
-                    Task::spawn(transmit(transport, queue, recycle)),
+                    Task::spawn(receive(
+                        Arc::clone(&transport),
+                        datagrams,
+                        suspended.clone(),
+                    )),
+                    Task::spawn(transmit(transport, queue, recycle, suspended)),
                 )
             }),
         }
@@ -324,6 +341,8 @@ struct Owner {
     queue_capacity: usize,
     /// Alternates which of local packets and datagrams is polled first.
     local_first: bool,
+    /// Whether the engine is suspended; every I/O task watches it.
+    suspended: watch::Sender<bool>,
 }
 
 impl Owner {
@@ -379,6 +398,10 @@ impl Owner {
     fn poll_wake(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
         if let Poll::Ready(command) = self.commands.poll_recv(cx) {
             return Poll::Ready(Wake::Command(command));
+        }
+        // Only handle commands run while suspended.
+        if *self.suspended.borrow() {
+            return Poll::Pending;
         }
         for (id, slot) in &mut self.transports {
             if let Some(flush) = &mut slot.flush
@@ -515,6 +538,14 @@ impl Owner {
                 };
                 let _ = reply.send(result);
             }
+            Command::Suspend(reply) => {
+                self.suspend();
+                let _ = reply.send(());
+            }
+            Command::Resume(reply) => {
+                self.resume();
+                let _ = reply.send(());
+            }
             Command::Subscribe(reply) => {
                 let _ = reply.send(self.events.subscribe());
             }
@@ -526,6 +557,22 @@ impl Owner {
         ControlFlow::Continue(())
     }
 
+    /// Suspends every I/O task and the owner's own polling, unless already suspended.
+    fn suspend(&mut self) {
+        if !self.suspended.send_replace(true) {
+            self.event(Event::Suspended);
+        }
+    }
+
+    /// Resumes after [`Owner::suspend`] and runs the timers that did not fire meanwhile.
+    fn resume(&mut self) {
+        if self.suspended.send_replace(false) {
+            self.event(Event::Resumed);
+            self.core.handle_timeout(now());
+            self.drain(true);
+        }
+    }
+
     /// Spawns the receive and transmit tasks of a transport, with `pending` datagrams
     /// waiting for its transmit queue.
     fn start_transport(&self, start: Start, pending: VecDeque<Datagram>) -> TransportSlot {
@@ -534,6 +581,7 @@ impl Owner {
             self.datagram_tx.clone(),
             transmit_rx,
             self.recycle_tx.clone(),
+            self.suspended.subscribe(),
         );
         TransportSlot {
             queue,
@@ -627,9 +675,18 @@ impl Owner {
     }
 }
 
+/// Waits while the engine is suspended; `false` once the engine is gone.
+async fn running(suspended: &mut watch::Receiver<bool>) -> bool {
+    suspended.wait_for(|suspended| !suspended).await.is_ok()
+}
+
 /// Reads local packets into the owner's queue until the source closes.
-async fn read_source<Src: PacketSource>(mut source: Src, local: mpsc::Sender<PacketBuf>) {
-    loop {
+async fn read_source<Src: PacketSource>(
+    mut source: Src,
+    local: mpsc::Sender<PacketBuf>,
+    mut suspended: watch::Receiver<bool>,
+) {
+    while running(&mut suspended).await {
         match source.recv().await {
             Ok(packet) => {
                 if local.send(packet).await.is_err() {
@@ -646,8 +703,15 @@ async fn read_source<Src: PacketSource>(mut source: Src, local: mpsc::Sender<Pac
 }
 
 /// Delivers decrypted packets to the sink until it closes.
-async fn write_sink<Snk: PacketSink>(sink: Snk, mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>) {
+async fn write_sink<Snk: PacketSink>(
+    sink: Snk,
+    mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>,
+    mut suspended: watch::Receiver<bool>,
+) {
     while let Some((from, packet)) = deliver.recv().await {
+        if !running(&mut suspended).await {
+            return;
+        }
         match sink.send(packet, from).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
@@ -660,9 +724,13 @@ async fn write_sink<Snk: PacketSink>(sink: Snk, mut deliver: mpsc::Receiver<(Pee
 }
 
 /// Receives datagrams into the owner's queue until the transport closes.
-async fn receive<T: Transport>(transport: Arc<T>, datagrams: mpsc::Sender<Datagram>) {
+async fn receive<T: Transport>(
+    transport: Arc<T>,
+    datagrams: mpsc::Sender<Datagram>,
+    mut suspended: watch::Receiver<bool>,
+) {
     let mut buf = PacketBuf::with_capacity(MAX_DATAGRAM);
-    loop {
+    while running(&mut suspended).await {
         match transport.recv(&mut buf).await {
             Ok((len, path)) => {
                 let data = PacketBuf::from_packet(&buf.as_packet()[..len]);
@@ -684,8 +752,12 @@ async fn transmit<T: Transport>(
     transport: Arc<T>,
     mut queue: mpsc::Receiver<Datagram>,
     recycle: mpsc::Sender<PacketBuf>,
+    mut suspended: watch::Receiver<bool>,
 ) {
     while let Some((path, data)) = queue.recv().await {
+        if !running(&mut suspended).await {
+            return;
+        }
         match transport.send(data.as_packet(), &path).await {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {

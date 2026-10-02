@@ -9,13 +9,7 @@ use std::ops::{Index, IndexMut};
 
 use rand_core::{OsRng, RngCore};
 
-use std::time::Duration;
-
-#[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
-
-#[cfg(not(feature = "mock-instant"))]
-use crate::sleepyinstant::Instant;
+use std::time::{Duration, Instant};
 
 // Some constants, represent time in seconds
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
@@ -68,8 +62,9 @@ pub(super) fn handshake_jitter() -> Duration {
 pub(super) struct Timers {
     /// Is the owner of the timer the initiator or the responder for the last handshake?
     is_initiator: bool,
-    /// Start time of the tunnel
-    time_started: Instant,
+    /// Origin of the timers' time base: the `now` of the first `update_timers_at` call. Every
+    /// timer is a `Duration` since it; before the first call all of them are zero.
+    origin: Option<Instant>,
     timers: [Duration; TimerName::Top as usize],
     pub(super) session_timers: [Duration; super::N_SESSIONS],
     /// First data received since we last sent anything: a passive keepalive is due
@@ -83,8 +78,15 @@ pub(super) struct Timers {
     persistent_keepalive_pending: bool,
     /// Jitter added to the retry of the handshake in flight
     handshake_jitter: Duration,
+    /// When the handshake initiation in flight was sent
+    pub(super) handshake_init_sent: Duration,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
+    /// Number of completed handshakes so far; never reset.
+    handshakes: u64,
+    /// Local index of the session we established as responder that the initiator has not
+    /// confirmed with a data message yet.
+    unconfirmed_session: Option<usize>,
 }
 
 impl Timers {
@@ -92,7 +94,7 @@ impl Timers {
         let persistent_keepalive = persistent_keepalive.unwrap_or(0);
         Self {
             is_initiator: false,
-            time_started: Instant::now(),
+            origin: None,
             timers: Default::default(),
             session_timers: Default::default(),
             keepalive_due_from: None,
@@ -100,7 +102,10 @@ impl Timers {
             persistent_keepalive,
             persistent_keepalive_pending: persistent_keepalive > 0,
             handshake_jitter: Duration::ZERO,
+            handshake_init_sent: Duration::ZERO,
             should_reset_rr: reset_rr,
+            handshakes: 0,
+            unconfirmed_session: None,
         }
     }
 
@@ -121,7 +126,7 @@ impl Timers {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear(&mut self) {
-        let now = Instant::now().duration_since(self.time_started);
+        let now = self[TimeCurrent];
         for t in &mut self.timers[..] {
             *t = now;
         }
@@ -144,6 +149,15 @@ impl IndexMut<TimerName> for Timers {
 }
 
 impl Tunn {
+    /// `now` on the time base of the timers, which starts at the first call. A `now` before
+    /// the origin counts as the origin, and the time base never goes backwards, so callers
+    /// whose clock jumps (e.g. paused test time) cannot make a timer misfire or panic.
+    fn time_base(&mut self, now: Instant) -> Duration {
+        let origin = *self.timers.origin.get_or_insert(now);
+        now.saturating_duration_since(origin)
+            .max(self.timers[TimeCurrent])
+    }
+
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
         let time = self.timers[TimeCurrent];
         match timer_name {
@@ -171,6 +185,20 @@ impl Tunn {
         self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
+        if is_initiator {
+            self.timers.handshakes += 1;
+        } else {
+            self.timers.unconfirmed_session = Some(session_idx);
+        }
+    }
+
+    /// Counts the handshake that established session `session_idx` as responder once the
+    /// initiator confirms it with its first data message.
+    pub(super) fn timer_tick_session_confirmed(&mut self, session_idx: usize) {
+        if self.timers.unconfirmed_session == Some(session_idx) {
+            self.timers.unconfirmed_session = None;
+            self.timers.handshakes += 1;
+        }
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -227,7 +255,7 @@ impl Tunn {
         // the retries give up and cease, and clear all existing packets queued
         // up to be sent. If a packet is explicitly queued up to be sent, then
         // this timer is reset.
-        if self.handshake.timer().is_some()
+        if self.handshake.is_init_sent()
             && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= REKEY_ATTEMPT_TIME
         {
             tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
@@ -240,12 +268,12 @@ impl Tunn {
 
     /// Whether a handshake initiation is due.
     fn handshake_due(&mut self, now: Duration) -> bool {
-        if let Some(time_init_sent) = self.handshake.timer() {
+        if self.handshake.is_init_sent() {
             // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
             // if a response has not been received, where jitter is some random
             // value between 0 and 333 ms.
-            // We avoid using `now` here, because it can be earlier than `time_init_sent`.
-            let due = time_init_sent.elapsed() >= REKEY_TIMEOUT + self.timers.handshake_jitter;
+            let due = now.saturating_sub(self.timers.handshake_init_sent)
+                >= REKEY_TIMEOUT + self.timers.handshake_jitter;
             if due {
                 tracing::warn!("HANDSHAKE(REKEY_TIMEOUT)");
             }
@@ -335,15 +363,25 @@ impl Tunn {
         false
     }
 
-    /// Advances the timers; returns a handshake or keepalive to send, if one is due.
+    /// Advances the timers to the crate clock (`std::time::Instant::now()`); see
+    /// [`Tunn::update_timers_at`].
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.update_timers_at(Instant::now(), dst)
+    }
+
+    /// Advances the timers to `now`; returns a handshake or keepalive to send, if one is due.
+    ///
+    /// Every timer decision of the tunnel uses the `now` passed here: the timers count from
+    /// the `now` of the first call, and events between two calls are timed at the earlier
+    /// one. A `now` before the latest one is treated as the latest one. Callers must pass
+    /// instants from one clock: mixing this method with [`Tunn::update_timers`] or
+    /// [`Tunn::time_since_last_handshake`] is only sound if `now` comes from the crate clock.
+    pub fn update_timers_at<'a>(&mut self, now: Instant, dst: &'a mut [u8]) -> TunnResult<'a> {
         if self.timers.should_reset_rr {
-            self.rate_limiter.reset_count();
+            self.rate_limiter.reset_count_at(now);
         }
 
-        // All the times are counted from tunnel initiation, for efficiency our timers are rounded
-        // to a second, as there is no real benefit to having highly accurate timers.
-        let now = Instant::now().duration_since(self.timers.time_started);
+        let now = self.time_base(now);
         self.timers[TimeCurrent] = now;
 
         self.update_session_timers(now);
@@ -357,24 +395,45 @@ impl Tunn {
         }
 
         // Keepalives only make sense outside of a handshake in progress.
-        if self.handshake.timer().is_none() && self.keepalive_due(now) {
+        if !self.handshake.is_init_sent() && self.keepalive_due(now) {
             return self.encapsulate(&[], dst);
         }
 
         TunnResult::Done
     }
 
-    /// Time since the current session was established.
+    /// Time since the current session was established, on the crate clock; see
+    /// [`Tunn::time_since_last_handshake_at`].
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
+        self.time_since_last_handshake_at(Instant::now())
+    }
+
+    /// Time from the establishment of the current session to `now`.
+    ///
+    /// `now` must come from the clock passed to [`Tunn::update_timers_at`]; the session was
+    /// established at the time of the last timer update before it.
+    pub fn time_since_last_handshake_at(&self, now: Instant) -> Option<Duration> {
         let current_session = self.current;
         if self.sessions[current_session % super::N_SESSIONS].is_some() {
-            let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
+            let since_origin = self.timers.origin.map_or(Duration::ZERO, |origin| {
+                now.saturating_duration_since(origin)
+            });
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 
-            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
+            Some(since_origin.saturating_sub(duration_since_session_established))
         } else {
             None
         }
+    }
+
+    /// Number of handshakes completed by this tunnel, as initiator or responder.
+    ///
+    /// Monotonic: it grows by one when the initiator accepts a handshake response, and when
+    /// the responder receives the first data message (or keepalive) on the session it
+    /// established, which confirms the handshake. A caller comparing it with the last value
+    /// it saw detects every completed handshake, even several between two looks.
+    pub const fn handshake_count(&self) -> u64 {
+        self.timers.handshakes
     }
 
     /// The persistent keepalive interval in seconds.

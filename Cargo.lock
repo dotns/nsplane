@@ -715,12 +715,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock_instant"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
-
-[[package]]
 name = "nix"
 version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -767,7 +761,6 @@ dependencies = [
  "criterion",
  "ip_network",
  "ip_network_table",
- "mock_instant",
  "nsplane-noise",
  "nsplane-packet",
  "rand_core",
@@ -798,7 +791,6 @@ dependencies = [
  "criterion",
  "etherparse",
  "hmac",
- "mock_instant",
  "nix",
  "parking_lot",
  "portable-atomic",

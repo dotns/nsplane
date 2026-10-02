@@ -411,6 +411,7 @@ async fn settings(node: &Node) -> TestResult<(Config, Vec<PeerStats>, Option<Pub
             rx: 0,
             tx: 0,
             data_rx: 0,
+            data_tx: 0,
             last_handshake: None,
             ..p
         })
