@@ -1,0 +1,46 @@
+[package]
+name = "nsplane-examples"
+description = "Runnable examples of the nsplane data plane: UDP, TUN, netstack, hybrid and ACL nodes"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+blake2 = "0.10.6"
+ciborium = "0.2.2"
+clap = { version = "4.6.7", features = ["derive"] }
+ed25519-dalek = "2.2.0"
+futures-core = "0.3.32"
+nsplane = { path = "../crates/nsplane", version = "0.8.0" }
+nsplane-acl = { path = "../crates/nsplane-acl", version = "0.8.0" }
+nsplane-core = { path = "../crates/nsplane-core", version = "0.8.0" }
+nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
+nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.19"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
+nsplane-tun = { path = "../crates/nsplane-tun", version = "0.8.0" }
+nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.8.0" }
+
+[dev-dependencies]
+nsplane-noise = { path = "../crates/nsplane-noise", version = "0.8.0" }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
