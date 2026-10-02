@@ -426,3 +426,4 @@ scripts extended. ns is read-only for this plan.
 - 2026-10-02: user confirmed `boringtun::device` is deleted after Phase 1 and that the
   work is split into phases; asked for a second architecture review against comparable
   GitHub projects. Review added above; the core became sans-I/O as a result.
+- 2026-10-02: renamed to nsplane; crates live under crates/

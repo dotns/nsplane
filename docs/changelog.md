@@ -89,3 +89,14 @@ engine (tokio runtime, `--tun-fd`, `--uapi-fd`, `--disable-connected-udp` and
 of `boringtun::device`, the `device` feature, its dependencies and `just integration`.
 `just e2e` passes unchanged against kernel WireGuard. README, CHANGELOG, architecture and
 the unsafe/Wintun ADRs updated; ADR `2026-10-02-async-engine-replaces-sync-device` added.
+
+## 2026-10-02 15:36 [progress]
+
+Task `20261002-1529-repo-cleanup-layout` done together with the rename (ADR
+`2026-10-02-rename-nsplane`): the crates moved under `crates/` with their nsplane names
+(`nsplane-noise`, `nsplane-cli`, `nsplane`, `nsplane-core`, `nsplane-packet`,
+`nsplane-tun`, `nsplane-uapi`, `nsplane-e2e`), identifiers, test interface names, e2e env
+vars and container prefixes follow. The FFI/JNI bindings, the upstream crypto benches and
+the banner/logo images are deleted. Attribution (Cloudflare copyright, dotns copyright,
+origin, WireGuard trademark) lives only in `LICENSE.md`; README and the living docs use the
+new names.

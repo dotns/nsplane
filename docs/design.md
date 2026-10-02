@@ -1,42 +1,40 @@
-# nstun Design Overview
+# nsplane Design Overview
 
-The one-page view of where nstun is going. `docs/architecture.md` describes what is on
+The one-page view of where nsplane is going. `docs/architecture.md` describes what is on
 `main` today; `docs/plan/` holds the approved plans with their investigation notes; this
 page ties them together and is updated whenever a plan is approved or a phase lands.
 
 Last updated: 2026-10-02 (Phase 1 of the data-plane plan in progress).
 
-**Naming.** The project is being renamed **nsplane** (ADR `2026-10-02-rename-nsplane`):
-it is the node's underlying data plane, and TUN is only one of its local attachments. The
-rename of the repository, crates (`nstun-*` → `nsplane-*`, `boringtun` → `nsplane-noise`)
-and docs happens as its own task after Phase 1 merges; this page still uses the names on
-`main` today.
+**Naming.** The project was renamed **nsplane** on 2026-10-02 (ADR
+`2026-10-02-rename-nsplane`): it is the node's underlying data plane, and TUN is only one of
+its local attachments.
 
 ## 1. Purpose and position
 
-nstun is the WireGuard data plane of dotns. It is a Rust library (a fork of
-cloudflare/boringtun, BSD-3-Clause) that owns everything between "an IP packet exists on
-this machine" and "an encrypted datagram leaves on some path": packet I/O (TUN or an
-in-process network stack), the WireGuard engine, the transports, the packet filters (ACL,
-NAT/translation, flow accounting) and the per-peer path decisions' *mechanics*.
+nsplane is the WireGuard data plane of dotns. It is a Rust library that owns everything
+between "an IP packet exists on this machine" and "an encrypted datagram leaves on some
+path": packet I/O (TUN or an in-process network stack), the WireGuard engine, the
+transports, the packet filters (ACL, NAT/translation, flow accounting) and the per-peer path
+decisions' *mechanics*.
 
-In the NS target architecture nstun is layer 1 of four; the layers above it live in ns:
+In the NS target architecture nsplane is layer 1 of four; the layers above it live in ns:
 
 | Layer | Owner | Content |
 |---|---|---|
 | 4 Features | ns | service publishing, reverse proxy / public ingress, subnet routing, exit, local proxies, apps (`send`, third-party) |
 | 3 Presentation | ns | how the overlay is shown to this host: TUN, userspace stack listeners, DNS, DNS-VIP, SOCKS5/HTTP/PAC |
 | 2 Overlay core | ns | identity, identity-derived IPv6, registry client, `PeerSource`s (NSD, quick, app sessions) and the merged peer table, policy namespaces, names, path-ladder *rules* |
-| 1 Engine | **nstun** | WireGuard, transports, path policy mechanics, filter chain, netstack, TUN, ACL, 4↔6 translation |
+| 1 Engine | **nsplane** | WireGuard, transports, path policy mechanics, filter chain, netstack, TUN, ACL, 4↔6 translation |
 
 One engine per node. Account mode, Quick mode and applications are peer *sources* and
-presentation choices on top of the same engine; "mode" never appears inside nstun. The
-CLI (`boringtun-cli`) is a Linux/macOS development tool only.
+presentation choices on top of the same engine; "mode" never appears inside nsplane. The
+CLI (`nsplane-cli`) is a Linux/macOS development tool only.
 
 ## 2. Non-goals
 
 - No control plane, pairing, identity, address allocation, registry or relay *client*
-  protocol: nstun carries datagrams on paths it is told about and reports which path
+  protocol: nsplane carries datagrams on paths it is told about and reports which path
   authenticated; ns decides what a path means.
 - No copying or vendoring of code from reference projects (firezone, gotatun, tailscale,
   NepTUN, ...), whatever their license. Design only. Mature crates are used for building
@@ -46,7 +44,7 @@ CLI (`boringtun-cli`) is a Linux/macOS development tool only.
 
 ## 3. Principles
 
-1. **Sans-I/O core.** `nstun-core` is a state machine: inputs in, outputs out, no sockets,
+1. **Sans-I/O core.** `nsplane-core` is a state machine: inputs in, outputs out, no sockets,
    no clock of its own. A driver owns it. Tests run two cores against each other with a
    fake clock; embedders (tokio driver, mobile hosts, ns's sans-I/O `quick-runtime`) drive
    it from their own loop.
@@ -70,30 +68,31 @@ CLI (`boringtun-cli`) is a Linux/macOS development tool only.
 ## 4. Crates
 
 ```
-boringtun        noise core (Tunn, in-place seal/open, RateLimiter, zerocopy wire views),
-                 x25519, ffi, jni            [exists; `device` deleted at end of Phase 1]
-nstun-packet     IP/TCP/UDP/ICMP header views, five-tuple, fragments, checksums,
+nsplane-noise    noise core (Tunn, in-place seal/open, RateLimiter, zerocopy wire views),
+                 x25519                      [exists; `device` deleted at end of Phase 1]
+nsplane-packet   IP/TCP/UDP/ICMP header views, five-tuple, fragments, checksums,
                  PacketBuf/PacketPool/PacketBatch, PeerId/Path/TransportId/Ecn    [merged]
-nstun-core       sans-I/O engine: Core, PeerTable, timers, PathPolicy, PacketFilter,
+nsplane-core     sans-I/O engine: Core, PeerTable, timers, PathPolicy, PacketFilter,
                  injection, events                                          [in progress]
-nstun            tokio driver: PacketSource/PacketSink/Transport traits, UdpTransport,
+nsplane          tokio driver: PacketSource/PacketSink/Transport traits, UdpTransport,
                  channel transports, Engine/EngineBuilder/EngineHandle, events  [in progress]
-nstun-tun        TUN backends: Linux, macOS utun, Windows Wintun, fd/handle adoption
+nsplane-tun      TUN backends: Linux, macOS utun, Windows Wintun, fd/handle adoption
                  (iOS, Android)                                             [in progress]
-nstun-uapi       `wg` UAPI over the engine (Unix socket / named pipe)           [planned]
-nstun-e2e        library-level end-to-end tests (two engines, kernel WireGuard)  [planned]
-nstun-netstack   smoltcp stack as PacketSink + PacketSource; TCP connections, UDP flows,
+nsplane-uapi     `wg` UAPI over the engine (Unix socket / named pipe)           [planned]
+nsplane-e2e      library-level end-to-end tests (two engines, kernel WireGuard)  [planned]
+nsplane-netstack smoltcp stack as PacketSink + PacketSource; TCP connections, UDP flows,
                  dialers; Splitter for hybrid TUN + netstack                [Phase 3]
-nstun-acl        policy engine as PacketFilter and connection-level check; fragment gate;
+nsplane-acl      policy engine as PacketFilter and connection-level check; fragment gate;
                  flow tracker                                               [Phase 4]
-nstun-nat        4↔6 translation filter, conntrack, DNAT/SNAT for service publishing
+nsplane-nat      4↔6 translation filter, conntrack, DNAT/SNAT for service publishing
                  (optional)                                                 [Phase 5]
-boringtun-cli    Linux/macOS dev tool on the engine                         [exists]
+nsplane-cli      Linux/macOS dev tool on the engine                         [exists]
 ```
 
-Dependency direction is strictly downward: `boringtun-cli` → `nstun-uapi` → `nstun` →
-`nstun-core` → `nstun-packet`; `nstun-tun`/`nstun-netstack`/`nstun-acl`/`nstun-nat` →
-`nstun` (+ `nstun-packet`). `nstun-core` is the only crate that depends on `boringtun`.
+Dependency direction is strictly downward: `nsplane-cli` → `nsplane-uapi` → `nsplane` →
+`nsplane-core` → `nsplane-packet`; `nsplane-tun`/`nsplane-netstack`/`nsplane-acl`/
+`nsplane-nat` → `nsplane` (+ `nsplane-packet`). `nsplane-core` is the only crate that
+depends on `nsplane-noise`.
 
 ## 5. The engine
 
@@ -135,7 +134,7 @@ trait PacketFilter { fn inbound(&self, peer, &mut PacketBuf) -> Verdict; fn outb
 ```
 
 `EngineBuilder` is generic over source/sink/transport with defaults (`UdpTransport`,
-`StandardRoaming`, TUN from `nstun-tun`); in-memory `Channel*` implementations serve
+`StandardRoaming`, TUN from `nsplane-tun`); in-memory `Channel*` implementations serve
 tests and embedders.
 
 ### Presentation × transport
@@ -143,7 +142,7 @@ tests and embedders.
 | Local side (PacketSink/Source) \ Transport | UDP | relay UDP | relay WSS |
 |---|:-:|:-:|:-:|
 | TUN (kernel stack) | ✓ | ✓ | ✓ |
-| `nstun-netstack` (no TUN, no root) | ✓ | ✓ | ✓ |
+| `nsplane-netstack` (no TUN, no root) | ✓ | ✓ | ✓ |
 | host bridge (iOS/Android fd, channels) | ✓ | ✓ | ✓ |
 
 Transports beyond UDP are ns implementations of `Transport`; the matrix is a property
@@ -151,14 +150,14 @@ of the design, not of individual features.
 
 ## 6. Packets, translation, MTU
 
-- `nstun-packet` views are `zerocopy` refs; parsing never copies. Checksums are
+- `nsplane-packet` views are `zerocopy` refs; parsing never copies. Checksums are
   incremental where a filter rewrites addresses.
 - The 4↔6 translation the NS architecture requires (`alias4 ↔ node6` embedding for peers,
-  `lan4 ↔ lan6` for published LANs) is a stateless `PacketFilter` in `nstun-nat`, applied
+  `lan4 ↔ lan6` for published LANs) is a stateless `PacketFilter` in `nsplane-nat`, applied
   before encryption and after decryption, shared by TUN and netstack. Remote nodes only
   see IPv6.
 - IPv6 fragmentation and ICMPv6 Packet Too Big are handled once in the engine after
-  translation; TUN and netstack share the same MTU/MSS limits (`nstun-netstack` derives
+  translation; TUN and netstack share the same MTU/MSS limits (`nsplane-netstack` derives
   its advertised MSS from the engine MTU).
 
 ## 7. Performance plan
@@ -166,7 +165,7 @@ of the design, not of individual features.
 - Already: in-place seal/open, no per-packet allocation on the data path
   (`PacketPool`), handshake-init demux without endpoint scans.
 - Phase 1 gate: the core must stay within 10 % of a `Tunn`-plus-routing baseline on
-  64 B and 1420 B packets (`nstun-core` bench vs `boringtun/benches/data_path`).
+  64 B and 1420 B packets (`nsplane-core` bench vs `crates/nsplane-noise/benches/data_path`).
 - Phase 5: Linux TUN virtio-net GSO/GRO, UDP GSO/GRO (`quinn-udp`), optional crypto worker
   pool in the driver; measured with iperf in the e2e containers before and after.
 
@@ -184,15 +183,15 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Phase | Deliverable | Status (2026-10-02) |
 |---|---|---|
 | Baseline | aws-lc-rs backend, pma-rust lints, protocol fixes, zero-copy noise, Windows device, CLI as dev tool | done, pushed (`1fb9899`) |
-| 1 | `nstun-packet`, `nstun-core`, `nstun` driver, `nstun-tun`, `nstun-uapi`, `nstun-e2e`, CLI on the engine, delete `boringtun::device` | BKD campaign `nstun-dp-p1`: P, C and B merged; D and E in progress |
+| 1 | `nsplane-packet`, `nsplane-core`, `nsplane` driver, `nsplane-tun`, `nsplane-uapi`, `nsplane-e2e`, CLI on the engine, delete the upstream `device` layer | BKD campaign `nstun-dp-p1`: P, C and B merged; D and E in progress |
 | 1b | Rename to nsplane (repo, crates, docs section) | after Phase 1, own task (ADR `2026-10-02-rename-nsplane`) |
 | 2 | multi-transport, `PathPolicy`, filter chain with `Handled`, injection, `force_handshake`, suspend/resume | planned |
-| 3 | `nstun-netstack`, `Splitter`, netstack-only e2e | planned |
-| 4 | `nstun-acl` (policy filter, connection check, fragment gate, flow tracker) | planned |
+| 3 | `nsplane-netstack`, `Splitter`, netstack-only e2e | planned |
+| 4 | `nsplane-acl` (policy filter, connection check, fragment gate, flow tracker) | planned |
 | 5 | 4↔6 translation filter, fragmentation/PTB, offload (TUN virtio-net, UDP GSO/GRO), crypto workers, conntrack/DNAT | planned |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan, its phases C and D) | after 1-5 |
 
-Phase 0 (ns pins nstun's `noise` with the `SocketAddr` source change) is independent and
+Phase 0 (ns pins nsplane's `noise` with the `SocketAddr` source change) is independent and
 runs in ns when its current refactor lands.
 
 ## 10. Decisions
@@ -201,10 +200,10 @@ runs in ns when its current refactor lands.
 |---|---|---|
 | 2026-10-01 | Fork baseline: `ring` → `aws-lc-rs`; no CI, local gates; `unsafe` only in platform/FFI modules; Wintun C library accepted | `docs/decisions/2026-10-01-*.md` |
 | 2026-10-02 | CLI is a Linux/macOS dev tool; Windows `device` kept until the engine replaces it | task `20261002-1008-cli-dev-tool` |
-| 2026-10-02 | Complete data plane with a sans-I/O core; `Transport` and `PathPolicy` split; smoltcp over `ipstack`; `boringtun::device` deleted after Phase 1 | plan `20261002-1024-data-plane-core` |
+| 2026-10-02 | Complete data plane with a sans-I/O core; `Transport` and `PathPolicy` split; smoltcp over `ipstack`; the upstream `device` layer deleted after Phase 1 | plan `20261002-1024-data-plane-core` |
 | 2026-10-02 | No code copied from reference projects; buffers on `bytes` | same plan, annotations |
-| 2026-10-02 | Value types (`PeerId`, `Path`, `TransportId`, `Ecn`) live in `nstun-packet`, re-exported by `nstun-core` | same plan, gate 1 |
-| 2026-10-02 | One nstun engine per NS node; 4↔6 translation and fragmentation live in the engine; both ns data planes migrate | NS next-architecture page (docs site, `ns/next`) |
+| 2026-10-02 | Value types (`PeerId`, `Path`, `TransportId`, `Ecn`) live in `nsplane-packet`, re-exported by `nsplane-core` | same plan, gate 1 |
+| 2026-10-02 | One nsplane engine per NS node; 4↔6 translation and fragmentation live in the engine; both ns data planes migrate | NS next-architecture page (docs site, `ns/next`) |
 | 2026-10-02 | Rename to **nsplane** (`nsplane-noise`, `nsplane-core`, `nsplane`, `nsplane-tun`, ...); executed after Phase 1 merges | ADR `2026-10-02-rename-nsplane` |
 
 ## 11. References (design only)

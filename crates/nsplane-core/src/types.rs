@@ -1,0 +1,338 @@
+//! Inputs, outputs, events and configuration of the core.
+
+use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
+use std::time::Duration;
+
+use nsplane_noise::x25519;
+use nsplane_packet::{PacketBuf, Path, PeerId};
+
+use crate::filter::PacketFilter;
+use crate::policy::{PathPolicy, StandardRoaming};
+
+/// A network in CIDR notation.
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
+pub struct AllowedIp {
+    /// Network address.
+    pub addr: IpAddr,
+    /// Prefix length.
+    pub cidr: u8,
+}
+
+impl FromStr for AllowedIp {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let ip: Vec<&str> = s.split('/').collect();
+        if ip.len() != 2 {
+            return Err("Invalid IP format".to_owned());
+        }
+
+        let (addr, cidr) = (ip[0].parse::<IpAddr>(), ip[1].parse::<u8>());
+        match (addr, cidr) {
+            (Ok(addr @ IpAddr::V4(_)), Ok(cidr)) if cidr <= 32 => Ok(Self { addr, cidr }),
+            (Ok(addr @ IpAddr::V6(_)), Ok(cidr)) if cidr <= 128 => Ok(Self { addr, cidr }),
+            _ => Err("Invalid IP format".to_owned()),
+        }
+    }
+}
+
+/// A peer to add, or the changes to apply to an existing peer.
+///
+/// On update, `None` leaves the preshared key, keepalive and path unchanged, and an all-zero
+/// preshared key removes it.
+#[derive(Clone)]
+pub struct PeerConfig {
+    /// Public key identifying the peer.
+    pub public_key: x25519::PublicKey,
+    /// Networks routed to the peer; added to the existing ones unless `replace_allowed_ips`.
+    pub allowed_ips: Vec<AllowedIp>,
+    /// Drop the existing allowed IPs of the peer before adding `allowed_ips`.
+    pub replace_allowed_ips: bool,
+    /// Preshared key; `Some([0; 32])` removes it.
+    pub preshared_key: Option<[u8; 32]>,
+    /// Persistent keepalive interval in seconds; `Some(0)` disables it.
+    pub persistent_keepalive: Option<u16>,
+    /// Path to reach the peer on.
+    pub path: Option<Path>,
+}
+
+impl PeerConfig {
+    /// A config that adds `public_key` without settings, or changes nothing about it.
+    pub const fn new(public_key: x25519::PublicKey) -> Self {
+        Self {
+            public_key,
+            allowed_ips: Vec::new(),
+            replace_allowed_ips: false,
+            preshared_key: None,
+            persistent_keepalive: None,
+            path: None,
+        }
+    }
+}
+
+impl fmt::Debug for PeerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerConfig")
+            .field("public_key", &self.public_key)
+            .field("allowed_ips", &self.allowed_ips)
+            .field("replace_allowed_ips", &self.replace_allowed_ips)
+            .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// A configuration change applied by the core.
+pub enum ConfigChange {
+    /// Replaces the private key; every peer is re-keyed and its sessions are cleared.
+    SetPrivateKey(x25519::StaticSecret),
+    /// Adds a peer, or updates it in place if its public key is known.
+    AddOrUpdatePeer(PeerConfig),
+    /// Removes a peer.
+    RemovePeer(x25519::PublicKey),
+    /// Removes all peers.
+    RemoveAllPeers,
+    /// Replaces the allowed IPs of a peer.
+    SetAllowedIps {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// The new allowed IPs.
+        allowed_ips: Vec<AllowedIp>,
+    },
+    /// Sets or removes the preshared key of a peer.
+    SetPresharedKey {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// The new preshared key; `None` removes it.
+        key: Option<[u8; 32]>,
+    },
+    /// Sets or disables the persistent keepalive of a peer.
+    SetKeepalive {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// Interval in seconds; `None` disables it.
+        interval: Option<u16>,
+    },
+    /// Sets the path of a peer.
+    SetPath {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// The new path.
+        path: Path,
+    },
+}
+
+impl fmt::Debug for ConfigChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SetPrivateKey(_) => f.debug_tuple("SetPrivateKey").field(&"<redacted>").finish(),
+            Self::AddOrUpdatePeer(config) => {
+                f.debug_tuple("AddOrUpdatePeer").field(config).finish()
+            }
+            Self::RemovePeer(key) => f.debug_tuple("RemovePeer").field(key).finish(),
+            Self::RemoveAllPeers => f.write_str("RemoveAllPeers"),
+            Self::SetAllowedIps { peer, allowed_ips } => f
+                .debug_struct("SetAllowedIps")
+                .field("peer", peer)
+                .field("allowed_ips", allowed_ips)
+                .finish(),
+            Self::SetPresharedKey { peer, key } => f
+                .debug_struct("SetPresharedKey")
+                .field("peer", peer)
+                .field("key", &key.map(|_| "<redacted>"))
+                .finish(),
+            Self::SetKeepalive { peer, interval } => f
+                .debug_struct("SetKeepalive")
+                .field("peer", peer)
+                .field("interval", interval)
+                .finish(),
+            Self::SetPath { peer, path } => f
+                .debug_struct("SetPath")
+                .field("peer", peer)
+                .field("path", path)
+                .finish(),
+        }
+    }
+}
+
+/// Input to the core.
+#[derive(Debug)]
+pub enum Input<'a> {
+    /// A datagram from a transport, with the path it arrived on.
+    Datagram {
+        /// Path the datagram arrived on.
+        path: Path,
+        /// The datagram; the core may decrypt it in place.
+        data: &'a mut PacketBuf,
+    },
+    /// A local packet (TUN read, netstack egress, injection) to encrypt.
+    Local {
+        /// The IP packet.
+        packet: PacketBuf,
+    },
+    /// A configuration change.
+    Config(ConfigChange),
+}
+
+/// Output of the core.
+#[derive(Debug)]
+pub enum Output {
+    /// Send this datagram on this path (ECN included).
+    Transmit {
+        /// Path to send the datagram on.
+        path: Path,
+        /// The datagram.
+        data: PacketBuf,
+    },
+    /// Deliver this decrypted packet to the local side.
+    Deliver {
+        /// Peer the packet came from.
+        from: PeerId,
+        /// The IP packet.
+        packet: PacketBuf,
+    },
+    /// Something the driver may want to report.
+    Event(Event),
+}
+
+/// An event reported by the core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A handshake with `peer` completed.
+    HandshakeCompleted {
+        /// The peer.
+        peer: PeerId,
+        /// Path the handshake completed on, if known.
+        path: Option<Path>,
+        /// Round-trip time of the handshake, if measured.
+        rtt: Option<Duration>,
+    },
+    /// An authenticated message from `peer` arrived on `from`.
+    Authenticated {
+        /// The peer.
+        peer: PeerId,
+        /// Path the message arrived on.
+        from: Path,
+    },
+    /// `path` became the current path of `peer`.
+    PathAdopted {
+        /// The peer.
+        peer: PeerId,
+        /// The new path.
+        path: Path,
+    },
+    /// The sessions with `peer` expired.
+    SessionExpired {
+        /// The peer.
+        peer: PeerId,
+    },
+    /// Periodic counters of `peer`.
+    PeerStats {
+        /// The peer.
+        peer: PeerId,
+        /// Bytes received on the wire, as counted by the tunnel.
+        rx: u64,
+        /// Bytes sent on the wire, as counted by the tunnel.
+        tx: u64,
+        /// Decrypted payload bytes delivered.
+        data_rx: u64,
+        /// Time since the last completed handshake.
+        last_handshake: Option<Duration>,
+    },
+    /// A packet was dropped.
+    Dropped {
+        /// The peer the packet came from or was routed to, if known.
+        peer: Option<PeerId>,
+        /// Static description of why the packet was dropped.
+        reason: &'static str,
+    },
+}
+
+/// A snapshot of one peer: its configuration and counters.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerStats {
+    /// The peer.
+    pub peer: PeerId,
+    /// Public key of the peer.
+    pub public_key: x25519::PublicKey,
+    /// Current path of the peer.
+    pub path: Option<Path>,
+    /// Networks routed to the peer.
+    pub allowed_ips: Vec<AllowedIp>,
+    /// Preshared key, if set.
+    pub preshared_key: Option<[u8; 32]>,
+    /// Persistent keepalive interval in seconds, if enabled.
+    pub persistent_keepalive: Option<u16>,
+    /// Bytes received on the wire, as counted by the tunnel.
+    pub rx: u64,
+    /// Bytes sent on the wire, as counted by the tunnel.
+    pub tx: u64,
+    /// Decrypted payload bytes delivered.
+    pub data_rx: u64,
+    /// Time since the last completed handshake.
+    pub last_handshake: Option<Duration>,
+}
+
+impl fmt::Debug for PeerStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerStats")
+            .field("peer", &self.peer)
+            .field("public_key", &self.public_key)
+            .field("path", &self.path)
+            .field("allowed_ips", &self.allowed_ips)
+            .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("rx", &self.rx)
+            .field("tx", &self.tx)
+            .field("data_rx", &self.data_rx)
+            .field("last_handshake", &self.last_handshake)
+            .finish()
+    }
+}
+
+/// Configuration of the core.
+pub struct CoreConfig {
+    /// Own private key; peers can only be added once it is set.
+    pub private_key: Option<x25519::StaticSecret>,
+    /// Path selection and roaming decisions.
+    pub policy: Box<dyn PathPolicy>,
+    /// Filters run in order on every plaintext packet.
+    pub filters: Vec<Box<dyn PacketFilter>>,
+    /// Handshakes per second tolerated before replying with cookies.
+    pub handshake_rate_limit: u64,
+    /// Interval of `Event::PeerStats`; `None` disables them.
+    pub stats_interval: Option<Duration>,
+    /// Maximum number of free packet buffers kept for reuse.
+    pub pool_size: usize,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            private_key: None,
+            policy: Box::new(StandardRoaming),
+            filters: Vec::new(),
+            handshake_rate_limit: 100,
+            stats_interval: None,
+            pool_size: 64,
+        }
+    }
+}
+
+impl fmt::Debug for CoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreConfig")
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("filters", &self.filters.len())
+            .field("handshake_rate_limit", &self.handshake_rate_limit)
+            .field("stats_interval", &self.stats_interval)
+            .field("pool_size", &self.pool_size)
+            .finish_non_exhaustive()
+    }
+}

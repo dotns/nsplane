@@ -1,29 +1,26 @@
-# nstun Architecture
+# nsplane Architecture
 
 This page describes what is on `main`. The target design and roadmap are in
 [design.md](design.md).
-
-nstun is the dotns fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun), a
-userspace WireGuard implementation. The upstream remote is kept for merges.
 
 ## Crates
 
 | Crate | Path | Role |
 |---|---|---|
-| `boringtun` | `boringtun/` | The Noise protocol state machine (`noise`), C FFI (`ffi`), and JNI (`jni`); no I/O |
-| `nstun-packet` | `nstun-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
-| `nstun-core` | `nstun-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
-| `nstun` | `nstun/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
-| `nstun-tun` | `nstun-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
-| `nstun-uapi` | `nstun-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
-| `boringtun-cli` | `boringtun-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
+| `nsplane-noise` | `crates/nsplane-noise/` | The Noise protocol state machine (`noise`); no I/O |
+| `nsplane-packet` | `crates/nsplane-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
+| `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
+| `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
+| `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
+| `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
+| `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
 
 ```text
-boringtun (noise) ─► nstun-core ─► nstun ─► nstun-tun, nstun-uapi ─► boringtun-cli
-nstun-packet ─────► nstun-core, nstun
+nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
+nsplane-packet ────────► nsplane-core, nsplane
 ```
 
-## boringtun
+## nsplane-noise
 
 - `noise`: transport-agnostic protocol core. `Tunn` owns the handshake, the session ring,
   the timers, and the per-peer packet queue. It never does I/O: callers pass datagrams in
@@ -34,10 +31,8 @@ nstun-packet ─────► nstun-core, nstun
   - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry).
 - `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
   and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
-- `ffi` / `jni` (features `ffi-bindings` / `jni-bindings`): C ABI and Android bindings
-  over `noise`.
 
-## nstun-core
+## nsplane-core
 
 `Core` performs no I/O and keeps no clock of its own. A driver feeds it `Input`s (local
 packets, received datagrams, configuration changes) with `handle_input`, calls
@@ -49,7 +44,7 @@ session index and allowed IP (cryptokey routing). Path selection and roaming are
 to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
 `PacketFilter`s.
 
-## nstun (driver)
+## nsplane (driver)
 
 One owner task owns the `Core` and loops: it waits for a handle command, a local packet, a
 received datagram or the core's next timeout, feeds the core and drains its outputs. Four
@@ -87,7 +82,7 @@ Backpressure:
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
 
-## nstun-tun
+## nsplane-tun
 
 `Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one, and `Tun::split`
 yields a `TunSource` and a `TunSink` registered with the tokio reactor.
@@ -98,21 +93,21 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
 - `unix`: non-blocking fd I/O shared by both.
 - `windows`: a Wintun adapter; a reader thread feeds the source.
 
-## nstun-uapi and the CLI
+## nsplane-uapi and the CLI
 
 `Uapi` answers `get=1` and `set=1` over an `EngineHandle`; `listen_port` and `fwmark` bind a
 new `UdpTransport` and install it with `EngineHandle::set_transport`. On Unix,
 `UapiListener` binds `/var/run/wireguard/<iface>.sock`. Windows has no listener yet.
 
-`boringtun-cli` builds a tokio multi-thread runtime (`--threads` workers), creates the TUN,
+`nsplane-cli` builds a tokio multi-thread runtime (`--threads` workers), creates the TUN,
 builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops privileges to
 `SUDO_UID`/`SUDO_GID`, and runs until SIGINT or SIGTERM.
 
 ## Unsafe code
 
-`unsafe` lives only in `boringtun`'s `ffi` and `jni` modules and in `nstun-tun`'s platform
+`unsafe` lives only in `nsplane-tun`'s platform
 modules (`unix`, `linux`, `darwin`, and loading Wintun in `windows`), each with SAFETY
-comments. `nstun-packet`, `nstun-core`, `nstun`, `nstun-uapi` and `boringtun-cli` declare
+comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-uapi` and `nsplane-cli` declare
 `#![forbid(unsafe_code)]`. See `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 ## Crypto
@@ -126,5 +121,5 @@ comments. `nstun-packet`, `nstun-core`, `nstun`, `nstun-uapi` and `boringtun-cli
 ## Testing
 
 `just check` runs the unit and integration tests of every crate (the engine against
-in-memory channels). `just e2e` (`scripts/e2e/linux.sh`) runs `boringtun-cli` against kernel
+in-memory channels). `just e2e` (`scripts/e2e/linux.sh`) runs `nsplane-cli` against kernel
 WireGuard in two containers.
