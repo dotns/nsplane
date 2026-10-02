@@ -38,8 +38,12 @@ pub const SINK_FULL: &str = "sink full";
 pub const SINK_CLOSED: &str = "sink closed";
 /// Emitted by the driver: a datagram was dropped because no transport serves its path.
 pub const NO_TRANSPORT: &str = "no transport";
-/// Emitted by the driver: a datagram caused by a received datagram or a timer was dropped
-/// because the transmit queue and the datagrams waiting for it were full.
+/// Emitted by the driver: a datagram caused by a local packet, a received datagram or a timer
+/// was dropped because its transport's transmit queue and the datagrams waiting for it were
+/// full.
 pub const TRANSMIT_FULL: &str = "transmit full";
 /// Emitted by the driver: a datagram was dropped because the transport has shut down.
 pub const TRANSPORT_CLOSED: &str = "transport closed";
+/// Emitted by the driver: a datagram queued for a transport was dropped because the
+/// transport was removed.
+pub const TRANSPORT_REMOVED: &str = "transport removed";
