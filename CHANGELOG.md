@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_NO_TRANSPORT`, `DROP_TRANSMIT_FULL` and
   `DROP_TRANSPORT_CLOSED`. In-memory `ChannelSource`/`ChannelSink`/`ChannelTransport` for
   tests and embedders.
+- `nsplane-noise`: `Tunn::update_timers_at(now, dst)`, `Tunn::time_since_last_handshake_at(now)`
+  and `RateLimiter::reset_count_at(now)` run the timers on the caller's clock; the
+  no-argument variants use `std::time::Instant::now()`.
+- `nsplane-noise`: `Tunn::handshake_count()` counts completed handshakes (monotonic), and
+  `Tunn::handle_verified_packet` is public for callers that verify mac1/mac2 with their own
+  `RateLimiter`; it does no rate limiting itself.
+- `nsplane-core`: `reasons` module with a constant for every `Event::Dropped` reason, the
+  core's (e.g. `reasons::HANDSHAKE_REJECTED`) and the driver's; re-exported as
+  `nsplane::reasons`, and the `nsplane::DROP_*` constants are aliases of it.
+- `nsplane-core`: `Event::Suspended`, `Event::Resumed` and `Event::MtuChanged { mtu }`,
+  emitted by the driver only.
 - `nstun-tun`: TUN devices as packet sources and sinks: Linux and Android
   (`/dev/net/tun`), macOS and iOS (utun), Windows (Wintun). `Tun::create`, `Tun::from_fd`
   (Unix) and `Tun::split`.
@@ -53,6 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking: `Tunn::encapsulate` and the session code return
   `WireGuardError::DestinationBufferTooSmall` instead of panicking on short buffers.
 - Breaking: `AllowedIps::insert` takes the prefix length as `u8`.
+- `nsplane-core` drives every tunnel's timers (handshake retries, keepalives, rekey, session
+  expiry, the rate limiter reset) and `last_handshake` with the `now` it is given instead
+  of nsplane-noise's own clock.
+- `nsplane-core` verifies and rate-limits each handshake message once with the shared gate,
+  so `handshake_rate_limit` is the real per-source rate (it used to allow twice that).
+- `nsplane-core` emits `Event::HandshakeCompleted` once per completed handshake, including
+  several within one timer tick. The responder reports it when the initiator's first data
+  message confirms the session.
+- Breaking: `PeerStats::rx`/`tx` and `Event::PeerStats::rx`/`tx` (and with them the UAPI
+  `rx_bytes`/`tx_bytes` and `wg show` transfer) count bytes on the wire, like kernel
+  WireGuard: whole handshake, keepalive and data datagrams accepted from or sent to the
+  peer, without cookie replies. They used to count IP payload only. The payload is in
+  `data_rx` and the new `data_tx` (plaintext sealed for the peer).
 - Breaking (CLI): `boringtun-cli` is a Linux/macOS development tool. It runs in the
   foreground, logs to stderr, and no longer daemonizes (`-f`/`--foreground` and `--log` are
   gone, so is the unmaintained `daemonize` dependency). Argument parsing uses clap derive;
@@ -64,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `boringtun` no longer depends on `socket2`, `thiserror`, `wintun-bindings`, `windows-sys`,
   `ip_network` or `ip_network_table`, nor on the `nix` `user` feature.
 - `just integration` and the upstream integration tests that ran against the device.
+- Breaking: the `mock-instant` features of `nsplane-noise` and `nsplane-core`; tests drive
+  the timers through the `_at` methods and the core's `now` instead.
 
 ### Security
 - Cookies (mac2) cover the source port as well as the IP, as the whitepaper requires.

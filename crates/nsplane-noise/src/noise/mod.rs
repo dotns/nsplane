@@ -418,7 +418,14 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
-    pub(crate) fn handle_verified_packet<'a>(
+    /// Handles a datagram that already passed the mac1/mac2 (and cookie) checks, e.g. a
+    /// [`Packet`] returned by [`RateLimiter::verify_packet`] on the caller's limiter.
+    ///
+    /// This entry point does no rate limiting and never answers with a cookie reply: a
+    /// caller that has not verified the datagram must use [`Tunn::decapsulate`] instead.
+    /// Repeat calls to drain queued packets go through [`Tunn::decapsulate`] with an empty
+    /// datagram.
+    pub fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet<'_>,
         dst: &'a mut [u8],
@@ -553,6 +560,7 @@ impl Tunn {
         };
 
         self.set_current_session(r_idx);
+        self.timer_tick_session_confirmed(r_idx);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
@@ -584,6 +592,7 @@ impl Tunn {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timers.new_handshake_jitter();
+                self.timers.handshake_init_sent = self.timers[TimerName::TimeCurrent];
                 self.timer_tick(TimerName::TimeLastPacketSent);
                 TunnResult::WriteToNetwork(packet)
             }
@@ -703,6 +712,12 @@ impl Tunn {
     /// * Time since last handshake in seconds
     /// * Data bytes sent
     /// * Data bytes received
+    /// * Estimated packet loss
+    /// * Round-trip time of the last handshake we initiated, in milliseconds
+    ///
+    /// The time since the last handshake is measured on the crate clock, like
+    /// [`Tunn::time_since_last_handshake`]. The round-trip time is always measured on the
+    /// real clock, whatever clock drives [`Tunn::update_timers_at`].
     pub fn stats(&self) -> (Option<Duration>, usize, usize, f32, Option<u32>) {
         let time = self.time_since_last_handshake();
         let tx_bytes = self.tx_bytes;
@@ -716,11 +731,11 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "mock-instant")]
     use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
     use super::*;
     use rand_core::{OsRng, RngCore};
+    use std::time::Instant;
 
     fn create_two_tuns() -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
@@ -801,10 +816,9 @@ mod tests {
         packet
     }
 
-    #[cfg(feature = "mock-instant")]
-    fn update_timer_results_in_handshake(tun: &mut Tunn) {
+    fn update_timer_results_in_handshake(tun: &mut Tunn, now: Instant) {
         let mut dst = vec![0u8; 2048];
-        let result = tun.update_timers(&mut dst);
+        let result = tun.update_timers_at(now, &mut dst);
         assert!(matches!(result, TunnResult::WriteToNetwork(_)));
         let TunnResult::WriteToNetwork(data) = result else {
             unreachable!();
@@ -855,17 +869,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mock-instant")]
     fn new_handshake_after_two_mins() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut my_dst = [0u8; 1024];
+        let mut now = start(&mut [&mut my_tun, &mut their_tun]);
 
         // Advance time 1 second and "send" 1 packet so that we send a handshake
         // after the timeout
-        mock_instant::MockClock::advance(Duration::from_secs(1));
-        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+        now += Duration::from_secs(1);
         assert!(matches!(
-            my_tun.update_timers(&mut my_dst),
+            their_tun.update_timers_at(now, &mut []),
+            TunnResult::Done
+        ));
+        assert!(matches!(
+            my_tun.update_timers_at(now, &mut my_dst),
             TunnResult::Done
         ));
         let sent_packet_buf = create_ipv4_udp_packet();
@@ -873,23 +890,28 @@ mod tests {
         assert!(matches!(data, TunnResult::WriteToNetwork(_)));
 
         //Advance to timeout
-        mock_instant::MockClock::advance(REKEY_AFTER_TIME);
-        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
-        update_timer_results_in_handshake(&mut my_tun);
+        now += REKEY_AFTER_TIME;
+        assert!(matches!(
+            their_tun.update_timers_at(now, &mut []),
+            TunnResult::Done
+        ));
+        update_timer_results_in_handshake(&mut my_tun, now);
     }
 
     #[test]
-    #[cfg(feature = "mock-instant")]
     fn handshake_no_resp_rekey_timeout() {
         let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
 
         let init = create_handshake_init(&mut my_tun);
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
         // Retries wait REKEY_TIMEOUT plus up to 333 ms of jitter.
-        mock_instant::MockClock::advance(REKEY_TIMEOUT + Duration::from_millis(334));
-        update_timer_results_in_handshake(&mut my_tun);
+        update_timer_results_in_handshake(
+            &mut my_tun,
+            now + REKEY_TIMEOUT + Duration::from_millis(334),
+        );
     }
 
     #[test]
@@ -985,9 +1007,6 @@ mod tests {
 
     /// Runs a full handshake, initiated by `initiator`; returns whether it completed.
     fn rehandshake(initiator: &mut Tunn, responder: &mut Tunn) -> bool {
-        // The responder rejects initiations whose timestamp does not advance.
-        #[cfg(feature = "mock-instant")]
-        mock_instant::MockClock::advance(Duration::from_millis(1));
         let mut dst = vec![0u8; 2048];
         let TunnResult::WriteToNetwork(init) =
             initiator.format_handshake_initiation(&mut dst, true)
@@ -1018,6 +1037,22 @@ mod tests {
     }
 
     #[test]
+    fn handshake_count_grows_by_one_per_completed_handshake() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        assert_eq!(my_tun.handshake_count(), 0);
+        assert_eq!(their_tun.handshake_count(), 0);
+
+        for count in 1..=2 {
+            assert!(rehandshake(&mut my_tun, &mut their_tun));
+            assert_eq!(my_tun.handshake_count(), count);
+            // The responder counts the handshake once the initiator confirms it.
+            assert_eq!(their_tun.handshake_count(), count - 1);
+            send_data(&mut my_tun, &mut their_tun);
+            assert_eq!(their_tun.handshake_count(), count);
+        }
+    }
+
+    #[test]
     fn preshared_key_change_keeps_the_live_session() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         my_tun.set_preshared_key(Some([7; 32]));
@@ -1045,19 +1080,28 @@ mod tests {
         assert_eq!(my_tun.persistent_keepalive(), None);
     }
 
-    /// Advances the clock and runs the timers, as the device does every 250 ms; nothing may be
-    /// due.
-    #[cfg(feature = "mock-instant")]
-    fn advance(d: Duration, tuns: &mut [&mut Tunn]) {
-        mock_instant::MockClock::advance(d);
+    /// Starts the timers of `tuns` on a test clock, whose current time is returned; nothing may
+    /// be due.
+    fn start(tuns: &mut [&mut Tunn]) -> Instant {
+        let mut now = Instant::now();
+        advance(&mut now, Duration::ZERO, tuns);
+        now
+    }
+
+    /// Advances the test clock `now` and runs the timers, as the device does every 250 ms;
+    /// nothing may be due.
+    fn advance(now: &mut Instant, d: Duration, tuns: &mut [&mut Tunn]) {
+        *now += d;
         let mut dst = vec![0u8; 2048];
         for tun in tuns {
-            assert!(matches!(tun.update_timers(&mut dst), TunnResult::Done));
+            assert!(matches!(
+                tun.update_timers_at(*now, &mut dst),
+                TunnResult::Done
+            ));
         }
     }
 
     /// Sends one data packet from `from` to `to`.
-    #[cfg(feature = "mock-instant")]
     fn send_data(from: &mut Tunn, to: &mut Tunn) {
         let packet = create_ipv4_udp_packet();
         let mut dst = vec![0u8; 2048];
@@ -1076,29 +1120,37 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mock-instant")]
     fn passive_keepalive_is_timed_from_the_received_data() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut dst = vec![0u8; 2048];
+        let mut now = start(&mut [&mut my_tun, &mut their_tun]);
 
         // A long idle period, then the peer sends data.
-        advance(Duration::from_secs(60), &mut [&mut my_tun, &mut their_tun]);
+        advance(
+            &mut now,
+            Duration::from_secs(60),
+            &mut [&mut my_tun, &mut their_tun],
+        );
         send_data(&mut their_tun, &mut my_tun);
 
         // The keepalive is due KEEPALIVE_TIMEOUT after the data, not right away.
-        advance(Duration::from_secs(9), &mut [&mut my_tun]);
-        mock_instant::MockClock::advance(Duration::from_secs(1));
-        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+        advance(&mut now, Duration::from_secs(9), &mut [&mut my_tun]);
+        now += Duration::from_secs(1);
+        assert!(is_keepalive(&my_tun.update_timers_at(now, &mut dst)));
     }
 
     #[test]
-    #[cfg(feature = "mock-instant")]
     fn handshake_after_unanswered_data_is_timed_from_the_sent_data() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut dst = vec![0u8; 2048];
+        let mut now = start(&mut [&mut my_tun, &mut their_tun]);
 
         // A long idle period, then we send data the peer does not answer.
-        advance(Duration::from_secs(60), &mut [&mut my_tun, &mut their_tun]);
+        advance(
+            &mut now,
+            Duration::from_secs(60),
+            &mut [&mut my_tun, &mut their_tun],
+        );
         let packet = create_ipv4_udp_packet();
         assert!(matches!(
             my_tun.encapsulate(&packet, &mut dst),
@@ -1106,9 +1158,9 @@ mod tests {
         ));
 
         // The handshake is due KEEPALIVE_TIMEOUT + REKEY_TIMEOUT after the data.
-        advance(Duration::from_secs(14), &mut [&mut my_tun]);
-        mock_instant::MockClock::advance(Duration::from_secs(1));
-        assert!(is_handshake_init(&my_tun.update_timers(&mut dst)));
+        advance(&mut now, Duration::from_secs(14), &mut [&mut my_tun]);
+        now += Duration::from_secs(1);
+        assert!(is_handshake_init(&my_tun.update_timers_at(now, &mut dst)));
     }
 
     #[test]
@@ -1121,16 +1173,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mock-instant")]
     fn persistent_keepalive_is_not_sent_while_traffic_flows() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut dst = vec![0u8; 2048];
+        let mut now = Instant::now();
         my_tun.set_persistent_keepalive(Some(25));
-        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+        assert!(is_keepalive(&my_tun.update_timers_at(now, &mut dst)));
 
         // Data out, keepalive back, every 10 s: the 25 s interval never elapses.
         for _ in 0..4 {
-            advance(Duration::from_secs(10), &mut [&mut my_tun]);
+            advance(&mut now, Duration::from_secs(10), &mut [&mut my_tun]);
             send_data(&mut my_tun, &mut their_tun);
             let TunnResult::WriteToNetwork(keepalive) = their_tun.encapsulate(&[], &mut dst) else {
                 panic!("expected a keepalive");
@@ -1143,9 +1195,9 @@ mod tests {
         }
 
         // Once the tunnel is idle for the interval, the keepalive is sent.
-        advance(Duration::from_secs(24), &mut [&mut my_tun]);
-        mock_instant::MockClock::advance(Duration::from_secs(1));
-        assert!(is_keepalive(&my_tun.update_timers(&mut dst)));
+        advance(&mut now, Duration::from_secs(24), &mut [&mut my_tun]);
+        now += Duration::from_secs(1);
+        assert!(is_keepalive(&my_tun.update_timers_at(now, &mut dst)));
     }
 
     #[test]
