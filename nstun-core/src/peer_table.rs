@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use boringtun::noise::Tunn;
 use boringtun::noise::rate_limiter::RateLimiter;
@@ -31,9 +32,9 @@ pub(crate) enum PeerTableError {
 struct OwnKey {
     private: StaticSecret,
     public: PublicKey,
-    /// Verifies handshakes before they are demultiplexed to a peer. Each peer's `Tunn` keeps
-    /// its own limiter, so this one only counts handshakes seen by the core.
-    gate: RateLimiter,
+    /// Verifies handshakes before they are demultiplexed to a peer. Every peer's `Tunn` shares
+    /// it, so the cookie it hands out also passes the tunnel's own verification.
+    gate: Arc<RateLimiter>,
 }
 
 /// The peers of the core.
@@ -87,13 +88,22 @@ impl PeerTable {
             return;
         }
 
+        // A handshake that reaches a tunnel is counted by the gate and again by the tunnel, so
+        // the shared limiter allows twice the configured rate.
+        let gate = Arc::new(RateLimiter::new(
+            &public_key,
+            self.handshake_rate_limit.saturating_mul(2),
+        ));
         for peer in self.peers.values_mut() {
-            peer.tunnel
-                .set_static_private(private_key.clone(), public_key, None);
+            peer.tunnel.set_static_private(
+                private_key.clone(),
+                public_key,
+                Some(Arc::clone(&gate)),
+            );
         }
 
         self.key = Some(OwnKey {
-            gate: RateLimiter::new(&public_key, self.handshake_rate_limit),
+            gate,
             private: private_key,
             public: public_key,
         });
@@ -106,7 +116,7 @@ impl PeerTable {
 
     /// The handshake gate for the own key, if set.
     pub(crate) fn rate_limiter(&self) -> Option<&RateLimiter> {
-        self.key.as_ref().map(|k| &k.gate)
+        self.key.as_ref().map(|k| &*k.gate)
     }
 
     /// Adds the peer, or updates it in place if its public key is known.
@@ -145,7 +155,7 @@ impl PeerTable {
                 preshared_key,
                 config.persistent_keepalive.filter(|&k| k > 0),
                 index,
-                None,
+                Some(Arc::clone(&own.gate)),
             );
             let peer = Peer::new(tunnel, config.public_key, index, config.path, preshared_key);
             self.next_id = next_id;
