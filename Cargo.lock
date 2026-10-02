@@ -831,9 +831,11 @@ name = "nstun"
 version = "0.8.0"
 dependencies = [
  "nix",
+ "nstun-core",
  "nstun-packet",
  "socket2 0.6.5",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -868,6 +870,17 @@ dependencies = [
  "nstun-packet",
  "tokio",
  "wintun-bindings",
+]
+
+[[package]]
+name = "nstun-uapi"
+version = "0.8.0"
+dependencies = [
+ "base64",
+ "hex",
+ "nstun",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1318,6 +1331,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
