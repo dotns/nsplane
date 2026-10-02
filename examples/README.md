@@ -8,7 +8,20 @@ cargo run -p nsplane-examples --bin <name> -- --help
 ```
 
 `just check` builds all of them (`just examples`), and `examples/tests/` runs the ones that
-need no root.
+need no root. `just e2e-examples` runs them in containers (see [End-to-end](#end-to-end)).
+The package `nsplane-examples` is not published.
+
+| Example | What it shows | Root |
+|---|---|---|
+| [`udp_pair`](#udp_pair) | Two engines over loopback UDP with netstacks: handshake, TCP and UDP echo, stats | no |
+| [`tun_node`](#tun_node) | A node on a TUN device, managed with `wg` | yes |
+| [`netstack_node`](#netstack_node) | A node whose local side is a userspace TCP/IP stack | no |
+| [`hybrid`](#hybrid) | A TUN device and a netstack behind one engine (`Splitter`, `MergeSource`) | yes |
+| [`acl_gateway`](#acl_gateway) | A TUN node filtered by a reloadable ACL policy | yes |
+| [`fd_bridge`](#fd_bridge) | The engine on a TUN handed over by a host: by fd or by packet channels | yes |
+| [`events_stats`](#events_stats) | Events, peer stats, drop counters, suspend/resume, MTU | no |
+| [`relay_server`](#relay_server) | A single-port relay with its own WireGuard engine, over UDP and WSS | no |
+| [`relay_transport`](#relay_transport) | Relay discovery and the direct/relay path ladder, in-process | no |
 
 ## Examples
 
@@ -18,13 +31,16 @@ Quick start: two engines in one process over loopback UDP, each on a userspace n
 handshake, TCP and UDP echo through the tunnel, peer stats. No root.
 
 ```sh
-cargo run -p nsplane-examples --bin udp_pair -- [--ipv6]
+cargo run -p nsplane-examples --bin udp_pair -- [--ipv6] [--check-timeout <SECS>] [--log <FILTER>]
 ```
 
 ### tun_node
 
 A TUN node managed with `wg show` / `wg set` (UAPI on the standard socket), echo and checks
 on the kernel stack. Needs root.
+
+Flags: node, echo and check flags, `--tun-name <NAME>` (default `nsp0`), `--address <CIDR>`
+(repeatable), `--mtu <N>` (default 1420).
 
 ```sh
 sudo cargo run -p nsplane-examples --bin tun_node -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --echo-port 7
@@ -34,6 +50,9 @@ sudo cargo run -p nsplane-examples --bin tun_node -- --private-key-file a.key --
 
 A node without TUN and without root: the engine's local side is `nsplane-netstack`, echo and
 checks run on the userspace stack.
+
+Flags: node, echo and check flags, `--address <CIDR>` (repeatable, required; one IPv4 and one
+IPv6 are used), `--mtu <N>` (default 1420).
 
 ```sh
 cargo run -p nsplane-examples --bin netstack_node -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 --check tcp:10.0.0.1:7 --exit-after-checks
@@ -97,7 +116,7 @@ peer stats (`STATS ...`) and drop counters (`DROPS ...`), and runs self-checked 
 `STEPS FAIL` (exit 1).
 
 ```sh
-cargo run -p nsplane-examples --bin events_stats
+cargo run -p nsplane-examples --bin events_stats -- [--step-timeout <SECS>] [--suspended-check <SECS>] [--log <FILTER>]
 ```
 
 ### relay_server
@@ -107,6 +126,13 @@ relay's own engine (netstack with `--address`, echo with `--echo-port`), WireGua
 other peers relayed blindly by mac1 and receiver index, and the relay's control messages
 (`register_source`, reflexive address). The design is in
 `docs/decisions/2026-10-02-single-port-relay.md`. No root.
+
+Flags: node, echo and check flags, `--address <CIDR>` (repeatable, required), `--mtu <N>`,
+`--config <PATH>`, `--target <MACHINE=WGKEY>`, `--static-target <WGKEY=IP:PORT>` (both
+repeatable), `--gateway-id <ID>` (carried in reflexive responses, default `relay`),
+`--wss-listen <IP:PORT>`, `--wss-name <NAME>`, `--wss-cert-out <PATH>`. The subcommand
+`gen-machine-key <PATH>` writes a new machine key (base64 Ed25519 seed, mode 0600; an existing
+file is not overwritten) and prints its public key.
 
 ```sh
 cargo run -p nsplane-examples --bin relay_server -- gen-machine-key a.machine   # prints the public key
@@ -169,6 +195,10 @@ direct -> relay -> direct. Prints `STEP <name> PASS|FAIL` for `discovery`, `rela
 With `--carrier wss` A and B reach the relay only over WebSocket over TLS (a pinned
 certificate generated at start); the direct path stays UDP, and the extra step `wss-carrier`
 checks both connections carried datagrams.
+
+Flags: `--carrier <udp|wss>` (default `udp`), `--probe-backoff-ms` (200),
+`--direct-timeout-ms` (2000), `--direct-probe-interval-ms` (3000), `--step-timeout <SECS>`
+(20), `--log <FILTER>` (default `warn`).
 
 ```sh
 cargo run -p nsplane-examples --bin relay_transport -- --carrier udp
@@ -240,7 +270,7 @@ authenticates. Status:
 | `--peer <SPEC>` | repeatable; `<base64 pubkey>[,endpoint=<host:port>][,allowed-ips=<cidr>[+<cidr>...]][,keepalive=<secs>][,psk-file=<path>]` |
 | `--status-file <PATH>` | write a JSON status snapshot every second |
 | `--log <FILTER>` | stderr log filter, default `info` (e.g. `nsplane=debug,info`) |
-| `--transport <udp>` | transport to run, default `udp` |
+| `--transport <udp\|relay\|wss>` | transport to run, default `udp`; `relay` and `wss` take the flags under [relay_transport](#relay_transport) |
 
 ### Echo and checks (`EchoArgs`)
 
@@ -283,3 +313,40 @@ CHECKS FAIL
 
 `extra` holds example-specific state, e.g. `extra.netstack` (the netstack's drop counters)
 on `netstack_node`.
+
+## End-to-end
+
+`just e2e-examples` (`scripts/e2e/examples.sh`) runs the release example binaries as the
+design's "presentation x transport" scenarios, each node in its own container, against each
+other and against kernel WireGuard. It needs docker and the `wireguard` kernel module on the
+host; nothing on the host is reconfigured. The containers use `scripts/e2e/Dockerfile`
+(`wireguard-tools`, `socat`, `iptables`, `tcpdump`).
+
+The matrix has 12 cells; each lists its cases, whose ids are `<row>/<column>/<case>`. In the
+UDP column the peers are the same example or kernel WireGuard; in the relay columns the node
+and a `tun_node` reach each other only through `relay_server`, with the direct path blocked.
+
+| Row | `udp` | `relay-udp` | `relay-wss` |
+|---|---|---|---|
+| `tun` (`tun_node`) | `tun_pair`, `tun_kernel` | `relay_tun` | `relay_tun` |
+| `netstack` (`netstack_node`) | `netstack_pair`, `netstack_kernel` | `relay_netstack` | `relay_netstack` |
+| `fd` (`fd_bridge --mode fd`) | `fd_kernel` | `relay_fd` | `relay_fd` |
+| `channel` (`fd_bridge --mode channel`) | `channel_tun` | `relay_channel` | `relay_channel` |
+
+Scenarios: `udp_pair`, `events_stats` (self-checks), `hybrid`, `acl_gateway` (against kernel
+WireGuard), `native_wg`, `native_wg_reverse` (native kernel WireGuard through the relay, in
+both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
+`nat_hole_punch` (the ladder behind MASQUERADE routers), `plain_wg_compat` (the relay
+extension against a plain WireGuard server). The run ends with the matrix and the scenario
+list and fails if anything failed.
+
+| Variable | Meaning |
+|---|---|
+| `NSPLANE_E2E_EX_ONLY` | run only the cases whose id (`<row>/<column>/<case>`, `scenario/<name>`) matches this regex |
+| `NSPLANE_E2E_EX_BIN_DIR` | directory holding prebuilt example binaries; otherwise they are built in the dev image |
+| `NSPLANE_E2E_EX_PREFIX` | name prefix of the containers, networks and image (default `nsplane-e2e-ex-<pid>`) |
+
+```sh
+just e2e-examples
+NSPLANE_E2E_EX_ONLY='acl|hybrid' scripts/e2e/examples.sh
+```

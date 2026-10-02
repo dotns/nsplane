@@ -96,6 +96,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flows the local side opened and reports drops under the `reasons` constants, with
   counters in `AclFilterStats`. `FlowTracker` is a pass-through `PacketFilter` counting
   packets and bytes per flow in a bounded table.
+- `nsplane-examples` (`examples/`, not published): runnable examples on the public APIs,
+  each with `--help` — `udp_pair`, `tun_node`, `netstack_node`, `hybrid`, `acl_gateway`,
+  `fd_bridge`, `events_stats` — sharing node, echo/check and status-file flags. See
+  `examples/README.md`.
+- `nsplane-examples`: a single-port relay (`relay_server`) that is also a WireGuard node:
+  one UDP socket carries WireGuard to its own engine, WireGuard between other peers relayed
+  by mac1 and receiver index, and signed control messages (`register_source`, reflexive
+  address); targets come from flags and a reloaded JSON config. Every node example gains
+  `--transport relay`: capability discovery, registration, the reflexive address and a
+  direct-first path ladder with relay fallback; `relay_transport` shows it in one process.
+  The wire format is in `docs/decisions/2026-10-02-single-port-relay.md` (Proposed).
+- `nsplane-examples`: WebSocket over TLS as a relay carrier. `relay_server --wss-listen`
+  accepts WSS clients with a self-signed certificate written for pinning (`--wss-cert-out`);
+  `--transport wss` reaches the relay over WSS with that certificate as the only trust
+  anchor, reconnecting with backoff; `relay_transport --carrier wss`.
+- `just e2e-examples` (`scripts/e2e/examples.sh`): the example binaries in containers as a
+  12-cell matrix (TUN, netstack, bridge by fd and by channel x UDP, relay over UDP, relay
+  over WSS; kernel WireGuard peers in the UDP column) and scenarios (hybrid, ACL gateway,
+  native WireGuard through the relay, the path ladder, NAT hole punching, plain WireGuard
+  compatibility). The e2e image adds `socat`, `iptables` and `tcpdump`.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
