@@ -249,7 +249,7 @@ async fn remove_peer_and_update_only() {
         .request(&format!("set=1\npublic_key={a_hex}\nremove=true\n\n"))
         .await;
     assert_eq!(reply, "errno=0\n\n");
-    assert!(node.handle.peers().await.unwrap().is_empty());
+    assert_eq!(node.handle.peers().await.unwrap(), []);
 }
 
 #[tokio::test]
