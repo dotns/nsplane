@@ -6,6 +6,12 @@ page ties them together and is updated whenever a plan is approved or a phase la
 
 Last updated: 2026-10-02 (Phase 1 of the data-plane plan in progress).
 
+**Naming.** The project is being renamed **nsplane** (ADR `2026-10-02-rename-nsplane`):
+it is the node's underlying data plane, and TUN is only one of its local attachments. The
+rename of the repository, crates (`nstun-*` → `nsplane-*`, `boringtun` → `nsplane-noise`)
+and docs happens as its own task after Phase 1 merges; this page still uses the names on
+`main` today.
+
 ## 1. Purpose and position
 
 nstun is the WireGuard data plane of dotns. It is a Rust library (a fork of
@@ -178,7 +184,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Phase | Deliverable | Status (2026-10-02) |
 |---|---|---|
 | Baseline | aws-lc-rs backend, pma-rust lints, protocol fixes, zero-copy noise, Windows device, CLI as dev tool | done, pushed (`1fb9899`) |
-| 1 | `nstun-packet`, `nstun-core`, `nstun` driver, `nstun-tun`, `nstun-uapi`, `nstun-e2e`, CLI on the engine, delete `boringtun::device` | BKD campaign `nstun-dp-p1`: P merged; C and B in progress; D and E queued |
+| 1 | `nstun-packet`, `nstun-core`, `nstun` driver, `nstun-tun`, `nstun-uapi`, `nstun-e2e`, CLI on the engine, delete `boringtun::device` | BKD campaign `nstun-dp-p1`: P, C and B merged; D and E in progress |
+| 1b | Rename to nsplane (repo, crates, docs section) | after Phase 1, own task (ADR `2026-10-02-rename-nsplane`) |
 | 2 | multi-transport, `PathPolicy`, filter chain with `Handled`, injection, `force_handshake`, suspend/resume | planned |
 | 3 | `nstun-netstack`, `Splitter`, netstack-only e2e | planned |
 | 4 | `nstun-acl` (policy filter, connection check, fragment gate, flow tracker) | planned |
@@ -198,6 +205,7 @@ runs in ns when its current refactor lands.
 | 2026-10-02 | No code copied from reference projects; buffers on `bytes` | same plan, annotations |
 | 2026-10-02 | Value types (`PeerId`, `Path`, `TransportId`, `Ecn`) live in `nstun-packet`, re-exported by `nstun-core` | same plan, gate 1 |
 | 2026-10-02 | One nstun engine per NS node; 4↔6 translation and fragmentation live in the engine; both ns data planes migrate | NS next-architecture page (docs site, `ns/next`) |
+| 2026-10-02 | Rename to **nsplane** (`nsplane-noise`, `nsplane-core`, `nsplane`, `nsplane-tun`, ...); executed after Phase 1 merges | ADR `2026-10-02-rename-nsplane` |
 
 ## 11. References (design only)
 

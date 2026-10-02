@@ -412,6 +412,9 @@ scripts extended. ns is read-only for this plan.
 
 ## Annotations
 
+- 2026-10-02: the project will be renamed **nsplane** (ADR `2026-10-02-rename-nsplane`);
+  crate names in this plan (`nstun-*`, `boringtun`) are the Phase 1 contract names and
+  stay until the campaign merges. Later phases use `nsplane-*`.
 - 2026-10-02: aligned with the NS next-architecture page (docs site `ns/next`): one
   engine per node, 4↔6 translation and fragmentation/PTB belong to the engine (Phase 5),
   Phase 6 migrates both ns data planes. L1 added workstream E (library e2e). The campaign

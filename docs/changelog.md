@@ -70,3 +70,11 @@ Added `docs/design.md`, the one-page design overview (position in the NS archite
 non-goals, principles, crate map, engine model, roadmap, decisions). Plan
 `20261002-1024-data-plane-core` aligned with the NS next-architecture page: 4↔6
 translation and fragmentation in Phase 5, both ns data planes in Phase 6, workstream E.
+
+## 2026-10-02 14:40 [decision]
+
+The project is renamed **nsplane**: it is the node's underlying data plane, not a TUN.
+ADR `2026-10-02-rename-nsplane` records the candidates checked, the crate scheme
+(`nsplane-noise`, `nsplane-core`, `nsplane`, `nsplane-tun`, ...) and the timing: executed
+as its own task after the Phase 1 BKD campaign merges D and E. The docs-site nstun pages
+were rewritten from `docs/design.md`.
