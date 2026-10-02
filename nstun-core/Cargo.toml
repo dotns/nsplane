@@ -1,0 +1,23 @@
+[package]
+name = "nstun-core"
+description = "Sans-I/O WireGuard engine core for the nstun data plane"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+boringtun = { path = "../boringtun" }
+nstun-packet = { path = "../nstun-packet" }
+ip_network = "0.4.1"
+ip_network_table = "0.2.0"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+tracing = "0.1.40"
