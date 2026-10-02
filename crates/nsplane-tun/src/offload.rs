@@ -9,13 +9,6 @@
 //! Checksums are computed here rather than with `nsplane-packet`'s helpers: the codec
 //! needs the folded, uncomplemented partial sums the kernel works with, which those
 //! helpers do not expose.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the Linux TUN device by a later change"
-    )
-)]
 
 use std::iter;
 

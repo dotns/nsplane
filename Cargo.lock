@@ -1198,10 +1198,13 @@ name = "nsplane-tun"
 version = "0.8.0"
 dependencies = [
  "criterion",
+ "futures-core",
  "libc",
  "nsplane",
+ "nsplane-netstack",
  "nsplane-packet",
  "tokio",
+ "tracing",
  "wintun-bindings",
 ]
 
