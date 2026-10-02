@@ -171,6 +171,52 @@
 //! next engine update, by [`AclEngine::expire_pinholes`], or by the
 //! evaluation that sees it, whichever comes first.
 //!
+//! # ACL hook
+//!
+//! The filter is a per-flow hook: a flow's first packet is evaluated, the
+//! later ones reuse its verdict, and with no [`AclFilter`] installed the
+//! engine's filter chain costs nothing.
+//!
+//! - **Generations.** [`AclEngine::generation`] increases on every published
+//!   change: [`load`](AclEngine::load), [`store`](AclEngine::store),
+//!   [`clear`](AclEngine::clear), [`clear_all`](AclEngine::clear_all),
+//!   storing or removing a namespace or a grant, and opening, closing,
+//!   sweeping or revoking a pinhole. A versioned [`PeerIdentity`] (its
+//!   [`generation`](PeerIdentity::generation), bumped by every
+//!   [`PeerIdentityMap`] change) versions the identities.
+//! - **Principal cache.** Per peer, the filter keeps its source assertion,
+//!   principal (an `Arc<str>`, no allocation per packet) and flags
+//!   (outbound-restricted, pinholes, bypass) under both generations.
+//! - **Flow verdict cache.** The reply table also holds, per peer, direction
+//!   and five-tuple, the verdict of a TCP or UDP flow's first packet
+//!   (accepted with its grant or pinhole dependency, or dropped with its
+//!   reason) under both generations: one table, one lock, one capacity
+//!   ([`AclFilterConfig::reply_capacity`]). A hit under other generations is
+//!   evaluated again, so a change applies to the very next packet; an
+//!   accepted verdict that depends on a pinhole is also checked against the
+//!   pinhole's expiry on every hit. Each hit has the side effects of an
+//!   evaluation (pending dependencies, the outbound allowance of a restricted
+//!   peer). A reply allowance for the same key takes precedence, as the reply
+//!   check comes first. When the table is full, cached verdicts are flushed
+//!   (counted in [`AclFilterStats::verdict_evictions`]) before an allowance
+//!   is evicted, so allowances behave as without the cache.
+//! - **Bypass.** On every update the engine computes the principals whose
+//!   inbound flows are all accepted by a rule (a common source namespace
+//!   with an accept rule from `*` to `*:*` for TCP and UDP for every
+//!   destination: the local node and every member address) and that are not
+//!   outbound-restricted, and whether the default policy accepts everything
+//!   (for principals in no namespace). A new inbound TCP or UDP flow from
+//!   such a peer is accepted without evaluation (counted in
+//!   [`AclFilterStats::accepted`] as before). The reply table is still
+//!   consulted first, so replies and the dependencies they carry behave as
+//!   before.
+//!
+//! Fragments, malformed packets, protocols other than TCP and UDP and the
+//! fail-closed rules (nothing loaded: every inbound packet dropped) are
+//! unchanged, and verdicts and counters equal a full evaluation of every
+//! packet. A [`PeerIdentity`] that is not versioned (generation 0, e.g. a
+//! closure) gets no cache: every packet is evaluated.
+//!
 //! # Performance
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
@@ -191,6 +237,8 @@
 //! [`Instant::now`]: std::time::Instant::now
 
 pub mod deny_scope;
+#[cfg(test)]
+mod differential;
 pub mod engine;
 mod filter;
 mod flow;

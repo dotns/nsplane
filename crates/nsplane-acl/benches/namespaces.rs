@@ -5,9 +5,12 @@
 //!   policy.
 //! - `namespaces`: 8 source namespaces of 64 members each (one restricting outbound traffic), 4
 //!   grants and 16 pinholes in one app namespace.
+//! - `bypass`: one namespace of 64 members accepting everything (a Quick-style namespace), so its
+//!   members bypass the evaluation.
 //!
-//! Inbound packets open new flows (the filter's reply table holds no allowance for them), so each
-//! one is evaluated against the policy.
+//! Inbound benches open a new flow with every packet (the source port changes), so each one is
+//! evaluated against the policy; `*_established` benches repeat one five-tuple, the established
+//! flow the filter's verdict cache serves. Outbound benches repeat one five-tuple.
 
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
@@ -159,13 +162,15 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
     (engine, guards.unwrap_or_default())
 }
 
-/// Bench `name`: `packet` to or from `peer` through `filter`, which must give `verdict`.
-fn bench_packet(
+/// Bench `name`: `packet` to or from `peer` through `filter`, which must accept it. With
+/// `new_flows`, the source port changes with every packet.
+fn bench_flow(
     c: &mut Criterion,
     name: &str,
     filter: &AclFilter,
     peer: PeerId,
     inbound: bool,
+    new_flows: bool,
     packet: &PacketBuf,
 ) {
     let run = |buf: &mut PacketBuf| {
@@ -177,7 +182,67 @@ fn bench_packet(
     };
     assert_eq!(run(&mut packet.clone()), Verdict::Accept, "{name}");
     let mut buf = packet.clone();
-    c.bench_function(name, |b| b.iter(|| run(std::hint::black_box(&mut buf))));
+    let mut port: u16 = 1024;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            if new_flows {
+                // The TCP source port, after the 40-byte IPv6 header.
+                port = port.checked_add(1).unwrap_or(1024);
+                buf.as_packet_mut()[40..42].copy_from_slice(&port.to_be_bytes());
+            }
+            run(std::hint::black_box(&mut buf))
+        });
+    });
+}
+
+/// [`bench_flow`] with new inbound flows or one repeated outbound five-tuple.
+fn bench_packet(
+    c: &mut Criterion,
+    name: &str,
+    filter: &AclFilter,
+    peer: PeerId,
+    inbound: bool,
+    packet: &PacketBuf,
+) {
+    bench_flow(c, name, filter, peer, inbound, inbound, packet);
+}
+
+/// [`bench_flow`] with one repeated five-tuple (an established flow).
+fn bench_established(
+    c: &mut Criterion,
+    name: &str,
+    filter: &AclFilter,
+    peer: PeerId,
+    inbound: bool,
+    packet: &PacketBuf,
+) {
+    bench_flow(c, name, filter, peer, inbound, false, packet);
+}
+
+/// An engine with one namespace whose 64 members (those of namespace 0) may send anything.
+fn bypass_engine() -> Arc<AclEngine> {
+    let engine = Arc::new(AclEngine::new());
+    let quick = NamespacePolicy {
+        members: (0..MEMBERS)
+            .map(|i| NamespaceMember {
+                principal: principal(peer(0, i)),
+                addresses: address(0, i).to_string().parse().into_iter().collect(),
+            })
+            .collect(),
+        policy: AclPolicy {
+            hosts: HashMap::new(),
+            acls: vec![AclRule {
+                action: AclAction::Accept,
+                src: vec!["*".to_owned()],
+                dst: vec!["*:*".to_owned()],
+                proto: None,
+            }],
+            tests: Vec::new(),
+        },
+        ..NamespacePolicy::default()
+    };
+    assert!(engine.store_namespace("quick", quick).is_ok());
+    engine
 }
 
 fn bench_namespaces(c: &mut Criterion) {
@@ -192,6 +257,14 @@ fn bench_namespaces(c: &mut Criterion) {
     let filter = AclFilter::new(engine, identity());
     let inbound = tcp(last_addr, 40000, LOCAL, 22);
     bench_packet(c, "default/inbound", &filter, last, true, &inbound);
+    bench_established(
+        c,
+        "default/inbound_established",
+        &filter,
+        last,
+        true,
+        &inbound,
+    );
     let outbound = tcp(LOCAL, 22, last_addr, 40000);
     bench_packet(c, "default/outbound", &filter, last, false, &outbound);
 
@@ -200,10 +273,26 @@ fn bench_namespaces(c: &mut Criterion) {
     assert_eq!(guards.len(), usize::from(PINHOLES));
     let filter = AclFilter::new(engine, identity());
     bench_packet(c, "namespaces/inbound", &filter, last, true, &inbound);
+    bench_established(
+        c,
+        "namespaces/inbound_established",
+        &filter,
+        last,
+        true,
+        &inbound,
+    );
     let granted = tcp(address(0, 1), 40000, address(1, 1), 443);
     bench_packet(
         c,
         "namespaces/inbound_grant",
+        &filter,
+        peer(0, 1),
+        true,
+        &granted,
+    );
+    bench_established(
+        c,
+        "namespaces/inbound_grant_established",
         &filter,
         peer(0, 1),
         true,
@@ -228,6 +317,22 @@ fn bench_namespaces(c: &mut Criterion) {
         false,
         &restricted_out,
     );
+
+    // (c) Bypass: a member of a namespace accepting everything.
+    let filter = AclFilter::new(bypass_engine(), identity());
+    let (member, member_addr) = (peer(0, 5), address(0, 5));
+    let inbound = tcp(member_addr, 40000, LOCAL, 443);
+    bench_packet(c, "bypass/inbound", &filter, member, true, &inbound);
+    bench_established(
+        c,
+        "bypass/inbound_established",
+        &filter,
+        member,
+        true,
+        &inbound,
+    );
+    let outbound = tcp(LOCAL, 443, member_addr, 40000);
+    bench_packet(c, "bypass/outbound", &filter, member, false, &outbound);
 }
 
 criterion_group!(namespaces, bench_namespaces);

@@ -199,9 +199,24 @@ kind); `PinholeStats` counts each reason.
 Reply allowances recorded for flows accepted through a grant or a pinhole depend on it.
 Removal is lazy: once the grant or pinhole is gone from the current snapshot, a dependent
 allowance is removed on its next lookup (`AclFilterStats::reply_revoked`) and the flow's
-packets are evaluated from scratch. The full rules and per-packet bench numbers (`cargo
-bench -p nsplane-acl --bench namespaces`) are in the crate docs
-(`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes* and *Performance*).
+packets are evaluated from scratch.
+
+**ACL hook.** The filter evaluates a flow once, not every packet. `AclEngine::generation`
+increases on every published change (default policy, namespaces, grants, pinholes opened,
+closed, swept or revoked, `clear_all`), and a versioned `PeerIdentity`
+(`PeerIdentity::generation`, bumped by `PeerIdentityMap`) on every identity change. The
+filter caches per peer its resolved principal and flags, and per peer, direction and
+five-tuple the verdict of a TCP/UDP flow's first packet, in the reply table (one lock, one
+capacity, cached verdicts flushed first when full), both tagged with the two generations: a
+hit under other generations is evaluated again, so a change applies to the very next
+packet, and a verdict accepted through a pinhole is also checked against the pinhole's
+expiry. Peers whose namespaces (or the default policy) accept every destination, port and
+protocol and are not outbound-restricted, as computed on every update, bypass the
+evaluation. The reply table, fragments and fail-closed rules are unchanged, and verdicts and
+counters equal a full evaluation (a differential test checks it). The full rules and
+per-packet bench numbers (`cargo bench -p nsplane-acl --bench namespaces`) are in the crate
+docs (`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes*, *ACL hook* and
+*Performance*).
 
 nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes

@@ -142,6 +142,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native WireGuard through the relay, the path ladder, NAT hole punching, plain WireGuard
   compatibility). The e2e image adds `socat`, `iptables` and `tcpdump`.
 - `nsplane-packet`: `PacketBuf::advance`, `reserve_front`, `headroom`, `from_shared`.
+- `nsplane-acl`: the ACL as a per-flow hook. `AclEngine::generation` increases on every
+  published change; `AclFilter` caches each peer's resolved principal and the verdict of each
+  TCP/UDP flow's first packet in its reply table, under the policy and identity
+  generations, so established flows skip the evaluation; peers whose namespaces (or the
+  default policy) accept everything bypass it. `PeerIdentity::generation` (default 0: not
+  cached) versions identities, and `PeerIdentityMap` bumps it on every change. Verdicts are
+  the same as a full evaluation (differential test). New counters
+  `AclFilterStats::pending_evictions` and `verdict_evictions`; `nsplane-e2e` `acl_hook`
+  tests.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their

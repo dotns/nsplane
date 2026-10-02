@@ -1,7 +1,7 @@
 //! Access requests, compiled policies and the shared [`AclEngine`] with its
 //! namespaces, grants and pinholes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -206,6 +206,16 @@ impl CompiledRule {
         }
         self.proto.is_none_or(|proto| proto == req.protocol)
     }
+
+    /// Whether the rule accepts every `protocol` request, whatever its
+    /// source, destination and port.
+    fn accepts_everything(&self, protocol: Protocol) -> bool {
+        self.src.iter().any(|src| matches!(src, SrcMatcher::Any))
+            && self.dst.iter().any(|dst| {
+                matches!(dst.host, HostMatcher::Any) && matches!(dst.ports, PortMatcher::Any)
+            })
+            && self.proto.is_none_or(|proto| proto == protocol)
+    }
 }
 
 // ── CompiledPolicy ────────────────────────────────────────────────────────────
@@ -333,6 +343,16 @@ impl CompiledPolicy {
             matched_rule_index: None,
             reason: "denied: no matching accept rule".to_owned(),
         }
+    }
+
+    /// Whether every TCP and UDP request is accepted, whatever its source,
+    /// destination and port.
+    fn accepts_everything(&self) -> bool {
+        [Protocol::Tcp, Protocol::Udp].into_iter().all(|protocol| {
+            self.compiled_rules
+                .iter()
+                .any(|rule| rule.accepts_everything(protocol))
+        })
     }
 
     /// Run the built-in policy tests and return a list of failures.
@@ -563,6 +583,13 @@ pub(crate) struct Snapshot {
     outbound_restrictions: bool,
     grants: BTreeMap<String, Arc<CompiledGrant>>,
     pinholes: BTreeMap<PinholeId, Arc<Pinhole>>,
+    /// Bumped on every published update ([`AclEngine::generation`]).
+    generation: u64,
+    /// The default policy accepts every inbound request (derived).
+    default_bypass: bool,
+    /// The members whose inbound requests are all accepted by a namespace
+    /// rule and that are not outbound-restricted (derived).
+    bypass: HashSet<String>,
 }
 
 impl Snapshot {
@@ -574,6 +601,31 @@ impl Snapshot {
     /// The default policy, for principals in no namespace.
     pub(crate) fn default_policy(&self) -> Option<&CompiledPolicy> {
         self.default.as_deref()
+    }
+
+    /// The generation of this snapshot.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether every inbound TCP or UDP request from `principal` (`None`: a
+    /// peer whose principal is not resolved because there are no members) is
+    /// accepted without a dependency and without recording an outbound reply
+    /// allowance, so the filter can skip its evaluation.
+    pub(crate) fn bypasses(&self, principal: Option<&str>) -> bool {
+        principal
+            .filter(|principal| self.memberships.contains_key(*principal))
+            .map_or(self.default_bypass, |principal| {
+                self.bypass.contains(principal)
+            })
+    }
+
+    /// Whether some pinhole (open or expired but not yet swept) belongs to
+    /// `principal`.
+    pub(crate) fn has_pinholes_of(&self, principal: &str) -> bool {
+        self.pinholes
+            .values()
+            .any(|pinhole| pinhole.spec.peer == principal)
     }
 
     /// Whether any principal is a namespace member.
@@ -780,6 +832,58 @@ impl Snapshot {
         self.memberships = memberships;
         self.hosts = hosts;
         self.addresses = addresses;
+    }
+
+    /// Recompute the bypass flags. A member bypasses when it is not
+    /// outbound-restricted and, for every destination (the local node and
+    /// every member address), a common source namespace accepts everything
+    /// (an accept rule from `*` to `*:*` for TCP and UDP).
+    fn rebypass(&mut self) {
+        self.default_bypass = self
+            .default
+            .as_ref()
+            .is_some_and(|policy| policy.accepts_everything());
+        let open: HashSet<&NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(id, namespace)| !id.is_app() && namespace.rules.accepts_everything())
+            .map(|(id, _)| id)
+            .collect();
+        let mut bypass = HashSet::new();
+        if !open.is_empty() {
+            let owners: HashSet<&str> = self
+                .hosts
+                .values()
+                .chain(self.addresses.iter().map(|(_, principal)| principal))
+                .map(String::as_str)
+                .collect();
+            // Members with the same open namespaces share the outcome.
+            let mut outcomes: HashMap<Vec<&NamespaceId>, bool> = HashMap::new();
+            for (principal, membership) in &self.memberships {
+                if membership.outbound_restricted {
+                    continue;
+                }
+                let mine: Vec<&NamespaceId> = membership
+                    .namespaces
+                    .iter()
+                    .filter(|id| open.contains(id))
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let reaches_all = *outcomes.entry(mine).or_insert_with_key(|mine| {
+                    owners.iter().all(|owner| {
+                        self.memberships
+                            .get(*owner)
+                            .is_some_and(|m| mine.iter().any(|id| m.contains(id)))
+                    })
+                });
+                if reaches_all {
+                    bypass.insert(principal.clone());
+                }
+            }
+        }
+        self.bypass = bypass;
     }
 
     /// Whether `peer` may hold a pinhole of `kind` in `app_namespace`
@@ -1215,6 +1319,16 @@ impl AclEngine {
         usize::try_from(expired).unwrap_or(usize::MAX)
     }
 
+    /// The policy generation: starts at 0 and increases on every published
+    /// change (default policy, namespaces, grants, pinholes opened, closed,
+    /// swept after expiry or revoked, [`clear_all`](Self::clear_all)). The
+    /// filter tags its cached verdicts with it, so no cached verdict outlives
+    /// a change; a pinhole that expired but is not swept yet is caught by the
+    /// filter's expiry check instead.
+    pub fn generation(&self) -> u64 {
+        self.snapshot.load().generation
+    }
+
     /// The pinhole counters.
     pub fn pinhole_stats(&self) -> PinholeStats {
         self.pinholes.stats()
@@ -1264,9 +1378,12 @@ impl AclEngine {
     fn publish_swept<T>(&self, update: impl FnOnce(&mut Snapshot) -> T) -> (u64, T) {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut next = Snapshot::clone(&self.snapshot.load());
+        let generation = next.generation + 1;
         let expired = next.sweep_pinholes(self.now());
         PinholeCounters::add(&self.pinholes.expired, expired);
         let out = update(&mut next);
+        next.generation = generation;
+        next.rebypass();
         self.snapshot.store(Arc::new(next));
         (expired, out)
     }
