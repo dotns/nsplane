@@ -29,6 +29,11 @@ pub mod port_map;
 pub mod table;
 pub mod translate;
 
+pub use conntrack::{
+    Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, Flow, FlowDirection, FlowMatch,
+    TcpState,
+};
+pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};
 pub use table::{
     LanPrefix, PeerMapping, SelfMapping, TableError, TranslationTable, TranslationTableBuilder,
 };
