@@ -41,7 +41,7 @@ const QUEUE: usize = 8;
 /// Datagrams a stalled transport can hold in the hub without a drop: its end of the link,
 /// its transmit queue, its backlog and the one datagram being sent.
 const HELD: u64 = (STALL_CAPACITY + QUEUE + QUEUE + 1) as u64;
-/// How much slower than the unstalled baseline the burst to `x` may be while `y` is
+/// How much slower than the baseline without a stall the burst to `x` may be while `y` is
 /// stalled; generous for scheduling noise.
 const SLOWDOWN: u32 = 3;
 /// Packets per round of a burst and rounds per burst.
@@ -135,7 +135,7 @@ impl Relay {
             to_y: None,
             _to_hub: to_hub,
         };
-        relay.unstall();
+        relay.resume();
         (relay, hub_end, y_end)
     }
 
@@ -149,7 +149,7 @@ impl Relay {
     }
 
     /// Forwards from the hub to `y` again.
-    fn unstall(&mut self) {
+    fn resume(&mut self) {
         let (stop, signal) = oneshot::channel();
         let task = tokio::spawn(forward(
             Arc::clone(&self.hub_side),
@@ -362,7 +362,7 @@ async fn single_stalled_transport_holds_back_the_source() -> TestResult {
     );
     assert_eq!(hub.drops(DROP_TRANSMIT_FULL).await?, 0);
 
-    relay.unstall();
+    relay.resume();
     for (seq, packet) in packets.iter().enumerate() {
         let (_, delivered) = y.expect_delivery().await?;
         if delivered != *packet {
