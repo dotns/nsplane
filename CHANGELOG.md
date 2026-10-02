@@ -70,6 +70,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
   serves the UAPI on an already-connected Unix stream socket next to the standard socket;
   the daemon takes ownership of both fds.
+- `nsplane-netstack`: a user-space TCP/IP stack on smoltcp 0.14 for IPv4 and IPv6.
+  `NetStack::new(NetStackConfig)` starts it and `NetStack::split` yields a
+  `NetStackSource` (`PacketSource`, the stack's egress) and a `NetStackSink` (`PacketSink`),
+  which an `EngineBuilder` takes in place of a TUN device. `NetStackHandle` accepts TCP
+  connections and UDP flows to any port of the stack's addresses (`incoming_tcp`,
+  `incoming_udp`) and opens them (`connect_tcp`, `bind_udp`); `TcpConnection` is
+  `AsyncRead + AsyncWrite` with half close, and a `UdpFlow` replies itself or through a
+  `UdpReply` handle. The advertised
+  MSS follows the configured MTU (`mtu - 40` over IPv4, `mtu - 60` over IPv6), so no
+  emitted packet exceeds it. One driver task runs one smoltcp egress turn per ingested
+  packet; every queue is bounded and every discarded packet, datagram or connection is
+  counted in `NetStackHandle::stats` (`NetStackStats`).
+- `nsplane`: `Splitter`, a `PacketSink` that routes each delivered packet to one of several
+  sinks of any types by a closure (`Fn(PeerId, &PacketBuf) -> usize`; out-of-range indices
+  are counted in `Splitter::misrouted`), and `MergeSource`, a `PacketSource` that merges
+  several sources round-robin, for a hybrid local side such as a TUN device next to a
+  netstack.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their

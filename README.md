@@ -8,7 +8,8 @@ implementation of the WireGuard protocol written in Rust. It:
   runtime code, documented `unsafe` only in platform modules),
 - has a zero-copy data path (in-place seal/open, `zerocopy` message views),
 - is built from a sans-I/O core (`nsplane-core`) and a tokio driver (`nsplane`), with TUN
-  devices (including Windows through Wintun) in `nsplane-tun`.
+  devices (including Windows through Wintun) in `nsplane-tun` and a user-space TCP/IP
+  stack in `nsplane-netstack`.
 
 See [CHANGELOG.md](CHANGELOG.md) for details.
 
@@ -21,6 +22,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
+| `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp (TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |

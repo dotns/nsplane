@@ -12,12 +12,14 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
+| `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
 | `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI |
 
 ```text
 nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
 nsplane-packet ────────► nsplane-core, nsplane
+nsplane, nsplane-packet ─► nsplane-netstack
 ```
 
 ## nsplane-noise
@@ -82,6 +84,13 @@ Backpressure:
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
 
+For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitter` is a
+`PacketSink` that routes each delivered packet to one of several sinks by a closure
+(`Fn(PeerId, &PacketBuf) -> usize`) and `MergeSource` is a `PacketSource` that serves
+several sources round-robin and reports the smallest of their MTUs. The splitter awaits
+only the chosen sink, but a waiting sink still holds back the engine's next delivery;
+packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
+
 ## nsplane-tun
 
 `Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one, and `Tun::split`
@@ -92,6 +101,31 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
   address-family header.
 - `unix`: non-blocking fd I/O shared by both.
 - `windows`: a Wintun adapter; a reader thread feeds the source.
+
+## nsplane-netstack
+
+`NetStack::new` starts a user-space TCP/IP stack on smoltcp for the addresses in its
+`NetStackConfig`, and `NetStack::split` yields a `NetStackSource` (egress) and a
+`NetStackSink` (ingress) that an `EngineBuilder` takes in place of a TUN device. The
+application side is `NetStackHandle`: `incoming_tcp` and `incoming_udp` accept connections
+and flows to any port of the stack's addresses, `connect_tcp` and `bind_udp` open them.
+
+One driver task owns smoltcp. Each iteration takes a bounded batch of ingress packets,
+sizes the TCP listener pool to the batch's SYNs, then ingests the packets one by one with a
+single smoltcp egress turn after each (`poll_ingress_single` / `poll_egress`), moves
+connection bytes between smoltcp and the applications, and flushes egress. UDP bypasses
+smoltcp on its own dispatch path.
+
+- Every queue is bounded (ingress, egress, accept and datagram capacities in
+  `NetStackConfig`); the sink waits while ingress is full.
+- Everything the stack discards is counted per reason in `NetStackHandle::stats`
+  (`NetStackStats`): malformed, foreign or unsupported packets, refused SYNs, connections
+  and flows not accepted, full UDP queues, the flow limit, and egress produced while the
+  egress backlog is full.
+- smoltcp sees the configured MTU as its device MTU, so it advertises an MSS of `mtu - 40`
+  (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
+  reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
+  scales with the MSS.
 
 ## nsplane-uapi and the CLI
 
