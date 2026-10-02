@@ -531,7 +531,7 @@ impl Coalescer {
         let group = &self.groups[open.group];
         let first = packets[group.first].as_packet();
         let packet = packets[i].as_packet();
-        let room = MAX_IP_LEN - group.hlen - group.payload;
+        let room = MAX_IP_LEN.saturating_sub(group.hlen + group.payload);
         let fits = c.hlen == group.hlen
             && c.payload <= group.gso_size.min(room)
             && group.count < MAX_SEGMENTS
@@ -1551,6 +1551,9 @@ mod tests {
 
         let (_, _, layout) = coalesce(false, &flow(&s, &[1400; 50]));
         assert_eq!(layout, [(0..46).collect::<Vec<_>>(), (46..50).collect()]);
+        // A maximal IPv6 packet (65535-byte payload) leaves no room at all.
+        let (_, _, layout) = coalesce(false, &flow(&spec(true, TCP), &[65515, 1]));
+        assert_eq!(layout, [vec![0], vec![1]]);
         let (_, _, layout) = coalesce(false, &flow(&s, &[100; 70]));
         assert_eq!(
             layout,
