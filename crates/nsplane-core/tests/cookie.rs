@@ -1,7 +1,6 @@
 //! The handshake gate under load: cookie replies, the mac2 retry through the gate and the
 //! peer's tunnel, the rate limiter reset, and garbage datagrams.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
@@ -10,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use common::{Fate, Net, Sent, packet_buf};
-use nsplane_core::{CoreConfig, Event, Output, Path};
+use nsplane_core::{CoreConfig, Event, Output, Path, reasons};
 
 /// Handshakes per second the responder tolerates in these tests.
 const LIMIT: u64 = 2;
@@ -71,9 +70,36 @@ fn flood_is_answered_with_cookie_replies() {
     let rejected = net
         .take_events(1)
         .into_iter()
-        .filter(|e| matches!(e, Event::Dropped { .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Dropped {
+                    reason: reasons::HANDSHAKE_REJECTED,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(rejected, 1, "the replay");
+}
+
+/// The gate counts each initiation once: [`LIMIT`] fresh initiations within a second are
+/// answered, the next one gets a cookie reply.
+#[test]
+fn each_initiation_counts_once() {
+    let mut net = net();
+    let inits: Vec<_> = (0..=LIMIT).map(|_| captured_init(&mut net)).collect();
+
+    let arrival = net.paths[0];
+    for init in &inits {
+        net.receive(1, arrival, packet_buf(init));
+    }
+    drop(net.drain());
+    let replies = net.take_transmits(1);
+    let (last, answered) = replies.split_last().unwrap();
+    assert_eq!(answered.len() as u64, LIMIT, "{replies:?}");
+    assert!(answered.iter().all(|t| t.data[0] == 2), "{replies:?}");
+    assert!(is_cookie_reply(last), "{replies:?}");
 }
 
 /// Under load, the initiator gets a cookie reply from the responder's gate, retries with mac2,

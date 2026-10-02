@@ -4,7 +4,6 @@
 //! `rekey_after_messages_starts_a_handshake` is not ported: the rekey message count is 2^60,
 //! which no test can send through a core, and the core offers no way to wear a session out.
 
-#![cfg(feature = "mock-instant")]
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
