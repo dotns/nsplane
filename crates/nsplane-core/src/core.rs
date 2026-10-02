@@ -16,6 +16,7 @@ use nsplane_noise::x25519;
 use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
 
 use crate::filter::{PacketFilter, Verdict};
+use crate::peer::Peer;
 use crate::peer_table::{PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
@@ -154,7 +155,7 @@ impl Core {
                         &mut self.pool,
                         self.policy.as_ref(),
                         id,
-                        peer.path(),
+                        peer,
                         kind,
                         data,
                     );
@@ -177,12 +178,12 @@ impl Core {
             && now >= due
         {
             for (peer, p) in self.peers.iter() {
-                let (_, tx, rx, ..) = p.tunnel.stats();
                 self.outputs.push_back(Output::Event(Event::PeerStats {
                     peer,
-                    rx: rx as u64,
-                    tx: tx as u64,
+                    rx: p.rx(),
+                    tx: p.tx(),
                     data_rx: p.data_rx(),
+                    data_tx: p.data_tx(),
                     last_handshake: p.time_since_last_handshake(now),
                 }));
             }
@@ -211,7 +212,6 @@ impl Core {
     /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
         let p = self.peers.peer(peer)?;
-        let (_, tx, rx, ..) = p.tunnel.stats();
         let last_handshake = self.now.and_then(|now| p.time_since_last_handshake(now));
         Some(PeerStats {
             peer,
@@ -220,9 +220,10 @@ impl Core {
             allowed_ips: self.peers.allowed_ips(peer),
             preshared_key: p.preshared_key().copied(),
             persistent_keepalive: p.persistent_keepalive(),
-            rx: rx as u64,
-            tx: tx as u64,
+            rx: p.rx(),
+            tx: p.tx(),
             data_rx: p.data_rx(),
+            data_tx: p.data_tx(),
             last_handshake,
         })
     }
@@ -265,7 +266,7 @@ impl Core {
                     &mut self.pool,
                     self.policy.as_ref(),
                     peer,
-                    p.path(),
+                    p,
                     MessageKind::HandshakeInit,
                     buf,
                 );
@@ -389,6 +390,7 @@ impl Core {
                 return;
             }
         };
+        peer.add_rx(len as u64);
         let completed = peer.take_completed_handshakes();
 
         let kind = if src.is_some() {
@@ -517,6 +519,10 @@ impl Core {
                 return self.pool.put(reply);
             }
         };
+        // Like the kernel, count handshake messages on the wire but not cookie replies.
+        if kind != MessageKind::CookieReply {
+            p.add_rx(datagram.len() as u64);
+        }
         let completed = p.take_completed_handshakes();
 
         let Some(reply_len) = reply_len else {
@@ -611,7 +617,7 @@ impl Core {
                 &mut self.pool,
                 self.policy.as_ref(),
                 id,
-                peer.path(),
+                peer,
                 MessageKind::Data,
                 buf,
             );
@@ -661,13 +667,15 @@ impl Core {
 
     /// Transmits a message of `kind` to `peer` on the path chosen by the policy.
     fn transmit(&mut self, id: PeerId, kind: MessageKind, data: PacketBuf) {
-        let current = self.peers.peer(id).and_then(crate::peer::Peer::path);
+        let Some(peer) = self.peers.peer_mut(id) else {
+            return self.pool.put(data);
+        };
         transmit(
             &mut self.outputs,
             &mut self.pool,
             self.policy.as_ref(),
             id,
-            current,
+            peer,
             kind,
             data,
         );
@@ -680,23 +688,25 @@ impl Core {
     }
 }
 
-/// Queues `data` for `peer` on the path the policy selects for `kind`, or on the peer's
-/// `current` path; drops it if there is neither.
+/// Queues `data` for peer `id` on the path the policy selects for `kind`, or on the peer's
+/// current path, and counts it as sent; drops it if there is neither.
 fn transmit(
     outputs: &mut VecDeque<Output>,
     pool: &mut PacketPool,
     policy: &dyn PathPolicy,
-    peer: PeerId,
-    current: Option<Path>,
+    id: PeerId,
+    peer: &mut Peer,
     kind: MessageKind,
     data: PacketBuf,
 ) {
-    if let Some(path) = policy.select(peer, kind).or(current) {
+    let current = peer.path();
+    if let Some(path) = policy.select(id, kind).or(current) {
+        peer.add_tx(data.len() as u64);
         outputs.push_back(Output::Transmit { path, data });
     } else {
         pool.put(data);
         outputs.push_back(Output::Event(Event::Dropped {
-            peer: Some(peer),
+            peer: Some(id),
             reason: reasons::NO_PATH,
         }));
     }

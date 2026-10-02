@@ -17,6 +17,14 @@ pub(crate) struct Peer {
     index: u32,
     path: Option<Path>,
     preshared_key: Option<[u8; 32]>,
+    /// Bytes received on the wire: the full datagram of every handshake initiation, handshake
+    /// response and transport data message (keepalives included) accepted from this peer.
+    /// Cookie replies and datagrams dropped before authentication are not counted.
+    rx: u64,
+    /// Bytes sent on the wire: the full datagram of every handshake initiation, handshake
+    /// response and transport data message (keepalives included) transmitted to this peer.
+    /// Cookie replies are not counted.
+    tx: u64,
     /// Decrypted payload bytes delivered from this peer.
     data_rx: u64,
     /// Whether the core reported the current expiry of the tunnel's sessions.
@@ -50,6 +58,8 @@ impl Peer {
             index,
             path,
             preshared_key,
+            rx: 0,
+            tx: 0,
             data_rx: 0,
             expired: false,
             handshakes,
@@ -83,6 +93,26 @@ impl Peer {
         self.path = Some(path);
     }
 
+    /// Counts a datagram of `bytes` accepted from this peer.
+    pub(crate) const fn add_rx(&mut self, bytes: u64) {
+        self.rx = self.rx.saturating_add(bytes);
+    }
+
+    /// Counts a datagram of `bytes` transmitted to this peer.
+    pub(crate) const fn add_tx(&mut self, bytes: u64) {
+        self.tx = self.tx.saturating_add(bytes);
+    }
+
+    /// Bytes received on the wire from this peer.
+    pub(crate) const fn rx(&self) -> u64 {
+        self.rx
+    }
+
+    /// Bytes sent on the wire to this peer.
+    pub(crate) const fn tx(&self) -> u64 {
+        self.tx
+    }
+
     /// Counts `bytes` of decrypted payload delivered from this peer.
     pub(crate) const fn add_data_rx(&mut self, bytes: u64) {
         self.data_rx = self.data_rx.saturating_add(bytes);
@@ -91,6 +121,11 @@ impl Peer {
     /// Decrypted payload bytes delivered from this peer.
     pub(crate) const fn data_rx(&self) -> u64 {
         self.data_rx
+    }
+
+    /// Plaintext payload bytes sealed for this peer, as counted by the tunnel.
+    pub(crate) fn data_tx(&self) -> u64 {
+        self.tunnel.stats().1 as u64
     }
 
     /// Handshakes the tunnel completed since the last call; the core reports each of them.

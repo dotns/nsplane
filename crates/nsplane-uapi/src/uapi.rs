@@ -433,6 +433,7 @@ mod tests {
             rx: 3,
             tx: 4,
             data_rx: 0,
+            data_tx: 0,
             last_handshake: Some(Duration::new(100, 0)),
         };
         let config = write_config(None, None, None, &[peer], now);
