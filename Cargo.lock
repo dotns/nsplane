@@ -810,6 +810,7 @@ name = "nstun-core"
 version = "0.8.0"
 dependencies = [
  "boringtun",
+ "criterion",
  "ip_network",
  "ip_network_table",
  "mock_instant",
