@@ -837,6 +837,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nstun-core"
+version = "0.8.0"
+dependencies = [
+ "boringtun",
+ "criterion",
+ "ip_network",
+ "ip_network_table",
+ "mock_instant",
+ "nstun-packet",
+ "rand_core",
+ "tracing",
+]
+
+[[package]]
 name = "nstun-packet"
 version = "0.8.0"
 dependencies = [
