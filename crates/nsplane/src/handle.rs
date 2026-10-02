@@ -6,11 +6,11 @@ use std::fmt;
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{AllowedIp, ConfigChange, Event, PeerConfig, PeerStats};
-use nsplane_packet::{PacketBuf, Path, PeerId};
+use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::engine::NewTransport;
 use crate::transport::Transport;
-use crate::udp::UdpTransport;
 
 /// The description of a peer for [`EngineHandle::add_or_update_peer`].
 ///
@@ -31,8 +31,37 @@ impl fmt::Display for EngineError {
 
 impl Error for EngineError {}
 
+/// The error of the transport calls of [`EngineHandle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportError {
+    /// The engine has stopped.
+    Stopped,
+    /// A transport with this id is already installed.
+    Duplicate(TransportId),
+    /// No transport with this id is installed.
+    Unknown(TransportId),
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped => EngineError.fmt(f),
+            Self::Duplicate(id) => write!(f, "transport {} is already installed", id.get()),
+            Self::Unknown(id) => write!(f, "transport {} is not installed", id.get()),
+        }
+    }
+}
+
+impl Error for TransportError {}
+
+impl From<EngineError> for TransportError {
+    fn from(_: EngineError) -> Self {
+        Self::Stopped
+    }
+}
+
 /// A request to the owner task; each carries the channel for its reply.
-pub(crate) enum Command<T> {
+pub(crate) enum Command {
     Config(ConfigChange, oneshot::Sender<()>),
     PeerId(PublicKey, oneshot::Sender<Option<PeerId>>),
     PeerStats(PeerId, oneshot::Sender<Option<PeerStats>>),
@@ -42,7 +71,12 @@ pub(crate) enum Command<T> {
     InjectInbound(PeerId, PacketBuf, oneshot::Sender<()>),
     InjectOutbound(PacketBuf, oneshot::Sender<()>),
     ForceHandshake(PeerId, Option<Path>, oneshot::Sender<()>),
-    SetTransport(T, oneshot::Sender<()>),
+    AddTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
+    RemoveTransport(TransportId, oneshot::Sender<Result<(), TransportError>>),
+    ReplaceTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
+    Suspend(oneshot::Sender<()>),
+    Resume(oneshot::Sender<()>),
+    Mtu(oneshot::Sender<u16>),
     Subscribe(oneshot::Sender<broadcast::Receiver<Event>>),
     DropCounters(oneshot::Sender<BTreeMap<&'static str, u64>>),
     Shutdown(oneshot::Sender<()>),
@@ -53,19 +87,12 @@ pub(crate) enum Command<T> {
 /// Every call is a message to the engine's owner task over a bounded channel and returns
 /// once the owner task has processed it, so a configuration change is visible to every
 /// later call. Calls fail with [`EngineError`] once the engine has stopped.
-pub struct EngineHandle<T: Transport = UdpTransport> {
-    commands: mpsc::Sender<Command<T>>,
+#[derive(Clone)]
+pub struct EngineHandle {
+    commands: mpsc::Sender<Command>,
 }
 
-impl<T: Transport> Clone for EngineHandle<T> {
-    fn clone(&self) -> Self {
-        Self {
-            commands: self.commands.clone(),
-        }
-    }
-}
-
-impl<T: Transport> fmt::Debug for EngineHandle<T> {
+impl fmt::Debug for EngineHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EngineHandle")
             .field("closed", &self.commands.is_closed())
@@ -73,15 +100,15 @@ impl<T: Transport> fmt::Debug for EngineHandle<T> {
     }
 }
 
-impl<T: Transport> EngineHandle<T> {
-    pub(crate) const fn new(commands: mpsc::Sender<Command<T>>) -> Self {
+impl EngineHandle {
+    pub(crate) const fn new(commands: mpsc::Sender<Command>) -> Self {
         Self { commands }
     }
 
     /// Sends the command built by `command` and waits for its reply.
     async fn call<R>(
         &self,
-        command: impl FnOnce(oneshot::Sender<R>) -> Command<T>,
+        command: impl FnOnce(oneshot::Sender<R>) -> Command,
     ) -> Result<R, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.commands
@@ -202,13 +229,72 @@ impl<T: Transport> EngineHandle<T> {
             .await
     }
 
-    /// Installs or replaces the transport.
+    /// Adds a transport under its [`Transport::id`] and spawns its tasks.
+    ///
+    /// Fails with [`TransportError::Duplicate`] when a transport with that id is installed;
+    /// `transport` is then dropped.
+    pub async fn add_transport<T: Transport>(&self, transport: T) -> Result<(), TransportError> {
+        let transport = NewTransport::new(transport);
+        self.call(|tx| Command::AddTransport(transport, tx)).await?
+    }
+
+    /// Removes the transport with id `id`.
+    ///
+    /// Its tasks are stopped and the transport is dropped before this returns, so its socket
+    /// is closed. Its datagrams waiting for transmission are dropped and counted under
+    /// [`crate::DROP_NO_TRANSPORT`], as is every later datagram to a path on `id`. Fails with
+    /// [`TransportError::Unknown`] when no transport with that id is installed.
+    pub async fn remove_transport(&self, id: TransportId) -> Result<(), TransportError> {
+        self.call(|tx| Command::RemoveTransport(id, tx)).await?
+    }
+
+    /// Replaces the transport with the same [`Transport::id`] as `transport`.
     ///
     /// The old transport's tasks are stopped and the transport is dropped before this
     /// returns, so its socket is closed; then the new transport's tasks are spawned.
-    /// Datagrams waiting for transmission go out on the new transport.
-    pub async fn set_transport(&self, transport: T) -> Result<(), EngineError> {
-        self.call(|tx| Command::SetTransport(transport, tx)).await
+    /// Datagrams waiting for transmission go out on the new transport. Fails with
+    /// [`TransportError::Unknown`] when no transport with that id is installed; `transport`
+    /// is then dropped.
+    pub async fn replace_transport<T: Transport>(
+        &self,
+        transport: T,
+    ) -> Result<(), TransportError> {
+        let transport = NewTransport::new(transport);
+        self.call(|tx| Command::ReplaceTransport(transport, tx))
+            .await?
+    }
+
+    /// Suspends the engine, for example while the host sleeps or the network is down.
+    ///
+    /// Until [`EngineHandle::resume`], no source, sink or transport I/O runs (an operation
+    /// already in progress may complete; datagrams that arrive stay in the socket's buffer)
+    /// and no timer fires. Peers and sessions are kept, and handle calls still work: the
+    /// datagrams they cause wait, within the engine's queue bounds, and go out after
+    /// resuming. Transports added or replaced meanwhile start suspended. Publishes
+    /// `Event::Suspended`; suspending a suspended engine does nothing.
+    pub async fn suspend(&self) -> Result<(), EngineError> {
+        self.call(Command::Suspend).await
+    }
+
+    /// Resumes a suspended engine.
+    ///
+    /// Publishes `Event::Resumed`, then runs the core's timers once with the current time,
+    /// so sessions that expired while suspended expire and due handshakes and keepalives
+    /// start; then normal operation continues. Resuming an engine that is not suspended
+    /// does nothing.
+    pub async fn resume(&self) -> Result<(), EngineError> {
+        self.call(Command::Resume).await
+    }
+
+    /// The MTU of the packet source, as last observed by the engine.
+    ///
+    /// The engine watches [`crate::PacketSource::mtu`] and publishes `Event::MtuChanged`
+    /// once for every change, after which this returns the new value. While suspended,
+    /// changes are not observed: this keeps returning the value from before the suspension,
+    /// and the latest value is published once after [`EngineHandle::resume`] if it
+    /// differs. Once the source drops its watch's sender, the last value stays.
+    pub async fn mtu(&self) -> Result<u16, EngineError> {
+        self.call(Command::Mtu).await
     }
 
     /// Subscribes to the engine's events; see [`crate::events`] for the delivery semantics.

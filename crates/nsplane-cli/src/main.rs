@@ -13,7 +13,8 @@ use clap::Parser;
 use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
 use nsplane::EngineBuilder;
 use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener};
+use nsplane_uapi::{Uapi, UapiListener, udp_transport};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::Level;
@@ -23,9 +24,21 @@ use tracing::Level;
 #[derive(Debug, Parser)]
 #[command(name = "nsplane-cli", version, about)]
 struct Args {
-    /// The name of the created interface
+    /// The name of the created interface. With --tun-fd it names the UAPI socket when the
+    /// adopted device's name cannot be queried
     #[arg(value_parser = check_tun_name)]
     interface_name: String,
+
+    /// Adopt this already-open TUN device fd instead of creating the interface. The
+    /// daemon takes ownership of the fd and closes it on exit
+    #[arg(long, env = "WG_TUN_FD")]
+    tun_fd: Option<i32>,
+
+    /// Also serve the UAPI on this already-connected Unix stream socket fd, next to the
+    /// standard socket; the daemon keeps running when that connection ends. The daemon
+    /// takes ownership of the fd and closes it on exit
+    #[arg(long, env = "WG_UAPI_FD")]
+    uapi_fd: Option<i32>,
 
     /// Number of runtime worker threads
     #[arg(short, long, env = "WG_THREADS", default_value_t = 4)]
@@ -118,21 +131,53 @@ fn run(args: &Args) -> anyhow::Result<()> {
     runtime.block_on(serve(args))
 }
 
+/// The MTU an adopted TUN fd starts with; a real TUN device's MTU replaces it at once.
+const ADOPTED_TUN_MTU: u16 = 1420;
+
+/// Adopts the connected Unix stream socket `fd` (`--uapi-fd`) for the tokio reactor.
+fn adopt_uapi_stream(fd: i32) -> anyhow::Result<tokio::net::UnixStream> {
+    let stream = UnixStream::from(nsplane_tun::adopt_fd(fd)?);
+    // Fails for anything that is not a Unix socket.
+    stream.local_addr()?;
+    stream.set_nonblocking(true)?;
+    Ok(tokio::net::UnixStream::from_std(stream)?)
+}
+
 /// Brings the interface up and runs it until SIGINT or SIGTERM.
 async fn serve(args: &Args) -> anyhow::Result<()> {
-    let tun = Tun::create(&args.interface_name).context("Failed to initialize tunnel")?;
-    let name = tun.name().context("Failed to read the tunnel name")?;
+    let uapi_stream = args
+        .uapi_fd
+        .map(|fd| adopt_uapi_stream(fd).with_context(|| format!("Invalid --uapi-fd {fd}")))
+        .transpose()?;
+    let tun = match args.tun_fd {
+        Some(fd) => Tun::from_raw_fd(fd, ADOPTED_TUN_MTU)
+            .with_context(|| format!("Invalid --tun-fd {fd}"))?,
+        None => Tun::create(&args.interface_name).context("Failed to initialize tunnel")?,
+    };
+    let name = tun.name().unwrap_or_else(|e| {
+        tracing::debug!(error = ?e, "Cannot read the tunnel name, using the given one");
+        args.interface_name.clone()
+    });
     let (source, sink) = tun.split().context("Failed to initialize tunnel")?;
 
-    let engine = EngineBuilder::new(source, sink).build();
+    let transport = udp_transport(0).context("Failed to bind the UDP socket")?;
+    let port = transport.local_addr().port();
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()
+        .context("Failed to start the engine")?;
     let handle = engine.handle();
-    let uapi = Uapi::new(engine.handle());
-    uapi.bind_transport(0)
-        .await
-        .context("Failed to bind the UDP socket")?;
+    let uapi = Uapi::with_listen_port(engine.handle(), port);
     let listener = UapiListener::bind(&name).context("Failed to bind the UAPI socket")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("Failed to watch SIGINT")?;
     let mut terminate = signal(SignalKind::terminate()).context("Failed to watch SIGTERM")?;
+    if let Some(stream) = uapi_stream {
+        let uapi = uapi.clone();
+        tokio::spawn(async move {
+            uapi.serve_stream(stream).await;
+            tracing::info!("UAPI connection of --uapi-fd closed");
+        });
+    }
     let mut uapi_task = tokio::spawn(async move { uapi.serve(listener).await });
 
     if !args.disable_drop_privileges {

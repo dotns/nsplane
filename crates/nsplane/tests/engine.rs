@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    AllowedIp, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT, DROP_SINK_FULL,
-    DROP_TRANSMIT_FULL, Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event, PacketBuf,
-    Path, Peer, PeerId, Transport, TransportId,
+    AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
+    DROP_SINK_FULL, DROP_TRANSMIT_FULL, Ecn, Engine, EngineBuilder, EngineError, EngineHandle,
+    Event, PacketBuf, Path, Peer, PeerId, Transport, TransportError, TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -72,9 +72,9 @@ fn link(capacity: usize) -> (ChannelTransport, ChannelTransport) {
 }
 
 /// One engine with the test ends of its source and sink.
-struct Node<T: Transport> {
-    engine: Engine<T>,
-    handle: EngineHandle<T>,
+struct Node {
+    engine: Engine,
+    handle: EngineHandle,
     local: mpsc::Sender<PacketBuf>,
     delivered: mpsc::Receiver<(PeerId, PacketBuf)>,
     _mtu: watch::Sender<u16>,
@@ -84,7 +84,7 @@ struct Node<T: Transport> {
     transport: TransportId,
 }
 
-impl<T: Transport> Node<T> {
+impl Node {
     fn public(&self) -> PublicKey {
         PublicKey::from(&self.secret)
     }
@@ -157,14 +157,15 @@ fn node<T: Transport>(
     transport_id: TransportId,
     transport: T,
     options: &Options,
-) -> Node<T> {
+) -> Node {
     let (source, local, mtu) = ChannelSource::new(4, 1420);
     let (sink, delivered) = ChannelSink::new(options.sink_capacity);
     let engine = EngineBuilder::new(source, sink)
         .transport(transport)
         .private_key(secret(seed))
         .queue_capacity(options.queue_capacity)
-        .build();
+        .build()
+        .unwrap();
     Node {
         handle: engine.handle(),
         engine,
@@ -179,7 +180,7 @@ fn node<T: Transport>(
 }
 
 /// Two engines linked by `a` and `b`, not yet peers of each other.
-fn nodes<T: Transport>(a: T, b: T, options: &Options) -> (Node<T>, Node<T>) {
+fn nodes<T: Transport>(a: T, b: T, options: &Options) -> (Node, Node) {
     (
         node(1, IP_A, addr_a(), TransportId::new(1), a, options),
         node(2, IP_B, addr_b(), TransportId::new(2), b, options),
@@ -187,7 +188,7 @@ fn nodes<T: Transport>(a: T, b: T, options: &Options) -> (Node<T>, Node<T>) {
 }
 
 /// Makes `a` and `b` peers of each other.
-async fn introduce<T: Transport>(a: &Node<T>, b: &Node<T>) {
+async fn introduce(a: &Node, b: &Node) {
     a.handle
         .add_or_update_peer(b.as_peer(a.transport))
         .await
@@ -199,7 +200,7 @@ async fn introduce<T: Transport>(a: &Node<T>, b: &Node<T>) {
 }
 
 /// Two linked engines that are peers of each other.
-async fn peered() -> (Node<ChannelTransport>, Node<ChannelTransport>) {
+async fn peered() -> (Node, Node) {
     let (ta, tb) = link(64);
     let (a, b) = nodes(ta, tb, &Options::default());
     introduce(&a, &b).await;
@@ -238,7 +239,7 @@ async fn eventually<F: Future<Output = bool>>(mut condition: impl FnMut() -> F) 
 }
 
 /// Sends a packet each way and checks both arrive.
-async fn exchange<T: Transport>(a: &mut Node<T>, b: &mut Node<T>) {
+async fn exchange(a: &mut Node, b: &mut Node) {
     a.send(IP_B, b"ping").await;
     let (from, packet) = b.expect_delivery().await;
     assert_eq!(from, b.peer_of(a).await);
@@ -433,8 +434,8 @@ async fn replaced_transport_keeps_traffic_flowing() {
     exchange(&mut a, &mut b).await;
 
     let (ta, tb) = link(64);
-    a.handle.set_transport(ta).await.unwrap();
-    b.handle.set_transport(tb).await.unwrap();
+    a.handle.replace_transport(ta).await.unwrap();
+    b.handle.replace_transport(tb).await.unwrap();
     exchange(&mut a, &mut b).await;
 }
 
@@ -527,6 +528,10 @@ impl Tapped {
 }
 
 impl Transport for Tapped {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
         self.inner.recv(buf).await
     }
@@ -658,10 +663,19 @@ async fn transmit_backlog_is_bounded() {
 async fn missing_transport_drops_with_a_counted_reason() {
     let (source, local, _mtu) = ChannelSource::new(4, 1420);
     let (sink, _delivered) = ChannelSink::new(4);
+    // The engine runs transport 3 only; the peer's path names transport 1.
+    let (other, _end) = ChannelTransport::pair(
+        4,
+        (TransportId::new(3), addr_a()),
+        (TransportId::new(4), addr_b()),
+    );
     let engine = EngineBuilder::new(source, sink)
+        .transport(other)
         .private_key(secret(1))
-        .build();
+        .build()
+        .unwrap();
     let handle = engine.handle();
+    let mut events = handle.subscribe().await.unwrap();
     let peer = Peer {
         allowed_ips: vec![AllowedIp {
             addr: IpAddr::V4(IP_B),
@@ -683,9 +697,230 @@ async fn missing_transport_drops_with_a_counted_reason() {
     handle.force_handshake(to_b, None).await.unwrap();
     let counters = handle.drop_counters().await.unwrap();
     assert_eq!(counters.get(DROP_NO_TRANSPORT), Some(&1));
+    let dropped = expect_event(
+        &mut events,
+        |e| matches!(e, Event::Dropped { reason, .. } if *reason == DROP_NO_TRANSPORT),
+    )
+    .await;
+    assert!(matches!(dropped, Event::Dropped { peer: None, .. }));
     drop(local);
     handle.shutdown().await.unwrap();
     timeout(WAIT, engine.wait()).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn build_needs_unique_transports() {
+    let builder = || {
+        let (source, _local, _mtu) = ChannelSource::new(4, 1420);
+        let (sink, _delivered) = ChannelSink::new(4);
+        EngineBuilder::new(source, sink)
+    };
+    assert_eq!(builder().build().unwrap_err(), BuildError::NoTransport);
+
+    let (ta, tb) = link(4);
+    let (same, _end) = link(4);
+    let err = builder()
+        .transport(ta)
+        .transport(tb)
+        .transport(same)
+        .build()
+        .unwrap_err();
+    assert_eq!(err, BuildError::DuplicateTransport(TransportId::new(1)));
+    assert_eq!(err.to_string(), "transport 1 was added more than once");
+    assert_eq!(
+        BuildError::NoTransport.to_string(),
+        "the engine has no transport"
+    );
+
+    // Distinct ids of different types build.
+    let (ta, _tb) = link(4);
+    let (tapped, _gate) = Tapped::new(
+        ChannelTransport::pair(
+            4,
+            (TransportId::new(3), addr_a()),
+            (TransportId::new(4), addr_b()),
+        )
+        .0,
+    );
+    let engine = builder().transport(ta).transport(tapped).build().unwrap();
+    engine.handle().shutdown().await.unwrap();
+}
+
+/// The second link of `a` and `b`: transport 3 on `a`, 4 on `b`, at new addresses.
+fn second_link() -> (ChannelTransport, ChannelTransport) {
+    ChannelTransport::pair(
+        64,
+        (TransportId::new(3), "192.0.2.11:1000".parse().unwrap()),
+        (TransportId::new(4), "192.0.2.12:2000".parse().unwrap()),
+    )
+}
+
+#[tokio::test]
+async fn transports_are_added_removed_and_replaced() {
+    let (mut a, mut b) = peered().await;
+    exchange(&mut a, &mut b).await;
+    let to_b = a.peer_of(&b).await;
+
+    // A second link: both ends move their peer to it and traffic follows.
+    let (ta, tb) = second_link();
+    a.handle.add_transport(ta).await.unwrap();
+    b.handle.add_transport(tb).await.unwrap();
+    let (dup, _end) = second_link();
+    assert_eq!(
+        a.handle.add_transport(dup).await,
+        Err(TransportError::Duplicate(TransportId::new(3)))
+    );
+    let path = Path {
+        transport: TransportId::new(3),
+        addr: "192.0.2.12:2000".parse().unwrap(),
+        ecn: Ecn::NotEct,
+    };
+    a.handle.set_path(b.public(), path).await.unwrap();
+    b.handle
+        .set_path(
+            a.public(),
+            Path {
+                transport: TransportId::new(4),
+                addr: "192.0.2.11:1000".parse().unwrap(),
+                ecn: Ecn::NotEct,
+            },
+        )
+        .await
+        .unwrap();
+    // The first link is gone; only the second can carry the exchange.
+    a.handle
+        .remove_transport(TransportId::new(1))
+        .await
+        .unwrap();
+    exchange(&mut a, &mut b).await;
+    assert_eq!(
+        a.handle.peer_stats(to_b).await.unwrap().unwrap().path,
+        Some(path)
+    );
+
+    let (ta, tb) = second_link();
+    a.handle.replace_transport(ta).await.unwrap();
+    b.handle.replace_transport(tb).await.unwrap();
+    exchange(&mut a, &mut b).await;
+
+    assert_eq!(
+        a.handle.remove_transport(TransportId::new(1)).await,
+        Err(TransportError::Unknown(TransportId::new(1)))
+    );
+    let (unknown, _end) = link(4);
+    assert_eq!(
+        a.handle.replace_transport(unknown).await,
+        Err(TransportError::Unknown(TransportId::new(1)))
+    );
+    assert_eq!(
+        TransportError::Unknown(TransportId::new(1)).to_string(),
+        "transport 1 is not installed"
+    );
+    assert_eq!(
+        TransportError::Duplicate(TransportId::new(3)).to_string(),
+        "transport 3 is already installed"
+    );
+
+    // Without a transport for the path, datagrams are dropped.
+    a.handle
+        .remove_transport(TransportId::new(3))
+        .await
+        .unwrap();
+    a.send(IP_B, b"lost").await;
+    b.expect_no_delivery().await;
+    assert!(a.drops(DROP_NO_TRANSPORT).await >= 1);
+
+    a.handle.shutdown().await.unwrap();
+    let (late, _end) = second_link();
+    assert_eq!(
+        a.handle.add_transport(late).await,
+        Err(TransportError::Stopped)
+    );
+    assert_eq!(
+        a.handle.remove_transport(TransportId::new(3)).await,
+        Err(TransportError::Stopped)
+    );
+    assert_eq!(TransportError::Stopped.to_string(), EngineError.to_string());
+}
+
+#[tokio::test]
+async fn stalled_transport_does_not_hold_back_another() {
+    let (ta, tb) = link(64);
+    let (ta, gate) = Tapped::new(ta);
+    let (tb, _gate_b) = Tapped::new(tb);
+    let options = Options {
+        queue_capacity: 2,
+        sink_capacity: 64,
+    };
+    let (mut a, mut b) = nodes(ta, tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    // `a` also reaches `c` on its second link (transport 3).
+    let (ta2, tc) = second_link();
+    a.handle.add_transport(ta2).await.unwrap();
+    let c = node(
+        3,
+        Ipv4Addr::new(10, 0, 0, 3),
+        "192.0.2.12:2000".parse().unwrap(),
+        TransportId::new(4),
+        tc,
+        &options,
+    );
+    a.handle
+        .add_or_update_peer(Peer {
+            path: Some(Path {
+                transport: TransportId::new(3),
+                addr: c.addr,
+                ecn: Ecn::NotEct,
+            }),
+            ..c.as_peer(TransportId::new(3))
+        })
+        .await
+        .unwrap();
+    c.handle
+        .add_or_update_peer(Peer {
+            path: Some(Path {
+                transport: TransportId::new(4),
+                addr: "192.0.2.11:1000".parse().unwrap(),
+                ecn: Ecn::NotEct,
+            }),
+            ..a.as_peer(TransportId::new(4))
+        })
+        .await
+        .unwrap();
+
+    // Transport 1 stops draining: its queue fills, datagrams wait in `a` and hold back the
+    // source.
+    gate.send(false).unwrap();
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..20u8 {
+            let packet = PacketBuf::from_packet(&ipv4(IP_A, IP_B, &[i]));
+            local.send(packet).await.unwrap();
+        }
+    });
+    sleep(QUIET).await;
+    assert!(!sender.is_finished(), "the source was not held back");
+
+    // A handshake with `c` on transport 3 still completes meanwhile.
+    let mut events = a.handle.subscribe().await.unwrap();
+    let to_c = a.peer_of(&c).await;
+    a.handle.force_handshake(to_c, None).await.unwrap();
+    let event = expect_event(
+        &mut events,
+        |e| matches!(e, Event::HandshakeCompleted { peer, .. } if *peer == to_c),
+    )
+    .await;
+    assert!(is_handshake(&event));
+
+    // Once transport 1 drains, the held-back packets arrive in order.
+    gate.send(true).unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    for i in 0..20u8 {
+        assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, &[i]));
+    }
+    assert!(a.handle.drop_counters().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -712,4 +947,86 @@ async fn shutdown_is_clean() {
     assert_eq!(EngineError.to_string(), "the engine has stopped");
     // The other engine keeps running.
     assert_eq!(b.handle.peers().await.unwrap().len(), 1);
+}
+
+const fn is_suspension(event: &Event) -> bool {
+    matches!(event, Event::Suspended | Event::Resumed)
+}
+
+#[tokio::test]
+async fn suspend_and_resume_are_idempotent() {
+    let (mut a, mut b) = peered().await;
+    exchange(&mut a, &mut b).await;
+    let mut events = a.handle.subscribe().await.unwrap();
+
+    a.handle.suspend().await.unwrap();
+    a.handle.suspend().await.unwrap();
+    a.handle.resume().await.unwrap();
+    a.handle.resume().await.unwrap();
+    assert!(matches!(
+        expect_event(&mut events, is_suspension).await,
+        Event::Suspended
+    ));
+    assert!(matches!(
+        expect_event(&mut events, is_suspension).await,
+        Event::Resumed
+    ));
+    assert!(
+        timeout(QUIET, expect_event(&mut events, is_suspension))
+            .await
+            .is_err(),
+        "a second transition was published"
+    );
+    exchange(&mut a, &mut b).await;
+
+    a.handle.shutdown().await.unwrap();
+    assert_eq!(a.handle.suspend().await, Err(EngineError));
+    assert_eq!(a.handle.resume().await, Err(EngineError));
+}
+
+#[tokio::test]
+async fn transports_replaced_while_suspended_start_suspended() {
+    let (mut a, mut b) = peered().await;
+    exchange(&mut a, &mut b).await;
+
+    a.handle.suspend().await.unwrap();
+    let (ta, tb) = link(64);
+    a.handle.replace_transport(ta).await.unwrap();
+    b.handle.replace_transport(tb).await.unwrap();
+    // Handle calls still run; the datagram they cause waits for the resume.
+    let packet = ipv4(IP_A, IP_B, b"held");
+    a.handle
+        .inject_outbound(PacketBuf::from_packet(&packet))
+        .await
+        .unwrap();
+    b.expect_no_delivery().await;
+
+    a.handle.resume().await.unwrap();
+    assert_eq!(b.expect_delivery().await.1, packet);
+    exchange(&mut a, &mut b).await;
+}
+
+#[tokio::test]
+async fn mtu_is_kept_once_the_source_watch_closes() {
+    let (source, _local, mtu) = ChannelSource::new(4, 1420);
+    let (sink, _delivered) = ChannelSink::new(4);
+    let (transport, _other) = link(4);
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .build()
+        .unwrap();
+    let handle = engine.handle();
+    let mut events = handle.subscribe().await.unwrap();
+    assert_eq!(handle.mtu().await.unwrap(), 1420);
+
+    mtu.send(1280).unwrap();
+    assert_eq!(
+        expect_event(&mut events, |e| matches!(e, Event::MtuChanged { .. })).await,
+        Event::MtuChanged { mtu: 1280 }
+    );
+    drop(mtu);
+    sleep(QUIET).await;
+    assert_eq!(handle.mtu().await.unwrap(), 1280);
+    handle.shutdown().await.unwrap();
+    assert_eq!(handle.mtu().await, Err(EngineError));
 }

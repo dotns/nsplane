@@ -112,11 +112,6 @@ impl ChannelTransport {
         (a_end, b_end)
     }
 
-    /// This end's transport id.
-    pub const fn id(&self) -> TransportId {
-        self.id
-    }
-
     /// This end's address, the source address the peer sees.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
@@ -124,6 +119,10 @@ impl ChannelTransport {
 }
 
 impl Transport for ChannelTransport {
+    fn id(&self) -> TransportId {
+        self.id
+    }
+
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
         let (datagram, ecn) = self.rx.lock().await.recv().await.ok_or_else(closed)?;
         let len = datagram.len().min(buf.capacity());

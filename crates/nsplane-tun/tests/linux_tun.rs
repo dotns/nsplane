@@ -95,3 +95,37 @@ async fn tun_device_round_trip() {
     assert_eq!(&buf[..len], b"from the tun");
     assert_eq!(from, SocketAddr::from((REMOTE, 4000)));
 }
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
+async fn tun_mtu_change_is_observed() {
+    let ip = |args: &[&str]| {
+        let status = Command::new("ip").args(args).status().unwrap();
+        assert!(status.success(), "ip {args:?}: {status}");
+    };
+
+    let tun = Tun::create("nsplanemtu%d").unwrap();
+    let name = tun.name().unwrap();
+    let initial = tun.mtu();
+    let (source, sink) = tun.split().unwrap();
+    let mut mtu = source.mtu();
+    assert_eq!(*mtu.borrow(), initial);
+
+    for value in [1280u16, 1400] {
+        ip(&["link", "set", "dev", &name, "mtu", &value.to_string()]);
+        tokio::time::timeout(Duration::from_secs(5), mtu.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let observed = *mtu.borrow_and_update();
+        println!("{name}: mtu {observed}");
+        assert_eq!(observed, value);
+    }
+
+    // Closing the device stops the watcher, which closes the watch.
+    drop((source, sink));
+    let closed = tokio::time::timeout(Duration::from_secs(5), mtu.changed())
+        .await
+        .unwrap();
+    assert!(closed.is_err());
+}
