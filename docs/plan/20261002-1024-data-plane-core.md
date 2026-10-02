@@ -338,9 +338,12 @@ scope change that goes through L1.
 - `nstun_packet` views: `Ipv4Header`, `Ipv6Header`, `UdpHeader`, `TcpHeader`,
   `IcmpHeader` as zerocopy `Ref`s; `IpPacket::parse(&[u8]) -> Result<IpPacket, Malformed>`
   with `src()`, `dst()`, `protocol()`, `five_tuple()`, `fragment()`; checksum helpers.
-- `nstun_core::Core` with `Input`, `Output`, `Event`, `ConfigChange`, `PeerId`, `Path`,
-  `TransportId`, `Ecn`, `MessageKind`, `Roam`, `Verdict`, and the traits `PathPolicy`
-  and `PacketFilter` exactly as sketched above. `Core::new(CoreConfig)`,
+- The pure value types `PeerId`, `Path`, `TransportId`, `Ecn` live in `nstun-packet`
+  (so the driver crate can depend on them without `nstun-core`) and are re-exported under
+  the same names from `nstun_core` (decided at gate 1, 2026-10-02).
+- `nstun_core::Core` with `Input`, `Output`, `Event`, `ConfigChange`, `MessageKind`,
+  `Roam`, `Verdict`, and the traits `PathPolicy` and `PacketFilter` exactly as sketched
+  above. `Core::new(CoreConfig)`,
   `handle_input`, `poll_output`, `poll_timeout`, `handle_timeout`.
 - `nstun` driver traits `PacketSource`, `PacketSink`, `Transport` as sketched above, plus
   `EngineBuilder`, `Engine`, `EngineHandle`, `UdpTransport`, and in-memory
@@ -408,6 +411,8 @@ scripts extended. ns is read-only for this plan.
 
 ## Annotations
 
+- 2026-10-02: gate 1 confirmed (`proceed`): four L2s P/C/B/D, value types moved to
+  `nstun-packet` with re-exports so C and B run in parallel.
 - 2026-10-02: no code is copied from reference projects; use mature crates (`bytes`) for
   buffers instead of a vendored or hand-written pool.
 - 2026-10-02: user confirmed `boringtun::device` is deleted after Phase 1 and that the
