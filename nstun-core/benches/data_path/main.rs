@@ -5,26 +5,21 @@
 //! Two references run next to the core: `tunn_round_trip`, a bare `Tunn` round trip in place
 //! as in boringtun's `round_trip_in_place`, and `device_equivalent_round_trip`, the same round
 //! trip plus the cryptokey routing a device does per packet (allowed-IP lookup of the
-//! destination on send, source check on receive) on the core's own allowed-IP table.
-
-// The core's allowed-IP table is crate-private: compile its source into the bench.
-#[allow(dead_code, reason = "the bench uses only the lookups of the table")]
-#[path = "../../src/allowed_ips.rs"]
-mod allowed_ips;
+//! destination on send, source check on receive) on the table the core's allowed IPs live in.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
+use ip_network::IpNetwork;
+use ip_network_table::IpNetworkTable;
 use nstun_core::noise::{DATA_HEADER_SZ, Tunn, TunnResult};
 use nstun_core::x25519::{PublicKey, StaticSecret};
 use nstun_core::{
     AllowedIp, ConfigChange, Core, CoreConfig, Ecn, Input, Output, PacketBuf, Path, PeerConfig,
-    PeerId, TransportId,
+    TransportId,
 };
 use rand_core::OsRng;
-
-use crate::allowed_ips::AllowedIps;
 
 /// Capacity of the packet buffers: room for any bench packet and its WireGuard overhead.
 const BUF_CAPACITY: usize = 2048;
@@ -146,11 +141,17 @@ fn connected_tunnels() -> (Tunn, Tunn) {
     (a, b)
 }
 
-/// The allowed-IP table of core `i`: its peer owns `ip4(1 - i)/32`.
-fn routes(i: u8) -> AllowedIps<PeerId> {
-    let mut table = AllowedIps::new();
-    table.insert(ip4(1 - i).into(), 32, PeerId::new(1));
+/// The allowed-IP table of core `i`: its peer (1) owns `ip4(1 - i)/32`.
+fn routes(i: u8) -> IpNetworkTable<u32> {
+    let mut table = IpNetworkTable::new();
+    let network = IpNetwork::new_truncate(ip4(1 - i), 32).unwrap();
+    table.insert(network, 1);
     table
+}
+
+/// The peer owning the longest prefix that contains `ip`, as the core's allowed-IP lookup.
+fn find(table: &IpNetworkTable<u32>, ip: IpAddr) -> Option<&u32> {
+    table.longest_match(ip).map(|(_net, peer)| peer)
 }
 
 /// An IPv4 packet of `len` bytes from `src` to `dst`.
@@ -224,13 +225,13 @@ fn bench_data_path(c: &mut Criterion) {
             |b, p| {
                 let (mut tx, mut rx) = connected_tunnels();
                 let (tx_routes, rx_routes) = (routes(0), routes(1));
-                let peer = PeerId::new(1);
+                let peer = 1;
                 let mut buf = vec![0u8; BUF_CAPACITY];
                 b.iter(|| {
                     buf[DATA_HEADER_SZ..DATA_HEADER_SZ + p.len()].copy_from_slice(p);
                     let packet = &buf[DATA_HEADER_SZ..DATA_HEADER_SZ + p.len()];
                     let dst = Tunn::dst_address(packet).unwrap();
-                    assert_eq!(tx_routes.find(dst), Some(&peer));
+                    assert_eq!(find(&tx_routes, dst), Some(&peer));
                     let TunnResult::WriteToNetwork(datagram) =
                         tx.encapsulate_in_place(&mut buf, p.len())
                     else {
@@ -242,7 +243,7 @@ fn bench_data_path(c: &mut Criterion) {
                     else {
                         panic!("decapsulate");
                     };
-                    assert_eq!(rx_routes.find(IpAddr::V4(src)), Some(&peer));
+                    assert_eq!(find(&rx_routes, IpAddr::V4(src)), Some(&peer));
                 });
             },
         );
