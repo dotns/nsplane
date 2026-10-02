@@ -1,6 +1,6 @@
 # 20261002-1509-phase1-followups Phase 1 follow-up fixes (data plane core campaign)
 
-- **status**: pending
+- **status**: in_progress
 - **priority**: P1
 - **owner**: (unassigned)
 - **createdAt**: 2026-10-02 15:09
@@ -57,6 +57,24 @@ for Phase 1 and must be fixed in a later task. Items 1-4 change `boringtun`,
    Count wire bytes in the core.
 9. **Drop reason constants.** The drop reason `"handshake rejected"` has no public
    constant, unlike the other reasons; export one.
+
+Status after Phase 2 (plan `20261002-1535-phase2-engine`, merged 2026-10-02 as d3d4f50):
+items 2, 3, 4, 6, 7, 8 and 9 are fixed; item 5 is partly fixed (Windows UAPI named pipe
+added); item 1 is open. Still open:
+
+- item 1 (small-packet data-path overhead), scheduled after Phase 2 with the Phase 5
+  design input in the plan;
+- item 5: the Wintun device and the named pipe's `ProtectedPrefix` path and security
+  descriptor are unverified on a real Windows host; the pipe uses the default descriptor
+  (full control for LocalSystem/Administrators/creator, read for everyone else), so a
+  non-elevated local process can occupy the waiting instance and delay clients;
+  wireguard-windows restricts it to LocalSystem and Administrators (needs Win32 `unsafe`
+  in an unsafe-owning crate); the UDP truncated-datagram sender attribution note stands;
+10. **Head-of-line blocking across transports** (found in Phase 2): local reads pause
+    while any transport has datagrams waiting, so one slow transport (e.g. a relay) holds
+    back traffic for peers on other transports. Needs per-transport backpressure.
+11. **Silent drop on transport removal** (found in Phase 2): datagrams already in a
+    removed transport's transmit queue are dropped without a counted reason; count them.
 
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
