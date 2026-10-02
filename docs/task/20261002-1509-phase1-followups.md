@@ -47,6 +47,13 @@ for Phase 1 and must be fixed in a later task. Items 1-4 change `boringtun`,
    source differs from the peer's current path; `HandshakeCompleted.rtt` is reported on
    the initiator only; a roamed path is compared on transport + addr and stored with
    `Ecn::NotEct`.
+8. **Traffic counters.** `PeerStats` `rx`/`tx` (and therefore UAPI `rx_bytes`/`tx_bytes`
+   and the `transfer` line of `wg show`) count only IP payload bytes from boringtun's
+   `Tunn` counters; keepalives and handshakes are not counted, although `nstun-core`
+   documents the fields as bytes on the wire and kernel WireGuard counts wire bytes.
+   Count wire bytes in the core.
+9. **Drop reason constants.** The drop reason `"handshake rejected"` has no public
+   constant, unlike the other reasons; export one.
 
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
@@ -63,4 +70,4 @@ Fixing Phase 1 data plane follow-ups
 ## Notes
 
 Item 1 numbers, item 2 and item 3 analysis come from the campaign's L2 reports for
-workstreams C (nstun-core) and E (nstun-e2e); item 4 and 6 from D and B.
+workstreams C (nstun-core) and E (nstun-e2e); item 4 and 6 from D and B; items 8-9 from E.
