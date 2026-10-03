@@ -694,14 +694,14 @@ scenario_app_session_tun() {
   echo "  ok  a: extra.acl.outbound_denied > 0"
 }
 
-# hybrid vs kernel WireGuard: a socat service on the TUN side and the netstack echo are both
-# reachable from the kernel peer; nothing is misrouted.
-scenario_hybrid() {
+# hybrid [args]... vs kernel WireGuard: a socat service on the TUN side and the netstack
+# echo are both reachable from the kernel peer; nothing is misrouted.
+hybrid_kernel() {
   start a k
   local a_pub k_pub a_ip k_ip
   a_pub=$(pub a); k_pub=$(pub k); a_ip=$(ip_of a); k_ip=$(ip_of k)
   echo_server a
-  node a hybrid --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 \
+  node a hybrid "$@" --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 \
     --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=10.0.0.2/32" --echo-port 7
   kernel_wg k 10.0.0.2/24 "$a_pub" "$a_ip" 10.0.0.1/32,10.1.0.1/32 10.1.0.1/32
   echo_check k tcp 10.0.0.1 7; echo_check k udp 10.0.0.1 7
@@ -710,6 +710,7 @@ scenario_hybrid() {
   wait_status a hybrid '.extra.splitter.misrouted == 0'
   echo "  ok  a: extra.splitter.misrouted == 0"
 }
+scenario_hybrid() { hybrid_kernel; }
 
 # acl_gateway vs kernel WireGuard: allowed and denied ports, live policy reload, stateful
 # replies to connections the gateway opens.
@@ -765,6 +766,42 @@ scenario_offload_fallback() {
   wait_log a tun_node 'TUN node started.* offload=off'
   X a "grep -q 'udp_offload=off' /tun_node.log"
   echo "  ok  a: tun_node logs offload=off, udp_offload=off"
+}
+
+# hybrid with --no-offload <-> kernel WireGuard: the hybrid scenario's checks on the plain
+# TUN device and UDP without GSO/GRO.
+scenario_offload_fallback_hybrid() {
+  hybrid_kernel --no-offload
+  X a "grep -Eq 'hybrid node started.* offload=off' /hybrid.log"
+  X a "grep -q 'udp_offload=off' /hybrid.log"
+  echo "  ok  a: hybrid logs offload=off, udp_offload=off"
+}
+
+# relay_server and two tun_nodes (relay UDP, direct path blocked), all with --no-offload:
+# a UDP check from a to b through the relay.
+scenario_offload_fallback_relay() {
+  start r a b
+  local a_pub b_pub r_ip a_ip b_ip name
+  a_pub=$(pub a); b_pub=$(pub b); r_ip=$(ip_of r); a_ip=$(ip_of a); b_ip=$(ip_of b)
+  mkey a b
+  relay_conf a b | relay_up r --no-offload
+  block a "$b_ip"; block b "$a_ip"
+  relay_client relay-udp "$r_ip"
+  echo_server b
+  node b tun_node --no-offload "${CLIENT[@]}" --address 10.0.0.2/24 \
+    --peer "$a_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.1/32"
+  node a tun_node --no-offload "${CLIENT[@]}" --address 10.0.0.1/24 \
+    --peer "$b_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.2/32" --check udp:10.0.0.2:7
+  checks_pass a tun_node
+  wait_status r relay_server '.extra.relay.counters.forwarded > 0' 5
+  echo "  ok  r: forwarded $(relay_counter r forwarded)"
+  X r "grep -q 'udp_offload=off' /relay_server.log"
+  echo "  ok  r: relay_server logs udp_offload=off"
+  for name in a b; do
+    X "$name" "grep -Eq 'TUN node started.* offload=off' /tun_node.log"
+    X "$name" "grep -q 'udp_offload=off' /tun_node.log"
+    echo "  ok  $name: tun_node logs offload=off, udp_offload=off"
+  done
 }
 
 # iperf_run <ctr> <tcp|udp> [iperf3 args]...: one 5 s iperf3 run against 10.0.0.2; prints
@@ -842,6 +879,8 @@ scenario ladder_netstack
 scenario nat_hole_punch
 scenario plain_wg_compat
 scenario offload_fallback
+scenario offload_fallback_hybrid
+scenario offload_fallback_relay
 scenario offload_iperf
 
 report

@@ -33,6 +33,7 @@
 //! --wss-cert-out relay.pem`
 //!
 //! [`Transport`]: nsplane::Transport
+//! [`UdpTransport`]: nsplane::UdpTransport
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -45,10 +46,10 @@ use std::time::Instant;
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use nsplane::x25519::PublicKey;
-use nsplane::{AllowedIp, EngineBuilder, StandardRoaming, UdpTransport};
+use nsplane::{AllowedIp, EngineBuilder, StandardRoaming};
 use nsplane_examples::echo::{Backend, EchoArgs};
 use nsplane_examples::node::{
-    self, NodeArgs, TransportKind, UDP_TRANSPORT, configure_peers, decode_key, init_logging,
+    self, NodeArgs, TransportKind, configure_peers, decode_key, init_logging,
     parse_cidr,
 };
 use nsplane_examples::out;
@@ -186,8 +187,7 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let private_key = args.node.private_key()?;
     let public_key = PublicKey::from(&private_key);
-    let udp = UdpTransport::bind(UDP_TRANSPORT, args.node.listen)
-        .with_context(|| format!("cannot bind UDP {}", args.node.listen))?;
+    let udp = node::bind_udp(args.node.listen, !args.node.no_offload)?;
     let listen = udp.local_addr();
 
     let base = flag_targets(&args)?;
