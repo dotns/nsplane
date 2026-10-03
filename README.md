@@ -38,7 +38,6 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | Feature        | Purpose                                                    |
 | -------------- | ---------------------------------------------------------- |
 | *(none)*       | Protocol only, with no network or TUN stack (`noise` module) |
-| `mock-instant` | Mocks `Instant` for deterministic timer tests              |
 
 ## Examples
 
@@ -100,7 +99,7 @@ on the data path, so such a client pays no extra latency for it:
 | `AclFilter` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` | off | none |
 | `FlowTracker` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | off | none |
 | Fragmentation stage | `EngineBuilder::fragmenter(FragmentConfig::default())` | off | one `Option` check per local packet |
-| Crypto worker pool | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0 (owner task) | one `Option` check per packet; an uncontended per-peer lock |
+| Crypto worker pool | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0 (owner task) | one `Option` check per packet; each peer owns its tunnel, no lock (with workers it is shared behind a `Mutex`) |
 | Netstack (`nsplane-netstack`), `Splitter`, `MergeSource` | `NetStack::split`, `Splitter`, `MergeSource` as the builder's source and sink | not used | none |
 | TUN offload (Linux, Android) | on with `Tun::create`; `TunOptions::new().offload(false)` opts out | on where the kernel supports it | off: one system call per packet |
 | UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: one system call per datagram |
@@ -159,7 +158,9 @@ flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
 `take_queue_stats` restarts the marks: a mark at its capacity together with
 `DROP_SINK_FULL` or `DROP_TRANSMIT_FULL` in `EngineHandle::drop_counters` means the queue is
 too small for the load (raise `queue_capacity`, e.g. to 2048 for many parallel bulk flows
-through a userspace netstack); marks far below the capacity mean it can shrink. See
+through a userspace netstack); marks far below the capacity mean it can shrink. With crypto
+workers, `QueueStats::crypto` and `crypto_done` cover the jobs with the workers, and
+`EngineHandle::fragment_stats` reports the fragmentation stage's counters. See
 [docs/architecture.md](docs/architecture.md#queue-depths) for the measurements.
 
 By default one owner task encrypts and decrypts every packet. A hub with several busy peers
@@ -170,10 +171,11 @@ with traffic from several peers: one peer's packets always go to one worker. See
 [docs/architecture.md](docs/architecture.md#crypto-worker-pool) for the design and the
 throughput note.
 
-Performance: on an x86-64 dev host a core round trip (seal and open) takes about 545 ns at
-64 B and 1.34 us at 1420 B, an ACL-filtered established flow about 51-55 ns per packet, and
-a hub with 8 peers moves about 0.7 Mpps of 1420 B packets on one owner task and 1.1 Mpps with
-2 crypto workers. The bench commands and the full table are in
+Performance: on an x86-64 dev host a core round trip (seal and open) takes about 532 ns at
+64 B and 1.35 us at 1420 B one packet at a time, and 412 ns and 1.23 us per packet in
+batches of 32 (`Core::handle_datagrams` / `handle_locals`), an ACL-filtered established flow about 51-55 ns per packet, and
+a hub with 8 peers moves about 0.9 Mpps of 1420 B packets on one owner task and 0.9-1.3 Mpps
+with 2 or 4 crypto workers. The bench commands and the full table are in
 [docs/architecture.md](docs/architecture.md#performance).
 
 ## Building

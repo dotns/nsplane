@@ -277,6 +277,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional features and defaults: a section in `README.md` and `docs/architecture.md` lists
   every optional feature with its switch, default and cost when off, the crates a minimal
   client needs, a minimal IPv4-only client, and that offload never waits for more packets.
+- `nsplane-core`: `Core::handle_datagrams` and `Core::handle_locals` take a batch of
+  received datagrams or local packets and process them exactly like feeding each to
+  `Core::handle_input` in order (same outputs, events, drops and counters), sharing one
+  schedule update, the output queue room and the session, route and peer lookups of
+  consecutive packets; `Core::handle_datagrams_deferred` and `Core::handle_locals_deferred`
+  do the same for `Core::handle_input_deferred`. A batch of 32 costs 3910 / 18980
+  instructions per 64 B / 1420 B round trip, 11.8 % / 2.7 % below the device-equivalent
+  baseline (see docs/architecture.md, "Performance").
+- `nsplane-core`: `CoreConfig::crypto_jobs` (default `false`) decides whether
+  `Core::handle_input_deferred` hands out `CryptoJob`s; the engine sets it with 2 or more
+  crypto workers.
+- `nsplane`: `QueueStats::crypto` (jobs with the crypto workers, capacity the bound of jobs
+  in flight) and `QueueStats::crypto_done` (batches waiting for the owner task); both are
+  zero without workers.
+- `nsplane`: `FragmentStats` and `EngineHandle::fragment_stats` report the fragmentation
+  stage's counters (packets fragmented, fragments emitted, Packet Too Big and Fragmentation
+  Needed errors sent, oversized packets dropped for the rate limit, for no route or without
+  an error); all zero without a stage. The drops are also counted in `drop_counters` under
+  the new reasons `DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and
+  `DROP_FRAGMENT_RATE_LIMITED` (`reasons::FRAGMENT_*` in `nsplane-core`).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
@@ -385,6 +405,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
   receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
   allows the fork's git source only.
+- `nsplane`: the owner task feeds the received datagrams and local packets already queued
+  (up to `MAX_BATCH`, never waiting for more) to the core as one batch. It reads local
+  packets only while a transport has transmit room and takes no more at once than that
+  room, so a saturated transport holds back the source instead of building a backlog. Under
+  a saturating flow the engine moves about 19 % more packets, and a receiving sink slower
+  than the tunnel now drops at `DROP_SINK_FULL` (see docs/architecture.md, "Performance").
+- `nsplane-core`: without crypto jobs every peer owns its tunnel and the data path takes no
+  lock; only a core built with `CoreConfig::crypto_jobs` keeps each tunnel behind a mutex
+  shared with its jobs. Breaking: `CoreConfig` struct literals need the new field (or
+  `..CoreConfig::default()`), and `Core::handle_input_deferred` on a core without
+  `crypto_jobs` processes every input at once and returns `None`.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
