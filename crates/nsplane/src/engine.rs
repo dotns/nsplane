@@ -91,12 +91,26 @@ const MAX_DATAGRAM: usize = 65535;
 /// [`crate::DROP_TRANSPORT_REMOVED`]. [`EngineHandle::replace_transport`] moves all of them,
 /// in order, to the new transport instead.
 ///
+/// Inline output: without crypto workers, the owner task sends the datagrams of one drain
+/// of the core itself ([`Transport::try_send_batch`]) when nothing of their transport is
+/// waiting in its backlog, queued or being sent by its transmit task, and hands the
+/// packets of the drain to the sink itself ([`PacketSink::try_send_batch`]) when nothing
+/// is queued for or being delivered by the sink task, so on an idle path neither task is
+/// woken. What the transport or sink does not take at once (it would block, or it takes
+/// part of the batch) goes to the transmit queue and backlog, or the deliver queue, in
+/// order and under the rules above; later datagrams and packets queue behind it until the
+/// task has drained, so each transport and the sink keep the order of the core's outputs.
+/// While suspended the owner task never sends or delivers itself. Failed and closed
+/// transports and sinks count as with their tasks; datagrams and packets the owner hands
+/// over itself never enter a queue, so the queues' high-water marks stay lower.
+///
 /// Buffers: datagrams are received into one reusable 64 KiB buffer and copied into an
 /// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. The core takes
 /// each datagram by value: it delivers a decrypted packet in the datagram's own buffer and
 /// puts the buffers of all other datagrams into its pool itself. Buffers rejected by a full
 /// sink and transmitted buffers (returned by the transmit task over a bounded queue, dropped
-/// when it is full) go back to the core's pool with [`Core::recycle`]. Delivered packets are
+/// when it is full, or by the owner task at once when it sent them itself) go back to the
+/// core's pool with [`Core::recycle`]. Delivered packets are
 /// owned by the sink.
 ///
 /// Suspension: [`EngineHandle::suspend`] pauses the engine without tearing it down. While
@@ -122,7 +136,7 @@ const MAX_DATAGRAM: usize = 65535;
 /// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
 /// and finishes each packet when its worker hands it back ([`Core::complete_job`]);
 /// everything else (routing, filters, handshakes, timers, counters, events) stays on the
-/// owner. The pool is sharded by peer:
+/// owner, which then never sends or delivers inline. The pool is sharded by peer:
 /// all packets of a peer, in both directions, go to the same worker (in batches, handed over
 /// when one is full or the owner has nothing else to do), which runs them in arrival order, so each peer's packets leave in the order they came while different peers
 /// are encrypted in parallel (on a multi-threaded runtime). At most queue capacity packets
