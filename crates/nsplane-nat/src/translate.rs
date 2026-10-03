@@ -45,10 +45,21 @@
 //! identification, offset and M flag; RFC 7915 section 5.1.1) and IPv6
 //! fragments become IPv4 fragments. A fragmented IPv4 UDP datagram without a
 //! checksum is reassembled first, since IPv6 needs a checksum over the whole
-//! datagram; the reassembled packet is sent unfragmented. Only fragments
-//! that follow the first one are joined: a later fragment that arrives
-//! before its first fragment is translated on its own, so such a datagram
-//! cannot complete. Pending fragments are consumed ([`Verdict::Handled`]).
+//! datagram; the reassembled packet is sent unfragmented, and dropped
+//! (counted in [`TranslatorStats::reassembled_too_big`]) when it would be
+//! larger than the MTU set with [`Translator::set_mtu`] (1280 by default).
+//! Only the first fragment shows the UDP checksum, so a later UDP fragment
+//! that arrives before its first fragment is held until the first one
+//! arrives, in any order. When the first fragment carries a checksum and
+//! fragments of its datagram are held, the datagram is reassembled too (and
+//! its checksum verified) so the held fragments are not lost; with nothing
+//! held it is translated on its own and the rest of its datagram is
+//! translated fragment by fragment, without waiting. Held and pending
+//! fragments are consumed ([`Verdict::Handled`]); they are bounded in count
+//! and bytes, and expire after 60 seconds, which
+//! [`TranslatorStats::fragment_budget_drops`] and
+//! [`TranslatorStats::fragment_timeouts`] count. Other fragments, and IPv6
+//! fragments, are translated one by one.
 //!
 //! A translated IPv4 packet grows by 20 bytes (28 with a fragment header),
 //! in place when the packet buffer's capacity allows it. A packet without
@@ -91,7 +102,7 @@ mod rfc7915;
 mod tests;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -112,6 +123,10 @@ const REASSEMBLY_LIMITS: Limits = Limits {
     max_entries: 256,
     max_bytes: 1 << 20,
 };
+
+/// The MTU until [`Translator::set_mtu`] is called: the IPv6 minimum, which
+/// fits every path.
+const DEFAULT_MTU: u16 = 1280;
 
 /// What the translator did with a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,8 +190,21 @@ pub struct TranslatorStats {
     pub dropped_out: u64,
     /// Inbound packets dropped.
     pub dropped_in: u64,
-    /// Zero-checksum UDP datagrams reassembled from IPv4 fragments.
+    /// Zero-checksum UDP datagrams reassembled from IPv4 fragments (and
+    /// datagrams with a checksum whose later fragments arrived first).
     pub reassembled: u64,
+    /// IPv4 UDP fragments stored for reassembly.
+    pub fragments_held: u64,
+    /// Incomplete datagrams discarded when their 60 seconds expired.
+    pub fragment_timeouts: u64,
+    /// Fragments dropped because reassembly was at its entry or byte limit.
+    pub fragment_budget_drops: u64,
+    /// Markers of datagrams translated fragment by fragment that were
+    /// forgotten at the entry limit; their later fragments are held instead.
+    pub fragment_marker_evictions: u64,
+    /// Reassembled datagrams dropped as larger than the
+    /// [MTU](Translator::set_mtu) once translated.
+    pub reassembled_too_big: u64,
     /// Packets, in either direction, whose buffer had no room for the
     /// translation and were copied into a larger one (the slow path).
     pub grown_copies: u64,
@@ -194,6 +222,8 @@ pub struct Translator {
     outbound: DirectionCounters,
     inbound: DirectionCounters,
     grown_copies: AtomicU64,
+    mtu: AtomicU16,
+    too_big: AtomicU64,
 }
 
 impl Translator {
@@ -206,7 +236,22 @@ impl Translator {
             outbound: DirectionCounters::default(),
             inbound: DirectionCounters::default(),
             grown_copies: AtomicU64::new(0),
+            mtu: AtomicU16::new(DEFAULT_MTU),
+            too_big: AtomicU64::new(0),
         }
+    }
+
+    /// Sets the largest IPv6 packet a reassembled datagram may become (the
+    /// tunnel MTU, as the engine's fragmenter uses it); it can change at any
+    /// time. A reassembled datagram that would be larger is dropped with
+    /// [`reasons::REASSEMBLED_TOO_BIG`]. Defaults to 1280, the IPv6 minimum.
+    pub fn set_mtu(&self, mtu: u16) {
+        self.mtu.store(mtu, Ordering::Relaxed);
+    }
+
+    /// The MTU set with [`set_mtu`](Self::set_mtu).
+    pub fn mtu(&self) -> u16 {
+        self.mtu.load(Ordering::Relaxed)
     }
 
     /// Replaces the table atomically; packets in flight see the old or the new one.
@@ -244,6 +289,11 @@ impl Translator {
             dropped_out: load(&self.outbound.dropped),
             dropped_in: load(&self.inbound.dropped),
             reassembled: reassembly.completed,
+            fragments_held: reassembly.accepted,
+            fragment_timeouts: reassembly.expired,
+            fragment_budget_drops: reassembly.budget_drops,
+            fragment_marker_evictions: reassembly.marker_evictions,
+            reassembled_too_big: load(&self.too_big),
             grown_copies: load(&self.grown_copies),
         }
     }
@@ -279,8 +329,13 @@ impl Translator {
             table,
             reassembly: &self.reassembly,
             now: self.epoch.elapsed().as_secs(),
+            mtu: usize::from(self.mtu()),
         };
-        rfc7915::v4_to_v6(packet, src6, dst6, cx).map(Action::from)
+        let result = rfc7915::v4_to_v6(packet, src6, dst6, cx);
+        if result == Err(reasons::REASSEMBLED_TOO_BIG) {
+            self.too_big.fetch_add(1, Ordering::Relaxed);
+        }
+        result.map(Action::from)
     }
 }
 
