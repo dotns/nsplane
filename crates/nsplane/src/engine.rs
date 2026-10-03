@@ -120,10 +120,9 @@ const MAX_DATAGRAM: usize = 65535;
 /// the transport fails to send (any error, [`io::ErrorKind::BrokenPipe`] included) is
 /// dropped and counted under [`crate::DROP_TRANSPORT_SEND_ERROR`]: the transmit task counts
 /// it in a counter shared with the owner task and wakes the owner, which publishes the
-/// drops, so a successful send costs nothing extra. A failed batched send counts every
-/// datagram the failing [`Transport::send_batch`] call was done with, since the call does not
-/// tell which of them failed: for [`crate::UdpTransport`], the failed segmented run and any
-/// runs it sent before it in that call.
+/// drops, so a successful send costs nothing extra. A failed batched send counts exactly the
+/// datagrams the [`Transport::send_batch`] call reports failed (at least one): for
+/// [`crate::UdpTransport`], the datagrams of the failed segmented run.
 ///
 /// The engine runs until [`EngineHandle::shutdown`]. Dropping the `Engine` aborts every task
 /// at once, so keep it alive (typically by awaiting [`Engine::wait`]) for as long as the
