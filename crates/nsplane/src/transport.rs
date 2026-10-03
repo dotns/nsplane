@@ -233,12 +233,13 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn send(&self, datagram: &[u8], _to: &Path) -> io::Result<()> {
-            if datagram[0] % 2 == 1 {
-                return Err(io::Error::other("odd"));
-            }
-            self.0.lock().unwrap().push(datagram[0]);
-            Ok(())
+        fn send(&self, datagram: &[u8], _to: &Path) -> impl Future<Output = io::Result<()>> + Send {
+            std::future::ready(if datagram[0] % 2 == 1 {
+                Err(io::Error::other("odd"))
+            } else {
+                self.0.lock().unwrap().push(datagram[0]);
+                Ok(())
+            })
         }
     }
 
