@@ -40,8 +40,8 @@ impl FromStr for AllowedIp {
 
 /// A peer to add, or the changes to apply to an existing peer.
 ///
-/// On update, `None` leaves the preshared key, keepalive and path unchanged, and an all-zero
-/// preshared key removes it.
+/// On update, `None` leaves the preshared key, keepalive, path and inbound destinations
+/// unchanged, and an all-zero preshared key removes it.
 #[derive(Clone)]
 pub struct PeerConfig {
     /// Public key identifying the peer.
@@ -56,6 +56,13 @@ pub struct PeerConfig {
     pub persistent_keepalive: Option<u16>,
     /// Path to reach the peer on.
     pub path: Option<Path>,
+    /// Networks the peer's decrypted packets may be addressed to; a packet to any other
+    /// destination is dropped as [`reasons::DESTINATION_NOT_ALLOWED`]. A new peer without
+    /// them is unchecked; `Some(vec![])` allows no destination. Independent of
+    /// `allowed_ips`: they add no routes.
+    ///
+    /// [`reasons::DESTINATION_NOT_ALLOWED`]: crate::reasons::DESTINATION_NOT_ALLOWED
+    pub inbound_destinations: Option<Vec<AllowedIp>>,
 }
 
 impl PeerConfig {
@@ -68,6 +75,7 @@ impl PeerConfig {
             preshared_key: None,
             persistent_keepalive: None,
             path: None,
+            inbound_destinations: None,
         }
     }
 }
@@ -81,6 +89,7 @@ impl fmt::Debug for PeerConfig {
             .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("path", &self.path)
+            .field("inbound_destinations", &self.inbound_destinations)
             .finish()
     }
 }
@@ -123,6 +132,14 @@ pub enum ConfigChange {
         /// The new path.
         path: Path,
     },
+    /// Sets or removes the inbound destinations of a peer (see
+    /// [`PeerConfig::inbound_destinations`]).
+    SetInboundDestinations {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// The new destinations; `None` removes them, leaving the peer unchecked.
+        destinations: Option<Vec<AllowedIp>>,
+    },
 }
 
 impl fmt::Debug for ConfigChange {
@@ -153,6 +170,11 @@ impl fmt::Debug for ConfigChange {
                 .debug_struct("SetPath")
                 .field("peer", peer)
                 .field("path", path)
+                .finish(),
+            Self::SetInboundDestinations { peer, destinations } => f
+                .debug_struct("SetInboundDestinations")
+                .field("peer", peer)
+                .field("destinations", destinations)
                 .finish(),
         }
     }
