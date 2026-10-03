@@ -51,10 +51,14 @@
 //! cannot complete. Pending fragments are consumed ([`Verdict::Handled`]).
 //!
 //! A translated IPv4 packet grows by 20 bytes (28 with a fragment header),
-//! inside the packet buffer's capacity; a packet that does not fit is
-//! dropped with [`reasons::NO_ROOM`]. Callers that fragment IPv4 before the
-//! core can use [`Translator::ipv4_translated_predicate`] to reserve the
-//! 28 bytes only for translated destinations.
+//! in place when the packet buffer's capacity allows it. A packet without
+//! that room (e.g. from [`PacketBuf::from_packet`] or
+//! [`PacketBuf::from_shared`]) is copied into a fresh buffer with the
+//! standard headroom and translated there, which
+//! [`TranslatorStats::grown_copies`] counts; sources that leave 28 bytes of
+//! room past the MTU keep translation in place. Callers that fragment IPv4
+//! before the core can use [`Translator::ipv4_translated_predicate`] to
+//! reserve the 28 bytes only for translated destinations.
 //!
 //! # Routing and filter order
 //!
@@ -173,6 +177,9 @@ pub struct TranslatorStats {
     pub dropped_in: u64,
     /// Zero-checksum UDP datagrams reassembled from IPv4 fragments.
     pub reassembled: u64,
+    /// Packets, in either direction, whose buffer had no room for the
+    /// translation and were copied into a larger one (the slow path).
+    pub grown_copies: u64,
 }
 
 /// Stateless IPv4 <-> IPv6 translation filter; see the [module docs](self).
@@ -186,6 +193,7 @@ pub struct Translator {
     epoch: Instant,
     outbound: DirectionCounters,
     inbound: DirectionCounters,
+    grown_copies: AtomicU64,
 }
 
 impl Translator {
@@ -197,6 +205,7 @@ impl Translator {
             epoch: Instant::now(),
             outbound: DirectionCounters::default(),
             inbound: DirectionCounters::default(),
+            grown_copies: AtomicU64::new(0),
         }
     }
 
@@ -235,6 +244,15 @@ impl Translator {
             dropped_out: load(&self.outbound.dropped),
             dropped_in: load(&self.inbound.dropped),
             reassembled: reassembly.completed,
+            grown_copies: load(&self.grown_copies),
+        }
+    }
+
+    /// Counts a packet whose buffer the translation replaced: a grown copy
+    /// starts at a new address.
+    fn count_grown(&self, start: *const u8, packet: &PacketBuf) {
+        if packet.as_packet().as_ptr() != start {
+            self.grown_copies.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -269,21 +287,25 @@ impl Translator {
 impl PacketFilter for Translator {
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
         let table = self.table.load();
+        let start = packet.as_packet().as_ptr();
         let result = match packet.as_packet().first().map(|byte| byte >> 4) {
             Some(4) => inbound_v4(&table, packet),
             Some(6) => inbound_v6(&table, peer, packet),
             _ => Ok(Action::Pass),
         };
+        self.count_grown(start, packet);
         self.inbound.count(result)
     }
 
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
         let table = self.table.load();
+        let start = packet.as_packet().as_ptr();
         let result = match packet.as_packet().first().map(|byte| byte >> 4) {
             Some(4) => self.outbound_v4(&table, peer, packet),
             Some(6) => outbound_v6(&table, peer, packet),
             _ => Ok(Action::Pass),
         };
+        self.count_grown(start, packet);
         self.outbound.count(result)
     }
 }

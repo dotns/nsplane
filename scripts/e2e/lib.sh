@@ -10,15 +10,16 @@
 #   scripts/e2e/lib.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-PREFIX=${NSPLANE_E2E_LIB_PREFIX:-nsplane-e2e-lib}
+PREFIX=${NSPLANE_E2E_LIB_PREFIX:-nsplane-e2e-lib-$$}
 NET=$PREFIX-net
 VOL=$PREFIX-kernel
 IMG=$PREFIX-image
 DEV_IMAGE=${NSPLANE_E2E_LIB_DEV_IMAGE:-ai-agent/nstun-dev}
 LABEL=${NSPLANE_E2E_LIB_LABEL:-nsplane-e2e-lib=true}
 LABELS=(--label "$LABEL" --label ai-agent=true)
-cleanup() { docker rm -f "$PREFIX-build" "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker volume rm "$VOL" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$PREFIX-build" "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker volume rm "$VOL" >/dev/null 2>&1 || true; docker image rm "$IMG" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 cleanup
 
 if [ -z "${NSPLANE_E2E_LIB_BIN:-}" ]; then

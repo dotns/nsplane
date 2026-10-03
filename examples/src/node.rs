@@ -74,6 +74,11 @@ pub struct NodeArgs {
     #[arg(long, value_name = "FILTER", default_value = "info")]
     pub log: String,
 
+    /// Turn segmentation offload off: a plain TUN device (one packet per read and write)
+    /// and UDP without GSO/GRO
+    #[arg(long)]
+    pub no_offload: bool,
+
     /// Transport selection
     #[command(flatten)]
     pub transport: TransportArgs,
@@ -228,15 +233,17 @@ impl TransportArgs {
     /// driver. WSS: like relay, over a [`WssTransport`] to `--relay-url` that keeps the
     /// UDP socket for every other address, with the relay's address added to the
     /// endpoints; discovery restarts on every (re)connect.
+    ///
+    /// The UDP socket has segmentation offload (GSO/GRO) on if `offload`, else off.
     pub fn transports<Src: PacketSource, Snk: PacketSink>(
         &self,
         builder: EngineBuilder<Src, Snk>,
         listen: SocketAddr,
+        offload: bool,
     ) -> anyhow::Result<(EngineBuilder<Src, Snk>, Transports)> {
         match self.transport {
             TransportKind::Udp => {
-                let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
-                    .with_context(|| format!("cannot bind UDP {listen}"))?;
+                let udp = bind_udp(listen, offload)?;
                 let transports = Transports {
                     default: UDP_TRANSPORT,
                     listen: udp.local_addr(),
@@ -245,8 +252,7 @@ impl TransportArgs {
                 Ok((builder, transports))
             }
             TransportKind::Relay => {
-                let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
-                    .with_context(|| format!("cannot bind UDP {listen}"))?;
+                let udp = bind_udp(listen, offload)?;
                 let transports = Transports {
                     default: UDP_TRANSPORT,
                     listen: udp.local_addr(),
@@ -257,8 +263,7 @@ impl TransportArgs {
                 Ok((builder, transports))
             }
             TransportKind::Wss => {
-                let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
-                    .with_context(|| format!("cannot bind UDP {listen}"))?;
+                let udp = bind_udp(listen, offload)?;
                 let transports = Transports {
                     default: UDP_TRANSPORT,
                     listen: udp.local_addr(),
@@ -326,6 +331,17 @@ impl TransportArgs {
     }
 }
 
+/// Binds the [`UDP_TRANSPORT`] to `listen`, with segmentation offload if `offload` and
+/// otherwise without (the socket keeps the OS's default fragmentation), and logs the
+/// offload it uses (`udp_offload`).
+pub fn bind_udp(listen: SocketAddr, offload: bool) -> anyhow::Result<UdpTransport> {
+    let udp = UdpTransport::bind_with_offload(UDP_TRANSPORT, listen, offload)
+        .with_context(|| format!("cannot bind UDP {listen}"))?;
+    let mode = if udp.offload() { "gso,gro" } else { "off" };
+    tracing::info!(listen = %udp.local_addr(), udp_offload = %mode, "UDP transport bound");
+    Ok(udp)
+}
+
 /// A built engine and what its transports listen on.
 #[derive(Debug)]
 pub struct Node {
@@ -358,7 +374,9 @@ pub fn build_engine_with<Src: PacketSource, Snk: PacketSink>(
     let private_key = args.private_key()?;
     let public_key = PublicKey::from(&private_key);
     let builder = configure(EngineBuilder::new(source, sink)).private_key(private_key);
-    let (builder, transports) = args.transport.transports(builder, args.listen)?;
+    let (builder, transports) =
+        args.transport
+            .transports(builder, args.listen, !args.no_offload)?;
     let engine = builder.build().context("cannot build the engine")?;
     if matches!(
         args.transport.transport,
@@ -751,6 +769,31 @@ fn ip(args: &[&str]) -> anyhow::Result<()> {
     } else {
         bail!("`ip {}` failed: {}", args.join(" "), stderr.trim())
     }
+}
+
+/// Creates the TUN device `name`, with segmentation offloads unless `--no-offload`, and
+/// logs the offloads it uses ([`offload_mode`]).
+#[cfg(unix)]
+pub fn create_tun(name: &str, args: &NodeArgs) -> anyhow::Result<nsplane_tun::Tun> {
+    let options = nsplane_tun::TunOptions::new().offload(!args.no_offload);
+    let tun = nsplane_tun::Tun::create_with(name, options)
+        .with_context(|| format!("cannot create TUN {name}"))?;
+    tracing::info!(offload = %offload_mode(tun.offload()), "TUN device opened");
+    Ok(tun)
+}
+
+/// The segmentation offloads of a TUN device for logs: `tso,uso`, `tso`, `vnet_hdr` (the
+/// header without offloads, an adopted fd) or `off`.
+#[cfg(unix)]
+pub fn offload_mode(offload: nsplane_tun::Offload) -> String {
+    let mut modes: Vec<&str> = [("tso", offload.tso), ("uso", offload.uso)]
+        .into_iter()
+        .filter_map(|(mode, on)| on.then_some(mode))
+        .collect();
+    if modes.is_empty() {
+        modes.push(if offload.vnet_hdr { "vnet_hdr" } else { "off" });
+    }
+    modes.join(",")
 }
 
 /// Serves the UAPI of `handle`'s engine on the standard socket of interface `name`.
