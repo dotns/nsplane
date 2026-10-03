@@ -14,6 +14,11 @@ use crate::stats::{self, Counters};
 /// Idle buffers the device keeps for reuse.
 const POOL_SIZE: usize = 256;
 
+/// Spare bytes behind every egress packet. An engine seals a packet in place and appends
+/// its trailer there (WireGuard: a 16-byte tag after up to 15 bytes of padding), so a
+/// full-size packet does not have to move to a larger buffer.
+pub(crate) const TAILROOM: usize = 32;
+
 /// RX token that hands a packet to smoltcp, then recycles its buffer for egress.
 pub(crate) struct VirtualRxToken<'a> {
     packet: PacketBuf,
@@ -51,7 +56,7 @@ impl TxToken for VirtualTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let capacity = len.max(self.mtu);
+        let capacity = len.max(self.mtu) + TAILROOM;
         let mut packet = self.pool.try_borrow_mut().map_or_else(
             |_| PacketBuf::with_capacity(capacity),
             |mut pool| pool.get(capacity),
@@ -259,6 +264,21 @@ mod tests {
         let packet = &mut dev.tx_queue[0];
         assert_eq!(packet.as_packet(), [0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(packet.with_headroom_mut().len(), HEADROOM + 4);
+        Ok(())
+    }
+
+    #[test]
+    fn tx_token_leaves_tailroom_behind_a_full_size_packet() -> Result<(), &'static str> {
+        let mut dev = device();
+        // A recycled ingress buffer smaller than the MTU, as the pool holds after an ACK.
+        dev.inject(PacketBuf::from_packet(&[0; 40]));
+        let (rx, _tx) = dev.receive(Instant::from_millis(0)).ok_or("no packet")?;
+        rx.consume(|_| ());
+        let token = dev.transmit(Instant::from_millis(0)).ok_or("no token")?;
+        token.consume(1360, |buf| buf.fill(1));
+        let packet = &dev.tx_queue[0];
+        assert_eq!(packet.len(), 1360);
+        assert!(packet.capacity() >= 1360 + TAILROOM);
         Ok(())
     }
 
