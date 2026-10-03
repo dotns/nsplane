@@ -100,3 +100,10 @@ vars and container prefixes follow. The FFI/JNI bindings, the upstream crypto be
 the banner/logo images are deleted. Attribution (Cloudflare copyright, dotns copyright,
 origin, WireGuard trademark) lives only in `LICENSE.md`; README and the living docs use the
 new names.
+
+## 2026-10-03 15:35 [decision]
+
+Plan `20261003-1630-perf-and-wss` PW widened by the user: the WsFrame terminate leg (ns
+`tunnel-ws` `WsTunnel`) moves into `nsplane-wss` now as PW (c), with OPEN resolution behind an
+embedder trait, so ns can delete `tunnel-ws` whole. ADR
+`2026-10-03-data-channel-protocols-in-nsplane` consequence updated (both legs move).
