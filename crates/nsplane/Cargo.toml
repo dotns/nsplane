@@ -24,7 +24,7 @@ tracing = "0.1.40"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 bytes = { workspace = true }
-nix = { version = "0.31", default-features = false, features = ["net"] }
+nix = { version = "0.31", default-features = false, features = ["net", "uio"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

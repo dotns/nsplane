@@ -27,23 +27,38 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`). On an IPv4 socket, sending to an IPv6
 /// address fails with [`io::ErrorKind::InvalidInput`].
 ///
-/// The socket is driven through `quinn-udp`, which also sets it up: IP fragmentation is
-/// off (`IP_PMTUDISC_PROBE` and `IPV6_DONTFRAG` on Linux and Android, `IP_DONTFRAG` or
-/// `IP_DONTFRAGMENT` elsewhere), so a datagram larger than the interface MTU fails to send
-/// instead of leaving in fragments. Where `quinn-udp` cannot set the socket up on other
-/// platforms than Linux and Android (Wine lacks some IPv4 options), the transport sends with
-/// plain `send_to` instead: without ECN marks and segmentation, fragmenting as the OS
-/// does by default.
+/// Whether the transport may use segmentation offload is chosen when binding:
+/// [`bind`](Self::bind) binds with offload, [`bind_with_offload`](Self::bind_with_offload)
+/// can bind without.
+///
+/// With offload, the socket is driven through `quinn-udp`, which also sets it up: IP
+/// fragmentation is off (`IP_PMTUDISC_PROBE` and `IPV6_DONTFRAG` on Linux and Android,
+/// `IP_DONTFRAG` or `IP_DONTFRAGMENT` elsewhere), as segmentation needs. A datagram larger
+/// than the MTU of the outgoing interface fails to send with `EMSGSIZE` instead of leaving
+/// in fragments; one that fits the interface but not a smaller MTU further along the path
+/// leaves with the DF bit set and is dropped where it does not fit. So the engine's MTU plus
+/// the WireGuard overhead must fit the path MTU. The engine logs a failed send at debug
+/// level and drops the datagram without counting it in its drop counters. Where
+/// `quinn-udp` cannot set the socket up on other platforms than Linux and Android (Wine
+/// lacks some IPv4 options), the transport sends with plain `send_to` instead: without ECN
+/// marks and segmentation, fragmenting as the OS does by default.
+///
+/// Without offload, `quinn-udp` never touches the socket: it keeps the OS's default path
+/// MTU discovery, so a datagram larger than the path MTU leaves in fragments. On Linux and
+/// Android it is driven with `sendmsg` / `recvmsg`, the ECN marks in `IP_TOS` /
+/// `IPV6_TCLASS` control messages (received ones asked for with `IP_RECVTOS` /
+/// `IPV6_RECVTCLASS`); elsewhere with plain `send_to` / `recv_from`, without ECN marks.
 ///
 /// ECN: on send, `to.ecn` is set per datagram with an `IP_TOS` / `IPV6_TCLASS` (Windows:
 /// `IP_ECN` / `IPV6_ECN`) control message, so no socket-wide state changes; Windows sets it
-/// only where its Winsock provider supports ECN (Wine does not). On Linux and Android the
-/// mark of each received datagram is read from its control message and reported in
-/// [`Path::ecn`]; on other platforms (macOS, iOS, the BSDs, Windows) received datagrams
-/// report [`Ecn::NotEct`].
+/// only with offload and where its Winsock provider supports ECN (Wine does not). On Linux
+/// and Android the mark of each received datagram is read from its control message and
+/// reported in [`Path::ecn`]; on other platforms (macOS, iOS, the BSDs, Windows) received
+/// datagrams report [`Ecn::NotEct`].
 ///
-/// Segmentation offload is on by default and turned off with
-/// [`set_offload`](Self::set_offload):
+/// Segmentation offload, where bound with it, is on by default and turned off with
+/// [`set_offload`](Self::set_offload), which leaves the socket set up by `quinn-udp`
+/// (fragmentation stays off):
 /// - Receive (Linux and Android, `UDP_GRO`): the kernel may coalesce datagrams of one sender
 ///   into one read, a train of equally sized datagrams of which the last may be shorter.
 ///   [`recv_batch`](Transport::recv_batch) hands out each one as a slice of the read
@@ -64,7 +79,7 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// offload support. Either way the datagrams, their order, sizes, paths and ECN marks are
 /// the same.
 ///
-/// Socket buffers: [`bind`](Self::bind) requests 4 MiB for both the receive (`SO_RCVBUF`)
+/// Socket buffers: binding requests 4 MiB for both the receive (`SO_RCVBUF`)
 /// and the send buffer (`SO_SNDBUF`), so a burst does not overflow the receive queue
 /// before the engine reads it, as it does with Linux's default of 208 KiB on a loaded
 /// host. The kernel grants what its limits allow: Linux clamps the
@@ -89,11 +104,11 @@ pub struct UdpTransport {
     id: TransportId,
     local: SocketAddr,
     socket: UdpSocket,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    state: UdpSocketState,
-    /// `None` where `quinn-udp` could not set the socket up.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// `None` when bound without offload, or where `quinn-udp` could not set the socket up
+    /// (only on other platforms than Linux and Android).
     state: Option<UdpSocketState>,
+    /// Bound without offload: the socket stays as the OS set it up.
+    plain: bool,
     offload: AtomicBool,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rx: std::sync::Mutex<linux::Rx>,
@@ -116,6 +131,19 @@ impl UdpTransport {
     ///
     /// Panics when called outside a tokio runtime with I/O enabled.
     pub fn bind(id: TransportId, addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_offload(id, addr, true)
+    }
+
+    /// Binds as [`bind`](Self::bind) does, with segmentation offload or, with `offload`
+    /// false, without it for the life of the transport: `quinn-udp` does not set the
+    /// socket up, so it keeps the OS's default fragmentation (see the
+    /// [type documentation](Self)), and [`set_offload`](Self::set_offload) cannot turn
+    /// offload on.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime with I/O enabled.
+    pub fn bind_with_offload(id: TransportId, addr: SocketAddr, offload: bool) -> io::Result<Self> {
         let socket = match addr {
             SocketAddr::V6(v6) if v6.ip().is_unspecified() => match bind_dual_stack(addr) {
                 Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
@@ -143,27 +171,22 @@ impl UdpTransport {
         }
         let socket = UdpSocket::from_std(socket.into())?;
         let local = socket.local_addr()?;
-        let state = UdpSocketState::new(UdpSockRef::from(&socket));
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let state = state?;
-        // Receive timestamps are not used, and their control message would crowd out the
-        // ECN mark of a coalesced read from `quinn-udp`'s control buffer.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        nix::sys::socket::setsockopt(
-            &socket,
-            nix::sys::socket::sockopt::ReceiveTimestampns,
-            &false,
-        )?;
+        let state = if offload {
+            Some(set_up(&socket)?)
+        } else {
+            linux::enable_ecn(&socket, local)?;
+            None
+        };
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let state = state
-            .inspect_err(|e| tracing::debug!(message = "Plain UDP sends", error = ?e))
-            .ok();
+        let state = offload.then(|| set_up(&socket)).flatten();
         Ok(Self {
             id,
             local,
             socket,
             state,
-            offload: AtomicBool::new(true),
+            plain: !offload,
+            offload: AtomicBool::new(offload),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rx: std::sync::Mutex::default(),
         })
@@ -192,11 +215,7 @@ impl UdpTransport {
     /// it granted.
     pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
         // Through `quinn-udp`, which caches the size on Apple platforms.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let state = Some(&self.state);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let state = self.state.as_ref();
-        let Some(state) = state else {
+        let Some(state) = &self.state else {
             return socket2::SockRef::from(&self.socket).set_send_buffer_size(bytes);
         };
         state.set_send_buffer_size(UdpSockRef::from(&self.socket), bytes)
@@ -216,10 +235,28 @@ impl UdpTransport {
 
     /// Turns segmentation offload on (the default) or off; see the
     /// [type documentation](Self). Takes effect for the next receive and send; datagrams
-    /// the kernel already coalesced are still split correctly.
+    /// the kernel already coalesced are still split correctly. Turning it off keeps the
+    /// socket set up by `quinn-udp`, so IP fragmentation stays off.
+    ///
+    /// On a transport bound without offload
+    /// ([`bind_with_offload`](Self::bind_with_offload)), turning it off does nothing and
+    /// turning it on fails with [`io::ErrorKind::Unsupported`].
     pub fn set_offload(&self, enabled: bool) -> io::Result<()> {
+        if self.plain {
+            if enabled {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "transport bound without offload",
+                ));
+            }
+            return Ok(());
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if self.state.gro_segments() > 1 {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.gro_segments() > 1)
+        {
             nix::sys::socket::setsockopt(
                 &self.socket,
                 nix::sys::socket::sockopt::UdpGroSegment,
@@ -260,11 +297,7 @@ impl UdpTransport {
 
     /// The most datagrams one send may carry right now.
     fn max_segments(&self) -> usize {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let state = Some(&self.state);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let state = self.state.as_ref();
-        match state {
+        match &self.state {
             Some(state) if self.offload() => state.max_gso_segments(),
             _ => 1,
         }
@@ -279,12 +312,9 @@ impl UdpTransport {
         to: &Path,
     ) -> io::Result<()> {
         let destination = self.target(to.addr)?;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let state = Some(&self.state);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let state = self.state.as_ref();
-        let Some(state) = state else {
-            return self.socket.send_to(contents, destination).await.map(drop);
+        let Some(state) = &self.state else {
+            // Without `quinn-udp` state nothing is segmented.
+            return self.send_to(contents, destination, to.ecn).await;
         };
         let transmit = Transmit {
             destination,
@@ -395,6 +425,28 @@ fn bind_socket(addr: SocketAddr) -> io::Result<Socket> {
     Ok(socket)
 }
 
+/// Sets `socket` up for `quinn-udp`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_up(socket: &UdpSocket) -> io::Result<UdpSocketState> {
+    let state = UdpSocketState::new(UdpSockRef::from(socket))?;
+    // Receive timestamps are not used, and their control message would crowd out the ECN
+    // mark of a coalesced read from `quinn-udp`'s control buffer.
+    nix::sys::socket::setsockopt(
+        socket,
+        nix::sys::socket::sockopt::ReceiveTimestampns,
+        &false,
+    )?;
+    Ok(state)
+}
+
+/// Sets `socket` up for `quinn-udp`; `None` where it cannot.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_up(socket: &UdpSocket) -> Option<UdpSocketState> {
+    UdpSocketState::new(UdpSockRef::from(socket))
+        .inspect_err(|e| tracing::debug!(message = "Plain UDP sends", error = ?e))
+        .ok()
+}
+
 /// Turns an IPv4-mapped IPv6 address back into an IPv4 address.
 fn unmap(addr: SocketAddr) -> SocketAddr {
     match addr {
@@ -409,22 +461,46 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     //! Receiving through `quinn-udp`, with generic receive offload: one read may return a
-    //! train of datagrams of one sender, all of one size (the stride) but the last.
+    //! train of datagrams of one sender, all of one size (the stride) but the last. Without
+    //! `quinn-udp` state, `recvmsg` / `sendmsg` with TOS and traffic class control messages.
 
     use std::collections::VecDeque;
-    use std::io::{self, IoSliceMut};
+    use std::io::{self, IoSlice, IoSliceMut};
+    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::os::fd::AsRawFd;
     use std::sync::{MutexGuard, PoisonError};
 
     use bytes::BytesMut;
+    use nix::sys::socket::{
+        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, sendmsg,
+    };
     use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH, PacketBuf, Path};
-    use quinn_udp::{RecvMeta, UdpSockRef};
+    use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
+    use socket2::SockRef;
     use tokio::io::Interest;
+    use tokio::net::UdpSocket;
 
     use super::UdpTransport;
 
     /// Bytes one coalesced read may fill: the largest datagram, and the most the kernel
     /// coalesces into one read.
     const READ: usize = 1 << 16;
+
+    /// Control-message buffer, aligned for `cmsghdr`; holds one TOS or traffic class
+    /// message (24 bytes on 64-bit targets) with room to spare.
+    #[repr(C, align(8))]
+    struct CmsgBuf([u8; 64]);
+
+    /// Asks for the TOS (IPv4, including IPv4-mapped peers of a dual-stack socket) and
+    /// traffic class (IPv6) of every received datagram.
+    pub(super) fn enable_ecn(socket: &UdpSocket, local: SocketAddr) -> io::Result<()> {
+        let socket = SockRef::from(socket);
+        socket.set_recv_tos_v4(true)?;
+        if local.is_ipv6() {
+            socket.set_recv_tclass_v6(true)?;
+        }
+        Ok(())
+    }
 
     /// What the receiving side keeps between receives.
     #[derive(Debug, Default)]
@@ -452,10 +528,10 @@ mod linux {
                         .copy_from_slice(&datagram.as_packet()[..len]);
                     return Ok((len, path));
                 }
-                if !self.offload() {
-                    return self.read_into(buf).await;
+                match &self.state {
+                    Some(state) if self.offload() => self.read_coalesced(state).await?,
+                    _ => return self.read_into(buf).await,
                 }
-                self.read_coalesced().await?;
             }
         }
 
@@ -481,12 +557,15 @@ mod linux {
                         return Ok(());
                     }
                 }
-                if !self.offload() {
-                    let (len, path) = self.read_into(buf).await?;
-                    datagrams.push_back((path, PacketBuf::from_packet(&buf.as_packet()[..len])));
-                    return Ok(());
+                match &self.state {
+                    Some(state) if self.offload() => self.read_coalesced(state).await?,
+                    _ => {
+                        let (len, path) = self.read_into(buf).await?;
+                        datagrams
+                            .push_back((path, PacketBuf::from_packet(&buf.as_packet()[..len])));
+                        return Ok(());
+                    }
                 }
-                self.read_coalesced().await?;
             }
         }
 
@@ -495,13 +574,20 @@ mod linux {
         /// are copied to the pending queue.
         async fn read_into(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
             buf.set_len(buf.capacity());
+            let Some(state) = &self.state else {
+                let (len, addr, ecn) = self
+                    .recv_from(buf.as_packet_mut())
+                    .await
+                    .inspect_err(|_| buf.set_len(0))?;
+                buf.set_len(len);
+                return Ok((len, self.path(addr, ecn)));
+            };
             let meta = self
                 .socket
                 .async_io(Interest::READABLE, || {
                     let mut meta = [RecvMeta::default()];
                     let mut bufs = [IoSliceMut::new(buf.as_packet_mut())];
-                    self.state
-                        .recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    state.recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
                     Ok(meta[0])
                 })
                 .await
@@ -527,9 +613,9 @@ mod linux {
         /// [`HEADROOM`] bytes, so the later datagrams of a train are moved apart within the
         /// storage to make that room: one move per train and no allocation. Once the core
         /// opens at any headroom, they can be sliced where they were read.
-        async fn read_coalesced(&self) -> io::Result<()> {
+        async fn read_coalesced(&self, state: &UdpSocketState) -> io::Result<()> {
             // A full read spread into the most datagrams the kernel coalesces.
-            let room = HEADROOM + READ + self.state.gro_segments() * HEADROOM;
+            let room = HEADROOM + READ + state.gro_segments() * HEADROOM;
             self.socket
                 .async_io(Interest::READABLE, || {
                     let mut rx = self.rx();
@@ -542,8 +628,7 @@ mod linux {
                     }
                     let mut meta = [RecvMeta::default()];
                     let mut bufs = [IoSliceMut::new(&mut rx.buf[HEADROOM..HEADROOM + READ])];
-                    self.state
-                        .recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    state.recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
                     let meta = meta[0];
                     let path = self.path(meta.addr, ecn(&meta));
                     let stride = meta.stride.clamp(1, READ);
@@ -577,6 +662,85 @@ mod linux {
         meta.ecn
             .map_or(Ecn::NotEct, |ecn| Ecn::from_bits(ecn as u8))
     }
+
+    impl UdpTransport {
+        /// Receives one datagram with `recvmsg`, truncated to `packet`, and its ECN mark.
+        async fn recv_from(&self, packet: &mut [u8]) -> io::Result<(usize, SocketAddr, Ecn)> {
+            let fd = self.socket.as_raw_fd();
+            self.socket
+                .async_io(Interest::READABLE, || {
+                    let mut iov = [IoSliceMut::new(&mut *packet)];
+                    let mut cmsg = CmsgBuf([0; 64]);
+                    let msg = recvmsg::<SockaddrStorage>(
+                        fd,
+                        &mut iov,
+                        Some(&mut cmsg.0),
+                        MsgFlags::empty(),
+                    )?;
+                    let addr = msg.address.as_ref().and_then(socket_addr).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "datagram without source")
+                    })?;
+                    // A truncated control buffer only loses the ECN mark.
+                    let ecn =
+                        msg.cmsgs()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .fold(Ecn::NotEct, |ecn, cmsg| match cmsg {
+                                ControlMessageOwned::Ipv4Tos(tos) => Ecn::from_bits(tos),
+                                ControlMessageOwned::Ipv6TClass(tclass) => {
+                                    u8::try_from(tclass & 0xFF).map_or(ecn, Ecn::from_bits)
+                                }
+                                _ => ecn,
+                            });
+                    Ok((msg.bytes, addr, ecn))
+                })
+                .await
+        }
+
+        /// Sends one datagram with `sendmsg`, marked with `ecn`.
+        pub(super) async fn send_to(
+            &self,
+            datagram: &[u8],
+            to: SocketAddr,
+            ecn: Ecn,
+        ) -> io::Result<()> {
+            let fd = self.socket.as_raw_fd();
+            let dest = SockaddrStorage::from(to);
+            let tos = ecn.to_bits();
+            let tclass = i32::from(tos);
+            // IPv4 and IPv4-mapped destinations take IP_TOS, even on an IPv6 socket.
+            let cmsg = match to {
+                _ if ecn == Ecn::NotEct => None,
+                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
+                    Some(ControlMessage::Ipv6TClass(&tclass))
+                }
+                _ => Some(ControlMessage::Ipv4Tos(&tos)),
+            };
+            self.socket
+                .async_io(Interest::WRITABLE, || {
+                    sendmsg(
+                        fd,
+                        &[IoSlice::new(datagram)],
+                        cmsg.as_slice(),
+                        MsgFlags::empty(),
+                        Some(&dest),
+                    )
+                    .map_err(io::Error::from)
+                })
+                .await
+                .map(drop)
+        }
+    }
+
+    fn socket_addr(addr: &SockaddrStorage) -> Option<SocketAddr> {
+        addr.as_sockaddr_in()
+            .map(|v4| SocketAddrV4::from(*v4).into())
+            .or_else(|| {
+                addr.as_sockaddr_in6()
+                    .map(|v6| SocketAddrV6::from(*v6).into())
+            })
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -596,6 +760,11 @@ impl UdpTransport {
     #[cfg(not(windows))]
     async fn recv_from(&self, packet: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.socket.recv_from(packet).await
+    }
+
+    /// Sends one datagram with plain `send_to`, without an ECN mark.
+    async fn send_to(&self, datagram: &[u8], to: SocketAddr, _ecn: Ecn) -> io::Result<()> {
+        self.socket.send_to(datagram, to).await.map(drop)
     }
 }
 
@@ -662,8 +831,16 @@ mod tests {
 
     const DATAGRAM: &[u8] = b"wireguard datagram";
 
+    /// Bound with offload, then without.
+    const OFFLOAD: [bool; 2] = [true, false];
+
     fn bind(id: u16, addr: &str) -> UdpTransport {
         UdpTransport::bind(TransportId::new(id), addr.parse().unwrap()).unwrap()
+    }
+
+    fn bind_with(id: u16, addr: &str, offload: bool) -> UdpTransport {
+        UdpTransport::bind_with_offload(TransportId::new(id), addr.parse().unwrap(), offload)
+            .unwrap()
     }
 
     fn path_to(addr: SocketAddr, ecn: Ecn) -> Path {
@@ -714,81 +891,93 @@ mod tests {
 
     #[tokio::test]
     async fn ipv4_roundtrip() {
-        let a = bind(1, "127.0.0.1:0");
-        let b = bind(2, "127.0.0.1:0");
-        assert_eq!(a.id(), TransportId::new(1));
-        roundtrip(&a, a.local_addr(), &b, b.local_addr()).await;
-        roundtrip(&b, b.local_addr(), &a, a.local_addr()).await;
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            assert_eq!(a.id(), TransportId::new(1));
+            roundtrip(&a, a.local_addr(), &b, b.local_addr()).await;
+            roundtrip(&b, b.local_addr(), &a, a.local_addr()).await;
+        }
     }
 
     #[tokio::test]
     async fn truncates_into_small_buffer() {
-        let a = bind(1, "127.0.0.1:0");
-        let b = bind(2, "127.0.0.1:0");
-        let mut small = PacketBuf::with_capacity(4);
-        let capacity = small.capacity();
-        assert!(capacity < DATAGRAM.len());
-        a.send(DATAGRAM, &path_to(b.local_addr(), Ecn::NotEct))
-            .await
-            .unwrap();
-        small.with_headroom_mut().fill(0xAA);
-        let (len, path) = b.recv(&mut small).await.unwrap();
-        assert_eq!(len, capacity);
-        assert_eq!(small.as_packet(), &DATAGRAM[..capacity]);
-        assert!(
-            small.with_headroom_mut()[..HEADROOM]
-                .iter()
-                .all(|&b| b == 0xAA)
-        );
-        assert_eq!(path.addr, a.local_addr());
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            let mut small = PacketBuf::with_capacity(4);
+            let capacity = small.capacity();
+            assert!(capacity < DATAGRAM.len());
+            a.send(DATAGRAM, &path_to(b.local_addr(), Ecn::NotEct))
+                .await
+                .unwrap();
+            small.with_headroom_mut().fill(0xAA);
+            let (len, path) = b.recv(&mut small).await.unwrap();
+            assert_eq!(len, capacity);
+            assert_eq!(small.as_packet(), &DATAGRAM[..capacity]);
+            assert!(
+                small.with_headroom_mut()[..HEADROOM]
+                    .iter()
+                    .all(|&b| b == 0xAA)
+            );
+            assert_eq!(path.addr, a.local_addr());
+        }
     }
 
     /// An ICMP port-unreachable for an earlier send must not fail a later receive
     /// (Windows reports it as `WSAECONNRESET`).
     #[tokio::test]
     async fn port_unreachable_does_not_fail_recv() {
-        let a = bind(1, "127.0.0.1:0");
-        let b = bind(2, "127.0.0.1:0");
-        let closed = bind(3, "127.0.0.1:0").local_addr();
-        a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
-            .await
-            .unwrap();
-        b.send(DATAGRAM, &path_to(a.local_addr(), Ecn::NotEct))
-            .await
-            .unwrap();
-        let (buf, path) = recv(&a, 1500).await;
-        assert_eq!(buf.as_packet(), DATAGRAM);
-        assert_eq!(path.addr, b.local_addr());
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            let closed = bind(3, "127.0.0.1:0").local_addr();
+            a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
+                .await
+                .unwrap();
+            b.send(DATAGRAM, &path_to(a.local_addr(), Ecn::NotEct))
+                .await
+                .unwrap();
+            let (buf, path) = recv(&a, 1500).await;
+            assert_eq!(buf.as_packet(), DATAGRAM);
+            assert_eq!(path.addr, b.local_addr());
+        }
     }
 
     #[tokio::test]
     async fn ipv6_roundtrip() {
-        let a = bind(1, "[::1]:0");
-        let b = bind(2, "[::1]:0");
-        roundtrip(&a, a.local_addr(), &b, b.local_addr()).await;
-        roundtrip(&b, b.local_addr(), &a, a.local_addr()).await;
+        for offload in OFFLOAD {
+            let a = bind_with(1, "[::1]:0", offload);
+            let b = bind_with(2, "[::1]:0", offload);
+            roundtrip(&a, a.local_addr(), &b, b.local_addr()).await;
+            roundtrip(&b, b.local_addr(), &a, a.local_addr()).await;
+        }
     }
 
     #[tokio::test]
     async fn dual_stack_unmaps_ipv4_peers() {
-        let dual = bind(1, "[::]:0");
-        assert!(dual.local_addr().is_ipv6());
-        let v4 = bind(2, "127.0.0.1:0");
-        let v6 = bind(3, "[::1]:0");
-        roundtrip(&v4, v4.local_addr(), &dual, seen_as(&dual, "127.0.0.1")).await;
-        roundtrip(&dual, seen_as(&dual, "127.0.0.1"), &v4, v4.local_addr()).await;
-        roundtrip(&v6, v6.local_addr(), &dual, seen_as(&dual, "::1")).await;
-        roundtrip(&dual, seen_as(&dual, "::1"), &v6, v6.local_addr()).await;
+        for offload in OFFLOAD {
+            let dual = bind_with(1, "[::]:0", offload);
+            assert!(dual.local_addr().is_ipv6());
+            let v4 = bind_with(2, "127.0.0.1:0", offload);
+            let v6 = bind_with(3, "[::1]:0", offload);
+            roundtrip(&v4, v4.local_addr(), &dual, seen_as(&dual, "127.0.0.1")).await;
+            roundtrip(&dual, seen_as(&dual, "127.0.0.1"), &v4, v4.local_addr()).await;
+            roundtrip(&v6, v6.local_addr(), &dual, seen_as(&dual, "::1")).await;
+            roundtrip(&dual, seen_as(&dual, "::1"), &v6, v6.local_addr()).await;
+        }
     }
 
     #[tokio::test]
     async fn ipv4_socket_rejects_ipv6_destination() {
-        let a = bind(1, "127.0.0.1:0");
-        let err = a
-            .send(DATAGRAM, &path_to("[::1]:9".parse().unwrap(), Ecn::NotEct))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let err = a
+                .send(DATAGRAM, &path_to("[::1]:9".parse().unwrap(), Ecn::NotEct))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     /// Sends one datagram per ECN codepoint from `from` to `to` and checks the mark `to`
@@ -797,6 +986,7 @@ mod tests {
         for ecn in [Ecn::Ect0, Ecn::Ect1, Ecn::Ce, Ecn::NotEct] {
             from.send(DATAGRAM, &path_to(to_addr, ecn)).await.unwrap();
             let (_, path) = recv(to, 1500).await;
+            // Marks are sent and received on Linux and Android in both modes.
             let expected = if cfg!(any(target_os = "linux", target_os = "android")) {
                 ecn
             } else {
@@ -808,33 +998,156 @@ mod tests {
 
     #[tokio::test]
     async fn ecn_ipv4() {
-        let a = bind(1, "127.0.0.1:0");
-        let b = bind(2, "127.0.0.1:0");
-        ecn_marks(&a, &b, b.local_addr()).await;
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            ecn_marks(&a, &b, b.local_addr()).await;
+        }
     }
 
     #[tokio::test]
     async fn ecn_ipv6() {
-        let a = bind(1, "[::1]:0");
-        let b = bind(2, "[::1]:0");
-        ecn_marks(&a, &b, b.local_addr()).await;
+        for offload in OFFLOAD {
+            let a = bind_with(1, "[::1]:0", offload);
+            let b = bind_with(2, "[::1]:0", offload);
+            ecn_marks(&a, &b, b.local_addr()).await;
+        }
     }
 
     #[tokio::test]
     async fn ecn_dual_stack() {
-        let dual = bind(1, "[::]:0");
-        let v4 = bind(2, "127.0.0.1:0");
-        ecn_marks(&v4, &dual, seen_as(&dual, "127.0.0.1")).await;
-        ecn_marks(&dual, &v4, v4.local_addr()).await;
+        for offload in OFFLOAD {
+            let dual = bind_with(1, "[::]:0", offload);
+            let v4 = bind_with(2, "127.0.0.1:0", offload);
+            ecn_marks(&v4, &dual, seen_as(&dual, "127.0.0.1")).await;
+            ecn_marks(&dual, &v4, v4.local_addr()).await;
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     #[ignore = "needs CAP_NET_ADMIN"]
     async fn fwmark() {
-        let a = bind(1, "127.0.0.1:0");
-        a.set_fwmark(0x5157).unwrap();
-        assert_eq!(socket2::SockRef::from(&a.socket).mark().unwrap(), 0x5157);
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            a.set_fwmark(0x5157).unwrap();
+            assert_eq!(socket2::SockRef::from(&a.socket).mark().unwrap(), 0x5157);
+        }
+    }
+
+    /// The socket options of a transport bound to `addr` and of a plain socket bound the
+    /// same way, as `(name, transport, plain)`. The path MTU discovery mode
+    /// (`IP_MTU_DISCOVER`, `IPV6_MTU_DISCOVER`) has no safe getter in `nix` or `socket2`;
+    /// the fragmentation e2e test in `nsplane-e2e` (`offload_udp`) checks its effect.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn socket_options(addr: &str, offload: bool) -> Vec<(&'static str, bool, bool)> {
+        use nix::sys::socket::{getsockopt, sockopt};
+
+        let transport = bind_with(1, addr, offload);
+        let addr: SocketAddr = addr.parse().unwrap();
+        let plain = if addr.ip().is_unspecified() {
+            bind_dual_stack(addr).unwrap()
+        } else {
+            bind_socket(addr).unwrap()
+        };
+        let socket = socket2::SockRef::from(&transport.socket);
+        let mut options = vec![
+            (
+                "UDP_GRO",
+                getsockopt(&transport.socket, sockopt::UdpGroSegment).unwrap(),
+                getsockopt(&plain, sockopt::UdpGroSegment).unwrap(),
+            ),
+            (
+                "SO_TIMESTAMPNS",
+                getsockopt(&transport.socket, sockopt::ReceiveTimestampns).unwrap(),
+                getsockopt(&plain, sockopt::ReceiveTimestampns).unwrap(),
+            ),
+            (
+                "IP_RECVTOS",
+                socket.recv_tos_v4().unwrap(),
+                plain.recv_tos_v4().unwrap(),
+            ),
+        ];
+        if addr.is_ipv4() {
+            options.push((
+                "IP_PKTINFO",
+                getsockopt(&transport.socket, sockopt::Ipv4PacketInfo).unwrap(),
+                getsockopt(&plain, sockopt::Ipv4PacketInfo).unwrap(),
+            ));
+        } else {
+            options.extend([
+                (
+                    "IPV6_DONTFRAG",
+                    getsockopt(&transport.socket, sockopt::Ipv6DontFrag).unwrap(),
+                    getsockopt(&plain, sockopt::Ipv6DontFrag).unwrap(),
+                ),
+                (
+                    "IPV6_RECVPKTINFO",
+                    getsockopt(&transport.socket, sockopt::Ipv6RecvPacketInfo).unwrap(),
+                    getsockopt(&plain, sockopt::Ipv6RecvPacketInfo).unwrap(),
+                ),
+                (
+                    "IPV6_RECVTCLASS",
+                    socket.recv_tclass_v6().unwrap(),
+                    plain.recv_tclass_v6().unwrap(),
+                ),
+            ]);
+        }
+        options
+    }
+
+    /// Bound without offload, the socket has the kernel defaults but for the ECN options
+    /// it asks for: `quinn-udp` never set it up.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn offload_off_bind_keeps_kernel_defaults() {
+        for addr in ["127.0.0.1:0", "[::1]:0", "[::]:0"] {
+            for (name, transport, plain) in socket_options(addr, false) {
+                match name {
+                    "IP_RECVTOS" | "IPV6_RECVTCLASS" => assert!(transport, "{addr} {name}"),
+                    _ => assert_eq!(transport, plain, "{addr} {name}"),
+                }
+                if name == "IPV6_DONTFRAG" {
+                    assert!(!transport, "{addr} {name}");
+                }
+            }
+        }
+    }
+
+    /// Bound with offload, the socket is set up by `quinn-udp`: fragmentation off
+    /// (`IPV6_DONTFRAG`), packet info and GRO on; turning offload off keeps that setup.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn offload_bind_sets_socket_up() {
+        for addr in ["127.0.0.1:0", "[::1]:0", "[::]:0"] {
+            for (name, transport, _) in socket_options(addr, true) {
+                match name {
+                    "SO_TIMESTAMPNS" => assert!(!transport, "{addr} {name}"),
+                    // Set where `quinn-udp` finds it supported; IPv6 marks come with
+                    // IPV6_RECVTCLASS.
+                    "IP_RECVTOS" => {}
+                    _ => assert!(transport, "{addr} {name}"),
+                }
+            }
+        }
+        let a = bind(1, "[::]:0");
+        a.set_offload(false).unwrap();
+        assert!(
+            nix::sys::socket::getsockopt(&a.socket, nix::sys::socket::sockopt::Ipv6DontFrag)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn offload_cannot_be_turned_on_when_bound_without() {
+        let a = bind_with(1, "127.0.0.1:0", false);
+        assert!(!a.offload());
+        assert_eq!(a.max_segments(), 1);
+        a.set_offload(false).unwrap();
+        let err = a.set_offload(true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(!a.offload());
+        assert!(a.state.is_none());
     }
 
     /// Linux's default socket buffer size (`net.core.rmem_default`), as reported.
@@ -856,52 +1169,56 @@ mod tests {
 
     #[tokio::test]
     async fn default_socket_buffers() {
-        let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-        let a = bind(1, "127.0.0.1:0");
-        for (effective, before, max) in [
-            (a.recv_buffer_size(), plain.recv_buffer_size(), "rmem_max"),
-            (a.send_buffer_size(), plain.send_buffer_size(), "wmem_max"),
-        ] {
-            let (effective, before) = (effective.unwrap(), before.unwrap());
-            match granted(DEFAULT_SOCKET_BUFFER, max) {
-                Some(granted) => {
-                    assert_eq!(effective, granted, "{max}");
-                    if granted > OLD_DEFAULT {
-                        assert!(effective > OLD_DEFAULT, "{max}");
+        for offload in OFFLOAD {
+            let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            for (effective, before, max) in [
+                (a.recv_buffer_size(), plain.recv_buffer_size(), "rmem_max"),
+                (a.send_buffer_size(), plain.send_buffer_size(), "wmem_max"),
+            ] {
+                let (effective, before) = (effective.unwrap(), before.unwrap());
+                match granted(DEFAULT_SOCKET_BUFFER, max) {
+                    Some(granted) => {
+                        assert_eq!(effective, granted, "{max}");
+                        if granted > OLD_DEFAULT {
+                            assert!(effective > OLD_DEFAULT, "{max}");
+                        }
                     }
+                    None => assert!(effective > 0 && effective >= before, "{max}"),
                 }
-                None => assert!(effective > 0 && effective >= before, "{max}"),
             }
         }
     }
 
     #[tokio::test]
     async fn socket_buffer_setters() {
-        let a = bind(1, "[::]:0");
-        let mut previous = [0; 2];
-        for bytes in [64 << 10, 1 << 20] {
-            a.set_recv_buffer_size(bytes).unwrap();
-            a.set_send_buffer_size(bytes).unwrap();
-            let effective = [a.recv_buffer_size().unwrap(), a.send_buffer_size().unwrap()];
-            for ((effective, previous), max) in
-                effective.iter().zip(previous).zip(["rmem_max", "wmem_max"])
-            {
-                match granted(bytes, max) {
-                    Some(granted) => assert_eq!(*effective, granted, "{max}"),
-                    None => assert!(*effective > previous, "{max}"),
+        for offload in OFFLOAD {
+            let a = bind_with(1, "[::]:0", offload);
+            let mut previous = [0; 2];
+            for bytes in [64 << 10, 1 << 20] {
+                a.set_recv_buffer_size(bytes).unwrap();
+                a.set_send_buffer_size(bytes).unwrap();
+                let effective = [a.recv_buffer_size().unwrap(), a.send_buffer_size().unwrap()];
+                for ((effective, previous), max) in
+                    effective.iter().zip(previous).zip(["rmem_max", "wmem_max"])
+                {
+                    match granted(bytes, max) {
+                        Some(granted) => assert_eq!(*effective, granted, "{max}"),
+                        None => assert!(*effective > previous, "{max}"),
+                    }
                 }
+                previous = effective;
             }
-            previous = effective;
         }
     }
 
     /// A burst of 512 datagrams of 1420 bytes sent before the receiver reads fits into the
-    /// default receive buffer, with offload on and off.
+    /// default receive buffer, with offload on, turned off, and bound without.
     #[tokio::test]
     async fn burst_fits_default_buffer() {
-        for offload in [true, false] {
-            let a = bind(1, "127.0.0.1:0");
-            let b = bind(2, "127.0.0.1:0");
+        for (bound, offload) in [(true, true), (true, false), (false, false)] {
+            let a = bind_with(1, "127.0.0.1:0", bound);
+            let b = bind_with(2, "127.0.0.1:0", bound);
             a.set_offload(offload).unwrap();
             b.set_offload(offload).unwrap();
             let datagrams: Vec<_> = (0..512).map(|seq| numbered(seq, 1420)).collect();
@@ -979,7 +1296,12 @@ mod tests {
     /// Whether both ends coalesce: `from` sends segmented, `to` receives coalesced.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn coalescing(from: &UdpTransport, to: &UdpTransport) -> bool {
-        from.max_segments() > 1 && to.offload() && to.state.gro_segments() > 1
+        from.max_segments() > 1
+            && to.offload()
+            && to
+                .state
+                .as_ref()
+                .is_some_and(|state| state.gro_segments() > 1)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1026,7 +1348,18 @@ mod tests {
     /// Senders bound to `send_on` send segmented trains of every size to a plain socket
     /// bound to `recv_on`, which gets them as separate datagrams.
     async fn segmented_to_plain(send_on: &str, recv_on: &str, seen_as_ip: &str) {
-        let sender = bind(1, send_on);
+        for offload in OFFLOAD {
+            segmented_to_plain_with(send_on, recv_on, seen_as_ip, offload).await;
+        }
+    }
+
+    async fn segmented_to_plain_with(
+        send_on: &str,
+        recv_on: &str,
+        seen_as_ip: &str,
+        offload: bool,
+    ) {
+        let sender = bind_with(1, send_on, offload);
         let plain = tokio::net::UdpSocket::bind(recv_on).await.unwrap();
         let from = seen_as(&sender, seen_as_ip);
         for size in [1, 1279, 1280, 1420] {
@@ -1066,22 +1399,24 @@ mod tests {
 
     #[tokio::test]
     async fn burst_from_plain_socket_keeps_boundaries() {
-        let receiver = bind(1, "127.0.0.1:0");
-        let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let datagrams: Vec<_> = (0..100).map(|seq| numbered(seq, 1 + seq * 13)).collect();
-        for datagram in &datagrams {
-            plain
-                .send_to(datagram, receiver.local_addr())
-                .await
-                .unwrap();
+        for offload in OFFLOAD {
+            let receiver = bind_with(1, "127.0.0.1:0", offload);
+            let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let datagrams: Vec<_> = (0..100).map(|seq| numbered(seq, 1 + seq * 13)).collect();
+            for datagram in &datagrams {
+                plain
+                    .send_to(datagram, receiver.local_addr())
+                    .await
+                    .unwrap();
+            }
+            let received: Vec<_> = recv_batches(&receiver, datagrams.len()).await.concat();
+            check(
+                &received,
+                &datagrams,
+                plain.local_addr().unwrap(),
+                Ecn::NotEct,
+            );
         }
-        let received: Vec<_> = recv_batches(&receiver, datagrams.len()).await.concat();
-        check(
-            &received,
-            &datagrams,
-            plain.local_addr().unwrap(),
-            Ecn::NotEct,
-        );
     }
 
     /// `from` sends a segmented train of each size with ECT(0) to `to`, which receives it
@@ -1155,9 +1490,15 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_batch_reaches_each_receiver_in_order() {
-        let sender = bind(1, "[::]:0");
-        let v4 = bind(2, "127.0.0.1:0");
-        let v6 = bind(3, "[::1]:0");
+        for offload in OFFLOAD {
+            mixed_batch(offload).await;
+        }
+    }
+
+    async fn mixed_batch(offload: bool) {
+        let sender = bind_with(1, "[::]:0", offload);
+        let v4 = bind_with(2, "127.0.0.1:0", offload);
+        let v6 = bind_with(3, "[::1]:0", offload);
         let ecns = [Ecn::NotEct, Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
         let mut batch = Vec::new();
         let mut expected: [Vec<(Ecn, Vec<u8>)>; 2] = Default::default();
