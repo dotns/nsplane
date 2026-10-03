@@ -7,7 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -115,6 +115,7 @@ impl NetStack {
             flows: HashMap::new(),
             bound: HashMap::new(),
             ingress,
+            batch: Vec::with_capacity(MAX_INJECT_PER_ITER),
             egress,
             commands: Some(commands),
             udp_rx,
@@ -568,11 +569,12 @@ struct Connecting {
     started: SmolInstant,
 }
 
-/// Socket pool limits: sockets per port and in total, and each socket's buffer size.
+/// Socket pool limits: sockets per port and in total, and each socket's buffer sizes.
 #[derive(Debug, Clone, Copy)]
 struct Pool {
     limit: usize,
-    buffer: usize,
+    rx_buffer: usize,
+    tx_buffer: usize,
 }
 
 /// The single task that owns smoltcp and every queue behind the stack.
@@ -596,6 +598,8 @@ struct Driver {
     flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
     bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
     ingress: mpsc::Receiver<PacketBuf>,
+    /// Ingress packets taken in one batch; empty between batches.
+    batch: Vec<PacketBuf>,
     egress: mpsc::Sender<PacketBuf>,
     /// `None` once every handle is gone.
     commands: Option<mpsc::Receiver<Command>>,
@@ -661,7 +665,8 @@ impl Driver {
         self.release_inbound();
         let pool = Pool {
             limit: self.settings.listener_pool,
-            buffer: self.settings.tcp_buffer(),
+            rx_buffer: self.settings.tcp_rx_buffer(),
+            tx_buffer: self.settings.tcp_tx_buffer(),
         };
         let refused = prepare_tcp_listeners(
             &demand,
@@ -707,14 +712,27 @@ impl Driver {
         if let Some(packet) = self.carried.take() {
             self.ingest(packet, &mut demand);
         }
-        for _ in 0..MAX_INJECT_PER_ITER {
-            match self.ingress.try_recv() {
-                Ok(packet) => self.ingest(packet, &mut demand),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return None,
-            }
+        // Taking the queued packets at once releases their queue slots in one step rather
+        // than one per packet. Without a packet the poll registers no waker that matters:
+        // `wait` polls the queue again with the driver's own.
+        let mut batch = std::mem::take(&mut self.batch);
+        let taken = self.ingress.poll_recv_many(
+            &mut Context::from_waker(Waker::noop()),
+            &mut batch,
+            MAX_INJECT_PER_ITER,
+        );
+        self.ingest_all(&mut batch, &mut demand);
+        self.batch = batch;
+        // Zero packets taken means the queue is closed and drained.
+        (taken != Poll::Ready(0)).then_some(demand)
+    }
+
+    /// Routes the packets of `batch` in order (see [`ingest`](Self::ingest)), leaving it
+    /// empty with its allocation kept.
+    fn ingest_all(&mut self, batch: &mut Vec<PacketBuf>, demand: &mut HashMap<u16, usize>) {
+        for packet in batch.drain(..) {
+            self.ingest(packet, demand);
         }
-        Some(demand)
     }
 
     /// Routes one ingress packet, counting the SYNs per destination port in `demand`.
@@ -957,7 +975,8 @@ impl Driver {
                 io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port")
             })?,
         };
-        let mut socket = new_tcp_socket(self.settings.tcp_buffer());
+        let mut socket =
+            new_tcp_socket(self.settings.tcp_rx_buffer(), self.settings.tcp_tx_buffer());
         socket.set_timeout(Some(CONNECT_TIMEOUT));
         socket
             .connect(
@@ -1467,10 +1486,12 @@ fn preserve_terminal_receive(
     shared.wake_reader();
 }
 
-/// A TCP socket tuned for relaying.
-fn new_tcp_socket(buffer: usize) -> tcp::Socket<'static> {
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; buffer]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; buffer]);
+/// A TCP socket tuned for relaying, with buffers of `rx_buffer` and `tx_buffer` bytes.
+///
+/// smoltcp derives the window-scale shift from the receive buffer's capacity here.
+fn new_tcp_socket(rx_buffer: usize, tx_buffer: usize) -> tcp::Socket<'static> {
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buffer]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buffer]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
     // smoltcp's default 10 ms delayed ACK withholds window updates until expiry, stalling
     // a far sender that filled the receive window (one ack delay per window over a
@@ -1652,7 +1673,7 @@ fn ensure_tcp_listeners(
 
     let handles = listeners.entry(port).or_default();
     for _ in 0..add {
-        let mut socket = new_tcp_socket(pool.buffer);
+        let mut socket = new_tcp_socket(pool.rx_buffer, pool.tx_buffer);
         let _ = socket.listen(port);
         handles.push(sockets.add(socket));
     }

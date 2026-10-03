@@ -268,7 +268,7 @@ impl TransportArgs {
                     default: UDP_TRANSPORT,
                     listen: udp.local_addr(),
                 };
-                let wss = WssTransport::connect(UDP_TRANSPORT, self.wss_config()?, Some(udp));
+                let wss = WssTransport::connect(UDP_TRANSPORT, self.wss_config()?, Some(udp))?;
                 let (relay, stats) = (wss.relay(), wss.stats());
                 let mut config = self.client_config()?;
                 if !config.relays.contains(&relay) {

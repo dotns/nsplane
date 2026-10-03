@@ -16,6 +16,7 @@ use nsplane_packet::checksum::{
 use nsplane_packet::{IpPacket, PacketBuf, UdpHeader, protocol};
 use tokio::sync::mpsc;
 
+use crate::device::TAILROOM;
 use crate::ownership::Registration;
 
 /// UDP header length.
@@ -76,7 +77,7 @@ pub(crate) fn build_udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Opt
     let udp_len_field = u16::try_from(udp_len).ok()?;
     let total_field = u16::try_from(total).ok()?;
 
-    let mut packet = PacketBuf::with_capacity(total);
+    let mut packet = PacketBuf::with_capacity(total + TAILROOM);
     packet.set_len(total);
     let bytes = packet.as_packet_mut();
     let (ip, segment) = bytes.split_at_mut(header_len);
@@ -394,6 +395,14 @@ mod tests {
             assert_eq!(got.dst, dst);
             assert_eq!(got.payload.as_ref(), payload);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn build_udp_leaves_tailroom() -> TestResult {
+        let pkt = build_udp("10.0.0.1:53".parse()?, "10.0.0.2:53".parse()?, &[7; 1392])
+            .ok_or("build failed")?;
+        assert!(pkt.capacity() >= pkt.len() + TAILROOM);
         Ok(())
     }
 
