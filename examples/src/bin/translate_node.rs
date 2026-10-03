@@ -68,7 +68,6 @@ mod unix {
         LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator, TranslatorStats,
     };
     use nsplane_packet::{PacketBuf, PeerId};
-    use nsplane_tun::Tun;
     use serde_json::{Value, json};
 
     /// A TUN node translating local IPv4 to IPv6 in the tunnel (needs root).
@@ -330,6 +329,11 @@ mod unix {
             "dropped_out": stats.dropped_out,
             "dropped_in": stats.dropped_in,
             "reassembled": stats.reassembled,
+            "fragments_held": stats.fragments_held,
+            "fragment_timeouts": stats.fragment_timeouts,
+            "fragment_budget_drops": stats.fragment_budget_drops,
+            "fragment_marker_evictions": stats.fragment_marker_evictions,
+            "reassembled_too_big": stats.reassembled_too_big,
             "grown_copies": stats.grown_copies,
         })
     }
@@ -337,14 +341,14 @@ mod unix {
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
         let peers = peers_with_mappings(&args)?;
-        let tun = Tun::create(&args.tun.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun.tun_name))?;
+        let tun = node::create_tun(&args.tun.tun_name, &args.node)?;
         let name = tun.name().unwrap_or_else(|_| args.tun.tun_name.clone());
         configure_tun(&name, &addresses(&args), args.tun.mtu, &peers)?;
         let (source, sink) = tun.split().context("cannot open the TUN device")?;
         // The table names peers by the ids the engine assigns when they are added, so the
         // translator starts empty (everything passes) and gets its table right after.
         let translator = Arc::new(Translator::new(TranslationTable::default()));
+        translator.set_mtu(args.tun.mtu);
         let engine_translator = SharedTranslator(Arc::clone(&translator));
         let node = build_engine_with(source, sink, &args.node, |builder| {
             builder.filter(Box::new(engine_translator))
