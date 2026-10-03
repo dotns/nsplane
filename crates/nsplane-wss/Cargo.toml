@@ -1,0 +1,30 @@
+[package]
+name = "nsplane-wss"
+description = "WebSocket-over-TLS (WSS) carriers for nsplane: a datagram link dialer for LinkTransport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nsplane = { path = "../nsplane", version = "0.8.0" }
+bytes = { workspace = true }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
+tokio = { version = "1.53.1", features = ["net", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tracing = "0.1.40"
+
+[dev-dependencies]
+nsplane-e2e = { path = "../nsplane-e2e" }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
