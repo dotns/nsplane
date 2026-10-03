@@ -7,6 +7,9 @@
 /// outside the prefix, or unspecified, loopback, link-local, multicast or a
 /// broadcast address.
 pub const UNSAFE_TARGET: &str = "nat64 lan unsafe target";
+/// More than one route resolves the destination; as ns, it is dropped
+/// rather than translated through whichever route comes first.
+pub const AMBIGUOUS_ROUTE: &str = "nat64 lan ambiguous route";
 /// A new flow found no free SNAT port within `port_tries` candidates.
 pub const PORT_EXHAUSTED: &str = "nat64 lan ports exhausted";
 /// A new flow could not be recorded: the conntrack table holds no flows at

@@ -672,7 +672,12 @@ unspecified; other mapped targets are dropped and counted) become IPv4 from the 
 `SnatPorts` and given back when the flow expires, is evicted or is removed
 (`Nat64Lan::remove_flow`, built on `Conntrack::remove` and its removal hook); a saturated
 range drops the packet rather than aliasing a flow. Replies and Fragmentation Needed (as
-Packet Too Big) are translated back; TCP MSS can be clamped. Unlike the filters above it sits
+Packet Too Big) are translated back; TCP MSS can be clamped. As in ns, translated packets
+leave DF clear (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
+fragmentation for a PMTU black hole when the LAN filters ICMP), and a destination that more
+than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`). The routes gate
+every forward packet; a flow keeps its SNAT address across a route replacement, and the
+caller revokes the flows of a removed route with `remove_flow`. Unlike the filters above it sits
 on the **local side**: the LAN's replies are addressed to `snat_source`, which no peer's
 allowed IPs contain, so the core could not route them to a peer before a filter ran.
 `Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
@@ -901,3 +906,8 @@ relay scenarios, against each other and kernel WireGuard (see `examples/README.m
 and the fragmentation stage between engines over channel transports (including the full
 `[AclFilter, PortMap, Translator]` stack); the `translate_node` and `port_map` example
 scenarios run them in containers against kernel WireGuard.
+
+`nsplane-e2e`'s `nat64_lan` test runs `Nat64Lan` around a gateway engine's local side, with an
+IPv6 client engine reaching an IPv4 netstack LAN host over channel transports.
+The `subnet_gateway` example scenario runs it in containers: a kernel WireGuard peer reaches
+an IPv4 LAN host through the mapped /96.

@@ -8,8 +8,10 @@
 //! - **Forward** ([`Nat64Lan::forward`]): an IPv6 TCP or UDP packet or
 //!   `ICMPv6` echo request to an address of a route's `mapped` prefix becomes
 //!   an IPv4 packet to the embedded LAN host, from the route's `snat_source`
-//!   with a source port (or ICMP echo identifier) reserved for the flow. The
-//!   first route that resolves the destination wins; a destination inside a
+//!   with a source port (or ICMP echo identifier) reserved for the flow.
+//!   Exactly one route must resolve the destination, as ns
+//!   `SubnetRouteSet::route_for`: a destination that several routes resolve
+//!   is dropped ([`reasons::AMBIGUOUS_ROUTE`]), and a destination inside a
 //!   `mapped` prefix that no route resolves to a safe address of its `real`
 //!   prefix (see [`LanRoute::resolve`]) is dropped
 //!   ([`reasons::UNSAFE_TARGET`]).
@@ -29,10 +31,19 @@
 //! (its start moves forward inside the buffer) and a reply grows by 20 bytes
 //! into its headroom; a reply whose buffer has less than 20 bytes of headroom
 //! is copied once into a buffer with the standard headroom. Checksums are
-//! recomputed, as ns does. Translated IPv4 packets above 1260 bytes get DF
-//! (RFC 7915), so the LAN answers with Fragmentation Needed instead of
-//! fragmenting; ns leaves DF clear. The hop limit and TTL are copied, as ns
-//! does: the node forwarding the translated packet decrements them.
+//! recomputed, as ns does. Translated IPv4 packets leave DF clear, as ns
+//! does, unless [`Nat64LanConfig::set_df`] is on. The hop limit and TTL are
+//! copied, as ns does: the node forwarding the translated packet decrements
+//! them.
+//!
+//! # Routes
+//!
+//! The routes gate every forward packet, not just the first of a flow: a
+//! packet whose destination no longer resolves through exactly one route is
+//! not translated, even if its flow is still tracked. A flow whose
+//! destination still resolves after a route replacement keeps the SNAT
+//! address it was created with; to revoke the flows of a removed route, call
+//! [`Nat64Lan::remove_flow`] for them, as ns does.
 //!
 //! # Flows and limits
 //!
@@ -49,10 +60,9 @@
 //! them to host sockets, as ns does with [`SnatPorts`].
 //!
 //! Differences from ns: routes are replaced through the caller's
-//! [`ArcSwap`] and the first resolving route wins (ns drops destinations
-//! that several routes resolve); flows expire when idle (ns keeps them until
-//! `remove_translated_flow`); a flow keeps the SNAT address it was created
-//! with when its route is replaced; DF as above.
+//! [`ArcSwap`]; flows expire when idle (ns keeps them until
+//! `remove_translated_flow`); DF can be turned on with
+//! [`Nat64LanConfig::set_df`].
 //!
 //! # Placement
 //!
@@ -104,6 +114,15 @@ pub struct Nat64LanConfig {
     pub port_tries: u8,
     /// The flow table: size and idle timeouts.
     pub conntrack: ConntrackConfig,
+    /// Set DF on translated IPv4 packets above 1260 bytes (RFC 7915).
+    /// Default `false`, as ns.
+    ///
+    /// With DF, LAN hosts and routers answer an oversized packet with ICMP
+    /// Fragmentation Needed, which [`Nat64Lan::reverse`] turns into an
+    /// `ICMPv6` Packet Too Big, so the peer lowers its path MTU; a LAN that
+    /// filters ICMP then black-holes those packets. Without DF there is no
+    /// such black hole, but oversized packets are fragmented on the LAN.
+    pub set_df: bool,
 }
 
 impl Default for Nat64LanConfig {
@@ -112,6 +131,7 @@ impl Default for Nat64LanConfig {
             max_tcp_mss: None,
             port_tries: 32,
             conntrack: ConntrackConfig::default(),
+            set_df: false,
         }
     }
 }
@@ -140,6 +160,8 @@ pub struct Nat64LanStats {
     pub packet_too_big: u64,
     /// Packets dropped with [`reasons::UNSAFE_TARGET`].
     pub unsafe_target: u64,
+    /// Packets dropped with [`reasons::AMBIGUOUS_ROUTE`].
+    pub ambiguous_route: u64,
     /// Packets dropped with [`reasons::PORT_EXHAUSTED`].
     pub port_exhausted: u64,
     /// Packets dropped with [`reasons::MALFORMED`] or
@@ -157,6 +179,7 @@ struct Counters {
     reversed: AtomicU64,
     packet_too_big: AtomicU64,
     unsafe_target: AtomicU64,
+    ambiguous_route: AtomicU64,
     port_exhausted: AtomicU64,
     other_drops: AtomicU64,
     not_ours: AtomicU64,
@@ -231,6 +254,7 @@ impl Nat64Lan {
             reversed: load(&c.reversed),
             packet_too_big: load(&c.packet_too_big),
             unsafe_target: load(&c.unsafe_target),
+            ambiguous_route: load(&c.ambiguous_route),
             port_exhausted: load(&c.port_exhausted),
             other_drops: load(&c.other_drops),
             not_ours: load(&c.not_ours),
@@ -297,6 +321,7 @@ impl Nat64Lan {
             Err(reason) => {
                 let counter = match reason {
                     reasons::UNSAFE_TARGET => &c.unsafe_target,
+                    reasons::AMBIGUOUS_ROUTE => &c.ambiguous_route,
                     reasons::PORT_EXHAUSTED => &c.port_exhausted,
                     _ => &c.other_drops,
                 };
@@ -313,21 +338,29 @@ impl Nat64Lan {
             return Ok(false);
         };
         let routes = self.routes.load();
-        let Some((route, target)) = routes
+        let mut resolving = routes
             .iter()
-            .find_map(|route| Some((route, route.resolve(request.dst)?)))
-        else {
+            .filter_map(|route| Some((route, route.resolve(request.dst)?)));
+        let Some((route, target)) = resolving.next() else {
             if routes.iter().any(|route| route.maps(request.dst)) {
                 return Err(reasons::UNSAFE_TARGET);
             }
             return Ok(false);
         };
+        if resolving.next().is_some() {
+            return Err(reasons::AMBIGUOUS_ROUTE);
+        }
         let (original, flags) = packet::request_tuple(bytes, request).ok_or(reasons::MALFORMED)?;
         let translated = match self.conntrack.lookup(&original, Some(flags)) {
             Some(found) if found.direction == FlowDirection::Original => found.flow.translated,
             _ => self.new_flow(&original, route.snat_source, target, flags)?,
         };
-        packet::to_ipv4(packet, &translated, self.config.max_tcp_mss);
+        packet::to_ipv4(
+            packet,
+            &translated,
+            self.config.max_tcp_mss,
+            self.config.set_df,
+        );
         Ok(true)
     }
 

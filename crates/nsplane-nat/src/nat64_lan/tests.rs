@@ -627,28 +627,90 @@ fn replies_of_unknown_flows_and_other_packets_are_not_ours() {
 // -- Routes replaced through the ArcSwap. --
 
 #[test]
-fn routes_are_replaced_atomically_and_the_first_resolving_route_wins() {
+fn routes_are_replaced_atomically() {
     let shared = routes(Vec::new());
     let lan = Nat64Lan::new(Arc::clone(&shared), Nat64LanConfig::default());
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
     assert_not_ours(&mut packet, |p| lan.forward(p));
 
-    let other_snat = Ipv4Addr::new(10, 9, 9, 9);
+    // Same `mapped` prefix, but HOST is outside `real`: only route() resolves.
     let elsewhere = LanRoute::new(
         (Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 7, 0, 0), 96),
         (Ipv4Addr::new(10, 0, 0, 0), 8),
-        other_snat,
+        Ipv4Addr::new(10, 9, 9, 9),
     )
     .unwrap();
-    let mut second = route();
-    second.snat_source = other_snat;
-    shared.store(Arc::new(vec![elsewhere, route(), second]));
+    shared.store(Arc::new(vec![elsewhere, route()]));
     assert_eq!(lan.forward(&mut packet), Nat64Verdict::Translated);
     assert_eq!(&packet.as_packet()[12..16], &SNAT.octets());
+    assert_eq!(lan.stats().ambiguous_route, 0);
 
     shared.store(Arc::new(Vec::new()));
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
     assert_not_ours(&mut packet, |p| lan.forward(p));
+}
+
+#[test]
+fn a_destination_several_routes_resolve_is_dropped_and_counted() {
+    let mut second = route();
+    second.snat_source = Ipv4Addr::new(10, 9, 9, 9);
+    let shared = routes(vec![route(), second]);
+    let lan = Nat64Lan::new(Arc::clone(&shared), Nat64LanConfig::default());
+    let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
+    let before = packet.as_packet().to_vec();
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::AMBIGUOUS_ROUTE)
+    );
+    assert_eq!(packet.as_packet(), before.as_slice());
+    let stats = lan.stats();
+    assert_eq!(stats.ambiguous_route, 1);
+    assert_eq!(stats.forwarded, 0);
+    assert_eq!(stats.conntrack.entries, 0);
+
+    // A tracked flow is gated too once its destination becomes ambiguous.
+    shared.store(Arc::new(vec![route()]));
+    forward_udp(&lan);
+    shared.store(Arc::new(vec![route(), second]));
+    let mut packet = ipv6(protocol::UDP, udp(4321, 53, b"query"));
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::AMBIGUOUS_ROUTE)
+    );
+    assert_eq!(lan.stats().ambiguous_route, 2);
+}
+
+// -- DF. --
+
+/// The DF bit of a UDP packet with `len` bytes of data, forwarded with
+/// `set_df`.
+fn forwarded_df(set_df: bool, len: usize) -> bool {
+    let config = Nat64LanConfig {
+        set_df,
+        ..Nat64LanConfig::default()
+    };
+    let lan = Nat64Lan::new(routes(vec![route()]), config);
+    let mut packet = ipv6(protocol::UDP, udp(4321, 53, &vec![0; len]));
+    assert_eq!(lan.forward(&mut packet), Nat64Verdict::Translated);
+    let bytes = packet.as_packet();
+    assert_valid4(bytes);
+    be16(bytes, 6) & 0x4000 != 0
+}
+
+#[test]
+fn df_is_clear_by_default() {
+    assert!(!Nat64LanConfig::default().set_df);
+    // 20 + 8 + 1300 bytes of IPv4: above the 1260-byte threshold.
+    assert!(!forwarded_df(false, 1300));
+    assert!(!forwarded_df(false, 5));
+}
+
+#[test]
+fn set_df_marks_only_packets_above_1260_bytes() {
+    assert!(forwarded_df(true, 1300));
+    // 20 + 8 + 1232 = 1260 bytes: at the threshold, not above.
+    assert!(!forwarded_df(true, 1232));
+    assert!(!forwarded_df(true, 5));
 }
 
 // -- SNAT ports. --
