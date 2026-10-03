@@ -8,11 +8,11 @@ use std::io;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use nsplane_core::x25519::StaticSecret;
-use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Output};
+use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Output, PeerStats};
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
@@ -25,7 +25,9 @@ use crate::events::{
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
 };
 use crate::fragment::{Action, FragmentStats, Fragmenter};
-use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
+use crate::handle::{
+    Command, EngineHandle, EngineStatus, QueueDepth, QueueStats, TransportError, TransportStats,
+};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
 
@@ -269,7 +271,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         jobs: Vec::with_capacity(MAX_BATCH),
     };
     for transport in parts.transports {
-        let slot = owner.start_transport(transport.start, VecDeque::new());
+        let slot = owner.start_transport(transport.start, VecDeque::new(), None);
         owner.transports.insert(transport.id, slot);
     }
 
@@ -351,15 +353,15 @@ type Datagram = (Path, PacketBuf);
 type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
 
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
-/// its transmit queue (both ends), the queue returning transmitted buffers, where to report
-/// failed sends and the suspension state.
+/// its transmit queue (both ends), the queue returning transmitted buffers, the transport's
+/// traffic counters (which report failed sends) and the suspension state.
 type Start = Box<
     dyn FnOnce(
             mpsc::Sender<Datagram>,
             mpsc::WeakSender<Datagram>,
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
-            SendErrors,
+            Arc<Traffic>,
             watch::Receiver<bool>,
         ) -> (Task, Transmitter)
         + Send,
@@ -376,23 +378,26 @@ impl NewTransport {
     pub(crate) fn new<T: Transport>(transport: T) -> Self {
         Self {
             id: transport.id(),
-            start: Box::new(move |datagrams, slots, queue, recycle, errors, suspended| {
-                let transport = Arc::new(transport);
-                let (stop, stopped) = oneshot::channel();
-                (
-                    Task::spawn(receive(
-                        Arc::clone(&transport),
-                        datagrams,
-                        suspended.clone(),
-                    )),
-                    Transmitter {
-                        stop: Some(stop),
-                        task: tokio::spawn(transmit(
-                            transport, slots, queue, recycle, errors, suspended, stopped,
+            start: Box::new(
+                move |datagrams, slots, queue, recycle, traffic, suspended| {
+                    let transport = Arc::new(transport);
+                    let (stop, stopped) = oneshot::channel();
+                    (
+                        Task::spawn(receive(
+                            Arc::clone(&transport),
+                            datagrams,
+                            Arc::clone(&traffic),
+                            suspended.clone(),
                         )),
-                    },
-                )
-            }),
+                        Transmitter {
+                            stop: Some(stop),
+                            task: tokio::spawn(transmit(
+                                transport, slots, queue, recycle, traffic, suspended, stopped,
+                            )),
+                        },
+                    )
+                },
+            ),
         }
     }
 }
@@ -421,8 +426,49 @@ impl SendErrors {
     }
 }
 
-/// An installed transport: its transmit queue, the datagrams waiting for room in it and its
-/// two tasks.
+/// The traffic counters of a transport, updated by its tasks once per batch, and where its
+/// failed sends are reported.
+struct Traffic {
+    rx_datagrams: AtomicU64,
+    rx_bytes: AtomicU64,
+    tx_datagrams: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_failed: AtomicU64,
+    errors: SendErrors,
+}
+
+impl Traffic {
+    const fn new(errors: SendErrors) -> Self {
+        Self {
+            rx_datagrams: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_datagrams: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            tx_failed: AtomicU64::new(0),
+            errors,
+        }
+    }
+
+    /// Counts `failed` datagrams and reports them to the owner.
+    fn failed(&self, failed: usize) {
+        self.tx_failed.fetch_add(failed as u64, Ordering::Relaxed);
+        self.errors.report(failed);
+    }
+
+    fn stats(&self, id: TransportId) -> TransportStats {
+        TransportStats {
+            id,
+            rx_datagrams: self.rx_datagrams.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            tx_datagrams: self.tx_datagrams.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            tx_failed: self.tx_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An installed transport: its transmit queue, the datagrams waiting for room in it, its
+/// two tasks and its traffic counters.
 struct TransportSlot {
     queue: mpsc::Sender<Datagram>,
     /// Datagrams waiting for room in the transmit queue, oldest first.
@@ -431,6 +477,7 @@ struct TransportSlot {
     flush: Option<Reserve>,
     receive: Task,
     transmit: Transmitter,
+    traffic: Arc<Traffic>,
 }
 
 impl TransportSlot {
@@ -939,12 +986,7 @@ impl Owner {
                 let _ = reply.send(self.core.peer_stats(peer));
             }
             Command::Peers(reply) => {
-                let peers = self
-                    .core
-                    .peers()
-                    .filter_map(|peer| self.core.peer_stats(peer))
-                    .collect();
-                let _ = reply.send(peers);
+                let _ = reply.send(self.peers());
             }
             Command::PublicKey(reply) => {
                 let _ = reply.send(self.core.public_key());
@@ -968,14 +1010,7 @@ impl Owner {
                 let _ = reply.send(());
             }
             Command::AddTransport(transport, reply) => {
-                let result = if self.transports.contains_key(&transport.id) {
-                    Err(TransportError::Duplicate(transport.id))
-                } else {
-                    let slot = self.start_transport(transport.start, VecDeque::new());
-                    self.transports.insert(transport.id, slot);
-                    Ok(())
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(self.add_transport(transport));
             }
             Command::RemoveTransport(id, reply) => {
                 let _ = reply.send(self.remove_transport(id).await);
@@ -983,9 +1018,11 @@ impl Owner {
             Command::ReplaceTransport(transport, reply) => {
                 let result = match self.transports.remove(&transport.id) {
                     Some(old) => {
-                        // The datagrams queued for the old transport go out on the new one.
+                        // The datagrams queued for the old transport go out on the new one,
+                        // and its counters keep running.
+                        let traffic = Arc::clone(&old.traffic);
                         let pending = old.stop().await;
-                        let slot = self.start_transport(transport.start, pending);
+                        let slot = self.start_transport(transport.start, pending, Some(traffic));
                         self.transports.insert(transport.id, slot);
                         self.drain(false);
                         Ok(())
@@ -1017,6 +1054,12 @@ impl Owner {
                 let _ = reply.send(self.queue_stats(take));
             }
             Command::FragmentStats(reply) => self.fragment_stats(reply),
+            Command::TransportStats(reply) => {
+                let _ = reply.send(self.transport_stats());
+            }
+            Command::Status(reply) => {
+                let _ = reply.send(self.status());
+            }
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
         }
         ControlFlow::Continue(())
@@ -1069,10 +1112,56 @@ impl Owner {
         stats
     }
 
+    /// Every peer's statistics.
+    fn peers(&self) -> Vec<PeerStats> {
+        self.core
+            .peers()
+            .filter_map(|peer| self.core.peer_stats(peer))
+            .collect()
+    }
+
+    /// A snapshot of the engine, counting the failed sends reported so far.
+    fn status(&mut self) -> EngineStatus {
+        self.send_errors();
+        let queues = self.queue_stats(false);
+        EngineStatus {
+            public_key: self.core.public_key(),
+            mtu: self.mtu,
+            suspended: *self.suspended.borrow(),
+            peers: self.peers(),
+            transports: self.transport_stats(),
+            drops: self.drops.clone(),
+            queues,
+            fragments: self
+                .fragmenter
+                .as_ref()
+                .map(Fragmenter::stats)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The traffic counters of every transport, ordered by id.
+    fn transport_stats(&self) -> Vec<TransportStats> {
+        self.transports
+            .iter()
+            .map(|(id, slot)| slot.traffic.stats(*id))
+            .collect()
+    }
+
     /// Replies with the counters of the fragmentation stage; all zeros without one.
     fn fragment_stats(&self, reply: oneshot::Sender<FragmentStats>) {
         let stats = self.fragmenter.as_ref().map(Fragmenter::stats);
         let _ = reply.send(stats.unwrap_or_default());
+    }
+
+    /// Starts and installs `transport` unless its id is taken.
+    fn add_transport(&mut self, transport: NewTransport) -> Result<(), TransportError> {
+        if self.transports.contains_key(&transport.id) {
+            return Err(TransportError::Duplicate(transport.id));
+        }
+        let slot = self.start_transport(transport.start, VecDeque::new(), None);
+        self.transports.insert(transport.id, slot);
+        Ok(())
     }
 
     /// Stops and removes transport `id`; the datagrams still queued for it are dropped.
@@ -1105,15 +1194,21 @@ impl Owner {
     }
 
     /// Spawns the receive and transmit tasks of a transport, with `pending` datagrams
-    /// waiting for its transmit queue.
-    fn start_transport(&self, start: Start, pending: VecDeque<Datagram>) -> TransportSlot {
+    /// waiting for its transmit queue, counting into `traffic` (new counters if `None`).
+    fn start_transport(
+        &self,
+        start: Start,
+        pending: VecDeque<Datagram>,
+        traffic: Option<Arc<Traffic>>,
+    ) -> TransportSlot {
+        let traffic = traffic.unwrap_or_else(|| Arc::new(Traffic::new(self.send_errors.clone())));
         let (queue, transmit_rx) = mpsc::channel(self.queue_capacity);
         let (receive, transmit) = start(
             self.datagram_tx.clone(),
             queue.downgrade(),
             transmit_rx,
             self.recycle_tx.clone(),
-            self.send_errors.clone(),
+            Arc::clone(&traffic),
             self.suspended.subscribe(),
         );
         TransportSlot {
@@ -1122,6 +1217,7 @@ impl Owner {
             flush: None,
             receive,
             transmit,
+            traffic,
         }
     }
 
@@ -1348,16 +1444,25 @@ async fn write_sink<Snk: PacketSink>(
     }
 }
 
-/// Receives batches of datagrams into the owner's queue until the transport closes.
+/// Receives batches of datagrams into the owner's queue until the transport closes, counting
+/// them in `traffic`.
 async fn receive<T: Transport>(
     transport: Arc<T>,
     datagrams: mpsc::Sender<Datagram>,
+    traffic: Arc<Traffic>,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut buf = PacketBuf::with_capacity(MAX_DATAGRAM);
     let mut received = VecDeque::with_capacity(MAX_BATCH);
     while running(&mut suspended).await {
         let result = transport.recv_batch(&mut buf, &mut received).await;
+        if !received.is_empty() {
+            let bytes = received.iter().map(|(_, data)| data.len() as u64).sum();
+            traffic
+                .rx_datagrams
+                .fetch_add(received.len() as u64, Ordering::Relaxed);
+            traffic.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
         while let Some(datagram) = received.pop_front() {
             if datagrams.send(datagram).await.is_err() {
                 return;
@@ -1390,8 +1495,9 @@ async fn unless_stopped<F: Future>(
 }
 
 /// Sends queued datagrams in batches of up to [`MAX_BATCH`] until the transport closes;
-/// returns the buffers for reuse and reports every failed datagram to `errors`. Once `stop` fires, hands back its queue and the datagrams
-/// of the batch it was sending that were not sent.
+/// returns the buffers for reuse and counts the datagrams it is done with, and every failed
+/// one, in `traffic`. Once `stop` fires, hands back its queue and the
+/// datagrams of the batch it was sending that were not sent.
 ///
 /// Every datagram of a batch after the first keeps its slot in the queue reserved (through
 /// `slots`, the queue's sender) until the batch is done, so a batch holds no more of the
@@ -1402,7 +1508,7 @@ async fn transmit<T: Transport>(
     slots: mpsc::WeakSender<Datagram>,
     mut queue: mpsc::Receiver<Datagram>,
     recycle: mpsc::Sender<PacketBuf>,
-    errors: SendErrors,
+    traffic: Arc<Traffic>,
     mut suspended: watch::Receiver<bool>,
     mut stop: oneshot::Receiver<()>,
 ) -> Option<Unsent> {
@@ -1441,7 +1547,7 @@ async fn transmit<T: Transport>(
                 // (a failed segmented send loses its run, not the runs handed off before
                 // it), at least one and never more than the call was done with.
                 sent = sent.max(before + 1).min(batch.len());
-                errors.report(failed.clamp(1, sent - before));
+                traffic.failed(failed.clamp(1, sent - before));
                 if e.kind() == io::ErrorKind::BrokenPipe {
                     tracing::debug!("Transport closed for sending");
                     return false;
@@ -1454,10 +1560,19 @@ async fn transmit<T: Transport>(
         })
         .await;
         reserved.clear();
+        let done = sent.min(batch.len());
+        let bytes = batch[..done]
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum();
+        traffic
+            .tx_datagrams
+            .fetch_add(done as u64, Ordering::Relaxed);
+        traffic.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
         if outcome == Some(false) {
             return None;
         }
-        for (_, data) in batch.drain(..sent.min(batch.len())) {
+        for (_, data) in batch.drain(..done) {
             // A full recycle queue just drops the buffer.
             let _ = recycle.try_send(data);
         }

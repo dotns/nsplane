@@ -132,6 +132,54 @@ pub struct QueueStats {
     pub crypto_done: QueueDepth,
 }
 
+/// The traffic counters of one installed transport since it was added; see
+/// [`EngineHandle::transport_stats`].
+///
+/// Counted by the transport's own receive and transmit tasks: whole datagrams as the
+/// transport reports and takes them (handshakes, cookie replies, keepalives, data), before
+/// the core authenticates them on the receive side, so they include datagrams the core
+/// drops afterwards. A [`EngineHandle::replace_transport`] keeps the counters of the id; a
+/// [`EngineHandle::remove_transport`] drops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TransportStats {
+    /// The transport.
+    pub id: TransportId,
+    /// Datagrams received.
+    pub rx_datagrams: u64,
+    /// Bytes of the datagrams received.
+    pub rx_bytes: u64,
+    /// Datagrams the transport was done with on the send side: handed off or failed.
+    pub tx_datagrams: u64,
+    /// Bytes of the datagrams in `tx_datagrams`.
+    pub tx_bytes: u64,
+    /// Datagrams of `tx_datagrams` whose send failed (also counted as
+    /// [`crate::DROP_TRANSPORT_SEND_ERROR`] drops).
+    pub tx_failed: u64,
+}
+
+/// A snapshot of the engine taken in one call; see [`EngineHandle::status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EngineStatus {
+    /// The engine's public key, once a private key is set.
+    pub public_key: Option<PublicKey>,
+    /// The current MTU.
+    pub mtu: u16,
+    /// Whether the engine is suspended.
+    pub suspended: bool,
+    /// Every peer, as [`EngineHandle::peers`].
+    pub peers: Vec<PeerStats>,
+    /// Every installed transport by id, as [`EngineHandle::transport_stats`].
+    pub transports: Vec<TransportStats>,
+    /// As [`EngineHandle::drop_counters`].
+    pub drops: BTreeMap<&'static str, u64>,
+    /// As [`EngineHandle::queue_stats`] (the marks keep running).
+    pub queues: QueueStats,
+    /// As [`EngineHandle::fragment_stats`].
+    pub fragments: FragmentStats,
+}
+
 /// A request to the owner task; each carries the channel for its reply.
 pub(crate) enum Command {
     Config(ConfigChange, oneshot::Sender<()>),
@@ -154,6 +202,8 @@ pub(crate) enum Command {
     /// With `true`, the high-water marks restart after the reply.
     QueueStats(bool, oneshot::Sender<QueueStats>),
     FragmentStats(oneshot::Sender<FragmentStats>),
+    TransportStats(oneshot::Sender<Vec<TransportStats>>),
+    Status(oneshot::Sender<EngineStatus>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -421,6 +471,24 @@ impl EngineHandle {
     /// The packets the stage drops are counted in [`EngineHandle::drop_counters`] too.
     pub async fn fragment_stats(&self) -> Result<FragmentStats, EngineError> {
         self.call(Command::FragmentStats).await
+    }
+
+    /// The traffic counters of every installed transport, ordered by id.
+    ///
+    /// The transport tasks count as datagrams move, so a datagram another engine already
+    /// received may show on its sender's transport a moment later.
+    pub async fn transport_stats(&self) -> Result<Vec<TransportStats>, EngineError> {
+        self.call(Command::TransportStats).await
+    }
+
+    /// The public key, MTU, suspension, peers, transport counters, drop counters, queue
+    /// statistics and fragmentation counters, taken together in one call to the owner task,
+    /// so they describe the same moment (up to the transport counters, see
+    /// [`EngineHandle::transport_stats`]).
+    ///
+    /// Rates are left to the caller: sample this periodically and take differences.
+    pub async fn status(&self) -> Result<EngineStatus, EngineError> {
+        self.call(Command::Status).await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and

@@ -101,6 +101,12 @@ list below).
 - Events are published on a `broadcast` channel (`EngineHandle::subscribe`); publishing never
   blocks, and a lagging subscriber loses the oldest events.
 - Drops are counted per reason (`EngineHandle::drop_counters`) and published as events.
+- Traffic is counted per peer (`PeerStats`: wire bytes and plaintext bytes) and per transport
+  (`EngineHandle::transport_stats`: datagrams and bytes each way, failed sends), the latter by
+  the transport's own tasks with one relaxed atomic update per batch. `EngineHandle::status`
+  returns the key, MTU, suspension, peers, transports, drops, queue and fragmentation stats in
+  one owner call. Counters only grow; rates, metric export and labels such as direct vs relay
+  are left to the caller (ns), which samples `status` and maps transport ids to its paths.
 
 Backpressure:
 

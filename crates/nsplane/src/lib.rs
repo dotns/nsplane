@@ -38,7 +38,10 @@ pub use events::{
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Event,
 };
 pub use fragment::{FragmentConfig, FragmentStats};
-pub use handle::{EngineError, EngineHandle, Peer, QueueDepth, QueueStats, TransportError};
+pub use handle::{
+    EngineError, EngineHandle, EngineStatus, Peer, QueueDepth, QueueStats, TransportError,
+    TransportStats,
+};
 pub use io::{PacketSink, PacketSource};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
