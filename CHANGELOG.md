@@ -320,6 +320,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsafe targets, port exhaustion and `remove_flow` checked. `nsplane-examples`:
   `subnet_gateway` (a TUN node with `--route <mapped>/96=<real>,snat=<IPv4>`) and its
   `scripts/e2e/examples.sh` scenario against kernel WireGuard.
+- `nsplane-nat`: `Redirect`, a local-side redirect (DNAT with the reverse SNAT) of IPv4
+  TCP/UDP flows to an endpoint a decision closure picks per new flow (`RedirectDecision`),
+  ported from ns `tun_service/rewrite.rs`. `forward` / `reverse` rewrite a `PacketBuf` in
+  place with incremental checksums and return a `RedirectVerdict`; flows live in a
+  `Conntrack` (bounded, idle expiry) and go through `remove_flow` and `retain`;
+  `original_destination` reports the service address of a flow the endpoint accepted;
+  `RedirectStats` counts the outcomes. Drop reasons in `nsplane_nat::redirect::reasons`.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

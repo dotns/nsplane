@@ -122,7 +122,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - Reverse path: reverse translation with TCP MSS clamp; ICMP Fragmentation Needed -> ICMPv6 Packet Too Big with mtu + 20 (min 1280).
   - Differences from nsplane_nat::Translator: stateful, a caller-owned SNAT source, port reservation coupled to host sockets.
   - Replaces: nat::subnet_route translate/SubnetConntrack.
-- ME-2 (to scope) a DNAT/SNAT rewrite for the TUN service (tun_service/rewrite.rs); evaluate whether nsplane_nat::PortMap fits first.
+- ME-2 done: `nsplane_nat::Redirect`, a local-side DNAT/SNAT redirect replacing tun_service/rewrite.rs (on `Conntrack`; PortMap's rewrite reused), covered by `nsplane-e2e`'s `redirect` tests.
 
 ## Acceptance
 

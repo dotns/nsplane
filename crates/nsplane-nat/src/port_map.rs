@@ -56,7 +56,7 @@
 //! peers), so their next packets are judged by the new rules.
 
 pub mod reasons;
-mod rewrite;
+pub(crate) mod rewrite;
 #[cfg(test)]
 mod tests;
 
