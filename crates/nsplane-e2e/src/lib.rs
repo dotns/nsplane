@@ -21,6 +21,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -28,16 +29,16 @@ use futures_core::Stream;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, ChannelTransport, Engine, EngineBuilder, EngineHandle,
-    PacketSource, Peer, Transport, UdpTransport,
+    PacketFilter, PacketSource, Peer, Transport, UdpTransport,
 };
-use nsplane_core::Event;
+use nsplane_core::{Event, Verdict};
 use nsplane_netstack::{
     NetStack, NetStackConfig, NetStackHandle, NetStackSink, NetStackSource, TcpConnection, UdpFlow,
 };
 use nsplane_packet::checksum::{
-    ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
+    internet_checksum, ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
-use nsplane_packet::{Ecn, PacketBuf, Path, PeerId, TransportId, protocol};
+use nsplane_packet::{Ecn, IpPacket, PacketBuf, Path, PeerId, TransportId, protocol};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -169,9 +170,159 @@ pub fn udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+/// An IP packet from `src` to `dst` carrying `segment` of `proto`: IPv4 with DF set, a TTL
+/// of 64 and a valid header checksum, or IPv6 with a hop limit of 64.
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` are of different IP versions or `segment` does not fit into
+/// one packet.
+pub fn ip_packet(src: IpAddr, dst: IpAddr, proto: u8, segment: &[u8]) -> Vec<u8> {
+    assert_eq!(src.is_ipv4(), dst.is_ipv4(), "mixed IP versions");
+    assert!(segment.len() <= MAX_PAYLOAD + 8, "segment too large");
+    match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            let total = u16::try_from(20 + segment.len()).unwrap_or(u16::MAX);
+            let mut packet = Vec::with_capacity(20 + segment.len());
+            packet.extend_from_slice(&[0x45, 0]);
+            packet.extend_from_slice(&total.to_be_bytes());
+            packet.extend_from_slice(&[0, 0, 0x40, 0, 64, proto, 0, 0]);
+            packet.extend_from_slice(&s.octets());
+            packet.extend_from_slice(&d.octets());
+            let sum = ipv4_header_checksum(&packet);
+            packet[10..12].copy_from_slice(&sum.to_be_bytes());
+            packet.extend_from_slice(segment);
+            packet
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let len = u16::try_from(segment.len()).unwrap_or(u16::MAX);
+            let mut packet = Vec::with_capacity(40 + segment.len());
+            packet.extend_from_slice(&[0x60, 0, 0, 0]);
+            packet.extend_from_slice(&len.to_be_bytes());
+            packet.extend_from_slice(&[proto, 64]);
+            packet.extend_from_slice(&s.octets());
+            packet.extend_from_slice(&d.octets());
+            packet.extend_from_slice(segment);
+            packet
+        }
+        _ => unreachable!("versions checked above"),
+    }
+}
+
+/// A TCP packet from `src` to `dst` with `flags`, sequence number `seq`, acknowledgment
+/// number `ack`, no options and `payload`, with valid checksums.
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` are of different IP versions or `payload` does not fit into
+/// one packet.
+pub fn tcp(
+    src: SocketAddr,
+    dst: SocketAddr,
+    flags: u8,
+    (seq, ack): (u32, u32),
+    payload: &[u8],
+) -> Vec<u8> {
+    assert_eq!(src.is_ipv4(), dst.is_ipv4(), "mixed IP versions");
+    let mut segment = Vec::with_capacity(20 + payload.len());
+    segment.extend_from_slice(&src.port().to_be_bytes());
+    segment.extend_from_slice(&dst.port().to_be_bytes());
+    segment.extend_from_slice(&seq.to_be_bytes());
+    segment.extend_from_slice(&ack.to_be_bytes());
+    segment.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    segment.extend_from_slice(payload);
+    let sum = match (src.ip(), dst.ip()) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => transport_checksum_v4(s, d, protocol::TCP, &segment),
+        (IpAddr::V6(s), IpAddr::V6(d)) => transport_checksum_v6(s, d, protocol::TCP, &segment),
+        _ => unreachable!("versions checked above"),
+    };
+    segment[16..18].copy_from_slice(&sum.to_be_bytes());
+    ip_packet(src.ip(), dst.ip(), protocol::TCP, &segment)
+}
+
+/// An ICMP (IPv4) or `ICMPv6` (IPv6) message of `kind` and `code` from `src` to `dst`, with
+/// `rest` as the second header word (identifier and sequence, MTU, pointer) and `body`
+/// after it, with valid checksums.
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` are of different IP versions or `body` does not fit into one
+/// packet.
+pub fn icmp(
+    src: IpAddr,
+    dst: IpAddr,
+    (kind, code): (u8, u8),
+    rest: [u8; 4],
+    body: &[u8],
+) -> Vec<u8> {
+    assert_eq!(src.is_ipv4(), dst.is_ipv4(), "mixed IP versions");
+    let mut message = Vec::with_capacity(8 + body.len());
+    message.extend_from_slice(&[kind, code, 0, 0]);
+    message.extend_from_slice(&rest);
+    message.extend_from_slice(body);
+    let (proto, sum) = match (src, dst) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => (protocol::ICMP, internet_checksum(&message)),
+        (IpAddr::V6(s), IpAddr::V6(d)) => (
+            protocol::ICMPV6,
+            transport_checksum_v6(s, d, protocol::ICMPV6, &message),
+        ),
+        _ => unreachable!("versions checked above"),
+    };
+    message[2..4].copy_from_slice(&sum.to_be_bytes());
+    ip_packet(src, dst, proto, &message)
+}
+
+/// Checks every checksum of `packet` by recomputing it in full: the IPv4 header checksum
+/// and the TCP, UDP (a zero UDP checksum only over IPv4), ICMP or `ICMPv6` checksum.
+pub fn verify_checksums(packet: &[u8]) -> TestResult {
+    let ip = IpPacket::parse(packet).map_err(|e| format!("malformed packet: {e:?}"))?;
+    let segment = ip.payload();
+    let sum = match (ip.src(), ip.dst(), ip.protocol()) {
+        (IpAddr::V4(_), IpAddr::V4(_), protocol::ICMP) => internet_checksum(segment),
+        (IpAddr::V4(s), IpAddr::V4(d), proto @ (protocol::TCP | protocol::UDP)) => {
+            if proto == protocol::UDP && segment.get(6..8) == Some(&[0, 0]) {
+                0
+            } else {
+                transport_checksum_v4(s, d, proto, segment)
+            }
+        }
+        (
+            IpAddr::V6(s),
+            IpAddr::V6(d),
+            proto @ (protocol::TCP | protocol::UDP | protocol::ICMPV6),
+        ) => transport_checksum_v6(s, d, proto, segment),
+        (_, _, proto) => return Err(format!("no checksum check for protocol {proto}").into()),
+    };
+    if sum != 0 {
+        return Err(format!("invalid protocol {} checksum", ip.protocol()).into());
+    }
+    if let IpPacket::V4 { header, .. } = &ip
+        && internet_checksum(&packet[..header.header_len()]) != 0
+    {
+        return Err("invalid IPv4 header checksum".into());
+    }
+    Ok(())
+}
+
 /// A recognisable payload of `len` bytes.
 pub fn payload(len: usize) -> Vec<u8> {
     (0..=u8::MAX).cycle().take(len).collect()
+}
+
+/// A packet filter shared between the engine and the test: the engine gets a
+/// `Box<SharedFilter<F>>` while the test keeps the `Arc` to reconfigure the filter or read
+/// its counters.
+#[derive(Debug)]
+pub struct SharedFilter<F>(pub Arc<F>);
+
+impl<F: PacketFilter> PacketFilter for SharedFilter<F> {
+    fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
+        self.0.inbound(peer, packet)
+    }
+
+    fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
+        self.0.outbound(peer, packet)
+    }
 }
 
 /// Settings of the engines a constructor builds.
@@ -329,6 +480,16 @@ impl<T: Transport> Node<T> {
         Ok(())
     }
 
+    /// Hands `packet` to the engine as a local packet, in a buffer with 64 bytes of room
+    /// beyond it, as a TUN source's buffers have (a translating filter grows the packet).
+    pub async fn send_with_room(&self, packet: &[u8]) -> TestResult {
+        let mut buf = PacketBuf::with_capacity(packet.len() + 64);
+        buf.set_len(packet.len());
+        buf.as_packet_mut().copy_from_slice(packet);
+        self.local.send(buf).await?;
+        Ok(())
+    }
+
     /// The next delivered packet and the peer it came from, within [`WAIT`].
     pub async fn expect_delivery(&mut self) -> TestResult<(PeerId, Vec<u8>)> {
         match timeout(WAIT, self.delivered.recv()).await {
@@ -461,6 +622,37 @@ pub fn channel_pair(options: Options) -> (Node<ChannelTransport>, Node<ChannelTr
         Node::new(1, a.0, a.1, link_a, options),
         Node::new(2, b.0, b.1, link_b, options),
     )
+}
+
+/// Two nodes (seeds 1 and 2) linked by a [`ChannelTransport`] pair, not yet peers, with
+/// `configure` adding settings to the engine builder of each, given its seed.
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub fn channel_pair_with(
+    options: Options,
+    mut configure: impl FnMut(
+        u8,
+        EngineBuilder<ChannelSource, ChannelSink>,
+    ) -> EngineBuilder<ChannelSource, ChannelSink>,
+) -> TestResult<(Node<ChannelTransport>, Node<ChannelTransport>)> {
+    let a = (
+        TransportId::new(1),
+        SocketAddr::from(([192, 0, 2, 1], 1000)),
+    );
+    let b = (
+        TransportId::new(2),
+        SocketAddr::from(([192, 0, 2, 2], 2000)),
+    );
+    let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
+    let node_a = Node::with_builder(1, a.0, a.1, options, |builder| {
+        configure(1, builder.transport(link_a))
+    })?;
+    let node_b = Node::with_builder(2, b.0, b.1, options, |builder| {
+        configure(2, builder.transport(link_b))
+    })?;
+    Ok((node_a, node_b))
 }
 
 /// Two nodes (seeds 1 and 2) on [`UdpTransport`]s bound to `ip` with OS-chosen ports, not

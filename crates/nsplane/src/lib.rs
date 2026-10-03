@@ -21,6 +21,7 @@ mod builder;
 mod channel;
 mod engine;
 pub mod events;
+mod fragment;
 mod handle;
 mod io;
 mod merge;
@@ -35,6 +36,7 @@ pub use events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED, Event,
 };
+pub use fragment::FragmentConfig;
 pub use handle::{EngineError, EngineHandle, Peer, TransportError};
 pub use io::{PacketSink, PacketSource};
 pub use merge::MergeSource;

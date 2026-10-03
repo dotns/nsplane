@@ -10,8 +10,9 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane-noise` | `crates/nsplane-noise/` | The Noise protocol state machine (`noise`); no I/O |
 | `nsplane-packet` | `crates/nsplane-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
 | `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
-| `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport` |
+| `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, the fragmentation stage (`FragmentConfig`) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
+| `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
@@ -22,7 +23,7 @@ This page describes what is on `main`. The target design and roadmap are in
 nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
 nsplane-packet ────────► nsplane-core, nsplane
 nsplane, nsplane-packet ─► nsplane-netstack
-nsplane-core, nsplane-packet ─► nsplane-acl
+nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
 ```
 
 ## nsplane-noise
@@ -48,6 +49,14 @@ leaves as the delivery; buffers come back through `recycle`. Peers are looked up
 session index and allowed IP (cryptokey routing). Path selection and roaming are delegated
 to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
 `PacketFilter`s.
+
+The filter chain is an onion: filters are installed from the wire side to the local side,
+decrypted packets run through them in install order and local packets in reverse. A local
+packet is routed by its destination (longest allowed-IP match) before the filters run, and a
+decrypted packet's source is checked against the peer's allowed IPs before them, so filters
+that rewrite addresses need those addresses in the peers' allowed IPs. `Core::route` exposes
+the routing decision, e.g. to pick the peer `Core::inject_inbound` delivers a locally
+generated reply as.
 
 ## nsplane (driver)
 
@@ -86,6 +95,25 @@ Backpressure:
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
+
+**Fragmentation.** `EngineBuilder::fragmenter(FragmentConfig)` installs a stage on the local
+path, in the owner task before the core, that keeps every local packet within the source's
+MTU (`PacketSource::mtu`, so it follows MTU changes); without it local packets enter the
+core whatever their size.
+
+- An IPv6 packet above the MTU is answered with an ICMPv6 Packet Too Big carrying the MTU.
+- An IPv4 packet above its ceiling is answered with an ICMP Fragmentation Needed carrying
+  the ceiling when DF is set, and is otherwise split into IPv4 fragments that enter the core
+  one by one. The ceiling is the MTU for native IPv4 and 20 bytes lower for destinations
+  that `FragmentConfig::translated` (e.g. `Translator::ipv4_translated_predicate`) reports
+  as translated to IPv6, whose fragments are sized to fit the MTU once translated with an
+  IPv6 Fragment header (MTU - 28). A UDP datagram without a checksum toward a translated
+  destination gets one before it is split, so each fragment translates on its own.
+- The errors look as if the packet's destination had sent them: they are delivered to the
+  local side as coming from the peer `Core::route` picks for that destination (no route: no
+  error) through `Core::inject_inbound`. They are rate-limited (a burst of 10, then 5 per
+  second) and never sent about ICMP errors, multicast or broadcast packets, or non-first
+  fragments.
 
 For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitter` is a
 `PacketSink` that routes each delivered packet to one of several sinks by a closure
@@ -207,11 +235,51 @@ nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and 
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
 through this API. `examples/src/bin/app_session.rs` shows a file transfer on it.
 
+## nsplane-nat
+
+Packet filters for the engine's filter chain; they rewrite packets in place and keep no I/O.
+
+**Address model.** Every peer owns a /127 IPv6 group, `node6` (native) and `node4` (its IPv4
+side). This node presents a peer to local applications as an IPv4 alias (`alias4 <-> node4`)
+and optionally an IPv6 alias (`alias6 <-> node6`); the node itself is `self4 <-> node4`, and
+IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the IPv4 address in the low 32 bits
+(`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
+by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
+atomically while traffic flows.
+
+**Translator.** A stateless RFC 7915 translator: local IPv4 to an `alias4` or a peer's LAN
+leaves as IPv6 to `node4` / `lan6`, IPv6 to `alias6` is rewritten to `node6`, and the
+replies are mapped back; native IPv4 and IPv6 pass unchanged and packets spoofing a
+local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
+quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
+IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
+incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first,
+which completes only when the first fragment arrives first. A translated packet grows by 20
+bytes (28 with a fragment header) inside its buffer, so packets need that much spare
+capacity (else `reasons::NO_ROOM`). Since the core routes and checks sources before the
+filters, each peer's allowed IPs must contain its `alias4/32`, the LAN IPv4 prefixes behind
+it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
+
+**PortMap and Conntrack.** `PortMap` publishes local services to peers: a `PortMapRule` maps a
+tunnel-facing `listen` address and port (TCP or UDP) to a local `target` of the same family,
+optionally for some peers only (other peers are dropped). Inbound packets are DNATed and
+their flow recorded in a `Conntrack`; replies are SNATed back to `listen` when routed to the
+flow's peer, and ICMP errors quoting a flow are rewritten too. `Conntrack` is bounded (least
+recently seen flow evicted), expires flows on per-protocol idle timeouts (TCP state aware)
+without a background task, and takes an injectable clock. `PortMap::set_rules` swaps rules
+atomically and drops the flows of changed rules.
+
+**Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
+next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
+ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
+`Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
+fragmented to fit the MTU after translation.
+
 ## Unsafe code
 
 `unsafe` lives only in `nsplane-tun`'s platform
 modules (`unix`, `linux`, `darwin`, and loading Wintun in `windows`), each with SAFETY
-comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-netstack`, `nsplane-uapi` and `nsplane-cli` declare
+comments. `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-nat`, `nsplane-netstack`, `nsplane-uapi` and `nsplane-cli` declare
 `#![forbid(unsafe_code)]`. See `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 ## Crypto
@@ -229,3 +297,8 @@ in-memory channels). `just e2e` (`scripts/e2e/linux.sh`) runs `nsplane-cli` agai
 WireGuard in two containers. `just e2e-examples` (`scripts/e2e/examples.sh`) runs the
 `nsplane-examples` binaries in containers as a matrix of local sides and transports plus
 relay scenarios, against each other and kernel WireGuard (see `examples/README.md`).
+
+`nsplane-e2e`'s `translate`, `port_map` and `fragment` tests run the `nsplane-nat` filters
+and the fragmentation stage between engines over channel transports (including the full
+`[AclFilter, PortMap, Translator]` stack); the `translate_node` and `port_map` example
+scenarios run them in containers against kernel WireGuard.
