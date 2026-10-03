@@ -1,6 +1,6 @@
 # 20261003-0715-phase5-followups Fix the open Phase 1-5 follow-ups
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-03 07:15
 - **approvedAt**: 2026-10-03 07:15 (user: "开始修复")
 - **relatedTask**: 20261002-1509-phase1-followups
@@ -73,3 +73,10 @@ nsplane repository only; no new dependencies; no lint changes.
   pinned to a tag on the fork, `deny.toml` allows that git source only, and the netstack
   workarounds (pure-ACK SEQ rewrite, `nudge_stalled`) are removed when the lossy e2e passes
   without them. Follow-up #19 becomes "send the fixes upstream" (still the user's call).
+- 2026-10-03: completed (campaign `nsplane-fu-202610030716`). Merges into main: FB 8f01a55,
+  smoltcp fork switch 5132f27, FA 91c4943. Final acceptance on main 91c4943: just check 909
+  tests, cross, test-windows, cargo doc, root nsplane-tun/nsplane ignored tests, linux.sh,
+  lib.sh (7), full examples.sh green. data_path: 64 B core 533 ns (device-equivalent 471),
+  batch of 32 at 64 B 416 ns per packet; 1420 B core 1.334 us (device-equivalent 1.290), batch
+  of 32 at 1420 B 1.26-1.32 us per packet (noisy host). Items 1, 14-18, 20 fixed; #19 moved to
+  the fork, upstream report is the user's call; #21 (sink backpressure / pacing) added as open.

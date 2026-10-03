@@ -36,4 +36,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261002-1535-phase2-engine Phase 2: multi-transport engine, engine-driven timers, follow-up fixes**](20261002-1535-phase2-engine.md) `2026-10-02`
 - [x] [**20261002-1725-phase3-4-netstack-acl Phases 3 and 4: netstack, ACL, transport backpressure**](20261002-1725-phase3-4-netstack-acl.md) `2026-10-02`
 - [x] [**20261002-2240-phase5-nat-offload-perf Phase 5: translation and NAT, offload, performance**](20261002-2240-phase5-nat-offload-perf.md) `2026-10-02`
-- [-] [**20261003-0715-phase5-followups Fix the open Phase 1-5 follow-ups**](20261003-0715-phase5-followups.md) `2026-10-03`
+- [x] [**20261003-0715-phase5-followups Fix the open Phase 1-5 follow-ups**](20261003-0715-phase5-followups.md) `2026-10-03`
