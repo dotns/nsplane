@@ -1,7 +1,7 @@
 //! The node side of the WSS carrier: [`WssTransport`].
 //!
 //! The transport keeps one WebSocket-over-TLS connection to the relay in a
-//! [`LinkTransport`], dialed by a [`WssDialer`] that reconnects with bounded exponential
+//! [`LinkTransport`], dialed by a `WssDialer` that reconnects with bounded exponential
 //! backoff. Datagrams to the relay's address leave as binary messages; while the
 //! connection is down they wait in the link's queue (256 datagrams; a full queue fails
 //! the send at once, so the engine never waits for it). Received messages come out of
