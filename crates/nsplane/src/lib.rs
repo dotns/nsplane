@@ -33,7 +33,7 @@ pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use engine::Engine;
 pub use events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
-    DROP_TRANSPORT_REMOVED, Event,
+    DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Event,
 };
 pub use handle::{EngineError, EngineHandle, Peer, QueueDepth, QueueStats, TransportError};
 pub use io::{PacketSink, PacketSource};

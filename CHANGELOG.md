@@ -220,6 +220,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `DROP_TRANSPORT_REMOVED` (`nsplane_core::reasons::TRANSPORT_REMOVED`) instead of
   dropping them silently; `replace_transport` carries them over to the new transport in
   order.
+- `nsplane`: every datagram a transport fails to send (any I/O error, e.g. `EMSGSIZE`) is
+  counted under the new `DROP_TRANSPORT_SEND_ERROR`
+  (`nsplane_core::reasons::TRANSPORT_SEND_ERROR`) and published as `Event::Dropped` instead
+  of only being logged. The transmit tasks report failures through a shared counter and a
+  wake signal to the owner task; successful sends take no extra work.
 - Breaking: `nsplane-core`'s `Input::Datagram` takes the datagram by value
   (`data: PacketBuf`) and `Input` loses its lifetime parameter. The core consumes the
   datagram: a packet it carries is decrypted in place and delivered in the same buffer
