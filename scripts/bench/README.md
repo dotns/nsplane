@@ -14,7 +14,7 @@ iputils-ping, jq, procps) on a dedicated docker network it creates (`<prefix>-ne
 - `--cap-add NET_ADMIN --device /dev/net/tun`, real TUN devices, nothing on the host is
   reconfigured;
 - tunnel 10.77.0.1/24 (a) and 10.77.0.2/24 (b), MTU 1420, fresh keys from `wg genkey`, UDP
-  port 51820 over the docker network.
+  port 51820 (nsplane-cli: its ephemeral startup port, see Pairs) over the docker network.
 
 Every implementation speaks the cross-platform UAPI, so all of them are configured like kernel
 WireGuard: the interface is created (`ip link add wg0 type wireguard`, `nsplane-cli wg0` with
@@ -34,6 +34,21 @@ other binaries are copied into the containers with `docker cp`.
 | `kernel-nsplane` | kernel WireGuard | nsplane-cli |
 | `wggo-wggo` | wireguard-go | wireguard-go |
 | `netstack` | `netstack_bench` client | `netstack_bench` server |
+
+`nsplane-nsplane` runs one row per variant, the same configuration on both sides. The default
+variants cover offload on/off x crypto workers 0/2:
+
+| Variant | nsplane-cli environment |
+|---|---|
+| `default` | none: offload on, no crypto workers |
+| `w2` | `WG_CRYPTO_WORKERS=2` |
+| `nooffload` | `WG_NO_OFFLOAD=1` (no TUN offload, no UDP GSO/GRO) |
+| `nooffload-w2` | `WG_NO_OFFLOAD=1 WG_CRYPTO_WORKERS=2` |
+
+`nsplane-kernel` and `kernel-nsplane` always run the default nsplane-cli configuration.
+nsplane-cli sides keep the UDP port bound at startup (read back with `wg show wg0
+listen-port`) instead of setting `listen-port 51820`: a `listen-port` set over the UAPI binds
+a new socket with offload on, which would undo `WG_NO_OFFLOAD`.
 
 wireguard-go is built from upstream source at a pinned tag in the builder image
 `ai-agent/wireguard-go` (`scripts/bench/wireguard-go/Dockerfile`, build arg
@@ -79,7 +94,7 @@ Per pair and repetition (the table reports the median of `BENCH_REPS`):
 | `BENCH_PING_COUNT` | `1000` | pings (or rr round trips) per latency run, 10 ms apart |
 | `BENCH_CPUS_A` | `2-5` | `--cpuset-cpus` of side a |
 | `BENCH_CPUS_B` | `6-9` | `--cpuset-cpus` of side b |
-| `BENCH_NSPLANE_VARIANTS` | `default` | `;`-separated `NAME[:ENV[:ARGS]]`; ENV (space-separated `KEY=VALUE`) and ARGS are given to nsplane-cli on both sides of `nsplane-nsplane`, one row each |
+| `BENCH_NSPLANE_VARIANTS` | the four variants under Pairs | `;`-separated `NAME[:ENV[:ARGS]]`; ENV (space-separated `KEY=VALUE`) and ARGS are given to nsplane-cli on both sides of `nsplane-nsplane`, one row each |
 | `NSPLANE_CLI_BIN` | `target/release/nsplane-cli` | nsplane-cli under test, e.g. built in another worktree |
 | `NETSTACK_BENCH_BIN` | `target/release/netstack_bench` | netstack pair binary |
 | `BENCH_OUT` | `.tmp/bench/<UTC timestamp>` | run directory (gitignored) |

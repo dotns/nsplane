@@ -22,7 +22,7 @@
 #                      ';'-separated nsplane-nsplane variants NAME[:ENV[:ARGS]], ENV and ARGS
 #                      space-separated, applied to nsplane-cli on both sides, e.g.
 #                      "default;t2:WG_THREADS=2;dbg:WG_LOG_LEVEL=debug:--threads 8"
-#                      (default "default": the stock configuration)
+#                      (default: offload on/off x crypto workers 0/2, $DEFAULT_VARIANTS)
 #   NSPLANE_CLI_BIN    nsplane-cli binary under test (default target/release/nsplane-cli)
 #   NETSTACK_BENCH_BIN netstack_bench binary (default target/release/netstack_bench); the
 #                      netstack pair is skipped when it is missing
@@ -41,7 +41,9 @@ UDP_RATES=${BENCH_UDP_RATES:-1G,3G}
 PING_COUNT=${BENCH_PING_COUNT:-1000}
 CPUS_A=${BENCH_CPUS_A:-2-5}
 CPUS_B=${BENCH_CPUS_B:-6-9}
-VARIANTS=${BENCH_NSPLANE_VARIANTS:-default}
+# "default" is the stock configuration (offload on, no crypto workers).
+DEFAULT_VARIANTS='default;w2:WG_CRYPTO_WORKERS=2;nooffload:WG_NO_OFFLOAD=1;nooffload-w2:WG_NO_OFFLOAD=1 WG_CRYPTO_WORKERS=2'
+VARIANTS=${BENCH_NSPLANE_VARIANTS:-$DEFAULT_VARIANTS}
 NSPLANE_BIN=$(abs "${NSPLANE_CLI_BIN:-$REPO/target/release/nsplane-cli}")
 NETSTACK_BIN=$(abs "${NETSTACK_BENCH_BIN:-$REPO/target/release/netstack_bench}")
 OUT=$(abs "${BENCH_OUT:-$REPO/.tmp/bench/$(date -u +%Y%m%dT%H%M%SZ)}")
@@ -93,9 +95,11 @@ ping_stats() {
 
 # --- WireGuard pairs (kernel, nsplane, wggo) ---------------------------------------------------
 
-# up_wg CONTAINER IMPL ADDR PEER_ADDR PEER_PUB PEER_IP EXTRA_ENV EXTRA_ARGS
+# up_wg CONTAINER IMPL EXTRA_ENV EXTRA_ARGS: creates wg0 with the key /k, prints its UDP port.
+# nsplane-cli keeps the ephemeral port it bound at startup: a UAPI listen-port rebinds the
+# socket with offload on, which would undo WG_NO_OFFLOAD.
 up_wg() {
-  local c=$1 impl=$2 addr=$3 peer_addr=$4 peer_pub=$5 peer_ip=$6 env=$7 args=$8
+  local c=$1 impl=$2 env=$3 args=$4
   case $impl in
     kernel) dx "$c" 'ip link add wg0 type wireguard' ;;
     nsplane) docker exec -d "$c" bash -c "env WG_SUDO=1 $env nsplane-cli $args wg0 > /wg.log 2>&1" ;;
@@ -103,9 +107,16 @@ up_wg() {
   esac
   if [[ $impl != kernel ]]; then
     for _ in $(seq 1 100); do dx "$c" 'test -S /var/run/wireguard/wg0.sock' && break; sleep 0.1; done
-    dx "$c" 'test -S /var/run/wireguard/wg0.sock' || { dx "$c" 'cat /wg.log'; return 1; }
+    dx "$c" 'test -S /var/run/wireguard/wg0.sock' || { dx "$c" 'cat /wg.log' >&2; return 1; }
   fi
-  dx "$c" "wg set wg0 private-key /k listen-port 51820 peer $peer_pub allowed-ips $peer_addr/32 endpoint $peer_ip:51820" \
+  if [[ $impl == nsplane ]]; then dx "$c" 'wg set wg0 private-key /k && wg show wg0 listen-port'
+  else dx "$c" 'wg set wg0 private-key /k listen-port 51820 && echo 51820'; fi
+}
+
+# peer_wg CONTAINER ADDR PEER_ADDR PEER_PUB PEER_IP PEER_PORT
+peer_wg() {
+  local c=$1 addr=$2 peer_addr=$3 peer_pub=$4 peer_ip=$5 peer_port=$6
+  dx "$c" "wg set wg0 peer $peer_pub allowed-ips $peer_addr/32 endpoint $peer_ip:$peer_port" \
     "&& ip addr add $addr/24 dev wg0 && ip link set wg0 mtu 1420 up"
 }
 
@@ -140,7 +151,7 @@ rep_wg() {
 
 # unit_wg IMPL_A IMPL_B EXTRA_ENV EXTRA_ARGS
 unit_wg() {
-  local ia=$1 ib=$2 env=$3 args=$4 rep pub_a pub_b
+  local ia=$1 ib=$2 env=$3 args=$4 rep pub_a pub_b port_a port_b
   local opts=(--cap-add NET_ADMIN --device /dev/net/tun -v "$NSPLANE_BIN:/usr/local/bin/nsplane-cli:ro")
   docker run -d --rm "${LABELS[@]}" --name "$A" --network "$NET" --cpuset-cpus "$CPUS_A" "${opts[@]}" "$IMG" sleep infinity >/dev/null
   docker run -d --rm "${LABELS[@]}" --name "$B" --network "$NET" --cpuset-cpus "$CPUS_B" "${opts[@]}" "$IMG" sleep infinity >/dev/null
@@ -151,8 +162,9 @@ unit_wg() {
   IP_A=$(ip_of "$A"); IP_B=$(ip_of "$B")
   dx "$A" 'umask 077; wg genkey > /k; wg pubkey < /k > /p'; dx "$B" 'umask 077; wg genkey > /k; wg pubkey < /k > /p'
   pub_a=$(dx "$A" 'cat /p'); pub_b=$(dx "$B" 'cat /p')
-  up_wg "$A" "$ia" "$TUN_A" "$TUN_B" "$pub_b" "$IP_B" "$env" "$args"
-  up_wg "$B" "$ib" "$TUN_B" "$TUN_A" "$pub_a" "$IP_A" "$env" "$args"
+  port_a=$(up_wg "$A" "$ia" "$env" "$args"); port_b=$(up_wg "$B" "$ib" "$env" "$args")
+  peer_wg "$A" "$TUN_A" "$TUN_B" "$pub_b" "$IP_B" "$port_b"
+  peer_wg "$B" "$TUN_B" "$TUN_A" "$pub_a" "$IP_A" "$port_a"
   for _ in $(seq 1 20); do dx "$A" "ping -c 1 -W 1 $TUN_B >/dev/null" && break; done
   dx "$A" "ping -c 1 -W 1 $TUN_B >/dev/null" || { log "tunnel did not come up"; return 1; }
   dx "$B" 'iperf3 -s -D'
