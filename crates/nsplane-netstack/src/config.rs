@@ -64,6 +64,16 @@ pub struct NetStackConfig {
     /// socket is created (its bit length minus 16, at least 0). The
     /// value is clamped to at least one IPv4 MSS (`mtu - 40`) and at most `65535 << 14`,
     /// the largest window TCP can advertise. Listener pool sockets get the same size.
+    ///
+    /// A window of more segments than the queues on the way hold costs throughput: the
+    /// peer may send the whole window at once, the queue that fills first (the engine's
+    /// `queue_capacity`, this stack's `ingress_capacity`, both 1024 packets by default)
+    /// drops the rest, and smoltcp recovers all but one lost segment per window by a
+    /// retransmission timeout of at least 1 s. Measured in-process at the default MTU,
+    /// 4 MiB (about 3000 segments) dropped packets at the receiving engine's full sink in
+    /// most runs and moved 64 MiB at about 50 MB/s instead of 250-450 MB/s; with 8192-packet
+    /// queues it ran without drops. Keep the window in segments (`buffer / (mtu - 40)`)
+    /// below those capacities, or raise them with it.
     /// Default `None`: 512 IPv4-sized segments, `(mtu - 40) * 512` (about 690 KiB at
     /// [`DEFAULT_MTU`]).
     pub tcp_rx_buffer: Option<usize>,

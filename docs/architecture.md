@@ -461,7 +461,12 @@ smoltcp on its own dispatch path.
   under smoltcp's 1 GiB limit) at most. The receive buffer is the window: smoltcp's
   `Socket::new` derives the window-scale shift from its capacity (its bit length minus 16,
   at least 0), so the SYN and SYN-ACK carry a scale and initial window
-  matching it with no further code. This is ns's MB-x5 knob and not the fix for the
+  matching it with no further code. A window of more segments than the queues on the path
+  hold loses its tail when the peer sends it at once (see the field docs): in-process,
+  4 MiB buffers (about 3000 segments) overflow the receiving engine's 1024-packet queue
+  (`DROP_SINK_FULL`) in most runs and take a 1 s retransmission timeout, about 50 MB/s
+  against 250-450 MB/s for the default and 1 MiB; with 8192-packet engine and stack queues
+  4 MiB runs without drops. This is ns's MB-x5 knob and not the fix for the
   throughput gap (MF-2): ns measured a 1 MiB window within noise of the default. ns's MB-x6
   (counting SYNs refused for a full listener pool) needs no code here:
   `NetStackStats::syn_refused` counts them, for a pool sized by

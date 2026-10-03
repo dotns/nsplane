@@ -4,7 +4,8 @@
 //! intact in bounded time.
 //!
 //! The ignored `throughput` test measures one direction for the default, 1 MiB and 4 MiB
-//! buffers; run it in release:
+//! buffers, with the engines' drop counters (a 4 MiB window overflows the 1024-packet
+//! engine queue); run it in release:
 //!
 //! ```text
 //! cargo test --release -p nsplane-e2e --test netstack_buffers -- --ignored --nocapture
@@ -190,6 +191,26 @@ async fn bulk_tcp_with_asymmetric_buffers() -> TestResult {
     both_directions(small_rx, Buffers::both(LARGE)).await
 }
 
+/// The non-zero engine drop counters and the stacks' `egress_full` of `nodes`.
+async fn drops(nodes: &[&StackNode]) -> TestResult<String> {
+    let mut report = Vec::new();
+    for node in nodes {
+        let counters = node.handle.drop_counters().await?;
+        let engine: Vec<String> = counters
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect();
+        report.push(format!(
+            "{}: [{}] egress_full={}",
+            node.ip4,
+            engine.join(" "),
+            node.stack.stats().egress_full
+        ));
+    }
+    Ok(report.join("; "))
+}
+
 /// Netstack TCP throughput for the default, 1 MiB and 4 MiB socket buffers on both stacks.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measurement; run in release with --nocapture"]
@@ -202,9 +223,10 @@ async fn throughput() -> TestResult {
         let (a, b) = pair(buffers, buffers).await?;
         let elapsed = bulk_tcp(&b, &a, THROUGHPUT_BULK, TRANSFER * 2).await?;
         println!(
-            "tcp, {name} buffers: {} MiB in {elapsed:.2?} = {:.1} MB/s",
+            "tcp, {name} buffers: {} MiB in {elapsed:.2?} = {:.1} MB/s, drops {}",
             THROUGHPUT_BULK >> 20,
-            mb_per_s(THROUGHPUT_BULK, elapsed)
+            mb_per_s(THROUGHPUT_BULK, elapsed),
+            drops(&[&a, &b]).await?
         );
     }
     Ok(())
