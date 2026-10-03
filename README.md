@@ -104,6 +104,12 @@ with traffic from several peers: one peer's packets always go to one worker. See
 [docs/architecture.md](docs/architecture.md#crypto-worker-pool) for the design and the
 throughput note.
 
+Performance: on an x86-64 dev host a core round trip (seal and open) takes about 545 ns at
+64 B and 1.34 us at 1420 B, an ACL-filtered established flow about 51-55 ns per packet, and
+a hub with 8 peers moves about 0.7 Mpps of 1420 B packets on one owner task and 1.1 Mpps with
+2 crypto workers. The bench commands and the full table are in
+[docs/architecture.md](docs/architecture.md#performance).
+
 ## Building
 
 The toolchain is pinned in `rust-toolchain.toml` (1.99.0); the MSRV is 1.95. Building

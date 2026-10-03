@@ -225,25 +225,29 @@
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
 //! packet (IPv6 TCP; "new flow": the source port changes with every packet,
-//! "established": one five-tuple repeated; one run in the dev image, x86-64):
+//! "established": one five-tuple repeated; release, dev image, x86-64, mean
+//! of two runs):
 //!
 //! | Scenario | New flow | Established | Outbound |
 //! | --- | --- | --- | --- |
-//! | No namespaces (default policy, 3 rules, not cached) | 60 ns | 62 ns | 86 ns |
-//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 350 ns | 55 ns | 98 ns |
-//! | same, through a grant (peer to peer) | 341 ns | 273 ns | |
-//! | same, through an inbound pinhole | 240 ns | | |
-//! | same, outbound-restricted peer (outbound rule) | | | 193 ns |
-//! | Bypass (a namespace accepting everything) | 50 ns | 47 ns | 95 ns |
+//! | No namespaces (default policy, 3 rules, not cached) | 55 ns | 55 ns | 76 ns |
+//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 184 ns | 51 ns | 95 ns |
+//! | same, through a grant (peer to peer) | 343 ns | 272 ns | |
+//! | same, through an inbound pinhole | 210 ns | | |
+//! | same, outbound-restricted peer (outbound rule) | | | 156 ns |
+//! | Bypass (a namespace accepting everything) | 38 ns | 37 ns | 77 ns |
 //!
 //! Before the hook every packet was a new flow: 71 ns (default policy),
 //! 669 ns (namespaces), 1.75 us (grant, established), 937 ns (bypass peer),
-//! 580/623 ns outbound. The floor every packet pays is parsing its
-//! five-tuple (6 ns) and loading the engine snapshot (10 ns); an established
-//! flow adds one flow-table lookup under its lock, and a bypass peer the
-//! reply check and its cached principal under that lock. A new flow accepted
-//! through a grant or a pinhole also records a pending dependency; full
-//! tables evict in O(1).
+//! 580/623 ns outbound; a new flow through a grant took 38 us and through a
+//! pinhole 15-20 us before full tables evicted in O(1). The floor
+//! every packet pays is parsing its five-tuple (6-7.5 ns) and loading the
+//! engine snapshot (9-11.5 ns), 16-19 ns; an established flow adds one
+//! flow-table lookup under its lock, and a bypass peer the reply check and
+//! its cached principal under that lock. Skipping the reply check would be
+//! exact only for unidirectional traffic, so it stays: verdicts and counters
+//! equal a full evaluation (checked by a differential test). A new flow
+//! accepted through a grant or a pinhole also records a pending dependency.
 //!
 //! [`Instant::now`]: std::time::Instant::now
 

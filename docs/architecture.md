@@ -398,16 +398,19 @@ intact at 1 % loss within 15 s, next to a loss-free reference.
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
-same harness stalled a connection for good in 2 of 20 runs at 8 connections and 512.
+same harness stalled a connection for good in 2 of 20 runs at 8 connections and 512. The
+5C-T7 re-run of these cases is in [Performance](#performance).
 
 ## nsplane-uapi and the CLI
 
 `Uapi` answers `get=1` and `set=1` over an `EngineHandle`; `listen_port` and `fwmark` bind a
-new `UdpTransport` and install it with `EngineHandle::set_transport`. Over an engine whose
+new `UdpTransport` and install it with `EngineHandle::replace_transport`. Over an engine whose
 transport the UAPI does not own (`Uapi::with_external_transport`, e.g. a relay or WSS
 carrier) they never replace it: the reported value is a no-op, any other fails with
 `EADDRINUSE`. On Unix,
-`UapiListener` binds `/var/run/wireguard/<iface>.sock`. Windows has no listener yet.
+`UapiListener` binds `/var/run/wireguard/<iface>.sock`. The Windows named-pipe listener
+exists since Phase 2; real-host verification of its `ProtectedPrefix` path and security
+descriptor is still pending.
 
 `nsplane-cli` builds a tokio multi-thread runtime (`--threads` workers), creates the TUN,
 builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops privileges to
@@ -490,7 +493,15 @@ evaluation. The reply table, fragments and fail-closed rules are unchanged, and 
 counters equal a full evaluation (a differential test checks it). The full rules and
 per-packet bench numbers (`cargo bench -p nsplane-acl --bench namespaces`) are in the crate
 docs (`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes*, *ACL hook* and
-*Performance*).
+*Performance*) and in [Performance](#performance).
+
+Measured results (5C-T3 record): a bypass peer costs ~41-54 ns (937 ns before the hook); an
+established flow 50-55 ns under namespaces and 62 ns under the default policy (deliberately
+uncached); new flows 60-75 ns (default policy), ~200-400 ns (namespaces), 0.34-0.56 us
+through a grant and 240-280 ns through a pinhole (38 us and 15-20 us before full tables
+evicted in O(1)). The floor is the five-tuple parse (6-7.5 ns) plus the snapshot load
+(9.5-11.5 ns), 16-19 ns; skipping the reply check would be exact only for unidirectional
+traffic. Exactness was not weakened (differential test).
 
 nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
@@ -535,6 +546,58 @@ next to the local side, so the ACL and the port map see overlay IPv6 in both dir
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
 `Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
 fragmented to fit the MTU after translation.
+
+## Performance
+
+Phase 5 (5C) numbers, re-run on the merged 5C branch (5C-T7, 2026-10-03): release / bench
+profile in the dev image, x86-64, 32-core host shared with other jobs (1-minute load 0.8-5.1
+during the runs), two runs each, criterion means. The subsections linked below hold each
+subtask's own measurements and analysis.
+
+```text
+cargo bench -p nsplane-core --bench data_path
+cargo bench -p nsplane-acl --bench namespaces
+cargo bench -p nsplane --bench worker_pool
+cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+```
+
+| Area | Case | Result (run 1 / run 2) | Reference |
+| --- | --- | --- | --- |
+| `data_path`, 64 B round trip | raw `Tunn` / device-equivalent / core | 359 / 358 ns, 474 / 473 ns, 545 / 544 ns (core vs device +15.0 % / +14.9 %) | Phase 3+4 core 540 ns |
+| `data_path`, 1420 B round trip | raw `Tunn` / device-equivalent / core | 1.16 / 1.17 us, 1.28 / 1.30 us, 1.34 / 1.34 us (core vs device +5.0 % / +3.4 %) | Phase 3+4 core 1.37 us |
+| `data_path`, one direction | core encapsulate / decapsulate, 64 B and 1420 B | 273 / 273 ns and 278 / 278 ns; 673 / 674 ns and 692 / 685 ns | |
+| ACL hook, established flow | namespace member / default policy (not cached) | 51.2 / 51.0 ns, 54.9 / 54.6 ns | before the hook: every packet a new flow, 669 ns / 71 ns |
+| ACL hook, bypass peer | new flow / established | 38.1 / 37.9 ns, 37.5 / 37.3 ns | 937 ns before the hook |
+| ACL hook, new flow | default policy / namespaces / grant / pinhole | 55.4 / 55.2 ns, 184 / 184 ns, 346 / 339 ns, 216 / 205 ns | |
+| ACL hook, grant established / outbound | grant / outbound (default, namespaces, restricted, bypass) | 268 / 276 ns; 76, 95, 156, 77 ns | 1.75 us grant, 580/623 ns outbound before |
+| ACL hook, floor | five-tuple parse + snapshot load | 5.7 + 8.8 ns | |
+| Queues | default capacities | `queue_capacity` 1024, command 64, `event_capacity` 1024 | [Queue depths](#queue-depths) |
+| Worker pool, 64 B | off / 2 / 4 workers | 1.20 / 1.14 Mpps, 1.36 / 1.36 Mpps, 1.38 / 1.28 Mpps | [Crypto worker pool](#crypto-worker-pool) |
+| Worker pool, 1420 B | off / 2 / 4 workers | 713 / 701 kpps (8.1 / 8.0 Gbit/s), 1.10 / 1.08 Mpps (12.5 / 12.2 Gbit/s), 1.05 / 1.01 Mpps (12.0 / 11.5 Gbit/s) | |
+| Netstack TCP, no loss | 64 MiB, one connection | 439.0 / 430.0 MB/s | [Netstack throughput](#netstack-throughput) |
+| Netstack TCP, 1 % loss | 16 MiB | 2.07 / 2.08 s (8.1 MB/s) | |
+| Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
+| Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
+| Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
+
+- Data path. Follow-up #1 removed the rx buffer swap, the `copy_within` shifts and the
+  `set_len` zero-fills; the 1420 B round trip holds the 10 % target over the
+  device-equivalent baseline, the 64 B one does not (accepted; the remaining dispatch cost,
+  ~695 instructions per round trip, is deferred to a batched data-path entry point, see
+  `docs/task/20261002-1509-phase1-followups.md` item 1). By instruction count (callgrind,
+  5C-T2): core vs device-equivalent +15.7 % at 64 B and +3.4 % at 1420 B.
+- ACL hook. An established flow costs about the same as the default policy's three rules,
+  and a bypass peer less than either: the floor every packet pays is parsing its five-tuple
+  and loading the engine snapshot (5C-T3: 6-7.5 ns + 9.5-11.5 ns = 16-19 ns), and the rest is
+  the flow-table lookup under its lock. Skipping the reply check would be exact only for
+  unidirectional traffic, so it stays. Exactness was not weakened: a differential test
+  checks verdicts and counters against a full evaluation of every packet. See
+  [nsplane-acl](#nsplane-acl).
+- Worker pool. The pool moves full-size packets about 1.5x further, small packets little;
+  4 workers do not add to 2, as the owner task stays the limit.
+- Netstack. Without loss the stack is not the limit (same-build spread 320-460 MB/s TCP,
+  470-900 MB/s UDP). At 3 % random loss smoltcp's timeout-bound recovery lands right at the
+  test's 60 s limit (5C-T6 finished in 54-59 s); the 1 % case and the bottleneck complete.
 
 ## Unsafe code
 
