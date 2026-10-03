@@ -316,6 +316,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed or idle) is dialed again at once, after a failed dial too; the dialer owns the
   backoff. Received datagrams come from the peer's address, and sends to another address
   are dropped. `nsplane` has no WebSocket or TLS dependency.
+- `nsplane`: `LinkState::Rejected(u16)`, the HTTP status with which the far end refused a
+  link (e.g. 401 or 403). Dialers report it to their own observers; `LinkTransport` itself
+  never does.
+- `nsplane-wss`, a new optional crate of WebSocket-over-TLS carriers (tokio-tungstenite,
+  rustls with aws-lc-rs; `nsplane` gains no dependency). All share `WssConfig` (URL,
+  `connect_addr`, `server_name`, extra headers, a `BearerProvider` for
+  `Authorization: Bearer`, backoff 2 s doubling to 60 s, pings every 10 s, read idle 35 s,
+  connect timeout 10 s) and `WssTls` (`Roots(RootCertStore)` or `Config(Arc<ClientConfig>)`;
+  no system or web PKI roots are bundled). A 401 or 403 on the upgrade is reported as
+  `LinkState::Rejected`; after a 401 the next dial waits for a new bearer token.
+  - `WssDialer`, a `LinkDialer` for `LinkTransport` (`into_transport`, `state`, `stats` as
+    `WssStats`): one binary message per datagram, as ns `OpaquePump` and the examples' relay.
+  - `frame`: the `WsFrame` codec of ns `tunnel-ws` and NSGW (`[stream_id u32][command u8]
+    [payload]`; OPEN_V4/OPEN_V6, DATA, CLOSE, CLOSE_ACK), byte-identical to ns.
+  - `WssStreamClient` (`open_tcp` -> `WssTcpStream`, `AsyncRead` + `AsyncWrite`;
+    `open_udp` -> `WssUdpFlow`; `connect`, `state`, `stats` as `WssStreamStats`), the
+    client leg of ns `proxy`: every TCP stream and UDP flow shares one session until it
+    holds `WssStreamLimits::max_streams_per_session` (1024, NSGW's default per-session cap)
+    live ones, then another session is dialed. `shutdown` sends CLOSE behind the written
+    data and keeps reading until the peer's CLOSE or CLOSE_ACK.
+  - `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats` as `WssServerStats`),
+    the terminate leg ported from ns `tunnel-ws` `WsTunnel`: it dials the relay, asks the
+    embedder's `WssResolver` for each OPEN's backend (`WssOpen` -> `SocketAddr` or
+    `Denied`), relays TCP and UDP to it and reports `WssStreamEvent`s (`Open`, `Close`
+    with a `WssCloseReason`). Bounded by `WssServerLimits` (4 MiB per stream, 32 MiB per
+    session, 64-frame stream queue, control 64 / data 256 queues, 1024 streams).
+  - Tests: unit tests in the crate, `crates/nsplane-wss/tests/stream.rs` (client and server
+    through a TLS test relay, frames checked against the ns layouts) and `nsplane-e2e`
+    `wss_datagram` (two engines over `WssDialer`).
 - `nsplane-e2e`: `udp_side_channel` (side datagrams beside a WireGuard transfer, offload on
   and off, an unread receiver) and `link` (transfer, redial, the bounded queue, the read
   idle timeout over an in-memory link).
@@ -514,6 +543,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of being dropped: `.extra.wss.dropped.disconnected` stays 0 and
   `dropped.queue_full` counts sends that failed on a full queue. The status field names are
   unchanged.
+- `nsplane-examples`: the relay WSS client dials with `nsplane_wss::WssDialer` instead of
+  its own tungstenite dialer (the pinning `ClientConfig` passed as `WssTls::Config`);
+  `WssTransport::connect` now returns `io::Result`.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
