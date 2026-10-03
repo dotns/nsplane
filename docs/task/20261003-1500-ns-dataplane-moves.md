@@ -71,6 +71,13 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - Opt-in: `NetStackConfig::udp_allow_fragmentation: bool` (default false).
   - Replaces: stack.rs send_reply + netstack::udp::build_udp_reply.
 
+- MB-x5 (NEW, from ns T10 throughput) Configurable TCP socket buffers.
+  - Config: `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (bytes; default today's 512 segments) with the advertised window and window scaling following the receive buffer.
+  - Evidence: ns user-space mode single-stream TCP is 15% below the legacy stack (1 MiB buffers) on a quiet host, with lower CPU use, i.e. window-limited.
+- MB-x6 (NEW, from ns T10 load) Configurable SYN listener pool.
+  - Config: `NetStackConfig::tcp_listen_backlog` (sockets in SYN-RECEIVED per listener; default today's 32). Overflow is counted, not silently reset.
+  - Evidence: 500 concurrent connects to a user-space echo: 135-168 accepted on the engine, 163-215 on legacy; both reset at the 32-socket listener pool.
+
 ## NEW workstream MC: transports (crates/nsplane/src/udp.rs, transport.rs; e2e)
 - MC-1 Side channel for non-WireGuard datagrams on a UdpTransport.
   - API: `UdpTransport::with_side_channel(self, classify: impl Fn(&[u8]) -> bool + Send + Sync + 'static, capacity: usize) -> (UdpTransport, SideSender, mpsc::Receiver<SideDatagram>)`.
