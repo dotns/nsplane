@@ -154,8 +154,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted in errors, fragments, incremental checksums), swaps its table atomically
   (`Translator::store`) and counts in `TranslatorStats`; a fragmented IPv4 UDP datagram
   without a checksum is reassembled first, and completes only when its first fragment
-  arrives first. A translated packet needs 20 bytes of spare buffer capacity (28 with a
-  fragment header). Each peer's allowed IPs must contain its `alias4/32`, its LAN IPv4
+  arrives first. A translated packet grows by 20 bytes (28 with a fragment header) in place
+  when its buffer has the room; otherwise it is copied into a larger buffer
+  (`TranslatorStats::grown_copies`) instead of being dropped, and `reasons::NO_ROOM` only
+  bounds the result at the largest IPv6 packet. Each peer's allowed IPs must contain its `alias4/32`, its LAN IPv4
   prefixes, `alias6`, `node4`, `node6` and its `lan6` prefixes, since the core routes and
   checks sources before the filters run. `PortMap` publishes local services by DNAT/SNAT
   (`PortMapRule`, optionally per peer, with ICMP errors rewritten) on a bounded `Conntrack`
@@ -192,7 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel supports neither; `Tun::offload` reports the outcome (`Offload { vnet_hdr, tso, uso
   }`). `Tun::create_with(name, TunOptions::new().offload(false))` opts out. The source reads
   up to 64 KiB plus the 10-byte header at once and segments TCP/UDP super-packets into
-  pooled `PacketBuf`s no larger than the MTU; the sink coalesces runs of TCP packets (and
+  pooled `PacketBuf`s no larger than the MTU, each with capacity for the MTU plus 28 bytes
+  so an IPv4 -> IPv6 translator grows them in place; the sink coalesces runs of TCP packets (and
   of equally sized UDP datagrams with USO) of one flow into one super-packet, written with
   one `writev` of the header and the packet pieces (no join copy). An adopted fd uses vnet
   framing only if it was opened with `IFF_VNET_HDR` (segmented on read, written as

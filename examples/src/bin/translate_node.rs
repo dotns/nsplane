@@ -330,6 +330,7 @@ mod unix {
             "dropped_out": stats.dropped_out,
             "dropped_in": stats.dropped_in,
             "reassembled": stats.reassembled,
+            "grown_copies": stats.grown_copies,
         })
     }
 

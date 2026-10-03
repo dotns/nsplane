@@ -7,7 +7,7 @@ mod vectors;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use nsplane_core::{PacketFilter, Verdict};
-use nsplane_packet::{PacketBuf, PeerId, protocol};
+use nsplane_packet::{HEADROOM, PacketBuf, PacketPool, PeerId, protocol};
 
 use super::{Translator, TranslatorStats, reasons};
 use crate::checksum::{internet_checksum, transport_checksum_v4, transport_checksum_v6};
@@ -679,30 +679,56 @@ fn predicate_follows_the_current_table() {
     assert!(translated(ALIAS4));
 }
 
+/// Translates `packet` outbound and checks it against the in-place result;
+/// returns the grown copies counted.
+fn translate_tight(mut packet: PacketBuf, expected: &[u8]) -> u64 {
+    let translator = translator();
+    assert_eq!(translator.outbound(PEER, &mut packet), Verdict::Accept);
+    assert_eq!(packet.as_packet(), expected);
+    assert!(packet.capacity() >= expected.len());
+    assert_eq!(packet.headroom(), HEADROOM);
+    translator.stats().grown_copies
+}
+
 #[test]
-fn packets_that_cannot_grow_are_dropped() {
+fn packets_without_room_are_translated_in_a_grown_copy() {
     let packet = ipv4_simple(
         SELF4,
         ALIAS4,
         protocol::UDP,
         &udp4(SELF4, ALIAS4, b"x", false),
     );
-    let mut tight = PacketBuf::with_capacity(packet.len() + 19);
-    tight.set_len(packet.len());
-    tight.as_packet_mut().copy_from_slice(&packet);
-    if tight.capacity() < packet.len() + 20 {
-        assert_eq!(
-            translator().outbound(PEER, &mut tight),
-            Verdict::Drop {
-                reason: reasons::NO_ROOM
-            }
-        );
-    }
-    let mut exact = PacketBuf::with_capacity(packet.len() + 20);
-    exact.set_len(packet.len());
-    exact.as_packet_mut().copy_from_slice(&packet);
-    assert_eq!(translator().outbound(PEER, &mut exact), Verdict::Accept);
-    check_v6(exact.as_packet());
+    let translator = translator();
+    let (verdict, expected) = outbound(&translator, PEER, &packet);
+    assert_eq!(verdict, Verdict::Accept);
+    check_v6(&expected);
+    assert_eq!(translator.stats().grown_copies, 0);
+
+    // Exact capacity, as `PacketBuf::from_packet` and a pooled exact-size
+    // buffer (e.g. an offload segment) hand out.
+    let exact = PacketBuf::from_packet(&packet);
+    assert!(exact.capacity() < packet.len() + 20);
+    assert_eq!(translate_tight(exact, &expected), 1);
+    let mut pooled = PacketPool::new(0).get(packet.len());
+    pooled.set_len(packet.len());
+    pooled.as_packet_mut().copy_from_slice(&packet);
+    assert!(pooled.capacity() < packet.len() + 20);
+    assert_eq!(translate_tight(pooled, &expected), 1);
+    // No headroom and no tailroom, as a split of a shared GRO read.
+    let storage = PacketBuf::from_packet(&packet).into_bytes();
+    let shared = PacketBuf::from_shared(storage, 0, packet.len()).unwrap();
+    assert_eq!(shared.headroom(), 0);
+    assert!(shared.capacity() < packet.len() + 20);
+    assert_eq!(translate_tight(shared, &expected), 1);
+    // Exactly the 20 bytes of room stay in place.
+    let mut room = PacketBuf::with_capacity(packet.len() + 20);
+    room.set_len(packet.len());
+    room.as_packet_mut().copy_from_slice(&packet);
+    let start = room.as_packet().as_ptr();
+    assert_eq!(translator.outbound(PEER, &mut room), Verdict::Accept);
+    assert_eq!(room.as_packet(), expected);
+    assert_eq!(room.as_packet().as_ptr(), start);
+    assert_eq!(translator.stats().grown_copies, 0);
 }
 
 #[test]
@@ -746,6 +772,7 @@ fn stats_count_each_outcome() {
             dropped_out: 1,
             dropped_in: 1,
             reassembled: 0,
+            grown_copies: 0,
         }
     );
 }
@@ -780,6 +807,22 @@ fn zero_checksum_udp_fragments_are_reassembled_in_order() {
     assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
     assert_eq!(translator.stats().reassembled, 1);
     assert_eq!(translator.stats().translated_out, 1);
+    assert_eq!(translator.stats().grown_copies, 0);
+}
+
+#[test]
+fn reassembled_datagram_larger_than_its_last_fragment_grows() {
+    let translator = translator();
+    let data: Vec<u8> = (0..400u16).map(|i| i.to_le_bytes()[0]).collect();
+    let udp = udp4(SELF4, ALIAS4, &data, true);
+    let first = fragment4(79, 0, true, 64, &udp[..400]);
+    let last = fragment4(79, 50, false, 64, &udp[400..]);
+    assert_eq!(outbound(&translator, PEER, &first).0, Verdict::Handled);
+    let (verdict, v6) = outbound(&translator, PEER, &last);
+    assert_eq!(verdict, Verdict::Accept);
+    check_v6(&v6);
+    assert_eq!(&v6[48..], data.as_slice());
+    assert_eq!(translator.stats().grown_copies, 1);
 }
 
 #[test]
