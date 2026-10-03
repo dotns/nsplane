@@ -1249,6 +1249,7 @@ dependencies = [
  "nsplane-e2e",
  "rcgen",
  "rustls",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
