@@ -37,6 +37,9 @@
 //! `linux`, `darwin`) and to loading the Wintun library (`windows`); see
 //! `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
+mod host;
+pub use host::{HostTun, HostTunInput, HostTunSink, HostTunSource, PushError};
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
