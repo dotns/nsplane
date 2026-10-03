@@ -297,6 +297,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error); all zero without a stage. The drops are also counted in `drop_counters` under
   the new reasons `DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and
   `DROP_FRAGMENT_RATE_LIMITED` (`reasons::FRAGMENT_*` in `nsplane-core`).
+- `nsplane-nat`: `Redirect`, a local-side redirect (DNAT with the reverse SNAT) of IPv4
+  TCP/UDP flows to an endpoint a decision closure picks per new flow (`RedirectDecision`),
+  ported from ns `tun_service/rewrite.rs`. `forward` / `reverse` rewrite a `PacketBuf` in
+  place with incremental checksums and return a `RedirectVerdict`; flows live in a
+  `Conntrack` (bounded, idle expiry) and go through `remove_flow` and `retain`;
+  `original_destination` reports the service address of a flow the endpoint accepted;
+  `RedirectStats` counts the outcomes. Drop reasons in `nsplane_nat::redirect::reasons`.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

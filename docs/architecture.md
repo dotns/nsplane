@@ -42,6 +42,7 @@ where it is described below.
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `checksum` |
+| `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
 Not public API: `nsplane-cli` (a binary), `nsplane-e2e` (test harness) and
@@ -661,6 +662,19 @@ recently seen flow evicted), expires flows on per-protocol idle timeouts (TCP st
 without a background task, and takes an injectable clock. `PortMap::set_rules` swaps rules
 atomically and drops the flows of changed rules.
 
+**Redirect.** `Redirect` is not a filter: it runs on the local side, on `PacketBuf`s before
+they reach a local endpoint (`forward`) and on that endpoint's replies (`reverse`). It
+sends the IPv4 TCP/UDP flows a local application opens to a service address to an
+endpoint a caller-supplied closure picks for each new flow (`RedirectDecision::Redirect`,
+`Pass` or `Drop`), for example a `nsplane-netstack` listening on its own address, and
+rewrites the replies so they come from the service address; the source is kept. Flows
+live in a `Conntrack` (translated tuple: application to endpoint; `Flow::peer` unused); an
+endpoint already used by a live flow from the same source is refused and the closure asked
+again, up to 32 times. `remove_flow` (by the endpoint's view of the flow) and `retain` end
+flows; `original_destination` gives the service address of an accepted flow. The closure
+never runs under a lock, so it may call back into the `Redirect`. IPv6, fragments, other
+protocols and untracked replies pass unchanged.
+
 **Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
 next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
@@ -677,6 +691,7 @@ path, so such a client pays no extra latency for it.
 |---|---|---|---|---|
 | IPv4/IPv6 translation | `nsplane-nat` | `EngineBuilder::filter(Box::new(Translator::new(table)))`; `Translator::set_mtu` to the tunnel MTU | not installed | none: the core's filter chain is empty |
 | Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
+| Local-side redirect (DNAT) | `nsplane-nat` | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |

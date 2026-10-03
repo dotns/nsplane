@@ -25,6 +25,11 @@
 //!   `PacketFilter`: LAN replies are addressed to the SNAT source, which no
 //!   peer's allowed IPs contain, so the translation sits on the local side
 //!   (`forward` / `reverse` on a `PacketBuf`).
+//! - **Local-side redirect** ([`redirect`]): a per-flow DNAT ([`Redirect`])
+//!   of local IPv4 TCP/UDP packets to an endpoint a caller-supplied closure
+//!   picks (e.g. a user-space stack), with the reverse SNAT of the replies
+//!   to the original destination. Like [`Nat64Lan`], it sits on the local
+//!   side (`forward` / `reverse` on a `PacketBuf`).
 //! - **Filter order**: the core's filter chain is installed from the wire side
 //!   to the local side (inbound in install order, outbound in reverse); the
 //!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
@@ -46,6 +51,7 @@ pub mod checksum;
 pub mod conntrack;
 pub mod nat64_lan;
 pub mod port_map;
+pub mod redirect;
 pub mod table;
 pub mod translate;
 
@@ -58,6 +64,7 @@ pub use nat64_lan::{
     Nat64Verdict, SnatPorts,
 };
 pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};
+pub use redirect::{Redirect, RedirectDecision, RedirectStats, RedirectVerdict};
 pub use table::{
     LanPrefix, PeerMapping, SelfMapping, TableError, TranslationTable, TranslationTableBuilder,
 };
