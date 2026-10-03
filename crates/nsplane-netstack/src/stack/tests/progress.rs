@@ -40,7 +40,11 @@ async fn unacked_and_last_ack_follow_the_peer_window() -> TestResult {
     let stalled_at = conn.last_ack().ok_or("the first window was acknowledged")?;
     assert!(conn.unacked() > 0);
     peer.pump(40).await;
-    assert_eq!(conn.last_ack(), Some(stalled_at), "no progress while stalled");
+    assert_eq!(
+        conn.last_ack(),
+        Some(stalled_at),
+        "no progress while stalled"
+    );
     assert!(conn.unacked() > 0);
 
     // The client reads again: everything is acknowledged.

@@ -69,12 +69,19 @@ async fn unacked_and_last_ack_show_a_stalled_receiver() -> TestResult {
             Err(_) => break,
         }
     }
-    assert!(written < BULK, "the stalled receiver must hold the sender back");
+    assert!(
+        written < BULK,
+        "the stalled receiver must hold the sender back"
+    );
     sleep(QUIET).await;
     let stalled_at = conn.last_ack().ok_or("the first bytes were acknowledged")?;
     assert!(conn.unacked() > 0, "bytes are outstanding while stalled");
     sleep(2 * QUIET).await;
-    assert_eq!(conn.last_ack(), Some(stalled_at), "no progress while stalled");
+    assert_eq!(
+        conn.last_ack(),
+        Some(stalled_at),
+        "no progress while stalled"
+    );
     assert!(conn.unacked() > 0);
 
     // The receiver resumes: everything is delivered and acknowledged.
@@ -95,7 +102,10 @@ async fn unacked_and_last_ack_show_a_stalled_receiver() -> TestResult {
     .await
     .map_err(|_| "every byte must be acknowledged")?;
     let resumed_at = conn.last_ack().ok_or("acknowledged")?;
-    assert!(resumed_at > stalled_at, "last_ack advances once the receiver reads");
+    assert!(
+        resumed_at > stalled_at,
+        "last_ack advances once the receiver reads"
+    );
     Ok(())
 }
 
@@ -176,9 +186,15 @@ async fn reassemble(raw: &mut Node<ChannelTransport>) -> TestResult<(Vec<u8>, us
     let mut id = None;
     while total.is_none_or(|total| parts.iter().map(|(_, p)| p.len()).sum::<usize>() < total) {
         let (_, fragment) = raw.expect_delivery().await?;
-        assert!(fragment.len() <= usize::from(MTU), "fragment within the MTU");
+        assert!(
+            fragment.len() <= usize::from(MTU),
+            "fragment within the MTU"
+        );
         let (ip, payload) = Ipv4Header::parse(&fragment)?;
-        assert_eq!(ipv4_header_checksum(&fragment[..20]).to_be_bytes(), fragment[10..12]);
+        assert_eq!(
+            ipv4_header_checksum(&fragment[..20]).to_be_bytes(),
+            fragment[10..12]
+        );
         assert_eq!(fragment[6] & DF, 0, "DF clear");
         assert_eq!(*id.get_or_insert(ip.identification()), ip.identification());
         let flags = u16::from_be_bytes([fragment[6], fragment[7]]);
