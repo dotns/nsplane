@@ -331,12 +331,11 @@ impl TransportArgs {
     }
 }
 
-/// Binds the [`UDP_TRANSPORT`] to `listen`, with segmentation offload on if `offload`.
+/// Binds the [`UDP_TRANSPORT`] to `listen`, with segmentation offload if `offload` and
+/// otherwise without (the socket keeps the OS's default fragmentation).
 fn bind_udp(listen: SocketAddr, offload: bool) -> anyhow::Result<UdpTransport> {
-    let udp = UdpTransport::bind(UDP_TRANSPORT, listen)
+    let udp = UdpTransport::bind_with_offload(UDP_TRANSPORT, listen, offload)
         .with_context(|| format!("cannot bind UDP {listen}"))?;
-    udp.set_offload(offload)
-        .context("cannot set the UDP segmentation offload")?;
     let mode = if udp.offload() { "gso,gro" } else { "off" };
     tracing::info!(listen = %udp.local_addr(), udp_offload = %mode, "UDP transport bound");
     Ok(udp)
