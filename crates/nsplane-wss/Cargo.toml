@@ -26,6 +26,5 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing = "0.1.40"
 
 [dev-dependencies]
-nsplane-e2e = { path = "../nsplane-e2e", version = "0.8.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
