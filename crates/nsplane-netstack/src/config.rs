@@ -96,6 +96,14 @@ pub(crate) struct Settings {
 ///
 /// The receive buffer is the window a peer may fill, so the window scales with the MSS
 /// (and so with the MTU): 512 segments is about 690 KiB at the default MTU.
+///
+/// A connection moves at most one window per round trip, so the window caps its throughput
+/// at `window / RTT`: about 14 MB/s at 50 ms, against 1.8 MB/s for 64 segments. A window
+/// that fits the buffer of a congested hop avoids losses there (measured in-process through
+/// a 64-packet buffer: 64 segments lose nothing, 512 segments with congestion control lose
+/// about 300 packets and take an order of magnitude longer), but the stack cannot know that
+/// buffer, and without loss a smaller window gains nothing. Congestion control keeps the
+/// large window from collapsing on a congested hop; the window stays large for long paths.
 const WINDOW_SEGMENTS: usize = 512;
 
 impl Settings {
