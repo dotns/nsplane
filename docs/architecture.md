@@ -1296,6 +1296,69 @@ without the engine batching, two runs each, 1-minute load 2.8-5.9.
   their bound (`QueueStats::crypto` at `queue_capacity`) with the queueing delay that adds;
   these rows are for information only.
 
+### Against WireGuard implementations
+
+`scripts/bench/wg-compare.sh` (see `scripts/bench/README.md`) runs every pair in two fresh
+containers on one docker network: side a (sender) pinned to CPUs 2-5, side b (receiver) to
+6-9, real TUN devices, MTU 1420, every implementation configured over the UAPI with `wg`
+and `ip`. Measured 2026-10-03 at f42b01e (main 3cc35ac plus the additive
+nsplane-cli flags `--crypto-workers` and `--no-offload`; nsplane code otherwise identical),
+image `ai-agent/nsplane-bench` (debian trixie-slim, iperf 3.18), wireguard-go 0.0.20250522
+(f333402), host AMD Ryzen AI MAX+ 395 with 32 CPUs shared with other jobs, kernel
+7.1.8+deb13-amd64. 30 s per run, 3 repetitions, medians. The 1-minute load was 20.5 at the
+start, 30 after `kernel-nsplane` and about 33 sampled during it, so these are loaded-host
+numbers.
+
+```text
+just bench-wg
+BENCH_PAIRS=nsplane-nsplane BENCH_NSPLANE_VARIANTS='default;w2:WG_CRYPTO_WORKERS=2' \
+  NSPLANE_CLI_BIN=../other-worktree/target/release/nsplane-cli scripts/bench/wg-compare.sh
+```
+
+Knobs: `BENCH_PAIRS`, `BENCH_DURATION`, `BENCH_REPS`, `BENCH_UDP_RATES`, `BENCH_CPUS_A`/`_B`,
+`BENCH_NSPLANE_VARIANTS`; `NSPLANE_CLI_BIN` measures a binary built on another branch.
+
+| Pair (a -> b) | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP rate: loss % | ping p50 / p99 idle ms | ping p50 / p99 loaded ms | CPU s/GB a | CPU s/GB b | 1-min load before / after |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| kernel-kernel | 3.68 | 3.69 | 1G: 0.77, 3G: 3.50 | 0.434 / 4.190 | 2.070 / 4.220 | 0.12 † | 0.93 † | 20.47 / 18.63 |
+| nsplane-nsplane | 6.65 | 6.36 | 1G: 0.14, 3G: 2.14 | 0.383 / 2.780 | 1.680 / 5.700 | 1.33 | 1.34 | 18.63 / 21.90 |
+| nsplane-nsplane (w2) | 4.14 | 6.06 | 1G: 1.88, 3G: 1.46 | 0.228 / 1.830 | 1.280 / 3.620 | 1.96 | 1.96 | 21.42 / 7.78 |
+| nsplane-nsplane (nooffload) | 2.03 | 3.01 | 1G: 2.71, 3G: 28.37 | 0.254 / 1.760 | 1.910 / 7.030 | 4.78 | 4.82 | 10.04 / 16.68 |
+| nsplane-nsplane (nooffload-w2) | 2.87 | 3.39 | 1G: 0.25, 3G: 5.07 | 0.532 / 2.370 | 1.400 / 3.790 | 3.87 | 4.32 | 18.47 / 9.69 |
+| nsplane-kernel | 5.30 | 4.23 | 1G: 4.04, 3G: 4.66 | 0.260 / 4.050 | 3.770 / 7.670 | 2.81 | 0.36 † | 9.69 / 21.38 |
+| kernel-nsplane | 3.67 | 3.13 | 1G: 2.76, 3G: 9.39 | 0.324 / 3.120 | 2.770 / 8.390 | 0.18 † | 2.66 | 21.38 / 30.04 |
+| wggo-wggo | 6.14 | 8.51 | 1G: 0.57, 3G: 42.51 | 0.361 / 3.100 | 3.870 / 8.140 | 1.58 | 2.17 | 29.64 / 11.36 |
+| netstack (user-space) | 3.06 | 1.61 | 1G: 0.25, 3G: 1.96 | 0.030 / 0.050 | 0.137 / 1.080 | 3.21 | 2.58 | 11.36 / 10.75 |
+
+Variants: `w2` = 2 crypto workers, `nooffload` = no TUN offload and no UDP GSO/GRO, on both
+sides; the mixed pairs run the default configuration. Throughput is the receiver-side sum;
+the loaded ping runs next to one saturating TCP stream; CPU s/GB is the container's cgroup
+CPU over the TCP P1 run divided by the GB received, iperf3's own CPU included.
+
+- Caveats. The host is shared and the 1-minute load moved between 7.8 and about 33 during
+  the run; the repetitions spread widely (e.g. nsplane-nsplane default TCP P1 6.46 / 8.86 / 6.65,
+  netstack 2.26 / 3.06 / 5.74), so only large differences are meaningful. † Kernel
+  WireGuard encrypts in kernel workqueue threads outside the container cgroup, so its CPU
+  per GB is an undercount. The `netstack` pair runs `netstack_bench` (engine, netstack and
+  load generator in one process per side, no TUN) instead of iperf3 and ping; its latency
+  columns are 1-byte TCP request/response round trips. nsplane-cli sides keep their
+  startup UDP port: a `listen-port` set over the UAPI rebinds with offload on, which would
+  undo `WG_NO_OFFLOAD`, so the harness does not set it.
+- Offload carries nsplane-cli's single-stream throughput: the default is 3.3x `nooffload`
+  at P1 (6.65 against 2.03 Gbit/s) at a quarter of the CPU per GB (1.33 against 4.78 s).
+  2 crypto workers lower P1 (4.14) and cost more CPU per GB (1.96), with P4 about the same
+  as the default.
+- Against the other implementations on this host and run: nsplane-nsplane default is above
+  kernel-kernel (3.68) and wireguard-go (6.14) at P1, below wireguard-go at P4 (6.36 against
+  8.51), and loses less UDP at 3G (2.14 % against 3.50 % and 42.51 %).
+- netstack: TCP P4 is below P1 in all three repetitions (1.55-2.50 against 2.26-5.74
+  Gbit/s), and also in a 5 s smoke run at a 1-minute load of 7 (1.08 against 1.83).
+- ns T10b (MF-1, MF-2 in `docs/task/20261003-1500-ns-dataplane-moves.md`) measured
+  single-stream TCP over TUN with a different harness and host, unloaded: engine 4044
+  against legacy tunnel-wg 4748 Mbit/s, and nsplane-netstack 4356 against legacy smoltcp
+  4897 Mbit/s. Here nsplane-nsplane default TCP P1 is 6.65 Gbit/s and netstack 3.06
+  Gbit/s; the setups differ, so these are not a like-for-like comparison.
+
 ## Unsafe code
 
 `unsafe` lives only in `nsplane-tun`'s platform

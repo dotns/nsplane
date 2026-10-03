@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
   serves the UAPI on an already-connected Unix stream socket next to the standard socket;
   the daemon takes ownership of both fds.
+- CLI: `--crypto-workers`/`WG_CRYPTO_WORKERS` sets the engine's crypto workers and `--no-offload`/`WG_NO_OFFLOAD` opens the TUN device and binds the UDP socket without segmentation offload.
+- Benchmarks: `just bench-wg` (`scripts/bench/wg-compare.sh`) compares nsplane-cli, kernel
+  WireGuard and wireguard-go in pinned containers (TCP, UDP loss, latency, CPU per GB), plus
+  nsplane's user-space mode through the `netstack_bench` example; results in
+  `docs/architecture.md` (*Against WireGuard implementations*).
 - `nsplane-netstack`: a user-space TCP/IP stack on smoltcp 0.14 for IPv4 and IPv6.
   `NetStack::new(NetStackConfig)` starts it and `NetStack::split` yields a
   `NetStackSource` (`PacketSource`, the stack's egress) and a `NetStackSink` (`PacketSink`),

@@ -218,6 +218,8 @@ wg setconf wg0 /path/to/wg0.conf
 | `--disable-drop-privileges` | `WG_SUDO`      | Keep root; otherwise switch to `SUDO_UID`/`SUDO_GID` after setup |
 | `--tun-fd <FD>`             | `WG_TUN_FD`    | Adopt this already-open TUN fd instead of creating the interface |
 | `--uapi-fd <FD>`            | `WG_UAPI_FD`   | Also serve the UAPI on this already-connected Unix stream socket |
+| `--crypto-workers <N>`      | `WG_CRYPTO_WORKERS` | Crypto worker tasks (default 0: crypto on the engine task; 2 or more enables the pool) |
+| `--no-offload`              | `WG_NO_OFFLOAD` | Open the TUN device and bind the UDP socket without segmentation offload |
 
 - The UAPI listens on `/var/run/wireguard/<name>.sock`.
 - The UDP socket is bound to an ephemeral port at startup; `wg set <name> listen-port <port>`
@@ -233,6 +235,11 @@ wg setconf wg0 /path/to/wg0.conf
   socket GSO/GRO when the kernel supports them, else plain per-packet I/O. With offload the
   socket sets DF; raise `net.core.rmem_max` / `wmem_max` (e.g. to 4194304) for the full
   4 MiB socket buffers.
+- `--no-offload` applies to the device and socket created at startup. With `--tun-fd` the
+  adopted device is used as is and only the UDP socket is affected. A `listen-port` or
+  `fwmark` set over the UAPI binds a new socket with offload, so keep the ephemeral port
+  (`wg show <name> listen-port`) when offload must stay off. `-v info` logs the offloads and
+  crypto workers in use (`Data path configured`).
 - `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 
