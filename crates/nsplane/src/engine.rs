@@ -24,7 +24,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
 };
-use crate::fragment::{Action, Fragmenter};
+use crate::fragment::{Action, FragmentStats, Fragmenter};
 use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -207,6 +207,10 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         .poll_timeout()
         .map_or_else(Instant::now, Instant::from_std);
 
+    let workers =
+        (parts.crypto_workers >= 2).then(|| Workers::spawn(parts.crypto_workers, capacity));
+    // The done queue holds as many batches as jobs may be in flight.
+    let crypto_capacity = workers.as_ref().map_or(0, |workers| workers.bound);
     let mut owner = Owner {
         core,
         private_key: parts.private_key,
@@ -244,11 +248,12 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
             transmit: QueueDepth::new(capacity),
             backlog: QueueDepth::new(capacity),
             events: QueueDepth::new(parts.event_capacity),
+            crypto: QueueDepth::new(crypto_capacity),
+            crypto_done: QueueDepth::new(crypto_capacity),
         },
         local_first: false,
         suspended,
-        workers: (parts.crypto_workers >= 2)
-            .then(|| Workers::spawn(parts.crypto_workers, capacity)),
+        workers,
     };
     for transport in parts.transports {
         let slot = owner.start_transport(transport.start, VecDeque::new());
@@ -472,6 +477,8 @@ struct Workers {
     done: mpsc::Receiver<Vec<CryptoJob>>,
     /// Jobs batched or with the workers and not completed yet; at most `bound`.
     in_flight: usize,
+    /// The most jobs in flight since [`Owner::queue_stats`] last took it.
+    peak: usize,
     bound: usize,
     tasks: Vec<Task>,
 }
@@ -492,6 +499,7 @@ impl Workers {
             batches: (0..n).map(|_| Vec::new()).collect(),
             done,
             in_flight: 0,
+            peak: 0,
             bound,
             tasks,
         }
@@ -503,6 +511,7 @@ impl Workers {
         let batch = &mut self.batches[worker];
         batch.push(job);
         self.in_flight += 1;
+        self.peak = self.peak.max(self.in_flight);
         batch.len() >= MAX_BATCH
     }
 
@@ -758,7 +767,7 @@ impl Owner {
                 }
             }
             Action::Reply(peer, packet) => self.core.inject_inbound(peer, packet),
-            Action::Drop => {}
+            Action::Drop(reason) => self.dropped(None, reason),
         }
     }
 
@@ -789,6 +798,9 @@ impl Owner {
         let Some(workers) = &mut self.workers else {
             return;
         };
+        self.high_water
+            .crypto_done
+            .record_received(workers.done.len());
         workers.in_flight -= jobs.len();
         for job in jobs {
             self.core.complete_job(job);
@@ -909,6 +921,7 @@ impl Owner {
             Command::QueueStats(take, reply) => {
                 let _ = reply.send(self.queue_stats(take));
             }
+            Command::FragmentStats(reply) => self.fragment_stats(reply),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
         }
         ControlFlow::Continue(())
@@ -935,6 +948,12 @@ impl Owner {
         marks
             .events
             .record(self.events.len().min(marks.events.capacity));
+        if let Some(workers) = &mut self.workers {
+            marks
+                .crypto
+                .record(std::mem::take(&mut workers.peak).max(workers.in_flight));
+            marks.crypto_done.record(workers.done.len());
+        }
         let stats = *marks;
         if take {
             for depth in [
@@ -946,11 +965,19 @@ impl Owner {
                 &mut marks.transmit,
                 &mut marks.backlog,
                 &mut marks.events,
+                &mut marks.crypto,
+                &mut marks.crypto_done,
             ] {
                 depth.high_water = 0;
             }
         }
         stats
+    }
+
+    /// Replies with the counters of the fragmentation stage; all zeros without one.
+    fn fragment_stats(&self, reply: oneshot::Sender<FragmentStats>) {
+        let stats = self.fragmenter.as_ref().map(Fragmenter::stats);
+        let _ = reply.send(stats.unwrap_or_default());
     }
 
     /// Stops and removes transport `id`; the datagrams still queued for it are dropped.

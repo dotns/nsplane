@@ -76,7 +76,7 @@ impl fmt::Debug for Core {
 impl Core {
     /// Creates a core from `config`; it has no peers yet.
     pub fn new(config: CoreConfig) -> Self {
-        let mut peers = PeerTable::new(config.handshake_rate_limit);
+        let mut peers = PeerTable::new(config.handshake_rate_limit, config.crypto_jobs);
         if let Some(private_key) = config.private_key {
             peers.set_private_key(private_key);
         }
@@ -110,13 +110,20 @@ impl Core {
     /// instead of being run: run it anywhere with [`CryptoJob::run`], then hand it back with
     /// [`Core::complete_job`]. Everything else (handshakes, configuration, packets that are
     /// dropped before their cryptography) is processed at once and returns `None`.
+    ///
+    /// A core built without [`CoreConfig::crypto_jobs`] hands out no jobs: it processes every
+    /// input at once like [`Core::handle_input`] and returns `None`.
     pub fn handle_input_deferred(&mut self, input: Input, now: Instant) -> Option<CryptoJob> {
+        if !self.peers.shared_tunnels() {
+            self.handle_input(input, now);
+            return None;
+        }
         self.start_schedule(now);
         match input {
             Input::Datagram { path, data } => {
                 let (data, index) = self.classify(path, data)?;
                 let peer = self.peers.by_index(index).and_then(|id| {
-                    let tunnel = self.peers.peer(id)?.shared_tunnel();
+                    let tunnel = self.peers.peer(id)?.shared_tunnel()?;
                     Some((id, tunnel))
                 });
                 let Some((id, tunnel)) = peer else {
@@ -128,11 +135,10 @@ impl Core {
             }
             Input::Local { packet } => {
                 let (id, packet, len) = self.prepare_send(packet, true)?;
-                let Some(peer) = self.peers.peer(id) else {
+                let Some(tunnel) = self.peers.peer(id).and_then(Peer::shared_tunnel) else {
                     self.pool.put(packet);
                     return None;
                 };
-                let tunnel = peer.shared_tunnel();
                 Some(CryptoJob::new(id, tunnel, packet, Direction::Seal { len }))
             }
             Input::Config(change) => {
@@ -327,7 +333,7 @@ impl Core {
 
         let mut buf = self.pool.get_len(BUF_SIZE);
         let initiation = p
-            .tunnel()
+            .tunnel_mut()
             .format_handshake_initiation(&mut buf.with_headroom_mut()[HEADROOM..], true);
         match initiation {
             TunnResult::WriteToNetwork(packet) => {
@@ -505,7 +511,7 @@ impl Core {
             return None;
         };
         let len = data.len();
-        let outcome = job::open(&mut self.peers.peer(id)?.tunnel(), path, data);
+        let outcome = job::open(&mut self.peers.peer_mut(id)?.tunnel_mut(), path, data);
         self.opened(id, path, len, outcome)
             .map(|plain_len| (id, plain_len))
     }
@@ -623,7 +629,7 @@ impl Core {
         };
 
         let verified = p
-            .tunnel()
+            .tunnel_mut()
             .handle_verified_packet(packet, &mut reply.with_headroom_mut()[HEADROOM..]);
         let reply_len = match verified {
             TunnResult::Done => None,
@@ -663,7 +669,7 @@ impl Core {
         let Some(peer) = self.peers.peer_mut(id) else {
             return self.pool.put(packet);
         };
-        let outcome = job::seal(&mut peer.tunnel(), &mut packet, len);
+        let outcome = job::seal(&mut peer.tunnel_mut(), &mut packet, len);
         sealed(
             &mut self.outputs,
             &mut self.pool,
@@ -733,7 +739,7 @@ impl Core {
         loop {
             let mut buf = self.pool.get_len(BUF_SIZE);
             let queued =
-                peer.tunnel()
+                peer.tunnel_mut()
                     .decapsulate(None, &[], &mut buf.with_headroom_mut()[HEADROOM..]);
             let TunnResult::WriteToNetwork(packet) = queued else {
                 return self.pool.put(buf);
@@ -763,7 +769,7 @@ impl Core {
         if completed > 0 {
             peer.expired = false;
             let rtt = (kind == MessageKind::HandshakeResponse)
-                .then(|| peer.tunnel().stats().4)
+                .then(|| peer.tunnel_mut().stats().4)
                 .flatten()
                 .map(|ms| Duration::from_millis(u64::from(ms)));
             handshakes_completed(&mut self.outputs, id, completed, Some(path), rtt);

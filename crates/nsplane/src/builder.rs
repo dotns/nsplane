@@ -208,6 +208,8 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             policy: self.policy,
             filters: self.filters,
             stats_interval: self.stats_interval,
+            // The engine hands out crypto jobs only to a pool of two or more workers.
+            crypto_jobs: self.crypto_workers >= 2,
             ..CoreConfig::default()
         };
         Ok(engine::spawn(engine::Parts {
