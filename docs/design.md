@@ -4,7 +4,7 @@ The one-page view of where nsplane is going. `docs/architecture.md` describes wh
 `main` today; `docs/plan/` holds the approved plans with their investigation notes; this
 page ties them together and is updated whenever a plan is approved or a phase lands.
 
-Last updated: 2026-10-02 (Phase 1 of the data-plane plan in progress).
+Last updated: 2026-10-03 (Phases 1-5 and their follow-ups merged; Phase 6 is the ns migration).
 
 **Naming.** The project was renamed **nsplane** on 2026-10-02 (ADR
 `2026-10-02-rename-nsplane`): it is the node's underlying data plane, and TUN is only one of
@@ -30,6 +30,17 @@ In the NS target architecture nsplane is layer 1 of four; the layers above it li
 One engine per node. Account mode, Quick mode and applications are peer *sources* and
 presentation choices on top of the same engine; "mode" never appears inside nsplane. The
 CLI (`nsplane-cli`) is a Linux/macOS development tool only.
+
+**Application mode** (decided 2026-10-02 against the docs site's `ns/next`, `ns/apps` and
+`ns/rendezvous`): nsplane provides the mechanics: engine peers that come and go with a
+session, in-tunnel connections through `nsplane-netstack` and `Splitter`, ACL enforcement per
+source namespace with cross-namespace default deny, directed grants, outbound rules for
+restricted namespaces such as `app:*`, pinholes that close with their session, and the 4↔6
+translation filter. ns keeps the `/quick/v2` rendezvous client, the `app:<session>` peer
+source lifecycle, `kind` dispatch, third-party app access, the pairing and transfer state
+machines and the relay client carriers. An app session reuses the existing tunnel to a peer
+it already has (through a pinhole the peer's source namespace must permit for that app kind)
+and only installs a session-scoped peer for an unpaired one.
 
 ## 2. Non-goals
 
@@ -68,31 +79,36 @@ CLI (`nsplane-cli`) is a Linux/macOS development tool only.
 ## 4. Crates
 
 ```
-nsplane-noise    noise core (Tunn, in-place seal/open, RateLimiter, zerocopy wire views),
-                 x25519                      [exists; `device` deleted at end of Phase 1]
+nsplane-noise    noise core (Tunn, in-place seal/open, RateLimiter, zerocopy wire views), x25519
 nsplane-packet   IP/TCP/UDP/ICMP header views, five-tuple, fragments, checksums,
-                 PacketBuf/PacketPool/PacketBatch, PeerId/Path/TransportId/Ecn    [merged]
-nsplane-core     sans-I/O engine: Core, PeerTable, timers, PathPolicy, PacketFilter,
-                 injection, events                                          [in progress]
-nsplane          tokio driver: PacketSource/PacketSink/Transport traits, UdpTransport,
-                 channel transports, Engine/EngineBuilder/EngineHandle, events  [in progress]
-nsplane-tun      TUN backends: Linux, macOS utun, Windows Wintun, fd/handle adoption
-                 (iOS, Android)                                             [in progress]
-nsplane-uapi     `wg` UAPI over the engine (Unix socket / named pipe)           [planned]
-nsplane-e2e      library-level end-to-end tests (two engines, kernel WireGuard)  [planned]
-nsplane-netstack smoltcp stack as PacketSink + PacketSource; TCP connections, UDP flows,
-                 dialers; Splitter for hybrid TUN + netstack                [Phase 3]
-nsplane-acl      policy engine as PacketFilter and connection-level check; fragment gate;
-                 flow tracker                                               [Phase 4]
-nsplane-nat      4↔6 translation filter, conntrack, DNAT/SNAT for service publishing
-                 (optional)                                                 [Phase 5]
-nsplane-cli      Linux/macOS dev tool on the engine                         [exists]
+                 PacketBuf/PacketPool/PacketBatch, PeerId/Path/TransportId/Ecn
+nsplane-core     sans-I/O engine: Core (single and batched input, deferred crypto jobs),
+                 PeerTable, timers, PathPolicy, onion-ordered PacketFilter chain, injection,
+                 events
+nsplane          tokio driver: PacketSource/PacketSink/Transport traits (batched),
+                 UdpTransport (GSO/GRO), channel transports, Splitter/MergeSource,
+                 fragmentation stage, crypto worker pool, Engine/EngineBuilder/EngineHandle,
+                 events, drop/queue/fragment/transport counters and status
+nsplane-tun      TUN backends: Linux/Android (virtio-net offload), macOS/iOS utun, Windows
+                 Wintun, fd/handle adoption
+nsplane-uapi     `wg` UAPI over the engine (Unix socket / named pipe)
+nsplane-netstack smoltcp (dotns/smoltcp fork) stack as PacketSink + PacketSource; TCP
+                 connections, UDP flows, dialers
+nsplane-acl      ACL engine and AclFilter: namespaces, grants, outbound rules, pinholes,
+                 per-flow hook with bypass and verdict cache; fragment gate; FlowTracker
+nsplane-nat      4↔6 translation filter (RFC 7915), conntrack, DNAT/SNAT port map
+nsplane-cli      Linux/macOS dev tool on the engine
+nsplane-e2e      library-level end-to-end tests (not published)
+examples         nsplane-examples: runnable examples, single-port relay (not published)
 ```
 
 Dependency direction is strictly downward: `nsplane-cli` → `nsplane-uapi` → `nsplane` →
 `nsplane-core` → `nsplane-packet`; `nsplane-tun`/`nsplane-netstack`/`nsplane-acl`/
-`nsplane-nat` → `nsplane` (+ `nsplane-packet`). `nsplane-core` is the only crate that
-depends on `nsplane-noise`.
+`nsplane-nat` → `nsplane-core` / `nsplane` (+ `nsplane-packet`). `nsplane-core` is the only
+crate that depends on `nsplane-noise`. All of the feature crates are optional: a basic client
+links `nsplane` and `nsplane-tun` only, and a feature that is not installed is not on the
+data path (`docs/architecture.md`, *Optional features and defaults*). The public interfaces
+of every crate are listed in `docs/architecture.md`, *Public interfaces*.
 
 ## 5. The engine
 
@@ -125,6 +141,8 @@ outputs to transports and sinks, sleep until `poll_timeout`. Each `PacketSource`
 locks on the hot path; `EngineHandle` calls are messages to the owner task.
 
 ```rust
+// Simplified; every method of the I/O traits has a batch form with a default
+// (`recv_batch`, `send_batch`), and `Transport::send_batch` reports failed datagrams.
 trait PacketSource { async fn recv(&mut self) -> io::Result<PacketBuf>; fn mtu(&self) -> watch::Receiver<u16>; }
 trait PacketSink   { async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()>; }
 trait Transport    { async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)>;
@@ -133,9 +151,14 @@ trait PathPolicy   { fn select(&self, peer, kind) -> Option<Path>; fn on_authent
 trait PacketFilter { fn inbound(&self, peer, &mut PacketBuf) -> Verdict; fn outbound(&self, peer, &mut PacketBuf) -> Verdict; }
 ```
 
-`EngineBuilder` is generic over source/sink/transport with defaults (`UdpTransport`,
-`StandardRoaming`, TUN from `nsplane-tun`); in-memory `Channel*` implementations serve
-tests and embedders.
+`EngineBuilder` takes the source and sink, any number of transports (`DynTransport` for
+runtime choice), a `PathPolicy` (`StandardRoaming` by default), filters, an optional
+fragmentation stage and crypto worker pool; in-memory `Channel*` implementations serve
+tests and embedders. The owner task feeds the core what is already queued as one batch
+(never waiting to fill one), reads local packets only up to the transmit room, and keeps a
+per-transport backlog so a stalled transport never holds back the others.
+`EngineHandle::status` and `transport_stats` report the engine's state and per-transport
+traffic in one call; rates and metric export are left to the caller.
 
 ### Presentation × transport
 
@@ -156,18 +179,33 @@ of the design, not of individual features.
   `lan4 ↔ lan6` for published LANs) is a stateless `PacketFilter` in `nsplane-nat`, applied
   before encryption and after decryption, shared by TUN and netstack. Remote nodes only
   see IPv6.
-- IPv6 fragmentation and ICMPv6 Packet Too Big are handled once in the engine after
-  translation; TUN and netstack share the same MTU/MSS limits (`nsplane-netstack` derives
-  its advertised MSS from the engine MTU).
+- Fragmentation and Packet Too Big are handled once in the engine, by an optional stage on
+  the local path before the core (the core encrypts right after its outbound filters):
+  IPv6 above the MTU gets an ICMPv6 Packet Too Big, IPv4 above its ceiling gets a
+  Fragmentation Needed (DF) or is split into IPv4 fragments that the translator turns into
+  IPv6 fragments (RFC 7915 5.1.1); destinations translated to IPv6 get a 20-byte lower
+  ceiling. TUN and netstack share the same MTU/MSS limits (`nsplane-netstack` derives its
+  advertised MSS from the engine MTU).
+- The filter chain is onion-ordered (installed from the wire side to the local side);
+  the recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL sees overlay IPv6
+  in both directions.
 
-## 7. Performance plan
+## 7. Performance
 
-- Already: in-place seal/open, no per-packet allocation on the data path
-  (`PacketPool`), handshake-init demux without endpoint scans.
-- Phase 1 gate: the core must stay within 10 % of a `Tunn`-plus-routing baseline on
-  64 B and 1420 B packets (`nsplane-core` bench vs `crates/nsplane-noise/benches/data_path`).
-- Phase 5: Linux TUN virtio-net GSO/GRO, UDP GSO/GRO (`quinn-udp`), optional crypto worker
-  pool in the driver; measured with iperf in the e2e containers before and after.
+Measured numbers and their analysis are in `docs/architecture.md`, *Performance*. In short:
+
+- In-place seal/open, no per-packet allocation (`PacketPool`), handshake-init demux without
+  endpoint scans, zero-copy GRO slices.
+- `data_path` (64 B round trip): core 533 ns per packet one at a time (device-equivalent
+  471 ns, +12 %), 411-416 ns per packet in batches of 32 (below the device-equivalent; the
+  10 % target is met for batched input, which the engine uses whenever packets queue up).
+- Offload: Linux/Android TUN virtio-net TSO/USO and UDP GSO/GRO, on by default with
+  fallback; nothing waits to fill a batch.
+- Optional crypto worker pool (2 or more workers, sharded by peer): up to about 1.4x on
+  full-size packets; without it the data path takes no lock.
+- ACL hook: bypass peer ~38 ns, established flow ~51-55 ns, unchanged verdicts.
+
+Open: sender pacing / receiver-side sink backpressure (follow-up #21).
 
 ## 8. Security and protocol baseline
 
@@ -180,19 +218,22 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 
 ## 9. Roadmap and status
 
-| Phase | Deliverable | Status (2026-10-02) |
+| Phase | Deliverable | Status (2026-10-03) |
 |---|---|---|
-| Baseline | aws-lc-rs backend, pma-rust lints, protocol fixes, zero-copy noise, Windows device, CLI as dev tool | done, pushed (`1fb9899`) |
-| 1 | `nsplane-packet`, `nsplane-core`, `nsplane` driver, `nsplane-tun`, `nsplane-uapi`, `nsplane-e2e`, CLI on the engine, delete the upstream `device` layer | BKD campaign `nstun-dp-p1`: P, C and B merged; D and E in progress |
-| 1b | Rename to nsplane (repo, crates, docs section) | after Phase 1, own task (ADR `2026-10-02-rename-nsplane`) |
-| 2 | multi-transport, `PathPolicy`, filter chain with `Handled`, injection, `force_handshake`, suspend/resume | planned |
-| 3 | `nsplane-netstack`, `Splitter`, netstack-only e2e | planned |
-| 4 | `nsplane-acl` (policy filter, connection check, fragment gate, flow tracker) | planned |
-| 5 | 4↔6 translation filter, fragmentation/PTB, offload (TUN virtio-net, UDP GSO/GRO), crypto workers, conntrack/DNAT | planned |
-| 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan, its phases C and D) | after 1-5 |
+| Baseline | aws-lc-rs backend, pma-rust lints, protocol fixes, zero-copy noise, Windows device, CLI as dev tool | done (`1fb9899`) |
+| 1 | `nsplane-packet`, `nsplane-core`, `nsplane` driver, `nsplane-tun`, `nsplane-uapi`, `nsplane-e2e`, CLI on the engine, upstream `device` layer deleted | done (`1660fc2`, `8c6ad9f`, `2827a4a`, `17eb69d`, `f712711`) |
+| 1b | Rename to nsplane, `crates/` layout, cleanup | done (`5578a90`) |
+| 2 | multi-transport, `PathPolicy`, filter chain with `Handled`, injection, `force_handshake`, suspend/resume, engine-driven timers | done (`ce54d62`, `d3d4f50`) |
+| 3+4 | per-transport backpressure, `nsplane-netstack`, `Splitter` / `MergeSource`, `nsplane-acl`, examples and the presentation × transport matrix, ACL namespaces / grants / outbound rules / pinholes | done (`7e7139c`, `0e10b0d`, `688e585`, `3a5f74c`, `c35429e`) |
+| 5 | `nsplane-nat` (translation, conntrack, port map), fragmentation stage, onion filter order, TUN and UDP offload, ACL flow hook, queue high-water marks, crypto worker pool | done (`a2c0635`, `33445e0`, `f46427f`, `e60072b`, `02ff770`, `64131c7`) |
+| 5 follow-ups | batched core entry, no lock without workers, exact send errors, worker/fragment stats, smoltcp fork | done (`8f01a55`, `5132f27`, `91c4943`) |
+| Status | per-transport traffic counters, `EngineHandle::status` | done (task `20261003-1215-traffic-status`) |
+| 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns, not started |
 
-Phase 0 (ns pins nsplane's `noise` with the `SocketAddr` source change) is independent and
-runs in ns when its current refactor lands.
+Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows
+real-host verification, #19 sending the smoltcp fixes upstream (the user's call), #21 sender
+pacing / sink backpressure. Phase 0 (ns pins nsplane's `noise` with the `SocketAddr` source
+change) runs in ns when its current refactor lands.
 
 ## 10. Decisions
 
@@ -205,6 +246,13 @@ runs in ns when its current refactor lands.
 | 2026-10-02 | Value types (`PeerId`, `Path`, `TransportId`, `Ecn`) live in `nsplane-packet`, re-exported by `nsplane-core` | same plan, gate 1 |
 | 2026-10-02 | One nsplane engine per NS node; 4↔6 translation and fragmentation live in the engine; both ns data planes migrate | NS next-architecture page (docs site, `ns/next`) |
 | 2026-10-02 | Rename to **nsplane** (`nsplane-noise`, `nsplane-core`, `nsplane`, `nsplane-tun`, ...); executed after Phase 1 merges | ADR `2026-10-02-rename-nsplane` |
+| 2026-10-02 | Examples package with real WebSocket over TLS; single-port relay in WireGuard's undefined message-type range, plain WireGuard peers keep working (Proposed wire contract with ns / nsgw) | ADR `2026-10-02-single-port-relay`, plan `20261002-1725` |
+| 2026-10-02 | Application mode split: nsplane provides peers, in-tunnel connections, ACL namespaces, grants, outbound rules and pinholes; ns keeps rendezvous, `kind` dispatch and app state machines; app traffic to an existing peer only through a pinhole permitted by its source namespace, closed with the session | plan `20261002-1725`, annotations |
+| 2026-10-02 | ACL as a per-flow hook: zero cost when not installed, per-peer bypass, verdict cache keyed by generation | plan `20261002-1725`, annotations |
+| 2026-10-02 | Every optional feature (translation, port map, ACL, fragmentation, worker pool, netstack) is opt-in and off the data path when not installed; offload is on with fallback | plan `20261002-2240` |
+| 2026-10-03 | Batched core entry and drain-only engine batching (no wait, no timer; local intake bounded by the transmit room); sink-full loss under saturation accepted, pacing is follow-up #21 | plan `20261003-0715` |
+| 2026-10-03 | nsplane-netstack depends on the `dotns/smoltcp` fork pinned to a tag; workarounds removed | ADR `2026-10-03-smoltcp-fork` |
+| 2026-10-03 | Status and traffic: nsplane reports counters (`status`, `transport_stats`); rates, metric export and direct/relay labels live in ns | task `20261003-1215-traffic-status` |
 
 ## 11. References (design only)
 
