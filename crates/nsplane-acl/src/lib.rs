@@ -186,7 +186,12 @@
 //!   [`PeerIdentityMap`] change) versions the identities.
 //! - **Principal cache.** Per peer, the filter keeps its source assertion,
 //!   principal (an `Arc<str>`, no allocation per packet) and flags
-//!   (outbound-restricted, pinholes, bypass) under both generations.
+//!   (outbound-restricted, pinholes, bypass) under both generations. A peer
+//!   terminating by source address
+//!   ([`PeerIdentityMap::insert_by_source`], [`PeerIdentity::by_source`]) has
+//!   one principal per remote address ([`PeerIdentity::assertion_for`]),
+//!   cached per peer and address in a least-recently-used table bounded by
+//!   [`AclFilterConfig::reply_capacity`], and is bypassed per address.
 //! - **Flow verdict cache.** The reply table also holds, per peer, direction
 //!   and five-tuple, the verdict of a namespace member's TCP or UDP flow's
 //!   first packet (accepted with its grant or pinhole dependency, or dropped
