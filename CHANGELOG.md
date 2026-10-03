@@ -155,6 +155,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AclFilterStats::pending_evictions` and `verdict_evictions`; `nsplane-e2e` `acl_hook`
   tests. The reply, pending and fragment tables evict their least recently seen (fragments:
   oldest) entry in O(1) instead of scanning the full table.
+- `nsplane`: `EngineHandle::queue_stats` reports the capacity and high-water mark of every
+  bounded queue of the engine (`QueueStats`, `QueueDepth`: commands, local packets,
+  received datagrams, deliveries, recycled buffers, the transmit queues and backlogs, events);
+  `take_queue_stats` also restarts the marks for windowed measurements. The owner task keeps
+  the marks without locks or atomics. Measured defaults: the queue capacity stays at 1024
+  and the command queue at 64 (see docs/architecture.md, "Queue depths").
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their

@@ -1,7 +1,7 @@
 //! The `--status-file` JSON snapshot.
 //!
-//! [`Status::spawn`] rewrites the file every second (written to `<path>.tmp`, then
-//! renamed, so readers never see a partial file):
+//! [`Status::spawn`] rewrites the file every second (written to a temporary file next to
+//! it, then renamed, so readers never see a partial file):
 //!
 //! ```json
 //! {"public_key": "<base64>", "listen": "0.0.0.0:51820", "mtu": 1420,
@@ -21,6 +21,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -32,6 +33,9 @@ use crate::node::{encode_key, encode_public_key};
 
 /// How often [`Status::spawn`] rewrites the file.
 pub const INTERVAL: Duration = Duration::from_secs(1);
+
+/// Numbers the temporary files of [`Status::write`] within this process.
+static WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// Adds entries to the `extra` object of a snapshot.
 pub type ExtraFn = dyn Fn(&mut Map<String, Value>) + Send + Sync;
@@ -107,19 +111,12 @@ impl Status {
         }))
     }
 
-    /// Writes one snapshot: to `<path>.tmp`, then renamed to `<path>`.
+    /// Writes one snapshot: to `<path>.<pid>.<n>.tmp`, then renamed to `<path>`. Every
+    /// write has its own temporary file, so concurrent writes of the same path never
+    /// collide; the last rename wins.
     pub async fn write(&self) -> anyhow::Result<()> {
         let snapshot = self.snapshot().await?;
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let body = serde_json::to_vec_pretty(&snapshot)?;
-        tokio::fs::write(&tmp, body)
-            .await
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .with_context(|| format!("cannot write {}", self.path.display()))
+        write_atomic(&self.path, &serde_json::to_vec_pretty(&snapshot)?).await
     }
 
     /// Writes a snapshot every [`INTERVAL`] until the engine stops or the task is aborted.
@@ -138,6 +135,25 @@ impl Status {
             }
         })
     }
+}
+
+/// Replaces the file at `path` with `body` through a temporary file unique to this write.
+async fn write_atomic(path: &std::path::Path, body: &[u8]) -> anyhow::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    tokio::fs::write(&tmp, body)
+        .await
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e).with_context(|| format!("cannot write {}", path.display()));
+    }
+    Ok(())
 }
 
 /// One peer of the snapshot.
@@ -176,4 +192,41 @@ pub fn netstack_json(stack: &nsplane_netstack::NetStackHandle) -> Value {
         "udp_not_accepted": stats.udp_not_accepted,
         "egress_full": stats.egress_full,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_never_collide() {
+        let dir = std::env::temp_dir().join(format!("nsplane-status-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("status.json");
+        let writers: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                tokio::spawn(async move {
+                    for j in 0..50 {
+                        write_atomic(&path, format!("{{\"w\":{i},\"n\":{j}}}").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        write_atomic(&path, b"{\"final\":true}").await.unwrap();
+        let body = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(body, b"{\"final\":true}");
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, ["status.json"], "temporary files are left behind");
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
 }

@@ -113,3 +113,7 @@ nsplane repository only; `/srv/dotns/ns` and `/srv/dotns/docs` read-only. Depend
   overhead) and `Core::route(dst)` for delivering locally generated ICMP; both added by 5A.
   Callers put a peer's alias4/32 and lan4 prefixes in its allowed IPs (core routes before the
   filters).
+- 2026-10-02: the core's PacketFilter chain becomes onion-ordered: install order goes from the
+  wire side to the local side, inbound runs in install order, outbound in reverse. The
+  recommended stack [AclFilter, PortMap, Translator] keeps the ACL on overlay IPv6 addresses in
+  both directions. Behaviour change for multi-filter users only; done in 5A-T3.
