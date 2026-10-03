@@ -196,7 +196,10 @@ async fn reassemble(raw: &mut Node<ChannelTransport>) -> TestResult<(Vec<u8>, us
             fragment[10..12]
         );
         assert_eq!(fragment[6] & DF, 0, "DF clear");
-        assert_eq!(*id.get_or_insert(ip.identification()), ip.identification());
+        assert_eq!(
+            *id.get_or_insert_with(|| ip.identification()),
+            ip.identification()
+        );
         let flags = u16::from_be_bytes([fragment[6], fragment[7]]);
         let offset = usize::from(flags & 0x1FFF) * 8;
         if offset == 0 {

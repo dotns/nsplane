@@ -388,7 +388,7 @@ mod tests {
         Ok(())
     }
 
-    /// A stack at 10.8.0.1 and fd00::1 with MTU 1420 and `udp_allow_fragmentation` set to
+    /// A stack at 10.8.0.1 and `fd00::1` with MTU 1420 and `udp_allow_fragmentation` set to
     /// `allow`, plus its source and sink.
     fn fragmenting_stack(
         allow: bool,
@@ -487,9 +487,9 @@ mod tests {
 
         let v4 = handle.bind_udp("10.8.0.1:53".parse()?).await?;
         let remote: SocketAddr = "10.0.0.2:5353".parse()?;
-        v4.send_to(&[1; 65_535 - 28], remote).await?;
+        v4.send_to(&vec![1; 65_535 - 28], remote).await?;
         let error = v4
-            .send_to(&[1; 65_535 - 27], remote)
+            .send_to(&vec![1; 65_535 - 27], remote)
             .await
             .err()
             .ok_or("a packet above 65 535 bytes must fail")?;

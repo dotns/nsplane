@@ -35,7 +35,7 @@ async fn unacked_and_last_ack_follow_the_peer_window() -> TestResult {
 
     // The client's 4 KiB receive buffer fills and it stops reading: the rest of the
     // 32 KiB stays unacknowledged.
-    conn.write_all(&[7; 32 * 1024]).await?;
+    conn.write_all(&vec![7; 32 * 1024]).await?;
     peer.pump(40).await;
     let stalled_at = conn.last_ack().ok_or("the first window was acknowledged")?;
     assert!(conn.unacked() > 0);
