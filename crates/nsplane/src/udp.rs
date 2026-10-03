@@ -1,15 +1,20 @@
 //! The default network-side transport: one tokio UDP socket driven through `quinn-udp`,
-//! with segmentation offload.
+//! with segmentation offload, and an optional side channel for datagrams that are not the
+//! engine's on the same socket.
 
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use bytes::Bytes;
 use nsplane_packet::{Ecn, PacketBuf, Path, TransportId};
 use quinn_udp::{EcnCodepoint, Transmit, UdpSockRef, UdpSocketState};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use crate::transport::Transport;
 
@@ -99,12 +104,20 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// before the receive. ICMP port-unreachable errors, which Windows reports on a later
 /// receive as `WSAECONNRESET`, are skipped and receiving continues.
 ///
+/// Side channel: [`with_side_channel`](Self::with_side_channel) takes the datagrams a
+/// classifier picks (another protocol sharing the port) out of
+/// [`recv`](Transport::recv) and [`recv_batch`](Transport::recv_batch), each datagram of a
+/// coalesced read on its own, and hands them to a channel instead of the engine; a
+/// [`SideSender`] sends that protocol's datagrams on the same socket. Without a side
+/// channel nothing is classified.
+///
 /// The transport never closes: it lives as long as its socket.
 #[derive(Debug)]
 pub struct UdpTransport {
     id: TransportId,
     local: SocketAddr,
-    socket: UdpSocket,
+    /// Shared with the [`SideSender`]s.
+    socket: Arc<UdpSocket>,
     /// `None` when bound without offload, or where `quinn-udp` could not set the socket up
     /// (only on other platforms than Linux and Android).
     state: Option<UdpSocketState>,
@@ -113,6 +126,7 @@ pub struct UdpTransport {
     offload: AtomicBool,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rx: std::sync::Mutex<linux::Rx>,
+    side: Option<Side>,
 }
 
 impl UdpTransport {
@@ -184,13 +198,51 @@ impl UdpTransport {
         Ok(Self {
             id,
             local,
-            socket,
+            socket: Arc::new(socket),
             state,
             plain: !offload,
             offload: AtomicBool::new(offload),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rx: std::sync::Mutex::default(),
+            side: None,
         })
+    }
+
+    /// Attaches a side channel: every received datagram for which `classify` returns true
+    /// is taken out of [`recv`](Transport::recv) and [`recv_batch`](Transport::recv_batch)
+    /// (each datagram of a coalesced read on its own) and handed to the returned receiver,
+    /// which holds up to `capacity` of them; when it is full or closed the datagram is
+    /// dropped. Either way it never reaches the engine, and receiving goes on with the next
+    /// datagram. `classify` runs on the receiving task for every datagram, so it should be
+    /// cheap (a prefix check).
+    ///
+    /// The [`SideSender`] sends on the transport's socket and counts what the receiver
+    /// took and what it could not ([`SideStats`]).
+    ///
+    /// Attaching another side channel replaces this one: its receiver then closes once
+    /// drained, and its senders keep sending but count nothing more.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0.
+    pub fn with_side_channel(
+        mut self,
+        classify: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
+        capacity: usize,
+    ) -> (Self, SideSender, mpsc::Receiver<SideDatagram>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let counters = Arc::new(SideCounters::default());
+        let sender = SideSender {
+            socket: Arc::clone(&self.socket),
+            local: self.local,
+            counters: Arc::clone(&counters),
+        };
+        self.side = Some(Side {
+            classify: Box::new(classify),
+            tx,
+            counters,
+        });
+        (self, sender, rx)
     }
 
     /// The bound address (with the OS-chosen port when bound to port 0).
@@ -219,7 +271,7 @@ impl UdpTransport {
         let Some(state) = &self.state else {
             return socket2::SockRef::from(&self.socket).set_send_buffer_size(bytes);
         };
-        state.set_send_buffer_size(UdpSockRef::from(&self.socket), bytes)
+        state.set_send_buffer_size(UdpSockRef::from(&*self.socket), bytes)
     }
 
     /// The receive buffer size the kernel reports (`SO_RCVBUF`): on Linux twice the
@@ -275,16 +327,14 @@ impl UdpTransport {
 
     /// Maps `addr` to the socket's address family.
     fn target(&self, addr: SocketAddr) -> io::Result<SocketAddr> {
-        match (self.local, addr) {
-            (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
-                Ok(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0).into())
-            }
-            (SocketAddr::V4(_), SocketAddr::V6(_)) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IPv6 destination on an IPv4 socket",
-            )),
-            _ => Ok(addr),
-        }
+        target(self.local, addr)
+    }
+
+    /// Whether the side channel took the datagram `datagram` from `from` (unmapped).
+    fn side_took(&self, datagram: &[u8], from: SocketAddr) -> bool {
+        self.side
+            .as_ref()
+            .is_some_and(|side| side.take(datagram, from))
     }
 
     /// The path of a datagram received from `addr` with mark `ecn`.
@@ -326,7 +376,7 @@ impl UdpTransport {
         };
         self.socket
             .async_io(Interest::WRITABLE, || {
-                state.try_send(UdpSockRef::from(&self.socket), &transmit)
+                state.try_send(UdpSockRef::from(&*self.socket), &transmit)
             })
             .await
     }
@@ -379,6 +429,129 @@ impl Transport for UdpTransport {
             result.inspect_err(|_| *failed += run)?;
         }
         Ok(())
+    }
+}
+
+/// A datagram the side channel took (see [`UdpTransport::with_side_channel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideDatagram {
+    /// The sender, reported as [`Path::addr`] would report it (IPv4 peers of a dual-stack
+    /// socket as plain IPv4 addresses).
+    pub from: SocketAddr,
+    /// The datagram as received; one longer than the receive buffer may be truncated, as
+    /// through [`recv`](Transport::recv).
+    pub datagram: Bytes,
+}
+
+/// Counters of a side channel, from [`SideSender::stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SideStats {
+    /// Datagrams handed to the side channel's receiver.
+    pub received: u64,
+    /// Datagrams the side channel took but its receiver could not take (full or closed),
+    /// so they were dropped.
+    pub dropped: u64,
+}
+
+/// Sends datagrams on the socket of a [`UdpTransport`] with a side channel (see
+/// [`UdpTransport::with_side_channel`]); cheap to clone.
+///
+/// Sending is synchronous and best effort, so a caller never waits on the engine's
+/// traffic: [`send_to`](Self::send_to) hands the datagram to the socket at once, or fails
+/// with [`io::ErrorKind::WouldBlock`] when the socket's send buffer is full.
+#[derive(Debug, Clone)]
+pub struct SideSender {
+    socket: Arc<UdpSocket>,
+    local: SocketAddr,
+    counters: Arc<SideCounters>,
+}
+
+impl SideSender {
+    /// Sends `datagram` to `to` from the transport's socket, without an ECN mark and without
+    /// segmentation. IPv4 destinations of a dual-stack socket are mapped as the transport
+    /// maps them; an IPv6 destination on an IPv4 socket fails with
+    /// [`io::ErrorKind::InvalidInput`]. Does not wait: when the socket cannot take the
+    /// datagram now this fails with [`io::ErrorKind::WouldBlock`] and the datagram is not
+    /// sent.
+    pub fn send_to(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
+        // Straight to the non-blocking socket: tokio's `try_send_to` also fails while it
+        // has not seen the socket writable yet.
+        socket2::SockRef::from(&*self.socket)
+            .send_to(datagram, &target(self.local, to)?.into())
+            .map(drop)
+    }
+
+    /// The transport's bound address.
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// What the side channel received and dropped so far.
+    pub fn stats(&self) -> SideStats {
+        SideStats {
+            received: self.counters.received.load(Ordering::Relaxed),
+            dropped: self.counters.dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The counters behind [`SideStats`].
+#[derive(Debug, Default)]
+struct SideCounters {
+    received: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// The classifier of a side channel.
+type Classify = dyn Fn(&[u8]) -> bool + Send + Sync;
+
+/// An attached side channel.
+struct Side {
+    classify: Box<Classify>,
+    tx: mpsc::Sender<SideDatagram>,
+    counters: Arc<SideCounters>,
+}
+
+impl Side {
+    /// Hands `datagram` from `from` to the receiver if it is classified as a side datagram,
+    /// counting it as received or dropped; whether it was.
+    fn take(&self, datagram: &[u8], from: SocketAddr) -> bool {
+        if !(self.classify)(datagram) {
+            return false;
+        }
+        let side = SideDatagram {
+            from,
+            datagram: Bytes::copy_from_slice(datagram),
+        };
+        let counter = match self.tx.try_send(side) {
+            Ok(()) => &self.counters.received,
+            Err(_) => &self.counters.dropped,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+impl fmt::Debug for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Side")
+            .field("tx", &self.tx)
+            .field("counters", &self.counters)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Maps `addr` to the address family of a socket bound to `local`.
+fn target(local: SocketAddr, addr: SocketAddr) -> io::Result<SocketAddr> {
+    match (local, addr) {
+        (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
+            Ok(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0).into())
+        }
+        (SocketAddr::V4(_), SocketAddr::V6(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv6 destination on an IPv4 socket",
+        )),
+        _ => Ok(addr),
     }
 }
 
@@ -533,7 +706,11 @@ mod linux {
                 }
                 match &self.state {
                     Some(state) if self.offload() => self.read_coalesced(state).await?,
-                    _ => return self.read_into(buf).await,
+                    _ => {
+                        if let Some(received) = self.read_into(buf).await? {
+                            return Ok(received);
+                        }
+                    }
                 }
             }
         }
@@ -563,19 +740,21 @@ mod linux {
                 match &self.state {
                     Some(state) if self.offload() => self.read_coalesced(state).await?,
                     _ => {
-                        let (len, path) = self.read_into(buf).await?;
-                        datagrams
-                            .push_back((path, PacketBuf::from_packet(&buf.as_packet()[..len])));
-                        return Ok(());
+                        if let Some((len, path)) = self.read_into(buf).await? {
+                            datagrams
+                                .push_back((path, PacketBuf::from_packet(&buf.as_packet()[..len])));
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
 
-        /// Reads into `buf` under the [`recv`](crate::Transport::recv) buffer contract.
-        /// Datagrams after the first of a train (coalesced before offload was turned off)
-        /// are copied to the pending queue.
-        async fn read_into(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        /// Reads into `buf` under the [`recv`](crate::Transport::recv) buffer contract;
+        /// `None` when the side channel took the datagram. Datagrams after the first of a
+        /// train (coalesced before offload was turned off) are copied to the pending queue,
+        /// but for those the side channel takes.
+        async fn read_into(&self, buf: &mut PacketBuf) -> io::Result<Option<(usize, Path)>> {
             buf.set_len(buf.capacity());
             let Some(state) = &self.state else {
                 let (len, addr, ecn) = self
@@ -583,14 +762,15 @@ mod linux {
                     .await
                     .inspect_err(|_| buf.set_len(0))?;
                 buf.set_len(len);
-                return Ok((len, self.path(addr, ecn)));
+                let path = self.path(addr, ecn);
+                return Ok((!self.side_took(buf.as_packet(), path.addr)).then_some((len, path)));
             };
             let meta = self
                 .socket
                 .async_io(Interest::READABLE, || {
                     let mut meta = [RecvMeta::default()];
                     let mut bufs = [IoSliceMut::new(buf.as_packet_mut())];
-                    state.recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    state.recv(UdpSockRef::from(&*self.socket), &mut bufs, &mut meta)?;
                     Ok(meta[0])
                 })
                 .await
@@ -600,16 +780,19 @@ mod linux {
             if len > 0 && len < meta.len {
                 let mut rx = self.rx();
                 for datagram in buf.as_packet()[len..meta.len].chunks(len) {
-                    rx.pending
-                        .push_back((path, PacketBuf::from_packet(datagram)));
+                    if !self.side_took(datagram, path.addr) {
+                        rx.pending
+                            .push_back((path, PacketBuf::from_packet(datagram)));
+                    }
                 }
             }
             buf.set_len(len);
-            Ok((len, path))
+            Ok((!self.side_took(buf.as_packet(), path.addr)).then_some((len, path)))
         }
 
         /// Reads one datagram or train into the shared storage and queues its datagrams,
-        /// each a zero-copy slice of the storage at the offset it was read to (no headroom).
+        /// each a zero-copy slice of the storage at the offset it was read to (no headroom),
+        /// but for those the side channel takes.
         async fn read_coalesced(&self, state: &UdpSocketState) -> io::Result<()> {
             self.socket
                 .async_io(Interest::READABLE, || {
@@ -623,14 +806,18 @@ mod linux {
                     }
                     let mut meta = [RecvMeta::default()];
                     let mut bufs = [IoSliceMut::new(&mut rx.buf[..READ])];
-                    state.recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
+                    state.recv(UdpSockRef::from(&*self.socket), &mut bufs, &mut meta)?;
                     let meta = meta[0];
                     let path = self.path(meta.addr, ecn(&meta));
                     let stride = meta.stride.clamp(1, READ);
                     let count = meta.len.div_ceil(stride).max(1);
                     let len = |i: usize| stride.min(meta.len - i * stride);
+                    let side = self.side.as_ref();
                     for i in 0..count {
                         let slot = rx.buf.split_to(len(i));
+                        if side.is_some_and(|side| side.take(&slot, path.addr)) {
+                            continue;
+                        }
                         match PacketBuf::from_shared(slot, 0, len(i)) {
                             Ok(datagram) => rx.pending.push_back((path, datagram)),
                             Err(e) => {
@@ -733,15 +920,21 @@ mod linux {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl UdpTransport {
-    /// [`Transport::recv`] without receive offload: one datagram per call, no ECN.
+    /// [`Transport::recv`] without receive offload: one datagram per call, no ECN; the
+    /// datagrams the side channel takes are skipped.
     async fn recv_datagram(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
-        buf.set_len(buf.capacity());
-        let (len, addr) = self
-            .recv_from(buf.as_packet_mut())
-            .await
-            .inspect_err(|_| buf.set_len(0))?;
-        buf.set_len(len);
-        Ok((len, self.path(addr, Ecn::NotEct)))
+        loop {
+            buf.set_len(buf.capacity());
+            let (len, addr) = self
+                .recv_from(buf.as_packet_mut())
+                .await
+                .inspect_err(|_| buf.set_len(0))?;
+            buf.set_len(len);
+            let path = self.path(addr, Ecn::NotEct);
+            if !self.side_took(buf.as_packet(), path.addr) {
+                return Ok((len, path));
+            }
+        }
     }
 
     /// Receives one datagram with plain `recv_from`, truncated to `packet`.
@@ -1589,6 +1782,207 @@ mod tests {
                 a.local_addr(),
                 Ecn::NotEct,
             );
+        }
+    }
+
+    /// The prefix of the side datagrams in the side channel tests.
+    const SIDE: &[u8] = b"NSGWP2P1";
+
+    fn is_side(datagram: &[u8]) -> bool {
+        datagram.starts_with(SIDE)
+    }
+
+    /// A side datagram carrying `body`.
+    fn side(body: &[u8]) -> Vec<u8> {
+        [SIDE, body].concat()
+    }
+
+    /// The side datagrams waiting in `rx`, as `(from, datagram)`.
+    fn drain(rx: &mut mpsc::Receiver<SideDatagram>) -> Vec<(SocketAddr, Vec<u8>)> {
+        let mut taken = Vec::new();
+        while let Ok(side) = rx.try_recv() {
+            taken.push((side.from, side.datagram.to_vec()));
+        }
+        taken
+    }
+
+    /// Side datagrams sent before a WireGuard-like one are taken out of `recv`, which
+    /// returns the WireGuard-like one.
+    #[tokio::test]
+    async fn side_channel_takes_classified_datagrams_from_recv() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let (b, _, mut side_rx) =
+                bind_with(2, "127.0.0.1:0", offload).with_side_channel(is_side, 8);
+            let control = side(b"control");
+            for datagram in [&control[..], &control, DATAGRAM] {
+                a.send(datagram, &path_to(b.local_addr(), Ecn::NotEct))
+                    .await
+                    .unwrap();
+            }
+            let (buf, path) = recv(&b, 1500).await;
+            assert_eq!(buf.as_packet(), DATAGRAM);
+            assert_eq!(path.addr, a.local_addr());
+            assert_eq!(drain(&mut side_rx), vec![(a.local_addr(), control); 2]);
+        }
+    }
+
+    /// A train of equally sized datagrams, every third one a side datagram: `recv_batch`
+    /// and `recv` hand out the others in order and the side channel gets the side ones,
+    /// with offload on (one coalesced read where the kernel coalesces) and off.
+    #[tokio::test]
+    async fn side_channel_splits_mixed_trains() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let (b, sender, mut side_rx) =
+                bind_with(2, "127.0.0.1:0", offload).with_side_channel(is_side, 64);
+            // Ends with a WireGuard-like datagram, so every side one was read before it.
+            let datagrams: Vec<_> = (0..21)
+                .map(|seq| {
+                    let datagram = numbered(seq, 1280);
+                    if seq % 3 == 1 {
+                        side(&datagram[SIDE.len()..])
+                    } else {
+                        datagram
+                    }
+                })
+                .collect();
+            let (sides, wireguard): (Vec<_>, Vec<_>) =
+                datagrams.iter().cloned().partition(|d| is_side(d));
+            let sides: Vec<_> = sides.into_iter().map(|d| (a.local_addr(), d)).collect();
+            let batch = batch(b.local_addr(), Ecn::Ect0, &datagrams);
+
+            send_all(&a, &batch).await;
+            let calls = recv_batches(&b, wireguard.len()).await;
+            if coalescing(&a, &b) {
+                assert_eq!(calls.len(), 1, "one coalesced read");
+            }
+            check(&calls.concat(), &wireguard, a.local_addr(), Ecn::Ect0);
+            assert_eq!(drain(&mut side_rx), sides);
+
+            send_all(&a, &batch).await;
+            let mut received = Vec::new();
+            for _ in &wireguard {
+                let (buf, path) = recv(&b, 1500).await;
+                received.push((path, buf));
+            }
+            check(&received, &wireguard, a.local_addr(), Ecn::Ect0);
+            assert_eq!(drain(&mut side_rx), sides);
+            assert_eq!(
+                sender.stats(),
+                SideStats {
+                    received: 2 * sides.len() as u64,
+                    dropped: 0
+                }
+            );
+        }
+    }
+
+    /// A full receiver drops side datagrams and counts them; a read of side datagrams only
+    /// does not end `recv_batch` without a datagram.
+    #[tokio::test]
+    async fn side_channel_counts_drops_when_full() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let (b, sender, mut side_rx) =
+                bind_with(2, "127.0.0.1:0", offload).with_side_channel(is_side, 1);
+            let sides = vec![side(b"control"); 3];
+            send_all(&a, &batch(b.local_addr(), Ecn::NotEct, &sides)).await;
+            a.send(DATAGRAM, &path_to(b.local_addr(), Ecn::NotEct))
+                .await
+                .unwrap();
+            let calls = recv_batches(&b, 1).await;
+            check(
+                &calls.concat(),
+                &[DATAGRAM.to_vec()],
+                a.local_addr(),
+                Ecn::NotEct,
+            );
+            assert_eq!(
+                sender.stats(),
+                SideStats {
+                    received: 1,
+                    dropped: 2
+                }
+            );
+            assert_eq!(drain(&mut side_rx).len(), 1);
+        }
+    }
+
+    /// A closed receiver drops side datagrams and counts them.
+    #[tokio::test]
+    async fn side_channel_counts_drops_when_closed() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let (b, sender, side_rx) =
+                bind_with(2, "127.0.0.1:0", offload).with_side_channel(is_side, 4);
+            drop(side_rx);
+            let control = side(b"control");
+            for datagram in [&control[..], &control, DATAGRAM] {
+                a.send(datagram, &path_to(b.local_addr(), Ecn::NotEct))
+                    .await
+                    .unwrap();
+            }
+            let (buf, _) = recv(&b, 1500).await;
+            assert_eq!(buf.as_packet(), DATAGRAM);
+            assert_eq!(
+                sender.stats(),
+                SideStats {
+                    received: 0,
+                    dropped: 2
+                }
+            );
+        }
+    }
+
+    /// A side sender sends from the transport's address, unmarked, mapping destinations as
+    /// the transport does; side datagrams back are reported from the unmapped address. A
+    /// second side channel replaces the first.
+    #[tokio::test]
+    async fn side_sender_sends_from_the_transport() {
+        for offload in OFFLOAD {
+            let (dual, sender, mut side_rx) =
+                bind_with(1, "[::]:0", offload).with_side_channel(is_side, 4);
+            assert_eq!(sender.local_addr(), dual.local_addr());
+            let v4 = bind_with(2, "127.0.0.1:0", offload);
+            let dual_v4 = seen_as(&dual, "127.0.0.1");
+            let control = side(b"punch");
+            sender.send_to(&control, v4.local_addr()).unwrap();
+            let (buf, path) = recv(&v4, 1500).await;
+            assert_eq!(buf.as_packet(), control);
+            assert_eq!(path.addr, dual_v4);
+            assert_eq!(path.ecn, Ecn::NotEct);
+
+            for datagram in [&control[..], DATAGRAM] {
+                v4.send(datagram, &path_to(dual_v4, Ecn::NotEct))
+                    .await
+                    .unwrap();
+            }
+            let (buf, _) = recv(&dual, 1500).await;
+            assert_eq!(buf.as_packet(), DATAGRAM);
+            assert_eq!(drain(&mut side_rx), [(v4.local_addr(), control.clone())]);
+
+            let (_, v4_sender, _) =
+                bind_with(3, "127.0.0.1:0", offload).with_side_channel(is_side, 1);
+            let err = v4_sender
+                .send_to(&control, "[::1]:9".parse().unwrap())
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            let (dual, second, mut second_rx) = dual.with_side_channel(is_side, 4);
+            assert!(matches!(
+                side_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ));
+            for datagram in [&control[..], DATAGRAM] {
+                v4.send(datagram, &path_to(dual_v4, Ecn::NotEct))
+                    .await
+                    .unwrap();
+            }
+            recv(&dual, 1500).await;
+            assert_eq!(drain(&mut second_rx), [(v4.local_addr(), control)]);
+            assert_eq!(sender.stats().received, 1);
+            assert_eq!(second.stats().received, 1);
         }
     }
 }

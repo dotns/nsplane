@@ -24,6 +24,7 @@ nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
 
 [dev-dependencies]
+bytes = { workspace = true }
 nsplane-acl = { path = "../nsplane-acl", version = "0.8.0" }
 nsplane-nat = { path = "../nsplane-nat", version = "0.8.0" }
 nsplane-uapi = { path = "../nsplane-uapi", version = "0.8.0" }
