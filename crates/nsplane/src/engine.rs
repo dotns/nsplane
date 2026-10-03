@@ -45,8 +45,9 @@ const MAX_DATAGRAM: usize = 65535;
 /// I/O tasks surround it, each connected through a bounded queue: the source task
 /// ([`PacketSource::recv`]), the sink task ([`PacketSink::send`]) and, for every transport,
 /// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The core
-/// is never shared; the only lock on the data path is each peer's tunnel mutex, uncontended
-/// without crypto workers.
+/// is never shared. Without crypto workers the data path takes no lock: each peer owns its
+/// tunnel. With crypto workers each peer's tunnel is shared with its jobs behind a mutex,
+/// uncontended except while a job of that peer runs.
 ///
 /// Transports: the engine runs any number of transports, keyed by [`Transport::id`]. Every
 /// transport's received datagrams feed the core through one queue, so a peer's
