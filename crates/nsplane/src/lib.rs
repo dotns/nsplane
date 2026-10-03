@@ -33,10 +33,11 @@ pub use builder::{BuildError, EngineBuilder};
 pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use engine::Engine;
 pub use events::{
-    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
+    DROP_FRAGMENT_NO_ROUTE, DROP_FRAGMENT_OVERSIZE, DROP_FRAGMENT_RATE_LIMITED, DROP_NO_TRANSPORT,
+    DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Event,
 };
-pub use fragment::FragmentConfig;
+pub use fragment::{FragmentConfig, FragmentStats};
 pub use handle::{EngineError, EngineHandle, Peer, QueueDepth, QueueStats, TransportError};
 pub use io::{PacketSink, PacketSource};
 pub use merge::MergeSource;

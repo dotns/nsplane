@@ -50,3 +50,12 @@ pub const TRANSPORT_REMOVED: &str = "transport removed";
 /// Emitted by the driver: the transport failed to send a datagram (any I/O error, such as a
 /// datagram too large for the path).
 pub const TRANSPORT_SEND_ERROR: &str = "transport send error";
+/// Emitted by the driver: a local packet above the MTU was dropped by the fragmentation
+/// stage without an ICMP error (an error about it is not allowed, or it cannot be split).
+pub const FRAGMENT_OVERSIZE: &str = "oversize packet";
+/// Emitted by the driver: a local packet above the MTU was dropped by the fragmentation
+/// stage, and no ICMP error was sent because its destination has no route.
+pub const FRAGMENT_NO_ROUTE: &str = "no route for ICMP error";
+/// Emitted by the driver: a local packet above the MTU was dropped by the fragmentation
+/// stage, and no ICMP error was sent because of the error rate limit.
+pub const FRAGMENT_RATE_LIMITED: &str = "ICMP error rate limited";
