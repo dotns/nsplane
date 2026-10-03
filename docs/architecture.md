@@ -37,7 +37,7 @@ where it is described below.
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket` | `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport` | `UdpTransport`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
@@ -311,6 +311,40 @@ the `data_path` core round trip measures 532 ns at 64 B (device-equivalent 474 n
 offload through `quinn-udp`.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
+
+**UDP side channel.** Another protocol can share the `UdpTransport`'s port (ns control
+messages next to WireGuard, say). `UdpTransport::with_side_channel(classify, capacity)`
+runs `classify` on every received datagram, each GRO segment on its own, in the receive
+path of `recv` and `recv_batch`; a datagram it picks is copied into a `SideDatagram`
+(`from`, unmapped as `Path::addr` reports it, and `datagram`) and `try_send`-ed to the
+returned receiver of `capacity` entries, never reaching the engine; a full or closed
+receiver drops it. `SideSender::stats` counts both (`SideStats { received, dropped }`);
+they live on the sender, not in `TransportStats`, because side datagrams never reach the
+engine's transport tasks. `SideSender::send_to` writes straight to the non-blocking socket
+without an ECN mark: it never waits behind the engine's traffic and fails with
+`WouldBlock` when the send buffer is full. A capacity of 0 panics; a second call replaces
+the channel (the old receiver closes once drained). Without a side channel nothing is
+classified; the receive path checks one `Option` per datagram.
+
+**Message links.** `LinkTransport` (opt-in; nothing runs unless one is created) carries
+datagrams to one peer as messages over a link the embedder dials, so `nsplane` itself has
+no WebSocket or TLS dependency. Its task asks the `LinkDialer` for a link (a `LinkSender`
+and a `LinkReceiver`), drains the send queue into it and hands received messages to
+`recv`, reported from `Path { transport: id, addr: peer, ecn: NotEct }`; sends to another address are
+dropped and count as sent.
+
+- `LinkConfig::queue` (256) bounds the datagrams waiting for the link, also while none is
+  up; `send` never waits, and on a full queue fails with `WouldBlock`, which the engine
+  counts under `DROP_TRANSPORT_SEND_ERROR`.
+- A link ends when the receiver yields `None` or an error, a send fails (that datagram is
+  lost; the queued ones go out on the next link) or `LinkConfig::read_idle_timeout`
+  (default `None`) passes without a message. The task reports `LinkState::Disconnected`
+  to `LinkDialer::on_state` and dials again at once, also after a failed dial; the dialer
+  owns the backoff and may sleep in `dial`.
+- The idle timeout is reset only by messages the receiver yields, so a dialer whose
+  keepalive frames are consumed inside its receiver does its own idle detection. The
+  examples' WSS client (`examples/src/relay/wss/client.rs`, a tokio-tungstenite dialer)
+  does: it pings every 10 s and closes a connection silent for 35 s.
 
 **Fragmentation.** `EngineBuilder::fragmenter(FragmentConfig)` installs a stage on the local
 path, in the owner task before the core, that keeps every local packet within the source's
@@ -685,6 +719,8 @@ path, so such a client pays no extra latency for it.
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
+| UDP side channel | `nsplane` | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified, no task or copy |
+| Message-link transport | `nsplane` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task is spawned and no dependency added; the dialer (WebSocket, TLS) is the embedder's |
 
 **Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
 `nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`

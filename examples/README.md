@@ -271,9 +271,11 @@ Every node example runs the same client with `--transport relay`:
 `--transport wss` is the same client with the relay reached over WebSocket over TLS; UDP on
 `--listen` still carries the direct paths and any other `--relay`. The relay's address
 (below) is added to the endpoints and is the `endpoint=` of peers reached through it.
-Datagrams to it while the connection is down are dropped and counted; the connection
-reconnects with backoff (250 ms doubling to 5 s) and discovery restarts on every connect,
-so the node registers again right away.
+The client is an `nsplane::LinkTransport` with a tokio-tungstenite dialer. Datagrams to
+the relay wait in the link's queue (256) while the connection is down, and a send fails at
+once when it is full; the connection reconnects with backoff (250 ms doubling to 5 s),
+pings every 10 s and is redialed after 35 s without a frame, and discovery restarts on
+every connect, so the node registers again right away.
 
 | Flag | Meaning |
 |---|---|
@@ -306,7 +308,7 @@ authenticates. Status:
 | `.extra.paths["<peer pubkey b64>"].{confirmed,direct,relay,candidates,to_direct,to_relay}` | ladder state and transition counters |
 | `.extra.wss.{connected,reconnects,connect_failures}` | `--transport wss`: connection up, reconnects after the first connect, failed attempts |
 | `.extra.wss.{tx,rx,drops}` | datagrams sent / received over the connection, dropped |
-| `.extra.wss.dropped.{disconnected,queue_full,text,oversized,no_route}` | drops by reason |
+| `.extra.wss.dropped.{disconnected,queue_full,text,oversized,no_route}` | drops by reason; `disconnected` stays 0 (datagrams wait in the queue), `queue_full` counts sends that failed on a full queue |
 | `.extra.wss.{url,relay}` | the URL and the relay's address |
 
 ### app_session

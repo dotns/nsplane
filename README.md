@@ -25,7 +25,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
 | `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, per-source rule namespaces, directed grants, outbound rules and app pinholes, and the `AclFilter` and `FlowTracker` packet filters |
 | `crates/nsplane-nat/`    | `nsplane-nat`    | IPv4/IPv6 translation (`Translator`, RFC 7915) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
-| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
+| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport (with an optional side channel), `LinkTransport` over a dialed message link |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp ([dotns/smoltcp](https://github.com/dotns/smoltcp) fork; TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
@@ -103,6 +103,8 @@ on the data path, so such a client pays no extra latency for it:
 | Netstack (`nsplane-netstack`), `Splitter`, `MergeSource` | `NetStack::split`, `Splitter`, `MergeSource` as the builder's source and sink | not used | none |
 | TUN offload (Linux, Android) | on with `Tun::create`; `TunOptions::new().offload(false)` opts out | on where the kernel supports it | off: one system call per packet |
 | UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: one system call per datagram |
+| UDP side channel | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified |
+| `LinkTransport` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task runs unless it is created |
 
 Offload never waits for more packets: the engine fills batches only with packets already
 queued (non-blocking `try_recv`, no timers), TUN and UDP segmentation coalesce only within
