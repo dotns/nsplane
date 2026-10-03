@@ -145,6 +145,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning `BoundsError` instead of panicking.
 - `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
   re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
+- `nsplane`: batched I/O. `PacketSource::recv_batch(&mut PacketBatch)`,
+  `PacketSink::send_batch(&mut VecDeque<(PeerId, PacketBuf)>)`,
+  `Transport::recv_batch(&mut PacketBuf, &mut VecDeque<(Path, PacketBuf)>)` and
+  `Transport::send_batch(&[(Path, PacketBuf)], &mut usize)` are additive default methods
+  (one packet or datagram at a time) that `DynTransport` mirrors. The engine's I/O tasks
+  move up to `MAX_BATCH` (64) packets or datagrams per call and keep backpressure, the
+  handback of unsent datagrams on stop and buffer recycling.
+- `nsplane-tun` (Linux, Android): virtio-net segmentation offload. `Tun::create` opens the
+  device with `IFF_VNET_HDR` and enables checksum offload and TSO4/6 (`TUNSETOFFLOAD`), plus
+  USO4/6 when the kernel accepts it, and falls back to a plain `IFF_NO_PI` device when the
+  kernel supports neither; `Tun::offload` reports the outcome (`Offload { vnet_hdr, tso, uso
+  }`). `Tun::create_with(name, TunOptions::new().offload(false))` opts out. The source reads
+  up to 64 KiB plus the 10-byte header at once and segments TCP/UDP super-packets into
+  pooled `PacketBuf`s no larger than the MTU; the sink coalesces runs of TCP packets (and
+  of equally sized UDP datagrams with USO) of one flow into one super-packet, written with
+  one `writev` of the header and the packet pieces (no join copy). An adopted fd uses vnet
+  framing only if it was opened with `IFF_VNET_HDR` (segmented on read, written as
+  `GSO_NONE`). macOS, iOS and Windows are unchanged. An `offload` bench (`cargo bench -p
+  nsplane-tun --bench offload`): a 64 KiB TCPv4 super-packet splits into 48 segments in
+  4.58 us, 48 segments coalesce into one in 6.17 us.
+- `nsplane`: UDP segmentation offload through `quinn-udp` 0.6.3. `UdpTransport::bind` turns
+  it on: GSO sends in `send_batch` on every platform that has it, GRO receives in
+  `recv_batch` on Linux and Android, where every datagram of a GRO train is a
+  `PacketBuf::from_shared` slice of the read buffer (no copy, headroom 0; the core opens it
+  in place at any headroom). `UdpTransport::bind_with_offload(id, addr, false)` binds the
+  Phase 3+4 socket (no `quinn-udp` setup, the OS's default fragmentation, the previous
+  `cmsg` ECN path); `set_offload` and `offload` switch and report it at runtime
+  (`set_offload(false)` on an offload-bound socket keeps DF, `set_offload(true)` on a
+  socket bound without it fails with `Unsupported`). With offload on, outer datagrams
+  above the path MTU fail with `EMSGSIZE`; the engine counts them under
+  `TRANSPORT_SEND_ERROR` (`nsplane_core::reasons::TRANSPORT_SEND_ERROR`, alias
+  `nsplane::DROP_TRANSPORT_SEND_ERROR`; `drop_counters`, `Event::Dropped`). Where
+  `quinn-udp` cannot set the socket up (Wine), sends fall back to plain `send_to`. A
+  `udp_offload` bench (`cargo bench -p nsplane --bench udp_offload`, 64 x 1420 B over
+  loopback): ~8 us with offload, ~85 us without.
+- `nsplane`: `UdpTransport::bind` requests 4 MiB socket buffers (`SO_RCVBUF`,
+  `SO_SNDBUF`); `set_recv_buffer_size`, `set_send_buffer_size`, `recv_buffer_size` and
+  `send_buffer_size` change and report them (Linux reports twice the granted size). The
+  kernel clamps the request to `net.core.rmem_max` / `net.core.wmem_max`, so large bursts
+  need those sysctls raised (e.g. to 4194304); `SO_RCVBUFFORCE` is not used.
+- `nsplane-uapi`: `Uapi::with_external_transport(handle, port)` serves an engine whose
+  transport under the UAPI's id is not a UDP transport the UAPI owns (a relay or WSS
+  carrier); `bind_transport` fails there with `Unsupported`.
+- `nsplane-examples`: `--no-offload` on every node example (including `hybrid` and
+  `relay_server`; `node::create_tun`, `node::bind_udp`) opens a plain TUN device and binds
+  UDP without GSO/GRO; the startup logs name the modes (`offload=<mode>`,
+  `udp_offload=<mode>`).
+- `nsplane-e2e`: `offload_batch`, `offload_udp` and `offload` tests, and
+  `nsplane-tun`'s `linux_offload` tests (root), cover batching, UDP GSO/GRO and TUN
+  offload. `just e2e-examples` adds the scenarios `offload_iperf` (iperf3 TCP and UDP
+  between a `tun_node` and kernel WireGuard with offload on and off, medians over
+  `NSPLANE_E2E_IPERF_REPS` runs at UDP rate `NSPLANE_E2E_IPERF_RATE`),
+  `offload_fallback`, `offload_fallback_hybrid` and `offload_fallback_relay`; the e2e image
+  adds `iperf3`. `offload_iperf` medians (3 runs, Mbit/s, offload on | off, shared host):
+  at `-b 0` TCP a->k 5373 | 2911, k->a 5657 | 4228, UDP a->k 5673 (57.4 % loss) | 2725
+  (83.1 %), k->a 5162 (0 %) | 4944 (1.5 %); at `-b 2G` TCP a->k 4460 | 3054, k->a 4806 |
+  4297, UDP ~1999 (0 %) both ways on and off. The UDP a->k loss at `-b 0` is on the
+  kernel/iperf3 side.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
@@ -221,6 +279,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `just integration` and the upstream integration tests that ran against the device.
 - Breaking: the `mock-instant` features of `nsplane-noise` and `nsplane-core`; tests drive
   the timers through the `_at` methods and the core's `now` instead.
+
+### Fixed
+- `nsplane-uapi`: `listen_port=` and `fwmark=` never replace a transport the UAPI does not
+  own: over `Uapi::with_external_transport` the reported value is a no-op and any other
+  fails with `EADDRINUSE`. `tun_node` uses it for relay and WSS transports, which
+  `wg set <if> listen-port` used to replace with plain UDP.
+- e2e: `scripts/e2e/linux.sh` and `lib.sh` default to PID-derived prefixes
+  (`nsplane-e2e-$$`, `nsplane-e2e-lib-$$`; the env overrides stay) and remove their
+  per-prefix images at cleanup, so concurrent runs no longer remove each other's
+  containers.
 
 ### Security
 - Cookies (mac2) cover the source port as well as the IP, as the whitepaper requires.
