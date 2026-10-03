@@ -6,11 +6,16 @@
 //! as in nsplane-noise's `round_trip_in_place`, and `device_equivalent_round_trip`, the same round
 //! trip plus the cryptokey routing a device does per packet (allowed-IP lookup of the
 //! destination on send, source check on receive) on the table the core's allowed IPs live in.
+//!
+//! The `*_batch32` cases feed the core [`BATCH`] packets per call through
+//! `Core::handle_locals` and `Core::handle_datagrams`; they report the time of a whole batch,
+//! with a throughput of [`BATCH`] elements: divide the time by [`BATCH`] for one packet.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::measurement::WallTime;
+use criterion::{BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 use ip_network::IpNetwork;
 use ip_network_table::IpNetworkTable;
 use nsplane_core::noise::{DATA_HEADER_SZ, Tunn, TunnResult};
@@ -23,6 +28,8 @@ use rand_core::OsRng;
 
 /// Capacity of the packet buffers: room for any bench packet and its WireGuard overhead.
 const BUF_CAPACITY: usize = 2048;
+/// Packets per call in the batched cases, as the engine's largest batch.
+const BATCH: usize = 32;
 
 /// Path of core `i` (0 or 1).
 fn path(i: u8) -> Path {
@@ -192,6 +199,120 @@ fn decapsulate(rx: &mut Core, data: PacketBuf, now: Instant) -> PacketBuf {
     packet
 }
 
+/// Seals `bufs` on `tx` in one batch and appends the datagrams to `datagrams`.
+fn encapsulate_batch(
+    tx: &mut Core,
+    bufs: &mut Vec<PacketBuf>,
+    datagrams: &mut Vec<(Path, PacketBuf)>,
+    now: Instant,
+) {
+    tx.handle_locals(bufs.drain(..), now);
+    while let Some(output) = tx.poll_output() {
+        let Output::Transmit { data, .. } = output else {
+            panic!("encapsulate");
+        };
+        datagrams.push((path(0), data));
+    }
+}
+
+/// Opens `datagrams` on `rx` in one batch and appends the delivered packets to `bufs`.
+fn decapsulate_batch(
+    rx: &mut Core,
+    datagrams: &mut Vec<(Path, PacketBuf)>,
+    bufs: &mut Vec<PacketBuf>,
+    now: Instant,
+) {
+    rx.handle_datagrams(datagrams.drain(..), now);
+    while let Some(output) = rx.poll_output() {
+        let Output::Deliver { packet, .. } = output else {
+            panic!("decapsulate");
+        };
+        bufs.push(packet);
+    }
+}
+
+/// Moves the buffers of `datagrams` to `bufs`.
+fn take_bufs(datagrams: &mut Vec<(Path, PacketBuf)>, bufs: &mut Vec<PacketBuf>) {
+    bufs.extend(datagrams.drain(..).map(|(_, data)| data));
+}
+
+/// [`BATCH`] empty packet buffers.
+fn batch_bufs() -> Vec<PacketBuf> {
+    (0..BATCH)
+        .map(|_| PacketBuf::with_capacity(BUF_CAPACITY))
+        .collect()
+}
+
+/// The batched cases at packet length `len`.
+fn bench_batches(group: &mut BenchmarkGroup<'_, WallTime>, len: usize, packet: &[u8]) {
+    group.throughput(Throughput::Elements(BATCH as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("core_round_trip_batch32", len),
+        packet,
+        |b, p| {
+            let (mut tx, mut rx) = connected_pair();
+            let now = Instant::now();
+            let mut bufs = batch_bufs();
+            let mut datagrams = Vec::with_capacity(BATCH);
+            b.iter(|| {
+                for buf in &mut bufs {
+                    fill(buf, p);
+                }
+                encapsulate_batch(&mut tx, &mut bufs, &mut datagrams, now);
+                // The delivered packets' buffers carry the next batch.
+                decapsulate_batch(&mut rx, &mut datagrams, &mut bufs, now);
+                assert_eq!(bufs.len(), BATCH);
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("core_encapsulate_batch32", len),
+        packet,
+        |b, p| {
+            let (mut tx, _rx) = connected_pair();
+            let now = Instant::now();
+            let mut bufs = batch_bufs();
+            let mut datagrams = Vec::with_capacity(BATCH);
+            b.iter(|| {
+                for buf in &mut bufs {
+                    fill(buf, p);
+                }
+                encapsulate_batch(&mut tx, &mut bufs, &mut datagrams, now);
+                // The datagrams' buffers carry the next batch.
+                take_bufs(&mut datagrams, &mut bufs);
+                assert_eq!(bufs.len(), BATCH);
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("core_decapsulate_batch32", len),
+        packet,
+        |b, p| {
+            let (mut tx, mut rx) = connected_pair();
+            let now = Instant::now();
+            b.iter_batched(
+                || {
+                    let mut bufs = batch_bufs();
+                    for buf in &mut bufs {
+                        fill(buf, p);
+                    }
+                    let mut datagrams = Vec::with_capacity(BATCH);
+                    encapsulate_batch(&mut tx, &mut bufs, &mut datagrams, now);
+                    (datagrams, bufs)
+                },
+                |(mut datagrams, mut bufs)| {
+                    decapsulate_batch(&mut rx, &mut datagrams, &mut bufs, now);
+                    bufs
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
 fn bench_data_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_path");
     for len in [64, 1420] {
@@ -292,6 +413,8 @@ fn bench_data_path(c: &mut Criterion) {
                 );
             },
         );
+
+        bench_batches(&mut group, len, &packet);
     }
     group.finish();
 }

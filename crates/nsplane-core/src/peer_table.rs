@@ -263,8 +263,24 @@ impl PeerTable {
 
     /// The peer with this id, mutably.
     pub(crate) fn peer_mut(&mut self, id: PeerId) -> Option<&mut Peer> {
-        let i = self.ids.binary_search(&id).ok()?;
+        let i = self.slot(id)?;
         self.peers.get_mut(i)
+    }
+
+    /// The position of the peer with this id; it stays valid until a peer is added or
+    /// removed.
+    pub(crate) fn slot(&self, id: PeerId) -> Option<usize> {
+        self.ids.binary_search(&id).ok()
+    }
+
+    /// The peer at `slot`.
+    pub(crate) fn at(&self, slot: usize) -> Option<&Peer> {
+        self.peers.get(slot)
+    }
+
+    /// The peer at `slot`, mutably.
+    pub(crate) fn at_mut(&mut self, slot: usize) -> Option<&mut Peer> {
+        self.peers.get_mut(slot)
     }
 
     /// The peer that owns the session index in a received message (`receiver_idx`).

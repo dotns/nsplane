@@ -44,10 +44,66 @@ struct Schedule {
     stats: Option<Instant>,
 }
 
+/// Lookups that consecutive data packets of a batch share: a peer's slot in the peer table, the
+/// peer a destination is routed to and a source a peer may send from. Only configuration
+/// changes the peer table, and a batch holds none, so they stay valid for the whole batch; a
+/// batch of datagrams still starts over after every handshake message, the only other message
+/// it holds.
+#[derive(Debug, Default)]
+struct Lookups {
+    /// The last receiver index, with its peer and slot.
+    session: Option<(u32, PeerId, usize)>,
+    /// The last destination, with the peer and slot it is routed to.
+    route: Option<(IpAddr, PeerId, usize)>,
+    /// The last source accepted from a peer.
+    source: Option<(IpAddr, PeerId)>,
+}
+
+impl Lookups {
+    /// The peer and slot that own the session of `receiver_idx`.
+    fn session(&mut self, peers: &PeerTable, receiver_idx: u32) -> Option<(PeerId, usize)> {
+        if let Some((idx, id, slot)) = self.session
+            && idx == receiver_idx
+        {
+            return Some((id, slot));
+        }
+        let id = peers.by_index(receiver_idx)?;
+        let slot = peers.slot(id)?;
+        self.session = Some((receiver_idx, id, slot));
+        Some((id, slot))
+    }
+
+    /// The peer and slot a packet to `dst` is routed to.
+    fn route(&mut self, peers: &PeerTable, dst: IpAddr) -> Option<(PeerId, usize)> {
+        if let Some((last, id, slot)) = self.route
+            && last == dst
+        {
+            return Some((id, slot));
+        }
+        let id = peers.by_destination(dst)?;
+        let slot = peers.slot(id)?;
+        self.route = Some((dst, id, slot));
+        Some((id, slot))
+    }
+
+    /// Whether peer `id` may send packets from `src`.
+    fn source_allowed(&mut self, peers: &PeerTable, src: IpAddr, id: PeerId) -> bool {
+        if self.source == Some((src, id)) {
+            return true;
+        }
+        let allowed = peers.routes_to(src, id);
+        if allowed {
+            self.source = Some((src, id));
+        }
+        allowed
+    }
+}
+
 /// The sans-I/O WireGuard engine.
 ///
-/// Feed it with [`Core::handle_input`] and [`Core::handle_timeout`], then drain
-/// [`Core::poll_output`] until it returns `None`. The core never reads the clock: every call
+/// Feed it with [`Core::handle_input`] (or batches of data packets with
+/// [`Core::handle_datagrams`] and [`Core::handle_locals`]) and [`Core::handle_timeout`], then
+/// drain [`Core::poll_output`] until it returns `None`. The core never reads the clock: every call
 /// that needs the time takes `now`, and the first such call starts the timer schedule
 /// reported by [`Core::poll_timeout`].
 pub struct Core {
@@ -100,8 +156,104 @@ impl Core {
         self.start_schedule(now);
         match input {
             Input::Datagram { path, data } => self.receive(path, data),
-            Input::Local { packet } => self.send(packet, true),
+            Input::Local { packet } => self.send(packet, true, &mut Lookups::default()),
             Input::Config(change) => self.configure(change, now),
+        }
+    }
+
+    /// Processes received datagrams exactly like feeding each to [`Core::handle_input`] as an
+    /// `Input::Datagram`, in order: same outputs, events, drops and counters.
+    ///
+    /// The batch shares the work around each datagram: one schedule update, room in the output
+    /// queue for the whole batch, and one session and peer lookup (and one allowed-IP check)
+    /// for consecutive transport data of the same session.
+    pub fn handle_datagrams(
+        &mut self,
+        batch: impl IntoIterator<Item = (Path, PacketBuf)>,
+        now: Instant,
+    ) {
+        let mut batch = batch.into_iter().peekable();
+        if batch.peek().is_none() {
+            return;
+        }
+        self.start_schedule(now);
+        self.outputs.reserve(batch.size_hint().0);
+        let mut lookups = Lookups::default();
+        for (path, data) in batch {
+            match self.classify(path, data) {
+                Some((data, index)) => self.receive_data(path, data, index, &mut lookups),
+                None => lookups = Lookups::default(),
+            }
+        }
+    }
+
+    /// Processes local packets exactly like feeding each to [`Core::handle_input`] as an
+    /// `Input::Local`, in order: same outputs, events, drops and counters.
+    ///
+    /// The batch shares the work around each packet: one schedule update, room in the output
+    /// queue for the whole batch, and one route and peer lookup for consecutive packets to the
+    /// same destination.
+    pub fn handle_locals(&mut self, batch: impl IntoIterator<Item = PacketBuf>, now: Instant) {
+        let mut batch = batch.into_iter().peekable();
+        if batch.peek().is_none() {
+            return;
+        }
+        self.start_schedule(now);
+        self.outputs.reserve(batch.size_hint().0);
+        let mut lookups = Lookups::default();
+        for packet in batch {
+            self.send(packet, true, &mut lookups);
+        }
+    }
+
+    /// Processes received datagrams like [`Core::handle_datagrams`], except that it hands out
+    /// jobs like [`Core::handle_input_deferred`]: the same as feeding each datagram to it in
+    /// order and pushing every job it returns onto `jobs`.
+    pub fn handle_datagrams_deferred(
+        &mut self,
+        batch: impl IntoIterator<Item = (Path, PacketBuf)>,
+        now: Instant,
+        jobs: &mut Vec<CryptoJob>,
+    ) {
+        if !self.peers.shared_tunnels() {
+            return self.handle_datagrams(batch, now);
+        }
+        let mut batch = batch.into_iter().peekable();
+        if batch.peek().is_none() {
+            return;
+        }
+        self.start_schedule(now);
+        jobs.reserve(batch.size_hint().0);
+        let mut lookups = Lookups::default();
+        for (path, data) in batch {
+            match self.classify(path, data) {
+                Some((data, index)) => jobs.extend(self.open_job(path, data, index, &mut lookups)),
+                None => lookups = Lookups::default(),
+            }
+        }
+    }
+
+    /// Processes local packets like [`Core::handle_locals`], except that it hands out jobs
+    /// like [`Core::handle_input_deferred`]: the same as feeding each packet to it in order and
+    /// pushing every job it returns onto `jobs`.
+    pub fn handle_locals_deferred(
+        &mut self,
+        batch: impl IntoIterator<Item = PacketBuf>,
+        now: Instant,
+        jobs: &mut Vec<CryptoJob>,
+    ) {
+        if !self.peers.shared_tunnels() {
+            return self.handle_locals(batch, now);
+        }
+        let mut batch = batch.into_iter().peekable();
+        if batch.peek().is_none() {
+            return;
+        }
+        self.start_schedule(now);
+        jobs.reserve(batch.size_hint().0);
+        let mut lookups = Lookups::default();
+        for packet in batch {
+            jobs.extend(self.seal_job(packet, &mut lookups));
         }
     }
 
@@ -122,25 +274,9 @@ impl Core {
         match input {
             Input::Datagram { path, data } => {
                 let (data, index) = self.classify(path, data)?;
-                let peer = self.peers.by_index(index).and_then(|id| {
-                    let tunnel = self.peers.peer(id)?.shared_tunnel()?;
-                    Some((id, tunnel))
-                });
-                let Some((id, tunnel)) = peer else {
-                    self.pool.put(data);
-                    self.dropped(None, reasons::UNKNOWN_SESSION);
-                    return None;
-                };
-                Some(CryptoJob::new(id, tunnel, data, Direction::Open { path }))
+                self.open_job(path, data, index, &mut Lookups::default())
             }
-            Input::Local { packet } => {
-                let (id, packet, len) = self.prepare_send(packet, true)?;
-                let Some(tunnel) = self.peers.peer(id).and_then(Peer::shared_tunnel) else {
-                    self.pool.put(packet);
-                    return None;
-                };
-                Some(CryptoJob::new(id, tunnel, packet, Direction::Seal { len }))
-            }
+            Input::Local { packet } => self.seal_job(packet, &mut Lookups::default()),
             Input::Config(change) => {
                 self.configure(change, now);
                 None
@@ -169,8 +305,9 @@ impl Core {
             },
             Direction::Open { path } => {
                 let len = job.buf.len();
-                match self.opened(id, path, len, outcome) {
-                    Some(plain_len) => self.deliver_opened(id, job.buf, plain_len),
+                let slot = self.peers.slot(id);
+                match self.opened(id, slot, path, len, outcome, &mut Lookups::default()) {
+                    Some(plain_len) => self.deliver_opened(id, slot, job.buf, plain_len),
                     None => self.pool.put(job.buf),
                 }
             }
@@ -317,7 +454,7 @@ impl Core {
     /// Encrypts `packet` like `Input::Local`, bypassing the outbound filters.
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
-        self.send(packet, false);
+        self.send(packet, false, &mut Lookups::default());
     }
 
     /// Starts a handshake with `peer` now, even if one is in progress. A `path` becomes the
@@ -434,7 +571,7 @@ impl Core {
     /// Handles a datagram from `path`.
     fn receive(&mut self, path: Path, data: PacketBuf) {
         if let Some((data, index)) = self.classify(path, data) {
-            self.receive_data(path, data, index);
+            self.receive_data(path, data, index, &mut Lookups::default());
         }
     }
 
@@ -459,16 +596,56 @@ impl Core {
     }
 
     /// Decrypts transport data in place and delivers it in the datagram's buffer.
-    fn receive_data(&mut self, path: Path, mut data: PacketBuf, receiver_idx: u32) {
-        let Some((id, plain_len)) = self.open(path, &mut data, receiver_idx) else {
+    fn receive_data(
+        &mut self,
+        path: Path,
+        mut data: PacketBuf,
+        receiver_idx: u32,
+        lookups: &mut Lookups,
+    ) {
+        let Some((id, slot)) = lookups.session(&self.peers, receiver_idx) else {
+            self.pool.put(data);
+            return self.dropped(None, reasons::UNKNOWN_SESSION);
+        };
+        let Some(peer) = self.peers.at_mut(slot) else {
             return self.pool.put(data);
         };
-        self.deliver_opened(id, data, plain_len);
+        let len = data.len();
+        let outcome = job::open(&mut peer.tunnel_mut(), path, &mut data);
+        match self.opened(id, Some(slot), path, len, outcome, lookups) {
+            Some(plain_len) => self.deliver_opened(id, Some(slot), data, plain_len),
+            None => self.pool.put(data),
+        }
     }
 
-    /// Delivers the `plain_len` bytes of plaintext opened in `data` from peer `id`, after
-    /// the inbound filters.
-    fn deliver_opened(&mut self, id: PeerId, mut data: PacketBuf, plain_len: usize) {
+    /// Hands out the decryption of transport data as a job.
+    fn open_job(
+        &mut self,
+        path: Path,
+        data: PacketBuf,
+        receiver_idx: u32,
+        lookups: &mut Lookups,
+    ) -> Option<CryptoJob> {
+        let peer = lookups
+            .session(&self.peers, receiver_idx)
+            .and_then(|(id, slot)| Some((id, self.peers.at(slot)?.shared_tunnel()?)));
+        let Some((id, tunnel)) = peer else {
+            self.pool.put(data);
+            self.dropped(None, reasons::UNKNOWN_SESSION);
+            return None;
+        };
+        Some(CryptoJob::new(id, tunnel, data, Direction::Open { path }))
+    }
+
+    /// Delivers the `plain_len` bytes of plaintext opened in `data` from peer `id` at `slot`,
+    /// after the inbound filters.
+    fn deliver_opened(
+        &mut self,
+        id: PeerId,
+        slot: Option<usize>,
+        mut data: PacketBuf,
+        plain_len: usize,
+    ) {
         // The plaintext lies behind the data header: move the packet start past it. A
         // decrypted datagram is longer than its header, so this does not fail.
         if data.advance(DATA_HEADER_SZ).is_err() {
@@ -492,33 +669,24 @@ impl Core {
             }
         }
 
-        if let Some(peer) = self.peers.peer_mut(id) {
+        if let Some(peer) = slot.and_then(|slot| self.peers.at_mut(slot)) {
             peer.add_data_rx(plain_len as u64);
         }
         self.outputs.push_back(Output::Deliver { from: id, packet });
     }
 
-    /// Decrypts transport data in place; returns the peer and the plaintext length if the
-    /// datagram carries a packet to deliver.
-    fn open(
+    /// Accounts for a datagram of `len` bytes from `path` that the tunnel of peer `id` at
+    /// `slot` opened with `outcome`; returns the plaintext length if it carries a packet to
+    /// deliver.
+    fn opened(
         &mut self,
+        id: PeerId,
+        slot: Option<usize>,
         path: Path,
-        data: &mut PacketBuf,
-        receiver_idx: u32,
-    ) -> Option<(PeerId, usize)> {
-        let Some(id) = self.peers.by_index(receiver_idx) else {
-            self.dropped(None, reasons::UNKNOWN_SESSION);
-            return None;
-        };
-        let len = data.len();
-        let outcome = job::open(&mut self.peers.peer_mut(id)?.tunnel_mut(), path, data);
-        self.opened(id, path, len, outcome)
-            .map(|plain_len| (id, plain_len))
-    }
-
-    /// Accounts for a datagram of `len` bytes from `path` that peer `id`'s tunnel opened
-    /// with `outcome`; returns the plaintext length if it carries a packet to deliver.
-    fn opened(&mut self, id: PeerId, path: Path, len: usize, outcome: Outcome) -> Option<usize> {
+        len: usize,
+        outcome: Outcome,
+        lookups: &mut Lookups,
+    ) -> Option<usize> {
         let (plain_len, src, handshakes) = match outcome {
             Outcome::Opened {
                 plain_len,
@@ -535,7 +703,7 @@ impl Core {
                 return None;
             }
         };
-        let peer = self.peers.peer_mut(id)?;
+        let peer = self.peers.at_mut(slot?)?;
         peer.add_rx(len as u64);
         let completed = peer.take_handshakes_up_to(handshakes);
 
@@ -554,7 +722,7 @@ impl Core {
         }
 
         let src = src?;
-        if !self.peers.routes_to(src, id) {
+        if !lookups.source_allowed(&self.peers, src, id) {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
         }
@@ -662,11 +830,11 @@ impl Core {
     }
 
     /// Encrypts a local packet in place and transmits it to the peer it is routed to.
-    fn send(&mut self, packet: PacketBuf, filter: bool) {
-        let Some((id, mut packet, len)) = self.prepare_send(packet, filter) else {
+    fn send(&mut self, packet: PacketBuf, filter: bool, lookups: &mut Lookups) {
+        let Some((id, slot, mut packet, len)) = self.prepare_send(packet, filter, lookups) else {
             return;
         };
-        let Some(peer) = self.peers.peer_mut(id) else {
+        let Some(peer) = self.peers.at_mut(slot) else {
             return self.pool.put(packet);
         };
         let outcome = job::seal(&mut peer.tunnel_mut(), &mut packet, len);
@@ -681,15 +849,26 @@ impl Core {
         );
     }
 
+    /// Hands out the encryption of a local packet as a job.
+    fn seal_job(&mut self, packet: PacketBuf, lookups: &mut Lookups) -> Option<CryptoJob> {
+        let (id, slot, packet, len) = self.prepare_send(packet, true, lookups)?;
+        let Some(tunnel) = self.peers.at(slot).and_then(Peer::shared_tunnel) else {
+            self.pool.put(packet);
+            return None;
+        };
+        Some(CryptoJob::new(id, tunnel, packet, Direction::Seal { len }))
+    }
+
     /// Routes a local packet, runs the outbound filters with `filter` and lays the packet out
-    /// for sealing in place; returns its peer, its buffer and its length.
+    /// for sealing in place; returns its peer and the peer's slot, its buffer and its length.
     fn prepare_send(
         &mut self,
         mut packet: PacketBuf,
         filter: bool,
-    ) -> Option<(PeerId, PacketBuf, usize)> {
-        let Some(id) =
-            Tunn::dst_address(packet.as_packet()).and_then(|dst| self.peers.by_destination(dst))
+        lookups: &mut Lookups,
+    ) -> Option<(PeerId, usize, PacketBuf, usize)> {
+        let Some((id, slot)) =
+            Tunn::dst_address(packet.as_packet()).and_then(|dst| lookups.route(&self.peers, dst))
         else {
             self.pool.put(packet);
             self.dropped(None, reasons::NO_ROUTE);
@@ -728,7 +907,7 @@ impl Core {
             self.pool.put(mem::replace(&mut packet, copy));
         }
         packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
-        Some((id, packet, len))
+        Some((id, slot, packet, len))
     }
 
     /// Transmits the packets the tunnel of `peer` queued while it had no session.
