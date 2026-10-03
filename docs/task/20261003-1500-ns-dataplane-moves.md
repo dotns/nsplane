@@ -74,9 +74,31 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
 - MB-x5 (NEW, from ns T10 throughput) Configurable TCP socket buffers.
   - Config: `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (bytes; default today's 512 segments) with the advertised window and window scaling following the receive buffer.
   - Evidence: ns user-space mode single-stream TCP is 15% below the legacy stack (1 MiB buffers) on a quiet host, with lower CPU use, i.e. window-limited.
-- MB-x6 (NEW, from ns T10 load) Configurable SYN listener pool.
-  - Config: `NetStackConfig::tcp_listen_backlog` (sockets in SYN-RECEIVED per listener; default today's 32). Overflow is counted, not silently reset.
-  - Evidence: 500 concurrent connects to a user-space echo: 135-168 accepted on the engine, 163-215 on legacy; both reset at the 32-socket listener pool.
+- MB-x6 (NEW, from ns T10 load) Count listener-pool overflow.
+  - The listener pool size is already caller config (ns raises it); the gap is visibility: a SYN that finds the pool full is reset silently. Add `NetStackStats::tcp_listen_overflow`.
+  - Evidence: with ns's pool at 32, 500 concurrent connects got 135-168 accepted and the rest reset without a counter; with the pool at 512, 500/500.
+
+## NEW workstream MF: engine throughput (ns release gate "throughput not below the legacy baseline")
+
+ns T10b profiling (Linux, two containers with pinned CPUs, real TUN, single-stream iperf3 TCP,
+nsplane 6d10ded0; full tables in ns docs/task/20261003-1300-account-mode-engine.md):
+
+- MF-1 TUN data path is 15-21% below ns's legacy tunnel-wg loops (unloaded rounds: 4044 vs
+  4748 Mbit/s; engine lower in 8 of 10 paired rounds). Nodes are not CPU-bound; per-byte CPU
+  is within -4% to +11%. ns code (ChannelIo copy, AccountFilter, payload counter, UDP transport
+  wrapper) is under 2% of samples. The engine spends 5-7 points more in engine/core internals
+  and about 5 points more in tokio channel handoffs (mpsc, batch_semaphore) along
+  read_source -> Owner -> transmit and receive -> Owner -> write_sink. Inclusive samples:
+  sender engine::transmit 3.63%, Core::prepare_send 2.57%, engine::read_source 2.00%,
+  Owner::drain 1.55%, Owner::transmit 0.96%; receiver engine::receive 3.70%,
+  engine::write_sink 1.56%, Owner::drain 1.03%, Core::deliver_opened 0.81%. Likely cause:
+  handoff latency and wakeups in the task pipeline (inferred). Ask: reduce handoffs on the
+  hot path (for example run-to-completion read -> seal -> send when no crypto workers are
+  configured), measured with the ns harness or an equivalent nsplane-e2e bench.
+- MF-2 user-space mode (nsplane-netstack) is 12-14% below the legacy smoltcp stack; raising
+  the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
+  ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is
+  not the fix.
 
 ## NEW workstream MC: transports (crates/nsplane/src/udp.rs, transport.rs; e2e)
 - MC-1 Side channel for non-WireGuard datagrams on a UdpTransport.
@@ -97,6 +119,12 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - Replaces: the OpaquePump loopback UDP hop and ns-engine WssTransport. The wire stays unchanged (campaign rule).
   - Alternative (no MC-2): keep the pump as it is. It is per-datagram code in ns, so it would be a recorded exception to the rule (D10).
   - Done (2026-10-03) as the generic form (D10): `LinkTransport` with `LinkDialer`, `LinkSender`, `LinkReceiver`, `LinkState { Connected, Disconnected }` and `LinkConfig { queue: 256, read_idle_timeout: None }`; no WebSocket or TLS dependency in nsplane, so `Rejected(u16)` stays with ns's dialer. Tests: `nsplane-e2e` `link` (in-memory link); the examples' relay WSS client runs on it with a tungstenite dialer (`examples/tests/wss.rs`, `just e2e-examples` relay-wss cells).
+- MC-3 (NEW, proposed 2026-10-03, revised, awaiting approval) WSS carriers in nsplane. Owner: ns is the business layer, nsplane the data plane; without UDP, WSS is the only channel, so all of ns `tunnel-ws` moves. This revisits D10's "no WebSocket or TLS dependency in nsplane".
+  - New crate `nsplane-wss` (tokio-tungstenite, rustls/aws-lc-rs); `nsplane` core stays free of WebSocket and TLS.
+  - (a) Datagram carrier: `WssDialer: LinkDialer`, from ns `OpaquePump` (bearer header, 401/403, doubling backoff 2 s..60 s, read-idle watchdog, ping) and `examples/src/relay/wss/client.rs`. `LinkState` gains `Rejected(u16)`.
+  - (b) Stream carrier: the WsFrame protocol (`[stream_id u32][cmd][payload]`, OPEN_V4/V6, DATA, CLOSE, CLOSE_ACK) with both legs: client (open a TCP/UDP flow to a target, today ns `proxy/wire.rs` + `wss_flow.rs`) and terminate (ns `tunnel-ws` `WsTunnel` session: per-session buffer cap, separate data/control queues, stream table). Business resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) stays in ns behind an embedder trait that maps an OPEN to a backend address or a denial.
+  - Finding: `WsTunnel` has had no consumer in ns since the connector crate was retired (ns 0aef94a0, 2026-08-28); only `OpaquePump` and ns `proxy/` (client leg) are live.
+  - ns then deletes `crates/tunnel-ws`, the opaque pump loopback hop and its own WsFrame codec, keeping listeners, route lookup, bearer source, ACL preflight and status mapping.
 
 ## NEW workstream MD: ACL and L3 gate (nsplane-acl, M6; option A holds until then)
 - MD-1 Per-packet source principal.
