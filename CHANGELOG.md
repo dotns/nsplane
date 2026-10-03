@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `--tun-fd`/`WG_TUN_FD` adopts an already-open TUN fd and `--uapi-fd`/`WG_UAPI_FD`
   serves the UAPI on an already-connected Unix stream socket next to the standard socket;
   the daemon takes ownership of both fds.
+- CLI: `--crypto-workers`/`WG_CRYPTO_WORKERS` sets the engine's crypto workers and `--no-offload`/`WG_NO_OFFLOAD` opens the TUN device and binds the UDP socket without segmentation offload.
+- Benchmarks: `just bench-wg` (`scripts/bench/wg-compare.sh`) compares nsplane-cli, kernel
+  WireGuard and wireguard-go in pinned containers (TCP, UDP loss, latency, CPU per GB), plus
+  nsplane's user-space mode through the `netstack_bench` example; results in
+  `docs/architecture.md` (*Against WireGuard implementations*).
 - `nsplane-netstack`: a user-space TCP/IP stack on smoltcp 0.14 for IPv4 and IPv6.
   `NetStack::new(NetStackConfig)` starts it and `NetStack::split` yields a
   `NetStackSource` (`PacketSource`, the stack's egress) and a `NetStackSink` (`PacketSink`),
@@ -316,6 +321,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed or idle) is dialed again at once, after a failed dial too; the dialer owns the
   backoff. Received datagrams come from the peer's address, and sends to another address
   are dropped. `nsplane` has no WebSocket or TLS dependency.
+- `nsplane`: `LinkState::Rejected(u16)`, the HTTP status with which the far end refused a
+  link (e.g. 401 or 403). Dialers report it to their own observers; `LinkTransport` itself
+  never does.
+- `nsplane-wss`, a new optional crate of WebSocket-over-TLS carriers (tokio-tungstenite,
+  rustls with aws-lc-rs; `nsplane` gains no dependency). All share `WssConfig` (URL,
+  `connect_addr`, `server_name`, extra headers, a `BearerProvider` for
+  `Authorization: Bearer`, backoff 2 s doubling to 60 s, pings every 10 s, read idle 35 s,
+  connect timeout 10 s) and `WssTls` (`Roots(RootCertStore)` or `Config(Arc<ClientConfig>)`;
+  no system or web PKI roots are bundled). A 401 or 403 on the upgrade is reported as
+  `LinkState::Rejected`; after a 401 the next dial waits for a new bearer token.
+  - `WssDialer`, a `LinkDialer` for `LinkTransport` (`into_transport`, `state`, `stats` as
+    `WssStats`): one binary message per datagram, as ns `OpaquePump` and the examples' relay.
+  - `frame`: the `WsFrame` codec of ns `tunnel-ws` and NSGW (`[stream_id u32][command u8]
+    [payload]`; OPEN_V4/OPEN_V6, DATA, CLOSE, CLOSE_ACK), byte-identical to ns.
+  - `WssStreamClient` (`open_tcp` -> `WssTcpStream`, `AsyncRead` + `AsyncWrite`;
+    `open_udp` -> `WssUdpFlow`; `connect`, `state`, `stats` as `WssStreamStats`), the
+    client leg of ns `proxy`: every TCP stream and UDP flow shares one session until it
+    holds `WssStreamLimits::max_streams_per_session` (1024, NSGW's default per-session cap)
+    live ones, then another session is dialed. `shutdown` sends CLOSE behind the written
+    data and keeps reading until the peer's CLOSE or CLOSE_ACK.
+  - `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats` as `WssServerStats`),
+    the terminate leg ported from ns `tunnel-ws` `WsTunnel`: it dials the relay, asks the
+    embedder's `WssResolver` for each OPEN's backend (`WssOpen` -> `SocketAddr` or
+    `Denied`), relays TCP and UDP to it and reports `WssStreamEvent`s (`Open`, `Close`
+    with a `WssCloseReason`). Bounded by `WssServerLimits` (4 MiB per stream, 32 MiB per
+    session, 64-frame stream queue, control 64 / data 256 queues, 1024 streams).
+  - Tests: unit tests in the crate, `crates/nsplane-wss/tests/stream.rs` (client and server
+    through a TLS test relay, frames checked against the ns layouts) and `nsplane-e2e`
+    `wss_datagram` (two engines over `WssDialer`).
 - `nsplane-e2e`: `udp_side_channel` (side datagrams beside a WireGuard transfer, offload on
   and off, an unread receiver) and `link` (transfer, redial, the bounded queue, the read
   idle timeout over an in-memory link).
@@ -389,6 +423,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled; invalid or overlapping fragments count as `malformed`). With it, `owns` reports
   TCP and UDP fragments to a stack address as the stack's: `Flow` for a first fragment on a
   registered tuple, `Listener` for any other.
+- `nsplane-netstack`: `NetStackConfig::tcp_rx_buffer` and `tcp_tx_buffer: Option<usize>`
+  size every TCP socket's receive and send buffer, listener pool sockets included (default
+  `None`: `(mtu - 40) * 512` as before). Values are clamped to one IPv4 MSS (`mtu - 40`) at
+  least and `65535 << 14` at most; the advertised window and the window-scale option follow
+  the receive buffer (smoltcp derives the shift from its capacity). A window larger than
+  the queues on the path loses its tail and recovers by retransmission timeout, so the
+  default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
+  refused for a full listener pool).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
@@ -497,6 +539,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
   receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
   allows the fork's git source only.
+- `nsplane-netstack`: the driver takes its queued ingress packets in one batch per turn,
+  and egress TCP segments and UDP datagrams keep 32 bytes of tail room, so the engine
+  seals them in place instead of reallocating each full-size packet. One 1 GiB TCP stream
+  between two netstacks over two engines takes 7-8 % less CPU time, 2.2-2.3 % fewer
+  instructions and 22-24 % fewer context switches (release, in-process; throughput within
+  the shared host's noise); behavior is unchanged. See docs/architecture.md, "Netstack
+  throughput".
 - `nsplane`: the owner task feeds the received datagrams and local packets already queued
   (up to `MAX_BATCH`, never waiting for more) to the core as one batch. It reads local
   packets only while a transport has transmit room and takes no more at once than that
@@ -514,6 +563,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of being dropped: `.extra.wss.dropped.disconnected` stays 0 and
   `dropped.queue_full` counts sends that failed on a full queue. The status field names are
   unchanged.
+- `nsplane-examples`: the relay WSS client dials with `nsplane_wss::WssDialer` instead of
+  its own tungstenite dialer (the pinning `ClientConfig` passed as `WssTls::Config`);
+  `WssTransport::connect` now returns `io::Result`.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and

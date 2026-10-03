@@ -12,6 +12,7 @@ members = [
     "crates/nsplane-e2e",
     "crates/nsplane-acl",
     "crates/nsplane-nat",
+    "crates/nsplane-wss",
     "examples",
 ]
 

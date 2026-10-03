@@ -5,7 +5,8 @@ const MAX_LISTENERS_PER_PORT: usize = 32;
 const MAX_LISTENERS_TOTAL: usize = 32;
 const POOL: Pool = Pool {
     limit: MAX_LISTENERS_TOTAL,
-    buffer: 4096,
+    rx_buffer: 4096,
+    tx_buffer: 4096,
 };
 
 type Listeners = HashMap<u16, Vec<SocketHandle>>;
@@ -486,7 +487,7 @@ fn tcp_sockets_run_cubic_congestion_control() {
         tcp::CongestionControl::Cubic
     );
     assert_eq!(
-        new_tcp_socket(4096).congestion_control(),
+        new_tcp_socket(4096, 4096).congestion_control(),
         tcp::CongestionControl::Cubic
     );
 }

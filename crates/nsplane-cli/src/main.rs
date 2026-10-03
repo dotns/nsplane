@@ -11,9 +11,10 @@ compile_error!("nsplane-cli is a Linux/macOS development tool; embed the library
 use anyhow::Context as _;
 use clap::Parser;
 use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
-use nsplane::EngineBuilder;
-use nsplane_tun::Tun;
-use nsplane_uapi::{Uapi, UapiListener, udp_transport};
+use nsplane::{EngineBuilder, UdpTransport};
+use nsplane_tun::{Tun, TunOptions};
+use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
+use std::net::Ipv6Addr;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
@@ -57,6 +58,16 @@ struct Args {
     /// Do not drop sudo privileges
     #[arg(long, env = "WG_SUDO", value_parser = clap::builder::BoolishValueParser::new())]
     disable_drop_privileges: bool,
+
+    /// Number of crypto worker tasks; 0 or 1 encrypts and decrypts on the engine task
+    #[arg(long, env = "WG_CRYPTO_WORKERS", default_value_t = 0)]
+    crypto_workers: usize,
+
+    /// Disable segmentation offload on the created TUN device and the UDP socket. With
+    /// --tun-fd only the UDP socket is affected; a `listen-port` set over the UAPI binds
+    /// a new socket with offload
+    #[arg(long, env = "WG_NO_OFFLOAD", value_parser = clap::builder::BoolishValueParser::new())]
+    no_offload: bool,
 }
 
 #[cfg_attr(
@@ -152,18 +163,35 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
     let tun = match args.tun_fd {
         Some(fd) => Tun::from_raw_fd(fd, ADOPTED_TUN_MTU)
             .with_context(|| format!("Invalid --tun-fd {fd}"))?,
-        None => Tun::create(&args.interface_name).context("Failed to initialize tunnel")?,
+        None => Tun::create_with(
+            &args.interface_name,
+            TunOptions::new().offload(!args.no_offload),
+        )
+        .context("Failed to initialize tunnel")?,
     };
     let name = tun.name().unwrap_or_else(|e| {
         tracing::debug!(error = ?e, "Cannot read the tunnel name, using the given one");
         args.interface_name.clone()
     });
+    let tun_offload = tun.offload();
     let (source, sink) = tun.split().context("Failed to initialize tunnel")?;
 
-    let transport = udp_transport(0).context("Failed to bind the UDP socket")?;
+    let transport = UdpTransport::bind_with_offload(
+        TRANSPORT_ID,
+        (Ipv6Addr::UNSPECIFIED, 0).into(),
+        !args.no_offload,
+    )
+    .context("Failed to bind the UDP socket")?;
     let port = transport.local_addr().port();
+    tracing::info!(
+        tun_offload = ?tun_offload,
+        udp_offload = transport.offload(),
+        crypto_workers = args.crypto_workers,
+        "Data path configured"
+    );
     let engine = EngineBuilder::new(source, sink)
         .transport(transport)
+        .crypto_workers(args.crypto_workers)
         .build()
         .context("Failed to start the engine")?;
     let handle = engine.handle();
