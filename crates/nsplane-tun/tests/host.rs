@@ -6,15 +6,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nsplane::{HEADROOM, PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId};
-use nsplane_tun::{HostTun, HostTunInput, HostTunSink, HostTunSource, PushError};
+use nsplane_tun::{
+    HOST_TUN_DEFAULT_CAPACITY, HostTunInput, HostTunSink, HostTunSource, PushError, host_tun,
+};
 use tokio::time::timeout;
 
 const MTU: u16 = 1280;
 const WAIT: Duration = Duration::from_secs(5);
 
 /// A host tun whose writes are discarded.
-fn host_tun(capacity: usize) -> (HostTunInput, HostTunSource, HostTunSink) {
-    HostTun::new(MTU, capacity, Arc::new(|_: &[u8]| true))
+fn discarding(capacity: usize) -> (HostTunInput, HostTunSource, HostTunSink) {
+    host_tun(MTU, capacity, Arc::new(|_: &[u8]| true))
 }
 
 async fn recv(source: &mut HostTunSource) -> io::Result<PacketBuf> {
@@ -25,7 +27,7 @@ async fn recv(source: &mut HostTunSource) -> io::Result<PacketBuf> {
 
 #[tokio::test]
 async fn packets_arrive_in_order_with_headroom() {
-    let (input, mut source, _sink) = host_tun(HostTun::DEFAULT_CAPACITY);
+    let (input, mut source, _sink) = discarding(HOST_TUN_DEFAULT_CAPACITY);
     for i in 0..3u8 {
         input.push(&[i; 40]).unwrap();
     }
@@ -38,7 +40,7 @@ async fn packets_arrive_in_order_with_headroom() {
 
 #[tokio::test]
 async fn recv_batch_drains_queued_packets() {
-    let (input, mut source, _sink) = host_tun(16);
+    let (input, mut source, _sink) = discarding(16);
     for i in 0..5u8 {
         input.push(&[i; 20]).unwrap();
     }
@@ -54,7 +56,7 @@ async fn recv_batch_drains_queued_packets() {
 
 #[tokio::test]
 async fn full_at_capacity_and_recovers_after_recv() {
-    let (input, mut source, _sink) = host_tun(2);
+    let (input, mut source, _sink) = discarding(2);
     input.push(&[1; 20]).unwrap();
     input.push(&[2; 20]).unwrap();
     assert_eq!(input.push(&[3; 20]), Err(PushError::Full));
@@ -66,14 +68,14 @@ async fn full_at_capacity_and_recovers_after_recv() {
 
 #[tokio::test]
 async fn closed_after_the_source_drops() {
-    let (input, source, _sink) = host_tun(4);
+    let (input, source, _sink) = discarding(4);
     drop(source);
     assert_eq!(input.push(&[1; 20]), Err(PushError::Closed));
 }
 
 #[tokio::test]
 async fn broken_pipe_once_inputs_drop_and_the_queue_drains() {
-    let (input, mut source, _sink) = host_tun(4);
+    let (input, mut source, _sink) = discarding(4);
     let clone = input.clone();
     input.push(&[1; 20]).unwrap();
     clone.push(&[2; 20]).unwrap();
@@ -92,7 +94,7 @@ async fn broken_pipe_once_inputs_drop_and_the_queue_drains() {
 
 #[tokio::test]
 async fn oversize_packets_are_dropped_and_counted() {
-    let (input, mut source, _sink) = host_tun(8);
+    let (input, mut source, _sink) = discarding(8);
     let mtu = usize::from(MTU);
     input.push(&[1; 1281]).unwrap();
     input.push(&vec![2; mtu]).unwrap();
@@ -114,7 +116,7 @@ async fn oversize_packets_are_dropped_and_counted() {
 async fn sink_writes_the_exact_bytes() {
     let written = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&written);
-    let (_input, _source, sink) = HostTun::new(
+    let (_input, _source, sink) = host_tun(
         MTU,
         4,
         Arc::new(move |packet: &[u8]| {
@@ -136,7 +138,7 @@ async fn sink_writes_the_exact_bytes() {
 async fn write_returning_false_is_broken_pipe() {
     let open = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&open);
-    let (_input, _source, sink) = HostTun::new(
+    let (_input, _source, sink) = host_tun(
         MTU,
         4,
         Arc::new(move |_: &[u8]| flag.load(Ordering::SeqCst)),
@@ -154,7 +156,7 @@ async fn write_returning_false_is_broken_pipe() {
 
 #[tokio::test]
 async fn push_from_a_plain_thread_wakes_a_pending_recv() {
-    let (input, mut source, _sink) = host_tun(4);
+    let (input, mut source, _sink) = discarding(4);
     let host = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         input.push(&[9; 60]).unwrap();
@@ -165,6 +167,6 @@ async fn push_from_a_plain_thread_wakes_a_pending_recv() {
 
 #[tokio::test]
 async fn mtu_watch_reports_the_constructor_mtu() {
-    let (_input, source, _sink) = HostTun::new(1400, 4, Arc::new(|_: &[u8]| true));
+    let (_input, source, _sink) = host_tun(1400, 4, Arc::new(|_: &[u8]| true));
     assert_eq!(*source.mtu().borrow(), 1400);
 }

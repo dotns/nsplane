@@ -1,4 +1,4 @@
-//! An engine whose local side is a `HostTun`, driven by a test host on a plain thread, peered
+//! An engine whose local side is a `host_tun`, driven by a test host on a plain thread, peered
 //! with a channel-transport node: packets in both directions and a host writer that closes.
 
 #![cfg(target_os = "linux")]
@@ -14,7 +14,7 @@ use nsplane::{
     Peer, TransportId,
 };
 use nsplane_e2e::{Family, Node, Options, QUIET, TestResult, WAIT, payload, udp4, udp6};
-use nsplane_tun::{HostTun, HostTunInput};
+use nsplane_tun::{HOST_TUN_DEFAULT_CAPACITY, HostTunInput, host_tun};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
@@ -22,7 +22,7 @@ const SEED: u8 = 1;
 const IP4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, SEED);
 const IP6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
 
-/// An engine on a `HostTun` and the host's ends of it.
+/// An engine on a `host_tun` and the host's ends of it.
 struct Host {
     _engine: Engine,
     handle: EngineHandle,
@@ -79,9 +79,9 @@ fn pair(
     let (link_a, link_b) = ChannelTransport::pair(1024, a, b);
 
     let (tx, written) = mpsc::unbounded_channel();
-    let (input, source, sink) = HostTun::new(
+    let (input, source, sink) = host_tun(
         nsplane_e2e::MTU,
-        HostTun::DEFAULT_CAPACITY,
+        HOST_TUN_DEFAULT_CAPACITY,
         Arc::new(move |packet: &[u8]| {
             writes.fetch_add(1, Ordering::SeqCst);
             write_open.load(Ordering::SeqCst) && tx.send(packet.to_vec()).is_ok()
