@@ -68,6 +68,16 @@
 //! masquerade keeps a small table of its own (two hash maps behind one
 //! mutex).
 //!
+//! # Drops
+//!
+//! A [`MasqueradeVerdict::Drop`] carries one of the [`reasons`], each
+//! counted in [`MasqueradeStats`]: [`reasons::TCP_NOT_SYN`],
+//! [`reasons::CAPACITY`], [`reasons::ROUTE_CHANGED`],
+//! [`reasons::TOKENS_EXHAUSTED`] and [`reasons::BAD_CHECKSUM`]. ns drops in
+//! all five cases; `bad_checksum` is the one the contract did not list. The
+//! new source is an [`Ipv6Addr`], so the closure cannot answer a source the
+//! masquerade could not write.
+//!
 //! # Concurrency
 //!
 //! All methods take `&self`, and a `Masquerade` is `Send + Sync`. The
@@ -113,9 +123,8 @@ type Decide = Box<dyn Fn(&FiveTuple) -> Option<MasqueradeDecision> + Send + Sync
 /// [`Masquerade`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MasqueradeDecision {
-    /// The flow's new source address. It must be IPv6; an IPv4 address drops
-    /// the packet ([`reasons::SOURCE_NOT_IPV6`]).
-    pub source: IpAddr,
+    /// The flow's new source address.
+    pub source: Ipv6Addr,
     /// A fingerprint of the route the flow takes. A reply is restored only
     /// while the closure still answers the same `route` for the flow.
     pub route: u64,
@@ -207,8 +216,6 @@ pub struct MasqueradeStats {
     pub tokens_exhausted: u64,
     /// Packets dropped with [`reasons::BAD_CHECKSUM`].
     pub bad_checksum: u64,
-    /// Packets dropped with [`reasons::SOURCE_NOT_IPV6`].
-    pub source_not_ipv6: u64,
     /// Live flows now, as [`Masquerade::len`].
     pub flows: usize,
     /// Flows recorded, in flows.
@@ -227,7 +234,6 @@ struct Counters {
     route_changed: AtomicU64,
     tokens_exhausted: AtomicU64,
     bad_checksum: AtomicU64,
-    source_not_ipv6: AtomicU64,
 }
 
 /// A flow key: a packet's protocol, addresses and ports (an Echo identifier
@@ -443,7 +449,6 @@ impl Masquerade {
             route_changed: load(&c.route_changed),
             tokens_exhausted: load(&c.tokens_exhausted),
             bad_checksum: load(&c.bad_checksum),
-            source_not_ipv6: load(&c.source_not_ipv6),
             flows,
             created,
             expired,
@@ -483,8 +488,7 @@ impl Masquerade {
                     reasons::CAPACITY => &c.capacity,
                     reasons::ROUTE_CHANGED => &c.route_changed,
                     reasons::TOKENS_EXHAUSTED => &c.tokens_exhausted,
-                    reasons::BAD_CHECKSUM => &c.bad_checksum,
-                    _ => &c.source_not_ipv6,
+                    _ => &c.bad_checksum,
                 };
                 (counter, MasqueradeVerdict::Drop(reason))
             }
@@ -555,9 +559,7 @@ impl Masquerade {
         let Some(decision) = (self.decide)(&tuple) else {
             return Ok(None);
         };
-        let IpAddr::V6(source) = decision.source else {
-            return Err(reasons::SOURCE_NOT_IPV6);
-        };
+        let source = decision.source;
         let now = (self.clock)();
         let config = &self.config;
         let mut table = self.lock();

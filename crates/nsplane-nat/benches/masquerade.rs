@@ -8,7 +8,7 @@
 //!   source port changes); old flows expire, so the table stays bounded.
 
 use std::hint::black_box;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ const SOURCE: Ipv6Addr = Ipv6Addr::new(0xfd00, 1, 2, 2, 0, 0, 0x6440, 1);
 fn decide() -> impl Fn(&FiveTuple) -> Option<MasqueradeDecision> + Send + Sync + 'static {
     |_| {
         Some(MasqueradeDecision {
-            source: IpAddr::V6(SOURCE),
+            source: SOURCE,
             route: 1,
         })
     }

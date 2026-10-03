@@ -38,6 +38,10 @@ pub trait PathPolicy: Send + Sync + 'static {
     /// The core asks about messages from a path other than the peer's current one; with
     /// [`PathPolicy::observe_every_message`], about every authenticated message. Never about
     /// cookie replies.
+    ///
+    /// Order (part of the contract): for a transport data message this runs before the
+    /// address checks and before [`crate::PacketFilter::inbound_from`] sees the decrypted
+    /// packet of the same datagram.
     fn on_authenticated(&self, peer: PeerId, from: &Path, kind: MessageKind) -> Roam;
 
     /// Whether [`PathPolicy::on_authenticated`] is called for every authenticated message,

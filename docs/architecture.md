@@ -38,7 +38,7 @@ where it is described below.
 | Crate | Entry points | Supporting types |
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`) | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
@@ -47,6 +47,7 @@ where it is described below.
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
+| `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig`, `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
 Not public API: `nsplane-cli` (a binary), `nsplane-e2e` (test harness) and
@@ -1089,6 +1090,29 @@ flows; `original_destination` gives the service address of an accepted flow. The
 never runs under a lock, so it may call back into the `Redirect`. IPv6, fragments, other
 protocols and untracked replies pass unchanged.
 
+**Masquerade.** `Masquerade` also runs on the local side: on the IPv6 packets a routed LAN
+host sends towards the tunnel (`forward`) and on their replies (`reverse`). It is a source
+NAPT ported from ns `SubnetLanIngressTranslator`: a caller-supplied closure gives each new
+TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision::source`, an `Ipv6Addr`: the
+contract's `IpAddr` was narrowed by L1 decision, so an IPv4 source cannot be expressed) and
+a `route` fingerprint, and the source port or Echo identifier becomes a token from
+`MasqueradeConfig::ports`, unique per destination and source. `reverse` restores the LAN
+host's address and port or identifier, after asking the closure again: a reply whose flow
+now gets `None` or another `route` is dropped and the flow removed (`route_changed`, ns's
+rule that the route fingerprint must stay current). The transport checksum is recomputed
+over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
+`MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
+flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
+`verify_checksums`, an invalid transport checksum; beyond the contract, ns drops these
+too). Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
+refuses new flows, as the contract and ns require, while a `Conntrack` evicts its least
+recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
+protocols and replies of unknown flows pass unchanged. A local side that answers pings
+itself can turn a forwarded `ICMPv6` Echo request into its reply with
+`nsplane_packet::icmp::echo_reply_in_place`, and `reverse` takes it back to the LAN host
+(`crates/nsplane-e2e/tests/masquerade.rs`). A criterion bench
+(`crates/nsplane-nat/benches/masquerade.rs`) measures both directions.
+
 **Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
 next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
@@ -1107,6 +1131,8 @@ path, so such a client pays no extra latency for it.
 | Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
 | NAT64 to LAN (NAPT) | `nsplane-nat` | wrap the local side: `EngineBuilder::new(Nat64LanSource::new(source, nat.clone()), Nat64LanSink::new(sink, nat))` | not installed | none |
 | Local-side redirect (DNAT) | `nsplane-nat` | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
+| Local-side masquerade (IPv6 source NAPT) | `nsplane-nat` | call `Masquerade::forward` / `Masquerade::reverse` on the local path | not used | none: a plain type, only called if the embedder wires it |
+| ICMP Echo reply synthesis | `nsplane-packet` | call `icmp::echo_reply_in_place` on a request for an address the local side answers | not used | none: a plain function, only called if the embedder wires it |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |

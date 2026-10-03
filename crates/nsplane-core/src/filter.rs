@@ -33,6 +33,12 @@ pub trait PacketFilter: Send + Sync + 'static {
     /// [`PacketFilter::inbound`]; a filter that answers on the path a packet came from (a
     /// probe responder, say) overrides this one. A wrapper around another filter should
     /// forward both.
+    ///
+    /// Order (part of the contract): for a transport data message the core first records it
+    /// as authenticated (handshake bookkeeping and [`crate::PathPolicy::on_authenticated`],
+    /// including a possible path change), then checks the source and destination addresses,
+    /// and only then runs the inbound filters, so a filter sees the path state after the
+    /// policy decided about this very datagram.
     fn inbound_from(&self, peer: PeerId, from: &Path, packet: &mut PacketBuf) -> Verdict {
         let _ = from;
         self.inbound(peer, packet)

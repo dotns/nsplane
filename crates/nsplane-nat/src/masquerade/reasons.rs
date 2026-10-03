@@ -18,6 +18,3 @@ pub const TOKENS_EXHAUSTED: &str = "tokens_exhausted";
 /// (a zero checksum field counts as invalid, as ns), with
 /// [`MasqueradeConfig::verify_checksums`](crate::MasqueradeConfig::verify_checksums).
 pub const BAD_CHECKSUM: &str = "bad_checksum";
-/// The decision closure answered an IPv4 [`MasqueradeDecision::source`](crate::MasqueradeDecision::source)
-/// for an IPv6 flow; nothing is recorded.
-pub const SOURCE_NOT_IPV6: &str = "source_not_ipv6";
