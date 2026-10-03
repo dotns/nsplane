@@ -1110,6 +1110,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "futures-core",
+ "futures-util",
  "nix",
  "nsplane",
  "nsplane-acl",
@@ -1119,7 +1120,12 @@ dependencies = [
  "nsplane-packet",
  "nsplane-tun",
  "nsplane-uapi",
+ "nsplane-wss",
+ "rcgen",
+ "rustls",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -1246,8 +1252,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "nsplane",
- "nsplane-e2e",
- "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",
