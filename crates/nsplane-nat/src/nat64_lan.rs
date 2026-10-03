@@ -63,10 +63,13 @@
 //! IPv6 packets before they reach the local stack (which routes the IPv4
 //! result to the LAN), `reverse` on local packets before the core routes
 //! them (the IPv6 result goes to the peer that owns the original source).
-//! `forward` and `reverse` are plain functions on [`PacketBuf`].
+//! `forward` and `reverse` are plain functions on [`PacketBuf`];
+//! [`Nat64LanSink`] and [`Nat64LanSource`] wrap the engine's sink and source
+//! with them.
 
 pub mod reasons;
 
+mod io;
 mod packet;
 mod ports;
 mod route;
@@ -81,6 +84,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use nsplane_packet::{FiveTuple, PacketBuf, PeerId, protocol};
 
+pub use self::io::{Nat64LanSink, Nat64LanSource};
 pub use self::ports::{DefaultSnatPorts, SnatPorts};
 pub use self::route::{LanRoute, Nat64LanError};
 use crate::conntrack::{Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, FlowDirection};

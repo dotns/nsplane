@@ -31,7 +31,7 @@ IMG=$PREFIX-image
 LABEL=nsplane-e2e-ex=$PREFIX
 LABELS=(--label ai-agent=true --label "$LABEL")
 EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server app_session
-  translate_node port_map)
+  translate_node port_map subnet_gateway)
 PORT=51820
 WSS_PORT=8443
 
@@ -861,6 +861,43 @@ scenario_port_map() {
   echo "  ok  a: the flow expired after ${timeout}s idle and a new one was recorded"
 }
 
+# subnet_gateway g between kernel WireGuard client k (IPv6 overlay only, fd00:c::2) and an
+# IPv4 LAN host l on g's LAN (an internal network). g maps fd00:64::/96 to the LAN's subnet
+# and SNATs to 10.201.0.1, which l routes back through g. k reaches l's echo and ping as
+# fd00:64::<l's IPv4>; the LAN's broadcast address is refused as an unsafe target.
+scenario_subnet_gateway() {
+  local lan
+  lan=$(case_net lan)
+  start_on "$NET" g --sysctl net.ipv4.ip_forward=1
+  docker network connect "$lan" "$(ctr g)"
+  start_on "$lan" l
+  start k
+  local g_pub k_pub g_ip k_ip lan4 g_lan l_ip l6 bcast6 a b c d len n
+  g_pub=$(pub g); k_pub=$(pub k); g_ip=$(ip_on g "$NET"); k_ip=$(ip_of k); g_lan=$(ip_on g "$lan")
+  l_ip=$(ip_on l "$lan")
+  lan4=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$lan")
+  # The mapped addresses: fd00:64:: with l's IPv4 address, or the LAN's broadcast address,
+  # in the low 32 bits.
+  IFS=./ read -r a b c d <<< "$l_ip"
+  l6=$(printf 'fd00:64::%x:%x' $(( a << 8 | b )) $(( c << 8 | d )))
+  IFS=./ read -r a b c d len <<< "$lan4"
+  n=$(( (a << 24 | b << 16 | c << 8 | d) | ((1 << (32 - len)) - 1) ))
+  bcast6=$(printf 'fd00:64::%x:%x' $(( n >> 16 )) $(( n & 0xffff )))
+  X l "ip route add 10.201.0.1/32 via $g_lan"
+  echo "  ok  l: LAN $lan4, $l_ip as $l6, 10.201.0.1 via g ($g_lan)"
+  echo_server l
+  node g subnet_gateway --address fd00:c::1/64 --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=fd00:c::2/128" \
+    --route "fd00:64::/96=$lan4,snat=10.201.0.1"
+  kernel_wg k fd00:c::2/128 "$g_pub" "$g_ip" fd00:64::/96 fd00:64::/96
+  echo_check k tcp "$l6" 7; echo_check k udp "$l6" 7
+  ping_check k "$l6"
+  wait_status g subnet_gateway '.extra.nat64_lan | .forwarded > 0 and .reversed > 0 and .flows_inserted >= 3' 5
+  echo "  ok  g: translated $(X g 'cat /subnet_gateway.json' | jq -c '.extra.nat64_lan | {forwarded, reversed, flows_inserted, unsafe_target}')"
+  if X k "ping -c 1 -w 2 $bcast6" >/dev/null 2>&1; then echo "  FAIL k: ping $bcast6 (broadcast) answered"; return 1; fi
+  wait_status g subnet_gateway '.extra.nat64_lan.unsafe_target > 0' 5
+  echo "  ok  g: broadcast $bcast6 refused as an unsafe target"
+}
+
 # --- scenarios: offload -----------------------------------------------------------------
 
 # tun_node with --no-offload <-> kernel WireGuard: the UDP cell's checks on the plain TUN
@@ -999,6 +1036,7 @@ scenario nat_hole_punch
 scenario plain_wg_compat
 scenario translate_node
 scenario port_map
+scenario subnet_gateway
 scenario offload_fallback
 scenario offload_fallback_hybrid
 scenario offload_fallback_relay

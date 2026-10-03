@@ -3,12 +3,14 @@
 //! flow lifetime (port reservation, expiry, eviction, removal) and route
 //! replacement.
 
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use nsplane_packet::{PacketBuf, protocol};
+use nsplane::{PacketSink, PacketSource};
+use nsplane_packet::{PacketBatch, PacketBuf, PeerId, protocol};
 
 use super::*;
 use crate::checksum::{
@@ -844,4 +846,78 @@ fn nat64_lan_is_shareable() {
     assert_send_sync::<Nat64Lan>();
     assert_eq!(Nat64LanConfig::default().port_tries, 32);
     assert!(format!("{:?}", lan()).starts_with("Nat64Lan"));
+}
+
+// -- The local-side wrappers. --
+
+#[tokio::test]
+async fn sink_forwards_in_order_and_discards_drops() {
+    let nat = Arc::new(lan());
+    let (sink, mut delivered) = nsplane::ChannelSink::new(8);
+    let sink = Nat64LanSink::new(sink, Arc::clone(&nat));
+    let unsafe_target = ipv6_bytes(
+        protocol::UDP,
+        CLIENT,
+        mapped(Ipv4Addr::LOCALHOST),
+        udp(1, 53, b""),
+    );
+    let not_ours = reply(protocol::UDP, udp(53, 1, b""));
+    let mut packets = VecDeque::from([
+        (PeerId::new(1), ipv6(protocol::UDP, udp(4321, 53, b"query"))),
+        (PeerId::new(1), PacketBuf::from_packet(&unsafe_target)),
+        (PeerId::new(2), PacketBuf::from_packet(not_ours.as_packet())),
+    ]);
+    sink.send_batch(&mut packets).await.unwrap();
+    assert!(packets.is_empty());
+    let (peer, first) = delivered.recv().await.unwrap();
+    assert_eq!(peer, PeerId::new(1));
+    assert_valid4(first.as_packet());
+    assert_eq!(first.as_packet()[16..20], HOST.octets());
+    let (peer, second) = delivered.recv().await.unwrap();
+    assert_eq!(
+        (peer, second.as_packet()),
+        (PeerId::new(2), not_ours.as_packet())
+    );
+
+    sink.send(PacketBuf::from_packet(&unsafe_target), PeerId::new(1))
+        .await
+        .unwrap();
+    assert!(delivered.try_recv().is_err());
+    let stats = nat.stats();
+    assert_eq!(
+        (stats.forwarded, stats.unsafe_target, stats.not_ours),
+        (1, 2, 1)
+    );
+}
+
+#[tokio::test]
+async fn source_reverses_in_order_and_keeps_the_mtu() {
+    let nat = Arc::new(lan());
+    let snat_port = be16(&forward_udp(&nat), 20);
+    let (source, local, mtu) = nsplane::ChannelSource::new(8, 1400);
+    let mut source = Nat64LanSource::new(source, Arc::clone(&nat));
+    let not_ours = reply(protocol::UDP, udp(53, 1, b""));
+    local
+        .send(reply(protocol::UDP, udp(53, snat_port, b"answer")))
+        .await
+        .unwrap();
+    local
+        .send(PacketBuf::from_packet(not_ours.as_packet()))
+        .await
+        .unwrap();
+
+    let mut batch = PacketBatch::new();
+    while batch.len() < 2 {
+        source.recv_batch(&mut batch).await.unwrap();
+    }
+    let packets: Vec<_> = batch.drain().collect();
+    assert_valid6(packets[0].as_packet());
+    assert_eq!(packets[0].as_packet()[24..40], CLIENT.octets());
+    assert_eq!(packets[1].as_packet(), not_ours.as_packet());
+
+    assert_eq!(*source.mtu().borrow(), 1400);
+    mtu.send(1280).unwrap();
+    assert_eq!(*source.mtu().borrow(), 1280);
+    let stats = nat.stats();
+    assert_eq!((stats.reversed, stats.not_ours), (1, 1));
 }

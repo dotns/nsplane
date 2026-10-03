@@ -297,6 +297,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error); all zero without a stage. The drops are also counted in `drop_counters` under
   the new reasons `DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and
   `DROP_FRAGMENT_RATE_LIMITED` (`reasons::FRAGMENT_*` in `nsplane-core`).
+- `nsplane-nat`: `Nat64Lan`, a stateful NAT64 to an IPv4 LAN (NAPT) for subnet routing,
+  ported from ns `SubnetRoute` / `SubnetConntrack`. A `LanRoute` maps an IPv6 /96
+  (`mapped`) to an IPv4 prefix (`real`) with a `snat_source`; IPv6 TCP, UDP and ICMPv6 echo
+  to `mapped` plus a safe LAN address become IPv4 from `snat_source` with a port (or echo
+  identifier) reserved per flow through the caller's `SnatPorts` (`DefaultSnatPorts` in
+  memory; `Nat64LanConfig::port_tries`, 32), and the LAN's replies (and Fragmentation
+  Needed, as Packet Too Big) are translated back; optional TCP MSS clamp
+  (`Nat64LanConfig::max_tcp_mss`), routes replaced through an `ArcSwap`, flows in a bounded
+  `Conntrack` with idle timeouts, `Nat64Lan::remove_flow` and `Nat64LanStats` (unsafe
+  targets and port exhaustion counted separately). `LanRoute` prefixes are
+  `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
+  `LanPrefix`, as no IP network crate is a dependency. The translation runs on the local
+  side: `Nat64LanSink` and `Nat64LanSource` wrap the engine's sink and source; nothing
+  runs unless they are installed. `nsplane-nat` now depends on `nsplane` (for the
+  wrappers); `nsplane` and `nsplane-tun` still do not depend on `nsplane-nat`.
+- `nsplane-nat`: `Conntrack::remove` removes a flow by either direction's tuple
+  (`ConntrackStats::removed`), and `Conntrack::with_removal_hook` reports every flow that
+  leaves the table (expired, evicted, retained out or removed).
+- `nsplane-e2e`: `nat64_lan` tests: an IPv6 client engine reaches an IPv4 netstack LAN host
+  behind a gateway engine with wrapped local side (TCP and UDP echo, ICMPv6 echo), with
+  unsafe targets, port exhaustion and `remove_flow` checked. `nsplane-examples`:
+  `subnet_gateway` (a TUN node with `--route <mapped>/96=<real>,snat=<IPv4>`) and its
+  `scripts/e2e/examples.sh` scenario against kernel WireGuard.
 - `nsplane-nat`: `Redirect`, a local-side redirect (DNAT with the reverse SNAT) of IPv4
   TCP/UDP flows to an endpoint a decision closure picks per new flow (`RedirectDecision`),
   ported from ns `tun_service/rewrite.rs`. `forward` / `reverse` rewrite a `PacketBuf` in

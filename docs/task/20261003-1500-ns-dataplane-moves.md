@@ -116,7 +116,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - Proposal item 7 (SOURCE_NOT_ALLOWED opt-out) is the source-side counterpart and stays conditional.
 
 ## NEW workstream ME: Subnet translation (nsplane-nat)
-- ME-1 Stateful NAT64-to-LAN (NAPT) filter.
+- ME-1 Stateful NAT64-to-LAN (NAPT) filter. Done: `Nat64Lan` with the `Nat64LanSink` / `Nat64LanSource` local-side wrappers, covered by `nsplane-e2e`'s `nat64_lan` tests and the `subnet_gateway` example scenario.
   - API: `Nat64Lan::new(routes: Arc<ArcSwap<Vec<LanRoute { mapped: Ipv6Net, real: Ipv4Net, snat_source: Ipv4Addr }>>>, config: Nat64LanConfig { max_tcp_mss: Option<u16>, port_tries: u8 /*32*/, ... })`, as a PacketFilter on the local side or a pure `forward(&[u8]) -> Option<BytesMut>` / `reverse(&[u8]) -> Option<BytesMut>` pair.
   - Translation: IPv6 TCP/UDP/ICMPv6 echo -> IPv4 with the embedded low-32 destination, rejecting unsafe LAN targets as SubnetRoute::resolve does; the SNAT port is reserved per (snat_source, port) for the flow lifetime; `remove_flow(proto, snat, target)` releases it.
   - Reverse path: reverse translation with TCP MSS clamp; ICMP Fragmentation Needed -> ICMPv6 Packet Too Big with mtu + 20 (min 1280).

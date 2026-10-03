@@ -12,7 +12,7 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, the fragmentation stage (`FragmentConfig`) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
-| `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
+| `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters; NAT64 to a LAN (`Nat64Lan`) on the local side |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
@@ -24,6 +24,7 @@ nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsp
 nsplane-packet ────────► nsplane-core, nsplane
 nsplane, nsplane-packet ─► nsplane-netstack
 nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
+nsplane ─► nsplane-nat
 ```
 
 ## Public interfaces
@@ -41,7 +42,7 @@ where it is described below.
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
-| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `checksum` |
+| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
@@ -662,6 +663,25 @@ recently seen flow evicted), expires flows on per-protocol idle timeouts (TCP st
 without a background task, and takes an injectable clock. `PortMap::set_rules` swaps rules
 atomically and drops the flows of changed rules.
 
+**Nat64Lan.** A stateful NAT64 to an IPv4 LAN (NAPT) for a subnet gateway, ported from ns
+`SubnetRoute`. A `LanRoute` maps an IPv6 /96 (`mapped`) to an IPv4 prefix (`real`); the
+prefixes are `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
+`LanPrefix`, since no IP network crate is a dependency. IPv6 TCP, UDP and ICMPv6 echo to
+`mapped` plus a safe address of `real` (not broadcast, loopback, link-local, multicast or
+unspecified; other mapped targets are dropped and counted) become IPv4 from the route's
+`snat_source`, with a port (or echo identifier) reserved for the flow through the caller's
+`SnatPorts` and given back when the flow expires, is evicted or is removed
+(`Nat64Lan::remove_flow`, built on `Conntrack::remove` and its removal hook); a saturated
+range drops the packet rather than aliasing a flow. Replies and Fragmentation Needed (as
+Packet Too Big) are translated back; TCP MSS can be clamped. Unlike the filters above it sits
+on the **local side**: the LAN's replies are addressed to `snat_source`, which no peer's
+allowed IPs contain, so the core could not route them to a peer before a filter ran.
+`Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
+`reverse` on local packets before the core routes them (the IPv6 result goes to the peer
+owning the original source). The clients route the mapped /96 to the gateway (it is in their
+allowed IPs for it), and the gateway's local side routes `snat_source` back to itself. The
+wrappers make `nsplane-nat` depend on `nsplane`; `nsplane` does not depend on `nsplane-nat`.
+
 **Redirect.** `Redirect` is not a filter: it runs on the local side, on `PacketBuf`s before
 they reach a local endpoint (`forward`) and on that endpoint's replies (`reverse`). It
 sends the IPv4 TCP/UDP flows a local application opens to a service address to an
@@ -691,6 +711,7 @@ path, so such a client pays no extra latency for it.
 |---|---|---|---|---|
 | IPv4/IPv6 translation | `nsplane-nat` | `EngineBuilder::filter(Box::new(Translator::new(table)))`; `Translator::set_mtu` to the tunnel MTU | not installed | none: the core's filter chain is empty |
 | Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
+| NAT64 to LAN (NAPT) | `nsplane-nat` | wrap the local side: `EngineBuilder::new(Nat64LanSource::new(source, nat.clone()), Nat64LanSink::new(sink, nat))` | not installed | none |
 | Local-side redirect (DNAT) | `nsplane-nat` | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
@@ -703,7 +724,8 @@ path, so such a client pays no extra latency for it.
 
 **Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
 `nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
-are separate crates that `nsplane` and `nsplane-tun` do not depend on, so they are not
+are separate crates that `nsplane` and `nsplane-tun` do not depend on (`nsplane-nat` and
+`nsplane-netstack` depend on `nsplane`, not the other way round), so they are not
 built or linked unless the application adds them; `nsplane-uapi` is only needed to serve
 the `wg` UAPI. None of the crates has optional Cargo features.
 
