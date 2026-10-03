@@ -3,6 +3,7 @@
 //! connects to local TCP and UDP targets, relays DATA and answers CLOSE with `CLOSE_ACK`.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::{BoxFuture, LinkState};
-use nsplane_e2e::{TestResult, WAIT};
 use nsplane_wss::frame::{self, FrameCommand, Protocol, WsFrame};
 use nsplane_wss::{
     BearerProvider, WssConfig, WssStreamClient, WssStreamLimits, WssTcpStream, WssTls, WssUdpFlow,
@@ -32,6 +32,11 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 
 /// The terminate's certificate name.
 const NAME: &str = "terminate.test";
+/// Upper bound for anything that is expected to happen.
+const WAIT: Duration = Duration::from_secs(5);
+
+/// The result of tests and their helpers: any error fails the test with its message.
+type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
