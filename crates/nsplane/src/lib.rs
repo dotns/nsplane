@@ -29,6 +29,8 @@ mod handle;
 mod io;
 mod link;
 mod merge;
+mod pipe;
+mod pump;
 mod splitter;
 mod transport;
 mod udp;
@@ -54,6 +56,8 @@ pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardR
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
 };
+pub use pipe::{PipeSink, PipeSource, pipe};
+pub use pump::{PumpStats, pump};
 pub use splitter::Splitter;
 pub use transport::{BoxFuture, DynTransport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};
