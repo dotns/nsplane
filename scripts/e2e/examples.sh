@@ -806,6 +806,8 @@ scenario_translate_node() {
     --peer "$k_pub,endpoint=$k_ip:$PORT" \
     --map "$k_pub,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2" --lan "$lan4=fd00:1::/96"
   wait_log t translate_node 'TUN device opened.* offload=off'
+  # The replies are the translated size, 20 bytes over the MTU; k's IPv4 underlay has room.
+  X k "ip link set wg0 mtu $(( mtu + 20 ))"
   if X c "ping -c 3 -i 0.3 -w 15 -M do -s $(( mtu - 28 )) 10.200.0.2" >/dev/null; then
     echo "  ok  c: ping 10.200.0.2 with $mtu-byte packets"
   else
