@@ -227,3 +227,11 @@ optional and off by default).
 Recommendation: its own plan after this round, two workstreams: MD-A (MD-1, 4, 5, 6 and the
 `crates/acl` parity tests) and MD-B (MD-2 with MD-3 and the composition). Until M6, ns keeps
 `AccountFilter` (option A in the M4 plan).
+2026-10-03: campaign nsplane-mv-202610031600 done (MB-x1..x4, MC-1, MC-2, ME-1, ME-2 in main).
+MB-x6 needs no code: `NetStackStats::syn_refused` counts the bare SYNs refused (RST) for a
+full listener pool, which `NetStackConfig::listener_pool` sizes. User decisions for the next
+round (plan 20261003-1630-perf-and-wss): MC-3 approved as recommended (new optional crate
+`nsplane-wss` with the WSS dependencies; datagram carrier complete, stream carrier client leg
+first, terminate leg when a consumer exists), ADR 2026-10-03-data-channel-protocols-in-nsplane
+(every data-channel protocol lives in nsplane), MF-1, MF-2 and MB-x5 after a benchmark
+harness against kernel WireGuard and wireguard-go.

@@ -254,6 +254,7 @@ change) runs in ns when its current refactor lands.
 | 2026-10-03 | Batched core entry and drain-only engine batching (no wait, no timer; local intake bounded by the transmit room); sink-full loss under saturation accepted, pacing is follow-up #21 | plan `20261003-0715` |
 | 2026-10-03 | nsplane-netstack depends on the `dotns/smoltcp` fork pinned to a tag; workarounds removed | ADR `2026-10-03-smoltcp-fork` |
 | 2026-10-03 | Status and traffic: nsplane reports counters (`status`, `transport_stats`); rates, metric export and direct/relay labels live in ns | task `20261003-1215-traffic-status` |
+| 2026-10-03 | Every data-channel protocol (transports and stream carriers) is implemented in nsplane; ns supplies configuration and business decisions only; heavy protocol dependencies live in optional crates (`nsplane-wss`) | ADR `2026-10-03-data-channel-protocols-in-nsplane` |
 
 ## 11. References (design only)
 

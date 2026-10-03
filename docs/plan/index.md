@@ -38,3 +38,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261002-2240-phase5-nat-offload-perf Phase 5: translation and NAT, offload, performance**](20261002-2240-phase5-nat-offload-perf.md) `2026-10-02`
 - [x] [**20261003-0715-phase5-followups Fix the open Phase 1-5 follow-ups**](20261003-0715-phase5-followups.md) `2026-10-03`
 - [x] [**20261003-1600-ns-dataplane-moves Move the remaining ns data-plane pieces into nsplane**](20261003-1600-ns-dataplane-moves.md) `2026-10-03`
+- [-] [**20261003-1630-perf-and-wss Throughput against WireGuard baselines, and the WSS carriers**](20261003-1630-perf-and-wss.md) `2026-10-03`
