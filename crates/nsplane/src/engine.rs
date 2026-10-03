@@ -65,14 +65,19 @@ const MAX_DATAGRAM: usize = 65535;
 /// capacity: a datagram caused by a local packet, a received datagram or a timer (including
 /// the timers run by [`EngineHandle::resume`]) that finds its transport's backlog at the
 /// bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
-/// handle calls always wait and may take a backlog past the bound. The owner stops reading
-/// local packets only while at least one transport is installed and every installed
-/// transport's backlog is at the bound (which transport a local packet leads to is only
-/// known once the core has handled it), which in turn holds back the source. So an engine
-/// with one transport holds back its local packets instead of dropping them, while with
-/// several transports a stalled one never holds back local packets for the others: those
-/// for the stalled one are dropped once its backlog is full. With no transport installed,
-/// local reads never pause. Received datagrams, timers and handle calls are served
+/// handle calls always wait and may take a backlog past the bound. Local packets are read
+/// only while some installed transport can take them without a deep backlog: its transmit
+/// queue has room or its backlog is below the local threshold ([`MAX_BATCH`], at most the
+/// queue capacity). The owner stops reading local packets while at least one transport is
+/// installed and every installed transport's transmit queue is full with its backlog at the
+/// threshold (which transport a local packet leads to is only known once the core has
+/// handled it), and takes no more at once than the most room any transport has, counting
+/// one datagram per packet; this in turn holds back the source, so a saturated transport
+/// does not build a backlog of local traffic ahead of new packets. So an engine with one
+/// transport holds back its local packets instead of dropping them, while with several
+/// transports a stalled one never holds back local packets for the others: those for the
+/// stalled one fill its backlog to the bound and are dropped from then on. With no
+/// transport installed, local reads never pause. Received datagrams, timers and handle calls are served
 /// meanwhile. A transport that never drains keeps its backlog until it closes (the backlog
 /// is then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or is removed with
 /// [`EngineHandle::remove_transport`], which counts every datagram still queued for it
@@ -737,15 +742,10 @@ impl Owner {
         Poll::Pending
     }
 
-    /// Polls the source queue, unless every installed transport's waiting datagrams are at
-    /// the bound.
+    /// Polls the source queue, unless there is no room for local packets
+    /// ([`Owner::local_room`]).
     fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
-        let bound = self.queue_capacity;
-        let full = !self.transports.is_empty()
-            && self
-                .transports
-                .values()
-                .all(|slot| slot.pending.len() >= bound);
+        let full = self.local_room() == 0;
         match &mut self.local {
             Some(local) if !full => local.poll_recv(cx).map(Wake::Local),
             _ => Poll::Pending,
@@ -794,12 +794,11 @@ impl Owner {
     /// workers; ICMP errors from the fragmentation stage go back to the local side.
     ///
     /// Takes only what is already queued, never waiting for more: at most [`MAX_BATCH`]
-    /// packets, no more than the crypto workers have room for and no more than fit before
-    /// every installed transport's waiting datagrams are at the bound, counting one datagram
-    /// per packet (but always `first`). A packet that leads to several datagrams (fragments,
-    /// a handshake) may take the waiting datagrams past that count, so a batch may overshoot
-    /// the point where reads would have paused by up to [`MAX_BATCH`] datagrams; those that
-    /// find the bound reached are dropped as usual.
+    /// packets, no more than the crypto workers have room for and no more than the room for
+    /// local packets ([`Owner::local_room`]), counting one datagram per packet (but always
+    /// `first`). A packet that leads to several datagrams (fragments, a handshake) may take
+    /// the waiting datagrams past the local threshold, up to their bound; those that find
+    /// the bound reached are dropped as usual.
     fn input_locals(&mut self, first: PacketBuf) {
         let Some(local) = &self.local else {
             return;
@@ -846,19 +845,22 @@ impl Owner {
         })
     }
 
-    /// The local packets that fit before every installed transport's waiting datagrams are
-    /// at the bound, counting one datagram per packet; unbounded without transports.
+    /// The local packets to take before every installed transport's transmit queue is full
+    /// and its waiting datagrams are at the local threshold ([`MAX_BATCH`], at most the queue
+    /// capacity), counting one datagram per packet: the most room over the transports, since
+    /// which transport a packet leads to is only known once the core has handled it.
+    /// Unbounded without transports.
     fn local_room(&self) -> usize {
-        let bound = self.queue_capacity;
+        let threshold = self.queue_capacity.min(MAX_BATCH);
         self.transports
             .values()
-            .map(|slot| bound.saturating_sub(slot.pending.len()))
+            .map(|slot| slot.queue.capacity() + threshold.saturating_sub(slot.pending.len()))
             .max()
             .unwrap_or(usize::MAX)
     }
 
-    /// Adds every job of the current batch to its worker's batch, handing the batches over whenever one
-    /// is full.
+    /// Adds every job of the current batch to its worker's batch, handing the batches over
+    /// whenever one is full.
     fn dispatch_jobs(&mut self) {
         let Some(workers) = &mut self.workers else {
             return;

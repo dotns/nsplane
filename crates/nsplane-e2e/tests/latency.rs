@@ -36,13 +36,20 @@ const PING_PORT: u16 = 7;
 type Delivered = mpsc::Receiver<(PeerId, PacketBuf)>;
 
 /// Two peered nodes on UDP loopback, each with `workers` crypto workers, after a handshake.
-async fn pair(workers: usize) -> TestResult<(Node<UdpTransport>, Node<UdpTransport>)> {
+async fn pair(
+    workers: usize,
+    capacity: Option<usize>,
+) -> TestResult<(Node<UdpTransport>, Node<UdpTransport>)> {
     let node = |seed: u8| -> TestResult<Node<UdpTransport>> {
         let id = TransportId::new(u16::from(seed));
         let transport = UdpTransport::bind(id, (IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())?;
         let addr = transport.local_addr();
         Node::with_builder(seed, id, addr, Options::default(), |builder| {
-            builder.transport(transport).crypto_workers(workers)
+            let builder = builder.transport(transport).crypto_workers(workers);
+            match capacity {
+                Some(capacity) => builder.queue_capacity(capacity),
+                None => builder,
+            }
         })
     };
     let (mut a, mut b) = (node(1)?, node(2)?);
@@ -179,7 +186,7 @@ fn report(label: &str, (mut times, lost): (Vec<Duration>, usize)) -> TestResult 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_round_trip_is_immediate() -> TestResult {
-    let (a, b) = pair(0).await?;
+    let (a, b) = pair(0, None).await?;
     let pong = ponger(b.delivered, b.local.clone(), b.ip4, a.ip4);
     let mut pinger = Pinger {
         peer: b.ip4,
@@ -196,9 +203,14 @@ async fn idle_round_trip_is_immediate() -> TestResult {
     Ok(())
 }
 
-/// Measures idle and loaded round trips between engines with `workers` crypto workers.
-async fn measure(workers: usize) -> TestResult {
-    let (a, b) = pair(workers).await?;
+/// Measures idle and loaded round trips between engines with `workers` crypto workers and
+/// queues of `capacity` (the builder's default if `None`).
+async fn measure(workers: usize, capacity: Option<usize>) -> TestResult {
+    let label = capacity.map_or_else(
+        || format!("workers={workers}"),
+        |capacity| format!("workers={workers} queue={capacity}"),
+    );
+    let (a, b) = pair(workers, capacity).await?;
     let pong = ponger(b.delivered, b.local.clone(), b.ip4, a.ip4);
     let (local, from) = (a.local.clone(), a.ip4);
     let mut pinger = Pinger {
@@ -208,7 +220,7 @@ async fn measure(workers: usize) -> TestResult {
     };
     pinger.round_trips(100, LOST).await?;
     report(
-        &format!("workers={workers} idle"),
+        &format!("{label} idle"),
         pinger.round_trips(ROUND_TRIPS, LOST).await?,
     )?;
 
@@ -222,11 +234,11 @@ async fn measure(workers: usize) -> TestResult {
     let loaded = pinger.round_trips(ROUND_TRIPS, LOST).await;
     stop.store(true, Ordering::Relaxed);
     flow.await?;
-    report(&format!("workers={workers} loaded"), loaded?)?;
+    report(&format!("{label} loaded"), loaded?)?;
     // Where the pings queued behind the bulk flow.
     writeln!(
         io::stderr(),
-        "workers={workers} loaded queues: a {:?}\nworkers={workers} loaded queues: b {:?}",
+        "{label} loaded queues: a {:?}\n{label} loaded queues: b {:?}",
         pinger.node.handle.queue_stats().await?,
         b.handle.queue_stats().await?
     )?;
@@ -237,6 +249,13 @@ async fn measure(workers: usize) -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement; run with --release --ignored --nocapture"]
 async fn round_trip_latency() -> TestResult {
-    measure(0).await?;
-    measure(2).await
+    measure(0, None).await?;
+    measure(2, None).await
+}
+
+/// The same with shallower queues, for comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement; run with --release --ignored --nocapture"]
+async fn round_trip_latency_queue_256() -> TestResult {
+    measure(0, Some(256)).await
 }
