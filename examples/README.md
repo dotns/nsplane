@@ -16,6 +16,7 @@ The package `nsplane-examples` is not published.
 | [`udp_pair`](#udp_pair) | Two engines over loopback UDP with netstacks: handshake, TCP and UDP echo, stats | no |
 | [`tun_node`](#tun_node) | A node on a TUN device, managed with `wg` | yes |
 | [`netstack_node`](#netstack_node) | A node whose local side is a userspace TCP/IP stack | no |
+| [`netstack_bench`](#netstack_bench) | iperf-like TCP/UDP load on a netstack node, one JSON result line | no |
 | [`hybrid`](#hybrid) | A TUN device and a netstack behind one engine (`Splitter`, `MergeSource`) | yes |
 | [`acl_gateway`](#acl_gateway) | A TUN node filtered by a reloadable ACL policy | yes |
 | [`translate_node`](#translate_node) | Local IPv4 to peers reached over IPv6 only (`Translator`, RFC 7915) | yes |
@@ -60,6 +61,22 @@ IPv6 are used), `--mtu <N>` (default 1420).
 
 ```sh
 cargo run -p nsplane-examples --bin netstack_node -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 --check tcp:10.0.0.1:7 --exit-after-checks
+```
+
+### netstack_bench
+
+A netstack node with an in-process load generator, to measure the user-space data path. The
+`server` serves repeated runs on `--port` (TCP and UDP) until Ctrl-C; a `client` run prints
+one JSON line on stdout: `tcp` (bulk streams, bytes counted by the server), `udp` (paced
+datagrams, loss from the server's count) or `rr` (1-byte round trips, p50/p99 in µs).
+
+Flags: node flags, `--address <CIDR>` (repeatable, required), `--mtu <N>` (default 1420), then
+`server --port <P>` or `client --target <IP:PORT> --mode tcp|udp|rr` with `--streams <N>`
+(default 1), `--duration <SECS>` (default 10), `--rate <BITS_PER_SEC>` (udp, required) and
+`--count <N>` (rr, default 1000).
+
+```sh
+cargo run -p nsplane-examples --bin netstack_bench -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 client --target 10.0.0.1:5201 --mode tcp --streams 4
 ```
 
 ### hybrid
