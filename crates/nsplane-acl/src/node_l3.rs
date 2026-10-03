@@ -23,6 +23,11 @@
 //!   authoritative. A WireGuard peer carrying a policy marker fails closed
 //!   until the matching snapshot is applied.
 //!
+//! [`NodeL3Filter`] runs the gate as a [`nsplane_core::PacketFilter`]
+//! composed with an optional [`crate::AclFilter`]: an enforced verdict is
+//! final, legacy and observed packets go on to the ACL, and enforced denials
+//! of gateway returns can be diverted to a gateway-consumer sink.
+//!
 //! The gate is inert unless constructed. Packet paths read one immutable
 //! snapshot and lock only the state shard of the remote peer; writers
 //! serialize on one mutex and migrate state with every shard locked, so a
@@ -42,6 +47,7 @@ use crate::net::IpNet;
 
 mod config;
 mod decisions;
+mod filter;
 mod gateway_consumer;
 mod packet;
 mod policy;
@@ -57,6 +63,9 @@ pub use config::{
     NODE_L3_SCHEMA_VERSION, NodeL3Config, NodeL3Grant, NodeL3Mode, NodeL3Node, NodeL3PeerBinding,
     NodeL3PeerPolicyRequirement, NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol,
     NodeL3Transport, NodeL3TransportPeer,
+};
+pub use filter::{
+    GatewayConsumerSink, NodeL3Filter, NodeL3FilterStats, PeerKeyMap, PeerPublicKeys,
 };
 pub use gateway_consumer::{GatewayConsumerAuthority, GatewayConsumerPacket};
 

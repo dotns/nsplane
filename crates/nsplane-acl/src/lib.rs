@@ -287,12 +287,12 @@ pub use merge::{
 pub use namespace::{Grant, GrantEnd, NamespaceId, NamespaceMember, NamespacePolicy, OutboundRule};
 pub use net::{IpNet, ParseIpNetError, Protocol};
 pub use node_l3::{
-    GatewayConsumerAuthority, GatewayConsumerPacket, NODE_L3_SCHEMA_VERSION, NodeL3Applied,
-    NodeL3Config, NodeL3ConfigError, NodeL3Counters, NodeL3Decision, NodeL3Gate, NodeL3Grant,
-    NodeL3Mode, NodeL3Node, NodeL3PeerBinding, NodeL3PeerPolicyRequirement, NodeL3PeerReadiness,
-    NodeL3PeerReadinessReason, NodeL3Reason, NodeL3Resource, NodeL3ServiceEndpoint,
-    NodeL3ServiceProtocol, NodeL3SubnetAuthorization, NodeL3Transport, NodeL3TransportError,
-    NodeL3TransportPeer,
+    GatewayConsumerAuthority, GatewayConsumerPacket, GatewayConsumerSink, NODE_L3_SCHEMA_VERSION,
+    NodeL3Applied, NodeL3Config, NodeL3ConfigError, NodeL3Counters, NodeL3Decision, NodeL3Filter,
+    NodeL3FilterStats, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node, NodeL3PeerBinding,
+    NodeL3PeerPolicyRequirement, NodeL3PeerReadiness, NodeL3PeerReadinessReason, NodeL3Reason,
+    NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol, NodeL3SubnetAuthorization,
+    NodeL3Transport, NodeL3TransportError, NodeL3TransportPeer, PeerKeyMap, PeerPublicKeys,
 };
 pub use pinhole::{Direction, PinholeError, PinholeGuard, PinholeId, PinholeSpec, PinholeStats};
 pub use policy::{AclAction, AclPolicy, AclRule, AclTest};

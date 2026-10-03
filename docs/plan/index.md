@@ -40,3 +40,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261003-1600-ns-dataplane-moves Move the remaining ns data-plane pieces into nsplane**](20261003-1600-ns-dataplane-moves.md) `2026-10-03`
 - [-] [**20261003-1630-perf-and-wss Throughput against WireGuard baselines, and the WSS carriers**](20261003-1630-perf-and-wss.md) `2026-10-03`
 - [-] [**20261003-2300-acl-l3-gate Move the account ACL and the node L3 gate into nsplane (MD)**](20261003-2300-acl-l3-gate.md) `2026-10-03`
+- [-] [**20261003-2330-local-side Local-side graph primitives, masquerade, Echo reply, host TUNs**](20261003-2330-local-side.md) `2026-10-03`
