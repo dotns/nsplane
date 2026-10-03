@@ -13,6 +13,7 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, the fragmentation stage (`FragmentConfig`) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
 | `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters; NAT64 to a LAN (`Nat64Lan`) on the local side |
+| `nsplane-wss` | `crates/nsplane-wss/` | WebSocket-over-TLS carriers: `WssDialer` for `LinkTransport`, the `WsFrame` stream client (`WssStreamClient`) and terminate leg (`WssStreamServer`) |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
@@ -25,6 +26,7 @@ nsplane-packet ────────► nsplane-core, nsplane
 nsplane, nsplane-packet ─► nsplane-netstack
 nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
 nsplane ─► nsplane-nat
+nsplane ─► nsplane-wss
 ```
 
 ## Public interfaces
@@ -39,6 +41,7 @@ where it is described below.
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`) | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
@@ -444,6 +447,132 @@ TUN reads (no virtio-net header, and Wintun reads on Windows) leave the same 28 
 room behind each packet as segmented ones (a read still takes at most the MTU), so a
 translator grows full-MTU IPv4 in place with offload off too.
 
+## nsplane-wss
+
+`nsplane-wss` carries data-plane traffic over WebSocket over TLS (ADR
+`2026-10-03-data-channel-protocols-in-nsplane`: both legs of each data-channel protocol live
+in nsplane). It is a separate crate on `nsplane`, so `nsplane` itself stays free of
+WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite` and
+`rustls` (aws-lc-rs provider). It is `#![forbid(unsafe_code)]` and publishes once
+`nsplane` 0.8.0 is on crates.io (it has no unpublished dependencies).
+
+**Connections.** Every carrier dials the same way, from one `WssConfig`:
+
+- TCP, TLS and the WebSocket upgrade within `connect_timeout` (10 s), to `connect_addr`
+  or the URL's host, with `server_name` (default the URL's host), the extra `headers` and,
+  with a `BearerProvider`, `Authorization: Bearer <token>` fetched per dial.
+- An upgrade answered with 401 or 403 is reported as `LinkState::Rejected(status)` on the
+  carrier's `state()` watch (and counted in its stats). After a 401 the next dial waits
+  until the provider yields a different token (polled every `token_poll`, 2 s, at most
+  `token_wait`, 300 s); a 403, and a 401 without a provider, back off like any failure.
+- Backoff: every dial but the first waits `backoff_min` (2 s) after a link that came up,
+  doubled after each failed dial up to `backoff_max` (60 s).
+- Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
+  (pongs included) arrived for `read_idle` (35 s). No message above `MAX_MESSAGE`
+  (4 x 65 535 bytes) is read.
+- TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
+  takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
+  default protocol versions and no client auth); `WssTls::Config` takes a complete
+  `Arc<rustls::ClientConfig>` used as is (ns passes its `control::tls::client_config()`).
+  Built-in roots may become an optional feature later if a consumer needs them.
+
+**Datagram carrier.** `WssDialer` is a `LinkDialer`: `into_transport(id, peer, config)`
+returns a `LinkTransport` whose links are WSS connections. Each datagram is one binary
+message carrying its raw bytes (the wire of ns `OpaquePump` and the examples' relay); text
+messages and messages above `MAX_DATAGRAM` (65 535) are dropped and counted in
+`WssStats`, a close frame or the end of the stream ends the link.
+
+**Stream carrier wire.** `WsFrame` (module `frame`) is ns `tunnel-ws`'s and NSGW's protocol,
+byte for byte: every binary message is one frame, big-endian.
+
+| Field / command | Bytes | Content |
+|---|---|---|
+| `stream_id` | 4 | the stream, per session (never 0 from the client) |
+| `command` | 1 | one of the commands below |
+| `OPEN_V4` (`0x01`) | 4 + 2 + 1 | IPv4 address, port, protocol (`0x00` TCP, `0x01` UDP) |
+| `OPEN_V6` (`0x02`) | 16 + 2 + 1 | IPv6 address, port, protocol |
+| `DATA` (`0x10`) | rest | stream bytes (at most `MAX_DATA_PAYLOAD`, 65 531, per frame), or one UDP datagram |
+| `CLOSE` (`0x20`) | 0 | close the stream |
+| `CLOSE_ACK` (`0x21`) | 0 | acknowledge a CLOSE |
+
+As in ns, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
+byte but `0x01` is TCP. The protocol has no open reply and no flow control: a refused
+OPEN is answered with CLOSE, and a stream whose peer outruns its receive budget is closed.
+
+**Stream client.** `WssStreamClient` (the client leg, ns `proxy/wire.rs` and
+`wss_flow.rs`) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
+`AsyncWrite`) and UDP flows (`open_udp`, a `WssUdpFlow` with `send` / `recv`) to targets
+behind a terminate (NSGW, or `WssStreamServer`).
+
+- Sessions: dialed lazily on the first open (or `connect`). Every TCP stream and UDP flow
+  is multiplexed over one session until it holds
+  `WssStreamLimits::max_streams_per_session` live ones (default 1024, NSGW's default
+  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time
+  and waiting opens share it. The wire format is ns's, unchanged. NSGW caveats: it rejects
+  OPENs beyond its own per-session cap, which its operator can set below 1024 (keep
+  `max_streams_per_session` at most the gateway's cap), and it writes all streams of a
+  session through one shared writer queue.
+- Stream ids count up from 1 per session, skipping ids still in use; an id stays in use
+  until the peer's CLOSE or `CLOSE_ACK`. An open returns once its OPEN is queued.
+- Half-close: `shutdown` sends CLOSE behind the data already written (the wire has no
+  other half-close) and the stream keeps reading until the peer's CLOSE or `CLOSE_ACK`,
+  then reads EOF; this matches the ns terminate and `WssStreamServer`, which drain the
+  stream to the backend before ending it. A peer's CLOSE reads as EOF after the bytes
+  before it and is answered with `CLOSE_ACK`; dropping a stream sends CLOSE.
+- Queues and bounds (`WssStreamLimits`, ns's defaults): a control queue (OPEN,
+  `CLOSE_ACK`, reset CLOSE, pings; 64 messages) written before the data queue (DATA and
+  orderly CLOSE; 256 messages), and receive budgets of 4 MiB per stream
+  (`stream_buffer`) and 32 MiB per session (`session_buffer`), each received frame
+  costing its payload plus 64 bytes. Over budget, a TCP stream is reset (reads fail with
+  `ConnectionReset`) and a UDP datagram is dropped while the flow stays.
+- Reconnection: when a session ends (socket error, close, read idle) every stream and flow
+  on it fails; the next open dials again after the backoff. Frames for unknown stream ids
+  are ignored and counted in `WssStreamStats`.
+
+**Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
+relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
+
+- Resolution is the embedder's: `WssResolver::resolve(WssOpen { session, stream_id,
+  target, protocol })` returns the backend `SocketAddr` or `Denied` (answered with CLOSE).
+  It runs on the stream's own task, so a slow answer delays only that stream. ns keeps its
+  resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) behind it.
+- An OPEN for an id in use, or beyond `max_streams` (1024), is answered with CLOSE. The
+  server connects a TCP stream or a connected UDP socket (bound to the backend's address
+  family) and relays: TCP bytes in DATA frames of at most `MAX_DATA_PAYLOAD`, one datagram
+  per DATA frame for UDP.
+- A CLOSE is always answered with `CLOSE_ACK`; the stream's queued data is still written
+  to the backend, then its write side is shut. A backend EOF sends CLOSE behind the
+  stream's data; a failed connect, a backend error (a failed UDP receive included) sends
+  CLOSE at once.
+- Queues and bounds (`WssServerLimits`, ns's defaults): 4 MiB per stream
+  (`stream_buffer`), 32 MiB per session (`session_buffer`), 64 frames per stream
+  (`stream_queue`), each received frame costing its payload plus 64 bytes until written;
+  a frame over a bound closes its stream only (`WssCloseReason::Overflow`). Control queue
+  64 messages (`CLOSE_ACK`, refusing or resetting CLOSE, pings), written before the data
+  queue of 256 (DATA and the CLOSE after a backend's end).
+- Events: `with_events(mpsc::Sender<WssStreamEvent>)` reports each stream's `Open` and
+  `Close { reason, to_backend, from_backend }`; sending never waits, an event that does
+  not fit is counted in `WssServerStats::event_drops`.
+- Reconnection: one session at a time carries every stream. When it ends its streams are
+  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after the
+  backoff; a shutdown closes the open streams and the session.
+
+ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
+here, ns can delete `tunnel-ws` whole.
+
+**Deviations from ns.** An orderly CLOSE is queued behind the stream's data on both legs.
+Client: an over-budget UDP datagram is dropped and the flow kept, and the receive budgets
+count payload plus 64 bytes per frame instead of ns's 64-message cap per stream. Server:
+on a peer's CLOSE the queued data is drained to the backend and its write side shut (ns
+dropped it), the half-close the client relies on; a failed UDP backend receive sends
+CLOSE; the UDP socket binds to the backend's address family.
+
+**Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
+`crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
+relay and checks the frames against the ns layouts; `nsplane-e2e` `wss_datagram` runs two
+engines over `WssDialer` (401, 403, reconnect, read idle); `examples/tests/wss.rs` and the
+`relay-wss` cells of `just e2e-examples` run the examples' relay client on it.
+
 ## nsplane-tun
 
 `Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one, and `Tun::split`
@@ -490,6 +619,19 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (default `None`: the 512 segments
+  above) size every TCP socket's buffers, listener pool sockets included, clamped to one
+  IPv4 MSS (`mtu - 40`) at least and `65535 << 14` (the largest window TCP can advertise,
+  under smoltcp's 1 GiB limit) at most. The receive buffer is the window: smoltcp's
+  `Socket::new` derives the window-scale shift from its capacity (its bit length minus 16,
+  at least 0), so the SYN and SYN-ACK carry a scale and initial window
+  matching it with no further code. A window of more segments than the queues on the path
+  hold loses its tail when the peer sends it at once (see the field docs and
+  [Socket buffers (MB-x5)](#socket-buffers-mb-x5)). This is ns's MB-x5 knob and not the
+  fix for the throughput gap (MF-2). ns's MB-x6
+  (counting SYNs refused for a full listener pool) needs no code here:
+  `NetStackStats::syn_refused` counts them, for a pool sized by
+  `NetStackConfig::listener_pool`.
 - UDP datagrams are built with DF set over IPv4 and an application payload whose packet
   exceeds the MTU fails with `InvalidInput`. With `NetStackConfig::udp_allow_fragmentation`
   an IPv4 one instead leaves as a single oversize packet with DF clear (up to the 65 535-byte
@@ -626,6 +768,176 @@ queue capacity 512 and 1024, release, 3 runs per cell) completed every run after
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
 same harness stalled a connection for good in 2 of 20 runs at 8 connections and 512. The
 5C-T7 re-run of these cases is in [Performance](#performance).
+
+#### Single-stream profile (MF-2)
+
+Method: `tests/netstack_stream.rs` streams 1 GiB over one TCP connection, MTU 1420,
+release, either between two netstacks over two engines on the in-process
+`ChannelTransport` pair (`stream_throughput_engines`) or between two netstacks whose egress
+feeds the other's ingress directly, without engine or crypto (`stream_throughput_direct`).
+Both sides run in the test process and are told apart by symbol. Profiles were taken with
+`perf` 6.12 in a sibling container (frame-pointer call graphs, built with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS=-Cforce-frame-pointers=yes`). They
+sample `instructions:u` as well as cycles: on the shared host (load 13-47 on 32 cores)
+cycle counts of unchanged smoltcp code swung by 25 % between runs, while instruction counts
+of one build stay within about 2 %. Temporary driver counters (never committed) counted
+turns and packets.
+
+```text
+cargo test --release -p nsplane-e2e --test netstack_stream -- --ignored --nocapture
+```
+
+Where the instructions go on main (per GiB):
+
+| | Over engines | Direct |
+| --- | --- | --- |
+| Whole process | 39.9 G | 7.6 G |
+| Both netstack drivers | 7.1 G (18 %) | 6.2 G (81 %) |
+| smoltcp and the device, inside the drivers | 4.9 G | 5.0 G |
+| ChaCha20-Poly1305 seal + open | 14.5 G (36 %) | - |
+| Driver turns, of which `yield_now` turns | 355 k, 268 k | 117 k, 42 k |
+
+- smoltcp is the stack's cost. `process_tcp` (21 % of the direct process), the egress
+  `dispatch_ip` closure (12 %) and `socket_egress` (10 %) lead, and about 15 % of all
+  instructions are the TCP checksum loop (`smoltcp::wire::ip::checksum::data`, including
+  a bounds-checked `try_into().unwrap()` per 4-byte chunk) in both directions.
+- The driver's own code is small: the ingress queue (0.49 G, one semaphore lock per
+  `try_recv`), its turn bookkeeping (0.27 G) and copies between the sockets and the
+  application buffers (0.1 G of instructions; `memmove` is about 5 % of the direct cycles).
+  The byte-wise looking `shared.rx.extend(bytes.iter())` only runs for terminal sockets
+  and is a slice copy (`VecDeque`'s `Extend<&u8>` from a slice iterator); it does not show
+  in the profile.
+- Every egress buffer is zero-filled before smoltcp writes it (`PacketPool::get` plus
+  `PacketBuf::set_len`, about 4 % of the direct instructions).
+- Over engines a full-size TCP segment did not fit its buffer once the engine appended the
+  WireGuard trailer, so every one was reallocated and copied when sealed (`_int_malloc`
+  2.5 %, `realloc` 1 % of the instructions).
+- The engine side dominates the engine pairing: crypto, the engine tasks and channel
+  handoffs, and `ChannelTransport::recv`, which zero-fills its 64 KiB receive buffer per
+  datagram (7 % of the instructions, 9 % of the cycles; a test harness cost, not a
+  netstack one).
+- smoltcp sends at most one segment per socket per egress pass, so on the sender most
+  turns end with more to send and yield (268 k of 355 k turns over engines).
+
+Fixes, without behavior change:
+
+1. Ingress is taken with `poll_recv_many` (still at most 256 packets per turn, same order),
+   so the queue slots of a batch are returned in one step: -2.3 % driver instructions
+   on the direct pairing.
+2. Egress TCP segments and UDP datagrams keep 32 bytes of tail room (`device::TAILROOM`),
+   so the engine seals them in place without reallocating: -2.0 % process instructions
+   over engines, CPU time 9.6 s to 8.7 s, context switches 529 k to 403 k per GiB.
+
+Not adopted: draining egress after a pass while it sends (up to the backlog bound) cut
+the turns over engines from 355 k to 93 k and the yields to almost none, but it made the
+sender fill the receive window to its edge, where smoltcp trims data (see the window-edge
+item under *Known remaining costs*): 2-5 % of the segments were retransmitted without any
+loss, and the direct pairing used more CPU. With that smoltcp issue fixed in a local
+prototype it retransmits 0.6 % and saves another 2.6 % of instructions and 30 % of the
+context switches over engines, but did not raise the throughput (median 519 MB/s against
+576 MB/s), so it stays out.
+
+Before and after: `main` against the branch, interleaved runs of the stream loads, median
+[range] per GiB, CPU time, instructions and context switches from `perf stat`. "First" is
+the window the fixes were measured in (five runs each, 1-minute load 13-18 on 32 cores);
+"final" is a fresh run of the merged workstream against `main` (2026-10-03, five runs
+each, load 20-29):
+
+| Stream | main, first | branch, first | main, final | branch, final |
+| --- | --- | --- | --- | --- |
+| Over engines, MB/s | 540 [498-545] | 576 [536-610] | 306 [187-330] | 309 [134-361] |
+| Over engines, CPU time | 5.99 s [5.90-6.41] | 5.50 s [5.29-6.03] | 10.08 s [9.51-11.22] | 9.34 s [8.88-10.59] |
+| Over engines, instructions | 39.45 G | 38.57 G | 39.41 G [39.37-39.43] | 38.49 G [38.43-38.60] |
+| Over engines, context switches | 448 k | 340 k | 555 k [480-603] | 431 k [396-473] |
+| Direct, MB/s | 2022 [1534-2144] | 1906 [1182-2377] | 1002 [628-1189] | 1162 [984-1254] |
+| Direct, CPU time | 0.87 s [0.86-1.32] | 1.00 s [0.82-1.71] | 1.82 s [1.61-1.88] | 1.60 s [1.54-1.74] |
+| Direct, instructions | 7.72 G [7.68-9.03] | 7.85 G [7.52-8.57] | 7.72 G [7.68-7.80] | 7.54 G [7.48-7.63] |
+
+Instruction counts are the stable measure: over engines the branch runs 2.2-2.3 % fewer
+(38.5-38.6 G against 39.4 G per GiB), with 7-8 % less CPU time and 22-24 % fewer
+context switches. Throughput follows the host load: at load 20-29 both builds reach about
+half of what they did at 13-18, and the branch's median is ahead by 1 % (final) to 7 %
+(first), inside the spread. The direct pairing has no sealing; the batched ingress saves
+2.3 % of its instructions in the final window and less than the run-to-run spread in the
+first.
+
+`netstack_lossy`'s throughput rows, three interleaved runs each (load 4-22 first, 17-37
+final), show no loss-recovery regression:
+
+| Case | main, first | branch, first | main, final | branch, final |
+| --- | --- | --- | --- | --- |
+| TCP, 64 MiB, no loss | 399 / 457 / 120 MB/s | 406 / 232 / 453 MB/s | 77 / 258 / 248 MB/s | 383 / 289 / 107 MB/s |
+| TCP, 16 MiB, 1 % loss | 1.08 / 2.08 / 0.18 s | 0.09 / 1.13 / 0.07 s | 1.28 / 1.13 / 4.19 s | 2.11 / 1.17 / 1.17 s |
+| TCP, 16 MiB, 3 % loss | 52.2 / 50.2 s, once not done after 60 s | 55.2 / 58.2 / 51.2 s | 57.2 s, twice not done after 60 s | 50.2 / 51.3 / 55.2 s |
+| TCP, 16 MiB, bottleneck | 14.9 / 23.9 / 21.9 s | 22.8 / 22.9 / 17.9 s | 21.8 / 17.9 / 20.9 s | 16.9 / 21.9 / 18.9 s |
+| UDP, 50 000 x 1200 B | 780 / 261 / 716 MB/s | 798 / 247 / 188 MB/s | 747 / 540 / 500 MB/s | 409 / 568 / 698 MB/s |
+
+The fixes do not touch retransmission: 3 % loss is timeout-bound right at the 60 s limit on
+both builds (main missed it three times in six runs, the branch never), and the other rows
+spread alike.
+
+#### Socket buffers (MB-x5)
+
+`NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (see [nsplane-netstack](#nsplane-netstack))
+size the window, and the window is a trade-off: a peer may send a whole window at once, and
+a window of more segments than the queues between the stacks hold loses its tail there.
+In-process that queue is the receiving engine's 1024-packet sink queue: the excess is
+dropped as `DROP_SINK_FULL`, and smoltcp recovers past the first lost segment of a window
+only by a retransmission timeout of at least 1 s (no SACK, no partial-ACK retransmission).
+`tests/netstack_buffers.rs` `throughput`, the branch only (`main` has no fields), three
+runs, release, load 17-31:
+
+| Buffers on both stacks | 64 MiB, MB/s, median [range] | `DROP_SINK_FULL` per run |
+| --- | --- | --- |
+| Default, 512 segments (about 690 KiB) | 287 [200-336] | 0 |
+| 1 MiB | 315 [298-334] | 0 |
+| 4 MiB, about 3000 segments | 52 [37-53] | 101-312 |
+
+```text
+cargo test --release -p nsplane-e2e --test netstack_buffers -- --ignored --nocapture
+```
+
+When the buffers were added (PS-BUF) the same load gave about 50 MB/s at 4 MiB against
+250-450 MB/s for the default and 1 MiB, and 4 MiB ran without drops once the engine and
+stack queues held 8192 packets. A larger window pays only on a path whose round trip needs
+it and whose queues match it, so the default stays at 512 segments. ns measured a 1 MiB
+window within noise of the default, so this knob is not the MF-2 fix.
+
+#### Known remaining costs (deferred)
+
+Decided for later, not in this workstream:
+
+- smoltcp fork, a later fork round (the fork stays at `v0.14.0-nsplane.3` for now):
+  - `src/wire/ip.rs`, `checksum::data`: sum 8-byte words into a `u64` (or 16-bit words via
+    `as_chunks::<2>` without the `try_into().unwrap()` per chunk) so the loop vectorises; it
+    is about 15 % of the stack's instructions on the direct pairing.
+  - `src/socket/tcp.rs` (the receive window check, around line 1718): the receiver checks
+    segments against the window it advertised last
+    (`remote_last_ack + remote_last_win << shift`), and with window scaling that right
+    edge moves left by up to `2^shift - 1` bytes whenever a segment arrives (the scaled
+    window rounds down), so data the sender was allowed to send is trimmed and
+    retransmitted. Tracking the furthest edge advertised (updated where `remote_last_ack`
+    and `remote_last_win` are set in `ack_reply` and `dispatch`, for non-SYN segments;
+    reset in `reset`) and accepting up to it removed those retransmissions in a local
+    prototype (direct stream with egress drain: 4.5 % to 0.6 % extra segments; main's
+    pacing already stays near zero).
+  - SACK, or NewReno's retransmission on a partial ACK: today any loss past the first
+    segment of a window waits for a timeout of at least 1 s, which keeps 3 % loss at
+    50-60 s and large windows at about 50 MB/s above.
+- `nsplane-packet`: setting a pooled buffer's length without zero-filling it (smoltcp
+  writes every byte of a transmitted packet) would save about 4 % of the direct
+  instructions. It is a later design item: it would need `unsafe` in a
+  `forbid(unsafe_code)` crate.
+- `nsplane`: `ChannelTransport::recv` zero-fills its 64 KiB receive buffer per datagram
+  (7 % of the instructions, 9 % of the cycles over engines), which skews every in-process
+  engine benchmark, the over-engines numbers above included. It is to be fixed after the
+  PF campaign merges.
+- MF-2's 12-14 % gap to ns's legacy stack cannot be split in-process: it was measured on
+  ns's own path, whose legacy WireGuard loop is tunnel-wg's, not the nsplane engine. The
+  netstack is about 18 % of the engine pairing's instructions (and the fixes above removed
+  its per-segment reallocation and per-packet queue locking), so most of the gap is likely
+  the engine (MF-1). PB's netstack pair (`scripts/bench`) is not on `main` yet; MF-2 is to
+  be re-measured with PB's harness.
 
 ## nsplane-uapi and the CLI
 
@@ -836,12 +1148,14 @@ path, so such a client pays no extra latency for it.
 | Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |
 | User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
 | Stack reassembly | `nsplane-netstack` | `NetStackConfig::reassembly = Some(ReassemblyConfig::default())` (64 datagrams, 30 s, 65 535 bytes) | off: fragments are dropped (`unsupported`) | one `Option` check per ingress packet; no reassembler is allocated |
+| TCP socket buffers | `nsplane-netstack` | `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer = Some(bytes)`, clamped to `mtu - 40 ..= 65535 << 14` | `None`: `(mtu - 40) * 512` bytes each, as before | none: the sizes are resolved once when the stack is created |
 | Oversize IPv4 UDP sends | `nsplane-netstack` | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send, as before |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
 | UDP side channel | `nsplane` | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified, no task or copy |
 | Message-link transport | `nsplane` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task is spawned and no dependency added; the dialer (WebSocket, TLS) is the embedder's |
+| WSS carriers | `nsplane-wss` | `WssDialer::new(config)?.into_transport(..)`, `WssStreamClient::new`, `WssStreamServer::new` | not a dependency | none: a separate crate; `nsplane` gains no WebSocket or TLS dependency (`tokio-tungstenite`, `rustls` with aws-lc-rs come only with `nsplane-wss`) |
 
 **Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
 `nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
@@ -914,6 +1228,7 @@ cargo bench -p nsplane-core --bench data_path
 cargo bench -p nsplane-acl --bench namespaces
 cargo bench -p nsplane --bench worker_pool
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test netstack_stream -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 ```
 
@@ -944,6 +1259,7 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Engine fast path (MF-1), TUN, nsplane-cli -> kernel WireGuard | the same | 4.36 / 4.64 Gbit/s | before: 6.89 / 6.77 Gbit/s (-37 % / -31 %) |
 | Engine fast path (MF-1), worker pool hub, pool off | 64 B / 1420 B | 1.37 / 1.31 Mpps, 806 / 810 kpps | before, same session: 1.45 / 1.46 Mpps, 880 / 913 kpps (-5 % to -11 %) |
 | Engine fast path (MF-1), engine latency, idle, no workers | `round_trip_latency` alone, p50 / p99 | 13.4 / 33.6 us, 10.8 / 24.0 us | before, same session: 22.3 / 40.5 us, 24.7 / 63.9 us; with the other test in parallel the order flips (see the subsection) |
+| Netstack TCP stream (PS) | 1 GiB, one connection, over two engines / direct, median of 5, per GiB (2026-10-03, load 20-29) | 309 MB/s, 9.34 s CPU, 38.49 G instructions / 1162 MB/s, 7.54 G instructions | `main`: 306 MB/s, 10.08 s, 39.41 G / 1002 MB/s, 7.72 G; [Single-stream profile (MF-2)](#single-stream-profile-mf-2) |
 
 - Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
   `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The
@@ -973,6 +1289,11 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 - Netstack. Without loss the stack is not the limit (same-build spread 320-460 MB/s TCP,
   470-900 MB/s UDP). At 3 % random loss smoltcp's timeout-bound recovery lands right at the
   test's 60 s limit (5C-T6 finished in 54-59 s); the 1 % case and the bottleneck complete.
+  On one 1 GiB stream the netstack is about 18 % of the engine pairing's instructions
+  (crypto 36 %); the PS fixes take 2.2-2.3 % of the instructions and 7-8 % of the CPU time
+  off it, and the rest of the stack's cost is smoltcp (see *Known remaining costs* under
+  [Netstack throughput](#netstack-throughput)). The gap to ns's legacy stack (MF-2) is to
+  be re-measured with PB's netstack pair.
 
 ### Engine batching under load
 
@@ -1014,13 +1335,78 @@ without the engine batching, two runs each, 1-minute load 2.8-5.9.
   their bound (`QueueStats::crypto` at `queue_capacity`) with the queueing delay that adds;
   these rows are for information only.
 
+### Against WireGuard implementations
+
+`scripts/bench/wg-compare.sh` (see `scripts/bench/README.md`) runs every pair in two fresh
+containers on one docker network: side a (sender) pinned to CPUs 2-5, side b (receiver) to
+6-9, real TUN devices, MTU 1420, every implementation configured over the UAPI with `wg`
+and `ip`. Measured 2026-10-03 at f42b01e (main 3cc35ac plus the additive
+nsplane-cli flags `--crypto-workers` and `--no-offload`; nsplane code otherwise identical),
+image `ai-agent/nsplane-bench` (debian trixie-slim, iperf 3.18), wireguard-go 0.0.20250522
+(f333402), host AMD Ryzen AI MAX+ 395 with 32 CPUs shared with other jobs, kernel
+7.1.8+deb13-amd64. 30 s per run, 3 repetitions, medians. The 1-minute load was 20.5 at the
+start, 30 after `kernel-nsplane` and about 33 sampled during it, so these are loaded-host
+numbers.
+
+```text
+just bench-wg
+BENCH_PAIRS=nsplane-nsplane BENCH_NSPLANE_VARIANTS='default;w2:WG_CRYPTO_WORKERS=2' \
+  NSPLANE_CLI_BIN=../other-worktree/target/release/nsplane-cli scripts/bench/wg-compare.sh
+```
+
+Knobs: `BENCH_PAIRS`, `BENCH_DURATION`, `BENCH_REPS`, `BENCH_UDP_RATES`, `BENCH_CPUS_A`/`_B`,
+`BENCH_NSPLANE_VARIANTS`; `NSPLANE_CLI_BIN` measures a binary built on another branch.
+
+| Pair (a -> b) | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP rate: loss % | ping p50 / p99 idle ms | ping p50 / p99 loaded ms | CPU s/GB a | CPU s/GB b | 1-min load before / after |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| kernel-kernel | 3.68 | 3.69 | 1G: 0.77, 3G: 3.50 | 0.434 / 4.190 | 2.070 / 4.220 | 0.12 † | 0.93 † | 20.47 / 18.63 |
+| nsplane-nsplane | 6.65 | 6.36 | 1G: 0.14, 3G: 2.14 | 0.383 / 2.780 | 1.680 / 5.700 | 1.33 | 1.34 | 18.63 / 21.90 |
+| nsplane-nsplane (w2) | 4.14 | 6.06 | 1G: 1.88, 3G: 1.46 | 0.228 / 1.830 | 1.280 / 3.620 | 1.96 | 1.96 | 21.42 / 7.78 |
+| nsplane-nsplane (nooffload) | 2.03 | 3.01 | 1G: 2.71, 3G: 28.37 | 0.254 / 1.760 | 1.910 / 7.030 | 4.78 | 4.82 | 10.04 / 16.68 |
+| nsplane-nsplane (nooffload-w2) | 2.87 | 3.39 | 1G: 0.25, 3G: 5.07 | 0.532 / 2.370 | 1.400 / 3.790 | 3.87 | 4.32 | 18.47 / 9.69 |
+| nsplane-kernel | 5.30 | 4.23 | 1G: 4.04, 3G: 4.66 | 0.260 / 4.050 | 3.770 / 7.670 | 2.81 | 0.36 † | 9.69 / 21.38 |
+| kernel-nsplane | 3.67 | 3.13 | 1G: 2.76, 3G: 9.39 | 0.324 / 3.120 | 2.770 / 8.390 | 0.18 † | 2.66 | 21.38 / 30.04 |
+| wggo-wggo | 6.14 | 8.51 | 1G: 0.57, 3G: 42.51 | 0.361 / 3.100 | 3.870 / 8.140 | 1.58 | 2.17 | 29.64 / 11.36 |
+| netstack (user-space) | 3.06 | 1.61 | 1G: 0.25, 3G: 1.96 | 0.030 / 0.050 | 0.137 / 1.080 | 3.21 | 2.58 | 11.36 / 10.75 |
+
+Variants: `w2` = 2 crypto workers, `nooffload` = no TUN offload and no UDP GSO/GRO, on both
+sides; the mixed pairs run the default configuration. Throughput is the receiver-side sum;
+the loaded ping runs next to one saturating TCP stream; CPU s/GB is the container's cgroup
+CPU over the TCP P1 run divided by the GB received, iperf3's own CPU included.
+
+- Caveats. The host is shared and the 1-minute load moved between 7.8 and about 33 during
+  the run; the repetitions spread widely (e.g. nsplane-nsplane default TCP P1 6.46 / 8.86 / 6.65,
+  netstack 2.26 / 3.06 / 5.74), so only large differences are meaningful. † Kernel
+  WireGuard encrypts in kernel workqueue threads outside the container cgroup, so its CPU
+  per GB is an undercount. The `netstack` pair runs `netstack_bench` (engine, netstack and
+  load generator in one process per side, no TUN) instead of iperf3 and ping; its latency
+  columns are 1-byte TCP request/response round trips. nsplane-cli sides keep their
+  startup UDP port: a `listen-port` set over the UAPI rebinds with offload on, which would
+  undo `WG_NO_OFFLOAD`, so the harness does not set it.
+- Offload carries nsplane-cli's single-stream throughput: the default is 3.3x `nooffload`
+  at P1 (6.65 against 2.03 Gbit/s) at a quarter of the CPU per GB (1.33 against 4.78 s).
+  2 crypto workers lower P1 (4.14) and cost more CPU per GB (1.96), with P4 about the same
+  as the default.
+- Against the other implementations on this host and run: nsplane-nsplane default is above
+  kernel-kernel (3.68) and wireguard-go (6.14) at P1, below wireguard-go at P4 (6.36 against
+  8.51), and loses less UDP at 3G (2.14 % against 3.50 % and 42.51 %).
+- netstack: TCP P4 is below P1 in all three repetitions (1.55-2.50 against 2.26-5.74
+  Gbit/s), and also in a 5 s smoke run at a 1-minute load of 7 (1.08 against 1.83).
+- ns T10b (MF-1, MF-2 in `docs/task/20261003-1500-ns-dataplane-moves.md`) measured
+  single-stream TCP over TUN with a different harness and host, unloaded: engine 4044
+  against legacy tunnel-wg 4748 Mbit/s, and nsplane-netstack 4356 against legacy smoltcp
+  4897 Mbit/s. Here nsplane-nsplane default TCP P1 is 6.65 Gbit/s and netstack 3.06
+  Gbit/s; the setups differ, so these are not a like-for-like comparison.
+
 ### Engine fast path (MF-1)
 
 The engine fast path without crypto workers (batched input handoff and inline output, see
 [nsplane (driver)](#nsplane-driver)) was measured A/B in one window on 2026-10-03
 (campaign `nsplane-pf-202610031630`, PF3). A ("before") is main at 3cc35ac plus the
-benchmark harness and the nsplane-cli variant flags, with no engine change; B ("after") is
-the same plus the fast path. Release builds in the dev image; 32-thread Ryzen AI MAX+ 395,
+benchmark harness and the nsplane-cli variant flags, with no engine change (the build of
+[Against WireGuard implementations](#against-wireguard-implementations)); B ("after") is
+the same plus the fast path. The harness is `scripts/bench/wg-compare.sh` as on main; it
+was run from that branch before it landed, unchanged since. Release builds in the dev image; 32-thread Ryzen AI MAX+ 395,
 shared with other jobs.
 
 Throughput with `scripts/bench/wg-compare.sh` (real TUN with offload, `UdpTransport` with

@@ -26,6 +26,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, per-source rule namespaces, directed grants, outbound rules and app pinholes, and the `AclFilter` and `FlowTracker` packet filters |
 | `crates/nsplane-nat/`    | `nsplane-nat`    | IPv4/IPv6 translation (`Translator`, RFC 7915) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport (with an optional side channel), `LinkTransport` over a dialed message link |
+| `crates/nsplane-wss/`    | `nsplane-wss`    | WebSocket-over-TLS carriers: `WssDialer` (datagrams for `LinkTransport`), and the `WsFrame` stream protocol of ns and NSGW with its client (`WssStreamClient`, TCP streams and UDP flows multiplexed per session) and terminate leg (`WssStreamServer`, backends from the embedder's `WssResolver`) |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp ([dotns/smoltcp](https://github.com/dotns/smoltcp) fork; TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
@@ -88,9 +89,9 @@ nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 
 A basic client (an `EngineBuilder` on a TUN device and a `UdpTransport`, with peers and no
 filters) needs only `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
-`nsplane-packet` and `nsplane-noise`; `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
-are not dependencies of either and are not built. A feature that is not installed is not
-on the data path, so such a client pays no extra latency for it:
+`nsplane-packet` and `nsplane-noise`; `nsplane-acl`, `nsplane-nat`, `nsplane-netstack` and
+`nsplane-wss` are not dependencies of either and are not built. A feature that is not
+installed is not on the data path, so such a client pays no extra latency for it:
 
 | Feature | How to enable | Default | Cost when not enabled |
 | ------- | ------------- | ------- | --------------------- |
@@ -105,6 +106,7 @@ on the data path, so such a client pays no extra latency for it:
 | UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: one system call per datagram |
 | UDP side channel | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified |
 | `LinkTransport` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task runs unless it is created |
+| WSS carriers (`nsplane-wss`) | add the crate: `WssDialer::into_transport`, `WssStreamClient::new`, `WssStreamServer::new` | not a dependency | none: `nsplane` has no WebSocket or TLS dependency; only `nsplane-wss` pulls in `tokio-tungstenite` and `rustls` (aws-lc-rs), and it bundles no system or web PKI roots (the caller passes a `RootCertStore` or a `rustls::ClientConfig`) |
 
 Offload never waits for more packets: the engine fills batches only with packets already
 queued (non-blocking `try_recv`, no timers), TUN and UDP segmentation coalesce only within
@@ -216,6 +218,8 @@ wg setconf wg0 /path/to/wg0.conf
 | `--disable-drop-privileges` | `WG_SUDO`      | Keep root; otherwise switch to `SUDO_UID`/`SUDO_GID` after setup |
 | `--tun-fd <FD>`             | `WG_TUN_FD`    | Adopt this already-open TUN fd instead of creating the interface |
 | `--uapi-fd <FD>`            | `WG_UAPI_FD`   | Also serve the UAPI on this already-connected Unix stream socket |
+| `--crypto-workers <N>`      | `WG_CRYPTO_WORKERS` | Crypto worker tasks (default 0: crypto on the engine task; 2 or more enables the pool) |
+| `--no-offload`              | `WG_NO_OFFLOAD` | Open the TUN device and bind the UDP socket without segmentation offload |
 
 - The UAPI listens on `/var/run/wireguard/<name>.sock`.
 - The UDP socket is bound to an ephemeral port at startup; `wg set <name> listen-port <port>`
@@ -231,6 +235,11 @@ wg setconf wg0 /path/to/wg0.conf
   socket GSO/GRO when the kernel supports them, else plain per-packet I/O. With offload the
   socket sets DF; raise `net.core.rmem_max` / `wmem_max` (e.g. to 4194304) for the full
   4 MiB socket buffers.
+- `--no-offload` applies to the device and socket created at startup. With `--tun-fd` the
+  adopted device is used as is and only the UDP socket is affected. A `listen-port` or
+  `fwmark` set over the UAPI binds a new socket with offload, so keep the ephemeral port
+  (`wg show <name> listen-port`) when offload must stay off. `-v info` logs the offloads and
+  crypto workers in use (`Data path configured`).
 - `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 

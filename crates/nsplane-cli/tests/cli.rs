@@ -17,18 +17,20 @@ fn run_with_env(env: &[(&str, &str)]) -> std::process::Output {
 
 #[test]
 fn boolean_environment_variables_accept_1() {
-    for value in ["1", "true", "yes"] {
-        let output = run_with_env(&[("WG_SUDO", value)]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.contains("invalid value"),
-            "WG_SUDO={value} was rejected: {stderr}"
-        );
-        assert_ne!(
-            output.status.code(),
-            Some(2),
-            "clap usage error for WG_SUDO={value}"
-        );
+    for name in ["WG_SUDO", "WG_NO_OFFLOAD"] {
+        for value in ["1", "true", "yes"] {
+            let output = run_with_env(&[(name, value)]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("invalid value"),
+                "{name}={value} was rejected: {stderr}"
+            );
+            assert_ne!(
+                output.status.code(),
+                Some(2),
+                "clap usage error for {name}={value}"
+            );
+        }
     }
 }
 
@@ -52,6 +54,10 @@ fn help_lists_the_supported_flags() {
         "WG_TUN_FD",
         "--uapi-fd",
         "WG_UAPI_FD",
+        "--crypto-workers",
+        "WG_CRYPTO_WORKERS",
+        "--no-offload",
+        "WG_NO_OFFLOAD",
     ] {
         assert!(help.contains(flag), "--help does not list {flag}: {help}");
     }

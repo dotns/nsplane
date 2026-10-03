@@ -208,7 +208,7 @@ async fn round_trip(server: &mut Server, client: &WssTransport) -> TestResult {
 async fn datagrams_round_trip_over_tls_and_websocket() -> TestResult {
     let cert = cert()?;
     let mut server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
-    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None);
+    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None)?;
     let stats = client.stats();
     until("the connection", || stats.connected()).await?;
     round_trip(&mut server, &client).await?;
@@ -241,7 +241,7 @@ async fn udp_and_wss_clients_relay_to_each_other() -> TestResult {
         static_source: None,
     };
     let server = Server::start("127.0.0.1:0".parse()?, &cert, vec![pin]).await?;
-    let b = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None);
+    let b = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None)?;
     let stats = b.stats();
     until("the connection", || stats.connected()).await?;
 
@@ -280,7 +280,7 @@ async fn udp_and_wss_clients_relay_to_each_other() -> TestResult {
 async fn a_foreign_certificate_is_rejected() -> TestResult {
     let (cert, foreign) = (cert()?, cert()?);
     let server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
-    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &foreign.pem)?, None);
+    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &foreign.pem)?, None)?;
     let stats = client.stats();
     until("failed attempts", || stats.connect_failures() >= 2).await?;
     assert!(!stats.connected());
@@ -350,7 +350,7 @@ async fn text_oversized_and_invalid_messages_are_dropped() -> TestResult {
 async fn the_client_reconnects_after_the_relay_restarts() -> TestResult {
     let cert = cert()?;
     let mut server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
-    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None);
+    let client = WssTransport::connect(UDP_TRANSPORT, config(&server, &cert.pem)?, None)?;
     let stats = client.stats();
     until("the connection", || stats.connected()).await?;
     round_trip(&mut server, &client).await?;
