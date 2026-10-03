@@ -25,6 +25,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sy
 
 [dev-dependencies]
 nsplane-acl = { path = "../nsplane-acl", version = "0.8.0" }
+nsplane-nat = { path = "../nsplane-nat", version = "0.8.0" }
 nsplane-uapi = { path = "../nsplane-uapi", version = "0.8.0" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

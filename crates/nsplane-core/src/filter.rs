@@ -17,6 +17,13 @@ pub enum Verdict {
 }
 
 /// A filter on the plaintext side of the core. It is called synchronously and never does I/O.
+///
+/// Filters form an onion: the chain is installed from the wire side to the local side.
+/// Decrypted packets run through it in install order before they are delivered, local
+/// packets in reverse install order before they are encrypted, so the first filter is the one
+/// next to the tunnel in both directions and sees what the peer sends and receives. The first
+/// verdict other than [`Verdict::Accept`] ends the chain. Local packets are routed to a peer
+/// before the chain runs.
 pub trait PacketFilter: Send + Sync + 'static {
     /// Decrypted packet from `peer`, before it is delivered. May rewrite it in place.
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict;

@@ -8,7 +8,9 @@
 # Rows: TUN, netstack, bridge(fd), bridge(channel); columns: direct UDP, and the single-port
 # relay (relay_server) over UDP and over WSS with the direct path blocked. Scenarios add
 # native kernel WireGuard through the relay, NAT hole punching behind MASQUERADE routers,
-# the direct/relay ladder and plain WireGuard servers under the relay extension.
+# the direct/relay ladder, plain WireGuard servers under the relay extension, and the NAT
+# examples: IPv4-only clients reaching an IPv6-only peer through translate_node, and a
+# service published through port_map.
 # Needs docker and the `wireguard` kernel module on the host; nothing on the host is
 # reconfigured. The release example binaries are built in the dev image unless
 # NSPLANE_E2E_EX_BIN_DIR names a directory holding them.
@@ -24,7 +26,8 @@ NET=$PREFIX-net
 IMG=$PREFIX-image
 LABEL=nsplane-e2e-ex=$PREFIX
 LABELS=(--label ai-agent=true --label "$LABEL")
-EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server app_session)
+EXAMPLES=(udp_pair tun_node netstack_node hybrid acl_gateway fd_bridge events_stats relay_server app_session
+  translate_node port_map)
 PORT=51820
 WSS_PORT=8443
 
@@ -150,9 +153,10 @@ echo_server() {
 }
 # echo_try <ctr> <tcp|udp> <ip> <port>: one socat echo round trip through the kernel stack.
 echo_try() {
-  local payload out
+  local payload out family=4 ip=$3
+  [[ $ip == *:* ]] && { family=6; ip="[$ip]"; }
   payload="nsplane-e2e-$2-$RANDOM$RANDOM"
-  out=$(X "$1" "printf %s $payload | timeout 4 socat -t 1 - ${2^^}4:$3:$4" 2>/dev/null) || true
+  out=$(X "$1" "printf %s $payload | timeout 4 socat -t 1 - ${2^^}$family:$ip:$4" 2>/dev/null) || true
   [ "$out" = "$payload" ]
 }
 # echo_check <ctr> <proto> <ip> <port> [tries]: the echo works (retried while handshaking).
@@ -755,6 +759,85 @@ scenario_acl_gateway() {
   echo "  ok  a: extra.acl.replies grew past $replies"
 }
 
+# --- scenarios: NAT --------------------------------------------------------------------
+# translate_node t between an IPv4-only client c on t's LAN (an internal network) and a
+# kernel WireGuard peer k whose overlay is IPv6 only. t maps k's /127 group (node6
+# fd00:a::2:0, node4 fd00:a::2:1) to alias4 10.200.0.2, its own self4 10.200.0.1 to node4
+# fd00:a::1:1, and the LAN's IPv4 subnet to fd00:1::/96. c routes 10.200.0.2 through t;
+# k sees the requests from fd00:1::<c's IPv4> to node4 and answers over IPv6.
+scenario_translate_node() {
+  local lan
+  lan=$(case_net lan)
+  start_on "$NET" t --sysctl net.ipv4.ip_forward=1
+  docker network connect "$lan" "$(ctr t)"
+  start_on "$lan" c --sysctl net.ipv6.conf.all.disable_ipv6=1
+  start k
+  local t_pub k_pub t_ip k_ip lan4 t_lan
+  t_pub=$(pub t); k_pub=$(pub k); t_ip=$(ip_on t "$NET"); k_ip=$(ip_of k); t_lan=$(ip_on t "$lan")
+  lan4=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$lan")
+  [ "$(X c 'cat /proc/sys/net/ipv6/conf/all/disable_ipv6')" = 1 ] || { echo "  FAIL c: IPv6 is enabled"; return 1; }
+  X c "ip route add 10.200.0.2/32 via $t_lan"
+  echo "  ok  c: IPv4 only, LAN $lan4, 10.200.0.2 via t ($t_lan)"
+  docker exec -d "$(ctr k)" bash -c "socat TCP6-LISTEN:7,fork,reuseaddr PIPE > /socat-7.log 2>&1 &
+    socat UDP6-RECVFROM:7,fork PIPE >> /socat-7.log 2>&1 & wait"
+  node t translate_node --self 10.200.0.1=fd00:a::1:1 --peer "$k_pub,endpoint=$k_ip:$PORT" \
+    --map "$k_pub,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2" --lan "$lan4=fd00:1::/96"
+  # node4 is k's preferred source, so its UDP replies come from the address c talks to.
+  kernel_wg k fd00:a::2:1/128 "$t_pub" "$t_ip" fd00:1::/96,fd00:a::1:0/127 fd00:1::/96 fd00:a::1:0/127
+  X k 'ip addr add fd00:a::2:0/128 dev wg0 preferred_lft 0'
+  echo_check c tcp 10.200.0.2 7; echo_check c udp 10.200.0.2 7
+  ping_check c 10.200.0.2
+  echo_check t tcp 10.200.0.2 7; echo_check t udp 10.200.0.2 7
+  wait_status t translate_node '.extra.translate | .translated_out > 0 and .translated_in > 0' 5
+  echo "  ok  t: translated $(X t 'cat /translate_node.json' | jq -c '.extra.translate | {translated_out, translated_in, dropped_out, dropped_in}')"
+  X k 'wg show wg0 transfer' | awk '$2 == 0 || $3 == 0 { exit 1 }'
+  echo "  ok  k: traffic on the IPv6-only tunnel both ways"
+}
+
+# udp_from <ctr> <ip6> <port> <source port>: one UDP echo round trip from a fixed port.
+udp_from() {
+  local payload out
+  payload="nsplane-e2e-udp-$RANDOM$RANDOM"
+  out=$(X "$1" "printf %s $payload | timeout 4 socat -t 1 - UDP6:[$2]:$3,sourceport=$4" 2>/dev/null) || true
+  [ "$out" = "$payload" ]
+}
+
+# port_map a publishes its echo port 7 as [fd00:b::1]:8007 (TCP for the kernel WireGuard
+# peer k only, UDP for every peer) and as TCP 8008 for another peer only. k reaches the
+# service through the listen port (the replies come back SNATed, or socat would not take
+# them), 8008 is refused, and an idle UDP flow expires after --udp-timeout.
+scenario_port_map() {
+  start a k
+  local a_pub k_pub a_ip k_ip other
+  a_pub=$(pub a); k_pub=$(pub k); a_ip=$(ip_of a); k_ip=$(ip_of k)
+  other=$(X a 'wg genkey | wg pubkey')
+  local timeout=3
+  node a port_map --address fd00:b::1/64 --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=fd00:b::2/128" \
+    --peer "$other,allowed-ips=fd00:b::3/128" --echo-port 7 \
+    --publish "tcp:[fd00:b::1]:8007=[fd00:b::1]:7@$k_pub" --publish "udp:[fd00:b::1]:8007=[fd00:b::1]:7" \
+    --publish "tcp:[fd00:b::1]:8008=[fd00:b::1]:7@$other" --udp-timeout "$timeout"
+  kernel_wg k fd00:b::2/64 "$a_pub" "$a_ip" fd00:b::1/128
+  wait_status a port_map '.extra.port_map.rules == 3'
+  echo_check k tcp fd00:b::1 8007; echo_check k udp fd00:b::1 8007
+  echo_denied k tcp fd00:b::1 8008
+  wait_status a port_map '.extra.port_map.conntrack | .inserted >= 2 and .hits > 0' 5
+  echo "  ok  a: flows mapped, $(X a 'cat /port_map.json' | jq -c '.extra.port_map.conntrack')"
+
+  echo "  -- a UDP flow from one source port: reused while active, expired after ${timeout}s"
+  local inserted
+  inserted=$(X a 'cat /port_map.json' | jq '.extra.port_map.conntrack.inserted')
+  udp_from k fd00:b::1 8007 40000 || { echo "  FAIL k: udp echo from port 40000"; return 1; }
+  wait_status a port_map ".extra.port_map.conntrack.inserted == $((inserted + 1))" 5
+  udp_from k fd00:b::1 8007 40000 || { echo "  FAIL k: second udp echo from port 40000"; return 1; }
+  sleep 1.5
+  wait_status a port_map ".extra.port_map.conntrack.inserted == $((inserted + 1))" 5
+  echo "  ok  a: the second datagram reused the flow"
+  sleep $((timeout + 1))
+  udp_from k fd00:b::1 8007 40000 || { echo "  FAIL k: udp echo from port 40000 after the timeout"; return 1; }
+  wait_status a port_map ".extra.port_map.conntrack | .inserted == $((inserted + 2)) and .expired > 0" 5
+  echo "  ok  a: the flow expired after ${timeout}s idle and a new one was recorded"
+}
+
 # --- run --------------------------------------------------------------------------------
 cell tun udp tun_pair tun_kernel
 cell netstack udp netstack_pair netstack_kernel
@@ -778,6 +861,8 @@ scenario ladder_tun
 scenario ladder_netstack
 scenario nat_hole_punch
 scenario plain_wg_compat
+scenario translate_node
+scenario port_map
 
 report
 if [ "$FAILED" -ne 0 ]; then echo "FAIL"; exit 1; fi
