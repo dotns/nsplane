@@ -95,6 +95,7 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   handoff latency and wakeups in the task pipeline (inferred). Ask: reduce handoffs on the
   hot path (for example run-to-completion read -> seal -> send when no crypto workers are
   configured), measured with the ns harness or an equivalent nsplane-e2e bench.
+  - Harness: `just bench-wg` (`scripts/bench/wg-compare.sh`); results in docs/architecture.md, Performance, *Against WireGuard implementations*.
 - MF-2 user-space mode (nsplane-netstack) is 12-14% below the legacy smoltcp stack; raising
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is
