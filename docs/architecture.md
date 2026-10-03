@@ -455,6 +455,22 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (default `None`: the 512 segments
+  above) size every TCP socket's buffers, listener pool sockets included, clamped to one
+  IPv4 MSS (`mtu - 40`) at least and `65535 << 14` (the largest window TCP can advertise,
+  under smoltcp's 1 GiB limit) at most. The receive buffer is the window: smoltcp's
+  `Socket::new` derives the window-scale shift from its capacity (its bit length minus 16,
+  at least 0), so the SYN and SYN-ACK carry a scale and initial window
+  matching it with no further code. A window of more segments than the queues on the path
+  hold loses its tail when the peer sends it at once (see the field docs): in-process,
+  4 MiB buffers (about 3000 segments) overflow the receiving engine's 1024-packet queue
+  (`DROP_SINK_FULL`) in most runs and take a 1 s retransmission timeout, about 50 MB/s
+  against 250-450 MB/s for the default and 1 MiB; with 8192-packet engine and stack queues
+  4 MiB runs without drops. This is ns's MB-x5 knob and not the fix for the
+  throughput gap (MF-2): ns measured a 1 MiB window within noise of the default. ns's MB-x6
+  (counting SYNs refused for a full listener pool) needs no code here:
+  `NetStackStats::syn_refused` counts them, for a pool sized by
+  `NetStackConfig::listener_pool`.
 - UDP datagrams are built with DF set over IPv4 and an application payload whose packet
   exceeds the MTU fails with `InvalidInput`. With `NetStackConfig::udp_allow_fragmentation`
   an IPv4 one instead leaves as a single oversize packet with DF clear (up to the 65 535-byte
@@ -801,6 +817,7 @@ path, so such a client pays no extra latency for it.
 | Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |
 | User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
 | Stack reassembly | `nsplane-netstack` | `NetStackConfig::reassembly = Some(ReassemblyConfig::default())` (64 datagrams, 30 s, 65 535 bytes) | off: fragments are dropped (`unsupported`) | one `Option` check per ingress packet; no reassembler is allocated |
+| TCP socket buffers | `nsplane-netstack` | `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer = Some(bytes)`, clamped to `mtu - 40 ..= 65535 << 14` | `None`: `(mtu - 40) * 512` bytes each, as before | none: the sizes are resolved once when the stack is created |
 | Oversize IPv4 UDP sends | `nsplane-netstack` | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send, as before |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |

@@ -389,6 +389,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled; invalid or overlapping fragments count as `malformed`). With it, `owns` reports
   TCP and UDP fragments to a stack address as the stack's: `Flow` for a first fragment on a
   registered tuple, `Listener` for any other.
+- `nsplane-netstack`: `NetStackConfig::tcp_rx_buffer` and `tcp_tx_buffer: Option<usize>`
+  size every TCP socket's receive and send buffer, listener pool sockets included (default
+  `None`: `(mtu - 40) * 512` as before). Values are clamped to one IPv4 MSS (`mtu - 40`) at
+  least and `65535 << 14` at most; the advertised window and the window-scale option follow
+  the receive buffer (smoltcp derives the shift from its capacity).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
