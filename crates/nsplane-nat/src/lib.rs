@@ -24,7 +24,13 @@
 //!   with SNAT ports reserved per flow through [`SnatPorts`]. It is not a
 //!   `PacketFilter`: LAN replies are addressed to the SNAT source, which no
 //!   peer's allowed IPs contain, so the translation sits on the local side
-//!   (`forward` / `reverse` on a `PacketBuf`).
+//!   (`forward` / `reverse` on a `PacketBuf`). On the gateway, wrap the
+//!   engine's local side: `EngineBuilder::new(Nat64LanSource::new(tun_source,
+//!   nat.clone()), Nat64LanSink::new(tun_sink, nat))` ([`Nat64LanSource`],
+//!   [`Nat64LanSink`]). Each IPv6 client's allowed IPs of the gateway peer
+//!   must contain the mapped /96, so the client routes it to the gateway;
+//!   the gateway's allowed IPs of each client contain the client's IPv6
+//!   source as usual.
 //! - **Filter order**: the core's filter chain is installed from the wire side
 //!   to the local side (inbound in install order, outbound in reverse); the
 //!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
@@ -54,8 +60,8 @@ pub use conntrack::{
     TcpState,
 };
 pub use nat64_lan::{
-    DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanStats,
-    Nat64Verdict, SnatPorts,
+    DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanSink,
+    Nat64LanSource, Nat64LanStats, Nat64Verdict, SnatPorts,
 };
 pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};
 pub use table::{
