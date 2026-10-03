@@ -59,9 +59,16 @@ fn bench_offload(c: &mut Criterion) {
     let mut pool = PacketPool::new(64);
     let mut batch = PacketBatch::new();
     assert!(
-        segment(&hdr, &packet, 0, &mut pool, &mut batch)
-            .unwrap()
-            .is_none()
+        segment(
+            &hdr,
+            &packet,
+            0,
+            HLEN + usize::from(GSO_SIZE),
+            &mut pool,
+            &mut batch
+        )
+        .unwrap()
+        .is_none()
     );
     let segments: Vec<PacketBuf> = batch.drain().collect();
 
@@ -72,7 +79,15 @@ fn bench_offload(c: &mut Criterion) {
         let mut pool = PacketPool::new(64);
         let mut out = PacketBatch::new();
         b.iter(|| {
-            let next = segment(&hdr, &packet, 0, &mut pool, &mut out).unwrap();
+            let next = segment(
+                &hdr,
+                &packet,
+                0,
+                HLEN + usize::from(GSO_SIZE),
+                &mut pool,
+                &mut out,
+            )
+            .unwrap();
             for buf in out.drain() {
                 pool.put(buf);
             }

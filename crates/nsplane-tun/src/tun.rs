@@ -301,7 +301,8 @@ impl PacketSource for TunSource {
     async fn recv(&mut self) -> io::Result<PacketBuf> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(vnet) = &mut self.vnet {
-            return vnet.recv(&self.fd, &mut self.pool).await;
+            let capacity = usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK;
+            return vnet.recv(&self.fd, capacity, &mut self.pool).await;
         }
         let capacity = usize::from(*self.mtu.borrow());
         let mut packet = self.pool.get(capacity);
@@ -330,7 +331,10 @@ impl PacketSource for TunSource {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn recv_batch(&mut self, batch: &mut PacketBatch) -> io::Result<()> {
         if let Some(vnet) = &mut self.vnet {
-            return vnet.recv_batch(&self.fd, &mut self.pool, batch).await;
+            let capacity = usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK;
+            return vnet
+                .recv_batch(&self.fd, capacity, &mut self.pool, batch)
+                .await;
         }
         if !batch.is_full() {
             let packet = self.recv().await?;
@@ -419,6 +423,12 @@ fn check_ip(packet: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Room beyond the MTU each packet read from a device with a virtio-net header gets:
+/// the growth of an IPv4 packet translated to IPv6 with a fragment header, so an
+/// IPv4 <-> IPv6 translator can rewrite a full-size packet in place.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TRANSLATION_SLACK: usize = 28;
+
 /// Bytes one read from a device with a virtio-net header may return: the header and the
 /// largest IP packet.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -458,10 +468,12 @@ impl VnetReader {
         }
     }
 
-    /// The next packet: a queued one, or the first of the next read.
+    /// The next packet: a queued one, or the first of the next read. Packets split off
+    /// a read get at least `capacity` bytes of capacity.
     async fn recv(
         &mut self,
         fd: &AsyncFd<OwnedFd>,
+        capacity: usize,
         pool: &mut PacketPool,
     ) -> io::Result<PacketBuf> {
         loop {
@@ -469,7 +481,7 @@ impl VnetReader {
                 return Ok(packet);
             }
             let mut staging = mem::take(&mut self.staging);
-            let result = self.recv_batch(fd, pool, &mut staging).await;
+            let result = self.recv_batch(fd, capacity, pool, &mut staging).await;
             self.ready.extend(staging.drain());
             self.staging = staging;
             result?;
@@ -477,10 +489,12 @@ impl VnetReader {
     }
 
     /// Appends queued packets and the rest of the last read if there are any; otherwise
-    /// reads until a read yields at least one packet.
+    /// reads until a read yields at least one packet. Packets split off a read get at
+    /// least `capacity` bytes of capacity.
     async fn recv_batch(
         &mut self,
         fd: &AsyncFd<OwnedFd>,
+        capacity: usize,
         pool: &mut PacketPool,
         batch: &mut PacketBatch,
     ) -> io::Result<()> {
@@ -493,7 +507,14 @@ impl VnetReader {
             let _ = batch.push(packet);
         }
         if let Some(pending) = self.pending.take() {
-            self.segment(pending.hdr, pending.len, pending.next, pool, batch);
+            self.segment(
+                pending.hdr,
+                pending.len,
+                pending.next,
+                capacity,
+                pool,
+                batch,
+            );
         }
         if batch.len() > before || batch.is_full() {
             return Ok(());
@@ -507,7 +528,7 @@ impl VnetReader {
                 Err(_would_block) => continue,
             };
             match VirtioNetHdr::parse(&self.scratch[..len]) {
-                Ok(hdr) => self.segment(hdr, len, 0, pool, batch),
+                Ok(hdr) => self.segment(hdr, len, 0, capacity, pool, batch),
                 Err(e) => tracing::debug!(?e, "dropping a TUN read without a vnet header"),
             }
             if batch.len() > before {
@@ -517,17 +538,19 @@ impl VnetReader {
     }
 
     /// Appends the segments of the `len`-byte read in `scratch` from index `first` on to
-    /// `batch` and keeps the rest pending; drops the read if it is malformed.
+    /// `batch`, each with at least `capacity` bytes of capacity, and keeps the rest
+    /// pending; drops the read if it is malformed.
     fn segment(
         &mut self,
         hdr: VirtioNetHdr,
         len: usize,
         first: usize,
+        capacity: usize,
         pool: &mut PacketPool,
         batch: &mut PacketBatch,
     ) {
         let packet = &self.scratch[VirtioNetHdr::LEN..len];
-        match offload::segment(&hdr, packet, first, pool, batch) {
+        match offload::segment(&hdr, packet, first, capacity, pool, batch) {
             Ok(next) => self.pending = next.map(|next| Pending { hdr, len, next }),
             Err(e) => tracing::debug!(?e, ?hdr, "dropping a malformed TUN read"),
         }
@@ -815,6 +838,33 @@ mod tests {
         source.recv_batch(&mut batch).await.unwrap();
         let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
         assert_eq!(got, run[2..]);
+    }
+
+    #[tokio::test]
+    async fn offload_reads_leave_room_to_grow() {
+        let (mut source, sink, kernel) = device(TSO);
+        let run = tcp_run(3);
+        sink.send_batch(&mut batch_of(&run)).await.unwrap();
+        let (hdr, super_packet) = recv_datagram(&kernel);
+        let mut framed = hdr.encode().to_vec();
+        framed.extend_from_slice(&super_packet);
+        kernel.send(&framed).unwrap();
+        let udp = packet(17, 1, 0, b"small");
+        let mut single = VirtioNetHdr::default().encode().to_vec();
+        single.extend_from_slice(&udp);
+        kernel.send(&single).unwrap();
+
+        // Segments and `GSO_NONE` packets get the MTU plus the translation slack, like
+        // a plain read, so a translator can grow them in place.
+        let mut got = Vec::new();
+        for _ in 0..=run.len() {
+            got.push(source.recv().await.unwrap());
+        }
+        assert_eq!(got[run.len()].as_packet(), udp);
+        for p in &got {
+            assert!(p.capacity() >= 1500 + TRANSLATION_SLACK);
+            assert_eq!(p.headroom(), nsplane::HEADROOM);
+        }
     }
 
     #[tokio::test]
