@@ -13,6 +13,7 @@ mod basic_udp;
 mod half_close;
 mod listener_integration;
 mod listener_pool;
+mod progress;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
