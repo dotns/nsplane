@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use crate::config::{NetStackConfig, Settings};
 use crate::device::VirtualDevice;
 use crate::stats::{self, Counters, NetStackStats};
-use crate::tcp::{Shared, TcpConnection, WriteHalf, lock};
+use crate::tcp::{Progress, Shared, TcpConnection, WriteHalf, lock};
 use crate::udp::{self, Datagram, UdpFlow, UdpOut, UdpReply, UdpSocket};
 
 /// Most ingress packets taken per driver iteration before smoltcp runs, so one burst
@@ -92,6 +92,7 @@ impl NetStack {
         let out = UdpOut {
             tx: udp_tx,
             mtu: usize::from(settings.mtu),
+            allow_fragmentation: settings.udp_allow_fragmentation,
         };
         let driver = Driver {
             settings,
@@ -143,7 +144,8 @@ impl NetStack {
 /// The stack's egress: IP packets it sends to peers.
 ///
 /// Each packet is a [`PacketBuf`] with its headroom free and is never larger than the
-/// configured MTU. [`recv`](PacketSource::recv) returns [`io::ErrorKind::BrokenPipe`] once
+/// configured MTU, except IPv4 UDP datagrams with DF clear under
+/// [`NetStackConfig::udp_allow_fragmentation`]. [`recv`](PacketSource::recv) returns [`io::ErrorKind::BrokenPipe`] once
 /// the driver stopped and the queue is drained, on every later call. [`mtu`](PacketSource::mtu)
 /// holds the (normalised) configured MTU, which never changes.
 #[derive(Debug)]
@@ -367,6 +369,9 @@ fn classify(bytes: &[u8], settings: &Settings) -> Result<Class, Reject> {
 struct Conn {
     shared: Arc<Mutex<Shared>>,
     terminal: watch::Sender<bool>,
+    progress: Arc<Progress>,
+    /// The socket's send queue at the end of the previous bridge pass.
+    queued: usize,
     /// `close()` was called on the socket.
     local_closed: bool,
     last_activity_at: SmolInstant,
@@ -383,6 +388,12 @@ struct Bridged {
 impl Conn {
     /// Moves bytes between the socket and the application and applies half closes.
     fn bridge(&mut self, socket: &mut tcp::Socket<'_>, now: SmolInstant) -> Bridged {
+        // Only an acknowledgement shrinks the send queue, except a reset, which empties it
+        // and leaves the socket closed.
+        if socket.send_queue() < self.queued && socket.state() != tcp::State::Closed {
+            self.progress
+                .set_last_ack(u64::try_from(now.total_micros()).unwrap_or(0));
+        }
         let mut shared = lock(&self.shared);
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
 
@@ -419,6 +430,11 @@ impl Conn {
         if sent {
             self.last_activity_at = now;
             shared.wake_writer();
+        }
+        let queued = socket.send_queue();
+        if queued != self.queued {
+            self.queued = queued;
+            self.progress.set_unacked(queued);
         }
         // Forward half close: the application shut its write half down (or dropped the
         // connection). Once every byte is in the socket, FIN follows them, so the peer
@@ -986,16 +1002,26 @@ impl Driver {
             .map_or(unspecified, endpoint_to_socket_addr);
         let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
         let (terminal, terminal_rx) = watch::channel(false);
+        let progress = Arc::new(Progress::new(self.epoch.into_std()));
         self.conns.insert(
             handle,
             Conn {
                 shared: Arc::clone(&shared),
+                progress: Arc::clone(&progress),
+                queued: 0,
                 terminal,
                 local_closed: false,
                 last_activity_at: now,
             },
         );
-        TcpConnection::new(shared, Arc::clone(&self.notify), local, peer, terminal_rx)
+        TcpConnection::new(
+            shared,
+            progress,
+            Arc::clone(&self.notify),
+            local,
+            peer,
+            terminal_rx,
+        )
     }
 
     /// Keeps the bytes of terminal sockets before smoltcp's timers discard the socket.
