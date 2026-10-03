@@ -28,6 +28,7 @@ mod fragment;
 mod handle;
 mod io;
 mod link;
+mod map;
 mod merge;
 mod splitter;
 mod transport;
@@ -48,6 +49,7 @@ pub use handle::{
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
+pub use map::{MapSink, MapSource, MapVerdict};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
