@@ -8,6 +8,7 @@
 mod buf;
 pub mod checksum;
 mod ip;
+pub mod reassembly;
 mod types;
 
 pub use buf::{BoundsError, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool};
