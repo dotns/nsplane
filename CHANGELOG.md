@@ -212,6 +212,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the data header in their headroom (copied into a pooled buffer only when the headroom is
   smaller than the data header), and the timers, queue flushes and handshake replies no
   longer zero-fill their buffers on every use.
+- `nsplane-netstack`: every TCP socket runs CUBIC congestion control (smoltcp feature
+  `socket-tcp-cubic`). A bulk transfer through a hop that drops part of a window (a full
+  socket buffer on a loaded host) no longer stalls on doubling retransmission timeouts:
+  16 MiB through a 25 MB/s link with a 64-packet buffer finish in 14-17 s instead of not at
+  all within 60 s, and at 1 % random loss in 3 s instead of 35-41 s (release, in-process).
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and

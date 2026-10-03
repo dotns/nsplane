@@ -129,6 +129,47 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- Every TCP socket (connect and listener pool) runs CUBIC congestion control (smoltcp
+  feature `socket-tcp-cubic`, no extra crate). Without it smoltcp sends the whole peer
+  window at once and, after a retransmission timeout, all of it again; a hop that drops
+  part of the burst (a full socket buffer on a loaded host) drops the retransmission too,
+  and the timeouts (1 s minimum, doubling) add up past 30 s. CUBIC rather than Reno: both
+  restart from one segment after a timeout and measured alike on the bottleneck below
+  (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
+  loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
+  its `f64` arithmetic is no concern on the targets nsplane runs on.
+
+### Netstack throughput
+
+Release, two netstacks over two engines on an in-process `ChannelTransport` pair (no
+latency), one TCP connection, MTU 1420; the link wrappers are `nsplane_e2e::LossyTransport`
+(drops a deterministic fraction of the data messages in each direction) and
+`nsplane_e2e::Bottleneck` (25 MB/s behind a 64-datagram drop-tail buffer, like a socket
+buffer drained by a busy receiver). Two runs each:
+
+```text
+cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+```
+
+| Case | Before (no congestion control) | After (CUBIC) |
+| --- | --- | --- |
+| TCP, 64 MiB, no loss | 440.5 / 441.0 MB/s | 464.3 / 334.0 MB/s |
+| TCP, 16 MiB, 1 % loss | 41.1 s / 35.1 s (0.4-0.5 MB/s) | 3.07 s / 3.09 s (5.4-5.5 MB/s) |
+| TCP, 16 MiB, 3 % loss | not done after 60 s (both) | not done after 60 s (both) |
+| TCP, 16 MiB, bottleneck | not done after 60 s (both, ~2650 drops) | 16.9 s / 13.9 s (1.0-1.2 MB/s, ~300 drops) |
+| UDP, 50 000 x 1200 B, no loss | 902.7 / 468.4 MB/s | 609.5 / 661.3 MB/s |
+
+Without loss the stack is not the limit (the spread between runs is scheduling noise) and
+congestion control costs nothing. With loss, smoltcp 0.14 recovers one lost segment per
+window by fast retransmit and any further one by a retransmission timeout of at least 1 s
+(no SACK, no retransmission on a partial ACK), so elapsed times come in whole seconds.
+Congestion control turns the stalls on a congested hop into completed transfers, but
+random loss of 2 % or more stays timeout-bound with or without it (an 8 MiB debug transfer
+takes 15-40 s at 2-3 %, under 1 s at 1 %). A smaller default window was measured and not
+adopted (see `WINDOW_SEGMENTS` in `config.rs`): through the bottleneck, 64 segments lose
+nothing (32 MiB in 2.9 s), but a window that small caps a connection at 1.8 MB/s over
+a 50 ms path, and without loss it gains nothing. `tests/netstack_lossy.rs` asserts that
+8 MiB complete intact at 1 % loss within 15 s, next to a loss-free reference.
 
 ## nsplane-uapi and the CLI
 
