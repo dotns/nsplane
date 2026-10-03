@@ -1141,6 +1141,11 @@ fn new_tcp_socket(buffer: usize) -> tcp::Socket<'static> {
     socket.set_ack_delay(None);
     socket.set_nagle_enabled(false);
     socket.set_keep_alive(None);
+    // Without congestion control smoltcp sends the whole peer window at once and, after a
+    // timeout, all of it again; a path that drops part of such a burst (a full socket
+    // buffer) loses the retransmission too and the timeouts double past 30 s. CUBIC
+    // restarts from one segment after a timeout and backs off on loss.
+    socket.set_congestion_control(tcp::CongestionControl::Cubic);
     socket
 }
 
