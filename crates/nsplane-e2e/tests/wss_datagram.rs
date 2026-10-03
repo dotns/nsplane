@@ -398,8 +398,11 @@ async fn forbidden_backs_off_and_retries() -> TestResult {
     let (mut a, mut b, mut sides) = pair(&relay).await?;
     sides[0].until(LinkState::Rejected(403)).await?;
     // A 403 is retried with the same token, backing off.
-    until("403 retries", || relay.upgrades(0).len() >= 3).await?;
-    assert!(sides[0].stats.rejected_forbidden() >= 3);
+    // The relay records an upgrade before the dialer counts its refusal.
+    until("403 retries", || {
+        relay.upgrades(0).len() >= 3 && sides[0].stats.rejected_forbidden() >= 3
+    })
+    .await?;
     assert_eq!(sides[0].stats.rejected_unauthorized(), 0);
     assert!(!sides[0].stats.connected());
 

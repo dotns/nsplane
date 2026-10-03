@@ -1,4 +1,5 @@
-//! The settings of a [`WssDialer`](crate::WssDialer).
+//! The settings of a [`WssDialer`](crate::WssDialer) or a
+//! [`WssStreamClient`](crate::WssStreamClient).
 
 use std::fmt;
 use std::io;
@@ -18,9 +19,28 @@ pub trait BearerProvider: Send + Sync + 'static {
     fn token(&self) -> BoxFuture<'_, io::Result<Option<String>>>;
 }
 
-/// The TLS trust of a [`WssDialer`](crate::WssDialer).
+/// The TLS trust of a [`WssDialer`](crate::WssDialer) or a
+/// [`WssStreamClient`](crate::WssStreamClient).
 ///
-/// No system or web PKI roots are bundled: the caller supplies what to trust.
+/// No system or web PKI roots are bundled: the caller supplies what to trust, as a root
+/// store or a complete client configuration, for instance with the aws-lc-rs provider:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use nsplane_wss::{WssConfig, WssTls};
+///
+/// # fn config(roots: rustls::RootCertStore) -> Result<WssConfig, rustls::Error> {
+/// let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+/// let client = rustls::ClientConfig::builder_with_provider(provider)
+///     .with_safe_default_protocol_versions()?
+///     .with_root_certificates(roots)
+///     .with_no_client_auth();
+/// let config = WssConfig::new("wss://relay.example/wss-relay", WssTls::Config(Arc::new(client)));
+/// # Ok(config)
+/// # }
+/// # config(rustls::RootCertStore::empty()).unwrap();
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WssTls {
@@ -31,7 +51,8 @@ pub enum WssTls {
     Config(Arc<ClientConfig>),
 }
 
-/// Where and how a [`WssDialer`](crate::WssDialer) connects.
+/// Where and how a [`WssDialer`](crate::WssDialer) or a
+/// [`WssStreamClient`](crate::WssStreamClient) connects.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WssConfig {
