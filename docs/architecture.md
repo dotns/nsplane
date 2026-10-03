@@ -45,7 +45,10 @@ packets, received datagrams, configuration changes) with `handle_input`, calls
 `handle_timeout` when `poll_timeout` is due, and drains `poll_output`: datagrams to
 transmit, packets to deliver, and events. Packets go through in place: a local packet is
 sealed in its own buffer and leaves as the transmit, a datagram is opened in its buffer and
-leaves as the delivery; buffers come back through `recycle`. Peers are looked up by key,
+leaves as the delivery; buffers come back through `recycle`. `handle_datagrams` and
+`handle_locals` take a batch of received datagrams or local packets and behave exactly like
+feeding each to `handle_input` in order, but share one schedule update, the output queue's
+room and the session, route and peer lookups of consecutive packets. Peers are looked up by key,
 session index and allowed IP (cryptokey routing). Path selection and roaming are delegated
 to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
 `PacketFilter`s.
@@ -63,8 +66,11 @@ threads: the cryptography of a local packet or a received transport data message
 as a `CryptoJob` (everything before it, such as routing and the outbound filters, has
 already run), `CryptoJob::run` seals or opens the packet under the lock of that peer's
 tunnel only, and `complete_job` does the rest in the core (counters, completed handshakes,
-roaming, the source check, the inbound filters, the output). Each peer's tunnel sits behind
-its own mutex for this; without jobs every lock is uncontended.
+roaming, the source check, the inbound filters, the output); `handle_datagrams_deferred`
+and `handle_locals_deferred` do the same for batches. Only a core built with
+`CoreConfig::crypto_jobs` hands out jobs, and only then does each peer's tunnel sit behind
+its own mutex, shared with its jobs; otherwise every peer owns its tunnel and the data path
+takes no lock (`handle_input_deferred` then processes every input at once).
 
 ## nsplane (driver)
 
@@ -80,8 +86,15 @@ Transport::recv ─► recv task ┘          ▲            └─► sink task
                           EngineHandle commands (64)
 ```
 
-The core is never shared; the only lock on the data path is each peer's tunnel mutex, which
-is uncontended unless the crypto worker pool is on.
+The core is never shared, and without the crypto worker pool the data path takes no lock;
+with the pool, each peer's tunnel is behind a mutex shared with the workers.
+
+When the owner wakes for a received datagram or a local packet, it also takes the ones
+already queued behind it (up to `MAX_BATCH`, 64) and feeds them to the core as one batch
+(`Core::handle_datagrams`, `Core::handle_locals`). It never waits for a batch to fill and
+runs no timer for it, so a lone packet goes through at once. Received datagrams are taken
+up to the sink queue's room; local packets up to the transmit room (see the backpressure
+list below).
 
 - `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
   stats, injection, shutdown) and returns their replies.
@@ -91,9 +104,13 @@ is uncontended unless the crypto worker pool is on.
 
 Backpressure:
 
-- Local packets are never dropped by the engine: when the transmit queue is full, datagrams
-  wait in the owner task and the owner stops reading local packets until they have moved to
-  the queue, which holds back the source.
+- Local packets are never dropped by an engine with one transport: when the transmit queue
+  is full, datagrams wait in the owner task (the transport's backlog). The owner reads local
+  packets only while some transport has room for them and takes no more at once than the
+  largest room, counting one datagram per packet; a transport's room is its free transmit
+  slots while its backlog is empty, plus `min(MAX_BATCH, capacity)` minus its backlog. With
+  no room it stops reading, which holds back the source, so a saturated transport keeps at
+  most `MAX_BATCH` local datagrams in its backlog.
 - Datagrams caused by received datagrams or timers that find the waiting datagrams at the
   queue capacity are dropped (`DROP_TRANSMIT_FULL`).
 - A full sink queue drops the decrypted packet (`DROP_SINK_FULL`); a closed sink or
@@ -121,6 +138,8 @@ channel's locks.
 | `transmit` | `queue_capacity` per transport | owner -> transmit task |
 | `backlog` | `queue_capacity` per transport | owner, waiting for room in `transmit` |
 | `events` | `event_capacity` | owner -> subscribers |
+| `crypto` | `queue_capacity` (the bound of jobs in flight) with 2 or more crypto workers, else 0 | owner -> workers -> owner (jobs not completed yet) |
+| `crypto_done` | `queue_capacity` with 2 or more crypto workers, else 0 | workers -> owner (batches of finished jobs) |
 
 Measured with the default capacity of 1024 on two engines linked in process (release
 build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy); the
@@ -206,7 +225,9 @@ datagrams     ─┘           └─► worker n - 1 ─┘
   interleave with the owner and only add overhead.
 
 Throughput note, from `cargo bench -p nsplane --bench worker_pool` (bench profile with
-LTO, multi-threaded runtime, 32-core host shared with other jobs; the range of two runs): a
+LTO, multi-threaded runtime, 32-core host shared with other jobs; the range of two runs,
+taken after the Phase 5 follow-ups #1 and #17: batched core input, no lock without
+workers): a
 hub engine with 8 peers, each its own engine without workers on an in-memory link, sends
 120 packets to every peer while every peer sends 120 to the hub, so the hub seals and opens
 all 1920 packets of an iteration. The pool off is the default of 0 workers; 1 worker is the
@@ -214,21 +235,30 @@ same code path.
 
 | Packet | Pool off (0 or 1) | 2 workers | 4 workers |
 | --- | --- | --- | --- |
-| 64 B | 0.96-1.10 Mpps | 1.02-1.36 Mpps | 0.97-1.26 Mpps |
-| 1420 B | 566-696 kpps (6.4-7.9 Gbit/s) | 0.88-1.08 Mpps (10.0-12.3 Gbit/s) | 0.88-1.03 Mpps (10.0-11.6 Gbit/s) |
+| 64 B | 1.49-1.55 Mpps (1.29 / 1.24 ms) | 1.64-1.68 Mpps (1.14 / 1.17 ms) | 1.61-1.64 Mpps (1.19 / 1.17 ms) |
+| 1420 B | 869-906 kpps (9.9-10.3 Gbit/s; 2.21 / 2.12 ms) | 0.94-1.20 Mpps (10.6-13.6 Gbit/s; 2.05 / 1.60 ms) | 1.17-1.26 Mpps (13.3-14.3 Gbit/s; 1.53 / 1.64 ms) |
 
-With full-size packets the pool moves the hub about 1.5x further; small packets gain little,
+Before those follow-ups, in the same session, the mean iteration times were 1.59 / 1.79 ms
+(64 B, pool off), 1.48 / 1.51 ms (64 B, 2 workers), 1.53 / 1.52 ms (64 B, 4 workers),
+2.84 / 2.84 ms (1420 B, pool off), 1.88 / 1.92 ms (1420 B, 2 workers) and 1.96 / 1.96 ms
+(1420 B, 4 workers): every case is about 15-25 % faster now, except 1420 B with 2 workers,
+which is within the run-to-run noise.
+
+With full-size packets the pool moves the hub up to about 1.4x further; small packets gain little,
 since there the cryptography is a small part of the owner's work per packet (queues,
 routing, counters). Beyond 2 workers the owner task itself, which still touches every
 packet twice, is the limit, so 4 workers do not add to 2. Sharding `Core` itself by peer
 (one owner per shard) would lift that limit, at the cost of splitting the handshake gate,
 the peer table and the allowed IPs across shards.
 
-The pool off costs one uncontended lock of the peer's tunnel per packet. The core's
-`data_path` bench, base and branch alternating three times, showed no change beyond the
-run-to-run spread (medians: `core_round_trip` 616 -> 569 ns at 64 B and 1347 -> 1362 ns at
-1420 B, `core_encapsulate` 297 -> 281 ns and 693 -> 674 ns, `core_decapsulate` 266 -> 286 ns
-and 705 -> 695 ns; single runs varied by up to 15%).
+The pool off takes no lock (follow-up #17): the core hands out crypto jobs only when built
+with `CoreConfig::crypto_jobs`, which the engine sets for 2 or more workers, and otherwise
+every peer owns its tunnel outright. With the pool, each peer's tunnel is shared with its
+jobs behind a mutex. The lock had cost no more than the run-to-run spread when it was added
+(`core_round_trip` medians 616 -> 569 ns at 64 B and 1347 -> 1362 ns at 1420 B); without it
+the `data_path` core round trip measures 532 ns at 64 B (device-equivalent 474 ns, raw
+`Tunn` 359 ns) and 1.348 us at 1420 B (device-equivalent 1.282 us), against 546 ns and
+1.354 us on main 64131c7.
 
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support,
 4 MiB socket buffers requested (clamped by `net.core.rmem_max` / `wmem_max`) and segmentation
@@ -254,6 +284,12 @@ core whatever their size.
   error) through `Core::inject_inbound`. They are rate-limited (a burst of 10, then 5 per
   second) and never sent about ICMP errors, multicast or broadcast packets, or non-first
   fragments.
+- `EngineHandle::fragment_stats` returns the stage's `FragmentStats` (all zero without a
+  stage): IPv4 packets fragmented, fragments emitted, Packet Too Big and Fragmentation
+  Needed errors sent, and oversized packets dropped without an error for the rate limit
+  (`rate_limited`), for no route (`no_route`) or because no error is allowed or the packet
+  cannot be split (`dropped`). The drops are counted in `drop_counters` too, under
+  `DROP_FRAGMENT_RATE_LIMITED`, `DROP_FRAGMENT_NO_ROUTE` and `DROP_FRAGMENT_OVERSIZE`.
 
 For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitter` is a
 `PacketSink` that routes each delivered packet to one of several sinks by a closure
@@ -590,7 +626,7 @@ path, so such a client pays no extra latency for it.
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
-| Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; each peer's tunnel stays behind an uncontended lock (measured as noise) |
+| Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |
 | User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
@@ -654,43 +690,59 @@ already there; nothing holds a packet back to fill a batch:
 
 ## Performance
 
-Phase 5 (5C) numbers, re-run on the merged 5C branch (5C-T7, 2026-10-03): release / bench
-profile in the dev image, x86-64, 32-core host shared with other jobs (1-minute load 0.8-5.1
-during the runs), two runs each, criterion means. The subsections linked below hold each
-subtask's own measurements and analysis.
+Phase 5 numbers: release / bench profile in the dev image, x86-64, 32-core host shared with
+other jobs, criterion means. The `data_path`, worker pool and engine latency rows are from
+the Phase 5 follow-ups (campaign `nsplane-fu-202610030716`, workstream FA, 2026-10-03:
+follow-ups #1 batched input and #17 no lock without workers); the other rows were re-run on
+the merged 5C branch (5C-T7, 2026-10-03, 1-minute load 0.8-5.1), two runs each. The
+subsections linked below hold each subtask's own measurements and analysis.
 
 ```text
 cargo bench -p nsplane-core --bench data_path
 cargo bench -p nsplane-acl --bench namespaces
 cargo bench -p nsplane --bench worker_pool
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 ```
 
 | Area | Case | Result (run 1 / run 2) | Reference |
 | --- | --- | --- | --- |
-| `data_path`, 64 B round trip | raw `Tunn` / device-equivalent / core | 359 / 358 ns, 474 / 473 ns, 545 / 544 ns (core vs device +15.0 % / +14.9 %) | Phase 3+4 core 540 ns |
-| `data_path`, 1420 B round trip | raw `Tunn` / device-equivalent / core | 1.16 / 1.17 us, 1.28 / 1.30 us, 1.34 / 1.34 us (core vs device +5.0 % / +3.4 %) | Phase 3+4 core 1.37 us |
-| `data_path`, one direction | core encapsulate / decapsulate, 64 B and 1420 B | 273 / 273 ns and 278 / 278 ns; 673 / 674 ns and 692 / 685 ns | |
+| `data_path`, 64 B round trip | raw `Tunn` / device-equivalent / core, one packet per call | 359 ns, 472-474 ns, 530-533 ns (core vs device +12 %) | main 64131c7 core 546 ns; Phase 3+4 core 540 ns |
+| `data_path`, 1420 B round trip | device-equivalent / core, one packet per call | 1.278-1.294 us, 1.331-1.351 us (core vs device +4-5 %) | main 64131c7 core 1.354 us; Phase 3+4 core 1.37 us |
+| `data_path`, 64 B batched | core, 32 per call (`core_round_trip_batch32`), per packet | 13.15-13.21 us per batch = 411-413 ns (core vs device -12.5 % to -13.0 %) | |
+| `data_path`, 1420 B batched | core, 32 per call, per packet | 39.24-39.31 us per batch = 1.227 us (core vs device -4.0 % to -5.2 %) | |
+| `data_path`, instructions per round trip (callgrind) | raw `Tunn` / device-equivalent / core / core batched, 64 B and 1420 B | 3090 / 4435 / 5299 / 3910 (batched vs device -11.8 %); 18168 / 19513 / 20370 / 18980 (-2.7 %) | core before #1's batching 5289 / 20359 |
+| `data_path`, one direction (5C) | core encapsulate / decapsulate, 64 B and 1420 B | 273 / 273 ns and 278 / 278 ns; 673 / 674 ns and 692 / 685 ns | |
 | ACL hook, established flow | namespace member / default policy (not cached) | 51.2 / 51.0 ns, 54.9 / 54.6 ns | before the hook: every packet a new flow, 669 ns / 71 ns |
 | ACL hook, bypass peer | new flow / established | 38.1 / 37.9 ns, 37.5 / 37.3 ns | 937 ns before the hook |
 | ACL hook, new flow | default policy / namespaces / grant / pinhole | 55.4 / 55.2 ns, 184 / 184 ns, 346 / 339 ns, 216 / 205 ns | |
 | ACL hook, grant established / outbound | grant / outbound (default, namespaces, restricted, bypass) | 268 / 276 ns; 76, 95, 156, 77 ns | 1.75 us grant, 580/623 ns outbound before |
 | ACL hook, floor | five-tuple parse + snapshot load | 5.7 + 8.8 ns | |
 | Queues | default capacities | `queue_capacity` 1024, command 64, `event_capacity` 1024 | [Queue depths](#queue-depths) |
-| Worker pool, 64 B | off / 2 / 4 workers | 1.20 / 1.14 Mpps, 1.36 / 1.36 Mpps, 1.38 / 1.28 Mpps | [Crypto worker pool](#crypto-worker-pool) |
-| Worker pool, 1420 B | off / 2 / 4 workers | 713 / 701 kpps (8.1 / 8.0 Gbit/s), 1.10 / 1.08 Mpps (12.5 / 12.2 Gbit/s), 1.05 / 1.01 Mpps (12.0 / 11.5 Gbit/s) | |
+| Worker pool, 64 B | off / 2 / 4 workers | 1.49 / 1.55 Mpps, 1.68 / 1.64 Mpps, 1.61 / 1.64 Mpps | before #1/#17: 1.21 / 1.07, 1.30 / 1.27, 1.25 / 1.26 Mpps; [Crypto worker pool](#crypto-worker-pool) |
+| Worker pool, 1420 B | off / 2 / 4 workers | 869 / 906 kpps (9.9 / 10.3 Gbit/s), 0.94 / 1.20 Mpps (10.6 / 13.6 Gbit/s), 1.26 / 1.17 Mpps (14.3 / 13.3 Gbit/s) | before #1/#17: 676 / 676 kpps, 1.02 / 1.00 Mpps, 0.98 / 0.98 Mpps |
+| Engine latency, idle | two engines over UDP loopback, builder defaults, 2000 pings, p50 / p99 | 11.3 / 36.0 us, 11.2 / 40.3 us | before #1's engine batching: 20.9 / 41.0 us, 11.0 / 23.7 us; [Engine batching under load](#engine-batching-under-load) |
+| Engine latency, loaded | the same next to a saturating bulk flow, p50 / p99 / lost pings | 2.15 / 4.69 ms / 13, 2.13 / 5.16 ms / 18 | before: 2.71 / 6.91 ms / 2, 2.36 / 4.74 ms / 1 |
 | Netstack TCP, no loss | 64 MiB, one connection | 439.0 / 430.0 MB/s | [Netstack throughput](#netstack-throughput) |
 | Netstack TCP, 1 % loss | 16 MiB | 2.07 / 2.08 s (8.1 MB/s) | |
 | Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
 
-- Data path. Follow-up #1 removed the rx buffer swap, the `copy_within` shifts and the
-  `set_len` zero-fills; the 1420 B round trip holds the 10 % target over the
-  device-equivalent baseline, the 64 B one does not (accepted; the remaining dispatch cost,
-  ~695 instructions per round trip, is deferred to a batched data-path entry point, see
-  `docs/task/20261002-1509-phase1-followups.md` item 1). By instruction count (callgrind,
-  5C-T2): core vs device-equivalent +15.7 % at 64 B and +3.4 % at 1420 B.
+- Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
+  `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The
+  batched entry points (`Core::handle_datagrams`, `Core::handle_locals`) share that dispatch
+  across a batch: at 32 packets per call the core is 11.8 % (64 B) and 2.7 % (1420 B) below
+  the device-equivalent baseline by instruction count, and 12.5-13.0 % and 4.0-5.2 % below it
+  in wall clock, so the 10 % target is met at 64 B for batched input. One packet per call
+  still costs +12 % (64 B) and +4-5 % (1420 B) over the baseline; the empty lookup cache adds
+  10 instructions to it. The engine feeds the core in batches of what is already queued, so
+  a lone packet takes the single-packet cost and a busy one approaches the batched cost.
+- No lock without workers (#17). The core round trip measures 532 ns at 64 B (device-equivalent
+  474 ns, raw 359 ns) and 1.348 us at 1420 B (device-equivalent 1.282 us), against 546 ns and
+  1.354 us on main 64131c7: removing the per-peer tunnel lock from the pool-off path is a
+  small gain within the run-to-run spread, and the worker pool no longer costs it to
+  embedders that do not use the pool.
 - ACL hook. An established flow costs about the same as the default policy's three rules,
   and a bypass peer less than either: the floor every packet pays is parsing its five-tuple
   and loading the engine snapshot (5C-T3: 6-7.5 ns + 9.5-11.5 ns = 16-19 ns), and the rest is
@@ -698,11 +750,53 @@ cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocaptu
   unidirectional traffic, so it stays. Exactness was not weakened: a differential test
   checks verdicts and counters against a full evaluation of every packet. See
   [nsplane-acl](#nsplane-acl).
-- Worker pool. The pool moves full-size packets about 1.5x further, small packets little;
-  4 workers do not add to 2, as the owner task stays the limit.
+- Worker pool. The batched input and the lock-free pool-off path make every case about
+  15-25 % faster than before the follow-ups (1420 B with 2 workers within the noise). The
+  pool moves full-size packets up to about 1.4x further, small packets little; 4 workers do
+  not add much to 2, as the owner task stays the limit.
 - Netstack. Without loss the stack is not the limit (same-build spread 320-460 MB/s TCP,
   470-900 MB/s UDP). At 3 % random loss smoltcp's timeout-bound recovery lands right at the
   test's 60 s limit (5C-T6 finished in 54-59 s); the 1 % case and the bottleneck complete.
+
+### Engine batching under load
+
+Follow-up #1's engine side feeds the core what is already queued, in batches of up to
+`MAX_BATCH`, with no wait and no timer, and reads local packets only up to the transmit
+room (see *Backpressure* under [nsplane (driver)](#nsplane-driver)). Measured with
+`crates/nsplane-e2e/tests/latency.rs` (`round_trip_latency`, `round_trip_latency_queue_256`):
+two engines over UDP loopback with the builder defaults, 2000 one-packet pings, idle and
+next to a saturating bulk flow between the same engines; "before" is the same branch
+without the engine batching, two runs each, 1-minute load 2.8-5.9.
+
+| Case | p50 / p99 / lost pings, after | before |
+| --- | --- | --- |
+| Idle, no workers | 11.3 / 36.0 us, 11.2 / 40.3 us | 20.9 / 41.0 us, 11.0 / 23.7 us |
+| Loaded, no workers | 2.15 / 4.69 ms / 13, 2.13 / 5.16 ms / 18 | 2.71 / 6.91 ms / 2, 2.36 / 4.74 ms / 1 |
+| Loaded, no workers, `queue_capacity` 256 | 1.75 / 12.0 ms / 100, 1.59 / 3.89 ms / 93 | 1.51 / 3.85 ms / 0, 1.52 / 3.81 ms / 0 |
+| Loaded, 2 workers (for information) | 7.40 / 21.7 ms / 286, 7.25 / 11.8 ms / 387 | 3.53 / 9.96 ms / 316, 3.36 / 9.59 ms / 267 |
+
+- Idle latency is unchanged within the run-to-run spread: a lone packet goes through at
+  once. Under load, p50 is lower in both runs and the worst p99 is lower (5.16 against
+  6.91 ms) than before, and the
+  sender's backlog stays at 64 (`MAX_BATCH`) because local intake follows the transmit room.
+  A first attempt that read local packets without that bound filled the sender's transmit
+  queue and backlog to 1024 each, and its loaded p99 rose to 7.8-19 ms.
+- The extra loss under a saturating flow happens only at the receiver's full sink. A
+  diagnostic run moved 1093 packets per ms of bulk traffic after the change against 919
+  before (about 19 % more), and the receiver dropped 486 251 packets under `DROP_SINK_FULL`
+  against 717 before; the sender dropped nothing. Batching raises the tunnel's throughput
+  until it outruns the receiving application. High-water marks, loaded without workers:
+  after, sender `local` 1024, `transmit` 1024, `backlog` 64, receiver `datagrams` 1024,
+  `deliver` 1024; before, sender `transmit` 284-640, `backlog` 0, receiver `deliver`
+  363-372. The lost pings are these sink drops, which a smaller `queue_capacity` makes more
+  frequent.
+- A sink slower than the tunnel must therefore size `queue_capacity` for its bursts or apply
+  its own flow control (e.g. TCP through the netstack); the engine does not pace the sender
+  to the receiver's sink. Sender pacing and receiver-side backpressure are an open design
+  item (`docs/task/20261002-1509-phase1-followups.md` item 21).
+- With 2 workers the loaded latency is higher in both builds, as the jobs in flight sit at
+  their bound (`QueueStats::crypto` at `queue_capacity`) with the queueing delay that adds;
+  these rows are for information only.
 
 ## Unsafe code
 
