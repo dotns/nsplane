@@ -74,9 +74,11 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
 - MB-x5 (NEW, from ns T10 throughput) Configurable TCP socket buffers.
   - Config: `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (bytes; default today's 512 segments) with the advertised window and window scaling following the receive buffer.
   - Evidence: ns user-space mode single-stream TCP is 15% below the legacy stack (1 MiB buffers) on a quiet host, with lower CPU use, i.e. window-limited.
+  - Done (2026-10-03): `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer: Option<usize>`; `None` keeps 512 IPv4-sized segments (`(mtu - 40) * 512`), values are clamped to `mtu - 40 ..= 65535 << 14`, and the window scale follows the receive buffer (smoltcp derives the shift from its capacity), listener pool sockets included. Tests: unit `stack/tests/buffers.rs`, `nsplane-e2e` `netstack_buffers`. Trade-off: a window above the queues on the path (in-process, the engine's 1024-packet sink queue) loses its tail as sink drops and recovers by retransmission timeout: 4 MiB about 52 MB/s against 287-315 MB/s for the default and 1 MiB (docs/architecture.md, "Socket buffers (MB-x5)").
 - MB-x6 (NEW, from ns T10 load) Count listener-pool overflow.
   - The listener pool size is already caller config (ns raises it); the gap is visibility: a SYN that finds the pool full is reset silently. Add `NetStackStats::tcp_listen_overflow`.
   - Evidence: with ns's pool at 32, 500 concurrent connects got 135-168 accepted and the rest reset without a counter; with the pool at 512, 500/500.
+  - Done (2026-10-03), no code: `NetStackStats::syn_refused` already counts SYNs refused for a full listener pool (sized by `NetStackConfig::listener_pool`); no `tcp_listen_overflow` counter is added.
 
 ## NEW workstream MF: engine throughput (ns release gate "throughput not below the legacy baseline")
 
@@ -99,6 +101,7 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is
   not the fix.
+  - Done (2026-10-03, partial): profiled with `nsplane-e2e` `netstack_stream` (1 GiB, one connection, over two engines and direct). Per GiB over engines: ChaCha20-Poly1305 36 % of the instructions, both netstack drivers 18 %, the harness's `ChannelTransport::recv` zero-fill 7-9 %; direct, smoltcp's TCP checksum loop is about 15 %. Fixes: batched ingress (`poll_recv_many`) and 32 bytes of egress tail room so the engine seals in place; over engines 2.2-2.3 % fewer instructions, 7-8 % less CPU time, 22-24 % fewer context switches per GiB, throughput within the noise of the shared host. Deferred: a later smoltcp fork round (vectorised `checksum::data`, the furthest advertised window edge, SACK or partial-ACK retransmission), length without zero-fill in `nsplane-packet` (needs `unsafe`), `ChannelTransport::recv` zero-fill (after PF merges). The gap cannot be split in-process (ns's legacy path is tunnel-wg's own loop); with the netstack at 18 % of the engine pairing, most of it is likely the engine (MF-1); to be re-measured with PB's netstack pair. See docs/architecture.md, "Netstack throughput".
 
 ## NEW workstream MC: transports (crates/nsplane/src/udp.rs, transport.rs; e2e)
 - MC-1 Side channel for non-WireGuard datagrams on a UdpTransport.

@@ -418,6 +418,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled; invalid or overlapping fragments count as `malformed`). With it, `owns` reports
   TCP and UDP fragments to a stack address as the stack's: `Flow` for a first fragment on a
   registered tuple, `Listener` for any other.
+- `nsplane-netstack`: `NetStackConfig::tcp_rx_buffer` and `tcp_tx_buffer: Option<usize>`
+  size every TCP socket's receive and send buffer, listener pool sockets included (default
+  `None`: `(mtu - 40) * 512` as before). Values are clamped to one IPv4 MSS (`mtu - 40`) at
+  least and `65535 << 14` at most; the advertised window and the window-scale option follow
+  the receive buffer (smoltcp derives the shift from its capacity). A window larger than
+  the queues on the path loses its tail and recovers by retransmission timeout, so the
+  default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
+  refused for a full listener pool).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
@@ -526,6 +534,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
   receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
   allows the fork's git source only.
+- `nsplane-netstack`: the driver takes its queued ingress packets in one batch per turn,
+  and egress TCP segments and UDP datagrams keep 32 bytes of tail room, so the engine
+  seals them in place instead of reallocating each full-size packet. One 1 GiB TCP stream
+  between two netstacks over two engines takes 7-8 % less CPU time, 2.2-2.3 % fewer
+  instructions and 22-24 % fewer context switches (release, in-process; throughput within
+  the shared host's noise); behavior is unchanged. See docs/architecture.md, "Netstack
+  throughput".
 - `nsplane`: the owner task feeds the received datagrams and local packets already queued
   (up to `MAX_BATCH`, never waiting for more) to the core as one batch. It reads local
   packets only while a transport has transmit room and takes no more at once than that
