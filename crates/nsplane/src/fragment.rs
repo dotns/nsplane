@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nsplane_core::reasons::{FRAGMENT_NO_ROUTE, FRAGMENT_OVERSIZE, FRAGMENT_RATE_LIMITED};
 use nsplane_packet::checksum::{
     internet_checksum, ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -88,24 +89,32 @@ impl fmt::Debug for FragmentConfig {
     }
 }
 
-/// Counters of a [`Fragmenter`].
+/// Counters of the fragmentation stage since the engine started; see
+/// [`EngineHandle::fragment_stats`](crate::EngineHandle::fragment_stats).
+///
+/// Every packet the stage drops is also counted in
+/// [`EngineHandle::drop_counters`](crate::EngineHandle::drop_counters):
+/// `rate_limited` under [`crate::DROP_FRAGMENT_RATE_LIMITED`], `no_route` under
+/// [`crate::DROP_FRAGMENT_NO_ROUTE`] and `dropped` under [`crate::DROP_FRAGMENT_OVERSIZE`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FragmentStats {
-    /// Packets split into fragments.
-    pub(crate) fragmented: u64,
+#[non_exhaustive]
+pub struct FragmentStats {
+    /// IPv4 packets split into fragments.
+    pub fragmented: u64,
     /// Fragments emitted.
-    pub(crate) fragments: u64,
+    pub fragments: u64,
     /// `ICMPv6` Packet Too Big errors delivered.
-    pub(crate) ptb_sent: u64,
+    pub ptb_sent: u64,
     /// ICMP Fragmentation Needed errors delivered.
-    pub(crate) frag_needed_sent: u64,
-    /// Errors not generated because of the rate limit.
-    pub(crate) rate_limited: u64,
-    /// Errors not generated because their destination has no route.
-    pub(crate) no_route: u64,
+    pub frag_needed_sent: u64,
+    /// Oversized packets whose error was not generated because of the rate limit.
+    pub rate_limited: u64,
+    /// Oversized packets whose error was not generated because its destination has no
+    /// route.
+    pub no_route: u64,
     /// Oversized packets dropped without an error (an error about it is not allowed, or it
     /// cannot be split).
-    pub(crate) dropped: u64,
+    pub dropped: u64,
 }
 
 /// What to do with a local packet.
@@ -117,8 +126,8 @@ pub(crate) enum Action {
     Fragments(Vec<PacketBuf>),
     /// Deliver this ICMP error to the local side as coming from the peer.
     Reply(PeerId, PacketBuf),
-    /// Nothing is sent.
-    Drop,
+    /// Nothing is sent, for this drop reason.
+    Drop(&'static str),
 }
 
 /// The fragmentation stage; see [`FragmentConfig`].
@@ -152,7 +161,6 @@ impl Fragmenter {
     }
 
     /// A snapshot of the counters.
-    #[cfg(test)]
     pub(crate) const fn stats(&self) -> FragmentStats {
         self.stats
     }
@@ -196,8 +204,9 @@ impl Fragmenter {
         if !may_answer_v6(src, dst, header.next_header(), payload) {
             return self.drop("IPv6 packet above the MTU");
         }
-        let Some(peer) = self.admit(IpAddr::V6(dst), now, route) else {
-            return Action::Drop;
+        let peer = match self.admit(IpAddr::V6(dst), now, route) {
+            Ok(peer) => peer,
+            Err(reason) => return Action::Drop(reason),
         };
         self.stats.ptb_sent += 1;
         tracing::debug!(%src, %dst, len = bytes.len(), mtu, "Packet Too Big");
@@ -232,8 +241,9 @@ impl Fragmenter {
             if !first || !may_answer_v4(src, dst, header.protocol(), payload) {
                 return self.drop("IPv4 DF packet above the ceiling");
             }
-            let Some(peer) = self.admit(IpAddr::V4(dst), now, route) else {
-                return Action::Drop;
+            let peer = match self.admit(IpAddr::V4(dst), now, route) {
+                Ok(peer) => peer,
+                Err(reason) => return Action::Drop(reason),
             };
             self.stats.frag_needed_sent += 1;
             tracing::debug!(%src, %dst, len = bytes.len(), ceiling, "fragmentation needed");
@@ -257,27 +267,27 @@ impl Fragmenter {
     fn drop(&mut self, why: &'static str) -> Action {
         self.stats.dropped += 1;
         tracing::debug!(why, "oversized local packet dropped");
-        Action::Drop
+        Action::Drop(FRAGMENT_OVERSIZE)
     }
 
     /// The peer to deliver an error about a packet to `dst` from, if it is routed and the
-    /// rate limit admits it.
+    /// rate limit admits it; otherwise the reason the packet is dropped.
     fn admit(
         &mut self,
         dst: IpAddr,
         now: Instant,
         route: impl FnOnce(IpAddr) -> Option<PeerId>,
-    ) -> Option<PeerId> {
+    ) -> Result<PeerId, &'static str> {
         let Some(peer) = route(dst) else {
             self.stats.no_route += 1;
             tracing::debug!(%dst, "no route for an ICMP error");
-            return None;
+            return Err(FRAGMENT_NO_ROUTE);
         };
         if !self.take_token(now) {
             self.stats.rate_limited += 1;
-            return None;
+            return Err(FRAGMENT_RATE_LIMITED);
         }
-        Some(peer)
+        Ok(peer)
     }
 
     fn take_token(&mut self, now: Instant) -> bool {
@@ -862,7 +872,10 @@ mod tests {
             &multicast6,
             &fragment6,
         ] {
-            assert!(matches!(run(&mut f, packet, 1420, now), Action::Drop));
+            assert!(matches!(
+                run(&mut f, packet, 1420, now),
+                Action::Drop(FRAGMENT_OVERSIZE)
+            ));
         }
         assert_eq!(f.stats().dropped, 7);
         assert_eq!(f.stats().ptb_sent + f.stats().frag_needed_sent, 0);
@@ -895,7 +908,7 @@ mod tests {
         ));
         assert!(matches!(
             run(&mut f, &packet, 1420, start + ICMP_REFILL),
-            Action::Drop
+            Action::Drop(FRAGMENT_RATE_LIMITED)
         ));
         let later = start + Duration::from_secs(60);
         let replies = (0..20)
@@ -914,7 +927,7 @@ mod tests {
             Instant::now(),
             |_| None,
         );
-        assert!(matches!(action, Action::Drop));
+        assert!(matches!(action, Action::Drop(FRAGMENT_NO_ROUTE)));
         assert_eq!(f.stats().no_route, 1);
         assert_eq!(f.stats().rate_limited, 0);
         assert_eq!(f.tokens, ICMP_BURST);
@@ -942,7 +955,7 @@ mod tests {
         let packet = ipv4(200, protocol::TCP, 0, &[]);
         assert!(matches!(
             run(&mut f, &packet, 50, Instant::now()),
-            Action::Drop
+            Action::Drop(FRAGMENT_OVERSIZE)
         ));
         assert_eq!(f.stats().dropped, 1);
     }

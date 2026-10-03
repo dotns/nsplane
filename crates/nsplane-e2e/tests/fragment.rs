@@ -2,13 +2,15 @@
 //! Big and Fragmentation Needed delivered to the sender, native IPv4 keeping the full MTU,
 //! IPv4 fragments translated to IPv6 fragments by a `Translator` (these cases also with the
 //! crypto worker pool on), zero-checksum IPv4 fragments arriving out of order reassembled by
-//! the `Translator`, MTU changes, and no stage without `EngineBuilder::fragmenter`.
+//! the `Translator`, MTU changes, and no stage without `EngineBuilder::fragmenter`; the
+//! stage's counters in `fragment_stats` and its drops in `drop_counters`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use nsplane::{
-    AllowedIp, ChannelTransport, Event, FragmentConfig, PacketBuf, PacketFilter, PeerId,
+    AllowedIp, ChannelTransport, DROP_FRAGMENT_NO_ROUTE, DROP_FRAGMENT_OVERSIZE, Event,
+    FragmentConfig, FragmentStats, PacketBuf, PacketFilter, PeerId,
 };
 use nsplane_core::Verdict;
 use nsplane_e2e::{
@@ -195,12 +197,22 @@ async fn oversized_ipv6_is_answered_with_packet_too_big_with(workers: usize) -> 
     a.send(&packet).await?;
     expect_packet_too_big(&mut a, from_b, &packet, MTU).await?;
     b.expect_no_delivery().await?;
+    assert_eq!(a.handle.fragment_stats().await?.ptb_sent, 1);
 
     // At the MTU, the packet goes through.
     let fits = udp6(a.ip6, b.ip6, &payload(usize::from(MTU) - 48));
     a.send(&fits).await?;
     assert_eq!(b.expect_delivery().await?.1, fits);
     a.expect_no_delivery().await?;
+
+    // No error about a multicast packet: it is dropped and counted.
+    let multicast = udp6(a.ip6, "ff02::1".parse()?, &payload(1500));
+    a.send(&multicast).await?;
+    a.expect_no_delivery().await?;
+    b.expect_no_delivery().await?;
+    let stats = a.handle.fragment_stats().await?;
+    assert_eq!((stats.ptb_sent, stats.dropped), (1, 1));
+    assert_eq!(a.drops(DROP_FRAGMENT_OVERSIZE).await?, 1);
     Ok(())
 }
 
@@ -225,6 +237,8 @@ async fn oversized_ipv4_with_df_is_answered_with_fragmentation_needed_with(
     a.send(&packet).await?;
     expect_fragmentation_needed(&mut a, from_b, &packet, MTU).await?;
     b.expect_no_delivery().await?;
+    let stats = a.handle.fragment_stats().await?;
+    assert_eq!((stats.frag_needed_sent, stats.ptb_sent), (1, 0));
     Ok(())
 }
 
@@ -335,6 +349,9 @@ async fn translated_ipv4_arrives_as_ipv6_fragments_with(workers: usize) -> TestR
     }
     // Every fragment was translated on its own: nothing waited for reassembly.
     assert_eq!(translator.stats().reassembled, 0);
+    let stats = a.handle.fragment_stats().await?;
+    assert!(stats.fragmented >= 1, "{stats:?}");
+    assert!(stats.fragments >= 2, "{stats:?}");
     Ok(())
 }
 
@@ -427,6 +444,7 @@ async fn without_a_fragmenter_oversized_packets_go_through() -> TestResult {
         assert_eq!(b.expect_delivery().await?.1, packet);
     }
     a.expect_no_delivery().await?;
+    assert_eq!(a.handle.fragment_stats().await?, FragmentStats::default());
     Ok(())
 }
 
@@ -438,5 +456,9 @@ async fn errors_need_a_route() -> TestResult {
     a.send(&packet).await?;
     a.expect_no_delivery().await?;
     b.expect_no_delivery().await?;
+    let stats = a.handle.fragment_stats().await?;
+    assert!(stats.no_route >= 1, "{stats:?}");
+    assert_eq!(stats.frag_needed_sent, 0);
+    assert_eq!(a.drops(DROP_FRAGMENT_NO_ROUTE).await?, 1);
     Ok(())
 }
