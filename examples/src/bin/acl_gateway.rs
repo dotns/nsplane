@@ -66,7 +66,6 @@ mod unix {
         encode_public_key, init_logging, serve_uapi,
     };
     use nsplane_examples::status::Status;
-    use nsplane_tun::Tun;
     use serde_json::{Value, json};
 
     /// How often the policy file is read.
@@ -282,8 +281,7 @@ mod unix {
         };
         policy.poll().await;
 
-        let tun = Tun::create(&args.tun.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun.tun_name))?;
+        let tun = node::create_tun(&args.tun.tun_name, &args.node)?;
         let name = tun.name().unwrap_or_else(|_| args.tun.tun_name.clone());
         configure_tun(&name, &args.tun.address, args.tun.mtu, &args.node.peer)?;
         let (source, sink) = tun.split().context("cannot open the TUN device")?;

@@ -8,7 +8,8 @@
 # Rows: TUN, netstack, bridge(fd), bridge(channel); columns: direct UDP, and the single-port
 # relay (relay_server) over UDP and over WSS with the direct path blocked. Scenarios add
 # native kernel WireGuard through the relay, NAT hole punching behind MASQUERADE routers,
-# the direct/relay ladder and plain WireGuard servers under the relay extension.
+# the direct/relay ladder, plain WireGuard servers under the relay extension, and the
+# offload and non-offload TUN/UDP paths (iperf3 throughput, --no-offload fallback).
 # Needs docker and the `wireguard` kernel module on the host; nothing on the host is
 # reconfigured. The release example binaries are built in the dev image unless
 # NSPLANE_E2E_EX_BIN_DIR names a directory holding them.
@@ -755,6 +756,68 @@ scenario_acl_gateway() {
   echo "  ok  a: extra.acl.replies grew past $replies"
 }
 
+# --- scenarios: offload -----------------------------------------------------------------
+
+# tun_node with --no-offload <-> kernel WireGuard: the UDP cell's checks on the plain TUN
+# device and UDP without GSO/GRO.
+scenario_offload_fallback() {
+  kernel_peer tun_node --no-offload
+  wait_log a tun_node 'TUN node started.* offload=off'
+  X a "grep -q 'udp_offload=off' /tun_node.log"
+  echo "  ok  a: tun_node logs offload=off, udp_offload=off"
+}
+
+# iperf_run <ctr> <tcp|udp> [iperf3 args]...: one 5 s iperf3 run against 10.0.0.2; prints
+# the received Mbit/s (UDP: and the loss) and fails unless data arrived.
+iperf_run() {
+  local name=$1 proto=$2 out; shift 2
+  local args=(-c 10.0.0.2 -t 5 -J --connect-timeout 5000 "$@")
+  # 1392 bytes fill the tunnel MTU (1420) with IPv4 and UDP headers.
+  [ "$proto" = udp ] && args+=(-u -b 0 -l 1392)
+  out=$(X "$name" "timeout 30 iperf3 $(printf '%q ' "${args[@]}") 2>> /iperf3.log") || return 1
+  jq -e '.end.sum_received.bytes > 0' <<< "$out" >/dev/null || return 1
+  jq -r '"\(.end.sum_received.bits_per_second / 1e6 | floor)"
+    + (.end.sum.lost_percent | if . == null then "" else " (loss \(. * 10 | round / 10)%)" end)' <<< "$out"
+}
+
+# tun_node (offload on, then --no-offload) <-> kernel WireGuard: iperf3 TCP and UDP in both
+# directions through the tunnel. Passes when every run moved data; prints all 8 rates.
+scenario_offload_iperf() {
+  local mode a k a_pub k_pub a_ip k_ip dir result
+  local -A rate=()
+  for mode in on off; do
+    a=a-$mode; k=k-$mode
+    start "$a" "$k"
+    a_pub=$(pub "$a"); k_pub=$(pub "$k"); a_ip=$(ip_of "$a"); k_ip=$(ip_of "$k")
+    local flags=()
+    [ "$mode" = off ] && flags=(--no-offload)
+    node "$a" tun_node "${flags[@]}" --address 10.0.0.1/24 \
+      --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=10.0.0.2/32"
+    kernel_wg "$k" 10.0.0.2/24 "$a_pub" "$a_ip" 10.0.0.1/32
+    if [ "$mode" = on ]; then wait_log "$a" tun_node 'TUN node started.* offload=tso'
+    else wait_log "$a" tun_node 'TUN node started.* offload=off'; fi
+    X "$a" "grep -E 'TUN node started' /tun_node.log" | grep -oE 'offload=[a-z_,]+' | sed "s/^/  $a: /"
+    ping_check "$a" 10.0.0.2
+    docker exec -d "$(ctr "$k")" iperf3 -s
+    sleep 0.5
+    for dir in "tcp a->k" "tcp k->a" "udp a->k" "udp k->a"; do
+      local args=()
+      [[ $dir == *"k->a" ]] && args=(-R)
+      if ! result=$(iperf_run "$a" "${dir%% *}" "${args[@]}"); then
+        echo "  FAIL $a: iperf3 $dir (offload $mode)"; return 1
+      fi
+      rate[$dir/$mode]=$result
+      echo "  ok  $a: iperf3 $dir (offload $mode): $result"
+    done
+    # Datagrams above the path MTU fail with EMSGSIZE (DF set): reported, not gated.
+    echo "  $a: EMSGSIZE in the node log: $(X "$a" "grep -cE 'Message too long|os error 90' /tun_node.log" || true)"
+  done
+  echo "  iperf3 Mbit/s   offload on              offload off"
+  for dir in "tcp a->k" "tcp k->a" "udp a->k" "udp k->a"; do
+    printf '  %-15s %-23s %s\n' "$dir" "${rate[$dir/on]}" "${rate[$dir/off]}"
+  done
+}
+
 # --- run --------------------------------------------------------------------------------
 cell tun udp tun_pair tun_kernel
 cell netstack udp netstack_pair netstack_kernel
@@ -778,6 +841,8 @@ scenario ladder_tun
 scenario ladder_netstack
 scenario nat_hole_punch
 scenario plain_wg_compat
+scenario offload_fallback
+scenario offload_iperf
 
 report
 if [ "$FAILED" -ne 0 ]; then echo "FAIL"; exit 1; fi
