@@ -7,7 +7,8 @@
 //! on the host's kernel stack, through the tunnel. Runs until Ctrl-C, or until the checks
 //! finish with `--exit-after-checks`. Needs root (or `CAP_NET_ADMIN`).
 //!
-//! APIs shown: `nsplane_tun::Tun::create` and `Tun::split` as the engine's packet source
+//! APIs shown: `nsplane_tun::Tun::create_with` (offloads off with `--no-offload`),
+//! `Tun::offload` and `Tun::split` as the engine's packet source
 //! and sink, `nsplane_uapi::Uapi::with_listen_port` (`--transport udp`) and
 //! `Uapi::with_external_transport` (`--transport relay|wss`), `UapiListener::bind` and
 //! `Uapi::serve`,
@@ -35,7 +36,6 @@ mod unix {
         parse_cidr,
     };
     use nsplane_examples::status::Status;
-    use nsplane_tun::Tun;
     use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
 
     // `wg set listen-port` rebinds the UAPI's transport, so the node's UDP transport is it;
@@ -181,8 +181,8 @@ mod unix {
 
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
-        let tun = Tun::create(&args.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun_name))?;
+        let tun = node::create_tun(&args.tun_name, &args.node)?;
+        let offload = node::offload_mode(tun.offload());
         let name = tun.name().unwrap_or_else(|_| args.tun_name.clone());
         #[cfg(target_os = "linux")]
         configure_interface(&name, &args)?;
@@ -207,7 +207,7 @@ mod unix {
                 tracing::warn!(error = %e, "UAPI server failed");
             }
         });
-        tracing::info!(interface = %name, listen = %node.transports.listen, uapi = %socket, "TUN node started");
+        tracing::info!(interface = %name, %offload, listen = %node.transports.listen, uapi = %socket, "TUN node started");
 
         let status = args
             .node
