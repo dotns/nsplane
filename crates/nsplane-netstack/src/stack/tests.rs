@@ -15,6 +15,7 @@ mod listener_integration;
 mod listener_pool;
 mod ownership;
 mod progress;
+mod reassembly;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

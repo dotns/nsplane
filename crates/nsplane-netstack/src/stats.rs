@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A snapshot of the stack's drop counters, one per reason.
 ///
 /// Every packet, datagram or connection the stack discards is counted in exactly one
-/// field. Counters only grow.
+/// field; with [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly) the
+/// reassembly counters also count datagrams completed. Counters only grow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetStackStats {
     /// Ingress packets that are not a parseable IPv4/IPv6 packet, or whose TCP/UDP header
@@ -13,7 +14,9 @@ pub struct NetStackStats {
     pub malformed: u64,
     /// Ingress packets whose destination is not one of the stack's addresses.
     pub no_address: u64,
-    /// Ingress packets of a protocol other than TCP or UDP, and IPv4 fragments.
+    /// Ingress packets of a protocol other than TCP or UDP, and (without
+    /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly)) IPv4 fragments
+    /// and IPv6 Fragment-header packets.
     pub unsupported: u64,
     /// Bare SYNs beyond the listener pool; the stack answers them with RST.
     pub syn_refused: u64,
@@ -31,6 +34,18 @@ pub struct NetStackStats {
     pub udp_not_accepted: u64,
     /// Packets the stack produced while its egress backlog was full.
     pub egress_full: u64,
+    /// Datagrams reassembled from fragments and handed on as one packet. Always 0 without
+    /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
+    pub reassembled: u64,
+    /// Incomplete datagrams discarded with their fragments after the reassembly timeout.
+    /// Always 0 without [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
+    pub reassembly_timeout: u64,
+    /// Fragments dropped at the reassembly bounds: a fragment of a further datagram once
+    /// `max_datagrams` are held, or one that grows its datagram beyond `max_bytes` (the
+    /// datagram's held fragments go with it). Fragments the reassembler rejects as
+    /// invalid or overlapping count as [`malformed`](Self::malformed). Always 0 without
+    /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
+    pub reassembly_overflow: u64,
 }
 
 /// The live counters behind [`NetStackStats`].
@@ -46,6 +61,9 @@ pub(crate) struct Counters {
     pub(crate) udp_flow_limit: AtomicU64,
     pub(crate) udp_not_accepted: AtomicU64,
     pub(crate) egress_full: AtomicU64,
+    pub(crate) reassembled: AtomicU64,
+    pub(crate) reassembly_timeout: AtomicU64,
+    pub(crate) reassembly_overflow: AtomicU64,
 }
 
 /// Adds `n` to `counter`.
@@ -68,6 +86,9 @@ impl Counters {
             udp_flow_limit: get(&self.udp_flow_limit),
             udp_not_accepted: get(&self.udp_not_accepted),
             egress_full: get(&self.egress_full),
+            reassembled: get(&self.reassembled),
+            reassembly_timeout: get(&self.reassembly_timeout),
+            reassembly_overflow: get(&self.reassembly_overflow),
         }
     }
 }
