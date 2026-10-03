@@ -9,6 +9,14 @@
 //! (a Wintun adapter; a reader thread feeds the source, so there is no fd). On every
 //! other target the crate is empty for now.
 //!
+//! Offloads (Linux/Android): [`Tun::create`] opens the device with a virtio-net header
+//! (`IFF_VNET_HDR`) and TCP segmentation offload, plus UDP segmentation offload where the
+//! kernel supports it, so one read or write can carry up to 64 KiB of one flow: the
+//! source splits such reads into MTU-sized packets, and the sink coalesces runs of
+//! packets into super-packets (`writev` of header and pieces, no copy). Kernels without
+//! these features get a plain device. `Tun::create_with` with `TunOptions::offload(false)`
+//! opts out, and `Tun::offload` reports what is in use.
+//!
 //! Raw fds (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
 //! (a parent process, the CLI's `--tun-fd` and `--uapi-fd`) so that callers need no
 //! `unsafe`. Either call takes ownership: the fd must be one the process inherited or
@@ -46,6 +54,8 @@ mod unix;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+mod offload;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod darwin;
@@ -61,7 +71,7 @@ mod windows;
     target_os = "macos",
     target_os = "ios"
 ))]
-pub use tun::{MTU_POLL_INTERVAL, Tun, TunSink, TunSource};
+pub use tun::{MTU_POLL_INTERVAL, Offload, Tun, TunOptions, TunSink, TunSource};
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
