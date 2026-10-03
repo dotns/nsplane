@@ -1,9 +1,10 @@
 //! The node side of the WSS carrier: [`WssTransport`].
 //!
 //! The transport keeps one WebSocket-over-TLS connection to the relay in a
-//! [`LinkTransport`], dialed by a `WssDialer` that reconnects with bounded exponential
-//! backoff. Datagrams to the relay's address leave as binary messages; while the
-//! connection is down they wait in the link's queue (256 datagrams; a full queue fails
+//! [`LinkTransport`], dialed by an [`nsplane_wss::WssDialer`] that pins the relay's
+//! certificate, keeps the connection alive with pings and reconnects with bounded
+//! exponential backoff. Datagrams to the relay's address leave as binary messages; while
+//! the connection is down they wait in the link's queue (256 datagrams; a full queue fails
 //! the send at once, so the engine never waits for it). Received messages come out of
 //! [`Transport::recv`] with the relay's address as their path. Datagrams to any other
 //! address go to an optional UDP socket (the direct paths of the ladder) or are dropped.
@@ -16,41 +17,20 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt as _, StreamExt as _};
-use nsplane::{
-    BoxFuture, LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport,
-    PacketBuf, Path, Transport, TransportId, UdpTransport,
-};
+use nsplane::{LinkConfig, LinkTransport, PacketBuf, Path, Transport, TransportId, UdpTransport};
+use nsplane_wss::{WssDialer, WssTls};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::{Bytes, Message};
 
-use super::{MAX_DATAGRAM, fill, ws_config};
+use super::{MAX_DATAGRAM, fill};
 use crate::relay::client::RelayClient;
-
-/// Time a connection attempt (TCP, TLS, WebSocket) may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Interval of keepalive pings.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-/// A connection silent this long (three and a half [`PING_INTERVAL`]s without any frame, pongs
-/// included) is closed and dialed again.
-///
-/// The receiver applies it to every frame rather than through
-/// [`LinkConfig::read_idle_timeout`]: that one only sees datagrams, so pongs would not
-/// count and an idle but healthy connection would be cut.
-const READ_IDLE: Duration = Duration::from_secs(35);
 
 /// Where and how [`WssTransport`] connects.
 #[derive(Debug, Clone)]
@@ -88,19 +68,14 @@ impl WssConfig {
     }
 }
 
-/// The transport's counters, shared with its dialer.
+/// The transport's counters: the dialer's, plus the drops of the transport itself.
 #[derive(Debug)]
 pub struct WssStats {
     relay: SocketAddr,
     url: String,
-    connected: AtomicBool,
+    link: Arc<nsplane_wss::WssStats>,
     connects: watch::Sender<u64>,
-    connect_failures: AtomicU64,
-    tx: AtomicU64,
-    rx: AtomicU64,
-    dropped_disconnected: AtomicU64,
     dropped_queue_full: AtomicU64,
-    dropped_text: AtomicU64,
     dropped_oversized: AtomicU64,
     dropped_no_route: AtomicU64,
 }
@@ -116,12 +91,12 @@ fn get(counter: &AtomicU64) -> u64 {
 impl WssStats {
     /// Whether the connection is up.
     pub fn connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.link.connected()
     }
 
     /// Successful connects.
     pub fn connects(&self) -> u64 {
-        *self.connects.borrow()
+        self.link.connects()
     }
 
     /// Successful connects after the first.
@@ -131,31 +106,30 @@ impl WssStats {
 
     /// Failed connection attempts.
     pub fn connect_failures(&self) -> u64 {
-        get(&self.connect_failures)
+        self.link.connect_failures()
     }
 
     /// Datagrams sent over the connection.
     pub fn tx(&self) -> u64 {
-        get(&self.tx)
+        self.link.tx()
     }
 
     /// Datagrams received over the connection.
     pub fn rx(&self) -> u64 {
-        get(&self.rx)
+        self.link.rx()
+    }
+
+    /// Datagrams dropped as too long, by the dialer or by `recv`.
+    fn dropped_oversized(&self) -> u64 {
+        self.link.dropped_oversized() + get(&self.dropped_oversized)
     }
 
     /// Datagrams dropped, for any reason.
     pub fn drops(&self) -> u64 {
-        [
-            &self.dropped_disconnected,
-            &self.dropped_queue_full,
-            &self.dropped_text,
-            &self.dropped_oversized,
-            &self.dropped_no_route,
-        ]
-        .into_iter()
-        .map(get)
-        .sum()
+        get(&self.dropped_queue_full)
+            + self.link.dropped_text()
+            + self.dropped_oversized()
+            + get(&self.dropped_no_route)
     }
 
     /// Watches the connect count.
@@ -185,10 +159,10 @@ impl WssStats {
             "rx": self.rx(),
             "drops": self.drops(),
             "dropped": {
-                "disconnected": get(&self.dropped_disconnected),
+                "disconnected": 0,
                 "queue_full": get(&self.dropped_queue_full),
-                "text": get(&self.dropped_text),
-                "oversized": get(&self.dropped_oversized),
+                "text": self.link.dropped_text(),
+                "oversized": self.dropped_oversized(),
                 "no_route": get(&self.dropped_no_route),
             },
         })
@@ -211,32 +185,52 @@ pub struct WssTransport {
 impl WssTransport {
     /// Starts connecting to the relay of `config` (inside a tokio runtime). `direct`
     /// carries datagrams to other addresses; it should have the same `id`.
-    pub fn connect(id: TransportId, config: WssConfig, direct: Option<UdpTransport>) -> Self {
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] on a URL that is not `wss://` with a
+    /// host.
+    pub fn connect(
+        id: TransportId,
+        config: WssConfig,
+        direct: Option<UdpTransport>,
+    ) -> io::Result<Self> {
+        let relay = config.relay;
+        let wss = nsplane_wss::WssConfig::new(config.url.clone(), WssTls::Config(config.tls))
+            .connect_addr(relay)
+            .server_name(config.server_name.to_str())
+            .backoff(config.backoff_min, config.backoff_max);
+        let dialer = WssDialer::new(wss)?;
         let stats = Arc::new(WssStats {
-            relay: config.relay,
-            url: config.url.clone(),
-            connected: AtomicBool::new(false),
+            relay,
+            url: config.url,
+            link: dialer.stats(),
             connects: watch::Sender::new(0),
-            connect_failures: AtomicU64::new(0),
-            tx: AtomicU64::new(0),
-            rx: AtomicU64::new(0),
-            dropped_disconnected: AtomicU64::new(0),
             dropped_queue_full: AtomicU64::new(0),
-            dropped_text: AtomicU64::new(0),
             dropped_oversized: AtomicU64::new(0),
             dropped_no_route: AtomicU64::new(0),
         });
-        let relay = config.relay;
-        let dialer = WssDialer::new(config, Arc::clone(&stats));
-        let link = LinkTransport::new(id, relay, Arc::new(dialer), LinkConfig::default());
-        Self {
+        // The dialer counts a connect before it publishes the state, so the count read
+        // after a change includes it. The watch ends with the dialer.
+        let mut state = dialer.state();
+        let counted = Arc::clone(&stats);
+        tokio::spawn(async move {
+            while state.changed().await.is_ok() {
+                let connects = counted.link.connects();
+                counted.connects.send_if_modified(|n| {
+                    let changed = *n != connects;
+                    *n = connects;
+                    changed
+                });
+            }
+        });
+        let link = dialer.into_transport(id, relay, LinkConfig::default());
+        Ok(Self {
             id,
             relay,
             direct,
             stats,
             link,
             scratch: Mutex::new(PacketBuf::with_capacity(MAX_DATAGRAM)),
-        }
+        })
     }
 
     /// The relay's address: the path address of everything the connection carries.
@@ -293,194 +287,6 @@ impl Transport for WssTransport {
         self.link.send(datagram, to).await.inspect_err(|e| {
             if e.kind() == io::ErrorKind::WouldBlock {
                 bump(&self.stats.dropped_queue_full);
-            }
-        })
-    }
-}
-
-type Ws = WebSocketStream<TlsStream<TcpStream>>;
-
-/// Dials the WSS connections of a [`WssTransport`]'s link.
-///
-/// Each dial is TCP, TLS with the pinned certificate and the WebSocket upgrade, within
-/// [`CONNECT_TIMEOUT`]. Every dial but the first waits first: `backoff_min` after a
-/// connection that came up, doubled after each failure up to `backoff_max`.
-#[derive(Debug)]
-struct WssDialer {
-    config: WssConfig,
-    stats: Arc<WssStats>,
-    /// The wait before the next dial; `None` before the first.
-    backoff: StdMutex<Option<Duration>>,
-}
-
-impl WssDialer {
-    /// A dialer for the relay of `config` that counts into `stats`.
-    const fn new(config: WssConfig, stats: Arc<WssStats>) -> Self {
-        Self {
-            config,
-            stats,
-            backoff: StdMutex::new(None),
-        }
-    }
-
-    fn set_backoff(&self, backoff: Duration) {
-        *self.backoff.lock().unwrap_or_else(PoisonError::into_inner) = Some(backoff);
-    }
-
-    /// TCP, TLS with the pinned certificate, and the WebSocket upgrade.
-    async fn open(&self) -> anyhow::Result<Ws> {
-        let config = &self.config;
-        let tcp = TcpStream::connect(config.relay).await?;
-        tcp.set_nodelay(true)?;
-        let tls = TlsConnector::from(Arc::clone(&config.tls))
-            .connect(config.server_name.clone(), tcp)
-            .await?;
-        let (ws, _) = tokio_tungstenite::client_async_with_config(
-            config.url.as_str(),
-            tls,
-            Some(ws_config()),
-        )
-        .await?;
-        Ok(ws)
-    }
-}
-
-impl LinkDialer for WssDialer {
-    fn dial(&self) -> BoxFuture<'_, io::Result<(Box<dyn LinkSender>, Box<dyn LinkReceiver>)>> {
-        Box::pin(async move {
-            let wait = *self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(wait) = wait {
-                tokio::time::sleep(wait).await;
-            }
-            let failed = |reason: String| {
-                bump(&self.stats.connect_failures);
-                let next = wait.map_or(self.config.backoff_min, |wait| {
-                    wait.saturating_mul(2).min(self.config.backoff_max)
-                });
-                self.set_backoff(next);
-                tracing::debug!(url = %self.config.url, error = reason, "wss connect failed");
-                io::Error::other(reason)
-            };
-            let ws = match tokio::time::timeout(CONNECT_TIMEOUT, self.open()).await {
-                Ok(Ok(ws)) => ws,
-                Ok(Err(e)) => return Err(failed(format!("{e:#}"))),
-                Err(_) => return Err(failed("timed out".to_owned())),
-            };
-            self.set_backoff(self.config.backoff_min);
-            let (sink, stream) = ws.split();
-            let sink = Arc::new(Mutex::new(sink));
-            let sender = WssSender {
-                sink: Arc::clone(&sink),
-                stats: Arc::clone(&self.stats),
-                pings: tokio::spawn(ping(sink)),
-            };
-            let receiver = WssReceiver {
-                stream,
-                stats: Arc::clone(&self.stats),
-            };
-            let link: (Box<dyn LinkSender>, Box<dyn LinkReceiver>) =
-                (Box::new(sender), Box::new(receiver));
-            Ok(link)
-        })
-    }
-
-    fn on_state(&self, state: LinkState) {
-        match state {
-            LinkState::Connected => {
-                self.stats.connected.store(true, Ordering::Relaxed);
-                self.stats.connects.send_modify(|n| *n += 1);
-                tracing::info!(url = %self.config.url, relay = %self.config.relay, "wss connected");
-            }
-            LinkState::Disconnected => {
-                self.stats.connected.store(false, Ordering::Relaxed);
-                tracing::info!(url = %self.config.url, "wss disconnected");
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The sending half of a WSS connection, shared with its ping task.
-type Sink = Arc<Mutex<SplitSink<Ws, Message>>>;
-
-/// Sends a keepalive ping every [`PING_INTERVAL`] until a send fails; the receiver then
-/// sees the connection end, or [`READ_IDLE`] pass.
-async fn ping(sink: Sink) {
-    let mut pings = tokio::time::interval(PING_INTERVAL);
-    pings.tick().await;
-    loop {
-        pings.tick().await;
-        if sink
-            .lock()
-            .await
-            .send(Message::Ping(Bytes::new()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-/// Sends datagrams as binary messages; owns the connection's ping task.
-struct WssSender {
-    sink: Sink,
-    stats: Arc<WssStats>,
-    pings: JoinHandle<()>,
-}
-
-impl Drop for WssSender {
-    fn drop(&mut self) {
-        self.pings.abort();
-    }
-}
-
-impl LinkSender for WssSender {
-    fn send(&mut self, message: &[u8]) -> BoxFuture<'_, io::Result<()>> {
-        let message = Message::Binary(Bytes::copy_from_slice(message));
-        Box::pin(async move {
-            self.sink
-                .lock()
-                .await
-                .send(message)
-                .await
-                .map_err(io::Error::other)?;
-            bump(&self.stats.tx);
-            Ok(())
-        })
-    }
-}
-
-/// Yields the payloads of binary messages; counts and skips the rest.
-struct WssReceiver {
-    stream: SplitStream<Ws>,
-    stats: Arc<WssStats>,
-}
-
-impl LinkReceiver for WssReceiver {
-    fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<Bytes>>> {
-        Box::pin(async move {
-            loop {
-                let Ok(message) = tokio::time::timeout(READ_IDLE, self.stream.next()).await else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "wss connection silent",
-                    ));
-                };
-                match message {
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.len() > MAX_DATAGRAM {
-                            bump(&self.stats.dropped_oversized);
-                        } else {
-                            bump(&self.stats.rx);
-                            return Ok(Some(data));
-                        }
-                    }
-                    Some(Ok(Message::Text(_))) => bump(&self.stats.dropped_text),
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => return Ok(None),
-                    Some(Err(e)) => return Err(io::Error::other(e)),
-                }
             }
         })
     }

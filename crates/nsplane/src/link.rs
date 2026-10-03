@@ -41,6 +41,10 @@ pub enum LinkState {
     Connected,
     /// The link was lost (closed, failed or idle); the transport dials again.
     Disconnected,
+    /// The far end refused the link with this HTTP status, e.g. 401 or 403. Reported by
+    /// dialers (to their own observers, when a dial is refused), never by
+    /// [`LinkTransport`] itself.
+    Rejected(u16),
 }
 
 /// Opens the links a [`LinkTransport`] runs on.

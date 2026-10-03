@@ -31,6 +31,7 @@ nsplane-core = { path = "../crates/nsplane-core", version = "0.8.0" }
 nsplane-nat = { path = "../crates/nsplane-nat", version = "0.8.0" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
 nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
+nsplane-wss = { path = "../crates/nsplane-wss", version = "0.8.0" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
