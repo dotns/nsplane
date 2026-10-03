@@ -1,6 +1,6 @@
 [package]
 name = "nsplane-examples"
-description = "Runnable examples of the nsplane data plane: UDP, TUN, netstack, hybrid and ACL nodes"
+description = "Runnable examples of the nsplane data plane: UDP, TUN, netstack, hybrid, ACL and NAT nodes"
 publish = false
 version.workspace = true
 authors.workspace = true
@@ -27,6 +27,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 nsplane = { path = "../crates/nsplane", version = "0.8.0" }
 nsplane-acl = { path = "../crates/nsplane-acl", version = "0.8.0" }
 nsplane-core = { path = "../crates/nsplane-core", version = "0.8.0" }
+nsplane-nat = { path = "../crates/nsplane-nat", version = "0.8.0" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
 nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
