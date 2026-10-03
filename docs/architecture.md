@@ -83,7 +83,9 @@ Backpressure:
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
 
-`UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
+`UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support,
+4 MiB socket buffers requested (clamped by `net.core.rmem_max` / `wmem_max`) and segmentation
+offload through `quinn-udp`.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
 
@@ -94,12 +96,37 @@ several sources round-robin and reports the smallest of their MTUs. The splitter
 only the chosen sink, but a waiting sink still holds back the engine's next delivery;
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
 
+**Batched I/O.** The I/O tasks move up to `MAX_BATCH` (64) packets or datagrams per call
+through `PacketSource::recv_batch`, `PacketSink::send_batch`, `Transport::recv_batch` and
+`Transport::send_batch` (default methods that fall back to one at a time; `DynTransport`
+mirrors them), with the same backpressure, stop handback and recycling as single calls:
+
+```text
+TUN read (vnet hdr + up to 64 KiB) ─► segments (<= MTU) ─► core seals ─► GSO UDP send
+UDP GRO read ─► zero-copy slices ─► core opens in place ─► coalesced TUN writev
+```
+
+Offload is negotiated where the device or socket is opened. `Tun::create` (Linux,
+Android) asks for `IFF_VNET_HDR` with checksum offload and TSO, plus USO when the kernel
+accepts it, and falls back to a plain `IFF_NO_PI` device; `Tun::offload` reports the
+result. `UdpTransport::bind` sets the socket up with `quinn-udp`: GSO on send where the
+platform has it, GRO on receive on Linux and Android, each GRO datagram a
+`PacketBuf::from_shared` slice of the read buffer without headroom. A segmented send that
+fails with `EIO`/`EINVAL` falls back to one datagram per send, and where `quinn-udp`
+cannot set the socket up (Wine) the transport sends with plain `send_to`. With offload on
+the socket sets DF, so outer datagrams above the path MTU fail with `EMSGSIZE`; the engine
+counts them under `TRANSPORT_SEND_ERROR`. `TunOptions::offload(false)`,
+`UdpTransport::bind_with_offload(.., false)` and the examples' `--no-offload` opt out.
+
 ## nsplane-tun
 
 `Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one, and `Tun::split`
 yields a `TunSource` and a `TunSink` registered with the tokio reactor.
 
-- `linux`: `/dev/net/tun` (Linux, Android), raw IP packets.
+- `linux`: `/dev/net/tun` (Linux, Android), raw IP packets, or with `IFF_VNET_HDR` a
+  10-byte virtio-net header per read and write.
+- `offload`: the virtio-net codec: GSO segmentation of read super-packets and TCP/UDP
+  coalescing for writes (one `writev` of header and packet pieces per super-packet).
 - `darwin` and `utun`: the utun control socket (macOS, iOS), packets framed by a 4-byte
   address-family header.
 - `unix`: non-blocking fd I/O shared by both.
@@ -133,7 +160,10 @@ smoltcp on its own dispatch path.
 ## nsplane-uapi and the CLI
 
 `Uapi` answers `get=1` and `set=1` over an `EngineHandle`; `listen_port` and `fwmark` bind a
-new `UdpTransport` and install it with `EngineHandle::set_transport`. On Unix,
+new `UdpTransport` and install it with `EngineHandle::set_transport`. Over an engine whose
+transport the UAPI does not own (`Uapi::with_external_transport`, e.g. a relay or WSS
+carrier) they never replace it: the reported value is a no-op, any other fails with
+`EADDRINUSE`. On Unix,
 `UapiListener` binds `/var/run/wireguard/<iface>.sock`. Windows has no listener yet.
 
 `nsplane-cli` builds a tokio multi-thread runtime (`--threads` workers), creates the TUN,

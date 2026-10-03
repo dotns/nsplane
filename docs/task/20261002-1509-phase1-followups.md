@@ -87,6 +87,14 @@ fixed by workstream 3C (per-transport backpressure, `DROP_TRANSPORT_REMOVED`).
     `lib.sh` default to fixed prefixes, so concurrent runs remove each other's containers;
     derive the default from the PID as `examples.sh` does.
 
+Status after Phase 5 (5B, branch `bkd/qni0z073`): item 12 is fixed by
+`Uapi::with_external_transport` (`listen_port=`/`fwmark=` leave a transport the UAPI does
+not own alone; covered by the `nsplane-uapi` unit tests and `nsplane-e2e`'s
+`uapi::listen_port_leaves_an_external_transport_alone` and
+`uapi::listen_port_rebinds_an_owned_udp_transport`); item 13 is fixed by PID-derived
+default prefixes in `linux.sh` and `lib.sh` (`nsplane-e2e-$$`, `nsplane-e2e-lib-$$`),
+verified by two concurrent default-prefix runs of each script.
+
 Status of item 1 after Phase 5 workstream 5C (follow-up #1, 2026-10-02): the rx buffer swap,
 both `copy_within` shifts and the `set_len(BUF_SIZE)` zero-fills on the timer, queue-flush
 and handshake-reply paths are gone. `Input::Datagram` takes the datagram by value and the
