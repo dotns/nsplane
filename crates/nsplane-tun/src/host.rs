@@ -11,56 +11,48 @@ use std::sync::Arc;
 use nsplane::{PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId};
 use tokio::sync::{mpsc, watch};
 
-/// The host's packet writer; see [`HostTun::new`].
+/// The host's packet writer; see [`host_tun`].
 type Write = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
-/// The local side of a host that hands packets over through callbacks rather than a file
-/// descriptor: the iOS `NEPacketTunnelFlow` local side, on every target.
+/// The recommended queue capacity for [`host_tun`], in packets.
+pub const HOST_TUN_DEFAULT_CAPACITY: usize = 4096;
+
+/// Creates the local side of a host that hands packets over through callbacks rather than
+/// a file descriptor: the iOS `NEPacketTunnelFlow` local side, usable on every target.
 ///
-/// [`HostTun::new`] creates the three ends; this type holds nothing itself.
-#[derive(Debug)]
-pub struct HostTun(());
-
-impl HostTun {
-    /// The recommended queue capacity for [`HostTun::new`], in packets.
-    pub const DEFAULT_CAPACITY: usize = 4096;
-
-    /// Creates a host local side with MTU `mtu`, queueing up to `capacity` packets from the
-    /// host ([`HostTun::DEFAULT_CAPACITY`] is recommended), that writes the engine's packets
-    /// with `write`, an `Arc<dyn Fn(&[u8]) -> bool + Send + Sync>`.
-    ///
-    /// Returns the input the host pushes its packets into, the source the engine reads
-    /// them from, and the sink that hands the engine's packets to `write`.
-    ///
-    /// `write` runs synchronously on the engine task, so it must not block for long; it
-    /// returns `false` once the host can no longer take packets.
-    /// `NEPacketTunnelFlow.writePackets` does not block.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `capacity` is 0.
-    #[expect(
-        clippy::new_ret_no_self,
-        reason = "the contract names the constructor of the three ends HostTun::new"
-    )]
-    pub fn new(
-        mtu: u16,
-        capacity: usize,
-        write: Write,
-    ) -> (HostTunInput, HostTunSource, HostTunSink) {
-        let (tx, rx) = mpsc::channel(capacity);
-        let (_, mtu_rx) = watch::channel(mtu);
-        (
-            HostTunInput { tx },
-            HostTunSource {
-                rx,
-                mtu,
-                mtu_rx,
-                oversize_drops: 0,
-            },
-            HostTunSink { write },
-        )
-    }
+/// This is the MT-2 local side; the contract's `HostTun::new` ships as `host_tun`.
+///
+/// The side has MTU `mtu`, queues up to `capacity` packets from the host
+/// ([`HOST_TUN_DEFAULT_CAPACITY`] is recommended), and writes the engine's packets with
+/// `write`, an `Arc<dyn Fn(&[u8]) -> bool + Send + Sync>`.
+///
+/// Returns the input the host pushes its packets into, the source the engine reads
+/// them from, and the sink that hands the engine's packets to `write`.
+///
+/// `write` runs synchronously on the engine task, so it must not block for long; it
+/// returns `false` once the host can no longer take packets.
+/// `NEPacketTunnelFlow.writePackets` does not block.
+///
+/// # Panics
+///
+/// Panics if `capacity` is 0.
+pub fn host_tun(
+    mtu: u16,
+    capacity: usize,
+    write: Write,
+) -> (HostTunInput, HostTunSource, HostTunSink) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let (_, mtu_rx) = watch::channel(mtu);
+    (
+        HostTunInput { tx },
+        HostTunSource {
+            rx,
+            mtu,
+            mtu_rx,
+            oversize_drops: 0,
+        },
+        HostTunSink { write },
+    )
 }
 
 /// Why [`HostTunInput::push`] did not queue a packet; the packet is dropped either way.
@@ -83,7 +75,7 @@ impl fmt::Display for PushError {
 
 impl std::error::Error for PushError {}
 
-/// The host's end of a [`HostTun`]: packets the host read for the engine go in here.
+/// The host's end of a [`host_tun`] local side: packets the host read for the engine go in here.
 ///
 /// Clones push into the same queue. Once every clone is dropped and the queue is drained,
 /// the [`HostTunSource`] returns [`io::ErrorKind::BrokenPipe`].
@@ -108,12 +100,12 @@ impl HostTunInput {
     }
 }
 
-/// The engine's source of a [`HostTun`]: the packets the host pushed, in order.
+/// The engine's source of a [`host_tun`] local side: the packets the host pushed, in order.
 ///
 /// Packets longer than the MTU are dropped and counted ([`HostTunSource::oversize_drops`]);
 /// the first one is logged as a warning. Once every [`HostTunInput`] is dropped and the
 /// queue is drained, `recv` returns [`io::ErrorKind::BrokenPipe`] on every call. The MTU
-/// is the one [`HostTun::new`] was given and does not change.
+/// is the one [`host_tun`] was given and does not change.
 #[derive(Debug)]
 pub struct HostTunSource {
     rx: mpsc::Receiver<PacketBuf>,
@@ -178,7 +170,7 @@ impl PacketSource for HostTunSource {
     }
 }
 
-/// The engine's sink of a [`HostTun`]: each packet goes to the host's `write` callback.
+/// The engine's sink of a [`host_tun`] local side: each packet goes to the host's `write` callback.
 ///
 /// `send` calls `write` synchronously; when it returns `false` the packet is dropped and
 /// `send` returns [`io::ErrorKind::BrokenPipe`].

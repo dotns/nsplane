@@ -38,7 +38,9 @@
 //! `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
 mod host;
-pub use host::{HostTun, HostTunInput, HostTunSink, HostTunSource, PushError};
+pub use host::{
+    HOST_TUN_DEFAULT_CAPACITY, HostTunInput, HostTunSink, HostTunSource, PushError, host_tun,
+};
 
 #[cfg(any(
     target_os = "linux",
