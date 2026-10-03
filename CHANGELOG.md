@@ -161,6 +161,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `take_queue_stats` also restarts the marks for windowed measurements. The owner task keeps
   the marks without locks or atomics. Measured defaults: the queue capacity stays at 1024
   and the command queue at 64 (see docs/architecture.md, "Queue depths").
+- `nsplane`: optional crypto worker pool, `EngineBuilder::crypto_workers(n)` (off by
+  default; 0 or 1 keeps the cryptography on the owner task). With 2 or more workers the
+  encryption of local packets and the decryption of received transport data run on `n`
+  worker tasks, sharded by peer, so each peer's packets keep their order in both directions
+  while different peers are encrypted in parallel; routing, filters, handshakes, timers,
+  counters and events stay on the owner task, and handle calls that read or change peers or
+  counters wait for the packets with the workers (see docs/architecture.md, "Crypto worker
+  pool").
+- `nsplane-core`: `Core::handle_input_deferred` returns the encryption or decryption of a
+  data packet as a `CryptoJob` (`Send`, locks only its peer's tunnel) to run on another
+  thread with `CryptoJob::run`; `Core::complete_job` finishes it in the core.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
