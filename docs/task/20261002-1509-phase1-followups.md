@@ -156,9 +156,9 @@ Added after Phase 5 (2026-10-03), still open:
     worker pool; uncontended and measured as noise, but the pool-off path could avoid it.
 18. **Plain TUN read capacity**: the non-offload read buffer is MTU, so a full-MTU IPv4 packet
     takes nsplane-nat's grown-copy path; give it MTU + 28.
-19. **smoltcp upstream**: two smoltcp 0.14 defects (pure-ACK SEQ after RTO rewind; zero-window
+19. **smoltcp upstream**: two smoltcp 0.14 defects (pure-ACK SEQ after the retransmission-timeout rewind; zero-window
     probe replacing the retransmit timer) are worked around in nsplane-netstack; random loss >= 2 %
-    stays RTO-bound (no SACK / NewReno). Report upstream (outward-facing; needs the user's go) and
+    stays bound by the retransmission timeout (no SACK / NewReno). Report upstream (outward-facing; needs the user's go) and
     drop the workarounds once fixed.
 20. **Zero-checksum fragmented IPv4 UDP** arriving out of order at the Translator cannot be
     translated (locally fragmented datagrams get checksums filled).
