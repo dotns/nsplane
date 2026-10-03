@@ -179,6 +179,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `port_map`.
 - `nsplane-e2e`: `translate`, `port_map` (including the full
   `[AclFilter, PortMap, Translator]` stack) and `fragment` tests between engines.
+- `nsplane-acl`: the ACL as a per-flow hook. `AclEngine::generation` increases on every
+  published change; `AclFilter` caches each peer's resolved principal and the verdict of each
+  TCP/UDP flow's first packet from a namespace member in its reply table, under the policy and identity
+  generations, so established flows skip the evaluation; peers whose namespaces (or the
+  default policy) accept everything bypass it. `PeerIdentity::generation` (default 0: not
+  cached) versions identities, and `PeerIdentityMap` bumps it on every change. Verdicts are
+  the same as a full evaluation (differential test). New counters
+  `AclFilterStats::pending_evictions` and `verdict_evictions`; `nsplane-e2e` `acl_hook`
+  tests. The reply, pending and fragment tables evict their least recently seen (fragments:
+  oldest) entry in O(1) instead of scanning the full table.
+- `nsplane`: `EngineHandle::queue_stats` reports the capacity and high-water mark of every
+  bounded queue of the engine (`QueueStats`, `QueueDepth`: commands, local packets,
+  received datagrams, deliveries, recycled buffers, the transmit queues and backlogs, events);
+  `take_queue_stats` also restarts the marks for windowed measurements. The owner task keeps
+  the marks without locks or atomics. Measured defaults: the queue capacity stays at 1024
+  and the command queue at 64 (see docs/architecture.md, "Queue depths").
+- `nsplane`: optional crypto worker pool, `EngineBuilder::crypto_workers(n)` (off by
+  default; 0 or 1 keeps the cryptography on the owner task). With 2 or more workers the
+  encryption of local packets and the decryption of received transport data run on `n`
+  worker tasks, sharded by peer, so each peer's packets keep their order in both directions
+  while different peers are encrypted in parallel; routing, filters, handshakes, timers,
+  counters and events stay on the owner task, and handle calls that read or change peers or
+  counters wait for the packets with the workers (see docs/architecture.md, "Crypto worker
+  pool").
+- `nsplane-core`: `Core::handle_input_deferred` returns the encryption or decryption of a
+  data packet as a `CryptoJob` (`Send`, locks only its peer's tunnel) to run on another
+  thread with `CryptoJob::run`; `Core::complete_job` finishes it in the core.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
@@ -238,6 +265,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `DROP_TRANSPORT_REMOVED` (`nsplane_core::reasons::TRANSPORT_REMOVED`) instead of
   dropping them silently; `replace_transport` carries them over to the new transport in
   order.
+- `nsplane`: every datagram a transport fails to send (any I/O error, e.g. `EMSGSIZE`) is
+  counted under the new `DROP_TRANSPORT_SEND_ERROR`
+  (`nsplane_core::reasons::TRANSPORT_SEND_ERROR`) and published as `Event::Dropped` instead
+  of only being logged. The transmit tasks report failures through a shared counter and a
+  wake signal to the owner task; successful sends take no extra work.
 - Breaking: `nsplane-core`'s `Input::Datagram` takes the datagram by value
   (`data: PacketBuf`) and `Input` loses its lifetime parameter. The core consumes the
   datagram: a packet it carries is decrypted in place and delivered in the same buffer

@@ -1050,6 +1050,7 @@ dependencies = [
 name = "nsplane"
 version = "0.8.0"
 dependencies = [
+ "criterion",
  "nix",
  "nsplane-core",
  "nsplane-packet",

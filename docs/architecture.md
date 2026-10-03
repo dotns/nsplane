@@ -58,6 +58,14 @@ that rewrite addresses need those addresses in the peers' allowed IPs. `Core::ro
 the routing decision, e.g. to pick the peer `Core::inject_inbound` delivers a locally
 generated reply as.
 
+`handle_input_deferred` is the same entry point for a driver that encrypts on several
+threads: the cryptography of a local packet or a received transport data message comes back
+as a `CryptoJob` (everything before it, such as routing and the outbound filters, has
+already run), `CryptoJob::run` seals or opens the packet under the lock of that peer's
+tunnel only, and `complete_job` does the rest in the core (counters, completed handshakes,
+roaming, the source check, the inbound filters, the output). Each peer's tunnel sits behind
+its own mutex for this; without jobs every lock is uncontended.
+
 ## nsplane (driver)
 
 One owner task owns the `Core` and loops: it waits for a handle command, a local packet, a
@@ -72,7 +80,8 @@ Transport::recv ─► recv task ┘          ▲            └─► sink task
                           EngineHandle commands (64)
 ```
 
-The core is never shared, so there are no locks on the data path.
+The core is never shared; the only lock on the data path is each peer's tunnel mutex, which
+is uncontended unless the crypto worker pool is on.
 
 - `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
   stats, injection, shutdown) and returns their replies.
@@ -91,6 +100,135 @@ Backpressure:
   transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
+
+### Queue depths
+
+`EngineHandle::queue_stats` reports, for every bounded queue, its capacity and high-water
+mark (the most items it held at once) since the start or the last `take_queue_stats`, which
+also restarts the marks. The owner task samples each queue whenever it sends to or receives
+from it (a receive sees the occupancy just before it, which is the peak since the previous
+receive), with plain fields and no locks or atomics on the data path. The event channel is
+sampled only for events other than `Event::Dropped`, because reading its occupancy takes the
+channel's locks.
+
+| Queue | Capacity | Producer -> consumer |
+| --- | --- | --- |
+| `command` | 64 | handles -> owner |
+| `local` | `queue_capacity` | source task -> owner |
+| `datagrams` | `queue_capacity` | every receive task -> owner |
+| `deliver` | `queue_capacity` | owner -> sink task |
+| `recycle` | `queue_capacity` | every transmit task -> owner (full: buffer dropped) |
+| `transmit` | `queue_capacity` per transport | owner -> transmit task |
+| `backlog` | `queue_capacity` per transport | owner, waiting for room in `transmit` |
+| `events` | `event_capacity` | owner -> subscribers |
+
+Measured with the default capacity of 1024 on two engines linked in process (release
+build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy); the
+highest mark of either engine over three runs:
+
+| Load | local | datagrams | deliver | recycle | transmit | backlog | command | events | Drops |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ping-pong, 1300 B, one packet in flight (the `data_path` pattern) | 1 | 1 | 1 | 1 | 1 | 0 | 0 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, channel link | 64 | 41 | 53 | 64 | 64 | 0 | 0 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, loopback `UdpTransport` | 103 | 43 | 64 | 107 | 107 | 0 | 0 | 0 | none |
+| UDP flood, 100k x 1300 B, channel link | 1024 | 341 | 866 | 1023 | 1024 | 449 | 0 | 0 | none |
+| UDP flood, 100k x 1300 B, loopback `UdpTransport` | 1024 | 120 | 239 | 1013 | 1024 | 280 | 0 | 0 | none (the kernel drops ~25%) |
+| Netstack TCP, 1 connection, 32 MiB echoed (2.5-7.4 Gbit/s) | 668 | 642 | 212 | 247 | 665 | 0 | 0 | 0 | none |
+| Netstack TCP, 4 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 469 | 1024 | 1024 | 0 | 0 | `DROP_SINK_FULL` in 3 of 6 runs |
+| Netstack TCP, 8-16 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 896 | 1024 | 1024 | 0 | 0 | `DROP_SINK_FULL` in every run |
+
+With capacity 2048, 8 and 16 netstack connections ran without a drop (deliver peaked at
+494 and 2021); with 512 and 256, even 4 connections dropped at the deliver queue. Once the
+deliver queue drops, the netstack's TCP throughput collapses (to 130-450 Mbit/s), and in
+some runs the connections stalled for good with every engine queue empty, a loss recovery
+problem of the netstack rather than of the queues.
+
+Defaults, from these numbers:
+
+- `queue_capacity` stays at 1024. A single bulk TCP flow, the heaviest paced load, peaks at
+  about 670 (1.5x headroom), and paced or request/response traffic stays far below. Floods
+  and many parallel bulk flows fill every queue upstream of the bottleneck whatever the
+  capacity (the in-process loop is bounded by the TCP windows, not by a link rate), so a
+  larger default would only add latency and memory, and a smaller one turns the sink-full
+  drops of the multi-flow case into a single-flow problem. Since queued packets are sized
+  to their contents, an idle or lightly loaded queue costs little.
+- The command queue stays at 64: every handle call waits for its reply, so it holds at most
+  one command per concurrent caller (the marks never passed 1).
+- `event_capacity` stays at 1024: without a subscriber the channel holds nothing, and a
+  subscriber that stops reading fills any capacity.
+
+Embedders that run many parallel bulk flows through a userspace netstack should raise
+`queue_capacity` (2048 held 16 flows without a drop here) and watch the marks and
+`DROP_SINK_FULL` with `queue_stats` and `drop_counters`.
+
+### Crypto worker pool
+
+The single owner task is the limit of one engine's throughput: it seals and opens every
+packet. `EngineBuilder::crypto_workers(n)` with `n` of 2 or more moves that cryptography to
+`n` worker tasks; 0 or 1 (the default) keeps today's single task, which then never calls the
+deferred API.
+
+```text
+local packets ─┐           ┌─► worker 0     ─┐
+               ├─► owner ──┼─► worker 1     ─┼─► done queue ─► owner ─► sink, transmit tasks
+datagrams     ─┘           └─► worker n - 1 ─┘
+```
+
+- Sharding by peer. The owner feeds each local packet and received datagram to
+  `Core::handle_input_deferred`, which routes it (receiver index or destination), runs the
+  outbound filters and returns a `CryptoJob` for the peer's tunnel. The job goes to worker
+  `peer id % n`; each worker runs its jobs in arrival order and hands them back on one done
+  queue, and the owner completes them (`Core::complete_job`) in the order they come back. So
+  all packets of one peer, in both directions, are sealed, opened and emitted in arrival
+  order, while different peers are processed in parallel. Peer ids are handed out in order,
+  so peers spread evenly over the workers; a single peer never uses more than one.
+- Batches. Jobs go to a worker in batches of up to 64 (`MAX_BATCH`): a worker's batch is
+  handed over when it is full, together with every other batch, or when the owner has
+  nothing else ready, and a worker hands each batch back whole. A busy owner thus wakes each
+  worker once per batch instead of once per packet; handing over every packet on its own
+  cost as much as the cryptography it moved and gained nothing.
+- Everything else stays on the owner: handshakes (the gate, the responses, flushing the
+  packets queued behind a handshake), timers, configuration, events, drop counters, roaming
+  and the per-peer counters. A handshake or a timer that touches a peer's tunnel while a
+  worker holds it waits for that one packet. The order on the wire stays the arrival order
+  even when the owner seals a keepalive or flushes queued packets while newer packets of the
+  peer are with a worker: those are emitted only once they come back.
+- Bounds: at most `queue_capacity` jobs are with the workers. While that many are, the owner
+  stops reading local packets and received datagrams (handle calls, timers and finished jobs
+  are still served), which holds back the sources as a full transmit queue does. Every
+  worker queue and the done queue hold that many jobs, so neither side ever waits on them.
+- Handle calls that read or change peers, sessions or counters (configuration, peer stats,
+  injection, forced handshakes, drop counters) first wait for every job in flight, so they
+  act after every packet read before them, exactly as without workers: per-peer stats and
+  drop counters stay exact, and a removed peer's packets read before the removal still go
+  out while later ones are dropped as `no route` / `unknown session`.
+- Parallelism needs a multi-threaded tokio runtime; on a current-thread runtime the workers
+  interleave with the owner and only add overhead.
+
+Throughput note, from `cargo bench -p nsplane --bench worker_pool` (bench profile with
+LTO, multi-threaded runtime, 32-core host shared with other jobs; the range of two runs): a
+hub engine with 8 peers, each its own engine without workers on an in-memory link, sends
+120 packets to every peer while every peer sends 120 to the hub, so the hub seals and opens
+all 1920 packets of an iteration. The pool off is the default of 0 workers; 1 worker is the
+same code path.
+
+| Packet | Pool off (0 or 1) | 2 workers | 4 workers |
+| --- | --- | --- | --- |
+| 64 B | 0.96-1.10 Mpps | 1.02-1.36 Mpps | 0.97-1.26 Mpps |
+| 1420 B | 566-696 kpps (6.4-7.9 Gbit/s) | 0.88-1.08 Mpps (10.0-12.3 Gbit/s) | 0.88-1.03 Mpps (10.0-11.6 Gbit/s) |
+
+With full-size packets the pool moves the hub about 1.5x further; small packets gain little,
+since there the cryptography is a small part of the owner's work per packet (queues,
+routing, counters). Beyond 2 workers the owner task itself, which still touches every
+packet twice, is the limit, so 4 workers do not add to 2. Sharding `Core` itself by peer
+(one owner per shard) would lift that limit, at the cost of splitting the handshake gate,
+the peer table and the allowed IPs across shards.
+
+The pool off costs one uncontended lock of the peer's tunnel per packet. The core's
+`data_path` bench, base and branch alternating three times, showed no change beyond the
+run-to-run spread (medians: `core_round_trip` 616 -> 569 ns at 64 B and 1347 -> 1362 ns at
+1420 B, `core_encapsulate` 297 -> 281 ns and 693 -> 674 ns, `core_decapsulate` 266 -> 286 ns
+and 705 -> 695 ns; single runs varied by up to 15%).
 
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
@@ -227,9 +365,25 @@ kind); `PinholeStats` counts each reason.
 Reply allowances recorded for flows accepted through a grant or a pinhole depend on it.
 Removal is lazy: once the grant or pinhole is gone from the current snapshot, a dependent
 allowance is removed on its next lookup (`AclFilterStats::reply_revoked`) and the flow's
-packets are evaluated from scratch. The full rules and per-packet bench numbers (`cargo
-bench -p nsplane-acl --bench namespaces`) are in the crate docs
-(`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes* and *Performance*).
+packets are evaluated from scratch.
+
+**ACL hook.** The filter evaluates a flow once, not every packet. `AclEngine::generation`
+increases on every published change (default policy, namespaces, grants, pinholes opened,
+closed, swept or revoked, `clear_all`), and a versioned `PeerIdentity`
+(`PeerIdentity::generation`, bumped by `PeerIdentityMap`) on every identity change. The
+filter caches per peer its resolved principal and flags, and per peer, direction and
+five-tuple the verdict of a namespace member's TCP/UDP flow's first packet (the default
+policy is cheaper to evaluate than to cache), in the reply table (one lock, one
+capacity, cached verdicts flushed first when full), both tagged with the two generations: a
+hit under other generations is evaluated again, so a change applies to the very next
+packet, and a verdict accepted through a pinhole is also checked against the pinhole's
+expiry. Peers whose namespaces (or the default policy) accept every destination, port and
+protocol and are not outbound-restricted, as computed on every update, bypass the
+evaluation. The reply table, fragments and fail-closed rules are unchanged, and verdicts and
+counters equal a full evaluation (a differential test checks it). The full rules and
+per-packet bench numbers (`cargo bench -p nsplane-acl --bench namespaces`) are in the crate
+docs (`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes*, *ACL hook* and
+*Performance*).
 
 nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
