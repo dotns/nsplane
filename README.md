@@ -77,6 +77,17 @@ nsplane-tun = { path = "../nsplane/crates/nsplane-tun" }
 nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 ```
 
+## Tuning
+
+The engine's packet queues hold 1024 packets each by default
+(`EngineBuilder::queue_capacity`), measured to leave 1.5x headroom over a single bulk TCP
+flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
+`take_queue_stats` restarts the marks: a mark at its capacity together with
+`DROP_SINK_FULL` or `DROP_TRANSMIT_FULL` in `EngineHandle::drop_counters` means the queue is
+too small for the load (raise `queue_capacity`, e.g. to 2048 for many parallel bulk flows
+through a userspace netstack); marks far below the capacity mean it can shrink. See
+[docs/architecture.md](docs/architecture.md#queue-depths) for the measurements.
+
 ## Building
 
 The toolchain is pinned in `rust-toolchain.toml` (1.99.0); the MSRV is 1.95. Building

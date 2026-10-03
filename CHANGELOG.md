@@ -145,6 +145,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning `BoundsError` instead of panicking.
 - `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
   re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
+- `nsplane`: `EngineHandle::queue_stats` reports the capacity and high-water mark of every
+  bounded queue of the engine (`QueueStats`, `QueueDepth`: commands, local packets,
+  received datagrams, deliveries, recycled buffers, the transmit queues and backlogs, events);
+  `take_queue_stats` also restarts the marks for windowed measurements. The owner task keeps
+  the marks without locks or atomics. Measured defaults: the queue capacity stays at 1024
+  and the command queue at 64 (see docs/architecture.md, "Queue depths").
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
