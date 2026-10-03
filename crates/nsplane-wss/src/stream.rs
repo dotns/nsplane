@@ -47,8 +47,8 @@ pub struct WssStreamLimits {
     /// The bounded queue of OPEN, `CLOSE_ACK` and reset CLOSE frames (and pings) toward the
     /// socket, written before data. 64 messages by default.
     pub control_queue: usize,
-    /// The bounded queue of DATA frames and orderly CLOSEs toward the socket. 256 messages
-    /// by default.
+    /// The bounded queue of DATA frames and orderly CLOSE frames toward the socket. 256
+    /// messages by default.
     pub data_queue: usize,
     /// The most live streams (TCP streams and UDP flows) on one session; an open beyond it
     /// goes to another session, dialed when none has room. 1024 by default.
