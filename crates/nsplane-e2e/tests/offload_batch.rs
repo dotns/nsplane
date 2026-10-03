@@ -2,7 +2,8 @@
 //! methods move a burst in fewer calls than packets in both directions, in order per peer
 //! and intact; a source, sink and transport implementing only the single methods take the
 //! default path and interoperate; removing or replacing a transport while a batch is half
-//! sent counts or moves every datagram, in order.
+//! sent counts or moves every datagram, in order; a failed batch send counts every datagram
+//! it loses. The key cases also run with a crypto worker pool on a multi-threaded runtime.
 //!
 //! The nodes share one in-memory switch: every transport port has an address and delivers
 //! to the port registered under the destination address, so one transport reaches several
@@ -17,9 +18,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    AllowedIp, DROP_NO_TRANSPORT, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, Ecn, Engine,
-    EngineBuilder, EngineHandle, MAX_BATCH, PacketBatch, PacketBuf, PacketSink, PacketSource, Path,
-    Peer, PeerId, Transport, TransportId,
+    AllowedIp, DROP_NO_TRANSPORT, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED,
+    DROP_TRANSPORT_SEND_ERROR, Ecn, Engine, EngineBuilder, EngineHandle, MAX_BATCH, PacketBatch,
+    PacketBuf, PacketSink, PacketSource, Path, Peer, PeerId, Transport, TransportId,
 };
 use nsplane_e2e::{MTU, QUIET, TestResult, WAIT, udp4};
 use tokio::sync::{mpsc, watch};
@@ -33,6 +34,8 @@ const SOURCE_CAPACITY: usize = 1024;
 const BURST: usize = 2 * MAX_BATCH;
 /// Datagrams a stalling transport sends from the batch it stalls in.
 const STALL_AFTER: usize = 5;
+/// Crypto workers of the pool-on variants.
+const WORKERS: usize = 2;
 
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "closed")
@@ -139,10 +142,12 @@ impl PacketSink for TestSink {
     }
 }
 
-/// Makes a port stall once, in the middle of a batch.
+/// Makes a port stall once, in the middle of a batch, or fail every send.
 #[derive(Debug, Default)]
 struct Gate {
     armed: AtomicBool,
+    /// While set, every batch send fails as a whole, as a failed segmented send does.
+    failing: AtomicBool,
     /// Datagrams sent from the batch before the stall and datagrams left in it.
     stalled: Mutex<Option<(usize, usize)>>,
 }
@@ -249,6 +254,11 @@ impl Transport for Port {
         sent: &mut usize,
     ) -> io::Result<()> {
         let start = *sent;
+        if self.gate.failing.load(Ordering::Relaxed) {
+            self.send_calls.batch(0);
+            *sent = datagrams.len();
+            return Err(io::Error::other("message too long"));
+        }
         let stall_at = start + STALL_AFTER.min(datagrams.len().saturating_sub(start + 1));
         self.send_calls.batch(0);
         while let Some((path, data)) = datagrams.get(*sent) {
@@ -327,6 +337,7 @@ struct Host {
 
 fn start<Src: PacketSource, Snk: PacketSink, T: Transport>(
     seed: u8,
+    workers: usize,
     source: Src,
     sink: Snk,
     transport: T,
@@ -334,13 +345,14 @@ fn start<Src: PacketSource, Snk: PacketSink, T: Transport>(
     Ok(EngineBuilder::new(source, sink)
         .private_key(StaticSecret::from([seed; 32]))
         .transport(transport)
+        .crypto_workers(workers)
         .build()?)
 }
 
 impl Host {
     /// A node with key seed `seed` at `192.0.2.<seed>:1000` and tunnel address
-    /// `10.0.0.<seed>`.
-    fn new(seed: u8, switch: &Switch, mode: Mode) -> TestResult<Self> {
+    /// `10.0.0.<seed>`, with `workers` crypto workers.
+    fn new(seed: u8, switch: &Switch, mode: Mode, workers: usize) -> TestResult<Self> {
         let io = Io::default();
         let addr = SocketAddr::from(([192, 0, 2, seed], 1000));
         let (local, rx) = mpsc::channel(SOURCE_CAPACITY);
@@ -359,8 +371,8 @@ impl Host {
         let gate = Arc::new(Gate::default());
         let port = switch.attach(addr, &io, Arc::clone(&gate));
         let engine = match mode {
-            Mode::Batched => start(seed, source, sink, port)?,
-            Mode::Single => start(seed, Single(source), Single(sink), Single(port))?,
+            Mode::Batched => start(seed, workers, source, sink, port)?,
+            Mode::Single => start(seed, workers, Single(source), Single(sink), Single(port))?,
         };
         Ok(Self {
             handle: engine.handle(),
@@ -511,10 +523,19 @@ fn batched(what: &str, calls: (usize, usize, usize), packets: usize) -> TestResu
 
 #[tokio::test]
 async fn bursts_cross_in_batches_in_order_per_peer() -> TestResult {
+    bursts_cross_in_batches_in_order_per_peer_with(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bursts_cross_in_batches_in_order_per_peer_on_workers() -> TestResult {
+    bursts_cross_in_batches_in_order_per_peer_with(WORKERS).await
+}
+
+async fn bursts_cross_in_batches_in_order_per_peer_with(workers: usize) -> TestResult {
     let switch = Switch::default();
-    let mut hub = Host::new(1, &switch, Mode::Batched)?;
-    let mut x = Host::new(2, &switch, Mode::Batched)?;
-    let mut y = Host::new(3, &switch, Mode::Batched)?;
+    let mut hub = Host::new(1, &switch, Mode::Batched, workers)?;
+    let mut x = Host::new(2, &switch, Mode::Batched, workers)?;
+    let mut y = Host::new(3, &switch, Mode::Batched, workers)?;
     link(&mut hub, &mut x).await?;
     link(&mut hub, &mut y).await?;
     let (hub_x, hub_y) = (hub.peer_of(&x).await?, hub.peer_of(&y).await?);
@@ -579,8 +600,8 @@ async fn bursts_cross_in_batches_in_order_per_peer() -> TestResult {
 #[tokio::test]
 async fn single_methods_take_the_default_path() -> TestResult {
     let switch = Switch::default();
-    let mut batched_node = Host::new(1, &switch, Mode::Batched)?;
-    let mut single = Host::new(2, &switch, Mode::Single)?;
+    let mut batched_node = Host::new(1, &switch, Mode::Batched, 0)?;
+    let mut single = Host::new(2, &switch, Mode::Single, 0)?;
     link(&mut batched_node, &mut single).await?;
     let to_single = batched_node.peer_of(&single).await?;
     let to_batched = single.peer_of(&batched_node).await?;
@@ -616,10 +637,14 @@ async fn single_methods_take_the_default_path() -> TestResult {
 
 /// The hub (seed 1) linked to `x` (seed 2); then the hub's transport stalls in the middle
 /// of the next batch it sends, after a burst of [`BURST`] packets to `x` was queued. Returns
-/// the burst and how many of its datagrams were sent before the stall.
-async fn stalled_mid_batch(switch: &Switch) -> TestResult<(Host, Host, Vec<Vec<u8>>, usize)> {
-    let mut hub = Host::new(1, switch, Mode::Batched)?;
-    let mut x = Host::new(2, switch, Mode::Batched)?;
+/// the burst and how many of its datagrams were sent before the stall. Both nodes have
+/// `workers` crypto workers.
+async fn stalled_mid_batch(
+    switch: &Switch,
+    workers: usize,
+) -> TestResult<(Host, Host, Vec<Vec<u8>>, usize)> {
+    let mut hub = Host::new(1, switch, Mode::Batched, workers)?;
+    let mut x = Host::new(2, switch, Mode::Batched, workers)?;
     link(&mut hub, &mut x).await?;
 
     let sent_before = hub.io.send.get().2;
@@ -645,8 +670,17 @@ async fn stalled_mid_batch(switch: &Switch) -> TestResult<(Host, Host, Vec<Vec<u
 
 #[tokio::test]
 async fn removing_a_transport_mid_batch_counts_every_datagram() -> TestResult {
+    removing_a_transport_mid_batch_counts_every_datagram_with(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_transport_mid_batch_counts_every_datagram_on_workers() -> TestResult {
+    removing_a_transport_mid_batch_counts_every_datagram_with(WORKERS).await
+}
+
+async fn removing_a_transport_mid_batch_counts_every_datagram_with(workers: usize) -> TestResult {
     let switch = Switch::default();
-    let (hub, mut x, burst, sent) = stalled_mid_batch(&switch).await?;
+    let (hub, mut x, burst, sent) = stalled_mid_batch(&switch, workers).await?;
     let x_hub = x.peer_of(&hub).await?;
     check_per_peer(
         &x.delivered(sent).await?,
@@ -689,8 +723,19 @@ async fn removing_a_transport_mid_batch_counts_every_datagram() -> TestResult {
 
 #[tokio::test]
 async fn replacing_a_transport_mid_batch_sends_every_datagram_in_order() -> TestResult {
+    replacing_a_transport_mid_batch_sends_every_datagram_in_order_with(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_a_transport_mid_batch_sends_every_datagram_in_order_on_workers() -> TestResult {
+    replacing_a_transport_mid_batch_sends_every_datagram_in_order_with(WORKERS).await
+}
+
+async fn replacing_a_transport_mid_batch_sends_every_datagram_in_order_with(
+    workers: usize,
+) -> TestResult {
     let switch = Switch::default();
-    let (hub, mut x, burst, _) = stalled_mid_batch(&switch).await?;
+    let (hub, mut x, burst, _) = stalled_mid_batch(&switch, workers).await?;
     let x_hub = x.peer_of(&hub).await?;
 
     let port = switch.attach(hub.addr, &hub.io, Arc::new(Gate::default()));
@@ -704,5 +749,53 @@ async fn replacing_a_transport_mid_batch_sends_every_datagram_in_order() -> Test
     ] {
         assert_eq!(hub.drops(reason).await?, 0, "{reason}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_batch_sends_count_every_datagram() -> TestResult {
+    failed_batch_sends_count_every_datagram_with(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_batch_sends_count_every_datagram_on_workers() -> TestResult {
+    failed_batch_sends_count_every_datagram_with(WORKERS).await
+}
+
+/// The hub's transport fails every batch send of a burst as a whole: each lost datagram is
+/// counted once under [`DROP_TRANSPORT_SEND_ERROR`], though the failed calls are fewer.
+async fn failed_batch_sends_count_every_datagram_with(workers: usize) -> TestResult {
+    let switch = Switch::default();
+    let mut hub = Host::new(1, &switch, Mode::Batched, workers)?;
+    let mut x = Host::new(2, &switch, Mode::Batched, workers)?;
+    link(&mut hub, &mut x).await?;
+
+    let before = hub.io.send.get();
+    hub.gate.failing.store(true, Ordering::Relaxed);
+    let burst: Vec<_> = (0..BURST).map(|seq| hub.numbered(&x, seq)).collect();
+    hub.queue(&burst)?;
+    let deadline = Instant::now() + WAIT;
+    while hub.drops(DROP_TRANSPORT_SEND_ERROR).await? < BURST as u64 {
+        if Instant::now() > deadline {
+            return Err(format!("not every failed send counted within {WAIT:?}").into());
+        }
+        sleep(QUIET / 10).await;
+    }
+    x.expect_no_delivery().await?;
+    assert_eq!(hub.drops(DROP_TRANSPORT_SEND_ERROR).await?, BURST as u64);
+    let (_, calls, _) = since(&hub.io.send, before);
+    assert!(
+        calls < BURST,
+        "{calls} failed calls for {BURST} datagrams, not batched"
+    );
+
+    // The transmit task keeps going.
+    hub.gate.failing.store(false, Ordering::Relaxed);
+    let packet = hub.numbered(&x, BURST);
+    hub.queue(std::slice::from_ref(&packet))?;
+    if x.delivered(1).await?[0].1 != packet {
+        return Err("packet after the failures changed".into());
+    }
+    assert_eq!(hub.drops(DROP_TRANSPORT_SEND_ERROR).await?, BURST as u64);
     Ok(())
 }

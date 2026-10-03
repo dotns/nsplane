@@ -2,7 +2,8 @@
 //! peer only: interleaved TCP-like and UDP flows of IPv4 and IPv6 packets from the channel
 //! source arrive at the peer's channel sink intact and in order per flow, in both
 //! directions at once, with every packet MTU - 1 bytes, MTU bytes, or of mixed sizes
-//! around the MTU.
+//! around the MTU. The cases with offload on also run with a crypto worker pool on a
+//! multi-threaded runtime.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -21,6 +22,8 @@ const TCP_HEADER: usize = 20;
 const UDP_HEADER: usize = 8;
 /// Bytes at the start of each payload: the flow number and the packet's sequence number.
 const TAG: usize = 9;
+/// Crypto workers of the pool-on variants.
+const WORKERS: usize = 2;
 
 /// A flow: IP version, transport protocol and source port (the destination port is fixed).
 #[derive(Debug, Clone, Copy)]
@@ -273,20 +276,22 @@ fn check_flows(
 }
 
 /// A node with key seed `seed` on a UDP transport on the IPv4 loopback, with segmentation
-/// offload `offload`.
-fn node(seed: u8, offload: bool) -> TestResult<Node<UdpTransport>> {
+/// offload `offload` and `workers` crypto workers.
+fn node(seed: u8, offload: bool, workers: usize) -> TestResult<Node<UdpTransport>> {
     let id = TransportId::new(u16::from(seed));
     let transport = UdpTransport::bind(id, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     transport.set_offload(offload)?;
     assert_eq!(transport.offload(), offload);
     let addr = transport.local_addr();
-    Ok(Node::new(seed, id, addr, transport, Options::default()))
+    Node::with_builder(seed, id, addr, Options::default(), |builder| {
+        builder.transport(transport).crypto_workers(workers)
+    })
 }
 
-/// Two peers with offload `a_offload` and `b_offload` move [`PACKETS`] packets each way at
-/// once, [`WINDOW`] at a time, for every size profile.
-async fn flows(a_offload: bool, b_offload: bool) -> TestResult {
-    let (mut a, mut b) = (node(1, a_offload)?, node(2, b_offload)?);
+/// Two peers with offload `a_offload` and `b_offload` and `workers` crypto workers move
+/// [`PACKETS`] packets each way at once, [`WINDOW`] at a time, for every size profile.
+async fn flows(a_offload: bool, b_offload: bool, workers: usize) -> TestResult {
+    let (mut a, mut b) = (node(1, a_offload, workers)?, node(2, b_offload, workers)?);
     introduce(&a, &b, None).await?;
     // The handshake first, so no packet waits for it.
     transfer(&a, &mut b, Family::V4, 64).await?;
@@ -321,15 +326,25 @@ async fn flows(a_offload: bool, b_offload: bool) -> TestResult {
 
 #[tokio::test]
 async fn flows_around_mtu_offload_on() -> TestResult {
-    flows(true, true).await
+    flows(true, true, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flows_around_mtu_offload_on_on_workers() -> TestResult {
+    flows(true, true, WORKERS).await
 }
 
 #[tokio::test]
 async fn flows_around_mtu_offload_off() -> TestResult {
-    flows(false, false).await
+    flows(false, false, 0).await
 }
 
 #[tokio::test]
 async fn flows_around_mtu_offload_on_and_off_peers() -> TestResult {
-    flows(true, false).await
+    flows(true, false, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flows_around_mtu_offload_on_and_off_peers_on_workers() -> TestResult {
+    flows(true, false, WORKERS).await
 }
