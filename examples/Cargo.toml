@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.7.1"
 base64 = "0.22"
 blake2 = "0.10.6"
 ciborium = "0.2.2"

@@ -120,3 +120,13 @@ Parallel, disjoint write scopes except `crates/nsplane-e2e/**` (new test files o
 Each branch and main after each merge: just check, just cross, just test-windows, cargo doc
 -D warnings, root tests, release CLI + linux.sh, lib.sh, examples.sh green; data_path no
 regression (64 B 532 ns, 1420 B 1.331 us; batched 415 ns / 1.226 us per packet).
+
+## Annotations
+- 2026-10-03: MB-x3 contract change (L1, on the MB-x yellow): `TcpConnection::unacked` is the
+  bytes written and not yet acknowledged (smoltcp's send queue, including bytes the peer or
+  congestion window holds back), not SND.NXT - SND.UNA: the fork exposes no SND.NXT, the
+  value matches the signal ns's stall check uses today, and it costs nothing per packet.
+- 2026-10-03: ME-2 API approved as `nsplane_nat::redirect::Redirect` (forward/reverse on
+  PacketBuf, caller `decide` closure, Conntrack-backed, never calling `decide` under a lock);
+  ME-1 `LanRoute` uses `(addr, prefix)` pairs instead of `Ipv6Net`/`Ipv4Net` (no ipnet
+  crate), and nsplane-nat gains a dependency on `nsplane` for the sink/source wrappers.
