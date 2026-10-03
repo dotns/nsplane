@@ -1,6 +1,6 @@
 # 20261003-1600-ns-dataplane-moves Move the remaining ns data-plane pieces into nsplane
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-03 16:00
 - **approvedAt**: 2026-10-03 16:00 (user: D9 do, D10 a generic link transport, SNAT/DNAT
   in nsplane-nat, evaluate the ACL move)
@@ -130,3 +130,11 @@ regression (64 B 532 ns, 1420 B 1.331 us; batched 415 ns / 1.226 us per packet).
   PacketBuf, caller `decide` closure, Conntrack-backed, never calling `decide` under a lock);
   ME-1 `LanRoute` uses `(addr, prefix)` pairs instead of `Ipv6Net`/`Ipv4Net` (no ipnet
   crate), and nsplane-nat gains a dependency on `nsplane` for the sink/source wrappers.
+- 2026-10-03: completed (campaign `nsplane-mv-202610031600`). Merges into main: MC c9008ba
+  (+ 197c00c side-channel capacity 0 raised to 1), ME 55abac8, MB-x 9c9efcd. Final acceptance
+  on main: just check 1048 tests, cross, test-windows, cargo doc, root nsplane-tun/nsplane
+  ignored tests, linux.sh, lib.sh (7), examples.sh (all cells and scenarios incl.
+  subnet_gateway) green; data_path 64 B 531 ns (batched 415 ns per packet), 1420 B 1.335 us
+  (batched 1.239 us), flat against before. Left in task 20261003-1500: MB-x5, MB-x6 (already
+  counted as `NetStackStats::syn_refused`), MC-3 (WSS carriers, needs the user's decision on
+  dependencies), MF (engine and netstack throughput), MD (ACL, own plan).
