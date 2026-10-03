@@ -95,6 +95,25 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   handoff latency and wakeups in the task pipeline (inferred). Ask: reduce handoffs on the
   hot path (for example run-to-completion read -> seal -> send when no crypto workers are
   configured), measured with the ns harness or an equivalent nsplane-e2e bench.
+  Done in nsplane (campaign nsplane-pf-202610031630, PF): without crypto workers the source
+  and receive tasks hand over whole batches and the owner sends and delivers inline through
+  the new `Transport::try_send_batch` / `PacketSink::try_send_batch` when the task is idle.
+  Measured A/B with scripts/bench/wg-compare.sh (TUN, CPUs 10-13 / 14-17, 6 interleaved
+  rounds; docs/architecture.md, "Engine fast path (MF-1)"): nsplane-cli -> nsplane-cli -P1
+  +12 % (8.83 -> 9.89 Gbit/s, quiet rounds, load1 2.3-10.6; +10 % over all six rounds) at
+  6-10 % less CPU per GB, short of the +18 % target. nsplane-cli -> kernel WireGuard
+  regressed 31-37 % (6.89 -> 4.36 Gbit/s): the owner now runs the GSO `sendmsg` itself and
+  saturates (~0.92 core), so sealing and sending no longer overlap. The pool-off
+  worker_pool hub (default `try_send_batch`) is 5-11 % slower.
+  MF-1 follow-ups (not done this round; PF1 numbers, /tmp/nsplane-pf/pf1/results.md):
+  - Keep `sendmsg` off a busy owner (inline only while nothing else is queued, or large GSO
+    trains to the transmit task); find the batched input queue's cost on paths without the
+    fast path (pool-off hub, crypto workers).
+  - Allocation in sealing and the pool: `Core::layout_for_sealing`, `PacketPool::get` and
+    the `UdpTransport` send train, ~4-5 % of sender samples (malloc/free 8.2 % sender).
+  - TSO split copy: `VnetReader::segment`, ~5 % of sender samples (4.4-5.7 %).
+  - TUN write coalescing in `write_sink` (`TunSink::send_batch`), ~8-10 % of receiver
+    samples (8.0-9.9 %).
 - MF-2 user-space mode (nsplane-netstack) is 12-14% below the legacy smoltcp stack; raising
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is

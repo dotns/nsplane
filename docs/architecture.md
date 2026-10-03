@@ -128,6 +128,9 @@ Transport::recv ─► recv task ┘          ▲            └─► sink task
                           EngineHandle commands (64)
 ```
 
+Without crypto workers the owner also sends and delivers itself when the transmit or sink
+task is idle (inline output, below), skipping that hop.
+
 The core is never shared, and without the crypto worker pool the data path takes no lock;
 with the pool, each peer's tunnel is behind a mutex shared with the workers.
 
@@ -136,7 +139,21 @@ already queued behind it (up to `MAX_BATCH`, 64) and feeds them to the core as o
 (`Core::handle_datagrams`, `Core::handle_locals`). It never waits for a batch to fill and
 runs no timer for it, so a lone packet goes through at once. Received datagrams are taken
 up to the sink queue's room; local packets up to the transmit room (see the backpressure
-list below).
+list below). Without crypto workers the source and receive tasks hand over what one read
+returned as one message (up to `MAX_BATCH` items, as many as the queue has room for); the
+input queues stay bounded in items (a semaphore of `queue_capacity` permits beside the
+channel).
+
+Inline output: without crypto workers and while not suspended, the owner sends a drain's
+datagrams itself (`Transport::try_send_batch`) when nothing of that transport is in its
+backlog, its transmit queue or the batch its transmit task is sending, and hands the
+drain's delivered packets to the sink itself (`PacketSink::try_send_batch`) when nothing is
+queued for or being delivered by the sink task. Whatever is not taken at once goes to the
+transmit queue / backlog or the deliver queue, in order, under the usual rules below; later
+traffic queues behind it until the task has drained it, so a peer's order on one transport
+is kept. Inline-sent buffers return to `Core::recycle` directly. The defaults of both
+`try_send_batch` methods take nothing, which keeps every datagram and packet on the tasks;
+`UdpTransport` and the Unix `TunSink` override them.
 
 - `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
   stats, injection, shutdown) and returns their replies.
@@ -144,8 +161,9 @@ list below).
   blocks, and a lagging subscriber loses the oldest events.
 - Drops are counted per reason (`EngineHandle::drop_counters`) and published as events.
 - Traffic is counted per peer (`PeerStats`: wire bytes and plaintext bytes) and per transport
-  (`EngineHandle::transport_stats`: datagrams and bytes each way, failed sends), the latter by
-  the transport's own tasks with one relaxed atomic update per batch. `EngineHandle::status`
+  (`EngineHandle::transport_stats`: datagrams and bytes each way, failed sends), the latter
+  once per batch by whoever moved it (the transport's receive/transmit tasks, or the owner
+  task when it sends itself), one relaxed atomic update per batch. `EngineHandle::status`
   returns the key, MTU, suspension, peers, transports, drops, queue and fragmentation stats in
   one owner call. Counters only grow; rates, metric export and labels such as direct vs relay
   are left to the caller (ns), which samples `status` and maps transport ids to its paths.
@@ -165,6 +183,14 @@ Backpressure:
   transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
+  Inline output follows the same rules: a failed inline send counts as a failed send
+  (`DROP_TRANSPORT_SEND_ERROR`), `WouldBlock` is not a drop (the rest is queued, and only
+  then can `DROP_SINK_FULL` / `DROP_TRANSMIT_FULL` apply), and `BrokenPipe` marks the
+  transport or sink closed.
+- Known limitation: `TunSink` with TCP segmentation offload coalesces packets before a
+  write; an inline TUN write that hits `EAGAIN` mid-chunk keeps the rest of that chunk and
+  writes it first with the next delivery (no drop, order kept). Only a lowered
+  `TUNSETSNDBUF` makes a Linux TUN write block.
 
 ### Queue depths
 
@@ -189,9 +215,15 @@ channel's locks.
 | `crypto` | `queue_capacity` (the bound of jobs in flight) with 2 or more crypto workers, else 0 | owner -> workers -> owner (jobs not completed yet) |
 | `crypto_done` | `queue_capacity` with 2 or more crypto workers, else 0 | workers -> owner (batches of finished jobs) |
 
+Without crypto workers, the datagrams and packets the owner sends or delivers inline (see
+[nsplane (driver)](#nsplane-driver)) never enter `transmit`, `deliver` or `recycle`, so on a
+path that keeps up those marks stay low or at 0; they rise only once a transport or the
+sink falls behind and traffic falls back to the tasks. `recycle` counts only the buffers a
+transmit task returns; inline-sent buffers go back to the core directly.
+
 Measured with the default capacity of 1024 on two engines linked in process (release
-build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy); the
-highest mark of either engine over three runs:
+build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy),
+before the inline output; the highest mark of either engine over three runs:
 
 | Load | local | datagrams | deliver | recycle | transmit | backlog | command | events | Drops |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -271,6 +303,9 @@ datagrams     ─┘           └─► worker n - 1 ─┘
   out while later ones are dropped as `no route` / `unknown session`.
 - Parallelism needs a multi-threaded tokio runtime; on a current-thread runtime the workers
   interleave with the owner and only add overhead.
+- No inline output: with 2 or more workers the owner never sends or delivers itself; every
+  datagram goes through the transmit task and every packet through the sink task, and the
+  source and receive tasks hand over one item per message, as before the engine fast path.
 
 Throughput note, from `cargo bench -p nsplane --bench worker_pool` (bench profile with
 LTO, multi-threaded runtime, 32-core host shared with other jobs; the range of two runs,
@@ -905,6 +940,10 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
+| Engine fast path (MF-1), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP -P1 / -P4, no workers, median of the 3 quiet rounds (load1 2.3-10.6) | 9.89 / 9.86 Gbit/s | before: 8.83 / 9.08 Gbit/s (+12 % / +9 %); [Engine fast path (MF-1)](#engine-fast-path-mf-1) |
+| Engine fast path (MF-1), TUN, nsplane-cli -> kernel WireGuard | the same | 4.36 / 4.64 Gbit/s | before: 6.89 / 6.77 Gbit/s (-37 % / -31 %) |
+| Engine fast path (MF-1), worker pool hub, pool off | 64 B / 1420 B | 1.37 / 1.31 Mpps, 806 / 810 kpps | before, same session: 1.45 / 1.46 Mpps, 880 / 913 kpps (-5 % to -11 %) |
+| Engine fast path (MF-1), engine latency, idle, no workers | `round_trip_latency` alone, p50 / p99 | 13.4 / 33.6 us, 10.8 / 24.0 us | before, same session: 22.3 / 40.5 us, 24.7 / 63.9 us; with the other test in parallel the order flips (see the subsection) |
 
 - Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
   `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The
@@ -974,6 +1013,119 @@ without the engine batching, two runs each, 1-minute load 2.8-5.9.
 - With 2 workers the loaded latency is higher in both builds, as the jobs in flight sit at
   their bound (`QueueStats::crypto` at `queue_capacity`) with the queueing delay that adds;
   these rows are for information only.
+
+### Engine fast path (MF-1)
+
+The engine fast path without crypto workers (batched input handoff and inline output, see
+[nsplane (driver)](#nsplane-driver)) was measured A/B in one window on 2026-10-03
+(campaign `nsplane-pf-202610031630`, PF3). A ("before") is main at 3cc35ac plus the
+benchmark harness and the nsplane-cli variant flags, with no engine change; B ("after") is
+the same plus the fast path. Release builds in the dev image; 32-thread Ryzen AI MAX+ 395,
+shared with other jobs.
+
+Throughput with `scripts/bench/wg-compare.sh` (real TUN with offload, `UdpTransport` with
+GSO/GRO, MTU 1420, nsplane-cli builder defaults): side a (sender) on CPUs 10-13, side b
+(receiver) on CPUs 14-17 for every run, 20 s per iperf3 run, one repetition per run,
+interleaved A, B, A, B, ... for six rounds. `default` has no crypto workers, `w2` 2 workers
+(`WG_CRYPTO_WORKERS=2`). The 1-minute load was 4.5-32.4 in rounds 1-3 and 2.3-10.6 in rounds
+4-6, so the table gives the medians of all six rounds and of the three quiet rounds;
+Gbit/s, TCP -P1 / -P4, receiver-side sum.
+
+| Pair (a -> b) | A, 6 rounds | B, 6 rounds | A, rounds 4-6 | B, rounds 4-6 | B vs A, rounds 4-6 |
+| --- | --- | --- | --- | --- | --- |
+| nsplane-cli -> nsplane-cli, `default` | 6.94 / 7.03 | 7.63 / 7.99 | 8.83 / 9.08 | 9.89 / 9.86 | +12 % / +9 % |
+| nsplane-cli -> nsplane-cli, `w2` | 7.49 / 7.68 | 6.88 / 7.18 | 8.42 / 8.61 | 7.89 / 8.07 | -6 % / -6 % |
+| nsplane-cli -> kernel WireGuard | 5.84 / 5.73 | 4.33 / 4.36 | 6.89 / 6.77 | 4.36 / 4.64 | -37 % / -31 % |
+| kernel WireGuard -> nsplane-cli | 5.17 / 4.82 | 5.07 / 4.56 | 6.78 / 7.31 | 5.84 / 5.89 | -14 % / -19 % |
+
+Per round, -P1 Gbit/s A / B, and the range of the 1-minute load over the A / B run:
+
+| Round | `default` | `w2` | nsplane -> kernel | kernel -> nsplane | load A / B |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 6.75 / 5.40 | 6.27 / 6.49 | 5.70 / 2.96 | 3.89 / 4.89 | 4.5-22.1 / 14.2-28.4 |
+| 2 | 4.80 / 4.26 | 4.26 / 3.05 | 4.90 / 3.94 | 4.12 / 3.19 | 18.3-30.1 / 18.4-32.4 |
+| 3 | 5.09 / 5.26 | 6.58 / 5.37 | 5.88 / 4.67 | 3.13 / 5.25 | 11.4-31.3 / 7.2-20.7 |
+| 4 | 7.13 / 9.91 | 8.39 / 7.89 | 5.81 / 4.30 | 6.21 / 4.63 | 5.1-10.6 / 4.0-6.3 |
+| 5 | 8.99 / 9.86 | 8.42 / 7.26 | 6.97 / 4.36 | 6.85 / 6.85 | 2.8-4.3 / 3.5-9.1 |
+| 6 | 8.83 / 9.89 | 8.42 / 7.91 | 6.89 / 4.66 | 6.78 / 5.84 | 2.3-4.2 / 2.6-3.7 |
+
+CPU seconds per GB (cgroup, iperf3 included), median of rounds 4-6, sender / receiver:
+`default` 1.21 / 0.98 before, 1.14 / 0.88 after (-6 % / -10 %); nsplane -> kernel sender
+2.31 before, 2.26 after.
+
+Where the time goes on the regressing pair: a 15 s `perf record` (frame pointers, 1999 Hz)
+and `pidstat -t` of the nsplane-cli sender towards kernel WireGuard, same CPU sets, two runs
+each, load 3.5-4.6 (A 7.26 / 6.80 Gbit/s, B 4.63 / 4.59 Gbit/s). Shares of the process's
+samples; the crypto assembly loses its callers, so it is listed apart (it runs in the owner
+task):
+
+| | A (before) | B (after) |
+| --- | --- | --- |
+| nsplane-cli CPU (cores of 4) | 2.00 | 1.17 |
+| owner task, without crypto | 7.6 % | 54.0 % |
+| crypto (seal) | 20.7 % | 24.4 % |
+| transmit task | 44.6 % | 0 |
+| I/O syscalls in that task (mostly UDP `sendmsg` with GSO segmentation in the kernel) | 39.5 % in the transmit task | 48.4 % in the owner task |
+| source task (TUN read, TSO split) | 6.8 % | 6.0 % |
+| handoffs (mpsc, semaphore, wake, futex) | 8.4 % | 1.7 % |
+
+Before, the owner spent about 0.57 core sealing while the transmit task spent about 0.89
+core in `sendmsg`; after, the owner seals and sends itself and is busy for about 0.92 core,
+i.e. it is the bottleneck: the handoffs are gone (8.4 % -> 1.7 %), but sealing and the
+kernel's GSO send now run one after the other in one task instead of side by side.
+
+Engine latency, `cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture`,
+A and B interleaved, 1-minute load 2.8-17.5; p50 / p99 / lost pings of 2000, two runs each.
+The two tests of the file run in parallel by default; "alone" runs `round_trip_latency`
+with `--exact`:
+
+| Case | A (before) | B (after) |
+| --- | --- | --- |
+| Idle, no workers, in parallel | 11.5 / 16.0 us, 12.7 / 36.4 us | 27.2 / 961 us, 36.3 / 71.6 us |
+| Idle, no workers, alone | 22.3 / 40.5 us, 24.7 / 63.9 us | 13.4 / 33.6 us, 10.8 / 24.0 us |
+| Idle, no workers, `queue_capacity` 256 | 12.1 / 23.5 us, 14.2 / 27.3 us | 27.3 / 794 us, 14.9 / 58.8 us |
+| Loaded, no workers, in parallel | 2.85 / 9.74 ms / 24, 4.06 / 7.79 ms / 13 | 2.95 / 11.4 ms / 125, 3.15 / 8.91 ms / 84 |
+| Loaded, no workers, alone | 2.12 / 4.14 ms / 16, 3.56 / 11.1 ms / 13 | 2.33 / 6.88 ms / 204, 2.32 / 6.90 ms / 252 |
+| Loaded, no workers, `queue_capacity` 256 | 1.96 / 9.49 ms / 119, 2.64 / 9.14 ms / 81 | 1.85 / 8.54 ms / 186, 1.84 / 6.56 ms / 205 |
+| Idle, 2 workers | 27.8 / 72.7 us, 33.7 / 63.8 us; alone 13.7 / 29.2, 14.2 / 31.0 us | 16.4 / 34.1 us, 15.8 / 20.2 us; alone 14.0 / 29.6, 14.4 / 17.2 us |
+| Loaded, 2 workers | 8.53 / 36.2 ms / 227, 7.15 / 15.5 ms / 315; alone 7.27 / 11.8 / 398, 7.31 / 12.3 / 398 | 7.24 / 27.2 ms / 208, 7.14 / 24.1 ms / 258; alone 6.56 / 13.6 / 288, 6.55 / 12.1 / 260 |
+
+Under load without workers the sender's `transmit`, `backlog` and `recycle` marks are 0
+after (1024, 64 and 1024 before): every datagram went out inline. The receiver's `deliver`
+mark stays at 1024 because the test's channel sink keeps the default `try_send_batch`, and
+the lost pings are its `DROP_SINK_FULL` drops, as in
+[Engine batching under load](#engine-batching-under-load).
+
+Worker pool hub, `cargo bench -p nsplane --bench worker_pool` (the 8-peer hub on in-memory
+`ChannelTransport` links, which keep the default `try_send_batch`), A, B, A, B, load
+4.0-8.3; criterion means, packets per second:
+
+| Packet | Pool off, A / B | 2 workers, A / B | 4 workers, A / B |
+| --- | --- | --- | --- |
+| 64 B | 1.45, 1.46 / 1.37, 1.31 Mpps | 1.57, 1.58 / 1.49, 1.47 Mpps | 1.65, 1.13 / 1.56, 1.44 Mpps |
+| 1420 B | 880, 913 / 806, 810 kpps | 1.17, 1.17 / 1.07, 0.78 Mpps | 1.16, 1.16 / 1.08, 0.72 Mpps |
+
+`cargo bench -p nsplane-core --bench data_path` (the core is unchanged): core round trip
+64 B 528.7 / 531.3 ns, 1420 B 1.337 / 1.338 us; batched 32 per call 413 / 415 ns and
+1.227 / 1.230 us per packet (A: 528.3 ns, 1.351 us, 412 ns, 1.224 us). No regression.
+
+Verdict against the target of +18 % single-stream nsplane-cli <-> nsplane-cli without
+workers: not met. In the quiet rounds the fast path gives +12 % (-P1) and +9 % (-P4) at
+6-10 % less CPU per GB, and B sat at 9.86-9.91 Gbit/s in all three of them, which may be a
+limit of this setup rather than of the engine. Against a fast receiver (kernel WireGuard)
+the sender loses 31-37 %: the owner task, which now also runs the GSO `sendmsg`, saturates.
+The pool-off hub with the default (refusing) `try_send_batch` is 5-11 % slower, and `w2`
+6 % slower in the quiet rounds, although the inline output is off for both; what they
+share with the fast path is the batched input queue (a `Vec` per handoff on an unbounded
+channel, one item per message with workers). Idle latency moves within 11-36 us p50 with
+the test's scheduling and shows no consistent effect.
+
+What is left, in order: keep `sendmsg` off the owner when it is the busy side (send inline
+only while the owner has nothing else queued, or hand large GSO trains to the transmit task)
+so that sealing and sending overlap again; check the batched input queue's cost on paths
+that cannot use the fast path (pool off with default `try_send_batch`, and with workers);
+then the items PF1 found outside the handoffs (allocation in sealing, the TSO split copy,
+TUN write coalescing; `docs/task/20261003-1500-ns-dataplane-moves.md`, MF-1).
 
 ## Unsafe code
 
