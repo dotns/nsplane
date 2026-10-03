@@ -1240,6 +1240,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-wss"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "nsplane",
+ "nsplane-e2e",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
