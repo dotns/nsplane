@@ -16,6 +16,8 @@ use nsplane_packet::checksum::{
 use nsplane_packet::{IpPacket, PacketBuf, UdpHeader, protocol};
 use tokio::sync::mpsc;
 
+use crate::ownership::Registration;
+
 /// UDP header length.
 const UDP_HEADER: usize = 8;
 /// Hop limit / TTL of every emitted datagram.
@@ -166,13 +168,24 @@ impl UdpOut {
 /// flow's queue is full are dropped and counted.
 #[derive(Debug)]
 pub struct UdpFlow {
+    /// Declared before `rx`: the tuple leaves the ownership table before the driver can
+    /// see the queue closed and open a new flow for it.
+    _registration: Registration,
     rx: mpsc::Receiver<Bytes>,
     reply: UdpReply,
 }
 
 impl UdpFlow {
-    pub(crate) const fn new(rx: mpsc::Receiver<Bytes>, reply: UdpReply) -> Self {
-        Self { rx, reply }
+    pub(crate) const fn new(
+        registration: Registration,
+        rx: mpsc::Receiver<Bytes>,
+        reply: UdpReply,
+    ) -> Self {
+        Self {
+            _registration: registration,
+            rx,
+            reply,
+        }
     }
 
     /// The stack's address the datagrams were sent to.
@@ -237,6 +250,9 @@ impl UdpReply {
 /// unless another socket is bound to the exact address. Dropping the socket unbinds it.
 #[derive(Debug)]
 pub struct UdpSocket {
+    /// Declared before `rx`: the address leaves the ownership table before the driver can
+    /// see the queue closed and bind it again.
+    _registration: Registration,
     local: SocketAddr,
     source: IpAddr,
     rx: mpsc::Receiver<(SocketAddr, Bytes)>,
@@ -245,12 +261,14 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     pub(crate) const fn new(
+        registration: Registration,
         local: SocketAddr,
         source: IpAddr,
         rx: mpsc::Receiver<(SocketAddr, Bytes)>,
         out: UdpOut,
     ) -> Self {
         Self {
+            _registration: registration,
             local,
             source,
             rx,
