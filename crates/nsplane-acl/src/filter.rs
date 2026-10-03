@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
@@ -210,12 +210,38 @@ pub struct AclFilterConfig {
     pub allow_other_protocols: bool,
     /// Accept inbound replies to flows the local side opened (stateful
     /// replies, not a conntrack/NAT). Default `true`.
+    ///
+    /// When `false` the filter records no reply allowance in either
+    /// direction: outbound TCP, UDP and ICMP echo packets record no inbound
+    /// allowance, accepted inbound flows from outbound-restricted peers
+    /// record no outbound allowance (their replies need an outbound rule or
+    /// an outbound pinhole), and no pending dependency is kept. Every inbound
+    /// packet is then judged by the policy alone. The only state left is the
+    /// flow verdict cache, which is exact: a verdict is reused only under the
+    /// policy and identity generations it was computed under, a pinhole
+    /// verdict is checked against the pinhole's expiry on every hit, and an
+    /// expired-pinhole verdict is never cached, so a hit equals a fresh
+    /// evaluation (checked by the differential tests).
     pub stateful_replies: bool,
     /// Maximum number of reply allowances (at least 1). When full, the least
     /// recently seen entry is evicted. Default 4096.
     pub reply_capacity: usize,
     /// How long a reply allowance lives without traffic. Default 120 s.
     pub reply_idle_timeout: Duration,
+    /// How inbound non-first IPv4 fragments are gated. Default
+    /// [`FragmentMode::Outcome`].
+    pub fragments: FragmentMode,
+    /// Accept an inbound IPv4 packet (at least 20 bytes) whose destination
+    /// is this address without consulting the policy, before anything else
+    /// (counted in [`AclFilterStats::bypassed`]). Default `None`.
+    pub accept_to_local: Option<Ipv4Addr>,
+    /// Accept an inbound IPv4 ICMP echo reply without consulting the policy,
+    /// after [`accept_to_local`](Self::accept_to_local) and before anything
+    /// else (counted in [`AclFilterStats::bypassed`]). The check reads the
+    /// raw header: IPv4, a header length of at least 20 bytes, at least 8
+    /// bytes after it, protocol 1 and type 0; a non-first fragment passing
+    /// it is accepted too. Default `false`.
+    pub accept_icmp_echo_reply: bool,
 }
 
 impl Default for AclFilterConfig {
@@ -226,8 +252,83 @@ impl Default for AclFilterConfig {
             stateful_replies: true,
             reply_capacity: 4096,
             reply_idle_timeout: Duration::from_secs(120),
+            fragments: FragmentMode::Outcome,
+            accept_to_local: None,
+            accept_icmp_echo_reply: false,
         }
     }
+}
+
+impl AclFilterConfig {
+    /// The settings of the ACL step of an ns account: for inbound IPv4
+    /// packets the filter equals ns `is_local_node_packet(pkt, local) ||
+    /// is_icmp_echo_reply(pkt) || acl_check_packet(..)` (the first term only
+    /// when `local` is set), with the principals of a [`PeerIdentityMap`]
+    /// holding the relay clients under [`insert`](PeerIdentityMap::insert)
+    /// with their [`SourceAssertion::WgPeerKey`] and every other peer under
+    /// [`insert_by_source`](PeerIdentityMap::insert_by_source).
+    ///
+    /// That is: no reply allowances ([`stateful_replies`](Self::stateful_replies)
+    /// off), protocols other than TCP and UDP dropped, IPv4 fragments gated by
+    /// [`FragmentMode::ALLOW_ONLY`], `local` in
+    /// [`accept_to_local`](Self::accept_to_local) and
+    /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on. Drop
+    /// reasons follow this filter (a packet ns drops is dropped here, possibly
+    /// with another reason), and IPv6 and outbound packets keep this filter's
+    /// handling.
+    pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
+        Self {
+            allow_other_protocols: false,
+            stateful_replies: false,
+            fragments: FragmentMode::ALLOW_ONLY,
+            accept_to_local: local,
+            accept_icmp_echo_reply: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// How an [`AclFilter`] gates inbound non-first IPv4 fragments, which carry
+/// no ports and follow their packet's first fragment.
+///
+/// IPv6 fragments and outbound fragments (to outbound-restricted peers) are
+/// always gated as in [`Outcome`](Self::Outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FragmentMode {
+    /// The outcome of each first fragment, accepted or dropped, is recorded
+    /// per peer, direction and (source, destination, protocol,
+    /// identification); later fragments get the same outcome, the last one
+    /// frees the entry, and a later fragment with no recorded first fragment
+    /// is dropped with [`reasons::FRAGMENT`]. The table holds
+    /// [`AclFilterConfig::fragment_capacity`] entries, evicting the oldest.
+    #[default]
+    Outcome,
+    /// The ns `FragmentAclGate`: only accepted first fragments are recorded,
+    /// keyed by (source, destination, protocol, identification) without the
+    /// peer, until `ttl` after the first fragment on the engine clock
+    /// ([`AclEngine::with_clock`]); the last fragment does not free the
+    /// entry. A non-first fragment is judged before anything but the
+    /// bypass flags (before the no-policy check): accepted when its entry is
+    /// live, else dropped with [`reasons::FRAGMENT`] (an expired entry is
+    /// removed). When the table holds `capacity` entries, the expired ones
+    /// are removed first and, if it is still full, the new entry is not
+    /// recorded (a live entry is never evicted).
+    AllowOnly {
+        /// How long an accepted first fragment admits its later fragments.
+        ttl: Duration,
+        /// Maximum number of recorded first fragments.
+        capacity: usize,
+    },
+}
+
+impl FragmentMode {
+    /// [`AllowOnly`](Self::AllowOnly) with the values of ns: a TTL of 15 s
+    /// and a capacity of 4096.
+    pub const ALLOW_ONLY: Self = Self::AllowOnly {
+        ttl: Duration::from_secs(15),
+        capacity: 4096,
+    };
 }
 
 /// Counters of an [`AclFilter`], in packets unless stated otherwise.
@@ -276,6 +377,10 @@ pub struct AclFilterStats {
     /// Cached flow verdicts flushed to make room in the full flow table (the
     /// flows are evaluated again on their next packet).
     pub verdict_evictions: u64,
+    /// Inbound packets accepted without the policy by
+    /// [`AclFilterConfig::accept_to_local`] or
+    /// [`AclFilterConfig::accept_icmp_echo_reply`].
+    pub bypassed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -297,6 +402,7 @@ struct Counters {
     reply_revoked: AtomicU64,
     pending_evictions: AtomicU64,
     verdict_evictions: AtomicU64,
+    bypassed: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -308,6 +414,8 @@ fn bump(counter: &AtomicU64) {
 enum Outcome {
     Accepted,
     Reply,
+    /// Accepted by a bypass flag, without the policy.
+    Bypassed,
     Denied,
     CrossNamespace,
     NoPolicy,
@@ -324,7 +432,11 @@ enum Outcome {
 impl Outcome {
     const fn verdict(self) -> Verdict {
         let reason = match self {
-            Self::Accepted | Self::Reply | Self::OutboundAccepted | Self::OutboundReply => {
+            Self::Accepted
+            | Self::Reply
+            | Self::Bypassed
+            | Self::OutboundAccepted
+            | Self::OutboundReply => {
                 return Verdict::Accept;
             }
             Self::Denied => reasons::DENIED,
@@ -343,6 +455,7 @@ impl Outcome {
         bump(match self {
             Self::Accepted => &counters.accepted,
             Self::Reply => &counters.replies,
+            Self::Bypassed => &counters.bypassed,
             Self::Denied => &counters.denied,
             Self::CrossNamespace => &counters.cross_namespace,
             Self::NoPolicy => &counters.no_policy,
@@ -370,10 +483,57 @@ struct FragmentKey {
 }
 
 /// First-fragment outcomes in insertion order; when full, the oldest is
-/// evicted (O(1)).
+/// evicted (O(1)). `allowed` is the table of [`FragmentMode::AllowOnly`]:
+/// the engine-clock time each accepted first fragment was recorded.
 #[derive(Debug, Default)]
 struct FragmentTable {
     entries: LruMap<FragmentKey, Outcome>,
+    allowed: HashMap<AllowedKey, Instant>,
+}
+
+/// The key of [`FragmentMode::AllowOnly`]: no peer, no direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AllowedKey {
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    id: u16,
+}
+
+/// The fragment fields of a raw IPv4 header (at least 20 bytes, version 4),
+/// as ns `ipv4_fragment_meta` reads them: the key, the offset is non-zero,
+/// the first fragment of several.
+const fn ipv4_fragment(bytes: &[u8]) -> Option<(AllowedKey, bool, bool)> {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
+    let key = AllowedKey {
+        src: Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
+        dst: Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]),
+        protocol: bytes[9],
+        id: u16::from_be_bytes([bytes[4], bytes[5]]),
+    };
+    let offset = flags & 0x1fff;
+    Some((key, offset > 0, offset == 0 && flags & 0x2000 != 0))
+}
+
+/// ns `is_local_node_packet`: an IPv4 packet addressed to `local`.
+fn is_to_local(bytes: &[u8], local: Ipv4Addr) -> bool {
+    bytes.len() >= 20 && bytes[0] >> 4 == 4 && bytes[16..20] == local.octets()
+}
+
+/// ns `is_icmp_echo_reply`: an IPv4 ICMP echo reply, read from the raw
+/// header whatever its fragment offset.
+fn is_icmp_echo_reply(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = usize::from(bytes[0] & 0x0f) * 4;
+    if ihl < 20 || bytes.len() < ihl + 8 || bytes[9] != protocol::ICMP {
+        return false;
+    }
+    bytes[ihl] == 0
 }
 
 /// The flow table, behind one lock: for each peer, direction and tuple
@@ -582,7 +742,8 @@ impl PeerInfo {
 ///
 /// IPv4 fragments: a first fragment is evaluated and its outcome recorded;
 /// later fragments of the same packet follow it, and a later fragment with no
-/// recorded first fragment is dropped.
+/// recorded first fragment is dropped. [`AclFilterConfig::fragments`] selects
+/// how inbound IPv4 fragments are recorded ([`FragmentMode`]).
 ///
 /// Clones share all state, so one clone can go to the engine and another can
 /// read [`stats`](Self::stats).
@@ -679,6 +840,7 @@ impl AclFilter {
             reply_revoked: load(&c.reply_revoked),
             pending_evictions: load(&c.pending_evictions),
             verdict_evictions: load(&c.verdict_evictions),
+            bypassed: load(&c.bypassed),
         }
     }
 }
@@ -706,6 +868,24 @@ impl Inner {
     }
 
     fn inbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
+        if let Some(local) = self.config.accept_to_local
+            && is_to_local(bytes, local)
+        {
+            return Outcome::Bypassed;
+        }
+        if self.config.accept_icmp_echo_reply && is_icmp_echo_reply(bytes) {
+            return Outcome::Bypassed;
+        }
+        // `Some` for an IPv4 packet in the allow-only mode.
+        let allow_only = match self.config.fragments {
+            FragmentMode::AllowOnly { ttl, capacity } => {
+                ipv4_fragment(bytes).map(|fragment| (fragment, ttl, capacity))
+            }
+            FragmentMode::Outcome => None,
+        };
+        if let Some(((key, true, _), ttl, _)) = allow_only {
+            return self.follow_allowed(key, ttl);
+        }
         let snapshot = self.engine.snapshot();
         if !snapshot.is_loaded() {
             return Outcome::NoPolicy;
@@ -713,9 +893,54 @@ impl Inner {
         let Ok(packet) = IpPacket::parse(bytes) else {
             return Outcome::Malformed;
         };
-        self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
-            self.evaluate(&snapshot, peer, packet)
-        })
+        let Some(((key, _, first_of_many), ttl, capacity)) = allow_only else {
+            return self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
+                self.evaluate(&snapshot, peer, packet)
+            });
+        };
+        let outcome = self.evaluate(&snapshot, peer, &packet);
+        if first_of_many && matches!(outcome, Outcome::Accepted | Outcome::Reply) {
+            self.remember_allowed(key, ttl, capacity);
+        }
+        outcome
+    }
+
+    /// [`FragmentMode::AllowOnly`]: whether the first fragment of `key` was
+    /// accepted less than `ttl` ago; an expired entry is removed.
+    fn follow_allowed(&self, key: AllowedKey, ttl: Duration) -> Outcome {
+        let now = self.engine.now();
+        let mut table = self
+            .fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match table.allowed.get(&key) {
+            Some(&recorded) if now.duration_since(recorded) < ttl => Outcome::Accepted,
+            Some(_) => {
+                table.allowed.remove(&key);
+                Outcome::Fragment
+            }
+            None => Outcome::Fragment,
+        }
+    }
+
+    /// [`FragmentMode::AllowOnly`]: record the accepted first fragment of
+    /// `key`, removing the expired entries first when the table is full and
+    /// recording nothing when it is still full.
+    fn remember_allowed(&self, key: AllowedKey, ttl: Duration, capacity: usize) {
+        let now = self.engine.now();
+        let mut table = self
+            .fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if table.allowed.len() >= capacity {
+            table
+                .allowed
+                .retain(|_, &mut recorded| now.duration_since(recorded) < ttl);
+            if table.allowed.len() >= capacity {
+                return;
+            }
+        }
+        table.allowed.insert(key, now);
     }
 
     /// Run `evaluate` on an unfragmented packet or a first fragment, recording
@@ -932,7 +1157,7 @@ impl Inner {
         if let Some(dependency) = &verdict.dependency {
             self.record_pending(table, tuple, dependency.clone());
         }
-        if verdict.restricted {
+        if verdict.restricted && self.config.stateful_replies {
             self.record_reply(
                 table,
                 peer,
@@ -3177,5 +3402,460 @@ mod tests {
             let stats = f.stats();
             assert_eq!((stats.outbound_denied, stats.outbound_replies), (1, 1));
         }
+    }
+
+    // ── crates/acl mode: allow-only fragments, bypass flags ───────────────
+
+    /// An engine with `policy` loaded whose clock is moved by hand.
+    fn clocked_engine(policy: AclPolicy) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let handle = Arc::clone(&clock);
+        let engine = AclEngine::with_clock(move || *handle.lock().unwrap());
+        engine.load(policy).unwrap();
+        (Arc::new(engine), clock)
+    }
+
+    fn advance(clock: &Mutex<Instant>, by: Duration) {
+        *clock.lock().unwrap() += by;
+    }
+
+    fn allow_only(capacity: usize) -> AclFilterConfig {
+        AclFilterConfig {
+            fragments: FragmentMode::AllowOnly {
+                ttl: Duration::from_secs(15),
+                capacity,
+            },
+            ..AclFilterConfig::default()
+        }
+    }
+
+    fn allowed_len(f: &AclFilter) -> usize {
+        f.inner.fragments.lock().unwrap().allowed.len()
+    }
+
+    /// The middle fragment of datagram `id`.
+    fn continuation(id: u16) -> PacketBuf {
+        fragment(id, 4, true, &[0; 8])
+    }
+
+    #[test]
+    fn allow_only_constants_are_those_of_ns() {
+        assert_eq!(FragmentMode::default(), FragmentMode::Outcome);
+        assert_eq!(
+            FragmentMode::ALLOW_ONLY,
+            FragmentMode::AllowOnly {
+                ttl: Duration::from_secs(15),
+                capacity: 4096,
+            }
+        );
+        let config = AclFilterConfig::default();
+        assert_eq!(config.fragments, FragmentMode::Outcome);
+        assert_eq!(config.accept_to_local, None);
+        assert!(!config.accept_icmp_echo_reply);
+    }
+
+    /// ns `fragment_gate_remembers_until_ttl_then_expires`.
+    #[test]
+    fn allow_only_remembers_until_ttl_then_expires() {
+        let (engine, clock) = clocked_engine(test_policy());
+        let f = AclFilter::with_config(engine, identity(), allow_only(4096));
+        assert_eq!(
+            inbound(&f, PEER, continuation(7)),
+            drop(reasons::FRAGMENT),
+            "empty gate denies"
+        );
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        advance(&clock, Duration::from_secs(1));
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        // Still valid just before the TTL boundary...
+        advance(&clock, Duration::from_millis(13_999));
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        // ...and gone at it (expiry is exclusive), removed on lookup.
+        advance(&clock, Duration::from_millis(1));
+        assert_eq!(inbound(&f, PEER, continuation(7)), drop(reasons::FRAGMENT));
+        assert_eq!(allowed_len(&f), 0, "expired entry removed on lookup");
+        let stats = f.stats();
+        assert_eq!((stats.accepted, stats.fragment), (3, 2));
+    }
+
+    /// ns `fragment_gate_is_bounded_and_prunes_expired_under_pressure`, with
+    /// a small capacity.
+    #[test]
+    fn allow_only_is_bounded_and_prunes_expired_under_pressure() {
+        let (engine, clock) = clocked_engine(test_policy());
+        let f = AclFilter::with_config(engine, identity(), allow_only(2));
+        for id in 1..=3 {
+            assert_eq!(inbound(&f, PEER, first_fragment(id, 80)), Verdict::Accept);
+        }
+        assert_eq!(allowed_len(&f), 2, "table must stay bounded");
+        // Live entries are never evicted: the third one was not recorded.
+        assert_eq!(inbound(&f, PEER, continuation(1)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(2)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(3)), drop(reasons::FRAGMENT));
+        assert_eq!(f.stats().fragment_evictions, 0);
+
+        // Once the live entries have expired, a new one prunes and succeeds.
+        advance(&clock, Duration::from_secs(16));
+        assert_eq!(inbound(&f, PEER, first_fragment(4, 80)), Verdict::Accept);
+        assert_eq!(allowed_len(&f), 1);
+        assert_eq!(inbound(&f, PEER, continuation(4)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_key_has_no_peer() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, OTHER_PEER, continuation(7)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_records_no_denied_first_fragment() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(9, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(allowed_len(&f), 0);
+        assert_eq!(inbound(&f, PEER, continuation(9)), drop(reasons::FRAGMENT));
+        let stats = f.stats();
+        assert_eq!((stats.denied, stats.fragment), (1, 1));
+    }
+
+    #[test]
+    fn allow_only_drops_out_of_order_continuations() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(inbound(&f, PEER, continuation(5)), drop(reasons::FRAGMENT));
+        assert_eq!(inbound(&f, PEER, first_fragment(5, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(5)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_last_fragment_keeps_the_entry() {
+        let f = filter_with(allow_only(4096));
+        let last = || fragment(6, 6, false, &[0; 8]);
+        assert_eq!(inbound(&f, PEER, first_fragment(6, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, last()), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, last()), Verdict::Accept);
+        assert_eq!(allowed_len(&f), 1);
+    }
+
+    #[test]
+    fn allow_only_records_first_fragments_of_several_only() {
+        let f = filter_with(allow_only(4096));
+        let r = addr("10.0.0.1");
+        let l = addr("10.0.0.2");
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(allowed_len(&f), 0);
+    }
+
+    #[test]
+    fn allow_only_judges_continuations_before_the_policy_check() {
+        let engine = loaded_engine(test_policy());
+        let f = AclFilter::with_config(Arc::clone(&engine), identity(), allow_only(4096));
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        engine.clear();
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(9, 80)),
+            drop(reasons::NO_POLICY)
+        );
+        // The outcome mode checks the policy first.
+        let f = AclFilter::with_config(engine, identity(), AclFilterConfig::default());
+        assert_eq!(inbound(&f, PEER, continuation(7)), drop(reasons::NO_POLICY));
+    }
+
+    #[test]
+    fn allow_only_leaves_ipv6_fragments_alone() {
+        let (r, l) = (addr("fd00::1"), addr("fd00::2"));
+        // A fragment header: next header TCP, offset 8 bytes, id 1.
+        let frag = ip(r, l, 44, &[protocol::TCP, 0, 0, 8, 0, 0, 0, 1, 0, 0]);
+        let first = ip(r, l, 44, &[protocol::TCP, 0, 0, 1, 0, 0, 0, 1, 0, 0]);
+        for config in [AclFilterConfig::default(), allow_only(4096)] {
+            let f = filter_with(config);
+            assert_eq!(inbound(&f, PEER, first.clone()), drop(reasons::PROTOCOL));
+            assert_eq!(inbound(&f, PEER, frag.clone()), drop(reasons::PROTOCOL));
+            assert_eq!(allowed_len(&f), 0);
+        }
+    }
+
+    #[test]
+    fn accept_to_local_bypasses_the_policy() {
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let engine = Arc::new(AclEngine::new());
+        let f = AclFilter::with_config(Arc::clone(&engine), identity(), AclFilterConfig::default());
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 9)),
+            drop(reasons::NO_POLICY)
+        );
+
+        let f = AclFilter::with_config(
+            engine,
+            identity(),
+            AclFilterConfig {
+                accept_to_local: Some("10.0.0.2".parse().unwrap()),
+                fragments: FragmentMode::ALLOW_ONLY,
+                ..AclFilterConfig::default()
+            },
+        );
+        // No policy, any port, an orphan fragment, another protocol.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 9)),
+            Verdict::Accept
+        );
+        assert_eq!(inbound(&f, PEER, continuation(3)), Verdict::Accept);
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(8, 1))),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, addr("10.0.0.3"), 9)),
+            drop(reasons::NO_POLICY)
+        );
+        // IPv6 is never bypassed.
+        assert_eq!(
+            inbound(
+                &f,
+                PEER,
+                tcp_packet(addr("fd00::1"), 4000, addr("fd00::2"), 9)
+            ),
+            drop(reasons::NO_POLICY)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.bypassed, stats.accepted, stats.no_policy), (3, 0, 2));
+        // Outbound is unaffected.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 9, r, 4000)),
+            Verdict::Accept
+        );
+    }
+
+    #[test]
+    fn accept_icmp_echo_reply_bypasses_the_policy() {
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let reply = || ip(r, l, protocol::ICMP, &icmp_echo(0, 1));
+        let request = || ip(r, l, protocol::ICMP, &icmp_echo(8, 1));
+        let f = filter();
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::PROTOCOL));
+
+        let f = AclFilter::with_config(
+            Arc::new(AclEngine::new()),
+            identity(),
+            AclFilterConfig {
+                accept_icmp_echo_reply: true,
+                fragments: FragmentMode::ALLOW_ONLY,
+                ..AclFilterConfig::default()
+            },
+        );
+        assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, request()), drop(reasons::NO_POLICY));
+        // As ns: the type byte of a non-first fragment is read too.
+        let tail = ip_frag(
+            r,
+            l,
+            protocol::ICMP,
+            &[0; 8],
+            Some(Frag {
+                id: 1,
+                offset_units: 4,
+                more: false,
+            }),
+        );
+        assert_eq!(inbound(&f, PEER, tail), Verdict::Accept);
+        // Too short for an ICMP header.
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &[0; 4])),
+            drop(reasons::NO_POLICY)
+        );
+        // An ICMPv6 echo reply is not bypassed.
+        let v6 = ip(
+            addr("fd00::1"),
+            addr("fd00::2"),
+            protocol::ICMPV6,
+            &icmp_echo(129, 1),
+        );
+        assert_eq!(inbound(&f, PEER, v6), drop(reasons::NO_POLICY));
+        assert_eq!(f.stats().bypassed, 2);
+    }
+
+    #[test]
+    fn stateless_replies_are_judged_by_the_policy_only() {
+        let f = AclFilter::with_config(
+            loaded_engine(test_policy()),
+            identity(),
+            AclFilterConfig {
+                stateful_replies: false,
+                allow_other_protocols: false,
+                ..AclFilterConfig::default()
+            },
+        );
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        assert_eq!(
+            outbound(&f, PEER, udp_packet(l, 5000, r, 9)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, udp_packet(r, 9, l, 5000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            outbound(&f, PEER, ip(l, r, protocol::ICMP, &icmp_echo(8, 1))),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(0, 1))),
+            drop(reasons::PROTOCOL)
+        );
+        // A reply the policy accepts is accepted as new traffic.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 80, r, 4000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        let stats = f.stats();
+        assert_eq!((stats.replies, stats.accepted), (0, 1));
+        let table = f.inner.table();
+        assert_eq!(table.entries.len(), 0);
+        assert!(table.pending.is_empty());
+    }
+
+    #[test]
+    fn stateless_replies_record_nothing_for_restricted_peers() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace(
+                "nsd:a",
+                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80")])),
+            )
+            .unwrap();
+        let config = AclFilterConfig {
+            stateful_replies: false,
+            ..AclFilterConfig::default()
+        };
+        let f = ns_filter(&engine, config);
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        for _ in 0..2 {
+            assert_eq!(
+                inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+                drop(reasons::OUTBOUND)
+            );
+        }
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 80, local, 5000)),
+            drop(reasons::DENIED)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.outbound_replies, stats.replies), (0, 0));
+        let table = f.inner.table();
+        assert_eq!(table.entries.len(), table.verdicts, "only cached verdicts");
+        assert!(table.pending.is_empty());
+    }
+
+    /// The identities of an ns account: gateways by source, relay clients
+    /// by key.
+    fn crates_acl_identity() -> Arc<PeerIdentityMap> {
+        let map = Arc::new(PeerIdentityMap::new());
+        map.insert_by_source(PEER);
+        map.insert(KEY_PEER, SourceAssertion::WgPeerKey { pubkey: KEY });
+        map
+    }
+
+    #[test]
+    fn crates_acl_preset() {
+        let local = "10.0.0.2".parse().unwrap();
+        let config = AclFilterConfig::crates_acl(Some(local));
+        assert_eq!(
+            config,
+            AclFilterConfig {
+                allow_other_protocols: false,
+                stateful_replies: false,
+                fragments: FragmentMode::ALLOW_ONLY,
+                accept_to_local: Some(local),
+                accept_icmp_echo_reply: true,
+                ..AclFilterConfig::default()
+            }
+        );
+        assert_eq!(AclFilterConfig::crates_acl(None).accept_to_local, None);
+    }
+
+    /// ns `acl_check_packet` (with `is_icmp_echo_reply` before it) through the
+    /// preset; ns has no unit tests of it, so these follow its code.
+    #[test]
+    fn crates_acl_matches_acl_check_packet() {
+        let engine = Arc::new(AclEngine::new());
+        let f = AclFilter::with_config(
+            Arc::clone(&engine),
+            crates_acl_identity(),
+            AclFilterConfig::crates_acl(None),
+        );
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        // No policy: fail closed, except echo replies.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            drop(reasons::NO_POLICY)
+        );
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(0, 1))),
+            Verdict::Accept
+        );
+        engine.load(test_policy()).unwrap();
+        // By source address.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(addr("10.0.0.7"), 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+        // A relay client by its key.
+        assert_eq!(
+            inbound(&f, KEY_PEER, udp_packet(addr("10.0.0.7"), 4000, l, 53)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, udp_packet(addr("10.0.0.7"), 4000, l, 53)),
+            drop(reasons::DENIED)
+        );
+        // Not TCP or UDP.
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(8, 1))),
+            drop(reasons::PROTOCOL)
+        );
+        // No reply allowances.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 5000, r, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 22, l, 5000)),
+            drop(reasons::DENIED)
+        );
+        // Fragments through the allow-only gate.
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, OTHER_PEER, continuation(7)), Verdict::Accept);
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(8, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
     }
 }

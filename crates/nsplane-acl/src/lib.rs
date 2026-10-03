@@ -226,6 +226,19 @@
 //! packet. A [`PeerIdentity`] that is not versioned (generation 0, e.g. a
 //! closure) gets no cache: every packet is evaluated.
 //!
+//! # The ns `crates/acl` mode
+//!
+//! [`AclFilterConfig::crates_acl`] makes the filter judge inbound IPv4
+//! packets as the ACL step of an ns account (`is_local_node_packet ||
+//! is_icmp_echo_reply || acl_check_packet`): packets to the local tunnel
+//! address and ICMP echo replies pass without the policy
+//! ([`AclFilterConfig::accept_to_local`],
+//! [`AclFilterConfig::accept_icmp_echo_reply`]), non-first fragments pass
+//! only after an accepted first fragment of the same datagram within 15 s
+//! ([`FragmentMode::AllowOnly`]), and there are no reply allowances
+//! ([`AclFilterConfig::stateful_replies`] off). Each of these settings is off
+//! by default and costs one branch when off.
+//!
 //! # Performance
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
@@ -278,7 +291,9 @@ pub use engine::{
     AccessRequest, AclDecision, AclEngine, AclTestFailure, CompiledPolicy, SourceAssertion,
     TerminateBinding, wg_peer_anchor,
 };
-pub use filter::{AclFilter, AclFilterConfig, AclFilterStats, PeerIdentity, PeerIdentityMap};
+pub use filter::{
+    AclFilter, AclFilterConfig, AclFilterStats, FragmentMode, PeerIdentity, PeerIdentityMap,
+};
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{
     MergeStats, MergedPolicy, PolicyLayers, RemotePolicy, RuleProvenance, acl_rule_key,
