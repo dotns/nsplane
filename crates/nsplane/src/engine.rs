@@ -24,7 +24,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
 };
-use crate::fragment::{Action, Fragmenter};
+use crate::fragment::{Action, FragmentStats, Fragmenter};
 use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -38,6 +38,10 @@ const MAX_DATAGRAM: usize = 65535;
 ///
 /// One owner task owns the [`Core`] and loops: it waits for a handle command, a local packet,
 /// a received datagram or the core's next timeout, feeds the core and drains its outputs.
+/// When it wakes for a local packet or a received datagram, it also takes the ones already
+/// queued behind it (up to [`MAX_BATCH`]) and feeds them to the core as one batch
+/// ([`Core::handle_locals`], [`Core::handle_datagrams`]); it never waits for a batch to fill,
+/// so a lone packet goes through at once.
 /// I/O tasks surround it, each connected through a bounded queue: the source task
 /// ([`PacketSource::recv`]), the sink task ([`PacketSink::send`]) and, for every transport,
 /// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The core
@@ -61,14 +65,19 @@ const MAX_DATAGRAM: usize = 65535;
 /// capacity: a datagram caused by a local packet, a received datagram or a timer (including
 /// the timers run by [`EngineHandle::resume`]) that finds its transport's backlog at the
 /// bound is dropped and counted under [`crate::DROP_TRANSMIT_FULL`]. Datagrams caused by
-/// handle calls always wait and may take a backlog past the bound. The owner stops reading
-/// local packets only while at least one transport is installed and every installed
-/// transport's backlog is at the bound (which transport a local packet leads to is only
-/// known once the core has handled it), which in turn holds back the source. So an engine
-/// with one transport holds back its local packets instead of dropping them, while with
-/// several transports a stalled one never holds back local packets for the others: those
-/// for the stalled one are dropped once its backlog is full. With no transport installed,
-/// local reads never pause. Received datagrams, timers and handle calls are served
+/// handle calls always wait and may take a backlog past the bound. Local packets are read
+/// only while some installed transport can take them without a deep backlog: its transmit
+/// queue has room or its backlog is below the local threshold ([`MAX_BATCH`], at most the
+/// queue capacity). The owner stops reading local packets while at least one transport is
+/// installed and every installed transport's transmit queue is full with its backlog at the
+/// threshold (which transport a local packet leads to is only known once the core has
+/// handled it), and takes no more at once than the most room any transport has, counting
+/// one datagram per packet; this in turn holds back the source, so a saturated transport
+/// does not build a backlog of local traffic ahead of new packets. So an engine with one
+/// transport holds back its local packets instead of dropping them, while with several
+/// transports a stalled one never holds back local packets for the others: those for the
+/// stalled one fill its backlog to the bound and are dropped from then on. With no
+/// transport installed, local reads never pause. Received datagrams, timers and handle calls are served
 /// meanwhile. A transport that never drains keeps its backlog until it closes (the backlog
 /// is then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or is removed with
 /// [`EngineHandle::remove_transport`], which counts every datagram still queued for it
@@ -104,9 +113,10 @@ const MAX_DATAGRAM: usize = 65535;
 ///
 /// Crypto workers: with [`EngineBuilder::crypto_workers`] set to 2 or more, the owner task
 /// hands the encryption of local packets and the decryption of received transport data to a
-/// pool of worker tasks ([`Core::handle_input_deferred`]) and finishes each packet when its
-/// worker hands it back ([`Core::complete_job`]); everything else (routing, filters,
-/// handshakes, timers, counters, events) stays on the owner. The pool is sharded by peer:
+/// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
+/// and finishes each packet when its worker hands it back ([`Core::complete_job`]);
+/// everything else (routing, filters, handshakes, timers, counters, events) stays on the
+/// owner. The pool is sharded by peer:
 /// all packets of a peer, in both directions, go to the same worker (in batches, handed over
 /// when one is full or the owner has nothing else to do), which runs them in arrival order, so each peer's packets leave in the order they came while different peers
 /// are encrypted in parallel (on a multi-threaded runtime). At most queue capacity packets
@@ -206,6 +216,10 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         .poll_timeout()
         .map_or_else(Instant::now, Instant::from_std);
 
+    let workers =
+        (parts.crypto_workers >= 2).then(|| Workers::spawn(parts.crypto_workers, capacity));
+    // The done queue holds as many batches as jobs may be in flight.
+    let crypto_capacity = workers.as_ref().map_or(0, |workers| workers.bound);
     let mut owner = Owner {
         core,
         private_key: parts.private_key,
@@ -243,11 +257,15 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
             transmit: QueueDepth::new(capacity),
             backlog: QueueDepth::new(capacity),
             events: QueueDepth::new(parts.event_capacity),
+            crypto: QueueDepth::new(crypto_capacity),
+            crypto_done: QueueDepth::new(crypto_capacity),
         },
         local_first: false,
         suspended,
-        workers: (parts.crypto_workers >= 2)
-            .then(|| Workers::spawn(parts.crypto_workers, capacity)),
+        workers,
+        datagram_batch: Vec::with_capacity(MAX_BATCH),
+        local_batch: Vec::with_capacity(MAX_BATCH),
+        jobs: Vec::with_capacity(MAX_BATCH),
     };
     for transport in parts.transports {
         let slot = owner.start_transport(transport.start, VecDeque::new());
@@ -471,6 +489,8 @@ struct Workers {
     done: mpsc::Receiver<Vec<CryptoJob>>,
     /// Jobs batched or with the workers and not completed yet; at most `bound`.
     in_flight: usize,
+    /// The most jobs in flight since [`Owner::queue_stats`] last took it.
+    peak: usize,
     bound: usize,
     tasks: Vec<Task>,
 }
@@ -491,6 +511,7 @@ impl Workers {
             batches: (0..n).map(|_| Vec::new()).collect(),
             done,
             in_flight: 0,
+            peak: 0,
             bound,
             tasks,
         }
@@ -502,7 +523,27 @@ impl Workers {
         let batch = &mut self.batches[worker];
         batch.push(job);
         self.in_flight += 1;
+        self.peak = self.peak.max(self.in_flight);
         batch.len() >= MAX_BATCH
+    }
+
+    /// Hands every batch of jobs to its worker; completes the jobs of a worker that is gone
+    /// (it panicked) on `core`.
+    fn flush(&mut self, core: &mut Core) {
+        for (queue, batch) in self.queues.iter().zip(&mut self.batches) {
+            if batch.is_empty() {
+                continue;
+            }
+            // Never full: a queue holds a batch of each job in flight.
+            if let Err(TrySendError::Full(jobs) | TrySendError::Closed(jobs)) =
+                queue.try_send(std::mem::take(batch))
+            {
+                self.in_flight -= jobs.len();
+                for job in jobs {
+                    core.complete_job(job);
+                }
+            }
+        }
     }
 
     /// Whether the bound of jobs in flight is reached.
@@ -567,6 +608,12 @@ struct Owner {
     suspended: watch::Sender<bool>,
     /// The crypto worker pool, if enabled.
     workers: Option<Workers>,
+    /// Reused for each batch of received datagrams.
+    datagram_batch: Vec<Datagram>,
+    /// Reused for each batch of local packets.
+    local_batch: Vec<PacketBuf>,
+    /// Reused for the crypto jobs of each batch.
+    jobs: Vec<CryptoJob>,
 }
 
 impl Owner {
@@ -601,20 +648,10 @@ impl Owner {
                         return;
                     }
                 }
-                Wake::Datagram(Some((path, data))) => {
-                    self.high_water
-                        .datagrams
-                        .record_received(self.datagrams.len());
-                    self.input(Input::Datagram { path, data });
-                }
+                Wake::Datagram(Some(datagram)) => self.input_datagrams(datagram),
                 // The owner keeps a sender, so the queue never closes.
                 Wake::Datagram(None) => {}
-                Wake::Local(Some(packet)) => {
-                    if let Some(local) = &self.local {
-                        self.high_water.local.record_received(local.len());
-                    }
-                    self.local_input(packet);
-                }
+                Wake::Local(Some(packet)) => self.input_locals(packet),
                 Wake::Local(None) => self.local = None,
                 Wake::Mtu(Some(mtu)) => {
                     if mtu != self.mtu {
@@ -705,15 +742,10 @@ impl Owner {
         Poll::Pending
     }
 
-    /// Polls the source queue, unless every installed transport's waiting datagrams are at
-    /// the bound.
+    /// Polls the source queue, unless there is no room for local packets
+    /// ([`Owner::local_room`]).
     fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
-        let bound = self.queue_capacity;
-        let full = !self.transports.is_empty()
-            && self
-                .transports
-                .values()
-                .all(|slot| slot.pending.len() >= bound);
+        let full = self.local_room() == 0;
         match &mut self.local {
             Some(local) if !full => local.poll_recv(cx).map(Wake::Local),
             _ => Poll::Pending,
@@ -729,57 +761,129 @@ impl Owner {
         }
     }
 
-    /// Feeds a local packet or a received datagram to the core, or its cryptography to the
-    /// crypto workers.
-    fn input(&mut self, input: Input) {
-        let Some(workers) = &mut self.workers else {
-            return self.core.handle_input(input, now());
-        };
-        if let Some(job) = self.core.handle_input_deferred(input, now())
-            && workers.dispatch(job)
+    /// Feeds `first` and the datagrams queued behind it to the core as one batch, or their
+    /// cryptography to the crypto workers.
+    ///
+    /// Takes only what is already queued, never waiting for more: at most [`MAX_BATCH`]
+    /// datagrams, no more than the crypto workers have room for and, since each may deliver a
+    /// packet, no more than the sink queue has room for (but always `first`).
+    fn input_datagrams(&mut self, first: Datagram) {
+        self.high_water
+            .datagrams
+            .record_received(self.datagrams.len());
+        let room = self.batch_room().min(self.deliver.capacity());
+        let batch = &mut self.datagram_batch;
+        batch.push(first);
+        while batch.len() < room
+            && let Ok(datagram) = self.datagrams.try_recv()
         {
-            self.flush_jobs();
+            batch.push(datagram);
+        }
+        let now = now();
+        if self.workers.is_some() {
+            self.core
+                .handle_datagrams_deferred(batch.drain(..), now, &mut self.jobs);
+            self.dispatch_jobs();
+        } else {
+            self.core.handle_datagrams(batch.drain(..), now);
         }
     }
 
-    /// Feeds a local packet through the fragmentation stage, if installed: what goes toward
-    /// the tunnel takes [`Owner::input`], ICMP errors go back to the local side.
-    fn local_input(&mut self, packet: PacketBuf) {
-        let Some(fragmenter) = &mut self.fragmenter else {
-            return self.input(Input::Local { packet });
+    /// Feeds `first` and the local packets queued behind it, each through the fragmentation
+    /// stage if installed, to the core as one batch, or their cryptography to the crypto
+    /// workers; ICMP errors from the fragmentation stage go back to the local side.
+    ///
+    /// Takes only what is already queued, never waiting for more: at most [`MAX_BATCH`]
+    /// packets, no more than the crypto workers have room for and no more than the room for
+    /// local packets ([`Owner::local_room`]), counting one datagram per packet (but always
+    /// `first`). A packet that leads to several datagrams (fragments, a handshake) may take
+    /// the waiting datagrams past the local threshold, up to their bound; those that find
+    /// the bound reached are dropped as usual.
+    fn input_locals(&mut self, first: PacketBuf) {
+        let Some(local) = &self.local else {
+            return;
         };
-        let core = &self.core;
-        match fragmenter.process(packet, self.mtu, now(), |dst| core.route(dst)) {
-            Action::Send(packet) => self.input(Input::Local { packet }),
-            Action::Fragments(fragments) => {
-                for packet in fragments {
-                    self.input(Input::Local { packet });
+        self.high_water.local.record_received(local.len());
+        let room = self.batch_room().min(self.local_room());
+        let now = now();
+        let mut next = Some(first);
+        let mut taken = 0;
+        while let Some(packet) = next {
+            taken += 1;
+            match &mut self.fragmenter {
+                None => self.local_batch.push(packet),
+                Some(fragmenter) => {
+                    let core = &self.core;
+                    match fragmenter.process(packet, self.mtu, now, |dst| core.route(dst)) {
+                        Action::Send(packet) => self.local_batch.push(packet),
+                        Action::Fragments(fragments) => self.local_batch.extend(fragments),
+                        Action::Reply(peer, packet) => self.core.inject_inbound(peer, packet),
+                        Action::Drop(reason) => self.dropped(None, reason),
+                    }
                 }
             }
-            Action::Reply(peer, packet) => self.core.inject_inbound(peer, packet),
-            Action::Drop => {}
+            next = match &mut self.local {
+                Some(local) if taken < room => local.try_recv().ok(),
+                _ => None,
+            };
+        }
+        let batch = &mut self.local_batch;
+        if self.workers.is_some() {
+            self.core
+                .handle_locals_deferred(batch.drain(..), now, &mut self.jobs);
+            self.dispatch_jobs();
+        } else {
+            self.core.handle_locals(batch.drain(..), now);
         }
     }
 
-    /// Hands every batch of jobs to its worker; completes the jobs of a worker that is gone
-    /// (it panicked) on the owner.
-    fn flush_jobs(&mut self) {
+    /// The most items to take from a packet queue at once: [`MAX_BATCH`], and no more than
+    /// the crypto workers have room for, each item leading to at most one job.
+    fn batch_room(&self) -> usize {
+        self.workers.as_ref().map_or(MAX_BATCH, |workers| {
+            MAX_BATCH.min(workers.bound.saturating_sub(workers.in_flight))
+        })
+    }
+
+    /// The local packets to take before every installed transport's transmit queue is full
+    /// and its waiting datagrams are at the local threshold ([`MAX_BATCH`], at most the queue
+    /// capacity), counting one datagram per packet: the most room over the transports, since
+    /// which transport a packet leads to is only known once the core has handled it.
+    /// Unbounded without transports.
+    fn local_room(&self) -> usize {
+        let threshold = self.queue_capacity.min(MAX_BATCH);
+        self.transports
+            .values()
+            .map(|slot| {
+                // Waiting datagrams take the queue's free slots first.
+                let free = if slot.pending.is_empty() {
+                    slot.queue.capacity()
+                } else {
+                    0
+                };
+                free + threshold.saturating_sub(slot.pending.len())
+            })
+            .max()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Adds every job of the current batch to its worker's batch, handing the batches over
+    /// whenever one is full.
+    fn dispatch_jobs(&mut self) {
         let Some(workers) = &mut self.workers else {
             return;
         };
-        for (queue, batch) in workers.queues.iter().zip(&mut workers.batches) {
-            if batch.is_empty() {
-                continue;
+        for job in self.jobs.drain(..) {
+            if workers.dispatch(job) {
+                workers.flush(&mut self.core);
             }
-            // Never full: a queue holds a batch of each job in flight.
-            if let Err(TrySendError::Full(jobs) | TrySendError::Closed(jobs)) =
-                queue.try_send(std::mem::take(batch))
-            {
-                workers.in_flight -= jobs.len();
-                for job in jobs {
-                    self.core.complete_job(job);
-                }
-            }
+        }
+    }
+
+    /// Hands every batch of jobs to its worker.
+    fn flush_jobs(&mut self) {
+        if let Some(workers) = &mut self.workers {
+            workers.flush(&mut self.core);
         }
     }
 
@@ -788,6 +892,9 @@ impl Owner {
         let Some(workers) = &mut self.workers else {
             return;
         };
+        self.high_water
+            .crypto_done
+            .record_received(workers.done.len());
         workers.in_flight -= jobs.len();
         for job in jobs {
             self.core.complete_job(job);
@@ -908,6 +1015,7 @@ impl Owner {
             Command::QueueStats(take, reply) => {
                 let _ = reply.send(self.queue_stats(take));
             }
+            Command::FragmentStats(reply) => self.fragment_stats(reply),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
         }
         ControlFlow::Continue(())
@@ -934,6 +1042,12 @@ impl Owner {
         marks
             .events
             .record(self.events.len().min(marks.events.capacity));
+        if let Some(workers) = &mut self.workers {
+            marks
+                .crypto
+                .record(std::mem::take(&mut workers.peak).max(workers.in_flight));
+            marks.crypto_done.record(workers.done.len());
+        }
         let stats = *marks;
         if take {
             for depth in [
@@ -945,11 +1059,19 @@ impl Owner {
                 &mut marks.transmit,
                 &mut marks.backlog,
                 &mut marks.events,
+                &mut marks.crypto,
+                &mut marks.crypto_done,
             ] {
                 depth.high_water = 0;
             }
         }
         stats
+    }
+
+    /// Replies with the counters of the fragmentation stage; all zeros without one.
+    fn fragment_stats(&self, reply: oneshot::Sender<FragmentStats>) {
+        let stats = self.fragmenter.as_ref().map(Fragmenter::stats);
+        let _ = reply.send(stats.unwrap_or_default());
     }
 
     /// Stops and removes transport `id`; the datagrams still queued for it are dropped.
