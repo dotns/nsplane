@@ -322,7 +322,7 @@ receiver drops it. `SideSender::stats` counts both (`SideStats { received, dropp
 they live on the sender, not in `TransportStats`, because side datagrams never reach the
 engine's transport tasks. `SideSender::send_to` writes straight to the non-blocking socket
 without an ECN mark: it never waits behind the engine's traffic and fails with
-`WouldBlock` when the send buffer is full. A capacity of 0 panics; a second call replaces
+`WouldBlock` when the send buffer is full. A capacity of 0 is raised to 1; a second call replaces
 the channel (the old receiver closes once drained). Without a side channel nothing is
 classified; the receive path checks one `Option` per datagram.
 

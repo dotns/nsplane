@@ -220,17 +220,14 @@ impl UdpTransport {
     /// took and what it could not ([`SideStats`]).
     ///
     /// Attaching another side channel replaces this one: its receiver then closes once
-    /// drained, and its senders keep sending but count nothing more.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `capacity` is 0.
+    /// drained, and its senders keep sending but count nothing more. A `capacity` of 0 is
+    /// raised to 1.
     pub fn with_side_channel(
         mut self,
         classify: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
         capacity: usize,
     ) -> (Self, SideSender, mpsc::Receiver<SideDatagram>) {
-        let (tx, rx) = mpsc::channel(capacity);
+        let (tx, rx) = mpsc::channel(capacity.max(1));
         let counters = Arc::new(SideCounters::default());
         let sender = SideSender {
             socket: Arc::clone(&self.socket),

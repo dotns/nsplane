@@ -305,7 +305,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SideSender::send_to` sends on the transport's socket, synchronously and best effort
   (`WouldBlock` when the socket buffer is full, no ECN mark), and `SideSender::stats`
   returns `SideStats { received, dropped }` (on the sender, not in `TransportStats`).
-  Without a side channel nothing is classified and nothing changes; a capacity of 0 panics
+  Without a side channel nothing is classified and nothing changes; a capacity of 0 is raised to 1
   and a second call replaces the channel.
 - `nsplane`: `LinkTransport`, an opt-in `Transport` to one peer over a message link the
   embedder dials (one datagram per message), with the `LinkDialer`, `LinkSender` and
