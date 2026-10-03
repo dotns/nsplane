@@ -181,6 +181,16 @@ pub struct EngineStatus {
 }
 
 /// A request to the owner task; each carries the channel for its reply.
+/// A packet or handshake the engine is told to send or deliver, see [`Command::Inject`].
+#[derive(Debug)]
+pub(crate) enum Injection {
+    Inbound(PeerId, PacketBuf),
+    Outbound(PacketBuf),
+    OutboundOn(PeerId, Path, PacketBuf),
+    Handshake(PeerId, Option<Path>),
+    HandshakeOn(PeerId, Path),
+}
+
 pub(crate) enum Command {
     Config(ConfigChange, oneshot::Sender<()>),
     PeerId(PublicKey, oneshot::Sender<Option<PeerId>>),
@@ -188,10 +198,7 @@ pub(crate) enum Command {
     Peers(oneshot::Sender<Vec<PeerStats>>),
     PublicKey(oneshot::Sender<Option<PublicKey>>),
     PrivateKey(oneshot::Sender<Option<StaticSecret>>),
-    InjectInbound(PeerId, PacketBuf, oneshot::Sender<()>),
-    InjectOutbound(PacketBuf, oneshot::Sender<()>),
-    InjectOutboundOn(PeerId, Path, PacketBuf, oneshot::Sender<()>),
-    ForceHandshake(PeerId, Option<Path>, oneshot::Sender<()>),
+    Inject(Injection, oneshot::Sender<()>),
     AddTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
     RemoveTransport(TransportId, oneshot::Sender<Result<(), TransportError>>),
     ReplaceTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
@@ -335,14 +342,15 @@ impl EngineHandle {
     /// Delivers `packet` to the local sink as if it came from `peer`, bypassing the inbound
     /// filters and the allowed-IP source check.
     pub async fn inject_inbound(&self, peer: PeerId, packet: PacketBuf) -> Result<(), EngineError> {
-        self.call(|tx| Command::InjectInbound(peer, packet, tx))
+        self.call(|tx| Command::Inject(Injection::Inbound(peer, packet), tx))
             .await
     }
 
     /// Encrypts `packet` and sends it to the peer it is routed to, bypassing the outbound
     /// filters.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
-        self.call(|tx| Command::InjectOutbound(packet, tx)).await
+        self.call(|tx| Command::Inject(Injection::Outbound(packet), tx))
+            .await
     }
 
     /// Encrypts `packet` for `peer` in its current session and sends it on `path`, bypassing
@@ -356,7 +364,7 @@ impl EngineHandle {
         path: Path,
         packet: PacketBuf,
     ) -> Result<(), EngineError> {
-        self.call(|tx| Command::InjectOutboundOn(peer, path, packet, tx))
+        self.call(|tx| Command::Inject(Injection::OutboundOn(peer, path, packet), tx))
             .await
     }
 
@@ -366,7 +374,14 @@ impl EngineHandle {
         peer: PeerId,
         path: Option<Path>,
     ) -> Result<(), EngineError> {
-        self.call(|tx| Command::ForceHandshake(peer, path, tx))
+        self.call(|tx| Command::Inject(Injection::Handshake(peer, path), tx))
+            .await
+    }
+
+    /// Sends a handshake initiation to `peer` on `path` now, without changing the peer's
+    /// path (see `Core::force_handshake_on`); unknown peers are ignored.
+    pub async fn force_handshake_on(&self, peer: PeerId, path: Path) -> Result<(), EngineError> {
+        self.call(|tx| Command::Inject(Injection::HandshakeOn(peer, path), tx))
             .await
     }
 

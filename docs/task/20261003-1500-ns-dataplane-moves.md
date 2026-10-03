@@ -1,8 +1,8 @@
 # 20261003-1500-ns-dataplane-moves Data-plane pieces ns still owns, to move into nsplane
 
-- **status**: pending
+- **status**: in_progress
 - **priority**: P1
-- **owner**: (unassigned)
+- **owner**: L1 (7f5cstru), plan 20261003-1600-ns-dataplane-moves
 - **createdAt**: 2026-10-03 15:00
 
 ## Description
@@ -141,3 +141,9 @@ Moving the remaining ns data-plane pieces into nsplane
 - **related**: 20261003-1300-ns-m4-requests
 
 ## Notes
+2026-10-03: MA-1..3 and MB-4..6 landed in 36cbe21 (task 20261003-1300-ns-m4-requests).
+MA-x1 done by L1 (D9: yes): `Core::force_handshake_on` / `EngineHandle::force_handshake_on`,
+covered by `nsplane-e2e`'s `path_hooks::a_handshake_can_start_on_a_candidate_without_moving_the_peer`.
+User decisions: D10 a generic message-link transport (no WebSocket dependency in nsplane);
+ME-1 and ME-2 (SNAT and DNAT) both in nsplane-nat; MD is evaluated, not implemented, this
+round. MB-x, MC and ME run as a BKD campaign (plan 20261003-1600-ns-dataplane-moves).

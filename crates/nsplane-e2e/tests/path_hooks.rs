@@ -78,6 +78,8 @@ impl PacketFilter for Arrivals {
 #[derive(Debug, Default)]
 struct Observer {
     every_message: bool,
+    /// Keep the current path instead of adopting.
+    keep: bool,
     calls: Mutex<Vec<(PeerId, Path, MessageKind)>>,
 }
 
@@ -92,7 +94,7 @@ impl PathPolicy for SharedObserver {
 
     fn on_authenticated(&self, peer: PeerId, from: &Path, kind: MessageKind) -> Roam {
         lock(&self.0.calls).push((peer, *from, kind));
-        Roam::Adopt
+        if self.0.keep { Roam::Keep } else { Roam::Adopt }
     }
 
     fn observe_every_message(&self) -> bool {
@@ -245,5 +247,47 @@ async fn a_default_policy_is_asked_only_about_other_paths() -> TestResult {
         "{:?}",
         lock(&observer.calls)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_handshake_can_start_on_a_candidate_without_moving_the_peer() -> TestResult {
+    let observer = Arc::new(Observer {
+        keep: true,
+        ..Observer::default()
+    });
+    let (a, b, _) = linked(Some(observer), 0)?;
+    introduce(&a, &b, None).await?;
+    let to_b = a.peer_of(&b).await?;
+    a.handle.force_handshake_on(to_b, path(A2, b2())).await?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let stats = a.handle.peer_stats(to_b).await?.ok_or("peer")?;
+        if stats.last_handshake.is_some() {
+            assert_eq!(stats.path, Some(path(A1, b1())));
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!("no handshake: {stats:?}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // The initiation (148 bytes) went out on link 2; link 1 carries only what follows the
+    // handshake on the peer's own path (the initiator's keepalive).
+    let transports = b.handle.transport_stats().await?;
+    let rx_bytes = |id| {
+        transports
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(0, |s| s.rx_bytes)
+    };
+    assert_eq!(rx_bytes(B2), 148, "{transports:?}");
+    assert!(rx_bytes(B1) < 148, "{transports:?}");
+
+    // Unknown peers are ignored.
+    a.handle
+        .force_handshake_on(PeerId::new(999), path(A2, b2()))
+        .await?;
     Ok(())
 }

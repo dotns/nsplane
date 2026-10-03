@@ -508,12 +508,27 @@ impl Core {
     /// peer's path first, without an `Event::PathAdopted`. Unknown peers are ignored.
     pub fn force_handshake(&mut self, peer: PeerId, path: Option<Path>, now: Instant) {
         self.start_schedule(now);
+        if let (Some(p), Some(path)) = (self.peers.peer_mut(peer), path) {
+            p.set_path(path);
+        }
+        self.initiate(peer, None);
+    }
+
+    /// Sends a handshake initiation to `peer` on `path` now, even if a handshake is in
+    /// progress, without changing the peer's path: e.g. to open a session through a
+    /// candidate path. The rest of the handshake (retries included) follows the policy and
+    /// the peer's path. Unknown peers are ignored.
+    pub fn force_handshake_on(&mut self, peer: PeerId, path: Path, now: Instant) {
+        self.start_schedule(now);
+        self.initiate(peer, Some(path));
+    }
+
+    /// Formats a handshake initiation for `peer` and transmits it on `on`, or as the policy
+    /// selects.
+    fn initiate(&mut self, peer: PeerId, on: Option<Path>) {
         let Some(p) = self.peers.peer_mut(peer) else {
             return;
         };
-        if let Some(path) = path {
-            p.set_path(path);
-        }
 
         let mut buf = self.pool.get_len(BUF_SIZE);
         let initiation = p
@@ -523,10 +538,21 @@ impl Core {
             TunnResult::WriteToNetwork(packet) => {
                 let len = packet.len();
                 buf.set_len(len);
+                let fixed;
+                let policy: &dyn PathPolicy = match on {
+                    Some(path) => {
+                        fixed = Fixed(Path {
+                            ecn: Ecn::NotEct,
+                            ..path
+                        });
+                        &fixed
+                    }
+                    None => self.policy.as_ref(),
+                };
                 transmit(
                     &mut self.outputs,
                     &mut self.pool,
-                    self.policy.as_ref(),
+                    policy,
                     peer,
                     p,
                     MessageKind::HandshakeInit,

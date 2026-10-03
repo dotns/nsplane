@@ -26,7 +26,8 @@ use crate::events::{
 };
 use crate::fragment::{Action, FragmentStats, Fragmenter};
 use crate::handle::{
-    Command, EngineHandle, EngineStatus, QueueDepth, QueueStats, TransportError, TransportStats,
+    Command, EngineHandle, EngineStatus, Injection, QueueDepth, QueueStats, TransportError,
+    TransportStats,
 };
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -994,24 +995,8 @@ impl Owner {
             Command::PrivateKey(reply) => {
                 let _ = reply.send(self.private_key.clone());
             }
-            Command::InjectInbound(peer, packet, reply) => {
-                self.core.inject_inbound(peer, packet);
-                self.drain(false);
-                let _ = reply.send(());
-            }
-            Command::InjectOutbound(packet, reply) => {
-                self.core.inject_outbound(packet, now());
-                self.drain(false);
-                let _ = reply.send(());
-            }
-            Command::InjectOutboundOn(peer, path, packet, reply) => {
-                self.core.inject_outbound_on(peer, path, packet, now());
-                self.drain(false);
-                let _ = reply.send(());
-            }
-            Command::ForceHandshake(peer, path, reply) => {
-                self.core.force_handshake(peer, path, now());
-                self.drain(false);
+            Command::Inject(injection, reply) => {
+                self.inject(injection);
                 let _ = reply.send(());
             }
             Command::AddTransport(transport, reply) => {
@@ -1167,6 +1152,21 @@ impl Owner {
         let slot = self.start_transport(transport.start, VecDeque::new(), None);
         self.transports.insert(transport.id, slot);
         Ok(())
+    }
+
+    /// Hands an injected packet or handshake to the core and sends what it produced.
+    fn inject(&mut self, injection: Injection) {
+        let now = now();
+        match injection {
+            Injection::Inbound(peer, packet) => self.core.inject_inbound(peer, packet),
+            Injection::Outbound(packet) => self.core.inject_outbound(packet, now),
+            Injection::OutboundOn(peer, path, packet) => {
+                self.core.inject_outbound_on(peer, path, packet, now);
+            }
+            Injection::Handshake(peer, path) => self.core.force_handshake(peer, path, now),
+            Injection::HandshakeOn(peer, path) => self.core.force_handshake_on(peer, path, now),
+        }
+        self.drain(false);
     }
 
     /// Stops and removes transport `id`; the datagrams still queued for it are dropped.
@@ -1350,10 +1350,7 @@ const fn settles(command: &Command) -> bool {
         Command::Config(..)
             | Command::PeerStats(..)
             | Command::Peers(..)
-            | Command::InjectInbound(..)
-            | Command::InjectOutbound(..)
-            | Command::InjectOutboundOn(..)
-            | Command::ForceHandshake(..)
+            | Command::Inject(..)
             | Command::DropCounters(..)
             | Command::Status(..)
     )
