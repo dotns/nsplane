@@ -66,3 +66,10 @@ Parallel; merge order by completion; L1 resolves `engine.rs` conflicts.
 nsplane repository only; no new dependencies; no lint changes.
 
 ## Annotations
+- 2026-10-03: user decision: nsplane depends on its own smoltcp fork `dotns/smoltcp` (forked from
+  smoltcp-rs/smoltcp, branch `nsplane/v0.14-fixes` from v0.14.0) carrying fixes for the two
+  0.14 defects (pure-ACK SEQ after a retransmission-timeout rewind; zero-window probe replacing the retransmit
+  timer). After the fork is fixed and pushed, nsplane-netstack switches to a git dependency
+  pinned to a tag on the fork, `deny.toml` allows that git source only, and the netstack
+  workarounds (pure-ACK SEQ rewrite, `nudge_stalled`) are removed when the lossy e2e passes
+  without them. Follow-up #19 becomes "send the fixes upstream" (still the user's call).
