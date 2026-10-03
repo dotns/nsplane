@@ -75,10 +75,12 @@ const MAX_DATAGRAM: usize = 65535;
 /// in order, to the new transport instead.
 ///
 /// Buffers: datagrams are received into one reusable 64 KiB buffer and copied into an
-/// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. Datagram buffers
-/// the core is done with, buffers rejected by a full sink and transmitted buffers (returned
-/// by the transmit task over a bounded queue, dropped when it is full) go back to the core's
-/// pool with [`Core::recycle`]. Delivered packets are owned by the sink.
+/// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. The core takes
+/// each datagram by value: it delivers a decrypted packet in the datagram's own buffer and
+/// puts the buffers of all other datagrams into its pool itself. Buffers rejected by a full
+/// sink and transmitted buffers (returned by the transmit task over a bounded queue, dropped
+/// when it is full) go back to the core's pool with [`Core::recycle`]. Delivered packets are
+/// owned by the sink.
 ///
 /// Suspension: [`EngineHandle::suspend`] pauses the engine without tearing it down. While
 /// suspended, every I/O task waits before its next read or write (one already in progress
@@ -442,15 +444,9 @@ impl Owner {
                         return;
                     }
                 }
-                Wake::Datagram(Some((path, mut data))) => {
-                    self.core.handle_input(
-                        Input::Datagram {
-                            path,
-                            data: &mut data,
-                        },
-                        now(),
-                    );
-                    self.core.recycle(data);
+                Wake::Datagram(Some((path, data))) => {
+                    self.core
+                        .handle_input(Input::Datagram { path, data }, now());
                 }
                 // The owner keeps a sender, so the queue never closes.
                 Wake::Datagram(None) => {}
