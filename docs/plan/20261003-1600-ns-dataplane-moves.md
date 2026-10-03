@@ -130,7 +130,7 @@ regression (64 B 532 ns, 1420 B 1.331 us; batched 415 ns / 1.226 us per packet).
   PacketBuf, caller `decide` closure, Conntrack-backed, never calling `decide` under a lock);
   ME-1 `LanRoute` uses `(addr, prefix)` pairs instead of `Ipv6Net`/`Ipv4Net` (no ipnet
   crate), and nsplane-nat gains a dependency on `nsplane` for the sink/source wrappers.
-- 2026-10-03: completed (campaign `nsplane-mv-202610031600`). Merges into main: MC c9008ba
+- 2026-10-03: completed (campaign `nsplane-mv-202610031600`). Merges into main: MC (merge commit of bkd/e6zu2uhj)
   (+ 197c00c side-channel capacity 0 raised to 1), ME 55abac8, MB-x 9c9efcd. Final acceptance
   on main: just check 1048 tests, cross, test-windows, cargo doc, root nsplane-tun/nsplane
   ignored tests, linux.sh, lib.sh (7), examples.sh (all cells and scenarios incl.
