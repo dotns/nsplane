@@ -217,10 +217,19 @@ async fn measure(workers: usize) -> TestResult {
     let stop = Arc::new(AtomicBool::new(false));
     let flow = bulk(local, from, pinger.peer, Arc::clone(&stop));
     pinger.round_trips(100, LOST).await?;
+    pinger.node.handle.take_queue_stats().await?;
+    b.handle.take_queue_stats().await?;
     let loaded = pinger.round_trips(ROUND_TRIPS, LOST).await;
     stop.store(true, Ordering::Relaxed);
     flow.await?;
     report(&format!("workers={workers} loaded"), loaded?)?;
+    // Where the pings queued behind the bulk flow.
+    writeln!(
+        io::stderr(),
+        "workers={workers} loaded queues: a {:?}\nworkers={workers} loaded queues: b {:?}",
+        pinger.node.handle.queue_stats().await?,
+        b.handle.queue_stats().await?
+    )?;
     pong.abort();
     Ok(())
 }
