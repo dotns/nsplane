@@ -44,7 +44,7 @@ impl Error for BuildError {}
 /// Builds an [`Engine`] on a packet source, a packet sink and one or more transports.
 ///
 /// Defaults: no private key, [`StandardRoaming`], no filters, no periodic stats, queues of
-/// 1024 packets and an event channel of 1024 events. At least one transport must be added
+/// 1024 packets, an event channel of 1024 events and no crypto workers. At least one transport must be added
 /// with [`EngineBuilder::transport`].
 pub struct EngineBuilder<Src, Snk> {
     source: Src,
@@ -56,6 +56,7 @@ pub struct EngineBuilder<Src, Snk> {
     stats_interval: Option<Duration>,
     queue_capacity: usize,
     event_capacity: usize,
+    crypto_workers: usize,
 }
 
 impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
@@ -68,6 +69,7 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("stats_interval", &self.stats_interval)
             .field("queue_capacity", &self.queue_capacity)
             .field("event_capacity", &self.event_capacity)
+            .field("crypto_workers", &self.crypto_workers)
             .finish_non_exhaustive()
     }
 }
@@ -86,6 +88,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             stats_interval: None,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            crypto_workers: 0,
         }
     }
 
@@ -151,6 +154,19 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         self
     }
 
+    /// Runs the encryption and decryption of data packets on `n` crypto worker tasks; 0 (the
+    /// default) or 1 runs them on the engine's owner task.
+    ///
+    /// The workers are sharded by peer, so each peer's packets keep their order in both
+    /// directions while different peers are encrypted in parallel. They run in parallel only
+    /// on a multi-threaded tokio runtime, and only traffic of several peers spreads over
+    /// them: a single peer is encrypted on one worker. See [`Engine`] for the whole rule.
+    #[must_use]
+    pub const fn crypto_workers(mut self, n: usize) -> Self {
+        self.crypto_workers = n;
+        self
+    }
+
     /// Spawns the engine's tasks and returns the running engine.
     ///
     /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
@@ -187,6 +203,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             transports: self.transports,
             queue_capacity: self.queue_capacity,
             event_capacity: self.event_capacity,
+            crypto_workers: self.crypto_workers,
         }))
     }
 }

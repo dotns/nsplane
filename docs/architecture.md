@@ -49,6 +49,14 @@ session index and allowed IP (cryptokey routing). Path selection and roaming are
 to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
 `PacketFilter`s.
 
+`handle_input_deferred` is the same entry point for a driver that encrypts on several
+threads: the cryptography of a local packet or a received transport data message comes back
+as a `CryptoJob` (everything before it, such as routing and the outbound filters, has
+already run), `CryptoJob::run` seals or opens the packet under the lock of that peer's
+tunnel only, and `complete_job` does the rest in the core (counters, completed handshakes,
+roaming, the source check, the inbound filters, the output). Each peer's tunnel sits behind
+its own mutex for this; without jobs every lock is uncontended.
+
 ## nsplane (driver)
 
 One owner task owns the `Core` and loops: it waits for a handle command, a local packet, a
@@ -63,7 +71,8 @@ Transport::recv ─► recv task ┘          ▲            └─► sink task
                           EngineHandle commands (64)
 ```
 
-The core is never shared, so there are no locks on the data path.
+The core is never shared; the only lock on the data path is each peer's tunnel mutex, which
+is uncontended unless the crypto worker pool is on.
 
 - `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
   stats, injection, shutdown) and returns their replies.
@@ -142,6 +151,75 @@ Defaults, from these numbers:
 Embedders that run many parallel bulk flows through a userspace netstack should raise
 `queue_capacity` (2048 held 16 flows without a drop here) and watch the marks and
 `DROP_SINK_FULL` with `queue_stats` and `drop_counters`.
+
+### Crypto worker pool
+
+The single owner task is the limit of one engine's throughput: it seals and opens every
+packet. `EngineBuilder::crypto_workers(n)` with `n` of 2 or more moves that cryptography to
+`n` worker tasks; 0 or 1 (the default) keeps today's single task, which then never calls the
+deferred API.
+
+```text
+local packets ─┐           ┌─► worker 0     ─┐
+               ├─► owner ──┼─► worker 1     ─┼─► done queue ─► owner ─► sink, transmit tasks
+datagrams     ─┘           └─► worker n - 1 ─┘
+```
+
+- Sharding by peer. The owner feeds each local packet and received datagram to
+  `Core::handle_input_deferred`, which routes it (receiver index or destination), runs the
+  outbound filters and returns a `CryptoJob` for the peer's tunnel. The job goes to worker
+  `peer id % n`; each worker runs its jobs in arrival order and hands them back on one done
+  queue, and the owner completes them (`Core::complete_job`) in the order they come back. So
+  all packets of one peer, in both directions, are sealed, opened and emitted in arrival
+  order, while different peers are processed in parallel. Peer ids are handed out in order,
+  so peers spread evenly over the workers; a single peer never uses more than one.
+- Batches. Jobs go to a worker in batches of up to 64 (`MAX_BATCH`): a worker's batch is
+  handed over when it is full, together with every other batch, or when the owner has
+  nothing else ready, and a worker hands each batch back whole. A busy owner thus wakes each
+  worker once per batch instead of once per packet; handing over every packet on its own
+  cost as much as the cryptography it moved and gained nothing.
+- Everything else stays on the owner: handshakes (the gate, the responses, flushing the
+  packets queued behind a handshake), timers, configuration, events, drop counters, roaming
+  and the per-peer counters. A handshake or a timer that touches a peer's tunnel while a
+  worker holds it waits for that one packet. The order on the wire stays the arrival order
+  even when the owner seals a keepalive or flushes queued packets while newer packets of the
+  peer are with a worker: those are emitted only once they come back.
+- Bounds: at most `queue_capacity` jobs are with the workers. While that many are, the owner
+  stops reading local packets and received datagrams (handle calls, timers and finished jobs
+  are still served), which holds back the sources as a full transmit queue does. Every
+  worker queue and the done queue hold that many jobs, so neither side ever waits on them.
+- Handle calls that read or change peers, sessions or counters (configuration, peer stats,
+  injection, forced handshakes, drop counters) first wait for every job in flight, so they
+  act after every packet read before them, exactly as without workers: per-peer stats and
+  drop counters stay exact, and a removed peer's packets read before the removal still go
+  out while later ones are dropped as `no route` / `unknown session`.
+- Parallelism needs a multi-threaded tokio runtime; on a current-thread runtime the workers
+  interleave with the owner and only add overhead.
+
+Throughput note, from `cargo bench -p nsplane --bench worker_pool` (bench profile with
+LTO, multi-threaded runtime, 32-core host shared with other jobs; the range of two runs): a
+hub engine with 8 peers, each its own engine without workers on an in-memory link, sends
+120 packets to every peer while every peer sends 120 to the hub, so the hub seals and opens
+all 1920 packets of an iteration. The pool off is the default of 0 workers; 1 worker is the
+same code path.
+
+| Packet | Pool off (0 or 1) | 2 workers | 4 workers |
+| --- | --- | --- | --- |
+| 64 B | 0.96-1.10 Mpps | 1.02-1.36 Mpps | 0.97-1.26 Mpps |
+| 1420 B | 566-696 kpps (6.4-7.9 Gbit/s) | 0.88-1.08 Mpps (10.0-12.3 Gbit/s) | 0.88-1.03 Mpps (10.0-11.6 Gbit/s) |
+
+With full-size packets the pool moves the hub about 1.5x further; small packets gain little,
+since there the cryptography is a small part of the owner's work per packet (queues,
+routing, counters). Beyond 2 workers the owner task itself, which still touches every
+packet twice, is the limit, so 4 workers do not add to 2. Sharding `Core` itself by peer
+(one owner per shard) would lift that limit, at the cost of splitting the handshake gate,
+the peer table and the allowed IPs across shards.
+
+The pool off costs one uncontended lock of the peer's tunnel per packet. The core's
+`data_path` bench, base and branch alternating three times, showed no change beyond the
+run-to-run spread (medians: `core_round_trip` 616 -> 569 ns at 64 B and 1347 -> 1362 ns at
+1420 B, `core_encapsulate` 297 -> 281 ns and 693 -> 674 ns, `core_decapsulate` 266 -> 286 ns
+and 705 -> 695 ns; single runs varied by up to 15%).
 
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
