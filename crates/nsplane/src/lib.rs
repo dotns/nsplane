@@ -11,6 +11,8 @@
 //! [`DynTransport`] is the object-safe form of [`Transport`] for code that has to hold
 //! transports of different types in one place. A [`UdpTransport`] can share its socket
 //! with another protocol through a side channel ([`UdpTransport::with_side_channel`]).
+//! [`LinkTransport`] carries datagrams as messages over a link the embedder dials (a
+//! WebSocket to a relay, say) and redials it when it is lost.
 //!
 //! For a hybrid local side (a TUN device next to a userspace netstack), [`Splitter`]
 //! routes delivered packets to one of several sinks and [`MergeSource`] merges several
@@ -25,6 +27,7 @@ pub mod events;
 mod fragment;
 mod handle;
 mod io;
+mod link;
 mod merge;
 mod splitter;
 mod transport;
@@ -44,6 +47,7 @@ pub use handle::{
     TransportStats,
 };
 pub use io::{PacketSink, PacketSource};
+pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
