@@ -1,7 +1,7 @@
 //! The engine's fragmentation stage between two engines over a channel transport: Packet Too
 //! Big and Fragmentation Needed delivered to the sender, native IPv4 keeping the full MTU,
-//! IPv4 fragments translated to IPv6 fragments by a `Translator`, MTU changes, and no stage
-//! without `EngineBuilder::fragmenter`.
+//! IPv4 fragments translated to IPv6 fragments by a `Translator` (these cases also with the
+//! crypto worker pool on), MTU changes, and no stage without `EngineBuilder::fragmenter`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -70,9 +70,11 @@ fn allowed(addr: impl Into<IpAddr>, cidr: u8) -> AllowedIp {
 }
 
 /// Two peers with a fragmenter on node 1 (the IPv4 side) and none on node 2 (the IPv6
-/// side); with `translate`, node 1 also translates node 2's IPv4 alias.
+/// side), both with `workers` crypto workers; with `translate`, node 1 also translates node
+/// 2's IPv4 alias.
 async fn pair(
     translate: bool,
+    workers: usize,
 ) -> TestResult<(
     Node<ChannelTransport>,
     Node<ChannelTransport>,
@@ -81,14 +83,17 @@ async fn pair(
     let translator = translate.then(|| table(None).map(|t| Arc::new(Translator::new(t))));
     let translator = translator.transpose()?;
     let shared = translator.clone();
-    let (a, b) = channel_pair_with(Options::default(), |seed, builder| match (seed, &shared) {
-        (1, Some(translator)) => builder
-            .filter(Box::new(Shared(Arc::clone(translator))))
-            .fragmenter(FragmentConfig {
-                translated: Some(translator.ipv4_translated_predicate()),
-            }),
-        (1, None) => builder.fragmenter(FragmentConfig::default()),
-        _ => builder,
+    let (a, b) = channel_pair_with(Options::default(), |seed, builder| {
+        let builder = builder.crypto_workers(workers);
+        match (seed, &shared) {
+            (1, Some(translator)) => builder
+                .filter(Box::new(Shared(Arc::clone(translator))))
+                .fragmenter(FragmentConfig {
+                    translated: Some(translator.ipv4_translated_predicate()),
+                }),
+            (1, None) => builder.fragmenter(FragmentConfig::default()),
+            _ => builder,
+        }
     })?;
     introduce(&a, &b, None).await?;
     if let Some(translator) = &translator {
@@ -169,7 +174,17 @@ async fn expect_fragmentation_needed(
 
 #[tokio::test]
 async fn oversized_ipv6_is_answered_with_packet_too_big() -> TestResult {
-    let (mut a, mut b, _) = pair(false).await?;
+    oversized_ipv6_is_answered_with_packet_too_big_with(0).await
+}
+
+/// The same with the crypto worker pool on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_ipv6_is_answered_with_packet_too_big_on_workers() -> TestResult {
+    oversized_ipv6_is_answered_with_packet_too_big_with(2).await
+}
+
+async fn oversized_ipv6_is_answered_with_packet_too_big_with(workers: usize) -> TestResult {
+    let (mut a, mut b, _) = pair(false, workers).await?;
     let from_b = a.peer_of(&b).await?;
 
     let packet = udp6(a.ip6, b.ip6, &payload(1500));
@@ -187,7 +202,19 @@ async fn oversized_ipv6_is_answered_with_packet_too_big() -> TestResult {
 
 #[tokio::test]
 async fn oversized_ipv4_with_df_is_answered_with_fragmentation_needed() -> TestResult {
-    let (mut a, mut b, _) = pair(false).await?;
+    oversized_ipv4_with_df_is_answered_with_fragmentation_needed_with(0).await
+}
+
+/// The same with the crypto worker pool on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_ipv4_with_df_is_answered_with_fragmentation_needed_on_workers() -> TestResult {
+    oversized_ipv4_with_df_is_answered_with_fragmentation_needed_with(2).await
+}
+
+async fn oversized_ipv4_with_df_is_answered_with_fragmentation_needed_with(
+    workers: usize,
+) -> TestResult {
+    let (mut a, mut b, _) = pair(false, workers).await?;
     let from_b = a.peer_of(&b).await?;
 
     let packet = udp4(a.ip4, b.ip4, &payload(1500));
@@ -199,7 +226,17 @@ async fn oversized_ipv4_with_df_is_answered_with_fragmentation_needed() -> TestR
 
 #[tokio::test]
 async fn native_ipv4_keeps_the_full_mtu() -> TestResult {
-    let (mut a, mut b, _translator) = pair(true).await?;
+    native_ipv4_keeps_the_full_mtu_with(0).await
+}
+
+/// The same with the crypto worker pool on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_ipv4_keeps_the_full_mtu_on_workers() -> TestResult {
+    native_ipv4_keeps_the_full_mtu_with(2).await
+}
+
+async fn native_ipv4_keeps_the_full_mtu_with(workers: usize) -> TestResult {
+    let (mut a, mut b, _translator) = pair(true, workers).await?;
     let from_b = a.peer_of(&b).await?;
 
     // A native destination: the predicate is false, so the whole MTU is usable.
@@ -256,7 +293,17 @@ async fn reassemble(node: &mut Node<ChannelTransport>) -> TestResult<Vec<u8>> {
 
 #[tokio::test]
 async fn translated_ipv4_arrives_as_ipv6_fragments() -> TestResult {
-    let (a, mut b, translator) = pair(true).await?;
+    translated_ipv4_arrives_as_ipv6_fragments_with(0).await
+}
+
+/// The same with the crypto worker pool on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn translated_ipv4_arrives_as_ipv6_fragments_on_workers() -> TestResult {
+    translated_ipv4_arrives_as_ipv6_fragments_with(2).await
+}
+
+async fn translated_ipv4_arrives_as_ipv6_fragments_with(workers: usize) -> TestResult {
+    let (a, mut b, translator) = pair(true, workers).await?;
     let translator = translator.ok_or("no translator")?;
     let data = payload(4000);
     let original = udp4(SELF4, PEER_ALIAS4, &data);
@@ -289,7 +336,7 @@ async fn translated_ipv4_arrives_as_ipv6_fragments() -> TestResult {
 
 #[tokio::test]
 async fn an_mtu_change_moves_the_threshold() -> TestResult {
-    let (mut a, mut b, _) = pair(false).await?;
+    let (mut a, mut b, _) = pair(false, 0).await?;
     let from_b = a.peer_of(&b).await?;
     let mut events = a.subscribe().await?;
     let packet = udp6(a.ip6, b.ip6, &payload(1300));
@@ -333,7 +380,7 @@ async fn without_a_fragmenter_oversized_packets_go_through() -> TestResult {
 
 #[tokio::test]
 async fn errors_need_a_route() -> TestResult {
-    let (mut a, mut b, _) = pair(false).await?;
+    let (mut a, mut b, _) = pair(false, 0).await?;
     // No peer has 10.9.9.9 in its allowed IPs: no route, no error, nothing sent.
     let packet = udp4(a.ip4, Ipv4Addr::new(10, 9, 9, 9), &payload(1500));
     a.send(&packet).await?;

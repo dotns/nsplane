@@ -135,6 +135,16 @@ Wall clock on a host at load ~85 (absolute numbers about twice the quiet ones): 
 1219 / 1113 ns vs device-equivalent 1083 / 1010 ns (+12.6 % / +10.2 %); 1420 B 3.15 / 3.02 us
 vs 3.15 / 2.90 us (+0.0 % / +4.3 %). The 64 B target is still not met.
 
+Final status of item 1 (5C-T7): **partially fixed, remainder deferred to a batched data-path
+entry point after 5B batching** (L1 decision: the 64 B target is accepted as not met). Final
+5C-T2 numbers: callgrind core vs device-equivalent 64 B +15.7 %, 1420 B +3.4 % (core 64 B
+5404 -> 5126 Ir, 1420 B 20795 -> 20146 Ir); wall clock 64 B +10-14 %, 1420 B 1.33 us (Phase
+3+4: 1.37 us). The ~695 Ir of dispatch left at 64 B: `handle_input` self ~170 (input match
+~40, data-header parse ~29, session-index and peer lookups ~35, glue ~50, output `VecDeque`
+~16), `transmit` ~87, `set_len` 2 x 14, the allowed-IP wrapper ~45, the bench harness ~75,
+and the second peer lookup after the filter chain. The re-run on the merged 5C branch is in
+`docs/architecture.md` (*Performance*).
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 

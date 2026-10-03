@@ -11,7 +11,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nsplane_core::{Core, Input};
 use nsplane_packet::checksum::{
     internet_checksum, ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -156,20 +155,6 @@ impl Fragmenter {
     #[cfg(test)]
     pub(crate) const fn stats(&self) -> FragmentStats {
         self.stats
-    }
-
-    /// Runs `packet` through the stage and feeds the result to `core`.
-    pub(crate) fn handle(&mut self, core: &mut Core, packet: PacketBuf, mtu: u16, now: Instant) {
-        match self.process(packet, mtu, now, |dst| core.route(dst)) {
-            Action::Send(packet) => core.handle_input(Input::Local { packet }, now),
-            Action::Fragments(fragments) => {
-                for packet in fragments {
-                    core.handle_input(Input::Local { packet }, now);
-                }
-            }
-            Action::Reply(peer, packet) => core.inject_inbound(peer, packet),
-            Action::Drop => {}
-        }
     }
 
     /// Decides about `packet` under `mtu`; `route` names the peer a destination is routed to.

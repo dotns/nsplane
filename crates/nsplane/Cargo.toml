@@ -28,8 +28,12 @@ nix = { version = "0.31", default-features = false, features = ["net", "uio"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [[bench]]
 name = "udp_offload"
+harness = false
+
+[[bench]]
+name = "worker_pool"
 harness = false

@@ -35,3 +35,6 @@ pub const DROP_TRANSPORT_CLOSED: &str = nsplane_core::reasons::TRANSPORT_CLOSED;
 /// A datagram still queued for a transport (being sent, in its transmit queue or waiting
 /// for room in it) was dropped because the transport was removed.
 pub const DROP_TRANSPORT_REMOVED: &str = nsplane_core::reasons::TRANSPORT_REMOVED;
+/// A datagram was dropped because the transport failed to send it (any I/O error, such as
+/// a datagram too large for the path).
+pub const DROP_TRANSPORT_SEND_ERROR: &str = nsplane_core::reasons::TRANSPORT_SEND_ERROR;
