@@ -10,6 +10,7 @@ use nsplane_core::{CoreConfig, PacketFilter, PathPolicy, StandardRoaming};
 use nsplane_packet::TransportId;
 
 use crate::engine::{self, Engine, NewTransport};
+use crate::fragment::{FragmentConfig, Fragmenter};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
 
@@ -43,9 +44,9 @@ impl Error for BuildError {}
 
 /// Builds an [`Engine`] on a packet source, a packet sink and one or more transports.
 ///
-/// Defaults: no private key, [`StandardRoaming`], no filters, no periodic stats, queues of
-/// 1024 packets, an event channel of 1024 events and no crypto workers. At least one transport must be added
-/// with [`EngineBuilder::transport`].
+/// Defaults: no private key, [`StandardRoaming`], no filters, no fragmenter, no periodic
+/// stats, queues of 1024 packets, an event channel of 1024 events and no crypto workers. At
+/// least one transport must be added with [`EngineBuilder::transport`].
 pub struct EngineBuilder<Src, Snk> {
     source: Src,
     sink: Snk,
@@ -56,6 +57,7 @@ pub struct EngineBuilder<Src, Snk> {
     stats_interval: Option<Duration>,
     queue_capacity: usize,
     event_capacity: usize,
+    fragmenter: Option<FragmentConfig>,
     crypto_workers: usize,
 }
 
@@ -69,6 +71,7 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("stats_interval", &self.stats_interval)
             .field("queue_capacity", &self.queue_capacity)
             .field("event_capacity", &self.event_capacity)
+            .field("fragmenter", &self.fragmenter)
             .field("crypto_workers", &self.crypto_workers)
             .finish_non_exhaustive()
     }
@@ -88,6 +91,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             stats_interval: None,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            fragmenter: None,
             crypto_workers: 0,
         }
     }
@@ -117,7 +121,9 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         self
     }
 
-    /// Appends a packet filter; filters run in the order they were added.
+    /// Appends a packet filter. Install order goes from the wire side to the local side:
+    /// decrypted packets run through the filters in the order they were added, local packets
+    /// in reverse, so the first filter added is the one next to the tunnel both ways.
     #[must_use]
     pub fn filter(mut self, filter: Box<dyn PacketFilter>) -> Self {
         self.filters.push(filter);
@@ -151,6 +157,15 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
     #[must_use]
     pub fn event_capacity(mut self, capacity: usize) -> Self {
         self.event_capacity = capacity.max(1);
+        self
+    }
+
+    /// Installs the fragmentation stage on the local path: every local packet is kept within
+    /// the source's MTU before it enters the core, see [`FragmentConfig`]. Without it, local
+    /// packets enter the core whatever their size.
+    #[must_use]
+    pub fn fragmenter(mut self, config: FragmentConfig) -> Self {
+        self.fragmenter = Some(config);
         self
     }
 
@@ -203,6 +218,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             transports: self.transports,
             queue_capacity: self.queue_capacity,
             event_capacity: self.event_capacity,
+            fragmenter: self.fragmenter.map(Fragmenter::new),
             crypto_workers: self.crypto_workers,
         }))
     }

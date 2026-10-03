@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use nsplane_noise::noise::errors::WireGuardError;
@@ -291,6 +292,13 @@ impl Core {
             data_tx: p.data_tx(),
             last_handshake,
         })
+    }
+
+    /// The peer a packet to `dst` is routed to: the longest allowed-IP match, as on the send
+    /// path. Use it to pick the `peer` of [`Core::inject_inbound`] for a locally generated
+    /// reply about a packet to `dst`.
+    pub fn route(&self, dst: IpAddr) -> Option<PeerId> {
+        self.peers.by_destination(dst)
     }
 
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
@@ -683,7 +691,9 @@ impl Core {
         };
 
         if filter {
-            for f in &self.filters {
+            // Onion order: the chain is installed from the wire side to the local side, so
+            // local packets meet it in reverse.
+            for f in self.filters.iter().rev() {
                 match f.outbound(id, &mut packet) {
                     Verdict::Accept => {}
                     Verdict::Drop { reason } => {
@@ -965,5 +975,32 @@ mod tests {
         let id = core.peer_id(&key).unwrap();
         assert_eq!(core.peers().collect::<Vec<_>>(), [id]);
         assert_eq!(core.peer_stats(id).unwrap().public_key, key);
+    }
+
+    #[test]
+    fn routes_by_the_longest_allowed_ip_match() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let mut add = |key: [u8; 32], allowed: &[&str]| {
+            let key = x25519::PublicKey::from(key);
+            let mut config = PeerConfig::new(key);
+            config.allowed_ips = allowed.iter().map(|a| a.parse().unwrap()).collect();
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            key
+        };
+        let wide = add([7; 32], &["10.0.0.0/8", "fd00::/8"]);
+        let narrow = add([8; 32], &["10.1.0.0/16"]);
+        let wide = core.peer_id(&wide).unwrap();
+        let narrow = core.peer_id(&narrow).unwrap();
+
+        assert_eq!(core.route("10.2.0.1".parse().unwrap()), Some(wide));
+        assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
+        assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
+        assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
     }
 }

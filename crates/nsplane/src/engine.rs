@@ -24,6 +24,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
 };
+use crate::fragment::{Action, Fragmenter};
 use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
@@ -176,6 +177,7 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) transports: Vec<NewTransport>,
     pub(crate) queue_capacity: usize,
     pub(crate) event_capacity: usize,
+    pub(crate) fragmenter: Option<Fragmenter>,
     /// Crypto worker tasks; fewer than 2 runs the cryptography on the owner task.
     pub(crate) crypto_workers: usize,
 }
@@ -223,6 +225,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         drops: BTreeMap::new(),
         mtu,
         mtu_changes: Some(mtu_changes),
+        fragmenter: parts.fragmenter,
         tasks: vec![
             Task::spawn(watch_mtu(mtu_watch, mtu_tx, suspended.subscribe())),
             Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
@@ -546,6 +549,8 @@ struct Owner {
     mtu: u16,
     /// MTU changes of the source; `None` once the source dropped its watch's sender.
     mtu_changes: Option<mpsc::Receiver<u16>>,
+    /// Keeps local packets within `mtu`, if installed.
+    fragmenter: Option<Fragmenter>,
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
@@ -603,7 +608,7 @@ impl Owner {
                     if let Some(local) = &self.local {
                         self.high_water.local.record_received(local.len());
                     }
-                    self.input(Input::Local { packet });
+                    self.local_input(packet);
                 }
                 Wake::Local(None) => self.local = None,
                 Wake::Mtu(Some(mtu)) => {
@@ -729,6 +734,25 @@ impl Owner {
             && workers.dispatch(job)
         {
             self.flush_jobs();
+        }
+    }
+
+    /// Feeds a local packet through the fragmentation stage, if installed: what goes toward
+    /// the tunnel takes [`Owner::input`], ICMP errors go back to the local side.
+    fn local_input(&mut self, packet: PacketBuf) {
+        let Some(fragmenter) = &mut self.fragmenter else {
+            return self.input(Input::Local { packet });
+        };
+        let core = &self.core;
+        match fragmenter.process(packet, self.mtu, now(), |dst| core.route(dst)) {
+            Action::Send(packet) => self.input(Input::Local { packet }),
+            Action::Fragments(fragments) => {
+                for packet in fragments {
+                    self.input(Input::Local { packet });
+                }
+            }
+            Action::Reply(peer, packet) => self.core.inject_inbound(peer, packet),
+            Action::Drop => {}
         }
     }
 

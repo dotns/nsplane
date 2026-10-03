@@ -1,0 +1,21 @@
+[package]
+name = "nsplane-nat"
+description = "IPv4/IPv6 translation and service-publishing NAT packet filters for nsplane"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nsplane-core = { version = "0.8.0", path = "../nsplane-core" }
+nsplane-packet = { version = "0.8.0", path = "../nsplane-packet" }
+arc-swap = "1.7.1"
+thiserror = "2.0.21"
