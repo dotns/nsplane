@@ -586,6 +586,121 @@ stay in the same range: 1 % loss completes in 1.1-6.2 s (before 2.1-4.1 s; whole
 are retransmission timeouts), the bottleneck in 15.9-19.8 s (before 18.9-20.9 s), and 3 %
 loss stays timeout-bound right at the 60 s limit, as before.
 
+#### Single-stream profile (MF-2)
+
+Method: `tests/netstack_stream.rs` streams 1 GiB over one TCP connection, MTU 1420,
+release, either between two netstacks over two engines on the in-process
+`ChannelTransport` pair (`stream_throughput_engines`) or between two netstacks whose egress
+feeds the other's ingress directly, without engine or crypto (`stream_throughput_direct`).
+Both sides run in the test process and are told apart by symbol. Profiles were taken with
+`perf` 6.12 in a sibling container (frame-pointer call graphs, built with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS=-Cforce-frame-pointers=yes`). They
+sample `instructions:u` as well as cycles: on the shared host (load 13-47 on 32 cores)
+cycle counts of unchanged smoltcp code swung by 25 % between runs, while instruction counts
+of one build stay within about 2 %. Temporary driver counters (never committed) counted
+turns and packets.
+
+```text
+cargo test --release -p nsplane-e2e --test netstack_stream -- --ignored --nocapture
+```
+
+Where the instructions go on main (per GiB):
+
+| | Over engines | Direct |
+| --- | --- | --- |
+| Whole process | 39.9 G | 7.6 G |
+| Both netstack drivers | 7.1 G (18 %) | 6.2 G (81 %) |
+| smoltcp and the device, inside the drivers | 4.9 G | 5.0 G |
+| ChaCha20-Poly1305 seal + open | 14.5 G (36 %) | - |
+| Driver turns, of which `yield_now` turns | 355 k, 268 k | 117 k, 42 k |
+
+- smoltcp is the stack's cost. `process_tcp` (21 % of the direct process), the egress
+  `dispatch_ip` closure (12 %) and `socket_egress` (10 %) lead, and about 15 % of all
+  instructions are the TCP checksum loop (`smoltcp::wire::ip::checksum::data`, including
+  a bounds-checked `try_into().unwrap()` per 4-byte chunk) in both directions.
+- The driver's own code is small: the ingress queue (0.49 G, one semaphore lock per
+  `try_recv`), its turn bookkeeping (0.27 G) and copies between the sockets and the
+  application buffers (0.1 G of instructions; `memmove` is about 5 % of the direct cycles).
+  The byte-wise looking `shared.rx.extend(bytes.iter())` only runs for terminal sockets
+  and is a slice copy (`VecDeque`'s `Extend<&u8>` from a slice iterator); it does not show
+  in the profile.
+- Every egress buffer is zero-filled before smoltcp writes it (`PacketPool::get` plus
+  `PacketBuf::set_len`, about 4 % of the direct instructions).
+- Over engines a full-size TCP segment did not fit its buffer once the engine appended the
+  WireGuard trailer, so every one was reallocated and copied when sealed (`_int_malloc`
+  2.5 %, `realloc` 1 % of the instructions).
+- The engine side dominates the engine pairing: crypto, the engine tasks and channel
+  handoffs, and `ChannelTransport::recv`, which zero-fills its 64 KiB receive buffer per
+  datagram (7 % of the instructions, 9 % of the cycles; a test harness cost, not a
+  netstack one).
+- smoltcp sends at most one segment per socket per egress pass, so on the sender most
+  turns end with more to send and yield (268 k of 355 k turns over engines).
+
+Fixes, without behavior change:
+
+1. Ingress is taken with `poll_recv_many` (still at most 256 packets per turn, same order),
+   so the queue slots of a batch are returned in one step: -2.3 % driver instructions
+   on the direct pairing.
+2. Egress TCP segments and UDP datagrams keep 32 bytes of tail room (`device::TAILROOM`),
+   so the engine seals them in place without reallocating: -2.0 % process instructions
+   over engines, CPU time 9.6 s to 8.7 s, context switches 529 k to 403 k per GiB.
+
+Not adopted: draining egress after a pass while it sends (up to the backlog bound) cut
+the turns over engines from 355 k to 93 k and the yields to almost none, but it made the
+sender fill the receive window to its edge, where smoltcp trims data (see the window-edge
+item below): 2-5 % of the segments were retransmitted without any loss, and the direct
+pairing used more CPU. With that smoltcp issue fixed in a local prototype it retransmits
+0.6 % and saves another 2.6 % of instructions and 30 % of the context switches over
+engines, but did not raise the throughput (median 519 MB/s against 576 MB/s), so it stays out.
+
+Before and after, five interleaved runs each of the stream loads (median [range], load
+13-18 on 32 cores; per GiB):
+
+| Stream | main | branch |
+| --- | --- | --- |
+| Over engines, MB/s | 540 [498-545] | 576 [536-610] |
+| Over engines, CPU time | 5.99 s [5.90-6.41] | 5.50 s [5.29-6.03] |
+| Over engines, instructions | 39.45 G | 38.57 G |
+| Over engines, context switches | 448 k | 340 k |
+| Direct, MB/s | 2022 [1534-2144] | 1906 [1182-2377] |
+| Direct, instructions | 7.72 G [7.68-9.03] | 7.85 G [7.52-8.57] |
+
+The direct pairing has no sealing and the batched ingress saves less than its run-to-run
+spread there. `netstack_lossy`'s throughput rows, three interleaved runs each (load
+4-22), show no loss-recovery regression:
+
+| Case | main | branch |
+| --- | --- | --- |
+| TCP, 64 MiB, no loss | 399 / 457 / 120 MB/s | 406 / 232 / 453 MB/s |
+| TCP, 16 MiB, 1 % loss | 1.08 / 2.08 / 0.18 s | 0.09 / 1.13 / 0.07 s |
+| TCP, 16 MiB, 3 % loss | 52.2 / 50.2 s, once not done after 60 s | 55.2 / 58.2 / 51.2 s |
+| TCP, 16 MiB, bottleneck | 14.9 / 23.9 / 21.9 s | 22.8 / 22.9 / 17.9 s |
+| UDP, 50 000 x 1200 B | 780 / 261 / 716 MB/s | 798 / 247 / 188 MB/s |
+
+What remains is outside the crate:
+
+- smoltcp fork, `src/wire/ip.rs`, `checksum::data`: sum 8-byte words into a `u64` (or
+  16-bit words via `as_chunks::<2>` without the `try_into().unwrap()` per chunk) so the loop
+  vectorises; it is about 15 % of the stack's instructions.
+- smoltcp fork, `src/socket/tcp.rs`: the receiver checks segments against the window it
+  advertised last (`remote_last_ack + remote_last_win << shift`), and with window scaling
+  that right edge moves left by up to `2^shift - 1` bytes whenever a segment arrives
+  (the scaled window rounds down), so data the sender was allowed to send is trimmed and
+  retransmitted. Tracking the furthest edge advertised (updated where `remote_last_ack` and
+  `remote_last_win` are set in `ack_reply` and `dispatch`, for non-SYN segments; reset in
+  `reset`) and accepting up to it removed those retransmissions in a local prototype
+  (direct stream with egress drain: 4.5 % to 0.6 % extra segments; main's pacing already
+  stays near zero).
+- `nsplane-packet`: a way to set a pooled buffer's length without zero-filling it (smoltcp
+  writes every byte of a transmitted packet) would save the 4 % above.
+- `nsplane`: `ChannelTransport::recv` should not zero-fill its 64 KiB buffer per datagram;
+  it makes the engine pairing a test of the harness as much as of the stack.
+
+MF-2's 12-14 % gap to ns's legacy stack was measured on ns's own path, whose WireGuard
+loop is not the nsplane engine, so this profile cannot split it; it shows the netstack at
+18 % of the engine pairing's instructions, of which the branch removed the per-segment
+reallocation and the per-packet queue locking.
+
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the

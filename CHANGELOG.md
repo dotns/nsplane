@@ -497,6 +497,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
   receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
   allows the fork's git source only.
+- `nsplane-netstack`: the driver takes its queued ingress packets in one batch per turn,
+  and egress TCP segments and UDP datagrams keep 32 bytes of tail room, so the engine
+  seals them in place instead of reallocating each full-size packet. One 1 GiB TCP stream
+  between two netstacks over two engines takes 8 % less CPU time and 2 % fewer
+  instructions (median 540 to 576 MB/s, release, in-process); behavior is unchanged. See
+  docs/architecture.md, "Netstack throughput".
 - `nsplane`: the owner task feeds the received datagrams and local packets already queued
   (up to `MAX_BATCH`, never waiting for more) to the core as one batch. It reads local
   packets only while a transport has transmit room and takes no more at once than that
