@@ -1107,6 +1107,7 @@ dependencies = [
 name = "nsplane-e2e"
 version = "0.8.0"
 dependencies = [
+ "arc-swap",
  "futures-core",
  "nix",
  "nsplane",
@@ -1125,6 +1126,7 @@ name = "nsplane-examples"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64 0.22.1",
  "blake2",
  "ciborium",
@@ -1160,9 +1162,11 @@ name = "nsplane-nat"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
+ "nsplane",
  "nsplane-core",
  "nsplane-packet",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

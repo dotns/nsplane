@@ -19,6 +19,18 @@
 //! - **Conntrack and port map** ([`conntrack`], [`port_map`]): a bounded
 //!   connection table and the DNAT/SNAT filter that publishes local services,
 //!   as an `nsplane_core::PacketFilter`.
+//! - **NAT64 to a LAN** ([`nat64_lan`]): a stateful NAPT ([`Nat64Lan`])
+//!   from IPv6 addresses of a mapped /96 to the IPv4 LAN hosts they embed,
+//!   with SNAT ports reserved per flow through [`SnatPorts`]. It is not a
+//!   `PacketFilter`: LAN replies are addressed to the SNAT source, which no
+//!   peer's allowed IPs contain, so the translation sits on the local side
+//!   (`forward` / `reverse` on a `PacketBuf`). On the gateway, wrap the
+//!   engine's local side: `EngineBuilder::new(Nat64LanSource::new(tun_source,
+//!   nat.clone()), Nat64LanSink::new(tun_sink, nat))` ([`Nat64LanSource`],
+//!   [`Nat64LanSink`]). Each IPv6 client's allowed IPs of the gateway peer
+//!   must contain the mapped /96, so the client routes it to the gateway;
+//!   the gateway's allowed IPs of each client contain the client's IPv6
+//!   source as usual.
 //! - **Filter order**: the core's filter chain is installed from the wire side
 //!   to the local side (inbound in install order, outbound in reverse); the
 //!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
@@ -38,6 +50,7 @@
 
 pub mod checksum;
 pub mod conntrack;
+pub mod nat64_lan;
 pub mod port_map;
 pub mod table;
 pub mod translate;
@@ -45,6 +58,10 @@ pub mod translate;
 pub use conntrack::{
     Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, Flow, FlowDirection, FlowMatch,
     TcpState,
+};
+pub use nat64_lan::{
+    DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanSink,
+    Nat64LanSource, Nat64LanStats, Nat64Verdict, SnatPorts,
 };
 pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};
 pub use table::{
