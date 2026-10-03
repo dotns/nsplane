@@ -150,7 +150,10 @@ async fn send_all(raw: &Node<ChannelTransport>, packets: &[Vec<u8>]) -> TestResu
 }
 
 /// Waits until the stack's counters satisfy `ready`.
-async fn until_stats(node: &StackNode, ready: impl Fn(&NetStackStats) -> bool) -> TestResult {
+async fn until_stats(
+    node: &StackNode,
+    ready: impl Fn(&NetStackStats) -> bool + Sync,
+) -> TestResult {
     timeout(WAIT, async {
         while !ready(&node.stack.stats()) {
             sleep(Duration::from_millis(10)).await;

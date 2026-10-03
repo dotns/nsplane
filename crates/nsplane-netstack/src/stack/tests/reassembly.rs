@@ -75,7 +75,7 @@ fn datagram(
     dst: SocketAddr,
     len: usize,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
-    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251).to_le_bytes()[0]).collect();
     let packet = build_udp(src, dst, &payload).ok_or("build")?;
     Ok((packet.as_packet().to_vec(), payload))
 }
@@ -91,7 +91,7 @@ async fn send_all(sink: &NetStackSink, packets: impl IntoIterator<Item = Vec<u8>
 /// Waits until `handle`'s counters satisfy `ready`.
 async fn until_stats(
     handle: &NetStackHandle,
-    ready: impl Fn(&NetStackStats) -> bool,
+    ready: impl Fn(&NetStackStats) -> bool + Sync,
 ) -> TestResult {
     timeout(Duration::from_secs(5), async {
         while !ready(&handle.stats()) {
