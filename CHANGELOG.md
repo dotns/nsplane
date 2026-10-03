@@ -289,6 +289,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket buffer on a loaded host) no longer stalls on doubling retransmission timeouts:
   16 MiB through a 25 MB/s link with a 64-packet buffer finish in 14-17 s instead of not at
   all within 60 s, and at 1 % random loss in 3 s instead of 35-41 s (release, in-process).
+- `nsplane-netstack`: TCP connections no longer stall for good under loss when both ends
+  send. Two smoltcp 0.14 defects are worked around in the driver: pure ACKs sent after a
+  retransmission timeout carry the peer's last acknowledgement number as their sequence
+  number, so the peer no longer drops them as old; and a connection that moved no bytes
+  for 1 s reopens a closed receive window by up to 1 KiB and probes the peer's window
+  with a keep-alive, so a segment lost at the edge of a closing window is resent.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
