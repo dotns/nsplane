@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 const UDP_HEADER: usize = 8;
 /// Hop limit / TTL of every emitted datagram.
 const HOP_LIMIT: u8 = 64;
+/// The IPv4 DF flag in byte 6 of the header.
+const DONT_FRAGMENT: u8 = 0x40;
 
 /// A parsed inbound UDP datagram.
 #[derive(Debug)]
@@ -84,7 +86,9 @@ pub(crate) fn build_udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Opt
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             ip[0] = 0x45;
             ip[2..4].copy_from_slice(&total_field.to_be_bytes());
-            ip[6] = 0x40; // Don't fragment: the stack never exceeds its MTU.
+            // Don't fragment: the stack never exceeds its MTU, unless
+            // `udp_allow_fragmentation` clears it on an oversize datagram.
+            ip[6] = DONT_FRAGMENT;
             ip[8] = HOP_LIMIT;
             ip[9] = protocol::UDP;
             ip[12..16].copy_from_slice(&src.octets());
@@ -110,6 +114,14 @@ pub(crate) fn build_udp(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Opt
     Some(packet)
 }
 
+/// Clears DF on an IPv4 packet built by [`build_udp`] and updates its header checksum.
+fn clear_dont_fragment(packet: &mut PacketBuf) {
+    let ip = &mut packet.as_packet_mut()[..20];
+    ip[6] &= !DONT_FRAGMENT;
+    let header_checksum = ipv4_header_checksum(ip);
+    ip[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -123,6 +135,8 @@ fn stack_gone() -> io::Error {
 pub(crate) struct UdpOut {
     pub(crate) tx: mpsc::Sender<PacketBuf>,
     pub(crate) mtu: usize,
+    /// IPv4 datagrams above the MTU leave with DF clear instead of failing.
+    pub(crate) allow_fragmentation: bool,
 }
 
 impl UdpOut {
@@ -131,9 +145,14 @@ impl UdpOut {
         if src.is_ipv4() != dst.is_ipv4() {
             return Err(invalid("address families differ"));
         }
-        let packet = build_udp(src, dst, payload)
-            .filter(|packet| packet.len() <= self.mtu)
-            .ok_or_else(|| invalid("datagram exceeds the MTU"))?;
+        let mut packet =
+            build_udp(src, dst, payload).ok_or_else(|| invalid("datagram exceeds the MTU"))?;
+        if packet.len() > self.mtu {
+            if !self.allow_fragmentation || !src.is_ipv4() {
+                return Err(invalid("datagram exceeds the MTU"));
+            }
+            clear_dont_fragment(&mut packet);
+        }
         self.tx.send(packet).await.map_err(|_| stack_gone())
     }
 }
@@ -200,6 +219,11 @@ impl UdpReply {
     /// Waits while the stack's send queue is full. Fails with
     /// [`io::ErrorKind::InvalidInput`] if the IP packet would exceed the MTU (the stack
     /// does not fragment) and with [`io::ErrorKind::BrokenPipe`] once the stack stopped.
+    ///
+    /// With [`NetStackConfig::udp_allow_fragmentation`](crate::NetStackConfig::udp_allow_fragmentation),
+    /// an IPv4 packet above the MTU leaves as one datagram with DF clear (for the engine's
+    /// fragmenter to split) and only a packet above the IPv4 total length limit of 65 535
+    /// bytes fails; IPv6 above the MTU still fails.
     pub async fn send(&self, payload: &[u8]) -> io::Result<()> {
         self.out.send(self.local, self.peer, payload).await
     }
@@ -245,6 +269,7 @@ impl UdpSocket {
     /// the socket is bound to the unspecified address. Fails with
     /// [`io::ErrorKind::InvalidInput`] if `remote` is of the other family or the IP packet
     /// would exceed the MTU, and with [`io::ErrorKind::BrokenPipe`] once the stack stopped.
+    /// Oversize IPv4 packets are handled as described on [`UdpReply::send`].
     pub async fn send_to(&self, payload: &[u8], remote: SocketAddr) -> io::Result<()> {
         let src = SocketAddr::new(self.source, self.local.port());
         self.out.send(src, remote, payload).await
@@ -360,6 +385,115 @@ mod tests {
         let v6: SocketAddr = "[fd00::1]:1".parse()?;
         assert!(build_udp(v4, v6, b"x").is_none());
         assert!(build_udp(v4, v4, &vec![0; 65_536]).is_none());
+        Ok(())
+    }
+
+    /// A stack at 10.8.0.1 and `fd00::1` with MTU 1420 and `udp_allow_fragmentation` set to
+    /// `allow`, plus its source and sink.
+    fn fragmenting_stack(
+        allow: bool,
+    ) -> (
+        crate::NetStackHandle,
+        crate::NetStackSource,
+        crate::NetStackSink,
+    ) {
+        let config = NetStackConfig {
+            udp_allow_fragmentation: allow,
+            ..NetStackConfig::new(
+                vec![
+                    (IpAddr::from([10, 8, 0, 1]), 24),
+                    (IpAddr::from([0xfd00, 0, 0, 0, 0, 0, 0, 1]), 64),
+                ],
+                1420,
+            )
+        };
+        let (stack, handle) = NetStack::new(config);
+        let (source, sink) = stack.split();
+        (handle, source, sink)
+    }
+
+    #[tokio::test]
+    async fn oversize_send_fails_without_udp_allow_fragmentation() -> TestResult {
+        let (handle, mut source, _sink) = fragmenting_stack(false);
+        let socket = handle.bind_udp("10.8.0.1:53".parse()?).await?;
+        let remote: SocketAddr = "10.0.0.2:5353".parse()?;
+        let error = socket
+            .send_to(&[1; 3000], remote)
+            .await
+            .err()
+            .ok_or("oversize send must fail")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // A datagram that fits leaves exactly as built, DF set.
+        socket.send_to(&[1; 1392], remote).await?;
+        let packet = timeout(WAIT, source.recv()).await??;
+        let expected = build_udp("10.8.0.1:53".parse()?, remote, &[1; 1392]).ok_or("build")?;
+        assert_eq!(packet.as_packet(), expected.as_packet());
+        assert_eq!(packet.len(), 1420);
+        assert_eq!(packet.as_packet()[6], DONT_FRAGMENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversize_ipv4_send_leaves_as_one_packet_with_df_clear() -> TestResult {
+        let (handle, mut source, sink) = fragmenting_stack(true);
+        let mut incoming = handle.incoming_udp();
+        let pkt = sample_udp_pkt([10, 0, 0, 2], [10, 8, 0, 1], 12345, 53, &[0])?;
+        sink.send(PacketBuf::from_packet(&pkt), PeerId::new(1))
+            .await?;
+        let flow = next_flow(&mut incoming).await?;
+        let payload: Vec<u8> = (0..=250u8).cycle().take(3000).collect();
+        flow.send(&payload).await?;
+
+        let packet = timeout(WAIT, source.recv()).await??;
+        assert_eq!(packet.len(), 20 + 8 + 3000);
+        let bytes = packet.as_packet();
+        assert_eq!(bytes[6] & DONT_FRAGMENT, 0, "DF clear");
+        assert_eq!(bytes[6..8], [0, 0], "no MF, offset zero");
+        assert_eq!(
+            ipv4_header_checksum(&bytes[..20]).to_be_bytes(),
+            bytes[10..12],
+            "header checksum matches"
+        );
+        let ip = IpPacket::parse(bytes)?;
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (ip.src(), ip.dst()) else {
+            return Err("IPv4 expected".into());
+        };
+        assert_eq!(
+            transport_checksum_v4(src, dst, protocol::UDP, ip.payload()),
+            0,
+            "UDP checksum must verify"
+        );
+        let got = parse_udp(packet).ok_or("reply must parse")?;
+        assert_eq!(got.payload.as_ref(), payload.as_slice());
+
+        // A datagram that fits still sets DF.
+        flow.send(b"small").await?;
+        let packet = timeout(WAIT, source.recv()).await??;
+        assert_eq!(packet.as_packet()[6], DONT_FRAGMENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversize_send_fails_for_ipv6_and_above_the_ipv4_length_limit() -> TestResult {
+        let (handle, _source, _sink) = fragmenting_stack(true);
+        let v6 = handle.bind_udp("[fd00::1]:53".parse()?).await?;
+        let error = v6
+            .send_to(&[1; 3000], "[fd00::2]:5353".parse()?)
+            .await
+            .err()
+            .ok_or("IPv6 oversize send must fail")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let v4 = handle.bind_udp("10.8.0.1:53".parse()?).await?;
+        let remote: SocketAddr = "10.0.0.2:5353".parse()?;
+        v4.send_to(&vec![1; 65_535 - 28], remote).await?;
+        let error = v4
+            .send_to(&vec![1; 65_535 - 27], remote)
+            .await
+            .err()
+            .ok_or("a packet above 65 535 bytes must fail")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         Ok(())
     }
 

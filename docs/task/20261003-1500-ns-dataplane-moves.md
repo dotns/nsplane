@@ -147,6 +147,10 @@ covered by `nsplane-e2e`'s `path_hooks::a_handshake_can_start_on_a_candidate_wit
 User decisions: D10 a generic message-link transport (no WebSocket dependency in nsplane);
 ME-1 and ME-2 (SNAT and DNAT) both in nsplane-nat; MD is evaluated, not implemented, this
 round. MB-x, MC and ME run as a BKD campaign (plan 20261003-1600-ns-dataplane-moves).
+MB-x3 and MB-x4 done: `TcpConnection::{unacked, last_ack}` (smoltcp exposes no SND.NXT, so
+`unacked` is the socket's send queue: in flight plus bytes held back for the peer's window)
+and `NetStackConfig::udp_allow_fragmentation`, covered by `nsplane-e2e`'s
+`netstack_progress`.
 
 ### MD assessment (L1, 2026-10-03; not implemented this round)
 

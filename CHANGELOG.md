@@ -297,6 +297,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error); all zero without a stage. The drops are also counted in `drop_counters` under
   the new reasons `DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and
   `DROP_FRAGMENT_RATE_LIMITED` (`reasons::FRAGMENT_*` in `nsplane-core`).
+- `nsplane-netstack`: `TcpConnection::unacked` (bytes handed to the stack's socket and not
+  acknowledged by the peer) and `TcpConnection::last_ack` (when the stack last saw the peer
+  acknowledge new data, `None` before it did) report a connection's send progress; the
+  driver writes them once per turn into atomics, and they stay readable after the
+  connection closed.
+- `nsplane-netstack`: `NetStackConfig::udp_allow_fragmentation` (default `false`): an IPv4
+  UDP datagram above the MTU from `UdpReply::send` / `UdpSocket::send_to` leaves as one
+  packet with DF clear for the engine's fragmenter (`EngineBuilder::fragmenter`) to split,
+  instead of failing with `InvalidInput`; IPv6 above the MTU and IPv4 above 65 535 bytes
+  still fail. Without it the bytes on the wire are unchanged (DF set).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
