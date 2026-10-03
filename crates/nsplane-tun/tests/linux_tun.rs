@@ -63,7 +63,9 @@ async fn plain_tun_full_mtu_read_leaves_room_to_grow() {
             .unwrap();
         let parsed = IpPacket::parse(packet.as_packet()).unwrap();
         if matches!(parsed, IpPacket::V4 { .. })
-            && parsed.five_tuple().is_some_and(|flow| flow.dst_port == 4000)
+            && parsed
+                .five_tuple()
+                .is_some_and(|flow| flow.dst_port == 4000)
         {
             // Room for an IPv4 -> IPv6 translator to grow it in place.
             assert_eq!(packet.len(), mtu);
