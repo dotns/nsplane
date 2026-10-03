@@ -8,6 +8,14 @@
 //! [`EngineHandle::add_transport`](nsplane::EngineHandle::add_transport) when the engine
 //! does not run it yet). Other transports of the engine are left alone.
 //!
+//! The UAPI only rebinds a UDP transport it owns: one it bound itself ([`Uapi::new`] with
+//! [`Uapi::bind_transport`] or `listen_port=`) or one the engine was built with
+//! ([`Uapi::with_listen_port`], over [`udp_transport`]). When the transport under
+//! [`TRANSPORT_ID`] is something else, such as a relay or a WebSocket carrier, build the
+//! UAPI with [`Uapi::with_external_transport`]: it never replaces that transport, treats a
+//! `listen_port=` or `fwmark=` equal to the reported value as a no-op, and fails any other
+//! value with `EADDRINUSE` (98), logging why. `get=1` still reports the listen port.
+//!
 //! [`Uapi::handle_request`] serves one request over any async reader and writer.
 //! [`UapiListener`] binds the endpoint that the `wg` tool talks to: on Unix the standard
 //! socket `/var/run/wireguard/<iface>.sock` (`socket_path`), on Windows the named pipe

@@ -11,7 +11,8 @@
 //!
 //! APIs shown: [`Splitter`] (a closure picks the sink per packet; shared through an `Arc`
 //! to read [`Splitter::misrouted`]), [`MergeSource`] (the minimum MTU of its sources),
-//! `nsplane_packet::IpPacket` header views, `nsplane_tun::Tun`, [`NetStack`], and the
+//! `nsplane_packet::IpPacket` header views, `nsplane_tun::Tun` (offloads off with
+//! `--no-offload`), [`NetStack`], and the
 //! shared node assembly (`build_engine`, `configure_peers`, `configure_tun`, `serve_uapi`).
 //!
 //! Usage: `sudo cargo run -p nsplane-examples --bin hybrid -- --private-key <KEY>
@@ -41,7 +42,6 @@ mod unix {
     use nsplane_examples::status::{Status, netstack_json};
     use nsplane_netstack::{NetStack, NetStackConfig};
     use nsplane_packet::IpPacket;
-    use nsplane_tun::Tun;
     use serde_json::json;
 
     /// Index of the TUN sink in the splitter.
@@ -102,8 +102,8 @@ mod unix {
 
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
-        let tun = Tun::create(&args.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun_name))?;
+        let tun = node::create_tun(&args.tun_name, &args.node)?;
+        let offload = node::offload_mode(tun.offload());
         let name = tun.name().unwrap_or_else(|_| args.tun_name.clone());
         configure_tun(&name, &args.tun_address, args.mtu, &args.node.peer)?;
         let (tun_source, tun_sink) = tun.split().context("cannot open the TUN device")?;
@@ -127,7 +127,7 @@ mod unix {
         let handle = node.engine.handle();
         configure_peers(&handle, &args.node.peer).await?;
         let socket = serve_uapi(handle.clone(), &name, node.transports.listen.port())?;
-        tracing::info!(interface = %name, listen = %node.transports.listen, uapi = %socket, "hybrid node started");
+        tracing::info!(interface = %name, %offload, listen = %node.transports.listen, uapi = %socket, "hybrid node started");
 
         let status = args.node.status_file.clone().map(|path| {
             let stack = stack_handle.clone();

@@ -8,17 +8,21 @@
 # Rows: TUN, netstack, bridge(fd), bridge(channel); columns: direct UDP, and the single-port
 # relay (relay_server) over UDP and over WSS with the direct path blocked. Scenarios add
 # native kernel WireGuard through the relay, NAT hole punching behind MASQUERADE routers,
-# the direct/relay ladder and plain WireGuard servers under the relay extension.
+# the direct/relay ladder, plain WireGuard servers under the relay extension, and the
+# offload and non-offload TUN/UDP paths (iperf3 throughput, --no-offload fallback).
 # Needs docker and the `wireguard` kernel module on the host; nothing on the host is
 # reconfigured. The release example binaries are built in the dev image unless
 # NSPLANE_E2E_EX_BIN_DIR names a directory holding them.
 #
 #   scripts/e2e/examples.sh
 #   NSPLANE_E2E_EX_ONLY='acl|hybrid' scripts/e2e/examples.sh   # cases whose id matches
+#   NSPLANE_E2E_IPERF_REPS=3 NSPLANE_E2E_IPERF_RATE=2G   # offload_iperf: runs per rate, UDP -b
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 PREFIX=${NSPLANE_E2E_EX_PREFIX:-nsplane-e2e-ex-$$}
 ONLY=${NSPLANE_E2E_EX_ONLY:-}
+IPERF_REPS=${NSPLANE_E2E_IPERF_REPS:-1}
+IPERF_RATE=${NSPLANE_E2E_IPERF_RATE:-0}
 DEV_IMAGE=${NSPLANE_E2E_EX_DEV_IMAGE:-ai-agent/nstun-dev}
 NET=$PREFIX-net
 IMG=$PREFIX-image
@@ -693,14 +697,14 @@ scenario_app_session_tun() {
   echo "  ok  a: extra.acl.outbound_denied > 0"
 }
 
-# hybrid vs kernel WireGuard: a socat service on the TUN side and the netstack echo are both
-# reachable from the kernel peer; nothing is misrouted.
-scenario_hybrid() {
+# hybrid [args]... vs kernel WireGuard: a socat service on the TUN side and the netstack
+# echo are both reachable from the kernel peer; nothing is misrouted.
+hybrid_kernel() {
   start a k
   local a_pub k_pub a_ip k_ip
   a_pub=$(pub a); k_pub=$(pub k); a_ip=$(ip_of a); k_ip=$(ip_of k)
   echo_server a
-  node a hybrid --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 \
+  node a hybrid "$@" --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 \
     --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=10.0.0.2/32" --echo-port 7
   kernel_wg k 10.0.0.2/24 "$a_pub" "$a_ip" 10.0.0.1/32,10.1.0.1/32 10.1.0.1/32
   echo_check k tcp 10.0.0.1 7; echo_check k udp 10.0.0.1 7
@@ -709,6 +713,7 @@ scenario_hybrid() {
   wait_status a hybrid '.extra.splitter.misrouted == 0'
   echo "  ok  a: extra.splitter.misrouted == 0"
 }
+scenario_hybrid() { hybrid_kernel; }
 
 # acl_gateway vs kernel WireGuard: allowed and denied ports, live policy reload, stateful
 # replies to connections the gateway opens.
@@ -755,6 +760,119 @@ scenario_acl_gateway() {
   echo "  ok  a: extra.acl.replies grew past $replies"
 }
 
+# --- scenarios: offload -----------------------------------------------------------------
+
+# tun_node with --no-offload <-> kernel WireGuard: the UDP cell's checks on the plain TUN
+# device and UDP without GSO/GRO.
+scenario_offload_fallback() {
+  kernel_peer tun_node --no-offload
+  wait_log a tun_node 'TUN node started.* offload=off'
+  X a "grep -q 'udp_offload=off' /tun_node.log"
+  echo "  ok  a: tun_node logs offload=off, udp_offload=off"
+}
+
+# hybrid with --no-offload <-> kernel WireGuard: the hybrid scenario's checks on the plain
+# TUN device and UDP without GSO/GRO.
+scenario_offload_fallback_hybrid() {
+  hybrid_kernel --no-offload
+  X a "grep -Eq 'hybrid node started.* offload=off' /hybrid.log"
+  X a "grep -q 'udp_offload=off' /hybrid.log"
+  echo "  ok  a: hybrid logs offload=off, udp_offload=off"
+}
+
+# relay_server and two tun_nodes (relay UDP, direct path blocked), all with --no-offload:
+# a UDP check from a to b through the relay.
+scenario_offload_fallback_relay() {
+  start r a b
+  local a_pub b_pub r_ip a_ip b_ip name
+  a_pub=$(pub a); b_pub=$(pub b); r_ip=$(ip_of r); a_ip=$(ip_of a); b_ip=$(ip_of b)
+  mkey a b
+  relay_conf a b | relay_up r --no-offload
+  block a "$b_ip"; block b "$a_ip"
+  relay_client relay-udp "$r_ip"
+  echo_server b
+  node b tun_node --no-offload "${CLIENT[@]}" --address 10.0.0.2/24 \
+    --peer "$a_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.1/32"
+  node a tun_node --no-offload "${CLIENT[@]}" --address 10.0.0.1/24 \
+    --peer "$b_pub,endpoint=$RELAY_EP,allowed-ips=10.0.0.2/32" --check udp:10.0.0.2:7
+  checks_pass a tun_node
+  wait_status r relay_server '.extra.relay.counters.forwarded > 0' 5
+  echo "  ok  r: forwarded $(relay_counter r forwarded)"
+  X r "grep -q 'udp_offload=off' /relay_server.log"
+  echo "  ok  r: relay_server logs udp_offload=off"
+  for name in a b; do
+    X "$name" "grep -Eq 'TUN node started.* offload=off' /tun_node.log"
+    X "$name" "grep -q 'udp_offload=off' /tun_node.log"
+    echo "  ok  $name: tun_node logs offload=off, udp_offload=off"
+  done
+}
+
+# iperf_run <ctr> <tcp|udp> [iperf3 args]...: one 5 s iperf3 run against 10.0.0.2 (UDP at
+# NSPLANE_E2E_IPERF_RATE); prints the received Mbit/s and, for UDP, the loss in percent,
+# and fails unless data arrived.
+iperf_run() {
+  local name=$1 proto=$2 out; shift 2
+  local args=(-c 10.0.0.2 -t 5 -J --connect-timeout 5000 "$@")
+  # 1392 bytes fill the tunnel MTU (1420) with IPv4 and UDP headers.
+  [ "$proto" = udp ] && args+=(-u -b "$IPERF_RATE" -l 1392)
+  out=$(X "$name" "timeout 30 iperf3 $(printf '%q ' "${args[@]}") 2>> /iperf3.log") || return 1
+  jq -e '.end.sum_received.bytes > 0' <<< "$out" >/dev/null || return 1
+  jq -r '"\(.end.sum_received.bits_per_second / 1e6 | floor)"
+    + (.end.sum.lost_percent | if . == null then "" else " \(. * 10 | round / 10)" end)' <<< "$out"
+}
+
+# iperf_median <run>...: the median Mbit/s (and loss) of runs printed by iperf_run.
+iperf_median() {
+  local mbit loss
+  mbit=$(printf '%s\n' "$@" | awk '{print $1}' | sort -n | awk '{v[NR]=$1} END {print v[int((NR+1)/2)]}')
+  loss=$(printf '%s\n' "$@" | awk 'NF>1 {print $2}' | sort -g | awk '{v[NR]=$1} END {if (NR) print v[int((NR+1)/2)]}')
+  echo "$mbit${loss:+ (loss $loss%)}"
+}
+
+# tun_node (offload on, then --no-offload) <-> kernel WireGuard: iperf3 TCP and UDP in both
+# directions through the tunnel, NSPLANE_E2E_IPERF_REPS times each (UDP at
+# NSPLANE_E2E_IPERF_RATE, iperf3 -b: 0 is unlimited). Passes when every run moved data;
+# prints the median of all 8 rates.
+scenario_offload_iperf() {
+  local mode a k a_pub k_pub a_ip k_ip dir result rep
+  local -A rate=()
+  for mode in on off; do
+    a=a-$mode; k=k-$mode
+    start "$a" "$k"
+    a_pub=$(pub "$a"); k_pub=$(pub "$k"); a_ip=$(ip_of "$a"); k_ip=$(ip_of "$k")
+    local flags=()
+    [ "$mode" = off ] && flags=(--no-offload)
+    node "$a" tun_node "${flags[@]}" --address 10.0.0.1/24 \
+      --peer "$k_pub,endpoint=$k_ip:$PORT,allowed-ips=10.0.0.2/32"
+    kernel_wg "$k" 10.0.0.2/24 "$a_pub" "$a_ip" 10.0.0.1/32
+    if [ "$mode" = on ]; then wait_log "$a" tun_node 'TUN node started.* offload=tso'
+    else wait_log "$a" tun_node 'TUN node started.* offload=off'; fi
+    X "$a" "grep -E 'TUN node started' /tun_node.log" | grep -oE 'offload=[a-z_,]+' | sed "s/^/  $a: /"
+    ping_check "$a" 10.0.0.2
+    docker exec -d "$(ctr "$k")" iperf3 -s
+    sleep 0.5
+    for dir in "tcp a->k" "tcp k->a" "udp a->k" "udp k->a"; do
+      local args=() runs=()
+      [[ $dir == *"k->a" ]] && args=(-R)
+      for rep in $(seq 1 "$IPERF_REPS"); do
+        if ! result=$(iperf_run "$a" "${dir%% *}" "${args[@]}"); then
+          echo "  FAIL $a: iperf3 $dir (offload $mode, run $rep)"; return 1
+        fi
+        runs+=("$result")
+        echo "  ok  $a: iperf3 $dir (offload $mode, run $rep): $result"
+      done
+      rate[$dir/$mode]=$(iperf_median "${runs[@]}")
+    done
+    # Datagrams above the path MTU fail with EMSGSIZE (DF set): reported, not gated.
+    echo "  $a: EMSGSIZE in the node log: $(X "$a" "grep -cE 'Message too long|os error 90' /tun_node.log" || true)"
+  done
+  echo "  iperf3 Mbit/s, median of $IPERF_REPS (UDP -b $IPERF_RATE)"
+  echo "                  offload on              offload off"
+  for dir in "tcp a->k" "tcp k->a" "udp a->k" "udp k->a"; do
+    printf '  %-15s %-23s %s\n' "$dir" "${rate[$dir/on]}" "${rate[$dir/off]}"
+  done
+}
+
 # --- run --------------------------------------------------------------------------------
 cell tun udp tun_pair tun_kernel
 cell netstack udp netstack_pair netstack_kernel
@@ -778,6 +896,10 @@ scenario ladder_tun
 scenario ladder_netstack
 scenario nat_hole_punch
 scenario plain_wg_compat
+scenario offload_fallback
+scenario offload_fallback_hybrid
+scenario offload_fallback_relay
+scenario offload_iperf
 
 report
 if [ "$FAILED" -ne 0 ]; then echo "FAIL"; exit 1; fi

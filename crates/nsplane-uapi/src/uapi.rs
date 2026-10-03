@@ -30,6 +30,9 @@ struct NetState {
     port: Option<u16>,
     /// The firewall mark of the transport, `None` when unset (or set to 0).
     fwmark: Option<u32>,
+    /// Whether the transport under [`TRANSPORT_ID`] is not a UDP transport the UAPI owns,
+    /// so the UAPI never replaces it.
+    external: bool,
 }
 
 /// Serves the `wg` UAPI for one engine.
@@ -43,6 +46,12 @@ struct NetState {
 /// current port with the mark (Linux and Android only; 0 removes it). Rebinding on the
 /// port the current transport holds first moves the engine to a temporary ephemeral
 /// transport to release the port.
+///
+/// The UAPI only rebinds a UDP transport it owns. Over an engine whose transport under
+/// [`TRANSPORT_ID`] is something else (a relay, a WebSocket carrier), built with
+/// [`Uapi::with_external_transport`], it never replaces that transport: repeating the
+/// reported `listen_port` or `fwmark` is a no-op, and any other value fails the request
+/// with `EADDRINUSE` (98) and logs the reason.
 #[derive(Debug, Clone)]
 pub struct Uapi {
     handle: EngineHandle,
@@ -68,6 +77,24 @@ impl Uapi {
             net: Arc::new(Mutex::new(NetState {
                 port: Some(port),
                 fwmark: None,
+                external: false,
+            })),
+        }
+    }
+
+    /// A UAPI over `handle`, whose engine runs a transport under [`TRANSPORT_ID`] that is
+    /// not a UDP transport the UAPI owns (a relay or a WebSocket carrier, say); `get`
+    /// reports `port` as its listen port.
+    ///
+    /// The UAPI never replaces that transport: a `listen_port=` or `fwmark=` other than the
+    /// reported one fails with `EADDRINUSE`, and so does [`Uapi::bind_transport`].
+    pub fn with_external_transport(handle: EngineHandle, port: u16) -> Self {
+        Self {
+            handle,
+            net: Arc::new(Mutex::new(NetState {
+                port: Some(port),
+                fwmark: None,
+                external: true,
             })),
         }
     }
@@ -80,7 +107,8 @@ impl Uapi {
     /// Binds the transport to `port` (0 picks a free port) as `listen_port=` does, and
     /// returns the bound port.
     ///
-    /// Use it to add the UAPI's transport to an engine that runs without it.
+    /// Use it to add the UAPI's transport to an engine that runs without it. Fails on a
+    /// UAPI built with [`Uapi::with_external_transport`].
     pub async fn bind_transport(&self, port: u16) -> io::Result<u16> {
         let mut net = self.net.lock().await;
         let fwmark = net.fwmark;
@@ -248,6 +276,12 @@ impl Uapi {
 
     /// Binds a transport to `port` with `fwmark` and installs it.
     async fn rebind(&self, net: &mut NetState, port: u16, fwmark: Option<u32>) -> io::Result<()> {
+        if net.external {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the transport is not a UDP transport the UAPI owns",
+            ));
+        }
         check_fwmark_support(fwmark)?;
         if port != 0 && net.port == Some(port) {
             // The current transport holds the port: move to a temporary one to release it.
@@ -430,7 +464,144 @@ fn write_config(
 
 #[cfg(test)]
 mod tests {
+    use nsplane::{ChannelSink, ChannelSource, ChannelTransport, Engine, EngineBuilder, Transport};
+
     use super::*;
+
+    /// An engine on in-memory packet ends running `transport`, with the packet ends kept
+    /// open.
+    fn engine<T: Transport>(transport: T) -> (Engine, impl Sized) {
+        let (source, local, mtu) = ChannelSource::new(16, 1420);
+        let (sink, delivered) = ChannelSink::new(16);
+        let engine = EngineBuilder::new(source, sink)
+            .transport(transport)
+            .build()
+            .unwrap();
+        (engine, (local, mtu, delivered))
+    }
+
+    /// The response to `request`.
+    async fn request(uapi: &Uapi, request: &str) -> String {
+        let mut reader = request.as_bytes();
+        let mut out = Vec::new();
+        uapi.handle_request(&mut reader, &mut out).await.unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The listen port `get` reports.
+    async fn listen_port(uapi: &Uapi) -> Option<u16> {
+        let config = request(uapi, "get=1\n\n").await;
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix("listen_port="))
+            .map(|port| port.parse().unwrap())
+    }
+
+    /// Whether `port` can be bound as the UAPI binds it.
+    fn port_is_free(port: u16) -> bool {
+        udp_transport(port).is_ok()
+    }
+
+    #[tokio::test]
+    async fn owned_transport_is_rebound() {
+        let transport = udp_transport(0).unwrap();
+        let first = transport.local_addr().port();
+        let (engine, _ends) = engine(transport);
+        let uapi = Uapi::with_listen_port(engine.handle(), first);
+
+        // Repeating the port keeps the transport.
+        assert_eq!(
+            request(&uapi, &format!("set=1\nlisten_port={first}\n\n")).await,
+            "errno=0\n\n"
+        );
+        assert!(!port_is_free(first));
+
+        // A new port replaces the transport and releases the old one.
+        assert_eq!(
+            request(&uapi, "set=1\nlisten_port=0\n\n").await,
+            "errno=0\n\n"
+        );
+        let second = listen_port(&uapi).await.unwrap();
+        assert_ne!(second, first);
+        assert!(!port_is_free(second));
+        assert!(port_is_free(first));
+
+        // Rebinding on the held port parks the engine on another one to release it.
+        assert_eq!(uapi.bind_transport(second).await.unwrap(), second);
+        assert_eq!(listen_port(&uapi).await, Some(second));
+        assert!(!port_is_free(second));
+    }
+
+    #[tokio::test]
+    async fn new_uapi_binds_the_transport() {
+        let (engine, _ends) = engine(udp_transport(0).unwrap());
+        // Leave the engine without the UAPI's transport, as `Uapi::new` expects.
+        engine
+            .handle()
+            .remove_transport(TRANSPORT_ID)
+            .await
+            .unwrap();
+        let uapi = Uapi::new(engine.handle());
+        assert_eq!(listen_port(&uapi).await, None);
+        let port = uapi.bind_transport(0).await.unwrap();
+        assert_eq!(listen_port(&uapi).await, Some(port));
+        assert!(!port_is_free(port));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN"]
+    async fn owned_transport_is_rebound_with_a_fwmark() {
+        let transport = udp_transport(0).unwrap();
+        let port = transport.local_addr().port();
+        let (engine, _ends) = engine(transport);
+        let uapi = Uapi::with_listen_port(engine.handle(), port);
+
+        assert_eq!(request(&uapi, "set=1\nfwmark=7\n\n").await, "errno=0\n\n");
+        let config = request(&uapi, "get=1\n\n").await;
+        assert!(
+            config.contains(&format!("listen_port={port}\nfwmark=7\n")),
+            "{config}"
+        );
+        assert!(!port_is_free(port));
+    }
+
+    #[tokio::test]
+    async fn external_transport_is_never_replaced() {
+        let relay = SocketAddr::from(([192, 0, 2, 1], 1000));
+        let far = SocketAddr::from(([192, 0, 2, 2], 1000));
+        let (near, far_end) =
+            ChannelTransport::pair(16, (TRANSPORT_ID, relay), (TRANSPORT_ID, far));
+        let (engine, _ends) = engine(near);
+        let uapi = Uapi::with_external_transport(engine.handle(), 51820);
+        let to_engine = Path {
+            transport: TRANSPORT_ID,
+            addr: relay,
+            ecn: Ecn::NotEct,
+        };
+
+        // The reported settings are no-ops; anything else fails with EADDRINUSE.
+        for (setting, errno) in [
+            ("listen_port=51820", 0),
+            ("fwmark=0", 0),
+            ("listen_port=51821", EADDRINUSE),
+            ("listen_port=0", EADDRINUSE),
+            ("fwmark=7", EADDRINUSE),
+        ] {
+            assert_eq!(
+                request(&uapi, &format!("set=1\n{setting}\n\n")).await,
+                format!("errno={errno}\n\n"),
+                "{setting}"
+            );
+            // The engine still runs the channel transport: its receiving end is open.
+            far_end.send(b"datagram", &to_engine).await.unwrap();
+        }
+        assert!(uapi.bind_transport(0).await.is_err());
+        far_end.send(b"datagram", &to_engine).await.unwrap();
+
+        let config = request(&uapi, "get=1\n\n").await;
+        assert_eq!(config, "listen_port=51820\nerrno=0\n\n");
+    }
 
     #[test]
     fn last_handshake_is_reported_as_unix_time() {
