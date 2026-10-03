@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use nsplane::{PacketBuf, PeerId, TransportId, UdpTransport};
@@ -73,17 +73,19 @@ fn is_ping(packet: &[u8]) -> bool {
 }
 
 /// Answers every ping delivered at `delivered` with a pong through `local`, and drops bulk
-/// packets.
+/// packets, counting them in `bulk`.
 fn ponger(
     mut delivered: Delivered,
     local: mpsc::Sender<PacketBuf>,
     own: Ipv4Addr,
     peer: Ipv4Addr,
+    bulk: Arc<AtomicU64>,
 ) -> JoinHandle<Delivered> {
     tokio::spawn(async move {
         while let Some((_, packet)) = delivered.recv().await {
             let packet = packet.as_packet();
             if !is_ping(packet) {
+                bulk.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let Some(seq) = packet.last_chunk::<4>().map(|b| u32::from_be_bytes(*b)) else {
@@ -187,7 +189,14 @@ fn report(label: &str, (mut times, lost): (Vec<Duration>, usize)) -> TestResult 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_round_trip_is_immediate() -> TestResult {
     let (a, b) = pair(0, None).await?;
-    let pong = ponger(b.delivered, b.local.clone(), b.ip4, a.ip4);
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+    let pong = ponger(
+        b.delivered,
+        b.local.clone(),
+        b.ip4,
+        a.ip4,
+        Arc::clone(&bulk_delivered),
+    );
     let mut pinger = Pinger {
         peer: b.ip4,
         node: a,
@@ -211,7 +220,14 @@ async fn measure(workers: usize, capacity: Option<usize>) -> TestResult {
         |capacity| format!("workers={workers} queue={capacity}"),
     );
     let (a, b) = pair(workers, capacity).await?;
-    let pong = ponger(b.delivered, b.local.clone(), b.ip4, a.ip4);
+    let bulk_delivered = Arc::new(AtomicU64::new(0));
+    let pong = ponger(
+        b.delivered,
+        b.local.clone(),
+        b.ip4,
+        a.ip4,
+        Arc::clone(&bulk_delivered),
+    );
     let (local, from) = (a.local.clone(), a.ip4);
     let mut pinger = Pinger {
         peer: b.ip4,
@@ -231,10 +247,21 @@ async fn measure(workers: usize, capacity: Option<usize>) -> TestResult {
     pinger.round_trips(100, LOST).await?;
     pinger.node.handle.take_queue_stats().await?;
     b.handle.take_queue_stats().await?;
+    let (started, bulk_before) = (Instant::now(), bulk_delivered.load(Ordering::Relaxed));
     let loaded = pinger.round_trips(ROUND_TRIPS, LOST).await;
+    let bulk_rate = u128::from(bulk_delivered.load(Ordering::Relaxed) - bulk_before)
+        / started.elapsed().as_millis().max(1);
     stop.store(true, Ordering::Relaxed);
     flow.await?;
     report(&format!("{label} loaded"), loaded?)?;
+    // Where the lost pings went: what the engines dropped, and the rate of the bulk flow.
+    writeln!(
+        io::stderr(),
+        "{label} loaded bulk delivered: {bulk_rate} packets/ms\n\
+         {label} loaded drops: a {:?}\n{label} loaded drops: b {:?}",
+        pinger.node.handle.drop_counters().await?,
+        b.handle.drop_counters().await?
+    )?;
     // Where the pings queued behind the bulk flow.
     writeln!(
         io::stderr(),

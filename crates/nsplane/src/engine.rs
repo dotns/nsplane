@@ -854,7 +854,15 @@ impl Owner {
         let threshold = self.queue_capacity.min(MAX_BATCH);
         self.transports
             .values()
-            .map(|slot| slot.queue.capacity() + threshold.saturating_sub(slot.pending.len()))
+            .map(|slot| {
+                // Waiting datagrams take the queue's free slots first.
+                let free = if slot.pending.is_empty() {
+                    slot.queue.capacity()
+                } else {
+                    0
+                };
+                free + threshold.saturating_sub(slot.pending.len())
+            })
             .max()
             .unwrap_or(usize::MAX)
     }
