@@ -49,8 +49,7 @@ use nsplane::x25519::PublicKey;
 use nsplane::{AllowedIp, EngineBuilder, StandardRoaming};
 use nsplane_examples::echo::{Backend, EchoArgs};
 use nsplane_examples::node::{
-    self, NodeArgs, TransportKind, configure_peers, decode_key, init_logging,
-    parse_cidr,
+    self, NodeArgs, TransportKind, configure_peers, decode_key, init_logging, parse_cidr,
 };
 use nsplane_examples::out;
 use nsplane_examples::relay::envelope::MachineKey;
