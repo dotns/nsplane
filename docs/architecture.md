@@ -83,6 +83,66 @@ Backpressure:
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
 
+### Queue depths
+
+`EngineHandle::queue_stats` reports, for every bounded queue, its capacity and high-water
+mark (the most items it held at once) since the start or the last `take_queue_stats`, which
+also restarts the marks. The owner task samples each queue whenever it sends to or receives
+from it (a receive sees the occupancy just before it, which is the peak since the previous
+receive), with plain fields and no locks or atomics on the data path. The event channel is
+sampled only for events other than `Event::Dropped`, because reading its occupancy takes the
+channel's locks.
+
+| Queue | Capacity | Producer -> consumer |
+| --- | --- | --- |
+| `command` | 64 | handles -> owner |
+| `local` | `queue_capacity` | source task -> owner |
+| `datagrams` | `queue_capacity` | every receive task -> owner |
+| `deliver` | `queue_capacity` | owner -> sink task |
+| `recycle` | `queue_capacity` | every transmit task -> owner (full: buffer dropped) |
+| `transmit` | `queue_capacity` per transport | owner -> transmit task |
+| `backlog` | `queue_capacity` per transport | owner, waiting for room in `transmit` |
+| `events` | `event_capacity` | owner -> subscribers |
+
+Measured with the default capacity of 1024 on two engines linked in process (release
+build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy); the
+highest mark of either engine over three runs:
+
+| Load | local | datagrams | deliver | recycle | transmit | backlog | command | events | Drops |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Ping-pong, 1300 B, one packet in flight (the `data_path` pattern) | 1 | 1 | 1 | 1 | 1 | 0 | 0 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, channel link | 64 | 41 | 53 | 64 | 64 | 0 | 0 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, loopback `UdpTransport` | 103 | 43 | 64 | 107 | 107 | 0 | 0 | 0 | none |
+| UDP flood, 100k x 1300 B, channel link | 1024 | 341 | 866 | 1023 | 1024 | 449 | 0 | 0 | none |
+| UDP flood, 100k x 1300 B, loopback `UdpTransport` | 1024 | 120 | 239 | 1013 | 1024 | 280 | 0 | 0 | none (the kernel drops ~25%) |
+| Netstack TCP, 1 connection, 32 MiB echoed (2.5-7.4 Gbit/s) | 668 | 642 | 212 | 247 | 665 | 0 | 0 | 0 | none |
+| Netstack TCP, 4 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 469 | 1024 | 1024 | 0 | 0 | `DROP_SINK_FULL` in 3 of 6 runs |
+| Netstack TCP, 8-16 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 896 | 1024 | 1024 | 0 | 0 | `DROP_SINK_FULL` in every run |
+
+With capacity 2048, 8 and 16 netstack connections ran without a drop (deliver peaked at
+494 and 2021); with 512 and 256, even 4 connections dropped at the deliver queue. Once the
+deliver queue drops, the netstack's TCP throughput collapses (to 130-450 Mbit/s), and in
+some runs the connections stalled for good with every engine queue empty, a loss recovery
+problem of the netstack rather than of the queues.
+
+Defaults, from these numbers:
+
+- `queue_capacity` stays at 1024. A single bulk TCP flow, the heaviest paced load, peaks at
+  about 670 (1.5x headroom), and paced or request/response traffic stays far below. Floods
+  and many parallel bulk flows fill every queue upstream of the bottleneck whatever the
+  capacity (the in-process loop is bounded by the TCP windows, not by a link rate), so a
+  larger default would only add latency and memory, and a smaller one turns the sink-full
+  drops of the multi-flow case into a single-flow problem. Since queued packets are sized
+  to their contents, an idle or lightly loaded queue costs little.
+- The command queue stays at 64: every handle call waits for its reply, so it holds at most
+  one command per concurrent caller (the marks never passed 1).
+- `event_capacity` stays at 1024: without a subscriber the channel holds nothing, and a
+  subscriber that stops reading fills any capacity.
+
+Embedders that run many parallel bulk flows through a userspace netstack should raise
+`queue_capacity` (2048 held 16 flows without a drop here) and watch the marks and
+`DROP_SINK_FULL` with `queue_stats` and `drop_counters`.
+
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.

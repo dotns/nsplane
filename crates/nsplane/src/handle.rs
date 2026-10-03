@@ -60,6 +60,68 @@ impl From<EngineError> for TransportError {
     }
 }
 
+/// The capacity of one of the engine's bounded queues and the most it held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// How many items the queue holds at most.
+    pub capacity: usize,
+    /// The most items the queue held at once since the engine started or the last
+    /// [`EngineHandle::take_queue_stats`].
+    pub high_water: usize,
+}
+
+impl QueueDepth {
+    pub(crate) const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            high_water: 0,
+        }
+    }
+
+    /// Raises the high-water mark to `occupancy`.
+    pub(crate) fn record(&mut self, occupancy: usize) {
+        self.high_water = self.high_water.max(occupancy);
+    }
+
+    /// Raises the high-water mark to the occupancy before an item was received, given the
+    /// `left` items after it: the queue only grows between two receives, so that is its
+    /// peak since the previous one. A sender may already have refilled the freed slot, so
+    /// the sum is capped at the capacity.
+    pub(crate) fn record_received(&mut self, left: usize) {
+        self.record((left + 1).min(self.capacity));
+    }
+}
+
+/// The depths of the engine's bounded queues; see [`EngineHandle::queue_stats`].
+///
+/// The packet queues hold `queue_capacity` items each (see
+/// [`crate::EngineBuilder::queue_capacity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QueueStats {
+    /// Handle calls waiting for the owner task.
+    pub command: QueueDepth,
+    /// Local packets read from the source, waiting for the owner task.
+    pub local: QueueDepth,
+    /// Datagrams received by every transport, waiting for the owner task.
+    pub datagrams: QueueDepth,
+    /// Decrypted packets waiting for the sink.
+    pub deliver: QueueDepth,
+    /// Transmitted buffers returned to the owner task for reuse.
+    pub recycle: QueueDepth,
+    /// Datagrams in a transport's transmit queue; the maximum over all transports.
+    pub transmit: QueueDepth,
+    /// Datagrams in a transport's backlog in the owner task, waiting for room in its
+    /// transmit queue; the maximum over all transports. The capacity is the bound for
+    /// datagrams caused by packets and timers; datagrams caused by handle calls may take a
+    /// backlog past it.
+    pub backlog: QueueDepth,
+    /// Events not yet received by the slowest subscriber, at most the event capacity.
+    /// Sampled when an event other than `Event::Dropped` is published and at every
+    /// [`EngineHandle::queue_stats`], so a burst of drop events alone is not seen.
+    pub events: QueueDepth,
+}
+
 /// A request to the owner task; each carries the channel for its reply.
 pub(crate) enum Command {
     Config(ConfigChange, oneshot::Sender<()>),
@@ -79,6 +141,8 @@ pub(crate) enum Command {
     Mtu(oneshot::Sender<u16>),
     Subscribe(oneshot::Sender<broadcast::Receiver<Event>>),
     DropCounters(oneshot::Sender<BTreeMap<&'static str, u64>>),
+    /// With `true`, the high-water marks restart after the reply.
+    QueueStats(bool, oneshot::Sender<QueueStats>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -316,6 +380,26 @@ impl EngineHandle {
     /// [`crate::DROP_TRANSPORT_REMOVED`], [`crate::DROP_TRANSMIT_FULL`]).
     pub async fn drop_counters(&self) -> Result<BTreeMap<&'static str, u64>, EngineError> {
         self.call(Command::DropCounters).await
+    }
+
+    /// The capacity and high-water mark of every bounded queue of the engine since it
+    /// started or the last [`EngineHandle::take_queue_stats`].
+    ///
+    /// Like [`EngineHandle::drop_counters`], this is for sizing the queues: a high-water mark
+    /// far below its capacity means the capacity can shrink (saving memory and latency),
+    /// one at its capacity means the queue filled up, and the drop counters say whether
+    /// that cost packets. The marks are kept by the owner task without locks or atomics:
+    /// it samples a queue's occupancy whenever it sends to or receives from it, and every
+    /// queue once more when serving this call. The calls to read the statistics do not
+    /// count towards the command queue's mark.
+    pub async fn queue_stats(&self) -> Result<QueueStats, EngineError> {
+        self.call(|tx| Command::QueueStats(false, tx)).await
+    }
+
+    /// Like [`EngineHandle::queue_stats`], then restarts every high-water mark at 0, so
+    /// measurements can be taken over windows.
+    pub async fn take_queue_stats(&self) -> Result<QueueStats, EngineError> {
+        self.call(|tx| Command::QueueStats(true, tx)).await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and
