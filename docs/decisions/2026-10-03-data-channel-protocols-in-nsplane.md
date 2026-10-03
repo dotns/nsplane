@@ -33,5 +33,5 @@ them. This supersedes the "no WebSocket or TLS dependency in nsplane" part of D1
 - ns deletes its protocol code as each carrier lands (`tunnel-ws`, the opaque pump hop, its
   WsFrame codec) and keeps listeners, route lookup, bearer source, ACL preflight and status
   mapping.
-- A protocol that is only needed by one side (e.g. the WsFrame terminate leg, which has no
-  consumer today) is added to nsplane when a consumer appears, not before.
+- Both legs of a protocol move, including a leg ns does not run today (the WsFrame terminate
+  leg, user decision 2026-10-03), so ns keeps no protocol code at all.
