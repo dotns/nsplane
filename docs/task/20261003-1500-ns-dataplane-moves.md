@@ -151,6 +151,9 @@ MB-x3 and MB-x4 done: `TcpConnection::{unacked, last_ack}` (smoltcp exposes no S
 `unacked` is the socket's send queue: in flight plus bytes held back for the peer's window)
 and `NetStackConfig::udp_allow_fragmentation`, covered by `nsplane-e2e`'s
 `netstack_progress`.
+MB-x1 done: `NetStackHandle::owns` / `Ownership` over a tuple table kept per connection,
+flow and socket (not per packet); fragments are `None` until the stack reassembles them;
+covered by `nsplane-e2e`'s `netstack_owns` (a `Splitter` routing on `owns`).
 
 ### MD assessment (L1, 2026-10-03; not implemented this round)
 

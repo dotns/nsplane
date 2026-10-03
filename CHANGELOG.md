@@ -307,6 +307,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packet with DF clear for the engine's fragmenter (`EngineBuilder::fragmenter`) to split,
   instead of failing with `InvalidInput`; IPv6 above the MTU and IPv4 above 65 535 bytes
   still fail. Without it the bytes on the wire are unchanged (DF set).
+- `nsplane-netstack`: `NetStackHandle::owns(packet) -> Ownership` tells, without waiting,
+  whether an ingress packet belongs to the stack: `Flow` for a TCP connection (open, in
+  SYN-SENT from the moment the connect is queued, mid handshake or half closed), a bound
+  UDP socket or a UDP flow, and for ICMP errors quoting one of them; `Listener` for a bare
+  SYN or a UDP datagram to a stack address that opens something new; `None` otherwise,
+  including fragments. A `Splitter` closure can share one decrypted stream between the stack
+  and other consumers with it. The table it reads changes only when a connection, flow or
+  socket opens or closes.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
