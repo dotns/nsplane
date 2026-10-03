@@ -74,9 +74,11 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
 - MB-x5 (NEW, from ns T10 throughput) Configurable TCP socket buffers.
   - Config: `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (bytes; default today's 512 segments) with the advertised window and window scaling following the receive buffer.
   - Evidence: ns user-space mode single-stream TCP is 15% below the legacy stack (1 MiB buffers) on a quiet host, with lower CPU use, i.e. window-limited.
+  - Done (2026-10-03): `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer: Option<usize>`; `None` keeps 512 IPv4-sized segments (`(mtu - 40) * 512`), values are clamped to `mtu - 40 ..= 65535 << 14`, and the window scale follows the receive buffer (smoltcp derives the shift from its capacity), listener pool sockets included. Tests: unit `stack/tests/buffers.rs`, `nsplane-e2e` `netstack_buffers`. Trade-off: a window above the queues on the path (in-process, the engine's 1024-packet sink queue) loses its tail as sink drops and recovers by retransmission timeout: 4 MiB about 52 MB/s against 287-315 MB/s for the default and 1 MiB (docs/architecture.md, "Socket buffers (MB-x5)").
 - MB-x6 (NEW, from ns T10 load) Count listener-pool overflow.
   - The listener pool size is already caller config (ns raises it); the gap is visibility: a SYN that finds the pool full is reset silently. Add `NetStackStats::tcp_listen_overflow`.
   - Evidence: with ns's pool at 32, 500 concurrent connects got 135-168 accepted and the rest reset without a counter; with the pool at 512, 500/500.
+  - Done (2026-10-03), no code: `NetStackStats::syn_refused` already counts SYNs refused for a full listener pool (sized by `NetStackConfig::listener_pool`); no `tcp_listen_overflow` counter is added.
 
 ## NEW workstream MF: engine throughput (ns release gate "throughput not below the legacy baseline")
 
@@ -99,6 +101,7 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is
   not the fix.
+  - Done (2026-10-03, partial): profiled with `nsplane-e2e` `netstack_stream` (1 GiB, one connection, over two engines and direct). Per GiB over engines: ChaCha20-Poly1305 36 % of the instructions, both netstack drivers 18 %, the harness's `ChannelTransport::recv` zero-fill 7-9 %; direct, smoltcp's TCP checksum loop is about 15 %. Fixes: batched ingress (`poll_recv_many`) and 32 bytes of egress tail room so the engine seals in place; over engines 2.2-2.3 % fewer instructions, 7-8 % less CPU time, 22-24 % fewer context switches per GiB, throughput within the noise of the shared host. Deferred: a later smoltcp fork round (vectorised `checksum::data`, the furthest advertised window edge, SACK or partial-ACK retransmission), length without zero-fill in `nsplane-packet` (needs `unsafe`), `ChannelTransport::recv` zero-fill (after PF merges). The gap cannot be split in-process (ns's legacy path is tunnel-wg's own loop); with the netstack at 18 % of the engine pairing, most of it is likely the engine (MF-1); to be re-measured with PB's netstack pair. See docs/architecture.md, "Netstack throughput".
 
 ## NEW workstream MC: transports (crates/nsplane/src/udp.rs, transport.rs; e2e)
 - MC-1 Side channel for non-WireGuard datagrams on a UdpTransport.
@@ -119,7 +122,7 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   - Replaces: the OpaquePump loopback UDP hop and ns-engine WssTransport. The wire stays unchanged (campaign rule).
   - Alternative (no MC-2): keep the pump as it is. It is per-datagram code in ns, so it would be a recorded exception to the rule (D10).
   - Done (2026-10-03) as the generic form (D10): `LinkTransport` with `LinkDialer`, `LinkSender`, `LinkReceiver`, `LinkState { Connected, Disconnected }` and `LinkConfig { queue: 256, read_idle_timeout: None }`; no WebSocket or TLS dependency in nsplane, so `Rejected(u16)` stays with ns's dialer. Tests: `nsplane-e2e` `link` (in-memory link); the examples' relay WSS client runs on it with a tungstenite dialer (`examples/tests/wss.rs`, `just e2e-examples` relay-wss cells).
-- MC-3 (NEW, proposed 2026-10-03, revised, awaiting approval) WSS carriers in nsplane. Owner: ns is the business layer, nsplane the data plane; without UDP, WSS is the only channel, so all of ns `tunnel-ws` moves. This revisits D10's "no WebSocket or TLS dependency in nsplane".
+- MC-3 (NEW, approved 2026-10-03, plan 20261003-1630-perf-and-wss PW) WSS carriers in nsplane. Owner: ns is the business layer, nsplane the data plane; without UDP, WSS is the only channel, so all of ns `tunnel-ws` moves. This revisits D10's "no WebSocket or TLS dependency in nsplane".
   - New crate `nsplane-wss` (tokio-tungstenite, rustls/aws-lc-rs); `nsplane` core stays free of WebSocket and TLS.
   - (a) Datagram carrier: `WssDialer: LinkDialer`, from ns `OpaquePump` (bearer header, 401/403, doubling backoff 2 s..60 s, read-idle watchdog, ping) and `examples/src/relay/wss/client.rs`. `LinkState` gains `Rejected(u16)`.
   - (b) Stream carrier: the WsFrame protocol (`[stream_id u32][cmd][payload]`, OPEN_V4/V6, DATA, CLOSE, CLOSE_ACK) with both legs: client (open a TCP/UDP flow to a target, today ns `proxy/wire.rs` + `wss_flow.rs`) and terminate (ns `tunnel-ws` `WsTunnel` session: per-session buffer cap, separate data/control queues, stream table). Business resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) stays in ns behind an embedder trait that maps an OPEN to a backend address or a denial.
@@ -232,6 +235,7 @@ MB-x6 needs no code: `NetStackStats::syn_refused` counts the bare SYNs refused (
 full listener pool, which `NetStackConfig::listener_pool` sizes. User decisions for the next
 round (plan 20261003-1630-perf-and-wss): MC-3 approved as recommended (new optional crate
 `nsplane-wss` with the WSS dependencies; datagram carrier complete, stream carrier client leg
-first, terminate leg when a consumer exists), ADR 2026-10-03-data-channel-protocols-in-nsplane
+first, terminate leg when a consumer exists; revised 15:35: terminate leg in scope now, PW
+(c)), ADR 2026-10-03-data-channel-protocols-in-nsplane
 (every data-channel protocol lives in nsplane), MF-1, MF-2 and MB-x5 after a benchmark
 harness against kernel WireGuard and wireguard-go.
