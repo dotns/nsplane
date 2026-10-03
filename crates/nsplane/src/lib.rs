@@ -17,6 +17,9 @@
 //! For a hybrid local side (a TUN device next to a userspace netstack), [`Splitter`]
 //! routes delivered packets to one of several sinks and [`MergeSource`] merges several
 //! sources fairly into one.
+//! [`MapSink`] and [`MapSource`] rewrite or drop packets in place, [`pipe`] feeds one
+//! engine's output into another's input and [`pump`] moves packets from a source into a
+//! sink: the local-side graph primitives.
 
 #![forbid(unsafe_code)]
 

@@ -15,7 +15,8 @@ use nsplane::{
 };
 use nsplane_core::{MessageKind, Roam, Verdict};
 use nsplane_e2e::{
-    Family, Node, Options, SharedFilter, TestResult, exchange, introduce, payload, transfer,
+    Family, Node, Options, SharedFilter, TestResult, channel_pair_with, exchange, introduce,
+    payload, transfer,
 };
 
 const A1: TransportId = TransportId::new(1);
@@ -289,5 +290,70 @@ async fn a_handshake_can_start_on_a_candidate_without_moving_the_peer() -> TestR
     a.handle
         .force_handshake_on(PeerId::new(999), path(A2, b2()))
         .await?;
+    Ok(())
+}
+
+/// Records, in one log, the policy's and the filter's view of each datagram.
+#[derive(Debug, Default)]
+struct Order(Mutex<Vec<&'static str>>);
+
+#[derive(Debug)]
+struct OrderPolicy(Arc<Order>);
+
+impl PathPolicy for OrderPolicy {
+    fn select(&self, _peer: PeerId, _kind: MessageKind) -> Option<Path> {
+        None
+    }
+
+    fn on_authenticated(&self, _peer: PeerId, _from: &Path, kind: MessageKind) -> Roam {
+        if kind == MessageKind::Data {
+            lock(&self.0.0).push("policy");
+        }
+        Roam::Adopt
+    }
+
+    fn observe_every_message(&self) -> bool {
+        true
+    }
+}
+
+impl PacketFilter for Order {
+    fn inbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+        Verdict::Accept
+    }
+
+    fn inbound_from(&self, _peer: PeerId, _from: &Path, _packet: &mut PacketBuf) -> Verdict {
+        lock(&self.0).push("filter");
+        Verdict::Accept
+    }
+
+    fn outbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+        Verdict::Accept
+    }
+}
+
+#[tokio::test]
+async fn the_policy_sees_a_data_message_before_the_inbound_filters() -> TestResult {
+    let order = Arc::new(Order::default());
+    let log = Arc::clone(&order);
+    let (mut a, mut b) = channel_pair_with(Options::default(), |seed, builder| {
+        if seed == 2 {
+            builder
+                .policy(Box::new(OrderPolicy(Arc::clone(&log))))
+                .filter(Box::new(SharedFilter(Arc::clone(&log))))
+        } else {
+            builder
+        }
+    })?;
+    introduce(&a, &b, None).await?;
+    exchange(&mut a, &mut b).await?;
+    lock(&order.0).clear();
+    for _ in 0..3 {
+        transfer(&a, &mut b, Family::V4, 100).await?;
+    }
+    assert_eq!(
+        *lock(&order.0),
+        ["policy", "filter", "policy", "filter", "policy", "filter"]
+    );
     Ok(())
 }
