@@ -37,6 +37,11 @@
 //! `linux`, `darwin`) and to loading the Wintun library (`windows`); see
 //! `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
 
+mod host;
+pub use host::{
+    HOST_TUN_DEFAULT_CAPACITY, HostTunInput, HostTunSink, HostTunSource, PushError, host_tun,
+};
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -81,3 +86,17 @@ pub use tun::{MTU_POLL_INTERVAL, Offload, Tun, TunOptions, TunSink, TunSource};
 pub use unix::adopt_fd;
 #[cfg(windows)]
 pub use windows::{Tun, TunSink, TunSource};
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+mod slot;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+pub use slot::{SlotSink, SlotSource, TunSlot};
