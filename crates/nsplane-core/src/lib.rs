@@ -11,9 +11,10 @@
 //! leaves as the `Transmit`, a datagram is opened in its buffer and leaves as the `Deliver`.
 //! Buffers the driver is done with go back through [`Core::recycle`].
 //!
-//! A driver that encrypts and decrypts on several threads feeds inputs with
-//! [`Core::handle_input_deferred`] instead: the cryptography of each data packet comes back
-//! as a [`CryptoJob`] to run anywhere, finished with [`Core::complete_job`].
+//! A driver that encrypts and decrypts on several threads builds the core with
+//! [`CoreConfig::crypto_jobs`] and feeds inputs with [`Core::handle_input_deferred`] instead:
+//! the cryptography of each data packet comes back as a [`CryptoJob`] to run anywhere,
+//! finished with [`Core::complete_job`].
 
 #![forbid(unsafe_code)]
 

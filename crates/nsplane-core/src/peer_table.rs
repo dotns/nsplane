@@ -76,6 +76,8 @@ pub(crate) struct PeerTable {
     next_index: IndexLfsr,
     next_id: u32,
     handshake_rate_limit: u64,
+    /// Whether peers share their tunnels with crypto jobs.
+    shared_tunnels: bool,
     key: Option<OwnKey>,
 }
 
@@ -89,8 +91,10 @@ impl std::fmt::Debug for PeerTable {
 
 impl PeerTable {
     /// Creates an empty table without a private key. `handshake_rate_limit` is the number of
-    /// handshakes per second the gate tolerates before replying with cookies.
-    pub(crate) fn new(handshake_rate_limit: u64) -> Self {
+    /// handshakes per second the gate tolerates before replying with cookies. With
+    /// `shared_tunnels` every peer keeps its tunnel behind a lock, to share it with crypto
+    /// jobs; otherwise it owns the tunnel.
+    pub(crate) fn new(handshake_rate_limit: u64, shared_tunnels: bool) -> Self {
         Self {
             ids: Vec::new(),
             peers: Vec::new(),
@@ -100,6 +104,7 @@ impl PeerTable {
             next_index: IndexLfsr::default(),
             next_id: 1,
             handshake_rate_limit,
+            shared_tunnels,
             key: None,
         }
     }
@@ -117,7 +122,7 @@ impl PeerTable {
 
         let gate = Arc::new(RateLimiter::new(&public_key, self.handshake_rate_limit));
         for peer in &mut self.peers {
-            peer.tunnel().set_static_private(
+            peer.tunnel_mut().set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&gate)),
@@ -129,6 +134,11 @@ impl PeerTable {
             private: private_key,
             public: public_key,
         });
+    }
+
+    /// Whether peers share their tunnels with crypto jobs.
+    pub(crate) const fn shared_tunnels(&self) -> bool {
+        self.shared_tunnels
     }
 
     /// The own key pair, if set.
@@ -190,7 +200,14 @@ impl PeerTable {
             let started = tunnel.update_timers_at(now, &mut []);
             debug_assert!(matches!(started, TunnResult::Done), "{started:?}");
             tunnel.set_persistent_keepalive(config.persistent_keepalive.filter(|&k| k > 0));
-            let peer = Peer::new(tunnel, config.public_key, index, config.path, preshared_key);
+            let peer = Peer::new(
+                tunnel,
+                self.shared_tunnels,
+                config.public_key,
+                index,
+                config.path,
+                preshared_key,
+            );
             self.next_id = next_id;
             self.ids.push(id);
             self.peers.push(peer);
@@ -363,7 +380,7 @@ mod tests {
     }
 
     fn table() -> PeerTable {
-        let mut table = PeerTable::new(100);
+        let mut table = PeerTable::new(100, false);
         table.set_private_key(StaticSecret::random_from_rng(OsRng));
         table
     }
@@ -504,7 +521,7 @@ mod tests {
 
     #[test]
     fn peers_need_a_private_key() {
-        let mut table = PeerTable::new(100);
+        let mut table = PeerTable::new(100, false);
         assert!(table.key_pair().is_none());
         assert!(table.rate_limiter().is_none());
         assert_eq!(
@@ -535,6 +552,20 @@ mod tests {
                 .time_since_last_handshake(Instant::now())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_a_shared_table_shares_tunnels() {
+        let mut table = table();
+        let id = add(&mut table, key(), &[]);
+        assert!(!table.shared_tunnels());
+        assert!(table.peer(id).unwrap().shared_tunnel().is_none());
+
+        let mut table = PeerTable::new(100, true);
+        table.set_private_key(StaticSecret::random_from_rng(OsRng));
+        let id = add(&mut table, key(), &[]);
+        assert!(table.shared_tunnels());
+        assert!(table.peer(id).unwrap().shared_tunnel().is_some());
     }
 
     #[test]
