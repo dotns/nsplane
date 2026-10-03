@@ -157,11 +157,27 @@ Added after Phase 5 (2026-10-03), still open:
 18. **Plain TUN read capacity**: the non-offload read buffer is MTU, so a full-MTU IPv4 packet
     takes nsplane-nat's grown-copy path; give it MTU + 28.
 19. **smoltcp upstream**: two smoltcp 0.14 defects (pure-ACK SEQ after the retransmission-timeout rewind; zero-window
-    probe replacing the retransmit timer) are worked around in nsplane-netstack; random loss >= 2 %
-    stays bound by the retransmission timeout (no SACK / NewReno). Report upstream (outward-facing; needs the user's go) and
-    drop the workarounds once fixed.
+    probe replacing the retransmit timer), plus two fast-retransmit defects found while removing
+    the workarounds (a pending fast retransmission lost when the device has no room; fast
+    retransmit with only a FIN outstanding). Status: fixed in the dotns/smoltcp fork (tag
+    `v0.14.0-nsplane.3`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`); nsplane-netstack depends on
+    it and its workarounds are removed. Upstream report pending, user's call. Random loss >= 2 %
+    stays bound by the retransmission timeout (no SACK / NewReno).
 20. **Zero-checksum fragmented IPv4 UDP** arriving out of order at the Translator cannot be
     translated (locally fragmented datagrams get checksums filled).
+
+Status after the Phase 5 follow-ups (campaign `nsplane-fu-202610030716`, branch
+`bkd/2nokkg29`): item 14 is fixed by the `failed: &mut usize` argument of
+`Transport::send_batch` (the engine counts exactly the failed datagrams; `UdpTransport` only
+those of the failed GSO run; covered by `udp::failed_run_counts_only_its_datagrams` and
+`nsplane-e2e`'s `offload_batch::partly_failed_batch_sends_count_only_the_failed_run` with and
+without workers); item 18 is fixed by giving plain and Wintun TUN reads the 28-byte
+translation slack (`linux_tun::plain_tun_full_mtu_read_leaves_room_to_grow`, and the
+`translate_node` e2e scenario's 1420-byte ping with `--no-offload` and `grown_copies` 0);
+item 20 is fixed by holding IPv4 UDP fragments that arrive before their first fragment
+(bounded at 256 datagrams and 1 MiB, 60 s) and dropping reassembled datagrams above
+`Translator::set_mtu` (the `nsplane-nat` translator tests and `nsplane-e2e`'s
+`fragment::zero_checksum_fragments_out_of_order_arrive_as_one_ipv6_datagram`).
 
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.

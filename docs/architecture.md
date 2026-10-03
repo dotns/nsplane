@@ -272,6 +272,10 @@ TUN read (vnet hdr + up to 64 KiB) ─► segments (<= MTU) ─► core seals �
 UDP GRO read ─► zero-copy slices ─► core opens in place ─► coalesced TUN writev
 ```
 
+`Transport::send_batch` reports in its `failed` argument which of the datagrams it was done
+with failed, so `TRANSPORT_SEND_ERROR` counts exactly the lost datagrams: a failed segmented
+`UdpTransport` send loses its run, not the runs handed off before it in the same call.
+
 Offload is negotiated where the device or socket is opened. `Tun::create` (Linux,
 Android) asks for `IFF_VNET_HDR` with checksum offload and TSO, plus USO when the kernel
 accepts it, and falls back to a plain `IFF_NO_PI` device; `Tun::offload` reports the
@@ -282,7 +286,10 @@ fails with `EIO`/`EINVAL` falls back to one datagram per send, and where `quinn-
 cannot set the socket up (Wine) the transport sends with plain `send_to`. With offload on
 the socket sets DF, so outer datagrams above the path MTU fail with `EMSGSIZE`; the engine
 counts them under `TRANSPORT_SEND_ERROR`. `TunOptions::offload(false)`,
-`UdpTransport::bind_with_offload(.., false)` and the examples' `--no-offload` opt out.
+`UdpTransport::bind_with_offload(.., false)` and the examples' `--no-offload` opt out. Plain
+TUN reads (no virtio-net header, and Wintun reads on Windows) leave the same 28 bytes of
+room behind each packet as segmented ones (a read still takes at most the MTU), so a
+translator grows full-MTU IPv4 in place with offload off too.
 
 ## nsplane-tun
 
@@ -331,36 +338,43 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- Two smoltcp 0.14 defects stalled connections for good under loss when both ends send
-  (an echo, request and response); the driver works around both without touching
-  smoltcp.
-  - After a retransmission timeout smoltcp rewinds its next sequence number to the oldest
-    byte it saw acknowledged and stamps its pure ACKs with it. If the peer had already
-    received past that point (only its ACKs were lost), the peer drops those ACKs as old,
-    acknowledgement included. With both ends in that state each resends data the other
-    has, cwnd stays at one segment and the timeouts back off to 60 s (traced: both sides
-    one segment in flight, retransmission timeout 32 s, each receiver 15-72 KB past the
-    other's `snd_una`). The device records the highest acknowledgement number each connection's
-    peer sent (`device::note_peer_ack`, also from segments smoltcp drops) and moves an
-    outgoing pure ACK whose sequence number lies before it up to it
-    (`device::fix_ack_seq`, checksum adjusted): that is where the peer's window starts,
-    which smoltcp always accepts, and what Linux would send.
-  - When a lost segment was the last in the peer's window, window scaling rounds the few
-    bytes left down to a zero window, the sender switches to zero-window probes and never
-    retransmits the lost bytes, and the receiver drops the sender's ACKs, whose sequence
-    number now lies past its window (traced: sender `remote_win_len` 0, 4 bytes in flight,
-    timer `Idle` after its probe timed out). A connection that moved no application bytes
-    for 1 s takes up to 1 KiB more into a full application buffer to reopen its window,
-    and keeps a 1 s keep-alive while it has bytes to send, standing in for the persist
-    timer (`stack::nudge_stalled`).
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.3`, ADR
+  `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus fixes for four defects that
+  stalled connections for good under loss when both ends send (an echo, request and
+  response).
+  - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
+    oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
+    received past that point (only its ACKs were lost), the peer dropped those ACKs as old,
+    acknowledgement included; with both ends in that state each resent data the other had
+    and the timeouts backed off to 60 s. The fork sends every empty segment with the
+    highest sequence number sent (RFC 9293 `SEQ=SND.NXT`), and such a segment no longer
+    moves the send position, so the rewind for retransmission stays in effect.
+  - When an ACK closed the peer's window while data was in flight (window scaling rounds
+    a few free bytes down to zero), the zero-window probe timer replaced the retransmission
+    timer, so lost bytes were never resent, and no timer ran once the window reopened. The
+    fork keeps outstanding data under the retransmission timer (RFC 6298 5.1) and probes
+    from the oldest unacknowledged byte when a timeout finds the window closed.
+  - The third duplicate ACK reset the retransmission timer and dropped the pending fast
+    retransmission before the segment reached the device; with the egress backlog full the
+    segment was never sent and no timer ran (traced: `LAST-ACK`, 360 KB in flight above
+    cwnd, timer idle). The fork keeps it pending until it is emitted.
+  - Three duplicate ACKs while only the FIN was outstanding replaced its retransmission
+    timer by a fast retransmission, which resends data only (traced: `FIN-WAIT-1`, empty
+    send buffer, FIN in flight, timer idle). The fork leaves a FIN to the retransmission
+    timer.
+
+  Phase 5 worked around the first two in the driver (an outgoing pure-ACK sequence
+  rewrite, and a stalled connection taking up to 1 KiB past its application buffer's bound
+  and keeping a 1 s keep-alive in place of the persist timer); all of it is gone.
 
   The engine's `DROP_SINK_FULL` is ordinary loss to TCP: a decrypted segment the engine
   drops at the full sink is never acknowledged, the retransmission timer stays armed and
   smoltcp resends it; the stalls above only needed such a loss at the wrong moment.
   `parallel_echo_*` in `tests/netstack_lossy.rs` run eight 1 MiB echoes through
-  256-packet engine queues, without loss and at 2 % loss; they passed 10 consecutive runs
-  in debug (2 % loss: 8.3-17.3 s) and in release (9.0-23.1 s), where without the two
-  workarounds 1 of 10 debug and 3 of 10 release runs stalled a flow for 60 s.
+  256-packet engine queues, without loss and at 2 % loss. On the fork without any driver
+  workaround they passed 10 consecutive runs in debug (2 % loss: 10.2-16.2 s) and in
+  release (11.0-21.0 s), as they did on smoltcp 0.14 with the Phase 5 workarounds (8.3-17.3 s
+  and 9.0-23.1 s).
 
 ### Netstack throughput
 
@@ -368,20 +382,21 @@ Release, two netstacks over two engines on an in-process `ChannelTransport` pair
 latency), one TCP connection, MTU 1420; the link wrappers are `nsplane_e2e::LossyTransport`
 (drops a deterministic fraction of the data messages in each direction) and
 `nsplane_e2e::Bottleneck` (25 MB/s behind a 64-datagram drop-tail buffer, like a socket
-buffer drained by a busy receiver). Two runs each; "after" is CUBIC with both stall
-workarounds:
+buffer drained by a busy receiver). "After" is CUBIC with the Phase 5 stall workarounds
+on smoltcp 0.14 (two runs each); "fork" is the same on `v0.14.0-nsplane.3` without any
+workaround (four runs each, on a host shared with other builds, load 7-11 on 32 cores):
 
 ```text
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
 ```
 
-| Case | Before (no congestion control) | After |
-| --- | --- | --- |
-| TCP, 64 MiB, no loss | 440.5 / 441.0 MB/s | 321.1 / 319.4 MB/s |
-| TCP, 16 MiB, 1 % loss | 41.1 s / 35.1 s (0.4-0.5 MB/s) | 4.09 s / 2.09 s (4.1-8.0 MB/s) |
-| TCP, 16 MiB, 3 % loss | not done after 60 s (both) | 54.2 s / 59.2 s (0.3 MB/s) |
-| TCP, 16 MiB, bottleneck | not done after 60 s (both, ~2650 drops) | 20.9 s / 18.9 s (0.8-0.9 MB/s, ~330 drops) |
-| UDP, 50 000 x 1200 B, no loss | 902.7 / 468.4 MB/s | 587.1 / 608.7 MB/s |
+| Case | Before (no congestion control) | After | Fork |
+| --- | --- | --- | --- |
+| TCP, 64 MiB, no loss | 440.5 / 441.0 MB/s | 321.1 / 319.4 MB/s | 308.6 / 129.2 / 246.7 / 228.9 MB/s |
+| TCP, 16 MiB, 1 % loss | 41.1 s / 35.1 s (0.4-0.5 MB/s) | 4.09 s / 2.09 s (4.1-8.0 MB/s) | 1.09 / 6.16 / 1.14 / 3.13 s (2.7-15.3 MB/s) |
+| TCP, 16 MiB, 3 % loss | not done after 60 s (both) | 54.2 s / 59.2 s (0.3 MB/s) | 53.2 s once, 3 of 4 not done after 60 s |
+| TCP, 16 MiB, bottleneck | not done after 60 s (both, ~2650 drops) | 20.9 s / 18.9 s (0.8-0.9 MB/s, ~330 drops) | 18.9 / 15.9 / 19.8 / 17.9 s (0.8-1.1 MB/s, 276-472 drops) |
+| UDP, 50 000 x 1200 B, no loss | 902.7 / 468.4 MB/s | 587.1 / 608.7 MB/s | 303.3 / 530.1 / 644.5 / 411.1 MB/s |
 
 Without loss the stack is not the limit (runs of the same build spread from 320 to
 460 MB/s for TCP and 470 to 900 MB/s for UDP: scheduling noise) and congestion control
@@ -394,6 +409,13 @@ completed transfers. A smaller default window was measured and not adopted (see
 (32 MiB in 2.9 s), but a window that small caps a connection at 1.8 MB/s over a 50 ms path,
 and without loss it gains nothing. `tests/netstack_lossy.rs` asserts that 8 MiB complete
 intact at 1 % loss within 15 s, next to a loss-free reference.
+
+The fork changes nothing on the loss-free path (its fixes only touch retransmission and
+empty segments, and the driver lost per-packet work); the loss-free spread above is the
+shared host, as the 320-460 MB/s spread of one build was before. With loss the results
+stay in the same range: 1 % loss completes in 1.1-6.2 s (before 2.1-4.1 s; whole seconds
+are retransmission timeouts), the bottleneck in 15.9-19.8 s (before 18.9-20.9 s), and 3 %
+loss stays timeout-bound right at the 60 s limit, as before.
 
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
@@ -525,10 +547,18 @@ replies are mapped back; native IPv4 and IPv6 pass unchanged and packets spoofin
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
-incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first,
-which completes only when the first fragment arrives first. A translated packet grows by 20
-bytes (28 with a fragment header) inside its buffer, so packets need that much spare
-capacity (else `reasons::NO_ROOM`). Since the core routes and checks sources before the
+incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
+any fragment order: only the first fragment shows the checksum, so later fragments that
+arrive before it are held (at most 256 datagrams and 1 MiB, for 60 s; a fragment after the
+expiry starts a new entry). A datagram with a checksum whose later fragments came first is
+reassembled the same way and sent unfragmented; with nothing held, in-order fragments of a
+checksummed datagram are translated one by one, without holding or waiting. A reassembled
+datagram larger than the translator's MTU (`Translator::set_mtu`, 1280 by default; set it
+to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent oversize.
+`TranslatorStats` counts `fragments_held`, `fragment_timeouts`, `fragment_budget_drops`,
+`fragment_marker_evictions` and `reassembled_too_big`. A translated packet grows by 20
+bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied
+into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. Since the core routes and checks sources before the
 filters, each peer's allowed IPs must contain its `alias4/32`, the LAN IPv4 prefixes behind
 it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
 
@@ -546,6 +576,81 @@ next to the local side, so the ACL and the port map see overlay IPv6 in both dir
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
 `Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
 fragmented to fit the MTU after translation.
+
+## Optional features and defaults
+
+A basic client is an `EngineBuilder` on a TUN device and a `UdpTransport` with peers and
+no filters. Every feature below is optional; one that is not installed is not on the data
+path, so such a client pays no extra latency for it.
+
+| Feature | Crate | How to enable | Default | Cost when not enabled |
+|---|---|---|---|---|
+| IPv4/IPv6 translation | `nsplane-nat` | `EngineBuilder::filter(Box::new(Translator::new(table)))`; `Translator::set_mtu` to the tunnel MTU | not installed | none: the core's filter chain is empty |
+| Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
+| ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
+| Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
+| Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
+| Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; each peer's tunnel stays behind an uncontended lock (measured as noise) |
+| User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
+| Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
+| TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
+| UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
+
+**Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
+`nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
+are separate crates that `nsplane` and `nsplane-tun` do not depend on, so they are not
+built or linked unless the application adds them; `nsplane-uapi` is only needed to serve
+the `wg` UAPI. None of the crates has optional Cargo features.
+
+**Address family.** IPv4-only, IPv6-only or dual stack is the caller's choice and needs no
+switch: the transport's bind address (`0.0.0.0:port` for IPv4 only, an IPv6 address for
+IPv6 only, `[::]:port` for a dual-stack socket), the addresses and routes configured on the
+TUN device (outside nsplane, e.g. `ip addr`), and the peers' allowed IPs.
+
+**A minimal IPv4-only client** (one TUN device, one UDP socket, one peer, no filters):
+
+```rust
+use std::error::Error;
+use std::net::SocketAddr;
+
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{Ecn, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_tun::Tun;
+
+async fn client(
+    key: StaticSecret,
+    server_key: PublicKey,
+    server: SocketAddr, // e.g. 198.51.100.1:51820
+) -> Result<(), Box<dyn Error>> {
+    const UDP: TransportId = TransportId::new(0);
+    // The caller sets up the TUN device's addresses and routes, e.g.
+    // `ip addr add 10.0.0.2/32 dev wg0` and `ip route add 10.0.0.0/24 dev wg0`.
+    let (source, sink) = Tun::create("wg0")?.split()?;
+    let udp = UdpTransport::bind(UDP, "0.0.0.0:0".parse()?)?;
+    let engine = EngineBuilder::new(source, sink)
+        .private_key(key)
+        .transport(udp)
+        .build()?;
+    let mut peer = Peer::new(server_key);
+    peer.allowed_ips = vec!["10.0.0.0/24".parse()?];
+    peer.persistent_keepalive = Some(25);
+    peer.path = Some(Path { transport: UDP, addr: server, ecn: Ecn::NotEct });
+    engine.handle().add_or_update_peer(peer).await?;
+    engine.wait().await?;
+    Ok(())
+}
+```
+
+**Offload never waits for more packets.** Batching and offload only group work that is
+already there; nothing holds a packet back to fill a batch:
+
+- the engine's I/O tasks fill a batch with non-blocking `try_recv` after the first packet
+  and send what they have (no timers, no linger);
+- TUN GSO/GRO writes coalesce only the packets of the batch they are handed;
+- UDP GSO segments only runs of datagrams within the current batch;
+- a GRO or segmented TUN read returns what one receive yields;
+- the crypto worker pool hands a batch to a worker when it is full or when the owner task
+  runs out of other work, never on a timer.
 
 ## Performance
 

@@ -1,8 +1,9 @@
 //! The engine's fragmentation stage between two engines over a channel transport: Packet Too
 //! Big and Fragmentation Needed delivered to the sender, native IPv4 keeping the full MTU,
 //! IPv4 fragments translated to IPv6 fragments by a `Translator` (these cases also with the
-//! crypto worker pool on), MTU changes, and no stage without `EngineBuilder::fragmenter`;
-//! the stage's counters in `fragment_stats` and its drops in `drop_counters`.
+//! crypto worker pool on), zero-checksum IPv4 fragments arriving out of order reassembled by
+//! the `Translator`, MTU changes, and no stage without `EngineBuilder::fragmenter`; the
+//! stage's counters in `fragment_stats` and its drops in `drop_counters`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -84,6 +85,9 @@ async fn pair(
 )> {
     let translator = translate.then(|| table(None).map(|t| Arc::new(Translator::new(t))));
     let translator = translator.transpose()?;
+    if let Some(translator) = &translator {
+        translator.set_mtu(MTU);
+    }
     let shared = translator.clone();
     let (a, b) = channel_pair_with(Options::default(), |seed, builder| {
         let builder = builder.crypto_workers(workers);
@@ -348,6 +352,54 @@ async fn translated_ipv4_arrives_as_ipv6_fragments_with(workers: usize) -> TestR
     let stats = a.handle.fragment_stats().await?;
     assert!(stats.fragmented >= 1, "{stats:?}");
     assert!(stats.fragments >= 2, "{stats:?}");
+    Ok(())
+}
+
+/// The IPv4 fragment of `datagram` holding its payload bytes `range` (DF clear).
+fn fragment_of(datagram: &[u8], range: std::ops::Range<usize>, more: bool) -> TestResult<Vec<u8>> {
+    let mut packet = datagram[..20].to_vec();
+    packet[2..4].copy_from_slice(&u16::try_from(20 + range.len())?.to_be_bytes());
+    let field = u16::try_from(range.start / 8)? | if more { 0x2000 } else { 0 };
+    packet[6..8].copy_from_slice(&field.to_be_bytes());
+    packet[10..12].fill(0);
+    let sum = ipv4_header_checksum(&packet);
+    packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    packet.extend_from_slice(&datagram[20 + range.start..20 + range.end]);
+    Ok(packet)
+}
+
+#[tokio::test]
+async fn zero_checksum_fragments_out_of_order_arrive_as_one_ipv6_datagram() -> TestResult {
+    let (a, mut b, translator) = pair(true, 0).await?;
+    let translator = translator.ok_or("no translator")?;
+    let data = payload(1000);
+    let mut original = udp4(SELF4, PEER_ALIAS4, &data);
+    original[26..28].fill(0);
+    let len = original.len() - 20;
+    let fragments = [
+        fragment_of(&original, 0..400, true)?,
+        fragment_of(&original, 400..800, true)?,
+        fragment_of(&original, 800..len, false)?,
+    ];
+    // Last first, then the first and the middle one.
+    for index in [2, 0, 1] {
+        a.send(&fragments[index]).await?;
+    }
+
+    let (_, packet) = b.expect_delivery().await?;
+    let (ip, udp) = Ipv6Header::parse(&packet)?;
+    assert_eq!((ip.src(), ip.dst()), (SELF_NODE4, PEER_NODE4));
+    assert_eq!(ip.next_header(), protocol::UDP);
+    assert_eq!(udp.len(), len);
+    assert_eq!(udp[..6], original[20..26]);
+    assert_eq!(udp[8..], data);
+    assert_eq!(
+        transport_checksum_v6(SELF_NODE4, PEER_NODE4, protocol::UDP, udp),
+        0
+    );
+    b.expect_no_delivery().await?;
+    let stats = translator.stats();
+    assert_eq!((stats.reassembled, stats.fragments_held), (1, 3));
     Ok(())
 }
 

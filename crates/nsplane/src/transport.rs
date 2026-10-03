@@ -73,34 +73,39 @@ pub trait Transport: Send + Sync + 'static {
     }
 
     /// Sends `datagrams[*sent..]` in order, each to its [`Path`] as with [`send`], advancing
-    /// `*sent` past every datagram it is done with.
+    /// `*sent` past every datagram it is done with and `*failed` by every one of those that
+    /// failed.
     ///
     /// The caller keeps the buffers (and reuses them once the call returns), so a batch
     /// costs no allocation; a transport may send a run of datagrams to the same path as
-    /// one segmented send. A datagram counts as done once it was handed off or failed.
-    /// On success every datagram is done (`*sent == datagrams.len()`). On an error the
-    /// datagrams that failed are done and dropped, and the error is returned: after
-    /// [`io::ErrorKind::BrokenPipe`] (the transport is closed) the caller stops, after any
-    /// other error it may call again to send the rest. Delivery is best effort and should
-    /// not wait indefinitely, as for [`send`].
+    /// one segmented send. A datagram counts as done once it was handed off or failed; a
+    /// failed one is dropped, and `*failed` never grows by more than `*sent` does. On
+    /// success every datagram is done (`*sent == datagrams.len()`) and none of this call
+    /// failed. On an error at least the last datagram the call was done with failed, and
+    /// the error is returned: after [`io::ErrorKind::BrokenPipe`] (the transport is closed)
+    /// the caller stops, after any other error it may call again to send the rest. A failed
+    /// segmented send fails exactly the datagrams of its run, not the ones handed off
+    /// before it. Delivery is best effort and should not wait indefinitely, as for [`send`].
     ///
     /// Cancellation safe: when the future is dropped, `*sent` counts the datagrams that
     /// were handed off and the rest were not sent, so the caller can hand them elsewhere
     /// in order.
     ///
-    /// The default calls [`send`] for each datagram in order.
+    /// The default calls [`send`] for each datagram in order and counts a failed one in
+    /// `*failed`.
     ///
     /// [`send`]: Transport::send
     fn send_batch(
         &self,
         datagrams: &[(Path, PacketBuf)],
         sent: &mut usize,
+        failed: &mut usize,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             while let Some((path, data)) = datagrams.get(*sent) {
                 let result = self.send(data.as_packet(), path).await;
                 *sent += 1;
-                result?;
+                result.inspect_err(|_| *failed += 1)?;
             }
             Ok(())
         }
@@ -143,6 +148,7 @@ pub trait DynTransport: Send + Sync + 'static {
         &'a self,
         datagrams: &'a [(Path, PacketBuf)],
         sent: &'a mut usize,
+        failed: &'a mut usize,
     ) -> BoxFuture<'a, io::Result<()>>;
 }
 
@@ -171,8 +177,9 @@ impl<T: Transport> DynTransport for T {
         &'a self,
         datagrams: &'a [(Path, PacketBuf)],
         sent: &'a mut usize,
+        failed: &'a mut usize,
     ) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(Transport::send_batch(self, datagrams, sent))
+        Box::pin(Transport::send_batch(self, datagrams, sent, failed))
     }
 }
 
@@ -201,7 +208,86 @@ impl Transport for Box<dyn DynTransport> {
         &self,
         datagrams: &[(Path, PacketBuf)],
         sent: &mut usize,
+        failed: &mut usize,
     ) -> io::Result<()> {
-        (**self).send_batch(datagrams, sent).await
+        (**self).send_batch(datagrams, sent, failed).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Hands off a datagram whose first byte is even and fails the others; keeps the
+    /// handed-off first bytes.
+    #[derive(Debug, Default)]
+    struct OddFails(Mutex<Vec<u8>>);
+
+    impl Transport for OddFails {
+        fn id(&self) -> TransportId {
+            TransportId::new(1)
+        }
+
+        async fn recv(&self, _buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+            std::future::pending().await
+        }
+
+        fn send(&self, datagram: &[u8], _to: &Path) -> impl Future<Output = io::Result<()>> + Send {
+            std::future::ready(if datagram[0] % 2 == 1 {
+                Err(io::Error::other("odd"))
+            } else {
+                self.0.lock().unwrap().push(datagram[0]);
+                Ok(())
+            })
+        }
+    }
+
+    /// Calls `send_batch` past every error, as the engine does; returns how many calls
+    /// failed and how many datagrams they reported failed.
+    async fn send_past_errors<T: Transport>(
+        transport: &T,
+        datagrams: &[(Path, PacketBuf)],
+    ) -> (usize, usize) {
+        let (mut sent, mut failed, mut errors) = (0, 0, 0);
+        while sent < datagrams.len() {
+            let before = (sent, failed);
+            if transport
+                .send_batch(datagrams, &mut sent, &mut failed)
+                .await
+                .is_err()
+            {
+                errors += 1;
+                assert!(failed > before.1, "an error fails at least one datagram");
+            } else {
+                assert_eq!(failed, before.1, "a success fails nothing");
+                assert_eq!(sent, datagrams.len());
+            }
+            assert!(failed - before.1 <= sent - before.0);
+        }
+        (errors, failed)
+    }
+
+    fn datagrams(first_bytes: &[u8]) -> Vec<(Path, PacketBuf)> {
+        let to = Path {
+            transport: TransportId::new(1),
+            addr: "192.0.2.1:1".parse().unwrap(),
+            ecn: nsplane_packet::Ecn::NotEct,
+        };
+        first_bytes
+            .iter()
+            .map(|&byte| (to, PacketBuf::from_packet(&[byte])))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_send_batch_counts_each_failed_send() {
+        let batch = datagrams(&[0, 1, 2, 3, 5, 4, 7]);
+        let transport = OddFails::default();
+        assert_eq!(send_past_errors(&transport, &batch).await, (4, 4));
+        assert_eq!(*transport.0.lock().unwrap(), [0, 2, 4]);
+
+        let boxed: Box<dyn DynTransport> = Box::new(OddFails::default());
+        assert_eq!(send_past_errors(&boxed, &batch).await, (4, 4));
     }
 }

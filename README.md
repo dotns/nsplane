@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-nat/`    | `nsplane-nat`    | IPv4/IPv6 translation (`Translator`, RFC 7915) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
-| `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp (TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
+| `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp ([dotns/smoltcp](https://github.com/dotns/smoltcp) fork; TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
@@ -84,6 +84,72 @@ nsplane = { path = "../nsplane/crates/nsplane" }
 nsplane-tun = { path = "../nsplane/crates/nsplane-tun" }
 nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 ```
+
+## Optional features and defaults
+
+A basic client (an `EngineBuilder` on a TUN device and a `UdpTransport`, with peers and no
+filters) needs only `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
+`nsplane-packet` and `nsplane-noise`; `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
+are not dependencies of either and are not built. A feature that is not installed is not
+on the data path, so such a client pays no extra latency for it:
+
+| Feature | How to enable | Default | Cost when not enabled |
+| ------- | ------------- | ------- | --------------------- |
+| `Translator` (`nsplane-nat`) | `EngineBuilder::filter(Box::new(Translator::new(table)))` | off | none (empty filter chain) |
+| `PortMap` / `Conntrack` (`nsplane-nat`) | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))` | off | none |
+| `AclFilter` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` | off | none |
+| `FlowTracker` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | off | none |
+| Fragmentation stage | `EngineBuilder::fragmenter(FragmentConfig::default())` | off | one `Option` check per local packet |
+| Crypto worker pool | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0 (owner task) | one `Option` check per packet; an uncontended per-peer lock |
+| Netstack (`nsplane-netstack`), `Splitter`, `MergeSource` | `NetStack::split`, `Splitter`, `MergeSource` as the builder's source and sink | not used | none |
+| TUN offload (Linux, Android) | on with `Tun::create`; `TunOptions::new().offload(false)` opts out | on where the kernel supports it | off: one system call per packet |
+| UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: one system call per datagram |
+
+Offload never waits for more packets: the engine fills batches only with packets already
+queued (non-blocking `try_recv`, no timers), TUN and UDP segmentation coalesce only within
+the batch they are handed, a GRO read returns what one receive yields, and the crypto
+worker pool hands work over when a batch is full or the owner task runs out of work, never
+on a timer.
+
+The address family is the caller's choice: IPv4 only, IPv6 only or dual stack follows from
+the transport's bind address (`0.0.0.0:port`, an IPv6 address, or `[::]:port` for a
+dual-stack socket), the TUN device's addresses and routes (configured outside nsplane) and
+the peers' allowed IPs. A minimal IPv4-only client:
+
+```rust
+use std::error::Error;
+use std::net::SocketAddr;
+
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{Ecn, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_tun::Tun;
+
+async fn client(
+    key: StaticSecret,
+    server_key: PublicKey,
+    server: SocketAddr, // e.g. 198.51.100.1:51820
+) -> Result<(), Box<dyn Error>> {
+    const UDP: TransportId = TransportId::new(0);
+    // The caller sets up the TUN device's addresses and routes, e.g.
+    // `ip addr add 10.0.0.2/32 dev wg0` and `ip route add 10.0.0.0/24 dev wg0`.
+    let (source, sink) = Tun::create("wg0")?.split()?;
+    let udp = UdpTransport::bind(UDP, "0.0.0.0:0".parse()?)?;
+    let engine = EngineBuilder::new(source, sink)
+        .private_key(key)
+        .transport(udp)
+        .build()?;
+    let mut peer = Peer::new(server_key);
+    peer.allowed_ips = vec!["10.0.0.0/24".parse()?];
+    peer.persistent_keepalive = Some(25);
+    peer.path = Some(Path { transport: UDP, addr: server, ecn: Ecn::NotEct });
+    engine.handle().add_or_update_peer(peer).await?;
+    engine.wait().await?;
+    Ok(())
+}
+```
+
+See [docs/architecture.md](docs/architecture.md#optional-features-and-defaults) for the
+details.
 
 ## Tuning
 

@@ -5,11 +5,14 @@
 mod vectors;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{HEADROOM, PacketBuf, PacketPool, PeerId, protocol};
 
-use super::{Translator, TranslatorStats, reasons};
+use super::fragment::{Limits, Reassembly};
+use super::{REASSEMBLY_LIMITS, Translator, TranslatorStats, reasons};
 use crate::checksum::{internet_checksum, transport_checksum_v4, transport_checksum_v6};
 use crate::{LanPrefix, PeerMapping, SelfMapping, TranslationTable};
 
@@ -772,6 +775,11 @@ fn stats_count_each_outcome() {
             dropped_out: 1,
             dropped_in: 1,
             reassembled: 0,
+            fragments_held: 0,
+            fragment_timeouts: 0,
+            fragment_budget_drops: 0,
+            fragment_marker_evictions: 0,
+            reassembled_too_big: 0,
             grown_copies: 0,
         }
     );
@@ -825,18 +833,266 @@ fn reassembled_datagram_larger_than_its_last_fragment_grows() {
     assert_eq!(translator.stats().grown_copies, 1);
 }
 
+/// A translator whose reassembly has `limits`.
+fn translator_with(limits: Limits) -> Translator {
+    Translator {
+        reassembly: Mutex::new(Reassembly::new(limits)),
+        ..translator()
+    }
+}
+
+/// Moves `translator`'s reassembly clock `secs` seconds ahead.
+fn advance(translator: &mut Translator, secs: u64) {
+    translator.epoch = translator
+        .epoch
+        .checked_sub(Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// Sends `packets` outbound in `order`: all but the last are held, the last
+/// completes the datagram, which is returned.
+fn reassemble_in(translator: &Translator, packets: &[Vec<u8>], order: &[usize]) -> Vec<u8> {
+    let (last, held) = order.split_last().unwrap();
+    for &index in held {
+        assert_eq!(
+            outbound(translator, PEER, &packets[index]).0,
+            Verdict::Handled
+        );
+    }
+    let (verdict, v6) = outbound(translator, PEER, &packets[*last]);
+    assert_eq!(verdict, Verdict::Accept);
+    v6
+}
+
 #[test]
-fn zero_checksum_tail_before_its_first_fragment_is_translated_alone() {
+fn zero_checksum_udp_fragments_are_reassembled_in_any_order() {
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let pieces = [
+        fragment4(80, 0, true, 2, &udp[..16]),
+        fragment4(80, 2, true, 64, &udp[16..24]),
+        fragment4(80, 3, false, 64, &udp[24..]),
+    ];
+    let mut translated = Vec::new();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let translator = translator();
+        let v6 = reassemble_in(&translator, &pieces, &order);
+        assert_eq!((v6[6], v6[7], v6.len()), (protocol::UDP, 1, 72));
+        check_v6(&v6);
+        assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
+        let stats = translator.stats();
+        assert_eq!((stats.reassembled, stats.fragments_held), (1, 3));
+        assert_eq!(stats.translated_out, 1);
+        translated.push(v6);
+    }
+    assert!(translated.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn zero_checksum_tail_before_its_first_fragment_is_held() {
     let translator = translator();
     let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
-    let tail = fragment4(78, 2, false, 64, &udp[16..]);
-    let (verdict, v6) = outbound(&translator, PEER, &tail);
-    assert_eq!(verdict, Verdict::Accept);
-    assert_eq!((v6[6], v6[40]), (44, protocol::UDP));
-    // The first fragment opens an entry that can no longer complete.
-    let first = fragment4(78, 0, true, 64, &udp[..16]);
+    let pieces = [
+        fragment4(78, 0, true, 64, &udp[..16]),
+        fragment4(78, 2, false, 64, &udp[16..]),
+    ];
+    let v6 = reassemble_in(&translator, &pieces, &[1, 0]);
+    check_v6(&v6);
+    assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
+    assert_eq!(translator.stats().reassembled, 1);
+}
+
+#[test]
+fn checksummed_udp_fragments_before_their_first_are_reassembled() {
+    let translator = translator();
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", false);
+    let pieces = [
+        fragment4(81, 0, true, 64, &udp[..16]),
+        fragment4(81, 2, true, 64, &udp[16..24]),
+        fragment4(81, 3, false, 64, &udp[24..]),
+    ];
+    let v6 = reassemble_in(&translator, &pieces, &[2, 0, 1]);
+    assert_eq!((v6[6], v6.len()), (protocol::UDP, 72));
+    check_v6(&v6);
+    assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
+    assert_eq!(translator.stats().reassembled, 1);
+
+    // A wrong checksum is still caught once the datagram is whole.
+    let mut bad = udp;
+    bad[8] ^= 1;
+    let pieces = [
+        fragment4(82, 0, true, 64, &bad[..16]),
+        fragment4(82, 2, false, 64, &bad[16..]),
+    ];
+    assert_eq!(outbound(&translator, PEER, &pieces[1]).0, Verdict::Handled);
+    assert_eq!(
+        outbound(&translator, PEER, &pieces[0]).0,
+        Verdict::Drop {
+            reason: reasons::INVALID_CHECKSUM
+        }
+    );
+}
+
+#[test]
+fn held_duplicates_are_ignored_and_overlaps_drop_the_datagram() {
+    let translator = translator();
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let pieces = [
+        fragment4(83, 0, true, 64, &udp[..16]),
+        fragment4(83, 2, true, 64, &udp[16..24]),
+        fragment4(83, 3, false, 64, &udp[24..]),
+    ];
+    let v6 = reassemble_in(&translator, &pieces, &[2, 2, 1, 0]);
+    assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
+    assert_eq!(translator.stats().fragments_held, 3);
+
+    let overlap = fragment4(84, 1, true, 64, &udp[8..24]);
+    let last = fragment4(84, 3, false, 64, &udp[24..]);
+    assert_eq!(outbound(&translator, PEER, &overlap).0, Verdict::Handled);
+    let shifted = fragment4(84, 2, true, 64, &udp[16..24]);
+    assert_eq!(
+        outbound(&translator, PEER, &shifted).0,
+        Verdict::Drop {
+            reason: reasons::OVERLAP
+        }
+    );
+    assert_eq!(outbound(&translator, PEER, &last).0, Verdict::Handled);
+}
+
+#[test]
+fn held_fragments_are_bounded_in_entries() {
+    let translator = translator_with(Limits {
+        max_entries: 2,
+        ..REASSEMBLY_LIMITS
+    });
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    for id in [90, 91] {
+        let tail = fragment4(id, 2, false, 64, &udp[16..]);
+        assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Handled);
+    }
+    let tail = fragment4(92, 2, false, 64, &udp[16..]);
+    assert_eq!(
+        outbound(&translator, PEER, &tail).0,
+        Verdict::Drop {
+            reason: reasons::BUDGET_EXCEEDED
+        }
+    );
+    let stats = translator.stats();
+    assert_eq!((stats.fragments_held, stats.fragment_budget_drops), (2, 1));
+    assert_eq!(stats.dropped_out, 1);
+}
+
+#[test]
+fn held_fragments_are_bounded_in_bytes() {
+    let translator = translator_with(Limits {
+        max_bytes: 24,
+        ..REASSEMBLY_LIMITS
+    });
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let middle = fragment4(93, 2, true, 64, &udp[16..24]);
+    let last = fragment4(93, 3, false, 64, &udp[24..]);
+    let other = fragment4(94, 2, false, 64, &udp[16..]);
+    assert_eq!(outbound(&translator, PEER, &middle).0, Verdict::Handled);
+    assert_eq!(outbound(&translator, PEER, &last).0, Verdict::Handled);
+    assert_eq!(
+        outbound(&translator, PEER, &other).0,
+        Verdict::Drop {
+            reason: reasons::BUDGET_EXCEEDED
+        }
+    );
+    let stats = translator.stats();
+    assert_eq!((stats.fragments_held, stats.fragment_budget_drops), (2, 1));
+}
+
+#[test]
+fn passed_markers_are_bounded() {
+    let translator = translator_with(Limits {
+        max_entries: 1,
+        ..REASSEMBLY_LIMITS
+    });
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", false);
+    for id in [95, 96] {
+        let first = fragment4(id, 0, true, 64, &udp[..16]);
+        assert_eq!(outbound(&translator, PEER, &first).0, Verdict::Accept);
+    }
+    assert_eq!(translator.stats().fragment_marker_evictions, 1);
+    // 96 is still marked and goes through; 95 was forgotten and is held.
+    let tail = fragment4(96, 2, false, 64, &udp[16..]);
+    assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Accept);
+    let tail = fragment4(95, 2, false, 64, &udp[16..]);
+    assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Handled);
+    assert_eq!(translator.stats().fragments_held, 1);
+}
+
+#[test]
+fn held_fragments_expire() {
+    let mut translator = translator();
+    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let tail = fragment4(97, 2, false, 64, &udp[16..]);
+    assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Handled);
+    advance(&mut translator, 60);
+    // The first fragment comes too late: it opens a new entry.
+    let first = fragment4(97, 0, true, 64, &udp[..16]);
     assert_eq!(outbound(&translator, PEER, &first).0, Verdict::Handled);
-    assert_eq!(translator.stats().reassembled, 0);
+    let stats = translator.stats();
+    assert_eq!((stats.fragment_timeouts, stats.reassembled), (1, 0));
+}
+
+/// The fragments of a zero-checksum datagram with `len` UDP payload bytes.
+fn zero_checksum_pieces(id: u16, len: usize) -> [Vec<u8>; 2] {
+    let data: Vec<u8> = (0..len).map(|i| i.to_le_bytes()[0]).collect();
+    let udp = udp4(SELF4, ALIAS4, &data, true);
+    [
+        fragment4(id, 0, true, 64, &udp[..1000]),
+        fragment4(id, 125, false, 64, &udp[1000..]),
+    ]
+}
+
+#[test]
+fn reassembled_datagrams_fit_the_default_mtu() {
+    let translator = translator();
+    assert_eq!(translator.mtu(), 1280);
+    // 40 + 8 + 1232 = 1280 bytes once translated.
+    let v6 = reassemble_in(&translator, &zero_checksum_pieces(110, 1232), &[1, 0]);
+    assert_eq!(v6.len(), 1280);
+    check_v6(&v6);
+
+    let pieces = zero_checksum_pieces(111, 1233);
+    assert_eq!(outbound(&translator, PEER, &pieces[1]).0, Verdict::Handled);
+    assert_eq!(
+        outbound(&translator, PEER, &pieces[0]).0,
+        Verdict::Drop {
+            reason: reasons::REASSEMBLED_TOO_BIG
+        }
+    );
+    let stats = translator.stats();
+    assert_eq!((stats.reassembled_too_big, stats.dropped_out), (1, 1));
+    assert_eq!(stats.translated_out, 1);
+}
+
+#[test]
+fn reassembled_datagrams_fit_the_set_mtu() {
+    let translator = translator();
+    translator.set_mtu(1400);
+    assert_eq!(translator.mtu(), 1400);
+    let v6 = reassemble_in(&translator, &zero_checksum_pieces(112, 1352), &[0, 1]);
+    assert_eq!(v6.len(), 1400);
+    check_v6(&v6);
+    let pieces = zero_checksum_pieces(113, 1353);
+    assert_eq!(outbound(&translator, PEER, &pieces[0]).0, Verdict::Handled);
+    assert_eq!(
+        outbound(&translator, PEER, &pieces[1]).0,
+        Verdict::Drop {
+            reason: reasons::REASSEMBLED_TOO_BIG
+        }
+    );
+    assert_eq!(translator.stats().reassembled_too_big, 1);
 }
 
 #[test]
@@ -865,6 +1121,10 @@ fn checksummed_udp_fragments_are_translated_one_by_one() {
         transport_checksum_v6(self_node4(), peer_mapping().node4, protocol::UDP, &joined),
         0
     );
+    // Nothing waited: no fragment was held or reassembled.
+    let stats = translator.stats();
+    assert_eq!((stats.fragments_held, stats.reassembled), (0, 0));
+    assert_eq!(stats.translated_out, 3);
 }
 
 #[test]

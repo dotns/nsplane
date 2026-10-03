@@ -153,8 +153,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `self4 <-> node4`, `alias6 <-> node6`, `lan4 <-> lan6`; ICMP/ICMPv6 including the packet
   quoted in errors, fragments, incremental checksums), swaps its table atomically
   (`Translator::store`) and counts in `TranslatorStats`; a fragmented IPv4 UDP datagram
-  without a checksum is reassembled first, and completes only when its first fragment
-  arrives first. A translated packet grows by 20 bytes (28 with a fragment header) in place
+  without a checksum is reassembled first, in any fragment order. A translated packet grows by 20 bytes (28 with a fragment header) in place
   when its buffer has the room; otherwise it is copied into a larger buffer
   (`TranslatorStats::grown_copies`) instead of being dropped, and `reasons::NO_ROOM` only
   bounds the result at the largest IPv6 packet. Each peer's allowed IPs must contain its `alias4/32`, its LAN IPv4
@@ -184,7 +183,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane`: batched I/O. `PacketSource::recv_batch(&mut PacketBatch)`,
   `PacketSink::send_batch(&mut VecDeque<(PeerId, PacketBuf)>)`,
   `Transport::recv_batch(&mut PacketBuf, &mut VecDeque<(Path, PacketBuf)>)` and
-  `Transport::send_batch(&[(Path, PacketBuf)], &mut usize)` are additive default methods
+  `Transport::send_batch(&[(Path, PacketBuf)], &mut usize, &mut usize)` are additive default methods
   (one packet or datagram at a time) that `DynTransport` mirrors. The engine's I/O tasks
   move up to `MAX_BATCH` (64) packets or datagrams per call and keep backpressure, the
   handback of unsent datagrams on stop and buffer recycling.
@@ -267,8 +266,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-core`: `Core::handle_input_deferred` returns the encryption or decryption of a
   data packet as a `CryptoJob` (`Send`, locks only its peer's tunnel) to run on another
   thread with `CryptoJob::run`; `Core::complete_job` finishes it in the core.
+- `nsplane-nat`: `Translator::set_mtu(u16)` and `Translator::mtu()` (default 1280, the IPv6
+  minimum; applications set the tunnel MTU, as `translate_node` does) bound the size of a
+  reassembled datagram, and `reasons::REASSEMBLED_TOO_BIG` reports one that is dropped as
+  larger. `translate_node`'s status file adds the five new `TranslatorStats` counters under
+  `extra.translate`.
+- `nsplane-examples`: `translate_node` honours `--no-offload` (it opens its TUN device with
+  `node::create_tun`); its e2e scenario adds a 1420-byte IPv4 ping with offload off that
+  checks `grown_copies` stays 0.
+- Optional features and defaults: a section in `README.md` and `docs/architecture.md` lists
+  every optional feature with its switch, default and cost when off, the crates a minimal
+  client needs, a minimal IPv4-only client, and that offload never waits for more packets.
 
 ### Changed
+- Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
+  `failed: &mut usize`. A call adds one for every datagram it was done with that failed
+  (and was dropped), never more than it advanced `sent`; `Ok` means nothing failed in the
+  call, an error means at least the last datagram it was done with failed. The default
+  method counts each failed `send`. Transports that override `send_batch` must count their
+  failures.
+- Breaking: `nsplane-nat`'s `TranslatorStats` gains `fragments_held`, `fragment_timeouts`,
+  `fragment_budget_drops`, `fragment_marker_evictions` and `reassembled_too_big`, so struct
+  literals of it no longer compile. `reasons::EXPIRED` is no longer emitted: a fragment
+  that arrives after its datagram expired starts a new held entry, and the expiry is
+  counted in `fragment_timeouts`.
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
   transport type parameter. `EngineBuilder::transport` adds a transport and may be called
   several times; `EngineBuilder::build` returns `Result<Engine, BuildError>` and fails with
@@ -331,8 +352,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`nsplane_core::reasons::TRANSPORT_SEND_ERROR`) and published as `Event::Dropped` instead
   of only being logged. The transmit tasks report failures through a shared counter and a
   wake signal to the owner task; successful sends take no extra work. A failed
-  `send_batch` call counts every datagram it was done with (for `UdpTransport`, the failed
-  GSO run and any runs sent before it in that call).
+  `send_batch` call counts exactly the datagrams it reports failed (for `UdpTransport`, the
+  failed GSO run).
 - Breaking: `nsplane-core`'s `Input::Datagram` takes the datagram by value
   (`data: PacketBuf`) and `Input` loses its lifetime parameter. The core consumes the
   datagram: a packet it carries is decrypted in place and delivered in the same buffer
@@ -353,11 +374,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16 MiB through a 25 MB/s link with a 64-packet buffer finish in 14-17 s instead of not at
   all within 60 s, and at 1 % random loss in 3 s instead of 35-41 s (release, in-process).
 - `nsplane-netstack`: TCP connections no longer stall for good under loss when both ends
-  send. Two smoltcp 0.14 defects are worked around in the driver: pure ACKs sent after a
-  retransmission timeout carry the peer's last acknowledgement number as their sequence
-  number, so the peer no longer drops them as old; and a connection that moved no bytes
-  for 1 s reopens a closed receive window by up to 1 KiB and probes the peer's window
-  with a keep-alive, so a segment lost at the edge of a closing window is resent.
+  send. smoltcp is now the `dotns/smoltcp` fork (git dependency, tag `v0.14.0-nsplane.3`,
+  v0.14.0 plus five TCP fixes; ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): empty
+  segments sent after a retransmission timeout carry the highest sequence number sent, so
+  the peer no longer drops them as old, without undoing the rewind for retransmission;
+  data lost before the peer's window closed stays under the retransmission timer instead
+  of being left to the zero-window probe; a fast retransmission the device has no room
+  for is sent later instead of being dropped with its timer; and duplicate ACKs no longer
+  take the retransmission timer away from a lost FIN. The driver workarounds are removed:
+  it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
+  receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
+  allows the fork's git source only.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
@@ -369,6 +396,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the timers through the `_at` methods and the core's `now` instead.
 
 ### Fixed
+- `nsplane`: `DROP_TRANSPORT_SEND_ERROR` is exact for batched sends. `UdpTransport` counts
+  only the datagrams of a failed GSO run, not the runs it handed off before it in the same
+  call; the engine counts what `Transport::send_batch` reports failed (at least one).
+- `nsplane-tun`: plain TUN reads (offload off on Linux and Android, and macOS/iOS) and
+  Wintun reads on Windows leave 28 bytes of room behind each packet, as offload reads do
+  (a read still takes at most the MTU), so a full-MTU IPv4 packet is translated to IPv6 in
+  place (`TranslatorStats::grown_copies` stays 0) with offload off.
+- `nsplane-nat`: IPv4 UDP fragments that arrive before their first fragment are held
+  (bounded at 256 datagrams and 1 MiB, 60 s) instead of being translated alone, so
+  zero-checksum datagrams reassemble in any order. A datagram with a checksum whose later
+  fragments came first is reassembled and sent unfragmented; in-order fragments of a
+  checksummed datagram still pass one by one, without holding or added latency. A
+  reassembled datagram larger than the translator's MTU is dropped and counted
+  (`reassembled_too_big`), never sent oversize.
 - `nsplane-uapi`: `listen_port=` and `fwmark=` never replace a transport the UAPI does not
   own: over `Uapi::with_external_transport` the reported value is a no-op and any other
   fails with `EADDRINUSE`. `tun_node` uses it for relay and WSS transports, which
