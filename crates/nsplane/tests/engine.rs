@@ -10,15 +10,15 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
-    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, Ecn, Engine, EngineBuilder,
-    EngineError, EngineHandle, Event, PacketBuf, Path, Peer, PeerId, Transport, TransportError,
-    TransportId,
+    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Ecn,
+    Engine, EngineBuilder, EngineError, EngineHandle, Event, PacketBuf, Path, Peer, PeerId,
+    Transport, TransportError, TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -579,6 +579,72 @@ async fn full_transmit_queue_holds_back_the_source() {
         assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, &[i]));
     }
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
+}
+
+/// A transport whose sends fail, as for a datagram too large for the path, once `failing`
+/// is set.
+struct Failing {
+    inner: ChannelTransport,
+    failing: Arc<AtomicBool>,
+}
+
+impl Transport for Failing {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err(io::Error::other("message too long"));
+        }
+        self.inner.send(datagram, to).await
+    }
+}
+
+#[tokio::test]
+async fn failed_sends_drop_with_a_counted_reason() {
+    const SENT: u8 = 5;
+    let (ta, tb) = link(64);
+    let failing = Arc::new(AtomicBool::new(false));
+    let ta = Failing {
+        inner: ta,
+        failing: Arc::clone(&failing),
+    };
+    let tb = Failing {
+        inner: tb,
+        failing: Arc::default(),
+    };
+    let (mut a, mut b) = nodes(ta, tb, &Options::default());
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+    let mut events = a.handle.subscribe().await.unwrap();
+
+    failing.store(true, Ordering::Relaxed);
+    for i in 0..SENT {
+        a.send(IP_B, &[i]).await;
+    }
+    let dropped = expect_event(
+        &mut events,
+        |e| matches!(e, Event::Dropped { reason, .. } if *reason == DROP_TRANSPORT_SEND_ERROR),
+    )
+    .await;
+    assert!(matches!(dropped, Event::Dropped { peer: None, .. }));
+    eventually(|| async { a.drops(DROP_TRANSPORT_SEND_ERROR).await == u64::from(SENT) }).await;
+    b.expect_no_delivery().await;
+    assert_eq!(
+        a.handle.drop_counters().await.unwrap().len(),
+        1,
+        "only failed sends are dropped"
+    );
+
+    // The transmit task keeps going.
+    failing.store(false, Ordering::Relaxed);
+    exchange(&mut a, &mut b).await;
+    assert_eq!(a.drops(DROP_TRANSPORT_SEND_ERROR).await, u64::from(SENT));
 }
 
 /// A handshake initiation from `initiator` to `responder`.

@@ -8,6 +8,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use nsplane_core::x25519::StaticSecret;
@@ -21,7 +22,7 @@ use tokio::time::{Instant, Sleep, sleep_until};
 
 use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
-    DROP_TRANSPORT_REMOVED,
+    DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
 };
 use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
 use crate::io::{PacketSink, PacketSource};
@@ -100,7 +101,11 @@ const MAX_DATAGRAM: usize = 65535;
 /// engine stops watching and keeps the last value.
 ///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
-/// keeps running without it; other I/O errors are logged and the task continues.
+/// keeps running without it; other I/O errors are logged and the task continues. A datagram
+/// the transport fails to send (any error, [`io::ErrorKind::BrokenPipe`] included) is
+/// dropped and counted under [`crate::DROP_TRANSPORT_SEND_ERROR`]: the transmit task counts
+/// it in a counter shared with the owner task and wakes the owner, which publishes the
+/// drops, so a successful send costs nothing extra.
 ///
 /// The engine runs until [`EngineHandle::shutdown`]. Dropping the `Engine` aborts every task
 /// at once, so keep it alive (typically by awaiting [`Engine::wait`]) for as long as the
@@ -165,6 +170,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let (local_tx, local) = mpsc::channel(capacity);
     let (datagram_tx, datagrams) = mpsc::channel(capacity);
     let (recycle_tx, recycled) = mpsc::channel(capacity);
+    let (signal, send_error_signal) = mpsc::channel(1);
     let (deliver, deliver_rx) = mpsc::channel(capacity);
     let (events, _) = broadcast::channel(parts.event_capacity);
     let (suspended, _) = watch::channel(false);
@@ -188,6 +194,11 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         datagram_tx,
         recycled,
         recycle_tx,
+        send_errors: SendErrors {
+            count: Arc::default(),
+            signal,
+        },
+        send_error_signal,
         deliver,
         transports: BTreeMap::new(),
         timer: Box::pin(sleep_until(deadline)),
@@ -296,12 +307,14 @@ type Datagram = (Path, PacketBuf);
 type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
 
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
-/// its transmit queue, the queue returning transmitted buffers and the suspension state.
+/// its transmit queue, the queue returning transmitted buffers, where to report failed
+/// sends and the suspension state.
 type Start = Box<
     dyn FnOnce(
             mpsc::Sender<Datagram>,
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
+            SendErrors,
             watch::Receiver<bool>,
         ) -> (Task, Transmitter)
         + Send,
@@ -318,7 +331,7 @@ impl NewTransport {
     pub(crate) fn new<T: Transport>(transport: T) -> Self {
         Self {
             id: transport.id(),
-            start: Box::new(move |datagrams, queue, recycle, suspended| {
+            start: Box::new(move |datagrams, queue, recycle, errors, suspended| {
                 let transport = Arc::new(transport);
                 let (stop, stopped) = oneshot::channel();
                 (
@@ -329,11 +342,36 @@ impl NewTransport {
                     )),
                     Transmitter {
                         stop: Some(stop),
-                        task: tokio::spawn(transmit(transport, queue, recycle, suspended, stopped)),
+                        task: tokio::spawn(transmit(
+                            transport, queue, recycle, errors, suspended, stopped,
+                        )),
                     },
                 )
             }),
         }
+    }
+}
+
+/// Where transmit tasks report failed sends: a count the owner task takes, and a signal
+/// that wakes it.
+#[derive(Clone)]
+struct SendErrors {
+    count: Arc<AtomicU64>,
+    /// The owner keeps a sender, so the signal never closes; a full signal is already
+    /// pending.
+    signal: mpsc::Sender<()>,
+}
+
+impl SendErrors {
+    fn report(&self) {
+        // The signal orders the count before the owner's take.
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let _ = self.signal.try_send(());
+    }
+
+    /// The failed sends since the last take.
+    fn take(&self) -> u64 {
+        self.count.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -398,6 +436,8 @@ enum Wake {
     Datagram(Option<Datagram>),
     Local(Option<PacketBuf>),
     Mtu(Option<u16>),
+    /// A transmit task reported failed sends.
+    SendErrors,
     /// Room in the transmit queue of a transport with waiting datagrams.
     Flush(TransportId, Option<OwnedPermit<Datagram>>),
     Timer,
@@ -418,6 +458,10 @@ struct Owner {
     recycled: mpsc::Receiver<PacketBuf>,
     /// Cloned into every transmit task.
     recycle_tx: mpsc::Sender<PacketBuf>,
+    /// Cloned into every transmit task.
+    send_errors: SendErrors,
+    /// Signalled by [`SendErrors::report`].
+    send_error_signal: mpsc::Receiver<()>,
     deliver: mpsc::Sender<(PeerId, PacketBuf)>,
     transports: BTreeMap<TransportId, TransportSlot>,
     timer: Pin<Box<Sleep>>,
@@ -479,6 +523,7 @@ impl Owner {
                     }
                 }
                 Wake::Mtu(None) => self.mtu_changes = None,
+                Wake::SendErrors => self.send_errors(),
                 Wake::Flush(id, permit) => {
                     // No permit: the transmit queue closed, and moving drops the datagrams.
                     if let Some(permit) = permit
@@ -533,6 +578,9 @@ impl Owner {
             && let Poll::Ready(mtu) = changes.poll_recv(cx)
         {
             return Poll::Ready(Wake::Mtu(mtu));
+        }
+        if self.send_error_signal.poll_recv(cx).is_ready() {
+            return Poll::Ready(Wake::SendErrors);
         }
         if self.timer.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Wake::Timer);
@@ -656,6 +704,8 @@ impl Owner {
                 let _ = reply.send(self.events.subscribe());
             }
             Command::DropCounters(reply) => {
+                // Includes failed sends whose signal is not served yet.
+                self.send_errors();
                 let _ = reply.send(self.drops.clone());
             }
             Command::QueueStats(take, reply) => {
@@ -742,6 +792,7 @@ impl Owner {
             self.datagram_tx.clone(),
             transmit_rx,
             self.recycle_tx.clone(),
+            self.send_errors.clone(),
             self.suspended.subscribe(),
         );
         TransportSlot {
@@ -837,6 +888,13 @@ impl Owner {
 
     fn dropped(&mut self, peer: Option<PeerId>, reason: &'static str) {
         self.event(Event::Dropped { peer, reason });
+    }
+
+    /// Counts and publishes the failed sends the transmit tasks reported.
+    fn send_errors(&mut self) {
+        for _ in 0..self.send_errors.take() {
+            self.dropped(None, DROP_TRANSPORT_SEND_ERROR);
+        }
     }
 
     /// Counts drops and publishes the event; never blocks.
@@ -962,12 +1020,14 @@ async fn unless_stopped<F: Future>(
     .await
 }
 
-/// Sends queued datagrams until the transport closes; returns the buffers for reuse. Once
-/// `stop` fires, hands back its queue and the datagram it was sending, if any.
+/// Sends queued datagrams until the transport closes; returns the buffers for reuse and
+/// reports every failed send to `errors`. Once `stop` fires, hands back its queue and the
+/// datagram it was sending, if any.
 async fn transmit<T: Transport>(
     transport: Arc<T>,
     mut queue: mpsc::Receiver<Datagram>,
     recycle: mpsc::Sender<PacketBuf>,
+    errors: SendErrors,
     mut suspended: watch::Receiver<bool>,
     mut stop: oneshot::Receiver<()>,
 ) -> Option<Unsent> {
@@ -991,9 +1051,14 @@ async fn transmit<T: Transport>(
             Some(Some(Ok(()))) => {}
             Some(Some(Err(e))) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Transport closed for sending");
+                errors.report();
+                let _ = recycle.try_send(data);
                 return None;
             }
-            Some(Some(Err(e))) => tracing::debug!(message = "Transport send error", error = ?e),
+            Some(Some(Err(e))) => {
+                tracing::debug!(message = "Transport send error", error = ?e);
+                errors.report();
+            }
         }
         // A full recycle queue just drops the buffer.
         let _ = recycle.try_send(data);
