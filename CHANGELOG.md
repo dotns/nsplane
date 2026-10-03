@@ -306,7 +306,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Needed, as Packet Too Big) are translated back; optional TCP MSS clamp
   (`Nat64LanConfig::max_tcp_mss`), routes replaced through an `ArcSwap`, flows in a bounded
   `Conntrack` with idle timeouts, `Nat64Lan::remove_flow` and `Nat64LanStats` (unsafe
-  targets and port exhaustion counted separately). `LanRoute` prefixes are
+  targets, ambiguous routes and port exhaustion counted separately). As ns, translated
+  IPv4 packets leave DF clear; `Nat64LanConfig::set_df` opts into RFC 7915 DF above 1260
+  bytes (Fragmentation Needed then comes back as Packet Too Big, at the risk of a PMTU black
+  hole when the LAN filters ICMP). As ns, a destination that more than one route resolves is
+  dropped (`reasons::AMBIGUOUS_ROUTE`) rather than translated by the first route. The routes
+  gate every forward packet; a flow keeps its SNAT address across a route replacement, and
+  the flows of a removed route are revoked with `Nat64Lan::remove_flow`, as ns. `LanRoute` prefixes are
   `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
   `LanPrefix`, as no IP network crate is a dependency. The translation runs on the local
   side: `Nat64LanSink` and `Nat64LanSource` wrap the engine's sink and source; nothing

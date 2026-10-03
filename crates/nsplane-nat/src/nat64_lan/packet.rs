@@ -24,8 +24,8 @@ const TCP_SYN: u8 = 0x02;
 
 /// The header size difference between IPv6 and IPv4.
 const HEADER_DELTA: usize = 20;
-/// IPv4 packets above this total length get DF (RFC 7915: 1280 minus the
-/// header difference).
+/// With `set_df`, IPv4 packets above this total length get DF (RFC 7915:
+/// 1280 minus the header difference).
 const DF_THRESHOLD: usize = 1260;
 /// The IPv6 minimum link MTU.
 const IPV6_MINIMUM_MTU: u32 = 1280;
@@ -136,8 +136,14 @@ pub(super) fn request_tuple(bytes: &[u8], request: Request) -> Option<(FiveTuple
 /// Translates a checked request to IPv4 from `translated.src` to
 /// `translated.dst` with the source port (or echo identifier)
 /// `translated.src_port`, in place: the IPv4 header is written over the end
-/// of the IPv6 header and the packet start moves forward by 20 bytes.
-pub(super) fn to_ipv4(packet: &mut PacketBuf, translated: &FiveTuple, max_tcp_mss: Option<u16>) {
+/// of the IPv6 header and the packet start moves forward by 20 bytes. DF is
+/// set only with `set_df` and above [`DF_THRESHOLD`].
+pub(super) fn to_ipv4(
+    packet: &mut PacketBuf,
+    translated: &FiveTuple,
+    max_tcp_mss: Option<u16>,
+    set_df: bool,
+) {
     let (IpAddr::V4(src), IpAddr::V4(dst)) = (translated.src, translated.dst) else {
         return;
     };
@@ -163,7 +169,7 @@ pub(super) fn to_ipv4(packet: &mut PacketBuf, translated: &FiveTuple, max_tcp_ms
     header[0] = 0x45;
     header[1] = traffic_class;
     put16(header, 2, u16::try_from(total).unwrap_or(u16::MAX));
-    if total > DF_THRESHOLD {
+    if set_df && total > DF_THRESHOLD {
         put16(header, 6, 0x4000);
     }
     header[8] = hop_limit;
