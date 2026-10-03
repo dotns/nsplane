@@ -331,36 +331,43 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- Two smoltcp 0.14 defects stalled connections for good under loss when both ends send
-  (an echo, request and response); the driver works around both without touching
-  smoltcp.
-  - After a retransmission timeout smoltcp rewinds its next sequence number to the oldest
-    byte it saw acknowledged and stamps its pure ACKs with it. If the peer had already
-    received past that point (only its ACKs were lost), the peer drops those ACKs as old,
-    acknowledgement included. With both ends in that state each resends data the other
-    has, cwnd stays at one segment and the timeouts back off to 60 s (traced: both sides
-    one segment in flight, retransmission timeout 32 s, each receiver 15-72 KB past the
-    other's `snd_una`). The device records the highest acknowledgement number each connection's
-    peer sent (`device::note_peer_ack`, also from segments smoltcp drops) and moves an
-    outgoing pure ACK whose sequence number lies before it up to it
-    (`device::fix_ack_seq`, checksum adjusted): that is where the peer's window starts,
-    which smoltcp always accepts, and what Linux would send.
-  - When a lost segment was the last in the peer's window, window scaling rounds the few
-    bytes left down to a zero window, the sender switches to zero-window probes and never
-    retransmits the lost bytes, and the receiver drops the sender's ACKs, whose sequence
-    number now lies past its window (traced: sender `remote_win_len` 0, 4 bytes in flight,
-    timer `Idle` after its probe timed out). A connection that moved no application bytes
-    for 1 s takes up to 1 KiB more into a full application buffer to reopen its window,
-    and keeps a 1 s keep-alive while it has bytes to send, standing in for the persist
-    timer (`stack::nudge_stalled`).
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.3`, ADR
+  `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus fixes for four defects that
+  stalled connections for good under loss when both ends send (an echo, request and
+  response).
+  - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
+    oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
+    received past that point (only its ACKs were lost), the peer dropped those ACKs as old,
+    acknowledgement included; with both ends in that state each resent data the other had
+    and the timeouts backed off to 60 s. The fork sends every empty segment with the
+    highest sequence number sent (RFC 9293 `SEQ=SND.NXT`), and such a segment no longer
+    moves the send position, so the rewind for retransmission stays in effect.
+  - When an ACK closed the peer's window while data was in flight (window scaling rounds
+    a few free bytes down to zero), the zero-window probe timer replaced the retransmission
+    timer, so lost bytes were never resent, and no timer ran once the window reopened. The
+    fork keeps outstanding data under the retransmission timer (RFC 6298 5.1) and probes
+    from the oldest unacknowledged byte when a timeout finds the window closed.
+  - The third duplicate ACK reset the retransmission timer and dropped the pending fast
+    retransmission before the segment reached the device; with the egress backlog full the
+    segment was never sent and no timer ran (traced: `LAST-ACK`, 360 KB in flight above
+    cwnd, timer idle). The fork keeps it pending until it is emitted.
+  - Three duplicate ACKs while only the FIN was outstanding replaced its retransmission
+    timer by a fast retransmission, which resends data only (traced: `FIN-WAIT-1`, empty
+    send buffer, FIN in flight, timer idle). The fork leaves a FIN to the retransmission
+    timer.
+
+  Phase 5 worked around the first two in the driver (an outgoing pure-ACK sequence
+  rewrite, and a stalled connection taking up to 1 KiB past its application buffer's bound
+  and keeping a 1 s keep-alive in place of the persist timer); all of it is gone.
 
   The engine's `DROP_SINK_FULL` is ordinary loss to TCP: a decrypted segment the engine
   drops at the full sink is never acknowledged, the retransmission timer stays armed and
   smoltcp resends it; the stalls above only needed such a loss at the wrong moment.
   `parallel_echo_*` in `tests/netstack_lossy.rs` run eight 1 MiB echoes through
-  256-packet engine queues, without loss and at 2 % loss; they passed 10 consecutive runs
-  in debug (2 % loss: 8.3-17.3 s) and in release (9.0-23.1 s), where without the two
-  workarounds 1 of 10 debug and 3 of 10 release runs stalled a flow for 60 s.
+  256-packet engine queues, without loss and at 2 % loss. On the fork without any driver
+  workaround they passed 10 consecutive runs in debug (2 % loss: 10.2-16.2 s) and in
+  release (11.0-21.0 s), as they did on smoltcp 0.14 with the Phase 5 workarounds (8.3-17.3 s
+  and 9.0-23.1 s).
 
 ### Netstack throughput
 
@@ -368,20 +375,21 @@ Release, two netstacks over two engines on an in-process `ChannelTransport` pair
 latency), one TCP connection, MTU 1420; the link wrappers are `nsplane_e2e::LossyTransport`
 (drops a deterministic fraction of the data messages in each direction) and
 `nsplane_e2e::Bottleneck` (25 MB/s behind a 64-datagram drop-tail buffer, like a socket
-buffer drained by a busy receiver). Two runs each; "after" is CUBIC with both stall
-workarounds:
+buffer drained by a busy receiver). "After" is CUBIC with the Phase 5 stall workarounds
+on smoltcp 0.14 (two runs each); "fork" is the same on `v0.14.0-nsplane.3` without any
+workaround (four runs each, on a host shared with other builds, load 7-11 on 32 cores):
 
 ```text
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
 ```
 
-| Case | Before (no congestion control) | After |
-| --- | --- | --- |
-| TCP, 64 MiB, no loss | 440.5 / 441.0 MB/s | 321.1 / 319.4 MB/s |
-| TCP, 16 MiB, 1 % loss | 41.1 s / 35.1 s (0.4-0.5 MB/s) | 4.09 s / 2.09 s (4.1-8.0 MB/s) |
-| TCP, 16 MiB, 3 % loss | not done after 60 s (both) | 54.2 s / 59.2 s (0.3 MB/s) |
-| TCP, 16 MiB, bottleneck | not done after 60 s (both, ~2650 drops) | 20.9 s / 18.9 s (0.8-0.9 MB/s, ~330 drops) |
-| UDP, 50 000 x 1200 B, no loss | 902.7 / 468.4 MB/s | 587.1 / 608.7 MB/s |
+| Case | Before (no congestion control) | After | Fork |
+| --- | --- | --- | --- |
+| TCP, 64 MiB, no loss | 440.5 / 441.0 MB/s | 321.1 / 319.4 MB/s | 308.6 / 129.2 / 246.7 / 228.9 MB/s |
+| TCP, 16 MiB, 1 % loss | 41.1 s / 35.1 s (0.4-0.5 MB/s) | 4.09 s / 2.09 s (4.1-8.0 MB/s) | 1.09 / 6.16 / 1.14 / 3.13 s (2.7-15.3 MB/s) |
+| TCP, 16 MiB, 3 % loss | not done after 60 s (both) | 54.2 s / 59.2 s (0.3 MB/s) | 53.2 s once, 3 of 4 not done after 60 s |
+| TCP, 16 MiB, bottleneck | not done after 60 s (both, ~2650 drops) | 20.9 s / 18.9 s (0.8-0.9 MB/s, ~330 drops) | 18.9 / 15.9 / 19.8 / 17.9 s (0.8-1.1 MB/s, 276-472 drops) |
+| UDP, 50 000 x 1200 B, no loss | 902.7 / 468.4 MB/s | 587.1 / 608.7 MB/s | 303.3 / 530.1 / 644.5 / 411.1 MB/s |
 
 Without loss the stack is not the limit (runs of the same build spread from 320 to
 460 MB/s for TCP and 470 to 900 MB/s for UDP: scheduling noise) and congestion control
@@ -394,6 +402,13 @@ completed transfers. A smaller default window was measured and not adopted (see
 (32 MiB in 2.9 s), but a window that small caps a connection at 1.8 MB/s over a 50 ms path,
 and without loss it gains nothing. `tests/netstack_lossy.rs` asserts that 8 MiB complete
 intact at 1 % loss within 15 s, next to a loss-free reference.
+
+The fork changes nothing on the loss-free path (its fixes only touch retransmission and
+empty segments, and the driver lost per-packet work); the loss-free spread above is the
+shared host, as the 320-460 MB/s spread of one build was before. With loss the results
+stay in the same range: 1 % loss completes in 1.1-6.2 s (before 2.1-4.1 s; whole seconds
+are retransmission timeouts), the bottleneck in 15.9-19.8 s (before 18.9-20.9 s), and 3 %
+loss stays timeout-bound right at the 60 s limit, as before.
 
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the

@@ -353,11 +353,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16 MiB through a 25 MB/s link with a 64-packet buffer finish in 14-17 s instead of not at
   all within 60 s, and at 1 % random loss in 3 s instead of 35-41 s (release, in-process).
 - `nsplane-netstack`: TCP connections no longer stall for good under loss when both ends
-  send. Two smoltcp 0.14 defects are worked around in the driver: pure ACKs sent after a
-  retransmission timeout carry the peer's last acknowledgement number as their sequence
-  number, so the peer no longer drops them as old; and a connection that moved no bytes
-  for 1 s reopens a closed receive window by up to 1 KiB and probes the peer's window
-  with a keep-alive, so a segment lost at the edge of a closing window is resent.
+  send. smoltcp is now the `dotns/smoltcp` fork (git dependency, tag `v0.14.0-nsplane.3`,
+  v0.14.0 plus five TCP fixes; ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): empty
+  segments sent after a retransmission timeout carry the highest sequence number sent, so
+  the peer no longer drops them as old, without undoing the rewind for retransmission;
+  data lost before the peer's window closed stays under the retransmission timer instead
+  of being left to the zero-window probe; a fast retransmission the device has no room
+  for is sent later instead of being dropped with its timer; and duplicate ACKs no longer
+  take the retransmission timer away from a lost FIN. The driver workarounds are removed:
+  it no longer rewrites the sequence number of outgoing pure ACKs, reopens a stalled
+  receive window past its bound or sets keep-alives on stalled connections. `deny.toml`
+  allows the fork's git source only.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
