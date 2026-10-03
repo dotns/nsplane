@@ -30,10 +30,10 @@ pub const MAX_DATA_PAYLOAD: usize = 65_536 - HEADER_LEN;
 
 /// What each queued received frame costs on top of its payload, so that empty or tiny
 /// frames cannot queue without bound.
-const FRAME_OVERHEAD: usize = 64;
+pub(crate) const FRAME_OVERHEAD: usize = 64;
 
 /// How long a session closing on its own waits for the WebSocket close handshake.
-const CLOSE_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 /// The bounds of a [`WssStreamClient`]; the defaults are ns `tunnel-ws`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

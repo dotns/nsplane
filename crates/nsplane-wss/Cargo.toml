@@ -1,6 +1,6 @@
 [package]
 name = "nsplane-wss"
-description = "WebSocket-over-TLS (WSS) carriers for nsplane: a datagram link dialer for LinkTransport and a multiplexed TCP/UDP stream client"
+description = "WebSocket-over-TLS (WSS) carriers for nsplane: a datagram link dialer for LinkTransport, and a multiplexed TCP/UDP stream client and terminate"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -19,7 +19,7 @@ nsplane = { path = "../nsplane", version = "0.8.0" }
 bytes = { workspace = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
-tokio = { version = "1.53.1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false }
 thiserror = "2.0.21"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
