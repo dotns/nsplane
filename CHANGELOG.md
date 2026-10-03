@@ -297,6 +297,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error); all zero without a stage. The drops are also counted in `drop_counters` under
   the new reasons `DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and
   `DROP_FRAGMENT_RATE_LIMITED` (`reasons::FRAGMENT_*` in `nsplane-core`).
+- `nsplane`: a side channel on `UdpTransport` for datagrams of another protocol sharing the
+  port. `UdpTransport::with_side_channel(classify, capacity)` returns the transport, a
+  `SideSender` and a receiver of `SideDatagram`s (`from`, `datagram`): every received
+  datagram `classify` picks (GRO segments one by one) is taken out of `recv` and
+  `recv_batch` and never reaches the engine; a full or closed receiver drops it.
+  `SideSender::send_to` sends on the transport's socket, synchronously and best effort
+  (`WouldBlock` when the socket buffer is full, no ECN mark), and `SideSender::stats`
+  returns `SideStats { received, dropped }` (on the sender, not in `TransportStats`).
+  Without a side channel nothing is classified and nothing changes; a capacity of 0 panics
+  and a second call replaces the channel.
+- `nsplane`: `LinkTransport`, an opt-in `Transport` to one peer over a message link the
+  embedder dials (one datagram per message), with the `LinkDialer`, `LinkSender` and
+  `LinkReceiver` traits, `LinkState` (`Connected`, `Disconnected`, reported to
+  `LinkDialer::on_state`) and `LinkConfig` (`queue` 256, `read_idle_timeout` `None`). Sends
+  wait in the queue, also while no link is up; on a full queue `send` fails with
+  `WouldBlock` and the engine counts `DROP_TRANSPORT_SEND_ERROR`. A lost link (closed,
+  failed or idle) is dialed again at once, after a failed dial too; the dialer owns the
+  backoff. Received datagrams come from the peer's address, and sends to another address
+  are dropped. `nsplane` has no WebSocket or TLS dependency.
+- `nsplane-e2e`: `udp_side_channel` (side datagrams beside a WireGuard transfer, offload on
+  and off, an unread receiver) and `link` (transfer, redial, the bounded queue, the read
+  idle timeout over an in-memory link).
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
@@ -416,6 +438,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared with its jobs. Breaking: `CoreConfig` struct literals need the new field (or
   `..CoreConfig::default()`), and `Core::handle_input_deferred` on a core without
   `crypto_jobs` processes every input at once and returns `None`.
+- `nsplane-examples`: the relay WSS client (`--transport wss`) runs on `LinkTransport`
+  with a tungstenite dialer (tungstenite and rustls stay in the examples package). While
+  the connection is down, datagrams to the relay now wait in the link's 256-entry queue
+  instead of being dropped: `.extra.wss.dropped.disconnected` stays 0 and
+  `dropped.queue_full` counts sends that failed on a full queue. The status field names are
+  unchanged.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and

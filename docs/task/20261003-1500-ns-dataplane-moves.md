@@ -87,6 +87,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - Semantics: received datagrams for which `classify` is true are taken out of recv and recv_batch (GRO segments included) and try_sent to the receiver, dropped when it is full or closed and counted in TransportStats (new `rx_side`, `rx_side_dropped`). Everything else reaches the core unchanged; the default is no side channel.
   - ns supplies `classify = |d| d.starts_with(b"NSGWP2P1")`.
   - Replaces: ns-engine SharedUdpTransport/ControlSender.
+  - Done (2026-10-03): `UdpTransport::with_side_channel`, `SideSender`, `SideDatagram`; the counters are `SideSender::stats() -> SideStats { received, dropped }`, not `TransportStats` (deviation recorded in the plan). Tests: `nsplane-e2e` `udp_side_channel`, unit tests in `crates/nsplane/src/udp.rs`.
 - MC-2 WebSocket datagram transport.
   - API: `nsplane::WsTransport::new(id: TransportId, peer: SocketAddr, dialer: Arc<dyn WsDialer>)` with
     `trait WsDialer: Send + Sync { fn dial(&self) -> BoxFuture<'_, io::Result<WebSocketStream<BoxedIo>>>; fn on_state(&self, state: WsLegState) {} }` and
@@ -95,6 +96,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
   - ns keeps URL, leg, bearer, 401/403 handling and backoff in its WsDialer (c).
   - Replaces: the OpaquePump loopback UDP hop and ns-engine WssTransport. The wire stays unchanged (campaign rule).
   - Alternative (no MC-2): keep the pump as it is. It is per-datagram code in ns, so it would be a recorded exception to the rule (D10).
+  - Done (2026-10-03) as the generic form (D10): `LinkTransport` with `LinkDialer`, `LinkSender`, `LinkReceiver`, `LinkState { Connected, Disconnected }` and `LinkConfig { queue: 256, read_idle_timeout: None }`; no WebSocket or TLS dependency in nsplane, so `Rejected(u16)` stays with ns's dialer. Tests: `nsplane-e2e` `link` (in-memory link); the examples' relay WSS client runs on it with a tungstenite dialer (`examples/tests/wss.rs`, `just e2e-examples` relay-wss cells).
 
 ## NEW workstream MD: ACL and L3 gate (nsplane-acl, M6; option A holds until then)
 - MD-1 Per-packet source principal.
@@ -154,6 +156,8 @@ covered by `nsplane-e2e`'s `path_hooks::a_handshake_can_start_on_a_candidate_wit
 User decisions: D10 a generic message-link transport (no WebSocket dependency in nsplane);
 ME-1 and ME-2 (SNAT and DNAT) both in nsplane-nat; MD is evaluated, not implemented, this
 round. MB-x, MC and ME run as a BKD campaign (plan 20261003-1600-ns-dataplane-moves).
+2026-10-03: MC-1 and MC-2 landed (campaign nsplane-mv-202610031600). The examples' WSS
+client now queues datagrams while disconnected (256 entries) instead of dropping them.
 
 ### MD assessment (L1, 2026-10-03; not implemented this round)
 
