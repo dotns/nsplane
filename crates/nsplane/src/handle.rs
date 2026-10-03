@@ -98,7 +98,9 @@ impl QueueDepth {
 /// The packet queues hold `queue_capacity` items each (see
 /// [`crate::EngineBuilder::queue_capacity`]). Without crypto workers (fewer than 2, see
 /// [`crate::EngineBuilder::crypto_workers`]), `crypto` and `crypto_done` are
-/// `QueueDepth { capacity: 0, high_water: 0 }`.
+/// `QueueDepth { capacity: 0, high_water: 0 }`, and the datagrams and packets the owner
+/// task hands to an idle transport or sink itself never enter the `transmit`, `deliver`
+/// or `recycle` queue, so on a path that keeps up those marks stay low or at 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QueueStats {
@@ -135,7 +137,8 @@ pub struct QueueStats {
 /// The traffic counters of one installed transport since it was added; see
 /// [`EngineHandle::transport_stats`].
 ///
-/// Counted by the transport's own receive and transmit tasks: whole datagrams as the
+/// Counted once per batch by whoever moved it: the transport's receive and transmit tasks,
+/// or the owner task when it sends on the transport itself. Whole datagrams as the
 /// transport reports and takes them (handshakes, cookie replies, keepalives, data), before
 /// the core authenticates them on the receive side, so they include datagrams the core
 /// drops afterwards. A [`EngineHandle::replace_transport`] keeps the counters of the id; a
