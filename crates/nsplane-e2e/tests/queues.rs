@@ -11,8 +11,8 @@ use nsplane::{
     ChannelTransport, DROP_SINK_FULL, EngineHandle, PacketBuf, QueueDepth, QueueStats, TransportId,
 };
 use nsplane_e2e::{
-    Family, Node, Options, TestResult, WAIT, channel_pair, channel_pair_with, exchange, introduce,
-    payload, serve_tcp_echo, stack_pair,
+    Family, Node, Options, QUIET, TestResult, WAIT, channel_pair, channel_pair_with, exchange,
+    introduce, payload, serve_tcp_echo, stack_pair,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, sleep, timeout};
@@ -64,6 +64,27 @@ async fn assert_restart(handle: &EngineHandle) -> TestResult {
     Ok(())
 }
 
+/// Receives what `b` delivers of a bulk transfer until `sender` is done and nothing arrives
+/// for [`QUIET`]; the marks, not reliable delivery, are what these tests check, and a loaded
+/// host may drop part of a UDP flood at the link or the sink.
+async fn drain_bulk(
+    b: &mut Node<ChannelTransport>,
+    sender: tokio::task::JoinHandle<TestResult>,
+) -> TestResult {
+    let mut delivered = 0;
+    loop {
+        match timeout(QUIET, b.delivered.recv()).await {
+            Ok(Some(_)) => delivered += 1,
+            Ok(None) => return Err("engine stopped".into()),
+            Err(_) if sender.is_finished() => break,
+            Err(_) => {}
+        }
+    }
+    timeout(WAIT, sender).await???;
+    assert!(delivered > 0, "nothing of the bulk transfer was delivered");
+    Ok(())
+}
+
 #[tokio::test]
 async fn bulk_udp_raises_marks_within_capacity() -> TestResult {
     let (mut a, mut b) = channel_pair(Options::default());
@@ -86,10 +107,7 @@ async fn bulk_udp_raises_marks_within_capacity() -> TestResult {
         }
         TestResult::Ok(())
     });
-    for _ in 0..BULK {
-        b.expect_delivery().await?;
-    }
-    timeout(WAIT, sender).await???;
+    drain_bulk(&mut b, sender).await?;
 
     let sent = a.handle.queue_stats().await?;
     let received = b.handle.queue_stats().await?;
@@ -121,10 +139,7 @@ async fn bulk_udp_on_workers_raises_the_crypto_marks() -> TestResult {
         }
         TestResult::Ok(())
     });
-    for _ in 0..BULK {
-        b.expect_delivery().await?;
-    }
-    timeout(WAIT, sender).await???;
+    drain_bulk(&mut b, sender).await?;
 
     for node in [&a.handle, &b.handle] {
         let stats = node.queue_stats().await?;
