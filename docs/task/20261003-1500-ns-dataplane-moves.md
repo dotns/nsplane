@@ -81,7 +81,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
 ## NEW workstream MF: engine throughput (ns release gate "throughput not below the legacy baseline")
 
 ns T10b profiling (Linux, two containers with pinned CPUs, real TUN, single-stream iperf3 TCP,
-nsplane 6d10ded0; full tables in ns docs/task/20261003-1300-account-mode-engine.md):
+nsplane main as of the traffic-status change; full tables in ns docs/task/20261003-1300-account-mode-engine.md):
 
 - MF-1 TUN data path is 15-21% below ns's legacy tunnel-wg loops (unloaded rounds: 4044 vs
   4748 Mbit/s; engine lower in 8 of 10 paired rounds). Nodes are not CPU-bound; per-byte CPU
