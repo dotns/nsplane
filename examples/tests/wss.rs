@@ -287,11 +287,20 @@ async fn a_foreign_certificate_is_rejected() -> TestResult {
     assert_eq!(stats.connects(), 0);
     assert!(server.status("handshake_failures") >= 2);
     assert_eq!(server.status("accepted"), 0);
-    // Datagrams to the relay are dropped while there is no connection; send never waits.
-    client
-        .send(&handshake(A, OWN)?.0, &to(client.relay()))
-        .await?;
+    // Datagrams to the relay wait for a connection in a queue of 256; send never waits,
+    // it fails once the queue is full.
+    let init = handshake(A, OWN)?.0;
+    for _ in 0..256 {
+        client.send(&init, &to(client.relay())).await?;
+    }
+    assert_eq!(stats.drops(), 0);
+    let full = client.send(&init, &to(client.relay())).await;
+    assert_eq!(
+        full.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
     assert_eq!(stats.drops(), 1);
+    assert_eq!(stats.status_json()["dropped"]["queue_full"], 1);
     server.stop().await;
     Ok(())
 }
@@ -349,16 +358,18 @@ async fn the_client_reconnects_after_the_relay_restarts() -> TestResult {
     let addr = server.wss;
     server.stop().await;
     until("the disconnect", || !stats.connected()).await?;
-    client
-        .send(&handshake(A, OWN)?.0, &to(client.relay()))
-        .await?;
-    assert!(stats.drops() >= 1);
+    // Sent while disconnected: it waits for the next connection.
+    let (queued, _) = handshake(B, OWN)?;
+    client.send(&queued, &to(client.relay())).await?;
+    assert_eq!(stats.drops(), 0);
 
     // A new relay on the same address, with the pinned certificate.
     let mut server = Server::start(addr, &cert, Vec::new()).await?;
     until("the reconnect", || stats.connected()).await?;
     assert_eq!(stats.reconnects(), 1);
+    assert_eq!(server.engine_recv().await?.0, queued);
     round_trip(&mut server, &client).await?;
+    assert_eq!((stats.tx(), stats.rx(), stats.drops()), (3, 2, 0));
     server.stop().await;
     Ok(())
 }
