@@ -23,7 +23,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::config::{NetStackConfig, Settings};
-use crate::device::{VirtualDevice, note_peer_ack};
+use crate::device::VirtualDevice;
 use crate::stats::{self, Counters, NetStackStats};
 use crate::tcp::{Shared, TcpConnection, WriteHalf, lock};
 use crate::udp::{self, Datagram, UdpFlow, UdpOut, UdpReply, UdpSocket};
@@ -41,15 +41,6 @@ const COMMAND_CAPACITY: usize = 64;
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
 /// Maximum interval without application payload in either direction of a connection.
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
-/// How long a connection may go without moving application bytes before the driver
-/// assumes smoltcp lost track of it and nudges it (see [`nudge_stalled`]).
-const STALL_KICK: SmolDuration = SmolDuration::from_secs(1);
-/// Bytes a stalled connection may take into its application buffer beyond the bound, to
-/// reopen its receive window.
-const STALL_RECEIVE: usize = 1024;
-/// Keep-alive interval of a stalled connection with bytes to send: it probes the peer's
-/// window instead of smoltcp's persist timer.
-const STALL_PROBE: SmolDuration = SmolDuration::from_secs(1);
 /// How long `connect_tcp` waits for the handshake.
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(20);
 /// First ephemeral port for `connect_tcp` and `bind_udp` on port 0 (RFC 6335).
@@ -352,8 +343,6 @@ struct Conn {
     /// `close()` was called on the socket.
     local_closed: bool,
     last_activity_at: SmolInstant,
-    /// `(local, remote)`, the connection's key in the device's peer acknowledgements.
-    endpoints: (SocketAddr, SocketAddr),
 }
 
 /// What one bridge pass did.
@@ -417,8 +406,6 @@ impl Conn {
             shared.write_half = WriteHalf::FinSent;
             shared.wake_writer();
         }
-
-        nudge_stalled(socket, &mut shared, &mut self.last_activity_at, now);
 
         if tcp_idle_timeout_expired(socket.state(), self.last_activity_at, now) {
             tracing::debug!(target: "netstack", "TCP connection exceeded idle timeout; aborting");
@@ -611,7 +598,6 @@ impl Driver {
                 if syn {
                     *demand.entry(dst_port).or_insert(0) += 1;
                 }
-                note_peer_ack(packet.as_packet(), &mut self.device.peer_acks);
                 self.device.inject(packet);
             }
             Ok(Class::Udp) => match udp::parse_udp(packet) {
@@ -909,7 +895,6 @@ impl Driver {
             .map_or(unspecified, endpoint_to_socket_addr);
         let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
         let (terminal, terminal_rx) = watch::channel(false);
-        self.device.peer_acks.insert((local, peer), None);
         self.conns.insert(
             handle,
             Conn {
@@ -917,7 +902,6 @@ impl Driver {
                 terminal,
                 local_closed: false,
                 last_activity_at: now,
-                endpoints: (local, peer),
             },
         );
         TcpConnection::new(shared, Arc::clone(&self.notify), local, peer, terminal_rx)
@@ -946,7 +930,6 @@ impl Driver {
         }
         for handle in released {
             if let Some(conn) = self.conns.remove(&handle) {
-                self.device.peer_acks.remove(&conn.endpoints);
                 conn.release();
             }
             self.sockets.remove(handle);
@@ -1119,55 +1102,6 @@ const fn record_receive_activity(
 ) {
     if received > 0 {
         *last_activity_at = now;
-    }
-}
-
-/// Nudges a connection that moved no application bytes for [`STALL_KICK`].
-///
-/// smoltcp 0.14 can strand a connection after a lost segment when the peer's window
-/// closes. Window scaling rounds a receive window of a few bytes down to zero, which
-/// pulls the right edge back behind data the sender already sent and lost. The sender
-/// then runs its zero-window probe timer instead of the retransmission timer, so the
-/// lost bytes are never resent. The receiver drops the sender's pure ACKs, whose
-/// sequence number now lies beyond its window, so its own data is never acknowledged;
-/// and a sender whose retransmission timer fires while the window is zero is left with
-/// no timer at all. When both ends wait on each other (an echo, a request and its
-/// response) neither moves again until a retransmission backed off to tens of seconds.
-///
-/// Two nudges break it, each bounded:
-/// - A receive side held back by a full application buffer takes up to
-///   [`STALL_RECEIVE`] bytes more. The window reopens, smoltcp announces it, and the
-///   peer's next data segment, which the receiver accepts, carries the ACK it dropped.
-/// - A side with bytes to send keeps a keep-alive of [`STALL_PROBE`] while stalled: the
-///   peer answers each probe with its current window, which stands in for the missing
-///   persist timer.
-fn nudge_stalled(
-    socket: &mut tcp::Socket<'_>,
-    shared: &mut Shared,
-    last_activity_at: &mut SmolInstant,
-    now: SmolInstant,
-) {
-    // Data may still flow in at least one direction.
-    let open = socket.may_send() || socket.may_recv();
-    let stalled = open && now - *last_activity_at >= STALL_KICK;
-    let limit = shared.capacity + STALL_RECEIVE;
-    if stalled && !shared.app_dropped && socket.can_recv() && shared.rx.len() < limit {
-        let room = limit - shared.rx.len();
-        let moved = socket
-            .recv(|data| {
-                let n = data.len().min(room);
-                shared.rx.extend(&data[..n]);
-                (n, n)
-            })
-            .unwrap_or(0);
-        if moved > 0 {
-            *last_activity_at = now;
-            shared.wake_reader();
-        }
-    }
-    let probe = stalled && socket.send_queue() > 0;
-    if probe != socket.keep_alive().is_some() {
-        socket.set_keep_alive(probe.then_some(STALL_PROBE));
     }
 }
 
