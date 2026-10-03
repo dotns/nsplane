@@ -44,6 +44,8 @@ pub(super) struct Context<'a> {
     pub(super) reassembly: &'a Mutex<Reassembly>,
     /// Seconds on the reassembly clock.
     pub(super) now: u64,
+    /// The largest IPv6 packet a reassembled datagram may become.
+    pub(super) mtu: usize,
 }
 
 /// The outer addresses of a packet on both sides of the translation.
@@ -228,11 +230,12 @@ pub(super) fn v4_to_v6(
     Ok(Done::Translated)
 }
 
-/// Feeds a UDP fragment to reassembly if its datagram has no checksum.
+/// Feeds a UDP fragment to reassembly if its datagram has no checksum, or
+/// may have none because its first fragment has not been seen yet.
 ///
 /// Returns `None` for fragments that are translated one by one: the first
-/// fragment of a datagram with a checksum, and later fragments of a datagram
-/// that is not being reassembled.
+/// fragment of a datagram with a checksum that has nothing held, and later
+/// fragments of such a datagram.
 fn reassemble(
     packet: &mut PacketBuf,
     v4: &Ipv4,
@@ -247,14 +250,16 @@ fn reassemble(
         protocol: v4.protocol,
     };
     let mut state = cx.reassembly.lock().unwrap_or_else(PoisonError::into_inner);
+    state.cleanup(cx.now);
     if v4.fragment_offset == 0 {
         if payload.len() < 8 {
             return Err(reasons::TINY_FRAGMENT);
         }
-        if be16(payload, 6) != 0 {
+        if be16(payload, 6) != 0 && !state.contains(&key) {
+            state.mark_passed(key, cx.now);
             return Ok(None);
         }
-    } else if !state.contains(&key) {
+    } else if !state.contains(&key) && state.passed(&key) {
         return Ok(None);
     }
     let piece = Piece {
@@ -274,6 +279,9 @@ fn reassemble(
     else {
         return Ok(Some(Done::Pending));
     };
+    if body.len() + 40 > cx.mtu {
+        return Err(reasons::REASSEMBLED_TOO_BIG);
+    }
     transport_v4_to_v6(&mut body, protocol::UDP, addrs, false)?;
     let (header, header_len) = V6Header {
         traffic_class: tos,

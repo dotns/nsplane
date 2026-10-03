@@ -42,8 +42,8 @@ fn bench_udp(c: &mut Criterion) {
         group.bench_function(format!("batch_64x{SIZE}_{name}"), |bench| {
             bench.iter(|| {
                 runtime.block_on(async {
-                    let mut sent = 0;
-                    a.send_batch(&batch, &mut sent).await.unwrap();
+                    let (mut sent, mut failed) = (0, 0);
+                    a.send_batch(&batch, &mut sent, &mut failed).await.unwrap();
                     let mut count = 0;
                     while count < MAX_BATCH {
                         received.clear();

@@ -120,10 +120,9 @@ const MAX_DATAGRAM: usize = 65535;
 /// the transport fails to send (any error, [`io::ErrorKind::BrokenPipe`] included) is
 /// dropped and counted under [`crate::DROP_TRANSPORT_SEND_ERROR`]: the transmit task counts
 /// it in a counter shared with the owner task and wakes the owner, which publishes the
-/// drops, so a successful send costs nothing extra. A failed batched send counts every
-/// datagram the failing [`Transport::send_batch`] call was done with, since the call does not
-/// tell which of them failed: for [`crate::UdpTransport`], the failed segmented run and any
-/// runs it sent before it in that call.
+/// drops, so a successful send costs nothing extra. A failed batched send counts exactly the
+/// datagrams the [`Transport::send_batch`] call reports failed (at least one): for
+/// [`crate::UdpTransport`], the datagrams of the failed segmented run.
 ///
 /// The engine runs until [`EngineHandle::shutdown`]. Dropping the `Engine` aborts every task
 /// at once, so keep it alive (typically by awaiting [`Engine::wait`]) for as long as the
@@ -1309,15 +1308,17 @@ async fn transmit<T: Transport>(
             }
             loop {
                 let before = sent;
-                let Err(e) = transport.send_batch(&batch, &mut sent).await else {
+                let mut failed = 0;
+                let Err(e) = transport.send_batch(&batch, &mut sent, &mut failed).await else {
                     sent = batch.len();
                     return true;
                 };
-                // The failed datagram is dropped, even if the transport did not count it.
-                // The call does not tell which of the datagrams it was done with failed, so
-                // all of them are reported: a failed segmented send loses its whole run.
+                // The failed datagram is dropped, even if the transport did not count it or
+                // advance past it. Only the datagrams the call reports failed are counted
+                // (a failed segmented send loses its run, not the runs handed off before
+                // it), at least one and never more than the call was done with.
                 sent = sent.max(before + 1).min(batch.len());
-                errors.report(sent - before);
+                errors.report(failed.clamp(1, sent - before));
                 if e.kind() == io::ErrorKind::BrokenPipe {
                     tracing::debug!("Transport closed for sending");
                     return false;
