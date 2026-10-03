@@ -85,6 +85,25 @@ nsplane-tun = { path = "../nsplane/crates/nsplane-tun" }
 nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 ```
 
+## Tuning
+
+The engine's packet queues hold 1024 packets each by default
+(`EngineBuilder::queue_capacity`), measured to leave 1.5x headroom over a single bulk TCP
+flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
+`take_queue_stats` restarts the marks: a mark at its capacity together with
+`DROP_SINK_FULL` or `DROP_TRANSMIT_FULL` in `EngineHandle::drop_counters` means the queue is
+too small for the load (raise `queue_capacity`, e.g. to 2048 for many parallel bulk flows
+through a userspace netstack); marks far below the capacity mean it can shrink. See
+[docs/architecture.md](docs/architecture.md#queue-depths) for the measurements.
+
+By default one owner task encrypts and decrypts every packet. A hub with several busy peers
+can spread that work over a pool of worker tasks with `EngineBuilder::crypto_workers(n)`
+(`n` of 2 or more; 0 or 1 is the default single task). The pool is sharded by peer, so
+each peer's packets keep their order, and it only helps on a multi-threaded tokio runtime
+with traffic from several peers: one peer's packets always go to one worker. See
+[docs/architecture.md](docs/architecture.md#crypto-worker-pool) for the design and the
+throughput note.
+
 ## Building
 
 The toolchain is pinned in `rust-toolchain.toml` (1.99.0); the MSRV is 1.95. Building

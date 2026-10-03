@@ -38,7 +38,7 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// in fragments; one that fits the interface but not a smaller MTU further along the path
 /// leaves with the DF bit set and is dropped where it does not fit. So the engine's MTU plus
 /// the WireGuard overhead must fit the path MTU. The engine logs a failed send at debug
-/// level and drops the datagram without counting it in its drop counters. Where
+/// level, drops the datagram and counts it under [`crate::DROP_TRANSPORT_SEND_ERROR`]. Where
 /// `quinn-udp` cannot set the socket up on other platforms than Linux and Android (Wine
 /// lacks some IPv4 options), the transport sends with plain `send_to` instead: without ECN
 /// marks and segmentation, fragmenting as the OS does by default.

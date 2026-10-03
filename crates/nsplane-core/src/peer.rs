@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::mem;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use nsplane_noise::noise::{Tunn, TunnResult};
@@ -10,8 +10,10 @@ use nsplane_packet::Path;
 
 /// A peer of the core: its tunnel and current path. Allowed IPs live in the peer table.
 pub(crate) struct Peer {
-    /// The associated tunnel struct
-    pub(crate) tunnel: Tunn,
+    /// The associated tunnel struct, shared with the peer's [`CryptoJob`]s.
+    ///
+    /// [`CryptoJob`]: crate::CryptoJob
+    tunnel: Arc<Mutex<Tunn>>,
     public_key: PublicKey,
     /// The index the tunnel uses
     index: u32,
@@ -44,7 +46,7 @@ impl std::fmt::Debug for Peer {
 
 impl Peer {
     /// Creates a peer around `tunnel`.
-    pub(crate) const fn new(
+    pub(crate) fn new(
         tunnel: Tunn,
         public_key: PublicKey,
         index: u32,
@@ -53,7 +55,7 @@ impl Peer {
     ) -> Self {
         let handshakes = tunnel.handshake_count();
         Self {
-            tunnel,
+            tunnel: Arc::new(Mutex::new(tunnel)),
             public_key,
             index,
             path,
@@ -66,21 +68,36 @@ impl Peer {
         }
     }
 
+    /// The tunnel, locked; uncontended unless a [`CryptoJob`] of this peer runs elsewhere.
+    ///
+    /// [`CryptoJob`]: crate::CryptoJob
+    pub(crate) fn tunnel(&self) -> MutexGuard<'_, Tunn> {
+        // A job that panicked while sealing or opening leaves a usable tunnel behind.
+        self.tunnel.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The shared tunnel, for a [`CryptoJob`].
+    ///
+    /// [`CryptoJob`]: crate::CryptoJob
+    pub(crate) fn shared_tunnel(&self) -> Arc<Mutex<Tunn>> {
+        Arc::clone(&self.tunnel)
+    }
+
     /// Replaces the preshared key; the next handshake uses it.
-    pub(crate) const fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         self.preshared_key = preshared_key;
-        self.tunnel.set_preshared_key(preshared_key);
+        self.tunnel().set_preshared_key(preshared_key);
     }
 
     /// Sets the persistent keepalive interval in seconds; `0` disables it.
-    pub(crate) fn set_persistent_keepalive(&mut self, interval: u16) {
-        self.tunnel
+    pub(crate) fn set_persistent_keepalive(&self, interval: u16) {
+        self.tunnel()
             .set_persistent_keepalive((interval > 0).then_some(interval));
     }
 
     /// Runs the timers of the tunnel at `now`; see [`Tunn::update_timers_at`].
-    pub(crate) fn update_timers<'a>(&mut self, now: Instant, dst: &'a mut [u8]) -> TunnResult<'a> {
-        self.tunnel.update_timers_at(now, dst)
+    pub(crate) fn update_timers<'a>(&self, now: Instant, dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.tunnel().update_timers_at(now, dst)
     }
 
     /// The current path.
@@ -125,23 +142,33 @@ impl Peer {
 
     /// Plaintext payload bytes sealed for this peer, as counted by the tunnel.
     pub(crate) fn data_tx(&self) -> u64 {
-        self.tunnel.stats().1 as u64
+        self.tunnel().stats().1 as u64
     }
 
     /// Handshakes the tunnel completed since the last call; the core reports each of them.
-    pub(crate) const fn take_completed_handshakes(&mut self) -> u64 {
-        let count = self.tunnel.handshake_count();
-        count.saturating_sub(mem::replace(&mut self.handshakes, count))
+    pub(crate) fn take_completed_handshakes(&mut self) -> u64 {
+        let count = self.tunnel().handshake_count();
+        self.take_handshakes_up_to(count)
+    }
+
+    /// Handshakes up to the tunnel's handshake count `count` that were not reported yet. The
+    /// count of a [`CryptoJob`] may lag behind one already taken: it then reports none.
+    ///
+    /// [`CryptoJob`]: crate::CryptoJob
+    pub(crate) fn take_handshakes_up_to(&mut self, count: u64) -> u64 {
+        let completed = count.saturating_sub(self.handshakes);
+        self.handshakes = self.handshakes.max(count);
+        completed
     }
 
     /// Time from the establishment of the current session to `now`.
     pub(crate) fn time_since_last_handshake(&self, now: Instant) -> Option<Duration> {
-        self.tunnel.time_since_last_handshake_at(now)
+        self.tunnel().time_since_last_handshake_at(now)
     }
 
     /// The persistent keepalive interval in seconds.
-    pub(crate) const fn persistent_keepalive(&self) -> Option<u16> {
-        self.tunnel.persistent_keepalive()
+    pub(crate) fn persistent_keepalive(&self) -> Option<u16> {
+        self.tunnel().persistent_keepalive()
     }
 
     /// The preshared key, if set.

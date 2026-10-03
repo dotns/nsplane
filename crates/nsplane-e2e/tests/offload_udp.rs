@@ -2,7 +2,8 @@
 //! on and off: a bulk transfer of several flows (IPv4 and IPv6 packets around the MTU) in
 //! both directions at once arrives intact and in order per flow, and the engines' counters
 //! agree with each other and with what was sent. Bursts of [`WINDOW`] packets each way rely
-//! on the transport's default socket buffers.
+//! on the transport's default socket buffers. The transfers with offload on also run with a
+//! crypto worker pool on a multi-threaded runtime.
 //!
 //! As root (`CAP_NET_ADMIN`), [`fragmentation_follows_bind_time_offload`] lowers the MTU of
 //! `lo`: a datagram above it leaves in fragments and arrives whole from a transport bound
@@ -29,8 +30,12 @@ const WINDOW: usize = 512;
 /// IPv4 and IPv6 header plus UDP header of the packets.
 const V4_HEADERS: usize = 28;
 const V6_HEADERS: usize = 48;
+/// Crypto workers of the pool-on variants.
+const WORKERS: usize = 2;
 
-fn node(seed: u8, ip: IpAddr, offload: bool) -> io::Result<Node<UdpTransport>> {
+/// A node with key seed `seed` on a UDP transport bound to `ip`, with segmentation offload
+/// `offload` and `workers` crypto workers.
+fn node(seed: u8, ip: IpAddr, offload: bool, workers: usize) -> io::Result<Node<UdpTransport>> {
     let id = TransportId::new(u16::from(seed));
     let transport = UdpTransport::bind(id, SocketAddr::new(ip, 0))?;
     transport.set_offload(offload)?;
@@ -38,7 +43,10 @@ fn node(seed: u8, ip: IpAddr, offload: bool) -> io::Result<Node<UdpTransport>> {
     let (recv, send) = (transport.recv_buffer_size()?, transport.send_buffer_size()?);
     writeln!(io::stderr(), "socket buffers: receive {recv}, send {send}")?;
     let addr = transport.local_addr();
-    Ok(Node::new(seed, id, addr, transport, Options::default()))
+    Node::with_builder(seed, id, addr, Options::default(), |builder| {
+        builder.transport(transport).crypto_workers(workers)
+    })
+    .map_err(io::Error::other)
 }
 
 /// Fails if `node` counted any drop.
@@ -188,8 +196,8 @@ async fn bulk_transfer(mut a: Node<UdpTransport>, mut b: Node<UdpTransport>) -> 
     expect_no_drops(&b).await
 }
 
-async fn bulk_over(ip: IpAddr, offload: bool) -> TestResult {
-    let pair = node(1, ip, offload).and_then(|a| Ok((a, node(2, ip, offload)?)));
+async fn bulk_over(ip: IpAddr, offload: bool, workers: usize) -> TestResult {
+    let pair = node(1, ip, offload, workers).and_then(|a| Ok((a, node(2, ip, offload, workers)?)));
     let (a, b) = match pair {
         Err(e) if ip.is_ipv6() && e.kind() == io::ErrorKind::AddrNotAvailable => {
             writeln!(io::stderr(), "skipped: cannot bind {ip}: {e}")?;
@@ -202,22 +210,32 @@ async fn bulk_over(ip: IpAddr, offload: bool) -> TestResult {
 
 #[tokio::test]
 async fn bulk_transfer_ipv4_offload_on() -> TestResult {
-    bulk_over(IpAddr::V4(Ipv4Addr::LOCALHOST), true).await
+    bulk_over(IpAddr::V4(Ipv4Addr::LOCALHOST), true, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_transfer_ipv4_offload_on_on_workers() -> TestResult {
+    bulk_over(IpAddr::V4(Ipv4Addr::LOCALHOST), true, WORKERS).await
 }
 
 #[tokio::test]
 async fn bulk_transfer_ipv4_offload_off() -> TestResult {
-    bulk_over(IpAddr::V4(Ipv4Addr::LOCALHOST), false).await
+    bulk_over(IpAddr::V4(Ipv4Addr::LOCALHOST), false, 0).await
 }
 
 #[tokio::test]
 async fn bulk_transfer_ipv6_offload_on() -> TestResult {
-    bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), true).await
+    bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), true, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_transfer_ipv6_offload_on_on_workers() -> TestResult {
+    bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), true, WORKERS).await
 }
 
 #[tokio::test]
 async fn bulk_transfer_ipv6_offload_off() -> TestResult {
-    bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), false).await
+    bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), false, 0).await
 }
 
 /// The MTU `lo` gets for [`fragmentation_follows_bind_time_offload`]; the minimum for IPv6.
