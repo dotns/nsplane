@@ -48,7 +48,7 @@ Conventions: every hook is additive, defaults keep today's behavior, nothing cos
 - MB-4 (proposal item 4) `NetStackConfig::accept_backpressure: bool` (default false).
   - Needed by: account_engine::stack parity with the legacy blocking accept (stack.rs:38).
 - MB-5 (proposal item 5) `NetStackHandle::connect_tcp_from(local_port: u16, remote: SocketAddr) -> io::Result<TcpConnection>`. AddrInUse when the port is taken by a connection or listener of the stack.
-  - Needed by: exit-owned runtimes (HostPortReservation). UDP is already covered: `bind_udp(SocketAddr::new(stack_ip, reserved_port))` picks the caller's port at 6d10ded0, so no UDP item is needed.
+  - Needed by: exit-owned runtimes (HostPortReservation). UDP is already covered: `bind_udp(SocketAddr::new(stack_ip, reserved_port))` already picks the caller's port (nsplane main as of the traffic-status change), so no UDP item is needed.
 - MB-6 (proposal item 6) random ephemeral start per stack.
   - Closes client_stack difference 2 (ports start at 49152).
 - MB-x1 (NEW) Packet ownership query so a local side can share one decrypted stream between the stack and other consumers.
