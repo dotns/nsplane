@@ -30,8 +30,10 @@
 //! `mtu - 40` (IPv4) or `mtu - 60` (IPv6) and no packet the stack emits exceeds the MTU.
 //! A peer then never sends segments that are black-holed once the tunnel wraps them
 //! (small packets pass and the first full-size segment stalls). Each socket's send and
-//! receive buffers hold 512 IPv4-sized segments, so the advertised window scales with
-//! the MSS.
+//! receive buffers hold 512 IPv4-sized segments by default, so the advertised window scales
+//! with the MSS; [`NetStackConfig::tcp_rx_buffer`] and [`NetStackConfig::tcp_tx_buffer`]
+//! set other sizes. The receive buffer is the window, and smoltcp derives the window-scale
+//! option from it.
 
 #![forbid(unsafe_code)]
 
