@@ -64,12 +64,16 @@ impl Hasher for IndexHasher {
 ///
 /// Peers are reachable by id, by public key, by the session index in received messages, and by
 /// allowed IP (cryptokey routing). Allowed IPs exist only in the routing table, so a range that
-/// a newer peer claims is moved away from its previous owner. Peer ids are never reused.
+/// a newer peer claims is moved away from its previous owner. Peer ids are never reused. A
+/// peer's inbound destinations are kept apart from the routing table, by slot.
 pub(crate) struct PeerTable {
     /// Ids of the peers, ascending: ids are handed out in order, so a new peer goes last.
     ids: Vec<PeerId>,
     /// The peers, at the position of their id in `ids`.
     peers: Vec<Peer>,
+    /// The inbound destinations of the peers, at the position of their id in `ids`; `None`
+    /// for an unchecked peer.
+    destinations: Vec<Option<AllowedIps<()>>>,
     by_key: HashMap<PublicKey, PeerId>,
     by_index: HashMap<u32, PeerId, BuildHasherDefault<IndexHasher>>,
     by_ip: AllowedIps<PeerId>,
@@ -98,6 +102,7 @@ impl PeerTable {
         Self {
             ids: Vec::new(),
             peers: Vec::new(),
+            destinations: Vec::new(),
             by_key: HashMap::new(),
             by_index: HashMap::default(),
             by_ip: AllowedIps::new(),
@@ -173,6 +178,9 @@ impl PeerTable {
                     p.set_preshared_key(preshared_key);
                 }
             }
+            if let Some(destinations) = &config.inbound_destinations {
+                self.set_inbound_destinations(id, Some(destinations));
+            }
             id
         } else {
             let own = self.key.as_ref().ok_or(PeerTableError::NoPrivateKey)?;
@@ -211,6 +219,8 @@ impl PeerTable {
             self.next_id = next_id;
             self.ids.push(id);
             self.peers.push(peer);
+            self.destinations
+                .push(config.inbound_destinations.as_deref().map(destination_set));
             self.by_key.insert(config.public_key, id);
             self.by_index.insert(index, id);
             tracing::info!("Peer added");
@@ -233,6 +243,7 @@ impl PeerTable {
         if let Ok(i) = self.ids.binary_search(&id) {
             self.ids.remove(i);
             let peer = self.peers.remove(i);
+            self.destinations.remove(i);
             self.by_index.remove(&peer.index());
         }
         self.by_ip.remove(&|p: &PeerId| *p == id);
@@ -245,6 +256,7 @@ impl PeerTable {
     pub(crate) fn clear(&mut self) {
         self.ids.clear();
         self.peers.clear();
+        self.destinations.clear();
         self.by_key.clear();
         self.by_index.clear();
         self.by_ip.clear();
@@ -308,6 +320,24 @@ impl PeerTable {
             .collect()
     }
 
+    /// Sets the inbound destinations of `peer`, or with `None` removes them.
+    pub(crate) fn set_inbound_destinations(
+        &mut self,
+        peer: PeerId,
+        destinations: Option<&[AllowedIp]>,
+    ) {
+        if let Some(slot) = self.slot(peer)
+            && let Some(set) = self.destinations.get_mut(slot)
+        {
+            *set = destinations.map(destination_set);
+        }
+    }
+
+    /// The inbound destinations of the peer at `slot`; `None` if it is unchecked.
+    pub(crate) fn inbound_destinations(&self, slot: usize) -> Option<&AllowedIps<()>> {
+        self.destinations.get(slot)?.as_ref()
+    }
+
     /// All peers with their ids, in id order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (PeerId, &Peer)> {
         self.ids.iter().copied().zip(&self.peers)
@@ -322,6 +352,15 @@ impl PeerTable {
     pub(crate) const fn len(&self) -> usize {
         self.peers.len()
     }
+}
+
+/// The networks of `destinations` as a lookup table.
+fn destination_set(destinations: &[AllowedIp]) -> AllowedIps<()> {
+    let mut set = AllowedIps::new();
+    for &AllowedIp { addr, cidr } in destinations {
+        set.insert(addr, cidr, ());
+    }
+    set
 }
 
 /// A basic linear-feedback shift register implemented as xorshift, used to
@@ -582,6 +621,84 @@ mod tests {
         let id = add(&mut table, key(), &[]);
         assert!(table.shared_tunnels());
         assert!(table.peer(id).unwrap().shared_tunnel().is_some());
+    }
+
+    /// The inbound destinations of `id`; `None` if it is unchecked.
+    fn destinations(table: &PeerTable, id: PeerId) -> Option<Vec<AllowedIp>> {
+        let set = table.inbound_destinations(table.slot(id)?)?;
+        Some(
+            set.iter()
+                .map(|(&(), addr, cidr)| AllowedIp { addr, cidr })
+                .collect(),
+        )
+    }
+
+    fn add_with_destinations(table: &mut PeerTable, peer: PublicKey, nets: &[&str]) -> PeerId {
+        let mut config = PeerConfig::new(peer);
+        config.inbound_destinations = Some(nets.iter().copied().map(net).collect());
+        table.apply(&config, Instant::now()).unwrap()
+    }
+
+    #[test]
+    fn inbound_destinations_are_unchecked_by_default() {
+        let mut table = table();
+        let id = add(&mut table, key(), &["10.0.0.0/24"]);
+        assert_eq!(destinations(&table, id), None);
+    }
+
+    #[test]
+    fn inbound_destinations_match_by_prefix_and_add_no_routes() {
+        let mut table = table();
+        let id = add_with_destinations(&mut table, key(), &["10.1.0.0/16", "fd01::/64"]);
+        let set = table.inbound_destinations(table.slot(id).unwrap()).unwrap();
+
+        assert!(set.find(ip("10.1.2.3")).is_some());
+        assert!(set.find(ip("10.2.0.1")).is_none());
+        assert!(set.find(ip("fd01::5")).is_some());
+        assert!(set.find(ip("fd02::5")).is_none());
+        assert!(table.by_destination(ip("10.1.2.3")).is_none());
+        assert_eq!(table.allowed_ips(id), Vec::new());
+    }
+
+    #[test]
+    fn an_update_without_inbound_destinations_keeps_them() {
+        let mut table = table();
+        let a = key();
+        let id = add_with_destinations(&mut table, a, &["10.1.0.0/16"]);
+
+        add(&mut table, a, &["10.0.0.0/24"]);
+        assert_eq!(destinations(&table, id), Some(vec![net("10.1.0.0/16")]));
+
+        add_with_destinations(&mut table, a, &["10.2.0.0/16"]);
+        assert_eq!(destinations(&table, id), Some(vec![net("10.2.0.0/16")]));
+
+        add_with_destinations(&mut table, a, &[]);
+        assert_eq!(destinations(&table, id), Some(Vec::new()));
+    }
+
+    #[test]
+    fn inbound_destinations_are_set_and_removed_by_peer() {
+        let mut table = table();
+        let a = key();
+        let b = key();
+        let peer_a = add(&mut table, a, &[]);
+        let peer_b = add_with_destinations(&mut table, b, &["10.1.0.0/16"]);
+
+        table.set_inbound_destinations(peer_a, Some(&[net("fd01::/64")]));
+        assert_eq!(destinations(&table, peer_a), Some(vec![net("fd01::/64")]));
+        table.set_inbound_destinations(peer_b, None);
+        assert_eq!(destinations(&table, peer_b), None);
+
+        // Removing a peer keeps the others' sets at their slots, and a peer added again
+        // starts unchecked.
+        table.set_inbound_destinations(peer_b, Some(&[net("10.2.0.0/16")]));
+        table.remove(&a);
+        assert_eq!(destinations(&table, peer_b), Some(vec![net("10.2.0.0/16")]));
+        let peer_a = add(&mut table, a, &[]);
+        assert_eq!(destinations(&table, peer_a), None);
+        table.clear();
+        let peer_b = add(&mut table, b, &[]);
+        assert_eq!(destinations(&table, peer_b), None);
     }
 
     #[test]
