@@ -150,23 +150,38 @@ async fn full_sink_fills_the_deliver_queue() -> TestResult {
     exchange(&mut a, &mut b).await?;
     b.handle.take_queue_stats().await?;
 
-    // The sink channel, the packet the sink task holds while waiting for room in it and the
-    // deliver queue take this many; the rest is dropped.
-    let held = SINK + 1 + DELIVER;
+    // The sink channel, the batch the sink task holds while waiting for room in it (the
+    // first packet and at most the `DELIVER` queued behind it) and the deliver queue take at
+    // most this many; the rest is dropped.
+    let held = SINK + (DELIVER + 1) + DELIVER;
     let sent = held + 64;
     let packet = a.packet_to(&b, Family::V4, &payload(64));
     for _ in 0..sent {
         a.send(&packet).await?;
     }
-    let expected = (sent - held) as u64;
+    let least = (sent - held) as u64;
     let deadline = Instant::now() + WAIT;
-    while b.drops(DROP_SINK_FULL).await? < expected {
+    while b.drops(DROP_SINK_FULL).await? < least {
         if Instant::now() > deadline {
-            return Err(format!("fewer than {expected} sink-full drops within {WAIT:?}").into());
+            return Err(format!("fewer than {least} sink-full drops within {WAIT:?}").into());
         }
         sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(b.drops(DROP_SINK_FULL).await?, expected);
+    // Draining the sink then accounts for every packet: delivered or dropped, once.
+    let mut delivered = 0;
+    loop {
+        while b.delivered.try_recv().is_ok() {
+            delivered += 1;
+        }
+        let dropped = b.drops(DROP_SINK_FULL).await?;
+        if delivered + dropped == sent as u64 {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!("{sent} sent: {delivered} delivered, {dropped} dropped").into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 
     let stats = b.handle.queue_stats().await?;
     assert_eq!(

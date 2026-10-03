@@ -8,12 +8,12 @@ use std::io;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Output};
-use nsplane_packet::{MAX_BATCH, PacketBuf, Path, PeerId, TransportId};
+use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
 use tokio::sync::{broadcast, oneshot, watch};
@@ -120,7 +120,10 @@ const MAX_DATAGRAM: usize = 65535;
 /// the transport fails to send (any error, [`io::ErrorKind::BrokenPipe`] included) is
 /// dropped and counted under [`crate::DROP_TRANSPORT_SEND_ERROR`]: the transmit task counts
 /// it in a counter shared with the owner task and wakes the owner, which publishes the
-/// drops, so a successful send costs nothing extra.
+/// drops, so a successful send costs nothing extra. A failed batched send counts every
+/// datagram the failing [`Transport::send_batch`] call was done with, since the call does not
+/// tell which of them failed: for [`crate::UdpTransport`], the failed segmented run and any
+/// runs it sent before it in that call.
 ///
 /// The engine runs until [`EngineHandle::shutdown`]. Dropping the `Engine` aborts every task
 /// at once, so keep it alive (typically by awaiting [`Engine::wait`]) for as long as the
@@ -285,8 +288,9 @@ impl Drop for Task {
     }
 }
 
-/// What a stopped transmit task hands back: its queue and the datagram it was sending.
-type Unsent = (mpsc::Receiver<Datagram>, Option<Datagram>);
+/// What a stopped transmit task hands back: its queue and the datagrams of the batch it was
+/// sending that were not sent, oldest first.
+type Unsent = (mpsc::Receiver<Datagram>, Vec<Datagram>);
 
 /// A transport's transmit task, stopped through a signal so that it hands back the datagrams
 /// it did not send; aborted when dropped.
@@ -329,11 +333,12 @@ type Datagram = (Path, PacketBuf);
 type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
 
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
-/// its transmit queue, the queue returning transmitted buffers, where to report failed
-/// sends and the suspension state.
+/// its transmit queue (both ends), the queue returning transmitted buffers, where to report
+/// failed sends and the suspension state.
 type Start = Box<
     dyn FnOnce(
             mpsc::Sender<Datagram>,
+            mpsc::WeakSender<Datagram>,
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
             SendErrors,
@@ -353,7 +358,7 @@ impl NewTransport {
     pub(crate) fn new<T: Transport>(transport: T) -> Self {
         Self {
             id: transport.id(),
-            start: Box::new(move |datagrams, queue, recycle, errors, suspended| {
+            start: Box::new(move |datagrams, slots, queue, recycle, errors, suspended| {
                 let transport = Arc::new(transport);
                 let (stop, stopped) = oneshot::channel();
                 (
@@ -365,7 +370,7 @@ impl NewTransport {
                     Transmitter {
                         stop: Some(stop),
                         task: tokio::spawn(transmit(
-                            transport, queue, recycle, errors, suspended, stopped,
+                            transport, slots, queue, recycle, errors, suspended, stopped,
                         )),
                     },
                 )
@@ -378,21 +383,22 @@ impl NewTransport {
 /// that wakes it.
 #[derive(Clone)]
 struct SendErrors {
-    count: Arc<AtomicU64>,
+    count: Arc<AtomicUsize>,
     /// The owner keeps a sender, so the signal never closes; a full signal is already
     /// pending.
     signal: mpsc::Sender<()>,
 }
 
 impl SendErrors {
-    fn report(&self) {
+    /// Reports `failed` datagrams.
+    fn report(&self, failed: usize) {
         // The signal orders the count before the owner's take.
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(failed, Ordering::Relaxed);
         let _ = self.signal.try_send(());
     }
 
     /// The failed sends since the last take.
-    fn take(&self) -> u64 {
+    fn take(&self) -> usize {
         self.count.swap(0, Ordering::Relaxed)
     }
 }
@@ -982,6 +988,7 @@ impl Owner {
         let (queue, transmit_rx) = mpsc::channel(self.queue_capacity);
         let (receive, transmit) = start(
             self.datagram_tx.clone(),
+            queue.downgrade(),
             transmit_rx,
             self.recycle_tx.clone(),
             self.send_errors.clone(),
@@ -1165,19 +1172,22 @@ async fn watch_mtu(
     }
 }
 
-/// Reads local packets into the owner's queue until the source closes.
+/// Reads batches of local packets into the owner's queue until the source closes.
 async fn read_source<Src: PacketSource>(
     mut source: Src,
     local: mpsc::Sender<PacketBuf>,
     mut suspended: watch::Receiver<bool>,
 ) {
+    let mut batch = PacketBatch::new();
     while running(&mut suspended).await {
-        match source.recv().await {
-            Ok(packet) => {
-                if local.send(packet).await.is_err() {
-                    return;
-                }
+        let result = source.recv_batch(&mut batch).await;
+        for packet in batch.drain() {
+            if local.send(packet).await.is_err() {
+                return;
             }
+        }
+        match result {
+            Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Packet source closed");
                 return;
@@ -1187,42 +1197,52 @@ async fn read_source<Src: PacketSource>(
     }
 }
 
-/// Delivers decrypted packets to the sink until it closes.
+/// Delivers decrypted packets to the sink in batches of what is queued, until it closes.
 async fn write_sink<Snk: PacketSink>(
     sink: Snk,
     mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>,
     mut suspended: watch::Receiver<bool>,
 ) {
-    while let Some((from, packet)) = deliver.recv().await {
+    let mut packets = VecDeque::with_capacity(MAX_BATCH);
+    while let Some(first) = deliver.recv().await {
+        packets.push_back(first);
+        while packets.len() < MAX_BATCH {
+            let Ok(next) = deliver.try_recv() else { break };
+            packets.push_back(next);
+        }
         if !running(&mut suspended).await {
             return;
         }
-        match sink.send(packet, from).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                tracing::debug!("Packet sink closed");
-                return;
+        while !packets.is_empty() {
+            match sink.send_batch(&mut packets).await {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    tracing::debug!("Packet sink closed");
+                    return;
+                }
+                Err(e) => tracing::warn!(message = "Packet sink error", error = ?e),
             }
-            Err(e) => tracing::warn!(message = "Packet sink error", error = ?e),
         }
     }
 }
 
-/// Receives datagrams into the owner's queue until the transport closes.
+/// Receives batches of datagrams into the owner's queue until the transport closes.
 async fn receive<T: Transport>(
     transport: Arc<T>,
     datagrams: mpsc::Sender<Datagram>,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut buf = PacketBuf::with_capacity(MAX_DATAGRAM);
+    let mut received = VecDeque::with_capacity(MAX_BATCH);
     while running(&mut suspended).await {
-        match transport.recv(&mut buf).await {
-            Ok((len, path)) => {
-                let data = PacketBuf::from_packet(&buf.as_packet()[..len]);
-                if datagrams.send((path, data)).await.is_err() {
-                    return;
-                }
+        let result = transport.recv_batch(&mut buf, &mut received).await;
+        while let Some(datagram) = received.pop_front() {
+            if datagrams.send(datagram).await.is_err() {
+                return;
             }
+        }
+        match result {
+            Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Transport closed for receiving");
                 return;
@@ -1247,47 +1267,79 @@ async fn unless_stopped<F: Future>(
     .await
 }
 
-/// Sends queued datagrams until the transport closes; returns the buffers for reuse and
-/// reports every failed send to `errors`. Once `stop` fires, hands back its queue and the
-/// datagram it was sending, if any.
+/// Sends queued datagrams in batches of up to [`MAX_BATCH`] until the transport closes;
+/// returns the buffers for reuse and reports every failed datagram to `errors`. Once `stop` fires, hands back its queue and the datagrams
+/// of the batch it was sending that were not sent.
+///
+/// Every datagram of a batch after the first keeps its slot in the queue reserved (through
+/// `slots`, the queue's sender) until the batch is done, so a batch holds no more of the
+/// transport's datagrams than sending them one by one would; one more only when the owner
+/// takes a freed slot first, which ends the batch.
 async fn transmit<T: Transport>(
     transport: Arc<T>,
+    slots: mpsc::WeakSender<Datagram>,
     mut queue: mpsc::Receiver<Datagram>,
     recycle: mpsc::Sender<PacketBuf>,
     errors: SendErrors,
     mut suspended: watch::Receiver<bool>,
     mut stop: oneshot::Receiver<()>,
 ) -> Option<Unsent> {
+    let mut batch = Vec::with_capacity(MAX_BATCH);
+    let mut reserved = Vec::with_capacity(MAX_BATCH);
     loop {
         let Some(next) = unless_stopped(&mut stop, queue.recv()).await else {
-            return Some((queue, None));
+            return Some((queue, batch));
         };
-        let (path, data) = next?;
-        let sent = unless_stopped(&mut stop, async {
-            // `None` once the engine is gone.
-            if running(&mut suspended).await {
-                Some(transport.send(data.as_packet(), &path).await)
-            } else {
-                None
+        batch.push(next?);
+        // Every datagram after the first holds a reserved slot.
+        while reserved.len() + 1 < MAX_BATCH {
+            let Ok(next) = queue.try_recv() else { break };
+            batch.push(next);
+            // The owner may take the freed slot first; the batch then ends here.
+            match slots.upgrade().map(mpsc::Sender::try_reserve_owned) {
+                Some(Ok(slot)) => reserved.push(slot),
+                _ => break,
+            }
+        }
+        let mut sent = 0;
+        let outcome = unless_stopped(&mut stop, async {
+            // `false` once the engine is gone or the transport is closed.
+            if !running(&mut suspended).await {
+                return false;
+            }
+            loop {
+                let before = sent;
+                let Err(e) = transport.send_batch(&batch, &mut sent).await else {
+                    sent = batch.len();
+                    return true;
+                };
+                // The failed datagram is dropped, even if the transport did not count it.
+                // The call does not tell which of the datagrams it was done with failed, so
+                // all of them are reported: a failed segmented send loses its whole run.
+                sent = sent.max(before + 1).min(batch.len());
+                errors.report(sent - before);
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    tracing::debug!("Transport closed for sending");
+                    return false;
+                }
+                tracing::debug!(message = "Transport send error", error = ?e);
+                if sent == batch.len() {
+                    return true;
+                }
             }
         })
         .await;
-        match sent {
-            None => return Some((queue, Some((path, data)))),
-            Some(None) => return None,
-            Some(Some(Ok(()))) => {}
-            Some(Some(Err(e))) if e.kind() == io::ErrorKind::BrokenPipe => {
-                tracing::debug!("Transport closed for sending");
-                errors.report();
-                let _ = recycle.try_send(data);
-                return None;
-            }
-            Some(Some(Err(e))) => {
-                tracing::debug!(message = "Transport send error", error = ?e);
-                errors.report();
-            }
+        reserved.clear();
+        if outcome == Some(false) {
+            return None;
         }
-        // A full recycle queue just drops the buffer.
-        let _ = recycle.try_send(data);
+        for (_, data) in batch.drain(..sent.min(batch.len())) {
+            // A full recycle queue just drops the buffer.
+            let _ = recycle.try_send(data);
+        }
+        if outcome.is_none() {
+            // Stopped: the datagrams not sent go back with the queue, in order.
+            return Some((queue, batch));
+        }
     }
 }

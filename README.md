@@ -7,6 +7,9 @@ implementation of the WireGuard protocol written in Rust. It:
 - follows the pma-rust baseline (edition 2024, strict workspace lints, no panics in
   runtime code, documented `unsafe` only in platform modules),
 - has a zero-copy data path (in-place seal/open, `zerocopy` message views),
+- batches I/O with segmentation offload: virtio-net TSO/USO on Linux/Android TUN devices
+  and UDP GSO/GRO through `quinn-udp`, falling back to one packet at a time where the
+  kernel lacks them,
 - is built from a sans-I/O core (`nsplane-core`) and a tokio driver (`nsplane`), with TUN
   devices (including Windows through Wintun) in `nsplane-tun` and a user-space TCP/IP
   stack in `nsplane-netstack`.
@@ -51,6 +54,8 @@ over TLS. Every example has `--help`:
 cargo run -p nsplane-examples --bin udp_pair       # quick start, no root
 cargo run -p nsplane-examples --bin <name> -- --help
 ```
+
+Node examples open TUN devices and UDP sockets with offload on; `--no-offload` turns it off.
 
 `just e2e-examples` runs them in containers as a matrix of local sides (TUN, netstack,
 bridge by fd, bridge by channel) and transports (UDP, relay over UDP, relay over WSS) plus
@@ -146,6 +151,10 @@ wg setconf wg0 /path/to/wg0.conf
   when it can be queried, else after `<interface_name>`.
 - `--uapi-fd` serves one client connection next to the standard socket, which is still
   bound; the daemon keeps running when that connection ends.
+- On Linux the TUN device uses virtio-net offload (`IFF_VNET_HDR`, TSO/USO) and the UDP
+  socket GSO/GRO when the kernel supports them, else plain per-packet I/O. With offload the
+  socket sets DF; raise `net.core.rmem_max` / `wmem_max` (e.g. to 4194304) for the full
+  4 MiB socket buffers.
 - `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 

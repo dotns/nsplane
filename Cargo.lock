@@ -1050,10 +1050,12 @@ dependencies = [
 name = "nsplane"
 version = "0.8.0"
 dependencies = [
+ "bytes",
  "criterion",
  "nix",
  "nsplane-core",
  "nsplane-packet",
+ "quinn-udp",
  "socket2",
  "tokio",
  "tracing",
@@ -1210,10 +1212,14 @@ dependencies = [
 name = "nsplane-tun"
 version = "0.8.0"
 dependencies = [
+ "criterion",
+ "futures-core",
  "libc",
  "nsplane",
+ "nsplane-netstack",
  "nsplane-packet",
  "tokio",
+ "tracing",
  "wintun-bindings",
 ]
 
@@ -1427,6 +1433,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "socket2",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

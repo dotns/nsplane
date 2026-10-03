@@ -52,5 +52,10 @@ pub const OVERLAP: &str = "translation fragment overlap";
 pub const EXPIRED: &str = "translation fragment expired";
 /// Reassembly is at its entry or byte limit.
 pub const BUDGET_EXCEEDED: &str = "translation fragment budget exceeded";
-/// The translated packet does not fit the buffer's capacity.
+/// The translated packet would be longer than any IPv6 packet.
+///
+/// That is a 40-byte header and a 65535-byte payload. A packet that merely
+/// outgrows its buffer is copied into a larger one instead, so this is a
+/// bound, not a capacity limit: the header encoders already reject such
+/// lengths with [`LENGTH_MISMATCH`].
 pub const NO_ROOM: &str = "translation no room";
