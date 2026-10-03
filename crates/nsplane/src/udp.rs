@@ -171,13 +171,15 @@ impl UdpTransport {
         }
         let socket = UdpSocket::from_std(socket.into())?;
         let local = socket.local_addr()?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let state = if offload {
-            set_up(&socket)?
+            Some(set_up(&socket)?)
         } else {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             linux::enable_ecn(&socket, local)?;
             None
         };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let state = offload.then(|| set_up(&socket)).flatten();
         Ok(Self {
             id,
             local,
@@ -423,27 +425,26 @@ fn bind_socket(addr: SocketAddr) -> io::Result<Socket> {
     Ok(socket)
 }
 
-/// Sets `socket` up for `quinn-udp`; `None` where it cannot on other platforms than Linux
-/// and Android.
-fn set_up(socket: &UdpSocket) -> io::Result<Option<UdpSocketState>> {
-    let state = UdpSocketState::new(UdpSockRef::from(socket));
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let state = {
-        let state = state?;
-        // Receive timestamps are not used, and their control message would crowd out the
-        // ECN mark of a coalesced read from `quinn-udp`'s control buffer.
-        nix::sys::socket::setsockopt(
-            socket,
-            nix::sys::socket::sockopt::ReceiveTimestampns,
-            &false,
-        )?;
-        Some(state)
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let state = state
-        .inspect_err(|e| tracing::debug!(message = "Plain UDP sends", error = ?e))
-        .ok();
+/// Sets `socket` up for `quinn-udp`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_up(socket: &UdpSocket) -> io::Result<UdpSocketState> {
+    let state = UdpSocketState::new(UdpSockRef::from(socket))?;
+    // Receive timestamps are not used, and their control message would crowd out the ECN
+    // mark of a coalesced read from `quinn-udp`'s control buffer.
+    nix::sys::socket::setsockopt(
+        socket,
+        nix::sys::socket::sockopt::ReceiveTimestampns,
+        &false,
+    )?;
     Ok(state)
+}
+
+/// Sets `socket` up for `quinn-udp`; `None` where it cannot.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_up(socket: &UdpSocket) -> Option<UdpSocketState> {
+    UdpSocketState::new(UdpSockRef::from(socket))
+        .inspect_err(|e| tracing::debug!(message = "Plain UDP sends", error = ?e))
+        .ok()
 }
 
 /// Turns an IPv4-mapped IPv6 address back into an IPv4 address.
