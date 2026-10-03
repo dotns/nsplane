@@ -1,6 +1,5 @@
 //! The platform-independent TUN device and its source and sink halves.
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::VecDeque;
 use std::io;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -16,6 +15,7 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nsplane::{MAX_BATCH, PacketBatch};
 use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId};
+use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
@@ -410,6 +410,47 @@ impl PacketSink for TunSink {
             }
         }
     }
+
+    /// Like [`send_batch`](Self::send_batch), but each write is tried once
+    /// ([`AsyncFd::try_io`]): a packet the device cannot take now stays in `packets` with
+    /// the ones behind it, and the call returns [`io::ErrorKind::WouldBlock`]. With TCP
+    /// segmentation offload, a coalesced chunk whose write would block part-way (its
+    /// packets are already merged) is kept and written before any later packet by the
+    /// next [`send_batch`](Self::send_batch) or `try_send_batch`, so order is kept; a Linux
+    /// TUN device blocks a write only when its send buffer was lowered (`TUNSETSNDBUF`).
+    fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vnet) = &self.vnet
+            && vnet.tso
+        {
+            return vnet.try_send_batch(&self.fd, packets);
+        }
+        while let Some((_, packet)) = packets.front() {
+            match self.try_write(packet.as_packet()) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
+                result => {
+                    packets.pop_front();
+                    result?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TunSink {
+    /// Writes `packet` as [`PacketSink::send`] does, without waiting.
+    fn try_write(&self, packet: &[u8]) -> io::Result<()> {
+        check_ip(packet)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vnet.is_some() {
+            let hdr = VirtioNetHdr::default().encode();
+            return try_write_vectored(&self.fd, &[IoSlice::new(&hdr), IoSlice::new(packet)]);
+        }
+        self.fd
+            .try_io(Interest::WRITABLE, |fd| sys::write(fd.as_fd(), packet))
+            .map(drop)
+    }
 }
 
 /// Fails with [`io::ErrorKind::InvalidInput`] unless `packet` is IPv4 or IPv6.
@@ -575,6 +616,11 @@ struct VnetWriter {
 struct WriteState {
     coalescer: Coalescer,
     chunk: Vec<PacketBuf>,
+    /// Groups of the coalesced chunk written so far; the rest are written before any
+    /// later packet.
+    written: usize,
+    /// The first error of the chunk's writes.
+    error: Option<io::Error>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -593,62 +639,167 @@ impl VnetWriter {
         fd: &AsyncFd<OwnedFd>,
         packets: &mut VecDeque<(PeerId, PacketBuf)>,
     ) -> io::Result<()> {
-        while let Some((_, front)) = packets.front() {
-            if let Err(e) = check_ip(front.as_packet()) {
-                packets.pop_front();
-                return Err(e);
-            }
-            let mut state = self
-                .state
-                .lock()
-                .ok()
-                .and_then(|mut state| state.take())
-                .unwrap_or_else(|| WriteState {
-                    coalescer: Coalescer::new(self.uso),
-                    chunk: Vec::with_capacity(MAX_BATCH),
-                });
-            while state.chunk.len() < MAX_BATCH
-                && packets
-                    .front()
-                    .is_some_and(|(_, packet)| check_ip(packet.as_packet()).is_ok())
-            {
-                if let Some((_, packet)) = packets.pop_front() {
-                    state.chunk.push(packet);
-                }
-            }
-            let result = state.write(fd).await;
-            state.chunk.clear();
-            if let Ok(mut slot) = self.state.lock() {
-                *slot = Some(state);
-            }
-            result?;
+        let mut state = self.take();
+        let result = state.send_batch(fd, packets).await;
+        self.put(state);
+        result
+    }
+
+    /// [`TunSink::try_send_batch`] with TCP segmentation offload.
+    fn try_send_batch(
+        &self,
+        fd: &AsyncFd<OwnedFd>,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    ) -> io::Result<()> {
+        let mut state = self.take();
+        let result = state.try_send_batch(fd, packets);
+        self.put(state);
+        result
+    }
+
+    /// The reusable write state, with the chunk an earlier call left unfinished.
+    fn take(&self) -> WriteState {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.take())
+            .unwrap_or_else(|| WriteState {
+                coalescer: Coalescer::new(self.uso),
+                chunk: Vec::with_capacity(MAX_BATCH),
+                written: 0,
+                error: None,
+            })
+    }
+
+    fn put(&self, state: WriteState) {
+        if let Ok(mut slot) = self.state.lock() {
+            *slot = Some(state);
         }
-        Ok(())
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl WriteState {
-    /// Coalesces the chunk and writes every group; returns the first error after trying
-    /// every group.
-    async fn write(&mut self, fd: &AsyncFd<OwnedFd>) -> io::Result<()> {
-        self.coalescer.coalesce(&mut self.chunk);
-        let mut result = Ok(());
-        for group in self.coalescer.groups() {
-            let hdr = group.hdr().encode();
-            let mut parts = [IoSlice::new(&[]); MAX_BATCH + 1];
-            let parts = &mut parts[..=group.len()];
-            parts[0] = IoSlice::new(&hdr);
-            for (slot, part) in parts[1..]
-                .iter_mut()
-                .zip(self.coalescer.parts(group, &self.chunk))
-            {
-                *slot = IoSlice::new(part);
-            }
-            result = result.and(write_vectored(fd, parts).await);
+    async fn send_batch(
+        &mut self,
+        fd: &AsyncFd<OwnedFd>,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    ) -> io::Result<()> {
+        self.finish(fd).await?;
+        while self.load(packets)? {
+            self.finish(fd).await?;
         }
-        result
+        Ok(())
     }
+
+    fn try_send_batch(
+        &mut self,
+        fd: &AsyncFd<OwnedFd>,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    ) -> io::Result<()> {
+        self.try_finish(fd)?;
+        while self.load(packets)? {
+            self.try_finish(fd)?;
+        }
+        Ok(())
+    }
+
+    /// Takes the next chunk, up to [`MAX_BATCH`] IP packets from the front of `packets`,
+    /// and coalesces it; `false` without packets. A packet that is neither IPv4 nor IPv6
+    /// at the front is dropped with [`io::ErrorKind::InvalidInput`].
+    fn load(&mut self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<bool> {
+        let Some((_, front)) = packets.front() else {
+            return Ok(false);
+        };
+        if let Err(e) = check_ip(front.as_packet()) {
+            packets.pop_front();
+            return Err(e);
+        }
+        while self.chunk.len() < MAX_BATCH
+            && packets
+                .front()
+                .is_some_and(|(_, packet)| check_ip(packet.as_packet()).is_ok())
+        {
+            if let Some((_, packet)) = packets.pop_front() {
+                self.chunk.push(packet);
+            }
+        }
+        self.coalescer.coalesce(&mut self.chunk);
+        self.written = 0;
+        Ok(true)
+    }
+
+    /// Whether groups of the chunk are left to write.
+    fn unfinished(&self) -> bool {
+        self.written < self.coalescer.groups().len()
+    }
+
+    /// Writes every group of the chunk not written yet; returns the chunk's first error
+    /// once every group was tried.
+    async fn finish(&mut self, fd: &AsyncFd<OwnedFd>) -> io::Result<()> {
+        while self.unfinished() {
+            let result = loop {
+                match self.try_write_group(fd) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // The next try clears the readiness again if the write still would block.
+                        fd.writable().await?.retain_ready();
+                    }
+                    result => break result,
+                }
+            };
+            self.wrote(result);
+        }
+        self.done()
+    }
+
+    /// [`WriteState::finish`] without waiting: a group that would block ends the call
+    /// with [`io::ErrorKind::WouldBlock`], and it and the rest stay unfinished.
+    fn try_finish(&mut self, fd: &AsyncFd<OwnedFd>) -> io::Result<()> {
+        while self.unfinished() {
+            match self.try_write_group(fd) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
+                result => self.wrote(result),
+            }
+        }
+        self.done()
+    }
+
+    /// Writes the next group once, as one `writev` of its virtio-net header and pieces.
+    fn try_write_group(&self, fd: &AsyncFd<OwnedFd>) -> io::Result<()> {
+        let group = &self.coalescer.groups()[self.written];
+        let hdr = group.hdr().encode();
+        let mut parts = [IoSlice::new(&[]); MAX_BATCH + 1];
+        let parts = &mut parts[..=group.len()];
+        parts[0] = IoSlice::new(&hdr);
+        for (slot, part) in parts[1..]
+            .iter_mut()
+            .zip(self.coalescer.parts(group, &self.chunk))
+        {
+            *slot = IoSlice::new(part);
+        }
+        try_write_vectored(fd, parts)
+    }
+
+    /// Counts the next group written, keeping the chunk's first error.
+    fn wrote(&mut self, result: io::Result<()>) {
+        self.written += 1;
+        if let Err(e) = result {
+            self.error.get_or_insert(e);
+        }
+    }
+
+    /// Ends the written chunk; its first error, if any.
+    fn done(&mut self) -> io::Result<()> {
+        self.chunk.clear();
+        self.error.take().map_or(Ok(()), Err)
+    }
+}
+
+/// Writes the concatenation of `parts` as one packet without waiting.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn try_write_vectored(fd: &AsyncFd<OwnedFd>, parts: &[IoSlice<'_>]) -> io::Result<()> {
+    fd.try_io(Interest::WRITABLE, |fd| sys::writev(fd.as_fd(), parts))
+        .map(drop)
 }
 
 /// Writes the concatenation of `parts` as one packet.
@@ -959,5 +1110,132 @@ mod tests {
         assert_eq!(got.as_packet(), full);
         assert!(got.capacity() >= 1500 + TRANSLATION_SLACK);
         assert_eq!(got.headroom(), nsplane::HEADROOM);
+    }
+
+    /// Writes small UDP packets with `try_send_batch` until the device would block;
+    /// returns how many it took.
+    fn fill(sink: &TunSink) -> usize {
+        let mut written = 0;
+        loop {
+            let mut packets = batch_of(&[packet(17, 0, 0, b"fill")]);
+            match sink.try_send_batch(&mut packets) {
+                Ok(()) => written += 1,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert_eq!(packets.len(), 1, "the blocked packet stays");
+                    return written;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            assert!(written < 100_000, "the socket never filled");
+        }
+    }
+
+    /// Drains the kernel side; returns the datagrams read.
+    fn drain(kernel: &UnixDatagram) -> Vec<Vec<u8>> {
+        kernel.set_nonblocking(true).unwrap();
+        let mut buf = vec![0; VNET_READ];
+        let mut got = Vec::new();
+        while let Ok(len) = kernel.recv(&mut buf) {
+            got.push(buf[..len].to_vec());
+        }
+        kernel.set_nonblocking(false).unwrap();
+        got
+    }
+
+    #[tokio::test]
+    async fn try_send_batch_leaves_what_would_block() {
+        for offload in [
+            Offload::default(),
+            Offload {
+                vnet_hdr: true,
+                ..Offload::default()
+            },
+        ] {
+            let (_source, sink, kernel) = device(offload);
+            let udp: Vec<Vec<u8>> = (0..4u8).map(|i| packet(17, 1, 0, &[i; 9])).collect();
+            // The reactor has not reported the new device writable yet.
+            let mut packets = batch_of(&udp);
+            let err = sink.try_send_batch(&mut packets).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(packets.len(), udp.len());
+
+            sink.fd.writable().await.unwrap().retain_ready();
+            sink.try_send_batch(&mut packets).unwrap();
+            assert!(packets.is_empty());
+            let filled = fill(&sink);
+            // Full: a non-IP packet in front is still dropped, the rest stay.
+            let mut packets = batch_of(&udp);
+            packets.push_front((PeerId::new(0), PacketBuf::from_packet(&[0x10, 0])));
+            let err = sink.try_send_batch(&mut packets).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let err = sink.try_send_batch(&mut packets).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(packets.len(), udp.len());
+
+            let header = if offload.vnet_hdr {
+                VirtioNetHdr::LEN
+            } else {
+                0
+            };
+            let got = drain(&kernel);
+            assert_eq!(got.len(), udp.len() + filled);
+            sink.fd.writable().await.unwrap().retain_ready();
+            sink.try_send_batch(&mut packets).unwrap();
+            let got: Vec<Vec<u8>> = drain(&kernel)
+                .iter()
+                .map(|d| d[header..].to_vec())
+                .collect();
+            assert_eq!(got, udp);
+        }
+    }
+
+    #[tokio::test]
+    async fn try_send_batch_coalesces_and_keeps_a_blocked_chunk_in_order() {
+        let (_source, sink, kernel) = device(TSO);
+        sink.fd.writable().await.unwrap().retain_ready();
+        let run = tcp_run(5);
+        let mut packets = batch_of(&run);
+        sink.try_send_batch(&mut packets).unwrap();
+        assert!(packets.is_empty());
+        let (hdr, super_packet) = recv_datagram(&kernel);
+        assert_eq!(hdr.gso_type, VirtioNetHdr::GSO_TCPV4);
+        assert_eq!(super_packet.len(), 40 + 5000);
+
+        // Large packets fill the socket buffer part-way through the next chunk: the
+        // writes before go out, the rest of the chunk is taken over and kept.
+        let big: Vec<Vec<u8>> = (0..MAX_BATCH)
+            .map(|i| {
+                let i = u8::try_from(i).unwrap();
+                packet(17, u16::from(i), 0, &vec![i; 60_000])
+            })
+            .collect();
+        let mut packets = batch_of(&big);
+        let err = sink.try_send_batch(&mut packets).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(packets.is_empty(), "the chunk was taken over");
+        let written: Vec<Vec<u8>> = drain(&kernel)
+            .iter()
+            .map(|d| d[VirtioNetHdr::LEN..].to_vec())
+            .collect();
+        assert!(!written.is_empty() && written.len() < big.len());
+        assert_eq!(written, big[..written.len()]);
+
+        // The next send writes the rest of the chunk first, while the kernel side reads.
+        let last = packet(17, 2, 0, b"last");
+        let expected = [&big[written.len()..], std::slice::from_ref(&last)].concat();
+        let count = expected.len();
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0; VNET_READ];
+            (0..count)
+                .map(|_| {
+                    let len = kernel.recv(&mut buf).unwrap();
+                    buf[VirtioNetHdr::LEN..len].to_vec()
+                })
+                .collect::<Vec<_>>()
+        });
+        sink.send_batch(&mut batch_of(std::slice::from_ref(&last)))
+            .await
+            .unwrap();
+        assert_eq!(reader.join().unwrap(), expected);
     }
 }

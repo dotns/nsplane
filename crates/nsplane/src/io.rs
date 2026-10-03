@@ -84,4 +84,23 @@ pub trait PacketSink: Send + Sync + 'static {
             Ok(())
         }
     }
+    /// Delivers packets from the front of `packets` like [`send_batch`], but never waits.
+    ///
+    /// Synchronous: the call returns as soon as it would have to wait, so the engine may
+    /// call it from its owner task when the sink task is idle, saving the handoff to that
+    /// task. Packets are taken over from the front, in order, under the [`send_batch`]
+    /// contract: on success `packets` is empty; on an error the packet that failed is
+    /// dropped and the rest stay in `packets` ([`io::ErrorKind::BrokenPipe`]: the local
+    /// side is gone). When the front packet cannot be taken over now, this returns
+    /// [`io::ErrorKind::WouldBlock`] and leaves it and the ones behind it in `packets` for
+    /// the caller, who delivers them later, after the ones taken over.
+    ///
+    /// The default takes nothing and returns [`io::ErrorKind::WouldBlock`], so the engine
+    /// delivers every packet through [`send_batch`] on the sink task.
+    ///
+    /// [`send_batch`]: PacketSink::send_batch
+    fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
+        let _ = packets;
+        Err(io::ErrorKind::WouldBlock.into())
+    }
 }
