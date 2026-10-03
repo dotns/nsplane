@@ -12,7 +12,29 @@
 //! [`PeerIdentityMap::insert_by_source`], a `relay_key` peer with its
 //! [`SourceAssertion::WgPeerKey`]) and one [`AclFilter`], feeds every packet
 //! in order with the clock at `t_ms`, and requires [`Verdict::Accept`]
-//! exactly when ns allowed the packet (any drop counts as denied).
+//! exactly when the packet's expected verdict is `allowed` (any drop counts
+//! as denied): ns's verdict, except for the [deviations](#deviations).
+//!
+//! # Deviations
+//!
+//! ns `parse_five_tuple` reads IHL + 4 bytes; nsplane-acl drops malformed
+//! IPv4; verdicts are equal on well-formed packets. nsplane-acl takes the
+//! payload as the bytes from the header length to the total length, so a
+//! packet is malformed when its total length exceeds the buffer or is below
+//! the header length, or when the payload is shorter than the TCP (20 bytes)
+//! or UDP (8 bytes) header (trailing bytes beyond the total length are
+//! fine). Such packets ns allows are marked in the fixture with their ns
+//! verdict and a deviation kind, and expected to be dropped:
+//!
+//! - `malformed-ipv4`: the malformed packet itself, dropped with
+//!   [`reasons::MALFORMED`];
+//! - `malformed-first-fragment`: a later fragment ns admits only through
+//!   the gate entry of such a malformed first fragment, which nsplane-acl
+//!   never recorded, dropped with [`reasons::FRAGMENT`].
+//!
+//! The test requires exactly [`DEVIATIONS`] marked packets (the fixture's
+//! `deviations` count too), each recorded as ns-allowed and dropped with
+//! its kind's reason, so no other difference can hide among them.
 //!
 //! # Fixture schema
 //!
@@ -21,12 +43,18 @@
 //!   "seed": u64,                 // seed of the generated sequences' LCG
 //!   "ns_commit": "<sha>",        // ns commit the verdicts come from
 //!   "generator": "<how>",
+//!   "deviations": 30,            // number of deviation-marked packets
 //!   "sequences": [{
 //!     "name": "recorded/..." | "generated/<policy>",
 //!     "policy": <crates/acl AclPolicy JSON> | null,   // null: no policy loaded
 //!     "local_ip": "a.b.c.d" | null,                   // ns tun_ip; null: no local bypass
 //!     "peers": [{ "id": u32, "kind": "by_source" | "relay_key", "key": "<64 hex>" }],
-//!     "packets": [[peer id, t_ms, "0x<packet hex>", allowed], ...]
+//!     "packets": [
+//!       [peer id, t_ms, "0x<packet hex>", allowed],
+//!       [peer id, t_ms, "0x<packet hex>", false,      // a deviation
+//!        { "ns": true, "deviation": "malformed-ipv4" | "malformed-first-fragment" }],
+//!       ...
+//!     ]
 //!   }]
 //! }
 //! ```
@@ -103,7 +131,15 @@
 //!   sent before the first fragment. The LCG is Knuth's MMIX one (as in
 //!   `src/differential.rs`), seeded with the fixture's `seed`, shared by
 //!   the policies in the order above;
-//! - `judge(seq)`: the ns verdicts as described under [Time](#time);
+//! - `judge(seq)`: the ns verdicts as described under [Time](#time), and
+//!   the [deviations](#deviations): `nsplane_malformed(packet)` applies the
+//!   rule above to a packet ns allowed through `acl_check_packet` (not a
+//!   bypass) that is not a later fragment (`malformed-ipv4`); a map from
+//!   `FragmentKey` to "admitted by a malformed first fragment", set whenever
+//!   ns allows a first-of-many fragment, marks the later fragments ns allows
+//!   through such an entry (`malformed-first-fragment`). A deviation is
+//!   written with `allowed: false` and `{ "ns": true, "deviation": kind }`;
+//!   `main` also writes their count as `deviations`;
 //! - `main`: writes the fixture in the line-oriented form above.
 
 use std::net::Ipv4Addr;
@@ -111,7 +147,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclPolicy, PeerIdentityMap, SourceAssertion,
+    AclEngine, AclFilter, AclFilterConfig, AclPolicy, PeerIdentityMap, SourceAssertion, reasons,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -122,10 +158,15 @@ const FIXTURE: &str = include_str!("fixtures/crates_acl_parity.json");
 /// Mismatches printed in full before the test fails.
 const SHOWN: usize = 40;
 
+/// Packets whose expected verdict deviates from ns (see
+/// [Deviations](self#deviations)).
+const DEVIATIONS: usize = 30;
+
 #[derive(Deserialize)]
 struct Fixture {
     seed: u64,
     ns_commit: String,
+    deviations: usize,
     sequences: Vec<Sequence>,
 }
 
@@ -135,7 +176,39 @@ struct Sequence {
     policy: Option<AclPolicy>,
     local_ip: Option<Ipv4Addr>,
     peers: Vec<Peer>,
-    packets: Vec<(u32, u64, String, bool)>,
+    packets: Vec<Packet>,
+}
+
+/// `[peer id, t_ms, "0x<hex>", allowed]`, plus the ns verdict and the
+/// deviation kind for a deviation.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Packet {
+    Equal(u32, u64, String, bool),
+    Deviation(u32, u64, String, bool, Deviation),
+}
+
+#[derive(Deserialize)]
+struct Deviation {
+    ns: bool,
+    deviation: DeviationKind,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "kebab-case")]
+enum DeviationKind {
+    MalformedIpv4,
+    MalformedFirstFragment,
+}
+
+impl DeviationKind {
+    /// The drop reason nsplane-acl gives the packet.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::MalformedIpv4 => reasons::MALFORMED,
+            Self::MalformedFirstFragment => reasons::FRAGMENT,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -164,9 +237,10 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Replays `seq`, returning one line per packet whose verdict differs, or
-/// why the sequence cannot be replayed.
-fn replay(seq: &Sequence) -> Result<Vec<String>, String> {
+/// Replays `seq`, returning one line per packet whose verdict differs from
+/// the expected one and the number of deviations, or why the sequence cannot
+/// be replayed.
+fn replay(seq: &Sequence) -> Result<(Vec<String>, usize), String> {
     let start = Instant::now();
     let clock = Arc::new(Mutex::new(start));
     let handle = Arc::clone(&clock);
@@ -195,13 +269,30 @@ fn replay(seq: &Sequence) -> Result<Vec<String>, String> {
         AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(seq.local_ip));
 
     let mut mismatches = Vec::new();
-    for (i, (peer, t_ms, hex, allowed)) in seq.packets.iter().enumerate() {
+    let mut deviations = 0;
+    for (i, packet) in seq.packets.iter().enumerate() {
+        let ((peer, t_ms, hex, allowed), deviation) = match packet {
+            Packet::Equal(peer, t_ms, hex, allowed) => ((peer, t_ms, hex, allowed), None),
+            Packet::Deviation(peer, t_ms, hex, allowed, deviation) => {
+                ((peer, t_ms, hex, allowed), Some(deviation))
+            }
+        };
         let bytes = unhex(hex).ok_or_else(|| format!("{} #{i}: bad hex {hex}", seq.name))?;
         *clock.lock().unwrap_or_else(PoisonError::into_inner) =
             start + Duration::from_millis(*t_ms);
         let mut packet = PacketBuf::from_packet(&bytes);
         let verdict = filter.inbound(PeerId::new(*peer), &mut packet);
-        if (verdict == Verdict::Accept) != *allowed {
+        if let Some(deviation) = deviation {
+            deviations += 1;
+            let reason = deviation.deviation.reason();
+            if !deviation.ns || *allowed || verdict != (Verdict::Drop { reason }) {
+                mismatches.push(format!(
+                    "{} #{i} peer {peer} t_ms {t_ms} {hex}: deviation {:?} (ns allowed: {}, \
+                     expected allowed: {allowed}) needs {reason:?}, nsplane-acl {verdict:?}",
+                    seq.name, deviation.deviation, deviation.ns
+                ));
+            }
+        } else if (verdict == Verdict::Accept) != *allowed {
             let ns = if *allowed { "allowed" } else { "denied" };
             mismatches.push(format!(
                 "{} #{i} peer {peer} t_ms {t_ms} {hex}: ns {ns}, nsplane-acl {verdict:?}",
@@ -209,7 +300,7 @@ fn replay(seq: &Sequence) -> Result<Vec<String>, String> {
             ));
         }
     }
-    Ok(mismatches)
+    Ok((mismatches, deviations))
 }
 
 #[test]
@@ -217,8 +308,11 @@ fn crates_acl_mode_matches_ns_acl_check_packet() {
     let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture");
     assert!(!fixture.sequences.is_empty());
     let mut mismatches = Vec::new();
+    let mut deviations = 0;
     for seq in &fixture.sequences {
-        mismatches.extend(replay(seq).expect("replayable sequence"));
+        let (lines, count) = replay(seq).expect("replayable sequence");
+        mismatches.extend(lines);
+        deviations += count;
     }
     for line in mismatches.iter().take(SHOWN) {
         eprintln!("{line}");
@@ -229,5 +323,10 @@ fn crates_acl_mode_matches_ns_acl_check_packet() {
         mismatches.len(),
         fixture.ns_commit,
         fixture.seed
+    );
+    assert_eq!(
+        (deviations, fixture.deviations),
+        (DEVIATIONS, DEVIATIONS),
+        "deviation-marked packets (marked, fixture count)"
     );
 }
