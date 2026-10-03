@@ -5,8 +5,10 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
@@ -72,6 +74,40 @@ impl Shared {
     }
 }
 
+/// Send progress of a connection, written by the driver once per turn and read without a
+/// lock by [`TcpConnection::unacked`] and [`TcpConnection::last_ack`].
+#[derive(Debug)]
+pub(crate) struct Progress {
+    /// The instant `last_ack` counts from.
+    epoch: Instant,
+    unacked: AtomicU32,
+    /// Microseconds after `epoch` plus one when the peer last acknowledged data; zero
+    /// before it ever did.
+    last_ack: AtomicU64,
+}
+
+impl Progress {
+    pub(crate) const fn new(epoch: Instant) -> Self {
+        Self {
+            epoch,
+            unacked: AtomicU32::new(0),
+            last_ack: AtomicU64::new(0),
+        }
+    }
+
+    /// Records the bytes in the socket not acknowledged yet.
+    pub(crate) fn set_unacked(&self, unacked: usize) {
+        let unacked = u32::try_from(unacked).unwrap_or(u32::MAX);
+        self.unacked.store(unacked, Ordering::Relaxed);
+    }
+
+    /// Records an acknowledgement `micros` after the epoch.
+    pub(crate) fn set_last_ack(&self, micros: u64) {
+        self.last_ack
+            .store(micros.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
 /// Locks `shared`, ignoring poisoning (the state stays consistent at every unlock).
 pub(crate) fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
@@ -96,6 +132,7 @@ fn broken_pipe() -> io::Error {
 /// direction for 5 minutes is aborted.
 pub struct TcpConnection {
     shared: Arc<Mutex<Shared>>,
+    progress: Arc<Progress>,
     driver: Arc<Notify>,
     local: SocketAddr,
     peer: SocketAddr,
@@ -105,6 +142,7 @@ pub struct TcpConnection {
 impl TcpConnection {
     pub(crate) const fn new(
         shared: Arc<Mutex<Shared>>,
+        progress: Arc<Progress>,
         driver: Arc<Notify>,
         local: SocketAddr,
         peer: SocketAddr,
@@ -112,6 +150,7 @@ impl TcpConnection {
     ) -> Self {
         Self {
             shared,
+            progress,
             driver,
             local,
             peer,
@@ -139,6 +178,29 @@ impl TcpConnection {
         let mut terminal = self.terminal.clone();
         // An error means the driver is gone, which releases every connection.
         let _ = terminal.wait_for(|terminal| *terminal).await;
+    }
+
+    /// Bytes handed to the stack's socket that the peer has not acknowledged yet.
+    ///
+    /// This is SND.NXT - SND.UNA plus the bytes the socket holds back for the peer's window
+    /// or the congestion window, so it stays above zero while the peer makes no progress.
+    /// Bytes still waiting in the connection's own buffer (written but not taken by the
+    /// stack yet) are not counted. The driver updates it once per turn; it keeps its last
+    /// value after the connection closed and drops to zero on a reset.
+    pub fn unacked(&self) -> u32 {
+        self.progress.unacked.load(Ordering::Relaxed)
+    }
+
+    /// When the stack last saw the peer acknowledge new data (SND.UNA advance), or `None`
+    /// before the peer acknowledged any data.
+    ///
+    /// The driver notices an acknowledgement in the turn that processes it, so the instant
+    /// is that turn's time. The value stays readable after the connection closed.
+    pub fn last_ack(&self) -> Option<Instant> {
+        match self.progress.last_ack.load(Ordering::Relaxed) {
+            0 => None,
+            micros => Some(self.progress.epoch + Duration::from_micros(micros - 1)),
+        }
     }
 
     /// Bytes received and not read yet.
