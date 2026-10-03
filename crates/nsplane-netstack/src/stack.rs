@@ -568,11 +568,12 @@ struct Connecting {
     started: SmolInstant,
 }
 
-/// Socket pool limits: sockets per port and in total, and each socket's buffer size.
+/// Socket pool limits: sockets per port and in total, and each socket's buffer sizes.
 #[derive(Debug, Clone, Copy)]
 struct Pool {
     limit: usize,
-    buffer: usize,
+    rx_buffer: usize,
+    tx_buffer: usize,
 }
 
 /// The single task that owns smoltcp and every queue behind the stack.
@@ -661,7 +662,8 @@ impl Driver {
         self.release_inbound();
         let pool = Pool {
             limit: self.settings.listener_pool,
-            buffer: self.settings.tcp_buffer(),
+            rx_buffer: self.settings.tcp_rx_buffer(),
+            tx_buffer: self.settings.tcp_tx_buffer(),
         };
         let refused = prepare_tcp_listeners(
             &demand,
@@ -957,7 +959,8 @@ impl Driver {
                 io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port")
             })?,
         };
-        let mut socket = new_tcp_socket(self.settings.tcp_buffer());
+        let mut socket =
+            new_tcp_socket(self.settings.tcp_rx_buffer(), self.settings.tcp_tx_buffer());
         socket.set_timeout(Some(CONNECT_TIMEOUT));
         socket
             .connect(
@@ -1467,10 +1470,12 @@ fn preserve_terminal_receive(
     shared.wake_reader();
 }
 
-/// A TCP socket tuned for relaying.
-fn new_tcp_socket(buffer: usize) -> tcp::Socket<'static> {
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; buffer]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; buffer]);
+/// A TCP socket tuned for relaying, with buffers of `rx_buffer` and `tx_buffer` bytes.
+///
+/// smoltcp derives the window-scale shift from the receive buffer's capacity here.
+fn new_tcp_socket(rx_buffer: usize, tx_buffer: usize) -> tcp::Socket<'static> {
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buffer]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buffer]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
     // smoltcp's default 10 ms delayed ACK withholds window updates until expiry, stalling
     // a far sender that filled the receive window (one ack delay per window over a
@@ -1652,7 +1657,7 @@ fn ensure_tcp_listeners(
 
     let handles = listeners.entry(port).or_default();
     for _ in 0..add {
-        let mut socket = new_tcp_socket(pool.buffer);
+        let mut socket = new_tcp_socket(pool.rx_buffer, pool.tx_buffer);
         let _ = socket.listen(port);
         handles.push(sockets.add(socket));
     }

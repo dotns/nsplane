@@ -10,6 +10,10 @@ pub const DEFAULT_MTU: u16 = 1420;
 /// Smallest MTU the stack runs with; a smaller configured value is raised to this.
 pub const MIN_MTU: u16 = 576;
 
+/// Largest TCP socket buffer: the largest window TCP can advertise, 65 535 shifted by the
+/// maximum window scale of 14 (RFC 7323), just under smoltcp's own 1 GiB receive limit.
+const MAX_TCP_BUFFER: usize = 65_535 << 14;
+
 /// Configuration of a [`NetStack`](crate::NetStack).
 ///
 /// Every capacity is a bound: no queue inside the stack grows past the value given here.
@@ -53,6 +57,21 @@ pub struct NetStackConfig {
     /// Most TCP sockets held open for inbound handshakes, per destination port and in
     /// total; SYNs beyond it are refused with RST. Default 32.
     pub listener_pool: usize,
+    /// Receive buffer of each TCP socket in bytes: the window a peer may fill.
+    ///
+    /// The window the stack advertises follows it, and so does the window-scale option of
+    /// its SYN and SYN-ACK: smoltcp derives the shift from the buffer's capacity when the
+    /// socket is created (its bit length minus 16, at least 0). The
+    /// value is clamped to at least one IPv4 MSS (`mtu - 40`) and at most `65535 << 14`,
+    /// the largest window TCP can advertise. Listener pool sockets get the same size.
+    /// Default `None`: 512 IPv4-sized segments, `(mtu - 40) * 512` (about 690 KiB at
+    /// [`DEFAULT_MTU`]).
+    pub tcp_rx_buffer: Option<usize>,
+    /// Send buffer of each TCP socket in bytes: the data in flight and queued unsent.
+    ///
+    /// Clamped like [`tcp_rx_buffer`](Self::tcp_rx_buffer). Default `None`: the same
+    /// `(mtu - 40) * 512`.
+    pub tcp_tx_buffer: Option<usize>,
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
@@ -105,6 +124,8 @@ impl Default for NetStackConfig {
             datagram_capacity: 128,
             stream_buffer: 64 * 1024,
             listener_pool: 32,
+            tcp_rx_buffer: None,
+            tcp_tx_buffer: None,
             max_udp_flows: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
@@ -125,12 +146,15 @@ pub(crate) struct Settings {
     pub(crate) datagram_capacity: usize,
     pub(crate) stream_buffer: usize,
     pub(crate) listener_pool: usize,
+    tcp_rx_buffer: usize,
+    tcp_tx_buffer: usize,
     pub(crate) max_udp_flows: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
 }
 
-/// Sockets get send and receive buffers of this many IPv4-sized segments.
+/// Sockets get send and receive buffers of this many IPv4-sized segments unless
+/// [`NetStackConfig::tcp_rx_buffer`] / [`NetStackConfig::tcp_tx_buffer`] say otherwise.
 ///
 /// The receive buffer is the window a peer may fill, so the window scales with the MSS
 /// (and so with the MTU): 512 segments is about 690 KiB at the default MTU.
@@ -159,10 +183,17 @@ impl Settings {
                 }
             }
         }
+        let mtu = config.mtu.max(MIN_MTU);
+        let mss = usize::from(mtu) - 40;
+        let tcp_buffer = |size: Option<usize>| {
+            size.map_or(mss * WINDOW_SEGMENTS, |size| {
+                size.clamp(mss, MAX_TCP_BUFFER)
+            })
+        };
         Self {
             v4,
             v6,
-            mtu: config.mtu.max(MIN_MTU),
+            mtu,
             ingress_capacity: config.ingress_capacity.max(1),
             egress_capacity: config.egress_capacity.max(1),
             accept_capacity: config.accept_capacity.max(1),
@@ -170,6 +201,8 @@ impl Settings {
             datagram_capacity: config.datagram_capacity.max(1),
             stream_buffer: config.stream_buffer.max(1),
             listener_pool: config.listener_pool.max(1),
+            tcp_rx_buffer: tcp_buffer(config.tcp_rx_buffer),
+            tcp_tx_buffer: tcp_buffer(config.tcp_tx_buffer),
             max_udp_flows: config.max_udp_flows.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
@@ -189,9 +222,14 @@ impl Settings {
         self.local_for(addr) == Some(addr)
     }
 
-    /// Send and receive buffer size of every TCP socket, see [`WINDOW_SEGMENTS`].
-    pub(crate) fn tcp_buffer(&self) -> usize {
-        (usize::from(self.mtu) - 40) * WINDOW_SEGMENTS
+    /// Receive buffer size of every TCP socket, see [`NetStackConfig::tcp_rx_buffer`].
+    pub(crate) const fn tcp_rx_buffer(&self) -> usize {
+        self.tcp_rx_buffer
+    }
+
+    /// Send buffer size of every TCP socket, see [`NetStackConfig::tcp_tx_buffer`].
+    pub(crate) const fn tcp_tx_buffer(&self) -> usize {
+        self.tcp_tx_buffer
     }
 }
 
@@ -238,5 +276,37 @@ mod tests {
         assert_eq!(settings.max_udp_flows, 1);
         assert_eq!(settings.v4, None);
         assert_eq!(settings.mtu, DEFAULT_MTU);
+    }
+
+    #[test]
+    fn tcp_buffers_default_to_512_segments() {
+        let settings = Settings::new(NetStackConfig::default());
+        assert_eq!(settings.tcp_rx_buffer(), 1380 * 512);
+        assert_eq!(settings.tcp_tx_buffer(), 1380 * 512);
+        let settings = Settings::new(NetStackConfig::new(Vec::new(), 1360));
+        assert_eq!(settings.tcp_rx_buffer(), 1320 * 512);
+        assert_eq!(settings.tcp_tx_buffer(), 1320 * 512);
+        // The MTU is normalised first.
+        let settings = Settings::new(NetStackConfig::new(Vec::new(), 100));
+        assert_eq!(settings.tcp_rx_buffer(), (576 - 40) * 512);
+    }
+
+    #[test]
+    fn tcp_buffers_pass_through_and_clamp() {
+        let buffers = |rx, tx| {
+            let settings = Settings::new(NetStackConfig {
+                tcp_rx_buffer: Some(rx),
+                tcp_tx_buffer: Some(tx),
+                ..NetStackConfig::new(Vec::new(), 1360)
+            });
+            (settings.tcp_rx_buffer(), settings.tcp_tx_buffer())
+        };
+        assert_eq!(buffers(16 << 10, 4 << 20), (16 << 10, 4 << 20));
+        assert_eq!(buffers(1320, 65_535 << 14), (1320, 65_535 << 14));
+        assert_eq!(buffers(0, 1319), (1320, 1320));
+        assert_eq!(
+            buffers(usize::MAX, (65_535 << 14) + 1),
+            (65_535 << 14, 65_535 << 14)
+        );
     }
 }
