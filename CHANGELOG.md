@@ -431,6 +431,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the queues on the path loses its tail and recovers by retransmission timeout, so the
   default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
   refused for a full listener pool).
+- `nsplane-tun` (Linux, Android, macOS, iOS): `TunSlot`, a TUN fd the host swaps while the
+  engine runs (Android `VpnService`; ns's MT-1). `TunSlot::new(mtu)` returns the cloneable
+  control handle with a `SlotSource` and a `SlotSink`. `replace(fd)` takes ownership of an
+  `OwnedFd`, sets it non-blocking and fences the previous one: once it returns no syscall
+  runs on the old fd, and a read completed on it but not yet returned is discarded and
+  retried on the new one. `disable` parks I/O and `enable` resumes it; `close` (or
+  dropping the last handle) makes the source, the sink and later `replace` calls fail with
+  `BrokenPipe`. Reads get an MTU + 1 buffer: longer reads are dropped and counted
+  (`SlotSource::oversize_drops`), a 0-byte read is `UnexpectedEof`; a short write is
+  `WriteZero`. No header and no offloads; the MTU is fixed. Not built on Windows.
+- `nsplane-tun`: `host_tun(mtu, capacity, write)`, a local side bridged through host
+  callbacks such as iOS `NEPacketTunnelFlow` (ns's MT-2; the contract's `HostTun::new`
+  ships as this free function, so no `clippy::new_ret_no_self` suppression is needed). It
+  returns a `HostTunInput`, whose `push` copies a packet into the queue from any thread
+  without blocking and fails with `PushError::Full` or `PushError::Closed`, a
+  `HostTunSource` that drops and counts packets longer than the MTU
+  (`HostTunSource::oversize_drops`, one warning per source), and a `HostTunSink` that calls
+  `write` and returns `BrokenPipe` when it returns `false`. `HOST_TUN_DEFAULT_CAPACITY` is
+  4096 packets. Built on every target.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
