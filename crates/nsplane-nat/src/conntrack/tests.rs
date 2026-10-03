@@ -400,3 +400,77 @@ fn conntrack_is_shareable() {
     assert_send_sync::<Conntrack>();
     assert_eq!(Conntrack::default().config(), ConntrackConfig::default());
 }
+
+#[test]
+fn remove_finds_both_directions_and_counts() {
+    let (table, _clock) = clocked(config());
+    let tuples = flow(protocol::UDP, 2, 40000);
+    let inserted = insert(&table, tuples, 0);
+    assert_eq!(table.remove(&tuples.0), Some(inserted));
+    assert_eq!(table.remove(&tuples.0), None);
+    assert_eq!(table.lookup(&tuples.0, None), None);
+
+    let inserted = insert(&table, tuples, 0);
+    assert_eq!(table.remove(&reverse(&tuples.1)), Some(inserted));
+    // The translated tuple itself is neither direction of the flow.
+    insert(&table, tuples, 0);
+    assert_eq!(table.remove(&tuples.1), None);
+    let s = table.stats();
+    assert_eq!((s.entries, s.removed), (1, 2));
+    assert_balanced(&table);
+}
+
+/// A table with a removal hook that records the source port of every
+/// removed flow, with the clock handle and the record.
+/// The source ports of the flows a removal hook saw, in order.
+type Removed = Arc<Mutex<Vec<u16>>>;
+
+fn hooked(config: ConntrackConfig) -> (Conntrack, Arc<Mutex<Instant>>, Removed) {
+    let (table, clock) = clocked(config);
+    let removed = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&removed);
+    let table =
+        table.with_removal_hook(move |flow| record.lock().unwrap().push(flow.original.src_port));
+    (table, clock, removed)
+}
+
+#[test]
+fn removal_hook_sees_every_removed_flow() {
+    let (table, clock, removed) = hooked(ConntrackConfig {
+        max_entries: 2,
+        ..config()
+    });
+    // Expired, found by a lookup.
+    let first = flow(protocol::UDP, 2, 1);
+    insert(&table, first, 0);
+    advance(&clock, 60);
+    assert_eq!(table.lookup(&first.0, None), None);
+    // Evicted by a full table.
+    insert(&table, flow(protocol::UDP, 2, 2), 0);
+    insert(&table, flow(protocol::UDP, 2, 3), 0);
+    insert(&table, flow(protocol::UDP, 2, 4), 0);
+    // Removed one by one and by retain.
+    assert!(table.remove(&flow(protocol::UDP, 2, 3).0).is_some());
+    assert_eq!(table.retain(|_| false), 1);
+    // Expired, found by the sweep of an insert.
+    insert(&table, flow(protocol::UDP, 2, 5), 0);
+    advance(&clock, 60);
+    insert(&table, flow(protocol::UDP, 2, 6), 0);
+
+    assert_eq!(*removed.lock().unwrap(), [1, 2, 3, 4, 5]);
+    let s = table.stats();
+    assert_eq!((s.expired, s.evicted, s.removed), (2, 1, 2));
+    assert_balanced(&table);
+}
+
+#[test]
+fn removal_hook_sees_a_replaced_expired_flow() {
+    let (table, clock, removed) = hooked(config());
+    let tuples = flow(protocol::UDP, 2, 1);
+    insert(&table, tuples, 0);
+    advance(&clock, 60);
+    // The insert itself finds the stale flow under the same original tuple.
+    insert(&table, tuples, 0);
+    assert_eq!(*removed.lock().unwrap(), [1]);
+    assert_balanced(&table);
+}

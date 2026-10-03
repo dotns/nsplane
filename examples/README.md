@@ -20,6 +20,7 @@ The package `nsplane-examples` is not published.
 | [`acl_gateway`](#acl_gateway) | A TUN node filtered by a reloadable ACL policy | yes |
 | [`translate_node`](#translate_node) | Local IPv4 to peers reached over IPv6 only (`Translator`, RFC 7915) | yes |
 | [`port_map`](#port_map) | Local services published to peers through DNAT/SNAT (`PortMap`, `Conntrack`) | yes |
+| [`subnet_gateway`](#subnet_gateway) | IPv6 peers reaching an IPv4 LAN through stateful NAT64 (`Nat64Lan`) | yes |
 | [`fd_bridge`](#fd_bridge) | The engine on a TUN handed over by a host: by fd or by packet channels | yes |
 | [`events_stats`](#events_stats) | Events, peer stats, drop counters, suspend/resume, MTU | no |
 | [`relay_server`](#relay_server) | A single-port relay with its own WireGuard engine, over UDP and WSS | no |
@@ -136,6 +137,25 @@ Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable)
 
 ```sh
 sudo cargo run -p nsplane-examples --bin port_map -- --private-key-file a.key --address fd00:b::1/64 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=fd00:b::2/128 --echo-port 7 --publish 'tcp:[fd00:b::1]:8007=[fd00:b::1]:7@<B_PUB>' --udp-timeout 5
+```
+
+### subnet_gateway
+
+A TUN node whose local side is wrapped in an `nsplane-nat` `Nat64Lan`: each `--route` maps
+an IPv6 /96 to an IPv4 LAN prefix. A peer's TCP, UDP or ping to `<MAPPED>::<IPv4>` leaves
+the TUN device as IPv4 to that LAN host, from `snat` with a port reserved for the flow, and
+the host's reply comes back to the peer as IPv6 from the mapped address; unsafe targets
+(broadcast, loopback, ...) are dropped. `snat` must not be an address of this host: the node
+routes `snat/32` into the TUN device and the LAN routes it to this host (IP forwarding on).
+The peers route the mapped /96 to this node. Status: `extra.nat64_lan` (`forwarded`,
+`reversed`, `packet_too_big`, `unsafe_target`, `port_exhausted`, `other_drops`,
+`not_ours`, `flows`, `flows_inserted`, ...). Needs root.
+
+Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
+`--route <IPv6>/96=<IPv4>/<len>,snat=<IPv4>` (repeatable), `--max-tcp-mss`.
+
+```sh
+sudo cargo run -p nsplane-examples --bin subnet_gateway -- --private-key-file a.key --address fd00:c::1/64 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=fd00:c::2/128 --route fd00:64::/96=192.168.50.0/24,snat=10.201.0.1
 ```
 
 ### fd_bridge
@@ -421,7 +441,10 @@ extension against a plain WireGuard server), `app_session` (self-checks), `app_s
 `translate_node` (an IPv4-only client container on the node's LAN reaches an IPv6-only
 kernel WireGuard peer through its `alias4`: ping, TCP and UDP echo), `port_map` (a kernel
 WireGuard peer reaches the echo service through the listen port, a rule for another peer
-refuses it, an idle UDP flow expires after `--udp-timeout`),
+refuses it, an idle UDP flow expires after `--udp-timeout`), `subnet_gateway` (an
+IPv6-only kernel WireGuard peer reaches an IPv4 host on the node's LAN through the mapped
+/96: TCP and UDP echo and ping, with flows recorded in `extra.nat64_lan`; a ping to the
+LAN's broadcast address is refused as an unsafe target),
 `offload_fallback` (`tun_node --no-offload` against kernel WireGuard: the checks of
 `tun_kernel` on the plain TUN device and UDP without GSO/GRO), `offload_fallback_hybrid`
 (`hybrid --no-offload`: the checks of `hybrid`), `offload_fallback_relay` (`relay_server`

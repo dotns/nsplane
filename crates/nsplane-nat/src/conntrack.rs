@@ -20,6 +20,9 @@
 //!   flows (amortized cleanup).
 //! - **Injectable clock** ([`Conntrack::with_clock`]) for deterministic tests;
 //!   the default is [`Instant::now`].
+//! - **Removal hook** ([`Conntrack::with_removal_hook`]): an optional callback
+//!   for every flow that leaves the table (expired, evicted or removed), so
+//!   per-flow resources such as a reserved port can be released.
 //!
 //! All methods take `&self`; the table sits behind one mutex, so a
 //! `Conntrack` can be shared by the inbound and outbound paths of a filter.
@@ -95,7 +98,7 @@ pub struct ConntrackStats {
     pub expired: u64,
     /// Flows removed before their timeout to make room for a new one.
     pub evicted: u64,
-    /// Flows removed by [`Conntrack::retain`].
+    /// Flows removed by [`Conntrack::retain`] and [`Conntrack::remove`].
     pub removed: u64,
     /// Lookups that found a live flow, in lookups.
     pub hits: u64,
@@ -194,11 +197,15 @@ pub enum ConntrackError {
     Unsupported,
 }
 
+/// The callback of [`Conntrack::with_removal_hook`].
+type RemovalHook = Box<dyn Fn(&Flow) + Send + Sync>;
+
 /// A bounded connection tracking table. See the [module docs](self).
 pub struct Conntrack {
     config: ConntrackConfig,
     table: Mutex<Table>,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    on_remove: Option<RemovalHook>,
 }
 
 impl Default for Conntrack {
@@ -232,7 +239,21 @@ impl Conntrack {
             config,
             table: Mutex::new(Table::new()),
             clock: Box::new(clock),
+            on_remove: None,
         }
+    }
+
+    /// Calls `hook` with every flow that leaves the table: expired, evicted,
+    /// or removed by [`retain`](Self::retain) or [`remove`](Self::remove).
+    /// Replaces an earlier hook.
+    ///
+    /// The hook runs under the table lock, so it must be quick and must not
+    /// call back into this `Conntrack` (that would deadlock). Without a hook
+    /// a removal costs one `Option` check more.
+    #[must_use]
+    pub fn with_removal_hook(mut self, hook: impl Fn(&Flow) + Send + Sync + 'static) -> Self {
+        self.on_remove = Some(Box::new(hook));
+        self
     }
 
     /// The table's settings.
@@ -264,7 +285,7 @@ impl Conntrack {
             .entry(index)
             .is_some_and(|entry| self.is_expired(entry, now))
         {
-            table.remove(index);
+            self.remove_at(&mut table, index);
             table.counters.expired += 1;
             table.counters.misses += 1;
             return None;
@@ -315,7 +336,7 @@ impl Conntrack {
                 table.touch(index);
                 return Ok(flow);
             }
-            table.remove(index);
+            self.remove_at(&mut table, index);
             table.counters.expired += 1;
         }
         let reply = reverse(&translated);
@@ -326,7 +347,7 @@ impl Conntrack {
             {
                 return Err(ConntrackError::Conflict);
             }
-            table.remove(index);
+            self.remove_at(&mut table, index);
             table.counters.expired += 1;
         }
 
@@ -340,7 +361,7 @@ impl Conntrack {
             let expired = table
                 .entry(oldest)
                 .is_some_and(|entry| self.is_expired(entry, now));
-            table.remove(oldest);
+            self.remove_at(&mut table, oldest);
             if expired {
                 table.counters.expired += 1;
             } else {
@@ -376,10 +397,31 @@ impl Conntrack {
             .filter(|&index| table.entry(index).is_some_and(|entry| !keep(&entry.flow)))
             .collect();
         for &index in &doomed {
-            table.remove(index);
+            self.remove_at(&mut table, index);
         }
         table.counters.removed += doomed.len() as u64;
         doomed.len()
+    }
+
+    /// Removes the flow a packet with `tuple` belongs to, in either
+    /// direction, and returns it (counted in [`ConntrackStats::removed`]).
+    /// O(1); an expired flow that is still in the table is removed and
+    /// returned too.
+    pub fn remove(&self, tuple: &FiveTuple) -> Option<Flow> {
+        let mut table = self.lock();
+        let (index, _) = table.find(tuple)?;
+        let flow = self.remove_at(&mut table, index)?;
+        table.counters.removed += 1;
+        Some(flow)
+    }
+
+    /// Removes the entry at `index` and reports it to the removal hook.
+    fn remove_at(&self, table: &mut Table, index: usize) -> Option<Flow> {
+        let flow = table.remove(index)?.flow;
+        if let Some(hook) = &self.on_remove {
+            hook(&flow);
+        }
+        Some(flow)
     }
 
     /// Removes the expired flows among the next [`SWEEP_BATCH`] slots.
@@ -392,7 +434,7 @@ impl Conntrack {
                 .entry(index)
                 .is_some_and(|entry| self.is_expired(entry, now))
             {
-                table.remove(index);
+                self.remove_at(table, index);
                 table.counters.expired += 1;
             }
         }

@@ -319,6 +319,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-e2e`: `udp_side_channel` (side datagrams beside a WireGuard transfer, offload on
   and off, an unread receiver) and `link` (transfer, redial, the bounded queue, the read
   idle timeout over an in-memory link).
+- `nsplane-nat`: `Nat64Lan`, a stateful NAT64 to an IPv4 LAN (NAPT) for subnet routing,
+  ported from ns `SubnetRoute` / `SubnetConntrack`. A `LanRoute` maps an IPv6 /96
+  (`mapped`) to an IPv4 prefix (`real`) with a `snat_source`; IPv6 TCP, UDP and ICMPv6 echo
+  to `mapped` plus a safe LAN address become IPv4 from `snat_source` with a port (or echo
+  identifier) reserved per flow through the caller's `SnatPorts` (`DefaultSnatPorts` in
+  memory; `Nat64LanConfig::port_tries`, 32), and the LAN's replies (and Fragmentation
+  Needed, as Packet Too Big) are translated back; optional TCP MSS clamp
+  (`Nat64LanConfig::max_tcp_mss`), routes replaced through an `ArcSwap`, flows in a bounded
+  `Conntrack` with idle timeouts, `Nat64Lan::remove_flow` and `Nat64LanStats` (unsafe
+  targets, ambiguous routes and port exhaustion counted separately). As ns, translated
+  IPv4 packets leave DF clear; `Nat64LanConfig::set_df` opts into RFC 7915 DF above 1260
+  bytes (Fragmentation Needed then comes back as Packet Too Big, at the risk of a PMTU black
+  hole when the LAN filters ICMP). As ns, a destination that more than one route resolves is
+  dropped (`reasons::AMBIGUOUS_ROUTE`) rather than translated by the first route. The routes
+  gate every forward packet; a flow keeps its SNAT address across a route replacement, and
+  the flows of a removed route are revoked with `Nat64Lan::remove_flow`, as ns. `LanRoute` prefixes are
+  `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
+  `LanPrefix`, as no IP network crate is a dependency. The translation runs on the local
+  side: `Nat64LanSink` and `Nat64LanSource` wrap the engine's sink and source; nothing
+  runs unless they are installed. `nsplane-nat` now depends on `nsplane` (for the
+  wrappers); `nsplane` and `nsplane-tun` still do not depend on `nsplane-nat`.
+- `nsplane-nat`: `Conntrack::remove` removes a flow by either direction's tuple
+  (`ConntrackStats::removed`), and `Conntrack::with_removal_hook` reports every flow that
+  leaves the table (expired, evicted, retained out or removed).
+- `nsplane-e2e`: `nat64_lan` tests: an IPv6 client engine reaches an IPv4 netstack LAN host
+  behind a gateway engine with wrapped local side (TCP and UDP echo, ICMPv6 echo), with
+  unsafe targets, port exhaustion and `remove_flow` checked. `nsplane-examples`:
+  `subnet_gateway` (a TUN node with `--route <mapped>/96=<real>,snat=<IPv4>`) and its
+  `scripts/e2e/examples.sh` scenario against kernel WireGuard.
+- `nsplane-nat`: `Redirect`, a local-side redirect (DNAT with the reverse SNAT) of IPv4
+  TCP/UDP flows to an endpoint a decision closure picks per new flow (`RedirectDecision`),
+  ported from ns `tun_service/rewrite.rs`. `forward` / `reverse` rewrite a `PacketBuf` in
+  place with incremental checksums and return a `RedirectVerdict`; flows live in a
+  `Conntrack` (bounded, idle expiry) and go through `remove_flow` and `retain`;
+  `original_destination` reports the service address of a flow the endpoint accepted;
+  `RedirectStats` counts the outcomes. Drop reasons in `nsplane_nat::redirect::reasons`.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

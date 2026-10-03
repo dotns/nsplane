@@ -18,7 +18,7 @@ const ICMP_CHECKSUM: usize = 2;
 
 /// Which address and port of a packet to rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum End {
+pub(crate) enum End {
     /// The source.
     Src,
     /// The destination.
@@ -27,7 +27,7 @@ pub(super) enum End {
 
 /// Rewrites the `end` address and port of the TCP/UDP packet in `packet`,
 /// whose transport header starts at `l4`.
-pub(super) fn endpoint(
+pub(crate) fn endpoint(
     packet: &mut [u8],
     l4: usize,
     end: End,
