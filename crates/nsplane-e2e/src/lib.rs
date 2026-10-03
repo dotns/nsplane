@@ -13,6 +13,8 @@
 //!
 //! [`StackNode`] is a node whose local side is an `nsplane_netstack::NetStack` instead of
 //! the test channels, with echo servers for its TCP connections and UDP flows.
+//! [`LossyTransport`] and [`Bottleneck`] wrap another transport to lose datagrams: a
+//! deterministic fraction, or what overflows a rate-limited buffer.
 
 use std::error::Error;
 use std::fmt;
@@ -21,6 +23,8 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -709,6 +713,159 @@ pub async fn stack_pair_with<S: PacketSource>(
     let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
     let a = StackNode::with_source(1, a.0, a.1, link_a, mtu, &wrap)?;
     let b = StackNode::with_source(2, b.0, b.1, link_b, mtu, &wrap)?;
+    a.handle
+        .add_or_update_peer(b.as_peer(a.path.transport))
+        .await?;
+    b.handle
+        .add_or_update_peer(a.as_peer(b.path.transport))
+        .await?;
+    Ok((a, b))
+}
+
+/// A transport that drops a deterministic fraction of the WireGuard data messages it sends.
+///
+/// Handshake messages always pass, so the loss only hits the tunnelled packets (and the
+/// keepalives) and never delays a session by a handshake retry. Whether the `n`-th data
+/// message is dropped is a fixed function of `n`, so a run is reproducible up to the
+/// order in which the engine sends.
+#[derive(Debug)]
+pub struct LossyTransport<T> {
+    inner: T,
+    permille: u64,
+    sent: AtomicU64,
+    dropped: Arc<AtomicU64>,
+}
+
+impl<T: Transport> LossyTransport<T> {
+    /// Wraps `inner`, dropping about `permille` of every 1000 data messages and counting
+    /// each drop in `dropped`.
+    pub const fn new(inner: T, permille: u64, dropped: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            permille,
+            sent: AtomicU64::new(0),
+            dropped,
+        }
+    }
+}
+
+/// WireGuard message type of a transport data message.
+const DATA_MESSAGE: u8 = 4;
+
+/// The splitmix64 finaliser: spreads consecutive counters over the whole `u64` range.
+const fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+impl<T: Transport> Transport for LossyTransport<T> {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        if datagram.first() == Some(&DATA_MESSAGE) {
+            let n = self.sent.fetch_add(1, Ordering::Relaxed);
+            if mix(n) % 1000 < self.permille {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        self.inner.send(datagram, to).await
+    }
+}
+
+/// A transport whose sends pass a bottleneck: a link of fixed rate behind a drop-tail
+/// buffer, like a socket buffer drained by a busy receiver.
+///
+/// A datagram that finds the buffer full is dropped; the others leave at the link rate.
+#[derive(Debug)]
+pub struct Bottleneck<T> {
+    inner: Arc<T>,
+    buffer: mpsc::Sender<(Vec<u8>, Path)>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl<T: Transport> Bottleneck<T> {
+    /// Wraps `inner` behind a link of `rate` bytes per second with room for `buffer`
+    /// datagrams, counting each drop in `dropped`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn new(inner: T, rate: u64, buffer: usize, dropped: Arc<AtomicU64>) -> Self {
+        let inner = Arc::new(inner);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, Path)>(buffer);
+        let link = Arc::clone(&inner);
+        tokio::spawn(async move {
+            // When the link may start the next datagram. Sleeps are coarse (about 1 ms), so
+            // up to 1 ms of credit is kept rather than lost to the sleep's overshoot.
+            let mut next = Instant::now();
+            while let Some((datagram, to)) = rx.recv().await {
+                let now = Instant::now();
+                let len = u64::try_from(datagram.len()).unwrap_or(u64::MAX);
+                next = next.max(now.checked_sub(Duration::from_millis(1)).unwrap_or(now))
+                    + Duration::from_nanos(len * 1_000_000_000 / rate.max(1));
+                if next > now {
+                    tokio::time::sleep_until(next).await;
+                }
+                if link.send(&datagram, &to).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            inner,
+            buffer: tx,
+            dropped,
+        }
+    }
+}
+
+impl<T: Transport> Transport for Bottleneck<T> {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.inner.recv(buf).await
+    }
+
+    fn send(&self, datagram: &[u8], to: &Path) -> impl Future<Output = io::Result<()>> + Send {
+        if self.buffer.try_send((datagram.to_vec(), *to)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        std::future::ready(Ok(()))
+    }
+}
+
+/// Two stack nodes (seeds 1 and 2) like [`stack_pair`], linked by a [`ChannelTransport`]
+/// pair with `link` wrapped around each end (a [`LossyTransport`], say).
+///
+/// # Panics
+///
+/// Panics when called outside a tokio runtime.
+pub async fn stack_pair_over<T: Transport>(
+    mtu: u16,
+    link: impl Fn(ChannelTransport) -> T,
+) -> TestResult<(StackNode, StackNode)> {
+    let a = (
+        TransportId::new(1),
+        SocketAddr::from(([192, 0, 2, 1], 1000)),
+    );
+    let b = (
+        TransportId::new(2),
+        SocketAddr::from(([192, 0, 2, 2], 2000)),
+    );
+    let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
+    let a = StackNode::new(1, a.0, a.1, link(link_a), mtu)?;
+    let b = StackNode::new(2, b.0, b.1, link(link_b), mtu)?;
     a.handle
         .add_or_update_peer(b.as_peer(a.path.transport))
         .await?;
