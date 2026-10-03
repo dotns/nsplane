@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_core::Stream;
 use nsplane::{PacketSink, PacketSource};
+use nsplane_packet::reassembly::{Outcome, Reassembler, ReassemblyStats};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId, protocol};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -90,7 +91,9 @@ impl NetStack {
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
             settings.v6.map(|(addr, _)| addr),
+            settings.reassembly.is_some(),
         ));
+        let reassembler = settings.reassembly.clone().map(Reassembler::new);
 
         let mut device = VirtualDevice::new(settings.mtu, EGRESS_BACKLOG, Arc::clone(&stats));
         let iface = interface(&settings, &mut device);
@@ -126,6 +129,8 @@ impl NetStack {
             waiting: VecDeque::new(),
             epoch: Instant::now(),
             owners: Arc::clone(&owners),
+            reassembler,
+            reassembly_counted: ReassemblyStats::default(),
         };
         tokio::spawn(driver.run());
 
@@ -327,8 +332,16 @@ impl NetStackHandle {
     /// - [`Ownership::Listener`]: a bare TCP SYN or a UDP datagram to one of the stack's
     ///   addresses that would open a new connection or flow.
     /// - [`Ownership::None`]: anything else, including malformed packets, IPv4 fragments
-    ///   and IPv6 packets with a Fragment header (the stack drops them), and every packet
-    ///   once the stack stopped.
+    ///   and IPv6 packets with a Fragment header without
+    ///   [`NetStackConfig::reassembly`] (the stack drops them), and every packet once the
+    ///   stack stopped.
+    ///
+    /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
+    /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
+    /// one of the above and [`Ownership::Listener`] otherwise; a later fragment carries no
+    /// ports, so it is [`Ownership::Listener`] (the stack takes it either way, and its
+    /// datagram goes wherever the first fragment's tuple leads once it is complete).
+    /// Fragments of other protocols stay [`Ownership::None`].
     ///
     /// The answer reflects the stack's state at the call; a connection or flow that opens
     /// or closes concurrently may be seen either way. A connect is visible from the moment
@@ -602,6 +615,10 @@ struct Driver {
     next_udp_port: u16,
     epoch: Instant,
     owners: Arc<Owners>,
+    /// Only with `NetStackConfig::reassembly`.
+    reassembler: Option<Reassembler>,
+    /// The reassembler's counts already added to `stats`.
+    reassembly_counted: ReassemblyStats,
 }
 
 impl Drop for Driver {
@@ -628,6 +645,7 @@ impl Driver {
     /// One driver iteration; `false` once the stack must stop.
     async fn turn(&mut self) -> bool {
         // 1. Take a bounded batch of ingress packets and pending requests.
+        self.expire_fragments();
         let Some(demand) = self.ingest_batch() else {
             tracing::debug!(target: "netstack", "sink dropped; stopping");
             return false;
@@ -701,6 +719,9 @@ impl Driver {
 
     /// Routes one ingress packet, counting the SYNs per destination port in `demand`.
     fn ingest(&mut self, packet: PacketBuf, demand: &mut HashMap<u16, usize>) {
+        let Some(packet) = self.reassemble(packet) else {
+            return;
+        };
         match classify(packet.as_packet(), &self.settings) {
             Ok(Class::Tcp { dst_port, syn }) => {
                 if syn {
@@ -720,6 +741,58 @@ impl Driver {
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Feeds a packet to the stack's address through the reassembler, if there is one:
+    /// the packet to route (the packet itself or a completed datagram), or `None` while
+    /// its datagram is incomplete or once the fragment is dropped.
+    fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
+        let Some(reassembler) = self.reassembler.as_mut() else {
+            return Some(packet);
+        };
+        let local =
+            IpPacket::parse(packet.as_packet()).is_ok_and(|ip| self.settings.is_local(ip.dst()));
+        if !local {
+            // `classify` counts it.
+            return Some(packet);
+        }
+        let routed = match reassembler.push(packet.as_packet(), Instant::now().into_std()) {
+            Outcome::Pass => return Some(packet),
+            Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
+            Outcome::Held | Outcome::Dropped => None,
+        };
+        self.count_reassembly();
+        routed
+    }
+
+    /// Discards incomplete datagrams past the reassembly timeout; free while none is held.
+    fn expire_fragments(&mut self) {
+        let Some(reassembler) = self.reassembler.as_mut() else {
+            return;
+        };
+        if reassembler.expire(Instant::now().into_std()) > 0 {
+            self.count_reassembly();
+        }
+    }
+
+    /// Adds what the reassembler counted since the last call to the stack's counters.
+    fn count_reassembly(&mut self) {
+        let Some(reassembler) = self.reassembler.as_ref() else {
+            return;
+        };
+        let now = reassembler.stats();
+        let before = std::mem::replace(&mut self.reassembly_counted, now);
+        stats::add(
+            &self.stats.reassembled,
+            now.reassembled - before.reassembled,
+        );
+        stats::add(&self.stats.reassembly_timeout, now.timeout - before.timeout);
+        stats::add(
+            &self.stats.reassembly_overflow,
+            now.overflow - before.overflow,
+        );
+        let rejected = (now.overlap + now.malformed) - (before.overlap + before.malformed);
+        stats::add(&self.stats.malformed, rejected);
     }
 
     /// Delivers a datagram to its bound socket, or to its flow.

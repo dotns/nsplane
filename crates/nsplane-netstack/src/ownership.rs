@@ -42,6 +42,8 @@ enum Key {
 pub(crate) struct Owners {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
+    /// Whether the stack reassembles fragments, so they are its packets too.
+    reassembly: bool,
     /// Registrations per key; a key can be held more than once (a connect registered by
     /// the handle and again by the driver).
     table: Mutex<HashMap<Key, usize>>,
@@ -83,10 +85,11 @@ const ICMPV6_ERRORS: [u8; 4] = [1, 2, 3, 4];
 const ICMP_HEADER: usize = 8;
 
 impl Owners {
-    pub(crate) fn new(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> Self {
+    pub(crate) fn new(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, reassembly: bool) -> Self {
         Self {
             v4,
             v6,
+            reassembly,
             table: Mutex::default(),
         }
     }
@@ -139,10 +142,17 @@ impl Owners {
         let Ok(ip) = IpPacket::parse(packet) else {
             return Ownership::None;
         };
-        if !self.is_local(ip.dst()) || ip.fragment().is_some() {
+        if !self.is_local(ip.dst()) {
             return Ownership::None;
         }
         let (src, dst) = (ip.src(), ip.dst());
+        if let Some((proto, transport)) = fragment_transport(&ip) {
+            return if self.reassembly {
+                self.fragment(proto, src, dst, transport)
+            } else {
+                Ownership::None
+            };
+        }
         // TCP first: the stack accepts TCP behind one IPv6 Hop-by-Hop header.
         if let Some(segment) = tcp_segment(packet) {
             let Some((src_port, dst_port, flags)) = tcp_ports_flags(segment) else {
@@ -175,6 +185,29 @@ impl Owners {
             protocol::ICMP if ip.src().is_ipv4() => self.icmp_error(ip.payload(), &ICMP_ERRORS),
             protocol::ICMPV6 if ip.src().is_ipv6() => self.icmp_error(ip.payload(), &ICMPV6_ERRORS),
             _ => Ownership::None,
+        }
+    }
+
+    /// A TCP or UDP fragment the stack reassembles: `Flow` for a first fragment whose
+    /// tuple is registered, `Listener` for any other (a later fragment carries no ports).
+    fn fragment(&self, proto: u8, src: IpAddr, dst: IpAddr, transport: Option<&[u8]>) -> Ownership {
+        if proto != protocol::TCP && proto != protocol::UDP {
+            return Ownership::None;
+        }
+        let Some(&[src_hi, src_lo, dst_hi, dst_lo]) = transport.and_then(|t| t.get(..4)) else {
+            return Ownership::Listener;
+        };
+        let local = SocketAddr::new(dst, u16::from_be_bytes([dst_hi, dst_lo]));
+        let remote = SocketAddr::new(src, u16::from_be_bytes([src_hi, src_lo]));
+        let owned = if proto == protocol::TCP {
+            self.lock().contains_key(&Key::Tcp(local, remote))
+        } else {
+            self.udp_registered(local, remote)
+        };
+        if owned {
+            Ownership::Flow
+        } else {
+            Ownership::Listener
         }
     }
 
@@ -219,6 +252,42 @@ impl Owners {
 
 const SYN: u8 = 0x02;
 const ACK: u8 = 0x10;
+
+/// IPv6 next-header values of the extension headers that may precede a Fragment header,
+/// and of the Fragment header.
+const HOP_BY_HOP: u8 = 0;
+const ROUTING: u8 = 43;
+const DESTINATION_OPTIONS: u8 = 60;
+const FRAGMENT: u8 = 44;
+
+/// For an IPv4 fragment or an IPv6 packet with a Fragment header: the fragmented
+/// protocol and, for the first fragment, the bytes the transport header starts in.
+fn fragment_transport<'a>(ip: &IpPacket<'a>) -> Option<(u8, Option<&'a [u8]>)> {
+    let payload = ip.payload();
+    match ip {
+        IpPacket::V4 { .. } => {
+            let fragment = ip.fragment()?;
+            Some((ip.protocol(), fragment.is_first().then_some(payload)))
+        }
+        IpPacket::V6 { .. } => {
+            let mut next = ip.protocol();
+            let mut at = 0;
+            while matches!(next, HOP_BY_HOP | ROUTING | DESTINATION_OPTIONS) {
+                let (&following, &len) = (payload.get(at)?, payload.get(at + 1)?);
+                next = following;
+                at += (usize::from(len) + 1) * 8;
+            }
+            if next != FRAGMENT {
+                return None;
+            }
+            let &[inner, _, offset_hi, offset_lo, ..] = payload.get(at..at + 8)? else {
+                return None;
+            };
+            let first = u16::from_be_bytes([offset_hi, offset_lo]) >> 3 == 0;
+            Some((inner, first.then(|| payload.get(at + 8..)).flatten()))
+        }
+    }
+}
 
 /// Source port, destination port and flags of a TCP segment with a complete header.
 fn tcp_ports_flags(segment: &[u8]) -> Option<(u16, u16, u8)> {

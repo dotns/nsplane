@@ -154,6 +154,11 @@ and `NetStackConfig::udp_allow_fragmentation`, covered by `nsplane-e2e`'s
 MB-x1 done: `NetStackHandle::owns` / `Ownership` over a tuple table kept per connection,
 flow and socket (not per packet); fragments are `None` until the stack reassembles them;
 covered by `nsplane-e2e`'s `netstack_owns` (a `Splitter` routing on `owns`).
+MB-x2 done: `nsplane_packet::reassembly::Reassembler` wired into the stack's driver by
+`NetStackConfig::reassembly` (default `None`), counted in
+`NetStackStats::{reassembled, reassembly_timeout, reassembly_overflow}`; with it `owns`
+reports TCP/UDP fragments to a stack address as `Flow` (first fragment, registered tuple)
+or `Listener`; covered by `nsplane-e2e`'s `netstack_reassembly`.
 
 ### MD assessment (L1, 2026-10-03; not implemented this round)
 

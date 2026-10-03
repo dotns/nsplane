@@ -44,6 +44,7 @@ mod tcp;
 mod udp;
 
 pub use config::{DEFAULT_MTU, MIN_MTU, NetStackConfig};
+pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
 pub use stack::{NetStack, NetStackHandle, NetStackSink, NetStackSource};
 pub use stats::NetStackStats;
