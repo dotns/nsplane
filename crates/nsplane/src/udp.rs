@@ -72,7 +72,9 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 ///   segmented send, up to the kernel's segment limit and 64 KiB, copying the run into one
 ///   buffer. Datagrams that start no run are sent one by one. Where segmentation is not
 ///   available, or a segmented send fails with `EIO` or `EINVAL` (a device without
-///   segmentation support), sending falls back to one datagram per send.
+///   segmentation support), sending falls back to one datagram per send. A failed send
+///   drops and counts exactly the datagrams of its run, so the engine counts each of them
+///   under [`crate::DROP_TRANSPORT_SEND_ERROR`] and none of the runs handed off before it.
 ///
 /// With offload off every datagram takes one system call in both directions, as without
 /// offload support. Either way the datagrams, their order, sizes, paths and ECN marks are
@@ -356,6 +358,7 @@ impl Transport for UdpTransport {
         &self,
         datagrams: &[(Path, PacketBuf)],
         sent: &mut usize,
+        failed: &mut usize,
     ) -> io::Result<()> {
         // One buffer for the runs of this batch; encrypting into it directly would save
         // the copy.
@@ -372,7 +375,8 @@ impl Transport for UdpTransport {
                 self.send_segments(&train, Some(first.len()), to).await
             };
             *sent += run;
-            result?;
+            // A failed send loses its run only; the runs before it were handed off.
+            result.inspect_err(|_| *failed += run)?;
         }
         Ok(())
     }
@@ -1234,9 +1238,12 @@ mod tests {
     }
 
     async fn send_all(transport: &UdpTransport, batch: &[(Path, PacketBuf)]) {
-        let mut sent = 0;
-        transport.send_batch(batch, &mut sent).await.unwrap();
-        assert_eq!(sent, batch.len());
+        let (mut sent, mut failed) = (0, 0);
+        transport
+            .send_batch(batch, &mut sent, &mut failed)
+            .await
+            .unwrap();
+        assert_eq!((sent, failed), (batch.len(), 0));
     }
 
     /// Receives `count` datagrams with `recv_batch`; returns what each call appended.
@@ -1536,5 +1543,52 @@ mod tests {
         a.set_offload(true).unwrap();
         b.set_offload(true).unwrap();
         segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
+    }
+
+    /// A batch whose middle run goes to the limited broadcast address, which the kernel
+    /// refuses without `SO_BROADCAST`: a call fails only the datagrams of that run, and
+    /// called past its errors as the engine does, the batch loses exactly that run while
+    /// the runs around it arrive in order.
+    #[tokio::test]
+    async fn failed_run_counts_only_its_datagrams() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            let refused: SocketAddr = "255.255.255.255:9".parse().unwrap();
+            let (head, lost, tail) = (train(1280, 6), train(1280, 4), train(1280, 3));
+            let mut datagrams = batch(b.local_addr(), Ecn::NotEct, &head);
+            datagrams.extend(batch(refused, Ecn::NotEct, &lost));
+            datagrams.extend(batch(b.local_addr(), Ecn::NotEct, &tail));
+            let run = run_len(&datagrams[head.len()..], a.max_segments());
+            if offload && cfg!(any(target_os = "linux", target_os = "android")) {
+                assert_eq!(run, lost.len(), "one segmented run");
+            }
+
+            let (mut sent, mut failed) = (0, 0);
+            a.send_batch(&datagrams, &mut sent, &mut failed)
+                .await
+                .unwrap_err();
+            assert_eq!((sent, failed), (head.len() + run, run));
+            while sent < datagrams.len() {
+                let before = (sent, failed);
+                if a.send_batch(&datagrams, &mut sent, &mut failed)
+                    .await
+                    .is_ok()
+                {
+                    assert_eq!(failed, before.1);
+                } else {
+                    assert!(failed > before.1 && failed - before.1 <= sent - before.0);
+                }
+            }
+            assert_eq!((sent, failed), (datagrams.len(), lost.len()));
+
+            let received = recv_batches(&b, head.len() + tail.len()).await.concat();
+            check(
+                &received,
+                &[head, tail].concat(),
+                a.local_addr(),
+                Ecn::NotEct,
+            );
+        }
     }
 }

@@ -2,8 +2,8 @@
 //! methods move a burst in fewer calls than packets in both directions, in order per peer
 //! and intact; a source, sink and transport implementing only the single methods take the
 //! default path and interoperate; removing or replacing a transport while a batch is half
-//! sent counts or moves every datagram, in order; a failed batch send counts every datagram
-//! it loses. The key cases also run with a crypto worker pool on a multi-threaded runtime.
+//! sent counts or moves every datagram, in order; a failed batch send counts exactly the
+//! datagrams it loses, whether it fails the whole batch or a run inside it. The key cases also run with a crypto worker pool on a multi-threaded runtime.
 //!
 //! The nodes share one in-memory switch: every transport port has an address and delivers
 //! to the port registered under the destination address, so one transport reaches several
@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::ready;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -142,12 +143,17 @@ impl PacketSink for TestSink {
     }
 }
 
-/// Makes a port stall once, in the middle of a batch, or fail every send.
+/// Makes a port stall once, in the middle of a batch, or fail every send or a run of sends.
 #[derive(Debug, Default)]
 struct Gate {
     armed: AtomicBool,
     /// While set, every batch send fails as a whole, as a failed segmented send does.
     failing: AtomicBool,
+    /// Datagrams the port's batch sends handled since `failing_run` was set.
+    seen: AtomicUsize,
+    /// The datagrams (counted in `seen`) a batch send fails as one run, as a failed
+    /// segmented send in the middle of a batch does.
+    failing_run: Mutex<Option<Range<usize>>>,
     /// Datagrams sent from the batch before the stall and datagrams left in it.
     stalled: Mutex<Option<(usize, usize)>>,
 }
@@ -155,6 +161,26 @@ struct Gate {
 impl Gate {
     fn stalled(&self) -> Option<(usize, usize)> {
         *self.stalled.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Fails the datagrams `run` of the batch sends from now on, counted from 0.
+    fn fail_run(&self, run: Range<usize>) {
+        let mut failing_run = self
+            .failing_run
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.seen.store(0, Ordering::Relaxed);
+        *failing_run = Some(run);
+    }
+
+    /// The datagrams from `seq` on (counted in `seen`) that fail as one run.
+    fn failing_from(&self, seq: usize) -> usize {
+        self.failing_run
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|run| run.contains(&seq))
+            .map_or(0, |run| run.end - seq)
     }
 }
 
@@ -252,10 +278,12 @@ impl Transport for Port {
         &self,
         datagrams: &[(Path, PacketBuf)],
         sent: &mut usize,
+        failed: &mut usize,
     ) -> io::Result<()> {
         let start = *sent;
         if self.gate.failing.load(Ordering::Relaxed) {
             self.send_calls.batch(0);
+            *failed += datagrams.len() - start;
             *sent = datagrams.len();
             return Err(io::Error::other("message too long"));
         }
@@ -272,6 +300,16 @@ impl Transport for Port {
                     Some((*sent - start, datagrams.len() - *sent));
                 std::future::pending::<()>().await;
             }
+            let seq = self.gate.seen.load(Ordering::Relaxed);
+            let run = self.gate.failing_from(seq).min(datagrams.len() - *sent);
+            if run > 0 {
+                // The run goes nowhere; the datagrams before it in the batch were sent.
+                self.gate.seen.fetch_add(run, Ordering::Relaxed);
+                *failed += run;
+                *sent += run;
+                return Err(io::Error::other("message too long"));
+            }
+            self.gate.seen.fetch_add(1, Ordering::Relaxed);
             self.switch.forward(self.addr, data.as_packet(), path);
             self.send_calls.packets.fetch_add(1, Ordering::Relaxed);
             *sent += 1;
@@ -753,18 +791,18 @@ async fn replacing_a_transport_mid_batch_sends_every_datagram_in_order_with(
 }
 
 #[tokio::test]
-async fn failed_batch_sends_count_every_datagram() -> TestResult {
-    failed_batch_sends_count_every_datagram_with(0).await
+async fn whole_failed_batch_sends_count_every_datagram() -> TestResult {
+    whole_failed_batch_sends_count_every_datagram_with(0).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_batch_sends_count_every_datagram_on_workers() -> TestResult {
-    failed_batch_sends_count_every_datagram_with(WORKERS).await
+async fn whole_failed_batch_sends_count_every_datagram_on_workers() -> TestResult {
+    whole_failed_batch_sends_count_every_datagram_with(WORKERS).await
 }
 
 /// The hub's transport fails every batch send of a burst as a whole: each lost datagram is
 /// counted once under [`DROP_TRANSPORT_SEND_ERROR`], though the failed calls are fewer.
-async fn failed_batch_sends_count_every_datagram_with(workers: usize) -> TestResult {
+async fn whole_failed_batch_sends_count_every_datagram_with(workers: usize) -> TestResult {
     let switch = Switch::default();
     let mut hub = Host::new(1, &switch, Mode::Batched, workers)?;
     let mut x = Host::new(2, &switch, Mode::Batched, workers)?;
@@ -774,13 +812,7 @@ async fn failed_batch_sends_count_every_datagram_with(workers: usize) -> TestRes
     hub.gate.failing.store(true, Ordering::Relaxed);
     let burst: Vec<_> = (0..BURST).map(|seq| hub.numbered(&x, seq)).collect();
     hub.queue(&burst)?;
-    let deadline = Instant::now() + WAIT;
-    while hub.drops(DROP_TRANSPORT_SEND_ERROR).await? < BURST as u64 {
-        if Instant::now() > deadline {
-            return Err(format!("not every failed send counted within {WAIT:?}").into());
-        }
-        sleep(QUIET / 10).await;
-    }
+    wait_for_send_errors(&hub, BURST).await?;
     x.expect_no_delivery().await?;
     assert_eq!(hub.drops(DROP_TRANSPORT_SEND_ERROR).await?, BURST as u64);
     let (_, calls, _) = since(&hub.io.send, before);
@@ -797,5 +829,57 @@ async fn failed_batch_sends_count_every_datagram_with(workers: usize) -> TestRes
         return Err("packet after the failures changed".into());
     }
     assert_eq!(hub.drops(DROP_TRANSPORT_SEND_ERROR).await?, BURST as u64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn partly_failed_batch_sends_count_only_the_failed_run() -> TestResult {
+    partly_failed_batch_sends_count_only_the_failed_run_with(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partly_failed_batch_sends_count_only_the_failed_run_on_workers() -> TestResult {
+    partly_failed_batch_sends_count_only_the_failed_run_with(WORKERS).await
+}
+
+/// The hub's transport fails a run of datagrams in the middle of a burst, as a failed
+/// segmented send does, and sends the rest: exactly that run is counted under
+/// [`DROP_TRANSPORT_SEND_ERROR`], not the datagrams the failing call sent before it, and
+/// every other datagram arrives in order.
+async fn partly_failed_batch_sends_count_only_the_failed_run_with(workers: usize) -> TestResult {
+    const LOST: Range<usize> = 10..17;
+    let switch = Switch::default();
+    let mut hub = Host::new(1, &switch, Mode::Batched, workers)?;
+    let mut x = Host::new(2, &switch, Mode::Batched, workers)?;
+    link(&mut hub, &mut x).await?;
+    let x_hub = x.peer_of(&hub).await?;
+
+    // The burst is all the hub sends from here on, so the port sees it in order.
+    hub.gate.fail_run(LOST);
+    let burst: Vec<_> = (0..BURST).map(|seq| hub.numbered(&x, seq)).collect();
+    hub.queue(&burst)?;
+    let arrived: Vec<_> = (0..BURST)
+        .filter(|seq| !LOST.contains(seq))
+        .map(|seq| burst[seq].clone())
+        .collect();
+    check_per_peer(&x.delivered(arrived.len()).await?, &[(x_hub, arrived)])?;
+    wait_for_send_errors(&hub, LOST.len()).await?;
+    x.expect_no_delivery().await?;
+    assert_eq!(
+        hub.drops(DROP_TRANSPORT_SEND_ERROR).await?,
+        LOST.len() as u64
+    );
+    Ok(())
+}
+
+/// Waits until `hub` counted at least `count` send errors.
+async fn wait_for_send_errors(hub: &Host, count: usize) -> TestResult {
+    let deadline = Instant::now() + WAIT;
+    while hub.drops(DROP_TRANSPORT_SEND_ERROR).await? < count as u64 {
+        if Instant::now() > deadline {
+            return Err(format!("not every failed send counted within {WAIT:?}").into());
+        }
+        sleep(QUIET / 10).await;
+    }
     Ok(())
 }

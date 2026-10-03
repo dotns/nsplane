@@ -1309,15 +1309,17 @@ async fn transmit<T: Transport>(
             }
             loop {
                 let before = sent;
-                let Err(e) = transport.send_batch(&batch, &mut sent).await else {
+                let mut failed = 0;
+                let Err(e) = transport.send_batch(&batch, &mut sent, &mut failed).await else {
                     sent = batch.len();
                     return true;
                 };
-                // The failed datagram is dropped, even if the transport did not count it.
-                // The call does not tell which of the datagrams it was done with failed, so
-                // all of them are reported: a failed segmented send loses its whole run.
+                // The failed datagram is dropped, even if the transport did not count it or
+                // advance past it. Only the datagrams the call reports failed are counted
+                // (a failed segmented send loses its run, not the runs handed off before
+                // it), at least one and never more than the call was done with.
                 sent = sent.max(before + 1).min(batch.len());
-                errors.report(sent - before);
+                errors.report(failed.clamp(1, sent - before));
                 if e.kind() == io::ErrorKind::BrokenPipe {
                     tracing::debug!("Transport closed for sending");
                     return false;
