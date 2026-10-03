@@ -5,16 +5,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::engine::{
-    AccessRequest, AclEngine, MemberVerdict, Membership, PinholeMatch, ReplyDependency, Snapshot,
+    AccessRequest, AclEngine, MemberVerdict, PinholeMatch, ReplyDependency, Snapshot,
     SourceAssertion,
 };
+use crate::lru::{FlowHash, LruMap};
 use crate::net::Protocol;
 use crate::pinhole::Direction;
 use crate::reasons;
@@ -29,6 +30,19 @@ use crate::reasons;
 pub trait PeerIdentity: Send + Sync + 'static {
     /// The source assertion of `peer`, or `None` when the peer is unknown.
     fn assertion(&self, peer: PeerId) -> Option<SourceAssertion>;
+
+    /// The identity generation: a non-zero value that changes whenever an
+    /// assertion may have changed (bumped once the change is visible to
+    /// [`assertion`](Self::assertion)). [`AclFilter`] caches the resolved
+    /// peers and the flow verdicts under it.
+    ///
+    /// The default, 0, means "not versioned": the filter then resolves the
+    /// peer and evaluates the policy on every packet (no principal cache, no
+    /// flow verdict cache, no bypass), so correctness never depends on it.
+    /// Closures keep the default; [`PeerIdentityMap`] is versioned.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 impl<F> PeerIdentity for F
@@ -44,14 +58,31 @@ impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
     fn assertion(&self, peer: PeerId) -> Option<SourceAssertion> {
         (**self).assertion(peer)
     }
+
+    fn generation(&self) -> u64 {
+        (**self).generation()
+    }
 }
 
 /// A concurrent map from peers to their source assertions.
 ///
 /// Wrap it in an `Arc` and hand a clone to the filter to update it at runtime.
-#[derive(Debug, Default)]
+/// Every [`insert`](Self::insert) and [`remove`](Self::remove) bumps its
+/// [generation](PeerIdentity::generation), so the filter's cached principals
+/// and verdicts never outlive an identity change.
+#[derive(Debug)]
 pub struct PeerIdentityMap {
     map: RwLock<HashMap<PeerId, SourceAssertion>>,
+    generation: AtomicU64,
+}
+
+impl Default for PeerIdentityMap {
+    fn default() -> Self {
+        Self {
+            map: RwLock::default(),
+            generation: AtomicU64::new(1),
+        }
+    }
 }
 
 impl PeerIdentityMap {
@@ -62,18 +93,18 @@ impl PeerIdentityMap {
 
     /// Set the assertion of `peer`, replacing any previous one.
     pub fn insert(&self, peer: PeerId, assertion: SourceAssertion) {
-        self.map
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(peer, assertion);
+        let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
+        map.insert(peer, assertion);
+        // Still under the write lock: a reader seeing the new generation
+        // also sees the new assertion.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Remove the assertion of `peer`; the peer becomes unknown.
     pub fn remove(&self, peer: PeerId) {
-        self.map
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&peer);
+        let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
+        map.remove(&peer);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -84,6 +115,10 @@ impl PeerIdentity for PeerIdentityMap {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&peer)
             .cloned()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 }
 
@@ -161,6 +196,13 @@ pub struct AclFilterStats {
     /// Reply-table entries removed because what they depended on (a grant or
     /// a pinhole) is gone.
     pub reply_revoked: u64,
+    /// Pending-dependency entries (the dependency of an inbound flow accepted
+    /// through a grant, a pinhole or a dependent allowance) evicted because
+    /// the table was full.
+    pub pending_evictions: u64,
+    /// Cached flow verdicts flushed to make room in the full flow table (the
+    /// flows are evaluated again on their next packet).
+    pub verdict_evictions: u64,
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +222,8 @@ struct Counters {
     outbound_denied: AtomicU64,
     outbound_replies: AtomicU64,
     reply_revoked: AtomicU64,
+    pending_evictions: AtomicU64,
+    verdict_evictions: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -252,37 +296,63 @@ struct FragmentKey {
     id: u16,
 }
 
-/// First-fragment outcomes in insertion order (`seq`); eviction scans for the
-/// smallest sequence, which is O(capacity) but only happens when full.
+/// First-fragment outcomes in insertion order; when full, the oldest is
+/// evicted (O(1)).
 #[derive(Debug, Default)]
 struct FragmentTable {
-    entries: HashMap<FragmentKey, (Outcome, u64)>,
-    next_seq: u64,
+    entries: LruMap<FragmentKey, Outcome>,
 }
 
-/// Reply allowances keyed by the expected tuple and its direction: inbound
-/// allowances (remote -> local, recorded by outbound packets) and outbound
-/// allowances (local -> remote, recorded by accepted inbound packets from
-/// outbound-restricted peers). Eviction scans for the least recently seen
-/// entry, O(capacity) and only when full.
+/// The flow table, behind one lock: for each peer, direction and tuple
+/// ([`EntryKey`]) either a reply allowance or a cached verdict, plus the
+/// pending dependencies and the resolved peers.
+///
+/// Reply allowances: inbound allowances (remote -> local, recorded by
+/// outbound packets) and outbound allowances (local -> remote, recorded by
+/// accepted inbound packets from outbound-restricted peers).
+///
+/// Cached verdicts: the decision of a flow's first packet, tagged with the
+/// policy and identity generations it was computed under; a hit under other
+/// generations (or whose pinhole is gone) is removed and re-evaluated. A
+/// verdict and an allowance for the same key never coexist: the allowance
+/// wins, as the reply check comes first.
+///
+/// Bounds: allowances and verdicts share `reply_capacity`. When full, cached
+/// verdicts make room first (all of them are flushed, counted in
+/// `verdict_evictions`), so an allowance is evicted (the least recently seen,
+/// in O(1): the entries are kept in recency order) exactly when the table
+/// holds allowances only, as without the cache. A new verdict is not cached when the table is
+/// full and fewer than an eighth of it are verdicts.
 ///
 /// `pending` remembers the dependency of inbound flows accepted through a
 /// grant, a pinhole or a dependent allowance, keyed by the packet's tuple:
 /// the inbound allowance recorded when the flow leaves again (forwarded to
 /// another peer, or answered by the local node) inherits it, so it is revoked
 /// with the grant or pinhole even towards an unrestricted peer. Same bounds
-/// as `entries`; an evicted or idle entry is dropped silently.
+/// as allowances (evictions counted in `pending_evictions`); an idle entry is
+/// dropped silently.
+///
+/// `peers` caches the resolved peers, bounded by `reply_capacity` too.
 #[derive(Debug, Default)]
-struct ReplyTable {
-    entries: HashMap<ReplyKey, ReplyEntry>,
-    pending: HashMap<FiveTuple, ReplyEntry>,
+struct FlowTable {
+    entries: LruMap<EntryKey, FlowEntry>,
+    /// How many of `entries` are cached verdicts.
+    verdicts: usize,
+    pending: LruMap<FiveTuple, ReplyEntry>,
+    peers: HashMap<PeerId, Arc<PeerInfo>, FlowHash>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ReplyKey {
+struct EntryKey {
     peer: PeerId,
     outbound: bool,
     tuple: FiveTuple,
+}
+
+#[derive(Debug)]
+enum FlowEntry {
+    Allowance(ReplyEntry),
+    Verdict(CachedVerdict),
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +360,99 @@ struct ReplyEntry {
     last_seen: Instant,
     /// Revokes the allowance when it is gone from the engine snapshot.
     dependency: Option<ReplyDependency>,
+}
+
+/// The decision about a flow and the side effects each of its packets has.
+#[derive(Debug, Clone)]
+struct FlowVerdict {
+    outcome: Outcome,
+    /// What an accepted flow depends on: its pending entry, and the outbound
+    /// allowance of `restricted`, inherit it.
+    dependency: Option<ReplyDependency>,
+    /// An accepted inbound flow from an outbound-restricted peer records the
+    /// outbound reply allowance.
+    restricted: bool,
+}
+
+impl FlowVerdict {
+    const fn new(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            dependency: None,
+            restricted: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedVerdict {
+    generation: u64,
+    identity: u64,
+    verdict: FlowVerdict,
+}
+
+/// What the flow table holds for a packet.
+enum Hit {
+    /// A live reply allowance (refreshed), with its dependency.
+    Allowance(Option<ReplyDependency>),
+    /// A verdict cached under the current generations.
+    Verdict(FlowVerdict),
+}
+
+/// A peer resolved under one policy and identity generation.
+#[derive(Debug)]
+struct PeerInfo {
+    generation: u64,
+    identity: u64,
+    /// `None` for an unknown peer.
+    source: Option<SourceAssertion>,
+    /// The source anchor of `source`.
+    principal: Option<Arc<str>>,
+    /// How the policy governs the peer.
+    governed: Governed,
+    /// Some pinhole belongs to the peer.
+    pinholes: bool,
+    /// Every new inbound TCP or UDP flow of the peer is accepted without a
+    /// dependency or an outbound allowance, so its evaluation is skipped.
+    bypass: bool,
+}
+
+/// How the policy governs a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Governed {
+    /// In no namespace: the default policy.
+    Default,
+    /// A namespace member, outbound unrestricted.
+    Member,
+    /// A namespace member, outbound-restricted.
+    Restricted,
+}
+
+impl PeerInfo {
+    fn resolve(
+        identity: &dyn PeerIdentity,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        generation: u64,
+    ) -> Self {
+        let source = identity.assertion(peer);
+        let principal: Option<Arc<str>> = source.as_ref().map(|s| s.source_anchor().into());
+        let principal_str = principal.as_deref();
+        let membership = principal_str.and_then(|principal| snapshot.membership(principal));
+        Self {
+            generation: snapshot.generation(),
+            identity: generation,
+            governed: match membership {
+                None => Governed::Default,
+                Some(membership) if membership.outbound_restricted() => Governed::Restricted,
+                Some(_) => Governed::Member,
+            },
+            pinholes: principal_str.is_some_and(|principal| snapshot.has_pinholes_of(principal)),
+            bypass: source.is_some() && snapshot.bypasses(principal_str),
+            source,
+            principal,
+        }
+    }
 }
 
 // ── AclFilter ─────────────────────────────────────────────────────────────────
@@ -309,6 +472,15 @@ struct ReplyEntry {
 /// traffic. Allowances expire after [`AclFilterConfig::reply_idle_timeout`]
 /// without traffic.
 ///
+/// **Per-flow hook**: with a versioned identity
+/// ([`PeerIdentity::generation`] non-zero, e.g. a [`PeerIdentityMap`]), the
+/// filter caches each peer's resolved principal and the verdict of each TCP or
+/// UDP flow's first packet from a namespace member, tagged with the engine's
+/// [generation](AclEngine::generation) and the identity generation; later
+/// packets of the flow reuse it until either changes. Peers whose policy
+/// accepts everything skip the evaluation altogether (see the crate docs on
+/// the ACL hook). Verdicts and counters are the same as without the cache.
+///
 /// IPv4 fragments: a first fragment is evaluated and its outcome recorded;
 /// later fragments of the same packet follow it, and a later fragment with no
 /// recorded first fragment is dropped.
@@ -324,8 +496,10 @@ struct Inner {
     engine: Arc<AclEngine>,
     identity: Box<dyn PeerIdentity>,
     config: AclFilterConfig,
+    /// Cache peers and verdicts (always, except in the differential tests).
+    cache: bool,
     fragments: Mutex<FragmentTable>,
-    replies: Mutex<ReplyTable>,
+    flows: Mutex<FlowTable>,
     counters: Counters,
 }
 
@@ -351,13 +525,34 @@ impl AclFilter {
         identity: impl PeerIdentity,
         config: AclFilterConfig,
     ) -> Self {
+        Self::build(engine, Box::new(identity), config, true)
+    }
+
+    /// A filter that never caches peers or verdicts: the reference the
+    /// differential tests compare the cached filter with.
+    #[cfg(test)]
+    pub(crate) fn uncached(
+        engine: Arc<AclEngine>,
+        identity: impl PeerIdentity,
+        config: AclFilterConfig,
+    ) -> Self {
+        Self::build(engine, Box::new(identity), config, false)
+    }
+
+    fn build(
+        engine: Arc<AclEngine>,
+        identity: Box<dyn PeerIdentity>,
+        config: AclFilterConfig,
+        cache: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 engine,
-                identity: Box::new(identity),
+                identity,
                 config,
+                cache,
                 fragments: Mutex::default(),
-                replies: Mutex::default(),
+                flows: Mutex::default(),
                 counters: Counters::default(),
             }),
         }
@@ -383,11 +578,34 @@ impl AclFilter {
             outbound_denied: load(&c.outbound_denied),
             outbound_replies: load(&c.outbound_replies),
             reply_revoked: load(&c.reply_revoked),
+            pending_evictions: load(&c.pending_evictions),
+            verdict_evictions: load(&c.verdict_evictions),
         }
     }
 }
 
 impl Inner {
+    fn table(&self) -> MutexGuard<'_, FlowTable> {
+        self.flows.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The identity generation; 0 (nothing is cached) when the identity is
+    /// not versioned or the cache is off.
+    fn identity_generation(&self) -> u64 {
+        if self.cache {
+            self.identity.generation()
+        } else {
+            0
+        }
+    }
+
+    /// Sweep the expired pinholes when a lookup saw one.
+    fn sweep_if(&self, sweep: bool) {
+        if sweep {
+            self.engine.expire_pinholes();
+        }
+    }
+
     fn inbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
         let snapshot = self.engine.snapshot();
         if !snapshot.is_loaded() {
@@ -439,26 +657,136 @@ impl Inner {
         let Some(tuple) = packet.five_tuple() else {
             return Outcome::Malformed;
         };
+        let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
+            return self.evaluate_other(snapshot, peer, packet, tuple);
+        };
+        let identity = self.identity_generation();
+        let key = EntryKey {
+            peer,
+            outbound: false,
+            tuple,
+        };
+        let mut sweep = false;
+        let mut table = self.table();
+        let info = match self.lookup(&mut table, snapshot, key, identity, &mut sweep) {
+            Some(Hit::Allowance(dependency)) => {
+                if let Some(dependency) = dependency {
+                    self.record_pending(&mut table, tuple, dependency);
+                }
+                drop(table);
+                self.sweep_if(sweep);
+                return Outcome::Reply;
+            }
+            Some(Hit::Verdict(verdict)) => {
+                self.replay(&mut table, peer, tuple, &verdict);
+                return verdict.outcome;
+            }
+            None if identity == 0 => None,
+            None => {
+                let info = self.cached_peer(&mut table, snapshot, peer, identity);
+                if info.bypass {
+                    drop(table);
+                    self.sweep_if(sweep);
+                    return Outcome::Accepted;
+                }
+                if info.governed == Governed::Default {
+                    // The default policy: a few rules and no side effects,
+                    // cheaper to evaluate under this lock than to cache.
+                    let (verdict, _) =
+                        self.evaluate_new(snapshot, info.source.clone(), None, tuple, protocol);
+                    drop(table);
+                    self.sweep_if(sweep);
+                    return verdict.outcome;
+                }
+                Some(Arc::clone(info))
+            }
+        };
+        drop(table);
+        self.sweep_if(sweep);
+        let (verdict, cacheable) = info.map_or_else(
+            || {
+                let source = self.identity.assertion(peer);
+                let principal = source
+                    .as_ref()
+                    .filter(|_| snapshot.has_members())
+                    .map(SourceAssertion::source_anchor);
+                self.evaluate_new(snapshot, source, principal.as_deref(), tuple, protocol)
+            },
+            |info| {
+                let principal = info.principal.as_deref();
+                self.evaluate_new(snapshot, info.source.clone(), principal, tuple, protocol)
+            },
+        );
+        let cache = cacheable && identity != 0;
+        if cache || verdict.dependency.is_some() || verdict.restricted {
+            let mut table = self.table();
+            self.replay(&mut table, peer, tuple, &verdict);
+            if cache {
+                let cached = CachedVerdict {
+                    generation: snapshot.generation(),
+                    identity,
+                    verdict: verdict.clone(),
+                };
+                self.cache_verdict(&mut table, key, cached);
+            }
+        }
+        verdict.outcome
+    }
+
+    /// Evaluate an inbound packet that is neither TCP nor UDP.
+    fn evaluate_other(
+        &self,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        packet: &IpPacket<'_>,
+        tuple: FiveTuple,
+    ) -> Outcome {
         if self.config.stateful_replies
             && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Reply))
-            && let Some(allowance) = self.reply_match(snapshot, peer, false, &tuple)
         {
-            if let Some(dependency) = allowance.dependency {
-                self.record_pending(tuple, dependency);
-            }
-            return Outcome::Reply;
-        }
-        let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
-            return if self.config.allow_other_protocols {
-                Outcome::Accepted
-            } else {
-                Outcome::Protocol
+            let key = EntryKey {
+                peer,
+                outbound: false,
+                tuple,
             };
+            let mut sweep = false;
+            let mut table = self.table();
+            let reply = match self.lookup(&mut table, snapshot, key, 0, &mut sweep) {
+                Some(Hit::Allowance(dependency)) => {
+                    if let Some(dependency) = dependency {
+                        self.record_pending(&mut table, tuple, dependency);
+                    }
+                    true
+                }
+                Some(Hit::Verdict(_)) | None => false,
+            };
+            drop(table);
+            self.sweep_if(sweep);
+            if reply {
+                return Outcome::Reply;
+            }
+        }
+        if self.config.allow_other_protocols {
+            Outcome::Accepted
+        } else {
+            Outcome::Protocol
+        }
+    }
+
+    /// Evaluate a new inbound TCP or UDP flow from `source`, whose principal
+    /// is `principal` (`None` when there are no namespace members). Returns
+    /// the verdict and whether it may be cached.
+    fn evaluate_new(
+        &self,
+        snapshot: &Snapshot,
+        source: Option<SourceAssertion>,
+        principal: Option<&str>,
+        tuple: FiveTuple,
+        protocol: Protocol,
+    ) -> (FlowVerdict, bool) {
+        let Some(source) = source else {
+            return (FlowVerdict::new(Outcome::UnknownPeer), true);
         };
-        let Some(source) = self.identity.assertion(peer) else {
-            return Outcome::UnknownPeer;
-        };
-        let principal = snapshot.has_members().then(|| source.source_anchor());
         let request = AccessRequest {
             src_ip: tuple.src,
             source,
@@ -466,19 +794,16 @@ impl Inner {
             dst_port: tuple.dst_port,
             protocol,
         };
-        let member = principal
-            .as_deref()
-            .and_then(|principal| Some((principal, snapshot.membership(principal)?)));
+        let member =
+            principal.and_then(|principal| Some((principal, snapshot.membership(principal)?)));
         let Some((principal, membership)) = member else {
             // A principal in no namespace: the default policy.
-            let Some(policy) = snapshot.default_policy() else {
-                return Outcome::NoPolicy;
+            let outcome = match snapshot.default_policy() {
+                None => Outcome::NoPolicy,
+                Some(policy) if policy.matched_rule(&request).is_some() => Outcome::Accepted,
+                Some(_) => Outcome::Denied,
             };
-            return if policy.is_allowed(&request).allowed {
-                Outcome::Accepted
-            } else {
-                Outcome::Denied
-            };
+            return (FlowVerdict::new(outcome), true);
         };
         let verdict =
             snapshot.evaluate_member(&request, principal, membership, || self.engine.now());
@@ -488,18 +813,150 @@ impl Inner {
             MemberVerdict::Pinhole(id) => Some(ReplyDependency::Pinhole(id)),
             MemberVerdict::PinholeExpired => {
                 self.engine.expire_pinholes();
-                return Outcome::Denied;
+                return (FlowVerdict::new(Outcome::Denied), false);
             }
-            MemberVerdict::Denied => return Outcome::Denied,
-            MemberVerdict::CrossNamespace => return Outcome::CrossNamespace,
+            MemberVerdict::Denied => return (FlowVerdict::new(Outcome::Denied), true),
+            MemberVerdict::CrossNamespace => {
+                return (FlowVerdict::new(Outcome::CrossNamespace), true);
+            }
         };
-        if let Some(dependency) = &dependency {
-            self.record_pending(tuple, dependency.clone());
+        let verdict = FlowVerdict {
+            outcome: Outcome::Accepted,
+            dependency,
+            restricted: membership.outbound_restricted(),
+        };
+        (verdict, true)
+    }
+
+    /// The side effects of an inbound packet of a flow with `verdict`.
+    fn replay(&self, table: &mut FlowTable, peer: PeerId, tuple: FiveTuple, verdict: &FlowVerdict) {
+        if let Some(dependency) = &verdict.dependency {
+            self.record_pending(table, tuple, dependency.clone());
         }
-        if membership.outbound_restricted() {
-            self.record_reply(peer, true, reversed(tuple), dependency);
+        if verdict.restricted {
+            self.record_reply(
+                table,
+                peer,
+                true,
+                reversed(tuple),
+                verdict.dependency.clone(),
+            );
         }
-        Outcome::Accepted
+    }
+
+    /// The resolved `peer` under the snapshot's generation and `identity`,
+    /// resolving it again when missing or stale.
+    fn cached_peer<'t>(
+        &self,
+        table: &'t mut FlowTable,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        identity: u64,
+    ) -> &'t Arc<PeerInfo> {
+        let generation = snapshot.generation();
+        let capacity = self.config.reply_capacity.max(1);
+        if table.peers.len() >= capacity && !table.peers.contains_key(&peer) {
+            table
+                .peers
+                .retain(|_, info| info.generation == generation && info.identity == identity);
+            if table.peers.len() >= capacity {
+                table.peers.clear();
+            }
+        }
+        let resolve = || Arc::new(PeerInfo::resolve(&*self.identity, snapshot, peer, identity));
+        let info = table.peers.entry(peer).or_insert_with(resolve);
+        if info.generation != generation || info.identity != identity {
+            *info = resolve();
+        }
+        info
+    }
+
+    /// The live reply allowance (refreshed) or the valid cached verdict for
+    /// `key`. Expired and revoked allowances are removed and counted (`sweep`
+    /// is set when a pinhole may have expired); stale verdicts are removed.
+    fn lookup(
+        &self,
+        table: &mut FlowTable,
+        snapshot: &Snapshot,
+        key: EntryKey,
+        identity: u64,
+        sweep: &mut bool,
+    ) -> Option<Hit> {
+        match table.entries.get_mut(&key)? {
+            FlowEntry::Allowance(allowance) => {
+                let now = Instant::now();
+                if now.duration_since(allowance.last_seen) > self.config.reply_idle_timeout {
+                    table.entries.remove(&key);
+                    bump(&self.counters.reply_expired);
+                    return None;
+                }
+                let revoked = allowance
+                    .dependency
+                    .as_ref()
+                    .filter(|dependency| !snapshot.is_live(dependency, || self.engine.now()));
+                if let Some(revoked) = revoked {
+                    // The pinhole may only have expired: sweep it.
+                    *sweep = matches!(revoked, ReplyDependency::Pinhole(_));
+                    table.entries.remove(&key);
+                    bump(&self.counters.reply_revoked);
+                    return None;
+                }
+                allowance.last_seen = now;
+                let dependency = allowance.dependency.clone();
+                table.entries.touch(&key);
+                Some(Hit::Allowance(dependency))
+            }
+            FlowEntry::Verdict(cached) => {
+                // Only a pinhole can close without a generation change: it
+                // expires.
+                let valid = identity != 0
+                    && cached.generation == snapshot.generation()
+                    && cached.identity == identity
+                    && cached.verdict.dependency.as_ref().is_none_or(|dependency| {
+                        matches!(dependency, ReplyDependency::Grant(_))
+                            || snapshot.is_live(dependency, || self.engine.now())
+                    });
+                if valid {
+                    return Some(Hit::Verdict(cached.verdict.clone()));
+                }
+                table.entries.remove(&key);
+                table.verdicts -= 1;
+                None
+            }
+        }
+    }
+
+    /// Cache `cached` under `key`, unless an allowance holds it or the table
+    /// is full of allowances.
+    fn cache_verdict(&self, table: &mut FlowTable, key: EntryKey, cached: CachedVerdict) {
+        match table.entries.get_mut(&key) {
+            Some(FlowEntry::Allowance(_)) => return,
+            Some(FlowEntry::Verdict(old)) => {
+                *old = cached;
+                return;
+            }
+            None => {}
+        }
+        let capacity = self.config.reply_capacity.max(1);
+        if table.entries.len() >= capacity {
+            if table.verdicts < (capacity / 8).max(1) {
+                return;
+            }
+            self.flush_verdicts(table);
+        }
+        table.entries.insert(key, FlowEntry::Verdict(cached));
+        table.verdicts += 1;
+    }
+
+    /// Remove every cached verdict, counting them as evictions.
+    fn flush_verdicts(&self, table: &mut FlowTable) {
+        table
+            .entries
+            .retain(|_, entry| matches!(entry, FlowEntry::Allowance(_)));
+        self.counters
+            .verdict_evictions
+            .fetch_add(table.verdicts as u64, Ordering::Relaxed);
+        table.verdicts = 0;
     }
 
     fn follow_fragment(&self, key: FragmentKey, last: bool) -> Option<Outcome> {
@@ -507,12 +964,11 @@ impl Inner {
             .fragments
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entry = if last {
+        if last {
             table.entries.remove(&key)
         } else {
             table.entries.get(&key).copied()
-        };
-        entry.map(|(outcome, _)| outcome)
+        }
     }
 
     fn record_fragment(&self, key: FragmentKey, outcome: Outcome) {
@@ -521,102 +977,74 @@ impl Inner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let capacity = self.config.fragment_capacity.max(1);
-        if !table.entries.contains_key(&key) && table.entries.len() >= capacity {
-            let oldest = table
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, seq))| *seq)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                table.entries.remove(&oldest);
-                bump(&self.counters.fragment_evictions);
-            }
+        if !table.entries.contains_key(&key)
+            && table.entries.len() >= capacity
+            && table.entries.pop_oldest().is_some()
+        {
+            bump(&self.counters.fragment_evictions);
         }
-        let seq = table.next_seq;
-        table.next_seq += 1;
-        table.entries.insert(key, (outcome, seq));
-    }
-
-    /// The live reply allowance for `tuple` with `peer` in the given
-    /// direction, refreshed. Expired and revoked allowances are
-    /// removed and counted.
-    fn reply_match(
-        &self,
-        snapshot: &Snapshot,
-        peer: PeerId,
-        outbound: bool,
-        tuple: &FiveTuple,
-    ) -> Option<ReplyEntry> {
-        let mut table = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
-        let key = ReplyKey {
-            peer,
-            outbound,
-            tuple: *tuple,
-        };
-        let entry = table.entries.get_mut(&key)?;
-        let now = Instant::now();
-        if now.duration_since(entry.last_seen) > self.config.reply_idle_timeout {
-            table.entries.remove(&key);
-            bump(&self.counters.reply_expired);
-            return None;
-        }
-        let revoked = entry
-            .dependency
-            .as_ref()
-            .filter(|dependency| !snapshot.is_live(dependency, || self.engine.now()));
-        if let Some(revoked) = revoked {
-            let pinhole = matches!(revoked, ReplyDependency::Pinhole(_));
-            table.entries.remove(&key);
-            drop(table);
-            bump(&self.counters.reply_revoked);
-            if pinhole {
-                // The pinhole may only have expired: sweep it.
-                self.engine.expire_pinholes();
-            }
-            return None;
-        }
-        entry.last_seen = now;
-        Some(entry.clone())
+        table.entries.insert(key, outcome);
     }
 
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
         let snapshot = self.engine.snapshot();
-        let principal = if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
-            self.identity
-                .assertion(peer)
-                .map(|source| source.source_anchor())
+        let identity = self.identity_generation();
+        let mut table = self.table();
+        // `None`: an unrestricted peer without pinholes.
+        let info = if identity != 0 {
+            let info = self.cached_peer(&mut table, &snapshot, peer, identity);
+            (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
+        } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
+            Some(Arc::new(PeerInfo::resolve(
+                &*self.identity,
+                &snapshot,
+                peer,
+                0,
+            )))
         } else {
             None
         };
-        let membership = principal
-            .as_deref()
-            .and_then(|principal| snapshot.membership(principal))
-            .filter(|membership| membership.outbound_restricted());
+        let restricted = info
+            .as_ref()
+            .is_some_and(|info| info.governed == Governed::Restricted);
         let Ok(packet) = IpPacket::parse(bytes) else {
-            return membership.map_or(Outcome::OutboundAccepted, |_| Outcome::OutboundDenied);
+            return if restricted {
+                Outcome::OutboundDenied
+            } else {
+                Outcome::OutboundAccepted
+            };
         };
-        let (Some(principal), Some(membership)) = (principal.as_deref(), membership) else {
+        let principal = info.as_ref().and_then(|info| info.principal.as_deref());
+        let Some(principal) = principal.filter(|_| restricted) else {
             if let Some(tuple) = packet.five_tuple() {
                 // Accepted anyway; an outbound pinhole still owns the replies.
-                let dependency = principal
-                    .as_deref()
-                    .and_then(|principal| self.outbound_pinhole(&snapshot, principal, &tuple));
-                self.track_outbound(peer, tuple, &packet, dependency);
+                let mut sweep = false;
+                let dependency = principal.and_then(|principal| {
+                    self.outbound_pinhole(&snapshot, principal, &tuple, &mut sweep)
+                });
+                self.track_outbound(&mut table, peer, tuple, &packet, dependency);
+                drop(table);
+                self.sweep_if(sweep);
             }
             return Outcome::OutboundAccepted;
         };
+        if packet.fragment().is_none() {
+            return self.evaluate_outbound(&snapshot, peer, principal, identity, &packet, table);
+        }
+        drop(table);
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(&snapshot, peer, principal, membership, packet)
+            self.evaluate_outbound(&snapshot, peer, principal, identity, packet, self.table())
         })
     }
 
     /// The open outbound pinhole of `principal` for `tuple`, as a reply
-    /// dependency. Sweeps expired pinholes when only those match.
+    /// dependency. Sets `sweep` when only expired pinholes match.
     fn outbound_pinhole(
         &self,
         snapshot: &Snapshot,
         principal: &str,
         tuple: &FiveTuple,
+        sweep: &mut bool,
     ) -> Option<ReplyDependency> {
         let protocol = Protocol::from_ip_number(tuple.protocol)?;
         match snapshot.match_pinhole(
@@ -628,21 +1056,23 @@ impl Inner {
         ) {
             PinholeMatch::Open(id) => Some(ReplyDependency::Pinhole(id)),
             PinholeMatch::Expired => {
-                self.engine.expire_pinholes();
+                *sweep = true;
                 None
             }
             PinholeMatch::Absent => None,
         }
     }
 
-    /// Evaluate an outbound packet to an outbound-restricted peer.
+    /// Evaluate an outbound packet to an outbound-restricted peer, holding
+    /// the flow table.
     fn evaluate_outbound(
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
         principal: &str,
-        membership: &Membership,
+        identity: u64,
         packet: &IpPacket<'_>,
+        mut table: MutexGuard<'_, FlowTable>,
     ) -> Outcome {
         let Some(tuple) = packet.five_tuple() else {
             return Outcome::OutboundDenied;
@@ -651,27 +1081,82 @@ impl Inner {
             if !self.config.allow_other_protocols {
                 return Outcome::OutboundDenied;
             }
-            self.track_outbound(peer, tuple, packet, None);
+            self.track_outbound(&mut table, peer, tuple, packet, None);
             return Outcome::OutboundAccepted;
         };
-        if let Some(allowance) = self.reply_match(snapshot, peer, true, &tuple) {
-            self.track_outbound(peer, tuple, packet, allowance.dependency);
-            return Outcome::OutboundReply;
+        let key = EntryKey {
+            peer,
+            outbound: true,
+            tuple,
+        };
+        let mut sweep = false;
+        let verdict = match self.lookup(&mut table, snapshot, key, identity, &mut sweep) {
+            Some(Hit::Allowance(dependency)) => FlowVerdict {
+                outcome: Outcome::OutboundReply,
+                dependency,
+                restricted: false,
+            },
+            Some(Hit::Verdict(verdict)) => verdict,
+            None => {
+                let (verdict, cacheable) =
+                    self.evaluate_new_outbound(snapshot, principal, protocol, &tuple, &mut sweep);
+                if cacheable && identity != 0 {
+                    let cached = CachedVerdict {
+                        generation: snapshot.generation(),
+                        identity,
+                        verdict: verdict.clone(),
+                    };
+                    self.cache_verdict(&mut table, key, cached);
+                }
+                verdict
+            }
+        };
+        if verdict.outcome != Outcome::OutboundDenied {
+            self.track_outbound(&mut table, peer, tuple, packet, verdict.dependency);
         }
-        if snapshot.outbound_rule_accepts(membership, protocol, tuple.dst_port) {
-            self.track_outbound(peer, tuple, packet, None);
-            return Outcome::OutboundAccepted;
+        drop(table);
+        self.sweep_if(sweep);
+        verdict.outcome
+    }
+
+    /// Evaluate a new outbound TCP or UDP flow to the outbound-restricted
+    /// `principal`. Returns the verdict and whether it may be cached.
+    fn evaluate_new_outbound(
+        &self,
+        snapshot: &Snapshot,
+        principal: &str,
+        protocol: Protocol,
+        tuple: &FiveTuple,
+        sweep: &mut bool,
+    ) -> (FlowVerdict, bool) {
+        let rule = snapshot.membership(principal).is_some_and(|membership| {
+            snapshot.outbound_rule_accepts(membership, protocol, tuple.dst_port)
+        });
+        if rule {
+            return (FlowVerdict::new(Outcome::OutboundAccepted), true);
         }
-        if let Some(dependency) = self.outbound_pinhole(snapshot, principal, &tuple) {
-            self.track_outbound(peer, tuple, packet, Some(dependency));
-            return Outcome::OutboundAccepted;
-        }
-        Outcome::OutboundDenied
+        let mut expired = false;
+        let dependency = self.outbound_pinhole(snapshot, principal, tuple, &mut expired);
+        let outcome = if dependency.is_some() {
+            Outcome::OutboundAccepted
+        } else {
+            Outcome::OutboundDenied
+        };
+        // Only expired pinholes matched: not cached, the sweep publishes a
+        // new generation anyway.
+        *sweep |= expired;
+        let verdict = FlowVerdict {
+            outcome,
+            dependency,
+            restricted: false,
+        };
+        (verdict, !expired)
     }
 
     /// Record the inbound reply allowance of an accepted outbound packet.
     fn track_outbound(
         &self,
+        table: &mut FlowTable,
         peer: PeerId,
         tuple: FiveTuple,
         packet: &IpPacket<'_>,
@@ -688,18 +1173,18 @@ impl Inner {
             _ => false,
         };
         if tracked {
-            self.record_reply(peer, false, reversed(tuple), dependency);
+            self.record_reply(table, peer, false, reversed(tuple), dependency);
         }
     }
 
     fn record_reply(
         &self,
+        table: &mut FlowTable,
         peer: PeerId,
         outbound: bool,
         tuple: FiveTuple,
         dependency: Option<ReplyDependency>,
     ) {
-        let mut table = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         // An inbound allowance inherits the dependency of the inbound flow it
         // continues: the same tuple forwarded to another peer, or the reply of
@@ -715,48 +1200,42 @@ impl Inner {
                 .and_then(|pending| pending.dependency.clone()),
             dependency => dependency,
         };
-        let key = ReplyKey {
+        let key = EntryKey {
             peer,
             outbound,
             tuple,
         };
+        let allowance = ReplyEntry {
+            last_seen: now,
+            dependency,
+        };
         let capacity = self.config.reply_capacity.max(1);
         if !table.entries.contains_key(&key) && table.entries.len() >= capacity {
-            let oldest = table
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                table.entries.remove(&oldest);
+            if table.verdicts > 0 {
+                self.flush_verdicts(table);
+            }
+            // Only allowances are left: the oldest is the least recently seen.
+            if table.entries.len() >= capacity && table.entries.pop_oldest().is_some() {
                 bump(&self.counters.reply_evictions);
             }
         }
-        table.entries.insert(
-            key,
-            ReplyEntry {
-                last_seen: now,
-                dependency,
-            },
-        );
+        let old = table.entries.insert(key, FlowEntry::Allowance(allowance));
+        if matches!(old, Some(FlowEntry::Verdict(_))) {
+            table.verdicts -= 1;
+        }
     }
 
     /// Remember that the inbound flow `tuple` depends on `dependency`.
-    fn record_pending(&self, tuple: FiveTuple, dependency: ReplyDependency) {
+    fn record_pending(&self, table: &mut FlowTable, tuple: FiveTuple, dependency: ReplyDependency) {
         if !self.config.stateful_replies {
             return;
         }
-        let mut table = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
         let capacity = self.config.reply_capacity.max(1);
-        if !table.pending.contains_key(&tuple) && table.pending.len() >= capacity {
-            let oldest = table
-                .pending
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .map(|(tuple, _)| *tuple);
-            if let Some(oldest) = oldest {
-                table.pending.remove(&oldest);
-            }
+        if !table.pending.contains_key(&tuple)
+            && table.pending.len() >= capacity
+            && table.pending.pop_oldest().is_some()
+        {
+            bump(&self.counters.pending_evictions);
         }
         table.pending.insert(
             tuple,

@@ -473,6 +473,25 @@ fn listener_socket_keeps_tcp_keep_alive_disabled() {
 }
 
 #[test]
+fn tcp_sockets_run_cubic_congestion_control() {
+    let mut listeners = Listeners::new();
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
+    let port: u16 = 5201;
+
+    ensure_tcp_listeners(port, 1, &mut listeners, &mut sockets, POOL);
+    let handle = pool(&listeners, port)[0];
+
+    assert_eq!(
+        sockets.get::<tcp::Socket<'_>>(handle).congestion_control(),
+        tcp::CongestionControl::Cubic
+    );
+    assert_eq!(
+        new_tcp_socket(4096).congestion_control(),
+        tcp::CongestionControl::Cubic
+    );
+}
+
+#[test]
 fn tcp_is_syn_matches_only_a_bare_syn() {
     let mut pkt = vec![0u8; 40];
     pkt[0] = 0x45;

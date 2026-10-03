@@ -117,7 +117,7 @@ impl PeerTable {
 
         let gate = Arc::new(RateLimiter::new(&public_key, self.handshake_rate_limit));
         for peer in &mut self.peers {
-            peer.tunnel.set_static_private(
+            peer.tunnel().set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&gate)),
