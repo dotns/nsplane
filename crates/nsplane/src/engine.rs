@@ -16,7 +16,7 @@ use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Outp
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
-use tokio::sync::{Semaphore, TryAcquireError, broadcast, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
@@ -100,7 +100,12 @@ const MAX_DATAGRAM: usize = 65535;
 /// part of the batch) goes to the transmit queue and backlog, or the deliver queue, in
 /// order and under the rules above; later datagrams and packets queue behind it until the
 /// task has drained, so each transport and the sink keep the order of the core's outputs.
-/// While suspended the owner task never sends or delivers itself. Failed and closed
+/// It sends itself only for a drain after which no local packet or received datagram is
+/// waiting (it would wait next): under load it hands the datagrams to the transmit tasks,
+/// which send them while it seals the next batch. A
+/// transport or sink that took nothing (one that keeps the default, or is full) is skipped
+/// for 1, 2, 4, ... up to 1024 drains, until it takes something again. While suspended
+/// the owner task never sends or delivers itself. Failed and closed
 /// transports and sinks count as with their tasks; datagrams and packets the owner hands
 /// over itself never enter a queue, so the queues' high-water marks stay lower.
 ///
@@ -295,7 +300,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         fast_path,
         inline: Inline {
             allowed: fast_path,
-            now: false,
+            send: false,
             queued: false,
             drains: 0,
         },
@@ -407,16 +412,11 @@ impl<T> BatchSender<T> {
                 .min(self.permits.available_permits().max(1));
             // `n` is at most `most`, which is at most the capacity.
             let permits = u32::try_from(n).map_err(drop)?;
-            match self.permits.try_acquire_many(permits) {
-                Ok(permit) => permit.forget(),
-                Err(TryAcquireError::NoPermits) => self
-                    .permits
-                    .acquire_many(permits)
-                    .await
-                    .map_err(drop)?
-                    .forget(),
-                Err(TryAcquireError::Closed) => return Err(()),
-            }
+            self.permits
+                .acquire_many(permits)
+                .await
+                .map_err(drop)?
+                .forget();
             let handoff = match items.pop_front() {
                 Some(item) if n == 1 => Handoff::One(item),
                 Some(item) => {
@@ -908,12 +908,12 @@ struct InlineSink {
 
 /// When the owner task sends and delivers itself.
 struct Inline {
-    /// No crypto workers and not suspended.
+    /// No crypto workers and not suspended: the owner task may deliver itself.
     allowed: bool,
     /// For the current drain: allowed, and no local packet or received datagram is waiting,
-    /// so the owner task would wait next. Under load it hands everything to the transmit
-    /// and sink tasks, which then send while it seals and opens the next batch.
-    now: bool,
+    /// so the owner task would wait next and may also send itself. Under load it hands the
+    /// datagrams to the transmit tasks, which send them while it seals the next batch.
+    send: bool,
     /// Some transport has datagrams in [`TransportSlot::inline`].
     queued: bool,
     /// Drains so far, the clock of [`Backoff`].
@@ -1613,7 +1613,7 @@ impl Owner {
     /// waiting datagrams.
     fn drain(&mut self, droppable: bool) {
         self.inline.drains += 1;
-        self.inline.now = self.inline.allowed
+        self.inline.send = self.inline.allowed
             && self.datagrams.is_empty()
             && self.local.as_ref().is_none_or(BatchQueue::is_empty);
         while let Some(output) = self.core.poll_output() {
@@ -1648,10 +1648,10 @@ impl Owner {
     }
 
     /// Sends a datagram on the transport its path names: without crypto workers, the owner
-    /// task sends it itself at the end of the drain when nothing of that transport is
-    /// waiting, queued or being sent, and otherwise queues it.
+    /// task sends it itself at the end of the drain when no input is waiting and nothing
+    /// of that transport is waiting, queued or being sent, and otherwise queues it.
     fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
-        if self.inline.now
+        if self.inline.send
             && let Some(slot) = self.transports.get_mut(&path.transport)
             && (!slot.inline.is_empty() || (slot.backoff.ready(self.inline.drains) && slot.idle()))
         {
@@ -1718,7 +1718,7 @@ impl Owner {
     /// task, and otherwise queues it.
     fn deliver(&mut self, from: PeerId, packet: PacketBuf) {
         let sink = &mut self.sink;
-        if self.inline.now
+        if self.inline.allowed
             && !sink.closed
             && (!sink.delivered.is_empty()
                 || (sink.backoff.ready(self.inline.drains)
