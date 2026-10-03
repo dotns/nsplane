@@ -1,5 +1,7 @@
 //! Bulk TCP through two netstacks over engines whose transport loses data messages: the
-//! transfer completes intact and in bounded time, with a loss-free reference run.
+//! transfer completes intact and in bounded time, with a loss-free reference run. Eight
+//! parallel echoes through small engine queues, which drop packets at the stack's full
+//! sink, complete without and with loss on the link.
 //!
 //! The ignored `throughput` test measures netstack TCP and UDP throughput over the same
 //! in-process engine pair, with and without loss; run it in release:
@@ -14,7 +16,7 @@ use std::time::Duration;
 
 use nsplane_e2e::{
     Bottleneck, Family, LossyTransport, StackNode, TRANSFER, TestResult, next_within,
-    stack_pair_over,
+    serve_tcp_echo, stack_pair_over,
 };
 use nsplane_netstack::DEFAULT_MTU;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,6 +39,19 @@ const THROUGHPUT_LIMIT: Duration = Duration::from_secs(60);
 const BOTTLENECK_RATE: u64 = 25_000_000;
 /// Datagrams the measured bottleneck buffers, fewer than a full TCP window.
 const BOTTLENECK_BUFFER: usize = 64;
+/// Parallel echo connections per run of the parallel tests.
+const FLOWS: usize = 8;
+/// Bytes each parallel connection sends and gets echoed.
+const FLOW_BULK: usize = 1 << 20;
+/// Engine queue capacity of the parallel tests: small enough that the engine drops
+/// decrypted packets at the stack's full sink (`DROP_SINK_FULL`) under eight flows.
+const SMALL_QUEUES: usize = 256;
+/// Data messages dropped per 1000 on each end of the lossy link of the parallel test.
+const PARALLEL_LOSS_PERMILLE: u64 = 20;
+/// Upper bound for every parallel connection to finish its echo, even in a debug build.
+const PARALLEL_BOUND: Duration = Duration::from_secs(60);
+/// TCP port of the echo server of the parallel tests.
+const ECHO_PORT: u16 = 7;
 /// TCP port of the receiving stack.
 const TCP_PORT: u16 = 9000;
 /// UDP port of the receiving stack.
@@ -63,9 +78,11 @@ fn mb_per_s(bytes: usize, elapsed: Duration) -> f64 {
 /// the count of messages dropped so far.
 async fn lossy_pair(permille: u64) -> TestResult<(StackNode, StackNode, Arc<AtomicU64>)> {
     let dropped = Arc::new(AtomicU64::new(0));
-    let (a, b) = stack_pair_over(DEFAULT_MTU, |link| {
-        LossyTransport::new(link, permille, Arc::clone(&dropped))
-    })
+    let (a, b) = stack_pair_over(
+        DEFAULT_MTU,
+        |link| LossyTransport::new(link, permille, Arc::clone(&dropped)),
+        |builder| builder,
+    )
     .await?;
     Ok((a, b, dropped))
 }
@@ -157,6 +174,81 @@ async fn udp_burst(client: &StackNode, server: &StackNode) -> TestResult<(usize,
     Ok((received, last.duration_since(started)))
 }
 
+/// Runs [`FLOWS`] connections from `client` to the echo server on `server` at once, each
+/// sending [`FLOW_BULK`] bytes (its own pattern) while reading the echo, and checks every
+/// echo within [`PARALLEL_BOUND`]. Returns the time until the last echo completed.
+async fn parallel_echo(client: &StackNode, server: &StackNode) -> TestResult<Duration> {
+    serve_tcp_echo(&server.stack);
+    let target = server.socket_addr(Family::V4, ECHO_PORT);
+    let started = Instant::now();
+    let deadline = started + PARALLEL_BOUND;
+    let flows: Vec<_> = (0..FLOWS)
+        .map(|flow| {
+            let stack = client.stack.clone();
+            tokio::spawn(async move {
+                let conn = stack.connect_tcp(target).await?;
+                let sent: Vec<u8> = data(FLOW_BULK + flow).split_off(flow);
+                let (mut reader, mut writer) = tokio::io::split(conn);
+                let write = async {
+                    writer.write_all(&sent).await?;
+                    writer.shutdown().await
+                };
+                let read = async {
+                    let mut echoed = Vec::with_capacity(FLOW_BULK);
+                    reader.read_to_end(&mut echoed).await?;
+                    Ok::<_, std::io::Error>(echoed)
+                };
+                let ((), echoed) = tokio::try_join!(write, read)?;
+                if echoed != sent {
+                    return Err(format!(
+                        "flow {flow}: {} of {FLOW_BULK} bytes echoed, or changed",
+                        echoed.len()
+                    )
+                    .into());
+                }
+                TestResult::Ok(())
+            })
+        })
+        .collect();
+    for (flow, task) in flows.into_iter().enumerate() {
+        timeout_at(deadline, task)
+            .await
+            .map_err(|_| format!("flow {flow} stalled for {PARALLEL_BOUND:?}"))???;
+    }
+    Ok(started.elapsed())
+}
+
+/// Two stack nodes with [`SMALL_QUEUES`] engine queues whose link drops `permille` of the
+/// data messages in each direction.
+async fn small_queue_pair(permille: u64) -> TestResult<(StackNode, StackNode)> {
+    let dropped = Arc::new(AtomicU64::new(0));
+    stack_pair_over(
+        DEFAULT_MTU,
+        |link| LossyTransport::new(link, permille, Arc::clone(&dropped)),
+        |builder| builder.queue_capacity(SMALL_QUEUES),
+    )
+    .await
+}
+
+/// Eight parallel echoes through small engine queues finish without loss on the link: the
+/// packets the engine drops at the stack's full sink are recovered, and no connection
+/// stalls in smoltcp's zero-window handling.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_echo_without_loss() -> TestResult {
+    let (a, b) = small_queue_pair(0).await?;
+    parallel_echo(&b, &a).await?;
+    Ok(())
+}
+
+/// Eight parallel echoes through small engine queues finish over a link that drops 2 % of
+/// the data messages in each direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_echo_with_loss() -> TestResult {
+    let (a, b) = small_queue_pair(PARALLEL_LOSS_PERMILLE).await?;
+    parallel_echo(&b, &a).await?;
+    Ok(())
+}
+
 /// The reference: 8 MiB over a loss-free link.
 #[tokio::test]
 async fn bulk_tcp_without_loss() -> TestResult {
@@ -203,14 +295,18 @@ async fn throughput() -> TestResult {
     }
 
     let dropped = Arc::new(AtomicU64::new(0));
-    let (a, b) = stack_pair_over(DEFAULT_MTU, |link| {
-        Bottleneck::new(
-            link,
-            BOTTLENECK_RATE,
-            BOTTLENECK_BUFFER,
-            Arc::clone(&dropped),
-        )
-    })
+    let (a, b) = stack_pair_over(
+        DEFAULT_MTU,
+        |link| {
+            Bottleneck::new(
+                link,
+                BOTTLENECK_RATE,
+                BOTTLENECK_BUFFER,
+                Arc::clone(&dropped),
+            )
+        },
+        |builder| builder,
+    )
     .await?;
     let report = measure_tcp(&b, &a, LOSSY_THROUGHPUT_BULK).await?;
     println!(

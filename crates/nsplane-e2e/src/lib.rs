@@ -1036,8 +1036,12 @@ impl<T: Transport> Transport for Bottleneck<T> {
     }
 }
 
-/// Two stack nodes (seeds 1 and 2) like [`stack_pair`], linked by a [`ChannelTransport`]
-/// pair with `link` wrapped around each end (a [`LossyTransport`], say).
+/// Two stack nodes (seeds 1 and 2) like [`stack_pair`] over wrapped links and configured
+/// engines.
+///
+/// The nodes are linked by a [`ChannelTransport`] pair with `link` wrapped around each
+/// end (a [`LossyTransport`], say), and `configure` is applied to both engine builders (a
+/// smaller queue capacity, say).
 ///
 /// # Panics
 ///
@@ -1045,6 +1049,9 @@ impl<T: Transport> Transport for Bottleneck<T> {
 pub async fn stack_pair_over<T: Transport>(
     mtu: u16,
     link: impl Fn(ChannelTransport) -> T,
+    configure: impl Fn(
+        EngineBuilder<NetStackSource, NetStackSink>,
+    ) -> EngineBuilder<NetStackSource, NetStackSink>,
 ) -> TestResult<(StackNode, StackNode)> {
     let a = (
         TransportId::new(1),
@@ -1055,8 +1062,14 @@ pub async fn stack_pair_over<T: Transport>(
         SocketAddr::from(([192, 0, 2, 2], 2000)),
     );
     let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a, b);
-    let a = StackNode::new(1, a.0, a.1, link(link_a), mtu)?;
-    let b = StackNode::new(2, b.0, b.1, link(link_b), mtu)?;
+    let link_a = link(link_a);
+    let link_b = link(link_b);
+    let a = StackNode::with_builder(1, a.0, a.1, mtu, |builder| {
+        configure(builder).transport(link_a)
+    })?;
+    let b = StackNode::with_builder(2, b.0, b.1, mtu, |builder| {
+        configure(builder).transport(link_b)
+    })?;
     a.handle
         .add_or_update_peer(b.as_peer(a.path.transport))
         .await?;
