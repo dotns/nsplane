@@ -1,7 +1,8 @@
 //! Queue high-water marks: under load the marks of the engine's bounded queues rise but
 //! never pass their capacities, they restart at 0 after `take_queue_stats`, and a sink that
 //! stops draining fills the deliver queue to its capacity while the overflow is counted
-//! under `DROP_SINK_FULL`.
+//! under `DROP_SINK_FULL`. With the crypto worker pool on, its job and done queues are
+//! reported too; without it they have no capacity.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -10,8 +11,8 @@ use nsplane::{
     ChannelTransport, DROP_SINK_FULL, EngineHandle, PacketBuf, QueueDepth, QueueStats, TransportId,
 };
 use nsplane_e2e::{
-    Family, Node, Options, TestResult, WAIT, channel_pair, exchange, introduce, payload,
-    serve_tcp_echo, stack_pair,
+    Family, Node, Options, TestResult, WAIT, channel_pair, channel_pair_with, exchange, introduce,
+    payload, serve_tcp_echo, stack_pair,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, sleep, timeout};
@@ -25,7 +26,7 @@ const BULK: usize = 4096;
 const SINK: usize = 1024;
 
 /// Every queue of `stats` in a fixed order, named.
-const fn depths(stats: &QueueStats) -> [(&'static str, QueueDepth); 8] {
+const fn depths(stats: &QueueStats) -> [(&'static str, QueueDepth); 10] {
     [
         ("command", stats.command),
         ("local", stats.local),
@@ -35,6 +36,8 @@ const fn depths(stats: &QueueStats) -> [(&'static str, QueueDepth); 8] {
         ("transmit", stats.transmit),
         ("backlog", stats.backlog),
         ("events", stats.events),
+        ("crypto", stats.crypto),
+        ("crypto_done", stats.crypto_done),
     ]
 }
 
@@ -69,6 +72,9 @@ async fn bulk_udp_raises_marks_within_capacity() -> TestResult {
     let stats = a.handle.queue_stats().await?;
     assert_eq!(stats.local.capacity, QUEUE);
     assert_eq!(stats.command.capacity, COMMAND);
+    // No crypto workers: their queues do not exist.
+    assert_eq!(stats.crypto, QueueDepth::default());
+    assert_eq!(stats.crypto_done, QueueDepth::default());
     a.handle.take_queue_stats().await?;
     b.handle.take_queue_stats().await?;
 
@@ -96,6 +102,40 @@ async fn bulk_udp_raises_marks_within_capacity() -> TestResult {
 
     assert_restart(&a.handle).await?;
     assert_restart(&b.handle).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_udp_on_workers_raises_the_crypto_marks() -> TestResult {
+    let (mut a, mut b) =
+        channel_pair_with(Options::default(), |_, builder| builder.crypto_workers(2))?;
+    introduce(&a, &b, None).await?;
+    exchange(&mut a, &mut b).await?;
+    a.handle.take_queue_stats().await?;
+    b.handle.take_queue_stats().await?;
+
+    let packet = a.packet_to(&b, Family::V4, &payload(1300));
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for _ in 0..BULK {
+            local.send(PacketBuf::from_packet(&packet)).await?;
+        }
+        TestResult::Ok(())
+    });
+    for _ in 0..BULK {
+        b.expect_delivery().await?;
+    }
+    timeout(WAIT, sender).await???;
+
+    for node in [&a.handle, &b.handle] {
+        let stats = node.queue_stats().await?;
+        assert_within_capacity(&stats);
+        assert_eq!(stats.crypto.capacity, QUEUE, "{stats:?}");
+        assert_eq!(stats.crypto_done.capacity, QUEUE, "{stats:?}");
+        assert!(stats.crypto.high_water > 0, "{stats:?}");
+        assert!(stats.crypto_done.high_water > 0, "{stats:?}");
+        assert_restart(node).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

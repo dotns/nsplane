@@ -356,6 +356,15 @@ pub struct CoreConfig {
     pub stats_interval: Option<Duration>,
     /// Maximum number of free packet buffers kept for reuse.
     pub pool_size: usize,
+    /// Whether [`Core::handle_input_deferred`] hands out [`CryptoJob`]s: then every peer keeps
+    /// its tunnel behind a lock, shared with its jobs. Otherwise (the default) every peer owns
+    /// its tunnel, the data path takes no lock, and [`Core::handle_input_deferred`] processes
+    /// every input at once like [`Core::handle_input`].
+    ///
+    /// [`Core::handle_input`]: crate::Core::handle_input
+    /// [`Core::handle_input_deferred`]: crate::Core::handle_input_deferred
+    /// [`CryptoJob`]: crate::CryptoJob
+    pub crypto_jobs: bool,
 }
 
 impl Default for CoreConfig {
@@ -367,6 +376,7 @@ impl Default for CoreConfig {
             handshake_rate_limit: 100,
             stats_interval: None,
             pool_size: 64,
+            crypto_jobs: false,
         }
     }
 }
@@ -382,6 +392,7 @@ impl fmt::Debug for CoreConfig {
             .field("handshake_rate_limit", &self.handshake_rate_limit)
             .field("stats_interval", &self.stats_interval)
             .field("pool_size", &self.pool_size)
+            .field("crypto_jobs", &self.crypto_jobs)
             .finish_non_exhaustive()
     }
 }

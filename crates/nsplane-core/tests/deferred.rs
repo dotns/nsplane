@@ -9,10 +9,18 @@ use std::collections::BTreeMap;
 use std::thread;
 
 use common::{InFlight, Net, ip4, packet_buf, udp4};
-use nsplane_core::{ConfigChange, CryptoJob, Event, Input, PeerId, reasons};
+use nsplane_core::{ConfigChange, CoreConfig, CryptoJob, Event, Input, PeerId, reasons};
 
 const fn assert_send<T: Send>() {}
 const _: () = assert_send::<CryptoJob>();
+
+/// `n` peered cores that hand out crypto jobs.
+fn deferred_net(n: usize) -> Net {
+    Net::with_configs(n, |_| CoreConfig {
+        crypto_jobs: true,
+        ..CoreConfig::default()
+    })
+}
 
 /// Feeds `inputs` to core `i` deferred, runs the jobs of each peer on a thread of its own,
 /// in order, and completes them peer by peer.
@@ -68,7 +76,7 @@ fn numbered(i: usize, j: usize, n: u32) -> Vec<u8> {
 
 #[test]
 fn deferred_jobs_keep_every_peer_in_order() {
-    let mut net = Net::new(3);
+    let mut net = deferred_net(3);
     net.handshake(0, 1);
     net.handshake(0, 2);
     net.clear_logs();
@@ -105,7 +113,7 @@ fn deferred_jobs_keep_every_peer_in_order() {
 
 #[test]
 fn a_deferred_packet_without_session_starts_the_handshake() {
-    let mut net = Net::new(2);
+    let mut net = deferred_net(2);
     let packet = numbered(0, 1, 7);
     run_deferred(
         &mut net,
@@ -129,7 +137,7 @@ fn a_deferred_packet_without_session_starts_the_handshake() {
 
 #[test]
 fn complete_job_runs_a_job_that_did_not_run() {
-    let mut net = Net::new(2);
+    let mut net = deferred_net(2);
     net.handshake(0, 1);
     net.clear_logs();
     let packet = numbered(0, 1, 1);
@@ -150,7 +158,7 @@ fn complete_job_runs_a_job_that_did_not_run() {
 
 #[test]
 fn drops_before_the_cryptography_need_no_job() {
-    let mut net = Net::new(2);
+    let mut net = deferred_net(2);
     net.handshake(0, 1);
     net.clear_logs();
     let now = net.now;
@@ -174,7 +182,7 @@ fn drops_before_the_cryptography_need_no_job() {
 
 #[test]
 fn a_job_of_a_removed_peer_is_discarded() {
-    let mut net = Net::new(2);
+    let mut net = deferred_net(2);
     net.handshake(0, 1);
     net.clear_logs();
     let now = net.now;
@@ -192,4 +200,36 @@ fn a_job_of_a_removed_peer_is_discarded() {
     net.cores[0].complete_job(job);
     assert_eq!(net.drain().len(), 0);
     assert_eq!(net.take_events(0), []);
+}
+
+#[test]
+fn a_core_without_crypto_jobs_processes_deferred_inputs_at_once() {
+    let mut net = Net::new(2);
+    net.handshake(0, 1);
+    net.clear_logs();
+    let now = net.now;
+    let packet = numbered(0, 1, 1);
+    let job = net.cores[0].handle_input_deferred(
+        Input::Local {
+            packet: packet_buf(&packet),
+        },
+        now,
+    );
+    assert!(job.is_none());
+    let in_flight = net.drain();
+    assert_eq!(in_flight.len(), 1, "sealed at once");
+    for datagram in in_flight {
+        let job = net.cores[1].handle_input_deferred(
+            Input::Datagram {
+                path: datagram.arrival,
+                data: datagram.data,
+            },
+            now,
+        );
+        assert!(job.is_none());
+    }
+    net.drain();
+    assert_eq!(net.take_delivered(1), [(net.peer_id(1, 0), packet)]);
+    assert_eq!(net.take_events(0), []);
+    assert_eq!(net.take_events(1), []);
 }

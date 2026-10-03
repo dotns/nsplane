@@ -10,6 +10,7 @@ use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::engine::NewTransport;
+use crate::fragment::FragmentStats;
 use crate::transport::Transport;
 
 /// The description of a peer for [`EngineHandle::add_or_update_peer`].
@@ -95,7 +96,9 @@ impl QueueDepth {
 /// The depths of the engine's bounded queues; see [`EngineHandle::queue_stats`].
 ///
 /// The packet queues hold `queue_capacity` items each (see
-/// [`crate::EngineBuilder::queue_capacity`]).
+/// [`crate::EngineBuilder::queue_capacity`]). Without crypto workers (fewer than 2, see
+/// [`crate::EngineBuilder::crypto_workers`]), `crypto` and `crypto_done` are
+/// `QueueDepth { capacity: 0, high_water: 0 }`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QueueStats {
@@ -120,6 +123,13 @@ pub struct QueueStats {
     /// Sampled when an event other than `Event::Dropped` is published and at every
     /// [`EngineHandle::queue_stats`], so a burst of drop events alone is not seen.
     pub events: QueueDepth,
+    /// Jobs with the crypto workers: batched for a worker or handed over, and not
+    /// completed by the owner task yet. The capacity is the bound of jobs in flight; at
+    /// the bound, the owner task stops taking packets until the workers hand jobs back.
+    pub crypto: QueueDepth,
+    /// Batches of jobs the crypto workers ran, waiting for the owner task to complete
+    /// them.
+    pub crypto_done: QueueDepth,
 }
 
 /// A request to the owner task; each carries the channel for its reply.
@@ -143,6 +153,7 @@ pub(crate) enum Command {
     DropCounters(oneshot::Sender<BTreeMap<&'static str, u64>>),
     /// With `true`, the high-water marks restart after the reply.
     QueueStats(bool, oneshot::Sender<QueueStats>),
+    FragmentStats(oneshot::Sender<FragmentStats>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -378,7 +389,8 @@ impl EngineHandle {
     /// ([`crate::DROP_SINK_FULL`], [`crate::DROP_SINK_CLOSED`],
     /// [`crate::DROP_NO_TRANSPORT`], [`crate::DROP_TRANSPORT_CLOSED`],
     /// [`crate::DROP_TRANSPORT_REMOVED`], [`crate::DROP_TRANSMIT_FULL`],
-    /// [`crate::DROP_TRANSPORT_SEND_ERROR`]).
+    /// [`crate::DROP_TRANSPORT_SEND_ERROR`], [`crate::DROP_FRAGMENT_OVERSIZE`],
+    /// [`crate::DROP_FRAGMENT_NO_ROUTE`], [`crate::DROP_FRAGMENT_RATE_LIMITED`]).
     pub async fn drop_counters(&self) -> Result<BTreeMap<&'static str, u64>, EngineError> {
         self.call(Command::DropCounters).await
     }
@@ -401,6 +413,14 @@ impl EngineHandle {
     /// measurements can be taken over windows.
     pub async fn take_queue_stats(&self) -> Result<QueueStats, EngineError> {
         self.call(|tx| Command::QueueStats(true, tx)).await
+    }
+
+    /// The counters of the fragmentation stage since the engine started; all zeros when no
+    /// stage is installed (see [`crate::EngineBuilder::fragmenter`]).
+    ///
+    /// The packets the stage drops are counted in [`EngineHandle::drop_counters`] too.
+    pub async fn fragment_stats(&self) -> Result<FragmentStats, EngineError> {
+        self.call(Command::FragmentStats).await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and
