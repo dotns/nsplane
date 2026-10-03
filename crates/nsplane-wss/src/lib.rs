@@ -2,13 +2,15 @@
 
 //! WebSocket-over-TLS (WSS) carriers for nsplane.
 //!
-//! Two carriers share one connection setup ([`WssConfig`]):
+//! The carriers share one connection setup ([`WssConfig`]):
 //!
 //! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport),
 //!   below.
 //! - [`WssStreamClient`], the stream carrier: TCP streams ([`WssTcpStream`]) and UDP flows
 //!   ([`WssUdpFlow`]) to targets behind a WSS terminate, multiplexed over sessions with the
 //!   `WsFrame` protocol of the [`frame`] module (the wire of ns and NSGW).
+//! - [`WssStreamServer`], the terminate leg of that protocol: it dials the relay too and
+//!   relays each opened stream to the backend a [`WssResolver`] picks.
 //!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each
@@ -76,15 +78,56 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The terminate leg, on its own configuration:
+//!
+//! ```no_run
+//! use std::net::SocketAddr;
+//! use std::sync::Arc;
+//!
+//! use nsplane::BoxFuture;
+//! use nsplane_wss::{
+//!     Denied, WssConfig, WssOpen, WssResolver, WssServerLimits, WssStreamServer, WssTls,
+//! };
+//!
+//! /// Serves only port 80, on a local backend.
+//! struct Web;
+//!
+//! impl WssResolver for Web {
+//!     fn resolve(&self, open: WssOpen) -> BoxFuture<'_, Result<SocketAddr, Denied>> {
+//!         let backend = if open.target.port() == 80 {
+//!             Ok(SocketAddr::from(([127, 0, 0, 1], 8080)))
+//!         } else {
+//!             Err(Denied)
+//!         };
+//!         Box::pin(std::future::ready(backend))
+//!     }
+//! }
+//!
+//! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
+//! let config = WssConfig::new("wss://relay.example/terminate", WssTls::Roots(roots));
+//! let server = WssStreamServer::new(config, WssServerLimits::default(), Arc::new(Web))?;
+//! let stats = server.stats();
+//! let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+//! // `stop.send(())`, or dropping `stop`, ends the run.
+//! server.run(async { let _ = stopped.await; }).await;
+//! # Ok(())
+//! # }
+//! ```
 
 mod config;
 mod connect;
 mod dialer;
 pub mod frame;
+mod server;
 mod stream;
 
 pub use config::{BearerProvider, WssConfig, WssTls};
 pub use dialer::{WssDialer, WssStats};
+pub use server::{
+    Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,
+    WssStreamEventKind, WssStreamServer,
+};
 pub use stream::{
     MAX_DATA_PAYLOAD, WssStreamClient, WssStreamLimits, WssStreamStats, WssTcpStream, WssUdpFlow,
 };
