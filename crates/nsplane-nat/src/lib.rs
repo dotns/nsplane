@@ -23,6 +23,15 @@
 //!   to the local side (inbound in install order, outbound in reverse); the
 //!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
 //!   the port map see overlay IPv6 in both directions.
+//! - **Allowed IPs**: the core routes local packets and checks the sources of
+//!   decrypted packets before the filters run, so each peer's allowed IPs
+//!   must contain its `alias4/32`, the LAN IPv4 prefixes behind it, its
+//!   `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
+//! - **Buffer room**: a translated IPv4 packet grows by 20 bytes (28 with a
+//!   fragment header) inside its buffer. To keep translated packets within
+//!   the MTU, install the engine's fragmentation stage
+//!   (`nsplane::EngineBuilder::fragmenter`) with
+//!   [`Translator::ipv4_translated_predicate`].
 //! - **Checksums** ([`checksum`]): RFC 1624 incremental checksum updates for
 //!   rewritten words, addresses and pseudo-headers, plus the UDP zero
 //!   checksum rule.
