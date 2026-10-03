@@ -18,7 +18,9 @@ fn host_tun(capacity: usize) -> (HostTunInput, HostTunSource, HostTunSink) {
 }
 
 async fn recv(source: &mut HostTunSource) -> io::Result<PacketBuf> {
-    timeout(WAIT, source.recv()).await.expect("recv timed out")
+    timeout(WAIT, source.recv())
+        .await
+        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "recv timed out")))
 }
 
 #[tokio::test]

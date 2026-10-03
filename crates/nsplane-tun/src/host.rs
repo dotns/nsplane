@@ -11,6 +11,9 @@ use std::sync::Arc;
 use nsplane::{PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId};
 use tokio::sync::{mpsc, watch};
 
+/// The host's packet writer; see [`HostTun::new`].
+type Write = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// The local side of a host that hands packets over through callbacks rather than a file
 /// descriptor: the iOS `NEPacketTunnelFlow` local side, on every target.
 ///
@@ -24,7 +27,7 @@ impl HostTun {
 
     /// Creates a host local side with MTU `mtu`, queueing up to `capacity` packets from the
     /// host ([`HostTun::DEFAULT_CAPACITY`] is recommended), that writes the engine's packets
-    /// with `write`.
+    /// with `write`, an `Arc<dyn Fn(&[u8]) -> bool + Send + Sync>`.
     ///
     /// Returns the input the host pushes its packets into, the source the engine reads
     /// them from, and the sink that hands the engine's packets to `write`.
@@ -36,10 +39,14 @@ impl HostTun {
     /// # Panics
     ///
     /// Panics if `capacity` is 0.
+    #[expect(
+        clippy::new_ret_no_self,
+        reason = "the contract names the constructor of the three ends HostTun::new"
+    )]
     pub fn new(
         mtu: u16,
         capacity: usize,
-        write: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+        write: Write,
     ) -> (HostTunInput, HostTunSource, HostTunSink) {
         let (tx, rx) = mpsc::channel(capacity);
         let (_, mtu_rx) = watch::channel(mtu);
@@ -177,7 +184,7 @@ impl PacketSource for HostTunSource {
 /// `send` returns [`io::ErrorKind::BrokenPipe`].
 #[derive(Clone)]
 pub struct HostTunSink {
-    write: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    write: Write,
 }
 
 impl fmt::Debug for HostTunSink {
@@ -187,15 +194,20 @@ impl fmt::Debug for HostTunSink {
 }
 
 impl PacketSink for HostTunSink {
-    async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
-        if (self.write)(packet.as_packet()) {
+    fn send(
+        &self,
+        packet: PacketBuf,
+        _from: PeerId,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        let result = if (self.write)(packet.as_packet()) {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "host packet writer closed",
             ))
-        }
+        };
+        std::future::ready(result)
     }
 }
 
