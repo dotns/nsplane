@@ -38,3 +38,15 @@ pub const DROP_TRANSPORT_REMOVED: &str = nsplane_core::reasons::TRANSPORT_REMOVE
 /// A datagram was dropped because the transport failed to send it (any I/O error, such as
 /// a datagram too large for the path).
 pub const DROP_TRANSPORT_SEND_ERROR: &str = nsplane_core::reasons::TRANSPORT_SEND_ERROR;
+/// A local packet above the MTU was dropped by the fragmentation stage without an ICMP
+/// error.
+///
+/// An error about it is not allowed (it is an ICMP error, multicast or broadcast, or a
+/// fragment other than the first), or it cannot be split.
+pub const DROP_FRAGMENT_OVERSIZE: &str = nsplane_core::reasons::FRAGMENT_OVERSIZE;
+/// A local packet above the MTU was dropped by the fragmentation stage, and no ICMP error
+/// was sent because its destination is routed to no peer.
+pub const DROP_FRAGMENT_NO_ROUTE: &str = nsplane_core::reasons::FRAGMENT_NO_ROUTE;
+/// A local packet above the MTU was dropped by the fragmentation stage, and no ICMP error
+/// was sent because of the error rate limit.
+pub const DROP_FRAGMENT_RATE_LIMITED: &str = nsplane_core::reasons::FRAGMENT_RATE_LIMITED;
