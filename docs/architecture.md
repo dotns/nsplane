@@ -272,6 +272,10 @@ TUN read (vnet hdr + up to 64 KiB) ─► segments (<= MTU) ─► core seals �
 UDP GRO read ─► zero-copy slices ─► core opens in place ─► coalesced TUN writev
 ```
 
+`Transport::send_batch` reports in its `failed` argument which of the datagrams it was done
+with failed, so `TRANSPORT_SEND_ERROR` counts exactly the lost datagrams: a failed segmented
+`UdpTransport` send loses its run, not the runs handed off before it in the same call.
+
 Offload is negotiated where the device or socket is opened. `Tun::create` (Linux,
 Android) asks for `IFF_VNET_HDR` with checksum offload and TSO, plus USO when the kernel
 accepts it, and falls back to a plain `IFF_NO_PI` device; `Tun::offload` reports the
@@ -282,7 +286,10 @@ fails with `EIO`/`EINVAL` falls back to one datagram per send, and where `quinn-
 cannot set the socket up (Wine) the transport sends with plain `send_to`. With offload on
 the socket sets DF, so outer datagrams above the path MTU fail with `EMSGSIZE`; the engine
 counts them under `TRANSPORT_SEND_ERROR`. `TunOptions::offload(false)`,
-`UdpTransport::bind_with_offload(.., false)` and the examples' `--no-offload` opt out.
+`UdpTransport::bind_with_offload(.., false)` and the examples' `--no-offload` opt out. Plain
+TUN reads (no virtio-net header, and Wintun reads on Windows) leave the same 28 bytes of
+room behind each packet as segmented ones (a read still takes at most the MTU), so a
+translator grows full-MTU IPv4 in place with offload off too.
 
 ## nsplane-tun
 
@@ -525,10 +532,18 @@ replies are mapped back; native IPv4 and IPv6 pass unchanged and packets spoofin
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
-incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first,
-which completes only when the first fragment arrives first. A translated packet grows by 20
-bytes (28 with a fragment header) inside its buffer, so packets need that much spare
-capacity (else `reasons::NO_ROOM`). Since the core routes and checks sources before the
+incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
+any fragment order: only the first fragment shows the checksum, so later fragments that
+arrive before it are held (at most 256 datagrams and 1 MiB, for 60 s; a fragment after the
+expiry starts a new entry). A datagram with a checksum whose later fragments came first is
+reassembled the same way and sent unfragmented; with nothing held, in-order fragments of a
+checksummed datagram are translated one by one, without holding or waiting. A reassembled
+datagram larger than the translator's MTU (`Translator::set_mtu`, 1280 by default; set it
+to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent oversize.
+`TranslatorStats` counts `fragments_held`, `fragment_timeouts`, `fragment_budget_drops`,
+`fragment_marker_evictions` and `reassembled_too_big`. A translated packet grows by 20
+bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied
+into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. Since the core routes and checks sources before the
 filters, each peer's allowed IPs must contain its `alias4/32`, the LAN IPv4 prefixes behind
 it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
 
@@ -546,6 +561,81 @@ next to the local side, so the ACL and the port map see overlay IPv6 in both dir
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
 `Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
 fragmented to fit the MTU after translation.
+
+## Optional features and defaults
+
+A basic client is an `EngineBuilder` on a TUN device and a `UdpTransport` with peers and
+no filters. Every feature below is optional; one that is not installed is not on the data
+path, so such a client pays no extra latency for it.
+
+| Feature | Crate | How to enable | Default | Cost when not enabled |
+|---|---|---|---|---|
+| IPv4/IPv6 translation | `nsplane-nat` | `EngineBuilder::filter(Box::new(Translator::new(table)))`; `Translator::set_mtu` to the tunnel MTU | not installed | none: the core's filter chain is empty |
+| Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
+| ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
+| Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
+| Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
+| Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; each peer's tunnel stays behind an uncontended lock (measured as noise) |
+| User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
+| Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
+| TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
+| UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
+
+**Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
+`nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`
+are separate crates that `nsplane` and `nsplane-tun` do not depend on, so they are not
+built or linked unless the application adds them; `nsplane-uapi` is only needed to serve
+the `wg` UAPI. None of the crates has optional Cargo features.
+
+**Address family.** IPv4-only, IPv6-only or dual stack is the caller's choice and needs no
+switch: the transport's bind address (`0.0.0.0:port` for IPv4 only, an IPv6 address for
+IPv6 only, `[::]:port` for a dual-stack socket), the addresses and routes configured on the
+TUN device (outside nsplane, e.g. `ip addr`), and the peers' allowed IPs.
+
+**A minimal IPv4-only client** (one TUN device, one UDP socket, one peer, no filters):
+
+```rust
+use std::error::Error;
+use std::net::SocketAddr;
+
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{Ecn, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_tun::Tun;
+
+async fn client(
+    key: StaticSecret,
+    server_key: PublicKey,
+    server: SocketAddr, // e.g. 198.51.100.1:51820
+) -> Result<(), Box<dyn Error>> {
+    const UDP: TransportId = TransportId::new(0);
+    // The caller sets up the TUN device's addresses and routes, e.g.
+    // `ip addr add 10.0.0.2/32 dev wg0` and `ip route add 10.0.0.0/24 dev wg0`.
+    let (source, sink) = Tun::create("wg0")?.split()?;
+    let udp = UdpTransport::bind(UDP, "0.0.0.0:0".parse()?)?;
+    let engine = EngineBuilder::new(source, sink)
+        .private_key(key)
+        .transport(udp)
+        .build()?;
+    let mut peer = Peer::new(server_key);
+    peer.allowed_ips = vec!["10.0.0.0/24".parse()?];
+    peer.persistent_keepalive = Some(25);
+    peer.path = Some(Path { transport: UDP, addr: server, ecn: Ecn::NotEct });
+    engine.handle().add_or_update_peer(peer).await?;
+    engine.wait().await?;
+    Ok(())
+}
+```
+
+**Offload never waits for more packets.** Batching and offload only group work that is
+already there; nothing holds a packet back to fill a batch:
+
+- the engine's I/O tasks fill a batch with non-blocking `try_recv` after the first packet
+  and send what they have (no timers, no linger);
+- TUN GSO/GRO writes coalesce only the packets of the batch they are handed;
+- UDP GSO segments only runs of datagrams within the current batch;
+- a GRO or segmented TUN read returns what one receive yields;
+- the crypto worker pool hands a batch to a worker when it is full or when the owner task
+  runs out of other work, never on a timer.
 
 ## Performance
 

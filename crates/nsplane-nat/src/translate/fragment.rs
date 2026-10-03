@@ -2,13 +2,16 @@
 //!
 //! IPv6 requires a UDP checksum, and it covers the whole datagram, so a
 //! fragmented IPv4 UDP datagram whose checksum is zero can only be translated
-//! once all of its fragments are in. Fragments of other datagrams are
-//! translated one by one and never stored here.
+//! once all of its fragments are in.
 //!
-//! An entry is opened by the first fragment (offset 0, zero UDP checksum) and
-//! later fragments of the same datagram join it. Entries are bounded in count
-//! and bytes and expire [`EXPIRY_SECS`] after they were opened. Exact
-//! duplicates are ignored; overlapping fragments drop the whole datagram.
+//! Only the first fragment (offset 0) shows the checksum, so a later fragment
+//! that arrives before it opens an entry too and is held there. A first
+//! fragment with a checksum then joins a held entry (the filter cannot release
+//! the held fragments one by one), or, with nothing held, is translated alone
+//! and leaves a marker so the rest of its datagram is translated one by one.
+//! Entries and markers are bounded in count (and entries in bytes) and expire
+//! [`EXPIRY_SECS`] after they were opened. Exact duplicates are ignored;
+//! overlapping fragments drop the whole datagram.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -73,6 +76,8 @@ pub(super) struct Counters {
     pub(super) expired: u64,
     pub(super) budget_drops: u64,
     pub(super) completed: u64,
+    /// Markers forgotten at the entry limit.
+    pub(super) marker_evictions: u64,
 }
 
 #[derive(Debug)]
@@ -110,6 +115,9 @@ pub(super) struct Reassembly {
     limits: Limits,
     entries: BTreeMap<Key, Entry>,
     bytes: usize,
+    /// Datagrams whose first fragment carried a checksum and was translated
+    /// alone, with the time it passed.
+    passed: BTreeMap<Key, u64>,
     counters: Counters,
 }
 
@@ -119,6 +127,7 @@ impl Reassembly {
             limits,
             entries: BTreeMap::new(),
             bytes: 0,
+            passed: BTreeMap::new(),
             counters: Counters {
                 accepted: 0,
                 duplicates: 0,
@@ -126,6 +135,7 @@ impl Reassembly {
                 expired: 0,
                 budget_drops: 0,
                 completed: 0,
+                marker_evictions: 0,
             },
         }
     }
@@ -149,8 +159,34 @@ impl Reassembly {
         self.entries.contains_key(key)
     }
 
-    /// Drops every entry that expired at `now` (seconds).
+    /// Records that the first fragment of `key` carried a checksum and was
+    /// translated alone at `now` (seconds). At the entry limit the oldest
+    /// marker is forgotten.
+    pub(super) fn mark_passed(&mut self, key: Key, now: u64) {
+        if !self.passed.contains_key(&key)
+            && self.passed.len() >= self.limits.max_entries
+            && let Some(oldest) = self
+                .passed
+                .iter()
+                .min_by_key(|(_, passed_at)| **passed_at)
+                .map(|(key, _)| *key)
+        {
+            self.passed.remove(&oldest);
+            self.counters.marker_evictions += 1;
+        }
+        self.passed.insert(key, now);
+    }
+
+    /// Whether the first fragment of `key` was translated alone: its later
+    /// fragments are then translated one by one too.
+    pub(super) fn passed(&self, key: &Key) -> bool {
+        self.passed.contains_key(key)
+    }
+
+    /// Drops every entry and marker that expired at `now` (seconds).
     pub(super) fn cleanup(&mut self, now: u64) {
+        self.passed
+            .retain(|_, passed_at| !is_expired(*passed_at, now));
         let expired: Vec<_> = self
             .entries
             .iter()
@@ -488,5 +524,28 @@ mod tests {
         assert_eq!(state.counters().expired, 2);
         assert!(!state.contains(&KEY));
         assert!(state.contains(&other));
+    }
+
+    #[test]
+    fn markers_expire_and_are_bounded() {
+        let mut state = state(2, 64);
+        let other = Key {
+            identification: 8,
+            ..KEY
+        };
+        let third = Key {
+            identification: 9,
+            ..KEY
+        };
+        state.mark_passed(KEY, 0);
+        state.mark_passed(other, 10);
+        state.mark_passed(third, 20);
+        assert!(!state.passed(&KEY) && state.passed(&other) && state.passed(&third));
+        assert_eq!(state.counters().marker_evictions, 1);
+        state.cleanup(70);
+        assert!(!state.passed(&other) && state.passed(&third));
+        state.cleanup(80);
+        assert!(!state.passed(&third));
+        assert_eq!(state.counters().expired, 0);
     }
 }

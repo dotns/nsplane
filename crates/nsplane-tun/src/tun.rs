@@ -292,9 +292,10 @@ pub struct TunSource {
 
 impl PacketSource for TunSource {
     /// Reads exactly one packet into the packet region of a pooled [`PacketBuf`],
-    /// leaving the headroom in front free. A packet longer than the MTU is truncated
-    /// by the OS. A zero-length read (end of stream) yields
-    /// [`io::ErrorKind::BrokenPipe`].
+    /// leaving the headroom in front free and room for the MTU plus 28 bytes behind it,
+    /// so an IPv4 <-> IPv6 translator can grow a full-size packet in place. A packet
+    /// longer than the MTU is truncated by the OS. A zero-length read (end of stream)
+    /// yields [`io::ErrorKind::BrokenPipe`].
     ///
     /// With a virtio-net header ([`Offload::vnet_hdr`]) one read may yield several
     /// packets; they are queued and returned one per call, before the next read.
@@ -304,11 +305,11 @@ impl PacketSource for TunSource {
             let capacity = usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK;
             return vnet.recv(&self.fd, capacity, &mut self.pool).await;
         }
-        let capacity = usize::from(*self.mtu.borrow());
-        let mut packet = self.pool.get(capacity);
+        let mtu = usize::from(*self.mtu.borrow());
+        let mut packet = self.pool.get(mtu + TRANSLATION_SLACK);
         // `PacketBuf` exposes only initialised bytes, so the read region is zero-filled
         // first.
-        packet.set_len(capacity);
+        packet.set_len(mtu);
         loop {
             let mut guard = self.fd.readable().await?;
             match guard.try_io(|fd| sys::read(fd.get_ref().as_fd(), packet.as_packet_mut())) {
@@ -423,10 +424,9 @@ fn check_ip(packet: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Room beyond the MTU each packet read from a device with a virtio-net header gets:
-/// the growth of an IPv4 packet translated to IPv6 with a fragment header, so an
-/// IPv4 <-> IPv6 translator can rewrite a full-size packet in place.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Room beyond the MTU each packet read from the device gets: the growth of an IPv4
+/// packet translated to IPv6 with a fragment header, so an IPv4 <-> IPv6 translator
+/// can rewrite a full-size packet in place.
 const TRANSLATION_SLACK: usize = 28;
 
 /// Bytes one read from a device with a virtio-net header may return: the header and the
@@ -946,5 +946,18 @@ mod tests {
         source.recv_batch(&mut batch).await.unwrap();
         let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
         assert_eq!(got, [udp.as_slice()]);
+    }
+
+    #[tokio::test]
+    async fn plain_reads_leave_room_to_grow() {
+        let (mut source, _sink, kernel) = device(Offload::default());
+        let full = packet(17, 1, 0, &[0x5a; 1500 - 28]);
+        assert_eq!(full.len(), 1500);
+        kernel.send(&full).unwrap();
+        // Like the virtio-net path, a full-MTU read gets the translation slack.
+        let got = source.recv().await.unwrap();
+        assert_eq!(got.as_packet(), full);
+        assert!(got.capacity() >= 1500 + TRANSLATION_SLACK);
+        assert_eq!(got.headroom(), nsplane::HEADROOM);
     }
 }
