@@ -52,6 +52,9 @@ pub const OVERLAP: &str = "translation fragment overlap";
 pub const EXPIRED: &str = "translation fragment expired";
 /// Reassembly is at its entry or byte limit.
 pub const BUDGET_EXCEEDED: &str = "translation fragment budget exceeded";
+/// A reassembled datagram would be larger than the translator's MTU once
+/// translated (see [`Translator::set_mtu`](crate::Translator::set_mtu)).
+pub const REASSEMBLED_TOO_BIG: &str = "translation reassembled datagram too big";
 /// The translated packet would be longer than any IPv6 packet.
 ///
 /// That is a 40-byte header and a 65535-byte payload. A packet that merely

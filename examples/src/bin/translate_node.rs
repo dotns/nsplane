@@ -330,6 +330,11 @@ mod unix {
             "dropped_out": stats.dropped_out,
             "dropped_in": stats.dropped_in,
             "reassembled": stats.reassembled,
+            "fragments_held": stats.fragments_held,
+            "fragment_timeouts": stats.fragment_timeouts,
+            "fragment_budget_drops": stats.fragment_budget_drops,
+            "fragment_marker_evictions": stats.fragment_marker_evictions,
+            "reassembled_too_big": stats.reassembled_too_big,
             "grown_copies": stats.grown_copies,
         })
     }
@@ -345,6 +350,7 @@ mod unix {
         // The table names peers by the ids the engine assigns when they are added, so the
         // translator starts empty (everything passes) and gets its table right after.
         let translator = Arc::new(Translator::new(TranslationTable::default()));
+        translator.set_mtu(args.tun.mtu);
         let engine_translator = SharedTranslator(Arc::clone(&translator));
         let node = build_engine_with(source, sink, &args.node, |builder| {
             builder.filter(Box::new(engine_translator))
