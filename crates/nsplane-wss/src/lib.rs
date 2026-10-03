@@ -2,6 +2,14 @@
 
 //! WebSocket-over-TLS (WSS) carriers for nsplane.
 //!
+//! Two carriers share one connection setup ([`WssConfig`]):
+//!
+//! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport),
+//!   below.
+//! - [`WssStreamClient`], the stream carrier: TCP streams ([`WssTcpStream`]) and UDP flows
+//!   ([`WssUdpFlow`]) to targets behind a WSS terminate, multiplexed over sessions with the
+//!   `WsFrame` protocol of the [`frame`] module (the wire of ns and NSGW).
+//!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each
 //! datagram is one binary WebSocket message carrying its raw bytes (no framing).
@@ -25,8 +33,8 @@
 //!   dropped and counted; a close frame or the end of the stream ends the link.
 //!
 //! TLS trust is the caller's: [`WssTls::Roots`] with the certificates to trust, or a
-//! complete [`rustls::ClientConfig`] in [`WssTls::Config`]. This crate bundles no system
-//! or web PKI roots.
+//! complete [`rustls::ClientConfig`] in [`WssTls::Config`] (see there for building one
+//! with the aws-lc-rs provider). This crate bundles no system or web PKI roots.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -45,15 +53,46 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The stream carrier on the same kind of configuration:
+//!
+//! ```no_run
+//! use nsplane_wss::{WssConfig, WssStreamClient, WssStreamLimits, WssTls};
+//! use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+//!
+//! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
+//! let config = WssConfig::new("wss://gateway.example/client", WssTls::Roots(roots));
+//! let client = WssStreamClient::new(config, WssStreamLimits::default())?;
+//!
+//! let mut stream = client.open_tcp("10.0.0.2:80".parse().unwrap()).await?;
+//! stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+//! stream.shutdown().await?;
+//! let mut reply = Vec::new();
+//! stream.read_to_end(&mut reply).await?;
+//!
+//! let mut dns = client.open_udp("10.0.0.2:53".parse().unwrap()).await?;
+//! dns.send(b"query").await?;
+//! let answer = dns.recv().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod config;
+mod connect;
 mod dialer;
+pub mod frame;
+mod stream;
 
 pub use config::{BearerProvider, WssConfig, WssTls};
 pub use dialer::{WssDialer, WssStats};
+pub use stream::{
+    MAX_DATA_PAYLOAD, WssStreamClient, WssStreamLimits, WssStreamStats, WssTcpStream, WssUdpFlow,
+};
 
-/// The longest datagram a message may carry; longer ones are dropped and counted.
+/// The longest datagram a message (or a UDP flow's DATA frame) may carry; longer ones are
+/// dropped and counted, or refused on send.
 pub const MAX_DATAGRAM: usize = 65_535;
 
-/// The longest WebSocket message or frame read at all; a longer one ends the link.
+/// The longest WebSocket message or frame read at all; a longer one ends the link or
+/// session.
 pub const MAX_MESSAGE: usize = 4 * MAX_DATAGRAM;
