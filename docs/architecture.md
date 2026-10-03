@@ -462,12 +462,9 @@ smoltcp on its own dispatch path.
   `Socket::new` derives the window-scale shift from its capacity (its bit length minus 16,
   at least 0), so the SYN and SYN-ACK carry a scale and initial window
   matching it with no further code. A window of more segments than the queues on the path
-  hold loses its tail when the peer sends it at once (see the field docs): in-process,
-  4 MiB buffers (about 3000 segments) overflow the receiving engine's 1024-packet queue
-  (`DROP_SINK_FULL`) in most runs and take a 1 s retransmission timeout, about 50 MB/s
-  against 250-450 MB/s for the default and 1 MiB; with 8192-packet engine and stack queues
-  4 MiB runs without drops. This is ns's MB-x5 knob and not the fix for the
-  throughput gap (MF-2): ns measured a 1 MiB window within noise of the default. ns's MB-x6
+  hold loses its tail when the peer sends it at once (see the field docs and
+  [Socket buffers (MB-x5)](#socket-buffers-mb-x5)). This is ns's MB-x5 knob and not the
+  fix for the throughput gap (MF-2). ns's MB-x6
   (counting SYNs refused for a full listener pool) needs no code here:
   `NetStackStats::syn_refused` counts them, for a pool sized by
   `NetStackConfig::listener_pool`.
@@ -602,6 +599,12 @@ stay in the same range: 1 % loss completes in 1.1-6.2 s (before 2.1-4.1 s; whole
 are retransmission timeouts), the bottleneck in 15.9-19.8 s (before 18.9-20.9 s), and 3 %
 loss stays timeout-bound right at the 60 s limit, as before.
 
+L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
+queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
+change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
+same harness stalled a connection for good in 2 of 20 runs at 8 connections and 512. The
+5C-T7 re-run of these cases is in [Performance](#performance).
+
 #### Single-stream profile (MF-2)
 
 Method: `tests/netstack_stream.rs` streams 1 GiB over one TCP connection, MTU 1420,
@@ -664,64 +667,113 @@ Fixes, without behavior change:
 Not adopted: draining egress after a pass while it sends (up to the backlog bound) cut
 the turns over engines from 355 k to 93 k and the yields to almost none, but it made the
 sender fill the receive window to its edge, where smoltcp trims data (see the window-edge
-item below): 2-5 % of the segments were retransmitted without any loss, and the direct
-pairing used more CPU. With that smoltcp issue fixed in a local prototype it retransmits
-0.6 % and saves another 2.6 % of instructions and 30 % of the context switches over
-engines, but did not raise the throughput (median 519 MB/s against 576 MB/s), so it stays out.
+item under *Known remaining costs*): 2-5 % of the segments were retransmitted without any
+loss, and the direct pairing used more CPU. With that smoltcp issue fixed in a local
+prototype it retransmits 0.6 % and saves another 2.6 % of instructions and 30 % of the
+context switches over engines, but did not raise the throughput (median 519 MB/s against
+576 MB/s), so it stays out.
 
-Before and after, five interleaved runs each of the stream loads (median [range], load
-13-18 on 32 cores; per GiB):
+Before and after: `main` against the branch, interleaved runs of the stream loads, median
+[range] per GiB, CPU time, instructions and context switches from `perf stat`. "First" is
+the window the fixes were measured in (five runs each, 1-minute load 13-18 on 32 cores);
+"final" is a fresh run of the merged workstream against `main` (2026-10-03, five runs
+each, load 20-29):
 
-| Stream | main | branch |
+| Stream | main, first | branch, first | main, final | branch, final |
+| --- | --- | --- | --- | --- |
+| Over engines, MB/s | 540 [498-545] | 576 [536-610] | 306 [187-330] | 309 [134-361] |
+| Over engines, CPU time | 5.99 s [5.90-6.41] | 5.50 s [5.29-6.03] | 10.08 s [9.51-11.22] | 9.34 s [8.88-10.59] |
+| Over engines, instructions | 39.45 G | 38.57 G | 39.41 G [39.37-39.43] | 38.49 G [38.43-38.60] |
+| Over engines, context switches | 448 k | 340 k | 555 k [480-603] | 431 k [396-473] |
+| Direct, MB/s | 2022 [1534-2144] | 1906 [1182-2377] | 1002 [628-1189] | 1162 [984-1254] |
+| Direct, CPU time | 0.87 s [0.86-1.32] | 1.00 s [0.82-1.71] | 1.82 s [1.61-1.88] | 1.60 s [1.54-1.74] |
+| Direct, instructions | 7.72 G [7.68-9.03] | 7.85 G [7.52-8.57] | 7.72 G [7.68-7.80] | 7.54 G [7.48-7.63] |
+
+Instruction counts are the stable measure: over engines the branch runs 2.2-2.3 % fewer
+(38.5-38.6 G against 39.4 G per GiB), with 7-8 % less CPU time and 22-24 % fewer
+context switches. Throughput follows the host load: at load 20-29 both builds reach about
+half of what they did at 13-18, and the branch's median is ahead by 1 % (final) to 7 %
+(first), inside the spread. The direct pairing has no sealing; the batched ingress saves
+2.3 % of its instructions in the final window and less than the run-to-run spread in the
+first.
+
+`netstack_lossy`'s throughput rows, three interleaved runs each (load 4-22 first, 17-37
+final), show no loss-recovery regression:
+
+| Case | main, first | branch, first | main, final | branch, final |
+| --- | --- | --- | --- | --- |
+| TCP, 64 MiB, no loss | 399 / 457 / 120 MB/s | 406 / 232 / 453 MB/s | 77 / 258 / 248 MB/s | 383 / 289 / 107 MB/s |
+| TCP, 16 MiB, 1 % loss | 1.08 / 2.08 / 0.18 s | 0.09 / 1.13 / 0.07 s | 1.28 / 1.13 / 4.19 s | 2.11 / 1.17 / 1.17 s |
+| TCP, 16 MiB, 3 % loss | 52.2 / 50.2 s, once not done after 60 s | 55.2 / 58.2 / 51.2 s | 57.2 s, twice not done after 60 s | 50.2 / 51.3 / 55.2 s |
+| TCP, 16 MiB, bottleneck | 14.9 / 23.9 / 21.9 s | 22.8 / 22.9 / 17.9 s | 21.8 / 17.9 / 20.9 s | 16.9 / 21.9 / 18.9 s |
+| UDP, 50 000 x 1200 B | 780 / 261 / 716 MB/s | 798 / 247 / 188 MB/s | 747 / 540 / 500 MB/s | 409 / 568 / 698 MB/s |
+
+The fixes do not touch retransmission: 3 % loss is timeout-bound right at the 60 s limit on
+both builds (main missed it three times in six runs, the branch never), and the other rows
+spread alike.
+
+#### Socket buffers (MB-x5)
+
+`NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (see [nsplane-netstack](#nsplane-netstack))
+size the window, and the window is a trade-off: a peer may send a whole window at once, and
+a window of more segments than the queues between the stacks hold loses its tail there.
+In-process that queue is the receiving engine's 1024-packet sink queue: the excess is
+dropped as `DROP_SINK_FULL`, and smoltcp recovers past the first lost segment of a window
+only by a retransmission timeout of at least 1 s (no SACK, no partial-ACK retransmission).
+`tests/netstack_buffers.rs` `throughput`, the branch only (`main` has no fields), three
+runs, release, load 17-31:
+
+| Buffers on both stacks | 64 MiB, MB/s, median [range] | `DROP_SINK_FULL` per run |
 | --- | --- | --- |
-| Over engines, MB/s | 540 [498-545] | 576 [536-610] |
-| Over engines, CPU time | 5.99 s [5.90-6.41] | 5.50 s [5.29-6.03] |
-| Over engines, instructions | 39.45 G | 38.57 G |
-| Over engines, context switches | 448 k | 340 k |
-| Direct, MB/s | 2022 [1534-2144] | 1906 [1182-2377] |
-| Direct, instructions | 7.72 G [7.68-9.03] | 7.85 G [7.52-8.57] |
+| Default, 512 segments (about 690 KiB) | 287 [200-336] | 0 |
+| 1 MiB | 315 [298-334] | 0 |
+| 4 MiB, about 3000 segments | 52 [37-53] | 101-312 |
 
-The direct pairing has no sealing and the batched ingress saves less than its run-to-run
-spread there. `netstack_lossy`'s throughput rows, three interleaved runs each (load
-4-22), show no loss-recovery regression:
+```text
+cargo test --release -p nsplane-e2e --test netstack_buffers -- --ignored --nocapture
+```
 
-| Case | main | branch |
-| --- | --- | --- |
-| TCP, 64 MiB, no loss | 399 / 457 / 120 MB/s | 406 / 232 / 453 MB/s |
-| TCP, 16 MiB, 1 % loss | 1.08 / 2.08 / 0.18 s | 0.09 / 1.13 / 0.07 s |
-| TCP, 16 MiB, 3 % loss | 52.2 / 50.2 s, once not done after 60 s | 55.2 / 58.2 / 51.2 s |
-| TCP, 16 MiB, bottleneck | 14.9 / 23.9 / 21.9 s | 22.8 / 22.9 / 17.9 s |
-| UDP, 50 000 x 1200 B | 780 / 261 / 716 MB/s | 798 / 247 / 188 MB/s |
+When the buffers were added (PS-BUF) the same load gave about 50 MB/s at 4 MiB against
+250-450 MB/s for the default and 1 MiB, and 4 MiB ran without drops once the engine and
+stack queues held 8192 packets. A larger window pays only on a path whose round trip needs
+it and whose queues match it, so the default stays at 512 segments. ns measured a 1 MiB
+window within noise of the default, so this knob is not the MF-2 fix.
 
-What remains is outside the crate:
+#### Known remaining costs (deferred)
 
-- smoltcp fork, `src/wire/ip.rs`, `checksum::data`: sum 8-byte words into a `u64` (or
-  16-bit words via `as_chunks::<2>` without the `try_into().unwrap()` per chunk) so the loop
-  vectorises; it is about 15 % of the stack's instructions.
-- smoltcp fork, `src/socket/tcp.rs`: the receiver checks segments against the window it
-  advertised last (`remote_last_ack + remote_last_win << shift`), and with window scaling
-  that right edge moves left by up to `2^shift - 1` bytes whenever a segment arrives
-  (the scaled window rounds down), so data the sender was allowed to send is trimmed and
-  retransmitted. Tracking the furthest edge advertised (updated where `remote_last_ack` and
-  `remote_last_win` are set in `ack_reply` and `dispatch`, for non-SYN segments; reset in
-  `reset`) and accepting up to it removed those retransmissions in a local prototype
-  (direct stream with egress drain: 4.5 % to 0.6 % extra segments; main's pacing already
-  stays near zero).
-- `nsplane-packet`: a way to set a pooled buffer's length without zero-filling it (smoltcp
-  writes every byte of a transmitted packet) would save the 4 % above.
-- `nsplane`: `ChannelTransport::recv` should not zero-fill its 64 KiB buffer per datagram;
-  it makes the engine pairing a test of the harness as much as of the stack.
+Decided for later, not in this workstream:
 
-MF-2's 12-14 % gap to ns's legacy stack was measured on ns's own path, whose WireGuard
-loop is not the nsplane engine, so this profile cannot split it; it shows the netstack at
-18 % of the engine pairing's instructions, of which the branch removed the per-segment
-reallocation and the per-packet queue locking.
-
-L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
-queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
-change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
-same harness stalled a connection for good in 2 of 20 runs at 8 connections and 512. The
-5C-T7 re-run of these cases is in [Performance](#performance).
+- smoltcp fork, a later fork round (the fork stays at `v0.14.0-nsplane.3` for now):
+  - `src/wire/ip.rs`, `checksum::data`: sum 8-byte words into a `u64` (or 16-bit words via
+    `as_chunks::<2>` without the `try_into().unwrap()` per chunk) so the loop vectorises; it
+    is about 15 % of the stack's instructions on the direct pairing.
+  - `src/socket/tcp.rs` (the receive window check, around line 1718): the receiver checks
+    segments against the window it advertised last
+    (`remote_last_ack + remote_last_win << shift`), and with window scaling that right
+    edge moves left by up to `2^shift - 1` bytes whenever a segment arrives (the scaled
+    window rounds down), so data the sender was allowed to send is trimmed and
+    retransmitted. Tracking the furthest edge advertised (updated where `remote_last_ack`
+    and `remote_last_win` are set in `ack_reply` and `dispatch`, for non-SYN segments;
+    reset in `reset`) and accepting up to it removed those retransmissions in a local
+    prototype (direct stream with egress drain: 4.5 % to 0.6 % extra segments; main's
+    pacing already stays near zero).
+  - SACK, or NewReno's retransmission on a partial ACK: today any loss past the first
+    segment of a window waits for a timeout of at least 1 s, which keeps 3 % loss at
+    50-60 s and large windows at about 50 MB/s above.
+- `nsplane-packet`: setting a pooled buffer's length without zero-filling it (smoltcp
+  writes every byte of a transmitted packet) would save about 4 % of the direct
+  instructions. It is a later design item: it would need `unsafe` in a
+  `forbid(unsafe_code)` crate.
+- `nsplane`: `ChannelTransport::recv` zero-fills its 64 KiB receive buffer per datagram
+  (7 % of the instructions, 9 % of the cycles over engines), which skews every in-process
+  engine benchmark, the over-engines numbers above included. It is to be fixed after the
+  PF campaign merges.
+- MF-2's 12-14 % gap to ns's legacy stack cannot be split in-process: it was measured on
+  ns's own path, whose legacy WireGuard loop is tunnel-wg's, not the nsplane engine. The
+  netstack is about 18 % of the engine pairing's instructions (and the fixes above removed
+  its per-segment reallocation and per-packet queue locking), so most of the gap is likely
+  the engine (MF-1). PB's netstack pair (`scripts/bench`) is not on `main` yet; MF-2 is to
+  be re-measured with PB's harness.
 
 ## nsplane-uapi and the CLI
 
@@ -1011,6 +1063,7 @@ cargo bench -p nsplane-core --bench data_path
 cargo bench -p nsplane-acl --bench namespaces
 cargo bench -p nsplane --bench worker_pool
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test netstack_stream -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 ```
 
@@ -1037,6 +1090,7 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
+| Netstack TCP stream (PS) | 1 GiB, one connection, over two engines / direct, median of 5, per GiB (2026-10-03, load 20-29) | 309 MB/s, 9.34 s CPU, 38.49 G instructions / 1162 MB/s, 7.54 G instructions | `main`: 306 MB/s, 10.08 s, 39.41 G / 1002 MB/s, 7.72 G; [Single-stream profile (MF-2)](#single-stream-profile-mf-2) |
 
 - Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
   `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The
@@ -1066,6 +1120,11 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 - Netstack. Without loss the stack is not the limit (same-build spread 320-460 MB/s TCP,
   470-900 MB/s UDP). At 3 % random loss smoltcp's timeout-bound recovery lands right at the
   test's 60 s limit (5C-T6 finished in 54-59 s); the 1 % case and the bottleneck complete.
+  On one 1 GiB stream the netstack is about 18 % of the engine pairing's instructions
+  (crypto 36 %); the PS fixes take 2.2-2.3 % of the instructions and 7-8 % of the CPU time
+  off it, and the rest of the stack's cost is smoltcp (see *Known remaining costs* under
+  [Netstack throughput](#netstack-throughput)). The gap to ns's legacy stack (MF-2) is to
+  be re-measured with PB's netstack pair.
 
 ### Engine batching under load
 
