@@ -1,6 +1,6 @@
 # 20261002-2240-phase5-nat-offload-perf Phase 5: translation and NAT, offload, performance
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-02 22:40
 - **approvedAt**: 2026-10-02 22:40 (user: run the roadmap to the end)
 - **relatedTask**: 20261002-1020-data-plane-core, 20261002-1509-phase1-followups
@@ -117,3 +117,10 @@ nsplane repository only; `/srv/dotns/ns` and `/srv/dotns/docs` read-only. Depend
   wire side to the local side, inbound runs in install order, outbound in reverse. The
   recommended stack [AclFilter, PortMap, Translator] keeps the ACL on overlay IPv6 addresses in
   both directions. Behaviour change for multi-filter users only; done in 5A-T3.
+- 2026-10-03: completed (campaign `nsplane-p5-202610022239`). Merges into main: 5C-T1 a2c0635,
+  5C-T1b 33445e0, examples fix d12c37b, 5C-T2 f46427f, 5A e60072b, 5B 02ff770, 5C 64131c7. Final
+  acceptance on main 64131c7: just check 887 tests, cross, test-windows, cargo doc, root
+  nsplane-tun/nsplane ignored tests, linux.sh, lib.sh (7), full examples.sh (12 matrix cells and all
+  scenarios) green. data_path: 64 B core 546 ns (device-equivalent 469, raw 358), 1420 B core 1.354
+  us (device-equivalent 1.282, raw 1.169). Accepted by the user: 64 B core overhead above 10 %
+  (deferred to a batched entry point), ACL bypass ~40 ns and established flow 51-55 ns.

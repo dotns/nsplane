@@ -450,3 +450,6 @@ scripts extended. ns is read-only for this plan.
      ordering kept. For nsplane: decide together with the optional crypto worker pool
      whether to shard `Core` by peer or hash flows to workers; the single owner task is
      the current limit.
+- 2026-10-03: Phases 1-5 are complete in this repository (plans 20261002-1535, 20261002-1725,
+  20261002-2240; main 64131c7). Phase 6 (ns migration of tunnel-wg and quick-runtime) and Phase 0
+  (ns pins nsplane) happen in ns and are not started here.

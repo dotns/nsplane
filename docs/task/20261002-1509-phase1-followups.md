@@ -145,6 +145,24 @@ entry point after 5B batching** (L1 decision: the 64 B target is accepted as not
 and the second peer lookup after the filter chain. The re-run on the merged 5C branch is in
 `docs/architecture.md` (*Performance*).
 
+Added after Phase 5 (2026-10-03), still open:
+14. **Exact send-error counting for batched UDP**: one failed `send_batch` call counts every
+    datagram it consumed; for `UdpTransport` a call that sent some GSO runs before a later run
+    failed over-counts. Needs `Transport::send_batch` to report failures (trait change).
+15. **QueueStats** does not cover the crypto worker-pool queues.
+16. **Fragmenter counters** (PTB / frag-needed sent, fragments made, no-route ICMP) are only
+    traced; expose them in drop_counters / stats.
+17. **Lock on the core path without workers**: each peer's `Tunn` is `Arc<Mutex<_>>` since the
+    worker pool; uncontended and measured as noise, but the pool-off path could avoid it.
+18. **Plain TUN read capacity**: the non-offload read buffer is MTU, so a full-MTU IPv4 packet
+    takes nsplane-nat's grown-copy path; give it MTU + 28.
+19. **smoltcp upstream**: two smoltcp 0.14 defects (pure-ACK SEQ after RTO rewind; zero-window
+    probe replacing the retransmit timer) are worked around in nsplane-netstack; random loss >= 2 %
+    stays RTO-bound (no SACK / NewReno). Report upstream (outward-facing; needs the user's go) and
+    drop the workarounds once fixed.
+20. **Zero-checksum fragmented IPv4 UDP** arriving out of order at the Translator cannot be
+    translated (locally fragmented datagrams get checksums filled).
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 
