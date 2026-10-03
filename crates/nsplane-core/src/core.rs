@@ -16,6 +16,7 @@ use nsplane_noise::x25519;
 use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
 
 use crate::filter::{PacketFilter, Verdict};
+use crate::job::{self, CryptoJob, Direction, Outcome};
 use crate::peer::Peer;
 use crate::peer_table::{PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
@@ -101,6 +102,72 @@ impl Core {
             Input::Datagram { path, data } => self.receive(path, data),
             Input::Local { packet } => self.send(packet, true),
             Input::Config(change) => self.configure(change, now),
+        }
+    }
+
+    /// Processes one input like [`Core::handle_input`], except that the encryption of a local
+    /// packet or the decryption of a received transport data message is returned as a job
+    /// instead of being run: run it anywhere with [`CryptoJob::run`], then hand it back with
+    /// [`Core::complete_job`]. Everything else (handshakes, configuration, packets that are
+    /// dropped before their cryptography) is processed at once and returns `None`.
+    pub fn handle_input_deferred(&mut self, input: Input, now: Instant) -> Option<CryptoJob> {
+        self.start_schedule(now);
+        match input {
+            Input::Datagram { path, data } => {
+                let (data, index) = self.classify(path, data)?;
+                let peer = self.peers.by_index(index).and_then(|id| {
+                    let tunnel = self.peers.peer(id)?.shared_tunnel();
+                    Some((id, tunnel))
+                });
+                let Some((id, tunnel)) = peer else {
+                    self.pool.put(data);
+                    self.dropped(None, reasons::UNKNOWN_SESSION);
+                    return None;
+                };
+                Some(CryptoJob::new(id, tunnel, data, Direction::Open { path }))
+            }
+            Input::Local { packet } => {
+                let (id, packet, len) = self.prepare_send(packet, true)?;
+                let Some(peer) = self.peers.peer(id) else {
+                    self.pool.put(packet);
+                    return None;
+                };
+                let tunnel = peer.shared_tunnel();
+                Some(CryptoJob::new(id, tunnel, packet, Direction::Seal { len }))
+            }
+            Input::Config(change) => {
+                self.configure(change, now);
+                None
+            }
+        }
+    }
+
+    /// Finishes a job from [`Core::handle_input_deferred`], running it first if it has not
+    /// run; the results are queued for [`Core::poll_output`] as with [`Core::handle_input`].
+    /// A job whose peer was removed in the meantime is discarded.
+    pub fn complete_job(&mut self, mut job: CryptoJob) {
+        let outcome = job.take_outcome();
+        let id = job.peer;
+        match job.direction {
+            Direction::Seal { .. } => match self.peers.peer_mut(id) {
+                Some(peer) => sealed(
+                    &mut self.outputs,
+                    &mut self.pool,
+                    self.policy.as_ref(),
+                    id,
+                    peer,
+                    job.buf,
+                    outcome,
+                ),
+                None => self.pool.put(job.buf),
+            },
+            Direction::Open { path } => {
+                let len = job.buf.len();
+                match self.opened(id, path, len, outcome) {
+                    Some(plain_len) => self.deliver_opened(id, job.buf, plain_len),
+                    None => self.pool.put(job.buf),
+                }
+            }
         }
     }
 
@@ -227,6 +294,13 @@ impl Core {
         })
     }
 
+    /// The peer a packet to `dst` is routed to: the longest allowed-IP match, as on the send
+    /// path. Use it to pick the `peer` of [`Core::inject_inbound`] for a locally generated
+    /// reply about a packet to `dst`.
+    pub fn route(&self, dst: IpAddr) -> Option<PeerId> {
+        self.peers.by_destination(dst)
+    }
+
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
     /// allowed-IP source check.
     pub fn inject_inbound(&mut self, peer: PeerId, packet: PacketBuf) {
@@ -252,10 +326,10 @@ impl Core {
         }
 
         let mut buf = self.pool.get_len(BUF_SIZE);
-        match p
-            .tunnel
-            .format_handshake_initiation(&mut buf.with_headroom_mut()[HEADROOM..], true)
-        {
+        let initiation = p
+            .tunnel()
+            .format_handshake_initiation(&mut buf.with_headroom_mut()[HEADROOM..], true);
+        match initiation {
             TunnResult::WriteToNetwork(packet) => {
                 let len = packet.len();
                 buf.set_len(len);
@@ -353,20 +427,29 @@ impl Core {
 
     /// Handles a datagram from `path`.
     fn receive(&mut self, path: Path, data: PacketBuf) {
+        if let Some((data, index)) = self.classify(path, data) {
+            self.receive_data(path, data, index);
+        }
+    }
+
+    /// Handles a datagram from `path` unless it is transport data, which is returned with its
+    /// receiver index.
+    fn classify(&mut self, path: Path, data: PacketBuf) -> Option<(PacketBuf, u32)> {
         let data_index = match Tunn::parse_incoming_packet(data.as_packet()) {
             Ok(Packet::PacketData(p)) => Some(p.receiver_idx),
             Ok(_) => None,
             Err(_) => {
                 self.pool.put(data);
-                return self.dropped(None, reasons::INVALID_PACKET);
+                self.dropped(None, reasons::INVALID_PACKET);
+                return None;
             }
         };
         if let Some(index) = data_index {
-            self.receive_data(path, data, index);
-        } else {
-            self.receive_handshake(path, data.as_packet());
-            self.pool.put(data);
+            return Some((data, index));
         }
+        self.receive_handshake(path, data.as_packet());
+        self.pool.put(data);
+        None
     }
 
     /// Decrypts transport data in place and delivers it in the datagram's buffer.
@@ -374,6 +457,12 @@ impl Core {
         let Some((id, plain_len)) = self.open(path, &mut data, receiver_idx) else {
             return self.pool.put(data);
         };
+        self.deliver_opened(id, data, plain_len);
+    }
+
+    /// Delivers the `plain_len` bytes of plaintext opened in `data` from peer `id`, after
+    /// the inbound filters.
+    fn deliver_opened(&mut self, id: PeerId, mut data: PacketBuf, plain_len: usize) {
         // The plaintext lies behind the data header: move the packet start past it. A
         // decrypted datagram is longer than its header, so this does not fail.
         if data.advance(DATA_HEADER_SZ).is_err() {
@@ -415,28 +504,34 @@ impl Core {
             self.dropped(None, reasons::UNKNOWN_SESSION);
             return None;
         };
-        let peer = self.peers.peer_mut(id)?;
         let len = data.len();
-        let (plain_len, src) =
-            match peer
-                .tunnel
-                .decapsulate_in_place(Some(path.addr), data.as_packet_mut(), len)
-            {
-                TunnResult::Done => (0, None),
-                TunnResult::WriteToTunnelV4(packet, src) => (packet.len(), Some(IpAddr::V4(src))),
-                TunnResult::WriteToTunnelV6(packet, src) => (packet.len(), Some(IpAddr::V6(src))),
-                TunnResult::Err(e) => {
-                    tracing::debug!(message = "Decapsulate error", error = ?e);
-                    self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
-                    return None;
-                }
-                TunnResult::WriteToNetwork(_) => {
-                    tracing::debug!("Unexpected result from decapsulate");
-                    return None;
-                }
-            };
+        let outcome = job::open(&mut self.peers.peer(id)?.tunnel(), path, data);
+        self.opened(id, path, len, outcome)
+            .map(|plain_len| (id, plain_len))
+    }
+
+    /// Accounts for a datagram of `len` bytes from `path` that peer `id`'s tunnel opened
+    /// with `outcome`; returns the plaintext length if it carries a packet to deliver.
+    fn opened(&mut self, id: PeerId, path: Path, len: usize, outcome: Outcome) -> Option<usize> {
+        let (plain_len, src, handshakes) = match outcome {
+            Outcome::Opened {
+                plain_len,
+                src,
+                handshakes,
+            } => (plain_len, src, handshakes),
+            Outcome::Failed(e) => {
+                tracing::debug!(message = "Decapsulate error", error = ?e);
+                self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
+                return None;
+            }
+            Outcome::Sealed(_) | Outcome::Queued | Outcome::Unexpected => {
+                tracing::debug!("Unexpected result from decapsulate");
+                return None;
+            }
+        };
+        let peer = self.peers.peer_mut(id)?;
         peer.add_rx(len as u64);
-        let completed = peer.take_completed_handshakes();
+        let completed = peer.take_handshakes_up_to(handshakes);
 
         let kind = if src.is_some() {
             MessageKind::Data
@@ -457,7 +552,7 @@ impl Core {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
         }
-        Some((id, plain_len))
+        Some(plain_len)
     }
 
     /// Verifies a handshake message with the handshake gate, finds its peer and lets the
@@ -527,10 +622,10 @@ impl Core {
             return self.pool.put(reply);
         };
 
-        let reply_len = match p
-            .tunnel
-            .handle_verified_packet(packet, &mut reply.with_headroom_mut()[HEADROOM..])
-        {
+        let verified = p
+            .tunnel()
+            .handle_verified_packet(packet, &mut reply.with_headroom_mut()[HEADROOM..]);
+        let reply_len = match verified {
             TunnResult::Done => None,
             TunnResult::WriteToNetwork(packet) => Some(packet.len()),
             TunnResult::Err(e) => {
@@ -561,30 +656,59 @@ impl Core {
     }
 
     /// Encrypts a local packet in place and transmits it to the peer it is routed to.
-    fn send(&mut self, mut packet: PacketBuf, filter: bool) {
+    fn send(&mut self, packet: PacketBuf, filter: bool) {
+        let Some((id, mut packet, len)) = self.prepare_send(packet, filter) else {
+            return;
+        };
+        let Some(peer) = self.peers.peer_mut(id) else {
+            return self.pool.put(packet);
+        };
+        let outcome = job::seal(&mut peer.tunnel(), &mut packet, len);
+        sealed(
+            &mut self.outputs,
+            &mut self.pool,
+            self.policy.as_ref(),
+            id,
+            peer,
+            packet,
+            outcome,
+        );
+    }
+
+    /// Routes a local packet, runs the outbound filters with `filter` and lays the packet out
+    /// for sealing in place; returns its peer, its buffer and its length.
+    fn prepare_send(
+        &mut self,
+        mut packet: PacketBuf,
+        filter: bool,
+    ) -> Option<(PeerId, PacketBuf, usize)> {
         let Some(id) =
             Tunn::dst_address(packet.as_packet()).and_then(|dst| self.peers.by_destination(dst))
         else {
             self.pool.put(packet);
-            return self.dropped(None, reasons::NO_ROUTE);
+            self.dropped(None, reasons::NO_ROUTE);
+            return None;
         };
 
         if filter {
-            for f in &self.filters {
+            // Onion order: the chain is installed from the wire side to the local side, so
+            // local packets meet it in reverse.
+            for f in self.filters.iter().rev() {
                 match f.outbound(id, &mut packet) {
                     Verdict::Accept => {}
                     Verdict::Drop { reason } => {
                         self.pool.put(packet);
-                        return self.dropped(Some(id), reason);
+                        self.dropped(Some(id), reason);
+                        return None;
                     }
-                    Verdict::Handled => return self.pool.put(packet),
+                    Verdict::Handled => {
+                        self.pool.put(packet);
+                        return None;
+                    }
                 }
             }
         }
 
-        let Some(peer) = self.peers.peer_mut(id) else {
-            return self.pool.put(packet);
-        };
         let len = packet.len();
         // The datagram is sealed in place with its data header in the headroom, so it starts
         // where it is written. The tail needs room for the tag and the padding, or for a
@@ -598,37 +722,7 @@ impl Core {
             self.pool.put(mem::replace(&mut packet, copy));
         }
         packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
-        let sealed_len = match peer
-            .tunnel
-            .encapsulate_in_place(packet.as_packet_mut(), len)
-        {
-            TunnResult::WriteToNetwork(datagram) => datagram.len(),
-            TunnResult::Done => {
-                // Queued behind a handshake in progress.
-                return self.pool.put(packet);
-            }
-            TunnResult::Err(e) => {
-                tracing::debug!(message = "Encapsulate error", error = ?e);
-                self.pool.put(packet);
-                return self.dropped(Some(id), reasons::ENCAPSULATE_ERROR);
-            }
-            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
-                tracing::debug!("Unexpected result from encapsulate");
-                return self.pool.put(packet);
-            }
-        };
-
-        packet.set_len(sealed_len);
-        let kind = message_kind(packet.as_packet());
-        transmit(
-            &mut self.outputs,
-            &mut self.pool,
-            self.policy.as_ref(),
-            id,
-            peer,
-            kind,
-            packet,
-        );
+        Some((id, packet, len))
     }
 
     /// Transmits the packets the tunnel of `peer` queued while it had no session.
@@ -638,10 +732,10 @@ impl Core {
         };
         loop {
             let mut buf = self.pool.get_len(BUF_SIZE);
-            let TunnResult::WriteToNetwork(packet) =
-                peer.tunnel
-                    .decapsulate(None, &[], &mut buf.with_headroom_mut()[HEADROOM..])
-            else {
+            let queued =
+                peer.tunnel()
+                    .decapsulate(None, &[], &mut buf.with_headroom_mut()[HEADROOM..]);
+            let TunnResult::WriteToNetwork(packet) = queued else {
                 return self.pool.put(buf);
             };
             let len = packet.len();
@@ -669,7 +763,7 @@ impl Core {
         if completed > 0 {
             peer.expired = false;
             let rtt = (kind == MessageKind::HandshakeResponse)
-                .then(|| peer.tunnel.stats().4)
+                .then(|| peer.tunnel().stats().4)
                 .flatten()
                 .map(|ms| Duration::from_millis(u64::from(ms)));
             handshakes_completed(&mut self.outputs, id, completed, Some(path), rtt);
@@ -720,6 +814,38 @@ impl Core {
         self.outputs
             .push_back(Output::Event(Event::Dropped { peer, reason }));
     }
+}
+
+/// Transmits the local packet that peer `id`'s tunnel sealed in `packet` with `outcome`.
+fn sealed(
+    outputs: &mut VecDeque<Output>,
+    pool: &mut PacketPool,
+    policy: &dyn PathPolicy,
+    id: PeerId,
+    peer: &mut Peer,
+    mut packet: PacketBuf,
+    outcome: Outcome,
+) {
+    let sealed_len = match outcome {
+        Outcome::Sealed(len) => len,
+        // Queued behind a handshake in progress.
+        Outcome::Queued => return pool.put(packet),
+        Outcome::Failed(e) => {
+            tracing::debug!(message = "Encapsulate error", error = ?e);
+            pool.put(packet);
+            return outputs.push_back(Output::Event(Event::Dropped {
+                peer: Some(id),
+                reason: reasons::ENCAPSULATE_ERROR,
+            }));
+        }
+        Outcome::Opened { .. } | Outcome::Unexpected => {
+            tracing::debug!("Unexpected result from encapsulate");
+            return pool.put(packet);
+        }
+    };
+    packet.set_len(sealed_len);
+    let kind = message_kind(packet.as_packet());
+    transmit(outputs, pool, policy, id, peer, kind, packet);
 }
 
 /// Queues `data` for peer `id` on the path the policy selects for `kind`, or on the peer's
@@ -849,5 +975,32 @@ mod tests {
         let id = core.peer_id(&key).unwrap();
         assert_eq!(core.peers().collect::<Vec<_>>(), [id]);
         assert_eq!(core.peer_stats(id).unwrap().public_key, key);
+    }
+
+    #[test]
+    fn routes_by_the_longest_allowed_ip_match() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let mut add = |key: [u8; 32], allowed: &[&str]| {
+            let key = x25519::PublicKey::from(key);
+            let mut config = PeerConfig::new(key);
+            config.allowed_ips = allowed.iter().map(|a| a.parse().unwrap()).collect();
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            key
+        };
+        let wide = add([7; 32], &["10.0.0.0/8", "fd00::/8"]);
+        let narrow = add([8; 32], &["10.1.0.0/16"]);
+        let wide = core.peer_id(&wide).unwrap();
+        let narrow = core.peer_id(&narrow).unwrap();
+
+        assert_eq!(core.route("10.2.0.1".parse().unwrap()), Some(wide));
+        assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
+        assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
+        assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
     }
 }

@@ -21,7 +21,8 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 | `crates/nsplane-packet/` | `nsplane-packet` | Packet buffers, IP header views and shared value types; no I/O |
 | `crates/nsplane-core/`   | `nsplane-core`   | Sans-I/O WireGuard engine core: peers, cryptokey routing, timers, path policy, filters |
 | `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, per-source rule namespaces, directed grants, outbound rules and app pinholes, and the `AclFilter` and `FlowTracker` packet filters |
-| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
+| `crates/nsplane-nat/`    | `nsplane-nat`    | IPv4/IPv6 translation (`Translator`, RFC 7915) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
+| `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp (TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
@@ -40,7 +41,9 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 
 Runnable programs in [`examples/`](examples/README.md) (package `nsplane-examples`, not
 published) show how the crates fit together: TUN and netstack nodes, a hybrid local side, an
-ACL gateway, app sessions on ACL namespaces and pinholes, host bridges by fd or channels,
+ACL gateway, app sessions on ACL namespaces and pinholes, IPv4 applications reaching
+IPv6-only peers (`translate_node`), services published by DNAT/SNAT (`port_map`), host
+bridges by fd or channels,
 events and stats, and a single-port relay with its client transport over UDP and WebSocket
 over TLS. Every example has `--help`:
 
@@ -76,6 +79,25 @@ nsplane = { path = "../nsplane/crates/nsplane" }
 nsplane-tun = { path = "../nsplane/crates/nsplane-tun" }
 nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 ```
+
+## Tuning
+
+The engine's packet queues hold 1024 packets each by default
+(`EngineBuilder::queue_capacity`), measured to leave 1.5x headroom over a single bulk TCP
+flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
+`take_queue_stats` restarts the marks: a mark at its capacity together with
+`DROP_SINK_FULL` or `DROP_TRANSMIT_FULL` in `EngineHandle::drop_counters` means the queue is
+too small for the load (raise `queue_capacity`, e.g. to 2048 for many parallel bulk flows
+through a userspace netstack); marks far below the capacity mean it can shrink. See
+[docs/architecture.md](docs/architecture.md#queue-depths) for the measurements.
+
+By default one owner task encrypts and decrypts every packet. A hub with several busy peers
+can spread that work over a pool of worker tasks with `EngineBuilder::crypto_workers(n)`
+(`n` of 2 or more; 0 or 1 is the default single task). The pool is sharded by peer, so
+each peer's packets keep their order, and it only helps on a multi-threaded tokio runtime
+with traffic from several peers: one peer's packets always go to one worker. See
+[docs/architecture.md](docs/architecture.md#crypto-worker-pool) for the design and the
+throughput note.
 
 ## Building
 

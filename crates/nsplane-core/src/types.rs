@@ -347,7 +347,8 @@ pub struct CoreConfig {
     pub private_key: Option<x25519::StaticSecret>,
     /// Path selection and roaming decisions.
     pub policy: Box<dyn PathPolicy>,
-    /// Filters run in order on every plaintext packet.
+    /// Filters run on every plaintext packet, installed from the wire side to the local side:
+    /// in this order on decrypted packets, in reverse on local packets.
     pub filters: Vec<Box<dyn PacketFilter>>,
     /// Handshakes per second tolerated before replying with cookies.
     pub handshake_rate_limit: u64,

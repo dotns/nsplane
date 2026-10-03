@@ -47,3 +47,6 @@ pub const TRANSPORT_CLOSED: &str = "transport closed";
 /// Emitted by the driver: a datagram queued for a transport was dropped because the
 /// transport was removed.
 pub const TRANSPORT_REMOVED: &str = "transport removed";
+/// Emitted by the driver: the transport failed to send a datagram (any I/O error, such as a
+/// datagram too large for the path).
+pub const TRANSPORT_SEND_ERROR: &str = "transport send error";

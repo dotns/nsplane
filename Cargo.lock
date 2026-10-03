@@ -1050,6 +1050,7 @@ dependencies = [
 name = "nsplane"
 version = "0.8.0"
 dependencies = [
+ "criterion",
  "nix",
  "nsplane-core",
  "nsplane-packet",
@@ -1109,6 +1110,7 @@ dependencies = [
  "nsplane",
  "nsplane-acl",
  "nsplane-core",
+ "nsplane-nat",
  "nsplane-netstack",
  "nsplane-packet",
  "nsplane-tun",
@@ -1132,6 +1134,7 @@ dependencies = [
  "nsplane",
  "nsplane-acl",
  "nsplane-core",
+ "nsplane-nat",
  "nsplane-netstack",
  "nsplane-noise",
  "nsplane-packet",
@@ -1148,6 +1151,16 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nsplane-nat"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "nsplane-core",
+ "nsplane-packet",
+ "thiserror",
 ]
 
 [[package]]

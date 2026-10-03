@@ -145,6 +145,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning `BoundsError` instead of panicking.
 - `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
   re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
+- `nsplane-nat`: IPv4/IPv6 translation and service-publishing NAT as `PacketFilter`s. The
+  address model is a validated, immutable `TranslationTable` (`TranslationTableBuilder`):
+  every peer owns a /127 IPv6 group (`node6`, `node4`) presented locally as `alias4` and
+  optionally `alias6`, this node as `self4 <-> node4`, and IPv4 LAN prefixes paired with IPv6
+  /96 prefixes. `Translator` translates statelessly as RFC 7915 describes (`alias4 <-> node4`,
+  `self4 <-> node4`, `alias6 <-> node6`, `lan4 <-> lan6`; ICMP/ICMPv6 including the packet
+  quoted in errors, fragments, incremental checksums), swaps its table atomically
+  (`Translator::store`) and counts in `TranslatorStats`; a fragmented IPv4 UDP datagram
+  without a checksum is reassembled first, and completes only when its first fragment
+  arrives first. A translated packet needs 20 bytes of spare buffer capacity (28 with a
+  fragment header). Each peer's allowed IPs must contain its `alias4/32`, its LAN IPv4
+  prefixes, `alias6`, `node4`, `node6` and its `lan6` prefixes, since the core routes and
+  checks sources before the filters run. `PortMap` publishes local services by DNAT/SNAT
+  (`PortMapRule`, optionally per peer, with ICMP errors rewritten) on a bounded `Conntrack`
+  (LRU eviction, per-protocol idle timeouts with TCP state, injectable clock). The
+  `checksum` module has RFC 1624 incremental update helpers.
+- `nsplane`: an optional fragmentation stage on the local path,
+  `EngineBuilder::fragmenter(FragmentConfig)`, keeps local packets within the source MTU
+  before they enter the core: oversized IPv6 is answered with an ICMPv6 Packet Too Big,
+  oversized IPv4 with an ICMP Fragmentation Needed (DF set) or split into fragments (DF
+  clear). The IPv4 ceiling is the MTU for native destinations and MTU - 20 (fragments
+  sized for MTU - 28) for destinations `FragmentConfig::translated` marks as translated
+  (e.g. `Translator::ipv4_translated_predicate`), whose zero UDP checksums are filled in
+  before splitting. Errors are delivered as coming from the peer the destination routes to
+  and are rate-limited (burst 10, then 5 per second).
+- `nsplane-core`: `Core::route(dst)` returns the peer a packet to `dst` is routed to (the
+  longest allowed-IP match), e.g. for the `peer` of `Core::inject_inbound`.
+- `nsplane-examples`: `translate_node` (a TUN node with a `Translator`: `--self`, `--map`,
+  `--lan`) and `port_map` (a TUN node with a `PortMap`: `--publish`, conntrack timeouts and
+  `--max-flows`); `just e2e-examples` scenarios `translate_node` (an IPv4-only client
+  container behind the translating node reaches an IPv6-only kernel WireGuard peer) and
+  `port_map`.
+- `nsplane-e2e`: `translate`, `port_map` (including the full
+  `[AclFilter, PortMap, Translator]` stack) and `fragment` tests between engines.
+- `nsplane-acl`: the ACL as a per-flow hook. `AclEngine::generation` increases on every
+  published change; `AclFilter` caches each peer's resolved principal and the verdict of each
+  TCP/UDP flow's first packet from a namespace member in its reply table, under the policy and identity
+  generations, so established flows skip the evaluation; peers whose namespaces (or the
+  default policy) accept everything bypass it. `PeerIdentity::generation` (default 0: not
+  cached) versions identities, and `PeerIdentityMap` bumps it on every change. Verdicts are
+  the same as a full evaluation (differential test). New counters
+  `AclFilterStats::pending_evictions` and `verdict_evictions`; `nsplane-e2e` `acl_hook`
+  tests. The reply, pending and fragment tables evict their least recently seen (fragments:
+  oldest) entry in O(1) instead of scanning the full table.
+- `nsplane`: `EngineHandle::queue_stats` reports the capacity and high-water mark of every
+  bounded queue of the engine (`QueueStats`, `QueueDepth`: commands, local packets,
+  received datagrams, deliveries, recycled buffers, the transmit queues and backlogs, events);
+  `take_queue_stats` also restarts the marks for windowed measurements. The owner task keeps
+  the marks without locks or atomics. Measured defaults: the queue capacity stays at 1024
+  and the command queue at 64 (see docs/architecture.md, "Queue depths").
+- `nsplane`: optional crypto worker pool, `EngineBuilder::crypto_workers(n)` (off by
+  default; 0 or 1 keeps the cryptography on the owner task). With 2 or more workers the
+  encryption of local packets and the decryption of received transport data run on `n`
+  worker tasks, sharded by peer, so each peer's packets keep their order in both directions
+  while different peers are encrypted in parallel; routing, filters, handshakes, timers,
+  counters and events stay on the owner task, and handle calls that read or change peers or
+  counters wait for the packets with the workers (see docs/architecture.md, "Crypto worker
+  pool").
+- `nsplane-core`: `Core::handle_input_deferred` returns the encryption or decryption of a
+  data packet as a `CryptoJob` (`Send`, locks only its peer's tunnel) to run on another
+  thread with `CryptoJob::run`; `Core::complete_job` finishes it in the core.
 
 ### Changed
 - Breaking: `Engine` and `EngineHandle` (and `EngineBuilder`'s third parameter) lose their
@@ -204,6 +265,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `DROP_TRANSPORT_REMOVED` (`nsplane_core::reasons::TRANSPORT_REMOVED`) instead of
   dropping them silently; `replace_transport` carries them over to the new transport in
   order.
+- `nsplane`: every datagram a transport fails to send (any I/O error, e.g. `EMSGSIZE`) is
+  counted under the new `DROP_TRANSPORT_SEND_ERROR`
+  (`nsplane_core::reasons::TRANSPORT_SEND_ERROR`) and published as `Event::Dropped` instead
+  of only being logged. The transmit tasks report failures through a shared counter and a
+  wake signal to the owner task; successful sends take no extra work.
 - Breaking: `nsplane-core`'s `Input::Datagram` takes the datagram by value
   (`data: PacketBuf`) and `Input` loses its lifetime parameter. The core consumes the
   datagram: a packet it carries is decrypted in place and delivered in the same buffer
@@ -212,6 +278,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the data header in their headroom (copied into a pooled buffer only when the headroom is
   smaller than the data header), and the timers, queue flushes and handshake replies no
   longer zero-fill their buffers on every use.
+- Behaviour change: `nsplane-core`'s `PacketFilter` chain is an onion. Filters are installed
+  from the wire side to the local side; decrypted packets run through them in install order
+  and local (outbound) packets in reverse install order. The recommended stack is
+  `[AclFilter, PortMap, Translator]`, so the ACL and the port map see overlay IPv6 in both
+  directions. Chains whose filters depend on running in install order outbound must be
+  reviewed.
 - `nsplane-netstack`: every TCP socket runs CUBIC congestion control (smoltcp feature
   `socket-tcp-cubic`). A bulk transfer through a hop that drops part of a window (a full
   socket buffer on a loaded host) no longer stalls on doubling retransmission timeouts:
