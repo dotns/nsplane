@@ -15,6 +15,7 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 nsplane-core = { path = "../nsplane-core", version = "0.8.0" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
 quinn-udp = { version = "0.6.3", default-features = false, features = ["tracing"] }
@@ -23,7 +24,6 @@ tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
 tracing = "0.1.40"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-bytes = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["net", "uio"] }
 
 [dev-dependencies]

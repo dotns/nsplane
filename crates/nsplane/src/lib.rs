@@ -9,7 +9,8 @@
 //! peer's [`Path`] names the transport its datagrams use. [`EngineBuilder::transport`] adds
 //! the initial ones and [`EngineHandle`] adds, removes and replaces them at runtime.
 //! [`DynTransport`] is the object-safe form of [`Transport`] for code that has to hold
-//! transports of different types in one place.
+//! transports of different types in one place. A [`UdpTransport`] can share its socket
+//! with another protocol through a side channel ([`UdpTransport::with_side_channel`]).
 //!
 //! For a hybrid local side (a TUN device next to a userspace netstack), [`Splitter`]
 //! routes delivered packets to one of several sinks and [`MergeSource`] merges several
@@ -51,4 +52,4 @@ pub use nsplane_packet::{
 };
 pub use splitter::Splitter;
 pub use transport::{BoxFuture, DynTransport, Transport};
-pub use udp::UdpTransport;
+pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};

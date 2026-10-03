@@ -147,3 +147,32 @@ covered by `nsplane-e2e`'s `path_hooks::a_handshake_can_start_on_a_candidate_wit
 User decisions: D10 a generic message-link transport (no WebSocket dependency in nsplane);
 ME-1 and ME-2 (SNAT and DNAT) both in nsplane-nat; MD is evaluated, not implemented, this
 round. MB-x, MC and ME run as a BKD campaign (plan 20261003-1600-ns-dataplane-moves).
+
+### MD assessment (L1, 2026-10-03; not implemented this round)
+
+What moves: ns `tunnel-wg/src/node_l3*` (about 3.2k lines plus 2.3k lines of tests:
+target-bound Node/Service/Subnet grants, source binding, same-owner rule, a stateful flow
+table with per-protocol idle timeouts and per-peer/global limits, orphan fragments, ICMP
+errors matched to flows, Legacy/Observe/Enforce modes), the account `AccountFilter`
+(340 lines, the composition and the IPv6 destination checks) and the `crates/acl` call
+path (`acl_check_packet`, `FragmentAclGate`). `nsplane-acl` (9.1k lines) already has the
+`crates/acl` policy model, matcher, merge, deny scope, fragment gate, reply table,
+namespaces, grants, pinholes and the flow hook.
+
+| Item | Size | Notes |
+|---|---|---|
+| MD-1 per-packet source principal | small-medium | `PeerIdentity` gains a per-source assertion; the flow cache key and the bypass computation must include it |
+| MD-3 divert verdict | small | needs the L3 gate's gateway-consumer candidate, so it lands with MD-2 |
+| MD-4 fragment parity | small-medium | keying (src, dst, proto, id), TTL and miss = drop, next to today's first-fragment gate |
+| MD-5 bypass flags | small | `accept_to_local`, `accept_icmp_echo_reply`; prove `stateful_replies: false` equals `crates/acl` with a differential test |
+| MD-6 destination authorization | small in the core | a per-peer `inbound_destinations` check mirrors the existing source check; the outbound "route owner" check disappears when ns expresses leases as allowed IPs |
+| MD-2 Node L3 gate | large | port the gate as its own module (tests carry the semantics); an nsplane-side config model mirroring `NodeL3Config` (nsplane cannot depend on ns `control`); an ordered composition where an enforced allow skips the L4 ACL (one combined filter, since `Verdict` has no final-accept); its locks and state tables need the ACL hook treatment to stay off the hot path |
+
+Main risks: semantic parity of the gate (mitigated by porting its tests and a differential
+test against the ns implementation on recorded packets), per-packet cost of the stateful
+gate, and keeping `nsplane-acl` usable without the account-specific parts (the gate stays
+optional and off by default).
+
+Recommendation: its own plan after this round, two workstreams: MD-A (MD-1, 4, 5, 6 and the
+`crates/acl` parity tests) and MD-B (MD-2 with MD-3 and the composition). Until M6, ns keeps
+`AccountFilter` (option A in the M4 plan).
