@@ -68,6 +68,8 @@ Status: `extra.splitter.misrouted`, `extra.netstack`. Needs root.
 
 Flags: node, echo and check flags, `--tun-name <NAME>` (default `nsp0`), `--tun-address <CIDR>`
 (repeatable), `--stack-address <CIDR>` (repeatable, required), `--mtu <N>` (default 1420).
+`--no-offload` opens a plain TUN device and binds UDP without GSO/GRO; the startup log shows
+`offload=` and `udp_offload=`.
 
 ```sh
 sudo cargo run -p nsplane-examples --bin hybrid -- --private-key-file a.key --tun-address 10.0.0.1/24 --stack-address 10.1.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32+10.1.0.2/32 --echo-port 7
@@ -134,6 +136,8 @@ repeatable), `--gateway-id <ID>` (carried in reflexive responses, default `relay
 `--wss-listen <IP:PORT>`, `--wss-name <NAME>`, `--wss-cert-out <PATH>`. The subcommand
 `gen-machine-key <PATH>` writes a new machine key (base64 Ed25519 seed, mode 0600; an existing
 file is not overwritten) and prints its public key.
+`--no-offload` binds the relay's UDP socket without GSO/GRO; the startup log shows
+`udp_offload=`.
 
 ```sh
 cargo run -p nsplane-examples --bin relay_server -- gen-machine-key a.machine   # prints the public key
@@ -297,7 +301,7 @@ sudo cargo run -p nsplane-examples --bin app_session -- --tun nsp-app --status a
 | `--peer <SPEC>` | repeatable; `<base64 pubkey>[,endpoint=<host:port>][,allowed-ips=<cidr>[+<cidr>...]][,keepalive=<secs>][,psk-file=<path>]` |
 | `--status-file <PATH>` | write a JSON status snapshot every second |
 | `--log <FILTER>` | stderr log filter, default `info` (e.g. `nsplane=debug,info`) |
-| `--no-offload` | turn segmentation offload off (on by default): TUN nodes (`tun_node`, `fd_bridge`, `acl_gateway`) open a plain TUN device, and the UDP socket runs without GSO/GRO. The startup log names the modes in use: `offload=tso,uso` / `offload=off` for the TUN, `udp_offload=gso,gro` / `udp_offload=off` for UDP |
+| `--no-offload` | turn segmentation offload off (on by default): TUN nodes (`tun_node`, `fd_bridge`, `acl_gateway`, `hybrid`) open a plain TUN device, and the UDP socket (also `relay_server`'s) runs without GSO/GRO. The startup log names the modes in use: `offload=tso,uso` / `offload=off` for the TUN, `udp_offload=gso,gro` / `udp_offload=off` for UDP |
 | `--transport <udp\|relay\|wss>` | transport to run, default `udp`; `relay` and `wss` take the flags under [relay_transport](#relay_transport) |
 
 ### Echo and checks (`EchoArgs`)
@@ -368,7 +372,10 @@ both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
 extension against a plain WireGuard server), `app_session` (self-checks), `app_session_tun`
 (`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status),
 `offload_fallback` (`tun_node --no-offload` against kernel WireGuard: the checks of
-`tun_kernel` on the plain TUN device and UDP without GSO/GRO), `offload_iperf` (`tun_node`
+`tun_kernel` on the plain TUN device and UDP without GSO/GRO), `offload_fallback_hybrid`
+(`hybrid --no-offload`: the checks of `hybrid`), `offload_fallback_relay` (`relay_server`
+and two `tun_node`s over relay UDP, all with `--no-offload`: one UDP check through the
+relay), each asserting `offload=off` / `udp_offload=off` in the startup logs, `offload_iperf` (`tun_node`
 against kernel WireGuard with offload on and with `--no-offload`: 5 s iperf3 runs of TCP and
 UDP in both directions; passes when every run moved data and prints the Mbit/s of all 8
 runs, UDP loss reported but not gated). The run ends with the matrix and the scenario list
