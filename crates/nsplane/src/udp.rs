@@ -62,11 +62,10 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// - Receive (Linux and Android, `UDP_GRO`): the kernel may coalesce datagrams of one sender
 ///   into one read, a train of equally sized datagrams of which the last may be shorter.
 ///   [`recv_batch`](Transport::recv_batch) hands out each one as a slice of the read
-///   ([`PacketBuf::from_shared`]) with [`HEADROOM`](nsplane_packet::HEADROOM) bytes in
-///   front, where the engine opens it in place. The first datagram of a read is not
-///   copied; the others are moved apart within the read buffer to make that room (one
-///   move per train, no allocation). [`recv`](Transport::recv) copies one datagram into
-///   the caller's buffer and keeps the rest of the train for the next receive.
+///   ([`PacketBuf::from_shared`]) at the offset it was read to, without headroom, where
+///   the engine opens it in place: no datagram of a train is copied.
+///   [`recv`](Transport::recv) copies one datagram into the caller's buffer and keeps the
+///   rest of the train for the next receive.
 /// - Send (Linux and Android `UDP_SEGMENT`, Windows USO):
 ///   [`send_batch`](Transport::send_batch) sends a run of consecutive datagrams to the same
 ///   address with the same ECN mark and of the same size (the last may be shorter) as one
@@ -474,7 +473,7 @@ mod linux {
     use nix::sys::socket::{
         ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, sendmsg,
     };
-    use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH, PacketBuf, Path};
+    use nsplane_packet::{Ecn, MAX_BATCH, PacketBuf, Path};
     use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
     use socket2::SockRef;
     use tokio::io::Interest;
@@ -606,50 +605,35 @@ mod linux {
         }
 
         /// Reads one datagram or train into the shared storage and queues its datagrams,
-        /// each a zero-copy slice of the storage with [`HEADROOM`] bytes in front.
-        ///
-        /// The read lands [`HEADROOM`] bytes into the storage, so its first datagram stays
-        /// where it was read. The core opens a datagram in place behind exactly
-        /// [`HEADROOM`] bytes, so the later datagrams of a train are moved apart within the
-        /// storage to make that room: one move per train and no allocation. Once the core
-        /// opens at any headroom, they can be sliced where they were read.
+        /// each a zero-copy slice of the storage at the offset it was read to (no headroom).
         async fn read_coalesced(&self, state: &UdpSocketState) -> io::Result<()> {
-            // A full read spread into the most datagrams the kernel coalesces.
-            let room = HEADROOM + READ + state.gro_segments() * HEADROOM;
             self.socket
                 .async_io(Interest::READABLE, || {
                     let mut rx = self.rx();
                     let rx = &mut *rx;
-                    if rx.buf.len() < room {
+                    if rx.buf.len() < READ {
                         // Reuses the allocation once every slice of it is gone. Twice the
-                        // room, so small datagrams take many reads per refill.
+                        // read, so small datagrams take many reads per refill.
                         rx.buf.clear();
-                        rx.buf.resize(2 * room, 0);
+                        rx.buf.resize(2 * READ, 0);
                     }
                     let mut meta = [RecvMeta::default()];
-                    let mut bufs = [IoSliceMut::new(&mut rx.buf[HEADROOM..HEADROOM + READ])];
+                    let mut bufs = [IoSliceMut::new(&mut rx.buf[..READ])];
                     state.recv(UdpSockRef::from(&self.socket), &mut bufs, &mut meta)?;
                     let meta = meta[0];
                     let path = self.path(meta.addr, ecn(&meta));
                     let stride = meta.stride.clamp(1, READ);
                     let count = meta.len.div_ceil(stride).max(1);
-                    if (count + 1) * HEADROOM + meta.len > rx.buf.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "more coalesced datagrams than announced",
-                        ));
-                    }
                     let len = |i: usize| stride.min(meta.len - i * stride);
-                    // Last first: datagram `i` moves `i * HEADROOM` bytes up.
-                    for i in (1..count).rev() {
-                        let from = HEADROOM + i * stride;
-                        rx.buf.copy_within(from..from + len(i), from + i * HEADROOM);
-                    }
                     for i in 0..count {
-                        let slot = rx.buf.split_to(HEADROOM + len(i));
-                        let datagram = PacketBuf::from_shared(slot, HEADROOM, len(i))
-                            .map_err(io::Error::other)?;
-                        rx.pending.push_back((path, datagram));
+                        let slot = rx.buf.split_to(len(i));
+                        match PacketBuf::from_shared(slot, 0, len(i)) {
+                            Ok(datagram) => rx.pending.push_back((path, datagram)),
+                            Err(e) => {
+                                debug_assert!(false, "datagram slice out of bounds: {e}");
+                                tracing::debug!(message = "Dropped coalesced datagram", error = %e);
+                            }
+                        }
                     }
                     Ok(())
                 })
@@ -1420,7 +1404,8 @@ mod tests {
     }
 
     /// `from` sends a segmented train of each size with ECT(0) to `to`, which receives it
-    /// in one read where both ends coalesce: slices of one buffer, [`HEADROOM`] apart.
+    /// in one read where both ends coalesce: slices of one buffer where they were read,
+    /// without a copy.
     async fn segmented_to_coalesced(
         from: &UdpTransport,
         from_addr: SocketAddr,
@@ -1433,12 +1418,13 @@ mod tests {
             let calls = recv_batches(to, datagrams.len()).await;
             if coalescing(from, to) {
                 assert_eq!(calls.len(), 1, "size {size}: one coalesced read");
-                for pair in calls[0].windows(2) {
-                    let (first, next) = (pair[0].1.as_packet(), pair[1].1.as_packet());
-                    assert_eq!(pair[1].1.headroom(), HEADROOM);
+                let first = calls[0][0].1.as_packet().as_ptr().addr();
+                for (i, (_, datagram)) in calls[0].iter().enumerate() {
+                    assert_eq!(datagram.headroom(), 0, "size {size}: datagram {i}");
                     assert_eq!(
-                        first.as_ptr().addr() + size + HEADROOM,
-                        next.as_ptr().addr()
+                        datagram.as_packet().as_ptr().addr(),
+                        first + i * size,
+                        "size {size}: datagram {i} is not where it was read"
                     );
                 }
             }
