@@ -3,6 +3,12 @@
 //! both directions at once arrives intact and in order per flow, and the engines' counters
 //! agree with each other and with what was sent. Bursts of [`WINDOW`] packets each way rely
 //! on the transport's default socket buffers.
+//!
+//! As root (`CAP_NET_ADMIN`), [`fragmentation_follows_bind_time_offload`] lowers the MTU of
+//! `lo`: a datagram above it leaves in fragments and arrives whole from a transport bound
+//! without offload, and fails to send with `EMSGSIZE` from one bound with offload. Run it
+//! alone (`-- --ignored`), as the lower MTU affects every other test in the network
+//! namespace.
 
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -212,4 +218,73 @@ async fn bulk_transfer_ipv6_offload_on() -> TestResult {
 #[tokio::test]
 async fn bulk_transfer_ipv6_offload_off() -> TestResult {
     bulk_over(IpAddr::V6(Ipv6Addr::LOCALHOST), false).await
+}
+
+/// The MTU `lo` gets for [`fragmentation_follows_bind_time_offload`]; the minimum for IPv6.
+#[cfg(target_os = "linux")]
+const LOW_MTU: u16 = 1280;
+
+/// Sets the MTU of `lo` with `ip link`.
+#[cfg(target_os = "linux")]
+fn set_lo_mtu(mtu: &str) -> TestResult {
+    let status = std::process::Command::new("ip")
+        .args(["link", "set", "dev", "lo", "mtu", mtu])
+        .status()?;
+    if !status.success() {
+        return Err(format!("ip link set dev lo mtu {mtu}: {status}").into());
+    }
+    Ok(())
+}
+
+/// Sends a datagram larger than [`LOW_MTU`] over `ip` from a transport bound with and one
+/// bound without offload.
+#[cfg(target_os = "linux")]
+async fn oversized_datagram(ip: IpAddr) -> TestResult {
+    use nsplane::Transport;
+    use nsplane_packet::{Ecn, Path};
+
+    let bind = |id, offload| {
+        UdpTransport::bind_with_offload(TransportId::new(id), SocketAddr::new(ip, 0), offload)
+    };
+    let receiver = bind(1, false)?;
+    let datagram = payload(2 * usize::from(LOW_MTU));
+    let to = Path {
+        transport: TransportId::new(0),
+        addr: receiver.local_addr(),
+        ecn: Ecn::NotEct,
+    };
+
+    // Without offload the kernel fragments it, and reassembles it on receive.
+    let plain = bind(2, false)?;
+    plain.send(&datagram, &to).await?;
+    let mut buf = PacketBuf::with_capacity(4 * usize::from(LOW_MTU));
+    let (len, path) = timeout(WAIT, receiver.recv(&mut buf)).await??;
+    if buf.as_packet() != datagram.as_slice() || path.addr != plain.local_addr() {
+        return Err(format!("{ip}: got {len} bytes from {}", path.addr).into());
+    }
+
+    // With offload (and still with offload turned off) fragmentation is off.
+    let offload = bind(3, true)?;
+    for enabled in [true, false] {
+        offload.set_offload(enabled)?;
+        match offload.send(&datagram, &to).await {
+            Err(e) if e.raw_os_error() == Some(nix::libc::EMSGSIZE) => {}
+            other => return Err(format!("{ip}, offload {enabled}: sent {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN"]
+async fn fragmentation_follows_bind_time_offload() -> TestResult {
+    let before = std::fs::read_to_string("/sys/class/net/lo/mtu")?;
+    set_lo_mtu(&LOW_MTU.to_string())?;
+    let mut result = oversized_datagram(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    if result.is_ok() {
+        result = oversized_datagram(IpAddr::V6(Ipv6Addr::LOCALHOST)).await;
+    }
+    set_lo_mtu(before.trim())?;
+    result
 }
