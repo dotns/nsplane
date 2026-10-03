@@ -41,4 +41,3 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261002-1529-repo-cleanup-layout Remove unused files and move crates under `crates/`**](20261002-1529-repo-cleanup-layout.md) `P2`
 - [x] [**20261003-1300-ns-m4-requests Engine hooks requested by ns account mode (M4)**](20261003-1300-ns-m4-requests.md) `P1`
 - [-] [**20261003-1500-ns-dataplane-moves Data-plane pieces ns still owns, to move into nsplane**](20261003-1500-ns-dataplane-moves.md) `P1`
-- [ ] [**20261003-1500-ns-dataplane-moves Data-plane pieces ns still owns, to move into nsplane**](20261003-1500-ns-dataplane-moves.md) `P1`
