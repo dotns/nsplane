@@ -1,6 +1,6 @@
 //! Synchronous packet filters run by the core on the plaintext side.
 
-use nsplane_packet::{PacketBuf, PeerId};
+use nsplane_packet::{PacketBuf, Path, PeerId};
 
 /// What a [`PacketFilter`] decided about a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,17 @@ pub enum Verdict {
 pub trait PacketFilter: Send + Sync + 'static {
     /// Decrypted packet from `peer`, before it is delivered. May rewrite it in place.
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict;
+
+    /// Decrypted packet from `peer` that arrived on `from`, before it is delivered; what the
+    /// core calls for every decrypted datagram. The default ignores the path and calls
+    /// [`PacketFilter::inbound`]; a filter that answers on the path a packet came from (a
+    /// probe responder, say) overrides this one. A wrapper around another filter should
+    /// forward both.
+    fn inbound_from(&self, peer: PeerId, from: &Path, packet: &mut PacketBuf) -> Verdict {
+        let _ = from;
+        self.inbound(peer, packet)
+    }
+
     /// Local packet routed to `peer`, before it is encrypted. May rewrite it in place.
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict;
 }

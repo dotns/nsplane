@@ -1,7 +1,7 @@
 //! The stack, its source and sink halves, its handle and the driver task.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -114,8 +114,9 @@ impl NetStack {
             notify,
             stats: Arc::clone(&stats),
             carried: None,
-            next_tcp_port: EPHEMERAL_START,
-            next_udp_port: EPHEMERAL_START,
+            next_tcp_port: random_ephemeral(),
+            next_udp_port: random_ephemeral(),
+            waiting: VecDeque::new(),
             epoch: Instant::now(),
         };
         tokio::spawn(driver.run());
@@ -182,6 +183,8 @@ impl PacketSink for NetStackSink {
 enum Command {
     Connect {
         remote: SocketAddr,
+        /// The local port, or `None` for an ephemeral one.
+        local_port: Option<u16>,
         reply: oneshot::Sender<io::Result<TcpConnection>>,
     },
     Bind {
@@ -237,9 +240,33 @@ impl NetStackHandle {
     /// [`io::ErrorKind::TimedOut`] if it does not answer within 20 seconds and
     /// [`io::ErrorKind::BrokenPipe`] once the stack stopped.
     pub async fn connect_tcp(&self, remote: SocketAddr) -> io::Result<TcpConnection> {
+        self.connect(remote, None).await
+    }
+
+    /// Opens a TCP connection from the stack's `local_port` to `remote`, like
+    /// [`connect_tcp`](Self::connect_tcp) (port `0` picks an ephemeral port). Fails with
+    /// [`io::ErrorKind::AddrInUse`] if a connection or listener of the stack uses the port.
+    pub async fn connect_tcp_from(
+        &self,
+        local_port: u16,
+        remote: SocketAddr,
+    ) -> io::Result<TcpConnection> {
+        self.connect(remote, (local_port != 0).then_some(local_port))
+            .await
+    }
+
+    async fn connect(
+        &self,
+        remote: SocketAddr,
+        local_port: Option<u16>,
+    ) -> io::Result<TcpConnection> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::Connect { remote, reply })
+            .send(Command::Connect {
+                remote,
+                local_port,
+                reply,
+            })
             .await
             .map_err(|_| stack_gone())?;
         response.await.map_err(|_| stack_gone())?
@@ -490,6 +517,9 @@ struct Driver {
     out: UdpOut,
     accept_tcp: mpsc::Sender<TcpConnection>,
     accept_udp: mpsc::Sender<UdpFlow>,
+    /// Accepted connections waiting for room in `accept_tcp`, oldest first; only with
+    /// `accept_backpressure`.
+    waiting: VecDeque<TcpConnection>,
     notify: Arc<Notify>,
     stats: Arc<Counters>,
     /// A packet taken while waiting, replayed into the next batch so listener demand is
@@ -577,6 +607,7 @@ impl Driver {
 
     /// Takes up to [`MAX_INJECT_PER_ITER`] ingress packets; `None` once the sink is gone.
     fn ingest_batch(&mut self) -> Option<HashMap<u16, usize>> {
+        self.flush_waiting();
         let mut demand = HashMap::new();
         if let Some(packet) = self.carried.take() {
             self.ingest(packet, &mut demand);
@@ -596,6 +627,10 @@ impl Driver {
         match classify(packet.as_packet(), &self.settings) {
             Ok(Class::Tcp { dst_port, syn }) => {
                 if syn {
+                    if self.accept_full() {
+                        // Unanswered, the peer retransmits it once the queue may have room.
+                        return stats::add(&self.stats.syn_deferred, 1);
+                    }
                     *demand.entry(dst_port).or_insert(0) += 1;
                 }
                 self.device.inject(packet);
@@ -702,7 +737,11 @@ impl Driver {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Connect { remote, reply } => match self.open_connect(remote) {
+            Command::Connect {
+                remote,
+                local_port,
+                reply,
+            } => match self.open_connect(remote, local_port) {
                 Ok(handle) => self.connecting.push(Connecting {
                     handle,
                     reply,
@@ -728,8 +767,12 @@ impl Driver {
         }
     }
 
-    /// Starts a handshake to `remote`.
-    fn open_connect(&mut self, remote: SocketAddr) -> io::Result<SocketHandle> {
+    /// Starts a handshake to `remote` from `local_port`, or an ephemeral port.
+    fn open_connect(
+        &mut self,
+        remote: SocketAddr,
+        local_port: Option<u16>,
+    ) -> io::Result<SocketHandle> {
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -742,9 +785,18 @@ impl Driver {
                 "the stack has no address of the remote's family",
             )
         })?;
-        let port = self
-            .ephemeral_tcp_port()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port"))?;
+        let port = match local_port {
+            Some(port) if self.tcp_ports_in_use().contains(&port) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "local port already in use",
+                ));
+            }
+            Some(port) => port,
+            None => self.ephemeral_tcp_port().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port")
+            })?,
+        };
         let mut socket = new_tcp_socket(self.settings.tcp_buffer());
         socket.set_timeout(Some(CONNECT_TIMEOUT));
         socket
@@ -757,19 +809,21 @@ impl Driver {
         Ok(self.sockets.add(socket))
     }
 
-    /// The next ephemeral port no connection or listener uses.
-    fn ephemeral_tcp_port(&mut self) -> Option<u16> {
-        let used: HashSet<u16> = self
-            .conns
+    /// The local ports of the stack's TCP connections (open or opening) and listeners.
+    fn tcp_ports_in_use(&self) -> HashSet<u16> {
+        self.conns
             .keys()
             .chain(self.connecting.iter().map(|connecting| &connecting.handle))
             .filter_map(|&handle| self.sockets.get::<tcp::Socket<'_>>(handle).local_endpoint())
             .map(|endpoint| endpoint.port)
-            .collect();
-        let listeners = &self.listeners;
-        next_ephemeral(&mut self.next_tcp_port, |port| {
-            !used.contains(&port) && !listeners.contains_key(&port)
-        })
+            .chain(self.listeners.keys().copied())
+            .collect()
+    }
+
+    /// The next ephemeral port no connection or listener uses.
+    fn ephemeral_tcp_port(&mut self) -> Option<u16> {
+        let used = self.tcp_ports_in_use();
+        next_ephemeral(&mut self.next_tcp_port, |port| !used.contains(&port))
     }
 
     /// Binds a UDP socket, see [`NetStackHandle::bind_udp`].
@@ -838,9 +892,46 @@ impl Driver {
                 remote = %connection.peer_addr(),
                 "TCP connection accepted"
             );
-            if self.accept_tcp.try_send(connection).is_err() {
+            self.offer(connection);
+        }
+    }
+
+    /// Whether new TCP connections are held back: with `accept_backpressure`, while
+    /// connections wait or `incoming_tcp` is full.
+    fn accept_full(&self) -> bool {
+        self.settings.accept_backpressure
+            && (!self.waiting.is_empty() || self.accept_tcp.capacity() == 0)
+    }
+
+    /// Hands `connection` to `incoming_tcp`; when it is full, keeps it waiting with
+    /// `accept_backpressure` and closes it otherwise.
+    fn offer(&mut self, connection: TcpConnection) {
+        if !self.waiting.is_empty() && self.settings.accept_backpressure {
+            return self.waiting.push_back(connection);
+        }
+        match self.accept_tcp.try_send(connection) {
+            Ok(()) => {}
+            Err(TrySendError::Full(connection)) if self.settings.accept_backpressure => {
+                self.waiting.push_back(connection);
+            }
+            Err(_) => {
                 tracing::debug!(target: "netstack", "incoming_tcp full or gone; closing");
                 stats::add(&self.stats.tcp_not_accepted, 1);
+            }
+        }
+    }
+
+    /// Moves waiting connections into `incoming_tcp` while it has room.
+    fn flush_waiting(&mut self) {
+        while let Some(connection) = self.waiting.pop_front() {
+            match self.accept_tcp.try_send(connection) {
+                Ok(()) => {}
+                Err(TrySendError::Full(connection)) => {
+                    return self.waiting.push_front(connection);
+                }
+                Err(TrySendError::Closed(_)) => {
+                    stats::add(&self.stats.tcp_not_accepted, 1);
+                }
             }
         }
     }
@@ -973,6 +1064,7 @@ impl Driver {
             return true;
         }
         let backlog = !self.device.tx_queue.is_empty();
+        let waiting = !self.waiting.is_empty();
         let has_commands = self.commands.is_some();
         let command = tokio::select! {
             packet = self.ingress.recv() => match packet {
@@ -992,6 +1084,12 @@ impl Driver {
                 tracing::debug!(target: "netstack", "source dropped; stopping");
                 return false;
             }
+            permit = self.accept_tcp.reserve(), if waiting => {
+                if let (Ok(permit), Some(connection)) = (permit, self.waiting.pop_front()) {
+                    permit.send(connection);
+                }
+                return true;
+            }
             permit = self.egress.reserve(), if backlog => match permit {
                 Ok(permit) => {
                     if let Some(packet) = self.device.tx_queue.pop_front() {
@@ -1009,6 +1107,15 @@ impl Driver {
         }
         true
     }
+}
+
+/// A random port of the ephemeral range, where a stack starts handing out ports, so that
+/// stacks (and restarts) do not reuse the same ports in the same order.
+fn random_ephemeral() -> u16 {
+    let span = u64::from(u16::MAX - EPHEMERAL_START) + 1;
+    let offset = RandomState::new().build_hasher().finish() % span;
+    // `offset` < `span` <= 2^16, so it fits, and the sum stays within the range.
+    EPHEMERAL_START.saturating_add(u16::try_from(offset).unwrap_or(0))
 }
 
 /// Takes the next port from `cursor` (cycling through the ephemeral range) that `free`

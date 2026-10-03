@@ -1004,6 +1004,11 @@ impl Owner {
                 self.drain(false);
                 let _ = reply.send(());
             }
+            Command::InjectOutboundOn(peer, path, packet, reply) => {
+                self.core.inject_outbound_on(peer, path, packet, now());
+                self.drain(false);
+                let _ = reply.send(());
+            }
             Command::ForceHandshake(peer, path, reply) => {
                 self.core.force_handshake(peer, path, now());
                 self.drain(false);
@@ -1347,8 +1352,10 @@ const fn settles(command: &Command) -> bool {
             | Command::Peers(..)
             | Command::InjectInbound(..)
             | Command::InjectOutbound(..)
+            | Command::InjectOutboundOn(..)
             | Command::ForceHandshake(..)
             | Command::DropCounters(..)
+            | Command::Status(..)
     )
 }
 

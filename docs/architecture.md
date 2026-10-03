@@ -36,10 +36,10 @@ where it is described below.
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket` | `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
-| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound`, `force_handshake`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`) and `PacketFilter` (`inbound`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_*`, `force_handshake`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport` | `UdpTransport`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport` | `UdpTransport`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
-| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `checksum` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
@@ -82,6 +82,22 @@ decrypted packet's source is checked against the peer's allowed IPs before them,
 that rewrite addresses need those addresses in the peers' allowed IPs. `Core::route` exposes
 the routing decision, e.g. to pick the peer `Core::inject_inbound` delivers a locally
 generated reply as.
+
+Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
+
+- `Core::inject_outbound_on` (`EngineHandle::inject_outbound_on`) seals one packet for a
+  peer in its current session and transmits it on an explicit path, bypassing routing, the
+  outbound filters and `PathPolicy::select`; the peer's path is not changed. It is how probes
+  reach a candidate path while the peer's traffic stays on its path. Without a current
+  session the packet is dropped as `reasons::NO_SESSION` and no handshake starts.
+- `PacketFilter::inbound_from` is what the core calls for every decrypted datagram, with the
+  path it arrived on; its default calls `inbound`. A probe responder overrides it to match a
+  reply with the exact tuple it probed, or to answer on the path a request came from.
+- `PathPolicy::observe_every_message` (read once when the core is built, `false` by default)
+  makes the core call `on_authenticated` for every authenticated message, on the current path
+  too, where the answer changes nothing; by default the core asks only about messages from
+  another path, which keeps the steady-state data path free
+  of the call. `Event::Authenticated` stays limited to path changes.
 
 `handle_input_deferred` is the same entry point for a driver that encrypts on several
 threads: the cryptography of a local packet or a received transport data message comes back
@@ -385,6 +401,14 @@ smoltcp on its own dispatch path.
 
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
   `NetStackConfig`); the sink waits while ingress is full.
+- A full accept queue closes new TCP connections (`tcp_not_accepted`) by default. With
+  `NetStackConfig::accept_backpressure`, bare SYNs are left unanswered while it is full
+  (`syn_deferred`; the peer retransmits) and connections that completed their handshake
+  meanwhile wait in the stack, bounded by the listener pool, until the application accepts
+  them.
+- `connect_tcp` takes an ephemeral port; `connect_tcp_from` a caller-chosen one (`AddrInUse`
+  when a connection or listener of the stack has it). Ephemeral TCP and UDP ports start at a
+  random point of 49152-65535 per stack and then go up in order.
 - Everything the stack discards is counted per reason in `NetStackHandle::stats`
   (`NetStackStats`): malformed, foreign or unsupported packets, refused SYNs, connections
   and flows not accepted, full UDP queues, the flow limit, and egress produced while the

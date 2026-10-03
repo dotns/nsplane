@@ -109,6 +109,8 @@ impl Lookups {
 pub struct Core {
     peers: PeerTable,
     policy: Box<dyn PathPolicy>,
+    /// [`PathPolicy::observe_every_message`], read once.
+    observe_every_message: bool,
     filters: Vec<Box<dyn PacketFilter>>,
     stats_interval: Option<Duration>,
     pool: PacketPool,
@@ -138,6 +140,7 @@ impl Core {
         }
         Self {
             peers,
+            observe_every_message: config.policy.observe_every_message(),
             policy: config.policy,
             filters: config.filters,
             stats_interval: config.stats_interval,
@@ -307,7 +310,7 @@ impl Core {
                 let len = job.buf.len();
                 let slot = self.peers.slot(id);
                 match self.opened(id, slot, path, len, outcome, &mut Lookups::default()) {
-                    Some(plain_len) => self.deliver_opened(id, slot, job.buf, plain_len),
+                    Some(plain_len) => self.deliver_opened(id, slot, path, job.buf, plain_len),
                     None => self.pool.put(job.buf),
                 }
             }
@@ -455,6 +458,50 @@ impl Core {
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
         self.send(packet, false, &mut Lookups::default());
+    }
+
+    /// Encrypts `packet` for `peer` in its current session and transmits it on `path`
+    /// (unmarked ECN), bypassing routing, the outbound filters and [`PathPolicy::select`]:
+    /// e.g. a probe on a candidate path while the peer's traffic stays on its path, which is
+    /// not changed. The tunnel counts it as sent data like any packet. Without a current
+    /// session the packet is dropped as [`reasons::NO_SESSION`], neither queued nor a reason
+    /// to start a handshake. Unknown peers are ignored.
+    pub fn inject_outbound_on(
+        &mut self,
+        peer: PeerId,
+        path: Path,
+        packet: PacketBuf,
+        now: Instant,
+    ) {
+        self.start_schedule(now);
+        let Some(slot) = self.peers.slot(peer) else {
+            return self.pool.put(packet);
+        };
+        let Some(p) = self.peers.at_mut(slot) else {
+            return self.pool.put(packet);
+        };
+        if !p.tunnel_mut().has_session() {
+            self.pool.put(packet);
+            return self.dropped(Some(peer), reasons::NO_SESSION);
+        }
+        let (mut packet, len) = self.layout_for_sealing(packet);
+        let Some(p) = self.peers.at_mut(slot) else {
+            return self.pool.put(packet);
+        };
+        let outcome = job::seal(&mut p.tunnel_mut(), &mut packet, len);
+        let path = Path {
+            ecn: Ecn::NotEct,
+            ..path
+        };
+        sealed(
+            &mut self.outputs,
+            &mut self.pool,
+            &Fixed(path),
+            peer,
+            p,
+            packet,
+            outcome,
+        );
     }
 
     /// Starts a handshake with `peer` now, even if one is in progress. A `path` becomes the
@@ -613,7 +660,7 @@ impl Core {
         let len = data.len();
         let outcome = job::open(&mut peer.tunnel_mut(), path, &mut data);
         match self.opened(id, Some(slot), path, len, outcome, lookups) {
-            Some(plain_len) => self.deliver_opened(id, Some(slot), data, plain_len),
+            Some(plain_len) => self.deliver_opened(id, Some(slot), path, data, plain_len),
             None => self.pool.put(data),
         }
     }
@@ -638,11 +685,12 @@ impl Core {
     }
 
     /// Delivers the `plain_len` bytes of plaintext opened in `data` from peer `id` at `slot`,
-    /// after the inbound filters.
+    /// received on `path`, after the inbound filters.
     fn deliver_opened(
         &mut self,
         id: PeerId,
         slot: Option<usize>,
+        path: Path,
         mut data: PacketBuf,
         plain_len: usize,
     ) {
@@ -656,7 +704,7 @@ impl Core {
         let mut packet = data;
 
         for filter in &self.filters {
-            match filter.inbound(id, &mut packet) {
+            match filter.inbound_from(id, &path, &mut packet) {
                 Verdict::Accept => {}
                 Verdict::Drop { reason } => {
                     self.pool.put(packet);
@@ -712,8 +760,10 @@ impl Core {
         } else {
             MessageKind::Keepalive
         };
-        // Steady state (no completed handshake, same source) has nothing to report or adopt.
+        // Steady state (no completed handshake, same source) has nothing to report or adopt,
+        // unless the policy observes every message.
         if completed > 0
+            || self.observe_every_message
             || !peer
                 .path()
                 .is_some_and(|current| same_route(&current, &path))
@@ -894,6 +944,12 @@ impl Core {
             }
         }
 
+        let (packet, len) = self.layout_for_sealing(packet);
+        Some((id, slot, packet, len))
+    }
+
+    /// Lays a local packet out for sealing in place; returns its buffer and its length.
+    fn layout_for_sealing(&mut self, mut packet: PacketBuf) -> (PacketBuf, usize) {
         let len = packet.len();
         // The datagram is sealed in place with its data header in the headroom, so it starts
         // where it is written. The tail needs room for the tag and the padding, or for a
@@ -907,7 +963,7 @@ impl Core {
             self.pool.put(mem::replace(&mut packet, copy));
         }
         packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
-        Some((id, slot, packet, len))
+        (packet, len)
     }
 
     /// Transmits the packets the tunnel of `peer` queued while it had no session.
@@ -955,11 +1011,17 @@ impl Core {
         }
 
         // Cookie replies are not authenticated by the peer's keys and never move the path.
-        if !roams(kind)
-            || peer
-                .path()
-                .is_some_and(|current| same_route(&current, &path))
+        if !roams(kind) {
+            return;
+        }
+        if peer
+            .path()
+            .is_some_and(|current| same_route(&current, &path))
         {
+            if self.observe_every_message {
+                // Already the peer's path: the answer changes nothing.
+                let _ = self.policy.on_authenticated(id, &path, kind);
+            }
             return;
         }
         self.outputs.push_back(Output::Event(Event::Authenticated {
@@ -998,6 +1060,19 @@ impl Core {
     fn dropped(&mut self, peer: Option<PeerId>, reason: &'static str) {
         self.outputs
             .push_back(Output::Event(Event::Dropped { peer, reason }));
+    }
+}
+
+/// A policy that sends everything on one path, for [`Core::inject_outbound_on`].
+struct Fixed(Path);
+
+impl PathPolicy for Fixed {
+    fn select(&self, _peer: PeerId, _kind: MessageKind) -> Option<Path> {
+        Some(self.0)
+    }
+
+    fn on_authenticated(&self, _peer: PeerId, _from: &Path, _kind: MessageKind) -> Roam {
+        Roam::Keep
     }
 }
 

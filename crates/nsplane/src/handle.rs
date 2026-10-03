@@ -190,6 +190,7 @@ pub(crate) enum Command {
     PrivateKey(oneshot::Sender<Option<StaticSecret>>),
     InjectInbound(PeerId, PacketBuf, oneshot::Sender<()>),
     InjectOutbound(PacketBuf, oneshot::Sender<()>),
+    InjectOutboundOn(PeerId, Path, PacketBuf, oneshot::Sender<()>),
     ForceHandshake(PeerId, Option<Path>, oneshot::Sender<()>),
     AddTransport(NewTransport, oneshot::Sender<Result<(), TransportError>>),
     RemoveTransport(TransportId, oneshot::Sender<Result<(), TransportError>>),
@@ -342,6 +343,21 @@ impl EngineHandle {
     /// filters.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::InjectOutbound(packet, tx)).await
+    }
+
+    /// Encrypts `packet` for `peer` in its current session and sends it on `path`, bypassing
+    /// routing, the outbound filters and the path policy; the peer's path stays as it is.
+    /// For probes on a candidate path while the peer's traffic stays on its path. Without a
+    /// current session the packet is dropped as `reasons::NO_SESSION` (no handshake is
+    /// started); unknown peers are ignored. See `Core::inject_outbound_on`.
+    pub async fn inject_outbound_on(
+        &self,
+        peer: PeerId,
+        path: Path,
+        packet: PacketBuf,
+    ) -> Result<(), EngineError> {
+        self.call(|tx| Command::InjectOutboundOn(peer, path, packet, tx))
+            .await
     }
 
     /// Starts a handshake with `peer` now; a `path` becomes the peer's path first.

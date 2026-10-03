@@ -33,8 +33,15 @@ pub struct NetStackConfig {
     /// Packets queued from the stack to the source before the stack holds back. Default 1024.
     pub egress_capacity: usize,
     /// Connections or flows waiting in `incoming_tcp` / `incoming_udp` before new ones are
-    /// dropped. Default 128.
+    /// dropped (or, for TCP with `accept_backpressure`, held back). Default 128.
     pub accept_capacity: usize,
+    /// Whether a full `incoming_tcp` holds new TCP connections back instead of closing
+    /// them. With it, bare SYNs are left unanswered (counted in
+    /// [`NetStackStats::syn_deferred`](crate::NetStackStats::syn_deferred), the peer
+    /// retransmits them) while the queue is full, and connections that completed their
+    /// handshake meanwhile wait in the stack until the application accepts them. UDP flows
+    /// are dropped as before. Default `false`.
+    pub accept_backpressure: bool,
     /// Datagrams queued per UDP flow or bound socket before new ones are dropped, and UDP
     /// payloads queued for sending before `send` waits. Default 128.
     pub datagram_capacity: usize,
@@ -69,6 +76,7 @@ impl Default for NetStackConfig {
             ingress_capacity: 1024,
             egress_capacity: 1024,
             accept_capacity: 128,
+            accept_backpressure: false,
             datagram_capacity: 128,
             stream_buffer: 64 * 1024,
             listener_pool: 32,
@@ -86,6 +94,7 @@ pub(crate) struct Settings {
     pub(crate) ingress_capacity: usize,
     pub(crate) egress_capacity: usize,
     pub(crate) accept_capacity: usize,
+    pub(crate) accept_backpressure: bool,
     pub(crate) datagram_capacity: usize,
     pub(crate) stream_buffer: usize,
     pub(crate) listener_pool: usize,
@@ -128,6 +137,7 @@ impl Settings {
             ingress_capacity: config.ingress_capacity.max(1),
             egress_capacity: config.egress_capacity.max(1),
             accept_capacity: config.accept_capacity.max(1),
+            accept_backpressure: config.accept_backpressure,
             datagram_capacity: config.datagram_capacity.max(1),
             stream_buffer: config.stream_buffer.max(1),
             listener_pool: config.listener_pool.max(1),

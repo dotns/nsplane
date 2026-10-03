@@ -323,6 +323,10 @@ impl<F: PacketFilter> PacketFilter for SharedFilter<F> {
         self.0.inbound(peer, packet)
     }
 
+    fn inbound_from(&self, peer: PeerId, from: &Path, packet: &mut PacketBuf) -> Verdict {
+        self.0.inbound_from(peer, from, packet)
+    }
+
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
         self.0.outbound(peer, packet)
     }

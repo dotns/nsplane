@@ -18,6 +18,8 @@ pub const NO_PRIVATE_KEY: &str = "no private key";
 pub const INVALID_HANDSHAKE: &str = "invalid handshake";
 /// A verified handshake message names no configured peer.
 pub const UNKNOWN_PEER: &str = "unknown peer";
+/// A packet for an explicit path (`Core::inject_outbound_on`) found no current session.
+pub const NO_SESSION: &str = "no session";
 /// The peer's tunnel rejected a verified handshake message (bad keys, replayed timestamp,
 /// no matching handshake in flight).
 pub const HANDSHAKE_REJECTED: &str = "handshake rejected";

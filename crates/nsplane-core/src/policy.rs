@@ -34,7 +34,19 @@ pub trait PathPolicy: Send + Sync + 'static {
     fn select(&self, peer: PeerId, kind: MessageKind) -> Option<Path>;
     /// An authenticated message of this kind arrived from `from`. Returns whether to adopt
     /// it as the peer's path.
+    ///
+    /// The core asks about messages from a path other than the peer's current one; with
+    /// [`PathPolicy::observe_every_message`], about every authenticated message. Never about
+    /// cookie replies.
     fn on_authenticated(&self, peer: PeerId, from: &Path, kind: MessageKind) -> Roam;
+
+    /// Whether [`PathPolicy::on_authenticated`] is called for every authenticated message,
+    /// on the peer's current path too (where its answer changes nothing), e.g. to keep a
+    /// path alive or detect its loss. Read once when the core is built; `false` by default,
+    /// which spares the call on the data path.
+    fn observe_every_message(&self) -> bool {
+        false
+    }
 }
 
 /// Standard WireGuard roaming: always send on the current path and adopt the source of every

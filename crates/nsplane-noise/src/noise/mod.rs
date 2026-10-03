@@ -303,6 +303,15 @@ impl Tunn {
         self.encapsulate_in_place(dst, src.len())
     }
 
+    /// Whether the tunnel can send transport data now: it has a current session whose
+    /// sending key is not worn out (Reject-After-Messages). Without one,
+    /// [`Tunn::encapsulate_in_place`] queues the packet and starts a handshake.
+    pub fn has_session(&self) -> bool {
+        self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .is_some_and(|session| !session.is_exhausted())
+    }
+
     /// Encapsulates the IP packet in `buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len]` without
     /// copying it: the packet is sealed where it lies and the data header is written in front.
     ///

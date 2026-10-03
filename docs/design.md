@@ -228,6 +228,7 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | 5 | `nsplane-nat` (translation, conntrack, port map), fragmentation stage, onion filter order, TUN and UDP offload, ACL flow hook, queue high-water marks, crypto worker pool | done (`a2c0635`, `33445e0`, `f46427f`, `e60072b`, `02ff770`, `64131c7`) |
 | 5 follow-ups | batched core entry, no lock without workers, exact send errors, worker/fragment stats, smoltcp fork | done (`8f01a55`, `5132f27`, `91c4943`) |
 | Status | per-transport traffic counters, `EngineHandle::status` | done (task `20261003-1215-traffic-status`) |
+| ns M4 hooks | `inject_outbound_on`, `PacketFilter::inbound_from`, `PathPolicy::observe_every_message`, netstack accept backpressure, `connect_tcp_from`, random ephemeral start | done (task `20261003-1300-ns-m4-requests`) |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns, not started |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows
