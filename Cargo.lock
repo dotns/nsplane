@@ -1145,6 +1145,7 @@ dependencies = [
  "nsplane-packet",
  "nsplane-tun",
  "nsplane-uapi",
+ "nsplane-wss",
  "rand_core 0.6.4",
  "rcgen",
  "rustls",
