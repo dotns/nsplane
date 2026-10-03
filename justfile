@@ -47,6 +47,12 @@ e2e:
     cargo build -p nsplane-cli --release --locked
     scripts/e2e/linux.sh
 
+# WireGuard implementations compared: throughput, latency, CPU per GB in pinned containers (needs docker and the wireguard module; see scripts/bench/README.md).
+bench-wg:
+    cargo build -p nsplane-cli --release --locked
+    if [ -f examples/src/bin/netstack_bench.rs ]; then cargo build -p nsplane-examples --release --bin netstack_bench --locked; fi
+    scripts/bench/wg-compare.sh
+
 # Library-level e2e: nsplane-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
 e2e-lib:
     scripts/e2e/lib.sh
