@@ -7,6 +7,7 @@
 
 mod buf;
 pub mod checksum;
+pub mod icmp;
 mod ip;
 pub mod reassembly;
 mod types;
