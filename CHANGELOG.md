@@ -145,6 +145,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning `BoundsError` instead of panicking.
 - `nsplane-packet`: `PacketPool::get_len` hands out a packet of a given length without
   re-zeroing bytes a pooled buffer already initialized; pooled buffers keep their bytes.
+- `nsplane-acl`: the ACL as a per-flow hook. `AclEngine::generation` increases on every
+  published change; `AclFilter` caches each peer's resolved principal and the verdict of each
+  TCP/UDP flow's first packet from a namespace member in its reply table, under the policy and identity
+  generations, so established flows skip the evaluation; peers whose namespaces (or the
+  default policy) accept everything bypass it. `PeerIdentity::generation` (default 0: not
+  cached) versions identities, and `PeerIdentityMap` bumps it on every change. Verdicts are
+  the same as a full evaluation (differential test). New counters
+  `AclFilterStats::pending_evictions` and `verdict_evictions`; `nsplane-e2e` `acl_hook`
+  tests. The reply, pending and fragment tables evict their least recently seen (fragments:
+  oldest) entry in O(1) instead of scanning the full table.
 - `nsplane`: `EngineHandle::queue_stats` reports the capacity and high-water mark of every
   bounded queue of the engine (`QueueStats`, `QueueDepth`: commands, local packets,
   received datagrams, deliveries, recycled buffers, the transmit queues and backlogs, events);
