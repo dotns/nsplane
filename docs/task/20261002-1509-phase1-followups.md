@@ -179,6 +179,37 @@ item 20 is fixed by holding IPv4 UDP fragments that arrive before their first fr
 `Translator::set_mtu` (the `nsplane-nat` translator tests and `nsplane-e2e`'s
 `fragment::zero_checksum_fragments_out_of_order_arrive_as_one_ipv6_datagram`).
 
+Status after the Phase 5 follow-ups (campaign `nsplane-fu-202610030716`, workstream FA):
+item 1 is **fixed** for batched input. `Core::handle_datagrams` / `Core::handle_locals` (and
+their `_deferred` forms) share the dispatch across a batch, and the engine feeds them what
+is already queued (up to `MAX_BATCH`, no wait, no timer). Callgrind per round trip, 32 packets
+per call: 64 B 3910 Ir against 4435 device-equivalent (-11.8 %), 1420 B 18980 against 19513
+(-2.7 %); wall clock 411-413 ns against 472 ns at 64 B and 1.227 us against 1.278-1.294 us at
+1420 B. One packet per call stays at 5299 / 20370 Ir (+10 Ir for the empty lookup cache;
+530-533 ns, 1.331-1.351 us), so a lone packet still costs about +12 % at 64 B. Covered by
+`nsplane-core`'s `tests/batch.rs` (`batches_behave_like_single_packets`,
+`deferred_batches_behave_like_deferred_single_packets`, `empty_batches_do_nothing`) and
+`nsplane-e2e`'s `batched_input` (`bursts_without_workers`, `bursts_with_workers`) and
+`latency` (`idle_round_trip_is_immediate`; the ignored `round_trip_latency` and
+`round_trip_latency_queue_256` measurements), with `backpressure` unchanged. Item 15 is
+fixed by `QueueStats::crypto` and `crypto_done` (`queues::bulk_udp_on_workers_raises_the_crypto_marks`,
+and `queues::bulk_udp_raises_marks_within_capacity` for their zero depths without workers).
+Item 16 is fixed by `FragmentStats` / `EngineHandle::fragment_stats` and the drop reasons
+`DROP_FRAGMENT_OVERSIZE`, `DROP_FRAGMENT_NO_ROUTE` and `DROP_FRAGMENT_RATE_LIMITED` (the
+`fragment` e2e tests, e.g. `errors_need_a_route` and
+`without_a_fragmenter_oversized_packets_go_through`). Item 17 is fixed: without
+`CoreConfig::crypto_jobs` (no crypto workers) each peer owns its tunnel and the data path
+takes no lock (`tunnel_storage::owned_and_shared_tunnels_behave_the_same`,
+`deferred::a_core_without_crypto_jobs_processes_deferred_inputs_at_once`); the core round
+trip measures 532 ns at 64 B and 1.348 us at 1420 B (main 64131c7: 546 ns, 1.354 us). The
+numbers are in `docs/architecture.md` (*Performance*, *Engine batching under load*).
+
+Added after the Phase 5 follow-ups (2026-10-03), still open:
+21. **Sender pacing / receiver-side sink backpressure**: under a saturating flow, a sink
+    slower than the tunnel drops at `DROP_SINK_FULL` (the batched engine moves about 19 %
+    more packets and outruns the receiving application). Options are pacing the owner's
+    batch rate or flow control from the sink; a separate design item.
+
 Out of this task: the rename to `nsplane` (ADR `docs/decisions/2026-10-02-rename-nsplane.md`,
 its own task after the campaign) and Phase 2-6 scope of the plan.
 
