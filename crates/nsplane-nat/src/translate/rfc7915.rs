@@ -3,7 +3,7 @@
 //! IPv4 to IPv6 grows a packet by 20 bytes (28 with a fragment header) plus
 //! the length of any IPv4 options, which are dropped; IPv6 to IPv4 shrinks it.
 //! The payload is moved inside the buffer; a packet that would outgrow the
-//! buffer's capacity is dropped with [`NO_ROOM`](reasons::NO_ROOM).
+//! buffer's capacity is first copied into a larger buffer.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
@@ -475,12 +475,31 @@ fn forwarded_hop(value: u8) -> Result<u8> {
         .ok_or(reasons::HOP_LIMIT_EXCEEDED)
 }
 
+/// The longest packet a translation can produce: an IPv6 header and the
+/// largest payload its length field holds.
+const MAX_LEN: usize = 40 + 65535;
+
+/// Makes room for `len` packet bytes: a buffer with less capacity is replaced
+/// by a fresh one with the standard headroom that holds a copy of the packet
+/// (the slow path [`TranslatorStats::grown_copies`](super::TranslatorStats)
+/// counts). Fails with [`NO_ROOM`](reasons::NO_ROOM) beyond [`MAX_LEN`].
+fn make_room(packet: &mut PacketBuf, len: usize) -> Result<()> {
+    if len > MAX_LEN {
+        return Err(reasons::NO_ROOM);
+    }
+    if len > packet.capacity() {
+        let mut grown = PacketBuf::with_capacity(len);
+        grown.set_len(packet.len());
+        grown.as_packet_mut().copy_from_slice(packet.as_packet());
+        *packet = grown;
+    }
+    Ok(())
+}
+
 /// Replaces everything in front of `payload` with `header`, moving the payload.
 fn replace_header(packet: &mut PacketBuf, payload: Range<usize>, header: &[u8]) -> Result<()> {
     let len = header.len() + payload.len();
-    if len > packet.capacity() {
-        return Err(reasons::NO_ROOM);
-    }
+    make_room(packet, len)?;
     if len > packet.len() {
         packet.set_len(len);
     }
@@ -494,9 +513,7 @@ fn replace_header(packet: &mut PacketBuf, payload: Range<usize>, header: &[u8]) 
 /// Replaces the whole packet with `header` followed by `body`.
 fn replace_all(packet: &mut PacketBuf, header: &[u8], body: &[u8]) -> Result<()> {
     let len = header.len() + body.len();
-    if len > packet.capacity() {
-        return Err(reasons::NO_ROOM);
-    }
+    make_room(packet, len)?;
     packet.set_len(len);
     let bytes = packet.as_packet_mut();
     bytes[..header.len()].copy_from_slice(header);

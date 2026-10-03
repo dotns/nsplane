@@ -133,8 +133,9 @@ pub(crate) enum OffloadError {
 /// data offset or UDP header), not from `hdr_len` or `csum_start`; IPv6 extension
 /// headers are not supported.
 ///
-/// Every packet is taken from `pool` with the standard headroom and appended to `out`,
-/// starting at segment index `first`. Segments that do not fit into `out` (at most
+/// Every packet is taken from `pool` with the standard headroom and a capacity of at
+/// least `capacity` (or its length, if larger), and appended to `out`, starting at
+/// segment index `first`. Segments that do not fit into `out` (at most
 /// [`MAX_BATCH`] packets) are not produced: the call then returns `Ok(Some(next))` and
 /// the caller continues with `first = next` and a batch with room. `Ok(None)` means all
 /// segments were produced. A malformed header or packet is an error and produces
@@ -143,6 +144,7 @@ pub(crate) fn segment(
     hdr: &VirtioNetHdr,
     packet: &[u8],
     first: usize,
+    capacity: usize,
     pool: &mut PacketPool,
     out: &mut PacketBatch,
 ) -> Result<Option<usize>, OffloadError> {
@@ -164,7 +166,7 @@ pub(crate) fn segment(
         if first > 0 {
             return Ok(None);
         }
-        let mut buf = pool.get(packet.len());
+        let mut buf = pool.get(packet.len().max(capacity));
         buf.set_len(packet.len());
         let seg = buf.as_packet_mut();
         seg.copy_from_slice(packet);
@@ -205,7 +207,7 @@ pub(crate) fn segment(
             return Ok(Some(i));
         }
         let chunk = &payload[i * gso_size..payload.len().min((i + 1) * gso_size)];
-        let mut buf = pool.get(hlen + chunk.len());
+        let mut buf = pool.get((hlen + chunk.len()).max(capacity));
         buf.set_len(hlen + chunk.len());
         let seg = buf.as_packet_mut();
         seg[..hlen].copy_from_slice(&packet[..hlen]);
@@ -980,7 +982,7 @@ mod tests {
         let mut first = 0;
         loop {
             let mut out = PacketBatch::new();
-            let next = segment(hdr, packet, first, &mut pool, &mut out)?;
+            let next = segment(hdr, packet, first, 0, &mut pool, &mut out)?;
             segments.extend(out.iter().map(|p| p.as_packet().to_vec()));
             match next {
                 Some(next) => first = next,
@@ -1087,13 +1089,13 @@ mod tests {
         let mut pool = PacketPool::new(0);
         let mut out = PacketBatch::new();
         assert_eq!(
-            segment(&hdr, &packet, 0, &mut pool, &mut out),
+            segment(&hdr, &packet, 0, 0, &mut pool, &mut out),
             Ok(Some(MAX_BATCH))
         );
         assert!(out.is_full());
         let mut segments: Vec<Vec<u8>> = out.drain().map(|p| p.as_packet().to_vec()).collect();
         assert_eq!(
-            segment(&hdr, &packet, MAX_BATCH, &mut pool, &mut out),
+            segment(&hdr, &packet, MAX_BATCH, 0, &mut pool, &mut out),
             Ok(None)
         );
         assert_eq!(out.len(), 71 - MAX_BATCH);
@@ -1114,11 +1116,20 @@ mod tests {
         for _ in 0..MAX_BATCH - 4 {
             out.push(PacketBuf::with_capacity(0)).unwrap();
         }
-        assert_eq!(segment(&hdr, &packet, 0, &mut pool, &mut out), Ok(Some(4)));
-        assert_eq!(segment(&hdr, &packet, 4, &mut pool, &mut out), Ok(Some(4)));
+        assert_eq!(
+            segment(&hdr, &packet, 0, 0, &mut pool, &mut out),
+            Ok(Some(4))
+        );
+        assert_eq!(
+            segment(&hdr, &packet, 4, 0, &mut pool, &mut out),
+            Ok(Some(4))
+        );
         let none = VirtioNetHdr::default();
-        assert_eq!(segment(&none, &packet, 0, &mut pool, &mut out), Ok(Some(0)));
-        assert_eq!(segment(&none, &packet, 1, &mut pool, &mut out), Ok(None));
+        assert_eq!(
+            segment(&none, &packet, 0, 0, &mut pool, &mut out),
+            Ok(Some(0))
+        );
+        assert_eq!(segment(&none, &packet, 1, 0, &mut pool, &mut out), Ok(None));
     }
 
     #[test]
@@ -1145,9 +1156,33 @@ mod tests {
         assert_eq!(run(&hdr, &[]).unwrap(), [Vec::<u8>::new()]);
         let mut pool = PacketPool::new(1);
         let mut out = PacketBatch::new();
-        segment(&hdr, &bytes, 0, &mut pool, &mut out).unwrap();
+        segment(&hdr, &bytes, 0, 0, &mut pool, &mut out).unwrap();
         let buf = out.iter_mut().next().unwrap();
         assert_eq!(buf.with_headroom_mut().len(), nsplane::HEADROOM + 77);
+    }
+
+    #[test]
+    fn packets_get_at_least_the_requested_capacity() {
+        let s = spec(false, TCP);
+        let (hdr, packet) = super_packet(&s, 3000, 1000);
+        let none = VirtioNetHdr::default();
+        let mut pool = PacketPool::new(0);
+        for capacity in [0, 1528, 1040] {
+            let mut out = PacketBatch::new();
+            assert_eq!(
+                segment(&hdr, &packet, 0, capacity, &mut pool, &mut out),
+                Ok(None)
+            );
+            assert_eq!(out.len(), 3);
+            assert_eq!(
+                segment(&none, &packet[..77], 0, capacity, &mut pool, &mut out),
+                Ok(None)
+            );
+            for p in out.iter() {
+                assert!(p.capacity() >= capacity.max(p.len()));
+                assert_eq!(p.headroom(), nsplane::HEADROOM);
+            }
+        }
     }
 
     #[test]
