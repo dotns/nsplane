@@ -7,7 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -115,6 +115,7 @@ impl NetStack {
             flows: HashMap::new(),
             bound: HashMap::new(),
             ingress,
+            batch: Vec::with_capacity(MAX_INJECT_PER_ITER),
             egress,
             commands: Some(commands),
             udp_rx,
@@ -596,6 +597,8 @@ struct Driver {
     flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
     bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
     ingress: mpsc::Receiver<PacketBuf>,
+    /// Ingress packets taken in one batch; empty between batches.
+    batch: Vec<PacketBuf>,
     egress: mpsc::Sender<PacketBuf>,
     /// `None` once every handle is gone.
     commands: Option<mpsc::Receiver<Command>>,
@@ -707,14 +710,27 @@ impl Driver {
         if let Some(packet) = self.carried.take() {
             self.ingest(packet, &mut demand);
         }
-        for _ in 0..MAX_INJECT_PER_ITER {
-            match self.ingress.try_recv() {
-                Ok(packet) => self.ingest(packet, &mut demand),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return None,
-            }
+        // Taking the queued packets at once releases their queue slots in one step rather
+        // than one per packet. Without a packet the poll registers no waker that matters:
+        // `wait` polls the queue again with the driver's own.
+        let mut batch = std::mem::take(&mut self.batch);
+        let taken = self.ingress.poll_recv_many(
+            &mut Context::from_waker(Waker::noop()),
+            &mut batch,
+            MAX_INJECT_PER_ITER,
+        );
+        self.ingest_all(&mut batch, &mut demand);
+        self.batch = batch;
+        // Zero packets taken means the queue is closed and drained.
+        (taken != Poll::Ready(0)).then_some(demand)
+    }
+
+    /// Routes the packets of `batch` in order (see [`ingest`](Self::ingest)), leaving it
+    /// empty with its allocation kept.
+    fn ingest_all(&mut self, batch: &mut Vec<PacketBuf>, demand: &mut HashMap<u16, usize>) {
+        for packet in batch.drain(..) {
+            self.ingest(packet, demand);
         }
-        Some(demand)
     }
 
     /// Routes one ingress packet, counting the SYNs per destination port in `demand`.
