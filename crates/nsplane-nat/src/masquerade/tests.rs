@@ -28,7 +28,7 @@ const ACK: u8 = 0x10;
 
 fn decision(route: u64) -> MasqueradeDecision {
     MasqueradeDecision {
-        source: IpAddr::V6(SOURCE),
+        source: SOURCE,
         route,
     }
 }
@@ -625,19 +625,6 @@ fn a_zero_capacity_drops_every_new_flow() {
     assert_drop(request(REMOTE, HOST_PORT), reasons::CAPACITY, |p| {
         f.masquerade.forward(p)
     });
-}
-
-#[test]
-fn an_ipv4_source_drops() {
-    let f = fixture();
-    f.answer(Some(MasqueradeDecision {
-        source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        route: ROUTE,
-    }));
-    assert_drop(request(REMOTE, HOST_PORT), reasons::SOURCE_NOT_IPV6, |p| {
-        f.masquerade.forward(p)
-    });
-    assert_eq!(f.masquerade.stats().source_not_ipv6, 1);
 }
 
 // -- Expiry. --
