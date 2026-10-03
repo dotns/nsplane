@@ -787,38 +787,45 @@ async fn crypto_workers_keep_the_tasks_sending_and_delivering() -> TestResult {
 }
 
 #[tokio::test]
-async fn owner_hands_over_while_more_input_is_waiting() -> TestResult {
+async fn owner_hands_datagrams_to_the_transmit_task_while_input_is_waiting() -> TestResult {
     let net = Net::default();
-    let mut a = Node::new(&net, 1, |b| b)?;
+    let mut a = Node::with_source(&net, 1, 1024, |b| b)?;
     let mut b = Node::new(&net, 2, |b| b)?;
     connect(&mut a, &mut b).await?;
 
-    // While `b` is suspended its transport is not read: the datagrams pile up, and after
-    // the resume its owner finds more of them waiting after every batch it takes, so it
-    // hands the packets to the sink task instead of delivering them itself.
-    b.handle.suspend().await?;
+    // While `a` is suspended neither its transport nor its source is read: datagrams from
+    // `b` and local packets pile up. After the resume its owner finds received datagrams
+    // waiting whenever it seals local packets, so it hands those to the transmit task.
+    a.handle.suspend().await?;
     for seq in 0..300 {
-        a.send(&a.packet_to(&b, seq)).await?;
+        b.send(&b.packet_to(&a, seq)).await?;
     }
     let deadline = Instant::now() + WAIT;
-    while a.transport.try_done() + a.transport.task_done() < 300 + 2 {
-        assert!(Instant::now() < deadline, "a did not send everything");
+    while b.transport.try_done() + b.transport.task_done() < 300 + 2 {
+        assert!(Instant::now() < deadline, "b did not send everything");
         sleep(Duration::from_millis(5)).await;
     }
-    b.handle.take_queue_stats().await?;
-    b.handle.resume().await?;
-    b.expect_seqs(&a, 0..300).await?;
-    assert!(b.sink.task_done() > 0, "the sink task delivered under load");
-    let stats = b.handle.queue_stats().await?;
-    assert!(stats.deliver.high_water > 0, "{stats:?}");
+    for seq in 0..100 {
+        a.send(&a.packet_to(&b, seq)).await?;
+    }
+    a.handle.take_queue_stats().await?;
+    a.handle.resume().await?;
+    b.expect_seqs(&a, 0..100).await?;
+    a.expect_seqs(&b, 0..300).await?;
+    assert!(
+        a.transport.task_done() > 0,
+        "the transmit task sent under load"
+    );
+    let stats = a.handle.queue_stats().await?;
+    assert!(stats.transmit.high_water > 0, "{stats:?}");
 
-    // Idle again, once the sink task is done with its last batch: the owner delivers
+    // Idle again, once the transmit task is done with its last batch: the owner sends
     // itself.
     sleep(QUIET).await;
-    let delivered = b.sink.try_done();
-    a.send(&a.packet_to(&b, 300)).await?;
-    b.expect_seqs(&a, 300..301).await?;
-    assert_eq!(b.sink.try_done(), delivered + 1);
+    let sent = a.transport.try_done();
+    a.send(&a.packet_to(&b, 100)).await?;
+    b.expect_seqs(&a, 100..101).await?;
+    assert_eq!(a.transport.try_done(), sent + 1);
     Ok(())
 }
 
