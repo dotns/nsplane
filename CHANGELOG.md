@@ -355,6 +355,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Conntrack` (bounded, idle expiry) and go through `remove_flow` and `retain`;
   `original_destination` reports the service address of a flow the endpoint accepted;
   `RedirectStats` counts the outcomes. Drop reasons in `nsplane_nat::redirect::reasons`.
+- `nsplane-netstack`: `TcpConnection::unacked` (bytes written and not yet acknowledged by
+  the peer, including bytes the socket still holds back for the peer's or the congestion
+  window, i.e. smoltcp's send queue; it is not SND.NXT - SND.UNA) and `TcpConnection::last_ack` (when the stack last saw the peer
+  acknowledge new data, `None` before it did) report a connection's send progress; the
+  driver writes them once per turn into atomics, and they stay readable after the
+  connection closed.
+- `nsplane-netstack`: `NetStackConfig::udp_allow_fragmentation` (default `false`): an IPv4
+  UDP datagram above the MTU from `UdpReply::send` / `UdpSocket::send_to` leaves as one
+  packet with DF clear for the engine's fragmenter (`EngineBuilder::fragmenter`) to split,
+  instead of failing with `InvalidInput`; IPv6 above the MTU and IPv4 above 65 535 bytes
+  still fail. Without it the bytes on the wire are unchanged (DF set).
+- `nsplane-netstack`: `NetStackHandle::owns(packet) -> Ownership` tells, without waiting,
+  whether an ingress packet belongs to the stack: `Flow` for a TCP connection (open, in
+  SYN-SENT from the moment the connect is queued, mid handshake or half closed), a bound
+  UDP socket or a UDP flow, and for ICMP errors quoting one of them; `Listener` for a bare
+  SYN or a UDP datagram to a stack address that opens something new; `None` otherwise,
+  including fragments. A `Splitter` closure can share one decrypted stream between the stack
+  and other consumers with it. The table it reads changes only when a connection, flow or
+  socket opens or closes.
+- `nsplane-packet`: `reassembly::Reassembler`, a sans-I/O reassembler of IPv4 fragments and
+  IPv6 Fragment-header packets on the caller's clock: `push` returns `Outcome::{Pass, Held,
+  Complete, Dropped}`, fragments may arrive in any order, overlaps drop the datagram, and
+  state is bounded by `ReassemblyConfig { max_datagrams (64), timeout (30 s), max_bytes
+  (65 535) }`, with `expire` and `ReassemblyStats`. Nothing is allocated before the first
+  fragment.
+- `nsplane-netstack`: `NetStackConfig::reassembly: Option<ReassemblyConfig>` (re-exported as
+  `nsplane_netstack::ReassemblyConfig`; default `None`, fragments dropped as before and no
+  reassembler allocated): the driver reassembles IPv4 fragments and IPv6 Fragment-header
+  packets to the stack's addresses and routes each completed datagram as if it had arrived
+  whole (UDP socket or flow, or TCP); expiry runs on the driver's existing tick. Counted in
+  the new `NetStackStats::{reassembled, reassembly_timeout, reassembly_overflow}` (0 when
+  disabled; invalid or overlapping fragments count as `malformed`). With it, `owns` reports
+  TCP and UDP fragments to a stack address as the stack's: `Flow` for a first fragment on a
+  registered tuple, `Listener` for any other.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

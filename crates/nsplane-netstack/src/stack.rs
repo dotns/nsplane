@@ -13,6 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_core::Stream;
 use nsplane::{PacketSink, PacketSource};
+use nsplane_packet::reassembly::{Outcome, Reassembler, ReassemblyStats};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId, protocol};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -24,8 +25,9 @@ use tokio::time::Instant;
 
 use crate::config::{NetStackConfig, Settings};
 use crate::device::VirtualDevice;
+use crate::ownership::{Owners, Ownership, Registration};
 use crate::stats::{self, Counters, NetStackStats};
-use crate::tcp::{Shared, TcpConnection, WriteHalf, lock};
+use crate::tcp::{Progress, Shared, TcpConnection, WriteHalf, lock};
 use crate::udp::{self, Datagram, UdpFlow, UdpOut, UdpReply, UdpSocket};
 
 /// Most ingress packets taken per driver iteration before smoltcp runs, so one burst
@@ -86,12 +88,19 @@ impl NetStack {
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let (_, mtu) = watch::channel(settings.mtu);
+        let owners = Arc::new(Owners::new(
+            settings.v4.map(|(addr, _)| addr),
+            settings.v6.map(|(addr, _)| addr),
+            settings.reassembly.is_some(),
+        ));
+        let reassembler = settings.reassembly.clone().map(Reassembler::new);
 
         let mut device = VirtualDevice::new(settings.mtu, EGRESS_BACKLOG, Arc::clone(&stats));
         let iface = interface(&settings, &mut device);
         let out = UdpOut {
             tx: udp_tx,
             mtu: usize::from(settings.mtu),
+            allow_fragmentation: settings.udp_allow_fragmentation,
         };
         let driver = Driver {
             settings,
@@ -99,6 +108,7 @@ impl NetStack {
             device,
             sockets: SocketSet::new(Vec::new()),
             listeners: HashMap::new(),
+            inbound: HashMap::new(),
             allocation_cursor: 0,
             conns: HashMap::new(),
             connecting: Vec::new(),
@@ -118,6 +128,9 @@ impl NetStack {
             next_udp_port: random_ephemeral(),
             waiting: VecDeque::new(),
             epoch: Instant::now(),
+            owners: Arc::clone(&owners),
+            reassembler,
+            reassembly_counted: ReassemblyStats::default(),
         };
         tokio::spawn(driver.run());
 
@@ -130,6 +143,7 @@ impl NetStack {
             incoming_tcp: Arc::new(Mutex::new(Some(incoming_tcp))),
             incoming_udp: Arc::new(Mutex::new(Some(incoming_udp))),
             stats,
+            owners,
         };
         (stack, handle)
     }
@@ -143,7 +157,8 @@ impl NetStack {
 /// The stack's egress: IP packets it sends to peers.
 ///
 /// Each packet is a [`PacketBuf`] with its headroom free and is never larger than the
-/// configured MTU. [`recv`](PacketSource::recv) returns [`io::ErrorKind::BrokenPipe`] once
+/// configured MTU, except IPv4 UDP datagrams with DF clear under
+/// [`NetStackConfig::udp_allow_fragmentation`]. [`recv`](PacketSource::recv) returns [`io::ErrorKind::BrokenPipe`] once
 /// the driver stopped and the queue is drained, on every later call. [`mtu`](PacketSource::mtu)
 /// holds the (normalised) configured MTU, which never changes.
 #[derive(Debug)]
@@ -185,6 +200,8 @@ enum Command {
         remote: SocketAddr,
         /// The local port, or `None` for an ephemeral one.
         local_port: Option<u16>,
+        /// The tuple of a connect from an explicit port, registered by the handle.
+        registration: Option<Registration>,
         reply: oneshot::Sender<io::Result<TcpConnection>>,
     },
     Bind {
@@ -203,6 +220,7 @@ pub struct NetStackHandle {
     incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
     stats: Arc<Counters>,
+    owners: Arc<Owners>,
 }
 
 /// Takes the value out of a shared slot, ignoring poisoning.
@@ -260,11 +278,17 @@ impl NetStackHandle {
         remote: SocketAddr,
         local_port: Option<u16>,
     ) -> io::Result<TcpConnection> {
+        // An explicit port gives the whole tuple now, so the connect is visible to `owns`
+        // before the command reaches the driver.
+        let registration = local_port
+            .zip(self.owners.local_for(remote.ip()))
+            .map(|(port, local)| self.owners.tcp(SocketAddr::new(local, port), remote));
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Connect {
                 remote,
                 local_port,
+                registration,
                 reply,
             })
             .await
@@ -291,6 +315,48 @@ impl NetStackHandle {
     /// The stack's drop counters.
     pub fn stats(&self) -> NetStackStats {
         self.stats.snapshot()
+    }
+
+    /// Whether the stack owns `packet`, an IP packet a peer sent towards the stack.
+    ///
+    /// Lets a local side share one decrypted stream between the stack and other
+    /// consumers, e.g. in an `nsplane::Splitter` closure:
+    ///
+    /// - [`Ownership::Flow`]: a TCP or UDP packet whose `(local, remote)` tuple (the
+    ///   packet's destination and source) is a TCP connection of the stack (accepted,
+    ///   mid handshake, opened with [`connect_tcp`](Self::connect_tcp) or
+    ///   [`connect_tcp_from`](Self::connect_tcp_from) and still in SYN-SENT, or half
+    ///   closed and still held), a UDP flow, or a UDP socket bound to the destination (any
+    ///   remote); or an IPv4 or IPv6 ICMP error (destination unreachable, packet too big,
+    ///   time exceeded, parameter problem) quoting a packet the stack sent on such a tuple.
+    /// - [`Ownership::Listener`]: a bare TCP SYN or a UDP datagram to one of the stack's
+    ///   addresses that would open a new connection or flow.
+    /// - [`Ownership::None`]: anything else, including malformed packets, IPv4 fragments
+    ///   and IPv6 packets with a Fragment header without
+    ///   [`NetStackConfig::reassembly`] (the stack drops them), and every packet once the
+    ///   stack stopped.
+    ///
+    /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
+    /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
+    /// one of the above and [`Ownership::Listener`] otherwise; a later fragment carries no
+    /// ports, so it is [`Ownership::Listener`] (the stack takes it either way, and its
+    /// datagram goes wherever the first fragment's tuple leads once it is complete).
+    /// Fragments of other protocols stay [`Ownership::None`].
+    ///
+    /// The answer reflects the stack's state at the call; a connection or flow that opens
+    /// or closes concurrently may be seen either way. A connect is visible from the moment
+    /// its SYN is queued: at the call for [`connect_tcp_from`](Self::connect_tcp_from) with
+    /// a port, before the first SYN leaves for an ephemeral port. An inbound connection is
+    /// visible before its SYN-ACK leaves. A UDP flow or socket stops being visible when it
+    /// is dropped.
+    ///
+    /// The call takes one short lock and never waits. The stack keeps the table it reads
+    /// as connections, flows and sockets open and close, not per packet.
+    pub fn owns(&self, packet: &[u8]) -> Ownership {
+        if self.commands.is_closed() {
+            return Ownership::None;
+        }
+        self.owners.owns(packet)
     }
 }
 
@@ -365,8 +431,13 @@ fn classify(bytes: &[u8], settings: &Settings) -> Result<Class, Reject> {
 
 /// Driver-side state of one connection handed to the application.
 struct Conn {
+    /// Keeps the connection's tuple visible to `owns` until the socket is released.
+    _registration: Registration,
     shared: Arc<Mutex<Shared>>,
     terminal: watch::Sender<bool>,
+    progress: Arc<Progress>,
+    /// The socket's send queue at the end of the previous bridge pass.
+    queued: usize,
     /// `close()` was called on the socket.
     local_closed: bool,
     last_activity_at: SmolInstant,
@@ -383,6 +454,12 @@ struct Bridged {
 impl Conn {
     /// Moves bytes between the socket and the application and applies half closes.
     fn bridge(&mut self, socket: &mut tcp::Socket<'_>, now: SmolInstant) -> Bridged {
+        // Only an acknowledgement shrinks the send queue, except a reset, which empties it
+        // and leaves the socket closed.
+        if socket.send_queue() < self.queued && socket.state() != tcp::State::Closed {
+            self.progress
+                .set_last_ack(u64::try_from(now.total_micros()).unwrap_or(0));
+        }
         let mut shared = lock(&self.shared);
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
 
@@ -419,6 +496,11 @@ impl Conn {
         if sent {
             self.last_activity_at = now;
             shared.wake_writer();
+        }
+        let queued = socket.send_queue();
+        if queued != self.queued {
+            self.queued = queued;
+            self.progress.set_unacked(queued);
         }
         // Forward half close: the application shut its write half down (or dropped the
         // connection). Once every byte is in the socket, FIN follows them, so the peer
@@ -480,6 +562,8 @@ fn receive_into(socket: &mut tcp::Socket<'_>, shared: &mut Shared) -> usize {
 /// A `connect_tcp` waiting for its handshake.
 struct Connecting {
     handle: SocketHandle,
+    /// Keeps the connect's tuple visible to `owns` while it is in SYN-SENT.
+    _registration: Registration,
     reply: oneshot::Sender<io::Result<TcpConnection>>,
     started: SmolInstant,
 }
@@ -497,6 +581,8 @@ struct Driver {
     iface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
+    /// Listener sockets mid handshake, with the tuple they registered for `owns`.
+    inbound: HashMap<SocketHandle, Registration>,
     /// port -> the sockets this port has open for inbound connections: those in `Listen`
     /// (free to accept a SYN) plus those in `SynReceived` (claimed by a SYN, mid
     /// handshake). A socket leaves the pool when it is established (promoted to a
@@ -528,6 +614,11 @@ struct Driver {
     next_tcp_port: u16,
     next_udp_port: u16,
     epoch: Instant,
+    owners: Arc<Owners>,
+    /// Only with `NetStackConfig::reassembly`.
+    reassembler: Option<Reassembler>,
+    /// The reassembler's counts already added to `stats`.
+    reassembly_counted: ReassemblyStats,
 }
 
 impl Drop for Driver {
@@ -554,6 +645,7 @@ impl Driver {
     /// One driver iteration; `false` once the stack must stop.
     async fn turn(&mut self) -> bool {
         // 1. Take a bounded batch of ingress packets and pending requests.
+        self.expire_fragments();
         let Some(demand) = self.ingest_batch() else {
             tracing::debug!(target: "netstack", "sink dropped; stopping");
             return false;
@@ -565,6 +657,8 @@ impl Driver {
         // every SYN in the batch up front: sizing it against the current state would leave
         // the 2nd..Nth simultaneous SYN without a socket to land on.
         let now = self.now();
+        // Before the pool reclaims sockets that left the handshake.
+        self.release_inbound();
         let pool = Pool {
             limit: self.settings.listener_pool,
             buffer: self.settings.tcp_buffer(),
@@ -582,6 +676,7 @@ impl Driver {
         self.preserve_all(now);
         self.device
             .poll_interface(&mut self.iface, now, &mut self.sockets);
+        self.track_inbound(&demand);
 
         // 3. Hand established connections to the application.
         self.promote(now);
@@ -624,6 +719,9 @@ impl Driver {
 
     /// Routes one ingress packet, counting the SYNs per destination port in `demand`.
     fn ingest(&mut self, packet: PacketBuf, demand: &mut HashMap<u16, usize>) {
+        let Some(packet) = self.reassemble(packet) else {
+            return;
+        };
         match classify(packet.as_packet(), &self.settings) {
             Ok(Class::Tcp { dst_port, syn }) => {
                 if syn {
@@ -643,6 +741,58 @@ impl Driver {
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Feeds a packet to the stack's address through the reassembler, if there is one:
+    /// the packet to route (the packet itself or a completed datagram), or `None` while
+    /// its datagram is incomplete or once the fragment is dropped.
+    fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
+        let Some(reassembler) = self.reassembler.as_mut() else {
+            return Some(packet);
+        };
+        let local =
+            IpPacket::parse(packet.as_packet()).is_ok_and(|ip| self.settings.is_local(ip.dst()));
+        if !local {
+            // `classify` counts it.
+            return Some(packet);
+        }
+        let routed = match reassembler.push(packet.as_packet(), Instant::now().into_std()) {
+            Outcome::Pass => return Some(packet),
+            Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
+            Outcome::Held | Outcome::Dropped => None,
+        };
+        self.count_reassembly();
+        routed
+    }
+
+    /// Discards incomplete datagrams past the reassembly timeout; free while none is held.
+    fn expire_fragments(&mut self) {
+        let Some(reassembler) = self.reassembler.as_mut() else {
+            return;
+        };
+        if reassembler.expire(Instant::now().into_std()) > 0 {
+            self.count_reassembly();
+        }
+    }
+
+    /// Adds what the reassembler counted since the last call to the stack's counters.
+    fn count_reassembly(&mut self) {
+        let Some(reassembler) = self.reassembler.as_ref() else {
+            return;
+        };
+        let now = reassembler.stats();
+        let before = std::mem::replace(&mut self.reassembly_counted, now);
+        stats::add(
+            &self.stats.reassembled,
+            now.reassembled - before.reassembled,
+        );
+        stats::add(&self.stats.reassembly_timeout, now.timeout - before.timeout);
+        stats::add(
+            &self.stats.reassembly_overflow,
+            now.overflow - before.overflow,
+        );
+        let rejected = (now.overlap + now.malformed) - (before.overlap + before.malformed);
+        stats::add(&self.stats.malformed, rejected);
     }
 
     /// Delivers a datagram to its bound socket, or to its flow.
@@ -709,7 +859,13 @@ impl Driver {
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
         // The queue is empty, so the first datagram always fits.
         let _ = tx.try_send(payload);
-        let flow = UdpFlow::new(rx, UdpReply::new(local, remote, self.out.clone()));
+        // Registered before the application can see (and drop) the flow.
+        let registration = self.owners.udp_flow(local, remote);
+        let flow = UdpFlow::new(
+            registration,
+            rx,
+            UdpReply::new(local, remote, self.out.clone()),
+        );
         if self.accept_udp.try_send(flow).is_ok() {
             self.flows.insert(key, tx);
         } else {
@@ -740,10 +896,12 @@ impl Driver {
             Command::Connect {
                 remote,
                 local_port,
+                registration,
                 reply,
-            } => match self.open_connect(remote, local_port) {
-                Ok(handle) => self.connecting.push(Connecting {
+            } => match self.open_connect(remote, local_port, registration) {
+                Ok((handle, registration)) => self.connecting.push(Connecting {
                     handle,
+                    _registration: registration,
                     reply,
                     started: self.now(),
                 }),
@@ -767,12 +925,14 @@ impl Driver {
         }
     }
 
-    /// Starts a handshake to `remote` from `local_port`, or an ephemeral port.
+    /// Starts a handshake to `remote` from `local_port`, or an ephemeral port, keeping
+    /// its tuple registered (`registration` already holds it for an explicit port).
     fn open_connect(
         &mut self,
         remote: SocketAddr,
         local_port: Option<u16>,
-    ) -> io::Result<SocketHandle> {
+        registration: Option<Registration>,
+    ) -> io::Result<(SocketHandle, Registration)> {
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -806,7 +966,10 @@ impl Driver {
                 IpEndpoint::new(local.into(), port),
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        Ok(self.sockets.add(socket))
+        // Registered before the driver's next poll emits the SYN.
+        let registration =
+            registration.unwrap_or_else(|| self.owners.tcp(SocketAddr::new(local, port), remote));
+        Ok((self.sockets.add(socket), registration))
     }
 
     /// The local ports of the stack's TCP connections (open or opening) and listeners.
@@ -859,7 +1022,14 @@ impl Driver {
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
         self.bound.insert(addr, tx);
-        Ok(UdpSocket::new(addr, source, rx, self.out.clone()))
+        let registration = self.owners.udp_bound(addr);
+        Ok(UdpSocket::new(
+            registration,
+            addr,
+            source,
+            rx,
+            self.out.clone(),
+        ))
     }
 
     /// Promotes established listener sockets to connections for `incoming_tcp`.
@@ -886,6 +1056,7 @@ impl Driver {
 
         for (handle, port) in accepted {
             let connection = self.adopt(handle, now);
+            self.inbound.remove(&handle);
             tracing::debug!(
                 target: "netstack",
                 port,
@@ -941,6 +1112,7 @@ impl Driver {
         for connecting in std::mem::take(&mut self.connecting) {
             let Connecting {
                 handle,
+                _registration: registration,
                 reply,
                 started,
             } = connecting;
@@ -966,6 +1138,7 @@ impl Driver {
                     }
                     self.connecting.push(Connecting {
                         handle,
+                        _registration: registration,
                         reply,
                         started,
                     });
@@ -986,16 +1159,29 @@ impl Driver {
             .map_or(unspecified, endpoint_to_socket_addr);
         let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
         let (terminal, terminal_rx) = watch::channel(false);
+        let progress = Arc::new(Progress::new(self.epoch.into_std()));
+        // Taken before the caller drops the connect's or the handshake's registration.
+        let registration = self.owners.tcp(local, peer);
         self.conns.insert(
             handle,
             Conn {
+                _registration: registration,
                 shared: Arc::clone(&shared),
+                progress: Arc::clone(&progress),
+                queued: 0,
                 terminal,
                 local_closed: false,
                 last_activity_at: now,
             },
         );
-        TcpConnection::new(shared, Arc::clone(&self.notify), local, peer, terminal_rx)
+        TcpConnection::new(
+            shared,
+            progress,
+            Arc::clone(&self.notify),
+            local,
+            peer,
+            terminal_rx,
+        )
     }
 
     /// Keeps the bytes of terminal sockets before smoltcp's timers discard the socket.
@@ -1026,6 +1212,50 @@ impl Driver {
             self.sockets.remove(handle);
         }
         sent
+    }
+
+    /// Unregisters listener sockets that left the handshake without being established
+    /// (reset back to `Listen`, or closed).
+    fn release_inbound(&mut self) {
+        let sockets = &self.sockets;
+        self.inbound.retain(|&handle, _| {
+            !matches!(
+                sockets.get::<tcp::Socket<'_>>(handle).state(),
+                tcp::State::Listen | tcp::State::Closed | tcp::State::TimeWait
+            )
+        });
+    }
+
+    /// Registers the tuples of listener sockets a SYN of this batch moved into
+    /// `SynReceived`, before their SYN-ACK leaves.
+    fn track_inbound(&mut self, demand: &HashMap<u16, usize>) {
+        for port in demand.keys() {
+            let Some(handles) = self.listeners.get(port) else {
+                continue;
+            };
+            for &handle in handles {
+                let socket = self.sockets.get::<tcp::Socket<'_>>(handle);
+                if socket.state() != tcp::State::SynReceived {
+                    continue;
+                }
+                let (Some(local), Some(remote)) =
+                    (socket.local_endpoint(), socket.remote_endpoint())
+                else {
+                    continue;
+                };
+                let (local, remote) = (
+                    endpoint_to_socket_addr(local),
+                    endpoint_to_socket_addr(remote),
+                );
+                if self
+                    .inbound
+                    .get(&handle)
+                    .is_none_or(|registration| !registration.is(local, remote))
+                {
+                    self.inbound.insert(handle, self.owners.tcp(local, remote));
+                }
+            }
+        }
     }
 
     /// Moves the egress backlog into the source's queue; `false` once the source is gone.
@@ -1136,7 +1366,7 @@ fn next_ephemeral(cursor: &mut u16, free: impl Fn(u16) -> bool) -> Option<u16> {
 }
 
 /// Locates a TCP segment before reserving listener capacity.
-fn tcp_segment(pkt: &[u8]) -> Option<&[u8]> {
+pub(crate) fn tcp_segment(pkt: &[u8]) -> Option<&[u8]> {
     if pkt.first().is_some_and(|byte| byte >> 4 == 6) {
         let packet = smoltcp::wire::Ipv6Packet::new_checked(pkt).ok()?;
         let mut next = packet.next_header();

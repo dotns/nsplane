@@ -186,6 +186,18 @@ ME-1 and ME-2 (SNAT and DNAT) both in nsplane-nat; MD is evaluated, not implemen
 round. MB-x, MC and ME run as a BKD campaign (plan 20261003-1600-ns-dataplane-moves).
 2026-10-03: MC-1 and MC-2 landed (campaign nsplane-mv-202610031600). The examples' WSS
 client now queues datagrams while disconnected (256 entries) instead of dropping them.
+MB-x3 and MB-x4 done: `TcpConnection::{unacked, last_ack}` (smoltcp exposes no SND.NXT, so
+`unacked` is the socket's send queue: in flight plus bytes held back for the peer's window)
+and `NetStackConfig::udp_allow_fragmentation`, covered by `nsplane-e2e`'s
+`netstack_progress`.
+MB-x1 done: `NetStackHandle::owns` / `Ownership` over a tuple table kept per connection,
+flow and socket (not per packet); fragments are `None` until the stack reassembles them;
+covered by `nsplane-e2e`'s `netstack_owns` (a `Splitter` routing on `owns`).
+MB-x2 done: `nsplane_packet::reassembly::Reassembler` wired into the stack's driver by
+`NetStackConfig::reassembly` (default `None`), counted in
+`NetStackStats::{reassembled, reassembly_timeout, reassembly_overflow}`; with it `owns`
+reports TCP/UDP fragments to a stack address as `Flow` (first fragment, registered tuple)
+or `Listener`; covered by `nsplane-e2e`'s `netstack_reassembly`.
 
 ### MD assessment (L1, 2026-10-03; not implemented this round)
 

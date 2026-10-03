@@ -12,6 +12,8 @@
 //! stack's addresses, [`incoming_udp`](NetStackHandle::incoming_udp) reports one
 //! [`UdpFlow`] per `(remote, local)` tuple, and [`connect_tcp`](NetStackHandle::connect_tcp)
 //! and [`bind_udp`](NetStackHandle::bind_udp) open the reverse direction.
+//! [`owns`](NetStackHandle::owns) tells whether an ingress packet is the stack's
+//! ([`Ownership`]), for a local side that shares one decrypted stream with other consumers.
 //!
 //! # Driver
 //!
@@ -35,12 +37,15 @@
 
 mod config;
 mod device;
+mod ownership;
 mod stack;
 mod stats;
 mod tcp;
 mod udp;
 
 pub use config::{DEFAULT_MTU, MIN_MTU, NetStackConfig};
+pub use nsplane_packet::reassembly::ReassemblyConfig;
+pub use ownership::Ownership;
 pub use stack::{NetStack, NetStackHandle, NetStackSink, NetStackSource};
 pub use stats::NetStackStats;
 pub use tcp::TcpConnection;

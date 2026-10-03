@@ -36,11 +36,11 @@ where it is described below.
 | Crate | Entry points | Supporting types |
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket` | `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`) | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
-| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`) | `NetStackConfig`, `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
@@ -455,6 +455,49 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- UDP datagrams are built with DF set over IPv4 and an application payload whose packet
+  exceeds the MTU fails with `InvalidInput`. With `NetStackConfig::udp_allow_fragmentation`
+  an IPv4 one instead leaves as a single oversize packet with DF clear (up to the 65 535-byte
+  total length), for the engine's fragmenter (`EngineBuilder::fragmenter`) to split; the
+  UDP egress bypasses smoltcp, so nothing in the stack caps it, and the source keeps
+  reporting the configured MTU. IPv6 still fails.
+- `TcpConnection::unacked` and `TcpConnection::last_ack` report send progress: after
+  smoltcp ran, each bridge pass reads the socket's send queue (bytes taken from the
+  application and not acknowledged; smoltcp exposes no SND.NXT, so bytes held back for the
+  peer's window count too) and stores it in an atomic shared with the connection when it
+  changed; a queue smaller than at the end of the previous pass means SND.UNA advanced
+  (only an acknowledgement shrinks it, except a reset, which leaves the socket closed and
+  is not counted), so the pass's time is stored as `last_ack`. No lock, no per-packet or
+  per-byte work; the values stay readable after the socket is released.
+- `NetStackHandle::owns(packet)` answers `Ownership::{Flow, Listener, None}` synchronously
+  for a local side that shares one decrypted stream between the stack and other consumers
+  (a `Splitter` closure). It reads one table of tuples behind a mutex, keyed
+  `(local, remote)`: TCP connections are registered when a connect is queued (by the handle
+  for `connect_tcp_from` with a port, by the driver before the SYN is emitted for an
+  ephemeral port), when a listener socket enters SYN-RECEIVED (after the poll that ingested
+  the SYN, before the SYN-ACK is flushed) and when a socket is adopted as a connection;
+  bound UDP sockets and UDP flows when they are created. Each registration is dropped with
+  what holds it (the released connection, the abandoned or failed connect, a handshake
+  socket back in `Listen` or closed, the dropped `UdpSocket` or `UdpFlow`, whose
+  registration goes before its queue closes so a rebind or a new flow never races it), so
+  the table changes per connection, never per packet, and costs nothing per packet when
+  `owns` is not called. `Flow` is an exact tuple match (any remote for a bound UDP socket)
+  or an ICMP/ICMPv6 error quoting a packet sent on a registered tuple; `Listener` a bare SYN
+  or UDP datagram to a stack address otherwise; `None` everything else, fragments (dropped
+  by the stack) and every packet once the driver stopped. The answer reflects the state at
+  the call. With reassembly on, TCP and UDP fragments to a stack address are the stack's:
+  `Flow` for a first fragment on a registered tuple, `Listener` for any other first
+  fragment and for every later one (it carries no ports, and the reassembler's state is the
+  driver's, not shared with `owns`).
+- `NetStackConfig::reassembly` gives the driver one `nsplane_packet::reassembly::Reassembler`
+  (none is created without it). Before `classify`, every ingress packet to a stack address
+  is pushed into it: a non-fragment passes unchanged, a fragment is held, and a completed
+  datagram continues through the normal ingress as one packet (UDP dispatch, or smoltcp for
+  TCP). Expiry runs at the start of each driver turn, which the driver's existing timer
+  (at most `MAX_POLL_DELAY`, 50 ms) already wakes, and is a single emptiness check while no
+  datagram is held. The reassembler's counts are added to `NetStackStats` after each push
+  or expiry: `reassembled`, `reassembly_timeout`, `reassembly_overflow`, and overlapping or
+  invalid fragments as `malformed`. Without it, fragments count as `unsupported`.
 - Every TCP socket (connect and listener pool) runs CUBIC congestion control (smoltcp
   feature `socket-tcp-cubic`, no extra crate). Without it smoltcp sends the whole peer
   window at once and, after a retransmission timeout, all of it again; a hop that drops
@@ -757,6 +800,8 @@ path, so such a client pays no extra latency for it.
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
 | Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |
 | User-space TCP/IP stack | `nsplane-netstack` | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
+| Stack reassembly | `nsplane-netstack` | `NetStackConfig::reassembly = Some(ReassemblyConfig::default())` (64 datagrams, 30 s, 65 535 bytes) | off: fragments are dropped (`unsupported`) | one `Option` check per ingress packet; no reassembler is allocated |
+| Oversize IPv4 UDP sends | `nsplane-netstack` | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send, as before |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |

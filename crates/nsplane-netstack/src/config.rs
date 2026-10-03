@@ -2,6 +2,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use nsplane_packet::reassembly::ReassemblyConfig;
+
 /// Default MTU: the WireGuard default for an IPv4 or IPv6 outer path.
 pub const DEFAULT_MTU: u16 = 1420;
 
@@ -54,6 +56,29 @@ pub struct NetStackConfig {
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
+    /// Whether an IPv4 UDP datagram the application sends above the MTU leaves as one
+    /// oversize packet with DF clear, for the engine's fragmenter
+    /// (`nsplane::EngineBuilder::fragmenter`) to split, instead of failing with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput).
+    ///
+    /// Datagrams that fit the MTU are unchanged (DF set), IPv6 datagrams above the MTU
+    /// still fail, and so do IPv4 packets above the 65 535-byte total length limit. The
+    /// source keeps reporting the configured MTU. Without a fragmenter on the engine (or
+    /// with a TUN device that does not fragment) such packets are dropped further down.
+    /// Default `false`.
+    pub udp_allow_fragmentation: bool,
+    /// Reassembly of ingress IPv4 fragments and IPv6 Fragment-header packets addressed to
+    /// the stack, within the given bounds.
+    ///
+    /// With it, the driver holds fragments in one reassembler and hands each completed
+    /// datagram on as if it had arrived whole (to a bound UDP socket or flow, or into TCP);
+    /// incomplete datagrams expire on the driver's own timer. The outcome is counted in
+    /// [`NetStackStats::reassembled`](crate::NetStackStats::reassembled),
+    /// [`reassembly_timeout`](crate::NetStackStats::reassembly_timeout) and
+    /// [`reassembly_overflow`](crate::NetStackStats::reassembly_overflow).
+    /// Default `None`: fragments are dropped (counted as
+    /// [`unsupported`](crate::NetStackStats::unsupported)) and no reassembly state exists.
+    pub reassembly: Option<ReassemblyConfig>,
 }
 
 impl NetStackConfig {
@@ -81,6 +106,8 @@ impl Default for NetStackConfig {
             stream_buffer: 64 * 1024,
             listener_pool: 32,
             max_udp_flows: 65_536,
+            udp_allow_fragmentation: false,
+            reassembly: None,
         }
     }
 }
@@ -99,6 +126,8 @@ pub(crate) struct Settings {
     pub(crate) stream_buffer: usize,
     pub(crate) listener_pool: usize,
     pub(crate) max_udp_flows: usize,
+    pub(crate) udp_allow_fragmentation: bool,
+    pub(crate) reassembly: Option<ReassemblyConfig>,
 }
 
 /// Sockets get send and receive buffers of this many IPv4-sized segments.
@@ -142,6 +171,8 @@ impl Settings {
             stream_buffer: config.stream_buffer.max(1),
             listener_pool: config.listener_pool.max(1),
             max_udp_flows: config.max_udp_flows.max(1),
+            udp_allow_fragmentation: config.udp_allow_fragmentation,
+            reassembly: config.reassembly,
         }
     }
 
