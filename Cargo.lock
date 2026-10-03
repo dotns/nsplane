@@ -1110,6 +1110,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "futures-core",
+ "futures-util",
  "nix",
  "nsplane",
  "nsplane-acl",
@@ -1119,7 +1120,12 @@ dependencies = [
  "nsplane-packet",
  "nsplane-tun",
  "nsplane-uapi",
+ "nsplane-wss",
+ "rcgen",
+ "rustls",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -1145,6 +1151,7 @@ dependencies = [
  "nsplane-packet",
  "nsplane-tun",
  "nsplane-uapi",
+ "nsplane-wss",
  "rand_core 0.6.4",
  "rcgen",
  "rustls",
@@ -1236,6 +1243,22 @@ dependencies = [
  "hex",
  "nsplane",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nsplane-wss"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "nsplane",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
 ]
 
