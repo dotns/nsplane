@@ -269,9 +269,9 @@ const fn targets(family: Family) -> (IpAddr, IpAddr, IpAddr) {
 async fn graph_two_engines_joined_by_pipe() -> TestResult {
     // A -> B: the forward Redirect from the virtual address to Y's, and a Drop rule for the
     // rest of Y's virtual range.
-    let (ab_sink, ab_source) = pipe(CAPACITY, MTU);
+    let (to_b_sink, to_b_source) = pipe(CAPACITY, MTU);
     let kept = Arc::new(AtomicU64::new(0));
-    let forward = Arc::new(MapSink::new(ab_sink, {
+    let forward = Arc::new(MapSink::new(to_b_sink, {
         let kept = Arc::clone(&kept);
         move |packet: &mut PacketBuf, _from: PeerId| {
             if redirect(packet.as_packet_mut()) {
@@ -283,8 +283,8 @@ async fn graph_two_engines_joined_by_pipe() -> TestResult {
         }
     }));
     // B -> A: a plain pipe, and the reverse translation on A's side of it.
-    let (ba_sink, ba_source) = pipe(CAPACITY, MTU);
-    let reverse = MapSource::new(ba_source, unredirect);
+    let (to_a_sink, to_a_source) = pipe(CAPACITY, MTU);
+    let reverse = MapSource::new(to_a_source, unredirect);
 
     let (tun_source, tun_in, _tun_mtu) = ChannelSource::new(CAPACITY, MTU);
     let (tun_sink, mut tun_out) = ChannelSink::new(CAPACITY);
@@ -298,7 +298,7 @@ async fn graph_two_engines_joined_by_pipe() -> TestResult {
 
     let (link_b, link_y) = ChannelTransport::pair(CAPACITY, B_PATH, Y_PATH);
     let mut y = Node::new(Y_SEED, Y_PATH.0, Y_PATH.1, link_y, Options::default());
-    let b = engine(B_SEED, ab_source, ba_sink, link_b)?;
+    let b = engine(B_SEED, to_b_source, to_a_sink, link_b)?;
     b.handle().add_or_update_peer(y.as_peer(B_PATH.0)).await?;
     y.handle
         .add_or_update_peer(gateway(B_SEED, Y_PATH.0, B_PATH.1))
