@@ -7,17 +7,19 @@
 #   cargo build -p nsplane-cli --release && scripts/e2e/linux.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-PREFIX=${NSPLANE_E2E_PREFIX:-nsplane-e2e}
+PREFIX=${NSPLANE_E2E_PREFIX:-nsplane-e2e-$$}
 NET=$PREFIX-net
 IMG=$PREFIX-image
 BIN=${NSPLANE_E2E_BIN:-$PWD/target/release/nsplane-cli}
 LABEL=${NSPLANE_E2E_LABEL:-nsplane-e2e=true}
-cleanup() { docker rm -f "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
+LABELS=(--label "$LABEL" --label ai-agent=true)
+cleanup() { docker rm -f "$PREFIX-a" "$PREFIX-b" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; docker image rm "$IMG" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 cleanup
-docker build -q --label "$LABEL" -t "$IMG" scripts/e2e >/dev/null
-docker network create --label "$LABEL" "$NET" >/dev/null
-run() { docker run -d --rm --label "$LABEL" --name "$1" --network "$NET" --cap-add NET_ADMIN \
+docker build -q "${LABELS[@]}" -t "$IMG" scripts/e2e >/dev/null
+docker network create "${LABELS[@]}" "$NET" >/dev/null
+run() { docker run -d --rm "${LABELS[@]}" --name "$1" --network "$NET" --cap-add NET_ADMIN \
   --device /dev/net/tun --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   -v "$BIN":/usr/local/bin/nsplane-cli:ro "$IMG" sleep infinity >/dev/null; }
 run "$PREFIX-a"; run "$PREFIX-b"

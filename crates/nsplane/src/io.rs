@@ -1,8 +1,9 @@
 //! Local-side driver traits: where plaintext packets come from and go to.
 
+use std::collections::VecDeque;
 use std::io;
 
-use nsplane_packet::{PacketBuf, PeerId};
+use nsplane_packet::{PacketBatch, PacketBuf, PeerId};
 use tokio::sync::watch;
 
 /// Produces plaintext IP packets from the local side.
@@ -14,6 +15,32 @@ pub trait PacketSource: Send + 'static {
     /// (device closed, all senders gone) this returns [`io::ErrorKind::BrokenPipe`],
     /// and keeps returning it on every later call.
     fn recv(&mut self) -> impl Future<Output = io::Result<PacketBuf>> + Send;
+
+    /// Appends the next packets from the local side to `batch`, in order.
+    ///
+    /// On success at least one packet was appended, unless `batch` was already full, and
+    /// never more than `batch` has room for. Each packet follows the [`recv`] buffer
+    /// contract. Once the source is exhausted this returns [`io::ErrorKind::BrokenPipe`],
+    /// like [`recv`]; packets appended before an error are kept in `batch`.
+    ///
+    /// The default appends one packet from [`recv`]; a source that can read several
+    /// packets at once overrides it. Cancellation safety is that of [`recv`]: the default
+    /// appends a packet only once [`recv`] resolved.
+    ///
+    /// [`recv`]: PacketSource::recv
+    fn recv_batch(
+        &mut self,
+        batch: &mut PacketBatch,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            if !batch.is_full() {
+                let packet = self.recv().await?;
+                // The batch had room, so the push succeeds.
+                let _ = batch.push(packet);
+            }
+            Ok(())
+        }
+    }
 
     /// The current local MTU; the receiver observes every later change.
     ///
@@ -32,4 +59,29 @@ pub trait PacketSink: Send + Sync + 'static {
     /// local side applies backpressure. Once the local side is gone this returns
     /// [`io::ErrorKind::BrokenPipe`] and the packet is dropped.
     fn send(&self, packet: PacketBuf, from: PeerId) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Delivers the decrypted packets in `packets` to the local side, front first.
+    ///
+    /// Each entry is a packet and the peer it was decrypted for, as for [`send`]. The
+    /// caller owns `packets` and reuses it, so delivering a batch does not allocate; the
+    /// sink removes each packet from the front as it takes it over. On success `packets`
+    /// is empty. On an error the packet that failed is dropped and the rest stay in
+    /// `packets`, in order: after [`io::ErrorKind::BrokenPipe`] (the local side is gone)
+    /// the caller stops; after any other error it may call again to deliver the rest.
+    ///
+    /// The default calls [`send`] for each packet in order. Cancelling it drops the packet
+    /// being delivered, if any; the ones not taken over yet stay in `packets`.
+    ///
+    /// [`send`]: PacketSink::send
+    fn send_batch(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            while let Some((from, packet)) = packets.pop_front() {
+                self.send(packet, from).await?;
+            }
+            Ok(())
+        }
+    }
 }
