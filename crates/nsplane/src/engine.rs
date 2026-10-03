@@ -23,7 +23,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_REMOVED,
 };
-use crate::handle::{Command, EngineHandle, TransportError};
+use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats, TransportError};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::Transport;
 
@@ -201,6 +201,16 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
             Task::spawn(write_sink(parts.sink, deliver_rx, suspended.subscribe())),
         ],
         queue_capacity: capacity,
+        high_water: QueueStats {
+            command: QueueDepth::new(COMMAND_CAPACITY),
+            local: QueueDepth::new(capacity),
+            datagrams: QueueDepth::new(capacity),
+            deliver: QueueDepth::new(capacity),
+            recycle: QueueDepth::new(capacity),
+            transmit: QueueDepth::new(capacity),
+            backlog: QueueDepth::new(capacity),
+            events: QueueDepth::new(parts.event_capacity),
+        },
         local_first: false,
         suspended,
     };
@@ -375,6 +385,11 @@ impl TransportSlot {
         unsent.append(&mut self.pending);
         unsent
     }
+
+    /// Datagrams in the transmit queue, counting a reserved slot.
+    fn queued(&self) -> usize {
+        self.queue.max_capacity() - self.queue.capacity()
+    }
 }
 
 /// What woke the owner task.
@@ -415,6 +430,8 @@ struct Owner {
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
+    /// Capacities and high-water marks of the queues, without the current occupancies.
+    high_water: QueueStats,
     /// Alternates which of local packets and datagrams is polled first.
     local_first: bool,
     /// Whether the engine is suspended; every I/O task watches it.
@@ -440,12 +457,20 @@ impl Owner {
                     }
                 }
                 Wake::Datagram(Some((path, data))) => {
+                    self.high_water
+                        .datagrams
+                        .record_received(self.datagrams.len());
                     self.core
                         .handle_input(Input::Datagram { path, data }, now());
                 }
                 // The owner keeps a sender, so the queue never closes.
                 Wake::Datagram(None) => {}
-                Wake::Local(Some(packet)) => self.core.handle_input(Input::Local { packet }, now()),
+                Wake::Local(Some(packet)) => {
+                    if let Some(local) = &self.local {
+                        self.high_water.local.record_received(local.len());
+                    }
+                    self.core.handle_input(Input::Local { packet }, now());
+                }
                 Wake::Local(None) => self.local = None,
                 Wake::Mtu(Some(mtu)) => {
                     if mtu != self.mtu {
@@ -457,12 +482,11 @@ impl Owner {
                 Wake::Flush(id, permit) => {
                     // No permit: the transmit queue closed, and moving drops the datagrams.
                     if let Some(permit) = permit
-                        && let Some(datagram) = self
-                            .transports
-                            .get_mut(&id)
-                            .and_then(|slot| slot.pending.pop_front())
+                        && let Some(slot) = self.transports.get_mut(&id)
+                        && let Some(datagram) = slot.pending.pop_front()
                     {
                         permit.send(datagram);
+                        self.high_water.transmit.record(slot.queued());
                     }
                     self.move_pending(id);
                 }
@@ -542,6 +566,9 @@ impl Owner {
 
     /// Handles a command; breaks with the reply channel on shutdown.
     async fn command(&mut self, command: Command) -> ControlFlow<oneshot::Sender<()>> {
+        if !matches!(command, Command::QueueStats(..)) {
+            self.high_water.command.record_received(self.commands.len());
+        }
         // Replies are best effort: the caller may have stopped waiting.
         match command {
             Command::Config(change, reply) => {
@@ -631,9 +658,51 @@ impl Owner {
             Command::DropCounters(reply) => {
                 let _ = reply.send(self.drops.clone());
             }
+            Command::QueueStats(take, reply) => {
+                let _ = reply.send(self.queue_stats(take));
+            }
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
         }
         ControlFlow::Continue(())
+    }
+
+    /// The high-water marks including the current occupancies; with `take`, the marks
+    /// restart at 0 afterwards.
+    fn queue_stats(&mut self, take: bool) -> QueueStats {
+        let marks = &mut self.high_water;
+        // The command being served is not counted.
+        marks.command.record(self.commands.len());
+        if let Some(local) = &self.local {
+            marks.local.record(local.len());
+        }
+        marks.datagrams.record(self.datagrams.len());
+        marks
+            .deliver
+            .record(self.deliver.max_capacity() - self.deliver.capacity());
+        marks.recycle.record(self.recycled.len());
+        for slot in self.transports.values() {
+            marks.transmit.record(slot.queued());
+            marks.backlog.record(slot.pending.len());
+        }
+        marks
+            .events
+            .record(self.events.len().min(marks.events.capacity));
+        let stats = *marks;
+        if take {
+            for depth in [
+                &mut marks.command,
+                &mut marks.local,
+                &mut marks.datagrams,
+                &mut marks.deliver,
+                &mut marks.recycle,
+                &mut marks.transmit,
+                &mut marks.backlog,
+                &mut marks.events,
+            ] {
+                depth.high_water = 0;
+            }
+        }
+        stats
     }
 
     /// Stops and removes transport `id`; the datagrams still queued for it are dropped.
@@ -705,6 +774,7 @@ impl Owner {
                 Output::Event(event) => self.event(event),
             }
         }
+        self.high_water.recycle.record(self.recycled.len());
         while let Ok(buf) = self.recycled.try_recv() {
             self.core.recycle(buf);
         }
@@ -718,7 +788,12 @@ impl Owner {
     /// Sends a datagram on the transport its path names.
     fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
         let result = match self.transports.get_mut(&path.transport) {
-            Some(slot) => slot.transmit((path, data), droppable, self.queue_capacity),
+            Some(slot) => {
+                let result = slot.transmit((path, data), droppable, self.queue_capacity);
+                self.high_water.transmit.record(slot.queued());
+                self.high_water.backlog.record(slot.pending.len());
+                result
+            }
             None => Err((data, DROP_NO_TRANSPORT)),
         };
         if let Err((data, reason)) = result {
@@ -740,8 +815,15 @@ impl Owner {
 
     fn deliver(&mut self, from: PeerId, packet: PacketBuf) {
         let reason = match self.deliver.try_send((from, packet)) {
-            Ok(()) => return,
+            Ok(()) => {
+                let queued = self.deliver.max_capacity() - self.deliver.capacity();
+                self.high_water.deliver.record(queued);
+                return;
+            }
             Err(TrySendError::Full((_, packet))) => {
+                self.high_water
+                    .deliver
+                    .record(self.high_water.deliver.capacity);
                 self.core.recycle(packet);
                 DROP_SINK_FULL
             }
@@ -759,11 +841,19 @@ impl Owner {
 
     /// Counts drops and publishes the event; never blocks.
     fn event(&mut self, event: Event) {
-        if let Event::Dropped { reason, .. } = event {
+        let dropped = if let Event::Dropped { reason, .. } = event {
             *self.drops.entry(reason).or_default() += 1;
-        }
+            true
+        } else {
+            false
+        };
         // No subscribers is not an error.
         let _ = self.events.send(event);
+        // Reading the occupancy takes the channel's locks: not on the per-packet drop path.
+        if !dropped {
+            let depth = &mut self.high_water.events;
+            depth.record(self.events.len().min(depth.capacity));
+        }
     }
 }
 
