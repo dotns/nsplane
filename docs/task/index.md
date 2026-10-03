@@ -39,4 +39,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [-] [**20261002-1509-phase1-followups Phase 1 follow-up fixes (data plane core campaign)**](20261002-1509-phase1-followups.md) `P1`
 - [x] [**20261003-1215-traffic-status Engine status snapshot and per-transport traffic counters**](20261003-1215-traffic-status.md) `P2`
 - [x] [**20261002-1529-repo-cleanup-layout Remove unused files and move crates under `crates/`**](20261002-1529-repo-cleanup-layout.md) `P2`
-- [ ] [**20261003-1300-ns-m4-requests Engine hooks requested by ns account mode (M4)**](20261003-1300-ns-m4-requests.md) `P1`
+- [-] [**20261003-1300-ns-m4-requests Engine hooks requested by ns account mode (M4)**](20261003-1300-ns-m4-requests.md) `P1`
+- [ ] [**20261003-1500-ns-dataplane-moves Data-plane pieces ns still owns, to move into nsplane**](20261003-1500-ns-dataplane-moves.md) `P1`
