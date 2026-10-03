@@ -797,6 +797,22 @@ scenario_translate_node() {
   echo "  ok  t: translated $(X t 'cat /translate_node.json' | jq -c '.extra.translate | {translated_out, translated_in, dropped_out, dropped_in}')"
   X k 'wg show wg0 transfer' | awk '$2 == 0 || $3 == 0 { exit 1 }'
   echo "  ok  k: traffic on the IPv6-only tunnel both ways"
+
+  echo "  -- t with --no-offload: full-MTU IPv4 packets grow in place"
+  node_stop t translate_node
+  X t 'rm -f /translate_node.json'
+  local mtu=1420
+  node t translate_node --no-offload --mtu "$mtu" --self 10.200.0.1=fd00:a::1:1 \
+    --peer "$k_pub,endpoint=$k_ip:$PORT" \
+    --map "$k_pub,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2" --lan "$lan4=fd00:1::/96"
+  wait_log t translate_node 'TUN device opened.* offload=off'
+  if X c "ping -c 3 -i 0.3 -w 15 -M do -s $(( mtu - 28 )) 10.200.0.2" >/dev/null; then
+    echo "  ok  c: ping 10.200.0.2 with $mtu-byte packets"
+  else
+    echo "  FAIL c: ping 10.200.0.2 with $mtu-byte packets"; return 1
+  fi
+  wait_status t translate_node '.extra.translate | .translated_out > 0 and .grown_copies == 0' 5
+  echo "  ok  t: translated $(X t 'cat /translate_node.json' | jq -c '.extra.translate | {translated_out, grown_copies}')"
 }
 
 # udp_from <ctr> <ip6> <port> <source port>: one UDP echo round trip from a fixed port.

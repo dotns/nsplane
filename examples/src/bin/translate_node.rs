@@ -68,7 +68,6 @@ mod unix {
         LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator, TranslatorStats,
     };
     use nsplane_packet::{PacketBuf, PeerId};
-    use nsplane_tun::Tun;
     use serde_json::{Value, json};
 
     /// A TUN node translating local IPv4 to IPv6 in the tunnel (needs root).
@@ -337,8 +336,7 @@ mod unix {
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
         let peers = peers_with_mappings(&args)?;
-        let tun = Tun::create(&args.tun.tun_name)
-            .with_context(|| format!("cannot create TUN {}", args.tun.tun_name))?;
+        let tun = node::create_tun(&args.tun.tun_name, &args.node)?;
         let name = tun.name().unwrap_or_else(|_| args.tun.tun_name.clone());
         configure_tun(&name, &addresses(&args), args.tun.mtu, &peers)?;
         let (source, sink) = tun.split().context("cannot open the TUN device")?;

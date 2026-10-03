@@ -17,6 +17,10 @@ use wintun_bindings::{Adapter, MAX_RING_CAPACITY, Session};
 /// Idle buffers kept by the reader thread's pool.
 const POOL_FREE: usize = 64;
 
+/// Room beyond each received packet: the growth of an IPv4 packet translated to IPv6
+/// with a fragment header, so an IPv4 <-> IPv6 translator can rewrite it in place.
+const TRANSLATION_SLACK: usize = 28;
+
 /// Packets queued between the reader thread and the [`TunSource`].
 const QUEUE_DEPTH: usize = 64;
 
@@ -98,7 +102,7 @@ fn read_loop(session: &Arc<Session>, packets: &mpsc::Sender<PacketBuf>) {
     let mut pool = PacketPool::new(POOL_FREE);
     while let Ok(received) = session.receive_blocking() {
         let bytes = received.bytes();
-        let mut packet = pool.get(bytes.len());
+        let mut packet = pool.get(bytes.len() + TRANSLATION_SLACK);
         packet.set_len(bytes.len());
         packet.as_packet_mut().copy_from_slice(bytes);
         // Release the ring slot before waiting for room in the channel.

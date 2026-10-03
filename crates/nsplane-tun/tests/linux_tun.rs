@@ -36,6 +36,45 @@ async fn plain_tun_device_round_trip() {
 
 #[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
+async fn plain_tun_full_mtu_read_leaves_room_to_grow() {
+    let tun = Tun::create_with("nsplanegrow%d", TunOptions::new().offload(false)).unwrap();
+    let name = tun.name().unwrap();
+    let mtu = usize::from(tun.mtu());
+    let local = Ipv4Addr::new(10, 77, 4, 1);
+    let remote = Ipv4Addr::new(10, 77, 4, 2);
+    for args in [
+        &["addr", "add", "10.77.4.1/24", "dev", &name][..],
+        &["link", "set", &name, "up"],
+    ] {
+        let status = Command::new("ip").args(args).status().unwrap();
+        assert!(status.success(), "ip {args:?}: {status}");
+    }
+    let (mut source, _sink) = tun.split().unwrap();
+
+    // A datagram filling the MTU: 20 bytes of IPv4 and 8 of UDP header.
+    let socket = UdpSocket::bind(SocketAddr::from((local, 0))).unwrap();
+    socket
+        .send_to(&vec![0x5a; mtu - 28], SocketAddr::from((remote, 4000)))
+        .unwrap();
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), source.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed = IpPacket::parse(packet.as_packet()).unwrap();
+        if matches!(parsed, IpPacket::V4 { .. })
+            && parsed.five_tuple().is_some_and(|flow| flow.dst_port == 4000)
+        {
+            // Room for an IPv4 -> IPv6 translator to grow it in place.
+            assert_eq!(packet.len(), mtu);
+            assert!(packet.capacity() >= mtu + 28, "{}", packet.capacity());
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
 async fn adopted_tun_fds_round_trip() {
     // An adopted vnet-header fd reads with the header and writes without offloads.
     let created = Tun::create("nsplanevnetfd%d").unwrap();
