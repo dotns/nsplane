@@ -256,6 +256,14 @@ supported.
   `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` with the default security
   descriptor; the path and descriptor are not yet verified on a real Windows host.
 
+### Platform local sides
+
+- Linux, macOS, Windows: `Tun` opens (or, on Unix, adopts) a TUN device.
+- Android: `TunSlot` over the `VpnService` fd; `TunSlot::replace` hot-swaps the fd on every
+  reconfiguration while the engine runs, and `disable`/`enable` park I/O in between.
+- iOS: `host_tun` bridges `NEPacketTunnelFlow`: the host pushes read packets into the
+  `HostTunInput` and the engine writes through the host's `write` callback.
+
 ## Quality gates
 
 There is no CI; run the gates locally before pushing (see `docs/decisions/`):

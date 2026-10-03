@@ -33,6 +33,18 @@
 //! stays the value it was adopted with. On Windows the MTU is read once when the
 //! Wintun adapter opens and is not watched.
 //!
+//! Hot-swappable fd (Linux, Android, macOS, iOS): `TunSlot::new` yields a control
+//! handle, a `SlotSource` and a `SlotSink` that do I/O on whichever fd is installed,
+//! for a host that replaces the fd while the engine runs (Android `VpnService`).
+//! `TunSlot::replace` fences the previous fd, `disable`/`enable` park I/O, and `close`
+//! ends both sides with `BrokenPipe`. Packets are read and written one at a time, without
+//! header or offloads.
+//!
+//! Host callbacks (every target): [`host_tun`] yields a [`HostTunInput`] the host pushes
+//! packets into from any thread, a [`HostTunSource`] the engine reads them from, and a
+//! [`HostTunSink`] that hands the engine's packets to the host's `write` callback, as iOS
+//! `NEPacketTunnelFlow` needs.
+//!
 //! `unsafe` is confined to the platform modules that perform syscalls (`unix`,
 //! `linux`, `darwin`) and to loading the Wintun library (`windows`); see
 //! `docs/decisions/2026-10-01-unsafe-code-in-boringtun.md`.
