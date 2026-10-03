@@ -13,6 +13,7 @@ This page describes what is on `main`. The target design and roadmap are in
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, the fragmentation stage (`FragmentConfig`) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
 | `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters; NAT64 to a LAN (`Nat64Lan`) on the local side |
+| `nsplane-wss` | `crates/nsplane-wss/` | WebSocket-over-TLS carriers: `WssDialer` for `LinkTransport`, the `WsFrame` stream client (`WssStreamClient`) and terminate leg (`WssStreamServer`) |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices as `PacketSource`/`PacketSink` |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource`/`PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener |
@@ -25,6 +26,7 @@ nsplane-packet ────────► nsplane-core, nsplane
 nsplane, nsplane-packet ─► nsplane-netstack
 nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
 nsplane ─► nsplane-nat
+nsplane ─► nsplane-wss
 ```
 
 ## Public interfaces
@@ -39,6 +41,7 @@ where it is described below.
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`) | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
@@ -408,6 +411,132 @@ counts them under `TRANSPORT_SEND_ERROR`. `TunOptions::offload(false)`,
 TUN reads (no virtio-net header, and Wintun reads on Windows) leave the same 28 bytes of
 room behind each packet as segmented ones (a read still takes at most the MTU), so a
 translator grows full-MTU IPv4 in place with offload off too.
+
+## nsplane-wss
+
+`nsplane-wss` carries data-plane traffic over WebSocket over TLS (ADR
+`2026-10-03-data-channel-protocols-in-nsplane`: both legs of each data-channel protocol live
+in nsplane). It is a separate crate on `nsplane`, so `nsplane` itself stays free of
+WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite` and
+`rustls` (aws-lc-rs provider). It is `#![forbid(unsafe_code)]` and publishes once
+`nsplane` 0.8.0 is on crates.io (it has no unpublished dependencies).
+
+**Connections.** Every carrier dials the same way, from one `WssConfig`:
+
+- TCP, TLS and the WebSocket upgrade within `connect_timeout` (10 s), to `connect_addr`
+  or the URL's host, with `server_name` (default the URL's host), the extra `headers` and,
+  with a `BearerProvider`, `Authorization: Bearer <token>` fetched per dial.
+- An upgrade answered with 401 or 403 is reported as `LinkState::Rejected(status)` on the
+  carrier's `state()` watch (and counted in its stats). After a 401 the next dial waits
+  until the provider yields a different token (polled every `token_poll`, 2 s, at most
+  `token_wait`, 300 s); a 403, and a 401 without a provider, back off like any failure.
+- Backoff: every dial but the first waits `backoff_min` (2 s) after a link that came up,
+  doubled after each failed dial up to `backoff_max` (60 s).
+- Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
+  (pongs included) arrived for `read_idle` (35 s). No message above `MAX_MESSAGE`
+  (4 x 65 535 bytes) is read.
+- TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
+  takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
+  default protocol versions and no client auth); `WssTls::Config` takes a complete
+  `Arc<rustls::ClientConfig>` used as is (ns passes its `control::tls::client_config()`).
+  Built-in roots may become an optional feature later if a consumer needs them.
+
+**Datagram carrier.** `WssDialer` is a `LinkDialer`: `into_transport(id, peer, config)`
+returns a `LinkTransport` whose links are WSS connections. Each datagram is one binary
+message carrying its raw bytes (the wire of ns `OpaquePump` and the examples' relay); text
+messages and messages above `MAX_DATAGRAM` (65 535) are dropped and counted in
+`WssStats`, a close frame or the end of the stream ends the link.
+
+**Stream carrier wire.** `WsFrame` (module `frame`) is ns `tunnel-ws`'s and NSGW's protocol,
+byte for byte: every binary message is one frame, big-endian.
+
+| Field / command | Bytes | Content |
+|---|---|---|
+| `stream_id` | 4 | the stream, per session (never 0 from the client) |
+| `command` | 1 | one of the commands below |
+| `OPEN_V4` (`0x01`) | 4 + 2 + 1 | IPv4 address, port, protocol (`0x00` TCP, `0x01` UDP) |
+| `OPEN_V6` (`0x02`) | 16 + 2 + 1 | IPv6 address, port, protocol |
+| `DATA` (`0x10`) | rest | stream bytes (at most `MAX_DATA_PAYLOAD`, 65 531, per frame), or one UDP datagram |
+| `CLOSE` (`0x20`) | 0 | close the stream |
+| `CLOSE_ACK` (`0x21`) | 0 | acknowledge a CLOSE |
+
+As in ns, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
+byte but `0x01` is TCP. The protocol has no open reply and no flow control: a refused
+OPEN is answered with CLOSE, and a stream whose peer outruns its receive budget is closed.
+
+**Stream client.** `WssStreamClient` (the client leg, ns `proxy/wire.rs` and
+`wss_flow.rs`) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
+`AsyncWrite`) and UDP flows (`open_udp`, a `WssUdpFlow` with `send` / `recv`) to targets
+behind a terminate (NSGW, or `WssStreamServer`).
+
+- Sessions: dialed lazily on the first open (or `connect`). Every TCP stream and UDP flow
+  is multiplexed over one session until it holds
+  `WssStreamLimits::max_streams_per_session` live ones (default 1024, NSGW's default
+  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time
+  and waiting opens share it. The wire format is ns's, unchanged. NSGW caveats: it rejects
+  OPENs beyond its own per-session cap, which its operator can set below 1024 (keep
+  `max_streams_per_session` at most the gateway's cap), and it writes all streams of a
+  session through one shared writer queue.
+- Stream ids count up from 1 per session, skipping ids still in use; an id stays in use
+  until the peer's CLOSE or `CLOSE_ACK`. An open returns once its OPEN is queued.
+- Half-close: `shutdown` sends CLOSE behind the data already written (the wire has no
+  other half-close) and the stream keeps reading until the peer's CLOSE or `CLOSE_ACK`,
+  then reads EOF; this matches the ns terminate and `WssStreamServer`, which drain the
+  stream to the backend before ending it. A peer's CLOSE reads as EOF after the bytes
+  before it and is answered with `CLOSE_ACK`; dropping a stream sends CLOSE.
+- Queues and bounds (`WssStreamLimits`, ns's defaults): a control queue (OPEN,
+  `CLOSE_ACK`, reset CLOSE, pings; 64 messages) written before the data queue (DATA and
+  orderly CLOSE; 256 messages), and receive budgets of 4 MiB per stream
+  (`stream_buffer`) and 32 MiB per session (`session_buffer`), each received frame
+  costing its payload plus 64 bytes. Over budget, a TCP stream is reset (reads fail with
+  `ConnectionReset`) and a UDP datagram is dropped while the flow stays.
+- Reconnection: when a session ends (socket error, close, read idle) every stream and flow
+  on it fails; the next open dials again after the backoff. Frames for unknown stream ids
+  are ignored and counted in `WssStreamStats`.
+
+**Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
+relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
+
+- Resolution is the embedder's: `WssResolver::resolve(WssOpen { session, stream_id,
+  target, protocol })` returns the backend `SocketAddr` or `Denied` (answered with CLOSE).
+  It runs on the stream's own task, so a slow answer delays only that stream. ns keeps its
+  resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) behind it.
+- An OPEN for an id in use, or beyond `max_streams` (1024), is answered with CLOSE. The
+  server connects a TCP stream or a connected UDP socket (bound to the backend's address
+  family) and relays: TCP bytes in DATA frames of at most `MAX_DATA_PAYLOAD`, one datagram
+  per DATA frame for UDP.
+- A CLOSE is always answered with `CLOSE_ACK`; the stream's queued data is still written
+  to the backend, then its write side is shut. A backend EOF sends CLOSE behind the
+  stream's data; a failed connect, a backend error (a failed UDP receive included) sends
+  CLOSE at once.
+- Queues and bounds (`WssServerLimits`, ns's defaults): 4 MiB per stream
+  (`stream_buffer`), 32 MiB per session (`session_buffer`), 64 frames per stream
+  (`stream_queue`), each received frame costing its payload plus 64 bytes until written;
+  a frame over a bound closes its stream only (`WssCloseReason::Overflow`). Control queue
+  64 messages (`CLOSE_ACK`, refusing or resetting CLOSE, pings), written before the data
+  queue of 256 (DATA and the CLOSE after a backend's end).
+- Events: `with_events(mpsc::Sender<WssStreamEvent>)` reports each stream's `Open` and
+  `Close { reason, to_backend, from_backend }`; sending never waits, an event that does
+  not fit is counted in `WssServerStats::event_drops`.
+- Reconnection: one session at a time carries every stream. When it ends its streams are
+  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after the
+  backoff; a shutdown closes the open streams and the session.
+
+ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
+here, ns can delete `tunnel-ws` whole.
+
+**Deviations from ns.** An orderly CLOSE is queued behind the stream's data on both legs.
+Client: an over-budget UDP datagram is dropped and the flow kept, and the receive budgets
+count payload plus 64 bytes per frame instead of ns's 64-message cap per stream. Server:
+on a peer's CLOSE the queued data is drained to the backend and its write side shut (ns
+dropped it), the half-close the client relies on; a failed UDP backend receive sends
+CLOSE; the UDP socket binds to the backend's address family.
+
+**Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
+`crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
+relay and checks the frames against the ns layouts; `nsplane-e2e` `wss_datagram` runs two
+engines over `WssDialer` (401, 403, reconnect, read idle); `examples/tests/wss.rs` and the
+`relay-wss` cells of `just e2e-examples` run the examples' relay client on it.
 
 ## nsplane-tun
 
@@ -807,6 +936,7 @@ path, so such a client pays no extra latency for it.
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
 | UDP side channel | `nsplane` | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified, no task or copy |
 | Message-link transport | `nsplane` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task is spawned and no dependency added; the dialer (WebSocket, TLS) is the embedder's |
+| WSS carriers | `nsplane-wss` | `WssDialer::new(config)?.into_transport(..)`, `WssStreamClient::new`, `WssStreamServer::new` | not a dependency | none: a separate crate; `nsplane` gains no WebSocket or TLS dependency (`tokio-tungstenite`, `rustls` with aws-lc-rs come only with `nsplane-wss`) |
 
 **Crates of a minimal client.** `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
 `nsplane-packet` and `nsplane-noise`. `nsplane-acl`, `nsplane-nat` and `nsplane-netstack`

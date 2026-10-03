@@ -281,7 +281,7 @@ async fn wss_node(
 ) -> anyhow::Result<Node> {
     let udp = UdpTransport::bind(UDP_TRANSPORT, loopback()).context("cannot bind a node")?;
     let listen = udp.local_addr();
-    let transport = WssTransport::connect(UDP_TRANSPORT, wss, Some(udp));
+    let transport = WssTransport::connect(UDP_TRANSPORT, wss, Some(udp))?;
     let (relay, stats) = (transport.relay(), transport.stats());
     let mut node = node_on(args, relays, address, key, transport, listen).await?;
     rediscover_on_connect(node.client.clone(), &stats, relay);
