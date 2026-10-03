@@ -16,7 +16,7 @@ use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Outp
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
@@ -44,7 +44,9 @@ const MAX_DATAGRAM: usize = 65535;
 /// When it wakes for a local packet or a received datagram, it also takes the ones already
 /// queued behind it (up to [`MAX_BATCH`]) and feeds them to the core as one batch
 /// ([`Core::handle_locals`], [`Core::handle_datagrams`]); it never waits for a batch to fill,
-/// so a lone packet goes through at once.
+/// so a lone packet goes through at once. Without crypto workers, the source and receive
+/// tasks hand over what one read returned as one message (up to [`MAX_BATCH`] items, as
+/// many as the queue has room for); either way the input queues are bounded in items.
 /// I/O tasks surround it, each connected through a bounded queue: the source task
 /// ([`PacketSource::recv`]), the sink task ([`PacketSink::send`]) and, for every transport,
 /// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The core
@@ -202,8 +204,11 @@ pub(crate) struct Parts<Src, Snk> {
 pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) -> Engine {
     let capacity = parts.queue_capacity;
     let (command_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
-    let (local_tx, local) = mpsc::channel(capacity);
-    let (datagram_tx, datagrams) = mpsc::channel(capacity);
+    // Without crypto workers the source and receive tasks hand over whole batches.
+    let fast_path = parts.crypto_workers < 2;
+    let handoff = if fast_path { MAX_BATCH } else { 1 };
+    let (local_tx, local) = batch_queue(capacity, handoff);
+    let (datagram_tx, datagrams) = batch_queue(capacity, handoff);
     let (recycle_tx, recycled) = mpsc::channel(capacity);
     let (signal, send_error_signal) = mpsc::channel(1);
     let (deliver, deliver_rx) = mpsc::channel(capacity);
@@ -309,6 +314,130 @@ impl Drop for Task {
     }
 }
 
+/// A queue bounded in items whose senders hand over batches: one message and one semaphore
+/// operation per batch rather than per item.
+fn batch_queue<T>(capacity: usize, handoff: usize) -> (BatchSender<T>, BatchQueue<T>) {
+    let (batches, rx) = mpsc::unbounded_channel();
+    let permits = Arc::new(Semaphore::new(capacity));
+    (
+        BatchSender {
+            batches,
+            permits: Arc::clone(&permits),
+            most: handoff.clamp(1, capacity),
+        },
+        BatchQueue {
+            batches: rx,
+            held: VecDeque::new(),
+            permits,
+            capacity,
+            taken: 0,
+        },
+    )
+}
+
+/// The sending side of a [`batch_queue`]; a permit of its semaphore stands for a free item
+/// slot.
+struct BatchSender<T> {
+    batches: mpsc::UnboundedSender<Vec<T>>,
+    permits: Arc<Semaphore>,
+    /// The most items one message carries, at most the capacity.
+    most: usize,
+}
+
+impl<T> Clone for BatchSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            batches: self.batches.clone(),
+            permits: Arc::clone(&self.permits),
+            most: self.most,
+        }
+    }
+}
+
+impl<T> BatchSender<T> {
+    /// Hands over every item of `items`, in order, waiting for room: in messages of up to
+    /// `most` items, each as large as the free slots allow (at least one). Fails once the
+    /// queue is gone.
+    async fn send(&self, items: &mut VecDeque<T>) -> Result<(), ()> {
+        while !items.is_empty() {
+            let n = items
+                .len()
+                .min(self.most)
+                .min(self.permits.available_permits().max(1));
+            // `n` is at most `most`, which is at most the capacity.
+            let permits = u32::try_from(n).map_err(drop)?;
+            self.permits
+                .acquire_many(permits)
+                .await
+                .map_err(drop)?
+                .forget();
+            self.batches
+                .send(items.drain(..n).collect())
+                .map_err(drop)?;
+        }
+        Ok(())
+    }
+}
+
+/// The receiving side of a [`batch_queue`], in the owner task. Items of a batch it has not
+/// taken yet stay held here, in order, and keep their slots.
+struct BatchQueue<T> {
+    batches: mpsc::UnboundedReceiver<Vec<T>>,
+    /// Received items not taken yet, oldest first.
+    held: VecDeque<T>,
+    permits: Arc<Semaphore>,
+    capacity: usize,
+    /// Items taken whose slots are not freed yet ([`BatchQueue::release`]).
+    taken: usize,
+}
+
+impl<T> BatchQueue<T> {
+    /// The next item; `None` once every sender is gone and every item was taken.
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if self.held.is_empty() {
+            match self.batches.poll_recv(cx) {
+                Poll::Ready(Some(batch)) => self.held.extend(batch),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(self.take())
+    }
+
+    /// The next item if one is queued.
+    fn try_recv(&mut self) -> Option<T> {
+        if self.held.is_empty() {
+            self.held.extend(self.batches.try_recv().ok()?);
+        }
+        self.take()
+    }
+
+    fn take(&mut self) -> Option<T> {
+        let item = self.held.pop_front()?;
+        self.taken += 1;
+        Some(item)
+    }
+
+    /// Frees the slots of the items taken, at once.
+    fn release(&mut self) {
+        if self.taken > 0 {
+            self.permits.add_permits(std::mem::take(&mut self.taken));
+        }
+    }
+
+    /// Items in the queue, not counting those taken.
+    fn len(&self) -> usize {
+        self.capacity - self.permits.available_permits() - self.taken
+    }
+}
+
+impl<T> Drop for BatchQueue<T> {
+    fn drop(&mut self) {
+        // Wakes the senders waiting for room.
+        self.permits.close();
+    }
+}
+
 /// What a stopped transmit task hands back: its queue and the datagrams of the batch it was
 /// sending that were not sent, oldest first.
 type Unsent = (mpsc::Receiver<Datagram>, Vec<Datagram>);
@@ -358,7 +487,7 @@ type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendErr
 /// traffic counters (which report failed sends) and the suspension state.
 type Start = Box<
     dyn FnOnce(
-            mpsc::Sender<Datagram>,
+            BatchSender<Datagram>,
             mpsc::WeakSender<Datagram>,
             mpsc::Receiver<Datagram>,
             mpsc::Sender<PacketBuf>,
@@ -623,10 +752,10 @@ struct Owner {
     private_key: Option<StaticSecret>,
     commands: mpsc::Receiver<Command>,
     /// Local packets; `None` once the source task has stopped.
-    local: Option<mpsc::Receiver<PacketBuf>>,
-    datagrams: mpsc::Receiver<Datagram>,
+    local: Option<BatchQueue<PacketBuf>>,
+    datagrams: BatchQueue<Datagram>,
     /// Cloned into every transport receive task.
-    datagram_tx: mpsc::Sender<Datagram>,
+    datagram_tx: BatchSender<Datagram>,
     /// Buffers returned by the transmit task.
     recycled: mpsc::Receiver<PacketBuf>,
     /// Cloned into every transmit task.
@@ -824,10 +953,11 @@ impl Owner {
         let batch = &mut self.datagram_batch;
         batch.push(first);
         while batch.len() < room
-            && let Ok(datagram) = self.datagrams.try_recv()
+            && let Some(datagram) = self.datagrams.try_recv()
         {
             batch.push(datagram);
         }
+        self.datagrams.release();
         let now = now();
         if self.workers.is_some() {
             self.core
@@ -872,9 +1002,12 @@ impl Owner {
                 }
             }
             next = match &mut self.local {
-                Some(local) if taken < room => local.try_recv().ok(),
+                Some(local) if taken < room => local.try_recv(),
                 _ => None,
             };
+        }
+        if let Some(local) = &mut self.local {
+            local.release();
         }
         let batch = &mut self.local_batch;
         if self.workers.is_some() {
@@ -1397,16 +1530,16 @@ async fn watch_mtu(
 /// Reads batches of local packets into the owner's queue until the source closes.
 async fn read_source<Src: PacketSource>(
     mut source: Src,
-    local: mpsc::Sender<PacketBuf>,
+    local: BatchSender<PacketBuf>,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut batch = PacketBatch::new();
+    let mut packets = VecDeque::with_capacity(MAX_BATCH);
     while running(&mut suspended).await {
         let result = source.recv_batch(&mut batch).await;
-        for packet in batch.drain() {
-            if local.send(packet).await.is_err() {
-                return;
-            }
+        packets.extend(batch.drain());
+        if local.send(&mut packets).await.is_err() {
+            return;
         }
         match result {
             Ok(()) => {}
@@ -1452,7 +1585,7 @@ async fn write_sink<Snk: PacketSink>(
 /// them in `traffic`.
 async fn receive<T: Transport>(
     transport: Arc<T>,
-    datagrams: mpsc::Sender<Datagram>,
+    datagrams: BatchSender<Datagram>,
     traffic: Arc<Traffic>,
     mut suspended: watch::Receiver<bool>,
 ) {
@@ -1467,10 +1600,8 @@ async fn receive<T: Transport>(
                 .fetch_add(received.len() as u64, Ordering::Relaxed);
             traffic.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
-        while let Some(datagram) = received.pop_front() {
-            if datagrams.send(datagram).await.is_err() {
-                return;
-            }
+        if datagrams.send(&mut received).await.is_err() {
+            return;
         }
         match result {
             Ok(()) => {}
