@@ -98,6 +98,40 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   hot path (for example run-to-completion read -> seal -> send when no crypto workers are
   configured), measured with the ns harness or an equivalent nsplane-e2e bench.
   - Harness: `just bench-wg` (`scripts/bench/wg-compare.sh`); results in docs/architecture.md, Performance, *Against WireGuard implementations*.
+  - Done in nsplane (campaign nsplane-pf-202610031630, PF): without crypto workers the source
+    and receive tasks hand over whole batches (a lone item without allocation); the owner
+    delivers inline (`PacketSink::try_send_batch`) when the sink task is idle, and sends
+    inline (`Transport::try_send_batch`) when the transmit task is idle and no input is
+    waiting; a transport or sink that takes nothing is skipped for up to 1024 drains.
+    Measured A/B against main 7196ab9 with `scripts/bench/wg-compare.sh` (TUN, CPUs 10-13 /
+    14-17; docs/architecture.md, "Engine fast path (MF-1)"): nsplane-cli -> nsplane-cli
+    -P1 +17 % (8.43 -> 9.90 Gbit/s), -P4 +19 % (8.70 -> 10.37), median of 3 quiet pairs, at
+    10 % less receiver CPU per GB; just short of the +18 % target. `w2` and nsplane-cli ->
+    kernel WireGuard within noise; worker_pool, latency (lost pings) and data_path within
+    noise. Open: kernel WireGuard -> nsplane-cli 7-23 % slower in B in the harness, not
+    reproduced in the profiling containers. The first round, which also sent inline while
+    input was waiting, cost nsplane-cli -> kernel WireGuard 31-37 % (the owner saturated).
+  - What is left on nsplane-cli -> nsplane-cli (profile, B at 9.7-9.8 Gbit/s): the
+    receiver's owner task is the busy side, about 0.8 core in one task: opening 51 % of the
+    receiver's samples plus inline delivery 17 % (TSO coalescing and the TUN write). The
+    sender uses 1.5 cores: sealing 39 %, transmit task 18 % (GSO `sendmsg` 10 %), TSO split
+    copy 7 %, allocation 7 %, handoffs 10 % (transmit queue and futex wakes). Gating
+    delivery on waiting input made the pair 25 % slower (PF2), so delivery stays inline.
+  - MF-1 follow-ups (not done this round; PF1 numbers, /tmp/nsplane-pf/pf1/results.md, and
+    PF3's profile):
+    - Cheaper delivery: TUN write coalescing in the owner's inline delivery and in
+      `write_sink` (`TunSink::send_batch`), ~8-10 % of receiver samples in PF1, 7 % self
+      (`WriteState::load`) plus 8 % TUN write in PF3; or parallel opening that keeps
+      per-peer order.
+    - Allocation in sealing and the pool: `Core::layout_for_sealing`, `PacketPool::get` and
+      the `UdpTransport` send train, ~4-5 % of sender samples (malloc/free 8.2 % sender in
+      PF1, 7.3 % in PF3).
+    - TSO split copy: `VnetReader::segment`, ~5 % of sender samples (4.4-5.7 % in PF1, 7 %
+      in PF3).
+    - Re-measure kernel WireGuard -> nsplane-cli on a quiet host after the merge (the full
+      harness table, run by L1; the dedicated quiet rerun showed -7 % median with one
+      3.74 Gbit/s outlier, not reproduced in the profiling containers); if confirmed, gate
+      inline delivery while datagrams are waiting.
 - MF-2 user-space mode (nsplane-netstack) is 12-14% below the legacy smoltcp stack; raising
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is

@@ -377,6 +377,30 @@ impl UdpTransport {
             })
             .await
     }
+
+    /// [`UdpTransport::send_segments`] without waiting: [`io::ErrorKind::WouldBlock`] when
+    /// the socket cannot take it now.
+    fn try_send_segments(
+        &self,
+        contents: &[u8],
+        segment_size: Option<usize>,
+        to: &Path,
+    ) -> io::Result<()> {
+        let destination = self.target(to.addr)?;
+        let Some(state) = &self.state else {
+            return self.try_send_to(contents, destination, to.ecn);
+        };
+        let transmit = Transmit {
+            destination,
+            ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
+            contents,
+            segment_size,
+            src_ip: None,
+        };
+        self.socket.try_io(Interest::WRITABLE, || {
+            state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+        })
+    }
 }
 
 impl Transport for UdpTransport {
@@ -423,6 +447,38 @@ impl Transport for UdpTransport {
             };
             *sent += run;
             // A failed send loses its run only; the runs before it were handed off.
+            result.inspect_err(|_| *failed += run)?;
+        }
+        Ok(())
+    }
+
+    /// [`send_batch`](Transport::send_batch) without waiting: the same runs, each tried
+    /// once; a run the socket cannot take now ends the call with
+    /// [`io::ErrorKind::WouldBlock`] and stays unsent.
+    fn try_send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+        failed: &mut usize,
+    ) -> io::Result<()> {
+        let mut train = Vec::new();
+        while let Some((to, first)) = datagrams.get(*sent) {
+            let run = run_len(&datagrams[*sent..], self.max_segments());
+            let result = if run == 1 {
+                self.try_send_segments(first.as_packet(), None, to)
+            } else {
+                train.clear();
+                for (_, datagram) in &datagrams[*sent..*sent + run] {
+                    train.extend_from_slice(datagram.as_packet());
+                }
+                self.try_send_segments(&train, Some(first.len()), to)
+            };
+            if let Err(e) = &result
+                && e.kind() == io::ErrorKind::WouldBlock
+            {
+                return result;
+            }
+            *sent += run;
             result.inspect_err(|_| *failed += run)?;
         }
         Ok(())
@@ -877,6 +933,24 @@ mod linux {
             to: SocketAddr,
             ecn: Ecn,
         ) -> io::Result<()> {
+            self.socket
+                .async_io(Interest::WRITABLE, || self.send_msg(datagram, to, ecn))
+                .await
+        }
+
+        /// [`UdpTransport::send_to`] without waiting.
+        pub(super) fn try_send_to(
+            &self,
+            datagram: &[u8],
+            to: SocketAddr,
+            ecn: Ecn,
+        ) -> io::Result<()> {
+            self.socket
+                .try_io(Interest::WRITABLE, || self.send_msg(datagram, to, ecn))
+        }
+
+        /// One non-blocking `sendmsg` of `datagram` to `to`, marked with `ecn`.
+        fn send_msg(&self, datagram: &[u8], to: SocketAddr, ecn: Ecn) -> io::Result<()> {
             let fd = self.socket.as_raw_fd();
             let dest = SockaddrStorage::from(to);
             let tos = ecn.to_bits();
@@ -889,19 +963,15 @@ mod linux {
                 }
                 _ => Some(ControlMessage::Ipv4Tos(&tos)),
             };
-            self.socket
-                .async_io(Interest::WRITABLE, || {
-                    sendmsg(
-                        fd,
-                        &[IoSlice::new(datagram)],
-                        cmsg.as_slice(),
-                        MsgFlags::empty(),
-                        Some(&dest),
-                    )
-                    .map_err(io::Error::from)
-                })
-                .await
-                .map(drop)
+            sendmsg(
+                fd,
+                &[IoSlice::new(datagram)],
+                cmsg.as_slice(),
+                MsgFlags::empty(),
+                Some(&dest),
+            )
+            .map_err(io::Error::from)
+            .map(drop)
         }
     }
 
@@ -943,6 +1013,11 @@ impl UdpTransport {
     /// Sends one datagram with plain `send_to`, without an ECN mark.
     async fn send_to(&self, datagram: &[u8], to: SocketAddr, _ecn: Ecn) -> io::Result<()> {
         self.socket.send_to(datagram, to).await.map(drop)
+    }
+
+    /// [`UdpTransport::send_to`] without waiting.
+    fn try_send_to(&self, datagram: &[u8], to: SocketAddr, _ecn: Ecn) -> io::Result<()> {
+        self.socket.try_send_to(datagram, to).map(drop)
     }
 }
 
@@ -1768,6 +1843,92 @@ mod tests {
                     assert_eq!(failed, before.1);
                 } else {
                     assert!(failed > before.1 && failed - before.1 <= sent - before.0);
+                }
+            }
+            assert_eq!((sent, failed), (datagrams.len(), lost.len()));
+
+            let received = recv_batches(&b, head.len() + tail.len()).await.concat();
+            check(
+                &received,
+                &[head, tail].concat(),
+                a.local_addr(),
+                Ecn::NotEct,
+            );
+        }
+    }
+
+    /// Sends `batch` with `try_send_batch`, waiting for the socket after each
+    /// [`io::ErrorKind::WouldBlock`], which must leave the counts as they were.
+    async fn try_send_all(transport: &UdpTransport, batch: &[(Path, PacketBuf)]) {
+        let (mut sent, mut failed) = (0, 0);
+        loop {
+            let before = sent;
+            match transport.try_send_batch(batch, &mut sent, &mut failed) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(sent >= before && sent < batch.len());
+                    transport.socket.writable().await.unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!((sent, failed), (batch.len(), 0));
+    }
+
+    #[tokio::test]
+    async fn try_send_batch_sends_runs_in_order() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            let datagrams = [train(1280, 20), train(900, 3), vec![numbered(7, 1400)]].concat();
+            let batch = batch(b.local_addr(), Ecn::Ect0, &datagrams);
+            if offload && cfg!(any(target_os = "linux", target_os = "android")) {
+                assert!(run_len(&batch, a.max_segments()) > 1, "segmented runs");
+            }
+            // The reactor has not reported the new socket writable yet: nothing goes out
+            // and nothing counts.
+            let (mut sent, mut failed) = (0, 0);
+            let error = a
+                .try_send_batch(&batch, &mut sent, &mut failed)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!((sent, failed), (0, 0));
+            try_send_all(&a, &batch).await;
+            let received = recv_batches(&b, datagrams.len()).await.concat();
+            check(&received, &datagrams, a.local_addr(), Ecn::Ect0);
+        }
+    }
+
+    #[tokio::test]
+    async fn try_send_batch_failed_run_counts_only_its_datagrams() {
+        for offload in OFFLOAD {
+            let a = bind_with(1, "127.0.0.1:0", offload);
+            let b = bind_with(2, "127.0.0.1:0", offload);
+            a.socket.writable().await.unwrap();
+            let refused: SocketAddr = "255.255.255.255:9".parse().unwrap();
+            let (head, lost, tail) = (train(1280, 6), train(1280, 4), train(1280, 3));
+            let mut datagrams = batch(b.local_addr(), Ecn::NotEct, &head);
+            datagrams.extend(batch(refused, Ecn::NotEct, &lost));
+            datagrams.extend(batch(b.local_addr(), Ecn::NotEct, &tail));
+            let run = run_len(&datagrams[head.len()..], a.max_segments());
+
+            let (mut sent, mut failed) = (0, 0);
+            let error = a
+                .try_send_batch(&datagrams, &mut sent, &mut failed)
+                .unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!((sent, failed), (head.len() + run, run));
+            while sent < datagrams.len() {
+                let before = (sent, failed);
+                match a.try_send_batch(&datagrams, &mut sent, &mut failed) {
+                    Ok(()) => assert_eq!(failed, before.1),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert_eq!(failed, before.1);
+                        a.socket.writable().await.unwrap();
+                    }
+                    Err(_) => {
+                        assert!(failed > before.1 && failed - before.1 <= sent - before.0);
+                    }
                 }
             }
             assert_eq!((sent, failed), (datagrams.len(), lost.len()));
