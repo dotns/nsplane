@@ -516,6 +516,8 @@ pub struct AclFilterStats {
     pub ipv6_accepted: u64,
     /// Outbound packets dropped with [`reasons::OUTBOUND_SOURCE`].
     pub outbound_source: u64,
+    /// Packets, inbound and outbound, dropped with [`reasons::INTERNAL`].
+    pub internal: u64,
 }
 
 #[derive(Debug, Default)]
@@ -540,6 +542,7 @@ struct Counters {
     bypassed: AtomicU64,
     ipv6_accepted: AtomicU64,
     outbound_source: AtomicU64,
+    internal: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -568,6 +571,8 @@ enum Outcome {
     OutboundDenied,
     /// An outbound packet whose source is outside [`AclFilterScope::outbound_sources`].
     OutboundSource,
+    /// The filter's own tables failed an invariant (fail-closed).
+    Internal,
 }
 
 impl Outcome {
@@ -590,6 +595,7 @@ impl Outcome {
             Self::Malformed => reasons::MALFORMED,
             Self::OutboundDenied => reasons::OUTBOUND,
             Self::OutboundSource => reasons::OUTBOUND_SOURCE,
+            Self::Internal => reasons::INTERNAL,
         };
         Verdict::Drop { reason }
     }
@@ -611,6 +617,7 @@ impl Outcome {
             Self::OutboundReply => &counters.outbound_replies,
             Self::OutboundDenied => &counters.outbound_denied,
             Self::OutboundSource => &counters.outbound_source,
+            Self::Internal => &counters.internal,
         });
     }
 }
@@ -1032,6 +1039,7 @@ impl AclFilter {
             bypassed: load(&c.bypassed),
             ipv6_accepted: load(&c.ipv6_accepted),
             outbound_source: load(&c.outbound_source),
+            internal: load(&c.internal),
         }
     }
 }
@@ -1206,7 +1214,13 @@ impl Inner {
             }
             None if identity == 0 => None,
             None => {
-                let info = self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity);
+                let Some(info) =
+                    self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity)
+                else {
+                    drop(table);
+                    self.sweep_if(sweep);
+                    return Outcome::Internal;
+                };
                 if info.bypass {
                     drop(table);
                     self.sweep_if(sweep);
@@ -1316,7 +1330,8 @@ impl Inner {
         }
         let mut table = self.table();
         let info = self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity);
-        if info.governed == Governed::Restricted {
+        // Without the peer no allowance is recorded: its replies stay denied.
+        if info.is_some_and(|info| info.governed == Governed::Restricted) {
             self.record_reply(&mut table, peer, true, reversed(tuple), None);
         }
     }
@@ -1395,7 +1410,8 @@ impl Inner {
     /// The resolved `peer` for packets whose remote address is `src` under
     /// the snapshot's generation and `identity`, resolving it again when
     /// missing or stale. A by-source peer is resolved per address; with no
-    /// address it is unknown.
+    /// address it is unknown. `None` if the cache lost the entry it just
+    /// stored (an invariant failure the caller drops the packet on).
     fn cached_peer<'t>(
         &self,
         table: &'t mut FlowTable,
@@ -1403,7 +1419,7 @@ impl Inner {
         peer: PeerId,
         src: Option<IpAddr>,
         identity: u64,
-    ) -> &'t Arc<PeerInfo> {
+    ) -> Option<&'t Arc<PeerInfo>> {
         let generation = snapshot.generation();
         let capacity = self.config.reply_capacity.max(1);
         if table.peers.len() >= capacity && !table.peers.contains_key(&peer) {
@@ -1430,7 +1446,7 @@ impl Inner {
             Some(src) if info.by_source => {
                 self.cached_source(&mut table.sources, snapshot, peer, src, identity)
             }
-            _ => info,
+            _ => Some(info),
         }
     }
 
@@ -1443,7 +1459,7 @@ impl Inner {
         peer: PeerId,
         src: IpAddr,
         identity: u64,
-    ) -> &'t Arc<PeerInfo> {
+    ) -> Option<&'t Arc<PeerInfo>> {
         let key = (peer, src);
         let fresh = sources.get(&key).is_some_and(|info| {
             info.generation == snapshot.generation() && info.identity == identity
@@ -1457,9 +1473,7 @@ impl Inner {
             let info = PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity);
             sources.insert(key, Arc::new(info));
         }
-        sources
-            .get(&key)
-            .unwrap_or_else(|| unreachable!("the entry was just touched or inserted"))
+        sources.get(&key)
     }
 
     /// The live reply allowance (refreshed) or the valid cached verdict for
@@ -1594,7 +1608,9 @@ impl Inner {
         let mut table = self.table();
         // `None`: an unrestricted peer without pinholes.
         let info = if identity != 0 {
-            let info = self.cached_peer(&mut table, &snapshot, peer, dst, identity);
+            let Some(info) = self.cached_peer(&mut table, &snapshot, peer, dst, identity) else {
+                return Outcome::Internal;
+            };
             (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
         } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
             let source = dst.map_or_else(
@@ -2114,6 +2130,16 @@ mod tests {
             drop(reasons::UNKNOWN_PEER)
         );
         assert_eq!(f.stats().unknown_peer, 1);
+    }
+
+    #[test]
+    fn internal_error_is_a_counted_drop() {
+        let f = filter();
+        let outcome = Outcome::Internal;
+        outcome.count(&f.inner.counters);
+        assert_eq!(outcome.verdict(), drop(reasons::INTERNAL));
+        assert_eq!(f.stats().internal, 1);
+        assert_eq!(f.stats().denied, 0);
     }
 
     #[test]

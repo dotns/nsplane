@@ -199,7 +199,8 @@ pub struct TranslatorStats {
     /// Zero-checksum UDP datagrams reassembled from IPv4 fragments (and
     /// datagrams with a checksum whose later fragments arrived first).
     pub reassembled: u64,
-    /// IPv4 UDP fragments stored for reassembly.
+    /// IPv4 UDP fragments stored for reassembly (an exact duplicate, which
+    /// is ignored, counts too).
     pub fragments_held: u64,
     /// Incomplete datagrams discarded when their 60 seconds expired.
     pub fragment_timeouts: u64,

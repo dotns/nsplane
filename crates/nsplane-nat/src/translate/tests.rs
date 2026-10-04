@@ -951,7 +951,8 @@ fn held_duplicates_are_ignored_and_overlaps_drop_the_datagram() {
     ];
     let v6 = reassemble_in(&translator, &pieces, &[2, 2, 1, 0]);
     assert_eq!(&v6[48..], b"abcdefghijklmnopqrstuvwx");
-    assert_eq!(translator.stats().fragments_held, 3);
+    // The duplicate is ignored but counts as held.
+    assert_eq!(translator.stats().fragments_held, 4);
 
     let overlap = fragment4(84, 1, true, 64, &udp[8..24]);
     let last = fragment4(84, 3, false, 64, &udp[24..]);

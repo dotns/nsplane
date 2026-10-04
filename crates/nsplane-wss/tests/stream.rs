@@ -159,7 +159,8 @@ impl Relay {
             .bearer(Arc::clone(token) as Arc<dyn BearerProvider>)
             .backoff(Duration::from_millis(50), Duration::from_millis(200))
             .token_refresh(Duration::from_millis(50), WAIT)
-            .keepalive(Duration::from_millis(100), Duration::from_millis(600))
+            // A read idle of seconds: a loaded host delays pongs well past 600 ms.
+            .keepalive(Duration::from_millis(100), WAIT / 2)
             .connect_timeout(Duration::from_secs(2))
     }
 
@@ -999,11 +1000,18 @@ fn watch_buffered(
 }
 
 /// Writes `len` bytes into `stream` until the server closes it: the write fails or the
-/// read sees EOF.
+/// read sees EOF. Fails only when a chunk makes no progress within [`WAIT`], so a loaded
+/// host slows it down without failing it.
 async fn write_until_closed(mut stream: WssTcpStream, len: usize) -> TestResult {
     let data = pattern(1, len);
-    // Generous: on a loaded host the overflow and the close it triggers take a while.
-    let _ = timeout(WAIT * 4, stream.write_all(&data)).await?;
+    for chunk in data.chunks(64 * 1024) {
+        let written = timeout(WAIT, stream.write_all(chunk))
+            .await
+            .map_err(|_| "a write made no progress within WAIT")?;
+        if written.is_err() {
+            break;
+        }
+    }
     assert_eq!(read_to_end(&mut stream).await?, b"");
     let Err(err) = stream.write_all(b"x").await else {
         return Err("a write after the close succeeded".into());

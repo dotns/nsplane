@@ -1588,12 +1588,13 @@ IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
 incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
 any fragment order: only the first fragment shows the checksum, so later fragments that
 arrive before it are held (at most 256 datagrams and 1 MiB, for 60 s; a fragment after the
-expiry starts a new entry). A datagram with a checksum whose later fragments came first is
+expiry starts a new entry) in an `nsplane_packet::reassembly::Reassembler`, the one the
+netstack driver uses; the translator keeps the byte budget and the markers on top of it. A datagram with a checksum whose later fragments came first is
 reassembled the same way and sent unfragmented; with nothing held, in-order fragments of a
 checksummed datagram are translated one by one, without holding or waiting. A reassembled
 datagram larger than the translator's MTU (`Translator::set_mtu`, 1280 by default; set it
 to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent oversize.
-`TranslatorStats` counts `fragments_held`, `fragment_timeouts`, `fragment_budget_drops`,
+`TranslatorStats` counts `fragments_held` (exact duplicates, ignored, included), `fragment_timeouts`, `fragment_budget_drops`,
 `fragment_marker_evictions` and `reassembled_too_big`. A translated packet grows by 20
 bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied
 into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. Since the core routes and checks sources before the
@@ -2008,8 +2009,8 @@ CPU over the TCP P1 run divided by the GB received, iperf3's own CPU included.
   per GB is an undercount. The `netstack` pair runs `netstack_bench` (engine, netstack and
   load generator in one process per side, no TUN) instead of iperf3 and ping; its latency
   columns are 1-byte TCP request/response round trips. nsplane-cli sides keep their
-  startup UDP port: a `listen-port` set over the UAPI rebinds with offload on, which would
-  undo `WG_NO_OFFLOAD`, so the harness does not set it.
+  startup UDP port (a `listen-port` set over the UAPI now keeps `WG_NO_OFFLOAD`; when these
+  rows were measured it rebound with offload on).
 - Offload carries nsplane-cli's single-stream throughput: the default is 3.3x `nooffload`
   at P1 (6.65 against 2.03 Gbit/s) at a quarter of the CPU per GB (1.33 against 4.78 s).
   2 crypto workers lower P1 (4.14) and cost more CPU per GB (1.96), with P4 about the same
