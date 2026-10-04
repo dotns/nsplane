@@ -1,7 +1,8 @@
 //! `WssStreamClient` and `WssStreamServer` end to end: both dial a small test relay (a TLS
 //! WebSocket server that forwards frames verbatim between a client session and a server
-//! session), and the client's TCP streams and UDP flows run through the server to local
-//! backends. The relay checks every frame it forwards against the ns frame layout.
+//! session, or a plain one for `ws://`), and the client's TCP streams and UDP flows run
+//! through the server to local backends. The relay checks every frame it forwards against
+//! the ns frame layout.
 
 use std::collections::HashMap;
 use std::io;
@@ -22,7 +23,7 @@ use nsplane_wss::{
 use rcgen::{CertificateParams, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
@@ -78,6 +79,8 @@ type Live = HashMap<usize, (u64, mpsc::UnboundedSender<Bytes>)>;
 struct Relay {
     addr: SocketAddr,
     roots: RootCertStore,
+    /// Plain WebSocket (`ws://`), without TLS.
+    plain: bool,
     upgrades: Mutex<Vec<Upgrade>>,
     /// Upgrades without `Authorization: Bearer <this>` are answered 401.
     token: Mutex<Option<String>>,
@@ -94,6 +97,15 @@ struct Relay {
 
 impl Relay {
     async fn start() -> TestResult<Arc<Self>> {
+        Self::launch(false).await
+    }
+
+    /// A relay without TLS, dialed with `ws://` URLs.
+    async fn start_plain() -> TestResult<Arc<Self>> {
+        Self::launch(true).await
+    }
+
+    async fn launch(plain: bool) -> TestResult<Arc<Self>> {
         let mut params = CertificateParams::new(vec![NAME.to_owned()])?;
         params
             .subject_alt_names
@@ -110,11 +122,12 @@ impl Relay {
                 vec![CertificateDer::from(cert.der().to_vec())],
                 PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
             )?;
-        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let acceptor = (!plain).then(|| TlsAcceptor::from(Arc::new(server)));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let relay = Arc::new(Self {
             addr: listener.local_addr()?,
             roots,
+            plain,
             upgrades: Mutex::new(Vec::new()),
             token: Mutex::new(Some("t".to_owned())),
             forbid: AtomicBool::new(false),
@@ -135,16 +148,19 @@ impl Relay {
     }
 
     fn config(&self, path: &str, token: &Arc<Token>) -> WssConfig {
-        WssConfig::new(
-            format!("wss://{NAME}:{}/{path}", self.addr.port()),
-            WssTls::Roots(self.roots.clone()),
-        )
-        .connect_addr(self.addr)
-        .bearer(Arc::clone(token) as Arc<dyn BearerProvider>)
-        .backoff(Duration::from_millis(50), Duration::from_millis(200))
-        .token_refresh(Duration::from_millis(50), WAIT)
-        .keepalive(Duration::from_millis(100), Duration::from_millis(600))
-        .connect_timeout(Duration::from_secs(2))
+        let tls = WssTls::Roots(self.roots.clone());
+        let config = if self.plain {
+            WssConfig::new(format!("ws://{}/{path}", self.addr), tls).allow_plaintext(true)
+        } else {
+            WssConfig::new(format!("wss://{NAME}:{}/{path}", self.addr.port()), tls)
+                .connect_addr(self.addr)
+        };
+        config
+            .bearer(Arc::clone(token) as Arc<dyn BearerProvider>)
+            .backoff(Duration::from_millis(50), Duration::from_millis(200))
+            .token_refresh(Duration::from_millis(50), WAIT)
+            .keepalive(Duration::from_millis(100), Duration::from_millis(600))
+            .connect_timeout(Duration::from_secs(2))
     }
 
     /// A client of this relay within `limits`, with the bearer `token`.
@@ -224,16 +240,24 @@ impl Relay {
         Ok((role, slot))
     }
 
-    async fn serve(self: Arc<Self>, tcp: TcpStream, acceptor: TlsAcceptor) {
-        let Ok(tls) = acceptor.accept(tcp).await else {
-            return;
-        };
+    async fn serve(self: Arc<Self>, tcp: TcpStream, acceptor: Option<TlsAcceptor>) {
+        match acceptor {
+            Some(acceptor) => {
+                if let Ok(tls) = acceptor.accept(tcp).await {
+                    self.session(tls).await;
+                }
+            }
+            None => self.session(tcp).await,
+        }
+    }
+
+    async fn session(self: Arc<Self>, stream: impl AsyncRead + AsyncWrite + Unpin) {
         let mut upgraded = None;
         let callback = Upgrader {
             relay: &self,
             upgraded: &mut upgraded,
         };
-        let Ok(ws) = tokio_tungstenite::accept_hdr_async(tls, callback).await else {
+        let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
             return;
         };
         let Some((role, slot)) = upgraded else {
@@ -878,6 +902,38 @@ async fn half_close_delivers_the_data_then_eof() -> TestResult {
     terminate.stop().await
 }
 
+/// A client and a server on `ws://` URLs (no TLS) through a plain relay: a TCP stream
+/// echoes, and the same URL without `allow_plaintext` is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_ws_urls_carry_streams() -> TestResult {
+    let map = Map::new();
+    let target = map.add(tcp_echo().await?);
+    let relay = Relay::start_plain().await?;
+    let token = Token::new("t");
+    let mut terminate = relay.server(0, WssServerLimits::default(), &map, &token)?;
+    terminate.connected().await?;
+    let client = relay.client(WssStreamLimits::default(), &token)?;
+    let mut stream = echo(client.open_tcp(target).await?, 11, 64 * 1024).await?;
+    stream.shutdown().await?;
+    assert_eq!(read_to_end(&mut stream).await?, b"");
+    assert_eq!(client.stats().sessions(), 1);
+    assert_eq!(
+        relay.upgrades(Role::Client),
+        [Upgrade {
+            role: Role::Client,
+            authorization: Some("Bearer t".to_owned()),
+            accepted: true
+        }]
+    );
+    relay.check_wire()?;
+
+    let mut config = relay.config("client", &token);
+    config.allow_plaintext = false;
+    let err = WssStreamClient::new(config, WssStreamLimits::default()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    terminate.stop().await
+}
+
 /// The resolver's denial and a backend that refuses: the client's stream reads EOF (the
 /// server's CLOSE), and acknowledges it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1266,4 +1322,98 @@ async fn dropping_the_run_ends_the_session() -> TestResult {
     stream.write_all(b"x").await?;
     assert_eq!(relay.opens().len(), 1);
     Ok(())
+}
+
+/// Opens timing out behind a dial that waits its backoff leave that wait alone: the next
+/// dial still goes a full backoff after the failure, and no open dials early. Each open
+/// fails with the dial's error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_opens_keep_the_backoff() -> TestResult {
+    let backoff = Duration::from_millis(1500);
+    // A port nothing listens on: every dial is refused at once.
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+    let config = WssConfig::new(
+        format!("ws://{addr}/client"),
+        WssTls::Roots(RootCertStore::empty()),
+    )
+    .allow_plaintext(true)
+    .backoff(backoff, backoff * 4);
+    let limits = WssStreamLimits::default().open_timeout(Duration::from_millis(100));
+    let client = WssStreamClient::new(config, limits)?;
+    let stats = client.stats();
+    let target: SocketAddr = "10.0.0.1:80".parse()?;
+
+    let first = client.open_tcp(target).await.unwrap_err();
+    let failed = Instant::now();
+    assert_eq!(stats.connect_failures(), 1);
+    for _ in 0..5 {
+        let started = Instant::now();
+        let err = client.open_tcp(target).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(
+            (err.kind(), err.to_string()),
+            (first.kind(), first.to_string())
+        );
+    }
+    until("the second dial", || stats.connect_failures() == 2).await?;
+    assert!(
+        failed.elapsed() >= backoff,
+        "the second dial went {:?} after the first",
+        failed.elapsed()
+    );
+    Ok(())
+}
+
+/// After a 401, opens timing out behind the dial waiting for a new token leave that wait
+/// alone: the refused token is offered again only after the token wait, and a new token is
+/// still picked up and serves later opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_opens_keep_the_token_wait() -> TestResult {
+    let token_wait = Duration::from_millis(1500);
+    let map = Map::new();
+    let target = map.add(tcp_echo().await?);
+    let (relay, terminate) = setup(&map, WssServerLimits::default()).await?;
+    *lock(&relay.token) = Some("good".to_owned());
+    let token = Token::new("bad");
+    let config = relay
+        .config("client", &token)
+        .token_refresh(Duration::from_millis(50), token_wait);
+    let limits = WssStreamLimits::default().open_timeout(Duration::from_millis(100));
+    let client = WssStreamClient::new(config, limits)?;
+    let stats = client.stats();
+
+    let err = client.open_tcp(target).await.unwrap_err();
+    let rejected = Instant::now();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    for _ in 0..5 {
+        let err = client.open_tcp(target).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+    until("the second rejection", || {
+        stats.rejected_unauthorized() == 2
+    })
+    .await?;
+    assert!(
+        rejected.elapsed() >= token_wait,
+        "the refused token went again {:?} after the first",
+        rejected.elapsed()
+    );
+    assert_eq!(relay.upgrades(Role::Client).len(), 2);
+
+    token.set("good");
+    let deadline = Instant::now() + WAIT;
+    let stream = loop {
+        match client.open_tcp(target).await {
+            Ok(stream) => break stream,
+            Err(err) if Instant::now() < deadline => {
+                assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(err) => return Err(format!("no session within {WAIT:?}: {err}").into()),
+        }
+    };
+    echo(stream, 1, 1000).await?;
+    assert_eq!(relay.upgrades(Role::Client).len(), 3);
+    terminate.stop().await
 }

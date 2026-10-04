@@ -56,8 +56,13 @@ pub enum WssTls {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WssConfig {
-    /// The `wss://` URL of the WebSocket request.
+    /// The `wss://` URL of the WebSocket request, or a `ws://` one when
+    /// [`allow_plaintext`](Self::allow_plaintext) is set.
     pub url: String,
+    /// Accepts a `ws://` URL: dialed over plain TCP (port 80 by default), without TLS, so
+    /// [`server_name`](Self::server_name) and [`tls`](Self::tls) go unused. `false` (the
+    /// default) accepts `wss://` only.
+    pub allow_plaintext: bool,
     /// Where to connect; `None` (the default) resolves the URL's host.
     pub connect_addr: Option<SocketAddr>,
     /// The TLS server name (SNI and the name the certificate must carry); `None` (the
@@ -75,6 +80,13 @@ pub struct WssConfig {
     pub backoff_min: Duration,
     /// The longest wait before a dial. 60 s by default.
     pub backoff_max: Duration,
+    /// The wait before a dial after a link or session that came up (for a
+    /// [`WssDialer`](crate::WssDialer) and a [`WssStreamServer`](crate::WssStreamServer),
+    /// the dial after a successful one); a dial failing after it backs off from
+    /// [`backoff_min`](Self::backoff_min), doubling from there. `None` (the default) waits
+    /// `backoff_min` instead, counted as the first step of the failure backoff, so a dial
+    /// failing after it waits twice `backoff_min`.
+    pub reconnect_delay: Option<Duration>,
     /// How often the bearer provider is asked for a new token after a 401. 2 s by default.
     pub token_poll: Duration,
     /// How long to wait for a new token after a 401 before dialing with the old one.
@@ -94,6 +106,7 @@ impl WssConfig {
     pub fn new(url: impl Into<String>, tls: WssTls) -> Self {
         Self {
             url: url.into(),
+            allow_plaintext: false,
             connect_addr: None,
             server_name: None,
             tls,
@@ -101,12 +114,20 @@ impl WssConfig {
             bearer: None,
             backoff_min: Duration::from_secs(2),
             backoff_max: Duration::from_secs(60),
+            reconnect_delay: None,
             token_poll: Duration::from_secs(2),
             token_wait: Duration::from_secs(300),
             ping_interval: Duration::from_secs(10),
             read_idle: Duration::from_secs(35),
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Sets [`allow_plaintext`](Self::allow_plaintext).
+    #[must_use]
+    pub const fn allow_plaintext(mut self, allow: bool) -> Self {
+        self.allow_plaintext = allow;
+        self
     }
 
     /// Sets [`connect_addr`](Self::connect_addr).
@@ -145,6 +166,13 @@ impl WssConfig {
         self
     }
 
+    /// Sets [`reconnect_delay`](Self::reconnect_delay).
+    #[must_use]
+    pub const fn reconnect_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = Some(delay);
+        self
+    }
+
     /// Sets [`token_poll`](Self::token_poll) and [`token_wait`](Self::token_wait).
     #[must_use]
     pub const fn token_refresh(mut self, poll: Duration, wait: Duration) -> Self {
@@ -174,6 +202,7 @@ impl fmt::Debug for WssConfig {
         let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("WssConfig")
             .field("url", &self.url)
+            .field("allow_plaintext", &self.allow_plaintext)
             .field("connect_addr", &self.connect_addr)
             .field("server_name", &self.server_name)
             .field("tls", &self.tls)
@@ -181,6 +210,7 @@ impl fmt::Debug for WssConfig {
             .field("bearer", &self.bearer.is_some())
             .field("backoff_min", &self.backoff_min)
             .field("backoff_max", &self.backoff_max)
+            .field("reconnect_delay", &self.reconnect_delay)
             .field("token_poll", &self.token_poll)
             .field("token_wait", &self.token_wait)
             .field("ping_interval", &self.ping_interval)
@@ -201,12 +231,14 @@ mod tests {
             WssTls::Roots(RootCertStore::empty()),
         );
         assert_eq!(config.url, "wss://relay.example/");
+        assert!(!config.allow_plaintext);
         assert_eq!(config.connect_addr, None);
         assert_eq!(config.server_name, None);
         assert_eq!(config.headers.len(), 0);
         assert!(config.bearer.is_none());
         assert_eq!(config.backoff_min, Duration::from_secs(2));
         assert_eq!(config.backoff_max, Duration::from_secs(60));
+        assert_eq!(config.reconnect_delay, None);
         assert_eq!(config.token_poll, Duration::from_secs(2));
         assert_eq!(config.token_wait, Duration::from_secs(300));
         assert_eq!(config.ping_interval, Duration::from_secs(10));
@@ -215,17 +247,21 @@ mod tests {
 
         let ms = Duration::from_millis;
         let config = config
+            .allow_plaintext(true)
             .connect_addr("127.0.0.1:9".parse().unwrap())
             .server_name("relay.test")
             .header("X-A", "1")
             .backoff(ms(1), ms(2))
+            .reconnect_delay(ms(8))
             .token_refresh(ms(3), ms(4))
             .keepalive(ms(5), ms(6))
             .connect_timeout(ms(7));
+        assert!(config.allow_plaintext);
         assert_eq!(config.connect_addr, Some("127.0.0.1:9".parse().unwrap()));
         assert_eq!(config.server_name.as_deref(), Some("relay.test"));
         assert_eq!(config.headers, [("X-A".to_owned(), "1".to_owned())]);
         assert_eq!((config.backoff_min, config.backoff_max), (ms(1), ms(2)));
+        assert_eq!(config.reconnect_delay, Some(ms(8)));
         assert_eq!((config.token_poll, config.token_wait), (ms(3), ms(4)));
         assert_eq!((config.ping_interval, config.read_idle), (ms(5), ms(6)));
         assert_eq!(config.connect_timeout, ms(7));
