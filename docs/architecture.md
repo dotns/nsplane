@@ -460,9 +460,14 @@ turned on before the transport is given to the engine; at most 64 wait, further 
 dropped and counted (`UdpTransport::path_mtu_reports_dropped`). The kernel learns of a too
 small path only for datagrams sent with DF: with offload all of them, without it only those
 below the path MTU it knows. Two caveats while it is on: an ICMP error can fail one send
-before a receive reads it (the engine drops and counts that datagram), and once the socket
-has reported an error tokio keeps its write readiness, so a send that finds the send buffer
-full retries without waiting until it drains. Pinned by the root test
+before a receive reads it (the engine drops and counts that datagram, `SideSender` returns
+the error), and once the socket has reported an error tokio keeps its write readiness (after
+`EPOLLERR`), so a send that finds the send buffer full (`send`, `send_batch`,
+`SideSender::send_to_async`) retries after pauses of 1 ms doubling up to 8 ms and may go out
+up to 8 ms after room appeared; sends that find room are not delayed, and with discovery off
+nothing changes (`nsplane`'s `udp::tests::full_sends_back_off_after_an_icmp_error` and the
+root `full_send_buffer_backs_off_after_an_icmp_error`, ignored without `CAP_NET_ADMIN`).
+Pinned by the root test
 `nsplane-e2e`'s `path_mtu_root::path_mtu_follows_real_icmp_errors` (ignored by default; needs
 `NET_ADMIN` and `SYS_ADMIN`, its module docs give the command).
 
