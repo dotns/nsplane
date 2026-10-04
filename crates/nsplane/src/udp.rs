@@ -70,7 +70,11 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 ///   into one read, a train of equally sized datagrams of which the last may be shorter.
 ///   [`recv_batch`](Transport::recv_batch) hands out each one as a slice of the read
 ///   ([`PacketBuf::from_shared`]) at the offset it was read to, without headroom, where
-///   the engine opens it in place: no datagram of a train is copied.
+///   the engine opens it in place: no datagram of a train is copied. While trains do not
+///   arrive (four reads in a row of one datagram each, as from senders without
+///   segmentation), [`recv_batch`](Transport::recv_batch) reads up to 16 datagrams with one
+///   `recvmmsg` instead, each into a slot of 64 KiB, and copies them out; the first train
+///   read that way switches back to one 64 KiB read without copies.
 ///   [`recv`](Transport::recv) copies one datagram into the caller's buffer and keeps the
 ///   rest of the train for the next receive.
 /// - Send (Linux and Android `UDP_SEGMENT`, Windows USO):
@@ -993,8 +997,12 @@ mod linux {
     /// each: the kernel's segment limit.
     pub(super) const IOVS: usize = 64;
 
-    /// The most datagrams one `recvmmsg` reads without offload.
+    /// The most datagrams one `recvmmsg` reads in batches.
     const SLOTS: usize = 16;
+
+    /// Coalesced reads of one datagram each in a row after which receive offload reads in
+    /// batches.
+    const SINGLES: u8 = 4;
 
     /// Control-message space of one batched read: as much as [`CmsgBuf`] holds.
     const CMSG: usize = 64;
@@ -1032,9 +1040,14 @@ mod linux {
         current: usize,
         /// Datagrams read but not handed out yet, oldest first.
         pending: VecDeque<(Path, PacketBuf)>,
-        /// The slots of a batched read without offload, as many bytes each as the caller's
-        /// buffer holds.
+        /// The slots of a batched read, as many bytes each as the caller's buffer holds
+        /// (a whole read with receive offload).
         slots: Vec<u8>,
+        /// Coalesced reads of one datagram each in a row, up to [`SINGLES`].
+        singles: u8,
+        /// With receive offload, batches go to one `recvmmsg` of several slots: no trains
+        /// arrived lately.
+        batched: bool,
     }
 
     impl Rx {
@@ -1259,6 +1272,12 @@ mod linux {
             self.rx.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
+        /// Whether receive offload reads in batches now.
+        #[cfg(test)]
+        pub(super) fn batched(&self) -> bool {
+            self.rx().batched
+        }
+
         /// [`Transport::recv`](crate::Transport::recv).
         pub(super) async fn recv_datagram(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
             loop {
@@ -1304,6 +1323,9 @@ mod linux {
                     }
                 }
                 match &self.state {
+                    Some(_) if self.offload() && self.rx().batched => {
+                        self.read_batch(READ, room).await?;
+                    }
                     Some(state) if self.offload() => self.read_coalesced(state).await?,
                     _ if self.batching() => self.read_batch(capacity, room).await?,
                     _ => {
@@ -1377,6 +1399,8 @@ mod linux {
                     let path = self.path(meta.addr, ecn(&meta));
                     let stride = meta.stride.clamp(1, READ);
                     let count = meta.len.div_ceil(stride).max(1);
+                    rx.singles = if count == 1 { rx.singles.saturating_add(1) } else { 0 };
+                    rx.batched = rx.singles >= SINGLES;
                     let len = |i: usize| stride.min(meta.len - i * stride);
                     let side = self.side.as_ref();
                     for i in 0..count {
@@ -1420,8 +1444,9 @@ mod linux {
         /// Reads up to `count` datagrams, at most [`SLOTS`], with one `recvmmsg` (through
         /// `quinn-udp` where it set the socket up), each into a slot of `capacity` bytes, so
         /// truncated to it, and queues a copy of each, but for those the side channel
-        /// takes. A train coalesced before offload was turned off is split as
-        /// [`read_into`](Self::read_into) splits it.
+        /// takes. A train (with receive offload, or coalesced before offload was turned off)
+        /// is split as [`read_into`](Self::read_into) splits it, and with offload ends the
+        /// batched reads.
         pub(super) async fn read_batch(&self, capacity: usize, count: usize) -> io::Result<()> {
             let capacity = capacity.max(1);
             let count = count.clamp(1, SLOTS);
@@ -1500,6 +1525,14 @@ mod linux {
                                         .push_back((path, PacketBuf::from_packet(datagram)));
                                 }
                             }
+                        }
+                        // A train: back to coalesced reads, without a copy.
+                        if received[..read]
+                            .iter()
+                            .any(|&(len, _, _, stride)| stride < len)
+                        {
+                            rx.batched = false;
+                            rx.singles = 0;
                         }
                         Ok(())
                     })
@@ -2905,6 +2938,40 @@ mod tests {
             assert_eq!(path.addr, seen_as(&a, "127.0.0.1"));
             assert_eq!(path.ecn, ecn);
         }
+    }
+
+    /// With receive offload, reads of one datagram each switch `recv_batch` to batched
+    /// copies, and the next train switches it back to slices of one read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn receive_offload_batches_while_no_trains_arrive() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        if !coalescing(&a, &b) {
+            return; // No segmentation offload on this host.
+        }
+        let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let singles: Vec<_> = (0..40).map(|seq| numbered(seq, 1200)).collect();
+        for datagram in &singles {
+            plain.send_to(datagram, b.local_addr()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let calls = recv_batches(&b, singles.len()).await;
+        let from = plain.local_addr().unwrap();
+        check(&calls.concat(), &singles, from, Ecn::NotEct);
+        let lens: Vec<_> = calls.iter().map(Vec::len).collect();
+        assert_eq!(lens[..4], [1; 4], "coalesced reads first: {lens:?}");
+        assert_eq!(lens[4], 16, "then batched: {lens:?}");
+        assert!(b.batched());
+
+        // A train read in a batch is split right and ends the batching.
+        let train1 = train(1280, 20);
+        send_all(&a, &batch(b.local_addr(), Ecn::Ect0, &train1)).await;
+        let calls = recv_batches(&b, train1.len()).await;
+        check(&calls.concat(), &train1, a.local_addr(), Ecn::Ect0);
+        assert!(!b.batched());
+        // The next one is sliced out of one read again.
+        segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
     }
 
     /// A segmented run leaves from the datagrams' own buffers on Linux and Android: the
