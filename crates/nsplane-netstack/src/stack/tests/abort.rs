@@ -173,3 +173,27 @@ async fn aborted_connect_from_frees_its_port_at_once() -> TestResult {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn idle_timeout_resets_the_peer_and_releases() -> TestResult {
+    let server: SocketAddrV4 = "10.9.14.1:80".parse()?;
+    let client: SocketAddrV4 = "10.9.14.2:49200".parse()?;
+    let (handle, conn, mut peer, socket) = establish(server, client).await?;
+    let tuple = segment(client, server, ACK);
+    assert_eq!(handle.owns(&tuple), Ownership::Flow);
+
+    // The driver of this test's stack runs on this thread.
+    let mut terminal = conn.terminal();
+    IDLE_TIMEOUT.set(Some(SmolDuration::from_millis(200)));
+    let rst = next_rst(&mut peer).await?;
+    let rst_segment = tcp_segment(rst.as_packet()).ok_or("TCP")?;
+    assert_eq!(rst_segment[0..2], server.port().to_be_bytes());
+    assert_eq!(rst_segment[2..4], client.port().to_be_bytes());
+    assert_eq!(handle.owns(&tuple), Ownership::None);
+    timeout(WAIT, terminal.wait_for(|terminal| *terminal)).await??;
+
+    peer.device.inject(rst);
+    peer.pump_until(|peer| peer.state(socket) == tcp::State::Closed)
+        .await?;
+    Ok(())
+}

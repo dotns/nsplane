@@ -564,7 +564,9 @@ impl Conn {
 
         if tcp_idle_timeout_expired(socket.state(), self.last_activity_at, now) {
             tracing::debug!(target: "netstack", "TCP connection exceeded idle timeout; aborting");
-            socket.abort();
+            // Released like an application abort: once the RST left.
+            shared.write_half = WriteHalf::Aborted;
+            return abort(socket, &mut shared);
         }
         let terminal = tcp_terminal_ready(
             socket.state(),
@@ -1569,7 +1571,25 @@ fn tcp_idle_timeout_expired(
     now: SmolInstant,
 ) -> bool {
     !matches!(state, tcp::State::Closed | tcp::State::TimeWait)
-        && now >= last_activity_at + TCP_IDLE_TIMEOUT
+        && now >= last_activity_at + idle_timeout()
+}
+
+#[cfg(not(test))]
+const fn idle_timeout() -> SmolDuration {
+    TCP_IDLE_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces [`TCP_IDLE_TIMEOUT`] for the stacks a test drives on its thread.
+    static IDLE_TIMEOUT: std::cell::Cell<Option<SmolDuration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn idle_timeout() -> SmolDuration {
+    IDLE_TIMEOUT
+        .with(std::cell::Cell::get)
+        .unwrap_or(TCP_IDLE_TIMEOUT)
 }
 
 fn tcp_terminal_ready(
