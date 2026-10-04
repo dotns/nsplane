@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NodeL3Filter`, new flows 13-15 % faster. `NodeL3Gate::with_clock` is unchanged.
 - `nsplane-nat`: the translator's zero-checksum UDP reassembly runs on
   `nsplane_packet::reassembly::Reassembler`, with the same bounds (256 datagrams, 1 MiB,
-  60 s), markers and drop reasons. `TranslatorStats::fragments_held` now counts exact
-  duplicates as well.
+  60 s), markers and other drop reasons. Duplicates differ from 0.9.0 in three cases: an
+  exact duplicate of a held fragment now counts in `TranslatorStats::fragments_held` and in
+  the 1 MiB byte budget; a fragment with the same range as a held one but a different payload
+  or MF flag is ignored as a duplicate instead of dropping the datagram with
+  `reasons::OVERLAP` (the first copy's payload wins, so the reassembled datagram never mixes
+  bytes of the two copies, but a later copy without MF still marks the end of the datagram);
+  and at the byte limit a duplicate is dropped with `reasons::BUDGET_EXCEEDED` instead of
+  being ignored.
 
 ### Fixed
 - `nsplane-acl`: a peer cache entry missing right after it was stored drops the packet with
