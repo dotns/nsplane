@@ -10,8 +10,9 @@
 //! The [`NetStackHandle`] is the application's side:
 //! [`incoming_tcp`](NetStackHandle::incoming_tcp) accepts connections to any port of the
 //! stack's addresses, [`incoming_udp`](NetStackHandle::incoming_udp) reports one
-//! [`UdpFlow`] per `(remote, local)` tuple, and [`connect_tcp`](NetStackHandle::connect_tcp)
-//! and [`bind_udp`](NetStackHandle::bind_udp) open the reverse direction.
+//! [`UdpFlow`] per `(remote, local)` tuple, and [`connect_tcp`](NetStackHandle::connect_tcp),
+//! [`bind_udp`](NetStackHandle::bind_udp) and [`connect_udp`](NetStackHandle::connect_udp)
+//! open the reverse direction.
 //! [`owns`](NetStackHandle::owns) tells whether an ingress packet is the stack's
 //! ([`Ownership`]), for a local side that shares one decrypted stream with other consumers.
 //!

@@ -43,8 +43,10 @@ pub struct NetStackStats {
     /// Fragments dropped at the reassembly bounds: a fragment of a further datagram once
     /// `max_datagrams` are held, or one that grows its datagram beyond `max_bytes` (the
     /// datagram's held fragments go with it). Fragments the reassembler rejects as
-    /// invalid or overlapping count as [`malformed`](Self::malformed). Always 0 without
-    /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
+    /// invalid or overlapping count as [`malformed`](Self::malformed). Also counts the
+    /// fragments dropped after
+    /// [`NetStackHandle::discard_fragments`](crate::NetStackHandle::discard_fragments).
+    /// Always 0 without [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
     pub reassembly_overflow: u64,
 }
 

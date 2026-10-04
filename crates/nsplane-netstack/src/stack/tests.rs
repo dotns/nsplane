@@ -9,8 +9,10 @@ use tokio::time::{sleep, timeout};
 use super::*;
 use crate::udp::build_udp;
 
+mod abort;
 mod basic_udp;
 mod buffers;
+mod connected_udp;
 mod half_close;
 mod listener_integration;
 mod listener_pool;
