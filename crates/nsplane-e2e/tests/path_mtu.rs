@@ -5,12 +5,13 @@
 //! stage answers with Packet Too Big and fragments IPv4 for that peer, and a second peer on
 //! another path keeps the source MTU; the learned MTU expires and the full MTU comes back.
 //!
-//! The padding of a constrained peer's data stops at its inner MTU, so a packet at the inner
-//! MTU makes an outer packet of exactly the path MTU, over IPv4 and IPv6 paths. A sending
-//! host without DF (`UdpTransport` today) would fragment a larger one; the router counts
-//! such datagrams once it has reported the limit and passes them on. Reports for unknown
-//! paths, increases and wrong quotes change nothing. An engine that never uses the feature
-//! keeps no state and spawns no report forwarder.
+//! Once the engine has a ceiling or a report, the padding of every peer's data stops at its
+//! inner MTU, also where that is the source MTU, so a packet at the inner MTU makes an outer
+//! packet of at most the path MTU, over IPv4 and IPv6 paths. A sending host without DF
+//! (`UdpTransport` today) would fragment a larger one; the router counts such datagrams once
+//! it has reported the limit and passes them on. Reports for unknown paths, increases and
+//! wrong quotes change nothing. An engine that never uses the feature keeps no state, pads as
+//! before and spawns no report forwarder.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -441,6 +442,57 @@ async fn packets_at_the_inner_mtu_fit_ipv4_and_ipv6_paths() -> TestResult {
         assert_eq!(router.largest(), usize::from(LIMIT), "{addrs:?}");
         assert_eq!(router.host_fragmented(), 0, "{addrs:?}");
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn packets_at_the_source_mtu_fit_once_the_feature_is_used() -> TestResult {
+    // The path carries 1500 bytes over IPv6: 1420 inside, the source MTU.
+    const PATH: u16 = 1500;
+    let full = |a: &Node<Router>, b: &Node<ChannelTransport>| v6_to(a, b, usize::from(MTU));
+
+    // Never used: 1420 bytes are padded to 1424, an outer packet of 1504 bytes.
+    let Net {
+        a, mut b, router, ..
+    } = net().await?;
+    deliver(&a, &full(&a, &b), &mut b).await?;
+    assert_eq!(router.largest(), 1504);
+    assert_eq!(a.handle.path_mtu_stats().await?, PathMtuStats::default());
+
+    // A declared transport ceiling that leaves the inner MTU at the source MTU.
+    let Net {
+        a,
+        mut b,
+        router,
+        b_id,
+        ..
+    } = net().await?;
+    router.set_limit(PATH);
+    a.handle
+        .set_transport_max_datagram(TransportId::new(1), Some(PATH - 48))
+        .await?;
+    assert_eq!(a.handle.peer_mtu(b_id).await?, Some(MTU));
+    deliver(&a, &full(&a, &b), &mut b).await?;
+    assert_eq!(router.largest(), usize::from(PATH));
+    assert_eq!(a.handle.path_mtu_stats().await?.reports, 0);
+
+    // A learned path MTU of 1500: the first full packet is lost and reported, later ones fit.
+    let Net {
+        a,
+        mut b,
+        router,
+        b_id,
+        ..
+    } = net().await?;
+    router.set_limit(PATH);
+    a.send(&full(&a, &b)).await?;
+    wait_for_reports(&a, 1).await?;
+    b.expect_no_delivery().await?;
+    assert_eq!(a.handle.peer_mtu(b_id).await?, Some(MTU));
+    assert!(a.handle.peer_mtus().await?.borrow().peers.is_empty());
+    deliver(&a, &full(&a, &b), &mut b).await?;
+    assert_eq!(router.largest(), usize::from(PATH));
+    assert_eq!(router.host_fragmented(), 0);
     Ok(())
 }
 
