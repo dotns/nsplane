@@ -31,11 +31,17 @@
 //!   yields a different token (polled every [`WssConfig::token_poll`], at most
 //!   [`WssConfig::token_wait`]), since the same token would be refused again; a 403, and a
 //!   401 without a bearer provider, back off like any other failure.
-//! - **Backoff**: every dial but the first waits: [`WssConfig::backoff_min`] after a link
-//!   that came up, doubled after each failed dial up to [`WssConfig::backoff_max`].
+//! - **Backoff**: every dial but the first waits: [`WssConfig::reconnect_delay`] after a
+//!   link that came up ([`WssConfig::backoff_min`] when unset), and after a failed dial
+//!   [`WssConfig::backoff_min`], doubled after each further failure up to
+//!   [`WssConfig::backoff_max`]. Without a reconnect delay, the wait after a link is the
+//!   first step of that doubling.
 //! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`]; the
 //!   receiving half ends the link when no frame at all (pongs included) arrived for
 //!   [`WssConfig::read_idle`].
+//! - **Events**: [`WssDialer::events`] (and [`WssStreamClient::events`]) receive one
+//!   [`WssDialEvent`] per link that came up or was lost, failed dial, dial timeout and
+//!   401/403 rejection, on a broadcast channel of [`WssDialEvent::CAPACITY`] events.
 //! - **Messages**: text messages and binary messages longer than [`MAX_DATAGRAM`] are
 //!   dropped and counted; a close frame or the end of the stream ends the link.
 //!
@@ -128,7 +134,7 @@ mod server;
 mod stream;
 
 pub use config::{BearerProvider, WssConfig, WssTls};
-pub use connect::WssDialError;
+pub use connect::{WssDialError, WssDialEvent};
 pub use dialer::{WssDialer, WssStats};
 pub use server::{
     Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,

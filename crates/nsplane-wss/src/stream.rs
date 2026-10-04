@@ -16,12 +16,14 @@ use bytes::{Buf as _, Bytes};
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::LinkState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::MAX_DATAGRAM;
 use crate::config::WssConfig;
-use crate::connect::{Connector, DialCounters, Ws, WssDialError, add, bump, get, invalid, lock};
+use crate::connect::{
+    Connector, DialCounters, Ws, WssDialError, WssDialEvent, add, bump, get, invalid, lock,
+};
 use crate::frame::{self, FrameCommand, HEADER_LEN, Protocol, WsFrame};
 
 /// The most stream bytes one DATA frame carries: a frame is at most 65536 bytes, as the
@@ -463,6 +465,7 @@ impl Session {
             flow.ended(End::Lost);
         }
         self.connector.lost();
+        self.connector.emit(WssDialEvent::Lost);
         if self.stats.active_sessions.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.connector.set_state(LinkState::Disconnected);
         }
@@ -608,6 +611,7 @@ impl Inner {
         );
         self.stats.active_sessions.fetch_add(1, Ordering::Relaxed);
         self.connector.set_state(LinkState::Connected);
+        self.connector.emit(WssDialEvent::Connected);
         tracing::info!(session = number, url = %self.connector.config().url, "wss session up");
         tokio::spawn(Arc::clone(&session).run(ws, queues));
         lock(&self.sessions).push(session);
@@ -960,10 +964,12 @@ impl WssUdpFlow {
 /// - **Sessions**: dialed like [`WssDialer`](crate::WssDialer) links (URL, TLS, headers,
 ///   bearer, 401/403 as [`LinkState::Rejected`], the doubling backoff, pings and the read
 ///   idle of the [`WssConfig`]), lazily on the first open or by [`connect`](Self::connect).
+///   [`events`](Self::events) reports each dial and session.
 ///   Every stream and flow shares one session until it holds
 ///   [`max_streams_per_session`](WssStreamLimits::max_streams_per_session) live ones;
 ///   only then is another session dialed. One dial runs at a time; opens waiting for it
-///   share its result. A dial after a session was lost waits the backoff.
+///   share its result. A dial after a session was lost waits
+///   [`reconnect_delay`](WssConfig::reconnect_delay), or the backoff.
 /// - **Stream ids**: per session, counting up from 1, never 0, skipping ids still in use.
 ///   An id stays in use until the peer's CLOSE or `CLOSE_ACK`.
 /// - **Loss**: when a session ends (socket error, close, read idle), every stream and flow
@@ -1026,6 +1032,13 @@ impl WssStreamClient {
     /// a dial was refused with 401 or 403 (until a session comes up).
     pub fn state(&self) -> watch::Receiver<LinkState> {
         self.inner.connector.state()
+    }
+
+    /// Receives the [`WssDialEvent`]s from now on: one per failed, timed out or rejected
+    /// session dial, [`Connected`](WssDialEvent::Connected) per session that came up and
+    /// [`Lost`](WssDialEvent::Lost) per session that ended, after its `Connected`.
+    pub fn events(&self) -> broadcast::Receiver<WssDialEvent> {
+        self.inner.connector.events()
     }
 
     /// Dials a session unless one is up.
