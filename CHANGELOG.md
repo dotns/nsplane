@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-wss`: plain `ws://` URLs behind `WssConfig::allow_plaintext` (default `false`):
+  TCP and the WebSocket upgrade without TLS, port 80 by default, with the same headers,
+  bearer, backoff, rejection handling and state as `wss://`; `WssDialer`,
+  `WssStreamClient` and `WssStreamServer` all accept them. A `ws://` URL without the
+  setting is refused with `InvalidInput`, naming it.
+- `nsplane-wss`: `WssDialError` (`status`, `headers`, `body` truncated to
+  `WssDialError::MAX_BODY` = 512 bytes) is the inner error of the `io::Error` of every
+  dial whose upgrade was refused with an HTTP response, any status; the error kind and
+  message stay as before (`PermissionDenied` with "wss upgrade rejected with HTTP 401"
+  for 401/403, `Other` with "wss connect failed: HTTP error: ..." otherwise). Stream
+  client opens waiting behind a refused dial get it too.
+
 ## [0.8.0] - 2026-10-04
 
 The first release under the nsplane name (formerly a boringtun fork): a sans-I/O WireGuard

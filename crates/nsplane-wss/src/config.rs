@@ -56,8 +56,13 @@ pub enum WssTls {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WssConfig {
-    /// The `wss://` URL of the WebSocket request.
+    /// The `wss://` URL of the WebSocket request, or a `ws://` one when
+    /// [`allow_plaintext`](Self::allow_plaintext) is set.
     pub url: String,
+    /// Accepts a `ws://` URL: dialed over plain TCP (port 80 by default), without TLS, so
+    /// [`server_name`](Self::server_name) and [`tls`](Self::tls) go unused. `false` (the
+    /// default) accepts `wss://` only.
+    pub allow_plaintext: bool,
     /// Where to connect; `None` (the default) resolves the URL's host.
     pub connect_addr: Option<SocketAddr>,
     /// The TLS server name (SNI and the name the certificate must carry); `None` (the
@@ -94,6 +99,7 @@ impl WssConfig {
     pub fn new(url: impl Into<String>, tls: WssTls) -> Self {
         Self {
             url: url.into(),
+            allow_plaintext: false,
             connect_addr: None,
             server_name: None,
             tls,
@@ -107,6 +113,13 @@ impl WssConfig {
             read_idle: Duration::from_secs(35),
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Sets [`allow_plaintext`](Self::allow_plaintext).
+    #[must_use]
+    pub const fn allow_plaintext(mut self, allow: bool) -> Self {
+        self.allow_plaintext = allow;
+        self
     }
 
     /// Sets [`connect_addr`](Self::connect_addr).
@@ -174,6 +187,7 @@ impl fmt::Debug for WssConfig {
         let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("WssConfig")
             .field("url", &self.url)
+            .field("allow_plaintext", &self.allow_plaintext)
             .field("connect_addr", &self.connect_addr)
             .field("server_name", &self.server_name)
             .field("tls", &self.tls)
@@ -201,6 +215,7 @@ mod tests {
             WssTls::Roots(RootCertStore::empty()),
         );
         assert_eq!(config.url, "wss://relay.example/");
+        assert!(!config.allow_plaintext);
         assert_eq!(config.connect_addr, None);
         assert_eq!(config.server_name, None);
         assert_eq!(config.headers.len(), 0);
@@ -215,6 +230,7 @@ mod tests {
 
         let ms = Duration::from_millis;
         let config = config
+            .allow_plaintext(true)
             .connect_addr("127.0.0.1:9".parse().unwrap())
             .server_name("relay.test")
             .header("X-A", "1")
@@ -222,6 +238,7 @@ mod tests {
             .token_refresh(ms(3), ms(4))
             .keepalive(ms(5), ms(6))
             .connect_timeout(ms(7));
+        assert!(config.allow_plaintext);
         assert_eq!(config.connect_addr, Some("127.0.0.1:9".parse().unwrap()));
         assert_eq!(config.server_name.as_deref(), Some("relay.test"));
         assert_eq!(config.headers, [("X-A".to_owned(), "1".to_owned())]);

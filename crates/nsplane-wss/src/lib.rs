@@ -19,8 +19,13 @@
 //! - **Dialing**: TCP, TLS (rustls with the aws-lc-rs provider) and the WebSocket upgrade,
 //!   within [`WssConfig::connect_timeout`]. The request carries the extra
 //!   [`headers`](WssConfig::headers) and, when a [`BearerProvider`] is set, an
-//!   `Authorization: Bearer <token>` header with a token fetched for that dial.
-//! - **Rejections**: an upgrade answered with 401 or 403 is reported as
+//!   `Authorization: Bearer <token>` header with a token fetched for that dial. A `ws://`
+//!   URL is dialed the same way without TLS (port 80 by default), but only with
+//!   [`WssConfig::allow_plaintext`] set; otherwise it is refused like any non-`wss://` URL.
+//! - **Rejections**: an upgrade answered with an HTTP response (any status but 101) fails
+//!   the dial with a [`WssDialError`] inside the [`std::io::Error`]: the status, the
+//!   response headers and the start of the body (at most [`WssDialError::MAX_BODY`]
+//!   bytes). One answered with 401 or 403 is also reported as
 //!   [`LinkState::Rejected`](nsplane::LinkState::Rejected) on the
 //!   [state watch](WssDialer::state). After a 401 the next dial waits until the provider
 //!   yields a different token (polled every [`WssConfig::token_poll`], at most
@@ -123,6 +128,7 @@ mod server;
 mod stream;
 
 pub use config::{BearerProvider, WssConfig, WssTls};
+pub use connect::WssDialError;
 pub use dialer::{WssDialer, WssStats};
 pub use server::{
     Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,

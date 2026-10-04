@@ -102,9 +102,9 @@ impl fmt::Debug for WssDialer {
 impl WssDialer {
     /// A dialer for `config`.
     ///
-    /// Fails with [`io::ErrorKind::InvalidInput`] on a URL that is not `wss://` with a
-    /// host, an invalid server name or header, or TLS roots no configuration can be built
-    /// from.
+    /// Fails with [`io::ErrorKind::InvalidInput`] on a URL that is not `wss://` (or `ws://`
+    /// with [`WssConfig::allow_plaintext`]) with a host, an invalid server name or header,
+    /// or TLS roots no configuration can be built from.
     pub fn new(config: WssConfig) -> io::Result<Self> {
         Ok(Self {
             connector: Connector::new(config)?,
