@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::MAX_DATAGRAM;
 use crate::config::WssConfig;
-use crate::connect::{Connector, DialCounters, Ws, add, bump, get, invalid, lock};
+use crate::connect::{Connector, DialCounters, Ws, WssDialError, add, bump, get, invalid, lock};
 use crate::frame::{self, FrameCommand, HEADER_LEN, Protocol, WsFrame};
 
 /// The most stream bytes one DATA frame carries: a frame is at most 65536 bytes, as the
@@ -520,6 +520,18 @@ impl Session {
     }
 }
 
+/// A copy of a dial error: its kind and message, and its [`WssDialError`] if it has one.
+fn copy_error(error: &io::Error) -> io::Error {
+    let kind = error.kind();
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<WssDialError>())
+        .map_or_else(
+            || io::Error::new(kind, error.to_string()),
+            |detail| io::Error::new(kind, detail.clone()),
+        )
+}
+
 /// The client state shared by its clones.
 struct Inner {
     connector: Arc<Connector>,
@@ -531,7 +543,7 @@ struct Inner {
     /// Finished dials.
     dials: AtomicU64,
     /// The error of the last dial, if it failed.
-    last_failure: StdMutex<Option<(io::ErrorKind, String)>>,
+    last_failure: StdMutex<Option<io::Error>>,
 }
 
 impl Drop for Inner {
@@ -559,11 +571,10 @@ impl Inner {
             if let Some(found) = self.find(&mut take) {
                 return Ok(found);
             }
-            if self.dials.load(Ordering::Acquire) != seen {
-                let failure = lock(&self.last_failure).clone();
-                if let Some((kind, message)) = failure {
-                    return Err(io::Error::new(kind, message));
-                }
+            if self.dials.load(Ordering::Acquire) != seen
+                && let Some(failure) = lock(&self.last_failure).as_ref()
+            {
+                return Err(copy_error(failure));
             }
             self.dial().await?;
         }
@@ -581,7 +592,7 @@ impl Inner {
         let ws = match result {
             Ok(ws) => ws,
             Err(error) => {
-                *lock(&self.last_failure) = Some((error.kind(), error.to_string()));
+                *lock(&self.last_failure) = Some(copy_error(&error));
                 return Err(error);
             }
         };
