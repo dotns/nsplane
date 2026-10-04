@@ -235,10 +235,12 @@ impl Owners {
         }
         let (src, dst) = (ip.src(), ip.dst());
         if let Some((proto, id, transport)) = fragment_transport(&ip) {
-            return match &self.fragments {
-                Some(fragments) => self.fragment(fragments, proto, id, src, dst, transport),
-                None => Ownership::None,
-            };
+            return self
+                .fragments
+                .as_ref()
+                .map_or(Ownership::None, |fragments| {
+                    self.fragment(fragments, proto, id, src, dst, transport)
+                });
         }
         // TCP first: the stack accepts TCP behind one IPv6 Hop-by-Hop header.
         if let Some(segment) = tcp_segment(packet) {

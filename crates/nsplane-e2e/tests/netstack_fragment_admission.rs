@@ -131,7 +131,11 @@ async fn barrier(
 }
 
 /// The bound address and the raw node's source of one family.
-fn tuple(node: &StackNode, raw: &Node<ChannelTransport>, v6: bool) -> (SocketAddr, SocketAddr) {
+const fn tuple(
+    node: &StackNode,
+    raw: &Node<ChannelTransport>,
+    v6: bool,
+) -> (SocketAddr, SocketAddr) {
     if v6 {
         (
             SocketAddr::new(IpAddr::V6(node.ip6), BOUND_PORT),
