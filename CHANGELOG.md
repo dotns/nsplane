@@ -5,6 +5,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-netstack`: `TcpConnection::abort(self)` resets a connection: an RST instead of
+  the FIN a drop sends, unread and unsent bytes discarded, and the socket released within
+  the driver turn that observes the abort, without waiting for the peer, TIME-WAIT or the
+  idle timeout. After that turn `owns` no longer reports the tuple, the local port is free
+  (a `connect_tcp_from` of the same port issued right after the abort succeeds) and
+  `terminated` has resolved. A connection the peer already reset or closed is only
+  released. Dropping a connection still closes it with a FIN (ns's MN-1).
+- `nsplane-netstack`: `NetStackHandle::discard_fragments(src, dst, protocol, id: u32)`, for
+  a flow whose admission is revoked: from the call on the driver drops every fragment of
+  that datagram, those already queued in the `NetStackSink` included, counted in
+  `NetStackStats::reassembly_overflow`; the fragments it holds never complete and expire at
+  the reassembly timeout. The discard lasts `ReassemblyConfig::timeout`, at most
+  `max_datagrams` are remembered (oldest forgotten first), `protocol` only narrows IPv4
+  keys, and the call does nothing without `NetStackConfig::reassembly` (ns's MN-2).
+- `nsplane-netstack`: with reassembly, `NetStackHandle::owns` remembers a first fragment's
+  `Flow` verdict per `(src, dst, protocol, id)` and reports the datagram's later fragments
+  as `Flow` instead of `Listener`, for `ReassemblyConfig::timeout`, bounded by
+  `max_datagrams` and ended by `discard_fragments`; a later fragment seen before its first
+  stays `Listener`. With reassembly and no discard, the driver pays one atomic load per
+  ingress packet (ns's MN-4).
+- `nsplane-netstack`: connected UDP sockets. `NetStackHandle::connect_udp(remote)` and
+  `connect_udp_from(local, remote)` open a `UdpSocket` that receives only the datagrams
+  from `remote` (port 0 picks an ephemeral port), ahead of a socket bound to the same
+  address, which keeps every other remote's; `UdpSocket::send(payload)` sends to the
+  remote (`NotConnected` on a bound socket) and `UdpSocket::peer_addr` returns it (`None`
+  for a bound socket). `owns` reports `Flow` for the tuple only and `Listener` for other
+  remotes. A duplicate tuple fails with `AddrInUse` (ns's MN-3).
+- `nsplane-packet`: `icmp::is_echo_request(packet) -> bool`, a read-only classifier for an
+  IPv4 ICMP or IPv6 `ICMPv6` Echo request (code 0, full ICMP header, first fragment only; no
+  IPv6 extension headers; checksums not verified; bytes beyond the IP length accepted)
+  (ns's MQ-10).
+- `nsplane-tun`: `HostTunSource::set_mtu(&mut self, mtu: u16)` changes a `host_tun` MTU after
+  creation: packets read afterwards, those queued before the call included, are checked
+  against it, the `PacketSource::mtu` watch is updated only on a change and
+  `oversize_drops` is not reset (ns's MQ-11).
+- `nsplane-tun`: `TunSlot::clear(&self)` removes the installed fd with the fencing of
+  `replace` and keeps the slot open; the fd closes once no I/O uses it and reads and writes
+  wait for the next `replace`. It does nothing after `close` (ns's MQ-16).
+- `nsplane`: `Splitter::stats()` returns a `SplitterStats` snapshot (`#[non_exhaustive]`)
+  with `misrouted` (index out of range) and `failed` (the chosen sink returned an error, or
+  every sink was gone); `Splitter::misrouted()` stays (ns's MQ-12).
+- `nsplane-core`: `Core::unanswered_handshakes(peer) -> Option<u64>` and
+  `Core::total_unanswered_handshakes() -> u64` count handshake initiations that got no
+  response (superseded by another initiation, or the attempt gave up); monotonic, the total
+  keeps removed peers, a responder never counts. `nsplane`:
+  `EngineHandle::unanswered_handshakes(peer)` and `total_unanswered_handshakes()` (ns's
+  MQ-13).
+- `nsplane-nat`: `MasqueradeConfig::recheck_route_on_forward` (default `false`): forward asks
+  the decision closure for every packet of a recorded flow and, when the route changed,
+  removes the flow and drops the packet with `ROUTE_CHANGED`, counted in
+  `MasqueradeStats::route_changed` (ns's MQ-14).
+
+### Changed
+- `nsplane-nat`: `Masquerade::forward` verifies the transport checksum (with
+  `verify_checksums`) only for packets it masquerades: for a new flow after the decision
+  closure returned `Some`, so a corrupt first packet records no flow, and for a recorded flow
+  before the route recheck. Packets that pass unchanged are no longer dropped as
+  `BAD_CHECKSUM` (ns's MQ-15).
+
+### Fixed
+- `nsplane-netstack`: a TCP connection reaped by the 5-minute idle timeout now sends an RST
+  to the peer before the stack releases it; previously the socket was dropped silently and
+  the peer kept a half-open connection.
+
 ## [0.8.0] - 2026-10-04
 
 The first release under the nsplane name (formerly a boringtun fork): a sans-I/O WireGuard

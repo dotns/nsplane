@@ -37,7 +37,7 @@ const MAX_INJECT_PER_ITER: usize = 256;
 /// transmitting at this bound; only immediate replies to ingested packets are dropped
 /// (and counted) beyond it.
 const EGRESS_BACKLOG: usize = 256;
-/// Commands (`connect_tcp`, `bind_udp`) queued for the driver.
+/// Commands (`connect_tcp`, `bind_udp`, `connect_udp`) queued for the driver.
 const COMMAND_CAPACITY: usize = 64;
 /// Longest the driver sleeps without a timer from smoltcp.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
@@ -45,7 +45,8 @@ const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(20);
-/// First ephemeral port for `connect_tcp` and `bind_udp` on port 0 (RFC 6335).
+/// First ephemeral port for `connect_tcp`, `bind_udp` and `connect_udp` on port 0
+/// (RFC 6335).
 const EPHEMERAL_START: u16 = 49_152;
 
 fn stack_gone() -> io::Error {
@@ -91,7 +92,7 @@ impl NetStack {
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
             settings.v6.map(|(addr, _)| addr),
-            settings.reassembly.is_some(),
+            settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
 
@@ -111,9 +112,12 @@ impl NetStack {
             inbound: HashMap::new(),
             allocation_cursor: 0,
             conns: HashMap::new(),
+            aborting: Vec::new(),
+            deferred: Vec::new(),
             connecting: Vec::new(),
             flows: HashMap::new(),
             bound: HashMap::new(),
+            connected: HashMap::new(),
             ingress,
             batch: Vec::with_capacity(MAX_INJECT_PER_ITER),
             egress,
@@ -209,6 +213,11 @@ enum Command {
         local: SocketAddr,
         reply: oneshot::Sender<io::Result<UdpSocket>>,
     },
+    ConnectUdp {
+        local: SocketAddr,
+        remote: SocketAddr,
+        reply: oneshot::Sender<io::Result<UdpSocket>>,
+    },
 }
 
 /// The application's side of a [`NetStack`]: accepts and opens connections and flows.
@@ -242,8 +251,8 @@ impl NetStackHandle {
 
     /// Inbound UDP flows, one per `(remote, local)` tuple, each with its first datagram.
     ///
-    /// Datagrams to an address bound with [`bind_udp`](Self::bind_udp) are not reported
-    /// here. Only the first call (on any clone of the handle) gets the flows; every later
+    /// Datagrams to an address bound with [`bind_udp`](Self::bind_udp) or of a tuple
+    /// connected with [`connect_udp`](Self::connect_udp) are not reported here. Only the first call (on any clone of the handle) gets the flows; every later
     /// call returns a stream that ends immediately. The stream ends when the stack stops.
     /// Flows that arrive while the stream is not consumed are queued up to
     /// [`NetStackConfig::accept_capacity`], then dropped and counted.
@@ -313,9 +322,78 @@ impl NetStackHandle {
         response.await.map_err(|_| stack_gone())?
     }
 
+    /// Opens a UDP socket connected to `remote`.
+    ///
+    /// The local end is the stack's address of `remote`'s family and an ephemeral port;
+    /// see [`connect_udp_from`](Self::connect_udp_from).
+    pub async fn connect_udp(&self, remote: SocketAddr) -> io::Result<UdpSocket> {
+        self.connect_udp_from(SocketAddr::new(unspecified(remote.ip()), 0), remote)
+            .await
+    }
+
+    /// Opens a UDP socket from `local` connected to `remote`.
+    ///
+    /// `local` must be the stack's address of `remote`'s family or the unspecified address
+    /// of that family (which stands for the stack's address); port `0` picks an ephemeral
+    /// port no other socket of the stack uses on that address. The socket receives only
+    /// the datagrams from `remote` to `local`, ahead of a socket bound to `local` with
+    /// [`bind_udp`](Self::bind_udp), which keeps every other remote's; the tuple is
+    /// [`Ownership::Flow`] for [`owns`](Self::owns) until the socket is dropped.
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] if `remote` is unspecified or `local` is
+    /// of the other family, [`io::ErrorKind::AddrNotAvailable`] if the stack has no address
+    /// of the family or `local` is another address, [`io::ErrorKind::AddrInUse`] if a live
+    /// connected socket or [`UdpFlow`] holds exactly this tuple, and
+    /// [`io::ErrorKind::BrokenPipe`] once the stack stopped.
+    pub async fn connect_udp_from(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> io::Result<UdpSocket> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ConnectUdp {
+                local,
+                remote,
+                reply,
+            })
+            .await
+            .map_err(|_| stack_gone())?;
+        response.await.map_err(|_| stack_gone())?
+    }
+
     /// The stack's drop counters.
     pub fn stats(&self) -> NetStackStats {
         self.stats.snapshot()
+    }
+
+    /// Discards the fragmented datagram `(src, dst, protocol, id)` sent towards the stack,
+    /// so that none of its fragments joins a later flow on the same tuple.
+    ///
+    /// Call it when a flow's admission is revoked while one of its datagrams may be half
+    /// reassembled. From the call on, the driver drops every fragment of that datagram
+    /// that reaches it, including fragments already queued in the [`NetStackSink`], and
+    /// counts each in [`NetStackStats::reassembly_overflow`]; the fragments the stack
+    /// already holds never complete and are discarded at the reassembly timeout (counted
+    /// in [`NetStackStats::reassembly_timeout`]). The datagram is forgotten one
+    /// [`ReassemblyConfig::timeout`](crate::ReassemblyConfig::timeout)
+    /// after the call, when the held fragments have expired, so a later datagram with
+    /// the same identification starts afresh. At most
+    /// [`ReassemblyConfig::max_datagrams`](crate::ReassemblyConfig::max_datagrams)
+    /// discarded datagrams are remembered at once; beyond that the oldest is forgotten
+    /// early. The call also ends the [`owns`](Self::owns) memory of the datagram.
+    ///
+    /// `src` and `dst` are the packet's addresses (the peer's and the stack's) and
+    /// `protocol` the fragmented protocol; `id` is the IPv6 Fragment header's 32-bit
+    /// identification, or the IPv4 16-bit identification widened. As for reassembly, an
+    /// IPv6 datagram is identified by its addresses and `id`: `protocol` only narrows an
+    /// IPv4 discard.
+    ///
+    /// Without [`NetStackConfig::reassembly`] the stack drops every fragment anyway and
+    /// the call does nothing. It takes one short lock and never waits; while nothing is
+    /// discarded, fragments cost the driver one atomic load.
+    pub fn discard_fragments(&self, src: IpAddr, dst: IpAddr, protocol: u8, id: u32) {
+        self.owners.discard_fragments(src, dst, protocol, id);
     }
 
     /// Whether the stack owns `packet`, an IP packet a peer sent towards the stack.
@@ -339,10 +417,19 @@ impl NetStackHandle {
     ///
     /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
     /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
-    /// one of the above and [`Ownership::Listener`] otherwise; a later fragment carries no
-    /// ports, so it is [`Ownership::Listener`] (the stack takes it either way, and its
-    /// datagram goes wherever the first fragment's tuple leads once it is complete).
-    /// Fragments of other protocols stay [`Ownership::None`].
+    /// one of the above and [`Ownership::Listener`] otherwise. A later fragment carries no
+    /// ports: it is [`Ownership::Flow`] when this call classified the first fragment of
+    /// its datagram (same addresses, protocol and identification) as
+    /// [`Ownership::Flow`] within the last
+    /// [`ReassemblyConfig::timeout`](crate::ReassemblyConfig::timeout)
+    /// and the datagram was not discarded with
+    /// [`discard_fragments`](Self::discard_fragments) since, and
+    /// [`Ownership::Listener`] otherwise, including when it arrives before its first
+    /// fragment (the stack takes it either way, and its datagram goes wherever the first
+    /// fragment's tuple leads once it is complete). This memory holds at most
+    /// [`ReassemblyConfig::max_datagrams`](crate::ReassemblyConfig::max_datagrams)
+    /// datagrams, dropping the oldest. Fragments of other protocols stay
+    /// [`Ownership::None`].
     ///
     /// The answer reflects the stack's state at the call; a connection or flow that opens
     /// or closes concurrently may be seen either way. A connect is visible from the moment
@@ -351,8 +438,8 @@ impl NetStackHandle {
     /// visible before its SYN-ACK leaves. A UDP flow or socket stops being visible when it
     /// is dropped.
     ///
-    /// The call takes one short lock and never waits. The stack keeps the table it reads
-    /// as connections, flows and sockets open and close, not per packet.
+    /// The call takes one short lock and never waits (a fragment two). The stack keeps the
+    /// table it reads as connections, flows and sockets open and close, not per packet.
     pub fn owns(&self, packet: &[u8]) -> Ownership {
         if self.commands.is_closed() {
             return Ownership::None;
@@ -450,6 +537,8 @@ struct Bridged {
     sent: bool,
     /// The socket can be released.
     terminal: bool,
+    /// The socket was aborted and releases once its RST left.
+    aborting: bool,
 }
 
 impl Conn {
@@ -462,6 +551,9 @@ impl Conn {
                 .set_last_ack(u64::try_from(now.total_micros()).unwrap_or(0));
         }
         let mut shared = lock(&self.shared);
+        if shared.write_half == WriteHalf::Aborted {
+            return abort(socket, &mut shared);
+        }
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
 
         // smoltcp -> application.
@@ -519,7 +611,9 @@ impl Conn {
 
         if tcp_idle_timeout_expired(socket.state(), self.last_activity_at, now) {
             tracing::debug!(target: "netstack", "TCP connection exceeded idle timeout; aborting");
-            socket.abort();
+            // Released like an application abort: once the RST left.
+            shared.write_half = WriteHalf::Aborted;
+            return abort(socket, &mut shared);
         }
         let terminal = tcp_terminal_ready(
             socket.state(),
@@ -527,7 +621,11 @@ impl Conn {
             self.last_activity_at,
             now,
         );
-        Bridged { sent, terminal }
+        Bridged {
+            sent,
+            terminal,
+            aborting: false,
+        }
     }
 
     /// Tells the application the socket is gone.
@@ -539,6 +637,25 @@ impl Conn {
         shared.wake_writer();
         drop(shared);
         self.terminal.send_replace(true);
+    }
+}
+
+/// Resets the socket of an aborted connection and discards its bytes.
+///
+/// smoltcp sends the RST on its next dispatch and then forgets the remote endpoint; until
+/// then the socket must stay. A socket already closed (reset by the peer, or after the
+/// close handshake) has nobody to reset and is released as is.
+fn abort(socket: &mut tcp::Socket<'_>, shared: &mut Shared) -> Bridged {
+    shared.rx.clear();
+    shared.tx.clear();
+    if !matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+        socket.abort();
+    }
+    let terminal = socket.state() == tcp::State::TimeWait || socket.remote_endpoint().is_none();
+    Bridged {
+        sent: false,
+        terminal,
+        aborting: !terminal,
     }
 }
 
@@ -594,9 +711,17 @@ struct Driver {
     /// more aggregate demand than the pool.
     allocation_cursor: u16,
     conns: HashMap<SocketHandle, Conn>,
+    /// Aborted connections whose RST the next poll sends; empty between turns.
+    aborting: Vec<SocketHandle>,
+    /// Connects from a port an aborted connection still holds, retried once it is
+    /// released.
+    deferred: Vec<Command>,
     connecting: Vec<Connecting>,
     flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
     bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
+    /// Connected UDP sockets by `(remote, local)`; checked before `bound` only while not
+    /// empty.
+    connected: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<(SocketAddr, Bytes)>>,
     ingress: mpsc::Receiver<PacketBuf>,
     /// Ingress packets taken in one batch; empty between batches.
     batch: Vec<PacketBuf>,
@@ -695,6 +820,7 @@ impl Driver {
                 .poll_interface(&mut self.iface, now, &mut self.sockets);
             self.preserve_all(now);
         }
+        self.release_aborted();
 
         // 5. Egress, then wait for more work.
         self.flush_egress() && self.wait(now).await
@@ -768,13 +894,19 @@ impl Driver {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return Some(packet);
         };
-        let local =
-            IpPacket::parse(packet.as_packet()).is_ok_and(|ip| self.settings.is_local(ip.dst()));
-        if !local {
+        let now = Instant::now().into_std();
+        let Ok(ip) = IpPacket::parse(packet.as_packet()) else {
             // `classify` counts it.
             return Some(packet);
+        };
+        if !self.settings.is_local(ip.dst()) {
+            return Some(packet);
         }
-        let routed = match reassembler.push(packet.as_packet(), Instant::now().into_std()) {
+        if self.owners.is_discarded(&ip, now) {
+            stats::add(&self.stats.reassembly_overflow, 1);
+            return None;
+        }
+        let routed = match reassembler.push(packet.as_packet(), now) {
             Outcome::Pass => return Some(packet),
             Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
             Outcome::Held | Outcome::Dropped => None,
@@ -783,14 +915,17 @@ impl Driver {
         routed
     }
 
-    /// Discards incomplete datagrams past the reassembly timeout; free while none is held.
+    /// Discards incomplete datagrams past the reassembly timeout, and forgets discarded
+    /// ones; free while none is held.
     fn expire_fragments(&mut self) {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return;
         };
-        if reassembler.expire(Instant::now().into_std()) > 0 {
+        let now = Instant::now().into_std();
+        if reassembler.expire(now) > 0 {
             self.count_reassembly();
         }
+        self.owners.expire_discarded(now);
     }
 
     /// Adds what the reassembler counted since the last call to the stack's counters.
@@ -813,13 +948,28 @@ impl Driver {
         stats::add(&self.stats.malformed, rejected);
     }
 
-    /// Delivers a datagram to its bound socket, or to its flow.
+    /// Delivers a datagram to its connected socket, its bound socket, or to its flow.
     fn dispatch_udp(&mut self, datagram: Datagram) {
         let Datagram {
             src,
             dst,
             mut payload,
         } = datagram;
+        if !self.connected.is_empty()
+            && let Some(socket) = self.connected.get(&(src, dst))
+        {
+            match socket.try_send((src, payload)) {
+                Ok(()) => return,
+                Err(TrySendError::Full(_)) => {
+                    stats::add(&self.stats.udp_queue_full, 1);
+                    return;
+                }
+                Err(TrySendError::Closed((_, returned))) => {
+                    self.connected.remove(&(src, dst));
+                    payload = returned;
+                }
+            }
+        }
         let unspecified = match dst.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -910,6 +1060,16 @@ impl Driver {
     }
 
     fn command(&mut self, command: Command) {
+        if let Command::Connect {
+            local_port: Some(port),
+            ..
+        } = command
+            && self.aborting_port(port)
+        {
+            // The abort releases the port later in this turn.
+            self.deferred.push(command);
+            return;
+        }
         match command {
             Command::Connect {
                 remote,
@@ -929,6 +1089,13 @@ impl Driver {
             },
             Command::Bind { local, reply } => {
                 let _ = reply.send(self.bind(local));
+            }
+            Command::ConnectUdp {
+                local,
+                remote,
+                reply,
+            } => {
+                let _ = reply.send(self.connect_udp(local, remote));
             }
         }
     }
@@ -1046,6 +1213,71 @@ impl Driver {
             registration,
             addr,
             source,
+            None,
+            rx,
+            self.out.clone(),
+        ))
+    }
+
+    /// Connects a UDP socket, see [`NetStackHandle::connect_udp_from`].
+    fn connect_udp(&mut self, local: SocketAddr, remote: SocketAddr) -> io::Result<UdpSocket> {
+        if remote.port() == 0 || remote.ip().is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote address or port is unspecified",
+            ));
+        }
+        if local.is_ipv4() != remote.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "address families differ",
+            ));
+        }
+        let source = self.settings.local_for(remote.ip()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "the stack has no address of the remote's family",
+            )
+        })?;
+        if !local.ip().is_unspecified() && local.ip() != source {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "not an address of the stack",
+            ));
+        }
+        // Dropped sockets leave the table here too, so it empties when none is live.
+        self.connected.retain(|_, tx| !tx.is_closed());
+        let port = if local.port() == 0 {
+            let (bound, connected) = (&self.bound, &self.connected);
+            let any = unspecified(source);
+            next_ephemeral(&mut self.next_udp_port, |port| {
+                let addr = SocketAddr::new(source, port);
+                !bound.contains_key(&addr)
+                    && !bound.contains_key(&SocketAddr::new(any, port))
+                    && !connected.keys().any(|&(_, local)| local == addr)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port"))?
+        } else {
+            local.port()
+        };
+        let local = SocketAddr::new(source, port);
+        let key = (remote, local);
+        if self.connected.contains_key(&key)
+            || self.flows.get(&key).is_some_and(|tx| !tx.is_closed())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "UDP tuple already in use",
+            ));
+        }
+        let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
+        self.connected.insert(key, tx);
+        let registration = self.owners.udp_flow(local, remote);
+        Ok(UdpSocket::new(
+            registration,
+            local,
+            source,
+            Some(remote),
             rx,
             self.out.clone(),
         ))
@@ -1212,7 +1444,8 @@ impl Driver {
         }
     }
 
-    /// Bridges every connection and releases terminal ones; `true` if bytes were sent.
+    /// Bridges every connection and releases terminal ones; `true` if bytes were sent or
+    /// an aborted connection waits for its RST to be sent.
     fn bridge_all(&mut self, now: SmolInstant) -> bool {
         let mut sent = false;
         let mut released = Vec::new();
@@ -1222,15 +1455,52 @@ impl Driver {
             sent |= bridged.sent;
             if bridged.terminal {
                 released.push(handle);
+            } else if bridged.aborting {
+                self.aborting.push(handle);
             }
         }
         for handle in released {
-            if let Some(conn) = self.conns.remove(&handle) {
-                conn.release();
-            }
-            self.sockets.remove(handle);
+            self.release_conn(handle);
         }
-        sent
+        sent || !self.aborting.is_empty()
+    }
+
+    /// Releases the aborted connections whose RST the poll after the bridge pass sent (one
+    /// the device could not send yet stays until a later bridge pass finds it sent), then
+    /// retries the connects that waited for their ports.
+    fn release_aborted(&mut self) {
+        for handle in std::mem::take(&mut self.aborting) {
+            if self
+                .sockets
+                .get::<tcp::Socket<'_>>(handle)
+                .remote_endpoint()
+                .is_none()
+            {
+                self.release_conn(handle);
+            }
+        }
+        for command in std::mem::take(&mut self.deferred) {
+            self.command(command);
+        }
+    }
+
+    /// Whether an aborted connection not released yet holds `port`.
+    fn aborting_port(&self, port: u16) -> bool {
+        self.conns.iter().any(|(&handle, conn)| {
+            self.sockets
+                .get::<tcp::Socket<'_>>(handle)
+                .local_endpoint()
+                .is_some_and(|endpoint| endpoint.port == port)
+                && lock(&conn.shared).write_half == WriteHalf::Aborted
+        })
+    }
+
+    /// Releases a connection's tuple and socket and tells the application.
+    fn release_conn(&mut self, handle: SocketHandle) {
+        if let Some(conn) = self.conns.remove(&handle) {
+            conn.release();
+        }
+        self.sockets.remove(handle);
     }
 
     /// Unregisters listener sockets that left the handshake without being established
@@ -1358,6 +1628,14 @@ impl Driver {
     }
 }
 
+/// The unspecified address of `ip`'s family.
+const fn unspecified(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
 /// A random port of the ephemeral range, where a stack starts handing out ports, so that
 /// stacks (and restarts) do not reuse the same ports in the same order.
 fn random_ephemeral() -> u16 {
@@ -1438,7 +1716,25 @@ fn tcp_idle_timeout_expired(
     now: SmolInstant,
 ) -> bool {
     !matches!(state, tcp::State::Closed | tcp::State::TimeWait)
-        && now >= last_activity_at + TCP_IDLE_TIMEOUT
+        && now >= last_activity_at + idle_timeout()
+}
+
+#[cfg(not(test))]
+const fn idle_timeout() -> SmolDuration {
+    TCP_IDLE_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces [`TCP_IDLE_TIMEOUT`] for the stacks a test drives on its thread.
+    static IDLE_TIMEOUT: std::cell::Cell<Option<SmolDuration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn idle_timeout() -> SmolDuration {
+    IDLE_TIMEOUT
+        .with(std::cell::Cell::get)
+        .unwrap_or(TCP_IDLE_TIMEOUT)
 }
 
 fn tcp_terminal_ready(
