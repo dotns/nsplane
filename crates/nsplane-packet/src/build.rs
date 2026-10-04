@@ -14,7 +14,7 @@
 //! The IP version follows the socket addresses: an IPv4-mapped IPv6 address
 //! (`::ffff:a.b.c.d`) in a [`SocketAddr::V6`] is taken as IPv6 and builds an IPv6
 //! datagram. Mixed versions and payloads that do not fit the 16-bit length fields (65 507
-//! bytes over IPv4, 65 527 over IPv6) are a [`BuildError`].
+//! bytes over IPv4, 65 527 over IPv6) are a [`UdpBuildError`].
 //!
 //! ```
 //! use std::net::{Ipv6Addr, SocketAddr};
@@ -55,14 +55,14 @@ const UDP_CHECKSUM: Range<usize> = 6..8;
 /// A UDP datagram cannot be built from the given addresses and payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BuildError {
+pub enum UdpBuildError {
     /// The source and destination are of different IP versions.
     MixedFamilies,
     /// The payload does not fit the 16-bit UDP or IP length fields.
     TooLarge,
 }
 
-impl fmt::Display for BuildError {
+impl fmt::Display for UdpBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::MixedFamilies => "source and destination of different IP versions",
@@ -71,7 +71,7 @@ impl fmt::Display for BuildError {
     }
 }
 
-impl std::error::Error for BuildError {}
+impl std::error::Error for UdpBuildError {}
 
 /// The addresses of a datagram, one IP version.
 #[derive(Clone, Copy)]
@@ -94,11 +94,11 @@ fn layout(
     src: SocketAddr,
     dst: SocketAddr,
     payload_len: usize,
-) -> Result<(Addresses, u16), BuildError> {
+) -> Result<(Addresses, u16), UdpBuildError> {
     let addresses = match (src.ip(), dst.ip()) {
         (IpAddr::V4(s), IpAddr::V4(d)) => Addresses::V4(s, d),
         (IpAddr::V6(s), IpAddr::V6(d)) => Addresses::V6(s, d),
-        _ => return Err(BuildError::MixedFamilies),
+        _ => return Err(UdpBuildError::MixedFamilies),
     };
     // IPv4 counts its header in the total length; the IPv6 payload length is the UDP length.
     let limit = match addresses {
@@ -109,7 +109,7 @@ fn layout(
         .checked_add(UDP_HEADER_LEN)
         .and_then(|len| u16::try_from(len).ok())
         .filter(|&len| len <= limit)
-        .ok_or(BuildError::TooLarge)?;
+        .ok_or(UdpBuildError::TooLarge)?;
     Ok((addresses, udp_len))
 }
 
@@ -123,15 +123,15 @@ fn packet_len(addresses: Addresses, udp_len: u16) -> usize {
 ///
 /// # Errors
 ///
-/// Returns [`BuildError::MixedFamilies`] if `src` and `dst` are of different IP versions
-/// and [`BuildError::TooLarge`] if `payload` does not fit the length fields; `buf` is left
+/// Returns [`UdpBuildError::MixedFamilies`] if `src` and `dst` are of different IP versions
+/// and [`UdpBuildError::TooLarge`] if `payload` does not fit the length fields; `buf` is left
 /// unchanged.
 pub fn write_udp(
     buf: &mut PacketBuf,
     src: SocketAddr,
     dst: SocketAddr,
     payload: &[u8],
-) -> Result<(), BuildError> {
+) -> Result<(), UdpBuildError> {
     let (addresses, udp_len) = layout(src, dst, payload.len())?;
     buf.set_len(packet_len(addresses, udp_len));
     let (header, segment) = buf.as_packet_mut().split_at_mut(addresses.header_len());
@@ -180,7 +180,7 @@ pub fn udp_packet(
     src: SocketAddr,
     dst: SocketAddr,
     payload: &[u8],
-) -> Result<PacketBuf, BuildError> {
+) -> Result<PacketBuf, UdpBuildError> {
     let (addresses, udp_len) = layout(src, dst, payload.len())?;
     let mut buf = PacketBuf::with_capacity(packet_len(addresses, udp_len));
     write_udp(&mut buf, src, dst, payload)?;
@@ -314,7 +314,7 @@ mod tests {
             let payload = vec![0xA5; max + 1];
             assert_eq!(
                 udp_packet(src, dst, &payload).unwrap_err(),
-                BuildError::TooLarge
+                UdpBuildError::TooLarge
             );
         }
     }
@@ -323,26 +323,26 @@ mod tests {
     fn mixed_families_fail_and_mapped_is_ipv6() {
         assert_eq!(
             udp_packet(v4(1, 5), v6(2, 6), b"x").unwrap_err(),
-            BuildError::MixedFamilies
+            UdpBuildError::MixedFamilies
         );
         assert_eq!(
             udp_packet(v6(1, 5), v4(2, 6), b"x").unwrap_err(),
-            BuildError::MixedFamilies
+            UdpBuildError::MixedFamilies
         );
         let mapped = |last| SocketAddr::from((Ipv4Addr::new(10, 0, 0, last).to_ipv6_mapped(), 7));
         assert_eq!(
             udp_packet(v4(1, 5), mapped(2), b"x").unwrap_err(),
-            BuildError::MixedFamilies
+            UdpBuildError::MixedFamilies
         );
         let packet = udp_packet(mapped(1), mapped(2), b"x").unwrap();
         assert_eq!(packet.as_packet()[0] >> 4, 6);
         assert_eq!(udp_sum(packet.as_packet()), 0);
         assert_eq!(
-            BuildError::MixedFamilies.to_string(),
+            UdpBuildError::MixedFamilies.to_string(),
             "source and destination of different IP versions"
         );
         assert_eq!(
-            BuildError::TooLarge.to_string(),
+            UdpBuildError::TooLarge.to_string(),
             "payload too large for a UDP datagram"
         );
     }
