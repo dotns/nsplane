@@ -1,11 +1,13 @@
 //! An engine whose local side is a `TunSlot`, with its fd swapped mid-transfer: packets
-//! after a swap arrive in order and once, and nothing is written to a replaced fd.
+//! after a swap arrive in order and once, and nothing is written to a replaced fd. And
+//! with its fd cleared: the fd closes at once and traffic resumes on the next one.
 
 #![cfg(target_os = "linux")]
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
+use std::time::Duration;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{AllowedIp, ChannelTransport, Engine, EngineBuilder, Peer};
@@ -177,5 +179,59 @@ async fn numbered_streams_survive_fd_swaps() -> TestResult {
     }
     let reverse: Vec<u32> = by_fd.concat();
     assert_eq!(reverse, (0..COUNT).collect::<Vec<_>>(), "{by_fd:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleared_fd_closes_and_traffic_resumes_on_the_next() -> TestResult {
+    /// Packets the node sends while the slot is empty.
+    const HELD: u32 = 5;
+    let (_engine, slot, mut node) = setup().await?;
+    let peer_ip = node.ip4;
+    let (fd, host) = pair()?;
+    slot.replace(fd)?;
+
+    host.send(&udp4(SLOT_IP, peer_ip, WARM_UP)).await?;
+    let (_, delivered) = node.expect_delivery().await?;
+    assert_eq!(delivered, udp4(SLOT_IP, peer_ip, WARM_UP));
+    node.send(&udp4(peer_ip, SLOT_IP, WARM_UP)).await?;
+    let mut buf = [0u8; 64];
+    let len = timeout(WAIT, host.recv(&mut buf)).await??;
+    assert_eq!(buf[..len], udp4(peer_ip, SLOT_IP, WARM_UP));
+
+    slot.clear();
+    // The engine's end of the cleared fd closes once its parked I/O let go of it.
+    timeout(WAIT, async {
+        while host.send(WARM_UP).await.is_ok() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    for n in 0..HELD {
+        node.send(&udp4(peer_ip, SLOT_IP, &n.to_be_bytes())).await?;
+    }
+    sleep(QUIET).await;
+    assert!(
+        host.try_recv(&mut buf).is_err(),
+        "a packet reached the cleared fd"
+    );
+
+    let (fd, host) = pair()?;
+    slot.replace(fd)?;
+    // What the node sent while the slot was empty waited for the new fd.
+    let mut held = Vec::new();
+    for _ in 0..HELD {
+        let len = timeout(WAIT, host.recv(&mut buf)).await??;
+        held.push(number(
+            buf.get(..len).ok_or("long packet")?,
+            peer_ip,
+            SLOT_IP,
+        )?);
+    }
+    assert_eq!(held, (0..HELD).collect::<Vec<_>>());
+    host.send(&udp4(SLOT_IP, peer_ip, &HELD.to_be_bytes()))
+        .await?;
+    let (_, delivered) = node.expect_delivery().await?;
+    assert_eq!(number(&delivered, SLOT_IP, peer_ip)?, HELD);
     Ok(())
 }
