@@ -17,6 +17,9 @@
 //! For a hybrid local side (a TUN device next to a userspace netstack), [`Splitter`]
 //! routes delivered packets to one of several sinks and [`MergeSource`] merges several
 //! sources fairly into one.
+//! [`MapSink`] and [`MapSource`] rewrite or drop packets in place, [`pipe`] feeds one
+//! engine's output into another's input and [`pump`] moves packets from a source into a
+//! sink: the local-side graph primitives.
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +31,10 @@ mod fragment;
 mod handle;
 mod io;
 mod link;
+mod map;
 mod merge;
+mod pipe;
+mod pump;
 mod splitter;
 mod transport;
 mod udp;
@@ -48,12 +54,15 @@ pub use handle::{
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
+pub use map::{MapSink, MapSource, MapVerdict};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
 };
+pub use pipe::{PipeSink, PipeSource, pipe};
+pub use pump::{PumpStats, pump};
 pub use splitter::Splitter;
 pub use transport::{BoxFuture, DynTransport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};

@@ -431,6 +431,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the queues on the path loses its tail and recovers by retransmission timeout, so the
   default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
   refused for a full listener pool).
+- `nsplane-nat`: `Masquerade`, a local-side IPv6 source NAPT of routed LAN ingress, ported
+  from ns `subnet/ingress.rs` (`SubnetLanIngressTranslator`). A decision closure gives each
+  new TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision { source: Ipv6Addr,
+  route: u64 }`; the contract's `source: IpAddr` became `Ipv6Addr` by L1 decision, so an
+  IPv4 source cannot be expressed), and the source port or Echo identifier becomes a token
+  from `MasqueradeConfig::ports`. `forward` / `reverse` rewrite a `PacketBuf` in place and
+  return a `MasqueradeVerdict`; `reverse` asks the closure again and drops the reply and
+  its flow when the route changed. Flows live in a table of their own (bounded, a full
+  table refuses new flows, per-protocol idle expiry). Drop reasons in
+  `nsplane_nat::masquerade::reasons`: `tcp_not_syn`, `capacity`, `route_changed`,
+  `tokens_exhausted` and `bad_checksum` (the last one beyond the contract; ns drops these
+  too); `MasqueradeStats` counts the outcomes.
+- `nsplane-packet`: `icmp::echo_reply_in_place(&mut [u8]) -> bool` turns an IPv4 ICMP or
+  IPv6 `ICMPv6` Echo request into its Echo reply in the same buffer (addresses swapped,
+  checksums recomputed, TTL / hop limit kept), ported from ns `subnet_icmp_echo_reply`;
+  anything else, IPv4 fragments and buffers longer than the IP length included, returns
+  `false` untouched.
+- `nsplane`: `MapSink` and `MapSource`, in-place transform wrappers for the local side: a
+  closure (`Fn(&mut PacketBuf, PeerId) -> MapVerdict` on the sink side,
+  `FnMut(&mut PacketBuf) -> MapVerdict` on the source side) rewrites each packet or drops
+  it (`MapVerdict::{Keep, Drop}`, counted in `dropped()`); the MTU passes through and batch
+  methods map each packet. A Redirect is a `MapSink` plus a `MapSource`.
+- `nsplane`: `pump(source, sink, from) -> io::Result<PumpStats>` moves every packet from a
+  `PacketSource` into a `PacketSink` in order (`recv_batch` then `send_batch`), awaiting the
+  sink's backpressure; it ends with `Ok` when either side returns `BrokenPipe` and is
+  cancellation-safe at batch boundaries. `PumpStats { packets, batches }`.
+- `nsplane`: `pipe(capacity, mtu) -> (PipeSink, PipeSource)`, a bounded in-memory loopback,
+  so one engine's (or `Splitter`'s) output feeds another engine's input without a
+  forwarding task. `PipeSink` is `Clone`; either end gone makes the other return
+  `BrokenPipe` (the source after draining); `PipeSource::mtu_sender` changes the MTU it
+  reports. A `local_graph` bench (`cargo bench -p nsplane --bench local_graph`).
+- `nsplane-e2e`: `local_graph` tests: two engines joined only by pipes through a `Splitter`,
+  a Redirect-like `MapSink`/`MapSource` and a `MergeSource` (IPv4 and IPv6, in order, with a
+  Drop rule), a TUN-like channel pumped into and out of an engine, backpressure without
+  loss, `BrokenPipe` from either end of a pipe, and a cancelled pump.
 - `nsplane-acl`: per-packet source principals. `PeerIdentity::assertion_for(peer, src)`
   (default: `assertion(peer)`) resolves a peer's principal for the packet's remote address, and
   `PeerIdentity::by_source` marks peers whose principal depends on it;
@@ -448,9 +483,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default; packets they accept count in the new `AclFilterStats::bypassed`.
 - `nsplane-acl`: `AclFilterConfig::crates_acl(local)`, the ns `crates/acl` preset: for inbound
   IPv4 it equals ns `is_local_node_packet || is_icmp_echo_reply || acl_check_packet` (no reply
-  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags). A differential
-  test (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
+  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags), and it passes
+  IPv6 unevaluated as ns does (`ipv6: Ipv6Mode::Accept`). A differential test
+  (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
   malformed IPv4, which nsplane-acl drops. `nsplane-e2e` `acl_parity` tests.
+- `nsplane-acl`: `AclFilterConfig::ipv6: Ipv6Mode` (`#[non_exhaustive]`). `Evaluate` (default)
+  judges IPv6 like IPv4; `Accept` passes every IPv6 packet, inbound and outbound, before
+  anything else without recording state, counted in the new `AclFilterStats::ipv6_accepted`
+  (ns runs no ACL on IPv6; its destination check is `PeerConfig::inbound_destinations`).
 - `nsplane-core`: per-peer inbound destinations. `PeerConfig::inbound_destinations:
   Option<Vec<AllowedIp>>` (`None`, the default: unchecked) restricts where a peer's decrypted
   packets may be addressed; others are dropped as the new `reasons::DESTINATION_NOT_ALLOWED`.
@@ -461,7 +501,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Breaking: struct literals of `PeerConfig` (`nsplane::Peer`), `AclFilterConfig` and
   `AclFilterStats` need the new fields (`inbound_destinations`; `fragments`, `accept_to_local`,
-  `accept_icmp_echo_reply`; `bypassed`) (`..Default::default()`, `PeerConfig::new`), and
+  `accept_icmp_echo_reply`, `ipv6`; `bypassed`, `ipv6_accepted`) (`..Default::default()`, `PeerConfig::new`), and
   exhaustive matches on `ConfigChange` the new `SetInboundDestinations`. Behavior with the
   defaults is unchanged.
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

@@ -1,0 +1,120 @@
+//! In-place ICMP Echo reply synthesis for addresses answered locally.
+//!
+//! [`echo_reply_in_place`] turns an ICMP Echo request into its Echo reply in
+//! the same buffer, so a caller that answers pings for an address it owns can
+//! send the request's bytes straight back. Ported from ns
+//! `tun_service/runtime/subnet.rs` (`subnet_icmp_echo_reply`,
+//! `recalc_icmpv4_checksum` and `is_icmpv6_echo_request`):
+//!
+//! - **IPv4**: an ICMP Echo request (type 8, code 0) gets its source and
+//!   destination swapped and type 0 (Echo reply); the ICMP checksum is
+//!   recomputed over the ICMP message and the header checksum over the IPv4
+//!   header (options included, kept as they are).
+//! - **IPv6**: an `ICMPv6` Echo request (type 128, code 0) directly after the
+//!   fixed header gets its source and destination swapped and type 129 (Echo
+//!   reply); the `ICMPv6` checksum is recomputed with the IPv6 pseudo-header.
+//! - The TTL / hop limit is unchanged (as ns), and so are the identifier, the
+//!   sequence number and the payload.
+//!
+//! Anything else returns `false` and leaves the buffer byte-for-byte
+//! untouched: other ICMP types and codes, other protocols, IPv6 extension
+//! headers (ns only looks at the next header of the fixed header), IPv4
+//! fragments other than a whole datagram (ns answers them; a fragment's
+//! checksum cannot be recomputed), malformed or truncated packets, and
+//! packets whose length differs from the one their IP header declares (ns
+//! answers a buffer with trailing bytes and sums them into the ICMP
+//! checksum). The packet is fully validated before anything is written. As
+//! in ns, incoming checksums are not verified.
+//!
+//! Only the packet transform lives here: the host ICMP socket ns uses to
+//! probe the real destination before answering stays in ns.
+
+use crate::checksum::{internet_checksum, ipv4_header_checksum, transport_checksum_v6};
+use crate::ip::{IcmpHeader, Ipv4Header, Ipv6Header};
+use crate::protocol;
+
+/// ICMP Echo request / reply types (RFC 792).
+const ECHO_REQUEST_V4: u8 = 8;
+const ECHO_REPLY_V4: u8 = 0;
+/// `ICMPv6` Echo request / reply types (RFC 4443).
+const ECHO_REQUEST_V6: u8 = 128;
+const ECHO_REPLY_V6: u8 = 129;
+/// Byte range of the source and destination addresses in each IP header.
+const IPV4_ADDRESSES: std::ops::Range<usize> = 12..20;
+const IPV6_ADDRESSES: std::ops::Range<usize> = 8..40;
+/// Byte range of the checksum field in the IPv4 header and the ICMP header.
+const IPV4_CHECKSUM: std::ops::Range<usize> = 10..12;
+const ICMP_CHECKSUM: std::ops::Range<usize> = 2..4;
+/// Length of the IPv6 fixed header.
+const IPV6_HEADER_LEN: usize = 40;
+
+/// Rewrites the IPv4 ICMP or IPv6 `ICMPv6` Echo request in `packet` into its
+/// Echo reply and returns `true`; returns `false` and leaves `packet`
+/// untouched for anything else. See the [module docs](self).
+pub fn echo_reply_in_place(packet: &mut [u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => reply_v4(packet),
+        Some(6) => reply_v6(packet),
+        _ => false,
+    }
+}
+
+/// Whether `message` is an ICMP or `ICMPv6` Echo request of type `request`
+/// (code 0, at least the 8-byte header).
+fn is_echo_request(message: &[u8], request: u8) -> bool {
+    IcmpHeader::parse(message)
+        .is_ok_and(|(header, _)| header.icmp_type() == request && header.code() == 0)
+}
+
+fn reply_v4(packet: &mut [u8]) -> bool {
+    let header_len = {
+        let Ok((header, message)) = Ipv4Header::parse(packet) else {
+            return false;
+        };
+        let whole = !header.more_fragments() && header.fragment_offset() == 0;
+        if usize::from(header.total_len()) != packet.len()
+            || header.protocol() != protocol::ICMP
+            || !whole
+            || !is_echo_request(message, ECHO_REQUEST_V4)
+        {
+            return false;
+        }
+        header.header_len()
+    };
+    let (src, dst) = packet[IPV4_ADDRESSES].split_at_mut(4);
+    src.swap_with_slice(dst);
+    let message = &mut packet[header_len..];
+    message[0] = ECHO_REPLY_V4;
+    message[ICMP_CHECKSUM].fill(0);
+    let sum = internet_checksum(message);
+    message[ICMP_CHECKSUM].copy_from_slice(&sum.to_be_bytes());
+    let sum = ipv4_header_checksum(&packet[..header_len]);
+    packet[IPV4_CHECKSUM].copy_from_slice(&sum.to_be_bytes());
+    true
+}
+
+fn reply_v6(packet: &mut [u8]) -> bool {
+    let (src, dst) = {
+        let Ok((header, message)) = Ipv6Header::parse(packet) else {
+            return false;
+        };
+        if IPV6_HEADER_LEN + usize::from(header.payload_len()) != packet.len()
+            || header.next_header() != protocol::ICMPV6
+            || !is_echo_request(message, ECHO_REQUEST_V6)
+        {
+            return false;
+        }
+        (header.dst(), header.src())
+    };
+    let (old_src, old_dst) = packet[IPV6_ADDRESSES].split_at_mut(16);
+    old_src.swap_with_slice(old_dst);
+    let message = &mut packet[IPV6_HEADER_LEN..];
+    message[0] = ECHO_REPLY_V6;
+    message[ICMP_CHECKSUM].fill(0);
+    let sum = transport_checksum_v6(src, dst, protocol::ICMPV6, message);
+    message[ICMP_CHECKSUM].copy_from_slice(&sum.to_be_bytes());
+    true
+}
+
+#[cfg(test)]
+mod tests;

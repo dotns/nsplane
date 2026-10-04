@@ -4,7 +4,8 @@
 //! shared `AclEngine`, the `PeerIdentityMap` naming `a`'s principals and a clone of the
 //! filter for its counters, and check deliveries and `Event::Dropped` reasons for
 //! by-source and relay-key principals, the allow-only fragment gate, the bypass flags,
-//! the absence of reply allowances and policy reloads under traffic.
+//! the absence of reply allowances, IPv6 passing unevaluated and policy reloads under
+//! traffic.
 //!
 //! The runtime's clock is paused and the `AclEngine` reads tokio's clock, so the fragment
 //! TTL elapses with `tokio::time::advance`. The preset is built without a local address
@@ -16,10 +17,10 @@ use std::time::Duration;
 
 use nsplane::{AllowedIp, ChannelTransport, Event, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, PeerIdentityMap,
-    SourceAssertion, reasons, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Ipv6Mode,
+    PeerIdentityMap, SourceAssertion, reasons, wg_peer_anchor,
 };
-use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, payload, udp};
+use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, payload, tcp, udp};
 use nsplane_packet::checksum::ipv4_header_checksum;
 use nsplane_packet::protocol;
 
@@ -338,11 +339,12 @@ async fn fragments_follow_an_accepted_first_fragment_within_the_ttl() -> TestRes
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
     // `accept_to_local`: packets to `b`'s address pass with and without a policy, and
-    // packets to its other address do not.
-    let (a, mut b, acl) = key_pair(AclFilterConfig::crates_acl(Some(Ipv4Addr::new(
-        10, 0, 0, 2,
-    ))))
-    .await?;
+    // packets to its other address do not (IPv6 evaluated, so the flag alone decides).
+    let config = AclFilterConfig {
+        ipv6: Ipv6Mode::Evaluate,
+        ..AclFilterConfig::crates_acl(Some(Ipv4Addr::new(10, 0, 0, 2)))
+    };
+    let (a, mut b, acl) = key_pair(config).await?;
     let mut events = b.subscribe().await?;
     let to_local = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, DENIED), b"local");
     delivered(&a, &mut b, &to_local).await?;
@@ -382,6 +384,39 @@ async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
     dropped(&a, &mut b, &mut events, &reply, reasons::PROTOCOL).await?;
     let stats = acl.filter.stats();
     assert_eq!((stats.bypassed, stats.denied, stats.protocol), (0, 1, 1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn ipv6_passes_unevaluated_in_the_preset_only() -> TestResult {
+    let syn = 0x02;
+    let (a, mut b, acl) = key_pair(preset()).await?;
+    acl.engine.load(AclPolicy::default())?;
+    let packet = tcp(
+        SocketAddr::new(IpAddr::V6(a.ip6), SRC_PORT),
+        SocketAddr::new(IpAddr::V6(b.ip6), DENIED),
+        syn,
+        (1, 0),
+        b"v6",
+    );
+    delivered(&a, &mut b, &packet).await?;
+    let stats = acl.filter.stats();
+    assert_eq!((stats.ipv6_accepted, stats.accepted), (1, 0));
+
+    // The default config judges the same packet by the policy.
+    let (a, mut b, acl) = key_pair(AclFilterConfig::default()).await?;
+    let mut events = b.subscribe().await?;
+    acl.engine.load(AclPolicy::default())?;
+    let packet = tcp(
+        SocketAddr::new(IpAddr::V6(a.ip6), SRC_PORT),
+        SocketAddr::new(IpAddr::V6(b.ip6), DENIED),
+        syn,
+        (1, 0),
+        b"v6",
+    );
+    dropped(&a, &mut b, &mut events, &packet, reasons::DENIED).await?;
+    let stats = acl.filter.stats();
+    assert_eq!((stats.ipv6_accepted, stats.denied), (0, 1));
     Ok(())
 }
 
