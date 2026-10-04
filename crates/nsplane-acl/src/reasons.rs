@@ -29,3 +29,7 @@ pub const OUTBOUND: &str = "acl outbound denied";
 /// The source address of an outbound packet is outside
 /// [`AclFilterScope::outbound_sources`](crate::AclFilterScope::outbound_sources).
 pub const OUTBOUND_SOURCE: &str = "acl outbound source";
+/// The filter's own tables failed an internal invariant; the packet is
+/// dropped rather than evaluated without its peer (fail-closed). Not expected
+/// in operation: a nonzero count is a bug to report.
+pub const INTERNAL: &str = "acl internal error";
