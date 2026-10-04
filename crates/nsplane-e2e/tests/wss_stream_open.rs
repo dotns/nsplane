@@ -38,7 +38,7 @@ enum Mode {
     Down,
     /// Refuses the upgrade with this status.
     Refuse(u16),
-    /// Upgrades it and echoes the DATA of every stream, acknowledging CLOSEs.
+    /// Upgrades it and echoes the DATA of every stream, acknowledging each CLOSE.
     Echo,
 }
 
