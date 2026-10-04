@@ -16,14 +16,15 @@
 //! in count (and entries in bytes) and expire [`EXPIRY_SECS`] after they were
 //! opened. Overlapping fragments drop the whole datagram (`reasons::OVERLAP`).
 //!
-//! A fragment with the same range as a held one is a duplicate, whatever its
-//! payload and MF flag: the first copy wins, so a reassembled datagram never
-//! mixes bytes of two copies. This differs from 0.9.0 in three ways: an exact
-//! duplicate counts as held and in the byte budget (0.9.0 did not count it); a
-//! duplicate with a different payload or MF flag is ignored (0.9.0 dropped the
-//! datagram with `reasons::OVERLAP`); and at the byte limit a duplicate is
-//! dropped with `reasons::BUDGET_EXCEEDED` (0.9.0 ignored it). The bounds, the
-//! markers and the other drop reasons are unchanged.
+//! A fragment with the same range as a held one is a duplicate: the first
+//! copy's payload wins, so a reassembled datagram never mixes bytes of two
+//! copies, but a later copy without MF still marks the end of the datagram.
+//! This differs from 0.9.0 in three ways: an exact duplicate counts as held and
+//! in the byte budget (0.9.0 did not count it); a duplicate with a different
+//! payload or MF flag no longer drops the datagram (0.9.0 dropped it with
+//! `reasons::OVERLAP`); and at the byte limit a duplicate is dropped with
+//! `reasons::BUDGET_EXCEEDED` (0.9.0 ignored it). The bounds, the markers and
+//! the other drop reasons are unchanged.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;

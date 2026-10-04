@@ -69,8 +69,9 @@
 //! counts in [`TranslatorStats::fragments_held`] and in the byte budget. A
 //! fragment with the same range as a held one but a different payload or M
 //! flag is ignored as a duplicate instead of dropping the datagram with
-//! `reasons::OVERLAP`: the first copy wins, and a reassembled datagram never
-//! mixes bytes of the two copies. At the byte limit, a duplicate is dropped
+//! `reasons::OVERLAP`: the first copy's payload wins, so a reassembled
+//! datagram never mixes bytes of the two copies, but a later copy without the
+//! M flag still marks the end of the datagram. At the byte limit, a duplicate is dropped
 //! with `reasons::BUDGET_EXCEEDED` instead of being ignored.
 //!
 //! A translated IPv4 packet grows by 20 bytes (28 with a fragment header),
@@ -208,7 +209,7 @@ pub struct TranslatorStats {
     /// datagrams with a checksum whose later fragments arrived first).
     pub reassembled: u64,
     /// IPv4 UDP fragments stored for reassembly. A duplicate of a held
-    /// fragment (same range; the first copy wins) counts too, and so does
+    /// fragment (same range; the first copy's payload wins) counts too, and so does
     /// its share of the byte budget; 0.9.0 did not count exact duplicates.
     pub fragments_held: u64,
     /// Incomplete datagrams discarded when their 60 seconds expired.

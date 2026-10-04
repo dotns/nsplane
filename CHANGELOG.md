@@ -24,9 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact duplicate of a held fragment now counts in `TranslatorStats::fragments_held` and in
   the 1 MiB byte budget; a fragment with the same range as a held one but a different payload
   or MF flag is ignored as a duplicate instead of dropping the datagram with
-  `reasons::OVERLAP` (the first copy wins, and the reassembled datagram never mixes bytes of
-  the two copies); and at the byte limit a duplicate is dropped with
-  `reasons::BUDGET_EXCEEDED` instead of being ignored.
+  `reasons::OVERLAP` (the first copy's payload wins, so the reassembled datagram never mixes
+  bytes of the two copies, but a later copy without MF still marks the end of the datagram);
+  and at the byte limit a duplicate is dropped with `reasons::BUDGET_EXCEEDED` instead of
+  being ignored.
 
 ### Fixed
 - `nsplane-acl`: a peer cache entry missing right after it was stored drops the packet with
