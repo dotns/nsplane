@@ -17,12 +17,10 @@ workspace = true
 [dependencies]
 nsplane = { path = "../nsplane", version = "0.8.0" }
 tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
+tracing = "0.1.40"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-tracing = "0.1.40"
 
 [target.'cfg(windows)'.dependencies]
 # JUSTIFICATION: Wintun is the only userspace TUN driver on Windows; the bindings load the
