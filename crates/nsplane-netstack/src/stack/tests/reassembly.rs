@@ -219,7 +219,11 @@ async fn fragments_are_owned_with_reassembly() -> TestResult {
     let (packet, _) = datagram(remote, local, 1000)?;
     let fragments = fragments_v4(&packet, 512, 1);
     assert_eq!(handle.owns(&fragments[0]), Ownership::Flow, "first, bound");
-    assert_eq!(handle.owns(&fragments[1]), Ownership::Listener, "later");
+    assert_eq!(
+        handle.owns(&fragments[1]),
+        Ownership::Flow,
+        "later, remembered"
+    );
     let (other, _) = datagram(remote, SocketAddr::new(LOCAL4.into(), 9), 1000)?;
     let fragments = fragments_v4(&other, 512, 2);
     assert_eq!(
@@ -251,5 +255,264 @@ async fn fragments_are_owned_with_reassembly() -> TestResult {
     let mut icmp = fragments_v4(&packet, 512, 5).remove(1);
     icmp[9] = protocol::ICMP;
     assert_eq!(handle.owns(&icmp), Ownership::None);
+    Ok(())
+}
+
+/// A bound socket on each family, with remotes to send from.
+struct Bound {
+    v4: (UdpSocket, SocketAddr, SocketAddr),
+    v6: (UdpSocket, SocketAddr, SocketAddr),
+}
+
+async fn bind_both(handle: &NetStackHandle) -> Result<Bound, Box<dyn Error>> {
+    let local = SocketAddr::new(LOCAL4.into(), 5353);
+    let local6 = SocketAddr::new(LOCAL6.into(), 5353);
+    Ok(Bound {
+        v4: (
+            handle.bind_udp(local).await?,
+            local,
+            "10.7.0.2:1000".parse()?,
+        ),
+        v6: (
+            handle.bind_udp(local6).await?,
+            local6,
+            "[fd00:7::2]:1000".parse()?,
+        ),
+    })
+}
+
+/// `packet` split into three fragments with identification `id`.
+fn split(packet: &[u8], id: u16) -> Vec<Vec<u8>> {
+    if packet[0] >> 4 == 4 {
+        fragments_v4(packet, 512, id)
+    } else {
+        fragments_v6(packet, 512, u32::from(id))
+    }
+}
+
+/// Sends `packet` whole and waits for it on `socket`, so every packet sent before it has
+/// been through the driver.
+async fn barrier(
+    sink: &NetStackSink,
+    socket: &mut UdpSocket,
+    remote: SocketAddr,
+    local: SocketAddr,
+) -> TestResult {
+    let (whole, payload) = datagram(remote, local, 8)?;
+    send_all(sink, [whole]).await?;
+    let (got, _) = timeout(WAIT, socket.recv_from()).await??;
+    assert_eq!(got.as_ref(), &payload[..]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discarded_fragments_never_complete() -> TestResult {
+    let (stack, handle) = NetStack::new(config(Some(ReassemblyConfig::default())));
+    let (_source, sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    let mut dropped = 0;
+    for (mut socket, local, remote) in [v4, v6] {
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let held = split(&packet, 7);
+        // The first fragment is held before the discard.
+        send_all(&sink, [held[0].clone()]).await?;
+        barrier(&sink, &mut socket, remote, local).await?;
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::UDP, 7);
+        send_all(&sink, held[1..].to_vec()).await?;
+        dropped += held.len() as u64 - 1;
+
+        // A new datagram on the same tuple is delivered, and only it.
+        let (next, payload) = datagram(remote, local, 1100)?;
+        send_all(&sink, split(&next, 8)).await?;
+        let (got, from) = timeout(WAIT, socket.recv_from()).await??;
+        assert_eq!((got.as_ref(), from), (&payload[..], remote));
+        barrier(&sink, &mut socket, remote, local).await?;
+    }
+    let stats = handle.stats();
+    assert_eq!((stats.reassembled, stats.reassembly_overflow), (2, dropped));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_discard_ends_with_the_reassembly_timeout() -> TestResult {
+    let reassembly = ReassemblyConfig {
+        timeout: Duration::from_millis(100),
+        ..ReassemblyConfig::default()
+    };
+    let (stack, handle) = NetStack::new(config(Some(reassembly)));
+    let (_source, sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    for (mut socket, local, remote) in [v4, v6] {
+        let (packet, payload) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 7);
+        send_all(&sink, [fragments[0].clone()]).await?;
+        barrier(&sink, &mut socket, remote, local).await?;
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::UDP, 7);
+        send_all(&sink, [fragments[1].clone()]).await?;
+        barrier(&sink, &mut socket, remote, local).await?;
+
+        // Past the window the same identification reassembles again.
+        sleep(Duration::from_millis(150)).await;
+        send_all(&sink, fragments).await?;
+        let (got, _) = timeout(WAIT, socket.recv_from()).await??;
+        assert_eq!(got.as_ref(), &payload[..]);
+    }
+    let stats = handle.stats();
+    assert_eq!(
+        (
+            stats.reassembled,
+            stats.reassembly_overflow,
+            stats.reassembly_timeout
+        ),
+        (2, 2, 2)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_discard_spares_other_datagrams() -> TestResult {
+    let (stack, handle) = NetStack::new(config(Some(ReassemblyConfig::default())));
+    let (_source, sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    for (mut socket, local, remote) in [v4, v6] {
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::UDP, 7);
+        // Another identification, and the same one from another peer.
+        let (packet, payload) = datagram(remote, local, 1200)?;
+        send_all(&sink, split(&packet, 8)).await?;
+        let (got, _) = timeout(WAIT, socket.recv_from()).await??;
+        assert_eq!(got.as_ref(), &payload[..]);
+        let other = SocketAddr::new(
+            match remote.ip() {
+                IpAddr::V4(_) => "10.7.0.3".parse()?,
+                IpAddr::V6(_) => "fd00:7::3".parse()?,
+            },
+            1000,
+        );
+        let (packet, payload) = datagram(other, local, 1200)?;
+        send_all(&sink, split(&packet, 7)).await?;
+        let (got, from) = timeout(WAIT, socket.recv_from()).await??;
+        assert_eq!((got.as_ref(), from), (&payload[..], other));
+
+        // The protocol narrows an IPv4 discard only; IPv6 keys datagrams without it.
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::TCP, 10);
+        let (packet, payload) = datagram(remote, local, 1200)?;
+        send_all(&sink, split(&packet, 10)).await?;
+        if remote.is_ipv4() {
+            let (got, _) = timeout(WAIT, socket.recv_from()).await??;
+            assert_eq!(got.as_ref(), &payload[..]);
+        } else {
+            // Anything delivered before the barrier fails it.
+            barrier(&sink, &mut socket, remote, local).await?;
+        }
+    }
+    assert_eq!(handle.stats().reassembly_overflow, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn later_fragments_follow_the_first_fragments_verdict() -> TestResult {
+    let (stack, handle) = NetStack::new(config(Some(ReassemblyConfig::default())));
+    let (_source, _sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    for (_socket, local, remote) in [v4, v6] {
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 7);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Flow, "first");
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Flow, "later");
+        assert_eq!(handle.owns(&fragments[2]), Ownership::Flow, "last");
+        assert_eq!(
+            handle.owns(&split(&packet, 8)[1]),
+            Ownership::Listener,
+            "another identification"
+        );
+
+        // A later fragment before its first one keeps the plain verdict.
+        let fragments = split(&packet, 9);
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Listener, "early");
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Flow, "first, after");
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Flow, "later, after");
+
+        // A discard ends the memory, and a first fragment after it does not renew it.
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::UDP, 7);
+        assert_eq!(handle.owns(&split(&packet, 7)[1]), Ownership::Listener);
+        assert_eq!(handle.owns(&split(&packet, 7)[0]), Ownership::Flow);
+        assert_eq!(handle.owns(&split(&packet, 7)[1]), Ownership::Listener);
+
+        // An unregistered tuple's first fragment leaves nothing to remember.
+        let (other, _) = datagram(remote, SocketAddr::new(local.ip(), 9), 1200)?;
+        let fragments = split(&other, 11);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Listener);
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Listener);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_fragment_memory_expires() -> TestResult {
+    let reassembly = ReassemblyConfig {
+        timeout: Duration::from_millis(100),
+        ..ReassemblyConfig::default()
+    };
+    let (stack, handle) = NetStack::new(config(Some(reassembly)));
+    let (_source, _sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    for (_socket, local, remote) in [v4, v6] {
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 7);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Flow);
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Flow);
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Listener);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_reassembly_a_discard_does_nothing() -> TestResult {
+    let (stack, handle) = NetStack::new(config(None));
+    let (_source, sink) = stack.split();
+    let Bound { v4, v6 } = bind_both(&handle).await?;
+    for (mut socket, local, remote) in [v4, v6] {
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 7);
+        handle.discard_fragments(remote.ip(), local.ip(), protocol::UDP, 7);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::None);
+        assert_eq!(handle.owns(&fragments[1]), Ownership::None);
+        send_all(&sink, fragments).await?;
+        barrier(&sink, &mut socket, remote, local).await?;
+    }
+    let stats = handle.stats();
+    assert_eq!(
+        (
+            stats.unsupported,
+            stats.reassembly_overflow,
+            stats.reassembled
+        ),
+        (6, 0, 0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_connected_sockets_fragments_are_flow_from_its_remote_only() -> TestResult {
+    let (stack, handle) = NetStack::new(config(Some(ReassemblyConfig::default())));
+    let (_source, _sink) = stack.split();
+    for remote in ["10.7.0.2:1000", "[fd00:7::2]:1000"] {
+        let remote: SocketAddr = remote.parse()?;
+        let socket = handle.connect_udp(remote).await?;
+        let local = socket.local_addr();
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 21);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Flow, "first");
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Flow, "later");
+
+        let other = SocketAddr::new(remote.ip(), 1001);
+        let (stray, _) = datagram(other, local, 1200)?;
+        assert_eq!(
+            handle.owns(&split(&stray, 22)[0]),
+            Ownership::Listener,
+            "another remote"
+        );
+    }
     Ok(())
 }
