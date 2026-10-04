@@ -111,6 +111,8 @@ impl NetStack {
             inbound: HashMap::new(),
             allocation_cursor: 0,
             conns: HashMap::new(),
+            aborting: Vec::new(),
+            deferred: Vec::new(),
             connecting: Vec::new(),
             flows: HashMap::new(),
             bound: HashMap::new(),
@@ -488,6 +490,8 @@ struct Bridged {
     sent: bool,
     /// The socket can be released.
     terminal: bool,
+    /// The socket was aborted and releases once its RST left.
+    aborting: bool,
 }
 
 impl Conn {
@@ -500,6 +504,9 @@ impl Conn {
                 .set_last_ack(u64::try_from(now.total_micros()).unwrap_or(0));
         }
         let mut shared = lock(&self.shared);
+        if shared.write_half == WriteHalf::Aborted {
+            return abort(socket, &mut shared);
+        }
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
 
         // smoltcp -> application.
@@ -565,7 +572,11 @@ impl Conn {
             self.last_activity_at,
             now,
         );
-        Bridged { sent, terminal }
+        Bridged {
+            sent,
+            terminal,
+            aborting: false,
+        }
     }
 
     /// Tells the application the socket is gone.
@@ -577,6 +588,25 @@ impl Conn {
         shared.wake_writer();
         drop(shared);
         self.terminal.send_replace(true);
+    }
+}
+
+/// Resets the socket of an aborted connection and discards its bytes.
+///
+/// smoltcp sends the RST on its next dispatch and then forgets the remote endpoint; until
+/// then the socket must stay. A socket already closed (reset by the peer, or after the
+/// close handshake) has nobody to reset and is released as is.
+fn abort(socket: &mut tcp::Socket<'_>, shared: &mut Shared) -> Bridged {
+    shared.rx.clear();
+    shared.tx.clear();
+    if !matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+        socket.abort();
+    }
+    let terminal = socket.state() == tcp::State::TimeWait || socket.remote_endpoint().is_none();
+    Bridged {
+        sent: false,
+        terminal,
+        aborting: !terminal,
     }
 }
 
@@ -632,6 +662,11 @@ struct Driver {
     /// more aggregate demand than the pool.
     allocation_cursor: u16,
     conns: HashMap<SocketHandle, Conn>,
+    /// Aborted connections whose RST the next poll sends; empty between turns.
+    aborting: Vec<SocketHandle>,
+    /// Connects from a port an aborted connection still holds, retried once it is
+    /// released.
+    deferred: Vec<Command>,
     connecting: Vec<Connecting>,
     flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
     bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
@@ -733,6 +768,7 @@ impl Driver {
                 .poll_interface(&mut self.iface, now, &mut self.sockets);
             self.preserve_all(now);
         }
+        self.release_aborted();
 
         // 5. Egress, then wait for more work.
         self.flush_egress() && self.wait(now).await
@@ -957,6 +993,16 @@ impl Driver {
     }
 
     fn command(&mut self, command: Command) {
+        if let Command::Connect {
+            local_port: Some(port),
+            ..
+        } = command
+            && self.aborting_port(port)
+        {
+            // The abort releases the port later in this turn.
+            self.deferred.push(command);
+            return;
+        }
         match command {
             Command::Connect {
                 remote,
@@ -1259,7 +1305,8 @@ impl Driver {
         }
     }
 
-    /// Bridges every connection and releases terminal ones; `true` if bytes were sent.
+    /// Bridges every connection and releases terminal ones; `true` if bytes were sent or
+    /// an aborted connection waits for its RST to be sent.
     fn bridge_all(&mut self, now: SmolInstant) -> bool {
         let mut sent = false;
         let mut released = Vec::new();
@@ -1269,15 +1316,52 @@ impl Driver {
             sent |= bridged.sent;
             if bridged.terminal {
                 released.push(handle);
+            } else if bridged.aborting {
+                self.aborting.push(handle);
             }
         }
         for handle in released {
-            if let Some(conn) = self.conns.remove(&handle) {
-                conn.release();
-            }
-            self.sockets.remove(handle);
+            self.release_conn(handle);
         }
-        sent
+        sent || !self.aborting.is_empty()
+    }
+
+    /// Releases the aborted connections whose RST the poll after the bridge pass sent (one
+    /// the device could not send yet stays until a later bridge pass finds it sent), then
+    /// retries the connects that waited for their ports.
+    fn release_aborted(&mut self) {
+        for handle in std::mem::take(&mut self.aborting) {
+            if self
+                .sockets
+                .get::<tcp::Socket<'_>>(handle)
+                .remote_endpoint()
+                .is_none()
+            {
+                self.release_conn(handle);
+            }
+        }
+        for command in std::mem::take(&mut self.deferred) {
+            self.command(command);
+        }
+    }
+
+    /// Whether an aborted connection not released yet holds `port`.
+    fn aborting_port(&self, port: u16) -> bool {
+        self.conns.iter().any(|(&handle, conn)| {
+            self.sockets
+                .get::<tcp::Socket<'_>>(handle)
+                .local_endpoint()
+                .is_some_and(|endpoint| endpoint.port == port)
+                && lock(&conn.shared).write_half == WriteHalf::Aborted
+        })
+    }
+
+    /// Releases a connection's tuple and socket and tells the application.
+    fn release_conn(&mut self, handle: SocketHandle) {
+        if let Some(conn) = self.conns.remove(&handle) {
+            conn.release();
+        }
+        self.sockets.remove(handle);
     }
 
     /// Unregisters listener sockets that left the handshake without being established
