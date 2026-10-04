@@ -6,13 +6,16 @@
 //! - `established/filter`: one repeated TCP ACK of a same-owner flow through `NodeL3Filter`
 //!   (with an accept-all `AclFilter` behind it, which an enforced allow skips).
 //! - `established/gate`: the same packet through `NodeL3Gate::evaluate_inbound`.
+//! - `established/outbound`: the local reply of that flow through
+//!   `NodeL3Gate::evaluate_outbound`.
 //! - `new_flow/node_grant`, `new_flow/service_grant`: a SYN with a new source port per packet
 //!   under a Node Grant and under a Service Grant (with its Provider listener installed). The
 //!   gate is rebuilt, untimed, every [`NEW_FLOW_CHUNK`] packets so the per-peer limit (2,048)
 //!   is never reached.
 //! - `baseline/acl_established`: the same packet through the `AclFilter` alone (the gate not
 //!   installed); `baseline/legacy_filter`: through `NodeL3Filter` whose gate has no snapshot,
-//!   so the packet goes on to the `AclFilter`.
+//!   so the packet goes on to the `AclFilter`; `baseline/legacy_gate`: through
+//!   `NodeL3Gate::evaluate_inbound` of that gate alone.
 //! - `contention/{1ms,10ms}`: `established/filter` while a thread applies a new generation
 //!   (same content, a Node Grant on an unrelated Node toggled) every 1 or 10 ms.
 
@@ -217,6 +220,25 @@ fn bench_new_flows(
     });
 }
 
+/// (d) Without the gate: the ACL filter alone, and a gate without a snapshot in front of it
+/// and alone.
+fn bench_baselines(c: &mut Criterion, syn: &PacketBuf, ack: &PacketBuf) {
+    let acl = accept_acl();
+    assert_eq!(acl.inbound(peer(), &mut syn.clone()), Verdict::Accept);
+    bench_filter(c, "baseline/acl_established", &acl, ack);
+    let legacy_gate = NodeL3Gate::new(MACHINE);
+    let legacy = NodeL3Filter::new(Arc::clone(&legacy_gate), keys()).with_acl(accept_acl());
+    assert_eq!(legacy.inbound(peer(), &mut syn.clone()), Verdict::Accept);
+    bench_filter(c, "baseline/legacy_filter", &legacy, ack);
+    assert_eq!(
+        legacy_gate.evaluate_inbound(REMOTE_KEY, ack.as_packet()),
+        NodeL3Decision::Legacy
+    );
+    c.bench_function("baseline/legacy_gate", |b| {
+        b.iter(|| legacy_gate.evaluate_inbound(REMOTE_KEY, std::hint::black_box(ack.as_packet())));
+    });
+}
+
 fn bench_node_l3(c: &mut Criterion) {
     let (syn, ack) = established_packets();
 
@@ -234,6 +256,17 @@ fn bench_node_l3(c: &mut Criterion) {
     c.bench_function("established/gate", |b| {
         b.iter(|| {
             established_gate.evaluate_inbound(REMOTE_KEY, std::hint::black_box(ack.as_packet()))
+        });
+    });
+
+    let reply = tcp(LOCAL, 22, REMOTE, 40000, ACK);
+    assert!(matches!(
+        established_gate.evaluate_outbound(REMOTE_KEY, reply.as_packet()),
+        NodeL3Decision::Enforce { allow: true, .. }
+    ));
+    c.bench_function("established/outbound", |b| {
+        b.iter(|| {
+            established_gate.evaluate_outbound(REMOTE_KEY, std::hint::black_box(reply.as_packet()))
         });
     });
 
@@ -273,13 +306,7 @@ fn bench_node_l3(c: &mut Criterion) {
     ));
     bench_new_flows(c, "new_flow/service_grant", service_grant, SERVICE_PORT);
 
-    // (d) Without the gate: the ACL filter alone, and a gate without a snapshot in front of it.
-    let acl = accept_acl();
-    assert_eq!(acl.inbound(peer(), &mut syn.clone()), Verdict::Accept);
-    bench_filter(c, "baseline/acl_established", &acl, &ack);
-    let legacy = NodeL3Filter::new(NodeL3Gate::new(MACHINE), keys()).with_acl(accept_acl());
-    assert_eq!(legacy.inbound(peer(), &mut syn.clone()), Verdict::Accept);
-    bench_filter(c, "baseline/legacy_filter", &legacy, &ack);
+    bench_baselines(c, &syn, &ack);
 
     // (e) (a) while a writer publishes a new generation every 1 or 10 ms.
     for (name, period) in [

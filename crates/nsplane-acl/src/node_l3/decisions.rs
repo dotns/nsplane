@@ -1,5 +1,6 @@
 //! Packet evaluation, decision recording and Provider flow queries.
 
+use std::cell::OnceCell;
 use std::net::SocketAddr;
 use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
@@ -10,8 +11,8 @@ use super::packet::{PacketMeta, flow_key, packet_ipv4_endpoints, related_flow_ke
 use super::policy::{CompiledPolicy, NodeIdentity};
 use super::snapshot::Snapshot;
 use super::state::{
-    Admission, FlowKey, FlowState, FragmentDisposition, ServiceFlowAuthorization, Shard, TcpClose,
-    protocol_timeout,
+    Admission, FlowKey, FlowState, FragmentDisposition, LiveFlow, ServiceFlowAuthorization, Shard,
+    TcpClose, protocol_timeout,
 };
 use super::{NodeL3Decision, NodeL3Gate, NodeL3Reason, PacketDirection, mode_decision};
 
@@ -167,12 +168,25 @@ impl NodeL3Gate {
     }
 
     /// Evaluate one packet at `now` without recording counters.
+    #[cfg(test)]
     pub(super) fn evaluate_at(
         &self,
         direction: PacketDirection,
         peer_key: [u8; 32],
         packet: &[u8],
         now: Instant,
+    ) -> NodeL3Decision {
+        self.evaluate_with(direction, peer_key, packet, OnceCell::from(now))
+    }
+
+    /// Evaluate one packet without recording counters; `now` is read from
+    /// the clock on first use unless already set.
+    pub(super) fn evaluate_with(
+        &self,
+        direction: PacketDirection,
+        peer_key: [u8; 32],
+        packet: &[u8],
+        now: OnceCell<Instant>,
     ) -> NodeL3Decision {
         let mut input = PacketInput {
             direction,
@@ -189,11 +203,16 @@ impl NodeL3Gate {
                 Step::Retry => {}
                 Step::SweepAll => {
                     drop(snapshot);
-                    self.state.sweep_all(now);
+                    self.state.sweep_all(self.now(&input));
                     input.swept = true;
                 }
             }
         }
+    }
+
+    /// The evaluation time of `input`, read from the clock once.
+    fn now(&self, input: &PacketInput<'_>) -> Instant {
+        *input.now.get_or_init(|| (self.clock)())
     }
 
     /// Lock `peer_key`'s shard if its state belongs to `snapshot`.
@@ -240,7 +259,6 @@ impl NodeL3Gate {
             return Step::Done(matches.decision(false, NodeL3Reason::AmbiguousNetwork));
         };
         let counts = &self.state.counts;
-        let now = input.now;
 
         if let Some(step) = self.fragment_or_icmp_error(snapshot, policy, input, meta) {
             return step;
@@ -274,6 +292,7 @@ impl NodeL3Gate {
         let (allowed, reason, service_authorization) =
             authorize_new_flow(snapshot, policy, source, target, direction, meta);
         if allowed {
+            let now = self.now(input);
             let admission = shard.insert_flow_with_fragment(
                 flow_key,
                 FlowState {
@@ -313,7 +332,7 @@ impl NodeL3Gate {
         input: &PacketInput<'_>,
         meta: &PacketMeta,
     ) -> Option<Step<NodeL3Decision>> {
-        let (direction, peer_key, now) = (input.direction, input.peer_key, input.now);
+        let (direction, peer_key) = (input.direction, input.peer_key);
         let counts = &self.state.counts;
         if meta.fragment_offset != 0 {
             let fragment_key = meta.fragment_key(policy, direction, peer_key);
@@ -321,7 +340,7 @@ impl NodeL3Gate {
                 return Some(Step::Retry);
             };
             return Some(Step::Done(
-                match shard.fragment_disposition(&fragment_key, now, counts) {
+                match shard.fragment_disposition(&fragment_key, self.now(input), counts) {
                     Some(FragmentDisposition::EnforceAllow) => {
                         mode_decision(policy.mode, true, NodeL3Reason::ValidState)
                     }
@@ -346,7 +365,7 @@ impl NodeL3Gate {
             let Some(mut shard) = self.lock_shard(snapshot, &peer_key) else {
                 return Some(Step::Retry);
             };
-            let allowed = shard.touch_flow(&related_key, now, counts).is_some();
+            let allowed = shard.touch_flow(&related_key, self.now(input), counts);
             return Some(Step::Done(mode_decision(
                 policy.mode,
                 allowed,
@@ -370,23 +389,32 @@ impl NodeL3Gate {
         meta: &PacketMeta,
     ) -> Option<Step<NodeL3Decision>> {
         let counts = &self.state.counts;
-        let now = input.now;
-        let existing = shard.live_flow(flow_key, now, counts)?;
-        // Flow keys are intentionally direction-independent so return
-        // traffic finds the initiator's state. A bare SYN in the opposite
-        // direction is nevertheless a new connection, not a return
-        // packet. Terminal state also cannot be recycled into another
-        // connection until its short FIN/RST tail expires.
-        if meta.tcp_initial_syn()
-            && (existing.close.closing() || input.direction != existing.initiator)
-        {
-            return Some(Step::Done(mode_decision(
-                policy.mode,
-                false,
-                NodeL3Reason::ReverseNewFlow,
-            )));
+        let now = self.now(input);
+        let touched = shard.with_live_flow(flow_key, now, counts, |existing| {
+            // Flow keys are intentionally direction-independent so return
+            // traffic finds the initiator's state. A bare SYN in the opposite
+            // direction is nevertheless a new connection, not a return
+            // packet. Terminal state also cannot be recycled into another
+            // connection until its short FIN/RST tail expires.
+            if meta.tcp_initial_syn()
+                && (existing.close.closing() || input.direction != existing.initiator)
+            {
+                return false;
+            }
+            existing.touch(flow_key.protocol, now);
+            true
+        });
+        match touched {
+            LiveFlow::Missing => return None,
+            LiveFlow::Found(false) => {
+                return Some(Step::Done(mode_decision(
+                    policy.mode,
+                    false,
+                    NodeL3Reason::ReverseNewFlow,
+                )));
+            }
+            LiveFlow::Found(true) => {}
         }
-        existing.touch(flow_key.protocol, now);
         if meta.more_fragments {
             let fragment_key = meta.fragment_key(policy, input.direction, input.peer_key);
             match shard.remember_fragment(
@@ -427,7 +455,7 @@ impl NodeL3Gate {
         input: &PacketInput<'_>,
         meta: &PacketMeta,
     ) -> Step<NodeL3Decision> {
-        let (direction, peer_key, now) = (input.direction, input.peer_key, input.now);
+        let (direction, peer_key) = (input.direction, input.peer_key);
         let applicable = match direction {
             PacketDirection::Inbound => Applicable::of(snapshot.with_local_ip(meta.destination)),
             // Every route to a known Node IP is authoritative even when
@@ -447,13 +475,15 @@ impl NodeL3Gate {
                 let Some(mut shard) = self.lock_shard(snapshot, &peer_key) else {
                     return Step::Retry;
                 };
-                return Step::Done(match shard.fragment_disposition(&fragment, now, counts) {
-                    Some(FragmentDisposition::LegacyL4) => NodeL3Decision::Legacy,
-                    Some(FragmentDisposition::EnforceAllow) | None => NodeL3Decision::Enforce {
-                        allow: false,
-                        reason: NodeL3Reason::OrphanFragment,
+                return Step::Done(
+                    match shard.fragment_disposition(&fragment, self.now(input), counts) {
+                        Some(FragmentDisposition::LegacyL4) => NodeL3Decision::Legacy,
+                        Some(FragmentDisposition::EnforceAllow) | None => NodeL3Decision::Enforce {
+                            allow: false,
+                            reason: NodeL3Reason::OrphanFragment,
+                        },
                     },
-                });
+                );
             }
             // Terminate/Public gateways authenticate the carrier hop, not the
             // original Node identity, so their inner source cannot satisfy a
@@ -473,7 +503,7 @@ impl NodeL3Gate {
                     match shard.remember_fragment(
                         fragment,
                         FragmentDisposition::LegacyL4,
-                        now,
+                        self.now(input),
                         counts,
                         input.swept,
                     ) {
@@ -502,7 +532,8 @@ pub(super) struct PacketInput<'a> {
     pub(super) packet: &'a [u8],
     /// `None` when the packet cannot be parsed.
     pub(super) meta: Option<PacketMeta>,
-    pub(super) now: Instant,
+    /// Read from the clock once the packet reaches the state.
+    pub(super) now: OnceCell<Instant>,
     /// Every shard was swept for this packet; a global limit now fails closed.
     pub(super) swept: bool,
 }

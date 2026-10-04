@@ -4,13 +4,14 @@
 //! shard (or every shard) is swept only when a limit would be hit, so a
 //! capacity verdict is reached only after expired entries were reclaimed.
 
-use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::PacketDirection;
+use super::hash::FastMap;
 use super::policy::NetIdx;
 use super::{
     FRAGMENT_TIMEOUT, ICMP_IDLE_TIMEOUT, OTHER_IDLE_TIMEOUT, TCP_HALF_CLOSE_TIMEOUT,
@@ -20,7 +21,7 @@ use super::{
 /// Number of state shards.
 pub(super) const SHARD_COUNT: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FlowKey {
     pub(super) net: NetIdx,
     pub(super) generation: u64,
@@ -30,6 +31,41 @@ pub(super) struct FlowKey {
     pub(super) protocol: u8,
     pub(super) remote_port: u16,
     pub(super) local_port: u16,
+}
+
+impl Hash for FlowKey {
+    /// Three words: the addresses folded with the first word of the peer key
+    /// (a random public key the peer authenticated with, not chosen per
+    /// packet), the Network and ports, and the generation and protocol.
+    /// Hashing a subset of the key's bits keeps equal keys equal.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(
+            peer_word(&self.remote_peer)
+                ^ u64::from(self.remote_ip.to_bits())
+                ^ (u64::from(self.local_ip.to_bits()) << 32),
+        );
+        state.write_u64(
+            u64::from(self.net)
+                | (u64::from(self.remote_port) << 32)
+                | (u64::from(self.local_port) << 48),
+        );
+        state.write_u64(self.generation ^ (u64::from(self.protocol) << 56));
+    }
+}
+
+/// The first word of a peer key.
+pub(super) fn peer_word(peer: &[u8; 32]) -> u64 {
+    let (words, _) = peer.as_chunks::<8>();
+    words.first().map_or(0, |word| u64::from_le_bytes(*word))
+}
+
+/// What a live flow lookup found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiveFlow<T> {
+    /// No live flow; an expired one was dropped.
+    Missing,
+    /// The live flow, mapped.
+    Found(T),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,9 +234,9 @@ impl Counts {
 pub(super) struct Shard {
     /// Epoch of the snapshot this shard's state was last migrated to.
     pub(super) epoch: u64,
-    pub(super) flows: HashMap<FlowKey, FlowState>,
-    pub(super) fragments: HashMap<FragmentKey, FragmentState>,
-    pub(super) peer_flows: HashMap<[u8; 32], usize>,
+    pub(super) flows: FastMap<FlowKey, FlowState>,
+    pub(super) fragments: FastMap<FragmentKey, FragmentState>,
+    pub(super) peer_flows: FastMap<[u8; 32], usize>,
 }
 
 impl Shard {
@@ -226,30 +262,29 @@ impl Shard {
         }
     }
 
-    /// The live flow for `key`, dropping it when expired.
-    pub(super) fn live_flow(
+    /// `with` applied to the live flow for `key` (one lookup), dropping the
+    /// flow when expired.
+    pub(super) fn with_live_flow<T>(
         &mut self,
         key: &FlowKey,
         now: Instant,
         counts: &Counts,
-    ) -> Option<&mut FlowState> {
-        if self.flows.get(key)?.expires_at <= now {
-            self.remove_flow(key, counts);
-            return None;
+        with: impl FnOnce(&mut FlowState) -> T,
+    ) -> LiveFlow<T> {
+        let Some(state) = self.flows.get_mut(key) else {
+            return LiveFlow::Missing;
+        };
+        if state.expires_at > now {
+            return LiveFlow::Found(with(state));
         }
-        self.flows.get_mut(key)
+        self.remove_flow(key, counts);
+        LiveFlow::Missing
     }
 
-    /// The live flow for `key` with its idle lifetime refreshed.
-    pub(super) fn touch_flow(
-        &mut self,
-        key: &FlowKey,
-        now: Instant,
-        counts: &Counts,
-    ) -> Option<&FlowState> {
-        let state = self.live_flow(key, now, counts)?;
-        state.touch(key.protocol, now);
-        Some(state)
+    /// Whether `key` has a live flow; its idle lifetime is refreshed.
+    pub(super) fn touch_flow(&mut self, key: &FlowKey, now: Instant, counts: &Counts) -> bool {
+        self.with_live_flow(key, now, counts, |state| state.touch(key.protocol, now))
+            != LiveFlow::Missing
     }
 
     pub(super) fn fragment_disposition(
@@ -481,11 +516,22 @@ impl StateTable {
     }
 }
 
-/// Shard of a remote peer key.
+/// Shard of a remote peer key: its four words multiplied by distinct odd
+/// constants (independently, unlike a byte-wise chain) and summed.
 pub(super) fn shard_index(peer: &[u8; 32]) -> usize {
-    let hash = peer.iter().fold(0_u64, |hash, byte| {
-        (hash.rotate_left(8) ^ u64::from(*byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-    });
+    const MULTIPLIERS: [u64; 4] = [
+        0x9E37_79B9_7F4A_7C15,
+        0xC2B2_AE3D_27D4_EB4F,
+        0x1656_67B1_9E37_79F9,
+        0x85EB_CA77_C2B2_AE63,
+    ];
+    let (words, _) = peer.as_chunks::<8>();
+    let hash = words
+        .iter()
+        .zip(MULTIPLIERS)
+        .fold(0_u64, |hash, (word, multiplier)| {
+            hash.wrapping_add(u64::from_le_bytes(*word).wrapping_mul(multiplier))
+        });
     usize::try_from(hash >> 58).unwrap_or(0)
 }
 

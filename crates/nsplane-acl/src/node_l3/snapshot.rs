@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::PacketDirection;
 use super::config::NodeL3Mode;
+use super::hash::{FastMap, FastSet};
 use super::policy::{BindingKey, CompiledPolicy, NetIdx, ProviderListenerKey, TransportProjection};
 
 /// The part of a Network tombstone that packet paths and queries read.
@@ -23,12 +24,12 @@ pub(super) struct TombstoneView {
 pub(super) struct ProviderListeners {
     pub(super) set: HashSet<ProviderListenerKey>,
     /// `(target_machine_id, service_id)` per `(protocol, port)`.
-    by_port: HashMap<(u8, u16), Vec<(String, String)>>,
+    by_port: FastMap<(u8, u16), Vec<(String, String)>>,
 }
 
 impl ProviderListeners {
     pub(super) fn new(set: HashSet<ProviderListenerKey>) -> Self {
-        let mut by_port = HashMap::<_, Vec<_>>::new();
+        let mut by_port = FastMap::<_, Vec<_>>::default();
         for key in &set {
             by_port
                 .entry((key.protocol, key.port))
@@ -61,13 +62,16 @@ impl ProviderListeners {
     }
 }
 
-/// Authoritative transport markers that are not ready, by binding, address
-/// and peer key.
+/// The transport's authoritative markers, and those that are not ready by
+/// address and peer key.
 #[derive(Debug, Default)]
 struct PendingAuthority {
-    bindings: HashSet<BindingKey>,
-    ips: HashSet<Ipv4Addr>,
-    peers: HashSet<[u8; 32]>,
+    /// The transport's authoritative local addresses.
+    local_ips: FastSet<Ipv4Addr>,
+    /// Every authoritative binding: whether its marker is not ready.
+    bindings: FastMap<BindingKey, bool>,
+    ips: FastSet<Ipv4Addr>,
+    peers: FastSet<[u8; 32]>,
 }
 
 /// Everything packet paths read, published atomically as one value.
@@ -80,9 +84,9 @@ pub(super) struct Snapshot {
     pub(super) transport: Option<Arc<TransportProjection>>,
     pub(super) listeners: Arc<ProviderListeners>,
     pub(super) tombstones: Arc<HashMap<NetIdx, TombstoneView>>,
-    by_binding: HashMap<BindingKey, Vec<NetIdx>>,
-    by_local_ip: HashMap<Ipv4Addr, Vec<NetIdx>>,
-    by_remote_ip: HashMap<Ipv4Addr, Vec<NetIdx>>,
+    by_binding: FastMap<BindingKey, Vec<Arc<CompiledPolicy>>>,
+    by_local_ip: FastMap<Ipv4Addr, Vec<Arc<CompiledPolicy>>>,
+    by_remote_ip: FastMap<Ipv4Addr, Vec<Arc<CompiledPolicy>>>,
     pending: PendingAuthority,
 }
 
@@ -94,16 +98,25 @@ impl Snapshot {
         listeners: Arc<ProviderListeners>,
         tombstones: Arc<HashMap<NetIdx, TombstoneView>>,
     ) -> Self {
-        let mut by_binding = HashMap::<_, Vec<_>>::new();
-        let mut by_local_ip = HashMap::<_, Vec<_>>::new();
-        let mut by_remote_ip = HashMap::<_, Vec<_>>::new();
-        for (net, policy) in &policies {
-            by_local_ip.entry(policy.local.ip).or_default().push(*net);
+        let mut by_binding = FastMap::<_, Vec<_>>::default();
+        let mut by_local_ip = FastMap::<_, Vec<_>>::default();
+        let mut by_remote_ip = FastMap::<_, Vec<_>>::default();
+        for policy in policies.values() {
+            by_local_ip
+                .entry(policy.local.ip)
+                .or_default()
+                .push(Arc::clone(policy));
             for binding in &policy.binding_order {
-                by_binding.entry(*binding).or_default().push(*net);
+                by_binding
+                    .entry(*binding)
+                    .or_default()
+                    .push(Arc::clone(policy));
             }
             for ip in &policy.remote_ips {
-                by_remote_ip.entry(*ip).or_default().push(*net);
+                by_remote_ip
+                    .entry(*ip)
+                    .or_default()
+                    .push(Arc::clone(policy));
             }
         }
         let pending = transport
@@ -123,28 +136,25 @@ impl Snapshot {
         }
     }
 
-    fn resolve<'a>(
-        &'a self,
-        nets: Option<&'a Vec<NetIdx>>,
-    ) -> impl Iterator<Item = &'a CompiledPolicy> {
-        nets.into_iter()
-            .flatten()
-            .filter_map(|net| self.policies.get(net).map(AsRef::as_ref))
+    fn resolve(
+        policies: Option<&Vec<Arc<CompiledPolicy>>>,
+    ) -> impl Iterator<Item = &CompiledPolicy> {
+        policies.into_iter().flatten().map(AsRef::as_ref)
     }
 
     /// Policies binding `binding` as a remote Node.
     pub(super) fn bound(&self, binding: &BindingKey) -> impl Iterator<Item = &CompiledPolicy> {
-        self.resolve(self.by_binding.get(binding))
+        Self::resolve(self.by_binding.get(binding))
     }
 
     /// Policies whose local Node has address `ip`.
     pub(super) fn with_local_ip(&self, ip: Ipv4Addr) -> impl Iterator<Item = &CompiledPolicy> {
-        self.resolve(self.by_local_ip.get(&ip))
+        Self::resolve(self.by_local_ip.get(&ip))
     }
 
     /// Policies with a remote Node at address `ip`.
     pub(super) fn with_remote_ip(&self, ip: Ipv4Addr) -> impl Iterator<Item = &CompiledPolicy> {
-        self.resolve(self.by_remote_ip.get(&ip))
+        Self::resolve(self.by_remote_ip.get(&ip))
     }
 
     /// Whether any policy has `ip` as its local or a remote Node address.
@@ -202,9 +212,9 @@ impl Snapshot {
         source: Ipv4Addr,
         destination: Ipv4Addr,
     ) -> bool {
-        let Some(transport) = self.transport.as_deref() else {
+        if self.transport.is_none() {
             return false;
-        };
+        }
         // A Node `/32` marker is authoritative for the address, not merely for
         // one route-table entry. If an accidental duplicate route selects a
         // different unmarked peer, it must not become a pre-policy Legacy
@@ -213,15 +223,15 @@ impl Snapshot {
         match direction {
             PacketDirection::Outbound => self.pending.ips.contains(&destination),
             PacketDirection::Inbound => {
-                if !transport.authoritative_local_ips.contains(&destination) {
+                if !self.pending.local_ips.contains(&destination) {
                     return false;
                 }
                 let exact = BindingKey {
                     peer_key,
                     ip: source,
                 };
-                if transport.authoritative_bindings.contains_key(&exact) {
-                    return self.pending.bindings.contains(&exact);
+                if let Some(pending) = self.pending.bindings.get(&exact) {
+                    return *pending;
                 }
                 // Before the snapshot exists, the marked peer must not bypass
                 // the gate merely by forging an unprojected inner source.
@@ -239,7 +249,10 @@ fn pending_authority(
         .values()
         .map(|policy| (policy.network_id.as_str(), policy.as_ref()))
         .collect();
-    let mut pending = PendingAuthority::default();
+    let mut pending = PendingAuthority {
+        local_ips: transport.authoritative_local_ips.iter().copied().collect(),
+        ..PendingAuthority::default()
+    };
     for (binding, requirement) in &transport.authoritative_bindings {
         let ready = transport.installed
             && transport.bindings.contains(binding)
@@ -254,8 +267,8 @@ fn pending_authority(
                                 || node.owner_id == policy.local.owner_id
                         })
                 });
+        pending.bindings.insert(*binding, !ready);
         if !ready {
-            pending.bindings.insert(*binding);
             pending.ips.insert(binding.ip);
             pending.peers.insert(binding.peer_key);
         }

@@ -1102,13 +1102,21 @@ engines: Grants, source binding, state, limits and expiry (injected clock), mode
 errors, divert and outbound.
 
 **Measured** (`cargo bench -p nsplane-acl --bench node_l3`, see [Performance](#performance)):
-2026-10-03 on the shared host (1-minute load 24-43), two runs: an established flow costs
-351 / 293 ns through `NodeL3Filter` and 229 / 384 ns through `evaluate_inbound` alone, new
-flows 558 / 811 ns (Node Grant) and 662 / 1006 ns (Service Grant); the `AclFilter` alone
-70 / 55 ns, `NodeL3Filter` with a gate without snapshot 171 / 166 ns; with a writer
-publishing every 1 ms / 10 ms 370 / 228 ns and 444 / 422 ns. The established flow misses
-the plan's target (the ACL hook's class, ~50-60 ns) by about 4-5x; the gate's flow lookup
-is the open follow-up, re-measured on a quiet host.
+2026-10-04 on the shared host (1-minute load 23-32), two runs interleaved with the previous
+code: an established flow costs 129 / 134 ns through `NodeL3Filter` (was 214 / 429) and
+90 / 103 ns through `evaluate_inbound` alone (was 229 / 350), 128 / 81 ns outbound; new
+flows 172 / 110 ns (Node Grant, was 396 / 781) and 235 / 121 ns (Service Grant, was
+476 / 795); the `AclFilter` alone 50 / 34 ns, `NodeL3Filter` with a gate without snapshot
+57 / 50 ns (was 114 / 170), that gate alone 2.3 ns; with a writer publishing every 1 ms /
+10 ms 87 / 88 ns and 90 / 92 ns. At load 13 the established flow measured 69-73 ns through
+the gate and 86-90 ns through the filter. A release-mode breakdown (load 5-20) puts
+`evaluate_inbound` at 64-69 ns: the clock 18 ns (`perf`: `clock_gettime` is 46 % of the
+samples), the snapshot load 9 ns, the shard lock 8 ns, the counter 4 ns, the flow and
+binding lookups 4 + 3 ns, parsing 2.4 ns. The clock read and the shard lock are what remain
+above the ACL hook's class (~50-60 ns): expiry needs the time of every packet that reaches
+state, and the state is locked per shard. A gate without snapshot or transport adds
+7-17 ns over the `AclFilter`: the peer key lookup (~10 ns, needed to drop unknown peers)
+and the hand-off counter.
 
 ## nsplane-nat
 
@@ -1344,16 +1352,19 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
   unidirectional traffic, so it stays. Exactness was not weakened: a differential test
   checks verdicts and counters against a full evaluation of every packet. See
   [nsplane-acl](#nsplane-acl).
-- Node L3 gate (`cargo bench -p nsplane-acl --bench node_l3`, 2026-10-03, load 24-43,
-  two runs). Established flow: 351 / 293 ns through `NodeL3Filter`, 229 / 384 ns through
-  `NodeL3Gate::evaluate_inbound`; new flow 558 / 811 ns (Node Grant), 662 / 1006 ns
-  (Service Grant); baseline `AclFilter` alone 70 / 55 ns (the namespaces bench's
-  established cases ran at 64 ns namespaces, 99 ns default in the same run, so the host
-  added about 25-80 %); a gate without snapshot in front of the ACL 171 / 166 ns; writer
-  contention (a new generation every 1 / 10 ms) 370 / 228 ns and 444 / 422 ns, within the
-  run-to-run spread. Not installed, the gate costs nothing (no filter on the chain). The
-  established flow is 4-5x the ACL hook's class, so the plan's target is not met yet; see
-  [Node L3 gate](#node-l3-gate).
+- Node L3 gate (`cargo bench -p nsplane-acl --bench node_l3`, 2026-10-04, load 23-32,
+  two runs interleaved with the previous code). Established flow: 129 / 134 ns through
+  `NodeL3Filter` (was 214 / 429), 90 / 103 ns through `NodeL3Gate::evaluate_inbound` (was
+  229 / 350; 69-73 ns at load 13); new flow 172 / 110 ns (Node Grant), 235 / 121 ns (Service
+  Grant), about half to a sixth of before; baseline `AclFilter` alone 50 / 34 ns (the
+  namespaces bench's established cases ran at 82 / 52 ns namespaces, 71 / 56 ns default in
+  the same run); a gate without snapshot in front of the ACL 57 / 50 ns, alone 2.3 ns;
+  writer contention (a new generation every 1 / 10 ms) 87 / 88 ns and 90 / 92 ns. Keyed
+  multiply hashing instead of `SipHash`, one flow lookup, no clock read before the state,
+  and an inert flag checked before anything else made the difference. Not installed, the
+  gate costs nothing (no filter on the chain). The established flow stays above the ACL
+  hook's class by the clock read (18 ns quiet, more under load) and the shard lock (8 ns);
+  see [Node L3 gate](#node-l3-gate).
 - Worker pool. The batched input and the lock-free pool-off path make every case about
   15-25 % faster than before the follow-ups (1420 B with 2 workers within the noise). The
   pool moves full-size packets up to about 1.4x further, small packets little; 4 workers do

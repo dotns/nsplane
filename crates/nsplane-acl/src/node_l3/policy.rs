@@ -1,6 +1,7 @@
 //! Compiled Network policies and transport projections.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -8,6 +9,8 @@ use super::config::{
     NodeL3Config, NodeL3Mode, NodeL3PeerPolicyRequirement, NodeL3Resource, NodeL3ServiceEndpoint,
     NodeL3Transport,
 };
+use super::hash::{FastMap, FastSet};
+use super::state::peer_word;
 use super::{NodeL3ConfigError, NodeL3TransportError};
 use crate::net::IpNet;
 
@@ -17,10 +20,18 @@ pub(super) type NetIdx = u32;
 /// Index of a Node within one compiled policy (the local Node is 0).
 pub(super) type NodeIdx = u32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BindingKey {
     pub(super) peer_key: [u8; 32],
     pub(super) ip: Ipv4Addr,
+}
+
+impl Hash for BindingKey {
+    /// One word: the address folded with the first word of the peer key.
+    /// Bindings are looked up, never inserted, by packets.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(peer_word(&self.peer_key) ^ u64::from(self.ip.to_bits()));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,16 +83,16 @@ pub(super) struct CompiledPolicy {
     pub(super) generation: u64,
     pub(super) mode: NodeL3Mode,
     pub(super) local: NodeIdentity,
-    pub(super) bindings: HashMap<BindingKey, NodeIdentity>,
+    pub(super) bindings: FastMap<BindingKey, NodeIdentity>,
     /// Distinct binding keys in snapshot order, for deterministic searches.
     pub(super) binding_order: Vec<BindingKey>,
     pub(super) remote_ips: HashSet<Ipv4Addr>,
-    pub(super) services: HashMap<ServiceKey, Arc<str>>,
+    pub(super) services: FastMap<ServiceKey, Arc<str>>,
     /// `(source, target)` Node Grants.
-    pub(super) node_grants: HashSet<(NodeIdx, NodeIdx)>,
+    pub(super) node_grants: FastSet<(NodeIdx, NodeIdx)>,
     /// `(source, target, protocol, port)` Service Grants. Compilation proves
     /// that the granted Service is the one projected on that listener.
-    pub(super) service_grants: HashSet<(NodeIdx, NodeIdx, u8, u16)>,
+    pub(super) service_grants: FastSet<(NodeIdx, NodeIdx, u8, u16)>,
     pub(super) subnet_grants: Vec<CompiledSubnetGrant>,
 }
 
@@ -106,7 +117,7 @@ impl CompiledPolicy {
             by_key: bindings,
             order: binding_order,
         } = compile_bindings(config, &local)?;
-        let mut services = HashMap::new();
+        let mut services = FastMap::default();
         for service in &config.services {
             validate_service(service, &nodes)?;
             let key = ServiceKey {
@@ -183,7 +194,7 @@ impl CompiledPolicy {
 /// Validated peer bindings and the Node table (local Node included).
 struct Bindings {
     nodes: HashMap<String, NodeIdentity>,
-    by_key: HashMap<BindingKey, NodeIdentity>,
+    by_key: FastMap<BindingKey, NodeIdentity>,
     order: Vec<BindingKey>,
 }
 
@@ -191,7 +202,7 @@ fn compile_bindings(
     config: &NodeL3Config,
     local: &NodeIdentity,
 ) -> Result<Bindings, NodeL3ConfigError> {
-    let mut bindings = HashMap::new();
+    let mut bindings = FastMap::default();
     let mut binding_order = Vec::new();
     let mut node_bindings = HashMap::new();
     let mut nodes = HashMap::from([(local.node_id.clone(), local.clone())]);
@@ -249,18 +260,18 @@ fn compile_bindings(
 
 /// Validated Grants by kind.
 struct Grants {
-    node: HashSet<(NodeIdx, NodeIdx)>,
-    service: HashSet<(NodeIdx, NodeIdx, u8, u16)>,
+    node: FastSet<(NodeIdx, NodeIdx)>,
+    service: FastSet<(NodeIdx, NodeIdx, u8, u16)>,
     subnet: Vec<CompiledSubnetGrant>,
 }
 
 fn compile_grants(
     config: &NodeL3Config,
     nodes: &HashMap<String, NodeIdentity>,
-    services: &HashMap<ServiceKey, Arc<str>>,
+    services: &FastMap<ServiceKey, Arc<str>>,
 ) -> Result<Grants, NodeL3ConfigError> {
-    let mut node_grants = HashSet::new();
-    let mut service_grants = HashSet::new();
+    let mut node_grants = FastSet::default();
+    let mut service_grants = FastSet::default();
     let mut subnet_grants = Vec::new();
     for grant in &config.grants {
         require_non_empty(&grant.grant_id, "grants.grant_id")?;

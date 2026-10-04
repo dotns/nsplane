@@ -33,10 +33,11 @@
 //! serialize on one mutex and migrate state with every shard locked, so a
 //! packet never observes a policy together with state of another policy.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,7 @@ mod config;
 mod decisions;
 mod filter;
 mod gateway_consumer;
+mod hash;
 mod packet;
 mod policy;
 mod projection;
@@ -474,6 +476,9 @@ type AuthorizationCallback = Arc<dyn Fn(u64) + Send + Sync>;
 pub struct NodeL3Gate {
     target_machine_ids: HashSet<String>,
     snapshot: ArcSwap<Snapshot>,
+    /// The published snapshot has no policy and no transport, so every
+    /// packet is Legacy. Read before the snapshot, without the clock.
+    inert: AtomicBool,
     writer: Mutex<WriterState>,
     state: StateTable,
     counters: RuntimeCounters,
@@ -504,6 +509,7 @@ impl NodeL3Gate {
         Arc::new(Self {
             target_machine_ids,
             snapshot: ArcSwap::default(),
+            inert: AtomicBool::new(true),
             writer: Mutex::default(),
             state: StateTable::new(global, peer, fragments),
             counters: RuntimeCounters::default(),
@@ -586,17 +592,29 @@ impl NodeL3Gate {
     /// Evaluate a packet after successful WireGuard decryption.
     #[must_use]
     pub fn evaluate_inbound(&self, peer_key: [u8; 32], packet: &[u8]) -> NodeL3Decision {
-        let decision = self.evaluate_at(PacketDirection::Inbound, peer_key, packet, (self.clock)());
-        self.record_decision(&decision);
-        decision
+        self.evaluate(PacketDirection::Inbound, peer_key, packet)
     }
 
     /// Evaluate a plaintext packet after the destination WireGuard peer was
     /// selected and before encryption.
     #[must_use]
     pub fn evaluate_outbound(&self, peer_key: [u8; 32], packet: &[u8]) -> NodeL3Decision {
-        let decision =
-            self.evaluate_at(PacketDirection::Outbound, peer_key, packet, (self.clock)());
+        self.evaluate(PacketDirection::Outbound, peer_key, packet)
+    }
+
+    /// Evaluate and record one packet. An inert gate answers Legacy without
+    /// parsing, loading the snapshot or reading the clock; otherwise the
+    /// clock is read only once the packet reaches the state.
+    fn evaluate(
+        &self,
+        direction: PacketDirection,
+        peer_key: [u8; 32],
+        packet: &[u8],
+    ) -> NodeL3Decision {
+        if self.inert.load(Ordering::Acquire) {
+            return NodeL3Decision::Legacy;
+        }
+        let decision = self.evaluate_with(direction, peer_key, packet, OnceCell::new());
         self.record_decision(&decision);
         decision
     }
@@ -692,10 +710,14 @@ impl NodeL3Gate {
     ) {
         let mut shards = self.state.lock_all();
         let epoch = self.snapshot.load().epoch + 1;
+        let inert = policies.is_empty() && transport.is_none();
         let snapshot = Arc::new(Snapshot::build(
             epoch, policies, transport, listeners, tombstones,
         ));
         self.snapshot.store(Arc::clone(&snapshot));
+        // A packet still reading the previous value is ordered before this
+        // publication, as if it had loaded the previous snapshot.
+        self.inert.store(inert, Ordering::Release);
         migrate(&mut shards, &snapshot);
         for shard in &mut shards {
             shard.epoch = epoch;
