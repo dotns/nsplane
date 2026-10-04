@@ -4,8 +4,9 @@
 //! configured range, and `reverse` restores the client as the destination of the replies.
 //! Covers an `ICMPv6` Echo answered by `nsplane_packet::icmp::echo_reply_in_place` on the
 //! far side (and an IPv4 Echo through `echo_reply_in_place` alone, which the masquerade
-//! passes), a route change that drops the next reply and removes its flow, and the
-//! counters.
+//! passes), a route change that drops the next reply and removes its flow (or, with
+//! `recheck_route_on_forward`, the next forward packet), a bad checksum that drops only
+//! the packets the masquerade rewrites, and the counters.
 //!
 //! The masquerade is applied at the netstack hop by a test-local pump, as `redirect.rs`
 //! does; it moves to the `MapSink` / `MapSource` wrappers once those land.
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use nsplane::{PacketBuf, PacketSink, PacketSource};
-use nsplane_e2e::{QUIET, TRANSFER, TestResult, WAIT, icmp, next_within, verify_checksums};
+use nsplane_e2e::{QUIET, TRANSFER, TestResult, WAIT, icmp, next_within, udp, verify_checksums};
 use nsplane_nat::masquerade::reasons;
 use nsplane_nat::{Masquerade, MasqueradeConfig, MasqueradeDecision, MasqueradeVerdict};
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, UdpFlow, UdpSocket};
@@ -62,6 +63,14 @@ struct Rig {
 /// The decision closure masquerades every flow of the client to [`SOURCE`] with the route
 /// `route` holds when it is asked, and passes everything else.
 fn rig() -> Rig {
+    rig_with(MasqueradeConfig {
+        ports: PORTS,
+        ..MasqueradeConfig::default()
+    })
+}
+
+/// As [`rig`], with the masquerade settings `config`.
+fn rig_with(config: MasqueradeConfig) -> Rig {
     let route = Arc::new(AtomicU64::new(1));
     let decisions = Arc::new(AtomicUsize::new(0));
     let (current, counter) = (Arc::clone(&route), Arc::clone(&decisions));
@@ -71,10 +80,6 @@ fn rig() -> Rig {
             source: SOURCE,
             route: current.load(Ordering::Relaxed),
         })
-    };
-    let config = MasqueradeConfig {
-        ports: PORTS,
-        ..MasqueradeConfig::default()
     };
     let masquerade = Arc::new(Masquerade::new(decide, config));
 
@@ -387,5 +392,74 @@ async fn a_route_change_drops_the_reply_and_the_next_flow_is_mapped_again() -> T
     assert_eq!(rig.masquerade.len(), 2);
     let stats = rig.masquerade.stats();
     assert_eq!((stats.created, stats.flows, stats.route_changed), (3, 2, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_recheck_a_route_change_drops_the_next_forward_packet() -> TestResult {
+    let mut rig = rig_with(MasqueradeConfig {
+        ports: PORTS,
+        recheck_route_on_forward: true,
+        ..MasqueradeConfig::default()
+    });
+    let mut incoming = rig.lan.incoming_udp();
+    let any = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    let mut socket = rig.client.bind_udp(any).await?;
+
+    let mut flow = open_udp_flow(&socket, &mut incoming, b"one").await?;
+    socket.send_to(b"two", v6(LAN_HOST, UDP_PORT)).await?;
+    let received = timeout(WAIT, flow.recv())
+        .await?
+        .ok_or("LAN host stopped")?;
+    assert_eq!(&received[..], b"two");
+    assert_eq!(rig.decisions.load(Ordering::Relaxed), 2);
+
+    // The route changes: the client's next datagram is dropped and takes its flow with it.
+    rig.route.store(2, Ordering::Relaxed);
+    socket.send_to(b"late", v6(LAN_HOST, UDP_PORT)).await?;
+    assert_eq!(next_drop(&mut rig.drops).await?, reasons::ROUTE_CHANGED);
+    assert!(timeout(QUIET, flow.recv()).await.is_err());
+    assert_eq!(rig.masquerade.len(), 0);
+
+    // The datagram after it is a new flow with a fresh mapping on the new route.
+    let again = open_udp_flow(&socket, &mut incoming, b"again").await?;
+    assert_ne!(again.peer_addr(), flow.peer_addr());
+    again.send(b"again back").await?;
+    assert_eq!(
+        recv(&mut socket).await?,
+        (b"again back".to_vec(), v6(LAN_HOST, UDP_PORT))
+    );
+    let stats = rig.masquerade.stats();
+    assert_eq!((stats.created, stats.flows, stats.route_changed), (2, 1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_bad_checksum_drops_only_masqueraded_packets() -> TestResult {
+    let rig = rig();
+    // The closure passes traffic of other sources; the masquerade leaves it to whatever
+    // checks the path has next, corrupt or not.
+    let other = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 0x11);
+    let mut corrupt = udp(v6(other, 10_000), v6(LAN_HOST, UDP_PORT), b"not ours");
+    *corrupt.last_mut().ok_or("empty packet")? ^= 1;
+    assert!(verify_checksums(&corrupt).is_err());
+    let mut packet = PacketBuf::from_packet(&corrupt);
+    assert_eq!(rig.masquerade.forward(&mut packet), MasqueradeVerdict::Pass);
+    assert_eq!(packet.as_packet(), &corrupt[..]);
+
+    // The same corruption from the client, which the closure masquerades, is dropped and
+    // records no flow.
+    let mut corrupt = udp(v6(CLIENT, 10_000), v6(LAN_HOST, UDP_PORT), b"ours");
+    *corrupt.last_mut().ok_or("empty packet")? ^= 1;
+    let mut packet = PacketBuf::from_packet(&corrupt);
+    assert_eq!(
+        rig.masquerade.forward(&mut packet),
+        MasqueradeVerdict::Drop(reasons::BAD_CHECKSUM)
+    );
+
+    assert_eq!(rig.decisions.load(Ordering::Relaxed), 2);
+    let stats = rig.masquerade.stats();
+    assert_eq!((stats.passed, stats.bad_checksum), (1, 1));
+    assert_eq!((stats.created, stats.flows), (0, 0));
     Ok(())
 }

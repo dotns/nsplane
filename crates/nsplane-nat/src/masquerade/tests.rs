@@ -239,6 +239,7 @@ fn defaults_match_the_contract() {
     assert_eq!(config.udp_timeout, Duration::from_secs(120));
     assert_eq!(config.icmp_timeout, Duration::from_secs(30));
     assert!(config.tcp_new_flow_requires_syn && config.verify_checksums);
+    assert!(!config.recheck_route_on_forward);
 }
 
 #[test]
@@ -460,21 +461,45 @@ fn corrupt(packet: &PacketBuf) -> PacketBuf {
 }
 
 #[test]
-fn a_bad_checksum_drops_without_asking() {
+fn a_bad_checksum_of_a_passing_packet_passes() {
     let f = fixture();
+    f.answer(None);
     let request = request(REMOTE, HOST_PORT);
-    assert_drop(corrupt(&request), reasons::BAD_CHECKSUM, |p| {
+    assert_pass(corrupt(&request), |p| f.masquerade.forward(p));
+    let mut zero = request.as_packet().to_vec();
+    zero[46..48].fill(0);
+    assert_pass(PacketBuf::from_packet(&zero), |p| f.masquerade.forward(p));
+    assert_eq!(f.calls(), 2);
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.passed, stats.bad_checksum, stats.flows), (2, 0, 0));
+}
+
+#[test]
+fn a_bad_checksum_drops_masqueraded_packets() {
+    let f = fixture();
+    let first = request(REMOTE, HOST_PORT);
+    // A corrupt first packet records no flow.
+    assert_drop(corrupt(&first), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.forward(p)
     });
     // A zero UDP checksum is not allowed over IPv6.
-    let mut zero = request.as_packet().to_vec();
+    let mut zero = first.as_packet().to_vec();
     zero[46..48].fill(0);
     assert_drop(PacketBuf::from_packet(&zero), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.forward(p)
     });
-    assert_eq!(f.calls(), 0);
+    assert_eq!(f.calls(), 2);
+    assert_eq!((f.masquerade.len(), f.masquerade.stats().created), (0, 0));
 
-    let forwarded = f.forward(request);
+    let forwarded = f.forward(first);
+    assert_eq!(token(&forwarded), FIRST_TOKEN, "no token was taken");
+    // A corrupt packet of the recorded flow does not ask again.
+    assert_drop(
+        corrupt(&request(REMOTE, HOST_PORT)),
+        reasons::BAD_CHECKSUM,
+        |p| f.masquerade.forward(p),
+    );
+    assert_eq!(f.calls(), 3);
     assert_drop(corrupt(&reply(&forwarded)), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.reverse(p)
     });
@@ -482,7 +507,26 @@ fn a_bad_checksum_drops_without_asking() {
     assert_pass(corrupt(&udp((REMOTE, 53), (SOURCE, 1))), |p| {
         f.masquerade.reverse(p)
     });
-    assert_eq!(f.masquerade.stats().bad_checksum, 3);
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.bad_checksum, stats.flows), (4, 1));
+}
+
+#[test]
+fn with_recheck_a_bad_checksum_drops_before_the_route_check() {
+    let f = rechecking();
+    let forwarded = f.forward(request(REMOTE, HOST_PORT));
+    f.answer(None);
+    assert_drop(
+        corrupt(&request(REMOTE, HOST_PORT)),
+        reasons::BAD_CHECKSUM,
+        |p| f.masquerade.forward(p),
+    );
+    assert_eq!(f.calls(), 1, "the closure is not asked");
+    assert_eq!(f.masquerade.len(), 1, "the flow is kept");
+    assert_drop(request(REMOTE, HOST_PORT), reasons::ROUTE_CHANGED, |p| {
+        f.masquerade.forward(p)
+    });
+    assert_pass(reply(&forwarded), |p| f.masquerade.reverse(p));
 }
 
 #[test]
@@ -519,6 +563,105 @@ fn parity_route_change_kills_the_reverse() {
     });
     let stats = f.masquerade.stats();
     assert_eq!((stats.route_changed, stats.flows), (2, 0));
+}
+
+#[test]
+fn by_default_a_route_change_does_not_drop_forward_packets() {
+    let f = fixture();
+    let first = f.forward(request(REMOTE, HOST_PORT));
+    f.answer(Some(decision(ROUTE + 1)));
+    let second = f.forward(request(REMOTE, HOST_PORT));
+    f.answer(None);
+    let third = f.forward(request(REMOTE, HOST_PORT));
+    assert_eq!([token(&second), token(&third)], [token(&first); 2]);
+    assert_eq!(f.calls(), 1, "a recorded flow does not ask again");
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.route_changed, stats.flows), (0, 1));
+}
+
+fn rechecking() -> Fixture {
+    Fixture::new(MasqueradeConfig {
+        recheck_route_on_forward: true,
+        ..MasqueradeConfig::default()
+    })
+}
+
+#[test]
+fn with_recheck_the_same_route_keeps_the_flow() {
+    let f = rechecking();
+    let first = f.forward(request(REMOTE, HOST_PORT));
+    let second = f.forward(request(REMOTE, HOST_PORT));
+    assert_eq!(token(&second), token(&first));
+    assert_eq!(f.calls(), 2, "every forward packet asks");
+    f.reverse(reply(&second));
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.forwarded, stats.created, stats.flows), (2, 1, 1));
+}
+
+#[test]
+fn with_recheck_parity_a_route_change_drops_the_forward_packet() {
+    let f = rechecking();
+    let first = f.forward(request(REMOTE, HOST_PORT));
+    f.forward(request(REMOTE, HOST_PORT + 1));
+
+    f.answer(None);
+    assert_drop(request(REMOTE, HOST_PORT), reasons::ROUTE_CHANGED, |p| {
+        f.masquerade.forward(p)
+    });
+    assert_eq!(f.masquerade.len(), 1, "the flow is removed");
+    assert_pass(reply(&first), |p| f.masquerade.reverse(p));
+
+    // The next packet opens a new flow with a fresh decision.
+    f.answer(Some(decision(ROUTE + 1)));
+    let calls = f.calls();
+    let next = f.forward(request(REMOTE, HOST_PORT));
+    assert_eq!(f.calls(), calls + 1);
+    assert_ne!(token(&next), token(&first));
+    assert_eq!(f.masquerade.len(), 2);
+
+    // Another route drops it the same way.
+    f.answer(Some(decision(ROUTE + 2)));
+    assert_drop(request(REMOTE, HOST_PORT), reasons::ROUTE_CHANGED, |p| {
+        f.masquerade.forward(p)
+    });
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.route_changed, stats.flows, stats.created), (2, 1, 3));
+}
+
+#[test]
+fn with_recheck_decide_gets_the_original_tuple_without_the_lock() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let slot: Arc<OnceLock<Weak<Masquerade>>> = Arc::new(OnceLock::new());
+    let inner = Arc::clone(&slot);
+    let masquerade = Arc::new(Masquerade::new(
+        move |tuple| {
+            // Would deadlock if `decide` ran under the table lock.
+            let _ = inner.get().and_then(Weak::upgrade).unwrap().stats();
+            log.lock().unwrap().push(*tuple);
+            Some(decision(ROUTE))
+        },
+        MasqueradeConfig {
+            recheck_route_on_forward: true,
+            ..MasqueradeConfig::default()
+        },
+    ));
+    slot.set(Arc::downgrade(&masquerade)).unwrap();
+    for _ in 0..2 {
+        let mut packet = echo(HOST, REMOTE, ECHO_REQUEST, 321);
+        assert_eq!(
+            masquerade.forward(&mut packet),
+            MasqueradeVerdict::Rewritten
+        );
+    }
+    let expected = FiveTuple {
+        src: IpAddr::V6(HOST),
+        dst: IpAddr::V6(REMOTE),
+        protocol: protocol::ICMPV6,
+        src_port: 321,
+        dst_port: 321,
+    };
+    assert_eq!(*seen.lock().unwrap(), [expected, expected]);
 }
 
 #[test]
