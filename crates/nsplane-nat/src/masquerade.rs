@@ -32,11 +32,15 @@
 //!
 //! The transport checksum of a rewritten packet is recomputed over the IPv6
 //! pseudo-header, as ns (a result of zero is written as `0xffff`). With
-//! [`MasqueradeConfig::verify_checksums`], a forward packet with an invalid
-//! transport checksum (a zero checksum field included) is dropped
-//! ([`reasons::BAD_CHECKSUM`]) before the decision closure is asked, and so
-//! is a reply of a recorded flow; the recomputation would otherwise launder
-//! the corruption. ns verifies every packet the same way.
+//! [`MasqueradeConfig::verify_checksums`], a packet that would be rewritten
+//! with an invalid transport checksum (a zero checksum field included) is
+//! dropped ([`reasons::BAD_CHECKSUM`]); the recomputation would otherwise
+//! launder the corruption. Only such packets are verified: the first packet
+//! of a flow once the decision closure answered [`Some`] (a corrupt one
+//! records no flow), a later packet of a recorded flow before any route
+//! recheck, and a reply of a recorded flow before its route check. A packet
+//! the closure answers [`None`] for passes unchanged whatever its checksum.
+//! ns verifies every packet before its decision.
 //!
 //! # Flows
 //!
@@ -59,8 +63,12 @@
 //!   SYN (SYN set, ACK clear) opens a flow; another TCP packet the closure
 //!   would masquerade without a flow is dropped ([`reasons::TCP_NOT_SYN`]).
 //!   TCP flows keep no state beyond their idle time.
-//! - Unlike ns, the forward direction does not ask the decision closure
-//!   again for a recorded flow; a changed route is noticed on the next reply.
+//! - By default, unlike ns, the forward direction does not ask the decision
+//!   closure again for a recorded flow; a changed route is noticed on the
+//!   next reply. With [`MasqueradeConfig::recheck_route_on_forward`], every
+//!   forward packet of a recorded flow asks it with the flow's original
+//!   tuple, as a reply does, and on [`None`] or another `route` the flow is
+//!   removed and the packet dropped ([`reasons::ROUTE_CHANGED`]), as ns.
 //!
 //! The flows do not live in a [`Conntrack`](crate::Conntrack): a full
 //! `Conntrack` evicts its least recently seen flow, while the masquerade must
@@ -153,8 +161,15 @@ pub struct MasqueradeConfig {
     /// Default `true`, as ns.
     pub tcp_new_flow_requires_syn: bool,
     /// Whether the transport checksum of a packet is verified before it is
-    /// rewritten; see the [module docs](self). Default `true`, as ns.
+    /// rewritten; packets that pass unchanged are not verified. See the
+    /// [module docs](self). Default `true`, as ns.
     pub verify_checksums: bool,
+    /// Whether every forward packet of a recorded flow asks the decision
+    /// closure again, dropping it with [`reasons::ROUTE_CHANGED`] and
+    /// removing the flow when the route changed; see the
+    /// [module docs](self#flows). Default `false`: the route is checked on
+    /// replies only, at no cost to forward packets. ns checks it on both.
+    pub recheck_route_on_forward: bool,
 }
 
 impl Default for MasqueradeConfig {
@@ -168,6 +183,7 @@ impl Default for MasqueradeConfig {
             icmp_timeout: Duration::from_secs(30),
             tcp_new_flow_requires_syn: true,
             verify_checksums: true,
+            recheck_route_on_forward: false,
         }
     }
 }
@@ -209,8 +225,9 @@ pub struct MasqueradeStats {
     pub tcp_not_syn: u64,
     /// Packets dropped with [`reasons::CAPACITY`].
     pub capacity: u64,
-    /// Replies dropped with [`reasons::ROUTE_CHANGED`], each removing its
-    /// flow.
+    /// Replies (and, with
+    /// [`MasqueradeConfig::recheck_route_on_forward`], forward packets)
+    /// dropped with [`reasons::ROUTE_CHANGED`], each removing its flow.
     pub route_changed: u64,
     /// Packets dropped with [`reasons::TOKENS_EXHAUSTED`].
     pub tokens_exhausted: u64,
@@ -501,14 +518,17 @@ impl Masquerade {
         let Some(info) = Info::parse(packet.as_packet(), false) else {
             return Ok(false);
         };
-        if self.config.verify_checksums && !info.checksum_valid(packet.as_packet()) {
-            return Err(reasons::BAD_CHECKSUM);
-        }
         let now = (self.clock)();
         let hit = self.lock().hit(&info.key, now, &self.config);
         let (source, token) = match hit {
-            Some(flow) => (flow.source, flow.token),
-            None => match self.new_flow(&info)? {
+            Some(flow) => {
+                self.verify_checksum(&info, packet.as_packet())?;
+                if self.config.recheck_route_on_forward {
+                    self.recheck_route(&info.key, &flow)?;
+                }
+                (flow.source, flow.token)
+            }
+            None => match self.new_flow(&info, packet.as_packet())? {
                 Some(found) => found,
                 None => return Ok(false),
             },
@@ -530,9 +550,25 @@ impl Masquerade {
         let Some((key, flow)) = found else {
             return Ok(false);
         };
-        if self.config.verify_checksums && !info.checksum_valid(packet.as_packet()) {
+        self.verify_checksum(&info, packet.as_packet())?;
+        self.recheck_route(&key, &flow)?;
+        info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
+        Ok(true)
+    }
+
+    /// Fails with [`reasons::BAD_CHECKSUM`] when checksums are verified and
+    /// the transport checksum of `bytes` is invalid.
+    fn verify_checksum(&self, info: &Info, bytes: &[u8]) -> Result<(), &'static str> {
+        if self.config.verify_checksums && !info.checksum_valid(bytes) {
             return Err(reasons::BAD_CHECKSUM);
         }
+        Ok(())
+    }
+
+    /// Asks the decision closure again about the recorded flow `flow` of
+    /// forward key `key`; when it no longer answers the flow's route, removes
+    /// the flow and fails with [`reasons::ROUTE_CHANGED`].
+    fn recheck_route(&self, key: &Key, flow: &Flow) -> Result<(), &'static str> {
         // No lock is held here: the closure may call back into `self`.
         let current = (self.decide)(&flow.tuple);
         if current.map(|decision| decision.route) != Some(flow.route) {
@@ -540,25 +576,26 @@ impl Masquerade {
             // Remove the flow unless another thread replaced it meanwhile.
             if table
                 .flows
-                .get(&key)
+                .get(key)
                 .is_some_and(|live| live.token == flow.token && live.route == flow.route)
             {
-                table.remove(&key);
+                table.remove(key);
             }
             return Err(reasons::ROUTE_CHANGED);
         }
-        info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
-        Ok(true)
+        Ok(())
     }
 
-    /// Asks the decision closure about a new flow and records it; returns
-    /// its source and token, or `None` when the packet passes.
-    fn new_flow(&self, info: &Info) -> Result<Option<(Ipv6Addr, u16)>, &'static str> {
+    /// Asks the decision closure about a new flow and, once the checksum of
+    /// its first packet `bytes` is verified, records it; returns its source
+    /// and token, or `None` when the packet passes.
+    fn new_flow(&self, info: &Info, bytes: &[u8]) -> Result<Option<(Ipv6Addr, u16)>, &'static str> {
         let tuple = info.tuple();
         // No lock is held here: the closure may call back into `self`.
         let Some(decision) = (self.decide)(&tuple) else {
             return Ok(None);
         };
+        self.verify_checksum(info, bytes)?;
         let source = decision.source;
         let now = (self.clock)();
         let config = &self.config;

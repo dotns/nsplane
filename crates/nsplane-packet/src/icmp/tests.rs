@@ -337,3 +337,129 @@ fn length_mismatches_are_untouched() {
         assert_untouched(packet);
     }
 }
+
+#[test]
+fn echo_requests_are_classified() {
+    let options = [0x94, 0x04, 0x00, 0x00]; // Router Alert
+    for (options, payload) in [(&[][..], &[][..]), (&options[..], PAYLOAD)] {
+        assert!(is_echo_request(&icmp_v4(
+            V4_CLIENT, V4_TARGET, 8, 0, options, payload
+        )));
+    }
+    for payload in [&[][..], PAYLOAD] {
+        assert!(is_echo_request(&icmp_v6(
+            V6_CLIENT, V6_TARGET, 128, 0, payload
+        )));
+    }
+}
+
+#[test]
+fn other_packets_are_not_echo_requests() {
+    for (icmp_type, code) in [(0, 0), (8, 1), (3, 3), (11, 0), (128, 0)] {
+        let packet = icmp_v4(V4_CLIENT, V4_TARGET, icmp_type, code, &[], PAYLOAD);
+        assert!(!is_echo_request(&packet));
+    }
+    for (icmp_type, code) in [(129, 0), (128, 1), (1, 4), (135, 0), (8, 0)] {
+        let packet = icmp_v6(V6_CLIENT, V6_TARGET, icmp_type, code, PAYLOAD);
+        assert!(!is_echo_request(&packet));
+    }
+    // Other protocols carrying an Echo request message.
+    let message = icmp_message(8, 0, PAYLOAD, internet_checksum);
+    for proto in [protocol::TCP, protocol::UDP, protocol::ICMPV6] {
+        assert!(!is_echo_request(&ipv4(
+            V4_CLIENT,
+            V4_TARGET,
+            proto,
+            0,
+            &[],
+            &message
+        )));
+    }
+    let message = icmp_message(128, 0, PAYLOAD, internet_checksum);
+    for next_header in [protocol::TCP, protocol::UDP, protocol::ICMP] {
+        assert!(!is_echo_request(&ipv6(
+            V6_CLIENT,
+            V6_TARGET,
+            next_header,
+            &message
+        )));
+    }
+    // An Echo request behind a Hop-by-Hop header.
+    let mut payload = vec![protocol::ICMPV6, 0, 1, 4, 0, 0, 0, 0];
+    payload.extend_from_slice(&message);
+    assert!(!is_echo_request(&ipv6(V6_CLIENT, V6_TARGET, 0, &payload)));
+    // Garbage and empty input.
+    for packet in [&[][..], &[0x45][..], &[0x60; 39][..], &[0xff; 64][..]] {
+        assert!(!is_echo_request(packet));
+    }
+}
+
+#[test]
+fn truncated_echo_requests_are_not_classified() {
+    let v4 = icmp_v4(V4_CLIENT, V4_TARGET, 8, 0, &[], &[]);
+    for len in 0..v4.len() {
+        assert!(!is_echo_request(&v4[..len]));
+    }
+    let v6 = icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, &[]);
+    for len in 0..v6.len() {
+        assert!(!is_echo_request(&v6[..len]));
+    }
+    // Headers that declare an ICMP message shorter than the 8-byte header.
+    let message = icmp_message(8, 0, &[], internet_checksum);
+    let packet = ipv4(V4_CLIENT, V4_TARGET, protocol::ICMP, 0, &[], &message[..7]);
+    assert!(!is_echo_request(&packet));
+    let packet = ipv6(V6_CLIENT, V6_TARGET, protocol::ICMPV6, &[128, 0, 0, 0]);
+    assert!(!is_echo_request(&packet));
+}
+
+#[test]
+fn echo_request_fragments_and_trailing_bytes() {
+    let message = icmp_message(8, 0, PAYLOAD, internet_checksum);
+    // A first fragment carries the whole ICMP header: classified, not answered.
+    let first = ipv4(V4_CLIENT, V4_TARGET, protocol::ICMP, 0x2000, &[], &message);
+    assert!(is_echo_request(&first));
+    assert_untouched(first);
+    // Middle and last fragments never start with an ICMP header.
+    for flags_fragment in [0x2003, 0x0003] {
+        let packet = ipv4(
+            V4_CLIENT,
+            V4_TARGET,
+            protocol::ICMP,
+            flags_fragment,
+            &[],
+            &message,
+        );
+        assert!(!is_echo_request(&packet));
+    }
+    // Trailing bytes beyond the declared length are ignored.
+    for mut packet in [
+        icmp_v4(V4_CLIENT, V4_TARGET, 8, 0, &[], PAYLOAD),
+        icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, PAYLOAD),
+    ] {
+        packet.extend_from_slice(&[0; 3]);
+        assert!(is_echo_request(&packet));
+        assert_untouched(packet);
+    }
+}
+
+#[test]
+fn every_answered_packet_is_an_echo_request() {
+    let options = [0x94, 0x04, 0x00, 0x00];
+    let message = icmp_message(8, 0, PAYLOAD, internet_checksum);
+    let packets = [
+        icmp_v4(V4_CLIENT, V4_TARGET, 8, 0, &[], &[]),
+        icmp_v4(V4_CLIENT, V4_TARGET, 8, 0, &[], b"odd"),
+        icmp_v4(V4_CLIENT, V4_TARGET, 8, 0, &options, PAYLOAD),
+        ipv4(V4_CLIENT, V4_TARGET, protocol::ICMP, 0x4000, &[], &message),
+        icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, &[]),
+        icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, b"odd"),
+        icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, PAYLOAD),
+    ];
+    for packet in packets {
+        assert!(is_echo_request(&packet));
+        let mut reply = packet.clone();
+        assert!(echo_reply_in_place(&mut reply));
+        // The reply itself is no longer a request.
+        assert!(!is_echo_request(&reply));
+    }
+}

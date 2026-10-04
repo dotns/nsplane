@@ -1,4 +1,23 @@
-//! In-place ICMP Echo reply synthesis for addresses answered locally.
+//! ICMP Echo request classification and in-place Echo reply synthesis for
+//! addresses answered locally.
+//!
+//! [`is_echo_request`] tells whether a packet is an ICMP or `ICMPv6` Echo
+//! request without touching it, so a caller can pick the pings it answers
+//! before handing them to [`echo_reply_in_place`]. It accepts the requests
+//! [`echo_reply_in_place`] rewrites, as well as a few it refuses (it only
+//! classifies, so it stays as permissive as ns `is_icmpv6_echo_request`):
+//!
+//! - **IPv4**: protocol 1, ICMP type 8, code 0, with the IPv4 header parsing
+//!   and the 8-byte ICMP header present within the total length. A non-first
+//!   fragment (offset other than 0) never starts with an ICMP header and is
+//!   `false`; a first fragment (offset 0, more-fragments set) whose ICMP
+//!   header is complete is `true`.
+//! - **IPv6**: next header 58 (`ICMPv6`) in the fixed header, type 128,
+//!   code 0, with the 8-byte header present within the payload length; IPv6
+//!   extension headers are not walked, so a request behind one is `false`.
+//! - Bytes beyond the length the IP header declares are ignored (ns accepts
+//!   them); a buffer shorter than that length is `false`. Checksums are not
+//!   verified.
 //!
 //! [`echo_reply_in_place`] turns an ICMP Echo request into its Echo reply in
 //! the same buffer, so a caller that answers pings for an address it owns can
@@ -48,6 +67,22 @@ const ICMP_CHECKSUM: std::ops::Range<usize> = 2..4;
 /// Length of the IPv6 fixed header.
 const IPV6_HEADER_LEN: usize = 40;
 
+/// Whether `packet` is an IPv4 ICMP or IPv6 `ICMPv6` Echo request; never
+/// modifies it. See the [module docs](self).
+pub fn is_echo_request(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => Ipv4Header::parse(packet).is_ok_and(|(header, message)| {
+            header.protocol() == protocol::ICMP
+                && header.fragment_offset() == 0
+                && is_echo_message(message, ECHO_REQUEST_V4)
+        }),
+        Some(6) => Ipv6Header::parse(packet).is_ok_and(|(header, message)| {
+            header.next_header() == protocol::ICMPV6 && is_echo_message(message, ECHO_REQUEST_V6)
+        }),
+        _ => false,
+    }
+}
+
 /// Rewrites the IPv4 ICMP or IPv6 `ICMPv6` Echo request in `packet` into its
 /// Echo reply and returns `true`; returns `false` and leaves `packet`
 /// untouched for anything else. See the [module docs](self).
@@ -61,7 +96,7 @@ pub fn echo_reply_in_place(packet: &mut [u8]) -> bool {
 
 /// Whether `message` is an ICMP or `ICMPv6` Echo request of type `request`
 /// (code 0, at least the 8-byte header).
-fn is_echo_request(message: &[u8], request: u8) -> bool {
+fn is_echo_message(message: &[u8], request: u8) -> bool {
     IcmpHeader::parse(message)
         .is_ok_and(|(header, _)| header.icmp_type() == request && header.code() == 0)
 }
@@ -75,7 +110,7 @@ fn reply_v4(packet: &mut [u8]) -> bool {
         if usize::from(header.total_len()) != packet.len()
             || header.protocol() != protocol::ICMP
             || !whole
-            || !is_echo_request(message, ECHO_REQUEST_V4)
+            || !is_echo_message(message, ECHO_REQUEST_V4)
         {
             return false;
         }
@@ -100,7 +135,7 @@ fn reply_v6(packet: &mut [u8]) -> bool {
         };
         if IPV6_HEADER_LEN + usize::from(header.payload_len()) != packet.len()
             || header.next_header() != protocol::ICMPV6
-            || !is_echo_request(message, ECHO_REQUEST_V6)
+            || !is_echo_message(message, ECHO_REQUEST_V6)
         {
             return false;
         }

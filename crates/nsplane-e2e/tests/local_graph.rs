@@ -5,7 +5,8 @@
 //! routes Y's virtual range through a Redirect-like `MapSink` into a pipe that is B's
 //! source; B's sink is a pipe that A's `MergeSource` reads through the reverse `MapSource`.
 //! Further cases pump a TUN-like channel into and out of an engine and check backpressure,
-//! the end of either side of a pipe and the cancellation of a pump.
+//! the end of either side of a pipe, the cancellation of a pump and the `Splitter` drop
+//! counters.
 
 use std::collections::VecDeque;
 use std::io;
@@ -609,5 +610,49 @@ async fn pump_cancellation() -> TestResult {
     // The pipe holds one packet: the next one, if the pump got to hand it over.
     assert!(rest.is_empty() || rest == [1], "after the abort: {rest:?}");
     assert_broken_pipe(in_sink.send(PacketBuf::from_packet(&[4]), TUN).await);
+    Ok(())
+}
+
+/// An engine delivers through a `Splitter` the test still reads: packets to Y's virtual range
+/// are routed to an index without a sink and counted as misrouted, the others arrive.
+#[tokio::test]
+async fn splitter_stats_count_misrouted_packets() -> TestResult {
+    let (tun_source, _tun_in, _tun_mtu) = ChannelSource::new(CAPACITY, MTU);
+    let (tun_sink, mut tun_out) = ChannelSink::new(CAPACITY);
+    let splitter =
+        Arc::new(Splitter::new(|_peer, packet| if to_y(packet) { 5 } else { 0 }).sink(tun_sink));
+    let (x, a) = x_and_a(tun_source, Shared(Arc::clone(&splitter))).await?;
+    let x_at_a = a
+        .handle()
+        .peer_id(x.public())
+        .await?
+        .ok_or("unknown peer")?;
+
+    let mut misrouted = 0;
+    for family in [Family::V4, Family::V6] {
+        let (virt, _, other) = targets(family);
+        let x_ip = tunnel(X_SEED, family);
+        for i in 0..BURST {
+            let to_other = packet(x_ip, other, &format!("to the TUN side {i}"));
+            x.send(&packet(x_ip, virt, &format!("misrouted {i}")))
+                .await?;
+            x.send(&to_other).await?;
+            let (peer, delivered) = timeout(WAIT, tun_out.recv())
+                .await?
+                .ok_or("A's TUN sink closed")?;
+            assert_eq!((peer, delivered.as_packet()), (x_at_a, &to_other[..]));
+        }
+        misrouted += BURST as u64;
+        // Each misrouted packet was sent before a delivered one, so it is counted by now.
+        assert_eq!(splitter.stats().misrouted, misrouted);
+    }
+
+    let stats = splitter.stats();
+    assert_eq!((stats.misrouted, stats.failed), (2 * BURST as u64, 0));
+    assert_eq!(splitter.misrouted(), 2 * BURST as u64);
+    assert!(
+        tun_out.try_recv().is_err(),
+        "unexpected packet on A's TUN side"
+    );
     Ok(())
 }
