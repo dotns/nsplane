@@ -7,6 +7,11 @@
 //!   grants and 16 pinholes in one app namespace.
 //! - `bypass`: one namespace of 64 members accepting everything (a Quick-style namespace), so its
 //!   members bypass the evaluation.
+//! - `by_source`: the `default` policy for a peer terminating by source address, whose principal
+//!   is each packet's source address.
+//! - `crates_acl`: the ns `crates/acl` preset (`AclFilterConfig::crates_acl`: allow-only IPv4
+//!   fragments, the bypass flags on) for a by-source peer sending IPv4 TCP to another address
+//!   than the local one, and a non-first fragment of a datagram whose first fragment it accepted.
 //!
 //! `floor` measures what every packet pays before the filter's tables: parsing the five-tuple
 //! and loading the engine snapshot.
@@ -16,15 +21,15 @@
 //! flow the filter's verdict cache serves. Outbound benches repeat one five-tuple.
 
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd,
-    NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap, PinholeGuard, PinholeSpec,
-    Protocol, SourceAssertion, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Direction, Grant,
+    GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap, PinholeGuard,
+    PinholeSpec, Protocol, SourceAssertion, wg_peer_anchor,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId};
@@ -64,6 +69,28 @@ fn tcp(src: Ipv6Addr, src_port: u16, dst: Ipv6Addr, dst_port: u16) -> PacketBuf 
     bytes.extend_from_slice(&dst_port.to_be_bytes());
     bytes.extend_from_slice(&[0; 8]);
     bytes.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    PacketBuf::from_packet(&bytes)
+}
+
+/// An IPv4 TCP packet without options or payload, or with `fragment` (offset in 8-byte units,
+/// more fragments) a fragment of datagram 7: a first fragment carries the TCP header, a later
+/// one 8 bytes.
+fn tcp4(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, fragment: Option<(u16, bool)>) -> PacketBuf {
+    let (offset, more) = fragment.unwrap_or((0, false));
+    let flags = offset | if more { 0x2000 } else { 0 };
+    let len: u16 = if offset > 0 { 28 } else { 40 };
+    let mut bytes = vec![0x45, 0];
+    bytes.extend_from_slice(&len.to_be_bytes());
+    bytes.extend_from_slice(&7_u16.to_be_bytes());
+    bytes.extend_from_slice(&flags.to_be_bytes());
+    bytes.extend_from_slice(&[64, 6, 0, 0]);
+    bytes.extend_from_slice(&src.octets());
+    bytes.extend_from_slice(&dst.octets());
+    bytes.extend_from_slice(&40000_u16.to_be_bytes());
+    bytes.extend_from_slice(&dst_port.to_be_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    bytes.truncate(usize::from(len));
     PacketBuf::from_packet(&bytes)
 }
 
@@ -186,12 +213,17 @@ fn bench_flow(
     assert_eq!(run(&mut packet.clone()), Verdict::Accept, "{name}");
     let mut buf = packet.clone();
     let mut port: u16 = 1024;
+    // The TCP source port, after the 20-byte IPv4 or the 40-byte IPv6 header.
+    let at = if packet.as_packet()[0] >> 4 == 4 {
+        20
+    } else {
+        40
+    };
     c.bench_function(name, |b| {
         b.iter(|| {
             if new_flows {
-                // The TCP source port, after the 40-byte IPv6 header.
                 port = port.checked_add(1).unwrap_or(1024);
-                buf.as_packet_mut()[40..42].copy_from_slice(&port.to_be_bytes());
+                buf.as_packet_mut()[at..at + 2].copy_from_slice(&port.to_be_bytes());
             }
             run(std::hint::black_box(&mut buf))
         });
@@ -352,5 +384,65 @@ fn bench_namespaces(c: &mut Criterion) {
     });
 }
 
-criterion_group!(namespaces, bench_namespaces);
+/// The `by_source` and `crates_acl` scenarios.
+fn bench_by_source(c: &mut Criterion) {
+    let (last, last_addr) = (
+        peer(NAMESPACES - 1, MEMBERS - 1),
+        address(NAMESPACES - 1, MEMBERS - 1),
+    );
+
+    // The default policy for a peer terminating by source address.
+    let engine = Arc::new(AclEngine::new());
+    assert!(engine.load(policy()).is_ok());
+    let by_source = Arc::new(PeerIdentityMap::new());
+    by_source.insert_by_source(last);
+    let filter = AclFilter::new(engine, Arc::clone(&by_source));
+    let inbound_v6 = tcp(last_addr, 40000, LOCAL, 22);
+    bench_packet(c, "by_source/inbound", &filter, last, true, &inbound_v6);
+    bench_established(
+        c,
+        "by_source/inbound_established",
+        &filter,
+        last,
+        true,
+        &inbound_v6,
+    );
+
+    // The ns `crates/acl` preset for the same peer, IPv4 TCP from 10.0.0.2 to 10.0.0.3:443
+    // (not the local 10.0.0.1), and a non-first fragment after an accepted first fragment. The
+    // engine clock stands still, so the fragment entry never expires.
+    let now = Instant::now();
+    let engine = Arc::new(AclEngine::with_clock(move || now));
+    assert!(engine.load(policy()).is_ok());
+    let config = AclFilterConfig::crates_acl(Some(Ipv4Addr::new(10, 0, 0, 1)));
+    let filter = AclFilter::with_config(engine, by_source, config);
+    let (src, dst) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+    let tcp_v4 = tcp4(src, dst, 443, None);
+    bench_packet(c, "crates_acl/inbound", &filter, last, true, &tcp_v4);
+    bench_established(
+        c,
+        "crates_acl/inbound_established",
+        &filter,
+        last,
+        true,
+        &tcp_v4,
+    );
+    let mut first = tcp4(src, dst, 443, Some((0, true)));
+    assert_eq!(
+        filter.inbound(last, &mut first),
+        Verdict::Accept,
+        "first fragment"
+    );
+    let later = tcp4(src, dst, 443, Some((3, true)));
+    bench_established(
+        c,
+        "crates_acl/inbound_fragment",
+        &filter,
+        last,
+        true,
+        &later,
+    );
+}
+
+criterion_group!(namespaces, bench_namespaces, bench_by_source);
 criterion_main!(namespaces);

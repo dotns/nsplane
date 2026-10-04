@@ -12,6 +12,9 @@ pub const UNKNOWN_SESSION: &str = "unknown session";
 pub const DECAPSULATE_ERROR: &str = "decapsulate error";
 /// A decrypted packet's source address is not in the sending peer's allowed IPs.
 pub const SOURCE_NOT_ALLOWED: &str = "source not allowed";
+/// A decrypted packet's destination address is not in the sending peer's inbound
+/// destinations (`PeerConfig::inbound_destinations`), or cannot be read.
+pub const DESTINATION_NOT_ALLOWED: &str = "destination not allowed";
 /// A handshake message arrived, or a peer was to be added, before a private key was set.
 pub const NO_PRIVATE_KEY: &str = "no private key";
 /// A handshake message failed the handshake gate's mac1 check.
