@@ -448,6 +448,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checksums recomputed, TTL / hop limit kept), ported from ns `subnet_icmp_echo_reply`;
   anything else, IPv4 fragments and buffers longer than the IP length included, returns
   `false` untouched.
+- `nsplane`: `MapSink` and `MapSource`, in-place transform wrappers for the local side: a
+  closure (`Fn(&mut PacketBuf, PeerId) -> MapVerdict` on the sink side,
+  `FnMut(&mut PacketBuf) -> MapVerdict` on the source side) rewrites each packet or drops
+  it (`MapVerdict::{Keep, Drop}`, counted in `dropped()`); the MTU passes through and batch
+  methods map each packet. A Redirect is a `MapSink` plus a `MapSource`.
+- `nsplane`: `pump(source, sink, from) -> io::Result<PumpStats>` moves every packet from a
+  `PacketSource` into a `PacketSink` in order (`recv_batch` then `send_batch`), awaiting the
+  sink's backpressure; it ends with `Ok` when either side returns `BrokenPipe` and is
+  cancellation-safe at batch boundaries. `PumpStats { packets, batches }`.
+- `nsplane`: `pipe(capacity, mtu) -> (PipeSink, PipeSource)`, a bounded in-memory loopback,
+  so one engine's (or `Splitter`'s) output feeds another engine's input without a
+  forwarding task. `PipeSink` is `Clone`; either end gone makes the other return
+  `BrokenPipe` (the source after draining); `PipeSource::mtu_sender` changes the MTU it
+  reports. A `local_graph` bench (`cargo bench -p nsplane --bench local_graph`).
+- `nsplane-e2e`: `local_graph` tests: two engines joined only by pipes through a `Splitter`,
+  a Redirect-like `MapSink`/`MapSource` and a `MergeSource` (IPv4 and IPv6, in order, with a
+  Drop rule), a TUN-like channel pumped into and out of an engine, backpressure without
+  loss, `BrokenPipe` from either end of a pipe, and a cancelled pump.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

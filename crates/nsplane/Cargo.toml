@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "worker_pool"
 harness = false
+
+[[bench]]
+name = "local_graph"
+harness = false
