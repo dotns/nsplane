@@ -1,7 +1,6 @@
 //! [`NodeL3Filter`]: the [`NodeL3Gate`] and an optional [`AclFilter`] as one
 //! ordered [`PacketFilter`], with the gateway-consumer divert.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +9,7 @@ use arc_swap::ArcSwap;
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, Path, PeerId};
 
+use super::hash::FastMap;
 use super::{GatewayConsumerPacket, NodeL3Decision, NodeL3Gate, NodeL3Reason};
 use crate::filter::AclFilter;
 
@@ -49,7 +49,7 @@ impl<T: PeerPublicKeys + ?Sized> PeerPublicKeys for Arc<T> {
 /// in an `Arc` and hand a clone to the filter to update it at runtime.
 #[derive(Debug, Default)]
 pub struct PeerKeyMap {
-    keys: ArcSwap<HashMap<PeerId, [u8; 32]>>,
+    keys: ArcSwap<FastMap<PeerId, [u8; 32]>>,
 }
 
 impl PeerKeyMap {
@@ -67,7 +67,7 @@ impl PeerKeyMap {
     /// Set the key of `peer`, replacing any previous one.
     pub fn insert(&self, peer: PeerId, key: [u8; 32]) {
         self.keys.rcu(|keys| {
-            let mut keys = HashMap::clone(keys);
+            let mut keys = FastMap::clone(keys);
             keys.insert(peer, key);
             keys
         });
@@ -76,7 +76,7 @@ impl PeerKeyMap {
     /// Remove the key of `peer`; the peer becomes unknown.
     pub fn remove(&self, peer: PeerId) {
         self.keys.rcu(|keys| {
-            let mut keys = HashMap::clone(keys);
+            let mut keys = FastMap::clone(keys);
             keys.remove(&peer);
             keys
         });

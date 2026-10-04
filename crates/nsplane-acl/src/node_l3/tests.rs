@@ -168,7 +168,8 @@ fn audit(gate: &NodeL3Gate) -> (usize, usize) {
             assert_eq!(state::shard_index(&key.remote_peer), index);
         }
         assert_eq!(
-            per_peer, shard.peer_flows,
+            per_peer,
+            shard.peer_flows.clone().into_iter().collect(),
             "per-peer counts of shard {index}"
         );
         assert!(per_peer.values().all(|count| *count <= counts.peer_limit));

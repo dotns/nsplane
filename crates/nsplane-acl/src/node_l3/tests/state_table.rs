@@ -192,7 +192,7 @@ fn a_stale_snapshot_retries_instead_of_touching_migrated_state() {
         peer_key: PEER,
         packet: &packet,
         meta: PacketMeta::parse(&packet),
-        now: Instant::now(),
+        now: Instant::now().into(),
         swept: false,
     };
     assert_eq!(gate.evaluate_once(&stale, &input), Step::Retry);

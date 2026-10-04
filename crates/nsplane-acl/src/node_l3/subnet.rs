@@ -358,7 +358,7 @@ impl NodeL3Gate {
             return Step::Retry;
         };
         let counts = &self.state.counts;
-        if shard.touch_flow(&flow_key, now, counts).is_some() {
+        if shard.touch_flow(&flow_key, now, counts) {
             return Step::Done(true);
         }
         let admission = shard.insert_flow_with_fragment(
