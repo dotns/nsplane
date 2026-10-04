@@ -49,6 +49,13 @@ where it is described below.
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
+Per-source ACL principals, the ns `crates/acl` mode and inbound destinations add:
+`nsplane-acl` `PeerIdentity::assertion_for` / `by_source`, `PeerIdentityMap::insert_by_source`,
+`AclFilterConfig::crates_acl` with the fields `fragments` (`FragmentMode`, `ALLOW_ONLY`),
+`accept_to_local` and `accept_icmp_echo_reply`, and `AclFilterStats::bypassed`; `nsplane-core`
+`PeerConfig::inbound_destinations`, `ConfigChange::SetInboundDestinations` and
+`reasons::DESTINATION_NOT_ALLOWED`; `nsplane` `EngineHandle::set_inbound_destinations`.
+
 Not public API: `nsplane-cli` (a binary), `nsplane-e2e` (test harness) and
 `nsplane-examples` (example binaries, including the single-port relay and its client
 transports; the relay wire format is the Proposed ADR `2026-10-02-single-port-relay`).
@@ -105,6 +112,17 @@ Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
   too, where the answer changes nothing; by default the core asks only about messages from
   another path, which keeps the steady-state data path free
   of the call. `Event::Authenticated` stays limited to path changes.
+
+**Inbound destinations.** `PeerConfig::inbound_destinations` (`None` by default: unchecked)
+restricts where a peer's decrypted packets may be addressed. The core checks the destination
+after decryption, right after the source check and before the inbound filters, on every receive
+path (per packet, batched, deferred); a packet to another destination, or whose destination
+cannot be read, is dropped as `reasons::DESTINATION_NOT_ALLOWED`. The networks sit in their
+own per-peer table, apart from routing (they add no routes), and the last accepted
+destination of the batch is remembered like the other lookups.
+`ConfigChange::SetInboundDestinations` (`EngineHandle::set_inbound_destinations`) sets or removes them at runtime, and
+`add_or_update_peer` with `Some` replaces them (`None` keeps them). An unchecked peer pays one
+`Option` check per packet; no peer pays an allocation or a lock.
 
 `handle_input_deferred` is the same entry point for a driver that encrypts on several
 threads: the cryptography of a local packet or a received transport data message comes back
@@ -1006,6 +1024,72 @@ evicted in O(1)). The floor is the five-tuple parse (6-7.5 ns) plus the snapshot
 (9.5-11.5 ns), 16-19 ns; skipping the reply check would be exact only for unidirectional
 traffic. Exactness was not weakened (differential test).
 
+**Per-source principals.** `PeerIdentity::assertion_for(peer, src)` resolves a principal for
+the packet's remote address (the source of an inbound packet, the destination of an outbound
+one); its default ignores the address. `PeerIdentityMap::insert_by_source` makes a peer
+terminate by source address, so each packet's principal is a terminate binding of its
+address, as `AccessRequest::from_ip` builds it (an ns gateway, whose packets carry several
+sources); `insert` with a `SourceAssertion::WgPeerKey` keeps a key principal (an ns relay
+client). The filter asks `PeerIdentity::by_source` once per peer and identity generation and
+caches such a peer's principal per address in a least-recently-used table bounded by
+`AclFilterConfig::reply_capacity`; the bypass and the flow verdict cache work per address
+too, so verdicts still equal a full evaluation (the differential test covers by-source
+peers).
+
+**Fragment modes and bypass flags.** `AclFilterConfig::fragments` selects how inbound
+non-first IPv4 fragments are gated. `FragmentMode::Outcome` (default) is the gate described
+above: the outcome of each first fragment, accepted or dropped, per peer and direction, the
+last fragment freeing it. `FragmentMode::AllowOnly { ttl, capacity }` is ns's
+`FragmentAclGate`: only accepted first fragments are recorded, keyed (source, destination,
+protocol, identification) without the peer, live for `ttl` on the engine clock; a non-first
+fragment is judged before anything but the bypass flags and dropped with `reasons::FRAGMENT`
+without a live entry; a full table drops expired entries and otherwise records nothing
+(`FragmentMode::ALLOW_ONLY`: 15 s, 4096, ns's values). `accept_to_local: Option<Ipv4Addr>` (ns
+`is_local_node_packet`) and `accept_icmp_echo_reply` (ns `is_icmp_echo_reply`, read from the
+raw header) accept an inbound IPv4 packet before anything else without the policy, counted in
+`AclFilterStats::bypassed`. Both are off by default and cost one branch each when off.
+
+**The ns `crates/acl` mode.** `AclFilterConfig::crates_acl(local)` sets
+`stateful_replies: false` (no reply allowances in either direction, no pending dependency),
+`allow_other_protocols: false`, `FragmentMode::ALLOW_ONLY`, `accept_to_local: local` and
+`accept_icmp_echo_reply: true`. With a `PeerIdentityMap` holding relay clients under their
+`WgPeerKey` and every other peer by source, it judges inbound IPv4 packets as ns's account
+ACL step: `is_local_node_packet(pkt, tun_ip) || is_icmp_echo_reply(pkt) ||
+acl_check_packet(..)`. Drop reasons are this crate's (a packet ns drops is dropped here,
+possibly under another reason); IPv6 and outbound packets keep this filter's handling.
+
+**Parity with ns.** `crates/nsplane-acl/tests/crates_acl_parity.rs` replays a fixture
+(`tests/fixtures/crates_acl_parity.json`, recorded and generated sequences with the verdicts
+ns `acl_check_packet` and the two bypass checks gave them, and the ns commit they come from)
+through one `AclFilter` per sequence in this mode on a manual clock, and requires the same
+verdict for every packet. The fixture marks 30 packets as an intended deviation: ns
+`parse_five_tuple` reads IHL+4 bytes; nsplane-acl drops malformed IPv4 (TCP/UDP header
+truncated, total length inconsistent with the buffer) as acl malformed in every mode;
+verdicts are equal on well-formed packets. (A later fragment ns admits only through such a
+malformed first fragment is dropped as `reasons::FRAGMENT`.) The test requires exactly those
+30, each ns-allowed and dropped with its kind's reason. `nsplane-e2e`'s `acl_parity` runs the
+mode between two engines.
+
+**What ns deletes.** The account filter's ACL and destination steps become nsplane calls;
+the file references are to ns `refactor/nsplane` (`crates/ns/src/account_engine/filters.rs`,
+`crates/tunnel-wg`).
+
+| ns today | nsplane |
+| --- | --- |
+| `tunnel_wg::acl_check_packet` (`tun_io.rs`) on the `crates/acl` `AclEngine` | `AclFilter` with `AclFilterConfig::crates_acl(Some(tun_ip))` on an `nsplane-acl` `AclEngine` (same policy model; `load` for a policy, `clear_all` for none: fail-closed, `reasons::NO_POLICY`) |
+| `nat::FragmentAclGate`, one per filter | `FragmentMode::ALLOW_ONLY` inside that filter |
+| `tunnel_wg::is_local_node_packet(pkt, tun_ip)` | `AclFilterConfig::accept_to_local = Some(tun_ip)` |
+| `tunnel_wg::is_icmp_echo_reply` | `AclFilterConfig::accept_icmp_echo_reply = true` |
+| `relay_client_keys` set and the `PeerKeys` map (engine `PeerId` to key; an unmapped peer dropped) | `PeerIdentityMap`: `insert(peer, SourceAssertion::WgPeerKey { pubkey })` for a relay client key, `insert_by_source(peer)` for every other peer, `remove` with the peer (an unknown peer is dropped as `reasons::UNKNOWN_PEER`) |
+| `AccountFilter` ACL step (`inbound_ipv4` after the Node L3 step; `account: acl denied`) | that filter; the Node L3 step before it is the Node L3 gate's (MD-B) |
+| `DynamicL3RouteTable` leases (`peer_key_for`) and Subnet return identities (`return_node_ip`, `enforced_subnet_return_peer_key`) in `AccountFilter::outbound_route`, and the outbound `account: route owner mismatch` drop | the lease prefixes and return identities in the owning peer's `allowed_ips`: routing picks the owner, so the outbound check disappears |
+| inbound IPv6 authorization (`allows_inbound_subnet_packet`: a lease owned by this node, or this node's `:2::<tun IPv4>` return identity from the lease's peer; `enforced_subnet_ingress_authorized`) and the `account: ipv6 not authorized` drop | `PeerConfig::inbound_destinations` of each peer, set from the same leases and grants (`Some` for every peer, also with no lease, since ns drops all unauthorized IPv6; with `0.0.0.0/0` because ns checks no IPv4 destination), dropped as `reasons::DESTINATION_NOT_ALLOWED`; updated with `EngineHandle::set_inbound_destinations` or `add_or_update_peer` when leases or Subnet returns change |
+
+ns keeps the policy compilation and projection (the control-plane policy into an
+`AclPolicy`, the relay-client key set, leases and Subnet returns into allowed IPs and
+inbound destinations) and the conversion of each into the calls above; the Node L3 gate's
+mapping is in its own section.
+
 nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
 through this API. `examples/src/bin/app_session.rs` shows a file transfer on it.
@@ -1108,6 +1192,11 @@ path, so such a client pays no extra latency for it.
 | NAT64 to LAN (NAPT) | `nsplane-nat` | wrap the local side: `EngineBuilder::new(Nat64LanSource::new(source, nat.clone()), Nat64LanSink::new(sink, nat))` | not installed | none |
 | Local-side redirect (DNAT) | `nsplane-nat` | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
+| ACL principal by source address | `nsplane-acl` | `PeerIdentityMap::insert_by_source(peer)` (or a `PeerIdentity` overriding `assertion_for` and `by_source`) | per peer: one principal per peer | one cached flag per peer; no per-address table is filled |
+| ACL fragment mode | `nsplane-acl` | `AclFilterConfig::fragments = FragmentMode::ALLOW_ONLY` (or `AllowOnly { ttl, capacity }`) | `FragmentMode::Outcome` | none: the same gate as before |
+| ACL bypass flags | `nsplane-acl` | `AclFilterConfig::accept_to_local = Some(addr)`, `accept_icmp_echo_reply = true` | off | one branch per inbound packet each |
+| ns `crates/acl` mode | `nsplane-acl` | `AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(local))` | not used | none: a preset of the options above |
+| Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations` | `None`: unchecked | one `Option` check per decrypted packet |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
 | Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |
@@ -1391,3 +1480,10 @@ scenarios run them in containers against kernel WireGuard.
 IPv6 client engine reaching an IPv4 netstack LAN host over channel transports.
 The `subnet_gateway` example scenario runs it in containers: a kernel WireGuard peer reaches
 an IPv4 LAN host through the mapped /96.
+
+`nsplane-acl`'s `crates_acl_parity` test replays the ns ACL verdicts of its fixture
+(`tests/fixtures/crates_acl_parity.json`) against the `crates/acl` mode (see
+[nsplane-acl](#nsplane-acl)), and `nsplane-e2e`'s `acl_parity` runs that mode between two
+engines (by-source and relay-key principals, the fragment gate, the bypass flags, policy
+reloads). `nsplane-core`'s and `nsplane-e2e`'s `inbound_destinations` tests cover the
+destination check on every receive path and its runtime changes.

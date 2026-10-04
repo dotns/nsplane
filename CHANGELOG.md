@@ -431,8 +431,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the queues on the path loses its tail and recovers by retransmission timeout, so the
   default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
   refused for a full listener pool).
+- `nsplane-acl`: per-packet source principals. `PeerIdentity::assertion_for(peer, src)`
+  (default: `assertion(peer)`) resolves a peer's principal for the packet's remote address, and
+  `PeerIdentity::by_source` marks peers whose principal depends on it;
+  `PeerIdentityMap::insert_by_source` makes a peer terminate by source address (each packet's
+  principal is a terminate binding of its address, as `AccessRequest::from_ip` builds it), next
+  to `insert` with a `SourceAssertion::WgPeerKey` for relay clients. `AclFilter` caches such a
+  principal per peer and address (bounded by `reply_capacity`, least recently used
+  evicted) under the identity generation.
+- `nsplane-acl`: `AclFilterConfig::fragments: FragmentMode` (`#[non_exhaustive]`). `Outcome`
+  (default) is today's gate; `AllowOnly { ttl, capacity }` is the ns `FragmentAclGate` (only
+  accepted first fragments recorded, keyed (source, destination, protocol, identification), a
+  miss drops with `reasons::FRAGMENT`); `FragmentMode::ALLOW_ONLY` has ns's 15 s and 4096.
+- `nsplane-acl`: bypass flags `AclFilterConfig::accept_to_local: Option<Ipv4Addr>` (ns
+  `is_local_node_packet`) and `accept_icmp_echo_reply: bool` (ns `is_icmp_echo_reply`), off by
+  default; packets they accept count in the new `AclFilterStats::bypassed`.
+- `nsplane-acl`: `AclFilterConfig::crates_acl(local)`, the ns `crates/acl` preset: for inbound
+  IPv4 it equals ns `is_local_node_packet || is_icmp_echo_reply || acl_check_packet` (no reply
+  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags). A differential
+  test (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
+  malformed IPv4, which nsplane-acl drops. `nsplane-e2e` `acl_parity` tests.
+- `nsplane-core`: per-peer inbound destinations. `PeerConfig::inbound_destinations:
+  Option<Vec<AllowedIp>>` (`None`, the default: unchecked) restricts where a peer's decrypted
+  packets may be addressed; others are dropped as the new `reasons::DESTINATION_NOT_ALLOWED`.
+  `ConfigChange::SetInboundDestinations` and `EngineHandle::set_inbound_destinations` change or
+  remove them at runtime (an update through `add_or_update_peer` with `None` keeps them). They
+  add no routes. `nsplane-core` and `nsplane-e2e` `inbound_destinations` tests.
 
 ### Changed
+- Breaking: struct literals of `PeerConfig` (`nsplane::Peer`), `AclFilterConfig` and
+  `AclFilterStats` need the new fields (`inbound_destinations`; `fragments`, `accept_to_local`,
+  `accept_icmp_echo_reply`; `bypassed`) (`..Default::default()`, `PeerConfig::new`), and
+  exhaustive matches on `ConfigChange` the new `SetInboundDestinations`. Behavior with the
+  defaults is unchanged.
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
   `failed: &mut usize`. A call adds one for every datagram it was done with that failed
   (and was dropped), never more than it advanced `sent`; `Ok` means nothing failed in the
