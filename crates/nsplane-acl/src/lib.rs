@@ -254,6 +254,9 @@
 //! | same, through an inbound pinhole | 210 ns | | |
 //! | same, outbound-restricted peer (outbound rule) | | | 156 ns |
 //! | Bypass (a namespace accepting everything) | 38 ns | 37 ns | 77 ns |
+//! | Default policy, by-source peer (best of 3 runs) | 79 ns | 79 ns | |
+//! | `crates_acl` preset, by-source peer, IPv4 TCP (best of 3 runs) | 71 ns | 80 ns | |
+//! | same, non-first fragment after an accepted first fragment | | 29 ns | |
 //!
 //! Before the hook every packet was a new flow: 71 ns (default policy),
 //! 669 ns (namespaces), 1.75 us (grant, established), 937 ns (bypass peer),
