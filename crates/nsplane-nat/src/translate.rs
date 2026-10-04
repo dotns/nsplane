@@ -63,7 +63,15 @@
 //! and bytes, and expire after 60 seconds, which
 //! [`TranslatorStats::fragment_budget_drops`] and
 //! [`TranslatorStats::fragment_timeouts`] count. Other fragments, and IPv6
-//! fragments, are translated one by one.
+//! fragments, are translated one by one. The bounds (256 datagrams, 1 MiB,
+//! 60 seconds), the markers and the other drop reasons are those of 0.9.0;
+//! duplicates differ in three ways. An exact duplicate of a held fragment
+//! counts in [`TranslatorStats::fragments_held`] and in the byte budget. A
+//! fragment with the same range as a held one but a different payload or M
+//! flag is ignored as a duplicate instead of dropping the datagram with
+//! `reasons::OVERLAP`: the first copy wins, and a reassembled datagram never
+//! mixes bytes of the two copies. At the byte limit, a duplicate is dropped
+//! with `reasons::BUDGET_EXCEEDED` instead of being ignored.
 //!
 //! A translated IPv4 packet grows by 20 bytes (28 with a fragment header),
 //! in place when the packet buffer's capacity allows it. A packet without
@@ -199,8 +207,9 @@ pub struct TranslatorStats {
     /// Zero-checksum UDP datagrams reassembled from IPv4 fragments (and
     /// datagrams with a checksum whose later fragments arrived first).
     pub reassembled: u64,
-    /// IPv4 UDP fragments stored for reassembly (an exact duplicate, which
-    /// is ignored, counts too).
+    /// IPv4 UDP fragments stored for reassembly. A duplicate of a held
+    /// fragment (same range; the first copy wins) counts too, and so does
+    /// its share of the byte budget; 0.9.0 did not count exact duplicates.
     pub fragments_held: u64,
     /// Incomplete datagrams discarded when their 60 seconds expired.
     pub fragment_timeouts: u64,
