@@ -466,6 +466,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Redirect-like `MapSink`/`MapSource` and a `MergeSource` (IPv4 and IPv6, in order, with a
   Drop rule), a TUN-like channel pumped into and out of an engine, backpressure without
   loss, `BrokenPipe` from either end of a pipe, and a cancelled pump.
+- `nsplane`: `Transport::try_send_batch` / `DynTransport::try_send_batch` and
+  `PacketSink::try_send_batch`, the non-blocking forms of `send_batch`: they hand off what
+  can go at once, in order, and return `WouldBlock` with the rest left to the caller. The
+  defaults hand off nothing (`WouldBlock`), which keeps today's path through the transmit
+  and sink tasks. `UdpTransport` and the Unix `TunSink` (Linux, Android, macOS, iOS)
+  override them.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
@@ -601,6 +607,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-examples`: the relay WSS client dials with `nsplane_wss::WssDialer` instead of
   its own tungstenite dialer (the pinning `ClientConfig` passed as `WssTls::Config`);
   `WssTransport::connect` now returns `io::Result`.
+- `nsplane`: without crypto workers the engine hands what one source or transport read
+  returned to the owner task as one message (the input queues stay bounded in packets; a
+  lone item goes over without an allocation). The owner delivers a drain's packets to the
+  sink itself (`try_send_batch`) when the sink has nothing queued or in flight, and sends a
+  drain's datagrams itself when the transport has nothing queued or in flight and no local
+  packet or received datagram is waiting; under load the transmit task sends while the
+  owner seals. A transport or sink whose `try_send_batch` takes nothing is skipped for 1,
+  2, 4, ... up to 1024 drains, so the default implementations cost about one try per 1024
+  drains. The rest falls back to the transmit and sink tasks (see docs/architecture.md,
+  "Engine fast path (MF-1)"). As a result the `QueueStats` mark of `deliver` is lower (those
+  of `transmit` and `recycle` under light load), and `TransportStats` may also be counted by
+  the owner task.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
