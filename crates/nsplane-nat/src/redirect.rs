@@ -257,8 +257,10 @@ impl Redirect {
     /// tuple `original` (application -> service): a live flow from the same
     /// source address and port, other than the flow of `original` itself,
     /// already goes to `endpoint`, so recording the new flow there would fail
-    /// and the decision closure would be asked again. Refreshes the flow it
-    /// finds, as [`original_destination`](Self::original_destination) does.
+    /// and the decision closure would be asked again. A flow past its idle
+    /// timeout does not count, and the query neither refreshes the flow it
+    /// finds nor counts a conntrack hit or miss ([`Conntrack::peek`]), so
+    /// scanning a pool never keeps an idle flow alive.
     ///
     /// The decision closure runs without any lock held, so it may call this
     /// to scan a pool of endpoints and offer a free one; see the
@@ -266,7 +268,7 @@ impl Redirect {
     /// before the closure's answer is recorded, which only costs a try.
     pub fn endpoint_in_use(&self, original: &FiveTuple, endpoint: SocketAddrV4) -> bool {
         let reply = reverse(&translated(original, endpoint));
-        self.conntrack.lookup(&reply, None).is_some_and(|found| {
+        self.conntrack.peek(&reply).is_some_and(|found| {
             found.direction == FlowDirection::Reply && found.flow.original != *original
         })
     }
