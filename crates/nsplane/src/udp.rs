@@ -111,6 +111,12 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// [`SideSender`] sends that protocol's datagrams on the same socket. Without a side
 /// channel nothing is classified.
 ///
+/// Path MTU discovery: on Linux and Android,
+/// [`set_path_mtu_discovery`](Self::set_path_mtu_discovery) turns the socket's ICMP
+/// Fragmentation Needed and Packet Too Big errors into
+/// [`PathMtuReport`](crate::PathMtuReport)s for the engine;
+/// it is off by default.
+///
 /// The transport never closes: it lives as long as its socket.
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -127,6 +133,10 @@ pub struct UdpTransport {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rx: std::sync::Mutex<linux::Rx>,
     side: Option<Side>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pmtu: linux::Pmtu,
+    /// Path MTU reports dropped while their receiver was full or closed.
+    pmtu_dropped: AtomicU64,
 }
 
 impl UdpTransport {
@@ -205,6 +215,9 @@ impl UdpTransport {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rx: std::sync::Mutex::default(),
             side: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            pmtu: linux::Pmtu::default(),
+            pmtu_dropped: AtomicU64::new(0),
         })
     }
 
@@ -320,6 +333,62 @@ impl UdpTransport {
     /// Whether segmentation offload is on.
     pub fn offload(&self) -> bool {
         self.offload.load(Ordering::Relaxed)
+    }
+
+    /// Turns path MTU discovery from the socket's ICMP errors on or off; it is off by
+    /// default.
+    ///
+    /// On, on Linux and Android, the socket asks for its ICMP errors (`IP_RECVERR` unless
+    /// it is IPv6-only, and `IPV6_RECVERR` on an IPv6 socket), and receiving also waits
+    /// for them and reads the socket's error queue empty before reading datagrams: each
+    /// ICMP Fragmentation Needed (type 3, code 4) or `ICMPv6` Packet Too Big (type 2,
+    /// code 0) about one of the transport's datagrams becomes a
+    /// [`PathMtuReport`](crate::PathMtuReport) for the
+    /// datagram's destination (reported as [`Path::addr`] would report it) with the MTU the
+    /// error carries, quoting the datagram's leading bytes. Other errors (port unreachable,
+    /// for example) are read and skipped. No error fails a receive.
+    ///
+    /// The reports go to the receiver [`Transport::path_mtu_reports`] hands out, once,
+    /// after this was first turned on; so turn it on before handing the transport to the
+    /// engine, which takes the receiver when it installs the transport. The receiver holds
+    /// up to 64 reports; while it is full or closed further reports are dropped and
+    /// counted ([`path_mtu_reports_dropped`](Self::path_mtu_reports_dropped)).
+    ///
+    /// The kernel learns of a too small path only for datagrams sent with the DF bit: with
+    /// offload ([`bind`](Self::bind)) all of them, without it those below the path MTU the
+    /// kernel knows (it fragments larger ones itself). While on, an ICMP error can fail
+    /// one send (the engine drops and counts that datagram) before receiving reads it, and
+    /// once the socket has reported an error, tokio keeps its write readiness, so a send
+    /// that finds the send buffer full retries without waiting until it drains.
+    ///
+    /// Turning it off clears the socket options, which discards the queued errors, and
+    /// restores the receive path; the receiver stays with the engine.
+    ///
+    /// Elsewhere turning it on fails with [`io::ErrorKind::Unsupported`]: macOS and Windows
+    /// do not deliver ICMP errors to an unconnected UDP socket. Report the path MTU with
+    /// [`EngineHandle::report_path_mtu`](crate::EngineHandle::report_path_mtu) there.
+    pub fn set_path_mtu_discovery(&self, on: bool) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.set_recv_err(on)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            if on {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no ICMP errors on unconnected UDP sockets",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Path MTU reports dropped because the receiver was full or closed (see
+    /// [`set_path_mtu_discovery`](Self::set_path_mtu_discovery)); always 0 where path MTU
+    /// discovery is not supported.
+    pub fn path_mtu_reports_dropped(&self) -> u64 {
+        self.pmtu_dropped.load(Ordering::Relaxed)
     }
 
     /// Maps `addr` to the socket's address family.
@@ -482,6 +551,13 @@ impl Transport for UdpTransport {
             result.inspect_err(|_| *failed += run)?;
         }
         Ok(())
+    }
+
+    /// The reports of [`UdpTransport::set_path_mtu_discovery`]: `Some` once, after it was
+    /// first turned on.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn path_mtu_reports(&self) -> Option<mpsc::Receiver<crate::PathMtuReport>> {
+        self.pmtu.take()
     }
 }
 
@@ -715,24 +791,36 @@ mod linux {
     //! Receiving through `quinn-udp`, with generic receive offload: one read may return a
     //! train of datagrams of one sender, all of one size (the stride) but the last. Without
     //! `quinn-udp` state, `recvmsg` / `sendmsg` with TOS and traffic class control messages.
+    //! With path MTU discovery on, every read first reads the error queue empty.
 
     use std::collections::VecDeque;
     use std::io::{self, IoSlice, IoSliceMut};
     use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::AsRawFd;
-    use std::sync::{MutexGuard, PoisonError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     use bytes::BytesMut;
+    use nix::errno::Errno;
+    use nix::libc::{SO_EE_ORIGIN_ICMP, SO_EE_ORIGIN_ICMP6, sock_extended_err};
     use nix::sys::socket::{
-        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg, sendmsg,
+        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, getsockopt, recvmsg,
+        sendmsg, setsockopt, sockopt,
     };
     use nsplane_packet::{Ecn, MAX_BATCH, PacketBuf, Path};
     use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
     use socket2::SockRef;
     use tokio::io::Interest;
     use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
 
     use super::UdpTransport;
+    use crate::transport::PathMtuReport;
+
+    /// The most path MTU reports waiting for the engine.
+    const REPORTS: usize = 64;
+    /// The leading bytes of a datagram read with its error: as many as a report keeps.
+    const QUOTE: usize = 8;
 
     /// Bytes one coalesced read may fill: the largest datagram, and the most the kernel
     /// coalesces into one read.
@@ -742,6 +830,12 @@ mod linux {
     /// message (24 bytes on 64-bit targets) with room to spare.
     #[repr(C, align(8))]
     struct CmsgBuf([u8; 64]);
+
+    /// Control-message buffer for an error-queue entry, aligned for `cmsghdr`: the error
+    /// with the sender of the ICMP message (64 bytes on 64-bit targets for IPv6) comes
+    /// last, after the packet info and TOS the socket may also ask for.
+    #[repr(C, align(8))]
+    struct ErrCmsgBuf([u8; 256]);
 
     /// Asks for the TOS (IPv4, including IPv4-mapped peers of a dual-stack socket) and
     /// traffic class (IPv6) of every received datagram.
@@ -764,7 +858,155 @@ mod linux {
         pending: VecDeque<(Path, PacketBuf)>,
     }
 
+    /// Path MTU discovery ([`UdpTransport::set_path_mtu_discovery`]).
+    #[derive(Debug, Default)]
+    pub(super) struct Pmtu {
+        on: AtomicBool,
+        /// The reports for the engine, from the first time it is turned on.
+        tx: OnceLock<mpsc::Sender<PathMtuReport>>,
+        /// The receiving end, until the engine takes it.
+        rx: Mutex<Option<mpsc::Receiver<PathMtuReport>>>,
+    }
+
+    impl Pmtu {
+        pub(super) fn on(&self) -> bool {
+            self.on.load(Ordering::Relaxed)
+        }
+
+        /// Creates the report queue if it does not exist yet.
+        fn open(&self) {
+            self.tx.get_or_init(|| {
+                let (tx, rx) = mpsc::channel(REPORTS);
+                *self.rx.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
+                tx
+            });
+        }
+
+        /// Queues `report`; false when the queue is full or closed.
+        fn push(&self, report: PathMtuReport) -> bool {
+            self.tx.get().is_none_or(|tx| tx.try_send(report).is_ok())
+        }
+
+        /// The receiver of the reports, once.
+        pub(super) fn take(&self) -> Option<mpsc::Receiver<PathMtuReport>> {
+            self.rx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        }
+    }
+
+    /// The report an error-queue entry makes: `err` is the error about a datagram sent on
+    /// `path`, `quote` the datagram's leading bytes. `None` unless the error is an ICMP
+    /// Fragmentation Needed or an `ICMPv6` Packet Too Big; the MTU is the one it carries.
+    pub(super) fn path_mtu_report(
+        path: Path,
+        err: &sock_extended_err,
+        quote: &[u8],
+    ) -> Option<PathMtuReport> {
+        let too_big = match err.ee_origin {
+            SO_EE_ORIGIN_ICMP => (err.ee_type, err.ee_code) == (3, 4),
+            SO_EE_ORIGIN_ICMP6 => (err.ee_type, err.ee_code) == (2, 0),
+            _ => false,
+        };
+        let mtu = u16::try_from(err.ee_info).unwrap_or(u16::MAX);
+        too_big.then(|| PathMtuReport::with_quote(path, mtu, quote))
+    }
+
     impl UdpTransport {
+        /// [`UdpTransport::set_path_mtu_discovery`].
+        pub(super) fn set_recv_err(&self, on: bool) -> io::Result<()> {
+            if self.local.is_ipv4() || !getsockopt(&self.socket, sockopt::Ipv6V6Only)? {
+                setsockopt(&self.socket, sockopt::Ipv4RecvErr, &on)?;
+            }
+            if self.local.is_ipv6() {
+                setsockopt(&self.socket, sockopt::Ipv6RecvErr, &on)?;
+            }
+            if on {
+                self.pmtu.open();
+            }
+            self.pmtu.on.store(on, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// What a read waits for: the socket to be readable, and with path MTU discovery
+        /// on also an error.
+        fn readiness(&self) -> Interest {
+            if self.pmtu.on() {
+                Interest::READABLE | Interest::ERROR
+            } else {
+                Interest::READABLE
+            }
+        }
+
+        /// Runs the non-blocking read `read`. With path MTU discovery on, it reads the
+        /// error queue empty first, and retries a failed read: a queued ICMP error also
+        /// fails the next read once with its error code, which is not the engine's.
+        fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+            if !self.pmtu.on() {
+                return read();
+            }
+            loop {
+                self.drain_errors();
+                match read() {
+                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                        tracing::trace!(message = "Read failed on an ICMP error", error = %e);
+                    }
+                    result => return result,
+                }
+            }
+        }
+
+        /// Reads the error queue empty, queuing a report for each Packet Too Big.
+        fn drain_errors(&self) {
+            let fd = self.socket.as_raw_fd();
+            loop {
+                let mut quote = [0; QUOTE];
+                let mut cmsg = ErrCmsgBuf([0; 256]);
+                let mut iov = [IoSliceMut::new(&mut quote)];
+                let (len, to, err) = match recvmsg::<SockaddrStorage>(
+                    fd,
+                    &mut iov,
+                    Some(&mut cmsg.0),
+                    MsgFlags::MSG_ERRQUEUE,
+                ) {
+                    Ok(msg) => (
+                        msg.bytes,
+                        // The datagram's destination.
+                        msg.address.as_ref().and_then(socket_addr),
+                        msg.cmsgs()
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .find_map(|cmsg| match cmsg {
+                                ControlMessageOwned::Ipv4RecvErr(err, _)
+                                | ControlMessageOwned::Ipv6RecvErr(err, _) => Some(err),
+                                _ => None,
+                            }),
+                    ),
+                    Err(Errno::EAGAIN) => return,
+                    Err(e) => {
+                        tracing::debug!(message = "Error queue not read", error = %e);
+                        return;
+                    }
+                };
+                if let (Some(to), Some(err)) = (to, err)
+                    && let Some(report) =
+                        path_mtu_report(self.path(to, Ecn::NotEct), &err, &quote[..len])
+                {
+                    self.push_report(report);
+                }
+            }
+        }
+
+        /// Queues `report` for the engine; drops and counts it when the queue is full or
+        /// closed.
+        pub(super) fn push_report(&self, report: PathMtuReport) {
+            if !self.pmtu.push(report) {
+                self.pmtu_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         fn rx(&self) -> MutexGuard<'_, Rx> {
             self.rx.lock().unwrap_or_else(PoisonError::into_inner)
         }
@@ -843,11 +1085,13 @@ mod linux {
             };
             let meta = self
                 .socket
-                .async_io(Interest::READABLE, || {
-                    let mut meta = [RecvMeta::default()];
-                    let mut bufs = [IoSliceMut::new(buf.as_packet_mut())];
-                    state.recv(UdpSockRef::from(&*self.socket), &mut bufs, &mut meta)?;
-                    Ok(meta[0])
+                .async_io(self.readiness(), || {
+                    self.read(|| {
+                        let mut meta = [RecvMeta::default()];
+                        let mut bufs = [IoSliceMut::new(buf.as_packet_mut())];
+                        state.recv(UdpSockRef::from(&*self.socket), &mut bufs, &mut meta)?;
+                        Ok(meta[0])
+                    })
                 })
                 .await
                 .inspect_err(|_| buf.set_len(0))?;
@@ -871,7 +1115,8 @@ mod linux {
         /// but for those the side channel takes.
         async fn read_coalesced(&self, state: &UdpSocketState) -> io::Result<()> {
             self.socket
-                .async_io(Interest::READABLE, || {
+                .async_io(self.readiness(), || {
+                    self.read(|| {
                     let mut rx = self.rx();
                     let rx = &mut *rx;
                     if rx.buf.len() < READ {
@@ -904,6 +1149,7 @@ mod linux {
                     }
                     Ok(())
                 })
+                })
                 .await
         }
     }
@@ -919,32 +1165,32 @@ mod linux {
         async fn recv_from(&self, packet: &mut [u8]) -> io::Result<(usize, SocketAddr, Ecn)> {
             let fd = self.socket.as_raw_fd();
             self.socket
-                .async_io(Interest::READABLE, || {
-                    let mut iov = [IoSliceMut::new(&mut *packet)];
-                    let mut cmsg = CmsgBuf([0; 64]);
-                    let msg = recvmsg::<SockaddrStorage>(
-                        fd,
-                        &mut iov,
-                        Some(&mut cmsg.0),
-                        MsgFlags::empty(),
-                    )?;
-                    let addr = msg.address.as_ref().and_then(socket_addr).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "datagram without source")
-                    })?;
-                    // A truncated control buffer only loses the ECN mark.
-                    let ecn =
-                        msg.cmsgs()
-                            .ok()
-                            .into_iter()
-                            .flatten()
-                            .fold(Ecn::NotEct, |ecn, cmsg| match cmsg {
+                .async_io(self.readiness(), || {
+                    self.read(|| {
+                        let mut iov = [IoSliceMut::new(&mut *packet)];
+                        let mut cmsg = CmsgBuf([0; 64]);
+                        let msg = recvmsg::<SockaddrStorage>(
+                            fd,
+                            &mut iov,
+                            Some(&mut cmsg.0),
+                            MsgFlags::empty(),
+                        )?;
+                        let addr = msg.address.as_ref().and_then(socket_addr).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "datagram without source")
+                        })?;
+                        // A truncated control buffer only loses the ECN mark.
+                        let ecn = msg.cmsgs().ok().into_iter().flatten().fold(
+                            Ecn::NotEct,
+                            |ecn, cmsg| match cmsg {
                                 ControlMessageOwned::Ipv4Tos(tos) => Ecn::from_bits(tos),
                                 ControlMessageOwned::Ipv6TClass(tclass) => {
                                     u8::try_from(tclass & 0xFF).map_or(ecn, Ecn::from_bits)
                                 }
                                 _ => ecn,
-                            });
-                    Ok((msg.bytes, addr, ecn))
+                            },
+                        );
+                        Ok((msg.bytes, addr, ecn))
+                    })
                 })
                 .await
         }
@@ -1343,6 +1589,11 @@ mod tests {
                 socket.recv_tos_v4().unwrap(),
                 plain.recv_tos_v4().unwrap(),
             ),
+            (
+                "IP_RECVERR",
+                getsockopt(&transport.socket, sockopt::Ipv4RecvErr).unwrap(),
+                getsockopt(&plain, sockopt::Ipv4RecvErr).unwrap(),
+            ),
         ];
         if addr.is_ipv4() {
             options.push((
@@ -1367,6 +1618,11 @@ mod tests {
                     socket.recv_tclass_v6().unwrap(),
                     plain.recv_tclass_v6().unwrap(),
                 ),
+                (
+                    "IPV6_RECVERR",
+                    getsockopt(&transport.socket, sockopt::Ipv6RecvErr).unwrap(),
+                    getsockopt(&plain, sockopt::Ipv6RecvErr).unwrap(),
+                ),
             ]);
         }
         options
@@ -1383,7 +1639,7 @@ mod tests {
                     "IP_RECVTOS" | "IPV6_RECVTCLASS" => assert!(transport, "{addr} {name}"),
                     _ => assert_eq!(transport, plain, "{addr} {name}"),
                 }
-                if name == "IPV6_DONTFRAG" {
+                if matches!(name, "IPV6_DONTFRAG" | "IP_RECVERR" | "IPV6_RECVERR") {
                     assert!(!transport, "{addr} {name}");
                 }
             }
@@ -1398,7 +1654,10 @@ mod tests {
         for addr in ["127.0.0.1:0", "[::1]:0", "[::]:0"] {
             for (name, transport, _) in socket_options(addr, true) {
                 match name {
-                    "SO_TIMESTAMPNS" => assert!(!transport, "{addr} {name}"),
+                    // Off until path MTU discovery is turned on.
+                    "SO_TIMESTAMPNS" | "IP_RECVERR" | "IPV6_RECVERR" => {
+                        assert!(!transport, "{addr} {name}");
+                    }
                     // Set where `quinn-udp` finds it supported; IPv6 marks come with
                     // IPV6_RECVTCLASS.
                     "IP_RECVTOS" => {}
@@ -1412,6 +1671,187 @@ mod tests {
             nix::sys::socket::getsockopt(&a.socket, nix::sys::socket::sockopt::Ipv6DontFrag)
                 .unwrap()
         );
+    }
+
+    /// Path MTU discovery asks for ICMP errors only while on; the reports' receiver is
+    /// handed out once, after it was first turned on.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn path_mtu_discovery_sets_recverr() {
+        // `IP_RECVERR` and `IPV6_RECVERR` when on; a socket bound to a specific IPv6
+        // address is IPv6-only and leaves `IP_RECVERR` alone.
+        for (addr, on) in [
+            ("127.0.0.1:0", &[true][..]),
+            ("[::1]:0", &[false, true]),
+            ("[::]:0", &[true, true]),
+        ] {
+            let off = vec![false; on.len()];
+            for offload in OFFLOAD {
+                let a = bind_with(1, addr, offload);
+                assert_eq!(recv_err(&a), off, "{addr}");
+                assert!(Transport::path_mtu_reports(&a).is_none());
+                a.set_path_mtu_discovery(false).unwrap();
+                assert!(Transport::path_mtu_reports(&a).is_none());
+
+                a.set_path_mtu_discovery(true).unwrap();
+                assert_eq!(recv_err(&a), on, "{addr}");
+                assert!(a.pmtu.on());
+                assert!(Transport::path_mtu_reports(&a).is_some());
+                assert!(Transport::path_mtu_reports(&a).is_none());
+
+                a.set_path_mtu_discovery(false).unwrap();
+                assert_eq!(recv_err(&a), off, "{addr}");
+                assert!(!a.pmtu.on());
+                a.set_path_mtu_discovery(true).unwrap();
+                assert_eq!(recv_err(&a), on, "{addr}");
+                assert!(Transport::path_mtu_reports(&a).is_none());
+            }
+        }
+    }
+
+    /// `IP_RECVERR` and, on an IPv6 socket, `IPV6_RECVERR` of `transport`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn recv_err(transport: &UdpTransport) -> Vec<bool> {
+        use nix::sys::socket::{getsockopt, sockopt};
+
+        let mut options = vec![getsockopt(&transport.socket, sockopt::Ipv4RecvErr).unwrap()];
+        if transport.local.is_ipv6() {
+            options.push(getsockopt(&transport.socket, sockopt::Ipv6RecvErr).unwrap());
+        }
+        options
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[tokio::test]
+    async fn path_mtu_discovery_is_unsupported() {
+        let a = bind(1, "127.0.0.1:0");
+        let err = a.set_path_mtu_discovery(true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        a.set_path_mtu_discovery(false).unwrap();
+        assert!(Transport::path_mtu_reports(&a).is_none());
+        assert_eq!(a.path_mtu_reports_dropped(), 0);
+    }
+
+    /// An error-queue entry with `origin`, ICMP `kind` and `code`, and `info`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn queued_error(origin: u8, (kind, code): (u8, u8), info: u32) -> nix::libc::sock_extended_err {
+        nix::libc::sock_extended_err {
+            ee_errno: nix::libc::EMSGSIZE.cast_unsigned(),
+            ee_origin: origin,
+            ee_type: kind,
+            ee_code: code,
+            ee_pad: 0,
+            ee_info: info,
+            ee_data: 0,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn error_queue_entries_report_packet_too_big_only() {
+        use nix::libc::{SO_EE_ORIGIN_ICMP, SO_EE_ORIGIN_ICMP6, SO_EE_ORIGIN_LOCAL};
+
+        let path = path_to("192.0.2.1:51820".parse().unwrap(), Ecn::NotEct);
+        let quote = [4, 0, 0, 0, 1, 2, 3, 4];
+        let report = |origin, icmp, info| {
+            linux::path_mtu_report(path, &queued_error(origin, icmp, info), &quote)
+        };
+
+        let v4 = report(SO_EE_ORIGIN_ICMP, (3, 4), 1400).unwrap();
+        assert_eq!((v4.path, v4.mtu, v4.quote()), (path, 1400, &quote[..]));
+        let v6 = report(SO_EE_ORIGIN_ICMP6, (2, 0), 1280).unwrap();
+        assert_eq!((v6.path, v6.mtu, v6.quote()), (path, 1280, &quote[..]));
+        // No MTU in the message; one beyond 16 bits saturates.
+        assert_eq!(report(SO_EE_ORIGIN_ICMP, (3, 4), 0).unwrap().mtu, 0);
+        assert_eq!(
+            report(SO_EE_ORIGIN_ICMP6, (2, 0), 70_000).unwrap().mtu,
+            u16::MAX
+        );
+        let short = linux::path_mtu_report(
+            path,
+            &queued_error(SO_EE_ORIGIN_ICMP, (3, 4), 1400),
+            &quote[..2],
+        )
+        .unwrap();
+        assert_eq!(short.quote(), &quote[..2]);
+
+        for (origin, icmp) in [
+            // Port and host unreachable.
+            (SO_EE_ORIGIN_ICMP, (3, 3)),
+            (SO_EE_ORIGIN_ICMP, (3, 1)),
+            // ICMPv6 codes under the other family's origin.
+            (SO_EE_ORIGIN_ICMP, (2, 0)),
+            (SO_EE_ORIGIN_ICMP6, (3, 4)),
+            // Destination unreachable, time exceeded.
+            (SO_EE_ORIGIN_ICMP6, (1, 4)),
+            (SO_EE_ORIGIN_ICMP6, (3, 0)),
+            // A local error (EMSGSIZE on send).
+            (SO_EE_ORIGIN_LOCAL, (3, 4)),
+            (SO_EE_ORIGIN_LOCAL, (0, 0)),
+        ] {
+            assert!(report(origin, icmp, 1400).is_none(), "{origin} {icmp:?}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn path_mtu_reports_queue_is_bounded() {
+        let a = bind(1, "127.0.0.1:0");
+        let report = crate::PathMtuReport::new(path_to(a.local_addr(), Ecn::NotEct), 1400);
+        // Not turned on yet: there is no queue.
+        a.push_report(report.clone());
+        assert_eq!(a.path_mtu_reports_dropped(), 0);
+
+        a.set_path_mtu_discovery(true).unwrap();
+        for _ in 0..70 {
+            a.push_report(report.clone());
+        }
+        assert_eq!(a.path_mtu_reports_dropped(), 6);
+        let mut reports = Transport::path_mtu_reports(&a).unwrap();
+        let mut queued = 0;
+        while let Ok(got) = reports.try_recv() {
+            assert_eq!(got, report);
+            queued += 1;
+        }
+        assert_eq!(queued, 64);
+        a.push_report(report.clone());
+        assert_eq!(reports.try_recv().unwrap(), report);
+
+        // A closed receiver drops and counts too.
+        drop(reports);
+        a.push_report(report);
+        assert_eq!(a.path_mtu_reports_dropped(), 7);
+    }
+
+    /// With path MTU discovery on, an ICMP port unreachable for an earlier send is read off
+    /// the error queue: receiving goes on with the next datagram, and nothing is reported.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn path_mtu_discovery_skips_other_icmp_errors() {
+        for (addr, ip) in [
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("[::1]:0", "::1"),
+            ("[::]:0", "127.0.0.1"),
+            ("[::]:0", "::1"),
+        ] {
+            for offload in OFFLOAD {
+                let a = bind_with(1, addr, offload);
+                let b = bind(2, &SocketAddr::new(ip.parse().unwrap(), 0).to_string());
+                a.set_path_mtu_discovery(true).unwrap();
+                let mut reports = Transport::path_mtu_reports(&a).unwrap();
+                for _ in 0..2 {
+                    // A port nobody listens on: bound, then closed.
+                    let closed =
+                        bind(3, &SocketAddr::new(ip.parse().unwrap(), 0).to_string()).local_addr();
+                    a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
+                        .await
+                        .unwrap();
+                    roundtrip(&b, b.local_addr(), &a, seen_as(&a, ip)).await;
+                }
+                assert!(reports.try_recv().is_err(), "{addr} {ip} {offload}");
+                assert_eq!(a.path_mtu_reports_dropped(), 0);
+            }
+        }
     }
 
     #[tokio::test]
