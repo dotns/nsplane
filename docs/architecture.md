@@ -1671,6 +1671,35 @@ without the engine batching, two runs each, 1-minute load 2.8-5.9.
 
 ### Against WireGuard implementations
 
+Latest run, main `92652cb` (after the engine fast path, the netstack fixes and the
+`ChannelTransport` fix), 2026-10-04, a quiet host (1-minute load 2-11), same harness, CPU
+sets 2-5 / 6-9, 30 s x 3 repetitions, medians:
+
+| Pair (a -> b) | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP loss 1G / 3G % | ping p50 / p99 idle ms | ping p50 / p99 loaded ms | CPU s/GB a / b |
+| --- | --- | --- | --- | --- | --- | --- |
+| kernel-kernel | 4.04 | 4.10 | 0.01 / 0.03 | 0.780 / 1.690 | 1.300 / 1.590 | 0.09 † / 0.82 † |
+| nsplane-nsplane | 8.12 | 8.93 | 0.04 / 0.44 | 0.241 / 0.728 | 3.010 / 8.270 | 1.26 / 1.10 |
+| nsplane-nsplane (w2) | 8.52 | 8.71 | 0.00 / 0.01 | 0.737 / 0.810 | 1.230 / 2.560 | 1.22 / 1.07 |
+| nsplane-nsplane (nooffload) | 3.13 | 3.41 | 0.00 / 0.05 | 0.561 / 0.603 | 1.300 / 2.640 | 3.63 / 3.08 |
+| nsplane-nsplane (nooffload-w2) | 3.71 | 4.28 | 0.00 / 0.12 | 0.708 / 0.789 | 1.210 / 2.650 | 3.60 / 3.41 |
+| nsplane-kernel | 7.71 | 7.57 | 0.00 / 0.01 | 0.750 / 1.580 | 3.360 / 5.720 | 2.14 / 0.31 † |
+| kernel-nsplane | 7.00 | 6.92 | 0.00 / 0.02 | 0.804 / 1.760 | 1.950 / 5.430 | 0.09 † / 1.67 |
+| wggo-wggo | 9.99 | 10.14 | 0.02 / 0.41 | 0.690 / 0.779 | 2.300 / 5.980 | 1.29 / 1.44 |
+| netstack (user-space) | 6.21 | 2.02 | 1.93 / 6.20 | 0.027 / 0.041 | 0.137 / 0.916 | 1.90 / 1.56 |
+
+† kernel WireGuard encrypts in kernel threads outside the container cgroup (undercount).
+Repetitions were tight for the mixed pairs (kernel -> nsplane 7.02 / 7.00 / 6.99, nsplane ->
+kernel 7.72 / 7.70 / 7.71) and wider for nsplane-nsplane (7.85 / 8.12 / 9.33) and
+wireguard-go (7.75 / 9.99 / 10.79). Kernel WireGuard -> nsplane-cli, left open after the MF-1
+A/B, measures 7.00 Gbit/s here against 3.67 in the first (loaded) run and 6.3 in the MF-1
+"before" reruns: no regression on a quiet host, so the open item is closed. What stays:
+wireguard-go leads on 4 streams (10.1 against 8.9), kernel WireGuard is CPU-pinned by the
+harness (its crypto threads do not run on the pinned sets), and the netstack pair's 4-stream
+result stays below its single stream (follow-up).
+
+The earlier, loaded run below is kept for its notes.
+
+
 `scripts/bench/wg-compare.sh` (see `scripts/bench/README.md`) runs every pair in two fresh
 containers on one docker network: side a (sender) pinned to CPUs 2-5, side b (receiver) to
 6-9, real TUN devices, MTU 1420, every implementation configured over the UAPI with `wg`

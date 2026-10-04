@@ -285,3 +285,7 @@ harness against kernel WireGuard and wireguard-go.
 2026-10-03: MD-A done (campaign nsplane-md-202610032300, plan 20261003-2300-acl-l3-gate): MD-1,
 MD-4, MD-5 and MD-6 with the `crates/acl` differential fixture; the ns mapping (what ns deletes
 and the conversion it keeps) is in docs/architecture.md (nsplane-acl). MD-2 and MD-3 are MD-B.
+2026-10-04: quiet-host re-measure on main 92652cb (load 2-11): kernel WireGuard ->
+nsplane-cli 7.00 Gbit/s P1 (reps 7.02 / 7.00 / 6.99), nsplane -> kernel 7.71, nsplane-nsplane
+8.12 / 8.93 (P1 / P4); the MF-1 open item (kernel -> nsplane slower in B) is closed, no
+regression. Full table in docs/architecture.md (Against WireGuard implementations).
