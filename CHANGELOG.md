@@ -5,6 +5,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-uapi`: `Uapi::offload(bool)` binds the transports of `listen_port=`, `fwmark=` and
+  `Uapi::bind_transport` with or without segmentation offload (on by default). `nsplane-cli
+  --no-offload` sets it, so a `listen-port` or `fwmark` set over the UAPI no longer turns
+  offload back on.
+- `nsplane-acl`: `reasons::INTERNAL` and `AclFilterStats::internal`. Breaking for code that
+  builds `AclFilterStats` with a struct literal.
+
+### Changed
+- `nsplane-acl`: the node L3 gate's default clock is the coarse monotonic clock on Linux and
+  Android (one scheduler tick of resolution, invisible to its second-scale timeouts):
+  established flows 62.8 -> 49.7 ns through `NodeL3Gate`, 81.7 -> 69.5 ns through
+  `NodeL3Filter`, new flows 13-15 % faster. `NodeL3Gate::with_clock` is unchanged.
+- `nsplane-nat`: the translator's zero-checksum UDP reassembly runs on
+  `nsplane_packet::reassembly::Reassembler`, with the same bounds (256 datagrams, 1 MiB,
+  60 s), markers and drop reasons. `TranslatorStats::fragments_held` now counts exact
+  duplicates as well.
+
+### Fixed
+- `nsplane-acl`: a peer cache entry missing right after it was stored drops the packet with
+  `reasons::INTERNAL` (counted, fail-closed) instead of panicking.
+- `nsplane-wss`: a stream closed at its buffer budget is reported as
+  `WssCloseReason::Overflow` even when its relay task ends first (it was sometimes
+  `PeerClosed` under load).
+- `nsplane-wss` tests: the budget tests wait for write progress instead of a fixed deadline,
+  and the test relay's read idle is seconds instead of 600 ms, so they hold at load 70.
+
 ## [0.9.0] - 2026-10-04
 
 The remaining ns data-plane requests: per-path MTU with Packet Too Big feedback and opt-in
