@@ -135,6 +135,8 @@ pub struct UdpTransport {
     side: Option<Side>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pmtu: linux::Pmtu,
+    /// Path MTU reports dropped while their receiver was full or closed.
+    pmtu_dropped: AtomicU64,
 }
 
 impl UdpTransport {
@@ -215,6 +217,7 @@ impl UdpTransport {
             side: None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             pmtu: linux::Pmtu::default(),
+            pmtu_dropped: AtomicU64::new(0),
         })
     }
 
@@ -385,14 +388,7 @@ impl UdpTransport {
     /// [`set_path_mtu_discovery`](Self::set_path_mtu_discovery)); always 0 where path MTU
     /// discovery is not supported.
     pub fn path_mtu_reports_dropped(&self) -> u64 {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            self.pmtu.dropped()
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            0
-        }
+        self.pmtu_dropped.load(Ordering::Relaxed)
     }
 
     /// Maps `addr` to the socket's address family.
@@ -801,7 +797,7 @@ mod linux {
     use std::io::{self, IoSlice, IoSliceMut};
     use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     use bytes::BytesMut;
@@ -870,8 +866,6 @@ mod linux {
         tx: OnceLock<mpsc::Sender<PathMtuReport>>,
         /// The receiving end, until the engine takes it.
         rx: Mutex<Option<mpsc::Receiver<PathMtuReport>>>,
-        /// Reports dropped while the receiver was full or closed.
-        dropped: AtomicU64,
     }
 
     impl Pmtu {
@@ -888,13 +882,9 @@ mod linux {
             });
         }
 
-        /// Queues `report`; drops and counts it when the queue is full or closed.
-        pub(super) fn push(&self, report: PathMtuReport) {
-            if let Some(tx) = self.tx.get()
-                && tx.try_send(report).is_err()
-            {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        /// Queues `report`; false when the queue is full or closed.
+        fn push(&self, report: PathMtuReport) -> bool {
+            self.tx.get().is_none_or(|tx| tx.try_send(report).is_ok())
         }
 
         /// The receiver of the reports, once.
@@ -903,10 +893,6 @@ mod linux {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take()
-        }
-
-        pub(super) fn dropped(&self) -> u64 {
-            self.dropped.load(Ordering::Relaxed)
         }
     }
 
@@ -1008,8 +994,16 @@ mod linux {
                     && let Some(report) =
                         path_mtu_report(self.path(to, Ecn::NotEct), &err, &quote[..len])
                 {
-                    self.pmtu.push(report);
+                    self.push_report(report);
                 }
+            }
+        }
+
+        /// Queues `report` for the engine; drops and counts it when the queue is full or
+        /// closed.
+        pub(super) fn push_report(&self, report: PathMtuReport) {
+            if !self.pmtu.push(report) {
+                self.pmtu_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -1805,12 +1799,12 @@ mod tests {
         let a = bind(1, "127.0.0.1:0");
         let report = crate::PathMtuReport::new(path_to(a.local_addr(), Ecn::NotEct), 1400);
         // Not turned on yet: there is no queue.
-        a.pmtu.push(report.clone());
+        a.push_report(report.clone());
         assert_eq!(a.path_mtu_reports_dropped(), 0);
 
         a.set_path_mtu_discovery(true).unwrap();
         for _ in 0..70 {
-            a.pmtu.push(report.clone());
+            a.push_report(report.clone());
         }
         assert_eq!(a.path_mtu_reports_dropped(), 6);
         let mut reports = Transport::path_mtu_reports(&a).unwrap();
@@ -1820,12 +1814,12 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, 64);
-        a.pmtu.push(report.clone());
+        a.push_report(report.clone());
         assert_eq!(reports.try_recv().unwrap(), report);
 
         // A closed receiver drops and counts too.
         drop(reports);
-        a.pmtu.push(report);
+        a.push_report(report);
         assert_eq!(a.path_mtu_reports_dropped(), 7);
     }
 
