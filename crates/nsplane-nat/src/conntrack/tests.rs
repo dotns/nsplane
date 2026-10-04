@@ -76,6 +76,48 @@ fn assert_balanced(table: &Conntrack) {
 }
 
 #[test]
+fn peek_finds_a_flow_without_touching_it() {
+    let config = ConntrackConfig {
+        max_entries: 2,
+        ..config()
+    };
+    let (table, clock) = clocked(config);
+    let first = flow(protocol::TCP, 2, 1000);
+    insert(&table, first, SYN);
+    advance(&clock, 1);
+    insert(&table, flow(protocol::TCP, 3, 1000), SYN);
+    let before = table.stats();
+
+    let found = table.peek(&first.0).unwrap();
+    assert_eq!(found.direction, FlowDirection::Original);
+    assert_eq!(found.flow.original, first.0);
+    let reply = table.peek(&reverse(&first.1)).unwrap();
+    assert_eq!(reply.direction, FlowDirection::Reply);
+    assert_eq!(reply.flow.tcp_state, Some(TcpState::SynSent));
+    assert!(table.peek(&flow(protocol::TCP, 4, 1000).0).is_none());
+    assert_eq!(table.stats(), before, "no hit, miss or other counter");
+
+    // Not refreshed: the flow still expires 30 s after its first packet.
+    advance(&clock, 28);
+    assert!(table.peek(&first.0).is_some());
+    advance(&clock, 1);
+    assert!(table.peek(&first.0).is_none(), "expired before any sweep");
+    assert_eq!(table.stats().entries, 2, "peek removes nothing");
+
+    // Not touched in the eviction order: the first flow is still the oldest.
+    let (table, clock) = clocked(config);
+    insert(&table, first, SYN);
+    advance(&clock, 1);
+    let second = flow(protocol::TCP, 3, 1000);
+    insert(&table, second, SYN);
+    assert!(table.peek(&first.0).is_some());
+    insert(&table, flow(protocol::TCP, 4, 1000), SYN);
+    assert!(table.peek(&first.0).is_none());
+    assert!(table.peek(&second.0).is_some());
+    assert_eq!(table.stats().evicted, 1);
+}
+
+#[test]
 fn insert_and_lookup_both_directions_refresh_the_flow() {
     let (table, clock) = clocked(config());
     let tuples = flow(protocol::UDP, 2, 40000);
