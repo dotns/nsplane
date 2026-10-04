@@ -22,6 +22,8 @@ pub(crate) enum WriteHalf {
     Shutdown,
     /// The FIN is queued in the socket (or the socket can no longer send).
     FinSent,
+    /// The application aborted the connection: an RST instead of a FIN.
+    Aborted,
 }
 
 /// State shared between a [`TcpConnection`] and the driver.
@@ -128,7 +130,9 @@ fn broken_pipe() -> io::Error {
 /// timed out, and once the stack stopped.
 ///
 /// Dropping the connection closes it gracefully (FIN after the buffered bytes) and
-/// discards bytes that arrive afterwards. A connection without traffic in either
+/// discards bytes that arrive afterwards; the socket and its tuple stay with the stack
+/// until the close completes. [`abort`](Self::abort) resets the connection instead and
+/// releases it at once. A connection without traffic in either
 /// direction for 5 minutes is aborted.
 pub struct TcpConnection {
     shared: Arc<Mutex<Shared>>,
@@ -180,6 +184,22 @@ impl TcpConnection {
         let _ = terminal.wait_for(|terminal| *terminal).await;
     }
 
+    /// Resets the connection and releases it at once.
+    ///
+    /// The stack sends an RST to the peer instead of the FIN a drop sends, discards the
+    /// bytes not read or not taken yet, and releases the socket within the driver turn
+    /// that observes the abort, without waiting for the peer, TIME-WAIT or the idle
+    /// timeout. After that turn [`NetStackHandle::owns`](crate::NetStackHandle::owns) no
+    /// longer reports the connection's tuple, its local port can be connected from again,
+    /// and the release [`terminated`](Self::terminated) waits for has happened. A
+    /// connection the peer already reset or closed is only released; no RST is sent.
+    pub fn abort(self) {
+        let mut shared = lock(&self.shared);
+        shared.write_half = WriteHalf::Aborted;
+        shared.app_dropped = true;
+        // Drop notifies the driver.
+    }
+
     /// Bytes handed to the stack's socket that the peer has not acknowledged yet.
     ///
     /// This is SND.NXT - SND.UNA plus the bytes the socket holds back for the peer's window
@@ -201,6 +221,12 @@ impl TcpConnection {
             0 => None,
             micros => Some(self.progress.epoch + Duration::from_micros(micros - 1)),
         }
+    }
+
+    /// The barrier behind [`terminated`](Self::terminated), observable after an abort.
+    #[cfg(test)]
+    pub(crate) fn terminal(&self) -> watch::Receiver<bool> {
+        self.terminal.clone()
     }
 
     /// Bytes received and not read yet.
