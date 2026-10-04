@@ -288,6 +288,129 @@ fn drops_a_new_flow_when_every_offered_endpoint_is_in_use() {
     );
 }
 
+/// The `n`th service address, for flows that differ only in their service.
+fn service(n: usize) -> SocketAddrV4 {
+    let [.., high, low] = u32::try_from(n).unwrap().to_be_bytes();
+    SocketAddrV4::new(Ipv4Addr::new(100, 64, high, low), 80)
+}
+
+/// Fills all but the last endpoint of a pool of `size` with flows from
+/// `CLIENT`, then restarts the in-turn closure at the first endpoint.
+fn fill_all_but_the_last(redirect: &Redirect, calls: &AtomicUsize, size: usize) {
+    for n in 0..size - 1 {
+        forward(redirect, udp(CLIENT, service(n)));
+    }
+    calls.store(0, Ordering::Relaxed);
+}
+
+#[test]
+fn enough_endpoint_tries_scan_a_whole_pool() {
+    const SIZE: usize = 40;
+    let (calls, decide) = pool(u16::try_from(SIZE).unwrap());
+    let redirect = Redirect::new(decide).with_endpoint_tries(NonZeroUsize::new(SIZE).unwrap());
+    fill_all_but_the_last(&redirect, &calls, SIZE);
+    let last = endpoint(FIRST_PORT + u16::try_from(SIZE - 1).unwrap());
+    assert_eq!(forward(&redirect, udp(CLIENT, service(SIZE))), last);
+    assert_eq!(calls.load(Ordering::Relaxed), SIZE);
+    assert_eq!(redirect.stats().conflicts, 0);
+}
+
+#[test]
+fn the_default_endpoint_tries_stop_after_32() {
+    const SIZE: usize = 40;
+    let (redirect, calls) = redirect(u16::try_from(SIZE).unwrap());
+    fill_all_but_the_last(&redirect, &calls, SIZE);
+    let mut packet = udp(CLIENT, service(SIZE));
+    assert_eq!(
+        redirect.forward(&mut packet),
+        RedirectVerdict::Drop(reasons::ENDPOINT_EXHAUSTED)
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), ENDPOINT_TRIES);
+    assert_eq!(redirect.stats().conflicts, 1);
+}
+
+#[test]
+fn endpoint_in_use_matches_a_conflicting_insert() {
+    let (redirect, _) = redirect(4);
+    // Endpoints 0 and 1 go to flows from CLIENT, endpoint 2 to OTHER_CLIENT.
+    forward(&redirect, udp(CLIENT, SERVICE_A));
+    forward(&redirect, udp(CLIENT, SERVICE_B));
+    forward(&redirect, udp(OTHER_CLIENT, SERVICE_A));
+    let original = FiveTuple {
+        src: IpAddr::V4(*CLIENT.ip()),
+        dst: IpAddr::V4(*service(7).ip()),
+        protocol: protocol::UDP,
+        src_port: CLIENT.port(),
+        dst_port: service(7).port(),
+    };
+    let mut in_use = Vec::new();
+    for port in FIRST_PORT..FIRST_PORT + 4 {
+        let predicted = redirect.endpoint_in_use(&original, endpoint(port));
+        let inserted =
+            redirect
+                .conntrack
+                .insert(PEER, original, translated(&original, endpoint(port)), 0);
+        assert_eq!(
+            predicted,
+            inserted == Err(ConntrackError::Conflict),
+            "{port}"
+        );
+        if inserted.is_ok() {
+            assert!(redirect.conntrack.remove(&original).is_some());
+        }
+        in_use.push(predicted);
+    }
+    assert_eq!(in_use, [true, true, false, false]);
+
+    // Another protocol, and the flow of `original` itself, are no conflict.
+    let tcp_original = FiveTuple {
+        protocol: protocol::TCP,
+        ..original
+    };
+    assert!(!redirect.endpoint_in_use(&tcp_original, endpoint(FIRST_PORT)));
+    let flow = FiveTuple {
+        dst: IpAddr::V4(*SERVICE_A.ip()),
+        dst_port: SERVICE_A.port(),
+        ..original
+    };
+    assert!(!redirect.endpoint_in_use(&flow, endpoint(FIRST_PORT)));
+}
+
+#[test]
+fn decide_may_scan_a_small_pool_with_endpoint_in_use() {
+    const SIZE: u16 = 4;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let redirect = reentrant(move |redirect, tuple| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        (FIRST_PORT..FIRST_PORT + SIZE)
+            .map(endpoint)
+            .find(|&endpoint| !redirect.endpoint_in_use(tuple, endpoint))
+            .map_or(RedirectDecision::Drop, RedirectDecision::Redirect)
+    });
+    let mut endpoints: Vec<_> = (0..usize::from(SIZE))
+        .map(|n| forward(&redirect, udp(CLIENT, service(n))))
+        .collect();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    assert_eq!(endpoints.len(), usize::from(SIZE));
+    assert_eq!(calls.load(Ordering::Relaxed), usize::from(SIZE));
+
+    // The pool is full for CLIENT: the closure denies at once.
+    let mut packet = udp(CLIENT, service(usize::from(SIZE)));
+    assert_eq!(
+        redirect.forward(&mut packet),
+        RedirectVerdict::Drop(reasons::DENIED)
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), usize::from(SIZE) + 1);
+    // A freed endpoint is found again.
+    assert!(redirect.remove_flow(protocol::UDP, endpoint(FIRST_PORT + 2), CLIENT));
+    assert_eq!(
+        forward(&redirect, udp(CLIENT, service(usize::from(SIZE)))),
+        endpoint(FIRST_PORT + 2)
+    );
+}
+
 // -- Flow removal (ns `remove_netstack_flow`, `revoke_removed_routes`, `clear_udp_flows`). --
 
 #[test]
