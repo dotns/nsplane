@@ -133,7 +133,7 @@ fn broken_pipe() -> io::Error {
 /// discards bytes that arrive afterwards; the socket and its tuple stay with the stack
 /// until the close completes. [`abort`](Self::abort) resets the connection instead and
 /// releases it at once. A connection without traffic in either
-/// direction for 5 minutes is aborted.
+/// direction for 5 minutes is reset the same way: the peer gets an RST.
 pub struct TcpConnection {
     shared: Arc<Mutex<Shared>>,
     progress: Arc<Progress>,
