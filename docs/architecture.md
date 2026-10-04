@@ -43,13 +43,18 @@ where it is described below.
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `MapSink` / `MapSource` / `MapVerdict`, `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter` (`stats`) / `SplitterStats`, `MergeSource`, `MapSink` / `MapSource` / `MapVerdict`, `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
+| `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
-| `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig`, `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
+| `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig` (`recheck_route_on_forward`), `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
 Per-source ACL principals, the ns `crates/acl` mode and inbound destinations add:
@@ -116,6 +121,15 @@ Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
   too, where the answer changes nothing; by default the core asks only about messages from
   another path, which keeps the steady-state data path free
   of the call. `Event::Authenticated` stays limited to path changes.
+
+**Unanswered handshakes.** `Core::unanswered_handshakes(peer)` (`None` for an unknown peer)
+counts the handshake initiations sent to a peer that got no response: one counts when another
+initiation is sent while it is still unanswered (a retry, a `force_handshake`) or when the
+attempt gives up (`Event::SessionExpired`); a completed handshake answers it. The count is
+monotonic and a peer that only responds stays at 0. `Core::total_unanswered_handshakes()` sums
+it over every peer, removed peers included, so a consumer with a peer registry polls one
+number and looks up the peer when it grows (`EngineHandle::unanswered_handshakes` /
+`total_unanswered_handshakes`); `Event` and `PeerStats` are unchanged.
 
 **Inbound destinations.** `PeerConfig::inbound_destinations` (`None` by default: unchecked)
 restricts where a peer's decrypted packets may be addressed. The core checks the destination
@@ -195,6 +209,8 @@ leaves behind, and the engine's later `send_batch` would map them a second time.
 - Events are published on a `broadcast` channel (`EngineHandle::subscribe`); publishing never
   blocks, and a lagging subscriber loses the oldest events.
 - Drops are counted per reason (`EngineHandle::drop_counters`) and published as events.
+- Unanswered handshake initiations are counted per peer and in total
+  (`EngineHandle::unanswered_handshakes` / `total_unanswered_handshakes`, see nsplane-core).
 - Traffic is counted per peer (`PeerStats`: wire bytes and plaintext bytes) and per transport
   (`EngineHandle::transport_stats`: datagrams and bytes each way, failed sends), the latter
   once per batch by whoever moved it (the transport's receive/transmit tasks, or the owner
@@ -450,6 +466,9 @@ For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitt
 several sources round-robin and reports the smallest of their MTUs. The splitter awaits
 only the chosen sink, but a waiting sink still holds back the engine's next delivery;
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
+`Splitter::stats` returns a `SplitterStats` snapshot (`#[non_exhaustive]`): `misrouted`, and
+`failed`, packets whose chosen sink returned an error or that found every sink gone; a
+delivered packet updates no counter.
 
 **Local-side graph.** Three more primitives join local-side endpoints (TUN devices,
 netstacks, engines, translators) into a graph, so an embedder writes routing closures and
@@ -705,7 +724,10 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
   the previous fd, and a read completed on it but not yet returned is discarded and
   retried on the new one; the old fd closes when no I/O holds it. `disable` parks reads
   and writes until `enable`; `close`, or dropping the last handle, fails the source, the
-  sink and later `replace` calls with `BrokenPipe`. Reads get an MTU + 1 buffer: a longer
+  sink and later `replace` calls with `BrokenPipe`. `clear` removes the installed fd with the
+  same fencing as `replace` and keeps the slot open: the fd closes once no I/O holds it, and
+  reads and writes wait for the next `replace` (a no-op after `close`), so a retired Android
+  generation's fd does not stay parked. Reads get an MTU + 1 buffer: a longer
   read is dropped and counted (`SlotSource::oversize_drops`), a 0-byte read is
   `UnexpectedEof`. Each packet is one write without header; a short write is `WriteZero`.
   No offloads, and the MTU watch keeps the value given to `new`. The caller keeps its own
@@ -719,7 +741,10 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
   thread, and fails with `PushError::Full` or `PushError::Closed` (source dropped). The
   source drops and counts packets longer than the MTU (`oversize_drops`), logging the first
   one as a warning, and returns `BrokenPipe` once every input is dropped and the queue is
-  drained. The sink calls `write` synchronously on the engine task; `false` drops the
+  drained. `HostTunSource::set_mtu` changes the MTU, e.g. once an iOS host knows its
+  configured MTU: every packet read afterwards is checked against it, those queued before
+  the call included, the value is published on the `PacketSource::mtu` watch only when it
+  changes, and `oversize_drops` is not reset. The sink calls `write` synchronously on the engine task; `false` drops the
   packet and returns `BrokenPipe`.
 
 ## nsplane-netstack
@@ -1520,16 +1545,21 @@ a `route` fingerprint, and the source port or Echo identifier becomes a token fr
 `MasqueradeConfig::ports`, unique per destination and source. `reverse` restores the LAN
 host's address and port or identifier, after asking the closure again: a reply whose flow
 now gets `None` or another `route` is dropped and the flow removed (`route_changed`, ns's
-rule that the route fingerprint must stay current). The transport checksum is recomputed
+rule that the route fingerprint must stay current). With
+`MasqueradeConfig::recheck_route_on_forward` (default `false`), forward asks the closure for
+every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`), as ns did. The transport checksum is recomputed
 over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
 `MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
 flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
 `verify_checksums`, an invalid transport checksum; beyond the contract, ns drops these
-too). Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
+too). Forward verifies the checksum only for packets it masquerades: for a new flow after the
+closure returned `Some` (a corrupt first packet records no flow), for a recorded flow before
+the route recheck; a packet that passes unchanged is never dropped for its checksum. Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
 refuses new flows, as the contract and ns require, while a `Conntrack` evicts its least
 recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
 protocols and replies of unknown flows pass unchanged. A local side that answers pings
-itself can turn a forwarded `ICMPv6` Echo request into its reply with
+itself can recognize a forwarded `ICMPv6` Echo request with the read-only
+`nsplane_packet::icmp::is_echo_request` and turn it into its reply with
 `nsplane_packet::icmp::echo_reply_in_place`, and `reverse` takes it back to the LAN host
 (`crates/nsplane-e2e/tests/masquerade.rs`). A criterion bench
 (`crates/nsplane-nat/benches/masquerade.rs`) measures both directions.

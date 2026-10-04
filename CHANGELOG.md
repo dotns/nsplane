@@ -33,6 +33,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remote (`NotConnected` on a bound socket) and `UdpSocket::peer_addr` returns it (`None`
   for a bound socket). `owns` reports `Flow` for the tuple only and `Listener` for other
   remotes. A duplicate tuple fails with `AddrInUse` (ns's MN-3).
+- `nsplane-packet`: `icmp::is_echo_request(packet) -> bool`, a read-only classifier for an
+  IPv4 ICMP or IPv6 `ICMPv6` Echo request (code 0, full ICMP header, first fragment only; no
+  IPv6 extension headers; checksums not verified; bytes beyond the IP length accepted)
+  (ns's MQ-10).
+- `nsplane-tun`: `HostTunSource::set_mtu(&mut self, mtu: u16)` changes a `host_tun` MTU after
+  creation: packets read afterwards, those queued before the call included, are checked
+  against it, the `PacketSource::mtu` watch is updated only on a change and
+  `oversize_drops` is not reset (ns's MQ-11).
+- `nsplane-tun`: `TunSlot::clear(&self)` removes the installed fd with the fencing of
+  `replace` and keeps the slot open; the fd closes once no I/O uses it and reads and writes
+  wait for the next `replace`. It does nothing after `close` (ns's MQ-16).
+- `nsplane`: `Splitter::stats()` returns a `SplitterStats` snapshot (`#[non_exhaustive]`)
+  with `misrouted` (index out of range) and `failed` (the chosen sink returned an error, or
+  every sink was gone); `Splitter::misrouted()` stays (ns's MQ-12).
+- `nsplane-core`: `Core::unanswered_handshakes(peer) -> Option<u64>` and
+  `Core::total_unanswered_handshakes() -> u64` count handshake initiations that got no
+  response (superseded by another initiation, or the attempt gave up); monotonic, the total
+  keeps removed peers, a responder never counts. `nsplane`:
+  `EngineHandle::unanswered_handshakes(peer)` and `total_unanswered_handshakes()` (ns's
+  MQ-13).
+- `nsplane-nat`: `MasqueradeConfig::recheck_route_on_forward` (default `false`): forward asks
+  the decision closure for every packet of a recorded flow and, when the route changed,
+  removes the flow and drops the packet with `ROUTE_CHANGED`, counted in
+  `MasqueradeStats::route_changed` (ns's MQ-14).
+
+### Changed
+- `nsplane-nat`: `Masquerade::forward` verifies the transport checksum (with
+  `verify_checksums`) only for packets it masquerades: for a new flow after the decision
+  closure returned `Some`, so a corrupt first packet records no flow, and for a recorded flow
+  before the route recheck. Packets that pass unchanged are no longer dropped as
+  `BAD_CHECKSUM` (ns's MQ-15).
 
 ### Fixed
 - `nsplane-netstack`: a TCP connection reaped by the 5-minute idle timeout now sends an RST
@@ -72,8 +103,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WssDialError`), or `TimedOut` ("wss open timed out") when no dial failed since the last
   session, instead of waiting out the backoff or the 401 token wait (up to 300 s); the
   dial goes on and serves later opens. `None` (the default) keeps opens waiting as before.
-
-### Fixed
 - `nsplane-wss`: a `WssStreamClient` open dropped while its session dial waited no longer
   resets that dial's backoff or 401 token wait (the next dial went at once): session dials
   now run in a task of their own that the waiting opens share.
