@@ -59,8 +59,12 @@
 //!   SYN (SYN set, ACK clear) opens a flow; another TCP packet the closure
 //!   would masquerade without a flow is dropped ([`reasons::TCP_NOT_SYN`]).
 //!   TCP flows keep no state beyond their idle time.
-//! - Unlike ns, the forward direction does not ask the decision closure
-//!   again for a recorded flow; a changed route is noticed on the next reply.
+//! - By default, unlike ns, the forward direction does not ask the decision
+//!   closure again for a recorded flow; a changed route is noticed on the
+//!   next reply. With [`MasqueradeConfig::recheck_route_on_forward`], every
+//!   forward packet of a recorded flow asks it with the flow's original
+//!   tuple, as a reply does, and on [`None`] or another `route` the flow is
+//!   removed and the packet dropped ([`reasons::ROUTE_CHANGED`]), as ns.
 //!
 //! The flows do not live in a [`Conntrack`](crate::Conntrack): a full
 //! `Conntrack` evicts its least recently seen flow, while the masquerade must
@@ -155,6 +159,12 @@ pub struct MasqueradeConfig {
     /// Whether the transport checksum of a packet is verified before it is
     /// rewritten; see the [module docs](self). Default `true`, as ns.
     pub verify_checksums: bool,
+    /// Whether every forward packet of a recorded flow asks the decision
+    /// closure again, dropping it with [`reasons::ROUTE_CHANGED`] and
+    /// removing the flow when the route changed; see the
+    /// [module docs](self#flows). Default `false`: the route is checked on
+    /// replies only, at no cost to forward packets. ns checks it on both.
+    pub recheck_route_on_forward: bool,
 }
 
 impl Default for MasqueradeConfig {
@@ -168,6 +178,7 @@ impl Default for MasqueradeConfig {
             icmp_timeout: Duration::from_secs(30),
             tcp_new_flow_requires_syn: true,
             verify_checksums: true,
+            recheck_route_on_forward: false,
         }
     }
 }
@@ -209,8 +220,9 @@ pub struct MasqueradeStats {
     pub tcp_not_syn: u64,
     /// Packets dropped with [`reasons::CAPACITY`].
     pub capacity: u64,
-    /// Replies dropped with [`reasons::ROUTE_CHANGED`], each removing its
-    /// flow.
+    /// Replies (and, with
+    /// [`MasqueradeConfig::recheck_route_on_forward`], forward packets)
+    /// dropped with [`reasons::ROUTE_CHANGED`], each removing its flow.
     pub route_changed: u64,
     /// Packets dropped with [`reasons::TOKENS_EXHAUSTED`].
     pub tokens_exhausted: u64,
@@ -507,7 +519,12 @@ impl Masquerade {
         let now = (self.clock)();
         let hit = self.lock().hit(&info.key, now, &self.config);
         let (source, token) = match hit {
-            Some(flow) => (flow.source, flow.token),
+            Some(flow) => {
+                if self.config.recheck_route_on_forward {
+                    self.recheck_route(&info.key, &flow)?;
+                }
+                (flow.source, flow.token)
+            }
             None => match self.new_flow(&info)? {
                 Some(found) => found,
                 None => return Ok(false),
@@ -533,6 +550,15 @@ impl Masquerade {
         if self.config.verify_checksums && !info.checksum_valid(packet.as_packet()) {
             return Err(reasons::BAD_CHECKSUM);
         }
+        self.recheck_route(&key, &flow)?;
+        info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
+        Ok(true)
+    }
+
+    /// Asks the decision closure again about the recorded flow `flow` of
+    /// forward key `key`; when it no longer answers the flow's route, removes
+    /// the flow and fails with [`reasons::ROUTE_CHANGED`].
+    fn recheck_route(&self, key: &Key, flow: &Flow) -> Result<(), &'static str> {
         // No lock is held here: the closure may call back into `self`.
         let current = (self.decide)(&flow.tuple);
         if current.map(|decision| decision.route) != Some(flow.route) {
@@ -540,15 +566,14 @@ impl Masquerade {
             // Remove the flow unless another thread replaced it meanwhile.
             if table
                 .flows
-                .get(&key)
+                .get(key)
                 .is_some_and(|live| live.token == flow.token && live.route == flow.route)
             {
-                table.remove(&key);
+                table.remove(key);
             }
             return Err(reasons::ROUTE_CHANGED);
         }
-        info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
-        Ok(true)
+        Ok(())
     }
 
     /// Asks the decision closure about a new flow and records it; returns

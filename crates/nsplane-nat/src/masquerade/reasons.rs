@@ -9,6 +9,9 @@ pub const TCP_NOT_SYN: &str = "tcp_not_syn";
 pub const CAPACITY: &str = "capacity";
 /// The decision closure no longer answers a reply's flow with the route the
 /// flow was recorded with (or answers `None`); the flow was removed.
+///
+/// With [`MasqueradeConfig::recheck_route_on_forward`](crate::MasqueradeConfig::recheck_route_on_forward),
+/// a forward packet of a recorded flow is checked and dropped the same way.
 pub const ROUTE_CHANGED: &str = "route_changed";
 /// No token of [`MasqueradeConfig::ports`](crate::MasqueradeConfig::ports)
 /// is free for a new flow within

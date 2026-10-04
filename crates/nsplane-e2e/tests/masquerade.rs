@@ -4,8 +4,8 @@
 //! configured range, and `reverse` restores the client as the destination of the replies.
 //! Covers an `ICMPv6` Echo answered by `nsplane_packet::icmp::echo_reply_in_place` on the
 //! far side (and an IPv4 Echo through `echo_reply_in_place` alone, which the masquerade
-//! passes), a route change that drops the next reply and removes its flow, and the
-//! counters.
+//! passes), a route change that drops the next reply and removes its flow (or, with
+//! `recheck_route_on_forward`, the next forward packet), and the counters.
 //!
 //! The masquerade is applied at the netstack hop by a test-local pump, as `redirect.rs`
 //! does; it moves to the `MapSink` / `MapSource` wrappers once those land.
@@ -62,6 +62,14 @@ struct Rig {
 /// The decision closure masquerades every flow of the client to [`SOURCE`] with the route
 /// `route` holds when it is asked, and passes everything else.
 fn rig() -> Rig {
+    rig_with(MasqueradeConfig {
+        ports: PORTS,
+        ..MasqueradeConfig::default()
+    })
+}
+
+/// As [`rig`], with the masquerade settings `config`.
+fn rig_with(config: MasqueradeConfig) -> Rig {
     let route = Arc::new(AtomicU64::new(1));
     let decisions = Arc::new(AtomicUsize::new(0));
     let (current, counter) = (Arc::clone(&route), Arc::clone(&decisions));
@@ -71,10 +79,6 @@ fn rig() -> Rig {
             source: SOURCE,
             route: current.load(Ordering::Relaxed),
         })
-    };
-    let config = MasqueradeConfig {
-        ports: PORTS,
-        ..MasqueradeConfig::default()
     };
     let masquerade = Arc::new(Masquerade::new(decide, config));
 
@@ -387,5 +391,44 @@ async fn a_route_change_drops_the_reply_and_the_next_flow_is_mapped_again() -> T
     assert_eq!(rig.masquerade.len(), 2);
     let stats = rig.masquerade.stats();
     assert_eq!((stats.created, stats.flows, stats.route_changed), (3, 2, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_recheck_a_route_change_drops_the_next_forward_packet() -> TestResult {
+    let mut rig = rig_with(MasqueradeConfig {
+        ports: PORTS,
+        recheck_route_on_forward: true,
+        ..MasqueradeConfig::default()
+    });
+    let mut incoming = rig.lan.incoming_udp();
+    let any = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    let mut socket = rig.client.bind_udp(any).await?;
+
+    let mut flow = open_udp_flow(&socket, &mut incoming, b"one").await?;
+    socket.send_to(b"two", v6(LAN_HOST, UDP_PORT)).await?;
+    let received = timeout(WAIT, flow.recv())
+        .await?
+        .ok_or("LAN host stopped")?;
+    assert_eq!(&received[..], b"two");
+    assert_eq!(rig.decisions.load(Ordering::Relaxed), 2);
+
+    // The route changes: the client's next datagram is dropped and takes its flow with it.
+    rig.route.store(2, Ordering::Relaxed);
+    socket.send_to(b"late", v6(LAN_HOST, UDP_PORT)).await?;
+    assert_eq!(next_drop(&mut rig.drops).await?, reasons::ROUTE_CHANGED);
+    assert!(timeout(QUIET, flow.recv()).await.is_err());
+    assert_eq!(rig.masquerade.len(), 0);
+
+    // The datagram after it is a new flow with a fresh mapping on the new route.
+    let again = open_udp_flow(&socket, &mut incoming, b"again").await?;
+    assert_ne!(again.peer_addr(), flow.peer_addr());
+    again.send(b"again back").await?;
+    assert_eq!(
+        recv(&mut socket).await?,
+        (b"again back".to_vec(), v6(LAN_HOST, UDP_PORT))
+    );
+    let stats = rig.masquerade.stats();
+    assert_eq!((stats.created, stats.flows, stats.route_changed), (2, 1, 1));
     Ok(())
 }
