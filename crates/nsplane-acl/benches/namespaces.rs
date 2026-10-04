@@ -10,6 +10,8 @@
 //!   members bypass the evaluation.
 //! - `by_source`: the `default` policy for a peer terminating by source address, whose principal
 //!   is each packet's source address.
+//! - `other`: the `default` policy and an `ICMPv6` echo request to the local address accepted by
+//!   an other-protocol scope rule (`AclFilterScope::other_protocols`).
 //! - `crates_acl`: the ns `crates/acl` preset (`AclFilterConfig::crates_acl`: allow-only IPv4
 //!   fragments, the bypass flags on) for a by-source peer sending IPv4 TCP to another address
 //!   than the local one, and a non-first fragment of a datagram whose first fragment it accepted.
@@ -29,8 +31,9 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
     AclAction, AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, AclRule,
-    Direction, Grant, GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap,
-    PinholeGuard, PinholeSpec, Protocol, SourceAssertion, wg_peer_anchor,
+    Direction, Grant, GrantEnd, NamespaceMember, NamespacePolicy, OtherProtocol, OtherProtocolRule,
+    OutboundRule, PeerIdentityMap, PinholeGuard, PinholeSpec, Protocol, SourceAssertion,
+    wg_peer_anchor,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId};
@@ -411,6 +414,26 @@ fn bench_source_scope(c: &mut Criterion) {
     );
 }
 
+/// `other/icmp_echo_scope`: an inbound `ICMPv6` echo request to the local address, accepted by
+/// an `IcmpEcho` scope rule for it.
+fn bench_other_scope(c: &mut Criterion) {
+    let (last, last_addr) = (
+        peer(NAMESPACES - 1, MEMBERS - 1),
+        address(NAMESPACES - 1, MEMBERS - 1),
+    );
+    let engine = Arc::new(AclEngine::new());
+    assert!(engine.load(policy()).is_ok());
+    let rule = OtherProtocolRule::new(OtherProtocol::IcmpEcho, format!("{LOCAL}/128").parse());
+    let scope = AclFilterScope::new().with_other_protocol(rule);
+    let filter = AclFilter::with_scope(engine, identity(), AclFilterConfig::default(), scope);
+    let mut bytes = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+    bytes.extend_from_slice(&last_addr.octets());
+    bytes.extend_from_slice(&LOCAL.octets());
+    bytes.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+    let echo = PacketBuf::from_packet(&bytes);
+    bench_established(c, "other/icmp_echo_scope", &filter, last, true, &echo);
+}
+
 /// The `by_source` and `crates_acl` scenarios.
 fn bench_by_source(c: &mut Criterion) {
     let (last, last_addr) = (
@@ -475,6 +498,7 @@ criterion_group!(
     namespaces,
     bench_namespaces,
     bench_source_scope,
+    bench_other_scope,
     bench_by_source
 );
 criterion_main!(namespaces);
