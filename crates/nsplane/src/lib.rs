@@ -64,6 +64,6 @@ pub use nsplane_packet::{
 };
 pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};
-pub use splitter::Splitter;
+pub use splitter::{Splitter, SplitterStats};
 pub use transport::{BoxFuture, DynTransport, PathMtuReport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};

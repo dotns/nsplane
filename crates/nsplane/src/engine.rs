@@ -1552,6 +1552,12 @@ impl Owner {
             | Command::PeerMtus(..)
             | Command::PathMtuStats(..)) => self.path_mtu_command(command),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
+            Command::UnansweredHandshakes(peer, reply) => {
+                let _ = reply.send(self.core.unanswered_handshakes(peer));
+            }
+            Command::TotalUnansweredHandshakes(reply) => {
+                let _ = reply.send(self.core.total_unanswered_handshakes());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2103,6 +2109,8 @@ const fn settles(command: &Command) -> bool {
             | Command::Inject(..)
             | Command::DropCounters(..)
             | Command::Status(..)
+            | Command::UnansweredHandshakes(..)
+            | Command::TotalUnansweredHandshakes(..)
     )
 }
 

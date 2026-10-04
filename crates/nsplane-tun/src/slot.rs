@@ -3,11 +3,12 @@
 //! [`TunSlot::new`] yields the control handle and a [`SlotSource`] and [`SlotSink`] that do
 //! their I/O on whatever fd is installed in the slot at the time.
 //!
-//! Fencing: every read and write runs under a shared lock that [`TunSlot::replace`] and
-//! [`TunSlot::close`] take exclusively, and only if the fd it waited on is still the
-//! installed one (a generation counter, bumped by every replace and by close). So once
-//! `replace` returned, no syscall runs on the previous fd; a read that completed on it
-//! but was not returned yet is discarded, and the call reads from the new fd instead.
+//! Fencing: every read and write runs under a shared lock that [`TunSlot::replace`],
+//! [`TunSlot::clear`] and [`TunSlot::close`] take exclusively, and only if the fd it waited
+//! on is still the installed one (a generation counter, bumped by each of them). So once
+//! `replace` or `clear` returned, no syscall runs on the previous fd; a read that completed
+//! on it but was not returned yet is discarded, and the call reads from the next installed
+//! fd instead.
 
 use std::fs::File;
 use std::future::poll_fn;
@@ -45,7 +46,7 @@ struct State {
 struct Shared {
     /// Read-locked around every syscall, write-locked to install or remove the fd.
     state: RwLock<State>,
-    /// Bumped by every replace and by close, under the write lock of `state`.
+    /// Bumped by every replace, clear and close, under the write lock of `state`.
     generation: AtomicU64,
     /// Notified after every change that may let waiting I/O proceed or end.
     changed: Notify,
@@ -115,9 +116,9 @@ impl Drop for Control {
 /// `VpnService` hands out a new fd on every reconfiguration.
 ///
 /// [`TunSlot::new`] returns the handle with a [`SlotSource`] and a [`SlotSink`]; the
-/// engine owns those and the host keeps the handle to [`replace`](Self::replace) the fd,
-/// [`disable`](Self::disable) and [`enable`](Self::enable) I/O, and
-/// [`close`](Self::close) the slot. The handle is cheap to clone; every clone controls
+/// engine owns those and the host keeps the handle to [`replace`](Self::replace) and
+/// [`clear`](Self::clear) the fd, [`disable`](Self::disable) and [`enable`](Self::enable)
+/// I/O, and [`close`](Self::close) the slot. The handle is cheap to clone; every clone controls
 /// the same slot. Dropping the last clone closes the slot, so the engine's local side
 /// ends.
 ///
@@ -194,6 +195,31 @@ impl TunSlot {
         Ok(())
     }
 
+    /// Removes the installed fd and keeps the slot open, so a retired fd is closed at once
+    /// instead of staying installed until the next [`replace`](Self::replace).
+    ///
+    /// The fd is fenced as by `replace`: once this returns, no read or write runs on it,
+    /// and a read that completed on it but was not returned yet is discarded. It is closed
+    /// once no I/O uses it any more. The slot is then empty, as a new one: reads and
+    /// writes wait, nothing is lost or fails, until the next `replace` installs an fd.
+    /// Whether I/O is enabled does not change.
+    ///
+    /// On an empty slot this only bumps the fence; after [`close`](Self::close) it does
+    /// nothing.
+    pub fn clear(&self) {
+        let shared = self.shared();
+        let previous = {
+            let mut state = shared.write();
+            if state.closed {
+                return;
+            }
+            shared.generation.fetch_add(1, Ordering::AcqRel);
+            state.fd.take()
+        };
+        shared.changed.notify_waiters();
+        drop(previous);
+    }
+
     /// Parks I/O: reads and writes wait, nothing is lost or fails, until
     /// [`enable`](Self::enable). A syscall already running completes.
     pub fn disable(&self) {
@@ -241,8 +267,8 @@ impl PacketSource for SlotSource {
     /// counted ([`SlotSource::oversize_drops`]) and the next packet is read. A read of 0
     /// bytes fails with [`io::ErrorKind::UnexpectedEof`]. While the slot is empty or
     /// disabled this waits; once it is closed this fails with
-    /// [`io::ErrorKind::BrokenPipe`]. A read that completed on an fd that was replaced
-    /// meanwhile is discarded (see [`TunSlot::replace`]).
+    /// [`io::ErrorKind::BrokenPipe`]. A read that completed on an fd that was replaced or
+    /// cleared meanwhile is discarded (see [`TunSlot::replace`]).
     ///
     /// Cancel-safe: a packet is only taken off the fd in the same poll that returns it.
     async fn recv(&mut self) -> io::Result<PacketBuf> {
@@ -268,7 +294,7 @@ impl PacketSource for SlotSource {
                 continue;
             };
             let Some(len) = result? else { continue };
-            // Fenced: the fd was replaced or the slot closed after the read.
+            // Fenced: the fd was replaced or cleared, or the slot closed, after the read.
             if self.shared.generation.load(Ordering::Acquire) != generation {
                 continue;
             }
@@ -305,7 +331,8 @@ impl PacketSink for SlotSink {
     /// A short write fails with [`io::ErrorKind::WriteZero`]. While the slot is empty or
     /// disabled this waits; once it is closed this fails with
     /// [`io::ErrorKind::BrokenPipe`]. A write never runs on an fd after
-    /// [`TunSlot::replace`] removed it: one waiting for that fd is done on the new one.
+    /// [`TunSlot::replace`] or [`TunSlot::clear`] removed it: one waiting for that fd is
+    /// done on the next installed one.
     async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
         let bytes = packet.as_packet();
         loop {
@@ -384,6 +411,11 @@ fn check_written(written: usize, len: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
     use super::*;
 
     #[test]
@@ -391,5 +423,79 @@ mod tests {
         assert!(check_written(60, 60).is_ok());
         let err = check_written(59, 60).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// The slot's end as an fd and the host's end.
+    fn pair() -> (OwnedFd, UnixDatagram) {
+        let (slot, host) = UnixDatagram::pair().unwrap();
+        (OwnedFd::from(slot), host)
+    }
+
+    #[tokio::test]
+    async fn clear_closes_the_fd_and_keeps_the_slot_open() {
+        let (slot, mut source, sink) = TunSlot::new(100);
+        let (fd, host) = pair();
+        slot.replace(fd).unwrap();
+        host.send(b"before").unwrap();
+        let packet = timeout(WAIT, source.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.as_packet(), b"before");
+
+        slot.clear();
+        // The slot's end is closed: the host can no longer send to it.
+        assert!(host.send(b"after").is_err());
+        // Still open: I/O waits for the next fd instead of failing.
+        let send = sink.send(PacketBuf::from_packet(b"out"), PeerId::new(0));
+        assert!(timeout(Duration::from_millis(50), send).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), source.recv())
+                .await
+                .is_err()
+        );
+        // Clearing an empty slot changes nothing.
+        slot.clear();
+
+        let (fd, host) = pair();
+        slot.replace(fd).unwrap();
+        host.send(b"next").unwrap();
+        let packet = timeout(WAIT, source.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.as_packet(), b"next");
+    }
+
+    #[tokio::test]
+    async fn pending_recv_waits_across_clear() {
+        let (slot, mut source, _sink) = TunSlot::new(100);
+        let (fd, old) = pair();
+        slot.replace(fd).unwrap();
+        let recv = tokio::spawn(async move { source.recv().await.map(|p| p.as_packet().to_vec()) });
+        tokio::task::yield_now().await;
+
+        slot.clear();
+        let (fd, host) = pair();
+        slot.replace(fd).unwrap();
+        host.send(b"next").unwrap();
+        let packet = timeout(WAIT, recv).await.unwrap().unwrap().unwrap();
+        assert_eq!(packet, b"next");
+        assert!(old.send(b"late").is_err());
+    }
+
+    #[tokio::test]
+    async fn clear_after_close_keeps_the_slot_closed() {
+        let (slot, mut source, sink) = TunSlot::new(100);
+        let (fd, _host) = pair();
+        slot.replace(fd).unwrap();
+        slot.close();
+        slot.clear();
+
+        let err = source.recv().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let send = sink.send(PacketBuf::from_packet(b"out"), PeerId::new(0));
+        assert_eq!(send.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let (fd, _host) = pair();
+        assert_eq!(
+            slot.replace(fd).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 }

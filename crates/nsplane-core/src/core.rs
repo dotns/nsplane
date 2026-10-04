@@ -133,6 +133,8 @@ pub struct Core {
     schedule: Option<Schedule>,
     /// The `now` of the latest call that passed the time.
     now: Option<Instant>,
+    /// Unanswered handshake initiations of the peers removed so far.
+    removed_unanswered_handshakes: u64,
 }
 
 impl fmt::Debug for Core {
@@ -163,6 +165,7 @@ impl Core {
             outputs: VecDeque::new(),
             schedule: None,
             now: None,
+            removed_unanswered_handshakes: 0,
         }
     }
 
@@ -358,11 +361,13 @@ impl Core {
             let completed = peer.take_completed_handshakes();
             if completed > 0 {
                 peer.expired = false;
+                peer.initiation_answered();
                 handshakes_completed(&mut self.outputs, id, completed, None, None);
             }
             match result {
                 TunnResult::Done => peer.expired = false,
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    peer.initiation_abandoned();
                     if !mem::replace(&mut peer.expired, true) {
                         self.outputs
                             .push_back(Output::Event(Event::SessionExpired { peer: id }));
@@ -454,6 +459,32 @@ impl Core {
             data_tx: p.data_tx(),
             last_handshake,
         })
+    }
+
+    /// Handshake initiations transmitted to `peer` that got no response; `None` for an
+    /// unknown peer.
+    ///
+    /// An initiation counts once when another one is transmitted to the peer while it is
+    /// still unanswered (a retry after `REKEY_TIMEOUT`, a [`Core::force_handshake`], ...) or
+    /// when the peer's handshake attempt gives up (`Event::SessionExpired`). A completed
+    /// handshake answers it. The count is monotonic; a peer that only ever responds to
+    /// handshakes stays at 0.
+    pub fn unanswered_handshakes(&self, peer: PeerId) -> Option<u64> {
+        self.peers.peer(peer).map(Peer::unanswered_handshakes)
+    }
+
+    /// The sum of [`Core::unanswered_handshakes`] over every peer, including the peers
+    /// removed since the core was created: monotonic.
+    ///
+    /// Cheap to poll (one pass over the peers, without locks): a consumer that keeps a registry of its peers (e.g. ns) can watch this
+    /// total and act on an increase, such as a registry resync when a peer stops answering,
+    /// then find the peer with [`Core::unanswered_handshakes`].
+    pub fn total_unanswered_handshakes(&self) -> u64 {
+        self.peers
+            .iter()
+            .fold(self.removed_unanswered_handshakes, |total, (_, p)| {
+                total.saturating_add(p.unanswered_handshakes())
+            })
     }
 
     /// The peer a packet to `dst` is routed to: the longest allowed-IP match, as on the send
@@ -663,10 +694,16 @@ impl Core {
                 return;
             }
             ConfigChange::RemovePeer(key) => {
+                if let Some(p) = self.peers.get(&key).and_then(|id| self.peers.peer(id)) {
+                    self.removed_unanswered_handshakes = self
+                        .removed_unanswered_handshakes
+                        .saturating_add(p.unanswered_handshakes());
+                }
                 self.peers.remove(&key);
                 return;
             }
             ConfigChange::RemoveAllPeers => {
+                self.removed_unanswered_handshakes = self.total_unanswered_handshakes();
                 self.peers.clear();
                 return;
             }
@@ -1104,6 +1141,7 @@ impl Core {
 
         if completed > 0 {
             peer.expired = false;
+            peer.initiation_answered();
             let rtt = (kind == MessageKind::HandshakeResponse)
                 .then(|| peer.tunnel_mut().stats().4)
                 .flatten()
@@ -1223,6 +1261,9 @@ fn transmit(
     let current = peer.path();
     if let Some(path) = policy.select(id, kind).or(current) {
         peer.add_tx(data.len() as u64);
+        if kind == MessageKind::HandshakeInit {
+            peer.initiation_sent();
+        }
         outputs.push_back(Output::Transmit { path, data });
     } else {
         pool.put(data);
@@ -1399,6 +1440,132 @@ mod tests {
         assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
         assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
         assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
+    }
+
+    /// A core with private key `own` and peer `peer` at `path`.
+    fn core_with_peer(own: u8, peer: u8, path: Path, now: Instant) -> (Core, PeerId) {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([own; 32])),
+            ..CoreConfig::default()
+        });
+        let key = x25519::PublicKey::from(&x25519::StaticSecret::from([peer; 32]));
+        let mut config = PeerConfig::new(key);
+        config.path = Some(path);
+        core.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(config)), now);
+        let id = core.peer_id(&key).unwrap();
+        (core, id)
+    }
+
+    fn path(port: u16) -> Path {
+        Path {
+            transport: nsplane_packet::TransportId::new(0),
+            addr: std::net::SocketAddr::from(([192, 0, 2, 1], port)),
+            ecn: Ecn::NotEct,
+        }
+    }
+
+    /// The datagrams `core` queued, its other outputs discarded.
+    fn transmits(core: &mut Core) -> Vec<PacketBuf> {
+        let mut sent = Vec::new();
+        while let Some(output) = core.poll_output() {
+            if let Output::Transmit { data, .. } = output {
+                sent.push(data);
+            }
+        }
+        sent
+    }
+
+    /// More than `REKEY_TIMEOUT` plus the largest retry jitter.
+    const RETRY: Duration = Duration::from_millis(5_400);
+
+    #[test]
+    fn unanswered_initiations_count_once_per_retry() {
+        let now = Instant::now();
+        let (mut core, id) = core_with_peer(1, 2, path(2), now);
+        assert_eq!(core.unanswered_handshakes(id), Some(0));
+
+        core.force_handshake(id, None, now);
+        assert_eq!(transmits(&mut core).len(), 1);
+        assert_eq!(core.unanswered_handshakes(id), Some(0));
+
+        for retry in 1..=3 {
+            core.handle_timeout(now + RETRY * retry);
+            assert_eq!(transmits(&mut core).len(), 1);
+            assert_eq!(core.unanswered_handshakes(id), Some(u64::from(retry)));
+        }
+        assert_eq!(core.total_unanswered_handshakes(), 3);
+
+        // The handshake attempt gives up: the last initiation is unanswered too, once.
+        core.handle_timeout(now + Duration::from_secs(95));
+        assert_eq!(core.unanswered_handshakes(id), Some(4));
+        core.handle_timeout(now + Duration::from_secs(100));
+        assert_eq!(core.unanswered_handshakes(id), Some(4));
+        // A new attempt starts with nothing outstanding.
+        core.force_handshake(id, None, now + Duration::from_secs(101));
+        assert_eq!(core.unanswered_handshakes(id), Some(4));
+    }
+
+    #[test]
+    fn answered_initiations_do_not_count() {
+        let now = Instant::now();
+        let (mut a, b_id) = core_with_peer(1, 2, path(2), now);
+        let (mut b, a_id) = core_with_peer(2, 1, path(1), now);
+
+        a.force_handshake(b_id, None, now);
+        for init in transmits(&mut a) {
+            b.handle_input(
+                Input::Datagram {
+                    path: path(1),
+                    data: init,
+                },
+                now,
+            );
+        }
+        for response in transmits(&mut b) {
+            a.handle_input(
+                Input::Datagram {
+                    path: path(2),
+                    data: response,
+                },
+                now,
+            );
+        }
+        assert_eq!(a.unanswered_handshakes(b_id), Some(0));
+
+        // The answer cleared the outstanding initiation: a new one does not count it.
+        a.force_handshake(b_id, None, now);
+        assert_eq!(a.unanswered_handshakes(b_id), Some(0));
+        a.handle_timeout(now + RETRY);
+        assert_eq!(a.unanswered_handshakes(b_id), Some(1));
+
+        // The responder never counts.
+        assert_eq!(b.unanswered_handshakes(a_id), Some(0));
+        assert_eq!(b.total_unanswered_handshakes(), 0);
+    }
+
+    #[test]
+    fn the_total_survives_peer_removal() {
+        let now = Instant::now();
+        let (mut core, id) = core_with_peer(1, 2, path(2), now);
+        core.force_handshake(id, None, now);
+        core.handle_timeout(now + RETRY);
+        core.handle_timeout(now + RETRY * 2);
+        assert_eq!(core.total_unanswered_handshakes(), 2);
+
+        let key = x25519::PublicKey::from(&x25519::StaticSecret::from([2; 32]));
+        core.handle_input(
+            Input::Config(ConfigChange::RemovePeer(key)),
+            now + RETRY * 2,
+        );
+        assert_eq!(core.unanswered_handshakes(id), None);
+        assert_eq!(core.total_unanswered_handshakes(), 2);
+
+        let (mut other, id) = core_with_peer(1, 3, path(3), now);
+        other.force_handshake(id, None, now);
+        other.handle_timeout(now + RETRY);
+        other.handle_input(Input::Config(ConfigChange::RemoveAllPeers), now + RETRY);
+        assert_eq!(other.total_unanswered_handshakes(), 1);
+        assert_eq!(other.unanswered_handshakes(id), None);
     }
 
     /// Sends data on a fixed path, everything else on the current one.

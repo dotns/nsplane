@@ -1,8 +1,10 @@
 //! An engine whose local side is a `host_tun`, driven by a test host on a plain thread, peered
-//! with a channel-transport node: packets in both directions and a host writer that closes.
+//! with a channel-transport node: packets in both directions, a host writer that closes and an
+//! MTU set on the source after packets were queued, before the engine is built.
 
 #![cfg(target_os = "linux")]
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10,12 +12,12 @@ use std::time::Duration;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    AllowedIp, ChannelTransport, DROP_SINK_CLOSED, Ecn, Engine, EngineBuilder, EngineHandle, Path,
-    Peer, TransportId,
+    AllowedIp, ChannelTransport, DROP_SINK_CLOSED, Ecn, Engine, EngineBuilder, EngineHandle,
+    PacketBatch, PacketBuf, PacketSource, Path, Peer, TransportId,
 };
 use nsplane_e2e::{Family, Node, Options, QUIET, TestResult, WAIT, payload, udp4, udp6};
-use nsplane_tun::{HOST_TUN_DEFAULT_CAPACITY, HostTunInput, host_tun};
-use tokio::sync::mpsc;
+use nsplane_tun::{HOST_TUN_DEFAULT_CAPACITY, HostTunInput, HostTunSource, host_tun};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 
 const SEED: u8 = 1;
@@ -209,5 +211,92 @@ async fn a_closed_host_writer_stops_delivery() -> TestResult {
     let outbound = Host::packet_to(&node, Family::V4, 64);
     host.push(vec![outbound.clone()]).await?;
     assert_eq!(node.expect_delivery().await?.1, outbound);
+    Ok(())
+}
+
+/// A `HostTunSource` the engine reads only once `open` turns true, so packets the host
+/// queued wait until the test made the peers known.
+struct Gated {
+    source: HostTunSource,
+    open: watch::Receiver<bool>,
+}
+
+impl Gated {
+    async fn wait_open(&mut self) -> io::Result<()> {
+        self.open
+            .wait_for(|open| *open)
+            .await
+            .map(|_| ())
+            .map_err(|_| io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+impl PacketSource for Gated {
+    async fn recv(&mut self) -> io::Result<PacketBuf> {
+        self.wait_open().await?;
+        self.source.recv().await
+    }
+
+    async fn recv_batch(&mut self, batch: &mut PacketBatch) -> io::Result<()> {
+        self.wait_open().await?;
+        self.source.recv_batch(batch).await
+    }
+
+    fn mtu(&self) -> watch::Receiver<u16> {
+        self.source.mtu()
+    }
+}
+
+#[tokio::test]
+async fn set_mtu_before_the_engine_applies_to_queued_packets() -> TestResult {
+    const INITIAL_MTU: u16 = 1280;
+    let a = (
+        TransportId::new(1),
+        SocketAddr::from(([192, 0, 2, 1], 1000)),
+    );
+    let b = (
+        TransportId::new(2),
+        SocketAddr::from(([192, 0, 2, 2], 2000)),
+    );
+    let (link_a, link_b) = ChannelTransport::pair(1024, a, b);
+    let mut node = Node::new(2, b.0, b.1, link_b, Options::default());
+
+    // The host pushes before the configured MTU is known: one packet above the configured
+    // MTU, and one above the initial MTU that fits the configured one.
+    let (input, mut source, sink) = host_tun(
+        INITIAL_MTU,
+        HOST_TUN_DEFAULT_CAPACITY,
+        Arc::new(|_: &[u8]| true),
+    );
+    let too_long = Host::packet_to(&node, Family::V6, usize::from(nsplane_e2e::MTU) - 47);
+    let fits = Host::packet_to(&node, Family::V4, usize::from(nsplane_e2e::MTU) - 28);
+    assert_eq!(too_long.len(), usize::from(nsplane_e2e::MTU) + 1);
+    assert!(fits.len() > usize::from(INITIAL_MTU));
+    input.push(&too_long)?;
+    input.push(&fits)?;
+    source.set_mtu(nsplane_e2e::MTU);
+
+    let (open, gate) = watch::channel(false);
+    let engine = EngineBuilder::new(Gated { source, open: gate }, sink)
+        .private_key(StaticSecret::from([SEED; 32]))
+        .transport(link_a)
+        .build()?;
+    let (_, written) = mpsc::unbounded_channel();
+    let host = Host {
+        handle: engine.handle(),
+        _engine: engine,
+        input,
+        written,
+    };
+    assert_eq!(host.handle.mtu().await?, nsplane_e2e::MTU);
+    introduce(&host, &node).await?;
+    open.send(true)?;
+
+    // The queued packet that fits the new MTU is forwarded, the other one was dropped.
+    assert_eq!(node.expect_delivery().await?.1, fits);
+    node.expect_no_delivery().await?;
+    let next = Host::packet_to(&node, Family::V4, 64);
+    host.push(vec![next.clone()]).await?;
+    assert_eq!(node.expect_delivery().await?.1, next);
     Ok(())
 }

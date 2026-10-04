@@ -267,6 +267,8 @@ pub(crate) enum Command {
     PeerMtus(oneshot::Sender<watch::Receiver<PeerMtus>>),
     PathMtuStats(oneshot::Sender<PathMtuStats>),
     Shutdown(oneshot::Sender<()>),
+    UnansweredHandshakes(PeerId, oneshot::Sender<Option<u64>>),
+    TotalUnansweredHandshakes(oneshot::Sender<u64>),
 }
 
 /// A cheap, cloneable handle to a running engine.
@@ -678,6 +680,28 @@ impl EngineHandle {
     /// Rates are left to the caller: sample this periodically and take differences.
     pub async fn status(&self) -> Result<EngineStatus, EngineError> {
         self.call(Command::Status).await
+    }
+
+    /// Handshake initiations sent to a peer that got no response; `None` for an unknown peer.
+    ///
+    /// An initiation counts once when another one is sent to the peer while it is still
+    /// unanswered (a retry after `REKEY_TIMEOUT`, an [`EngineHandle::force_handshake`], ...)
+    /// or when the peer's handshake attempt gives up (`Event::SessionExpired`). A completed
+    /// handshake answers it. The count is monotonic; a peer that only ever responds to
+    /// handshakes stays at 0.
+    pub async fn unanswered_handshakes(&self, peer: PeerId) -> Result<Option<u64>, EngineError> {
+        self.call(|tx| Command::UnansweredHandshakes(peer, tx))
+            .await
+    }
+
+    /// The sum of [`EngineHandle::unanswered_handshakes`] over every peer, including the peers
+    /// removed since the engine started: monotonic.
+    ///
+    /// Cheap to poll: a consumer that keeps a registry of its peers (e.g. ns) can watch this
+    /// total and act on an increase, such as a registry resync when a peer stops answering,
+    /// then find the peer with [`EngineHandle::unanswered_handshakes`].
+    pub async fn total_unanswered_handshakes(&self) -> Result<u64, EngineError> {
+        self.call(Command::TotalUnansweredHandshakes).await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and
