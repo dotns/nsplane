@@ -41,7 +41,7 @@ where it is described below.
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `MapSink` / `MapSource` / `MapVerdict`, `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
-| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
@@ -527,15 +527,42 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - TCP, TLS and the WebSocket upgrade within `connect_timeout` (10 s), to `connect_addr`
   or the URL's host, with `server_name` (default the URL's host), the extra `headers` and,
   with a `BearerProvider`, `Authorization: Bearer <token>` fetched per dial.
+- A `ws://` URL is accepted only with `allow_plaintext` (default `false`): TCP and the
+  upgrade without TLS (port 80 by default; `server_name` and `tls` unused), everything
+  else as for `wss://`. The connection's byte stream is a crate-private enum over the TLS
+  stream (boxed, once per dial) and the plain `TcpStream`; one match per poll.
+- An upgrade answered with any HTTP response (no 101) fails the dial with a public
+  `WssDialError` inside the `io::Error` (`get_ref()` + `downcast_ref`): `status`, the
+  response `headers` (non-UTF-8 values lossily) and the start of the `body`, the bytes
+  that arrived with the head up to `WssDialError::MAX_BODY` (512, ns's log cut). The kind
+  and message are unchanged: `PermissionDenied`, "wss upgrade rejected with HTTP {status}"
+  for 401/403; `Other`, "wss connect failed: HTTP error: {status}" otherwise. Stream
+  client opens waiting behind that dial get a copy with the detail.
 - An upgrade answered with 401 or 403 is reported as `LinkState::Rejected(status)` on the
   carrier's `state()` watch (and counted in its stats). After a 401 the next dial waits
   until the provider yields a different token (polled every `token_poll`, 2 s, at most
   `token_wait`, 300 s); a 403, and a 401 without a provider, back off like any failure.
-- Backoff: every dial but the first waits `backoff_min` (2 s) after a link that came up,
-  doubled after each failed dial up to `backoff_max` (60 s).
+- Backoff: every dial but the first waits. After a link or session that came up (for the
+  dialer and the server, the dial after a successful one) it waits `reconnect_delay` when
+  set, and a dial failing after it waits `backoff_min` (2 s), doubled after each further
+  failure up to `backoff_max` (60 s); the connector models this as a distinct
+  `Retry::Reconnect` state, so the failure backoff restarts at the floor instead of
+  doubling the reconnect delay. Without `reconnect_delay` (the default) the wait after a
+  link is `backoff_min` as the first step of the doubling, as before. A stream client's
+  capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
-  (pongs included) arrived for `read_idle` (35 s). No message above `MAX_MESSAGE`
-  (4 x 65 535 bytes) is read.
+  (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
+  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. No message
+  above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
+- Events: `WssDialer::events()` and `WssStreamClient::events()` subscribe to a
+  `broadcast` channel in the shared connector (`WssDialEvent::CAPACITY` = 64; a lagging
+  receiver sees `RecvError::Lagged`), one `WssDialEvent` per occurrence: the connector
+  sends `DialFailed`, `TimedOut` and `Rejected(status)` for each failed dial; the dialer
+  sends `Connected` and `Lost` from `LinkDialer::on_state` (so a link's `Connected`, sent
+  when the transport reports it up right after the dial, precedes its `Lost`), the stream
+  client when a session comes up and where it ends. Without a receiver a send is a lock
+  and a count check, no allocation; events are per dial, never per datagram. The counters
+  and the `state()` watch are unchanged.
 - TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
   takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
   default protocol versions and no client auth); `WssTls::Config` takes a complete
@@ -592,8 +619,8 @@ behind a terminate (NSGW, or `WssStreamServer`).
   costing its payload plus 64 bytes. Over budget, a TCP stream is reset (reads fail with
   `ConnectionReset`) and a UDP datagram is dropped while the flow stays.
 - Reconnection: when a session ends (socket error, close, read idle) every stream and flow
-  on it fails; the next open dials again after the backoff. Frames for unknown stream ids
-  are ignored and counted in `WssStreamStats`.
+  on it fails; the next open dials again after `reconnect_delay` (or the backoff). Frames
+  for unknown stream ids are ignored and counted in `WssStreamStats`.
 
 **Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
 relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
@@ -620,8 +647,8 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   `Close { reason, to_backend, from_backend }`; sending never waits, an event that does
   not fit is counted in `WssServerStats::event_drops`.
 - Reconnection: one session at a time carries every stream. When it ends its streams are
-  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after the
-  backoff; a shutdown closes the open streams and the session.
+  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after
+  `reconnect_delay` (or the backoff); a shutdown closes the open streams and the session.
 
 ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
 here, ns can delete `tunnel-ws` whole.
@@ -635,8 +662,13 @@ CLOSE; the UDP socket binds to the backend's address family.
 
 **Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
 `crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
-relay and checks the frames against the ns layouts; `nsplane-e2e` `wss_datagram` runs two
-engines over `WssDialer` (401, 403, reconnect, read idle); `examples/tests/wss.rs` and the
+relay (and a plain one for `ws://`) and checks the frames against the ns layouts;
+`nsplane-e2e` `wss_datagram` runs two engines over `WssDialer` (401, 403, reconnect, read
+idle), `wss_plain` over `ws://`, `wss_dial_error` checks the `WssDialError` of a 401
+and a 503 (header, truncated body) from the dialer and the stream client,
+`wss_keepalive` the ping cadence and read idle of both carriers at two settings, and
+`wss_events` the event sequence (up, lost, up, 401 x 2, 403 x 2, relay down, timeout) and
+the reconnect delay against the doubling backoff on both carriers; `examples/tests/wss.rs` and the
 `relay-wss` cells of `just e2e-examples` run the examples' relay client on it.
 
 ## nsplane-tun

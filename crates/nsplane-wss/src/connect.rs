@@ -1,32 +1,188 @@
 //! The connection setup shared by the carriers: URL, TLS, request headers and the bearer,
-//! 401/403 classification and the dial backoff.
+//! 401/403 classification, the dial backoff and the dial events.
 
 use std::fmt;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use nsplane::LinkState;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::handshake::client::{Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::MAX_MESSAGE;
 use crate::config::{WssConfig, WssTls};
 
-/// A dialed WSS connection.
-pub(crate) type Ws = WebSocketStream<TlsStream<TcpStream>>;
+/// A dialed WebSocket connection.
+pub(crate) type Ws = WebSocketStream<Carrier>;
+
+/// The byte stream under a WebSocket connection: TLS for `wss://`, plain TCP for `ws://`.
+/// The TLS stream is boxed (once per dial) to keep the plain variant small.
+pub(crate) enum Carrier {
+    Tls(Box<TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+impl AsyncRead for Carrier {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Carrier {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tls(stream) => stream.is_write_vectored(),
+            Self::Plain(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// A WebSocket upgrade refused with an HTTP response: the inner error of the
+/// [`io::Error`] a failed dial returns, reached with
+/// `error.get_ref().and_then(|e| e.downcast_ref::<WssDialError>())`.
+///
+/// Its message is the dial error's: `wss upgrade rejected with HTTP <status>` for a 401 or
+/// 403 (an [`io::ErrorKind::PermissionDenied`] error), `wss connect failed: HTTP error:
+/// <status>` for any other status (an [`io::ErrorKind::Other`] error).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct WssDialError {
+    /// The HTTP status of the response.
+    pub status: u16,
+    /// The response headers, as name and value, in order; a value that is not UTF-8 is
+    /// converted lossily.
+    pub headers: Vec<(String, String)>,
+    /// The start of the response body: the bytes that arrived with the response head, at
+    /// most [`MAX_BODY`](Self::MAX_BODY).
+    pub body: Bytes,
+}
+
+impl WssDialError {
+    /// The most body bytes kept.
+    pub const MAX_BODY: usize = 512;
+
+    fn new(response: &Response) -> Self {
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                (name.as_str().to_owned(), value)
+            })
+            .collect();
+        let body = response.body().as_deref().unwrap_or_default();
+        Self {
+            status: response.status().as_u16(),
+            headers,
+            body: Bytes::copy_from_slice(&body[..body.len().min(Self::MAX_BODY)]),
+        }
+    }
+}
+
+impl fmt::Display for WssDialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if is_rejection(self.status) {
+            return write!(f, "wss upgrade rejected with HTTP {}", self.status);
+        }
+        match StatusCode::from_u16(self.status) {
+            Ok(status) => write!(f, "wss connect failed: HTTP error: {status}"),
+            Err(_) => write!(f, "wss connect failed: HTTP error: {}", self.status),
+        }
+    }
+}
+
+impl std::error::Error for WssDialError {}
+
+/// One dial or connection of a [`WssDialer`](crate::WssDialer) or a
+/// [`WssStreamClient`](crate::WssStreamClient), as their `events()` receivers see it: one
+/// event per occurrence.
+///
+/// Events go out on a [`broadcast`] channel of [`CAPACITY`](Self::CAPACITY) events; a
+/// receiver that falls further behind loses the oldest ones and sees
+/// [`RecvError::Lagged`](broadcast::error::RecvError::Lagged) with their count. Without a
+/// receiver, nothing is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WssDialEvent {
+    /// A link or session came up.
+    Connected,
+    /// A link or session that came up ended: closed, failed, or silent past
+    /// [`WssConfig::read_idle`].
+    Lost,
+    /// A dial failed: TCP, TLS, the bearer token, or an upgrade refused with an HTTP status
+    /// other than 401 and 403.
+    DialFailed,
+    /// A dial did not finish within [`WssConfig::connect_timeout`].
+    TimedOut,
+    /// A dial was refused with this HTTP status, 401 or 403.
+    Rejected(u16),
+}
+
+impl WssDialEvent {
+    /// How many events a receiver may fall behind before it loses the oldest.
+    pub const CAPACITY: usize = 64;
+}
 
 /// Locks `mutex`, ignoring poisoning: the guarded state stays consistent.
 pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
@@ -65,6 +221,9 @@ enum Retry {
     Now,
     /// This backoff.
     Backoff(Duration),
+    /// After a connection that came up: [`WssConfig::reconnect_delay`]; a dial failing
+    /// after it backs off from the floor.
+    Reconnect(Duration),
     /// After a 401: a token other than the refused one.
     NewToken(Option<String>),
 }
@@ -76,13 +235,17 @@ fn next_backoff(wait: Option<Duration>, min: Duration, max: Duration) -> Duratio
         .min(max)
 }
 
-/// The HTTP status of a refused upgrade that is a rejection (401 or 403).
-fn rejection(error: &WsError) -> Option<u16> {
+/// The detail of an upgrade refused with an HTTP response.
+fn refusal(error: &WsError) -> Option<WssDialError> {
     let WsError::Http(response) = error else {
         return None;
     };
-    let status = response.status().as_u16();
-    matches!(status, 401 | 403).then_some(status)
+    Some(WssDialError::new(response))
+}
+
+/// Whether a refusal with `status` is a rejection (401 or 403).
+const fn is_rejection(status: u16) -> bool {
+    matches!(status, 401 | 403)
 }
 
 /// The WebSocket request to `url` with `headers` and, when `token` is set, a bearer
@@ -116,15 +279,16 @@ fn ws_config() -> WebSocketConfig {
 }
 
 /// Dials the WSS connections of one [`WssConfig`], one at a time, with its backoff and
-/// rejection handling, and owns the state watch.
+/// rejection handling, and owns the state watch and the dial events.
 pub(crate) struct Connector {
     config: WssConfig,
     /// The host and port of the URL, dialed when no connect address is set.
     host: String,
     port: u16,
-    server_name: ServerName<'static>,
-    tls: TlsConnector,
+    /// The TLS client and server name of a `wss://` URL; `None` for `ws://`.
+    tls: Option<(TlsConnector, ServerName<'static>)>,
     state: watch::Sender<LinkState>,
+    events: broadcast::Sender<WssDialEvent>,
     retry: StdMutex<Retry>,
 }
 
@@ -140,15 +304,29 @@ impl fmt::Debug for Connector {
 impl Connector {
     /// A connector for `config`.
     ///
-    /// Fails with [`io::ErrorKind::InvalidInput`] on a URL that is not `wss://` with a
-    /// host, an invalid server name or header, or TLS roots no configuration can be built
-    /// from.
+    /// Fails with [`io::ErrorKind::InvalidInput`] on a URL that is not `wss://` (or `ws://`
+    /// with [`WssConfig::allow_plaintext`]) with a host, an invalid server name or header,
+    /// or TLS roots no configuration can be built from.
     pub(crate) fn new(config: WssConfig) -> io::Result<Self> {
         let probe = request(&config.url, &config.headers, None)?;
         let uri = probe.uri();
-        if uri.scheme_str() != Some("wss") {
-            return Err(invalid(format!("`{}` is not a wss:// URL", config.url)));
-        }
+        let secure = match uri.scheme_str() {
+            Some("wss") => true,
+            Some("ws") if config.allow_plaintext => false,
+            Some("ws") => {
+                return Err(invalid(format!(
+                    "`{}` is a ws:// URL, but allow_plaintext is not set",
+                    config.url
+                )));
+            }
+            _ if config.allow_plaintext => {
+                return Err(invalid(format!(
+                    "`{}` is not a wss:// or ws:// URL",
+                    config.url
+                )));
+            }
+            _ => return Err(invalid(format!("`{}` is not a wss:// URL", config.url))),
+        };
         let host = uri
             .host()
             .filter(|host| !host.is_empty())
@@ -158,29 +336,19 @@ impl Connector {
             .and_then(|host| host.strip_suffix(']'))
             .unwrap_or(host)
             .to_owned();
-        let port = uri.port_u16().unwrap_or(443);
-        let name = config.server_name.clone().unwrap_or_else(|| host.clone());
-        let server_name = ServerName::try_from(name.clone())
-            .map_err(|e| invalid(format!("invalid TLS server name `{name}`: {e}")))?;
-        let client = match &config.tls {
-            WssTls::Roots(roots) => {
-                let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-                let client = ClientConfig::builder_with_provider(provider)
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| invalid(format!("no TLS protocol version: {e}")))?
-                    .with_root_certificates(roots.clone())
-                    .with_no_client_auth();
-                Arc::new(client)
-            }
-            WssTls::Config(client) => Arc::clone(client),
+        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+        let tls = if secure {
+            Some(tls(&config, &host)?)
+        } else {
+            None
         };
         Ok(Self {
             config,
             host,
             port,
-            server_name,
-            tls: TlsConnector::from(client),
+            tls,
             state: watch::Sender::new(LinkState::Disconnected),
+            events: broadcast::Sender::new(WssDialEvent::CAPACITY),
             retry: StdMutex::new(Retry::default()),
         })
     }
@@ -198,22 +366,44 @@ impl Connector {
         self.state.send_replace(state);
     }
 
+    /// Receives the dial events from now on.
+    pub(crate) fn events(&self) -> broadcast::Receiver<WssDialEvent> {
+        self.events.subscribe()
+    }
+
+    /// Sends `event` to the event receivers, if any.
+    pub(crate) fn emit(&self, event: WssDialEvent) {
+        let _ = self.events.send(event);
+    }
+
+    /// The wait before the dial after a connection that came up: the reconnect delay, or
+    /// without one the backoff floor (the first step of the failure backoff).
+    fn reconnect(&self) -> Retry {
+        self.config
+            .reconnect_delay
+            .map_or(Retry::Backoff(self.config.backoff_min), Retry::Reconnect)
+    }
+
     /// Lets the next dial go at once (a dial for more capacity, not after a loss).
     pub(crate) fn retry_now(&self) {
         *lock(&self.retry) = Retry::Now;
     }
 
-    /// Records a lost connection: the next dial waits at least the backoff floor.
+    /// Records a lost connection: the next dial waits the reconnect delay, or the backoff
+    /// floor without one, unless it already waits.
     pub(crate) fn lost(&self) {
         let mut retry = lock(&self.retry);
         if matches!(*retry, Retry::Now) {
-            *retry = Retry::Backoff(self.config.backoff_min);
+            *retry = self.reconnect();
         }
     }
 
-    /// Waits as the last dial asks, then dials: TCP, TLS and the WebSocket upgrade. A
-    /// success makes the next dial wait the backoff floor; a failure doubles the wait, and a
-    /// 401 or 403 also sets [`LinkState::Rejected`].
+    /// Waits as the last dial asks, then dials: TCP, TLS (for `wss://`) and the WebSocket
+    /// upgrade. A success makes the next dial wait the reconnect delay (or the backoff
+    /// floor); a failure doubles the wait, starting from the floor, and a 401 or 403 also
+    /// sets [`LinkState::Rejected`]. An upgrade refused with an HTTP response fails with a
+    /// [`WssDialError`] inside. Every failure sends its event; the carriers send
+    /// [`WssDialEvent::Connected`] themselves.
     pub(crate) async fn connect(&self, counters: &DialCounters) -> io::Result<Ws> {
         let retry = std::mem::take(&mut *lock(&self.retry));
         let (wait, token) = match retry {
@@ -222,26 +412,37 @@ impl Connector {
                 tokio::time::sleep(wait).await;
                 (Some(wait), self.token().await)
             }
+            Retry::Reconnect(delay) => {
+                tokio::time::sleep(delay).await;
+                (None, self.token().await)
+            }
             Retry::NewToken(refused) => (None, self.token_other_than(refused).await),
         };
         let token = match token {
             Ok(token) => token,
             Err(e) => {
-                return Err(self.failed(counters, wait, &format_args!("bearer token: {e}")));
+                let error = format_args!("bearer token: {e}");
+                return Err(self.failed(counters, wait, &error, WssDialEvent::DialFailed));
             }
         };
         let opened =
             tokio::time::timeout(self.config.connect_timeout, self.open(token.as_deref())).await;
         match opened {
             Ok(Ok(ws)) => {
-                *lock(&self.retry) = Retry::Backoff(self.config.backoff_min);
+                *lock(&self.retry) = self.reconnect();
                 Ok(ws)
             }
-            Ok(Err(e)) => Err(rejection(&e).map_or_else(
-                || self.failed(counters, wait, &e),
-                |status| self.rejected(counters, wait, status, token),
-            )),
-            Err(_) => Err(self.failed(counters, wait, &"timed out")),
+            Ok(Err(e)) => Err(match refusal(&e) {
+                Some(detail) if is_rejection(detail.status) => {
+                    self.rejected(counters, wait, detail, token)
+                }
+                Some(detail) => {
+                    self.count_failure(counters, wait, &e, WssDialEvent::DialFailed);
+                    io::Error::other(detail)
+                }
+                None => self.failed(counters, wait, &e, WssDialEvent::DialFailed),
+            }),
+            Err(_) => Err(self.failed(counters, wait, &"timed out", WssDialEvent::TimedOut)),
         }
     }
 
@@ -266,7 +467,7 @@ impl Connector {
         }
     }
 
-    /// TCP, TLS and the WebSocket upgrade.
+    /// TCP, TLS (for `wss://`) and the WebSocket upgrade.
     async fn open(&self, token: Option<&str>) -> Result<Ws, WsError> {
         let config = &self.config;
         let request = request(&config.url, &config.headers, token)?;
@@ -275,36 +476,53 @@ impl Connector {
             None => TcpStream::connect((self.host.as_str(), self.port)).await?,
         };
         tcp.set_nodelay(true)?;
-        let tls = self.tls.connect(self.server_name.clone(), tcp).await?;
+        let stream = match &self.tls {
+            Some((tls, name)) => Carrier::Tls(Box::new(tls.connect(name.clone(), tcp).await?)),
+            None => Carrier::Plain(tcp),
+        };
         let (ws, _) =
-            tokio_tungstenite::client_async_with_config(request, tls, Some(ws_config())).await?;
+            tokio_tungstenite::client_async_with_config(request, stream, Some(ws_config())).await?;
         Ok(ws)
     }
 
-    /// Records a failed dial that waited `wait` and returns its error.
+    /// Records a failed dial that waited `wait`, sends `event` and returns its error.
     fn failed(
         &self,
         counters: &DialCounters,
         wait: Option<Duration>,
         error: &dyn fmt::Display,
+        event: WssDialEvent,
     ) -> io::Error {
+        self.count_failure(counters, wait, error, event);
+        io::Error::other(format!("wss connect failed: {error}"))
+    }
+
+    /// Records a failed dial that waited `wait` and sends `event`.
+    fn count_failure(
+        &self,
+        counters: &DialCounters,
+        wait: Option<Duration>,
+        error: &dyn fmt::Display,
+        event: WssDialEvent,
+    ) {
         bump(&counters.connect_failures);
+        self.emit(event);
         let config = &self.config;
         *lock(&self.retry) =
             Retry::Backoff(next_backoff(wait, config.backoff_min, config.backoff_max));
         tracing::debug!(url = %config.url, %error, "wss connect failed");
-        io::Error::other(format!("wss connect failed: {error}"))
     }
 
-    /// Records a dial refused with `status` and returns its error.
+    /// Records a dial refused with a 401 or 403 and returns its error.
     fn rejected(
         &self,
         counters: &DialCounters,
         wait: Option<Duration>,
-        status: u16,
+        detail: WssDialError,
         token: Option<String>,
     ) -> io::Error {
         let config = &self.config;
+        let status = detail.status;
         bump(&counters.connect_failures);
         if status == 401 {
             bump(&counters.rejected_unauthorized);
@@ -318,12 +536,33 @@ impl Connector {
             Retry::Backoff(next_backoff(wait, config.backoff_min, config.backoff_max))
         };
         self.state.send_replace(LinkState::Rejected(status));
+        self.emit(WssDialEvent::Rejected(status));
         tracing::warn!(url = %config.url, status, "wss upgrade rejected");
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("wss upgrade rejected with HTTP {status}"),
-        )
+        io::Error::new(io::ErrorKind::PermissionDenied, detail)
     }
+}
+
+/// The TLS client and server name dialing `host` with `config`.
+fn tls(config: &WssConfig, host: &str) -> io::Result<(TlsConnector, ServerName<'static>)> {
+    let name = config
+        .server_name
+        .clone()
+        .unwrap_or_else(|| host.to_owned());
+    let server_name = ServerName::try_from(name.clone())
+        .map_err(|e| invalid(format!("invalid TLS server name `{name}`: {e}")))?;
+    let client = match &config.tls {
+        WssTls::Roots(roots) => {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let client = ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| invalid(format!("no TLS protocol version: {e}")))?
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            Arc::new(client)
+        }
+        WssTls::Config(client) => Arc::clone(client),
+    };
+    Ok((TlsConnector::from(client), server_name))
 }
 
 #[cfg(test)]
@@ -373,10 +612,66 @@ mod tests {
         );
     }
 
+    /// A loss after a session came up waits the reconnect delay (when set), and a dial
+    /// failing after it backs off from the floor rather than from that delay; capacity
+    /// dials still go at once. Each failure is one event.
+    #[tokio::test]
+    async fn reconnect_delay_then_failures_back_off_from_the_floor() {
+        let ms = Duration::from_millis;
+        // A port nothing listens on: every dial is refused at once.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let config = WssConfig::new(format!("ws://{addr}/"), roots())
+            .allow_plaintext(true)
+            .backoff(ms(10), ms(40))
+            .reconnect_delay(ms(5));
+        let connector = Connector::new(config).unwrap();
+        let mut events = connector.events();
+        let retry = || match *lock(&connector.retry) {
+            Retry::Now => "now".to_owned(),
+            Retry::Backoff(wait) => format!("backoff {}", wait.as_millis()),
+            Retry::Reconnect(delay) => format!("reconnect {}", delay.as_millis()),
+            Retry::NewToken(_) => "token".to_owned(),
+        };
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
+        // A further loss keeps the pending wait.
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
+
+        let counters = DialCounters::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert!(connector.connect(&counters).await.is_err());
+            seen.push(retry());
+            assert_eq!(events.try_recv(), Ok(WssDialEvent::DialFailed));
+        }
+        assert_eq!(
+            seen,
+            ["backoff 10", "backoff 20", "backoff 40", "backoff 40"]
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(get(&counters.connect_failures), 4);
+
+        // A capacity dial goes at once, and a loss then waits the reconnect delay again.
+        connector.retry_now();
+        assert_eq!(retry(), "now");
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
+    }
+
     fn http(status: u16) -> WsError {
         WsError::Http(Box::new(
             Response::builder().status(status).body(None).unwrap(),
         ))
+    }
+
+    /// The status of a refusal with an HTTP response, if it is a rejection.
+    fn rejection(error: &WsError) -> Option<u16> {
+        refusal(error)
+            .map(|detail| detail.status)
+            .filter(|&status| is_rejection(status))
     }
 
     /// 401 and 403 are rejections, told apart by their status; transport loss and other
@@ -393,6 +688,50 @@ mod tests {
             rejection(&WsError::Io(io::ErrorKind::TimedOut.into())),
             None
         );
+        assert!(refusal(&WsError::ConnectionClosed).is_none());
+        assert_eq!(refusal(&http(500)).map(|detail| detail.status), Some(500));
+    }
+
+    /// Every refusal keeps its status, headers (non-UTF-8 values lossily) and the body up
+    /// to the limit; its message is the dial error's of before.
+    #[test]
+    fn refusals_keep_their_detail() {
+        let body = vec![b'x'; WssDialError::MAX_BODY + 100];
+        let response = Response::builder()
+            .status(401)
+            .header("X-Reason", "expired")
+            .header("X-Raw", HeaderValue::from_bytes(b"a\xffb").unwrap())
+            .body(Some(body.clone()))
+            .unwrap();
+        let detail = refusal(&WsError::Http(Box::new(response))).unwrap();
+        assert_eq!(detail.status, 401);
+        assert_eq!(
+            detail.headers,
+            [
+                ("x-reason".to_owned(), "expired".to_owned()),
+                ("x-raw".to_owned(), "a\u{fffd}b".to_owned()),
+            ]
+        );
+        assert_eq!(detail.body, body[..WssDialError::MAX_BODY]);
+        assert_eq!(detail.to_string(), "wss upgrade rejected with HTTP 401");
+
+        let short = Response::builder()
+            .status(503)
+            .body(Some(b"busy".to_vec()))
+            .unwrap();
+        let detail = refusal(&WsError::Http(Box::new(short))).unwrap();
+        assert_eq!(detail.body, &b"busy"[..]);
+        assert_eq!(
+            detail.to_string(),
+            "wss connect failed: HTTP error: 503 Service Unavailable"
+        );
+        assert_eq!(
+            detail.to_string(),
+            format!("wss connect failed: {}", http(503))
+        );
+        let detail = refusal(&http(403)).unwrap();
+        assert!(detail.headers.is_empty() && detail.body.is_empty());
+        assert_eq!(detail.to_string(), "wss upgrade rejected with HTTP 403");
     }
 
     #[test]
@@ -433,8 +772,8 @@ mod tests {
             ("relay.example", 8443)
         );
         assert_eq!(
-            connector.server_name,
-            ServerName::try_from("relay.example").unwrap()
+            connector.tls.as_ref().map(|(_, name)| name.clone()),
+            Some(ServerName::try_from("relay.example").unwrap())
         );
         assert_eq!(*connector.state().borrow(), LinkState::Disconnected);
 
@@ -444,8 +783,8 @@ mod tests {
         let config = WssConfig::new("wss://192.0.2.1/", roots()).server_name("relay.test");
         let connector = Connector::new(config).unwrap();
         assert_eq!(
-            connector.server_name,
-            ServerName::try_from("relay.test").unwrap()
+            connector.tls.as_ref().map(|(_, name)| name.clone()),
+            Some(ServerName::try_from("relay.test").unwrap())
         );
 
         for url in [
@@ -457,9 +796,49 @@ mod tests {
             let err = Connector::new(WssConfig::new(url, roots())).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{url}");
         }
+        let err = Connector::new(WssConfig::new("ws://relay.example/", roots())).unwrap_err();
+        assert!(err.to_string().contains("allow_plaintext"), "{err}");
         let config = WssConfig::new("wss://relay.example/", roots()).server_name("bad name!");
         assert!(Connector::new(config).is_err());
         let config = WssConfig::new("wss://relay.example/", roots()).header("bad name", "v");
         assert!(Connector::new(config).is_err());
+    }
+
+    /// `ws://` is dialed without TLS (port 80 unless given) only with `allow_plaintext`;
+    /// `wss://` stays TLS and other schemes stay refused.
+    #[test]
+    fn plain_urls_need_allow_plaintext() {
+        let plain = |url: &str| Connector::new(WssConfig::new(url, roots()).allow_plaintext(true));
+        let connector = plain("ws://relay.example/x").unwrap();
+        assert_eq!(
+            (connector.host.as_str(), connector.port),
+            ("relay.example", 80)
+        );
+        assert!(connector.tls.is_none());
+        let connector = plain("ws://127.0.0.1:8080/x").unwrap();
+        assert_eq!(
+            (connector.host.as_str(), connector.port),
+            ("127.0.0.1", 8080)
+        );
+        // The server name is a TLS setting: unused, so unchecked, for ws://.
+        let config = WssConfig::new("ws://[::1]/", roots())
+            .allow_plaintext(true)
+            .server_name("bad name!");
+        let connector = Connector::new(config).unwrap();
+        assert_eq!((connector.host.as_str(), connector.port), ("::1", 80));
+
+        let connector = plain("wss://relay.example/").unwrap();
+        assert_eq!(connector.port, 443);
+        assert!(connector.tls.is_some());
+
+        for url in [
+            "https://relay.example/",
+            "http://relay.example/",
+            "ws:///x",
+            "relay",
+        ] {
+            let err = plain(url).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{url}");
+        }
     }
 }

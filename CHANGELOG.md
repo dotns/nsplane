@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-wss`: plain `ws://` URLs behind `WssConfig::allow_plaintext` (default `false`):
+  TCP and the WebSocket upgrade without TLS, port 80 by default, with the same headers,
+  bearer, backoff, rejection handling and state as `wss://`; `WssDialer`,
+  `WssStreamClient` and `WssStreamServer` all accept them. A `ws://` URL without the
+  setting is refused with `InvalidInput`, naming it.
+- `nsplane-wss`: `WssDialError` (`status`, `headers`, `body` truncated to
+  `WssDialError::MAX_BODY` = 512 bytes) is the inner error of the `io::Error` of every
+  dial whose upgrade was refused with an HTTP response, any status; the error kind and
+  message stay as before (`PermissionDenied` with "wss upgrade rejected with HTTP 401"
+  for 401/403, `Other` with "wss connect failed: HTTP error: ..." otherwise). Stream
+  client opens waiting behind a refused dial get it too.
+- `nsplane-wss`: `WssDialer::events()` and `WssStreamClient::events()` return a
+  `broadcast::Receiver<WssDialEvent>` with one event per occurrence: `Connected` (a link
+  the transport reported up, or a session up), `Lost` (that link or session ended:
+  closed, failed or read idle), `DialFailed` (TCP, TLS, bearer token, or an HTTP refusal
+  other than 401/403), `TimedOut` (`connect_timeout`) and `Rejected(status)` (401/403).
+  The channel holds `WssDialEvent::CAPACITY` (64) events; a lagging receiver sees
+  `RecvError::Lagged`. Without a receiver an event costs one failed send. Counters and the
+  `state()` watch are unchanged.
+- `nsplane-wss`: `WssConfig::reconnect_delay: Option<Duration>` (setter
+  `reconnect_delay(Duration)`): the wait before the dial after a link or session that
+  came up was lost, apart from the failure backoff; a dial failing after it waits
+  `backoff_min`, then doubles up to `backoff_max` (ns: 1 s, then 2, 4, ... 60 s). `None`
+  (the default) keeps the wait at `backoff_min` as the first backoff step, as before.
+- `nsplane-wss`: `WssConfig::ping_interval` and `read_idle` (setter `keepalive`) are
+  covered per carrier by `nsplane-e2e` `wss_keepalive`: `WssDialer` links and
+  `WssStreamClient` sessions ping at the configured interval and end after the configured
+  read idle.
+
 ## [0.8.0] - 2026-10-04
 
 The first release under the nsplane name (formerly a boringtun fork): a sans-I/O WireGuard
