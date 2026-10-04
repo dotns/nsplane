@@ -126,7 +126,9 @@ async fn ephemeral_ports_differ_and_skip_bound_ports() -> TestResult {
         bound.push(handle.bind_udp(SocketAddr::new(ip, port)).await?);
     }
     let socket = handle.connect_udp(remote).await?;
-    assert_eq!(socket.local_addr().port(), following(port));
+    let picked = socket.local_addr().port();
+    assert_eq!(picked, following(port));
+    assert!(bound.iter().all(|b| b.local_addr().port() != picked));
     Ok(())
 }
 
