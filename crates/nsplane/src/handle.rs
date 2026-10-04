@@ -633,9 +633,9 @@ impl EngineHandle {
     /// `min(source MTU, min(transport ceiling, mtu - IP header - 8) - 32)`, at least 1280:
     /// with an IPv6 path MTU of 1500, 1420. The engine does not probe for a larger MTU.
     ///
-    /// The core pads the plaintext of every data message to a multiple of 16 bytes, so a
-    /// packet at the inner MTU may still make an outer packet up to 15 bytes above the
-    /// path MTU (which a sending host without DF fragments).
+    /// The padding of the peer's data stops at its inner MTU, as the kernel pads to the MTU,
+    /// so a packet at the inner MTU makes an outer packet of exactly the path MTU (earlier,
+    /// padding to a multiple of 16 bytes could overshoot it by up to 15 bytes).
     pub async fn report_path_mtu(&self, path: Path, mtu: u16) -> Result<bool, EngineError> {
         let report = PathMtuReport::new(path, mtu);
         self.call(|tx| Command::ReportPathMtu(report, tx)).await

@@ -230,11 +230,14 @@ impl Session {
     /// data header in front of it; returns the datagram, a prefix of `buf`.
     ///
     /// The plaintext is zero-padded to a multiple of 16 bytes as far as `buf` has room behind
-    /// it; `buf` needs at least `DATA_OFFSET + len + AEAD_SIZE` bytes.
+    /// it and, like the kernel's padding to the MTU, not past `pad_limit` bytes (a plaintext
+    /// of at least `pad_limit` bytes is not padded); `buf` needs at least
+    /// `DATA_OFFSET + len + AEAD_SIZE` bytes.
     pub(super) fn seal_in_place<'a>(
         &self,
         buf: &'a mut [u8],
         len: usize,
+        pad_limit: usize,
     ) -> Result<&'a mut [u8], WireGuardError> {
         let room = buf
             .len()
@@ -242,7 +245,7 @@ impl Session {
             .filter(|&room| room >= len)
             .ok_or(WireGuardError::DestinationBufferTooSmall)?;
         // The spec pads the plaintext with zeros to a multiple of 16 bytes.
-        let padded_len = padded_len(len).min(room);
+        let padded_len = padded_len(len).min(room).min(pad_limit.max(len));
 
         // Never hand out a counter at or past Reject-After-Messages: the nonce must not repeat.
         let sending_key_counter = self
@@ -284,7 +287,7 @@ impl Session {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
         dst[DATA_OFFSET..DATA_OFFSET + src.len()].copy_from_slice(src);
-        self.seal_in_place(dst, src.len())
+        self.seal_in_place(dst, src.len(), usize::MAX)
     }
 
     /// Opens the encrypted packet and tag in `ciphertext` in place; returns the plaintext, a
