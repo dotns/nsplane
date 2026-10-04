@@ -1323,3 +1323,97 @@ async fn dropping_the_run_ends_the_session() -> TestResult {
     assert_eq!(relay.opens().len(), 1);
     Ok(())
 }
+
+/// Opens timing out behind a dial that waits its backoff leave that wait alone: the next
+/// dial still goes a full backoff after the failure, and no open dials early. Each open
+/// fails with the dial's error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_opens_keep_the_backoff() -> TestResult {
+    let backoff = Duration::from_millis(1500);
+    // A port nothing listens on: every dial is refused at once.
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+    let config = WssConfig::new(
+        format!("ws://{addr}/client"),
+        WssTls::Roots(RootCertStore::empty()),
+    )
+    .allow_plaintext(true)
+    .backoff(backoff, backoff * 4);
+    let limits = WssStreamLimits::default().open_timeout(Duration::from_millis(100));
+    let client = WssStreamClient::new(config, limits)?;
+    let stats = client.stats();
+    let target: SocketAddr = "10.0.0.1:80".parse()?;
+
+    let first = client.open_tcp(target).await.unwrap_err();
+    let failed = Instant::now();
+    assert_eq!(stats.connect_failures(), 1);
+    for _ in 0..5 {
+        let started = Instant::now();
+        let err = client.open_tcp(target).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(
+            (err.kind(), err.to_string()),
+            (first.kind(), first.to_string())
+        );
+    }
+    until("the second dial", || stats.connect_failures() == 2).await?;
+    assert!(
+        failed.elapsed() >= backoff,
+        "the second dial went {:?} after the first",
+        failed.elapsed()
+    );
+    Ok(())
+}
+
+/// After a 401, opens timing out behind the dial waiting for a new token leave that wait
+/// alone: the refused token is offered again only after the token wait, and a new token is
+/// still picked up and serves later opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_opens_keep_the_token_wait() -> TestResult {
+    let token_wait = Duration::from_millis(1500);
+    let map = Map::new();
+    let target = map.add(tcp_echo().await?);
+    let (relay, terminate) = setup(&map, WssServerLimits::default()).await?;
+    *lock(&relay.token) = Some("good".to_owned());
+    let token = Token::new("bad");
+    let config = relay
+        .config("client", &token)
+        .token_refresh(Duration::from_millis(50), token_wait);
+    let limits = WssStreamLimits::default().open_timeout(Duration::from_millis(100));
+    let client = WssStreamClient::new(config, limits)?;
+    let stats = client.stats();
+
+    let err = client.open_tcp(target).await.unwrap_err();
+    let rejected = Instant::now();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    for _ in 0..5 {
+        let err = client.open_tcp(target).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+    until("the second rejection", || {
+        stats.rejected_unauthorized() == 2
+    })
+    .await?;
+    assert!(
+        rejected.elapsed() >= token_wait,
+        "the refused token went again {:?} after the first",
+        rejected.elapsed()
+    );
+    assert_eq!(relay.upgrades(Role::Client).len(), 2);
+
+    token.set("good");
+    let deadline = Instant::now() + WAIT;
+    let stream = loop {
+        match client.open_tcp(target).await {
+            Ok(stream) => break stream,
+            Err(err) if Instant::now() < deadline => {
+                assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(err) => return Err(format!("no session within {WAIT:?}: {err}").into()),
+        }
+    };
+    echo(stream, 1, 1000).await?;
+    assert_eq!(relay.upgrades(Role::Client).len(), 3);
+    terminate.stop().await
+}
