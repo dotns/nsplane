@@ -218,7 +218,7 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 
 ## 9. Roadmap and status
 
-| Phase | Deliverable | Status (2026-10-03) |
+| Phase | Deliverable | Status (2026-10-04) |
 |---|---|---|
 | Baseline | aws-lc-rs backend, pma-rust lints, protocol fixes, zero-copy noise, Windows device, CLI as dev tool | done (`1fb9899`) |
 | 1 | `nsplane-packet`, `nsplane-core`, `nsplane` driver, `nsplane-tun`, `nsplane-uapi`, `nsplane-e2e`, CLI on the engine, upstream `device` layer deleted | done (`1660fc2`, `8c6ad9f`, `2827a4a`, `17eb69d`, `f712711`) |
@@ -229,11 +229,20 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | 5 follow-ups | batched core entry, no lock without workers, exact send errors, worker/fragment stats, smoltcp fork | done (`8f01a55`, `5132f27`, `91c4943`) |
 | Status | per-transport traffic counters, `EngineHandle::status` | done (task `20261003-1215-traffic-status`) |
 | ns M4 hooks | `inject_outbound_on`, `PacketFilter::inbound_from`, `PathPolicy::observe_every_message`, netstack accept backpressure, `connect_tcp_from`, random ephemeral start | done (task `20261003-1300-ns-m4-requests`) |
-| 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns, not started |
+| ns data-plane moves | `owns()`, reassembly, send progress, oversize UDP (netstack); UDP side channel, `LinkTransport`; `Nat64Lan`, `Redirect` (nsplane-nat); `force_handshake_on` | done (plan `20261003-1600-ns-dataplane-moves`) |
+| Throughput and WSS | benchmark harness against kernel WireGuard and wireguard-go; engine fast path (batched handoff, inline output); netstack fixes and TCP buffers; `nsplane-wss` (datagram carrier, WsFrame stream client and server) | done (plan `20261003-1630-perf-and-wss`) |
+| ACL and node L3 gate | per-source principals, fragment modes, bypass flags, `Ipv6Mode`, `crates_acl()` preset, inbound destinations; `NodeL3Gate`, `NodeL3Filter`, divert; differential fixtures against ns | done (plan `20261003-2300-acl-l3-gate`) |
+| Local side | `MapSink` / `MapSource`, `pump`, `pipe`; `Masquerade`, `echo_reply_in_place`; `TunSlot`, `host_tun` | done (plan `20261003-2330-local-side`) |
+| Release 0.8.0 | first nsplane release (tag `v0.8.0`) | 2026-10-04 |
+| 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows
 real-host verification, #19 sending the smoltcp fixes upstream (the user's call), #21 sender
-pacing / sink backpressure. Phase 0 (ns pins nsplane's `noise` with the `SocketAddr` source
+pacing / sink backpressure. Performance follow-ups: multi-stream throughput against
+wireguard-go (10.1 against 8.9 Gbit/s on 4 streams), the netstack pair's 4-stream result,
+sealing/pool allocation, the TSO split copy, TUN write coalescing, a smoltcp-fork round
+(checksum over u64 words, SACK or partial-ACK retransmit). ns requests for Quick on the
+engine (MQ-1..5) wait for M5. Phase 0 (ns pins nsplane's `noise` with the `SocketAddr` source
 change) runs in ns when its current refactor lands.
 
 ## 10. Decisions

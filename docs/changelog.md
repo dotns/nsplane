@@ -107,3 +107,22 @@ Plan `20261003-1630-perf-and-wss` PW widened by the user: the WsFrame terminate 
 `tunnel-ws` `WsTunnel`) moves into `nsplane-wss` now as PW (c), with OPEN resolution behind an
 embedder trait, so ns can delete `tunnel-ws` whole. ADR
 `2026-10-03-data-channel-protocols-in-nsplane` consequence updated (both legs move).
+
+## 2026-10-04 06:00 [progress]
+
+Campaigns since the Phase 5 follow-ups, all merged into `main` with their final gates and
+the full e2e suites green: traffic counters and `EngineHandle::status`; the ns M4 engine hooks
+(`inject_outbound_on`, `PacketFilter::inbound_from`, `observe_every_message`,
+`force_handshake_on`, netstack accept backpressure and ports); the ns data-plane moves (plan
+`20261003-1600`: netstack ownership, reassembly, send progress; UDP side channel and
+`LinkTransport`; `Nat64Lan` and `Redirect`); throughput and WSS (plan `20261003-1630`:
+benchmark harness, engine fast path +17 % / +19 %, netstack fixes, `nsplane-wss`); the ACL and
+node L3 gate (plan `20261003-2300`, differential fixtures against ns); the local side (plan
+`20261003-2330`: graph primitives, `Masquerade`, Echo reply, `TunSlot`, `host_tun`). ADR
+`2026-10-03-data-channel-protocols-in-nsplane`: every data-channel protocol lives in nsplane.
+
+## 2026-10-04 11:00 [release]
+
+Release 0.8.0 (tag `v0.8.0`), the first release under the nsplane name. Quiet-host comparison
+on main: nsplane <-> nsplane 8.1 / 8.9 Gbit/s (1 / 4 TCP streams), kernel WireGuard ->
+nsplane 7.0, nsplane -> kernel 7.7, wireguard-go 10.0 / 10.1.

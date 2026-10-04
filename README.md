@@ -154,6 +154,24 @@ async fn client(
 See [docs/architecture.md](docs/architecture.md#optional-features-and-defaults) for the
 details.
 
+## Performance
+
+Measured with `just bench-wg` (`scripts/bench/wg-compare.sh`): two containers per pair,
+pinned CPU sets, real TUN devices, MTU 1420, iperf3, 30 s x 3, medians, on a quiet 32-CPU
+host (2026-10-04, main `92652cb`):
+
+| Pair | TCP 1 stream | TCP 4 streams | UDP 3 Gbit/s loss |
+| --- | --- | --- | --- |
+| nsplane <-> nsplane | 8.1 Gbit/s | 8.9 Gbit/s | 0.4 % |
+| nsplane -> kernel WireGuard | 7.7 Gbit/s | 7.6 Gbit/s | 0.0 % |
+| kernel WireGuard -> nsplane | 7.0 Gbit/s | 6.9 Gbit/s | 0.0 % |
+| wireguard-go <-> wireguard-go | 10.0 Gbit/s | 10.1 Gbit/s | 0.4 % |
+| kernel WireGuard <-> kernel WireGuard | 4.0 Gbit/s | 4.1 Gbit/s | 0.0 % |
+
+Kernel WireGuard is held back by the CPU pinning (its crypto threads run outside the pinned
+sets). Offload carries nsplane: without it, 3.1 Gbit/s on one stream. Details, latency and CPU
+per GB are in [docs/architecture.md](docs/architecture.md#against-wireguard-implementations).
+
 ## Tuning
 
 The engine's packet queues hold 1024 packets each by default

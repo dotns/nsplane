@@ -5,6 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-04
+
+The first release under the nsplane name (formerly a boringtun fork): a sans-I/O WireGuard
+core (`nsplane-core`) and a tokio engine (`nsplane`) with multiple transports and path
+policies, TUN devices with segmentation offload (`nsplane-tun`), a user-space TCP/IP stack
+(`nsplane-netstack`, on the `dotns/smoltcp` fork), the ACL engine and node L3 gate
+(`nsplane-acl`), IPv4/IPv6 translation, port maps, NAT64 to a LAN and masquerade
+(`nsplane-nat`), WebSocket-over-TLS carriers (`nsplane-wss`), the `wg` UAPI (`nsplane-uapi`)
+and a development CLI (`nsplane-cli`). The entries below list every change since the fork;
+items marked Breaking concern the public API.
+
 ### Added
 - `nstun-packet`: packet buffers with header room (`PacketBuf`, `PacketPool`,
   `PacketBatch`), IP/TCP/UDP/ICMP header views and the shared value types (`PeerId`,
