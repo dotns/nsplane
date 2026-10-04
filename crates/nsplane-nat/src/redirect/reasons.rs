@@ -3,7 +3,8 @@
 /// The decision closure answered [`RedirectDecision::Drop`](crate::RedirectDecision::Drop)
 /// for a new flow.
 pub const DENIED: &str = "redirect denied";
-/// Every endpoint the decision closure offered for a new flow (32 in a row)
+/// Every endpoint the decision closure offered for a new flow (32 in a row,
+/// or as set by [`Redirect::with_endpoint_tries`](crate::Redirect::with_endpoint_tries))
 /// is in use by a live flow from the same source, so replies could not be
 /// told apart.
 pub const ENDPOINT_EXHAUSTED: &str = "redirect endpoints exhausted";

@@ -2,6 +2,7 @@
 //! the ported ns translation tests and RFC 7915 vectors. Every translated
 //! packet's checksums are verified by a full recompute.
 
+mod native_alias;
 mod vectors;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
