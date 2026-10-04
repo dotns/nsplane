@@ -461,21 +461,45 @@ fn corrupt(packet: &PacketBuf) -> PacketBuf {
 }
 
 #[test]
-fn a_bad_checksum_drops_without_asking() {
+fn a_bad_checksum_of_a_passing_packet_passes() {
     let f = fixture();
+    f.answer(None);
     let request = request(REMOTE, HOST_PORT);
-    assert_drop(corrupt(&request), reasons::BAD_CHECKSUM, |p| {
+    assert_pass(corrupt(&request), |p| f.masquerade.forward(p));
+    let mut zero = request.as_packet().to_vec();
+    zero[46..48].fill(0);
+    assert_pass(PacketBuf::from_packet(&zero), |p| f.masquerade.forward(p));
+    assert_eq!(f.calls(), 2);
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.passed, stats.bad_checksum, stats.flows), (2, 0, 0));
+}
+
+#[test]
+fn a_bad_checksum_drops_masqueraded_packets() {
+    let f = fixture();
+    let first = request(REMOTE, HOST_PORT);
+    // A corrupt first packet records no flow.
+    assert_drop(corrupt(&first), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.forward(p)
     });
     // A zero UDP checksum is not allowed over IPv6.
-    let mut zero = request.as_packet().to_vec();
+    let mut zero = first.as_packet().to_vec();
     zero[46..48].fill(0);
     assert_drop(PacketBuf::from_packet(&zero), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.forward(p)
     });
-    assert_eq!(f.calls(), 0);
+    assert_eq!(f.calls(), 2);
+    assert_eq!((f.masquerade.len(), f.masquerade.stats().created), (0, 0));
 
-    let forwarded = f.forward(request);
+    let forwarded = f.forward(first);
+    assert_eq!(token(&forwarded), FIRST_TOKEN, "no token was taken");
+    // A corrupt packet of the recorded flow does not ask again.
+    assert_drop(
+        corrupt(&request(REMOTE, HOST_PORT)),
+        reasons::BAD_CHECKSUM,
+        |p| f.masquerade.forward(p),
+    );
+    assert_eq!(f.calls(), 3);
     assert_drop(corrupt(&reply(&forwarded)), reasons::BAD_CHECKSUM, |p| {
         f.masquerade.reverse(p)
     });
@@ -483,7 +507,26 @@ fn a_bad_checksum_drops_without_asking() {
     assert_pass(corrupt(&udp((REMOTE, 53), (SOURCE, 1))), |p| {
         f.masquerade.reverse(p)
     });
-    assert_eq!(f.masquerade.stats().bad_checksum, 3);
+    let stats = f.masquerade.stats();
+    assert_eq!((stats.bad_checksum, stats.flows), (4, 1));
+}
+
+#[test]
+fn with_recheck_a_bad_checksum_drops_before_the_route_check() {
+    let f = rechecking();
+    let forwarded = f.forward(request(REMOTE, HOST_PORT));
+    f.answer(None);
+    assert_drop(
+        corrupt(&request(REMOTE, HOST_PORT)),
+        reasons::BAD_CHECKSUM,
+        |p| f.masquerade.forward(p),
+    );
+    assert_eq!(f.calls(), 1, "the closure is not asked");
+    assert_eq!(f.masquerade.len(), 1, "the flow is kept");
+    assert_drop(request(REMOTE, HOST_PORT), reasons::ROUTE_CHANGED, |p| {
+        f.masquerade.forward(p)
+    });
+    assert_pass(reply(&forwarded), |p| f.masquerade.reverse(p));
 }
 
 #[test]

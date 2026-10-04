@@ -5,7 +5,8 @@
 //! Covers an `ICMPv6` Echo answered by `nsplane_packet::icmp::echo_reply_in_place` on the
 //! far side (and an IPv4 Echo through `echo_reply_in_place` alone, which the masquerade
 //! passes), a route change that drops the next reply and removes its flow (or, with
-//! `recheck_route_on_forward`, the next forward packet), and the counters.
+//! `recheck_route_on_forward`, the next forward packet), a bad checksum that drops only
+//! the packets the masquerade rewrites, and the counters.
 //!
 //! The masquerade is applied at the netstack hop by a test-local pump, as `redirect.rs`
 //! does; it moves to the `MapSink` / `MapSource` wrappers once those land.
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use nsplane::{PacketBuf, PacketSink, PacketSource};
-use nsplane_e2e::{QUIET, TRANSFER, TestResult, WAIT, icmp, next_within, verify_checksums};
+use nsplane_e2e::{QUIET, TRANSFER, TestResult, WAIT, icmp, next_within, udp, verify_checksums};
 use nsplane_nat::masquerade::reasons;
 use nsplane_nat::{Masquerade, MasqueradeConfig, MasqueradeDecision, MasqueradeVerdict};
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, UdpFlow, UdpSocket};
@@ -430,5 +431,35 @@ async fn with_recheck_a_route_change_drops_the_next_forward_packet() -> TestResu
     );
     let stats = rig.masquerade.stats();
     assert_eq!((stats.created, stats.flows, stats.route_changed), (2, 1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_bad_checksum_drops_only_masqueraded_packets() -> TestResult {
+    let rig = rig();
+    // The closure passes traffic of other sources; the masquerade leaves it to whatever
+    // checks the path has next, corrupt or not.
+    let other = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 0x11);
+    let mut corrupt = udp(v6(other, 10_000), v6(LAN_HOST, UDP_PORT), b"not ours");
+    *corrupt.last_mut().ok_or("empty packet")? ^= 1;
+    assert!(verify_checksums(&corrupt).is_err());
+    let mut packet = PacketBuf::from_packet(&corrupt);
+    assert_eq!(rig.masquerade.forward(&mut packet), MasqueradeVerdict::Pass);
+    assert_eq!(packet.as_packet(), &corrupt[..]);
+
+    // The same corruption from the client, which the closure masquerades, is dropped and
+    // records no flow.
+    let mut corrupt = udp(v6(CLIENT, 10_000), v6(LAN_HOST, UDP_PORT), b"ours");
+    *corrupt.last_mut().ok_or("empty packet")? ^= 1;
+    let mut packet = PacketBuf::from_packet(&corrupt);
+    assert_eq!(
+        rig.masquerade.forward(&mut packet),
+        MasqueradeVerdict::Drop(reasons::BAD_CHECKSUM)
+    );
+
+    assert_eq!(rig.decisions.load(Ordering::Relaxed), 2);
+    let stats = rig.masquerade.stats();
+    assert_eq!((stats.passed, stats.bad_checksum), (1, 1));
+    assert_eq!((stats.created, stats.flows), (0, 0));
     Ok(())
 }

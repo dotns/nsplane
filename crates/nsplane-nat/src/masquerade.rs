@@ -32,11 +32,15 @@
 //!
 //! The transport checksum of a rewritten packet is recomputed over the IPv6
 //! pseudo-header, as ns (a result of zero is written as `0xffff`). With
-//! [`MasqueradeConfig::verify_checksums`], a forward packet with an invalid
-//! transport checksum (a zero checksum field included) is dropped
-//! ([`reasons::BAD_CHECKSUM`]) before the decision closure is asked, and so
-//! is a reply of a recorded flow; the recomputation would otherwise launder
-//! the corruption. ns verifies every packet the same way.
+//! [`MasqueradeConfig::verify_checksums`], a packet that would be rewritten
+//! with an invalid transport checksum (a zero checksum field included) is
+//! dropped ([`reasons::BAD_CHECKSUM`]); the recomputation would otherwise
+//! launder the corruption. Only such packets are verified: the first packet
+//! of a flow once the decision closure answered [`Some`] (a corrupt one
+//! records no flow), a later packet of a recorded flow before any route
+//! recheck, and a reply of a recorded flow before its route check. A packet
+//! the closure answers [`None`] for passes unchanged whatever its checksum.
+//! ns verifies every packet before its decision.
 //!
 //! # Flows
 //!
@@ -157,7 +161,8 @@ pub struct MasqueradeConfig {
     /// Default `true`, as ns.
     pub tcp_new_flow_requires_syn: bool,
     /// Whether the transport checksum of a packet is verified before it is
-    /// rewritten; see the [module docs](self). Default `true`, as ns.
+    /// rewritten; packets that pass unchanged are not verified. See the
+    /// [module docs](self). Default `true`, as ns.
     pub verify_checksums: bool,
     /// Whether every forward packet of a recorded flow asks the decision
     /// closure again, dropping it with [`reasons::ROUTE_CHANGED`] and
@@ -513,19 +518,17 @@ impl Masquerade {
         let Some(info) = Info::parse(packet.as_packet(), false) else {
             return Ok(false);
         };
-        if self.config.verify_checksums && !info.checksum_valid(packet.as_packet()) {
-            return Err(reasons::BAD_CHECKSUM);
-        }
         let now = (self.clock)();
         let hit = self.lock().hit(&info.key, now, &self.config);
         let (source, token) = match hit {
             Some(flow) => {
+                self.verify_checksum(&info, packet.as_packet())?;
                 if self.config.recheck_route_on_forward {
                     self.recheck_route(&info.key, &flow)?;
                 }
                 (flow.source, flow.token)
             }
-            None => match self.new_flow(&info)? {
+            None => match self.new_flow(&info, packet.as_packet())? {
                 Some(found) => found,
                 None => return Ok(false),
             },
@@ -547,12 +550,19 @@ impl Masquerade {
         let Some((key, flow)) = found else {
             return Ok(false);
         };
-        if self.config.verify_checksums && !info.checksum_valid(packet.as_packet()) {
-            return Err(reasons::BAD_CHECKSUM);
-        }
+        self.verify_checksum(&info, packet.as_packet())?;
         self.recheck_route(&key, &flow)?;
         info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
         Ok(true)
+    }
+
+    /// Fails with [`reasons::BAD_CHECKSUM`] when checksums are verified and
+    /// the transport checksum of `bytes` is invalid.
+    fn verify_checksum(&self, info: &Info, bytes: &[u8]) -> Result<(), &'static str> {
+        if self.config.verify_checksums && !info.checksum_valid(bytes) {
+            return Err(reasons::BAD_CHECKSUM);
+        }
+        Ok(())
     }
 
     /// Asks the decision closure again about the recorded flow `flow` of
@@ -576,14 +586,16 @@ impl Masquerade {
         Ok(())
     }
 
-    /// Asks the decision closure about a new flow and records it; returns
-    /// its source and token, or `None` when the packet passes.
-    fn new_flow(&self, info: &Info) -> Result<Option<(Ipv6Addr, u16)>, &'static str> {
+    /// Asks the decision closure about a new flow and, once the checksum of
+    /// its first packet `bytes` is verified, records it; returns its source
+    /// and token, or `None` when the packet passes.
+    fn new_flow(&self, info: &Info, bytes: &[u8]) -> Result<Option<(Ipv6Addr, u16)>, &'static str> {
         let tuple = info.tuple();
         // No lock is held here: the closure may call back into `self`.
         let Some(decision) = (self.decide)(&tuple) else {
             return Ok(None);
         };
+        self.verify_checksum(info, bytes)?;
         let source = decision.source;
         let now = (self.clock)();
         let config = &self.config;
