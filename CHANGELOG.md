@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `nsplane-acl`: a peer cache entry missing right after it was stored drops the packet with
   `reasons::INTERNAL` (counted, fail-closed) instead of panicking.
+- `nsplane-acl`: the filter tables' LRU map frees an empty slot as a no-op instead of
+  panicking.
 - `nsplane-wss`: a stream closed at its buffer budget is reported as
   `WssCloseReason::Overflow` even when its relay task ends first (it was sometimes
   `PeerClosed` under load).
