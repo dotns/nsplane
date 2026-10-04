@@ -292,7 +292,7 @@ mod tests {
         map.insert(5, 5);
         map.insert(6, 6);
         assert_eq!(map.slots.len(), 5);
-        assert!(map.free.is_empty());
+        assert_eq!(map.free, [] as [usize; 0]);
         assert_eq!(keys(&mut map), [0, 2, 3, 5, 6]);
         assert_eq!(map.release(0), None);
         assert!(map.is_empty());
