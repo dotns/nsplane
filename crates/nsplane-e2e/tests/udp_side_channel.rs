@@ -2,8 +2,9 @@
 //! channel for datagrams starting with [`PREFIX`], with segmentation offload on and off:
 //! side datagrams sent both ways on the same sockets while WireGuard traffic flows arrive at
 //! the other side's receiver from the right address, never reach an engine, and leave the
-//! transfer intact. A side receiver that is never read drops what it cannot hold and counts
-//! it.
+//! transfer intact. Side datagrams sent with the awaiting `send_to_async` while an engine
+//! sends on the same socket arrive too. A side receiver that is never read drops what it
+//! cannot hold and counts it.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -172,6 +173,54 @@ async fn side_channel_beside_wireguard_offload_on() -> TestResult {
 #[tokio::test]
 async fn side_channel_beside_wireguard_offload_off() -> TestResult {
     side_channel_beside_wireguard(false).await
+}
+
+/// Side datagrams sent with `send_to_async` while an engine sends on the same socket.
+const AWAITED: u64 = 64;
+
+async fn awaited_side_sends_beside_wireguard(offload: bool) -> TestResult {
+    let (a, a_sender, _a_rx) = node(1, offload, 1)?;
+    let (mut b, _b_sender, mut b_rx) = node(2, offload, usize::try_from(AWAITED)?)?;
+    let (a_addr, b_addr) = (a.path.addr, b.path.addr);
+    introduce(&a, &b, None).await?;
+    transfer(&a, &mut b, Family::V4, 64).await?;
+
+    let packets: Vec<_> = (0..ROUNDS * BURST)
+        .map(|seq| {
+            let mut data = payload(1300);
+            data[..8].copy_from_slice(&seq.to_be_bytes());
+            a.packet_to(&b, Family::V4, &data)
+        })
+        .collect();
+    let traffic = async {
+        for packet in &packets {
+            a.local.send(PacketBuf::from_packet(packet)).await?;
+        }
+        collect(&mut b, &packets).await
+    };
+    let sides = async {
+        for seq in 0..AWAITED {
+            a_sender
+                .send_to_async(&side_datagram(1, seq), b_addr)
+                .await?;
+            tokio::task::yield_now().await;
+        }
+        collect_side(&mut b_rx, 1, AWAITED, a_addr).await
+    };
+    let (traffic, sides) = tokio::join!(traffic, sides);
+    traffic?;
+    sides?;
+    expect_no_drops(&b).await
+}
+
+#[tokio::test]
+async fn awaited_side_sends_beside_wireguard_offload_on() -> TestResult {
+    awaited_side_sends_beside_wireguard(true).await
+}
+
+#[tokio::test]
+async fn awaited_side_sends_beside_wireguard_offload_off() -> TestResult {
+    awaited_side_sends_beside_wireguard(false).await
 }
 
 /// Side datagrams sent to a receiver of capacity 1 that is never read.

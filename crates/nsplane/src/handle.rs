@@ -356,6 +356,9 @@ impl EngineHandle {
 
     /// Delivers `packet` to the local sink as if it came from `peer`, bypassing the inbound
     /// filters and the allowed-IP source check.
+    ///
+    /// Part of the contract: no inbound filter sees the packet, so a stateful filter records
+    /// nothing about it and a translating filter does not translate it.
     pub async fn inject_inbound(&self, peer: PeerId, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Inbound(peer, packet), tx))
             .await
@@ -363,6 +366,11 @@ impl EngineHandle {
 
     /// Encrypts `packet` and sends it to the peer it is routed to, bypassing the outbound
     /// filters.
+    ///
+    /// Part of the contract, which will not change silently: no outbound filter sees the
+    /// packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply state for
+    /// it, so the peer's replies are judged by the inbound rules alone, and a translating
+    /// filter does not translate it.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Outbound(packet), tx))
             .await
@@ -373,6 +381,10 @@ impl EngineHandle {
     /// For probes on a candidate path while the peer's traffic stays on its path. Without a
     /// current session the packet is dropped as `reasons::NO_SESSION` (no handshake is
     /// started); unknown peers are ignored. See `Core::inject_outbound_on`.
+    ///
+    /// Like [`EngineHandle::inject_outbound`], part of the contract: no outbound filter sees
+    /// the packet, so a stateful filter records no reply state for it (its replies are judged
+    /// by the inbound rules alone) and a translating filter does not translate it.
     pub async fn inject_outbound_on(
         &self,
         peer: PeerId,
