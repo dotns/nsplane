@@ -1,7 +1,7 @@
 //! Packet ownership: which ingress packets belong to the stack's connections and flows.
 //!
 //! The driver and the UDP handles register the tuple of every TCP connection (opening,
-//! open or held half closed), bound UDP socket and UDP flow in one shared table when it
+//! open or held half closed), bound or connected UDP socket and UDP flow in one shared table when it
 //! opens and remove it when it is gone, so [`NetStackHandle::owns`](crate::NetStackHandle::owns)
 //! answers with one short lock and no work per packet when it is not called.
 //!
@@ -26,8 +26,8 @@ use crate::stack::tcp_segment;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ownership {
     /// The packet belongs to something the stack holds: a TCP connection (open, opening or
-    /// half closed), a bound UDP socket or a UDP flow, or it is an ICMP error about a
-    /// packet one of them sent.
+    /// half closed), a bound UDP socket, a connected UDP socket (from its remote only) or a
+    /// UDP flow, or it is an ICMP error about a packet one of them sent.
     Flow,
     /// The packet opens something new the stack accepts: a bare TCP SYN or a UDP datagram
     /// to one of the stack's addresses.
@@ -199,7 +199,8 @@ impl Owners {
         self.register(Key::Tcp(local, remote))
     }
 
-    /// Registers the UDP flow from `remote` to `local`.
+    /// Registers the UDP flow from `remote` to `local`, or a UDP socket connected from
+    /// `local` to `remote`.
     pub(crate) fn udp_flow(
         self: &Arc<Self>,
         local: SocketAddr,
@@ -380,7 +381,8 @@ impl Owners {
         }
     }
 
-    /// Whether a UDP datagram from `remote` to `local` reaches a bound socket or a flow.
+    /// Whether a UDP datagram from `remote` to `local` reaches a bound or connected socket
+    /// or a flow.
     fn udp_registered(&self, local: SocketAddr, remote: SocketAddr) -> bool {
         let unspecified = match local.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),

@@ -492,3 +492,27 @@ async fn without_reassembly_a_discard_does_nothing() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_connected_sockets_fragments_are_flow_from_its_remote_only() -> TestResult {
+    let (stack, handle) = NetStack::new(config(Some(ReassemblyConfig::default())));
+    let (_source, _sink) = stack.split();
+    for remote in ["10.7.0.2:1000", "[fd00:7::2]:1000"] {
+        let remote: SocketAddr = remote.parse()?;
+        let socket = handle.connect_udp(remote).await?;
+        let local = socket.local_addr();
+        let (packet, _) = datagram(remote, local, 1200)?;
+        let fragments = split(&packet, 21);
+        assert_eq!(handle.owns(&fragments[0]), Ownership::Flow, "first");
+        assert_eq!(handle.owns(&fragments[1]), Ownership::Flow, "later");
+
+        let other = SocketAddr::new(remote.ip(), 1001);
+        let (stray, _) = datagram(other, local, 1200)?;
+        assert_eq!(
+            handle.owns(&split(&stray, 22)[0]),
+            Ownership::Listener,
+            "another remote"
+        );
+    }
+    Ok(())
+}

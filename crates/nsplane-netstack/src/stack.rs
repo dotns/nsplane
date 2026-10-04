@@ -37,7 +37,7 @@ const MAX_INJECT_PER_ITER: usize = 256;
 /// transmitting at this bound; only immediate replies to ingested packets are dropped
 /// (and counted) beyond it.
 const EGRESS_BACKLOG: usize = 256;
-/// Commands (`connect_tcp`, `bind_udp`) queued for the driver.
+/// Commands (`connect_tcp`, `bind_udp`, `connect_udp`) queued for the driver.
 const COMMAND_CAPACITY: usize = 64;
 /// Longest the driver sleeps without a timer from smoltcp.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
@@ -45,7 +45,8 @@ const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(20);
-/// First ephemeral port for `connect_tcp` and `bind_udp` on port 0 (RFC 6335).
+/// First ephemeral port for `connect_tcp`, `bind_udp` and `connect_udp` on port 0
+/// (RFC 6335).
 const EPHEMERAL_START: u16 = 49_152;
 
 fn stack_gone() -> io::Error {
@@ -116,6 +117,7 @@ impl NetStack {
             connecting: Vec::new(),
             flows: HashMap::new(),
             bound: HashMap::new(),
+            connected: HashMap::new(),
             ingress,
             batch: Vec::with_capacity(MAX_INJECT_PER_ITER),
             egress,
@@ -211,6 +213,11 @@ enum Command {
         local: SocketAddr,
         reply: oneshot::Sender<io::Result<UdpSocket>>,
     },
+    ConnectUdp {
+        local: SocketAddr,
+        remote: SocketAddr,
+        reply: oneshot::Sender<io::Result<UdpSocket>>,
+    },
 }
 
 /// The application's side of a [`NetStack`]: accepts and opens connections and flows.
@@ -244,8 +251,8 @@ impl NetStackHandle {
 
     /// Inbound UDP flows, one per `(remote, local)` tuple, each with its first datagram.
     ///
-    /// Datagrams to an address bound with [`bind_udp`](Self::bind_udp) are not reported
-    /// here. Only the first call (on any clone of the handle) gets the flows; every later
+    /// Datagrams to an address bound with [`bind_udp`](Self::bind_udp) or of a tuple
+    /// connected with [`connect_udp`](Self::connect_udp) are not reported here. Only the first call (on any clone of the handle) gets the flows; every later
     /// call returns a stream that ends immediately. The stream ends when the stack stops.
     /// Flows that arrive while the stream is not consumed are queued up to
     /// [`NetStackConfig::accept_capacity`], then dropped and counted.
@@ -310,6 +317,46 @@ impl NetStackHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Bind { local, reply })
+            .await
+            .map_err(|_| stack_gone())?;
+        response.await.map_err(|_| stack_gone())?
+    }
+
+    /// Opens a UDP socket connected to `remote`.
+    ///
+    /// The local end is the stack's address of `remote`'s family and an ephemeral port;
+    /// see [`connect_udp_from`](Self::connect_udp_from).
+    pub async fn connect_udp(&self, remote: SocketAddr) -> io::Result<UdpSocket> {
+        self.connect_udp_from(SocketAddr::new(unspecified(remote.ip()), 0), remote)
+            .await
+    }
+
+    /// Opens a UDP socket from `local` connected to `remote`.
+    ///
+    /// `local` must be the stack's address of `remote`'s family or the unspecified address
+    /// of that family (which stands for the stack's address); port `0` picks an ephemeral
+    /// port no other socket of the stack uses on that address. The socket receives only
+    /// the datagrams from `remote` to `local`, ahead of a socket bound to `local` with
+    /// [`bind_udp`](Self::bind_udp), which keeps every other remote's; the tuple is
+    /// [`Ownership::Flow`] for [`owns`](Self::owns) until the socket is dropped.
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] if `remote` is unspecified or `local` is
+    /// of the other family, [`io::ErrorKind::AddrNotAvailable`] if the stack has no address
+    /// of the family or `local` is another address, [`io::ErrorKind::AddrInUse`] if a live
+    /// connected socket or [`UdpFlow`] holds exactly this tuple, and
+    /// [`io::ErrorKind::BrokenPipe`] once the stack stopped.
+    pub async fn connect_udp_from(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> io::Result<UdpSocket> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ConnectUdp {
+                local,
+                remote,
+                reply,
+            })
             .await
             .map_err(|_| stack_gone())?;
         response.await.map_err(|_| stack_gone())?
@@ -670,6 +717,9 @@ struct Driver {
     connecting: Vec<Connecting>,
     flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
     bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
+    /// Connected UDP sockets by `(remote, local)`; checked before `bound` only while not
+    /// empty.
+    connected: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<(SocketAddr, Bytes)>>,
     ingress: mpsc::Receiver<PacketBuf>,
     /// Ingress packets taken in one batch; empty between batches.
     batch: Vec<PacketBuf>,
@@ -896,13 +946,28 @@ impl Driver {
         stats::add(&self.stats.malformed, rejected);
     }
 
-    /// Delivers a datagram to its bound socket, or to its flow.
+    /// Delivers a datagram to its connected socket, its bound socket, or to its flow.
     fn dispatch_udp(&mut self, datagram: Datagram) {
         let Datagram {
             src,
             dst,
             mut payload,
         } = datagram;
+        if !self.connected.is_empty()
+            && let Some(socket) = self.connected.get(&(src, dst))
+        {
+            match socket.try_send((src, payload)) {
+                Ok(()) => return,
+                Err(TrySendError::Full(_)) => {
+                    stats::add(&self.stats.udp_queue_full, 1);
+                    return;
+                }
+                Err(TrySendError::Closed((_, returned))) => {
+                    self.connected.remove(&(src, dst));
+                    payload = returned;
+                }
+            }
+        }
         let unspecified = match dst.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -1023,6 +1088,13 @@ impl Driver {
             Command::Bind { local, reply } => {
                 let _ = reply.send(self.bind(local));
             }
+            Command::ConnectUdp {
+                local,
+                remote,
+                reply,
+            } => {
+                let _ = reply.send(self.connect_udp(local, remote));
+            }
         }
     }
 
@@ -1139,6 +1211,71 @@ impl Driver {
             registration,
             addr,
             source,
+            None,
+            rx,
+            self.out.clone(),
+        ))
+    }
+
+    /// Connects a UDP socket, see [`NetStackHandle::connect_udp_from`].
+    fn connect_udp(&mut self, local: SocketAddr, remote: SocketAddr) -> io::Result<UdpSocket> {
+        if remote.port() == 0 || remote.ip().is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote address or port is unspecified",
+            ));
+        }
+        if local.is_ipv4() != remote.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "address families differ",
+            ));
+        }
+        let source = self.settings.local_for(remote.ip()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "the stack has no address of the remote's family",
+            )
+        })?;
+        if !local.ip().is_unspecified() && local.ip() != source {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "not an address of the stack",
+            ));
+        }
+        // Dropped sockets leave the table here too, so it empties when none is live.
+        self.connected.retain(|_, tx| !tx.is_closed());
+        let port = if local.port() == 0 {
+            let (bound, connected) = (&self.bound, &self.connected);
+            let any = unspecified(source);
+            next_ephemeral(&mut self.next_udp_port, |port| {
+                let addr = SocketAddr::new(source, port);
+                !bound.contains_key(&addr)
+                    && !bound.contains_key(&SocketAddr::new(any, port))
+                    && !connected.keys().any(|&(_, local)| local == addr)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port"))?
+        } else {
+            local.port()
+        };
+        let local = SocketAddr::new(source, port);
+        let key = (remote, local);
+        if self.connected.contains_key(&key)
+            || self.flows.get(&key).is_some_and(|tx| !tx.is_closed())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "UDP tuple already in use",
+            ));
+        }
+        let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
+        self.connected.insert(key, tx);
+        let registration = self.owners.udp_flow(local, remote);
+        Ok(UdpSocket::new(
+            registration,
+            local,
+            source,
+            Some(remote),
             rx,
             self.out.clone(),
         ))
@@ -1486,6 +1623,14 @@ impl Driver {
             None => self.commands = None,
         }
         true
+    }
+}
+
+/// The unspecified address of `ip`'s family.
+const fn unspecified(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     }
 }
 
