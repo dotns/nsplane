@@ -131,7 +131,7 @@ impl PacketBuf {
     /// # Errors
     ///
     /// Returns [`BoundsError`] if `n > len()`; the packet is left unchanged.
-    pub fn advance(&mut self, n: usize) -> Result<(), BoundsError> {
+    pub const fn advance(&mut self, n: usize) -> Result<(), BoundsError> {
         if n > self.len() {
             return Err(BoundsError);
         }
