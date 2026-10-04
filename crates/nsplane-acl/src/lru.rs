@@ -192,10 +192,10 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
                 break;
             };
             let next = node.next;
-            if !keep(&node.key, &node.value) {
-                if let Some((key, _)) = self.release(slot) {
-                    self.index.remove(&key);
-                }
+            if !keep(&node.key, &node.value)
+                && let Some((key, _)) = self.release(slot)
+            {
+                self.index.remove(&key);
             }
             slot = next;
         }
