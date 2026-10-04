@@ -71,6 +71,11 @@ type TranslatedPredicate = Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync>;
 /// rate-limited and never sent about ICMP errors, multicast or broadcast packets, or
 /// fragments other than the first.
 ///
+/// When the path a peer's data leaves on limits its inner MTU below the source MTU (see
+/// [`EngineHandle::peer_mtus`](crate::EngineHandle::peer_mtus)), packets to the
+/// destinations routed to that peer are held to the peer's MTU instead: the errors carry
+/// it and the fragments fit it. This is how the per-peer MTU reaches the local side.
+///
 /// [`PacketSource::mtu`]: crate::PacketSource::mtu
 /// [`translated`]: Self::translated
 #[derive(Clone, Default)]
@@ -165,22 +170,24 @@ impl Fragmenter {
         self.stats
     }
 
-    /// Decides about `packet` under `mtu`; `route` names the peer a destination is routed to.
+    /// Decides about `packet`. No packet's MTU is below `floor`; above it, `lookup` names the
+    /// peer a destination is routed to and the MTU of packets to it (the source MTU, or the
+    /// lower inner MTU of that peer), so packets within the floor never pay for it.
     pub(crate) fn process(
         &mut self,
         packet: PacketBuf,
-        mtu: u16,
+        floor: u16,
         now: Instant,
-        route: impl FnOnce(IpAddr) -> Option<PeerId>,
+        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
-        let mtu = usize::from(mtu);
+        let floor = usize::from(floor);
         // Within every ceiling: the common case.
-        if packet.len() <= mtu.saturating_sub(TRANSLATION_GROWTH + IPV6_FRAGMENT_HEADER) {
+        if packet.len() <= floor.saturating_sub(TRANSLATION_GROWTH + IPV6_FRAGMENT_HEADER) {
             return Action::Send(packet);
         }
         match packet.as_packet().first().map(|b| b >> 4) {
-            Some(4) => self.ipv4(packet, mtu, now, route),
-            Some(6) => self.ipv6(packet, mtu, now, route),
+            Some(4) => self.ipv4(packet, floor, now, lookup),
+            Some(6) => self.ipv6(packet, floor, now, lookup),
             // Not IP: the core drops it.
             _ => Action::Send(packet),
         }
@@ -189,22 +196,27 @@ impl Fragmenter {
     fn ipv6(
         &mut self,
         packet: PacketBuf,
-        mtu: usize,
+        floor: usize,
         now: Instant,
-        route: impl FnOnce(IpAddr) -> Option<PeerId>,
+        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
         let bytes = packet.as_packet();
-        if bytes.len() <= mtu {
+        if bytes.len() <= floor {
             return Action::Send(packet);
         }
         let Ok((header, payload)) = Ipv6Header::parse(bytes) else {
             return Action::Send(packet);
         };
         let (src, dst) = (header.src(), header.dst());
+        let (peer, mtu) = lookup(IpAddr::V6(dst));
+        let mtu = usize::from(mtu);
+        if bytes.len() <= mtu {
+            return Action::Send(packet);
+        }
         if !may_answer_v6(src, dst, header.next_header(), payload) {
             return self.drop("IPv6 packet above the MTU");
         }
-        let peer = match self.admit(IpAddr::V6(dst), now, route) {
+        let peer = match self.admit(IpAddr::V6(dst), peer, now) {
             Ok(peer) => peer,
             Err(reason) => return Action::Drop(reason),
         };
@@ -216,9 +228,9 @@ impl Fragmenter {
     fn ipv4(
         &mut self,
         packet: PacketBuf,
-        mtu: usize,
+        floor: usize,
         now: Instant,
-        route: impl FnOnce(IpAddr) -> Option<PeerId>,
+        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
         let bytes = packet.as_packet();
         let Ok((header, payload)) = Ipv4Header::parse(bytes) else {
@@ -227,11 +239,17 @@ impl Fragmenter {
         let (src, dst) = (header.src(), header.dst());
         let translated = self.translated.as_ref().is_some_and(|t| t(dst));
         let fragment = header.more_fragments() || header.fragment_offset() != 0;
-        let ceiling = match (translated, fragment) {
+        let ceiling = |mtu: usize| match (translated, fragment) {
             (false, _) => mtu,
             (true, false) => mtu.saturating_sub(TRANSLATION_GROWTH),
             (true, true) => mtu.saturating_sub(TRANSLATION_GROWTH + IPV6_FRAGMENT_HEADER),
         };
+        if bytes.len() <= ceiling(floor) {
+            return Action::Send(packet);
+        }
+        let (peer, mtu) = lookup(IpAddr::V4(dst));
+        let mtu = usize::from(mtu);
+        let ceiling = ceiling(mtu);
         if bytes.len() <= ceiling {
             return Action::Send(packet);
         }
@@ -241,7 +259,7 @@ impl Fragmenter {
             if !first || !may_answer_v4(src, dst, header.protocol(), payload) {
                 return self.drop("IPv4 DF packet above the ceiling");
             }
-            let peer = match self.admit(IpAddr::V4(dst), now, route) {
+            let peer = match self.admit(IpAddr::V4(dst), peer, now) {
                 Ok(peer) => peer,
                 Err(reason) => return Action::Drop(reason),
             };
@@ -270,15 +288,15 @@ impl Fragmenter {
         Action::Drop(FRAGMENT_OVERSIZE)
     }
 
-    /// The peer to deliver an error about a packet to `dst` from, if it is routed and the
-    /// rate limit admits it; otherwise the reason the packet is dropped.
+    /// The peer to deliver an error about a packet to `dst` from, if it is routed (to
+    /// `peer`) and the rate limit admits it; otherwise the reason the packet is dropped.
     fn admit(
         &mut self,
         dst: IpAddr,
+        peer: Option<PeerId>,
         now: Instant,
-        route: impl FnOnce(IpAddr) -> Option<PeerId>,
     ) -> Result<PeerId, &'static str> {
-        let Some(peer) = route(dst) else {
+        let Some(peer) = peer else {
             self.stats.no_route += 1;
             tracing::debug!(%dst, "no route for an ICMP error");
             return Err(FRAGMENT_NO_ROUTE);
@@ -557,7 +575,9 @@ mod tests {
     }
 
     fn run(f: &mut Fragmenter, packet: &[u8], mtu: u16, now: Instant) -> Action {
-        f.process(PacketBuf::from_packet(packet), mtu, now, |_| Some(PEER))
+        f.process(PacketBuf::from_packet(packet), mtu, now, |_| {
+            (Some(PEER), mtu)
+        })
     }
 
     /// Checks `fragments` of `original` (headers, offsets, sizes under `mtu`) and returns
@@ -925,7 +945,7 @@ mod tests {
             PacketBuf::from_packet(&packet),
             1420,
             Instant::now(),
-            |_| None,
+            |_| (None, 1420),
         );
         assert!(matches!(action, Action::Drop(FRAGMENT_NO_ROUTE)));
         assert_eq!(f.stats().no_route, 1);
@@ -958,5 +978,141 @@ mod tests {
             Action::Drop(FRAGMENT_OVERSIZE)
         ));
         assert_eq!(f.stats().dropped, 1);
+    }
+
+    /// Two peers: `DST4` / `DST6` routed to `PEER` at `mtu`, everything else to `OTHER` at
+    /// 1420; the floor is the lower. Counts the lookups.
+    fn run_per_peer(
+        f: &mut Fragmenter,
+        packet: &[u8],
+        mtu: u16,
+        lookups: &std::cell::Cell<u32>,
+    ) -> Action {
+        f.process(
+            PacketBuf::from_packet(packet),
+            mtu.min(1420),
+            Instant::now(),
+            |dst| {
+                lookups.set(lookups.get() + 1);
+                if dst == IpAddr::V4(DST4) || dst == IpAddr::V6(DST6) {
+                    (Some(PEER), mtu)
+                } else {
+                    (Some(OTHER), 1420)
+                }
+            },
+        )
+    }
+
+    const OTHER: PeerId = PeerId::new(8);
+    const OTHER4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 3);
+    const OTHER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 3);
+
+    fn to_other4(mut packet: Vec<u8>) -> Vec<u8> {
+        packet[16..20].copy_from_slice(&OTHER4.octets());
+        let sum = recompute(&packet[..IPV4_HEADER], 10, ipv4_header_checksum);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn the_peer_lookup_runs_only_above_the_floor() {
+        let lookups = std::cell::Cell::new(0);
+        let mut f = fragmenter(true);
+        // Within the floor less the translation room: never looked up.
+        for packet in [
+            ipv4(1320 - 28, protocol::TCP, DF, &[]),
+            ipv6(1320 - 28, protocol::UDP, DST6),
+        ] {
+            assert!(matches!(
+                run_per_peer(&mut f, &packet, 1320, &lookups),
+                Action::Send(_)
+            ));
+        }
+        // Native IPv4 and IPv6 up to the floor itself: not looked up either.
+        let mut native = fragmenter(false);
+        for packet in [
+            ipv4(1320, protocol::TCP, DF, &[]),
+            ipv6(1320, protocol::UDP, DST6),
+        ] {
+            assert!(matches!(
+                run_per_peer(&mut native, &packet, 1320, &lookups),
+                Action::Send(_)
+            ));
+        }
+        assert_eq!(lookups.get(), 0);
+        // Above the floor: looked up once, and sent when the destination's peer allows it.
+        let packet = ipv6(1400, protocol::UDP, OTHER6);
+        assert!(matches!(
+            run_per_peer(&mut native, &packet, 1320, &lookups),
+            Action::Send(_)
+        ));
+        assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn errors_carry_the_peer_mtu() {
+        let lookups = std::cell::Cell::new(0);
+        let mut f = fragmenter(false);
+        let packet = ipv6(1400, protocol::UDP, DST6);
+        let Action::Reply(peer, reply) = run_per_peer(&mut f, &packet, 1320, &lookups) else {
+            panic!("no Packet Too Big");
+        };
+        assert_eq!(peer, PEER);
+        assert_eq!(reply.as_packet()[44..48], 1320u32.to_be_bytes());
+
+        let packet = ipv4(1400, protocol::TCP, DF, &[]);
+        let Action::Reply(peer, reply) = run_per_peer(&mut f, &packet, 1320, &lookups) else {
+            panic!("no Fragmentation Needed");
+        };
+        assert_eq!(peer, PEER);
+        let icmp = &reply.as_packet()[IPV4_HEADER..];
+        assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), 1320);
+        assert_eq!(f.stats().ptb_sent + f.stats().frag_needed_sent, 2);
+    }
+
+    #[test]
+    fn fragments_are_sized_per_peer() {
+        let lookups = std::cell::Cell::new(0);
+        let mut f = fragmenter(false);
+        let packet = ipv4(3000, protocol::UDP, 0, &[]);
+        let Action::Fragments(fragments) = run_per_peer(&mut f, &packet, 1320, &lookups) else {
+            panic!("not fragmented");
+        };
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(
+            check_fragments(&packet, &fragments, 1320, false),
+            packet[IPV4_HEADER..]
+        );
+        // The same packet to the other peer fits its 1420 in fewer fragments.
+        let other = to_other4(packet);
+        let Action::Fragments(fragments) = run_per_peer(&mut f, &other, 1320, &lookups) else {
+            panic!("not fragmented");
+        };
+        assert_eq!(fragments.len(), 3);
+        assert!(fragments[0].len() > 1320);
+        check_fragments(&other, &fragments, 1420, false);
+    }
+
+    #[test]
+    fn two_peers_keep_their_own_mtus() {
+        let lookups = std::cell::Cell::new(0);
+        let mut f = fragmenter(false);
+        // 1400 bytes: above the first peer's 1320, within the other's 1420.
+        let to_peer = ipv4(1400, protocol::TCP, DF, &[]);
+        let to_other = to_other4(to_peer.clone());
+        assert!(matches!(
+            run_per_peer(&mut f, &to_peer, 1320, &lookups),
+            Action::Reply(PEER, _)
+        ));
+        assert!(matches!(
+            run_per_peer(&mut f, &to_other, 1320, &lookups),
+            Action::Send(_)
+        ));
+        let to_other6 = ipv6(1500, protocol::UDP, OTHER6);
+        let Action::Reply(peer, reply) = run_per_peer(&mut f, &to_other6, 1320, &lookups) else {
+            panic!("no Packet Too Big");
+        };
+        assert_eq!(peer, OTHER);
+        assert_eq!(reply.as_packet()[44..48], 1420u32.to_be_bytes());
     }
 }

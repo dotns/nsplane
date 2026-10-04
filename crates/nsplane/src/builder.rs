@@ -1,6 +1,6 @@
 //! Configuration of an engine before it starts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use nsplane_packet::TransportId;
 use crate::engine::{self, Engine, NewTransport};
 use crate::fragment::{FragmentConfig, Fragmenter};
 use crate::io::{PacketSink, PacketSource};
+use crate::path_mtu;
 use crate::transport::Transport;
 
 /// Default capacity of the internal packet queues, in packets: 1.5x the high-water mark of a
@@ -45,8 +46,9 @@ impl Error for BuildError {}
 /// Builds an [`Engine`] on a packet source, a packet sink and one or more transports.
 ///
 /// Defaults: no private key, [`StandardRoaming`], no filters, no fragmenter, no periodic
-/// stats, queues of 1024 packets, an event channel of 1024 events and no crypto workers. At
-/// least one transport must be added with [`EngineBuilder::transport`].
+/// stats, queues of 1024 packets, an event channel of 1024 events, no crypto workers, no
+/// transport ceilings and learned path MTUs that expire after 10 minutes. At least one
+/// transport must be added with [`EngineBuilder::transport`].
 pub struct EngineBuilder<Src, Snk> {
     source: Src,
     sink: Snk,
@@ -59,6 +61,8 @@ pub struct EngineBuilder<Src, Snk> {
     event_capacity: usize,
     fragmenter: Option<FragmentConfig>,
     crypto_workers: usize,
+    transport_max: BTreeMap<TransportId, u16>,
+    path_mtu_expiry: Duration,
 }
 
 impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
@@ -73,6 +77,8 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("event_capacity", &self.event_capacity)
             .field("fragmenter", &self.fragmenter)
             .field("crypto_workers", &self.crypto_workers)
+            .field("transport_max", &self.transport_max)
+            .field("path_mtu_expiry", &self.path_mtu_expiry)
             .finish_non_exhaustive()
     }
 }
@@ -93,6 +99,8 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             fragmenter: None,
             crypto_workers: 0,
+            transport_max: BTreeMap::new(),
+            path_mtu_expiry: path_mtu::DEFAULT_EXPIRY,
         }
     }
 
@@ -182,6 +190,31 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         self
     }
 
+    /// Limits the WireGuard datagrams (the bytes handed to [`Transport::send`]) of transport
+    /// `id` to `max` bytes, e.g. a relay's frame limit: the inner MTU of every peer whose data
+    /// leaves on it becomes at most `max - 32` (never below 1280, never above the source
+    /// MTU), together with the path MTUs the engine learns ([`crate::EngineHandle::report_path_mtu`]).
+    /// Changed at runtime with [`crate::EngineHandle::set_transport_max_datagram`].
+    ///
+    /// The per-peer MTU reaches the local side only through the fragmentation stage
+    /// ([`EngineBuilder::fragmenter`]) or through ICMP the caller generates from
+    /// [`crate::EngineHandle::peer_mtus`]; without a fragmenter it is visible only there.
+    #[must_use]
+    pub fn transport_max_datagram(mut self, id: TransportId, max: u16) -> Self {
+        self.transport_max.insert(id, max);
+        self
+    }
+
+    /// Sets how long a learned path MTU lasts after the last report that set or confirmed
+    /// it; 10 minutes by default. When it expires the transport's ceiling applies again.
+    /// See [`crate::EngineHandle::report_path_mtu`]; like there, the per-peer MTU reaches
+    /// the local side only through the fragmentation stage or ICMP the caller generates.
+    #[must_use]
+    pub const fn path_mtu_expiry(mut self, expiry: Duration) -> Self {
+        self.path_mtu_expiry = expiry;
+        self
+    }
+
     /// Spawns the engine's tasks and returns the running engine.
     ///
     /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
@@ -222,6 +255,8 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             event_capacity: self.event_capacity,
             fragmenter: self.fragmenter.map(Fragmenter::new),
             crypto_workers: self.crypto_workers,
+            transport_max: self.transport_max,
+            path_mtu_expiry: self.path_mtu_expiry,
         }))
     }
 }

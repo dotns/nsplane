@@ -33,6 +33,7 @@ mod io;
 mod link;
 mod map;
 mod merge;
+mod path_mtu;
 mod pipe;
 mod pump;
 mod splitter;
@@ -49,8 +50,8 @@ pub use events::{
 };
 pub use fragment::{FragmentConfig, FragmentStats};
 pub use handle::{
-    EngineError, EngineHandle, EngineStatus, Peer, QueueDepth, QueueStats, TransportError,
-    TransportStats,
+    EngineError, EngineHandle, EngineStatus, PathMtuStats, Peer, PeerMtus, QueueDepth, QueueStats,
+    TransportError, TransportStats,
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
@@ -64,5 +65,5 @@ pub use nsplane_packet::{
 pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};
 pub use splitter::{Splitter, SplitterStats};
-pub use transport::{BoxFuture, DynTransport, Transport};
+pub use transport::{BoxFuture, DynTransport, PathMtuReport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};
