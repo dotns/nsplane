@@ -91,7 +91,7 @@ impl NetStack {
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
             settings.v6.map(|(addr, _)| addr),
-            settings.reassembly.is_some(),
+            settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
 
@@ -318,6 +318,35 @@ impl NetStackHandle {
         self.stats.snapshot()
     }
 
+    /// Discards the fragmented datagram `(src, dst, protocol, id)` sent towards the stack,
+    /// so that none of its fragments joins a later flow on the same tuple.
+    ///
+    /// Call it when a flow's admission is revoked while one of its datagrams may be half
+    /// reassembled. From the call on, the driver drops every fragment of that datagram
+    /// that reaches it, including fragments already queued in the [`NetStackSink`], and
+    /// counts each in [`NetStackStats::reassembly_overflow`]; the fragments the stack
+    /// already holds never complete and are discarded at the reassembly timeout (counted
+    /// in [`NetStackStats::reassembly_timeout`]). The datagram is forgotten one
+    /// [`ReassemblyConfig::timeout`](crate::ReassemblyConfig::timeout)
+    /// after the call, when the held fragments have expired, so a later datagram with
+    /// the same identification starts afresh. At most
+    /// [`ReassemblyConfig::max_datagrams`](crate::ReassemblyConfig::max_datagrams)
+    /// discarded datagrams are remembered at once; beyond that the oldest is forgotten
+    /// early. The call also ends the [`owns`](Self::owns) memory of the datagram.
+    ///
+    /// `src` and `dst` are the packet's addresses (the peer's and the stack's) and
+    /// `protocol` the fragmented protocol; `id` is the IPv6 Fragment header's 32-bit
+    /// identification, or the IPv4 16-bit identification widened. As for reassembly, an
+    /// IPv6 datagram is identified by its addresses and `id`: `protocol` only narrows an
+    /// IPv4 discard.
+    ///
+    /// Without [`NetStackConfig::reassembly`] the stack drops every fragment anyway and
+    /// the call does nothing. It takes one short lock and never waits; while nothing is
+    /// discarded, fragments cost the driver one atomic load.
+    pub fn discard_fragments(&self, src: IpAddr, dst: IpAddr, protocol: u8, id: u32) {
+        self.owners.discard_fragments(src, dst, protocol, id);
+    }
+
     /// Whether the stack owns `packet`, an IP packet a peer sent towards the stack.
     ///
     /// Lets a local side share one decrypted stream between the stack and other
@@ -339,10 +368,19 @@ impl NetStackHandle {
     ///
     /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
     /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
-    /// one of the above and [`Ownership::Listener`] otherwise; a later fragment carries no
-    /// ports, so it is [`Ownership::Listener`] (the stack takes it either way, and its
-    /// datagram goes wherever the first fragment's tuple leads once it is complete).
-    /// Fragments of other protocols stay [`Ownership::None`].
+    /// one of the above and [`Ownership::Listener`] otherwise. A later fragment carries no
+    /// ports: it is [`Ownership::Flow`] when this call classified the first fragment of
+    /// its datagram (same addresses, protocol and identification) as
+    /// [`Ownership::Flow`] within the last
+    /// [`ReassemblyConfig::timeout`](crate::ReassemblyConfig::timeout)
+    /// and the datagram was not discarded with
+    /// [`discard_fragments`](Self::discard_fragments) since, and
+    /// [`Ownership::Listener`] otherwise, including when it arrives before its first
+    /// fragment (the stack takes it either way, and its datagram goes wherever the first
+    /// fragment's tuple leads once it is complete). This memory holds at most
+    /// [`ReassemblyConfig::max_datagrams`](crate::ReassemblyConfig::max_datagrams)
+    /// datagrams, dropping the oldest. Fragments of other protocols stay
+    /// [`Ownership::None`].
     ///
     /// The answer reflects the stack's state at the call; a connection or flow that opens
     /// or closes concurrently may be seen either way. A connect is visible from the moment
@@ -351,8 +389,8 @@ impl NetStackHandle {
     /// visible before its SYN-ACK leaves. A UDP flow or socket stops being visible when it
     /// is dropped.
     ///
-    /// The call takes one short lock and never waits. The stack keeps the table it reads
-    /// as connections, flows and sockets open and close, not per packet.
+    /// The call takes one short lock and never waits (a fragment two). The stack keeps the
+    /// table it reads as connections, flows and sockets open and close, not per packet.
     pub fn owns(&self, packet: &[u8]) -> Ownership {
         if self.commands.is_closed() {
             return Ownership::None;
@@ -768,13 +806,19 @@ impl Driver {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return Some(packet);
         };
-        let local =
-            IpPacket::parse(packet.as_packet()).is_ok_and(|ip| self.settings.is_local(ip.dst()));
-        if !local {
+        let now = Instant::now().into_std();
+        let Ok(ip) = IpPacket::parse(packet.as_packet()) else {
             // `classify` counts it.
             return Some(packet);
+        };
+        if !self.settings.is_local(ip.dst()) {
+            return Some(packet);
         }
-        let routed = match reassembler.push(packet.as_packet(), Instant::now().into_std()) {
+        if self.owners.is_discarded(&ip, now) {
+            stats::add(&self.stats.reassembly_overflow, 1);
+            return None;
+        }
+        let routed = match reassembler.push(packet.as_packet(), now) {
             Outcome::Pass => return Some(packet),
             Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
             Outcome::Held | Outcome::Dropped => None,
@@ -783,14 +827,17 @@ impl Driver {
         routed
     }
 
-    /// Discards incomplete datagrams past the reassembly timeout; free while none is held.
+    /// Discards incomplete datagrams past the reassembly timeout, and forgets discarded
+    /// ones; free while none is held.
     fn expire_fragments(&mut self) {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return;
         };
-        if reassembler.expire(Instant::now().into_std()) > 0 {
+        let now = Instant::now().into_std();
+        if reassembler.expire(now) > 0 {
             self.count_reassembly();
         }
+        self.owners.expire_discarded(now);
     }
 
     /// Adds what the reassembler counted since the last call to the stack's counters.
