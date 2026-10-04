@@ -35,7 +35,9 @@
 //!   link that came up ([`WssConfig::backoff_min`] when unset), and after a failed dial
 //!   [`WssConfig::backoff_min`], doubled after each further failure up to
 //!   [`WssConfig::backoff_max`]. Without a reconnect delay, the wait after a link is the
-//!   first step of that doubling.
+//!   first step of that doubling. A [`WssStreamClient`] open waits for that dial unless
+//!   [`WssStreamLimits::open_timeout`] is set; past it the open fails with the last dial
+//!   error while the dial goes on.
 //! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`]; the
 //!   receiving half ends the link when no frame at all (pongs included) arrived for
 //!   [`WssConfig::read_idle`].

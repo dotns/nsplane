@@ -404,6 +404,9 @@ impl Connector {
     /// sets [`LinkState::Rejected`]. An upgrade refused with an HTTP response fails with a
     /// [`WssDialError`] inside. Every failure sends its event; the carriers send
     /// [`WssDialEvent::Connected`] themselves.
+    ///
+    /// Not cancellation safe: dropped before it finishes, the next dial goes at once (the
+    /// wait it took is lost), so the carriers run it to the end in their own task.
     pub(crate) async fn connect(&self, counters: &DialCounters) -> io::Result<Ws> {
         let retry = std::mem::take(&mut *lock(&self.retry));
         let (wait, token) = match retry {

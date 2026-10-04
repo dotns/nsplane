@@ -81,12 +81,15 @@ fn limits_defaults_and_setters() {
     assert_eq!(limits.control_queue, 64);
     assert_eq!(limits.data_queue, 256);
     assert_eq!(limits.max_streams_per_session, 1024);
+    assert_eq!(limits.open_timeout, None);
+    assert!(format!("{limits:?}").contains("open_timeout: None"));
     let limits = limits
         .stream_buffer(1)
         .session_buffer(2)
         .control_queue(3)
         .data_queue(4)
-        .max_streams_per_session(5);
+        .max_streams_per_session(5)
+        .open_timeout(Duration::from_millis(6));
     assert_eq!(
         (
             limits.stream_buffer,
@@ -97,6 +100,8 @@ fn limits_defaults_and_setters() {
         ),
         (1, 2, 3, 4, 5)
     );
+    assert_eq!(limits.open_timeout, Some(Duration::from_millis(6)));
+    assert!(format!("{limits:?}").contains("open_timeout: Some(6ms)"));
     assert_eq!(MAX_DATA_PAYLOAD + HEADER_LEN, 65_536);
 }
 
