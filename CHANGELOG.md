@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-acl`: `AclFilterScope` and `AclFilter::with_scope`: an optional outbound source
+  constraint (`outbound_sources`). An outbound packet whose source address is outside the
+  allowed prefixes is dropped with `reasons::OUTBOUND_SOURCE` (counted in
+  `AclFilterStats::outbound_source`) before the destination rules; off by default.
+
 ## [0.8.0] - 2026-10-04
 
 The first release under the nsplane name (formerly a boringtun fork): a sans-I/O WireGuard
