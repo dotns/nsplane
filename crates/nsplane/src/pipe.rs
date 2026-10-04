@@ -1,5 +1,6 @@
 //! An in-memory loopback from a [`PacketSink`] to a [`PacketSource`].
 
+use std::collections::VecDeque;
 use std::io;
 
 use nsplane_packet::{PacketBatch, PacketBuf, PeerId};
@@ -55,6 +56,22 @@ pub struct PipeSink {
 impl PacketSink for PipeSink {
     async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
         self.tx.send(packet).await.map_err(|_| closed())
+    }
+
+    /// Queues packets from the front of `packets` while the pipe has room, without
+    /// waiting, so an engine can deliver into a pipe from its owner task.
+    fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
+        while let Some((from, packet)) = packets.pop_front() {
+            match self.tx.try_send(packet) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(packet)) => {
+                    packets.push_front((from, packet));
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -249,6 +266,27 @@ mod tests {
         timeout(WAIT, mtu.changed()).await??;
         assert_eq!(*mtu.borrow_and_update(), 1280);
         assert_eq!(*source.mtu().borrow(), 1280);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_send_batch_fills_the_pipe_without_waiting() -> TestResult {
+        let (sink, mut source) = pipe(2, 1280);
+        let mut packets: VecDeque<_> = (1..=3u8)
+            .map(|byte| (PeerId::new(1), PacketBuf::from_packet(&[byte])))
+            .collect();
+        let err = sink.try_send_batch(&mut packets).err().ok_or("no error")?;
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(source.recv().await?.as_packet(), [1]);
+        assert_eq!(source.recv().await?.as_packet(), [2]);
+        sink.try_send_batch(&mut packets)?;
+        assert!(packets.is_empty());
+        assert_eq!(source.recv().await?.as_packet(), [3]);
+        drop(source);
+        let mut more: VecDeque<_> = [(PeerId::new(1), PacketBuf::from_packet(&[4]))].into();
+        let err = sink.try_send_batch(&mut more).err().ok_or("no error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         Ok(())
     }
 }

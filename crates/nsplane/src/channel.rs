@@ -126,9 +126,10 @@ impl Transport for ChannelTransport {
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
         let (datagram, ecn) = self.rx.lock().await.recv().await.ok_or_else(closed)?;
         let len = datagram.len().min(buf.capacity());
-        buf.set_len(buf.capacity());
-        buf.as_packet_mut()[..len].copy_from_slice(&datagram[..len]);
+        // Only the datagram's length: growing to the capacity would zero-fill the whole
+        // buffer (64 KiB in the engine) for every datagram.
         buf.set_len(len);
+        buf.as_packet_mut().copy_from_slice(&datagram[..len]);
         let path = Path {
             transport: self.id,
             addr: self.peer,

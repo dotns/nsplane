@@ -706,6 +706,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the timers through the `_at` methods and the core's `now` instead.
 
 ### Fixed
+- `nsplane`: `PipeSink` implements `PacketSink::try_send_batch` (queues while the pipe has
+  room, never waits), so an engine delivers into a pipe from its owner task; `MapSink`
+  keeps the default by design. `ChannelTransport::recv` no longer zero-fills the whole
+  receive buffer (64 KiB in the engine) for every datagram, which slowed every in-process
+  engine benchmark.
+- Tests: `nsplane-cli`'s `boolean_environment_variables_accept_1` no longer hangs under
+  `CAP_NET_ADMIN` (it adopts a closed descriptor so startup fails whatever the
+  privileges); the WSS tests `a_foreign_certificate_is_rejected` and
+  `session_budget_bounds_all_streams` wait for the server's counter and allow a loaded
+  host more time.
 - `nsplane`: `DROP_TRANSPORT_SEND_ERROR` is exact for batched sends. `UdpTransport` counts
   only the datagrams of a failed GSO run, not the runs it handed off before it in the same
   call; the engine counts what `Transport::send_batch` reports failed (at least one).

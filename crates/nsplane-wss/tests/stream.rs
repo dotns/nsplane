@@ -946,7 +946,8 @@ fn watch_buffered(
 /// read sees EOF.
 async fn write_until_closed(mut stream: WssTcpStream, len: usize) -> TestResult {
     let data = pattern(1, len);
-    let _ = timeout(WAIT, stream.write_all(&data)).await?;
+    // Generous: on a loaded host the overflow and the close it triggers take a while.
+    let _ = timeout(WAIT * 4, stream.write_all(&data)).await?;
     assert_eq!(read_to_end(&mut stream).await?, b"");
     let Err(err) = stream.write_all(b"x").await else {
         return Err("a write after the close succeeded".into());

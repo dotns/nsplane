@@ -5,8 +5,8 @@
 
 use std::process::Command;
 
-/// Runs the daemon with `env` set; device creation is expected to fail in
-/// the test environment, but argument parsing must succeed.
+/// Runs the daemon with `env` set; starting is expected to fail, but argument parsing
+/// must succeed.
 fn run_with_env(env: &[(&str, &str)]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_nsplane-cli"))
         .args(["nsplane-clitest"])
@@ -19,7 +19,9 @@ fn run_with_env(env: &[(&str, &str)]) -> std::process::Output {
 fn boolean_environment_variables_accept_1() {
     for name in ["WG_SUDO", "WG_NO_OFFLOAD"] {
         for value in ["1", "true", "yes"] {
-            let output = run_with_env(&[(name, value)]);
+            // Adopting a descriptor that is not open makes startup fail whatever the
+            // privileges: with CAP_NET_ADMIN a created device would keep the daemon running.
+            let output = run_with_env(&[(name, value), ("WG_TUN_FD", "987654")]);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
                 !stderr.contains("invalid value"),

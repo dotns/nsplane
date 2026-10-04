@@ -285,7 +285,11 @@ async fn a_foreign_certificate_is_rejected() -> TestResult {
     until("failed attempts", || stats.connect_failures() >= 2).await?;
     assert!(!stats.connected());
     assert_eq!(stats.connects(), 0);
-    assert!(server.status("handshake_failures") >= 2);
+    // The server counts a failed handshake after the client has seen it fail.
+    until("server handshake failures", || {
+        server.status("handshake_failures") >= 2
+    })
+    .await?;
     assert_eq!(server.status("accepted"), 0);
     // Datagrams to the relay wait for a connection in a queue of 256; send never waits,
     // it fails once the queue is full.

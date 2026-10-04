@@ -86,6 +86,10 @@ where
         packets.retain_mut(|(from, packet)| self.map(packet, *from));
         self.inner.send_batch(packets).await
     }
+
+    // `try_send_batch` keeps the default (`WouldBlock`, the engine delivers through
+    // `send_batch` on its sink task): forwarding it would map the packets the inner sink
+    // leaves behind, and the engine's later `send_batch` would map them a second time.
 }
 
 impl<S: fmt::Debug, F> fmt::Debug for MapSink<S, F> {

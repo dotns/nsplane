@@ -184,7 +184,9 @@ sink whose `try_send_batch` took nothing (it keeps the default, or is full) is s
 1, 2, 4, ... up to 1024 drains and tried again once that wait is over; taking anything
 resets the wait, so a default implementation costs about one try per 1024 drains. The
 defaults of both `try_send_batch` methods take nothing, which keeps every datagram and
-packet on the tasks; `UdpTransport` and the Unix `TunSink` override them.
+packet on the tasks; `UdpTransport`, the Unix `TunSink` and `PipeSink` override them.
+`MapSink` keeps the default on purpose: forwarding would map the packets its inner sink
+leaves behind, and the engine's later `send_batch` would map them a second time.
 
 - `EngineHandle` sends commands to the owner (peers, keys, allowed IPs, path, transport,
   stats, injection, shutdown) and returns their replies.
