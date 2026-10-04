@@ -38,15 +38,16 @@ where it is described below.
 | Crate | Entry points | Supporting types |
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`) | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `MapSink` / `MapSource` / `MapVerdict`, `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`) | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
+| `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig`, `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
 Not public API: `nsplane-cli` (a binary), `nsplane-e2e` (test harness) and
@@ -417,6 +418,41 @@ For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitt
 several sources round-robin and reports the smallest of their MTUs. The splitter awaits
 only the chosen sink, but a waiting sink still holds back the engine's next delivery;
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
+
+**Local-side graph.** Three more primitives join local-side endpoints (TUN devices,
+netstacks, engines, translators) into a graph, so an embedder writes routing closures and
+decisions, not packet loops:
+
+- `MapSink::new(sink, f)` and `MapSource::new(source, f)` run a closure on every packet in
+  place, before delivery (`Fn(&mut PacketBuf, PeerId) -> MapVerdict`) or after reception
+  (`FnMut(&mut PacketBuf) -> MapVerdict`). `MapVerdict::Drop` discards the packet: the
+  sink's `send` returns `Ok`, the source reads the next one, and both count it in
+  `dropped()`. The MTU passes through and the batch methods map each packet. A Redirect is a
+  `MapSink` running the forward translation plus a `MapSource` running the reverse one.
+  `Nat64LanSink` / `Nat64LanSource` are equivalent to a `MapSink` / `MapSource` over a
+  `Nat64Lan` and stay as they are.
+- `pipe(capacity, mtu)` returns a `PipeSink` and a `PipeSource`: what is sent to the sink
+  comes out of the source in order, so one engine's (or a `Splitter`'s) output is another
+  engine's input without a forwarding task. `send` waits while the pipe is full; once the
+  source is dropped it returns `BrokenPipe`, and once every `PipeSink` clone is dropped the
+  source returns `BrokenPipe` after draining. The `from` peer is not carried.
+  `PipeSource::mtu_sender` changes the MTU the source reports.
+- `pump(source, sink, from)` moves every packet from a source into a sink in order, one
+  `recv_batch` and one `send_batch` per round, and awaits the sink's backpressure instead of
+  dropping. It ends with `Ok(PumpStats { packets, batches })` once either side returns
+  `BrokenPipe` and returns any other error. Cancelled while it waits for the source it
+  loses nothing; while it waits for the sink, at most the batch in flight.
+
+```text
+TUN source ─► pump ─► Splitter ─┬─► pipe ─► MergeSource ─► engine A
+                                └─► MapSink (Redirect) ─► netstack sink
+netstack source ─► MapSource (reverse) ─► MergeSource
+engine A ─► Splitter ─┬─► pipe ─► engine B
+                      └─► TUN sink
+```
+
+They are plain generic types and a `pump` runs only where the embedder spawns it: an engine
+that does not use them is unchanged.
 
 **Batched I/O.** The I/O tasks move up to `MAX_BATCH` (64) packets or datagrams per call
 through `PacketSource::recv_batch`, `PacketSink::send_batch`, `Transport::recv_batch` and
@@ -1124,6 +1160,29 @@ flows; `original_destination` gives the service address of an accepted flow. The
 never runs under a lock, so it may call back into the `Redirect`. IPv6, fragments, other
 protocols and untracked replies pass unchanged.
 
+**Masquerade.** `Masquerade` also runs on the local side: on the IPv6 packets a routed LAN
+host sends towards the tunnel (`forward`) and on their replies (`reverse`). It is a source
+NAPT ported from ns `SubnetLanIngressTranslator`: a caller-supplied closure gives each new
+TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision::source`, an `Ipv6Addr`: the
+contract's `IpAddr` was narrowed by L1 decision, so an IPv4 source cannot be expressed) and
+a `route` fingerprint, and the source port or Echo identifier becomes a token from
+`MasqueradeConfig::ports`, unique per destination and source. `reverse` restores the LAN
+host's address and port or identifier, after asking the closure again: a reply whose flow
+now gets `None` or another `route` is dropped and the flow removed (`route_changed`, ns's
+rule that the route fingerprint must stay current). The transport checksum is recomputed
+over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
+`MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
+flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
+`verify_checksums`, an invalid transport checksum; beyond the contract, ns drops these
+too). Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
+refuses new flows, as the contract and ns require, while a `Conntrack` evicts its least
+recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
+protocols and replies of unknown flows pass unchanged. A local side that answers pings
+itself can turn a forwarded `ICMPv6` Echo request into its reply with
+`nsplane_packet::icmp::echo_reply_in_place`, and `reverse` takes it back to the LAN host
+(`crates/nsplane-e2e/tests/masquerade.rs`). A criterion bench
+(`crates/nsplane-nat/benches/masquerade.rs`) measures both directions.
+
 **Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
 next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
 ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
@@ -1142,6 +1201,8 @@ path, so such a client pays no extra latency for it.
 | Service publishing (DNAT/SNAT) | `nsplane-nat` | `EngineBuilder::filter(Box::new(PortMap::new(rules)?))`, or `PortMap::with_conntrack` for a sized `Conntrack` | not installed | none |
 | NAT64 to LAN (NAPT) | `nsplane-nat` | wrap the local side: `EngineBuilder::new(Nat64LanSource::new(source, nat.clone()), Nat64LanSink::new(sink, nat))` | not installed | none |
 | Local-side redirect (DNAT) | `nsplane-nat` | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
+| Local-side masquerade (IPv6 source NAPT) | `nsplane-nat` | call `Masquerade::forward` / `Masquerade::reverse` on the local path | not used | none: a plain type, only called if the embedder wires it |
+| ICMP Echo reply synthesis | `nsplane-packet` | call `icmp::echo_reply_in_place` on a request for an address the local side answers | not used | none: a plain function, only called if the embedder wires it |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
@@ -1151,6 +1212,7 @@ path, so such a client pays no extra latency for it.
 | TCP socket buffers | `nsplane-netstack` | `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer = Some(bytes)`, clamped to `mtu - 40 ..= 65535 << 14` | `None`: `(mtu - 40) * 512` bytes each, as before | none: the sizes are resolved once when the stack is created |
 | Oversize IPv4 UDP sends | `nsplane-netstack` | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send, as before |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
+| Local-side graph | `nsplane` | `MapSink::new(sink, f)` / `MapSource::new(source, f)` around a sink or source; `pipe(capacity, mtu)` to feed one engine's output into another's input; `pump(source, sink, from)` spawned between two endpoints | not used | none: plain generic types, used only when passed to the builder or spawned; nothing changes for an engine that does not use them |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
 | UDP side channel | `nsplane` | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified, no task or copy |
@@ -1227,6 +1289,7 @@ subsections linked below hold each subtask's own measurements and analysis.
 cargo bench -p nsplane-core --bench data_path
 cargo bench -p nsplane-acl --bench namespaces
 cargo bench -p nsplane --bench worker_pool
+cargo bench -p nsplane --bench local_graph
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test netstack_stream -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
@@ -1260,6 +1323,8 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Engine fast path (MF-1), worker pool hub, pool off | 64 B / 1420 B | 1.37 / 1.31 Mpps, 806 / 810 kpps | before, same session: 1.45 / 1.46 Mpps, 880 / 913 kpps (-5 % to -11 %) |
 | Engine fast path (MF-1), engine latency, idle, no workers | `round_trip_latency` alone, p50 / p99 | 13.4 / 33.6 us, 10.8 / 24.0 us | before, same session: 22.3 / 40.5 us, 24.7 / 63.9 us; with the other test in parallel the order flips (see the subsection) |
 | Netstack TCP stream (PS) | 1 GiB, one connection, over two engines / direct, median of 5, per GiB (2026-10-03, load 20-29) | 309 MB/s, 9.34 s CPU, 38.49 G instructions / 1162 MB/s, 7.54 G instructions | `main`: 306 MB/s, 10.08 s, 39.41 G / 1002 MB/s, 7.72 G; [Single-stream profile (MF-2)](#single-stream-profile-mf-2) |
+| Local-side graph, `pipe` | send + `recv_batch`, 64 B / 1420 B, per packet (1024 packets per iteration, current-thread runtime; 2026-10-03, load 9.99 21.78 29.87; at load 59: ~132 / ~151 ns) | ~68 ns / ~68 ns | |
+| Local-side graph, `pump` | pipe -> pipe, 64 B / 1420 B, per packet (two spawned tasks, allocation excluded; same run; at load 59: ~263 / ~369 ns) | ~146 ns / ~170 ns | |
 
 - Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
   `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The
@@ -1545,3 +1610,7 @@ scenarios run them in containers against kernel WireGuard.
 IPv6 client engine reaching an IPv4 netstack LAN host over channel transports.
 The `subnet_gateway` example scenario runs it in containers: a kernel WireGuard peer reaches
 an IPv4 LAN host through the mapped /96.
+
+`nsplane-e2e`'s `local_graph` test joins two engines over channel transports only by pipes,
+through a `Splitter`, a Redirect-like `MapSink` / `MapSource` and a `MergeSource`, and checks
+`pump` for order, backpressure without loss, `BrokenPipe` from either end and cancellation.

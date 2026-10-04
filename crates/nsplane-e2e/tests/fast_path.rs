@@ -180,6 +180,30 @@ impl Transport for TestTransport {
         Ok((len, at(from)))
     }
 
+    /// Takes every datagram already queued, up to [`MAX_BATCH`], as a socket read with
+    /// receive offload does.
+    async fn recv_batch(
+        &self,
+        _buf: &mut PacketBuf,
+        datagrams: &mut VecDeque<(Path, PacketBuf)>,
+    ) -> io::Result<()> {
+        let mut rx = self.rx.lock().await;
+        if datagrams.len() >= MAX_BATCH {
+            return Ok(());
+        }
+        let (from, datagram) = rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        datagrams.push_back((at(from), PacketBuf::from_packet(&datagram)));
+        while datagrams.len() < MAX_BATCH
+            && let Ok((from, datagram)) = rx.try_recv()
+        {
+            datagrams.push_back((at(from), PacketBuf::from_packet(&datagram)));
+        }
+        Ok(())
+    }
+
     async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
         self.control.pass().await;
         self.net.send(self.addr, to.addr, datagram);
@@ -295,8 +319,20 @@ impl Node {
             EngineBuilder<ChannelSource, TestSink>,
         ) -> EngineBuilder<ChannelSource, TestSink>,
     ) -> TestResult<Self> {
+        Self::with_source(net, seed, SOURCE, configure)
+    }
+
+    /// [`Node::new`] with a source channel of `source` packets.
+    fn with_source(
+        net: &Net,
+        seed: u8,
+        source: usize,
+        configure: impl FnOnce(
+            EngineBuilder<ChannelSource, TestSink>,
+        ) -> EngineBuilder<ChannelSource, TestSink>,
+    ) -> TestResult<Self> {
         let (transport, sink) = (Control::new(), Control::new());
-        let (source, local, _mtu) = ChannelSource::new(SOURCE, nsplane_e2e::MTU);
+        let (source, local, _mtu) = ChannelSource::new(source, nsplane_e2e::MTU);
         let (tx, delivered) = mpsc::unbounded_channel();
         let builder = EngineBuilder::new(
             source,
@@ -747,5 +783,93 @@ async fn crypto_workers_keep_the_tasks_sending_and_delivering() -> TestResult {
         assert!(node.transport.task_done() > 200);
         assert_eq!(node.sink.task_done(), 201);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_hands_datagrams_to_the_transmit_task_while_input_is_waiting() -> TestResult {
+    let net = Net::default();
+    let mut a = Node::with_source(&net, 1, 1024, |b| b)?;
+    let mut b = Node::new(&net, 2, |b| b)?;
+    connect(&mut a, &mut b).await?;
+
+    // While `a` is suspended neither its transport nor its source is read: datagrams from
+    // `b` and local packets pile up. After the resume its owner finds received datagrams
+    // waiting whenever it seals local packets, so it hands those to the transmit task.
+    a.handle.suspend().await?;
+    for seq in 0..300 {
+        b.send(&b.packet_to(&a, seq)).await?;
+    }
+    let deadline = Instant::now() + WAIT;
+    while b.transport.try_done() + b.transport.task_done() < 300 + 2 {
+        assert!(Instant::now() < deadline, "b did not send everything");
+        sleep(Duration::from_millis(5)).await;
+    }
+    for seq in 0..100 {
+        a.send(&a.packet_to(&b, seq)).await?;
+    }
+    a.handle.take_queue_stats().await?;
+    a.handle.resume().await?;
+    b.expect_seqs(&a, 0..100).await?;
+    a.expect_seqs(&b, 0..300).await?;
+    assert!(
+        a.transport.task_done() > 0,
+        "the transmit task sent under load"
+    );
+    let stats = a.handle.queue_stats().await?;
+    assert!(stats.transmit.high_water > 0, "{stats:?}");
+
+    // Idle again, once the transmit task is done with its last batch: the owner sends
+    // itself.
+    sleep(QUIET).await;
+    let sent = a.transport.try_done();
+    a.send(&a.packet_to(&b, 100)).await?;
+    b.expect_seqs(&a, 100..101).await?;
+    assert_eq!(a.transport.try_done(), sent + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backoff_bounds_the_tries_on_a_transport_and_sink_that_take_nothing() -> TestResult {
+    let net = Net::default();
+    let mut a = Node::new(&net, 1, |b| b)?;
+    let mut b = Node::new(&net, 2, |b| b)?;
+    connect(&mut a, &mut b).await?;
+    // Like the default `try_send_batch`: nothing is ever taken without waiting.
+    a.transport.set_mode(Mode::Block);
+    b.sink.set_mode(Mode::Block);
+    let (transport_tries, sink_tries) = (a.transport.try_calls(), b.sink.try_calls());
+
+    // One packet at a time, each in drains of its own on an idle transport and sink.
+    let count = 300;
+    for seq in 0..count {
+        a.send(&a.packet_to(&b, seq)).await?;
+        b.expect_seqs(&a, seq..seq + 1).await?;
+    }
+    // Waits of 1, 2, 4, ... drains: about log2 of the drains instead of one per packet.
+    let tries = a.transport.try_calls() - transport_tries;
+    assert!((1..=12).contains(&tries), "{tries} transport tries");
+    let tries = b.sink.try_calls() - sink_tries;
+    assert!((1..=12).contains(&tries), "{tries} sink tries");
+
+    // Once they take again, the owner gets back to them within the longest wait and then
+    // sends and delivers itself every time.
+    a.transport.set_mode(Mode::Accept);
+    b.sink.set_mode(Mode::Accept);
+    let (sent, delivered) = (a.transport.try_done(), b.sink.try_done());
+    let mut seq = count;
+    while a.transport.try_done() == sent || b.sink.try_done() == delivered {
+        assert!(seq < count + 2100, "no try within the longest wait");
+        a.send(&a.packet_to(&b, seq)).await?;
+        b.expect_seqs(&a, seq..seq + 1).await?;
+        seq += 1;
+    }
+    let (sent, delivered) = (a.transport.try_done(), b.sink.try_done());
+    for next in seq..seq + 10 {
+        a.send(&a.packet_to(&b, next)).await?;
+        b.expect_seqs(&a, next..next + 1).await?;
+    }
+    assert_eq!(a.transport.try_done(), sent + 10);
+    assert_eq!(b.sink.try_done(), delivered + 10);
     Ok(())
 }
