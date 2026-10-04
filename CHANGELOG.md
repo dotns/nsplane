@@ -85,9 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors off its error queue (`IP_RECVERR` / `IPV6_RECVERR`) and hands them to the engine as
   `PathMtuReport`s through `Transport::path_mtu_reports`; reports beyond a queue of 64 are
   dropped and counted (`UdpTransport::path_mtu_reports_dropped`). While on, an ICMP error
-  may fail one send (dropped and counted), and once an error was seen a send that finds the
-  send buffer full busy-retries until it drains (tokio keeps the write readiness) (ns's
-  MQ-1).
+  may fail one send (the engine drops and counts it, `SideSender` returns the error), and a
+  send that finds the send buffer full after an ICMP error retries after pauses of 1 ms
+  doubling up to 8 ms (tokio keeps the write readiness after `EPOLLERR`), so it may go out up
+  to 8 ms after room appeared; sends that find room are not delayed, and with discovery off
+  nothing changes (ns's MQ-1).
 - `nsplane-packet`: `build::write_udp(buf, src, dst, payload)` and `build::udp_packet(src,
   dst, payload) -> PacketBuf` (re-exported at the crate root) build an IPv4 or IPv6 UDP
   datagram with its checksums (IPv4: DF, TTL 64, no options; IPv6: hop limit 64, no
