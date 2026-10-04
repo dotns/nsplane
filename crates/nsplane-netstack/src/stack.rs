@@ -542,8 +542,14 @@ struct Bridged {
 }
 
 impl Conn {
-    /// Moves bytes between the socket and the application and applies half closes.
-    fn bridge(&mut self, socket: &mut tcp::Socket<'_>, now: SmolInstant) -> Bridged {
+    /// Whether bytes wait in the socket's send buffer or in the application's.
+    fn sending(&self, socket: &tcp::Socket<'_>) -> bool {
+        socket.send_queue() > 0 || !lock(&self.shared).tx.is_empty()
+    }
+
+    /// Moves bytes between the socket and the application and applies half closes,
+    /// filling the socket's send buffer up to `limit` bytes.
+    fn bridge(&mut self, socket: &mut tcp::Socket<'_>, now: SmolInstant, limit: usize) -> Bridged {
         // Only an acknowledgement shrinks the send queue, except a reset, which empties it
         // and leaves the socket closed.
         if socket.send_queue() < self.queued && socket.state() != tcp::State::Closed {
@@ -579,7 +585,11 @@ impl Conn {
         // Application -> smoltcp.
         let mut sent = false;
         while !shared.tx.is_empty() && socket.can_send() {
-            let n = socket.send_slice(shared.tx.as_slices().0).unwrap_or(0);
+            let room = limit.saturating_sub(socket.send_queue());
+            let data = shared.tx.as_slices().0;
+            let n = socket
+                .send_slice(&data[..data.len().min(room)])
+                .unwrap_or(0);
             if n == 0 {
                 break;
             }
@@ -1449,9 +1459,20 @@ impl Driver {
     fn bridge_all(&mut self, now: SmolInstant) -> bool {
         let mut sent = false;
         let mut released = Vec::new();
+        // Each sending connection's share of the send budget.
+        let limit = self.settings.tcp_send_budget.map_or(usize::MAX, |budget| {
+            let senders = self
+                .conns
+                .iter()
+                .filter(|&(&handle, conn)| {
+                    conn.sending(self.sockets.get::<tcp::Socket<'_>>(handle))
+                })
+                .count();
+            (budget / senders.max(1)).max(usize::from(self.settings.mtu) - 40)
+        });
         for (&handle, conn) in &mut self.conns {
             let socket = self.sockets.get_mut::<tcp::Socket<'_>>(handle);
-            let bridged = conn.bridge(socket, now);
+            let bridged = conn.bridge(socket, now, limit);
             sent |= bridged.sent;
             if bridged.terminal {
                 released.push(handle);
