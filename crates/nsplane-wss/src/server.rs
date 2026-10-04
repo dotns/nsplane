@@ -539,8 +539,9 @@ impl Session {
             stream_id = id,
             "wss stream buffer full; closing only that stream"
         );
-        self.remove(id, &stream);
+        // Marked before the removal ends the stream's queue, which can end its relay first.
         stream.overflowed.store(true, Ordering::Relaxed);
+        self.remove(id, &stream);
         stream.reset.notify_one();
         self.send_control(&WsFrame::close(id));
     }
@@ -564,16 +565,16 @@ impl Session {
         let reason = tokio::select! {
             biased;
             _ = down.wait_for(|down| *down) => WssCloseReason::SessionEnded,
-            () = stream.reset.notified() => {
-                if stream.overflowed.load(Ordering::Relaxed) {
-                    WssCloseReason::Overflow
-                } else {
-                    WssCloseReason::PeerClosed
-                }
-            }
+            () = stream.reset.notified() => WssCloseReason::PeerClosed,
             reason = self.serve(&stream, open, rx, &moved) => reason,
         };
         self.remove(stream.id, &stream);
+        // An overflow ends the queue too, so `serve` may have seen a peer CLOSE.
+        let reason = if stream.overflowed.load(Ordering::Relaxed) {
+            WssCloseReason::Overflow
+        } else {
+            reason
+        };
         // Denied (or ended before resolving): no stream was opened.
         let Some(&backend) = stream.backend.get() else {
             return;
