@@ -126,3 +126,9 @@ node L3 gate (plan `20261003-2300`, differential fixtures against ns); the local
 Release 0.8.0 (tag `v0.8.0`), the first release under the nsplane name. Quiet-host comparison
 on main: nsplane <-> nsplane 8.1 / 8.9 Gbit/s (1 / 4 TCP streams), kernel WireGuard ->
 nsplane 7.0, nsplane -> kernel 7.7, wireguard-go 10.0 / 10.1.
+
+## 2026-10-04 15:30 [release]
+
+Release 0.9.0 (tag `v0.9.0`): the remaining ns requests (plan `20261004-1100-ns-requests`,
+campaigns RN, RW, RA, RS, RX), all additive. Next: the optimization round (quiet-host
+re-measure, multi-stream throughput against wireguard-go, netstack 4-stream anomaly).

@@ -234,6 +234,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | ACL and node L3 gate | per-source principals, fragment modes, bypass flags, `Ipv6Mode`, `crates_acl()` preset, inbound destinations; `NodeL3Gate`, `NodeL3Filter`, divert; differential fixtures against ns | done (plan `20261003-2300-acl-l3-gate`) |
 | Local side | `MapSink` / `MapSource`, `pump`, `pipe`; `Masquerade`, `echo_reply_in_place`; `TunSlot`, `host_tun` | done (plan `20261003-2330-local-side`) |
 | Release 0.8.0 | first nsplane release (tag `v0.8.0`) | 2026-10-04 |
+| ns requests | per-path MTU and Linux path MTU discovery, padding cap, UDP builder, `send_to_async`, redirect tries, native alias; netstack abort, fragment discard, connected UDP; `nsplane-wss` plain ws, events, keepalive, timeouts; ACL source scope | done (plan `20261004-1100-ns-requests`) |
+| Release 0.9.0 | the remaining ns requests (tag `v0.9.0`) | 2026-10-04 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

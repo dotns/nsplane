@@ -25,13 +25,13 @@ clap = { version = "4.6.7", features = ["derive"] }
 ed25519-dalek = "2.2.0"
 futures-core = "0.3.32"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-nsplane = { path = "../crates/nsplane", version = "0.8.0" }
-nsplane-acl = { path = "../crates/nsplane-acl", version = "0.8.0" }
-nsplane-core = { path = "../crates/nsplane-core", version = "0.8.0" }
-nsplane-nat = { path = "../crates/nsplane-nat", version = "0.8.0" }
-nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.8.0" }
-nsplane-packet = { path = "../crates/nsplane-packet", version = "0.8.0" }
-nsplane-wss = { path = "../crates/nsplane-wss", version = "0.8.0" }
+nsplane = { path = "../crates/nsplane", version = "0.9.0" }
+nsplane-acl = { path = "../crates/nsplane-acl", version = "0.9.0" }
+nsplane-core = { path = "../crates/nsplane-core", version = "0.9.0" }
+nsplane-nat = { path = "../crates/nsplane-nat", version = "0.9.0" }
+nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.9.0" }
+nsplane-packet = { path = "../crates/nsplane-packet", version = "0.9.0" }
+nsplane-wss = { path = "../crates/nsplane-wss", version = "0.9.0" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
@@ -46,9 +46,9 @@ tracing-subscriber = "0.3.19"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
-nsplane-tun = { path = "../crates/nsplane-tun", version = "0.8.0" }
-nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.8.0" }
+nsplane-tun = { path = "../crates/nsplane-tun", version = "0.9.0" }
+nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.9.0" }
 
 [dev-dependencies]
-nsplane-noise = { path = "../crates/nsplane-noise", version = "0.8.0" }
+nsplane-noise = { path = "../crates/nsplane-noise", version = "0.9.0" }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }

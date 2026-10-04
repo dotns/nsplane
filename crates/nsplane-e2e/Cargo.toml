@@ -17,20 +17,20 @@ workspace = true
 
 [dependencies]
 futures-core = "0.3.32"
-nsplane = { path = "../nsplane", version = "0.8.0" }
-nsplane-core = { path = "../nsplane-core", version = "0.8.0" }
-nsplane-netstack = { path = "../nsplane-netstack", version = "0.8.0" }
-nsplane-packet = { path = "../nsplane-packet", version = "0.8.0" }
+nsplane = { path = "../nsplane", version = "0.9.0" }
+nsplane-core = { path = "../nsplane-core", version = "0.9.0" }
+nsplane-netstack = { path = "../nsplane-netstack", version = "0.9.0" }
+nsplane-packet = { path = "../nsplane-packet", version = "0.9.0" }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "test-util"] }
 
 [dev-dependencies]
 bytes = { workspace = true }
-nsplane-acl = { path = "../nsplane-acl", version = "0.8.0" }
-nsplane-nat = { path = "../nsplane-nat", version = "0.8.0" }
-nsplane-uapi = { path = "../nsplane-uapi", version = "0.8.0" }
+nsplane-acl = { path = "../nsplane-acl", version = "0.9.0" }
+nsplane-nat = { path = "../nsplane-nat", version = "0.9.0" }
+nsplane-uapi = { path = "../nsplane-uapi", version = "0.9.0" }
 arc-swap = "1.7.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-nsplane-wss = { path = "../nsplane-wss", version = "0.8.0" }
+nsplane-wss = { path = "../nsplane-wss", version = "0.9.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
 tokio-rustls = { version = "0.26.6", default-features = false }
@@ -38,4 +38,4 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
-nsplane-tun = { path = "../nsplane-tun", version = "0.8.0" }
+nsplane-tun = { path = "../nsplane-tun", version = "0.9.0" }

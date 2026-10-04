@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-acl"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "criterion",
  "ip_network",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-e2e"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-examples"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-nat"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-netstack"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-noise"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aead",
  "aws-lc-rs",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-packet"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "smallvec",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-tun"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "criterion",
  "futures-core",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-uapi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-wss"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "futures-util",

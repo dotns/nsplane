@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-04
+
+The remaining ns data-plane requests: per-path MTU with Packet Too Big feedback and opt-in
+Linux path MTU discovery, padding capped at the inner MTU, a UDP packet builder, awaitable
+side-channel sends, redirect endpoint retries and native IPv4 aliases (`nsplane-nat`),
+netstack abort, fragment discard and connected UDP sockets, plain `ws://`, dial events,
+keepalive and timeouts in `nsplane-wss`, and the ACL outbound source scope. All API
+changes are additive.
+
 ### Added
 - `nsplane-netstack`: `TcpConnection::abort(self)` resets a connection: an RST instead of
   the FIN a drop sends, unread and unsent bytes discarded, and the socket released within
