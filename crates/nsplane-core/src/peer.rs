@@ -78,6 +78,10 @@ pub(crate) struct Peer {
     pub(crate) expired: bool,
     /// The tunnel's handshake count when the core last reported completed handshakes.
     handshakes: u64,
+    /// Whether a handshake initiation was transmitted and no handshake completed since.
+    initiation_outstanding: bool,
+    /// Handshake initiations transmitted to this peer that got no response.
+    unanswered_handshakes: u64,
 }
 
 impl std::fmt::Debug for Peer {
@@ -119,6 +123,8 @@ impl Peer {
             data_rx: 0,
             expired: false,
             handshakes,
+            initiation_outstanding: false,
+            unanswered_handshakes: 0,
         }
     }
 
@@ -227,6 +233,34 @@ impl Peer {
         let completed = count.saturating_sub(self.handshakes);
         self.handshakes = self.handshakes.max(count);
         completed
+    }
+
+    /// Records a handshake initiation transmitted to this peer: the previous one, if still
+    /// outstanding, got no response.
+    pub(crate) const fn initiation_sent(&mut self) {
+        if self.initiation_outstanding {
+            self.unanswered_handshakes = self.unanswered_handshakes.saturating_add(1);
+        }
+        self.initiation_outstanding = true;
+    }
+
+    /// Records a completed handshake: the outstanding initiation, if any, was answered.
+    pub(crate) const fn initiation_answered(&mut self) {
+        self.initiation_outstanding = false;
+    }
+
+    /// Records that the tunnel gave up its handshake attempt: the outstanding initiation, if
+    /// any, got no response.
+    pub(crate) const fn initiation_abandoned(&mut self) {
+        if self.initiation_outstanding {
+            self.unanswered_handshakes = self.unanswered_handshakes.saturating_add(1);
+        }
+        self.initiation_outstanding = false;
+    }
+
+    /// Handshake initiations transmitted to this peer that got no response.
+    pub(crate) const fn unanswered_handshakes(&self) -> u64 {
+        self.unanswered_handshakes
     }
 
     /// Time from the establishment of the current session to `now`.
