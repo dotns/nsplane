@@ -466,7 +466,7 @@ impl Conn {
                 .set_last_ack(u64::try_from(now.total_micros()).unwrap_or(0));
         }
         let mut shared = lock(&self.shared);
-        if shared.aborted {
+        if shared.write_half == WriteHalf::Aborted {
             return abort(socket, &mut shared);
         }
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
@@ -1305,7 +1305,7 @@ impl Driver {
                 .get::<tcp::Socket<'_>>(handle)
                 .local_endpoint()
                 .is_some_and(|endpoint| endpoint.port == port)
-                && lock(&conn.shared).aborted
+                && lock(&conn.shared).write_half == WriteHalf::Aborted
         })
     }
 

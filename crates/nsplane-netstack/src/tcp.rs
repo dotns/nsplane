@@ -22,6 +22,8 @@ pub(crate) enum WriteHalf {
     Shutdown,
     /// The FIN is queued in the socket (or the socket can no longer send).
     FinSent,
+    /// The application aborted the connection: an RST instead of a FIN.
+    Aborted,
 }
 
 /// State shared between a [`TcpConnection`] and the driver.
@@ -41,8 +43,6 @@ pub(crate) struct Shared {
     pub(crate) writer: Option<Waker>,
     /// The application dropped the connection.
     pub(crate) app_dropped: bool,
-    /// The application aborted the connection: reset it instead of closing it.
-    pub(crate) aborted: bool,
     /// The driver released the connection: the socket is gone (or the stack stopped).
     pub(crate) released: bool,
     pub(crate) capacity: usize,
@@ -58,7 +58,6 @@ impl Shared {
             write_half: WriteHalf::Open,
             writer: None,
             app_dropped: false,
-            aborted: false,
             released: false,
             capacity,
         }
@@ -196,7 +195,7 @@ impl TcpConnection {
     /// connection the peer already reset or closed is only released; no RST is sent.
     pub fn abort(self) {
         let mut shared = lock(&self.shared);
-        shared.aborted = true;
+        shared.write_half = WriteHalf::Aborted;
         shared.app_dropped = true;
         // Drop notifies the driver.
     }
