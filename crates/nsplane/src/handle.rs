@@ -291,6 +291,18 @@ impl EngineHandle {
             .await
     }
 
+    /// Sets the inbound destinations of a peer: its decrypted packets to any other destination
+    /// are dropped. `None` removes them, so the peer is unchecked again. Ignored for an
+    /// unknown peer.
+    pub async fn set_inbound_destinations(
+        &self,
+        peer: PublicKey,
+        destinations: Option<Vec<AllowedIp>>,
+    ) -> Result<(), EngineError> {
+        self.config(ConfigChange::SetInboundDestinations { peer, destinations })
+            .await
+    }
+
     /// Sets the preshared key of a peer; `None` removes it.
     pub async fn set_preshared_key(
         &self,

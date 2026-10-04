@@ -466,6 +466,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Redirect-like `MapSink`/`MapSource` and a `MergeSource` (IPv4 and IPv6, in order, with a
   Drop rule), a TUN-like channel pumped into and out of an engine, backpressure without
   loss, `BrokenPipe` from either end of a pipe, and a cancelled pump.
+- `nsplane-tun` (Linux, Android, macOS, iOS): `TunSlot`, a TUN fd the host swaps while the
+  engine runs (Android `VpnService`; ns's MT-1). `TunSlot::new(mtu)` returns the cloneable
+  control handle with a `SlotSource` and a `SlotSink`. `replace(fd)` takes ownership of an
+  `OwnedFd`, sets it non-blocking and fences the previous one: once it returns no syscall
+  runs on the old fd, and a read completed on it but not yet returned is discarded and
+  retried on the new one. `disable` parks I/O and `enable` resumes it; `close` (or
+  dropping the last handle) makes the source, the sink and later `replace` calls fail with
+  `BrokenPipe`. Reads get an MTU + 1 buffer: longer reads are dropped and counted
+  (`SlotSource::oversize_drops`), a 0-byte read is `UnexpectedEof`; a short write is
+  `WriteZero`. No header and no offloads; the MTU is fixed. Not built on Windows.
+- `nsplane-tun`: `host_tun(mtu, capacity, write)`, a local side bridged through host
+  callbacks such as iOS `NEPacketTunnelFlow` (ns's MT-2; the contract's `HostTun::new`
+  ships as this free function, so no `clippy::new_ret_no_self` suppression is needed). It
+  returns a `HostTunInput`, whose `push` copies a packet into the queue from any thread
+  without blocking and fails with `PushError::Full` or `PushError::Closed`, a
+  `HostTunSource` that drops and counts packets longer than the MTU
+  (`HostTunSource::oversize_drops`, one warning per source), and a `HostTunSink` that calls
+  `write` and returns `BrokenPipe` when it returns `false`. `HOST_TUN_DEFAULT_CAPACITY` is
+  4096 packets. Built on every target.
+- `nsplane-acl`: the node L3 gate (MD-2), a port of ns tunnel-wg `node_l3`. `NodeL3Gate`
+  applies target-bound `NodeL3Config` snapshots (Node, Service and Subnet Grants, peer
+  bindings, modes `disabled` / `observe` / `enforce`) and the WireGuard projection
+  (`NodeL3Transport`), and judges decrypted inbound and plaintext outbound IPv4 packets:
+  source binding by `(peer key, inner address)`, the same-owner rule, stateful flows with
+  per-protocol idle timeouts, 2,048 flows per peer and 16,384 in all (a full table drops
+  with `state_capacity`, never evicts), orphan fragments, ICMP errors matched to their flow,
+  Provider listeners for Service Grants and the reserved Subnet transport admission.
+  `NodeL3Reason` names every verdict (`as_str`, `drop_reason`); `NodeL3Counters` counts
+  enforced and observed denials. Not installed by default; nothing is on the data path
+  without it.
+- `nsplane-acl`: `NodeL3Filter`, the gate and an optional `AclFilter` as one ordered
+  `PacketFilter`: an enforced allow ends the decision before the ACL, an enforced denial
+  drops with the gate's reason, Legacy and Observe go on to the ACL; outbound is the gate
+  only unless `with_acl_outbound(true)`. Peers resolve to WireGuard keys through
+  `PeerPublicKeys` (`PeerKeyMap`); `NodeL3FilterStats` counts the steps.
+- `nsplane-acl`: gateway-consumer divert (MD-3): `NodeL3Filter::with_divert` hands a
+  `SourceBinding` / `OrphanFragment` denial the gate captures as a gateway return
+  (`GatewayConsumerPacket`) to a `GatewayConsumerSink` and reports it as
+  `Verdict::Handled`; a refused candidate is dropped. Tests: `nsplane-e2e` `node_l3`; bench
+  `cargo bench -p nsplane-acl --bench node_l3`.
+- `nsplane-acl`: per-packet source principals. `PeerIdentity::assertion_for(peer, src)`
+  (default: `assertion(peer)`) resolves a peer's principal for the packet's remote address, and
+  `PeerIdentity::by_source` marks peers whose principal depends on it;
+  `PeerIdentityMap::insert_by_source` makes a peer terminate by source address (each packet's
+  principal is a terminate binding of its address, as `AccessRequest::from_ip` builds it), next
+  to `insert` with a `SourceAssertion::WgPeerKey` for relay clients. `AclFilter` caches such a
+  principal per peer and address (bounded by `reply_capacity`, least recently used
+  evicted) under the identity generation.
+- `nsplane-acl`: `AclFilterConfig::fragments: FragmentMode` (`#[non_exhaustive]`). `Outcome`
+  (default) is today's gate; `AllowOnly { ttl, capacity }` is the ns `FragmentAclGate` (only
+  accepted first fragments recorded, keyed (source, destination, protocol, identification), a
+  miss drops with `reasons::FRAGMENT`); `FragmentMode::ALLOW_ONLY` has ns's 15 s and 4096.
+- `nsplane-acl`: bypass flags `AclFilterConfig::accept_to_local: Option<Ipv4Addr>` (ns
+  `is_local_node_packet`) and `accept_icmp_echo_reply: bool` (ns `is_icmp_echo_reply`), off by
+  default; packets they accept count in the new `AclFilterStats::bypassed`.
+- `nsplane-acl`: `AclFilterConfig::crates_acl(local)`, the ns `crates/acl` preset: for inbound
+  IPv4 it equals ns `is_local_node_packet || is_icmp_echo_reply || acl_check_packet` (no reply
+  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags), and it passes
+  IPv6 unevaluated as ns does (`ipv6: Ipv6Mode::Accept`). A differential test
+  (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
+  malformed IPv4, which nsplane-acl drops. `nsplane-e2e` `acl_parity` tests.
+- `nsplane-acl`: `AclFilterConfig::ipv6: Ipv6Mode` (`#[non_exhaustive]`). `Evaluate` (default)
+  judges IPv6 like IPv4; `Accept` passes every IPv6 packet, inbound and outbound, before
+  anything else without recording state, counted in the new `AclFilterStats::ipv6_accepted`
+  (ns runs no ACL on IPv6; its destination check is `PeerConfig::inbound_destinations`).
+- `nsplane-core`: per-peer inbound destinations. `PeerConfig::inbound_destinations:
+  Option<Vec<AllowedIp>>` (`None`, the default: unchecked) restricts where a peer's decrypted
+  packets may be addressed; others are dropped as the new `reasons::DESTINATION_NOT_ALLOWED`.
+  `ConfigChange::SetInboundDestinations` and `EngineHandle::set_inbound_destinations` change or
+  remove them at runtime (an update through `add_or_update_peer` with `None` keeps them). They
+  add no routes. `nsplane-core` and `nsplane-e2e` `inbound_destinations` tests.
 - `nsplane`: `Transport::try_send_batch` / `DynTransport::try_send_batch` and
   `PacketSink::try_send_batch`, the non-blocking forms of `send_batch`: they hand off what
   can go at once, in order, and return `WouldBlock` with the rest left to the caller. The
@@ -474,6 +545,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override them.
 
 ### Changed
+- Breaking: struct literals of `PeerConfig` (`nsplane::Peer`), `AclFilterConfig` and
+  `AclFilterStats` need the new fields (`inbound_destinations`; `fragments`, `accept_to_local`,
+  `accept_icmp_echo_reply`, `ipv6`; `bypassed`, `ipv6_accepted`) (`..Default::default()`, `PeerConfig::new`), and
+  exhaustive matches on `ConfigChange` the new `SetInboundDestinations`. Behavior with the
+  defaults is unchanged.
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
   `failed: &mut usize`. A call adds one for every datagram it was done with that failed
   (and was dropped), never more than it advanced `sent`; `Ok` means nothing failed in the
