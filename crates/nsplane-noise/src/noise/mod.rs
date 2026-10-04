@@ -81,6 +81,8 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     rate_limiter: Arc<RateLimiter>,
+    /// The padding of transport data does not take a plaintext past this length.
+    pad_limit: usize,
 }
 
 use wire::{
@@ -257,6 +259,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            pad_limit: usize::MAX,
         }
     }
 
@@ -289,12 +292,26 @@ impl Tunn {
         self.timers.set_persistent_keepalive(interval);
     }
 
+    /// Caps the padding of transport data at `limit` bytes of plaintext, as the kernel pads
+    /// to the interface MTU: a packet is padded to the lower of the next multiple of 16 bytes
+    /// and `limit`, and a packet of at least `limit` bytes is not padded. Set it to the
+    /// peer's inner MTU so that a packet at that MTU makes a datagram of exactly the MTU plus
+    /// 32 bytes. `None` (the default) pads to the next multiple of 16 bytes as far as the
+    /// buffer has room. The receiver strips the padding either way.
+    pub const fn set_pad_limit(&mut self, limit: Option<usize>) {
+        self.pad_limit = match limit {
+            Some(limit) => limit,
+            None => usize::MAX,
+        };
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns `TunnResult`.
     ///
     /// Size of dst should be at least `src.len()` + 32, and no less than 148 bytes,
     /// otherwise `WireGuardError::DestinationBufferTooSmall` is returned. The plaintext is
-    /// padded to a multiple of 16 bytes when dst has room for up to 15 more bytes.
+    /// padded to a multiple of 16 bytes when dst has room for up to 15 more bytes, and not
+    /// past [`Tunn::set_pad_limit`].
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let Some(payload) = dst.get_mut(DATA_HEADER_SZ..DATA_HEADER_SZ + src.len()) else {
             return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
@@ -326,7 +343,7 @@ impl Tunn {
     /// Read packets from the TUN interface directly into `buf[DATA_HEADER_SZ..]`. `buf` needs
     /// `DATA_HEADER_SZ + len + 16` bytes, plus up to 15 bytes of padding room, and at least
     /// 148 bytes in case a handshake initiation is returned instead (the packet is then
-    /// queued until the handshake completes).
+    /// queued until the handshake completes). The padding stops at [`Tunn::set_pad_limit`].
     pub fn encapsulate_in_place<'a>(&mut self, buf: &'a mut [u8], len: usize) -> TunnResult<'a> {
         let current = self.current % N_SESSIONS;
         // A sending key that is worn out (Reject-After-Messages) is dropped, so the packet is
@@ -340,7 +357,7 @@ impl Tunn {
 
         if let Some(session) = &self.sessions[current] {
             // Send the packet using an established session
-            let packet = match session.seal_in_place(buf, len) {
+            let packet = match session.seal_in_place(buf, len, self.pad_limit) {
                 Ok(packet) => packet,
                 Err(e) => return TunnResult::Err(e),
             };
@@ -1020,6 +1037,75 @@ mod tests {
         };
         // The receiver strips the padding using the IP length field.
         assert_eq!(received, &sent[..]);
+    }
+
+    #[test]
+    fn padding_stops_at_the_pad_limit() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet_with_payload(&[7; 11]);
+        assert_eq!(sent.len(), 39);
+
+        // (limit, padded plaintext): no limit pads to 48; a limit inside the padding stops
+        // it there; a limit at or below the packet pads nothing.
+        for (limit, padded) in [
+            (None, 48),
+            (Some(48), 48),
+            (Some(1280), 48),
+            (Some(42), 42),
+            (Some(39), 39),
+            (Some(20), 39),
+        ] {
+            my_tun.set_pad_limit(limit);
+            let mut buf = vec![0u8; 2048];
+            buf[DATA_HEADER_SZ..DATA_HEADER_SZ + sent.len()].copy_from_slice(&sent);
+            let TunnResult::WriteToNetwork(encrypted) =
+                my_tun.encapsulate_in_place(&mut buf, sent.len())
+            else {
+                unreachable!();
+            };
+            assert_eq!(encrypted.len(), 16 + padded + 16, "limit {limit:?}");
+
+            let encrypted = encrypted.to_vec();
+            let mut their_dst = vec![0u8; 2048];
+            let TunnResult::WriteToTunnelV4(received, _) =
+                their_tun.decapsulate(None, &encrypted, &mut their_dst)
+            else {
+                unreachable!();
+            };
+            assert_eq!(received, &sent[..], "limit {limit:?}");
+        }
+    }
+
+    #[test]
+    fn queued_packets_honor_the_pad_limit() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.set_pad_limit(Some(42));
+        let sent = create_ipv4_udp_packet_with_payload(&[7; 11]);
+
+        // No session yet: the packet is queued behind a handshake initiation.
+        let mut dst = vec![0u8; 2048];
+        let TunnResult::WriteToNetwork(init) = my_tun.encapsulate(&sent, &mut dst) else {
+            unreachable!();
+        };
+        let init = init.to_vec();
+        let TunnResult::WriteToNetwork(resp) = their_tun.decapsulate(None, &init, &mut dst) else {
+            unreachable!();
+        };
+        let resp = resp.to_vec();
+        let TunnResult::WriteToNetwork(keepalive) = my_tun.decapsulate(None, &resp, &mut dst)
+        else {
+            unreachable!();
+        };
+        let keepalive = keepalive.to_vec();
+        assert!(matches!(
+            their_tun.decapsulate(None, &keepalive, &mut dst),
+            TunnResult::Done
+        ));
+
+        let TunnResult::WriteToNetwork(queued) = my_tun.decapsulate(None, &[], &mut dst) else {
+            unreachable!();
+        };
+        assert_eq!(queued.len(), 16 + 42 + 16);
     }
 
     /// Runs a full handshake, initiated by `initiator`; returns whether it completed.

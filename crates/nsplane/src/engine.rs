@@ -1700,7 +1700,8 @@ impl Owner {
         self.publish_peer_mtus();
     }
 
-    /// Publishes the peers' inner MTUs, if they differ from the published ones.
+    /// Publishes the peers' inner MTUs, if they differ from the published ones, and caps the
+    /// padding of every constrained peer's data at its inner MTU.
     fn publish_peer_mtus(&mut self) {
         let mtus = match &mut self.path_mtus.table {
             Some(table) => {
@@ -1709,9 +1710,20 @@ impl Owner {
             }
             None => PeerMtus::unconstrained(self.mtu),
         };
+        let core = &mut self.core;
         self.path_mtus.published.send_if_modified(|current| {
             let modified = *current != mtus;
             if modified {
+                for &peer in current.peers.keys() {
+                    if !mtus.peers.contains_key(&peer) {
+                        core.set_peer_pad_limit(peer, None);
+                    }
+                }
+                for (&peer, &mtu) in &mtus.peers {
+                    if current.peers.get(&peer) != Some(&mtu) {
+                        core.set_peer_pad_limit(peer, Some(mtu));
+                    }
+                }
                 *current = mtus;
             }
             modified

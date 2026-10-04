@@ -480,6 +480,18 @@ impl Core {
             .is_some_and(|p| p.remote_index() == Some(index))
     }
 
+    /// Caps the padding of `peer`'s transport data at `limit` bytes of plaintext, as the
+    /// kernel pads to the interface MTU: set it to the peer's inner MTU so that a packet at
+    /// that MTU makes a datagram of exactly the MTU plus 32 bytes. Packets of at least
+    /// `limit` bytes are not padded. `None` (the default) pads every packet to a multiple of
+    /// 16 bytes. Both [`Core::handle_input`] and [`CryptoJob`]s honor it. Unknown peers are
+    /// ignored.
+    pub fn set_peer_pad_limit(&mut self, peer: PeerId, limit: Option<u16>) {
+        if let Some(p) = self.peers.peer_mut(peer) {
+            p.tunnel_mut().set_pad_limit(limit.map(usize::from));
+        }
+    }
+
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
     /// allowed-IP source check.
     ///
@@ -1440,5 +1452,120 @@ mod tests {
         });
         let id = add(&mut core, true);
         assert_eq!(core.data_path(id), Some(path(2)));
+    }
+
+    /// Two cores, `0` at `10.0.0.1` and `1` at `10.0.0.2`, peered with each other.
+    fn core_pair(crypto_jobs: bool) -> [Core; 2] {
+        let secrets = [[1; 32], [2; 32]].map(x25519::StaticSecret::from);
+        let path = |i: u8| Path {
+            transport: nsplane_packet::TransportId::new(u16::from(i)),
+            addr: std::net::SocketAddr::from(([192, 0, 2, i + 1], 51820)),
+            ecn: Ecn::NotEct,
+        };
+        [0u8, 1].map(|i| {
+            let other = usize::from(1 - i);
+            let mut core = Core::new(CoreConfig {
+                private_key: Some(secrets[usize::from(i)].clone()),
+                crypto_jobs,
+                ..CoreConfig::default()
+            });
+            let mut config = PeerConfig::new(x25519::PublicKey::from(&secrets[other]));
+            config.allowed_ips = vec![format!("10.0.0.{}/32", other + 1).parse().unwrap()];
+            config.path = Some(path(1 - i));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core
+        })
+    }
+
+    /// Moves datagrams between the cores until both are quiet; returns what each delivered.
+    fn pump(cores: &mut [Core; 2]) -> [Vec<Vec<u8>>; 2] {
+        let mut delivered = [Vec::new(), Vec::new()];
+        loop {
+            let mut quiet = true;
+            for i in 0..2 {
+                while let Some(output) = cores[i].poll_output() {
+                    match output {
+                        Output::Transmit { data, .. } => {
+                            quiet = false;
+                            // It arrives on the path the receiver has for the sender.
+                            let sender = cores[1 - i].peers().next().unwrap();
+                            let path = cores[1 - i].data_path(sender).unwrap();
+                            cores[1 - i]
+                                .handle_input(Input::Datagram { path, data }, Instant::now());
+                        }
+                        Output::Deliver { packet, .. } => {
+                            delivered[i].push(packet.as_packet().to_vec());
+                        }
+                        Output::Event(_) => {}
+                    }
+                }
+            }
+            if quiet {
+                return delivered;
+            }
+        }
+    }
+
+    /// An IPv4 packet of `len` bytes from `10.0.0.1` to `10.0.0.2`.
+    fn local_packet(len: usize) -> PacketBuf {
+        let mut buf = PacketBuf::with_capacity(2048);
+        buf.set_len(len);
+        let p = buf.as_packet_mut();
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        buf
+    }
+
+    #[test]
+    fn padding_stops_at_the_peer_pad_limit() {
+        for crypto_jobs in [false, true] {
+            let mut cores = core_pair(crypto_jobs);
+            // The first packet waits for the handshake.
+            cores[0].handle_input(
+                Input::Local {
+                    packet: local_packet(100),
+                },
+                Instant::now(),
+            );
+            assert_eq!(pump(&mut cores)[1].len(), 1);
+            let peer = cores[0].peers().next().unwrap();
+
+            // (limit, packet length, padded plaintext)
+            for (limit, len, padded) in [
+                (None, 1001, 1008),
+                (Some(1003), 1001, 1003),
+                (Some(1003), 1003, 1003),
+                (Some(1003), 1010, 1010),
+                (Some(1280), 1001, 1008),
+                (None, 1003, 1008),
+            ] {
+                cores[0].set_peer_pad_limit(peer, limit);
+                let packet = local_packet(len);
+                let sent = packet.as_packet().to_vec();
+                let input = Input::Local { packet };
+                if crypto_jobs {
+                    let mut job = cores[0]
+                        .handle_input_deferred(input, Instant::now())
+                        .unwrap();
+                    job.run();
+                    cores[0].complete_job(job);
+                } else {
+                    cores[0].handle_input(input, Instant::now());
+                }
+                let Some(Output::Transmit { path, data }) = cores[0].poll_output() else {
+                    unreachable!();
+                };
+                assert_eq!(data.len(), DATA_HEADER_SZ + padded + 16, "{limit:?} {len}");
+                cores[0].outputs.push_front(Output::Transmit { path, data });
+                assert_eq!(pump(&mut cores)[1], [sent], "{limit:?} {len}");
+            }
+        }
     }
 }

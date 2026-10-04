@@ -16,12 +16,15 @@ use bytes::{Buf as _, Bytes};
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::LinkState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::MAX_DATAGRAM;
 use crate::config::WssConfig;
-use crate::connect::{Connector, DialCounters, Ws, add, bump, get, invalid, lock};
+use crate::connect::{
+    Connector, DialCounters, Ws, WssDialError, WssDialEvent, add, bump, get, invalid, lock,
+};
 use crate::frame::{self, FrameCommand, HEADER_LEN, Protocol, WsFrame};
 
 /// The most stream bytes one DATA frame carries: a frame is at most 65536 bytes, as the
@@ -57,6 +60,14 @@ pub struct WssStreamLimits {
     /// configurable by its operator), so keep this at most the gateway's cap. NSGW writes
     /// all streams of a session through one shared writer queue.
     pub max_streams_per_session: usize,
+    /// How long [`connect`](WssStreamClient::connect), [`open_tcp`](WssStreamClient::open_tcp)
+    /// and [`open_udp`](WssStreamClient::open_udp) wait for a session. Past it they fail
+    /// with the error of the last session dial (its kind, message and [`WssDialError`]),
+    /// or with [`io::ErrorKind::TimedOut`] when none failed since the last session came up;
+    /// the dial goes on, with its backoff, and serves later opens. `None` (the default)
+    /// waits as long as the dial does: its backoff, the token wait after a 401
+    /// ([`WssConfig::token_wait`]) and the dial itself.
+    pub open_timeout: Option<Duration>,
 }
 
 impl Default for WssStreamLimits {
@@ -67,6 +78,7 @@ impl Default for WssStreamLimits {
             control_queue: 64,
             data_queue: 256,
             max_streams_per_session: 1024,
+            open_timeout: None,
         }
     }
 }
@@ -105,6 +117,13 @@ impl WssStreamLimits {
     #[must_use]
     pub const fn max_streams_per_session(mut self, streams: usize) -> Self {
         self.max_streams_per_session = streams;
+        self
+    }
+
+    /// Sets [`open_timeout`](Self::open_timeout).
+    #[must_use]
+    pub const fn open_timeout(mut self, timeout: Duration) -> Self {
+        self.open_timeout = Some(timeout);
         self
     }
 }
@@ -463,6 +482,7 @@ impl Session {
             flow.ended(End::Lost);
         }
         self.connector.lost();
+        self.connector.emit(WssDialEvent::Lost);
         if self.stats.active_sessions.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.connector.set_state(LinkState::Disconnected);
         }
@@ -520,22 +540,45 @@ impl Session {
     }
 }
 
+/// A copy of a dial error: its kind and message, and its [`WssDialError`] if it has one.
+fn copy_error(error: &io::Error) -> io::Error {
+    let kind = error.kind();
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<WssDialError>())
+        .map_or_else(
+            || io::Error::new(kind, error.to_string()),
+            |detail| io::Error::new(kind, detail.clone()),
+        )
+}
+
+/// A session dial in flight, run by its own task.
+struct Dial {
+    /// Closed when the dial finished and its outcome is recorded.
+    done: watch::Receiver<()>,
+    task: AbortHandle,
+}
+
 /// The client state shared by its clones.
 struct Inner {
     connector: Arc<Connector>,
     limits: WssStreamLimits,
     stats: Arc<WssStreamStats>,
     sessions: StdMutex<Vec<Arc<Session>>>,
-    /// Held while dialing: one dial at a time.
-    dialing: Mutex<()>,
+    /// The dial in flight: one at a time. Its outcome is recorded under this lock.
+    dialing: StdMutex<Option<Dial>>,
     /// Finished dials.
     dials: AtomicU64,
     /// The error of the last dial, if it failed.
-    last_failure: StdMutex<Option<(io::ErrorKind, String)>>,
+    last_failure: StdMutex<Option<io::Error>>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        let dial = lock(&self.dialing).take();
+        if let Some(dial) = dial {
+            dial.task.abort();
+        }
         for session in lock(&self.sessions).iter() {
             session.shutdown.send_replace(true);
         }
@@ -543,11 +586,31 @@ impl Drop for Inner {
 }
 
 impl Inner {
+    /// [`with_session`](Self::with_session) within the open timeout, if one is set.
+    async fn within_open_timeout<T>(
+        self: &Arc<Self>,
+        take: impl FnMut(&Arc<Session>) -> Option<T> + Send,
+    ) -> io::Result<T> {
+        let Some(limit) = self.limits.open_timeout else {
+            return self.with_session(take).await;
+        };
+        if let Ok(result) = tokio::time::timeout(limit, self.with_session(take)).await {
+            return result;
+        }
+        Err(lock(&self.last_failure).as_ref().map_or_else(
+            || io::Error::new(io::ErrorKind::TimedOut, "wss open timed out"),
+            copy_error,
+        ))
+    }
+
     /// The first of `take` over the live sessions that is `Some`, dialing a new session
     /// while there is none. Waiters behind a failed dial get its error rather than dialing
     /// once each.
+    ///
+    /// The dial runs in its own task, so a waiter dropped (or timed out) neither stops it
+    /// nor loses its backoff or token wait.
     async fn with_session<T>(
-        &self,
+        self: &Arc<Self>,
         mut take: impl FnMut(&Arc<Session>) -> Option<T> + Send,
     ) -> io::Result<T> {
         loop {
@@ -555,17 +618,26 @@ impl Inner {
                 return Ok(found);
             }
             let seen = self.dials.load(Ordering::Acquire);
-            let _dialing = self.dialing.lock().await;
+            let mut done = {
+                let mut dialing = lock(&self.dialing);
+                if let Some(found) = self.find(&mut take) {
+                    return Ok(found);
+                }
+                if self.dials.load(Ordering::Acquire) != seen
+                    && let Some(failure) = lock(&self.last_failure).as_ref()
+                {
+                    return Err(copy_error(failure));
+                }
+                dialing.get_or_insert_with(|| self.dial()).done.clone()
+            };
+            // Closed once the dial's outcome is recorded.
+            let _ = done.changed().await;
             if let Some(found) = self.find(&mut take) {
                 return Ok(found);
             }
-            if self.dials.load(Ordering::Acquire) != seen {
-                let failure = lock(&self.last_failure).clone();
-                if let Some((kind, message)) = failure {
-                    return Err(io::Error::new(kind, message));
-                }
+            if let Some(failure) = lock(&self.last_failure).as_ref() {
+                return Err(copy_error(failure));
             }
-            self.dial().await?;
         }
     }
 
@@ -575,14 +647,35 @@ impl Inner {
         sessions.iter().find_map(take)
     }
 
-    async fn dial(&self) -> io::Result<()> {
-        let result = self.connector.connect(&self.stats.dial).await;
+    /// Starts a dial in its own task; called with [`dialing`](Self::dialing) locked.
+    fn dial(self: &Arc<Self>) -> Dial {
+        let (finished, done) = watch::channel(());
+        let inner = Arc::downgrade(self);
+        let connector = Arc::clone(&self.connector);
+        let stats = Arc::clone(&self.stats);
+        let task = tokio::spawn(async move {
+            let result = connector.connect(&stats.dial).await;
+            if let Some(inner) = inner.upgrade() {
+                inner.dialed(result);
+            }
+            drop(finished);
+        });
+        Dial {
+            done,
+            task: task.abort_handle(),
+        }
+    }
+
+    /// Records the outcome of the dial in flight: a session, or the failure.
+    fn dialed(&self, result: io::Result<Ws>) {
+        let mut dialing = lock(&self.dialing);
+        *dialing = None;
         self.dials.fetch_add(1, Ordering::Release);
         let ws = match result {
             Ok(ws) => ws,
             Err(error) => {
-                *lock(&self.last_failure) = Some((error.kind(), error.to_string()));
-                return Err(error);
+                *lock(&self.last_failure) = Some(error);
+                return;
             }
         };
         *lock(&self.last_failure) = None;
@@ -597,16 +690,16 @@ impl Inner {
         );
         self.stats.active_sessions.fetch_add(1, Ordering::Relaxed);
         self.connector.set_state(LinkState::Connected);
+        self.connector.emit(WssDialEvent::Connected);
         tracing::info!(session = number, url = %self.connector.config().url, "wss session up");
         tokio::spawn(Arc::clone(&session).run(ws, queues));
         lock(&self.sessions).push(session);
-        Ok(())
     }
 
     /// Reserves a flow on a session with room and sends its OPEN.
-    async fn open(&self, target: SocketAddr, protocol: Protocol) -> io::Result<Handle> {
+    async fn open(self: &Arc<Self>, target: SocketAddr, protocol: Protocol) -> io::Result<Handle> {
         let (session, flow) = self
-            .with_session(|session| {
+            .within_open_timeout(|session| {
                 session
                     .reserve(protocol)
                     .map(|flow| (Arc::clone(session), flow))
@@ -949,10 +1042,14 @@ impl WssUdpFlow {
 /// - **Sessions**: dialed like [`WssDialer`](crate::WssDialer) links (URL, TLS, headers,
 ///   bearer, 401/403 as [`LinkState::Rejected`], the doubling backoff, pings and the read
 ///   idle of the [`WssConfig`]), lazily on the first open or by [`connect`](Self::connect).
+///   [`events`](Self::events) reports each dial and session.
 ///   Every stream and flow shares one session until it holds
 ///   [`max_streams_per_session`](WssStreamLimits::max_streams_per_session) live ones;
-///   only then is another session dialed. One dial runs at a time; opens waiting for it
-///   share its result. A dial after a session was lost waits the backoff.
+///   only then is another session dialed. One dial runs at a time, in its own task; opens
+///   waiting for it share its result. A dial after a session was lost waits
+///   [`reconnect_delay`](WssConfig::reconnect_delay), or the backoff. With
+///   [`open_timeout`](WssStreamLimits::open_timeout), opens fail fast with the last dial
+///   error instead of waiting out the backoff or the token wait; the dial goes on.
 /// - **Stream ids**: per session, counting up from 1, never 0, skipping ids still in use.
 ///   An id stays in use until the peer's CLOSE or `CLOSE_ACK`.
 /// - **Loss**: when a session ends (socket error, close, read idle), every stream and flow
@@ -996,7 +1093,7 @@ impl WssStreamClient {
             limits,
             stats: Arc::new(WssStreamStats::default()),
             sessions: StdMutex::new(Vec::new()),
-            dialing: Mutex::new(()),
+            dialing: StdMutex::new(None),
             dials: AtomicU64::new(0),
             last_failure: StdMutex::new(None),
         };
@@ -1017,9 +1114,16 @@ impl WssStreamClient {
         self.inner.connector.state()
     }
 
+    /// Receives the [`WssDialEvent`]s from now on: one per failed, timed out or rejected
+    /// session dial, [`Connected`](WssDialEvent::Connected) per session that came up and
+    /// [`Lost`](WssDialEvent::Lost) per session that ended, after its `Connected`.
+    pub fn events(&self) -> broadcast::Receiver<WssDialEvent> {
+        self.inner.connector.events()
+    }
+
     /// Dials a session unless one is up.
     pub async fn connect(&self) -> io::Result<()> {
-        self.inner.with_session(|_| Some(())).await
+        self.inner.within_open_timeout(|_| Some(())).await
     }
 
     /// Opens a TCP stream to `target` (an OPEN with protocol TCP).

@@ -5,15 +5,15 @@
 //! stage answers with Packet Too Big and fragments IPv4 for that peer, and a second peer on
 //! another path keeps the source MTU; the learned MTU expires and the full MTU comes back.
 //!
-//! The core pads every data message's plaintext to a multiple of 16 bytes, also past the
-//! inner MTU, so a packet at the inner MTU may make an outer packet up to 15 bytes above the
-//! path MTU; a sending host without DF (`UdpTransport` today) fragments it. The router models
-//! that: once it has reported the limit, it counts such datagrams and passes them on.
-//! Reports for unknown paths, increases and wrong quotes change nothing. An engine that
-//! never uses the feature keeps no state and spawns no report forwarder.
+//! The padding of a constrained peer's data stops at its inner MTU, so a packet at the inner
+//! MTU makes an outer packet of exactly the path MTU, over IPv4 and IPv6 paths. A sending
+//! host without DF (`UdpTransport` today) would fragment a larger one; the router counts
+//! such datagrams once it has reported the limit and passes them on. Reports for unknown
+//! paths, increases and wrong quotes change nothing. An engine that never uses the feature
+//! keeps no state and spawns no report forwarder.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,8 +38,8 @@ const INNER: u16 = 1320;
 /// How long to wait for the engine to take a report.
 const WAIT: Duration = Duration::from_secs(5);
 
-/// A router in front of a channel transport: the first datagram whose IPv6 packet is above
-/// a new limit is dropped and the limit reported, quoting the datagram, like an `ICMPv6`
+/// A router in front of a channel transport: the first datagram whose IP packet is above a
+/// new limit is dropped and the limit reported, quoting the datagram, like an `ICMPv6`
 /// Packet Too Big; later ones above it count as fragmented by the sending host and pass.
 struct Router {
     inner: ChannelTransport,
@@ -48,6 +48,8 @@ struct Router {
     reported: Arc<AtomicBool>,
     /// Datagrams above the reported limit.
     host_fragmented: Arc<AtomicU64>,
+    /// The largest IP packet passed on.
+    largest: Arc<AtomicUsize>,
     reports: mpsc::Sender<PathMtuReport>,
     feed: Mutex<Option<mpsc::Receiver<PathMtuReport>>>,
     /// The leading bytes of the last datagram dropped.
@@ -60,6 +62,7 @@ struct Control {
     limit: Arc<AtomicU16>,
     reported: Arc<AtomicBool>,
     host_fragmented: Arc<AtomicU64>,
+    largest: Arc<AtomicUsize>,
     reports: mpsc::Sender<PathMtuReport>,
     dropped: Arc<Mutex<Option<Vec<u8>>>>,
 }
@@ -71,6 +74,7 @@ impl Router {
             limit: Arc::new(AtomicU16::new(OPEN)),
             reported: Arc::default(),
             host_fragmented: Arc::default(),
+            largest: Arc::default(),
             reports,
             dropped: Arc::default(),
         };
@@ -79,6 +83,7 @@ impl Router {
             limit: Arc::clone(&control.limit),
             reported: Arc::clone(&control.reported),
             host_fragmented: Arc::clone(&control.host_fragmented),
+            largest: Arc::clone(&control.largest),
             reports: control.reports.clone(),
             feed: Mutex::new(Some(feed)),
             dropped: Arc::clone(&control.dropped),
@@ -91,6 +96,12 @@ impl Control {
     fn set_limit(&self, limit: u16) {
         self.limit.store(limit, Ordering::Relaxed);
         self.reported.store(false, Ordering::Relaxed);
+        self.largest.store(0, Ordering::Relaxed);
+    }
+
+    /// The largest IP packet passed on since the limit was set.
+    fn largest(&self) -> usize {
+        self.largest.load(Ordering::Relaxed)
     }
 
     /// Datagrams above the reported limit, fragmented by the sending host.
@@ -119,9 +130,11 @@ impl Transport for Router {
 
     async fn send(&self, datagram: &[u8], to: &Path) -> std::io::Result<()> {
         let limit = self.limit.load(Ordering::Relaxed);
-        if datagram.len() + 48 > usize::from(limit) && self.reported.load(Ordering::Relaxed) {
+        // IP and UDP headers.
+        let outer = datagram.len() + if to.addr.is_ipv6() { 48 } else { 28 };
+        if outer > usize::from(limit) && self.reported.load(Ordering::Relaxed) {
             self.host_fragmented.fetch_add(1, Ordering::Relaxed);
-        } else if datagram.len() + 48 > usize::from(limit) {
+        } else if outer > usize::from(limit) {
             self.reported.store(true, Ordering::Relaxed);
             let quote = &datagram[..datagram.len().min(8)];
             if let Ok(mut dropped) = self.dropped.lock() {
@@ -133,6 +146,7 @@ impl Transport for Router {
                 .try_send(PathMtuReport::with_quote(*to, limit, quote));
             return Ok(());
         }
+        self.largest.fetch_max(outer, Ordering::Relaxed);
         self.inner.send(datagram, to).await
     }
 
@@ -141,8 +155,8 @@ impl Transport for Router {
     }
 }
 
-/// Node 1 with a fragmenter, linked to node 2 over IPv6 through a [`Router`] (transport 1)
-/// and to node 3 over a plain channel (transport 3); 2 and 3 are peers of 1.
+/// Node 1 with a fragmenter, linked to node 2 through a [`Router`] (transport 1) and to
+/// node 3 over a plain channel (transport 3); 2 and 3 are peers of 1.
 struct Net {
     a: Node<Router>,
     b: Node<ChannelTransport>,
@@ -157,10 +171,19 @@ fn addr(s: &str) -> TestResult<SocketAddr> {
     Ok(s.parse()?)
 }
 
+/// [`Net`] over IPv6.
 async fn net() -> TestResult<Net> {
-    let a_addr = addr("[2001:db8::1]:1000")?;
-    let b_addr = addr("[2001:db8::2]:2000")?;
-    let c_addr = addr("[2001:db8::3]:3000")?;
+    net_on([
+        "[2001:db8::1]:1000",
+        "[2001:db8::2]:2000",
+        "[2001:db8::3]:3000",
+    ])
+    .await
+}
+
+/// [`Net`] with nodes 1, 2 and 3 at `addrs`.
+async fn net_on(addrs: [&str; 3]) -> TestResult<Net> {
+    let [a_addr, b_addr, c_addr] = [addr(addrs[0])?, addr(addrs[1])?, addr(addrs[2])?];
     let (t1, t3) = (TransportId::new(1), TransportId::new(3));
     let (to_b, from_a) = ChannelTransport::pair(64, (t1, a_addr), (TransportId::new(2), b_addr));
     let (to_c, from_a3) = ChannelTransport::pair(64, (t3, a_addr), (TransportId::new(4), c_addr));
@@ -347,12 +370,10 @@ async fn the_inner_mtu_follows_the_path_and_recovers() -> TestResult {
     a.send(&too_big).await?;
     expect_packet_too_big(&mut a, b_id, &too_big, INNER).await?;
     b.expect_no_delivery().await?;
-    // 1312 bytes fit the path with their datagram; 1320 bytes are padded to 1328 and
-    // their outer packet (1408 bytes) is fragmented by the sending host.
-    deliver(&a, &v6_to(&a, &b, 1312), &mut b).await?;
-    assert_eq!(router.host_fragmented(), 0);
+    // 1320 bytes are padded only up to the inner MTU: their outer packet fits the path.
     deliver(&a, &v6_to(&a, &b, usize::from(INNER)), &mut b).await?;
-    assert_eq!(router.host_fragmented(), 1);
+    assert_eq!(router.largest(), usize::from(LIMIT));
+    assert_eq!(router.host_fragmented(), 0);
     deliver(&a, &v6_to(&a, &c, 1420), &mut c).await?;
 
     // IPv4 without DF arrives at node 2 in fragments within its MTU.
@@ -361,8 +382,8 @@ async fn the_inner_mtu_follows_the_path_and_recovers() -> TestResult {
     let (joined, fragments) = reassemble(&mut b, INNER).await?;
     assert_eq!(joined, packet);
     assert_eq!(fragments, 3);
-    // The two full fragments (1316 bytes) are padded past the path too.
-    assert_eq!(router.host_fragmented(), 3);
+    // The two full fragments (1316 bytes) fit the path too.
+    assert_eq!(router.host_fragmented(), 0);
     let fragment_stats = a.handle.fragment_stats().await?;
     assert_eq!(fragment_stats.ptb_sent, 1);
     assert_eq!(fragment_stats.fragmented, 1);
@@ -385,6 +406,41 @@ async fn the_inner_mtu_follows_the_path_and_recovers() -> TestResult {
     assert_eq!((stats.expired, stats.paths), (1, 0));
     deliver(&a, &v6_to(&a, &b, 1420), &mut b).await?;
     events.expect_none(is_mtu_change).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn packets_at_the_inner_mtu_fit_ipv4_and_ipv6_paths() -> TestResult {
+    // (addresses, inner MTU under an outer MTU of 1400: 1400 - IP header - 8 - 32)
+    let families = [
+        (["192.0.2.1:1000", "192.0.2.2:2000", "192.0.2.3:3000"], 1340),
+        (
+            [
+                "[2001:db8::1]:1000",
+                "[2001:db8::2]:2000",
+                "[2001:db8::3]:3000",
+            ],
+            INNER,
+        ),
+    ];
+    for (addrs, inner) in families {
+        let Net {
+            a, mut b, router, ..
+        } = net_on(addrs).await?;
+        let mut mtus = a.handle.peer_mtus().await?;
+        router.set_limit(LIMIT);
+        a.send(&v6_to(&a, &b, 1420)).await?;
+        let published = wait_for(&mut mtus, |m| !m.peers.is_empty()).await?;
+        assert_eq!(published.min, inner);
+
+        // Padded to a multiple of 16, these would exceed the path by 4 (IPv4) or 8 (IPv6)
+        // bytes.
+        for len in [inner - 1, inner] {
+            deliver(&a, &v6_to(&a, &b, usize::from(len)), &mut b).await?;
+        }
+        assert_eq!(router.largest(), usize::from(LIMIT), "{addrs:?}");
+        assert_eq!(router.host_fragmented(), 0, "{addrs:?}");
+    }
     Ok(())
 }
 

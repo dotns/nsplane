@@ -244,11 +244,14 @@ impl UdpReply {
 }
 
 /// A UDP socket bound to one of the stack's addresses, from
-/// [`NetStackHandle::bind_udp`](crate::NetStackHandle::bind_udp).
+/// [`NetStackHandle::bind_udp`](crate::NetStackHandle::bind_udp), or connected to one
+/// remote, from [`NetStackHandle::connect_udp`](crate::NetStackHandle::connect_udp).
 ///
 /// Datagrams to the bound address go to this socket, not to `incoming_udp`. A socket bound
 /// to the unspecified address of a family receives that family's datagrams to its port
-/// unless another socket is bound to the exact address. Dropping the socket unbinds it.
+/// unless another socket is bound to the exact address. A connected socket receives only
+/// the datagrams from its remote to its local address, ahead of any socket bound to that
+/// address. Dropping the socket unbinds it.
 #[derive(Debug)]
 pub struct UdpSocket {
     /// Declared before `rx`: the address leaves the ownership table before the driver can
@@ -256,6 +259,8 @@ pub struct UdpSocket {
     _registration: Registration,
     local: SocketAddr,
     source: IpAddr,
+    /// The remote of a connected socket.
+    peer: Option<SocketAddr>,
     rx: mpsc::Receiver<(SocketAddr, Bytes)>,
     out: UdpOut,
 }
@@ -265,6 +270,7 @@ impl UdpSocket {
         registration: Registration,
         local: SocketAddr,
         source: IpAddr,
+        peer: Option<SocketAddr>,
         rx: mpsc::Receiver<(SocketAddr, Bytes)>,
         out: UdpOut,
     ) -> Self {
@@ -272,14 +278,33 @@ impl UdpSocket {
             _registration: registration,
             local,
             source,
+            peer,
             rx,
             out,
         }
     }
 
-    /// The bound address, with the port the stack picked if `0` was requested.
+    /// The bound address, with the port the stack picked if `0` was requested. A connected
+    /// socket's address is always one of the stack's, never the unspecified address.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// The remote of a connected socket, `None` for a bound one.
+    pub const fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// Sends `payload` to the remote of a connected socket.
+    ///
+    /// Fails with [`io::ErrorKind::NotConnected`] on a socket from
+    /// [`bind_udp`](crate::NetStackHandle::bind_udp), and otherwise like
+    /// [`send_to`](Self::send_to).
+    pub async fn send(&self, payload: &[u8]) -> io::Result<()> {
+        let peer = self.peer.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "UDP socket is not connected")
+        })?;
+        self.send_to(payload, peer).await
     }
 
     /// Sends `payload` to `remote`.
@@ -294,7 +319,8 @@ impl UdpSocket {
         self.out.send(src, remote, payload).await
     }
 
-    /// The next datagram's payload and sender.
+    /// The next datagram's payload and sender; on a connected socket the sender is always
+    /// its remote.
     ///
     /// Fails with [`io::ErrorKind::BrokenPipe`] once the stack stopped and the queue is
     /// empty.

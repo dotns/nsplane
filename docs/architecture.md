@@ -41,9 +41,9 @@ where it is described below.
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`), `SideSender`, `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter`, `MergeSource`, `MapSink` / `MapSource` / `MapVerdict`, `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
-| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with`, `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions`, `TunSource`, `TunSink`, `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
-| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` / `TranslationTable`, `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
@@ -527,15 +527,42 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - TCP, TLS and the WebSocket upgrade within `connect_timeout` (10 s), to `connect_addr`
   or the URL's host, with `server_name` (default the URL's host), the extra `headers` and,
   with a `BearerProvider`, `Authorization: Bearer <token>` fetched per dial.
+- A `ws://` URL is accepted only with `allow_plaintext` (default `false`): TCP and the
+  upgrade without TLS (port 80 by default; `server_name` and `tls` unused), everything
+  else as for `wss://`. The connection's byte stream is a crate-private enum over the TLS
+  stream (boxed, once per dial) and the plain `TcpStream`; one match per poll.
+- An upgrade answered with any HTTP response (no 101) fails the dial with a public
+  `WssDialError` inside the `io::Error` (`get_ref()` + `downcast_ref`): `status`, the
+  response `headers` (non-UTF-8 values lossily) and the start of the `body`, the bytes
+  that arrived with the head up to `WssDialError::MAX_BODY` (512, ns's log cut). The kind
+  and message are unchanged: `PermissionDenied`, "wss upgrade rejected with HTTP {status}"
+  for 401/403; `Other`, "wss connect failed: HTTP error: {status}" otherwise. Stream
+  client opens waiting behind that dial get a copy with the detail.
 - An upgrade answered with 401 or 403 is reported as `LinkState::Rejected(status)` on the
   carrier's `state()` watch (and counted in its stats). After a 401 the next dial waits
   until the provider yields a different token (polled every `token_poll`, 2 s, at most
   `token_wait`, 300 s); a 403, and a 401 without a provider, back off like any failure.
-- Backoff: every dial but the first waits `backoff_min` (2 s) after a link that came up,
-  doubled after each failed dial up to `backoff_max` (60 s).
+- Backoff: every dial but the first waits. After a link or session that came up (for the
+  dialer and the server, the dial after a successful one) it waits `reconnect_delay` when
+  set, and a dial failing after it waits `backoff_min` (2 s), doubled after each further
+  failure up to `backoff_max` (60 s); the connector models this as a distinct
+  `Retry::Reconnect` state, so the failure backoff restarts at the floor instead of
+  doubling the reconnect delay. Without `reconnect_delay` (the default) the wait after a
+  link is `backoff_min` as the first step of the doubling, as before. A stream client's
+  capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
-  (pongs included) arrived for `read_idle` (35 s). No message above `MAX_MESSAGE`
-  (4 x 65 535 bytes) is read.
+  (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
+  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. No message
+  above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
+- Events: `WssDialer::events()` and `WssStreamClient::events()` subscribe to a
+  `broadcast` channel in the shared connector (`WssDialEvent::CAPACITY` = 64; a lagging
+  receiver sees `RecvError::Lagged`), one `WssDialEvent` per occurrence: the connector
+  sends `DialFailed`, `TimedOut` and `Rejected(status)` for each failed dial; the dialer
+  sends `Connected` and `Lost` from `LinkDialer::on_state` (so a link's `Connected`, sent
+  when the transport reports it up right after the dial, precedes its `Lost`), the stream
+  client when a session comes up and where it ends. Without a receiver a send is a lock
+  and a count check, no allocation; events are per dial, never per datagram. The counters
+  and the `state()` watch are unchanged.
 - TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
   takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
   default protocol versions and no client auth); `WssTls::Config` takes a complete
@@ -573,8 +600,10 @@ behind a terminate (NSGW, or `WssStreamServer`).
 - Sessions: dialed lazily on the first open (or `connect`). Every TCP stream and UDP flow
   is multiplexed over one session until it holds
   `WssStreamLimits::max_streams_per_session` live ones (default 1024, NSGW's default
-  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time
-  and waiting opens share it. The wire format is ns's, unchanged. NSGW caveats: it rejects
+  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time,
+  in a task of its own (one per dial, not per open), and waiting opens share its outcome;
+  an open dropped while it waits therefore loses neither the backoff nor the 401 token
+  wait, and never starts a second dial. The wire format is ns's, unchanged. NSGW caveats: it rejects
   OPENs beyond its own per-session cap, which its operator can set below 1024 (keep
   `max_streams_per_session` at most the gateway's cap), and it writes all streams of a
   session through one shared writer queue.
@@ -591,9 +620,15 @@ behind a terminate (NSGW, or `WssStreamServer`).
   (`stream_buffer`) and 32 MiB per session (`session_buffer`), each received frame
   costing its payload plus 64 bytes. Over budget, a TCP stream is reset (reads fail with
   `ConnectionReset`) and a UDP datagram is dropped while the flow stays.
+- Fail-fast opens: `WssStreamLimits::open_timeout` (default `None`: an open waits as long
+  as the dial, its backoff and token wait included). With `Some(t)`, `connect`, `open_tcp`
+  and `open_udp` give up after `t` with a copy of the last dial failure (kind, message,
+  `WssDialError`), or `TimedOut` ("wss open timed out") when no dial failed since the last
+  session came up; the dial goes on and its session serves later opens. A dial that fails
+  at once still fails the open at once. Without it no timer is armed.
 - Reconnection: when a session ends (socket error, close, read idle) every stream and flow
-  on it fails; the next open dials again after the backoff. Frames for unknown stream ids
-  are ignored and counted in `WssStreamStats`.
+  on it fails; the next open dials again after `reconnect_delay` (or the backoff). Frames
+  for unknown stream ids are ignored and counted in `WssStreamStats`.
 
 **Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
 relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
@@ -620,8 +655,8 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   `Close { reason, to_backend, from_backend }`; sending never waits, an event that does
   not fit is counted in `WssServerStats::event_drops`.
 - Reconnection: one session at a time carries every stream. When it ends its streams are
-  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after the
-  backoff; a shutdown closes the open streams and the session.
+  closed (`WssCloseReason::SessionEnded`) and the next session is dialed after
+  `reconnect_delay` (or the backoff); a shutdown closes the open streams and the session.
 
 ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
 here, ns can delete `tunnel-ws` whole.
@@ -635,8 +670,15 @@ CLOSE; the UDP socket binds to the backend's address family.
 
 **Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
 `crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
-relay and checks the frames against the ns layouts; `nsplane-e2e` `wss_datagram` runs two
-engines over `WssDialer` (401, 403, reconnect, read idle); `examples/tests/wss.rs` and the
+relay (and a plain one for `ws://`) and checks the frames against the ns layouts;
+`nsplane-e2e` `wss_datagram` runs two engines over `WssDialer` (401, 403, reconnect, read
+idle), `wss_plain` over `ws://`, `wss_dial_error` checks the `WssDialError` of a 401
+and a 503 (header, truncated body) from the dialer and the stream client,
+`wss_keepalive` the ping cadence and read idle of both carriers at two settings, and
+`wss_events` the event sequence (up, lost, up, 401 x 2, 403 x 2, relay down, timeout) and
+the reconnect delay against the doubling backoff on both carriers, and `wss_stream_open`
+the stream client's `open_timeout` (relay down, 403, relay coming up, and the default
+waiting open); `examples/tests/wss.rs` and the
 `relay-wss` cells of `just e2e-examples` run the examples' relay client on it.
 
 ## nsplane-tun
@@ -684,7 +726,8 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
 `NetStackConfig`, and `NetStack::split` yields a `NetStackSource` (egress) and a
 `NetStackSink` (ingress) that an `EngineBuilder` takes in place of a TUN device. The
 application side is `NetStackHandle`: `incoming_tcp` and `incoming_udp` accept connections
-and flows to any port of the stack's addresses, `connect_tcp` and `bind_udp` open them.
+and flows to any port of the stack's addresses, `connect_tcp`, `bind_udp` and
+`connect_udp` open them.
 
 One driver task owns smoltcp. Each iteration takes a bounded batch of ingress packets,
 sizes the TCP listener pool to the batch's SYNs, then ingests the packets one by one with a
@@ -737,6 +780,29 @@ smoltcp on its own dispatch path.
   (only an acknowledgement shrinks it, except a reset, which leaves the socket closed and
   is not counted), so the pass's time is stored as `last_ack`. No lock, no per-packet or
   per-byte work; the values stay readable after the socket is released.
+- Dropping a `TcpConnection` closes it gracefully (FIN; the socket stays until the close
+  completes). `TcpConnection::abort` resets it instead: the driver turn that observes the
+  abort resets the socket and discards its unread and unsent bytes, the poll after the
+  bridge pass sends the RST, and the connection is released (tuple out of the `owns` table,
+  socket removed, `terminated` resolved) in the same turn when the device had room for the
+  RST, else in the next. A connection the peer already reset or closed is released without
+  an RST. A `connect_tcp_from` of a port an aborted connection still holds is deferred by
+  the driver and retried once that release frees the port, so it succeeds when issued right
+  after the abort. A connection without traffic for 5 minutes takes the same path, so the
+  idle timeout also sends the peer an RST before the release. Unused, the abort costs one
+  state compare under the connection's existing lock and two empty-`Vec` takes per driver
+  turn. A reset peer reads `Ok(0)` and writes fail with `BrokenPipe`.
+- `connect_udp` / `connect_udp_from` open a `UdpSocket` connected to one remote: the local
+  end is the stack's address of the remote's family (an unspecified `local` stands for it,
+  port 0 picks an ephemeral port), `send` goes to the remote (`NotConnected` on a bound
+  socket) and `peer_addr` returns it (`None` on a bound socket). A datagram goes to the
+  connected socket of its exact tuple first, then to a socket bound to its exact address,
+  then to one bound to the unspecified address, then to a flow; other remotes still reach a
+  bound socket or `incoming_udp`. Errors: `InvalidInput` (unspecified remote, other-family
+  local), `AddrNotAvailable` (no stack address of the family, or another address),
+  `AddrInUse` (a live connected socket or flow on the tuple, or no free port),
+  `BrokenPipe` (stack stopped). The connected table is checked only while not empty: one
+  `HashMap::is_empty` per UDP datagram when unused.
 - `NetStackHandle::owns(packet)` answers `Ownership::{Flow, Listener, None}` synchronously
   for a local side that shares one decrypted stream between the stack and other consumers
   (a `Splitter` closure). It reads one table of tuples behind a mutex, keyed
@@ -744,19 +810,24 @@ smoltcp on its own dispatch path.
   for `connect_tcp_from` with a port, by the driver before the SYN is emitted for an
   ephemeral port), when a listener socket enters SYN-RECEIVED (after the poll that ingested
   the SYN, before the SYN-ACK is flushed) and when a socket is adopted as a connection;
-  bound UDP sockets and UDP flows when they are created. Each registration is dropped with
+  bound and connected UDP sockets and UDP flows when they are created. Each registration is dropped with
   what holds it (the released connection, the abandoned or failed connect, a handshake
   socket back in `Listen` or closed, the dropped `UdpSocket` or `UdpFlow`, whose
   registration goes before its queue closes so a rebind or a new flow never races it), so
   the table changes per connection, never per packet, and costs nothing per packet when
-  `owns` is not called. `Flow` is an exact tuple match (any remote for a bound UDP socket)
-  or an ICMP/ICMPv6 error quoting a packet sent on a registered tuple; `Listener` a bare SYN
+  `owns` is not called. `Flow` is an exact tuple match (any remote for a bound UDP socket,
+  only its remote for a connected one) or an ICMP/ICMPv6 error quoting a packet sent on a registered tuple; `Listener` a bare SYN
   or UDP datagram to a stack address otherwise; `None` everything else, fragments (dropped
   by the stack) and every packet once the driver stopped. The answer reflects the state at
   the call. With reassembly on, TCP and UDP fragments to a stack address are the stack's:
   `Flow` for a first fragment on a registered tuple, `Listener` for any other first
-  fragment and for every later one (it carries no ports, and the reassembler's state is the
-  driver's, not shared with `owns`).
+  fragment. A later fragment carries no ports, so `owns` remembers each first fragment it
+  classified as `Flow` by `(src, dst, protocol, id)` (the reassembler's key: `protocol`
+  only for IPv4) and reports the later fragments of that datagram as `Flow`; the entry
+  lives `ReassemblyConfig::timeout`, the memory holds at most `max_datagrams` entries
+  (oldest dropped) and `discard_fragments` clears the datagram's entry. A later fragment
+  that arrives before its first, or after the memory forgot it, is `Listener`. Only
+  fragment classification takes this memory's lock; without reassembly none exists.
 - `NetStackConfig::reassembly` gives the driver one `nsplane_packet::reassembly::Reassembler`
   (none is created without it). Before `classify`, every ingress packet to a stack address
   is pushed into it: a non-fragment passes unchanged, a fragment is held, and a completed
@@ -766,6 +837,17 @@ smoltcp on its own dispatch path.
   datagram is held. The reassembler's counts are added to `NetStackStats` after each push
   or expiry: `reassembled`, `reassembly_timeout`, `reassembly_overflow`, and overlapping or
   invalid fragments as `malformed`. Without it, fragments count as `unsupported`.
+- `NetStackHandle::discard_fragments(src, dst, protocol, id)` is for a local side that
+  revokes a flow's admission while one of its datagrams may be half reassembled. The call
+  records the datagram (IPv4 16-bit id widened to `u32`, IPv6 32-bit id; `protocol` only
+  narrows an IPv4 key) synchronously under one short lock, so from then on the driver drops
+  every fragment of it, those already queued in the `NetStackSink` included, and counts
+  them in `reassembly_overflow`; the fragments the reassembler holds never complete and
+  expire at the reassembly timeout (`reassembly_timeout`). The record lives
+  `ReassemblyConfig::timeout`, so a later datagram with the same id starts afresh, and at
+  most `max_datagrams` records are kept (the oldest forgotten early). Without reassembly
+  the call does nothing; with it and nothing discarded, the driver checks one atomic per
+  ingress packet and takes no lock.
 - Every TCP socket (connect and listener pool) runs CUBIC congestion control (smoltcp
   feature `socket-tcp-cubic`, no extra crate). Without it smoltcp sends the whole peer
   window at once and, after a retransmission timeout, all of it again; a hop that drops
@@ -1462,6 +1544,10 @@ path, so such a client pays no extra latency for it.
 | Stack reassembly | `nsplane-netstack` | `NetStackConfig::reassembly = Some(ReassemblyConfig::default())` (64 datagrams, 30 s, 65 535 bytes) | off: fragments are dropped (`unsupported`) | one `Option` check per ingress packet; no reassembler is allocated |
 | TCP socket buffers | `nsplane-netstack` | `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer = Some(bytes)`, clamped to `mtu - 40 ..= 65535 << 14` | `None`: `(mtu - 40) * 512` bytes each, as before | none: the sizes are resolved once when the stack is created |
 | Oversize IPv4 UDP sends | `nsplane-netstack` | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send, as before |
+| TCP abort | `nsplane-netstack` | `TcpConnection::abort` instead of dropping the connection | drop closes with a FIN | one state compare under the connection's lock and two empty-`Vec` takes per driver turn |
+| Fragment discard | `nsplane-netstack` | `NetStackHandle::discard_fragments(src, dst, protocol, id)` when a flow's admission is revoked; needs `NetStackConfig::reassembly` | not called | none without reassembly; with it one atomic load per ingress packet while nothing is discarded, no lock |
+| Later-fragment ownership | `nsplane-netstack` | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
+| Connected UDP sockets | `nsplane-netstack` | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | Local-side graph | `nsplane` | `MapSink::new(sink, f)` / `MapSource::new(source, f)` around a sink or source; `pipe(capacity, mtu)` to feed one engine's output into another's input; `pump(source, sink, from)` spawned between two endpoints | not used | none: plain generic types, used only when passed to the builder or spawned; nothing changes for an engine that does not use them |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
