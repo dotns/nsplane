@@ -1,5 +1,6 @@
 //! An engine whose local side is a `host_tun`, driven by a test host on a plain thread, peered
-//! with a channel-transport node: packets in both directions and a host writer that closes.
+//! with a channel-transport node: packets in both directions, a host writer that closes and an
+//! MTU the host changes while the engine runs.
 
 #![cfg(target_os = "linux")]
 
@@ -10,8 +11,8 @@ use std::time::Duration;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    AllowedIp, ChannelTransport, DROP_SINK_CLOSED, Ecn, Engine, EngineBuilder, EngineHandle, Path,
-    Peer, TransportId,
+    AllowedIp, ChannelTransport, DROP_SINK_CLOSED, Ecn, Engine, EngineBuilder, EngineHandle, Event,
+    Path, Peer, TransportId,
 };
 use nsplane_e2e::{Family, Node, Options, QUIET, TestResult, WAIT, payload, udp4, udp6};
 use nsplane_tun::{HOST_TUN_DEFAULT_CAPACITY, HostTunInput, host_tun};
@@ -209,5 +210,49 @@ async fn a_closed_host_writer_stops_delivery() -> TestResult {
     let outbound = Host::packet_to(&node, Family::V4, 64);
     host.push(vec![outbound.clone()]).await?;
     assert_eq!(node.expect_delivery().await?.1, outbound);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_engine_follows_set_mtu() -> TestResult {
+    const NEW_MTU: u16 = 1280;
+    let (host, mut node) = pair(
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicUsize::new(0)),
+    )?;
+    introduce(&host, &node).await?;
+    let mut events = host.handle.subscribe().await?;
+    assert_eq!(host.handle.mtu().await?, nsplane_e2e::MTU);
+
+    // Setting the current MTU publishes nothing; a new one is published once.
+    host.input.set_mtu(nsplane_e2e::MTU);
+    host.input.clone().set_mtu(NEW_MTU);
+    let event = timeout(WAIT, async {
+        loop {
+            if let Event::MtuChanged { mtu } = events.recv().await? {
+                return TestResult::Ok(mtu);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(event, NEW_MTU);
+    assert_eq!(host.handle.mtu().await?, NEW_MTU);
+
+    // A packet above the new MTU is dropped by the source; one at it is forwarded.
+    let len = usize::from(NEW_MTU) - 28;
+    let above = Host::packet_to(&node, Family::V4, len + 1);
+    let at = Host::packet_to(&node, Family::V4, len);
+    assert_eq!(at.len(), usize::from(NEW_MTU));
+    host.push(vec![above, at.clone()]).await?;
+    assert_eq!(node.expect_delivery().await?.1, at);
+    node.expect_no_delivery().await?;
+
+    sleep(QUIET).await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, Event::MtuChanged { .. }),
+            "unexpected {event:?}"
+        );
+    }
     Ok(())
 }

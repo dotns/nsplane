@@ -22,7 +22,7 @@ pub const HOST_TUN_DEFAULT_CAPACITY: usize = 4096;
 ///
 /// This is the MT-2 local side; the contract's `HostTun::new` ships as `host_tun`.
 ///
-/// The side has MTU `mtu`, queues up to `capacity` packets from the host
+/// The side starts with MTU `mtu` ([`HostTunInput::set_mtu`] changes it later), queues up to `capacity` packets from the host
 /// ([`HOST_TUN_DEFAULT_CAPACITY`] is recommended), and writes the engine's packets with
 /// `write`, an `Arc<dyn Fn(&[u8]) -> bool + Send + Sync>`.
 ///
@@ -42,9 +42,9 @@ pub fn host_tun(
     write: Write,
 ) -> (HostTunInput, HostTunSource, HostTunSink) {
     let (tx, rx) = mpsc::channel(capacity);
-    let (_, mtu_rx) = watch::channel(mtu);
+    let (mtu_tx, mtu_rx) = watch::channel(mtu);
     (
-        HostTunInput { tx },
+        HostTunInput { tx, mtu: mtu_tx },
         HostTunSource {
             rx,
             mtu,
@@ -77,11 +77,12 @@ impl std::error::Error for PushError {}
 
 /// The host's end of a [`host_tun`] local side: packets the host read for the engine go in here.
 ///
-/// Clones push into the same queue. Once every clone is dropped and the queue is drained,
+/// Clones push into the same queue and set the same MTU. Once every clone is dropped and the queue is drained,
 /// the [`HostTunSource`] returns [`io::ErrorKind::BrokenPipe`].
 #[derive(Debug, Clone)]
 pub struct HostTunInput {
     tx: mpsc::Sender<PacketBuf>,
+    mtu: watch::Sender<u16>,
 }
 
 impl HostTunInput {
@@ -98,6 +99,21 @@ impl HostTunInput {
                 mpsc::error::TrySendError::Closed(_) => PushError::Closed,
             })
     }
+
+    /// Sets the MTU of the local side to `mtu`; callable from any thread.
+    ///
+    /// The engine sees the change through [`PacketSource::mtu`], as for any source, and
+    /// the [`HostTunSource`] drops the packets it reads from then on that are longer than
+    /// `mtu`, including those already queued. [`HostTunSource::oversize_drops`] keeps
+    /// counting. Setting the current MTU again does nothing; setting it after the source
+    /// was dropped is harmless.
+    pub fn set_mtu(&self, mtu: u16) {
+        self.mtu.send_if_modified(|current| {
+            let changed = *current != mtu;
+            *current = mtu;
+            changed
+        });
+    }
 }
 
 /// The engine's source of a [`host_tun`] local side: the packets the host pushed, in order.
@@ -105,7 +121,8 @@ impl HostTunInput {
 /// Packets longer than the MTU are dropped and counted ([`HostTunSource::oversize_drops`]);
 /// the first one is logged as a warning. Once every [`HostTunInput`] is dropped and the
 /// queue is drained, `recv` returns [`io::ErrorKind::BrokenPipe`] on every call. The MTU
-/// is the one [`host_tun`] was given and does not change.
+/// is the one [`host_tun`] was given until [`HostTunInput::set_mtu`] changes it; each
+/// packet is checked against the MTU current when it is read.
 #[derive(Debug)]
 pub struct HostTunSource {
     rx: mpsc::Receiver<PacketBuf>,
@@ -122,6 +139,11 @@ impl HostTunSource {
 
     /// `packet` if it fits the MTU; otherwise drops and counts it.
     fn admit(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
+        // A version check without a lock; the lock is taken only after a change, or on
+        // every packet once every input is gone (the closed channel may hide a last change).
+        if !matches!(self.mtu_rx.has_changed(), Ok(false)) {
+            self.mtu = *self.mtu_rx.borrow_and_update();
+        }
         if packet.len() <= usize::from(self.mtu) {
             return Some(packet);
         }
@@ -206,4 +228,73 @@ impl PacketSink for HostTunSink {
 /// The error the source returns once every input is gone.
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "host packet input closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn side(mtu: u16) -> (HostTunInput, HostTunSource) {
+        let (input, source, _) = host_tun(mtu, 16, Arc::new(|_: &[u8]| true));
+        (input, source)
+    }
+
+    #[tokio::test]
+    async fn set_mtu_applies_to_queued_and_later_packets() -> TestResult {
+        let (input, mut source) = side(100);
+        input.push(&[0; 100])?;
+        input.push(&[1; 80])?;
+        input.clone().set_mtu(80);
+        input.push(&[2; 81])?;
+        input.push(&[3; 80])?;
+
+        // Queued before the change or not, every packet is checked against the new MTU.
+        assert_eq!(source.recv().await?.as_packet(), [1; 80]);
+        assert_eq!(source.recv().await?.as_packet(), [3; 80]);
+        assert_eq!(source.oversize_drops(), 2);
+
+        input.set_mtu(200);
+        input.push(&[4; 200])?;
+        let mut batch = PacketBatch::new();
+        source.recv_batch(&mut batch).await?;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(source.oversize_drops(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_mtu_publishes_changes_only() -> TestResult {
+        let (input, source) = side(1280);
+        let mut mtu = source.mtu();
+        assert_eq!(*mtu.borrow_and_update(), 1280);
+
+        input.set_mtu(1280);
+        assert!(!mtu.has_changed()?);
+        input.set_mtu(1400);
+        assert!(mtu.has_changed()?);
+        assert_eq!(*mtu.borrow_and_update(), 1400);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_change_before_inputs_drop_still_applies() -> TestResult {
+        let (input, mut source) = side(100);
+        input.push(&[0; 100])?;
+        input.set_mtu(99);
+        drop(input);
+        let err = source.recv().await.err().ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(source.oversize_drops(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn set_mtu_after_the_source_is_dropped() {
+        let (input, source) = side(1280);
+        drop(source);
+        input.set_mtu(1400);
+        assert_eq!(input.push(&[0; 10]), Err(PushError::Closed));
+    }
 }
