@@ -463,6 +463,23 @@ impl Core {
         self.peers.by_destination(dst)
     }
 
+    /// The path `peer`'s next transport data message would leave on: the one the policy
+    /// selects for [`MessageKind::Data`], or the peer's current path. `None` for an unknown
+    /// peer or one without a path.
+    pub fn data_path(&self, peer: PeerId) -> Option<Path> {
+        let current = self.peers.peer(peer)?.path();
+        self.policy.select(peer, MessageKind::Data).or(current)
+    }
+
+    /// Whether `index` is the receiver index `peer`'s current session puts on its transport
+    /// data messages (the index the peer assigned to it), e.g. to check that a quoted
+    /// datagram is ours. `false` for an unknown peer or one without a session.
+    pub fn is_remote_index(&self, peer: PeerId, index: u32) -> bool {
+        self.peers
+            .peer(peer)
+            .is_some_and(|p| p.remote_index() == Some(index))
+    }
+
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
     /// allowed-IP source check.
     ///
@@ -1370,5 +1387,58 @@ mod tests {
         assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
         assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
         assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
+    }
+
+    /// Sends data on a fixed path, everything else on the current one.
+    struct DataOn(Path);
+
+    impl PathPolicy for DataOn {
+        fn select(&self, _peer: PeerId, kind: MessageKind) -> Option<Path> {
+            (kind == MessageKind::Data).then_some(self.0)
+        }
+
+        fn on_authenticated(&self, _peer: PeerId, _from: &Path, _kind: MessageKind) -> Roam {
+            Roam::Keep
+        }
+    }
+
+    #[test]
+    fn data_path_follows_the_policy_then_the_current_path() {
+        let path = |port| Path {
+            transport: nsplane_packet::TransportId::new(1),
+            addr: std::net::SocketAddr::from(([192, 0, 2, 1], port)),
+            ecn: Ecn::NotEct,
+        };
+        let add = |core: &mut Core, with_path: bool| {
+            let key = x25519::PublicKey::from([7; 32]);
+            let mut config = PeerConfig::new(key);
+            config.path = with_path.then(|| path(1));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core.peer_id(&key).unwrap()
+        };
+        let private_key = Some(x25519::StaticSecret::from([1; 32]));
+
+        let mut core = Core::new(CoreConfig {
+            private_key: private_key.clone(),
+            ..CoreConfig::default()
+        });
+        assert_eq!(core.data_path(PeerId::new(99)), None);
+        let id = add(&mut core, false);
+        assert_eq!(core.data_path(id), None);
+        let id = add(&mut core, true);
+        assert_eq!(core.data_path(id), Some(path(1)));
+        assert!(!core.is_remote_index(id, 0));
+        assert!(!core.is_remote_index(PeerId::new(99), 0));
+
+        let mut core = Core::new(CoreConfig {
+            private_key,
+            policy: Box::new(DataOn(path(2))),
+            ..CoreConfig::default()
+        });
+        let id = add(&mut core, true);
+        assert_eq!(core.data_path(id), Some(path(2)));
     }
 }
