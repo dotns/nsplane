@@ -301,6 +301,24 @@ impl Conntrack {
         Some(FlowMatch { direction, flow })
     }
 
+    /// Finds the flow of a packet with `tuple`, in either direction, without
+    /// touching it: unlike [`lookup`](Self::lookup) it neither refreshes the
+    /// flow, advances its [`TcpState`] or changes its place in the eviction
+    /// order, nor counts a hit or miss. A flow past its idle timeout is not
+    /// returned (and left for the next lookup or sweep to remove).
+    pub fn peek(&self, tuple: &FiveTuple) -> Option<FlowMatch> {
+        let now = (self.clock)();
+        let table = self.lock();
+        let (index, direction) = table.find(tuple)?;
+        let entry = table
+            .entry(index)
+            .filter(|entry| !self.is_expired(entry, now))?;
+        Some(FlowMatch {
+            direction,
+            flow: entry.flow,
+        })
+    }
+
     /// Inserts the flow of a first packet `original` from `peer` that is
     /// translated to `translated`, and returns it.
     ///

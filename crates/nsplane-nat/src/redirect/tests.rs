@@ -481,6 +481,41 @@ fn idle_flows_expire() {
 }
 
 #[test]
+fn endpoint_in_use_does_not_keep_an_idle_flow_alive() {
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = Arc::clone(&now);
+    let conntrack =
+        Conntrack::with_clock(ConntrackConfig::default(), move || *clock.lock().unwrap());
+    let (calls, decide) = pool(1);
+    let redirect = Redirect::with_conntrack(conntrack, decide);
+    let local = forward(&redirect, udp(CLIENT, SERVICE_A));
+    let original = FiveTuple {
+        src: IpAddr::V4(*CLIENT.ip()),
+        dst: IpAddr::V4(*SERVICE_B.ip()),
+        protocol: protocol::UDP,
+        src_port: CLIENT.port(),
+        dst_port: SERVICE_B.port(),
+    };
+    let before = redirect.stats().conntrack;
+
+    // An allocator scanning its pool every 10 s across the 30 s UDP timeout.
+    for _ in 0..2 {
+        assert!(redirect.endpoint_in_use(&original, local));
+        *now.lock().unwrap() += Duration::from_secs(10);
+    }
+    assert!(redirect.endpoint_in_use(&original, local));
+    let stats = redirect.stats().conntrack;
+    assert_eq!((stats.hits, stats.misses), (before.hits, before.misses));
+    *now.lock().unwrap() += Duration::from_secs(10);
+    assert!(!redirect.endpoint_in_use(&original, local), "expired");
+
+    // The endpoint is free: the next flow of the same source takes it.
+    assert_eq!(forward(&redirect, udp(CLIENT, SERVICE_B)), local);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(redirect.stats().conflicts, 0);
+}
+
+#[test]
 fn a_full_table_evicts_the_least_recently_seen_flow() {
     let config = ConntrackConfig {
         max_entries: 2,
