@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Output, PeerStats};
@@ -26,16 +27,19 @@ use crate::events::{
 };
 use crate::fragment::{Action, FragmentStats, Fragmenter};
 use crate::handle::{
-    Command, EngineHandle, EngineStatus, Injection, QueueDepth, QueueStats, TransportError,
-    TransportStats,
+    Command, EngineHandle, EngineStatus, Injection, PeerMtus, QueueDepth, QueueStats,
+    TransportError, TransportStats,
 };
 use crate::io::{PacketSink, PacketSource};
-use crate::transport::Transport;
+use crate::path_mtu::{PathMtu, Verdict};
+use crate::transport::{PathMtuReport, Transport};
 
 /// Capacity of the command queue from the handles to the owner task.
 const COMMAND_CAPACITY: usize = 64;
 /// Size of the receive buffer: the largest UDP payload.
 const MAX_DATAGRAM: usize = 65535;
+/// Capacity of the queue of path MTU reports from the transports to the owner task.
+const PATH_MTU_REPORTS: usize = 16;
 
 /// A running engine.
 ///
@@ -136,6 +140,17 @@ const MAX_DATAGRAM: usize = 65535;
 /// after [`EngineHandle::resume`] if it differs. Once the source drops its sender, the
 /// engine stops watching and keeps the last value.
 ///
+/// Path MTU: the inner MTU of each peer follows the path its data leaves on, lowered from
+/// the source MTU by the ceiling of its transport ([`EngineBuilder::transport_max_datagram`])
+/// and the MTU learned for the path ([`EngineHandle::report_path_mtu`],
+/// [`Transport::path_mtu_reports`]); [`EngineHandle::peer_mtus`] publishes it. It reaches
+/// the local side through the fragmentation stage, which holds packets to the
+/// destination's peer's MTU, or through ICMP the caller generates; without a fragmenter it
+/// is visible only through [`EngineHandle::peer_mtus`]. The source MTU above keeps its
+/// meaning. The owner keeps this state only once a ceiling is set or a report arrives, and
+/// a transport's reports are forwarded by a task (gated by the suspension) only when it
+/// has any; until then nothing of it costs anything.
+///
 /// Crypto workers: with [`EngineBuilder::crypto_workers`] set to 2 or more, the owner task
 /// hands the encryption of local packets and the decryption of received transport data to a
 /// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
@@ -166,6 +181,7 @@ const MAX_DATAGRAM: usize = 65535;
 /// [`PathPolicy`]: nsplane_core::PathPolicy
 /// [`DynTransport`]: crate::DynTransport
 /// [`EngineBuilder::crypto_workers`]: crate::EngineBuilder::crypto_workers
+/// [`EngineBuilder::transport_max_datagram`]: crate::EngineBuilder::transport_max_datagram
 pub struct Engine {
     handle: EngineHandle,
     owner: Option<JoinHandle<()>>,
@@ -217,6 +233,10 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) fragmenter: Option<Fragmenter>,
     /// Crypto worker tasks; fewer than 2 runs the cryptography on the owner task.
     pub(crate) crypto_workers: usize,
+    /// The largest datagram of each transport given to the builder.
+    pub(crate) transport_max: BTreeMap<TransportId, u16>,
+    /// How long a learned path MTU lasts.
+    pub(crate) path_mtu_expiry: Duration,
 }
 
 /// Spawns the owner task and the I/O tasks.
@@ -272,6 +292,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         mtu,
         mtu_changes: Some(mtu_changes),
         fragmenter: parts.fragmenter,
+        path_mtus: PathMtus::new(mtu, parts.transport_max, parts.path_mtu_expiry),
         tasks: vec![
             Task::spawn(watch_mtu(mtu_watch, mtu_tx, suspended.subscribe())),
             Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
@@ -564,7 +585,7 @@ type TryDeliver = Box<dyn Fn(&mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<(
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
 /// its transmit queue (both ends), the queue returning transmitted buffers, the transport's
 /// traffic counters (which report failed sends) and the suspension state; also returns how
-/// to send on it without waiting.
+/// to send on it without waiting and its path MTU reports, if it has any.
 type Start = Box<
     dyn FnOnce(
             BatchSender<Datagram>,
@@ -573,8 +594,12 @@ type Start = Box<
             mpsc::Sender<PacketBuf>,
             Arc<Traffic>,
             watch::Receiver<bool>,
-        ) -> (Task, Transmitter, TrySend)
-        + Send,
+        ) -> (
+            Task,
+            Transmitter,
+            TrySend,
+            Option<mpsc::Receiver<PathMtuReport>>,
+        ) + Send,
 >;
 
 /// A transport on its way to the owner task, erased to its id and the spawning of its tasks,
@@ -590,6 +615,7 @@ impl NewTransport {
             id: transport.id(),
             start: Box::new(
                 move |datagrams, slots, queue, recycle, traffic, suspended| {
+                    let reports = transport.path_mtu_reports();
                     let transport = Arc::new(transport);
                     let (stop, stopped) = oneshot::channel();
                     let sender = Arc::clone(&transport);
@@ -609,6 +635,7 @@ impl NewTransport {
                         Box::new(move |datagrams, sent, failed| {
                             sender.try_send_batch(datagrams, sent, failed)
                         }),
+                        reports,
                     )
                 },
             ),
@@ -707,6 +734,8 @@ struct TransportSlot {
     flush: Option<Reserve>,
     receive: Task,
     transmit: Transmitter,
+    /// Forwards the transport's path MTU reports, if it has any.
+    reports: Option<Task>,
     traffic: Arc<Traffic>,
     try_send: TrySend,
     /// Datagrams the owner task sends itself at the end of the current drain, oldest
@@ -802,6 +831,9 @@ impl TransportSlot {
     /// first: the one being sent, the transmit queue's, then the waiting ones.
     async fn stop(mut self) -> VecDeque<Datagram> {
         self.flush = None;
+        if let Some(reports) = self.reports.take() {
+            reports.stop().await;
+        }
         self.receive.stop().await;
         let mut unsent = self.transmit.stop().await;
         unsent.append(&mut self.pending);
@@ -950,12 +982,56 @@ impl Backoff {
     }
 }
 
+/// The per-path MTU state of the owner task.
+struct PathMtus {
+    /// The ceilings; `None` until a ceiling is set or a report arrives.
+    table: Option<Box<PathMtu>>,
+    /// How long a learned path MTU lasts.
+    expiry: Duration,
+    /// The queue the transports' report forwarders feed; `None` until a transport has
+    /// reports.
+    reports: Option<(mpsc::Sender<PathMtuReport>, mpsc::Receiver<PathMtuReport>)>,
+    /// Publishes the peers' inner MTUs.
+    published: watch::Sender<PeerMtus>,
+    /// The padding limit set in the core for each peer; empty while there is no table.
+    pad_limits: BTreeMap<PeerId, u16>,
+}
+
+impl PathMtus {
+    /// No table unless the builder set transport ceilings.
+    fn new(mtu: u16, transport_max: BTreeMap<TransportId, u16>, expiry: Duration) -> Self {
+        let table = (!transport_max.is_empty()).then(|| {
+            let mut table = PathMtu::new(expiry);
+            for (id, max) in transport_max {
+                table.set_transport_max(id, Some(max));
+            }
+            Box::new(table)
+        });
+        Self {
+            table,
+            expiry,
+            reports: None,
+            published: watch::Sender::new(PeerMtus::unconstrained(mtu)),
+            pad_limits: BTreeMap::new(),
+        }
+    }
+
+    /// The table, created on first use.
+    fn table(&mut self) -> &mut PathMtu {
+        let expiry = self.expiry;
+        self.table
+            .get_or_insert_with(|| Box::new(PathMtu::new(expiry)))
+    }
+}
+
 /// What woke the owner task.
 enum Wake {
     Command(Option<Command>),
     Datagram(Option<Datagram>),
     Local(Option<PacketBuf>),
     Mtu(Option<u16>),
+    /// A transport reported a path MTU.
+    PathMtu(Option<PathMtuReport>),
     /// A transmit task reported failed sends.
     SendErrors,
     /// Room in the transmit queue of a transport with waiting datagrams.
@@ -993,8 +1069,9 @@ struct Owner {
     mtu: u16,
     /// MTU changes of the source; `None` once the source dropped its watch's sender.
     mtu_changes: Option<mpsc::Receiver<u16>>,
-    /// Keeps local packets within `mtu`, if installed.
+    /// Keeps local packets within `mtu` (or a peer's lower MTU), if installed.
     fragmenter: Option<Fragmenter>,
+    path_mtus: PathMtus,
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
@@ -1052,15 +1129,19 @@ impl Owner {
                     }
                 }
                 Wake::Datagram(Some(datagram)) => self.input_datagrams(datagram),
-                // The owner keeps a sender, so the queue never closes.
-                Wake::Datagram(None) => {}
+                // The owner keeps a sender of both queues, so they never close.
+                Wake::Datagram(None) | Wake::PathMtu(None) => {}
                 Wake::Local(Some(packet)) => self.input_locals(packet),
                 Wake::Local(None) => self.local = None,
                 Wake::Mtu(Some(mtu)) => {
                     if mtu != self.mtu {
                         self.mtu = mtu;
                         self.event(Event::MtuChanged { mtu });
+                        self.recompute_peer_mtus();
                     }
+                }
+                Wake::PathMtu(Some(report)) => {
+                    self.report_path_mtu(&report);
                 }
                 Wake::Mtu(None) => self.mtu_changes = None,
                 Wake::SendErrors => self.send_errors(),
@@ -1079,7 +1160,15 @@ impl Owner {
                 Wake::Crypto(Some(jobs)) => self.complete_jobs(jobs),
                 // The workers are gone (one panicked): the jobs they held are lost.
                 Wake::Crypto(None) => self.workers = None,
-                Wake::Timer => self.core.handle_timeout(now()),
+                Wake::Timer => {
+                    let now = now();
+                    self.core.handle_timeout(now);
+                    if let Some(table) = &mut self.path_mtus.table
+                        && table.expire(now)
+                    {
+                        self.recompute_peer_mtus();
+                    }
+                }
             }
             self.drain(droppable);
         }
@@ -1137,6 +1226,11 @@ impl Owner {
         {
             return Poll::Ready(Wake::Mtu(mtu));
         }
+        if let Some((_, reports)) = &mut self.path_mtus.reports
+            && let Poll::Ready(report) = reports.poll_recv(cx)
+        {
+            return Poll::Ready(Wake::PathMtu(report));
+        }
         if self.send_error_signal.poll_recv(cx).is_ready() {
             return Poll::Ready(Wake::SendErrors);
         }
@@ -1156,8 +1250,19 @@ impl Owner {
         }
     }
 
+    /// Arms the timer for the core's next timeout or, if earlier, the next expiry of a
+    /// learned path MTU.
     fn arm_timer(&mut self) {
-        if let Some(deadline) = self.core.poll_timeout() {
+        let mut deadline = self.core.poll_timeout();
+        if let Some(expiry) = self
+            .path_mtus
+            .table
+            .as_ref()
+            .and_then(|table| table.next_expiry())
+        {
+            deadline = Some(deadline.map_or(expiry, |deadline| deadline.min(expiry)));
+        }
+        if let Some(deadline) = deadline {
             let deadline = Instant::from_std(deadline);
             if self.timer.deadline() != deadline {
                 self.timer.as_mut().reset(deadline);
@@ -1211,6 +1316,12 @@ impl Owner {
         self.high_water.local.record_received(local.len());
         let room = self.batch_room().min(self.local_room());
         let now = now();
+        let source = self.mtu;
+        let floor = self
+            .path_mtus
+            .table
+            .as_ref()
+            .map_or(source, |table| table.floor(source));
         let mut next = Some(first);
         let mut taken = 0;
         while let Some(packet) = next {
@@ -1219,7 +1330,20 @@ impl Owner {
                 None => self.local_batch.push(packet),
                 Some(fragmenter) => {
                     let core = &self.core;
-                    match fragmenter.process(packet, self.mtu, now, |dst| core.route(dst)) {
+                    let table = &mut self.path_mtus.table;
+                    // Above the floor: the destination's peer and its MTU, following the
+                    // path its data leaves on now (a policy may have moved it).
+                    let lookup = |dst| {
+                        let peer = core.route(dst);
+                        let mtu = match (peer, table.as_deref_mut()) {
+                            (Some(peer), Some(table)) => {
+                                table.peer(peer, core.data_path(peer), source)
+                            }
+                            _ => source,
+                        };
+                        (peer, mtu)
+                    };
+                    match fragmenter.process(packet, floor, now, lookup) {
                         Action::Send(packet) => self.local_batch.push(packet),
                         Action::Fragments(fragments) => self.local_batch.extend(fragments),
                         Action::Reply(peer, packet) => self.core.inject_inbound(peer, packet),
@@ -1234,6 +1358,14 @@ impl Owner {
         }
         if let Some(local) = &mut self.local {
             local.release();
+        }
+        if self
+            .path_mtus
+            .table
+            .as_ref()
+            .is_some_and(|table| table.changed())
+        {
+            self.publish_peer_mtus();
         }
         let batch = &mut self.local_batch;
         if self.workers.is_some() {
@@ -1337,6 +1469,9 @@ impl Owner {
                 }
                 self.core.handle_input(Input::Config(change), now());
                 self.drain(false);
+                if self.path_mtus.table.is_some() {
+                    self.recompute_peer_mtus();
+                }
                 let _ = reply.send(());
             }
             Command::PeerId(key, reply) => {
@@ -1411,6 +1546,11 @@ impl Owner {
             Command::Status(reply) => {
                 let _ = reply.send(self.status());
             }
+            command @ (Command::SetTransportMaxDatagram(..)
+            | Command::ReportPathMtu(..)
+            | Command::PeerMtu(..)
+            | Command::PeerMtus(..)
+            | Command::PathMtuStats(..)) => self.path_mtu_command(command),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
             Command::UnansweredHandshakes(peer, reply) => {
                 let _ = reply.send(self.core.unanswered_handshakes(peer));
@@ -1494,6 +1634,117 @@ impl Owner {
                 .as_ref()
                 .map(Fragmenter::stats)
                 .unwrap_or_default(),
+            peer_mtus: self.path_mtus.published.borrow().clone(),
+            path_mtu: self
+                .path_mtus
+                .table
+                .as_ref()
+                .map(|table| table.stats())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Handles a command about the path MTUs.
+    fn path_mtu_command(&mut self, command: Command) {
+        match command {
+            Command::SetTransportMaxDatagram(id, max, reply) => {
+                self.set_transport_max(id, max);
+                let _ = reply.send(());
+            }
+            Command::ReportPathMtu(report, reply) => {
+                let _ = reply.send(self.report_path_mtu(&report));
+            }
+            Command::PeerMtu(peer, reply) => {
+                let _ = reply.send(self.peer_mtu(peer));
+            }
+            Command::PeerMtus(reply) => {
+                let _ = reply.send(self.path_mtus.published.subscribe());
+            }
+            Command::PathMtuStats(reply) => {
+                let stats = self.path_mtus.table.as_ref().map(|table| table.stats());
+                let _ = reply.send(stats.unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
+    /// Sets or clears the largest datagram of transport `id`.
+    fn set_transport_max(&mut self, id: TransportId, max: Option<u16>) {
+        if max.is_none() && self.path_mtus.table.is_none() {
+            return;
+        }
+        if self.path_mtus.table().set_transport_max(id, max) {
+            self.recompute_peer_mtus();
+        }
+    }
+
+    /// Validates and applies a path MTU report; whether it was accepted.
+    fn report_path_mtu(&mut self, report: &PathMtuReport) -> bool {
+        let now = now();
+        let verdict = self.path_mtus.table().report(report, now, &self.core);
+        if verdict == Verdict::Lowered {
+            self.recompute_peer_mtus();
+        }
+        verdict != Verdict::Ignored
+    }
+
+    /// The inner MTU of `peer`; `None` for an unknown peer.
+    fn peer_mtu(&mut self, peer: PeerId) -> Option<u16> {
+        self.core.peer_stats(peer)?;
+        let Some(table) = &mut self.path_mtus.table else {
+            return Some(self.mtu);
+        };
+        let mtu = table.peer(peer, self.core.data_path(peer), self.mtu);
+        if table.changed() {
+            self.publish_peer_mtus();
+        }
+        Some(mtu)
+    }
+
+    /// Recomputes every peer's inner MTU and publishes the result if it changed.
+    fn recompute_peer_mtus(&mut self) {
+        if let Some(table) = &mut self.path_mtus.table {
+            table.recompute(&self.core, self.mtu);
+        }
+        self.publish_peer_mtus();
+    }
+
+    /// Publishes the peers' inner MTUs, if they differ from the published ones, and caps the
+    /// padding of every peer's data at its inner MTU once there is a table.
+    fn publish_peer_mtus(&mut self) {
+        let mtus = match &mut self.path_mtus.table {
+            Some(table) => {
+                table.take_changed();
+                table.peer_mtus(self.mtu)
+            }
+            None => PeerMtus::unconstrained(self.mtu),
+        };
+        self.set_pad_limits(&mtus);
+        self.path_mtus.published.send_if_modified(|current| {
+            let modified = *current != mtus;
+            if modified {
+                *current = mtus;
+            }
+            modified
+        });
+    }
+
+    /// Caps the padding of every peer's data at its inner MTU in `mtus` (the source MTU for a
+    /// peer not listed), so that a packet at that MTU fits the path. Without a table nothing
+    /// is set and the padding stays as it always was. The table is never dropped once
+    /// created, so the limits are never cleared as a whole; they also follow the source MTU.
+    fn set_pad_limits(&mut self, mtus: &PeerMtus) {
+        if self.path_mtus.table.is_none() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.core.peers().collect();
+        let limits = &mut self.path_mtus.pad_limits;
+        limits.retain(|peer, _| peers.binary_search(peer).is_ok());
+        for peer in peers {
+            let limit = mtus.peers.get(&peer).copied().unwrap_or(self.mtu);
+            if limits.insert(peer, limit) != Some(limit) {
+                self.core.set_peer_pad_limit(peer, Some(limit));
+            }
         }
     }
 
@@ -1570,14 +1821,14 @@ impl Owner {
     /// Spawns the receive and transmit tasks of a transport, with `pending` datagrams
     /// waiting for its transmit queue, counting into `traffic` (new counters if `None`).
     fn start_transport(
-        &self,
+        &mut self,
         start: Start,
         pending: VecDeque<Datagram>,
         traffic: Option<Arc<Traffic>>,
     ) -> TransportSlot {
         let traffic = traffic.unwrap_or_else(|| Arc::new(Traffic::new(self.send_errors.clone())));
         let (queue, transmit_rx) = mpsc::channel(self.queue_capacity);
-        let (receive, transmit, try_send) = start(
+        let (receive, transmit, try_send, reports) = start(
             self.datagram_tx.clone(),
             queue.downgrade(),
             transmit_rx,
@@ -1585,12 +1836,24 @@ impl Owner {
             Arc::clone(&traffic),
             self.suspended.subscribe(),
         );
+        let reports = reports.map(|reports| {
+            let (owner, _) = self
+                .path_mtus
+                .reports
+                .get_or_insert_with(|| mpsc::channel(PATH_MTU_REPORTS));
+            Task::spawn(forward_path_mtu(
+                reports,
+                owner.clone(),
+                self.suspended.subscribe(),
+            ))
+        });
         TransportSlot {
             queue,
             pending,
             flush: None,
             receive,
             transmit,
+            reports,
             traffic,
             try_send,
             inline: Vec::new(),
@@ -1811,6 +2074,14 @@ impl Owner {
 
     /// Counts drops and publishes the event; never blocks.
     fn event(&mut self, event: Event) {
+        if let Event::PathAdopted { peer, .. } = event
+            && let Some(table) = &mut self.path_mtus.table
+        {
+            table.peer(peer, self.core.data_path(peer), self.mtu);
+            if table.changed() {
+                self.publish_peer_mtus();
+            }
+        }
         let dropped = if let Event::Dropped { reason, .. } = event {
             *self.drops.entry(reason).or_default() += 1;
             true
@@ -1876,6 +2147,20 @@ async fn watch_mtu(
         }
         let value = *mtu.borrow_and_update();
         if changes.send(value).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Forwards a transport's path MTU reports to the owner until either side is gone. Reports
+/// that arrive while suspended wait until the engine resumes.
+async fn forward_path_mtu(
+    mut reports: mpsc::Receiver<PathMtuReport>,
+    owner: mpsc::Sender<PathMtuReport>,
+    mut suspended: watch::Receiver<bool>,
+) {
+    while let Some(report) = reports.recv().await {
+        if !running(&mut suspended).await || owner.send(report).await.is_err() {
             return;
         }
     }

@@ -283,6 +283,11 @@ impl Peer {
         &self.public_key
     }
 
+    /// The receiver index of the current session's transport data messages, if any.
+    pub(crate) fn remote_index(&self) -> Option<u32> {
+        self.with_tunnel(Tunn::remote_index)
+    }
+
     /// The index the tunnel uses for its sessions.
     pub(crate) const fn index(&self) -> u32 {
         self.index

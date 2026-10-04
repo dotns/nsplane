@@ -57,6 +57,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the decision closure for every packet of a recorded flow and, when the route changed,
   removes the flow and drops the packet with `ROUTE_CHANGED`, counted in
   `MasqueradeStats::route_changed` (ns's MQ-14).
+- `nsplane`: per-path MTU ceilings (ns's MQ-1). `EngineBuilder::transport_max_datagram(id,
+  max)` / `EngineHandle::set_transport_max_datagram` cap a transport's WireGuard datagrams
+  (e.g. a relay's frame limit); `EngineHandle::report_path_mtu(path, mtu)` and
+  `Transport::path_mtu_reports` (a `PathMtuReport` stream, default `None`) lower a path's
+  outer MTU (accepted only for a path some peer uses, only when it lowers something, and
+  with a quote only for a data message to that peer's current session; `mtu` 0 takes the
+  next RFC 1191 plateau); a learned MTU expires after `EngineBuilder::path_mtu_expiry` (10
+  minutes). Each peer's inner MTU follows the path its data leaves on: the source MTU,
+  lowered to the transport's datagram limit or the learned MTU less the IP and UDP headers,
+  whichever is lower, minus 32 (1420 for a 1500 IPv6 path), never below 1280; published by
+  `EngineHandle::peer_mtu` / `peer_mtus` (a `PeerMtus { min, peers }` watch) and
+  `path_mtu_stats` (`PathMtuStats`), also in `EngineStatus::peer_mtus` / `path_mtu`. The
+  fragmentation stage holds packets to the destination's peer's MTU (Packet Too Big,
+  Fragmentation Needed, IPv4 fragments). `EngineHandle::mtu` and `Event::MtuChanged` keep
+  reporting the source MTU. No state, task or per-packet cost until a ceiling is set or a
+  report arrives.
+- `nsplane-core`: `Core::set_peer_pad_limit(peer, limit)` caps a peer's data padding at
+  `limit` bytes of plaintext, as kernel WireGuard pads to the interface MTU, plus
+  `Core::data_path(peer)` and `Core::is_remote_index(peer, index)`; `nsplane-noise`:
+  `Tunn::set_pad_limit` and `Tunn::remote_index`. Once an engine has a transport ceiling or a
+  path MTU report it caps every peer's padding at its inner MTU, so a packet at the inner
+  MTU never makes an outer datagram above the path MTU (before, padding to 16 bytes could
+  overshoot it by up to 15); without that state padding is unchanged (ns's MQ-1).
+- `nsplane`: `UdpTransport::set_path_mtu_discovery(on)` (off by default; Linux and Android,
+  `Unsupported` elsewhere) reads the socket's ICMP Fragmentation Needed and Packet Too Big
+  errors off its error queue (`IP_RECVERR` / `IPV6_RECVERR`) and hands them to the engine as
+  `PathMtuReport`s through `Transport::path_mtu_reports`; reports beyond a queue of 64 are
+  dropped and counted (`UdpTransport::path_mtu_reports_dropped`). While on, an ICMP error
+  may fail one send (the engine drops and counts it, `SideSender` returns the error), and a
+  send that finds the send buffer full after an ICMP error retries after pauses of 1 ms
+  doubling up to 8 ms (tokio keeps the write readiness after `EPOLLERR`), so it may go out up
+  to 8 ms after room appeared; sends that find room are not delayed, and with discovery off
+  nothing changes (ns's MQ-1).
+- `nsplane-packet`: `build::write_udp(buf, src, dst, payload)` and `build::udp_packet(src,
+  dst, payload) -> PacketBuf` (re-exported at the crate root) build an IPv4 or IPv6 UDP
+  datagram with its checksums (IPv4: DF, TTL 64, no options; IPv6: hop limit 64, no
+  extension headers; a zero UDP checksum is sent as `0xFFFF`), ready for
+  `inject_outbound` / `inject_outbound_on`; mixed families and oversize payloads are a
+  `UdpBuildError` (`#[non_exhaustive]`) (ns's MQ-2).
+- `nsplane`: `SideSender::send_to_async(datagram, to)` sends as `send_to` does but waits for
+  the socket to be writable when its send buffer is full instead of failing with
+  `WouldBlock`; cancel safe, takes no lock and does not delay the engine's sends (ns's MQ-5).
+- `nsplane-nat`: `Redirect::with_endpoint_tries(NonZeroUsize)` (default 32) sets how many
+  times the decision closure is asked for a free endpoint, and
+  `Redirect::endpoint_in_use(original, endpoint)` lets the closure scan a small pool; it
+  looks flows up with the new `Conntrack::peek`, which neither refreshes a flow nor counts a
+  hit or miss and skips expired flows (ns's MQ-6).
+- `nsplane-nat`: native IPv4 alias of a peer's `node6` (quick-v2 `alias6(b)`):
+  `TranslationTableBuilder::peer_with_native_alias4(id, mapping, alias)`,
+  `TranslationTable::native_alias4` / `by_native_alias4`. `Translator` turns IPv4 to the
+  alias into IPv6 to `node6` (source `self4` -> `node4`, or a LAN address -> its `lan6`) and
+  IPv6 from `node6` into IPv4 from the alias, ICMP errors and fragments included;
+  `ipv4_translated_predicate` covers the alias. It coexists with `alias4` and `alias6`
+  (ns's MQ-9).
 
 ### Changed
 - `nsplane-nat`: `Masquerade::forward` verifies the transport checksum (with
@@ -64,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closure returned `Some`, so a corrupt first packet records no flow, and for a recorded flow
   before the route recheck. Packets that pass unchanged are no longer dropped as
   `BAD_CHECKSUM` (ns's MQ-15).
+- `nsplane-core`, `nsplane`: documented as part of the contract that packets injected with
+  `inject_inbound`, `inject_outbound` or `inject_outbound_on` skip the filter chain, so a
+  stateful filter such as `AclFilter` keeps no reply state for them and a translating filter
+  does not translate them; behavior unchanged (ns's MQ-8).
 
 ### Fixed
 - `nsplane-netstack`: a TCP connection reaped by the 5-minute idle timeout now sends an RST

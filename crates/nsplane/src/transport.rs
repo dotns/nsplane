@@ -5,6 +5,61 @@ use std::io;
 use std::pin::Pin;
 
 use nsplane_packet::{MAX_BATCH, PacketBuf, Path, TransportId};
+use tokio::sync::mpsc;
+
+/// The most quoted bytes a [`PathMtuReport`] keeps: a transport data message's type and
+/// receiver index.
+const QUOTE_LEN: usize = 8;
+
+/// A report that an outer path carries IP packets of at most `mtu` bytes.
+///
+/// It comes, for example, from an `ICMPv6` Packet Too Big or ICMP Fragmentation Needed
+/// about one of the engine's datagrams; see [`Transport::path_mtu_reports`] and
+/// [`EngineHandle::report_path_mtu`](crate::EngineHandle::report_path_mtu).
+///
+/// The engine accepts a report only for a path some peer uses, only if it lowers what it
+/// knows about the path, and, when the report quotes the datagram, only if the quote is a
+/// transport data message to that peer's current session; see
+/// [`EngineHandle::report_path_mtu`](crate::EngineHandle::report_path_mtu) for the whole rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PathMtuReport {
+    /// The path the datagram was sent on: the transport and the remote address (its ECN
+    /// mark is ignored).
+    pub path: Path,
+    /// The largest IP packet the outer path carries, IP and UDP headers included; 0 when
+    /// the error did not say (an RFC 1191 plateau below the current size is taken).
+    pub mtu: u16,
+    /// Up to 8 leading bytes of the datagram the error was about; empty when
+    /// not known.
+    quote: Vec<u8>,
+}
+
+impl PathMtuReport {
+    /// A report without a quote.
+    pub const fn new(path: Path, mtu: u16) -> Self {
+        Self {
+            path,
+            mtu,
+            quote: Vec::new(),
+        }
+    }
+
+    /// A report quoting the leading bytes of the datagram the error was about (the payload
+    /// of the UDP datagram the ICMP error quotes); only the first 8 bytes are kept.
+    pub fn with_quote(path: Path, mtu: u16, quote: &[u8]) -> Self {
+        Self {
+            path,
+            mtu,
+            quote: quote[..quote.len().min(QUOTE_LEN)].to_vec(),
+        }
+    }
+
+    /// The quoted leading bytes of the datagram, at most 8; empty without a quote.
+    pub fn quote(&self) -> &[u8] {
+        &self.quote
+    }
+}
 
 /// A datagram transport (a UDP socket, a relay, an in-memory link).
 ///
@@ -136,6 +191,17 @@ pub trait Transport: Send + Sync + 'static {
         let _ = (datagrams, sent, failed);
         Err(io::ErrorKind::WouldBlock.into())
     }
+
+    /// Reports about the MTU of this transport's outer paths, e.g. from the ICMP errors the
+    /// socket receives about the engine's datagrams; see [`PathMtuReport`].
+    ///
+    /// The engine calls this once, when the transport is installed (built, added or
+    /// replaced), and only when it returns a receiver does it spawn a small task that
+    /// forwards the reports to the engine (gated by the suspension like the I/O tasks). The
+    /// default returns `None`: no reports, and no task.
+    fn path_mtu_reports(&self) -> Option<mpsc::Receiver<PathMtuReport>> {
+        None
+    }
 }
 
 /// The boxed future a [`DynTransport`] method returns.
@@ -184,6 +250,9 @@ pub trait DynTransport: Send + Sync + 'static {
         sent: &mut usize,
         failed: &mut usize,
     ) -> io::Result<()>;
+
+    /// [`Transport::path_mtu_reports`].
+    fn path_mtu_reports(&self) -> Option<mpsc::Receiver<PathMtuReport>>;
 }
 
 impl<T: Transport> DynTransport for T {
@@ -224,6 +293,10 @@ impl<T: Transport> DynTransport for T {
     ) -> io::Result<()> {
         Transport::try_send_batch(self, datagrams, sent, failed)
     }
+
+    fn path_mtu_reports(&self) -> Option<mpsc::Receiver<PathMtuReport>> {
+        Transport::path_mtu_reports(self)
+    }
 }
 
 impl Transport for Box<dyn DynTransport> {
@@ -263,6 +336,10 @@ impl Transport for Box<dyn DynTransport> {
         failed: &mut usize,
     ) -> io::Result<()> {
         (**self).try_send_batch(datagrams, sent, failed)
+    }
+
+    fn path_mtu_reports(&self) -> Option<mpsc::Receiver<PathMtuReport>> {
+        (**self).path_mtu_reports()
     }
 }
 
@@ -397,6 +474,48 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Hands out one report receiver.
+    struct Reporting(std::sync::Mutex<Option<mpsc::Receiver<PathMtuReport>>>);
+
+    impl Transport for Reporting {
+        fn id(&self) -> TransportId {
+            TransportId::new(1)
+        }
+
+        async fn recv(&self, _buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+            std::future::pending().await
+        }
+
+        fn send(
+            &self,
+            _datagram: &[u8],
+            _to: &Path,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn path_mtu_reports(&self) -> Option<mpsc::Receiver<PathMtuReport>> {
+            self.0.lock().unwrap().take()
+        }
+    }
+
+    #[test]
+    fn path_mtu_reports_default_to_none_and_are_forwarded_when_boxed() {
+        assert!(Transport::path_mtu_reports(&OddFails::default()).is_none());
+        let boxed: Box<dyn DynTransport> = Box::new(OddFails::default());
+        assert!(Transport::path_mtu_reports(&boxed).is_none());
+
+        let (tx, rx) = mpsc::channel(1);
+        let boxed: Box<dyn DynTransport> = Box::new(Reporting(Mutex::new(Some(rx))));
+        let mut reports = Transport::path_mtu_reports(&boxed).unwrap();
+        let report = PathMtuReport::with_quote(datagrams(&[0])[0].0, 1400, &[4; 20]);
+        assert_eq!(report.quote(), [4; 8]);
+        tx.try_send(report.clone()).unwrap();
+        assert_eq!(reports.try_recv().unwrap(), report);
+        assert!(Transport::path_mtu_reports(&boxed).is_none());
+        assert_eq!(PathMtuReport::new(report.path, 0).quote(), []);
     }
 
     #[test]

@@ -7,11 +7,11 @@ use std::fmt;
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{AllowedIp, ConfigChange, Event, PeerConfig, PeerStats};
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::engine::NewTransport;
 use crate::fragment::FragmentStats;
-use crate::transport::Transport;
+use crate::transport::{PathMtuReport, Transport};
 
 /// The description of a peer for [`EngineHandle::add_or_update_peer`].
 ///
@@ -161,6 +161,48 @@ pub struct TransportStats {
     pub tx_failed: u64,
 }
 
+/// The inner MTU of the peers whose path limits it below the source MTU; see
+/// [`EngineHandle::peer_mtus`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PeerMtus {
+    /// The lowest inner MTU over the source MTU and every peer in `peers`: what a local side
+    /// with a single MTU for all peers would use.
+    pub min: u16,
+    /// Every peer whose inner MTU is below the source MTU, with that MTU; empty when no
+    /// ceiling applies to any peer.
+    pub peers: BTreeMap<PeerId, u16>,
+}
+
+impl PeerMtus {
+    /// No peer below the source MTU `mtu`.
+    pub(crate) const fn unconstrained(mtu: u16) -> Self {
+        Self {
+            min: mtu,
+            peers: BTreeMap::new(),
+        }
+    }
+}
+
+/// Counters of the path MTU reports since the engine started; see
+/// [`EngineHandle::path_mtu_stats`]. All zeros while no ceiling or report was ever given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PathMtuStats {
+    /// Reports received, from the transports and [`EngineHandle::report_path_mtu`].
+    pub reports: u64,
+    /// Reports accepted: they lowered a path's MTU or confirmed it (which postpones its
+    /// expiry).
+    pub applied: u64,
+    /// Reports ignored: for an unknown path, quoting another message or session, or not
+    /// lowering anything.
+    pub ignored: u64,
+    /// Learned path MTUs that expired.
+    pub expired: u64,
+    /// Paths with a learned MTU now.
+    pub paths: usize,
+}
+
 /// A snapshot of the engine taken in one call; see [`EngineHandle::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -181,6 +223,10 @@ pub struct EngineStatus {
     pub queues: QueueStats,
     /// As [`EngineHandle::fragment_stats`].
     pub fragments: FragmentStats,
+    /// As the current value of [`EngineHandle::peer_mtus`].
+    pub peer_mtus: PeerMtus,
+    /// As [`EngineHandle::path_mtu_stats`].
+    pub path_mtu: PathMtuStats,
 }
 
 /// A request to the owner task; each carries the channel for its reply.
@@ -215,6 +261,11 @@ pub(crate) enum Command {
     FragmentStats(oneshot::Sender<FragmentStats>),
     TransportStats(oneshot::Sender<Vec<TransportStats>>),
     Status(oneshot::Sender<EngineStatus>),
+    SetTransportMaxDatagram(TransportId, Option<u16>, oneshot::Sender<()>),
+    ReportPathMtu(PathMtuReport, oneshot::Sender<bool>),
+    PeerMtu(PeerId, oneshot::Sender<Option<u16>>),
+    PeerMtus(oneshot::Sender<watch::Receiver<PeerMtus>>),
+    PathMtuStats(oneshot::Sender<PathMtuStats>),
     Shutdown(oneshot::Sender<()>),
     UnansweredHandshakes(PeerId, oneshot::Sender<Option<u64>>),
     TotalUnansweredHandshakes(oneshot::Sender<u64>),
@@ -358,6 +409,9 @@ impl EngineHandle {
 
     /// Delivers `packet` to the local sink as if it came from `peer`, bypassing the inbound
     /// filters and the allowed-IP source check.
+    ///
+    /// Part of the contract: no inbound filter sees the packet, so a stateful filter records
+    /// nothing about it and a translating filter does not translate it.
     pub async fn inject_inbound(&self, peer: PeerId, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Inbound(peer, packet), tx))
             .await
@@ -365,6 +419,11 @@ impl EngineHandle {
 
     /// Encrypts `packet` and sends it to the peer it is routed to, bypassing the outbound
     /// filters.
+    ///
+    /// Part of the contract, which will not change silently: no outbound filter sees the
+    /// packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply state for
+    /// it, so the peer's replies are judged by the inbound rules alone, and a translating
+    /// filter does not translate it.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Outbound(packet), tx))
             .await
@@ -375,6 +434,10 @@ impl EngineHandle {
     /// For probes on a candidate path while the peer's traffic stays on its path. Without a
     /// current session the packet is dropped as `reasons::NO_SESSION` (no handshake is
     /// started); unknown peers are ignored. See `Core::inject_outbound_on`.
+    ///
+    /// Like [`EngineHandle::inject_outbound`], part of the contract: no outbound filter sees
+    /// the packet, so a stateful filter records no reply state for it (its replies are judged
+    /// by the inbound rules alone) and a translating filter does not translate it.
     pub async fn inject_outbound_on(
         &self,
         peer: PeerId,
@@ -529,8 +592,88 @@ impl EngineHandle {
         self.call(Command::TransportStats).await
     }
 
+    /// Sets the largest WireGuard datagram (the bytes handed to [`Transport::send`]) the
+    /// transport `id` carries, or clears it with `None`; the inner MTU of every peer whose
+    /// data leaves on that transport drops to at most `max - 32` (never below 1280, never
+    /// above the source MTU). Takes effect at once; the transport need not be installed.
+    ///
+    /// The per-peer MTU reaches the local side only through the fragmentation stage
+    /// ([`crate::EngineBuilder::fragmenter`]) or through ICMP the caller generates from
+    /// [`EngineHandle::peer_mtus`]. See also [`crate::EngineBuilder::transport_max_datagram`].
+    pub async fn set_transport_max_datagram(
+        &self,
+        id: TransportId,
+        max: Option<u16>,
+    ) -> Result<(), EngineError> {
+        self.call(|tx| Command::SetTransportMaxDatagram(id, max, tx))
+            .await
+    }
+
+    /// Reports that `path` carries IP packets of at most `mtu` bytes (IP and UDP headers
+    /// included), e.g. from a Packet Too Big the caller received about the engine's
+    /// datagrams; returns whether the report was accepted. On Linux a transport can feed
+    /// such reports itself ([`Transport::path_mtu_reports`]); on macOS and Windows no Packet
+    /// Too Big reaches the transport, and this is the way to report one.
+    ///
+    /// Every report, from here or a transport, is checked the same way:
+    ///
+    /// - `path` (transport and address; its ECN mark is ignored) must be the path some
+    ///   peer's data leaves on or its stored path; reports for other paths are ignored.
+    /// - A report that quotes the datagram ([`PathMtuReport::with_quote`]) must quote a
+    ///   transport data message (type 4) and, with 8 bytes, carry the receiver index of that
+    ///   peer's current session.
+    /// - `mtu` 0 stands for the next RFC 1191 plateau (1492, 1280, 1006, 576) below the
+    ///   path's current outer MTU. IPv6 paths take at least 1280, IPv4 (and IPv4-mapped)
+    ///   paths at least 576.
+    /// - The learned MTU only goes down: a report at or above what the path allows already
+    ///   (its learned MTU, or the transport's ceiling plus the IP and UDP headers) is
+    ///   ignored, except that one equal to the learned MTU confirms it.
+    ///
+    /// A learned MTU expires a while after the report that set or last confirmed it (10
+    /// minutes by default, [`crate::EngineBuilder::path_mtu_expiry`]), which restores the
+    /// transport's ceiling. Every peer whose data leaves on the path gets the inner MTU
+    /// `min(source MTU, min(transport ceiling, mtu - IP header - 8) - 32)`, at least 1280:
+    /// with an IPv6 path MTU of 1500, 1420. The engine does not probe for a larger MTU.
+    ///
+    /// From the first ceiling or report on, the padding of every peer's data stops at its
+    /// inner MTU, as the kernel pads to the MTU, so a packet at the inner MTU makes an outer
+    /// packet of at most the path MTU (earlier, padding to a multiple of 16 bytes could
+    /// overshoot it by up to 15 bytes).
+    pub async fn report_path_mtu(&self, path: Path, mtu: u16) -> Result<bool, EngineError> {
+        let report = PathMtuReport::new(path, mtu);
+        self.call(|tx| Command::ReportPathMtu(report, tx)).await
+    }
+
+    /// The inner MTU of `peer`: the source MTU, lowered by the ceilings of the path its data
+    /// leaves on (see [`EngineHandle::report_path_mtu`]); `None` for an unknown peer.
+    pub async fn peer_mtu(&self, peer: PeerId) -> Result<Option<u16>, EngineError> {
+        self.call(|tx| Command::PeerMtu(peer, tx)).await
+    }
+
+    /// A watch of the peers whose inner MTU is below the source MTU.
+    ///
+    /// Updated (only when the value changes) as path MTUs are learned or expire, transport
+    /// ceilings change, the source MTU changes, peers change or move to another path. A
+    /// path policy may move a peer's data to another path without telling the engine; the
+    /// fragmentation stage notices that on the peer's next large packet. Without any
+    /// ceiling, `peers` is empty and `min` is the source MTU.
+    ///
+    /// [`EngineHandle::mtu`] and `Event::MtuChanged` keep reporting the source MTU. The
+    /// per-peer MTU reaches the local kernel or stack only through the fragmentation stage
+    /// ([`crate::EngineBuilder::fragmenter`]), which answers packets above it with Packet
+    /// Too Big or Fragmentation Needed and fragments IPv4 packets to fit it, or through ICMP
+    /// the caller generates; without a fragmenter it is visible only here.
+    pub async fn peer_mtus(&self) -> Result<watch::Receiver<PeerMtus>, EngineError> {
+        self.call(Command::PeerMtus).await
+    }
+
+    /// The counters of the path MTU reports since the engine started.
+    pub async fn path_mtu_stats(&self) -> Result<PathMtuStats, EngineError> {
+        self.call(Command::PathMtuStats).await
+    }
+
     /// The public key, MTU, suspension, peers, transport counters, drop counters, queue
-    /// statistics and fragmentation counters, taken together in one call to the owner task,
+    /// statistics, fragmentation counters, peer MTUs and path MTU counters, taken together in one call to the owner task,
     /// so they describe the same moment (up to the transport counters, see
     /// [`EngineHandle::transport_stats`]).
     ///
