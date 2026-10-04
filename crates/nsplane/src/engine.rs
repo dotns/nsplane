@@ -993,6 +993,8 @@ struct PathMtus {
     reports: Option<(mpsc::Sender<PathMtuReport>, mpsc::Receiver<PathMtuReport>)>,
     /// Publishes the peers' inner MTUs.
     published: watch::Sender<PeerMtus>,
+    /// The padding limit set in the core for each peer; empty while there is no table.
+    pad_limits: BTreeMap<PeerId, u16>,
 }
 
 impl PathMtus {
@@ -1010,6 +1012,7 @@ impl PathMtus {
             expiry,
             reports: None,
             published: watch::Sender::new(PeerMtus::unconstrained(mtu)),
+            pad_limits: BTreeMap::new(),
         }
     }
 
@@ -1701,7 +1704,7 @@ impl Owner {
     }
 
     /// Publishes the peers' inner MTUs, if they differ from the published ones, and caps the
-    /// padding of every constrained peer's data at its inner MTU.
+    /// padding of every peer's data at its inner MTU once there is a table.
     fn publish_peer_mtus(&mut self) {
         let mtus = match &mut self.path_mtus.table {
             Some(table) => {
@@ -1710,24 +1713,33 @@ impl Owner {
             }
             None => PeerMtus::unconstrained(self.mtu),
         };
-        let core = &mut self.core;
+        self.set_pad_limits(&mtus);
         self.path_mtus.published.send_if_modified(|current| {
             let modified = *current != mtus;
             if modified {
-                for &peer in current.peers.keys() {
-                    if !mtus.peers.contains_key(&peer) {
-                        core.set_peer_pad_limit(peer, None);
-                    }
-                }
-                for (&peer, &mtu) in &mtus.peers {
-                    if current.peers.get(&peer) != Some(&mtu) {
-                        core.set_peer_pad_limit(peer, Some(mtu));
-                    }
-                }
                 *current = mtus;
             }
             modified
         });
+    }
+
+    /// Caps the padding of every peer's data at its inner MTU in `mtus` (the source MTU for a
+    /// peer not listed), so that a packet at that MTU fits the path. Without a table nothing
+    /// is set and the padding stays as it always was. The table is never dropped once
+    /// created, so the limits are never cleared as a whole; they also follow the source MTU.
+    fn set_pad_limits(&mut self, mtus: &PeerMtus) {
+        if self.path_mtus.table.is_none() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.core.peers().collect();
+        let limits = &mut self.path_mtus.pad_limits;
+        limits.retain(|peer, _| peers.binary_search(peer).is_ok());
+        for peer in peers {
+            let limit = mtus.peers.get(&peer).copied().unwrap_or(self.mtu);
+            if limits.insert(peer, limit) != Some(limit) {
+                self.core.set_peer_pad_limit(peer, Some(limit));
+            }
+        }
     }
 
     /// The traffic counters of every transport, ordered by id.

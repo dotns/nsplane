@@ -1545,6 +1545,9 @@ mod tests {
                 (Some(1003), 1010, 1010),
                 (Some(1280), 1001, 1008),
                 (None, 1003, 1008),
+                // A peer at the source MTU: 1420 bytes would pad to 1424.
+                (Some(1420), 1420, 1420),
+                (None, 1420, 1424),
             ] {
                 cores[0].set_peer_pad_limit(peer, limit);
                 let packet = local_packet(len);
