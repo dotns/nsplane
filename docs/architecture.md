@@ -2008,8 +2008,8 @@ CPU over the TCP P1 run divided by the GB received, iperf3's own CPU included.
   per GB is an undercount. The `netstack` pair runs `netstack_bench` (engine, netstack and
   load generator in one process per side, no TUN) instead of iperf3 and ping; its latency
   columns are 1-byte TCP request/response round trips. nsplane-cli sides keep their
-  startup UDP port: a `listen-port` set over the UAPI rebinds with offload on, which would
-  undo `WG_NO_OFFLOAD`, so the harness does not set it.
+  startup UDP port (a `listen-port` set over the UAPI now keeps `WG_NO_OFFLOAD`; when these
+  rows were measured it rebound with offload on).
 - Offload carries nsplane-cli's single-stream throughput: the default is 3.3x `nooffload`
   at P1 (6.65 against 2.03 Gbit/s) at a quarter of the CPU per GB (1.33 against 4.78 s).
   2 crypto workers lower P1 (4.14) and cost more CPU per GB (1.96), with P4 about the same

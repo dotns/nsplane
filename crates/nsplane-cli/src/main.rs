@@ -64,8 +64,8 @@ struct Args {
     crypto_workers: usize,
 
     /// Disable segmentation offload on the created TUN device and the UDP socket. With
-    /// --tun-fd only the UDP socket is affected; a `listen-port` set over the UAPI binds
-    /// a new socket with offload
+    /// --tun-fd only the UDP socket is affected; a `listen-port` or `fwmark` set over the
+    /// UAPI binds its new socket without offload too
     #[arg(long, env = "WG_NO_OFFLOAD", value_parser = clap::builder::BoolishValueParser::new())]
     no_offload: bool,
 }
@@ -195,7 +195,7 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
         .build()
         .context("Failed to start the engine")?;
     let handle = engine.handle();
-    let uapi = Uapi::with_listen_port(engine.handle(), port);
+    let uapi = Uapi::with_listen_port(engine.handle(), port).offload(!args.no_offload);
     let listener = UapiListener::bind(&name).context("Failed to bind the UAPI socket")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("Failed to watch SIGINT")?;
     let mut terminate = signal(SignalKind::terminate()).context("Failed to watch SIGTERM")?;
