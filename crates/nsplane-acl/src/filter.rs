@@ -16,7 +16,7 @@ use crate::engine::{
     SourceAssertion,
 };
 use crate::lru::{FlowHash, LruMap};
-use crate::net::Protocol;
+use crate::net::{IpNet, Protocol};
 use crate::pinhole::Direction;
 use crate::reasons;
 
@@ -301,6 +301,41 @@ impl AclFilterConfig {
     }
 }
 
+/// Per-filter address scopes of an [`AclFilter`] (beyond [`AclFilterConfig`]).
+///
+/// Built with [`new`](Self::new) and the `with_*` setters; the default scopes
+/// nothing and costs nothing on the packet path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AclFilterScope {
+    /// Allowed source prefixes of outbound packets. `None` (default): no check.
+    ///
+    /// When set, every outbound packet (to any peer, of any protocol, every
+    /// fragment included) whose source address is in none of the prefixes is
+    /// dropped with [`reasons::OUTBOUND_SOURCE`] before the destination rules,
+    /// the outbound pinholes and the reply allowances are consulted, and
+    /// leaves no state. The source address is read from the raw IPv4 or IPv6
+    /// header; a packet too short to hold it (or of another IP version) is
+    /// dropped too. An empty list drops every outbound packet.
+    /// [`Ipv6Mode::Accept`] still passes IPv6 packets unevaluated.
+    pub outbound_sources: Option<Vec<IpNet>>,
+}
+
+impl AclFilterScope {
+    /// The default scope: no constraint.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`outbound_sources`](Self::outbound_sources) to `prefixes`.
+    #[must_use]
+    pub fn with_outbound_sources(mut self, prefixes: impl IntoIterator<Item = IpNet>) -> Self {
+        self.outbound_sources = Some(prefixes.into_iter().collect());
+        self
+    }
+}
+
 /// Whether an [`AclFilter`] evaluates IPv6 packets
 /// ([`AclFilterConfig::ipv6`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -411,6 +446,8 @@ pub struct AclFilterStats {
     /// IPv6 packets, inbound and outbound, accepted unevaluated by
     /// [`Ipv6Mode::Accept`] (not counted in [`accepted`](Self::accepted)).
     pub ipv6_accepted: u64,
+    /// Outbound packets dropped with [`reasons::OUTBOUND_SOURCE`].
+    pub outbound_source: u64,
 }
 
 #[derive(Debug, Default)]
@@ -434,6 +471,7 @@ struct Counters {
     verdict_evictions: AtomicU64,
     bypassed: AtomicU64,
     ipv6_accepted: AtomicU64,
+    outbound_source: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -460,6 +498,8 @@ enum Outcome {
     OutboundAccepted,
     OutboundReply,
     OutboundDenied,
+    /// An outbound packet whose source is outside [`AclFilterScope::outbound_sources`].
+    OutboundSource,
 }
 
 impl Outcome {
@@ -481,6 +521,7 @@ impl Outcome {
             Self::Fragment => reasons::FRAGMENT,
             Self::Malformed => reasons::MALFORMED,
             Self::OutboundDenied => reasons::OUTBOUND,
+            Self::OutboundSource => reasons::OUTBOUND_SOURCE,
         };
         Verdict::Drop { reason }
     }
@@ -501,6 +542,7 @@ impl Outcome {
             Self::OutboundAccepted => return,
             Self::OutboundReply => &counters.outbound_replies,
             Self::OutboundDenied => &counters.outbound_denied,
+            Self::OutboundSource => &counters.outbound_source,
         });
     }
 }
@@ -556,6 +598,24 @@ const fn ipv4_fragment(bytes: &[u8]) -> Option<(AllowedKey, bool, bool)> {
 /// ns `is_local_node_packet`: an IPv4 packet addressed to `local`.
 fn is_to_local(bytes: &[u8], local: Ipv4Addr) -> bool {
     bytes.len() >= 20 && bytes[0] >> 4 == 4 && bytes[16..20] == local.octets()
+}
+
+/// Whether the source address of an IPv4 or IPv6 packet, read from the raw
+/// header, lies in one of `prefixes`; `false` when the buffer is too short to
+/// hold it or the version is neither 4 nor 6.
+fn source_in(bytes: &[u8], prefixes: &[IpNet]) -> bool {
+    let source = match bytes.first().map(|b| b >> 4) {
+        Some(4) => bytes
+            .get(12..16)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map(IpAddr::from),
+        Some(6) => bytes
+            .get(8..24)
+            .and_then(|s| <[u8; 16]>::try_from(s).ok())
+            .map(IpAddr::from),
+        _ => None,
+    };
+    source.is_some_and(|source| prefixes.iter().any(|net| net.contains(&source)))
 }
 
 /// ns `is_icmp_echo_reply`: an IPv4 ICMP echo reply, read from the raw
@@ -757,7 +817,8 @@ impl PeerInfo {
 /// principal comes from a [`PeerIdentity`]; anything the policy does not
 /// accept is dropped with a [`reasons`] constant. With no policy loaded every
 /// inbound packet is dropped (fail-closed). Outbound packets are accepted,
-/// except to outbound-restricted peers (see the crate docs on namespaces).
+/// except to outbound-restricted peers (see the crate docs on namespaces) and
+/// from sources outside [`AclFilterScope::outbound_sources`] when set.
 ///
 /// **Stateful replies, not a conntrack/NAT**: with
 /// [`AclFilterConfig::stateful_replies`] on, an outbound TCP or UDP packet to a
@@ -791,6 +852,8 @@ struct Inner {
     engine: Arc<AclEngine>,
     identity: Box<dyn PeerIdentity>,
     config: AclFilterConfig,
+    /// [`AclFilterScope::outbound_sources`].
+    outbound_sources: Option<Box<[IpNet]>>,
     /// Cache peers and verdicts (always, except in the differential tests).
     cache: bool,
     fragments: Mutex<FragmentTable>,
@@ -803,6 +866,7 @@ impl fmt::Debug for AclFilter {
         f.debug_struct("AclFilter")
             .field("engine", &self.inner.engine)
             .field("config", &self.inner.config)
+            .field("outbound_sources", &self.inner.outbound_sources)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -820,7 +884,17 @@ impl AclFilter {
         identity: impl PeerIdentity,
         config: AclFilterConfig,
     ) -> Self {
-        Self::build(engine, Box::new(identity), config, true)
+        Self::with_scope(engine, identity, config, AclFilterScope::default())
+    }
+
+    /// A filter with the given settings and address scopes.
+    pub fn with_scope(
+        engine: Arc<AclEngine>,
+        identity: impl PeerIdentity,
+        config: AclFilterConfig,
+        scope: AclFilterScope,
+    ) -> Self {
+        Self::build(engine, Box::new(identity), config, scope, true)
     }
 
     /// A filter that never caches peers or verdicts: the reference the
@@ -831,13 +905,20 @@ impl AclFilter {
         identity: impl PeerIdentity,
         config: AclFilterConfig,
     ) -> Self {
-        Self::build(engine, Box::new(identity), config, false)
+        Self::build(
+            engine,
+            Box::new(identity),
+            config,
+            AclFilterScope::default(),
+            false,
+        )
     }
 
     fn build(
         engine: Arc<AclEngine>,
         identity: Box<dyn PeerIdentity>,
         config: AclFilterConfig,
+        scope: AclFilterScope,
         cache: bool,
     ) -> Self {
         Self {
@@ -845,6 +926,7 @@ impl AclFilter {
                 engine,
                 identity,
                 config,
+                outbound_sources: scope.outbound_sources.map(Vec::into_boxed_slice),
                 cache,
                 fragments: Mutex::default(),
                 flows: Mutex::default(),
@@ -877,6 +959,7 @@ impl AclFilter {
             verdict_evictions: load(&c.verdict_evictions),
             bypassed: load(&c.bypassed),
             ipv6_accepted: load(&c.ipv6_accepted),
+            outbound_source: load(&c.outbound_source),
         }
     }
 }
@@ -1400,6 +1483,11 @@ impl Inner {
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
         if self.accepts_ipv6(bytes) {
             return Outcome::Ipv6Accepted;
+        }
+        if let Some(prefixes) = &self.outbound_sources
+            && !source_in(bytes, prefixes)
+        {
+            return Outcome::OutboundSource;
         }
         let snapshot = self.engine.snapshot();
         let identity = self.identity_generation();
@@ -4017,5 +4105,243 @@ mod tests {
             (3, 0, 0)
         );
         assert_eq!(f.inner.table().entries.len(), 0);
+    }
+
+    // ── outbound source scope ─────────────────────────────────────────────
+
+    /// The local IPv4 address of the scope tests.
+    const LOCAL4: &str = "10.0.0.2";
+
+    /// A filter whose outbound sources are `LOCAL4/32` and `LOCAL/128`.
+    fn scoped(engine: &Arc<AclEngine>, config: AclFilterConfig) -> AclFilter {
+        let scope = AclFilterScope::new().with_outbound_sources([
+            format!("{LOCAL4}/32").parse().unwrap(),
+            format!("{LOCAL}/128").parse().unwrap(),
+        ]);
+        AclFilter::with_scope(Arc::clone(engine), ns_identity(), config, scope)
+    }
+
+    /// `A` restricted to outbound TCP 80, in one namespace with `C`.
+    fn scope_engine() -> Arc<AclEngine> {
+        let engine = loaded_engine(test_policy());
+        engine
+            .store_namespace(
+                "nsd:a",
+                namespace(&[A, C], Some(vec![outbound_rule(Some("tcp"), "80")])),
+            )
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn default_scope_accepts_a_foreign_outbound_source() {
+        assert_eq!(AclFilterScope::new(), AclFilterScope::default());
+        assert_eq!(AclFilterScope::default().outbound_sources, None);
+        let f = filter();
+        let foreign = tcp_packet(addr("10.0.0.99"), 5000, addr("10.0.0.1"), 80);
+        assert_eq!(outbound(&f, PEER, foreign), Verdict::Accept);
+        let foreign = tcp_packet(addr("fd00::99"), 5000, addr("fd00::9"), 80);
+        assert_eq!(outbound(&f, PEER, foreign), Verdict::Accept);
+        assert_eq!(f.stats().outbound_source, 0);
+    }
+
+    #[test]
+    fn outbound_source_scope_passes_own_addresses_to_the_destination_rules() {
+        let engine = scope_engine();
+        let f = scoped(&engine, AclFilterConfig::default());
+        let (a, local, local4) = (peer_addr(A), addr(LOCAL), addr(LOCAL4));
+        let foreign = addr("fd00::99");
+
+        // An unrestricted peer: own sources pass, foreign ones are dropped.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(local4, 5000, addr("10.0.0.1"), 9)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, PEER, udp_packet(local, 5000, addr("fd00::9"), 9)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(
+                &f,
+                PEER,
+                tcp_packet(addr("10.0.0.99"), 5000, addr("10.0.0.1"), 9)
+            ),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        // The ns evidence: an IPv6 SYN from fd00::99 into the tunnel.
+        assert_eq!(
+            outbound(&f, A, tcp_packet(foreign, 40000, a, 22)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+
+        // A restricted peer: own sources are still judged by its outbound rules.
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 22)),
+            drop(reasons::OUTBOUND)
+        );
+        // Every protocol is checked.
+        let ping = ip(foreign, a, protocol::ICMPV6, &icmp_echo(128, 1));
+        assert_eq!(outbound(&f, A, ping), drop(reasons::OUTBOUND_SOURCE));
+
+        let stats = f.stats();
+        assert_eq!((stats.outbound_source, stats.outbound_denied), (3, 1));
+        // Inbound handling is unchanged.
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+    }
+
+    #[test]
+    fn outbound_source_is_checked_before_rules_pinholes_and_replies() {
+        let engine = scope_engine();
+        let (a, c, foreign) = (peer_addr(A), peer_addr(C), addr("fd00::99"));
+        let unscoped = ns_filter(&engine, AclFilterConfig::default());
+        let f = scoped(&engine, AclFilterConfig::default());
+
+        // A matching outbound rule.
+        let to_rule = || tcp_packet(foreign, 5000, a, 80);
+        assert_eq!(outbound(&unscoped, A, to_rule()), Verdict::Accept);
+        assert_eq!(outbound(&f, A, to_rule()), drop(reasons::OUTBOUND_SOURCE));
+
+        // A reply allowance: `A` reaches `C` on TCP 22 and `C` answers from its own address.
+        let reply = || tcp_packet(c, 22, a, 4000);
+        for filter in [&unscoped, &f] {
+            assert_eq!(
+                inbound(filter, A, tcp_packet(a, 4000, c, 22)),
+                Verdict::Accept
+            );
+        }
+        assert_eq!(outbound(&unscoped, A, reply()), Verdict::Accept);
+        assert_eq!(outbound(&f, A, reply()), drop(reasons::OUTBOUND_SOURCE));
+        assert_eq!(unscoped.stats().outbound_replies, 1);
+        assert_eq!(f.stats().outbound_replies, 0);
+
+        // An open outbound pinhole.
+        let (engine, clock) = pinhole_engine(Some(Vec::new()));
+        let unscoped = ns_filter(&engine, AclFilterConfig::default());
+        let f = scoped(&engine, AclFilterConfig::default());
+        let _guard = open(&engine, &clock, E, Direction::Outbound, 7000);
+        let to_pinhole = || tcp_packet(foreign, 5000, peer_addr(E), 7000);
+        assert_eq!(outbound(&unscoped, E, to_pinhole()), Verdict::Accept);
+        assert_eq!(
+            outbound(&f, E, to_pinhole()),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(f.stats().outbound_source, 1);
+
+        // A dropped packet to an unrestricted peer records no reply allowance.
+        let f = scoped(&engine, AclFilterConfig::default());
+        assert_eq!(
+            outbound(&f, PEER, udp_packet(foreign, 5000, addr("fd00::9"), 53)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(f.inner.table().entries.len(), 0);
+    }
+
+    #[test]
+    fn outbound_source_scope_drops_truncated_and_foreign_fragments() {
+        let engine = scope_engine();
+        let f = scoped(&engine, AclFilterConfig::default());
+        // Too short to hold the source address, or no IP version at all.
+        let mut v4 = vec![0x45; 15];
+        let mut v6 = vec![0x60; 23];
+        assert_eq!(
+            outbound(&f, PEER, PacketBuf::from_packet(&v4)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(
+            outbound(&f, PEER, PacketBuf::from_packet(&v6)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(
+            outbound(&f, PEER, PacketBuf::from_packet(&[])),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        // Long enough for the source, but not a valid packet: judged as before.
+        v4.push(0x45);
+        v4[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        assert_eq!(
+            outbound(&f, PEER, PacketBuf::from_packet(&v4)),
+            Verdict::Accept
+        );
+        v6.push(0x60);
+        v6[8..24].copy_from_slice(&"fd00::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(
+            outbound(&f, PEER, PacketBuf::from_packet(&v6)),
+            Verdict::Accept
+        );
+
+        // Each fragment carries the source: a non-first one from a foreign address is dropped.
+        let (local4, remote) = (addr(LOCAL4), addr("10.0.0.1"));
+        let frag = |src, offset_units| {
+            ip_frag(
+                src,
+                remote,
+                protocol::UDP,
+                &[0; 8],
+                Some(Frag {
+                    id: 9,
+                    offset_units,
+                    more: true,
+                }),
+            )
+        };
+        assert_eq!(outbound(&f, PEER, frag(local4, 0)), Verdict::Accept);
+        assert_eq!(outbound(&f, PEER, frag(local4, 1)), Verdict::Accept);
+        assert_eq!(
+            outbound(&f, PEER, frag(addr("10.0.0.99"), 1)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(f.stats().outbound_source, 4);
+    }
+
+    #[test]
+    fn empty_outbound_sources_drop_every_outbound_packet() {
+        let engine = scope_engine();
+        let scope = AclFilterScope::new().with_outbound_sources(Vec::new());
+        assert_eq!(scope.outbound_sources, Some(Vec::new()));
+        let f = AclFilter::with_scope(engine, ns_identity(), AclFilterConfig::default(), scope);
+        let (local, a) = (addr(LOCAL), peer_addr(A));
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 80)),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(
+            outbound(
+                &f,
+                PEER,
+                tcp_packet(addr(LOCAL4), 5000, addr("10.0.0.1"), 80)
+            ),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        assert_eq!(f.stats().outbound_source, 2);
+    }
+
+    #[test]
+    fn ipv6_accept_passes_outbound_ipv6_before_the_source_scope() {
+        let engine = scope_engine();
+        let f = scoped(&engine, ipv6_accept());
+        let foreign = addr("fd00::99");
+        assert_eq!(
+            outbound(&f, A, tcp_packet(foreign, 5000, peer_addr(A), 22)),
+            Verdict::Accept
+        );
+        // IPv4 is still checked.
+        assert_eq!(
+            outbound(
+                &f,
+                PEER,
+                tcp_packet(addr("10.0.0.99"), 5000, addr("10.0.0.1"), 80)
+            ),
+            drop(reasons::OUTBOUND_SOURCE)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.ipv6_accepted, stats.outbound_source), (1, 1));
     }
 }
