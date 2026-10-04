@@ -242,6 +242,16 @@ pub struct AclFilterConfig {
     /// bytes after it, protocol 1 and type 0; a non-first fragment passing
     /// it is accepted too. Default `false`.
     pub accept_icmp_echo_reply: bool,
+    /// Whether IPv6 packets are evaluated. Default [`Ipv6Mode::Evaluate`].
+    ///
+    /// [`Ipv6Mode::Accept`] passes every IPv6 packet (version nibble 6), in
+    /// both directions, before anything else and without recording any
+    /// state (counted in [`AclFilterStats::ipv6_accepted`]). ns runs no ACL
+    /// on IPv6: its account filter only checks where an inbound IPv6 packet
+    /// is addressed, which nsplane does in the core with a peer's
+    /// `inbound_destinations` (`nsplane-core` `PeerConfig`), and it has no
+    /// outbound ACL.
+    pub ipv6: Ipv6Mode,
 }
 
 impl Default for AclFilterConfig {
@@ -255,6 +265,7 @@ impl Default for AclFilterConfig {
             fragments: FragmentMode::Outcome,
             accept_to_local: None,
             accept_icmp_echo_reply: false,
+            ipv6: Ipv6Mode::Evaluate,
         }
     }
 }
@@ -272,10 +283,11 @@ impl AclFilterConfig {
     /// off), protocols other than TCP and UDP dropped, IPv4 fragments gated by
     /// [`FragmentMode::ALLOW_ONLY`], `local` in
     /// [`accept_to_local`](Self::accept_to_local) and
-    /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on. Drop
-    /// reasons follow this filter (a packet ns drops is dropped here, possibly
-    /// with another reason), and IPv6 and outbound packets keep this filter's
-    /// handling.
+    /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on, and IPv6
+    /// packets accepted unevaluated ([`Ipv6Mode::Accept`], as ns: IPv6 is
+    /// authorized by the core's inbound destinations). Drop reasons follow
+    /// this filter (a packet ns drops is dropped here, possibly with another
+    /// reason), and outbound IPv4 packets keep this filter's handling.
     pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
         Self {
             allow_other_protocols: false,
@@ -283,9 +295,24 @@ impl AclFilterConfig {
             fragments: FragmentMode::ALLOW_ONLY,
             accept_to_local: local,
             accept_icmp_echo_reply: true,
+            ipv6: Ipv6Mode::Accept,
             ..Self::default()
         }
     }
+}
+
+/// Whether an [`AclFilter`] evaluates IPv6 packets
+/// ([`AclFilterConfig::ipv6`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Ipv6Mode {
+    /// IPv6 packets are judged like IPv4 packets.
+    #[default]
+    Evaluate,
+    /// Every IPv6 packet, inbound and outbound (fragments, `ICMPv6` and
+    /// packets malformed beyond the version included), is accepted
+    /// unevaluated and leaves no flow, reply or fragment state.
+    Accept,
 }
 
 /// How an [`AclFilter`] gates inbound non-first IPv4 fragments, which carry
@@ -381,6 +408,9 @@ pub struct AclFilterStats {
     /// [`AclFilterConfig::accept_to_local`] or
     /// [`AclFilterConfig::accept_icmp_echo_reply`].
     pub bypassed: u64,
+    /// IPv6 packets, inbound and outbound, accepted unevaluated by
+    /// [`Ipv6Mode::Accept`] (not counted in [`accepted`](Self::accepted)).
+    pub ipv6_accepted: u64,
 }
 
 #[derive(Debug, Default)]
@@ -403,6 +433,7 @@ struct Counters {
     pending_evictions: AtomicU64,
     verdict_evictions: AtomicU64,
     bypassed: AtomicU64,
+    ipv6_accepted: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -416,6 +447,8 @@ enum Outcome {
     Reply,
     /// Accepted by a bypass flag, without the policy.
     Bypassed,
+    /// An IPv6 packet accepted unevaluated by [`Ipv6Mode::Accept`].
+    Ipv6Accepted,
     Denied,
     CrossNamespace,
     NoPolicy,
@@ -435,6 +468,7 @@ impl Outcome {
             Self::Accepted
             | Self::Reply
             | Self::Bypassed
+            | Self::Ipv6Accepted
             | Self::OutboundAccepted
             | Self::OutboundReply => {
                 return Verdict::Accept;
@@ -456,6 +490,7 @@ impl Outcome {
             Self::Accepted => &counters.accepted,
             Self::Reply => &counters.replies,
             Self::Bypassed => &counters.bypassed,
+            Self::Ipv6Accepted => &counters.ipv6_accepted,
             Self::Denied => &counters.denied,
             Self::CrossNamespace => &counters.cross_namespace,
             Self::NoPolicy => &counters.no_policy,
@@ -841,6 +876,7 @@ impl AclFilter {
             pending_evictions: load(&c.pending_evictions),
             verdict_evictions: load(&c.verdict_evictions),
             bypassed: load(&c.bypassed),
+            ipv6_accepted: load(&c.ipv6_accepted),
         }
     }
 }
@@ -867,7 +903,15 @@ impl Inner {
         }
     }
 
+    /// Whether [`Ipv6Mode::Accept`] passes `bytes` unevaluated.
+    fn accepts_ipv6(&self, bytes: &[u8]) -> bool {
+        self.config.ipv6 == Ipv6Mode::Accept && bytes.first().is_some_and(|b| b >> 4 == 6)
+    }
+
     fn inbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
+        if self.accepts_ipv6(bytes) {
+            return Outcome::Ipv6Accepted;
+        }
         if let Some(local) = self.config.accept_to_local
             && is_to_local(bytes, local)
         {
@@ -1354,6 +1398,9 @@ impl Inner {
     }
 
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
+        if self.accepts_ipv6(bytes) {
+            return Outcome::Ipv6Accepted;
+        }
         let snapshot = self.engine.snapshot();
         let identity = self.identity_generation();
         let parsed = IpPacket::parse(bytes);
@@ -3786,6 +3833,7 @@ mod tests {
                 fragments: FragmentMode::ALLOW_ONLY,
                 accept_to_local: Some(local),
                 accept_icmp_echo_reply: true,
+                ipv6: Ipv6Mode::Accept,
                 ..AclFilterConfig::default()
             }
         );
@@ -3857,5 +3905,117 @@ mod tests {
             drop(reasons::DENIED)
         );
         assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
+    }
+
+    fn ipv6_accept() -> AclFilterConfig {
+        AclFilterConfig {
+            ipv6: Ipv6Mode::Accept,
+            ..AclFilterConfig::default()
+        }
+    }
+
+    #[test]
+    fn ipv6_is_evaluated_by_default() {
+        assert_eq!(AclFilterConfig::default().ipv6, Ipv6Mode::Evaluate);
+        let f = filter();
+        let (r, l) = (addr("fd00::1"), addr("fd00::2"));
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 444)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().ipv6_accepted, 0);
+    }
+
+    #[test]
+    fn ipv6_accept_passes_inbound_ipv6_unevaluated() {
+        let (r, l) = (addr("fd00::1"), addr("fd00::2"));
+        let frag = ip(r, l, 44, &[protocol::TCP, 0, 0, 8, 0, 0, 0, 1, 0, 0]);
+        let echo = ip(r, l, protocol::ICMPV6, &icmp_echo(128, 1));
+        let truncated = || PacketBuf::from_packet(&[0x60, 0, 0]);
+        for config in [ipv6_accept(), AclFilterConfig::crates_acl(None)] {
+            // No policy loaded.
+            let engine = Arc::new(AclEngine::new());
+            let f = AclFilter::with_config(Arc::clone(&engine), identity(), config);
+            assert_eq!(
+                inbound(&f, PEER, tcp_packet(r, 4000, l, 444)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                inbound(
+                    &f,
+                    PEER,
+                    tcp_packet(addr("10.0.0.1"), 4000, addr("10.0.0.2"), 80)
+                ),
+                drop(reasons::NO_POLICY)
+            );
+            engine.load(test_policy()).unwrap();
+            // A denied port, a fragment, ICMPv6 and a truncated packet.
+            assert_eq!(
+                inbound(&f, PEER, tcp_packet(r, 4000, l, 444)),
+                Verdict::Accept
+            );
+            assert_eq!(inbound(&f, PEER, frag.clone()), Verdict::Accept);
+            assert_eq!(inbound(&f, PEER, echo.clone()), Verdict::Accept);
+            assert_eq!(inbound(&f, PEER, truncated()), Verdict::Accept);
+            let stats = f.stats();
+            assert_eq!((stats.ipv6_accepted, stats.accepted), (5, 0));
+            assert_eq!(f.inner.table().entries.len(), 0);
+            assert_eq!(allowed_len(&f), 0);
+            assert_eq!(f.inner.fragments.lock().unwrap().entries.len(), 0);
+            // IPv4 is unaffected.
+            let (r4, l4) = (addr("10.0.0.1"), addr("10.0.0.2"));
+            assert_eq!(
+                inbound(&f, PEER, tcp_packet(r4, 4000, l4, 80)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                inbound(&f, PEER, tcp_packet(r4, 4000, l4, 81)),
+                drop(reasons::DENIED)
+            );
+            let stats = f.stats();
+            assert_eq!((stats.ipv6_accepted, stats.accepted), (5, 1));
+        }
+    }
+
+    #[test]
+    fn ipv6_accept_passes_outbound_ipv6_unevaluated() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace(
+                "nsd:a",
+                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80")])),
+            )
+            .unwrap();
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        let evaluate = ns_filter(&engine, AclFilterConfig::default());
+        assert_eq!(
+            outbound(&evaluate, A, tcp_packet(local, 5000, a, 22)),
+            drop(reasons::OUTBOUND)
+        );
+
+        let f = ns_filter(&engine, ipv6_accept());
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(
+                &f,
+                A,
+                ip(local, a, 44, &[protocol::TCP, 0, 0, 8, 0, 0, 0, 1, 0, 0])
+            ),
+            Verdict::Accept
+        );
+        // The reply passes unevaluated too; no allowance was recorded.
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 22, local, 5000)),
+            Verdict::Accept
+        );
+        let stats = f.stats();
+        assert_eq!(
+            (stats.ipv6_accepted, stats.outbound_denied, stats.replies),
+            (3, 0, 0)
+        );
+        assert_eq!(f.inner.table().entries.len(), 0);
     }
 }

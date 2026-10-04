@@ -236,8 +236,11 @@
 //! [`AclFilterConfig::accept_icmp_echo_reply`]), non-first fragments pass
 //! only after an accepted first fragment of the same datagram within 15 s
 //! ([`FragmentMode::AllowOnly`]), and there are no reply allowances
-//! ([`AclFilterConfig::stateful_replies`] off). Each of these settings is off
-//! by default and costs one branch when off.
+//! ([`AclFilterConfig::stateful_replies`] off). IPv6 packets pass in both
+//! directions without the policy ([`Ipv6Mode::Accept`]): ns runs no ACL on
+//! IPv6 and authorizes it only by destination, which the core's per-peer
+//! inbound destinations do. Each of these settings is off by default and
+//! costs one branch when off.
 //!
 //! # Performance
 //!
@@ -295,7 +298,8 @@ pub use engine::{
     TerminateBinding, wg_peer_anchor,
 };
 pub use filter::{
-    AclFilter, AclFilterConfig, AclFilterStats, FragmentMode, PeerIdentity, PeerIdentityMap,
+    AclFilter, AclFilterConfig, AclFilterStats, FragmentMode, Ipv6Mode, PeerIdentity,
+    PeerIdentityMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{

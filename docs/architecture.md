@@ -53,7 +53,8 @@ where it is described below.
 Per-source ACL principals, the ns `crates/acl` mode and inbound destinations add:
 `nsplane-acl` `PeerIdentity::assertion_for` / `by_source`, `PeerIdentityMap::insert_by_source`,
 `AclFilterConfig::crates_acl` with the fields `fragments` (`FragmentMode`, `ALLOW_ONLY`),
-`accept_to_local` and `accept_icmp_echo_reply`, and `AclFilterStats::bypassed`; `nsplane-core`
+`accept_to_local`, `accept_icmp_echo_reply` and `ipv6` (`Ipv6Mode`), and
+`AclFilterStats::bypassed` and `ipv6_accepted`; `nsplane-core`
 `PeerConfig::inbound_destinations`, `ConfigChange::SetInboundDestinations` and
 `reasons::DESTINATION_NOT_ALLOWED`; `nsplane` `EngineHandle::set_inbound_destinations`.
 
@@ -1087,12 +1088,19 @@ raw header) accept an inbound IPv4 packet before anything else without the polic
 
 **The ns `crates/acl` mode.** `AclFilterConfig::crates_acl(local)` sets
 `stateful_replies: false` (no reply allowances in either direction, no pending dependency),
-`allow_other_protocols: false`, `FragmentMode::ALLOW_ONLY`, `accept_to_local: local` and
-`accept_icmp_echo_reply: true`. With a `PeerIdentityMap` holding relay clients under their
+`allow_other_protocols: false`, `FragmentMode::ALLOW_ONLY`, `accept_to_local: local`,
+`accept_icmp_echo_reply: true` and `ipv6: Ipv6Mode::Accept`. With a `PeerIdentityMap` holding relay clients under their
 `WgPeerKey` and every other peer by source, it judges inbound IPv4 packets as ns's account
 ACL step: `is_local_node_packet(pkt, tun_ip) || is_icmp_echo_reply(pkt) ||
 acl_check_packet(..)`. Drop reasons are this crate's (a packet ns drops is dropped here,
-possibly under another reason); IPv6 and outbound packets keep this filter's handling.
+possibly under another reason); outbound IPv4 packets keep this filter's handling. IPv6 is
+not judged by the policy, as in ns, whose account filter runs no ACL on IPv6 and only checks
+an inbound IPv6 packet's destination: `Ipv6Mode::Accept` passes every IPv6 packet in both
+directions (fragments, `ICMPv6` and packets malformed beyond the version included) before
+anything else, records no flow, reply or fragment state and counts it in
+`AclFilterStats::ipv6_accepted`; the destination check is the core's
+`PeerConfig::inbound_destinations`. The default, `Ipv6Mode::Evaluate`, judges IPv6 like IPv4,
+and `Accept` costs one branch per packet when off.
 
 **Parity with ns.** `crates/nsplane-acl/tests/crates_acl_parity.rs` replays a fixture
 (`tests/fixtures/crates_acl_parity.json`, recorded and generated sequences with the verdicts
@@ -1104,7 +1112,8 @@ truncated, total length inconsistent with the buffer) as acl malformed in every 
 verdicts are equal on well-formed packets. (A later fragment ns admits only through such a
 malformed first fragment is dropped as `reasons::FRAGMENT`.) The test requires exactly those
 30, each ns-allowed and dropped with its kind's reason. `nsplane-e2e`'s `acl_parity` runs the
-mode between two engines.
+mode between two engines, including IPv6 TCP to a denied port, delivered in this mode and
+dropped as `reasons::DENIED` under the default config.
 
 **What ns deletes.** The account filter's ACL and destination steps become nsplane calls;
 the file references are to ns `refactor/nsplane` (`crates/ns/src/account_engine/filters.rs`,
@@ -1119,7 +1128,7 @@ the file references are to ns `refactor/nsplane` (`crates/ns/src/account_engine/
 | `relay_client_keys` set and the `PeerKeys` map (engine `PeerId` to key; an unmapped peer dropped) | `PeerIdentityMap`: `insert(peer, SourceAssertion::WgPeerKey { pubkey })` for a relay client key, `insert_by_source(peer)` for every other peer, `remove` with the peer (an unknown peer is dropped as `reasons::UNKNOWN_PEER`) |
 | `AccountFilter` ACL step (`inbound_ipv4` after the Node L3 step; `account: acl denied`) | that filter; the Node L3 step before it is the Node L3 gate's (MD-B) |
 | `DynamicL3RouteTable` leases (`peer_key_for`) and Subnet return identities (`return_node_ip`, `enforced_subnet_return_peer_key`) in `AccountFilter::outbound_route`, and the outbound `account: route owner mismatch` drop | the lease prefixes and return identities in the owning peer's `allowed_ips`: routing picks the owner, so the outbound check disappears |
-| inbound IPv6 authorization (`allows_inbound_subnet_packet`: a lease owned by this node, or this node's `:2::<tun IPv4>` return identity from the lease's peer; `enforced_subnet_ingress_authorized`) and the `account: ipv6 not authorized` drop | `PeerConfig::inbound_destinations` of each peer, set from the same leases and grants (`Some` for every peer, also with no lease, since ns drops all unauthorized IPv6; with `0.0.0.0/0` because ns checks no IPv4 destination), dropped as `reasons::DESTINATION_NOT_ALLOWED`; updated with `EngineHandle::set_inbound_destinations` or `add_or_update_peer` when leases or Subnet returns change |
+| `AccountFilter` inbound IPv6 step (`inbound_ipv6`: `allows_inbound_subnet_packet`, a lease owned by this node, or this node's `:2::<tun IPv4>` return identity from the lease's peer; `enforced_subnet_ingress_authorized`; no ACL) and the `account: ipv6 not authorized` drop | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` (set by `crates_acl`: the filter does not judge IPv6) plus `PeerConfig::inbound_destinations` of each peer in the core, set from the same leases and grants (`Some` for every peer, also with no lease, since ns drops all unauthorized IPv6; with `0.0.0.0/0` because ns checks no IPv4 destination), dropped as `reasons::DESTINATION_NOT_ALLOWED`; updated with `EngineHandle::set_inbound_destinations` or `add_or_update_peer` when leases or Subnet returns change |
 
 ns keeps the policy compilation and projection (the control-plane policy into an
 `AclPolicy`, the relay-client key set, leases and Subnet returns into allowed IPs and
@@ -1256,6 +1265,7 @@ path, so such a client pays no extra latency for it.
 | ACL principal by source address | `nsplane-acl` | `PeerIdentityMap::insert_by_source(peer)` (or a `PeerIdentity` overriding `assertion_for` and `by_source`) | per peer: one principal per peer | one cached flag per peer; no per-address table is filled |
 | ACL fragment mode | `nsplane-acl` | `AclFilterConfig::fragments = FragmentMode::ALLOW_ONLY` (or `AllowOnly { ttl, capacity }`) | `FragmentMode::Outcome` | none: the same gate as before |
 | ACL bypass flags | `nsplane-acl` | `AclFilterConfig::accept_to_local = Some(addr)`, `accept_icmp_echo_reply = true` | off | one branch per inbound packet each |
+| ACL IPv6 mode | `nsplane-acl` | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` | `Ipv6Mode::Evaluate` | one branch per packet |
 | ns `crates/acl` mode | `nsplane-acl` | `AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(local))` | not used | none: a preset of the options above |
 | Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations` | `None`: unchecked | one `Option` check per decrypted packet |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |

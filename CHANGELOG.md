@@ -483,9 +483,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default; packets they accept count in the new `AclFilterStats::bypassed`.
 - `nsplane-acl`: `AclFilterConfig::crates_acl(local)`, the ns `crates/acl` preset: for inbound
   IPv4 it equals ns `is_local_node_packet || is_icmp_echo_reply || acl_check_packet` (no reply
-  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags). A differential
-  test (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
+  allowances, TCP and UDP only, `FragmentMode::ALLOW_ONLY`, both bypass flags), and it passes
+  IPv6 unevaluated as ns does (`ipv6: Ipv6Mode::Accept`). A differential test
+  (`tests/crates_acl_parity.rs`) replays ns verdicts from a fixture; it differs only on
   malformed IPv4, which nsplane-acl drops. `nsplane-e2e` `acl_parity` tests.
+- `nsplane-acl`: `AclFilterConfig::ipv6: Ipv6Mode` (`#[non_exhaustive]`). `Evaluate` (default)
+  judges IPv6 like IPv4; `Accept` passes every IPv6 packet, inbound and outbound, before
+  anything else without recording state, counted in the new `AclFilterStats::ipv6_accepted`
+  (ns runs no ACL on IPv6; its destination check is `PeerConfig::inbound_destinations`).
 - `nsplane-core`: per-peer inbound destinations. `PeerConfig::inbound_destinations:
   Option<Vec<AllowedIp>>` (`None`, the default: unchecked) restricts where a peer's decrypted
   packets may be addressed; others are dropped as the new `reasons::DESTINATION_NOT_ALLOWED`.
@@ -496,7 +501,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Breaking: struct literals of `PeerConfig` (`nsplane::Peer`), `AclFilterConfig` and
   `AclFilterStats` need the new fields (`inbound_destinations`; `fragments`, `accept_to_local`,
-  `accept_icmp_echo_reply`; `bypassed`) (`..Default::default()`, `PeerConfig::new`), and
+  `accept_icmp_echo_reply`, `ipv6`; `bypassed`, `ipv6_accepted`) (`..Default::default()`, `PeerConfig::new`), and
   exhaustive matches on `ConfigChange` the new `SetInboundDestinations`. Behavior with the
   defaults is unchanged.
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
