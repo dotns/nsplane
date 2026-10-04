@@ -11,7 +11,7 @@ use std::sync::{Mutex, PoisonError};
 
 use nsplane_packet::{PacketBuf, protocol};
 
-use super::fragment::{Key, Outcome, Piece, Reassembly};
+use super::fragment::{Key, Outcome, Reassembly};
 use super::parse::{Fragment, Ipv4, Ipv6, be16, put16};
 use super::{Result, icmp, reasons};
 use crate::TranslationTable;
@@ -262,23 +262,20 @@ fn reassemble(
     } else if !state.contains(&key) && state.passed(&key) {
         return Ok(None);
     }
-    let piece = Piece {
-        offset: v4.fragment_offset,
-        more: v4.more_fragments,
-        tos: v4.tos,
-        ttl: v4.ttl,
-        payload: payload.to_vec(),
-    };
-    let outcome = state.observe(key, piece, cx.now)?;
+    let len = payload.len();
+    let outcome = state.observe(key, packet.as_packet(), len, cx.now)?;
     drop(state);
-    let Outcome::Complete {
-        payload: mut body,
-        tos,
-        ttl,
-    } = outcome
-    else {
+    let Outcome::Complete(mut body) = outcome else {
         return Ok(Some(Done::Pending));
     };
+    // The header is the first fragment's.
+    let Ipv4 {
+        tos,
+        ttl,
+        header_len,
+        ..
+    } = Ipv4::parse(&body, false)?;
+    body.drain(..header_len);
     if body.len() + 40 > cx.mtu {
         return Err(reasons::REASSEMBLED_TOO_BIG);
     }
