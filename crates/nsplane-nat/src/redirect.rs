@@ -39,8 +39,11 @@
 //! An endpoint must not be shared by two live flows from the same source
 //! address and port, or their replies could not be told apart: when the
 //! endpoint the closure picked is in use that way, the closure is asked
-//! again, up to 32 times, before the packet is dropped
-//! ([`reasons::ENDPOINT_EXHAUSTED`]). Flows go when idle, when evicted,
+//! again, up to 32 times by default ([`Redirect::with_endpoint_tries`]),
+//! before the packet is dropped ([`reasons::ENDPOINT_EXHAUSTED`]). A caller
+//! with a small endpoint pool can instead scan it in the closure with
+//! [`Redirect::endpoint_in_use`] and offer a free endpoint first, or set as
+//! many tries as the pool has endpoints. Flows go when idle, when evicted,
 //! through [`Redirect::remove_flow`] (by the endpoint's view of the flow,
 //! as a user-space stack reports a closed connection) and through
 //! [`Redirect::retain`] (e.g. when a service is revoked).
@@ -51,7 +54,8 @@
 //! the `Redirect` or its `Conntrack` is held, so it may call back into the
 //! `Redirect` ([`remove_flow`](Redirect::remove_flow),
 //! [`retain`](Redirect::retain),
-//! [`original_destination`](Redirect::original_destination), even
+//! [`original_destination`](Redirect::original_destination),
+//! [`endpoint_in_use`](Redirect::endpoint_in_use), even
 //! [`forward`](Redirect::forward)). When the first packets of one flow race
 //! on two threads, both may ask the closure, but only one flow is recorded:
 //! the loser's insert returns the flow already recorded for the same
@@ -64,12 +68,13 @@ mod tests;
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsplane_packet::{FiveTuple, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::conntrack::{
-    Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, Flow, FlowDirection,
+    Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, Flow, FlowDirection, reverse,
 };
 use crate::port_map::rewrite::{self, End};
 
@@ -77,7 +82,8 @@ use crate::port_map::rewrite::{self, End};
 const PEER: PeerId = PeerId::new(0);
 
 /// Decisions asked for a new flow before it is dropped with
-/// [`reasons::ENDPOINT_EXHAUSTED`], as ns tries its endpoint pool.
+/// [`reasons::ENDPOINT_EXHAUSTED`], as ns tries its endpoint pool, unless
+/// [`Redirect::with_endpoint_tries`] says otherwise.
 const ENDPOINT_TRIES: usize = 32;
 
 /// The decision closure of a [`Redirect`].
@@ -141,6 +147,8 @@ struct Counters {
 pub struct Redirect {
     conntrack: Conntrack,
     decide: Decide,
+    /// Decisions asked for a new flow; see [`Redirect::with_endpoint_tries`].
+    endpoint_tries: usize,
     counters: Counters,
 }
 
@@ -180,8 +188,20 @@ impl Redirect {
         Self {
             conntrack,
             decide: Box::new(decide),
+            endpoint_tries: ENDPOINT_TRIES,
             counters: Counters::default(),
         }
+    }
+
+    /// Asks the decision closure up to `tries` times (default 32) for an
+    /// endpoint not in use before a new flow is dropped with
+    /// [`reasons::ENDPOINT_EXHAUSTED`]; see the [module docs](self#flows).
+    /// A closure that offers each endpoint of a pool in turn scans the whole
+    /// pool with as many tries as it has endpoints.
+    #[must_use]
+    pub const fn with_endpoint_tries(mut self, tries: NonZeroUsize) -> Self {
+        self.endpoint_tries = tries.get();
+        self
     }
 
     /// A snapshot of the counters.
@@ -231,6 +251,26 @@ impl Redirect {
             IpAddr::V4(addr) => Some(SocketAddrV4::new(addr, found.flow.original.dst_port)),
             IpAddr::V6(_) => None,
         }
+    }
+
+    /// Whether `endpoint` is in use for a new flow whose first packet has the
+    /// tuple `original` (application -> service): a live flow from the same
+    /// source address and port, other than the flow of `original` itself,
+    /// already goes to `endpoint`, so recording the new flow there would fail
+    /// and the decision closure would be asked again. A flow past its idle
+    /// timeout does not count, and the query neither refreshes the flow it
+    /// finds nor counts a conntrack hit or miss ([`Conntrack::peek`]), so
+    /// scanning a pool never keeps an idle flow alive.
+    ///
+    /// The decision closure runs without any lock held, so it may call this
+    /// to scan a pool of endpoints and offer a free one; see the
+    /// [module docs](self#flows). Another thread may still take the endpoint
+    /// before the closure's answer is recorded, which only costs a try.
+    pub fn endpoint_in_use(&self, original: &FiveTuple, endpoint: SocketAddrV4) -> bool {
+        let reply = reverse(&translated(original, endpoint));
+        self.conntrack.peek(&reply).is_some_and(|found| {
+            found.direction == FlowDirection::Reply && found.flow.original != *original
+        })
     }
 
     /// Removes the flow between `endpoint` and `remote` (the application's
@@ -315,18 +355,14 @@ impl Redirect {
     /// Asks the decision closure for the endpoint of a new flow and records
     /// it; returns the translated tuple, or `None` when the flow passes.
     fn new_flow(&self, original: &FiveTuple, flags: u8) -> Result<Option<FiveTuple>, &'static str> {
-        for _ in 0..ENDPOINT_TRIES {
+        for _ in 0..self.endpoint_tries {
             // No lock is held here: the closure may call back into `self`.
             let endpoint = match (self.decide)(original) {
                 RedirectDecision::Redirect(endpoint) => endpoint,
                 RedirectDecision::Pass => return Ok(None),
                 RedirectDecision::Drop => return Err(reasons::DENIED),
             };
-            let translated = FiveTuple {
-                dst: IpAddr::V4(*endpoint.ip()),
-                dst_port: endpoint.port(),
-                ..*original
-            };
+            let translated = translated(original, endpoint);
             match self.conntrack.insert(PEER, *original, translated, flags) {
                 // A concurrent packet of the same flow may have recorded it
                 // first; its endpoint wins.
@@ -371,6 +407,15 @@ impl Info {
             l4: header.header_len(),
             tcp_flags,
         })
+    }
+}
+
+/// The tuple of `original` sent to `endpoint` instead.
+const fn translated(original: &FiveTuple, endpoint: SocketAddrV4) -> FiveTuple {
+    FiveTuple {
+        dst: IpAddr::V4(*endpoint.ip()),
+        dst_port: endpoint.port(),
+        ..*original
     }
 }
 

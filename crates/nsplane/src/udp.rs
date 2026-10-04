@@ -509,9 +509,11 @@ pub struct SideStats {
 /// Sends datagrams on the socket of a [`UdpTransport`] with a side channel (see
 /// [`UdpTransport::with_side_channel`]); cheap to clone.
 ///
-/// Sending is synchronous and best effort, so a caller never waits on the engine's
-/// traffic: [`send_to`](Self::send_to) hands the datagram to the socket at once, or fails
-/// with [`io::ErrorKind::WouldBlock`] when the socket's send buffer is full.
+/// [`send_to`](Self::send_to) is synchronous and best effort, so a caller never waits on
+/// the engine's traffic: it hands the datagram to the socket at once, or fails with
+/// [`io::ErrorKind::WouldBlock`] when the socket's send buffer is full.
+/// [`send_to_async`](Self::send_to_async) instead waits until the socket is writable and
+/// retries, for datagrams that should not be lost to a full buffer.
 #[derive(Debug, Clone)]
 pub struct SideSender {
     socket: Arc<UdpSocket>,
@@ -531,6 +533,27 @@ impl SideSender {
         // has not seen the socket writable yet.
         socket2::SockRef::from(&*self.socket)
             .send_to(datagram, &target(self.local, to)?.into())
+            .map(drop)
+    }
+
+    /// Sends `datagram` to `to` as [`send_to`](Self::send_to) does, addressed the same way,
+    /// but when the socket's send buffer is full waits until the socket is writable and
+    /// tries again, until it is sent or fails with another error.
+    ///
+    /// Cancel safe: each try hands the whole datagram to the socket or nothing, so dropping
+    /// the future sends either nothing or the whole datagram, once.
+    ///
+    /// The socket is the engine's: this waits on the same writability as the engine's own
+    /// sends and takes no lock, so it neither blocks nor delays them. Once the socket is
+    /// writable each waiter tries its datagram; the engine's sends and this one go out in
+    /// whatever order they reach the socket, and the ones that do not fit wait again.
+    pub async fn send_to_async(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
+        let to = target(self.local, to)?.into();
+        self.socket
+            .async_io(Interest::WRITABLE, || {
+                socket2::SockRef::from(&*self.socket).send_to(datagram, &to)
+            })
+            .await
             .map(drop)
     }
 
@@ -2142,5 +2165,93 @@ mod tests {
             assert_eq!(sender.stats().received, 1);
             assert_eq!(second.stats().received, 1);
         }
+    }
+
+    /// `send_to_async` addresses as `send_to` does: from the transport's address, unmarked,
+    /// IPv4 destinations of a dual-stack socket mapped, IPv6 ones on an IPv4 socket rejected.
+    #[tokio::test]
+    async fn side_sender_send_to_async_addresses_as_send_to() {
+        for offload in OFFLOAD {
+            let (dual, sender, _) = bind_with(1, "[::]:0", offload).with_side_channel(is_side, 1);
+            let v4 = bind_with(2, "127.0.0.1:0", offload);
+            let control = side(b"probe");
+            sender
+                .send_to_async(&control, v4.local_addr())
+                .await
+                .unwrap();
+            let (buf, path) = recv(&v4, 1500).await;
+            assert_eq!(buf.as_packet(), control);
+            assert_eq!(path.addr, seen_as(&dual, "127.0.0.1"));
+            assert_eq!(path.ecn, Ecn::NotEct);
+
+            let (_, v4_sender, _) =
+                bind_with(3, "127.0.0.1:0", offload).with_side_channel(is_side, 1);
+            let err = v4_sender
+                .send_to_async(&control, "[::1]:9".parse().unwrap())
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    /// With the send buffer full, `send_to` fails with `WouldBlock` while `send_to_async`
+    /// waits and sends once the buffer drains; a `send_to_async` dropped while waiting sends
+    /// nothing. Loopback frees a datagram's buffer space at once, so the buffer is filled
+    /// with datagrams to a neighbour on a dummy interface that never answers ARP: they wait
+    /// in its queue until resolution gives up (about 3 s) and frees them.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN"]
+    async fn side_sender_send_to_async_waits_for_a_full_send_buffer() {
+        const DEV: &str = "nsside0";
+        let ip = |args: &[&str]| {
+            let status = std::process::Command::new("ip")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "ip {args:?}: {status}");
+        };
+        ip(&["link", "add", DEV, "type", "dummy"]);
+        ip(&["link", "set", DEV, "arp", "on", "up"]);
+        ip(&["addr", "add", "10.200.0.1/24", "dev", DEV]);
+
+        let (a, sender, _) = bind(1, "0.0.0.0:0").with_side_channel(is_side, 1);
+        a.set_send_buffer_size(1).unwrap();
+        let b = bind(2, "127.0.0.1:0");
+        let unresolved: SocketAddr = "10.200.0.2:9".parse().unwrap();
+        for seq in 0.. {
+            assert!(seq < 1000, "the send buffer never filled");
+            match sender.send_to(&numbered(seq, 1400), unresolved) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let control = side(b"register");
+        let err = sender.send_to(&control, b.local_addr()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let cancelled = sender.send_to_async(b"cancelled", b.local_addr());
+        assert!(
+            timeout(Duration::from_millis(100), cancelled)
+                .await
+                .is_err()
+        );
+        timeout(
+            Duration::from_secs(10),
+            sender.send_to_async(&control, b.local_addr()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (buf, path) = recv(&b, 1500).await;
+        assert_eq!(buf.as_packet(), control);
+        assert_eq!(path.addr, seen_as(&a, "127.0.0.1"));
+        let mut buf = PacketBuf::with_capacity(1500);
+        assert!(
+            timeout(Duration::from_millis(100), b.recv(&mut buf))
+                .await
+                .is_err()
+        );
+        ip(&["link", "del", DEV]);
     }
 }

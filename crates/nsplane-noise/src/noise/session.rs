@@ -200,6 +200,12 @@ impl Session {
         }
     }
 
+    /// The index the peer assigned to this session, carried as the receiver index of every
+    /// transport data message sent in it.
+    pub(super) const fn remote_index(&self) -> u32 {
+        self.sending_index
+    }
+
     pub(super) const fn local_index(&self) -> usize {
         self.receiving_index as usize
     }
