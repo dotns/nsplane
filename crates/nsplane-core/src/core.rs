@@ -465,12 +465,20 @@ impl Core {
 
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
     /// allowed-IP source check.
+    ///
+    /// Part of the contract: no inbound [`PacketFilter`] sees the packet, so a stateful
+    /// filter records nothing about it and a translating filter does not translate it.
     pub fn inject_inbound(&mut self, peer: PeerId, packet: PacketBuf) {
         self.outputs
             .push_back(Output::Deliver { from: peer, packet });
     }
 
     /// Encrypts `packet` like `Input::Local`, bypassing the outbound filters.
+    ///
+    /// Part of the contract, which will not change silently: no outbound [`PacketFilter`]
+    /// sees the packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply
+    /// state for it, so the peer's replies are judged by the inbound rules alone, and a
+    /// translating filter does not translate it.
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
         self.send(packet, false, &mut Lookups::default());
@@ -482,6 +490,10 @@ impl Core {
     /// not changed. The tunnel counts it as sent data like any packet. Without a current
     /// session the packet is dropped as [`reasons::NO_SESSION`], neither queued nor a reason
     /// to start a handshake. Unknown peers are ignored.
+    ///
+    /// Like [`Core::inject_outbound`], part of the contract: no outbound [`PacketFilter`]
+    /// sees the packet, so a stateful filter records no reply state for it (its replies are
+    /// judged by the inbound rules alone) and a translating filter does not translate it.
     pub fn inject_outbound_on(
         &mut self,
         peer: PeerId,

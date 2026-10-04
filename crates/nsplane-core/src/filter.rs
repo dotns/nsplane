@@ -24,6 +24,11 @@ pub enum Verdict {
 /// next to the tunnel in both directions and sees what the peer sends and receives. The first
 /// verdict other than [`Verdict::Accept`] ends the chain. Local packets are routed to a peer
 /// before the chain runs.
+///
+/// Packets injected with [`Core::inject_inbound`](crate::Core::inject_inbound),
+/// [`Core::inject_outbound`](crate::Core::inject_outbound) or
+/// [`Core::inject_outbound_on`](crate::Core::inject_outbound_on) skip the chain (part of the
+/// contract): no filter sees them, so a stateful filter keeps no state for them.
 pub trait PacketFilter: Send + Sync + 'static {
     /// Decrypted packet from `peer`, before it is delivered. May rewrite it in place.
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict;
