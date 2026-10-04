@@ -1,7 +1,7 @@
 //! The drop reasons of [`AclFilter`](crate::AclFilter).
 //!
 //! The core reports them in `Event::Dropped` for packets the filter drops,
-//! inbound and (for [`OUTBOUND`]) outbound.
+//! inbound and (for [`OUTBOUND`] and [`OUTBOUND_SOURCE`]) outbound.
 
 /// The policy has no rule accepting the packet.
 pub const DENIED: &str = "acl denied";
@@ -22,3 +22,6 @@ pub const CROSS_NAMESPACE: &str = "acl cross namespace";
 /// no open outbound pinhole and no reply allowance (or is not TCP/UDP while
 /// other protocols are not allowed).
 pub const OUTBOUND: &str = "acl outbound denied";
+/// The source address of an outbound packet is outside
+/// [`AclFilterScope::outbound_sources`](crate::AclFilterScope::outbound_sources).
+pub const OUTBOUND_SOURCE: &str = "acl outbound source";

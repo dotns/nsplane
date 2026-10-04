@@ -2,7 +2,8 @@
 //! with rule namespaces, grants and pinholes.
 //!
 //! - `default`: no namespaces; a peer in no namespace is evaluated against a few-rule default
-//!   policy.
+//!   policy. `default/outbound_source_scope` adds an outbound source constraint
+//!   (`AclFilterScope::outbound_sources`) the packet passes.
 //! - `namespaces`: 8 source namespaces of 64 members each (one restricting outbound traffic), 4
 //!   grants and 16 pinholes in one app namespace.
 //! - `bypass`: one namespace of 64 members accepting everything (a Quick-style namespace), so its
@@ -27,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Direction, Grant,
-    GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap, PinholeGuard,
-    PinholeSpec, Protocol, SourceAssertion, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, AclRule,
+    Direction, Grant, GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap,
+    PinholeGuard, PinholeSpec, Protocol, SourceAssertion, wg_peer_anchor,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId};
@@ -384,6 +385,32 @@ fn bench_namespaces(c: &mut Criterion) {
     });
 }
 
+/// `default/outbound_source_scope`: `default/outbound` with an outbound source constraint
+/// the packet passes.
+fn bench_source_scope(c: &mut Criterion) {
+    let (last, last_addr) = (
+        peer(NAMESPACES - 1, MEMBERS - 1),
+        address(NAMESPACES - 1, MEMBERS - 1),
+    );
+    let engine = Arc::new(AclEngine::new());
+    assert!(engine.load(policy()).is_ok());
+    let scope = AclFilterScope::new().with_outbound_sources(
+        ["fd00:ffff::/32", "10.0.0.0/8"]
+            .iter()
+            .filter_map(|prefix| prefix.parse().ok()),
+    );
+    let filter = AclFilter::with_scope(engine, identity(), AclFilterConfig::default(), scope);
+    let outbound = tcp(LOCAL, 22, last_addr, 40000);
+    bench_packet(
+        c,
+        "default/outbound_source_scope",
+        &filter,
+        last,
+        false,
+        &outbound,
+    );
+}
+
 /// The `by_source` and `crates_acl` scenarios.
 fn bench_by_source(c: &mut Criterion) {
     let (last, last_addr) = (
@@ -444,5 +471,10 @@ fn bench_by_source(c: &mut Criterion) {
     );
 }
 
-criterion_group!(namespaces, bench_namespaces, bench_by_source);
+criterion_group!(
+    namespaces,
+    bench_namespaces,
+    bench_source_scope,
+    bench_by_source
+);
 criterion_main!(namespaces);
