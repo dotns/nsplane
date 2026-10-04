@@ -46,6 +46,7 @@ use thiserror::Error;
 
 use crate::net::IpNet;
 
+mod clock;
 mod config;
 mod decisions;
 mod filter;
@@ -531,7 +532,7 @@ impl NodeL3Gate {
     /// global id.
     #[must_use]
     pub fn new_for_targets(target_machine_ids: impl IntoIterator<Item = String>) -> Arc<Self> {
-        Self::with_clock(target_machine_ids, Instant::now)
+        Self::with_clock(target_machine_ids, clock::coarse())
     }
 
     /// A gate for one target with explicit state limits: `global` flows,
@@ -548,13 +549,15 @@ impl NodeL3Gate {
             global,
             peer,
             fragments,
-            Box::new(Instant::now),
+            Box::new(clock::coarse()),
         )
     }
 
     /// A gate with the default limits whose flow and fragment expiry follows
-    /// `clock` instead of [`Instant::now`] (e.g. a manual clock in tests and
-    /// benches).
+    /// `clock` instead of the default clock (e.g. a manual clock in tests and
+    /// benches). The default is the coarse monotonic clock on Linux and
+    /// Android (a resolution of one scheduler tick, 1 to 4 ms) and
+    /// [`Instant::now`] elsewhere.
     #[must_use]
     pub fn with_clock(
         target_machine_ids: impl IntoIterator<Item = String>,
