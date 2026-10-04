@@ -312,6 +312,14 @@ impl Tunn {
             .is_some_and(|session| !session.is_exhausted())
     }
 
+    /// The receiver index of the transport data messages the current session sends (the
+    /// index the peer assigned to it); `None` without a current session.
+    pub fn remote_index(&self) -> Option<u32> {
+        self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .map(session::Session::remote_index)
+    }
+
     /// Encapsulates the IP packet in `buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len]` without
     /// copying it: the packet is sealed where it lies and the data header is written in front.
     ///
