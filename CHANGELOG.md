@@ -608,13 +608,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own tungstenite dialer (the pinning `ClientConfig` passed as `WssTls::Config`);
   `WssTransport::connect` now returns `io::Result`.
 - `nsplane`: without crypto workers the engine hands what one source or transport read
-  returned to the owner task as one message (the input queues stay bounded in packets), and
-  the owner sends a drain's datagrams and delivers its packets itself
-  (`try_send_batch`) when the transport or sink has nothing queued or in flight, falling
-  back to the transmit and sink tasks for the rest (see docs/architecture.md, "Engine fast
-  path (MF-1)"). As a result the `QueueStats` marks of `transmit`, `deliver` and `recycle`
-  are lower, down to 0 under light load, and `TransportStats` may also be counted by the
-  owner task.
+  returned to the owner task as one message (the input queues stay bounded in packets; a
+  lone item goes over without an allocation). The owner delivers a drain's packets to the
+  sink itself (`try_send_batch`) when the sink has nothing queued or in flight, and sends a
+  drain's datagrams itself when the transport has nothing queued or in flight and no local
+  packet or received datagram is waiting; under load the transmit task sends while the
+  owner seals. A transport or sink whose `try_send_batch` takes nothing is skipped for 1,
+  2, 4, ... up to 1024 drains, so the default implementations cost about one try per 1024
+  drains. The rest falls back to the transmit and sink tasks (see docs/architecture.md,
+  "Engine fast path (MF-1)"). As a result the `QueueStats` mark of `deliver` is lower (those
+  of `transmit` and `recycle` under light load), and `TransportStats` may also be counted by
+  the owner task.
 
 ### Removed
 - Breaking: the `boringtun::device` module and the `device` feature (TUN, epoll/kqueue and
