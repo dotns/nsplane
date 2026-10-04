@@ -100,7 +100,12 @@ const MAX_DATAGRAM: usize = 65535;
 /// part of the batch) goes to the transmit queue and backlog, or the deliver queue, in
 /// order and under the rules above; later datagrams and packets queue behind it until the
 /// task has drained, so each transport and the sink keep the order of the core's outputs.
-/// While suspended the owner task never sends or delivers itself. Failed and closed
+/// It sends itself only for a drain after which no local packet or received datagram is
+/// waiting (it would wait next): under load it hands the datagrams to the transmit tasks,
+/// which send them while it seals the next batch. A
+/// transport or sink that took nothing (one that keeps the default, or is full) is skipped
+/// for 1, 2, 4, ... up to 1024 drains, until it takes something again. While suspended
+/// the owner task never sends or delivers itself. Failed and closed
 /// transports and sinks count as with their tasks; datagrams and packets the owner hands
 /// over itself never enter a queue, so the queues' high-water marks stay lower.
 ///
@@ -293,11 +298,17 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         local_first: false,
         suspended,
         fast_path,
-        inline: fast_path,
+        inline: Inline {
+            allowed: fast_path,
+            send: false,
+            queued: false,
+            drains: 0,
+        },
         sink: InlineSink {
             try_deliver: Box::new(move |packets| sink.try_send_batch(packets)),
             outstanding: sink_outstanding,
             closed: false,
+            backoff: Backoff::default(),
             delivered: VecDeque::with_capacity(MAX_BATCH),
         },
         workers,
@@ -364,10 +375,16 @@ fn batch_queue<T>(capacity: usize, handoff: usize) -> (BatchSender<T>, BatchQueu
     )
 }
 
+/// One message of a [`batch_queue`]: a lone item travels without an allocation.
+enum Handoff<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
 /// The sending side of a [`batch_queue`]; a permit of its semaphore stands for a free item
 /// slot.
 struct BatchSender<T> {
-    batches: mpsc::UnboundedSender<Vec<T>>,
+    batches: mpsc::UnboundedSender<Handoff<T>>,
     permits: Arc<Semaphore>,
     /// The most items one message carries, at most the capacity.
     most: usize,
@@ -400,9 +417,17 @@ impl<T> BatchSender<T> {
                 .await
                 .map_err(drop)?
                 .forget();
-            self.batches
-                .send(items.drain(..n).collect())
-                .map_err(drop)?;
+            let handoff = match items.pop_front() {
+                Some(item) if n == 1 => Handoff::One(item),
+                Some(item) => {
+                    let mut batch = Vec::with_capacity(n);
+                    batch.push(item);
+                    batch.extend(items.drain(..n - 1));
+                    Handoff::Many(batch)
+                }
+                None => return Ok(()),
+            };
+            self.batches.send(handoff).map_err(drop)?;
         }
         Ok(())
     }
@@ -411,7 +436,7 @@ impl<T> BatchSender<T> {
 /// The receiving side of a [`batch_queue`], in the owner task. Items of a batch it has not
 /// taken yet stay held here, in order, and keep their slots.
 struct BatchQueue<T> {
-    batches: mpsc::UnboundedReceiver<Vec<T>>,
+    batches: mpsc::UnboundedReceiver<Handoff<T>>,
     /// Received items not taken yet, oldest first.
     held: VecDeque<T>,
     permits: Arc<Semaphore>,
@@ -424,11 +449,11 @@ impl<T> BatchQueue<T> {
     /// The next item; `None` once every sender is gone and every item was taken.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if self.held.is_empty() {
-            match self.batches.poll_recv(cx) {
-                Poll::Ready(Some(batch)) => self.held.extend(batch),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
+            return match self.batches.poll_recv(cx) {
+                Poll::Ready(Some(handoff)) => Poll::Ready(self.unpack(handoff)),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            };
         }
         Poll::Ready(self.take())
     }
@@ -436,15 +461,35 @@ impl<T> BatchQueue<T> {
     /// The next item if one is queued.
     fn try_recv(&mut self) -> Option<T> {
         if self.held.is_empty() {
-            self.held.extend(self.batches.try_recv().ok()?);
+            let handoff = self.batches.try_recv().ok()?;
+            return self.unpack(handoff);
         }
         self.take()
+    }
+
+    /// Takes the first item of a message received with nothing held, holding the rest.
+    fn unpack(&mut self, handoff: Handoff<T>) -> Option<T> {
+        match handoff {
+            Handoff::One(item) => {
+                self.taken += 1;
+                Some(item)
+            }
+            Handoff::Many(batch) => {
+                self.held.extend(batch);
+                self.take()
+            }
+        }
     }
 
     fn take(&mut self) -> Option<T> {
         let item = self.held.pop_front()?;
         self.taken += 1;
         Some(item)
+    }
+
+    /// Whether no item is held or queued.
+    fn is_empty(&self) -> bool {
+        self.held.is_empty() && self.batches.is_empty()
     }
 
     /// Frees the slots of the items taken, at once.
@@ -669,6 +714,7 @@ struct TransportSlot {
     inline: Vec<Datagram>,
     /// The transport reported [`io::ErrorKind::BrokenPipe`] to the owner task.
     closed: bool,
+    backoff: Backoff,
 }
 
 impl TransportSlot {
@@ -854,9 +900,54 @@ struct InlineSink {
     outstanding: Arc<AtomicUsize>,
     /// The sink reported [`io::ErrorKind::BrokenPipe`] to the owner task.
     closed: bool,
+    backoff: Backoff,
     /// Packets the owner task delivers itself at the end of the current drain, oldest
     /// first ([`Owner::deliver_inline`]).
     delivered: VecDeque<(PeerId, PacketBuf)>,
+}
+
+/// When the owner task sends and delivers itself.
+struct Inline {
+    /// No crypto workers and not suspended: the owner task may deliver itself.
+    allowed: bool,
+    /// For the current drain: allowed, and no local packet or received datagram is waiting,
+    /// so the owner task would wait next and may also send itself. Under load it hands the
+    /// datagrams to the transmit tasks, which send them while it seals the next batch.
+    send: bool,
+    /// Some transport has datagrams in [`TransportSlot::inline`].
+    queued: bool,
+    /// Drains so far, the clock of [`Backoff`].
+    drains: u64,
+}
+
+/// The longest a transport or sink that took nothing is skipped, in drains.
+const MAX_BACKOFF: u64 = 1024;
+
+/// Skips inline sending to a transport or sink that took nothing (one that does not
+/// support it, or is full) for a number of drains that doubles with every such try, up to
+/// [`MAX_BACKOFF`], and restarts once it takes something.
+#[derive(Debug, Default)]
+struct Backoff {
+    /// The first drain to try again in.
+    retry_at: u64,
+    /// The last wait, in drains.
+    wait: u64,
+}
+
+impl Backoff {
+    const fn ready(&self, drain: u64) -> bool {
+        drain >= self.retry_at
+    }
+
+    /// Records a try in `drain`; `took` whether anything was taken.
+    fn record(&mut self, drain: u64, took: bool) {
+        if took {
+            self.wait = 0;
+        } else {
+            self.wait = (self.wait * 2).clamp(1, MAX_BACKOFF);
+            self.retry_at = drain + self.wait;
+        }
+    }
 }
 
 /// What woke the owner task.
@@ -915,8 +1006,7 @@ struct Owner {
     suspended: watch::Sender<bool>,
     /// No crypto workers: the owner task may send datagrams and deliver packets itself.
     fast_path: bool,
-    /// `fast_path` while not suspended.
-    inline: bool,
+    inline: Inline,
     /// How the owner task delivers packets itself.
     sink: InlineSink,
     /// The crypto worker pool, if enabled.
@@ -1455,7 +1545,7 @@ impl Owner {
 
     /// Suspends every I/O task and the owner's own polling, unless already suspended.
     fn suspend(&mut self) {
-        self.inline = false;
+        self.inline.allowed = false;
         if !self.suspended.send_replace(true) {
             self.event(Event::Suspended);
         }
@@ -1464,7 +1554,7 @@ impl Owner {
     /// Resumes after [`Owner::suspend`] and runs the timers that did not fire meanwhile.
     fn resume(&mut self) {
         if self.suspended.send_replace(false) {
-            self.inline = self.fast_path;
+            self.inline.allowed = self.fast_path;
             self.event(Event::Resumed);
             self.core.handle_timeout(now());
             self.drain(true);
@@ -1499,6 +1589,7 @@ impl Owner {
             try_send,
             inline: Vec::new(),
             closed: false,
+            backoff: Backoff::default(),
         }
     }
 
@@ -1521,6 +1612,10 @@ impl Owner {
     /// flush of waiting datagrams. With `droppable`, datagrams to transmit may overflow the
     /// waiting datagrams.
     fn drain(&mut self, droppable: bool) {
+        self.inline.drains += 1;
+        self.inline.send = self.inline.allowed
+            && self.datagrams.is_empty()
+            && self.local.as_ref().is_none_or(BatchQueue::is_empty);
         while let Some(output) = self.core.poll_output() {
             match output {
                 Output::Transmit { path, data } => self.transmit(path, data, droppable),
@@ -1528,13 +1623,15 @@ impl Owner {
                 Output::Event(event) => self.event(event),
             }
         }
-        while let Some(id) = self
-            .transports
-            .iter()
-            .find(|(_, slot)| !slot.inline.is_empty())
-            .map(|(id, _)| *id)
-        {
-            self.send_inline(id, droppable);
+        if std::mem::take(&mut self.inline.queued) {
+            while let Some(id) = self
+                .transports
+                .iter()
+                .find(|(_, slot)| !slot.inline.is_empty())
+                .map(|(id, _)| *id)
+            {
+                self.send_inline(id, droppable);
+            }
         }
         if !self.sink.delivered.is_empty() {
             self.deliver_inline();
@@ -1551,14 +1648,15 @@ impl Owner {
     }
 
     /// Sends a datagram on the transport its path names: without crypto workers, the owner
-    /// task sends it itself at the end of the drain when nothing of that transport is
-    /// waiting, queued or being sent, and otherwise queues it.
+    /// task sends it itself at the end of the drain when no input is waiting and nothing
+    /// of that transport is waiting, queued or being sent, and otherwise queues it.
     fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
-        if self.inline
+        if self.inline.send
             && let Some(slot) = self.transports.get_mut(&path.transport)
-            && (!slot.inline.is_empty() || slot.idle())
+            && (!slot.inline.is_empty() || (slot.backoff.ready(self.inline.drains) && slot.idle()))
         {
             slot.inline.push((path, data));
+            self.inline.queued = true;
             if slot.inline.len() >= MAX_BATCH {
                 self.send_inline(path.transport, droppable);
             }
@@ -1575,6 +1673,7 @@ impl Owner {
         };
         let mut batch = std::mem::take(&mut slot.inline);
         let sent = slot.send_now(&batch);
+        slot.backoff.record(self.inline.drains, sent > 0);
         for (path, data) in batch.drain(sent..) {
             self.queue_datagram(path, data, droppable);
         }
@@ -1619,9 +1718,11 @@ impl Owner {
     /// task, and otherwise queues it.
     fn deliver(&mut self, from: PeerId, packet: PacketBuf) {
         let sink = &mut self.sink;
-        if self.inline
+        if self.inline.allowed
             && !sink.closed
-            && (!sink.delivered.is_empty() || sink.outstanding.load(Ordering::Acquire) == 0)
+            && (!sink.delivered.is_empty()
+                || (sink.backoff.ready(self.inline.drains)
+                    && sink.outstanding.load(Ordering::Acquire) == 0))
         {
             sink.delivered.push_back((from, packet));
             if sink.delivered.len() >= MAX_BATCH {
@@ -1636,6 +1737,7 @@ impl Owner {
     /// in order.
     fn deliver_inline(&mut self) {
         let mut packets = std::mem::take(&mut self.sink.delivered);
+        let offered = packets.len();
         while !packets.is_empty() {
             match (self.sink.try_deliver)(&mut packets) {
                 Ok(()) => break,
@@ -1648,6 +1750,9 @@ impl Owner {
                 Err(e) => tracing::warn!(message = "Packet sink error", error = ?e),
             }
         }
+        self.sink
+            .backoff
+            .record(self.inline.drains, packets.len() < offered);
         while let Some((from, packet)) = packets.pop_front() {
             self.queue_delivery(from, packet);
         }
