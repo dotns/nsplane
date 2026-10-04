@@ -1,7 +1,8 @@
 //! Differential test of the ACL hook: an [`AclFilter`] with its principal
 //! cache, flow verdict cache and bypass against the uncached filter (full
-//! evaluation of every packet), on generated policies, identities and packet
-//! sequences with policy changes in the middle of flows.
+//! evaluation of every packet), on generated policies, identities (some
+//! peers terminating by source address) and packet sequences with policy
+//! changes in the middle of flows.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -81,6 +82,16 @@ fn principal(peer: u32) -> String {
     assertion(peer, false).source_anchor()
 }
 
+/// The principal of a peer, or of an address as a by-source peer resolves it.
+fn any_principal(rng: &mut Lcg) -> String {
+    let peer = rng.peer();
+    if rng.chance(30) {
+        address(peer).to_string()
+    } else {
+        principal(peer)
+    }
+}
+
 fn rule(src: &str, dst: &str, proto: Option<&str>) -> AclRule {
     AclRule {
         action: AclAction::Accept,
@@ -97,6 +108,7 @@ fn random_policy(rng: &mut Lcg) -> AclPolicy {
         rule("*", "10.0.0.0/24:*", Some("udp")),
         rule("10.0.0.0/24", "*:22", None),
         rule(&wg_peer_anchor(&[2; 32]), "*:443", Some("tcp")),
+        rule("10.0.0.3/32", "*:*", Some("tcp")),
         rule("*", "*:*", Some("tcp")),
         rule("*", "*:*", Some("udp")),
     ];
@@ -125,6 +137,13 @@ fn random_namespace(rng: &mut Lcg, app: bool) -> NamespacePolicy {
             principal: principal(peer),
             addresses,
         });
+        // The address principal of a by-source peer.
+        if rng.chance(30) {
+            members.push(NamespaceMember {
+                principal: address(peer).to_string(),
+                addresses: Vec::new(),
+            });
+        }
     }
     if app {
         return NamespacePolicy {
@@ -154,7 +173,7 @@ fn random_namespace(rng: &mut Lcg, app: bool) -> NamespacePolicy {
 
 fn random_end(rng: &mut Lcg) -> GrantEnd {
     if rng.chance(50) {
-        GrantEnd::Peer(principal(rng.peer()))
+        GrantEnd::Peer(any_principal(rng))
     } else {
         GrantEnd::Namespace(rng.pick(&NAMESPACES[..3]).into())
     }
@@ -177,9 +196,10 @@ impl World {
             base + Duration::from_secs(ticks.load(Ordering::Relaxed))
         }));
         let identity = Arc::new(PeerIdentityMap::new());
-        for peer in 1..=PEERS {
+        for peer in 1..PEERS {
             identity.insert(PeerId::new(peer), assertion(peer, false));
         }
+        identity.insert_by_source(PeerId::new(PEERS));
         Self {
             engine,
             identity,
@@ -226,7 +246,7 @@ impl World {
             }
             9 | 12 | 13 => {
                 let spec = PinholeSpec {
-                    peer: principal(rng.peer()),
+                    peer: any_principal(rng),
                     kind: "t".to_owned(),
                     protocol: rng.pick(&[Protocol::Tcp, Protocol::Udp]),
                     direction: rng.pick(&[Direction::Inbound, Direction::Outbound]),
@@ -245,8 +265,9 @@ impl World {
             }
             _ => {
                 let peer = rng.peer();
-                match rng.below(4) {
+                match rng.below(5) {
                     0 => self.identity.remove(PeerId::new(peer)),
+                    4 => self.identity.insert_by_source(PeerId::new(peer)),
                     1 => self
                         .identity
                         .insert(PeerId::new(peer), assertion(peer, true)),
@@ -276,7 +297,13 @@ struct Flow {
 impl Flow {
     fn random(rng: &mut Lcg) -> Self {
         let peer = 1 + u32::try_from(rng.below(u64::from(PEERS) + 1)).unwrap();
-        let remote = || address(peer);
+        // Mostly the peer's own address; a by-source peer's principal
+        // follows it.
+        let remote = if rng.chance(30) {
+            address(rng.peer())
+        } else {
+            address(peer)
+        };
         let other = |rng: &mut Lcg| {
             let member = address(rng.peer());
             rng.pick(&[
@@ -288,9 +315,9 @@ impl Flow {
         };
         let outbound = rng.chance(40);
         let (src, dst) = if outbound {
-            (other(rng), remote())
+            (other(rng), remote)
         } else {
-            (remote(), other(rng))
+            (remote, other(rng))
         };
         Self {
             peer,

@@ -15,6 +15,7 @@ use nsplane_noise::noise::{DATA_HEADER_SZ, Packet, Tunn, TunnResult};
 use nsplane_noise::x25519;
 use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
 
+use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
 use crate::job::{self, CryptoJob, Direction, Outcome};
 use crate::peer::Peer;
@@ -45,10 +46,10 @@ struct Schedule {
 }
 
 /// Lookups that consecutive data packets of a batch share: a peer's slot in the peer table, the
-/// peer a destination is routed to and a source a peer may send from. Only configuration
-/// changes the peer table, and a batch holds none, so they stay valid for the whole batch; a
-/// batch of datagrams still starts over after every handshake message, the only other message
-/// it holds.
+/// peer a destination is routed to, a source a peer may send from and a destination a peer may
+/// send to. Only configuration changes the peer table, and a batch holds none, so they stay
+/// valid for the whole batch; a batch of datagrams still starts over after every handshake
+/// message, the only other message it holds.
 #[derive(Debug, Default)]
 struct Lookups {
     /// The last receiver index, with its peer and slot.
@@ -57,6 +58,8 @@ struct Lookups {
     route: Option<(IpAddr, PeerId, usize)>,
     /// The last source accepted from a peer.
     source: Option<(IpAddr, PeerId)>,
+    /// The last destination accepted from a peer with inbound destinations.
+    destination: Option<(IpAddr, PeerId)>,
 }
 
 impl Lookups {
@@ -94,6 +97,18 @@ impl Lookups {
         let allowed = peers.routes_to(src, id);
         if allowed {
             self.source = Some((src, id));
+        }
+        allowed
+    }
+
+    /// Whether peer `id`, whose inbound destinations are `set`, may send packets to `dst`.
+    fn destination_allowed(&mut self, set: &AllowedIps<()>, dst: IpAddr, id: PeerId) -> bool {
+        if self.destination == Some((dst, id)) {
+            return true;
+        }
+        let allowed = set.find(dst).is_some();
+        if allowed {
+            self.destination = Some((dst, id));
         }
         allowed
     }
@@ -307,9 +322,10 @@ impl Core {
                 None => self.pool.put(job.buf),
             },
             Direction::Open { path } => {
-                let len = job.buf.len();
                 let slot = self.peers.slot(id);
-                match self.opened(id, slot, path, len, outcome, &mut Lookups::default()) {
+                let opened =
+                    self.opened(id, slot, path, &job.buf, outcome, &mut Lookups::default());
+                match opened {
                     Some(plain_len) => self.deliver_opened(id, slot, path, job.buf, plain_len),
                     None => self.pool.put(job.buf),
                 }
@@ -600,6 +616,7 @@ impl Core {
             | ConfigChange::SetPresharedKey { peer, .. }
             | ConfigChange::SetKeepalive { peer, .. }
             | ConfigChange::SetPath { peer, .. }
+            | ConfigChange::SetInboundDestinations { peer, .. }
                 if self.peers.get(&peer).is_none() =>
             {
                 return;
@@ -630,6 +647,14 @@ impl Core {
                 path: Some(path),
                 ..PeerConfig::new(peer)
             },
+            ConfigChange::SetInboundDestinations { peer, destinations } => {
+                // A `None` in a PeerConfig leaves them unchanged: remove them directly.
+                if let Some(id) = self.peers.get(&peer) {
+                    self.peers
+                        .set_inbound_destinations(id, destinations.as_deref());
+                }
+                return;
+            }
         };
         if let Err(e) = self.peers.apply(&config, now) {
             let reason = match e {
@@ -683,9 +708,8 @@ impl Core {
         let Some(peer) = self.peers.at_mut(slot) else {
             return self.pool.put(data);
         };
-        let len = data.len();
         let outcome = job::open(&mut peer.tunnel_mut(), path, &mut data);
-        match self.opened(id, Some(slot), path, len, outcome, lookups) {
+        match self.opened(id, Some(slot), path, &data, outcome, lookups) {
             Some(plain_len) => self.deliver_opened(id, Some(slot), path, data, plain_len),
             None => self.pool.put(data),
         }
@@ -749,15 +773,14 @@ impl Core {
         self.outputs.push_back(Output::Deliver { from: id, packet });
     }
 
-    /// Accounts for a datagram of `len` bytes from `path` that the tunnel of peer `id` at
-    /// `slot` opened with `outcome`; returns the plaintext length if it carries a packet to
-    /// deliver.
+    /// Accounts for `datagram` from `path` that the tunnel of peer `id` at `slot` opened in
+    /// place with `outcome`; returns the plaintext length if it carries a packet to deliver.
     fn opened(
         &mut self,
         id: PeerId,
         slot: Option<usize>,
         path: Path,
-        len: usize,
+        datagram: &PacketBuf,
         outcome: Outcome,
         lookups: &mut Lookups,
     ) -> Option<usize> {
@@ -777,8 +800,9 @@ impl Core {
                 return None;
             }
         };
-        let peer = self.peers.at_mut(slot?)?;
-        peer.add_rx(len as u64);
+        let slot = slot?;
+        let peer = self.peers.at_mut(slot)?;
+        peer.add_rx(datagram.len() as u64);
         let completed = peer.take_handshakes_up_to(handshakes);
 
         let kind = if src.is_some() {
@@ -801,6 +825,16 @@ impl Core {
         if !lookups.source_allowed(&self.peers, src, id) {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
+        }
+        if let Some(set) = self.peers.inbound_destinations(slot) {
+            let dst = datagram
+                .as_packet()
+                .get(DATA_HEADER_SZ..DATA_HEADER_SZ + plain_len)
+                .and_then(Tunn::dst_address);
+            if !dst.is_some_and(|dst| lookups.destination_allowed(set, dst, id)) {
+                self.dropped(Some(id), reasons::DESTINATION_NOT_ALLOWED);
+                return None;
+            }
         }
         Some(plain_len)
     }
@@ -1261,6 +1295,42 @@ mod tests {
         let id = core.peer_id(&key).unwrap();
         assert_eq!(core.peers().collect::<Vec<_>>(), [id]);
         assert_eq!(core.peer_stats(id).unwrap().public_key, key);
+    }
+
+    #[test]
+    fn inbound_destinations_of_unknown_peers_are_ignored() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let key = x25519::PublicKey::from([7; 32]);
+        let change = ConfigChange::SetInboundDestinations {
+            peer: key,
+            destinations: Some(vec!["10.1.0.0/16".parse().unwrap()]),
+        };
+        assert!(format!("{change:?}").contains("10.1.0.0"));
+        core.handle_input(Input::Config(change), Instant::now());
+        assert!(core.poll_output().is_none());
+        assert_eq!(core.peer_id(&key), None);
+
+        let mut config = PeerConfig::new(key);
+        assert!(format!("{config:?}").contains("inbound_destinations: None"));
+        config.inbound_destinations = Some(Vec::new());
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+        let id = core.peer_id(&key).unwrap();
+        let slot = core.peers.slot(id).unwrap();
+        assert!(core.peers.inbound_destinations(slot).is_some());
+        core.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinations {
+                peer: key,
+                destinations: None,
+            }),
+            Instant::now(),
+        );
+        assert!(core.peers.inbound_destinations(slot).is_none());
     }
 
     #[test]

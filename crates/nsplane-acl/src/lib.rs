@@ -186,7 +186,12 @@
 //!   [`PeerIdentityMap`] change) versions the identities.
 //! - **Principal cache.** Per peer, the filter keeps its source assertion,
 //!   principal (an `Arc<str>`, no allocation per packet) and flags
-//!   (outbound-restricted, pinholes, bypass) under both generations.
+//!   (outbound-restricted, pinholes, bypass) under both generations. A peer
+//!   terminating by source address
+//!   ([`PeerIdentityMap::insert_by_source`], [`PeerIdentity::by_source`]) has
+//!   one principal per remote address ([`PeerIdentity::assertion_for`]),
+//!   cached per peer and address in a least-recently-used table bounded by
+//!   [`AclFilterConfig::reply_capacity`], and is bypassed per address.
 //! - **Flow verdict cache.** The reply table also holds, per peer, direction
 //!   and five-tuple, the verdict of a namespace member's TCP or UDP flow's
 //!   first packet (accepted with its grant or pinhole dependency, or dropped
@@ -221,6 +226,19 @@
 //! packet. A [`PeerIdentity`] that is not versioned (generation 0, e.g. a
 //! closure) gets no cache: every packet is evaluated.
 //!
+//! # The ns `crates/acl` mode
+//!
+//! [`AclFilterConfig::crates_acl`] makes the filter judge inbound IPv4
+//! packets as the ACL step of an ns account (`is_local_node_packet ||
+//! is_icmp_echo_reply || acl_check_packet`): packets to the local tunnel
+//! address and ICMP echo replies pass without the policy
+//! ([`AclFilterConfig::accept_to_local`],
+//! [`AclFilterConfig::accept_icmp_echo_reply`]), non-first fragments pass
+//! only after an accepted first fragment of the same datagram within 15 s
+//! ([`FragmentMode::AllowOnly`]), and there are no reply allowances
+//! ([`AclFilterConfig::stateful_replies`] off). Each of these settings is off
+//! by default and costs one branch when off.
+//!
 //! # Performance
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
@@ -236,6 +254,9 @@
 //! | same, through an inbound pinhole | 210 ns | | |
 //! | same, outbound-restricted peer (outbound rule) | | | 156 ns |
 //! | Bypass (a namespace accepting everything) | 38 ns | 37 ns | 77 ns |
+//! | Default policy, by-source peer (best of 3 runs) | 79 ns | 79 ns | |
+//! | `crates_acl` preset, by-source peer, IPv4 TCP (best of 3 runs) | 71 ns | 80 ns | |
+//! | same, non-first fragment after an accepted first fragment | | 29 ns | |
 //!
 //! Before the hook every packet was a new flow: 71 ns (default policy),
 //! 669 ns (namespaces), 1.75 us (grant, established), 937 ns (bypass peer),
@@ -273,7 +294,9 @@ pub use engine::{
     AccessRequest, AclDecision, AclEngine, AclTestFailure, CompiledPolicy, SourceAssertion,
     TerminateBinding, wg_peer_anchor,
 };
-pub use filter::{AclFilter, AclFilterConfig, AclFilterStats, PeerIdentity, PeerIdentityMap};
+pub use filter::{
+    AclFilter, AclFilterConfig, AclFilterStats, FragmentMode, PeerIdentity, PeerIdentityMap,
+};
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{
     MergeStats, MergedPolicy, PolicyLayers, RemotePolicy, RuleProvenance, acl_rule_key,

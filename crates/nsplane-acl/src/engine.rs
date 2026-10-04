@@ -85,6 +85,17 @@ impl SourceAssertion {
         }
     }
 
+    /// The terminate binding of a bare source IP: the principal of
+    /// [`AccessRequest::from_ip`].
+    pub(crate) fn from_ip(ip: IpAddr) -> Self {
+        Self::Terminate {
+            binding: TerminateBinding {
+                ip: Some(ip),
+                anchor: ip.to_string(),
+            },
+        }
+    }
+
     /// The IP-bearing source, when any (terminate bindings). `None` for
     /// key/IdP assertions — those match by anchor, not CIDR.
     #[must_use]
@@ -133,12 +144,7 @@ impl AccessRequest {
     pub fn from_ip(src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16, protocol: Protocol) -> Self {
         Self {
             src_ip,
-            source: SourceAssertion::Terminate {
-                binding: TerminateBinding {
-                    ip: Some(src_ip),
-                    anchor: src_ip.to_string(),
-                },
-            },
+            source: SourceAssertion::from_ip(src_ip),
             dst_ip,
             dst_port,
             protocol,

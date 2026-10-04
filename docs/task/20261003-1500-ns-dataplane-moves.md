@@ -136,6 +136,7 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   - API: `SourceAssertion::TerminateFromPacket` (or `PeerIdentity::assertion_for(&self, peer, src: IpAddr) -> Option<SourceAssertion>` with a default delegating to `assertion`).
   - Semantics: for peers marked "terminate by IP", the principal is `Terminate { ip: Some(src), anchor: src.to_string() }` from the packet's source address (crates/acl AccessRequest::from_ip). For relay client keys it is `WgPeerKey { pubkey }` (with_wg_peer_key).
   - Caching: per (peer, src) under the identity generation.
+  - Done (2026-10-03, plan 20261003-2300-acl-l3-gate MD-A): `PeerIdentity::assertion_for(peer, src)` (default `assertion`) and `PeerIdentity::by_source`; `PeerIdentityMap::insert_by_source` (principal `AccessRequest::from_ip`'s terminate binding of the packet's remote address) next to `insert` with a `WgPeerKey`. The filter caches a by-source principal per (peer, address) in an LRU table bounded by `reply_capacity` under the identity generation; bypass and flow verdicts per address. Tests: the differential test with by-source peers, unit tests in `crates/nsplane-acl/src/filter.rs`, `nsplane-e2e` `acl_parity`.
 - MD-2 Node L3 gate as an nsplane-acl mode. It must express:
   - target-bound Node/Service/Subnet grants;
   - source binding (packet source must be the peer's projected Node address);
@@ -149,13 +150,16 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
   - Input: the compiled NodeL3Config (ns still compiles it, (c)).
 - MD-3 Divert verdict. AclFilter config `divert: Option<mpsc::Sender<(PeerId, Bytes)>>` plus a predicate on the drop reason: a packet denied for SourceBinding/OrphanFragment is try_sent there and reported as `Verdict::Handled` (gateway-consumer path, filters.rs:200).
 - MD-4 Fragment parity with FragmentAclGate. Non-first IPv4 fragments are judged by the remembered verdict of their datagram's first fragment, keyed (src, dst, proto, id) with a TTL (FragmentAclGate's) and the fragment_capacity bound. nsplane-acl already gates on the first fragment; the requirement is equal keying, TTL and miss behavior (drop).
+  - Done (2026-10-03, MD-A): `AclFilterConfig::fragments: FragmentMode`; `Outcome` (default) is the previous gate, `AllowOnly { ttl, capacity }` equals `FragmentAclGate` (accepted first fragments only, keyed (src, dst, proto, id), TTL on the engine clock, miss drops as `reasons::FRAGMENT`, a full table drops expired entries and otherwise records nothing); `FragmentMode::ALLOW_ONLY` = 15 s, 4096. Tests: unit tests in `crates/nsplane-acl/src/filter.rs`, the differential fixture (MD-5), `nsplane-e2e` `acl_parity`.
 - MD-5 Bypass flags in AclFilterConfig, default false:
   - `accept_to_local: Option<Ipv4Addr>`: IPv4 packets to this address skip the ACL (is_local_node_packet);
   - `accept_icmp_echo_reply: bool`;
   - `stateful_replies: false` must give crates/acl semantics exactly. The flag exists today; verify that it also disables the flow verdict cache side effects.
+  - Done (2026-10-03, MD-A): `accept_to_local`, `accept_icmp_echo_reply` (default off, counted in `AclFilterStats::bypassed`) and the preset `AclFilterConfig::crates_acl(local)`, which for inbound IPv4 equals `is_local_node_packet || is_icmp_echo_reply || acl_check_packet`; `stateful_replies: false` records no allowance or pending dependency, and the flow verdict cache it keeps is exact. Differential test against ns: `crates/nsplane-acl/tests/crates_acl_parity.rs` with `tests/fixtures/crates_acl_parity.json`; engine level: `nsplane-e2e` `acl_parity`. Deviation (30 fixture packets): ns parse_five_tuple reads IHL+4 bytes; nsplane-acl drops malformed IPv4 (TCP/UDP header truncated, total length inconsistent with the buffer) as acl malformed in every mode; verdicts are equal on well-formed packets.
 - MD-6 Destination authorization per peer. `AllowedDestinations` per peer, checked on inbound (the IPv6 destination must be in the peer's authorized Subnet set or lease, else drop "ipv6 not authorized") and on outbound ("packet routed to a peer other than the destination's owner" = drop "route owner mismatch").
   - Alternative: nsplane-core inbound destination check per peer (new PeerConfig field `inbound_destinations: Option<Vec<AllowedIp>>`, None = unchecked).
   - Proposal item 7 (SOURCE_NOT_ALLOWED opt-out) is the source-side counterpart and stays conditional.
+  - Done (2026-10-03, MD-A) as the alternative: `PeerConfig::inbound_destinations: Option<Vec<AllowedIp>>` (`None` unchecked), checked by the core after the source check on every receive path, dropped as `reasons::DESTINATION_NOT_ALLOWED`; runtime update with `ConfigChange::SetInboundDestinations` / `EngineHandle::set_inbound_destinations` or `add_or_update_peer`. ns expresses leases and Subnet returns as allowed IPs (routing picks the owner, so "route owner mismatch" disappears) and its IPv6 authorization as inbound destinations; the mapping is in docs/architecture.md (nsplane-acl, "What ns deletes"). Tests: `nsplane-core` and `nsplane-e2e` `inbound_destinations`.
 
 ## NEW workstream ME: Subnet translation (nsplane-nat)
 - ME-1 Stateful NAT64-to-LAN (NAPT) filter. Done: `Nat64Lan` with the `Nat64LanSink` / `Nat64LanSource` local-side wrappers, covered by `nsplane-e2e`'s `nat64_lan` tests and the `subnet_gateway` example scenario.
@@ -241,3 +245,6 @@ first, terminate leg when a consumer exists; revised 15:35: terminate leg in sco
 (c)), ADR 2026-10-03-data-channel-protocols-in-nsplane
 (every data-channel protocol lives in nsplane), MF-1, MF-2 and MB-x5 after a benchmark
 harness against kernel WireGuard and wireguard-go.
+2026-10-03: MD-A done (campaign nsplane-md-202610032300, plan 20261003-2300-acl-l3-gate): MD-1,
+MD-4, MD-5 and MD-6 with the `crates/acl` differential fixture; the ns mapping (what ns deletes
+and the conversion it keeps) is in docs/architecture.md (nsplane-acl). MD-2 and MD-3 are MD-B.

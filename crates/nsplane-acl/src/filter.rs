@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use nsplane_core::{PacketFilter, Verdict};
@@ -28,12 +28,37 @@ use crate::reasons;
 /// [`PeerIdentityMap`] and by `Arc<T>` of any implementation, so a caller can
 /// keep a handle to update the identities while the filter uses them.
 pub trait PeerIdentity: Send + Sync + 'static {
-    /// The source assertion of `peer`, or `None` when the peer is unknown.
+    /// The source assertion of `peer`, or `None` when the peer is unknown or
+    /// has no principal independent of the packet's address (see
+    /// [`by_source`](Self::by_source)).
     fn assertion(&self, peer: PeerId) -> Option<SourceAssertion>;
+
+    /// The source assertion of `peer` for a packet whose remote address is
+    /// `src`: the IP source of an inbound packet, the IP destination of an
+    /// outbound one. [`AclFilter`] resolves every principal through this
+    /// method.
+    ///
+    /// The default ignores `src` and returns [`assertion`](Self::assertion).
+    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
+        let _ = src;
+        self.assertion(peer)
+    }
+
+    /// Whether the [`assertion_for`](Self::assertion_for) of `peer` depends
+    /// on the address. [`AclFilter`] asks once per peer and identity
+    /// generation, then caches the principal of such a peer per address, and
+    /// of any other peer per peer; so a versioned implementation must return
+    /// `true` for every peer whose assertion depends on the address. Default
+    /// `false`.
+    fn by_source(&self, peer: PeerId) -> bool {
+        let _ = peer;
+        false
+    }
 
     /// The identity generation: a non-zero value that changes whenever an
     /// assertion may have changed (bumped once the change is visible to
-    /// [`assertion`](Self::assertion)). [`AclFilter`] caches the resolved
+    /// [`assertion_for`](Self::assertion_for) and
+    /// [`by_source`](Self::by_source)). [`AclFilter`] caches the resolved
     /// peers and the flow verdicts under it.
     ///
     /// The default, 0, means "not versioned": the filter then resolves the
@@ -59,6 +84,14 @@ impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
         (**self).assertion(peer)
     }
 
+    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
+        (**self).assertion_for(peer, src)
+    }
+
+    fn by_source(&self, peer: PeerId) -> bool {
+        (**self).by_source(peer)
+    }
+
     fn generation(&self) -> u64 {
         (**self).generation()
     }
@@ -67,13 +100,22 @@ impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
 /// A concurrent map from peers to their source assertions.
 ///
 /// Wrap it in an `Arc` and hand a clone to the filter to update it at runtime.
-/// Every [`insert`](Self::insert) and [`remove`](Self::remove) bumps its
+/// Every [`insert`](Self::insert), [`insert_by_source`](Self::insert_by_source)
+/// and [`remove`](Self::remove) bumps its
 /// [generation](PeerIdentity::generation), so the filter's cached principals
 /// and verdicts never outlive an identity change.
 #[derive(Debug)]
 pub struct PeerIdentityMap {
-    map: RwLock<HashMap<PeerId, SourceAssertion>>,
+    map: RwLock<HashMap<PeerId, Identity>>,
     generation: AtomicU64,
+}
+
+/// The identity of a peer in a [`PeerIdentityMap`].
+#[derive(Debug)]
+enum Identity {
+    Assertion(SourceAssertion),
+    /// The principal of each packet is its remote address.
+    BySource,
 }
 
 impl Default for PeerIdentityMap {
@@ -91,16 +133,37 @@ impl PeerIdentityMap {
         Self::default()
     }
 
-    /// Set the assertion of `peer`, replacing any previous one.
+    /// Set the assertion of `peer`, replacing any previous one. A relayed
+    /// client is inserted with its [`SourceAssertion::WgPeerKey`].
     pub fn insert(&self, peer: PeerId, assertion: SourceAssertion) {
+        self.set(peer, Identity::Assertion(assertion));
+    }
+
+    /// Make `peer` terminate by source address, replacing any previous
+    /// assertion: the principal of each of its packets is the packet's
+    /// remote address (see [`PeerIdentity::assertion_for`]), a
+    /// [`SourceAssertion::Terminate`] binding of that address as
+    /// [`AccessRequest::from_ip`] builds it. For a gateway whose packets
+    /// carry several source addresses. [`assertion`](PeerIdentity::assertion)
+    /// of such a peer is `None`.
+    pub fn insert_by_source(&self, peer: PeerId) {
+        self.set(peer, Identity::BySource);
+    }
+
+    fn set(&self, peer: PeerId, identity: Identity) {
         let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
-        map.insert(peer, assertion);
+        map.insert(peer, identity);
         // Still under the write lock: a reader seeing the new generation
         // also sees the new assertion.
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Remove the assertion of `peer`; the peer becomes unknown.
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<PeerId, Identity>> {
+        self.map.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Remove the assertion (or the by-source mark) of `peer`; the peer
+    /// becomes unknown.
     pub fn remove(&self, peer: PeerId) {
         let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
         map.remove(&peer);
@@ -110,11 +173,21 @@ impl PeerIdentityMap {
 
 impl PeerIdentity for PeerIdentityMap {
     fn assertion(&self, peer: PeerId) -> Option<SourceAssertion> {
-        self.map
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&peer)
-            .cloned()
+        match self.read().get(&peer)? {
+            Identity::Assertion(assertion) => Some(assertion.clone()),
+            Identity::BySource => None,
+        }
+    }
+
+    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
+        match self.read().get(&peer)? {
+            Identity::Assertion(assertion) => Some(assertion.clone()),
+            Identity::BySource => Some(SourceAssertion::from_ip(src)),
+        }
+    }
+
+    fn by_source(&self, peer: PeerId) -> bool {
+        matches!(self.read().get(&peer), Some(Identity::BySource))
     }
 
     fn generation(&self) -> u64 {
@@ -137,12 +210,38 @@ pub struct AclFilterConfig {
     pub allow_other_protocols: bool,
     /// Accept inbound replies to flows the local side opened (stateful
     /// replies, not a conntrack/NAT). Default `true`.
+    ///
+    /// When `false` the filter records no reply allowance in either
+    /// direction: outbound TCP, UDP and ICMP echo packets record no inbound
+    /// allowance, accepted inbound flows from outbound-restricted peers
+    /// record no outbound allowance (their replies need an outbound rule or
+    /// an outbound pinhole), and no pending dependency is kept. Every inbound
+    /// packet is then judged by the policy alone. The only state left is the
+    /// flow verdict cache, which is exact: a verdict is reused only under the
+    /// policy and identity generations it was computed under, a pinhole
+    /// verdict is checked against the pinhole's expiry on every hit, and an
+    /// expired-pinhole verdict is never cached, so a hit equals a fresh
+    /// evaluation (checked by the differential tests).
     pub stateful_replies: bool,
     /// Maximum number of reply allowances (at least 1). When full, the least
     /// recently seen entry is evicted. Default 4096.
     pub reply_capacity: usize,
     /// How long a reply allowance lives without traffic. Default 120 s.
     pub reply_idle_timeout: Duration,
+    /// How inbound non-first IPv4 fragments are gated. Default
+    /// [`FragmentMode::Outcome`].
+    pub fragments: FragmentMode,
+    /// Accept an inbound IPv4 packet (at least 20 bytes) whose destination
+    /// is this address without consulting the policy, before anything else
+    /// (counted in [`AclFilterStats::bypassed`]). Default `None`.
+    pub accept_to_local: Option<Ipv4Addr>,
+    /// Accept an inbound IPv4 ICMP echo reply without consulting the policy,
+    /// after [`accept_to_local`](Self::accept_to_local) and before anything
+    /// else (counted in [`AclFilterStats::bypassed`]). The check reads the
+    /// raw header: IPv4, a header length of at least 20 bytes, at least 8
+    /// bytes after it, protocol 1 and type 0; a non-first fragment passing
+    /// it is accepted too. Default `false`.
+    pub accept_icmp_echo_reply: bool,
 }
 
 impl Default for AclFilterConfig {
@@ -153,8 +252,83 @@ impl Default for AclFilterConfig {
             stateful_replies: true,
             reply_capacity: 4096,
             reply_idle_timeout: Duration::from_secs(120),
+            fragments: FragmentMode::Outcome,
+            accept_to_local: None,
+            accept_icmp_echo_reply: false,
         }
     }
+}
+
+impl AclFilterConfig {
+    /// The settings of the ACL step of an ns account: for inbound IPv4
+    /// packets the filter equals ns `is_local_node_packet(pkt, local) ||
+    /// is_icmp_echo_reply(pkt) || acl_check_packet(..)` (the first term only
+    /// when `local` is set), with the principals of a [`PeerIdentityMap`]
+    /// holding the relay clients under [`insert`](PeerIdentityMap::insert)
+    /// with their [`SourceAssertion::WgPeerKey`] and every other peer under
+    /// [`insert_by_source`](PeerIdentityMap::insert_by_source).
+    ///
+    /// That is: no reply allowances ([`stateful_replies`](Self::stateful_replies)
+    /// off), protocols other than TCP and UDP dropped, IPv4 fragments gated by
+    /// [`FragmentMode::ALLOW_ONLY`], `local` in
+    /// [`accept_to_local`](Self::accept_to_local) and
+    /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on. Drop
+    /// reasons follow this filter (a packet ns drops is dropped here, possibly
+    /// with another reason), and IPv6 and outbound packets keep this filter's
+    /// handling.
+    pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
+        Self {
+            allow_other_protocols: false,
+            stateful_replies: false,
+            fragments: FragmentMode::ALLOW_ONLY,
+            accept_to_local: local,
+            accept_icmp_echo_reply: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// How an [`AclFilter`] gates inbound non-first IPv4 fragments, which carry
+/// no ports and follow their packet's first fragment.
+///
+/// IPv6 fragments and outbound fragments (to outbound-restricted peers) are
+/// always gated as in [`Outcome`](Self::Outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FragmentMode {
+    /// The outcome of each first fragment, accepted or dropped, is recorded
+    /// per peer, direction and (source, destination, protocol,
+    /// identification); later fragments get the same outcome, the last one
+    /// frees the entry, and a later fragment with no recorded first fragment
+    /// is dropped with [`reasons::FRAGMENT`]. The table holds
+    /// [`AclFilterConfig::fragment_capacity`] entries, evicting the oldest.
+    #[default]
+    Outcome,
+    /// The ns `FragmentAclGate`: only accepted first fragments are recorded,
+    /// keyed by (source, destination, protocol, identification) without the
+    /// peer, until `ttl` after the first fragment on the engine clock
+    /// ([`AclEngine::with_clock`]); the last fragment does not free the
+    /// entry. A non-first fragment is judged before anything but the
+    /// bypass flags (before the no-policy check): accepted when its entry is
+    /// live, else dropped with [`reasons::FRAGMENT`] (an expired entry is
+    /// removed). When the table holds `capacity` entries, the expired ones
+    /// are removed first and, if it is still full, the new entry is not
+    /// recorded (a live entry is never evicted).
+    AllowOnly {
+        /// How long an accepted first fragment admits its later fragments.
+        ttl: Duration,
+        /// Maximum number of recorded first fragments.
+        capacity: usize,
+    },
+}
+
+impl FragmentMode {
+    /// [`AllowOnly`](Self::AllowOnly) with the values of ns: a TTL of 15 s
+    /// and a capacity of 4096.
+    pub const ALLOW_ONLY: Self = Self::AllowOnly {
+        ttl: Duration::from_secs(15),
+        capacity: 4096,
+    };
 }
 
 /// Counters of an [`AclFilter`], in packets unless stated otherwise.
@@ -203,6 +377,10 @@ pub struct AclFilterStats {
     /// Cached flow verdicts flushed to make room in the full flow table (the
     /// flows are evaluated again on their next packet).
     pub verdict_evictions: u64,
+    /// Inbound packets accepted without the policy by
+    /// [`AclFilterConfig::accept_to_local`] or
+    /// [`AclFilterConfig::accept_icmp_echo_reply`].
+    pub bypassed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -224,6 +402,7 @@ struct Counters {
     reply_revoked: AtomicU64,
     pending_evictions: AtomicU64,
     verdict_evictions: AtomicU64,
+    bypassed: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -235,6 +414,8 @@ fn bump(counter: &AtomicU64) {
 enum Outcome {
     Accepted,
     Reply,
+    /// Accepted by a bypass flag, without the policy.
+    Bypassed,
     Denied,
     CrossNamespace,
     NoPolicy,
@@ -251,7 +432,11 @@ enum Outcome {
 impl Outcome {
     const fn verdict(self) -> Verdict {
         let reason = match self {
-            Self::Accepted | Self::Reply | Self::OutboundAccepted | Self::OutboundReply => {
+            Self::Accepted
+            | Self::Reply
+            | Self::Bypassed
+            | Self::OutboundAccepted
+            | Self::OutboundReply => {
                 return Verdict::Accept;
             }
             Self::Denied => reasons::DENIED,
@@ -270,6 +455,7 @@ impl Outcome {
         bump(match self {
             Self::Accepted => &counters.accepted,
             Self::Reply => &counters.replies,
+            Self::Bypassed => &counters.bypassed,
             Self::Denied => &counters.denied,
             Self::CrossNamespace => &counters.cross_namespace,
             Self::NoPolicy => &counters.no_policy,
@@ -297,10 +483,57 @@ struct FragmentKey {
 }
 
 /// First-fragment outcomes in insertion order; when full, the oldest is
-/// evicted (O(1)).
+/// evicted (O(1)). `allowed` is the table of [`FragmentMode::AllowOnly`]:
+/// the engine-clock time each accepted first fragment was recorded.
 #[derive(Debug, Default)]
 struct FragmentTable {
     entries: LruMap<FragmentKey, Outcome>,
+    allowed: HashMap<AllowedKey, Instant>,
+}
+
+/// The key of [`FragmentMode::AllowOnly`]: no peer, no direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AllowedKey {
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    id: u16,
+}
+
+/// The fragment fields of a raw IPv4 header (at least 20 bytes, version 4),
+/// as ns `ipv4_fragment_meta` reads them: the key, the offset is non-zero,
+/// the first fragment of several.
+const fn ipv4_fragment(bytes: &[u8]) -> Option<(AllowedKey, bool, bool)> {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
+    let key = AllowedKey {
+        src: Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
+        dst: Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]),
+        protocol: bytes[9],
+        id: u16::from_be_bytes([bytes[4], bytes[5]]),
+    };
+    let offset = flags & 0x1fff;
+    Some((key, offset > 0, offset == 0 && flags & 0x2000 != 0))
+}
+
+/// ns `is_local_node_packet`: an IPv4 packet addressed to `local`.
+fn is_to_local(bytes: &[u8], local: Ipv4Addr) -> bool {
+    bytes.len() >= 20 && bytes[0] >> 4 == 4 && bytes[16..20] == local.octets()
+}
+
+/// ns `is_icmp_echo_reply`: an IPv4 ICMP echo reply, read from the raw
+/// header whatever its fragment offset.
+fn is_icmp_echo_reply(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 || bytes[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = usize::from(bytes[0] & 0x0f) * 4;
+    if ihl < 20 || bytes.len() < ihl + 8 || bytes[9] != protocol::ICMP {
+        return false;
+    }
+    bytes[ihl] == 0
 }
 
 /// The flow table, behind one lock: for each peer, direction and tuple
@@ -332,7 +565,12 @@ struct FragmentTable {
 /// as allowances (evictions counted in `pending_evictions`); an idle entry is
 /// dropped silently.
 ///
-/// `peers` caches the resolved peers, bounded by `reply_capacity` too.
+/// `peers` caches the resolved peers, bounded by `reply_capacity` too. A
+/// peer whose principal depends on the packet's address
+/// ([`PeerIdentity::by_source`]) is cached there as a marker, and resolved
+/// per remote address in `sources`, bounded by `reply_capacity` as well (when
+/// full, the least recently used entry is evicted in O(1); an evicted address
+/// is only resolved again).
 #[derive(Debug, Default)]
 struct FlowTable {
     entries: LruMap<EntryKey, FlowEntry>,
@@ -340,6 +578,7 @@ struct FlowTable {
     verdicts: usize,
     pending: LruMap<FiveTuple, ReplyEntry>,
     peers: HashMap<PeerId, Arc<PeerInfo>, FlowHash>,
+    sources: LruMap<(PeerId, IpAddr), Arc<PeerInfo>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -399,11 +638,15 @@ enum Hit {
     Verdict(FlowVerdict),
 }
 
-/// A peer resolved under one policy and identity generation.
+/// A peer (or a by-source peer and a remote address) resolved under one
+/// policy and identity generation.
 #[derive(Debug)]
 struct PeerInfo {
     generation: u64,
     identity: u64,
+    /// A marker: the peer's principal depends on the packet's address and is
+    /// resolved per address. Its other fields are those of an unknown peer.
+    by_source: bool,
     /// `None` for an unknown peer.
     source: Option<SourceAssertion>,
     /// The source anchor of `source`.
@@ -429,19 +672,35 @@ enum Governed {
 }
 
 impl PeerInfo {
+    /// Resolve `peer` for packets whose remote address is `src`.
     fn resolve(
         identity: &dyn PeerIdentity,
         snapshot: &Snapshot,
         peer: PeerId,
+        src: IpAddr,
         generation: u64,
     ) -> Self {
-        let source = identity.assertion(peer);
+        Self::new(
+            identity.assertion_for(peer, src),
+            snapshot,
+            generation,
+            false,
+        )
+    }
+
+    fn new(
+        source: Option<SourceAssertion>,
+        snapshot: &Snapshot,
+        generation: u64,
+        by_source: bool,
+    ) -> Self {
         let principal: Option<Arc<str>> = source.as_ref().map(|s| s.source_anchor().into());
         let principal_str = principal.as_deref();
         let membership = principal_str.and_then(|principal| snapshot.membership(principal));
         Self {
             generation: snapshot.generation(),
             identity: generation,
+            by_source,
             governed: match membership {
                 None => Governed::Default,
                 Some(membership) if membership.outbound_restricted() => Governed::Restricted,
@@ -483,7 +742,8 @@ impl PeerInfo {
 ///
 /// IPv4 fragments: a first fragment is evaluated and its outcome recorded;
 /// later fragments of the same packet follow it, and a later fragment with no
-/// recorded first fragment is dropped.
+/// recorded first fragment is dropped. [`AclFilterConfig::fragments`] selects
+/// how inbound IPv4 fragments are recorded ([`FragmentMode`]).
 ///
 /// Clones share all state, so one clone can go to the engine and another can
 /// read [`stats`](Self::stats).
@@ -580,6 +840,7 @@ impl AclFilter {
             reply_revoked: load(&c.reply_revoked),
             pending_evictions: load(&c.pending_evictions),
             verdict_evictions: load(&c.verdict_evictions),
+            bypassed: load(&c.bypassed),
         }
     }
 }
@@ -607,6 +868,24 @@ impl Inner {
     }
 
     fn inbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
+        if let Some(local) = self.config.accept_to_local
+            && is_to_local(bytes, local)
+        {
+            return Outcome::Bypassed;
+        }
+        if self.config.accept_icmp_echo_reply && is_icmp_echo_reply(bytes) {
+            return Outcome::Bypassed;
+        }
+        // `Some` for an IPv4 packet in the allow-only mode.
+        let allow_only = match self.config.fragments {
+            FragmentMode::AllowOnly { ttl, capacity } => {
+                ipv4_fragment(bytes).map(|fragment| (fragment, ttl, capacity))
+            }
+            FragmentMode::Outcome => None,
+        };
+        if let Some(((key, true, _), ttl, _)) = allow_only {
+            return self.follow_allowed(key, ttl);
+        }
         let snapshot = self.engine.snapshot();
         if !snapshot.is_loaded() {
             return Outcome::NoPolicy;
@@ -614,9 +893,54 @@ impl Inner {
         let Ok(packet) = IpPacket::parse(bytes) else {
             return Outcome::Malformed;
         };
-        self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
-            self.evaluate(&snapshot, peer, packet)
-        })
+        let Some(((key, _, first_of_many), ttl, capacity)) = allow_only else {
+            return self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
+                self.evaluate(&snapshot, peer, packet)
+            });
+        };
+        let outcome = self.evaluate(&snapshot, peer, &packet);
+        if first_of_many && matches!(outcome, Outcome::Accepted | Outcome::Reply) {
+            self.remember_allowed(key, ttl, capacity);
+        }
+        outcome
+    }
+
+    /// [`FragmentMode::AllowOnly`]: whether the first fragment of `key` was
+    /// accepted less than `ttl` ago; an expired entry is removed.
+    fn follow_allowed(&self, key: AllowedKey, ttl: Duration) -> Outcome {
+        let now = self.engine.now();
+        let mut table = self
+            .fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match table.allowed.get(&key) {
+            Some(&recorded) if now.duration_since(recorded) < ttl => Outcome::Accepted,
+            Some(_) => {
+                table.allowed.remove(&key);
+                Outcome::Fragment
+            }
+            None => Outcome::Fragment,
+        }
+    }
+
+    /// [`FragmentMode::AllowOnly`]: record the accepted first fragment of
+    /// `key`, removing the expired entries first when the table is full and
+    /// recording nothing when it is still full.
+    fn remember_allowed(&self, key: AllowedKey, ttl: Duration, capacity: usize) {
+        let now = self.engine.now();
+        let mut table = self
+            .fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if table.allowed.len() >= capacity {
+            table
+                .allowed
+                .retain(|_, &mut recorded| now.duration_since(recorded) < ttl);
+            if table.allowed.len() >= capacity {
+                return;
+            }
+        }
+        table.allowed.insert(key, now);
     }
 
     /// Run `evaluate` on an unfragmented packet or a first fragment, recording
@@ -683,7 +1007,7 @@ impl Inner {
             }
             None if identity == 0 => None,
             None => {
-                let info = self.cached_peer(&mut table, snapshot, peer, identity);
+                let info = self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity);
                 if info.bypass {
                     drop(table);
                     self.sweep_if(sweep);
@@ -705,7 +1029,7 @@ impl Inner {
         self.sweep_if(sweep);
         let (verdict, cacheable) = info.map_or_else(
             || {
-                let source = self.identity.assertion(peer);
+                let source = self.identity.assertion_for(peer, tuple.src);
                 let principal = source
                     .as_ref()
                     .filter(|_| snapshot.has_members())
@@ -833,7 +1157,7 @@ impl Inner {
         if let Some(dependency) = &verdict.dependency {
             self.record_pending(table, tuple, dependency.clone());
         }
-        if verdict.restricted {
+        if verdict.restricted && self.config.stateful_replies {
             self.record_reply(
                 table,
                 peer,
@@ -844,13 +1168,16 @@ impl Inner {
         }
     }
 
-    /// The resolved `peer` under the snapshot's generation and `identity`,
-    /// resolving it again when missing or stale.
+    /// The resolved `peer` for packets whose remote address is `src` under
+    /// the snapshot's generation and `identity`, resolving it again when
+    /// missing or stale. A by-source peer is resolved per address; with no
+    /// address it is unknown.
     fn cached_peer<'t>(
         &self,
         table: &'t mut FlowTable,
         snapshot: &Snapshot,
         peer: PeerId,
+        src: Option<IpAddr>,
         identity: u64,
     ) -> &'t Arc<PeerInfo> {
         let generation = snapshot.generation();
@@ -863,12 +1190,52 @@ impl Inner {
                 table.peers.clear();
             }
         }
-        let resolve = || Arc::new(PeerInfo::resolve(&*self.identity, snapshot, peer, identity));
+        let resolve = || {
+            let info = match src {
+                _ if self.identity.by_source(peer) => PeerInfo::new(None, snapshot, identity, true),
+                Some(src) => PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity),
+                None => PeerInfo::new(self.identity.assertion(peer), snapshot, identity, false),
+            };
+            Arc::new(info)
+        };
         let info = table.peers.entry(peer).or_insert_with(resolve);
         if info.generation != generation || info.identity != identity {
             *info = resolve();
         }
-        info
+        match src {
+            Some(src) if info.by_source => {
+                self.cached_source(&mut table.sources, snapshot, peer, src, identity)
+            }
+            _ => info,
+        }
+    }
+
+    /// The resolved by-source `peer` for the remote address `src`, as
+    /// [`cached_peer`](Self::cached_peer).
+    fn cached_source<'t>(
+        &self,
+        sources: &'t mut LruMap<(PeerId, IpAddr), Arc<PeerInfo>>,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        src: IpAddr,
+        identity: u64,
+    ) -> &'t Arc<PeerInfo> {
+        let key = (peer, src);
+        let fresh = sources.get(&key).is_some_and(|info| {
+            info.generation == snapshot.generation() && info.identity == identity
+        });
+        if fresh {
+            sources.touch(&key);
+        } else {
+            if !sources.contains_key(&key) && sources.len() >= self.config.reply_capacity.max(1) {
+                sources.pop_oldest();
+            }
+            let info = PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity);
+            sources.insert(key, Arc::new(info));
+        }
+        sources
+            .get(&key)
+            .unwrap_or_else(|| unreachable!("the entry was just touched or inserted"))
     }
 
     /// The live reply allowance (refreshed) or the valid cached verdict for
@@ -989,25 +1356,27 @@ impl Inner {
     fn outbound(&self, peer: PeerId, bytes: &[u8]) -> Outcome {
         let snapshot = self.engine.snapshot();
         let identity = self.identity_generation();
+        let parsed = IpPacket::parse(bytes);
+        // The remote address; a by-source peer is unknown without it.
+        let dst = parsed.as_ref().ok().map(IpPacket::dst);
         let mut table = self.table();
         // `None`: an unrestricted peer without pinholes.
         let info = if identity != 0 {
-            let info = self.cached_peer(&mut table, &snapshot, peer, identity);
+            let info = self.cached_peer(&mut table, &snapshot, peer, dst, identity);
             (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
         } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
-            Some(Arc::new(PeerInfo::resolve(
-                &*self.identity,
-                &snapshot,
-                peer,
-                0,
-            )))
+            let source = dst.map_or_else(
+                || self.identity.assertion(peer),
+                |dst| self.identity.assertion_for(peer, dst),
+            );
+            Some(Arc::new(PeerInfo::new(source, &snapshot, 0, false)))
         } else {
             None
         };
         let restricted = info
             .as_ref()
             .is_some_and(|info| info.governed == Governed::Restricted);
-        let Ok(packet) = IpPacket::parse(bytes) else {
+        let Ok(packet) = parsed else {
             return if restricted {
                 Outcome::OutboundDenied
             } else {
@@ -2787,5 +3156,706 @@ mod tests {
             inbound(&f, PEER, tcp_packet(remote, 4000, v4_local, 80)),
             Verdict::Accept
         );
+    }
+
+    // ── Per-source principals ──
+
+    const GATEWAY: PeerId = PeerId::new(20);
+
+    /// The ns identities plus [`GATEWAY`] terminating by source address.
+    fn by_source_identity() -> Arc<PeerIdentityMap> {
+        let map = ns_identity();
+        map.insert_by_source(GATEWAY);
+        map
+    }
+
+    /// A namespace whose only member is the source address `member`, with
+    /// `acls` and the given outbound rules.
+    fn address_namespace(
+        member: IpAddr,
+        acls: Vec<AclRule>,
+        outbound: Option<Vec<OutboundRule>>,
+    ) -> NamespacePolicy {
+        NamespacePolicy {
+            members: vec![NamespaceMember {
+                principal: member.to_string(),
+                addresses: vec![member.to_string().parse().unwrap()],
+            }],
+            policy: policy(acls),
+            outbound,
+            ..NamespacePolicy::default()
+        }
+    }
+
+    #[test]
+    fn by_source_peer_is_judged_by_each_source() {
+        let map = by_source_identity();
+        let (r, other, l) = (addr("10.0.0.1"), addr("10.0.0.5"), addr("10.0.0.2"));
+        // The principal of `AccessRequest::from_ip`, and no address-independent one.
+        assert!(map.assertion(GATEWAY).is_none());
+        let source = map.assertion_for(GATEWAY, r).unwrap();
+        let expected = AccessRequest::from_ip(r, l, 80, Protocol::Tcp).source;
+        assert_eq!(source.source_anchor(), expected.source_anchor());
+        assert_eq!(source.ip(), expected.ip());
+        assert_eq!(source.source_class(), "terminate-binding");
+        assert!(map.by_source(GATEWAY) && !map.by_source(KEY_PEER));
+
+        let f = AclFilter::new(loaded_engine(test_policy()), Arc::clone(&map));
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(other, 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+        // Each source keeps its own principal on later packets.
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(r, 4001, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(other, 4001, l, 80)),
+            drop(reasons::DENIED)
+        );
+        // A relayed client in the same map keeps its key principal.
+        assert_eq!(
+            inbound(&f, KEY_PEER, udp_packet(other, 5000, l, 53)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, KEY_PEER, tcp_packet(r, 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+    }
+
+    #[test]
+    fn by_source_cache_is_bounded() {
+        let config = AclFilterConfig {
+            reply_capacity: 2,
+            ..AclFilterConfig::default()
+        };
+        let f = AclFilter::with_config(loaded_engine(test_policy()), by_source_identity(), config);
+        let l = addr("10.0.0.2");
+        for round in 0..3 {
+            for last in [1, 5, 6, 7] {
+                let src = addr(&format!("10.0.0.{last}"));
+                let expected = if last == 1 {
+                    Verdict::Accept
+                } else {
+                    drop(reasons::DENIED)
+                };
+                assert_eq!(
+                    inbound(&f, GATEWAY, tcp_packet(src, 4000 + round, l, 80)),
+                    expected
+                );
+            }
+        }
+        let table = f.inner.table();
+        assert!(table.sources.len() <= 2);
+    }
+
+    #[test]
+    fn closure_identity_uses_the_default_assertion_for() {
+        let identity =
+            |peer: PeerId| (peer == PEER).then_some(SourceAssertion::WgPeerKey { pubkey: KEY });
+        let any = addr("10.0.0.9");
+        assert_eq!(
+            identity.assertion_for(PEER, any).map(|s| s.source_anchor()),
+            Some(wg_peer_anchor(&KEY))
+        );
+        assert!(!identity.by_source(PEER));
+        let f = AclFilter::new(loaded_engine(test_policy()), identity);
+        assert_eq!(
+            inbound(&f, PEER, udp_packet(any, 5000, addr("10.0.0.2"), 53)),
+            Verdict::Accept
+        );
+    }
+
+    #[test]
+    fn switching_between_by_source_and_by_key_applies_to_the_next_packet() {
+        let engine = Arc::new(AclEngine::new());
+        let member = peer_addr(A);
+        engine
+            .store_namespace(
+                "nsd:a",
+                address_namespace(member, vec![rule("*", "*:22", "tcp")], None),
+            )
+            .unwrap();
+        let map = by_source_identity();
+        let f = AclFilter::new(Arc::clone(&engine), Arc::clone(&map));
+        let local = addr(LOCAL);
+        let packet = || tcp_packet(member, 4000, local, 22);
+
+        // The member source's flow verdict is cached.
+        assert_eq!(inbound(&f, GATEWAY, packet()), Verdict::Accept);
+        assert_eq!(inbound(&f, GATEWAY, packet()), Verdict::Accept);
+        // Another source of the same peer is in no namespace.
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(addr("fd00::77"), 4000, local, 22)),
+            drop(reasons::NO_POLICY)
+        );
+
+        // By key: the key principal is in no namespace either.
+        map.insert(
+            GATEWAY,
+            SourceAssertion::WgPeerKey {
+                pubkey: peer_key(A),
+            },
+        );
+        assert_eq!(inbound(&f, GATEWAY, packet()), drop(reasons::NO_POLICY));
+        map.insert_by_source(GATEWAY);
+        assert_eq!(inbound(&f, GATEWAY, packet()), Verdict::Accept);
+        map.remove(GATEWAY);
+        assert_eq!(inbound(&f, GATEWAY, packet()), drop(reasons::UNKNOWN_PEER));
+    }
+
+    #[test]
+    fn bypass_is_never_shared_across_sources() {
+        let engine = Arc::new(AclEngine::new());
+        let open = addr("fd00::b");
+        let accept_all = AclRule {
+            action: AclAction::Accept,
+            src: vec!["*".to_owned()],
+            dst: vec!["*:*".to_owned()],
+            proto: None,
+        };
+        engine
+            .store_namespace("nsd:a", address_namespace(open, vec![accept_all], None))
+            .unwrap();
+        let f = AclFilter::new(Arc::clone(&engine), by_source_identity());
+        let local = addr(LOCAL);
+        assert_eq!(
+            inbound(&f, GATEWAY, udp_packet(open, 4000, local, 9999)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, GATEWAY, udp_packet(addr("fd00::c"), 4000, local, 9999)),
+            drop(reasons::NO_POLICY)
+        );
+
+        // A default policy that accepts everything bypasses every source in no namespace.
+        engine.load(policy(vec![rule("*", "*:*", "udp")])).unwrap();
+        assert_eq!(
+            inbound(&f, GATEWAY, udp_packet(addr("fd00::c"), 4000, local, 9999)),
+            Verdict::Accept
+        );
+        // A partial default policy bypasses nothing.
+        engine
+            .load(policy(vec![rule("fd00::d/128", "*:*", "udp")]))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, GATEWAY, udp_packet(addr("fd00::d"), 4000, local, 9999)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, GATEWAY, udp_packet(addr("fd00::c"), 4000, local, 9999)),
+            drop(reasons::DENIED)
+        );
+    }
+
+    #[test]
+    fn outbound_restriction_follows_the_destination_address() {
+        let engine = Arc::new(AclEngine::new());
+        let restricted = peer_addr(A);
+        engine
+            .store_namespace(
+                "nsd:a",
+                address_namespace(
+                    restricted,
+                    vec![rule("*", "*:22", "tcp")],
+                    Some(vec![outbound_rule(Some("tcp"), "80")]),
+                ),
+            )
+            .unwrap();
+        let local = addr(LOCAL);
+        for f in [
+            AclFilter::new(Arc::clone(&engine), by_source_identity()),
+            AclFilter::uncached(
+                Arc::clone(&engine),
+                by_source_identity(),
+                AclFilterConfig::default(),
+            ),
+        ] {
+            assert_eq!(
+                outbound(&f, GATEWAY, tcp_packet(local, 5000, restricted, 9999)),
+                drop(reasons::OUTBOUND)
+            );
+            assert_eq!(
+                outbound(&f, GATEWAY, tcp_packet(local, 5000, restricted, 80)),
+                Verdict::Accept
+            );
+            // Another destination behind the same peer is unrestricted.
+            assert_eq!(
+                outbound(&f, GATEWAY, tcp_packet(local, 5000, addr("fd00::c"), 9999)),
+                Verdict::Accept
+            );
+            // The restricted source's accepted inbound flow allows its reply.
+            assert_eq!(
+                inbound(&f, GATEWAY, tcp_packet(restricted, 4000, local, 22)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                outbound(&f, GATEWAY, tcp_packet(local, 22, restricted, 4000)),
+                Verdict::Accept
+            );
+            let stats = f.stats();
+            assert_eq!((stats.outbound_denied, stats.outbound_replies), (1, 1));
+        }
+    }
+
+    // ── crates/acl mode: allow-only fragments, bypass flags ───────────────
+
+    /// An engine with `policy` loaded whose clock is moved by hand.
+    fn clocked_engine(policy: AclPolicy) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
+        let clock = Arc::new(Mutex::new(Instant::now()));
+        let handle = Arc::clone(&clock);
+        let engine = AclEngine::with_clock(move || *handle.lock().unwrap());
+        engine.load(policy).unwrap();
+        (Arc::new(engine), clock)
+    }
+
+    fn advance(clock: &Mutex<Instant>, by: Duration) {
+        *clock.lock().unwrap() += by;
+    }
+
+    fn allow_only(capacity: usize) -> AclFilterConfig {
+        AclFilterConfig {
+            fragments: FragmentMode::AllowOnly {
+                ttl: Duration::from_secs(15),
+                capacity,
+            },
+            ..AclFilterConfig::default()
+        }
+    }
+
+    fn allowed_len(f: &AclFilter) -> usize {
+        f.inner.fragments.lock().unwrap().allowed.len()
+    }
+
+    /// The middle fragment of datagram `id`.
+    fn continuation(id: u16) -> PacketBuf {
+        fragment(id, 4, true, &[0; 8])
+    }
+
+    #[test]
+    fn allow_only_constants_are_those_of_ns() {
+        assert_eq!(FragmentMode::default(), FragmentMode::Outcome);
+        assert_eq!(
+            FragmentMode::ALLOW_ONLY,
+            FragmentMode::AllowOnly {
+                ttl: Duration::from_secs(15),
+                capacity: 4096,
+            }
+        );
+        let config = AclFilterConfig::default();
+        assert_eq!(config.fragments, FragmentMode::Outcome);
+        assert_eq!(config.accept_to_local, None);
+        assert!(!config.accept_icmp_echo_reply);
+    }
+
+    /// ns `fragment_gate_remembers_until_ttl_then_expires`.
+    #[test]
+    fn allow_only_remembers_until_ttl_then_expires() {
+        let (engine, clock) = clocked_engine(test_policy());
+        let f = AclFilter::with_config(engine, identity(), allow_only(4096));
+        assert_eq!(
+            inbound(&f, PEER, continuation(7)),
+            drop(reasons::FRAGMENT),
+            "empty gate denies"
+        );
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        advance(&clock, Duration::from_secs(1));
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        // Still valid just before the TTL boundary...
+        advance(&clock, Duration::from_millis(13_999));
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        // ...and gone at it (expiry is exclusive), removed on lookup.
+        advance(&clock, Duration::from_millis(1));
+        assert_eq!(inbound(&f, PEER, continuation(7)), drop(reasons::FRAGMENT));
+        assert_eq!(allowed_len(&f), 0, "expired entry removed on lookup");
+        let stats = f.stats();
+        assert_eq!((stats.accepted, stats.fragment), (3, 2));
+    }
+
+    /// ns `fragment_gate_is_bounded_and_prunes_expired_under_pressure`, with
+    /// a small capacity.
+    #[test]
+    fn allow_only_is_bounded_and_prunes_expired_under_pressure() {
+        let (engine, clock) = clocked_engine(test_policy());
+        let f = AclFilter::with_config(engine, identity(), allow_only(2));
+        for id in 1..=3 {
+            assert_eq!(inbound(&f, PEER, first_fragment(id, 80)), Verdict::Accept);
+        }
+        assert_eq!(allowed_len(&f), 2, "table must stay bounded");
+        // Live entries are never evicted: the third one was not recorded.
+        assert_eq!(inbound(&f, PEER, continuation(1)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(2)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(3)), drop(reasons::FRAGMENT));
+        assert_eq!(f.stats().fragment_evictions, 0);
+
+        // Once the live entries have expired, a new one prunes and succeeds.
+        advance(&clock, Duration::from_secs(16));
+        assert_eq!(inbound(&f, PEER, first_fragment(4, 80)), Verdict::Accept);
+        assert_eq!(allowed_len(&f), 1);
+        assert_eq!(inbound(&f, PEER, continuation(4)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_key_has_no_peer() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, OTHER_PEER, continuation(7)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_records_no_denied_first_fragment() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(9, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(allowed_len(&f), 0);
+        assert_eq!(inbound(&f, PEER, continuation(9)), drop(reasons::FRAGMENT));
+        let stats = f.stats();
+        assert_eq!((stats.denied, stats.fragment), (1, 1));
+    }
+
+    #[test]
+    fn allow_only_drops_out_of_order_continuations() {
+        let f = filter_with(allow_only(4096));
+        assert_eq!(inbound(&f, PEER, continuation(5)), drop(reasons::FRAGMENT));
+        assert_eq!(inbound(&f, PEER, first_fragment(5, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(5)), Verdict::Accept);
+    }
+
+    #[test]
+    fn allow_only_last_fragment_keeps_the_entry() {
+        let f = filter_with(allow_only(4096));
+        let last = || fragment(6, 6, false, &[0; 8]);
+        assert_eq!(inbound(&f, PEER, first_fragment(6, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, last()), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, last()), Verdict::Accept);
+        assert_eq!(allowed_len(&f), 1);
+    }
+
+    #[test]
+    fn allow_only_records_first_fragments_of_several_only() {
+        let f = filter_with(allow_only(4096));
+        let r = addr("10.0.0.1");
+        let l = addr("10.0.0.2");
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(allowed_len(&f), 0);
+    }
+
+    #[test]
+    fn allow_only_judges_continuations_before_the_policy_check() {
+        let engine = loaded_engine(test_policy());
+        let f = AclFilter::with_config(Arc::clone(&engine), identity(), allow_only(4096));
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        engine.clear();
+        assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(9, 80)),
+            drop(reasons::NO_POLICY)
+        );
+        // The outcome mode checks the policy first.
+        let f = AclFilter::with_config(engine, identity(), AclFilterConfig::default());
+        assert_eq!(inbound(&f, PEER, continuation(7)), drop(reasons::NO_POLICY));
+    }
+
+    #[test]
+    fn allow_only_leaves_ipv6_fragments_alone() {
+        let (r, l) = (addr("fd00::1"), addr("fd00::2"));
+        // A fragment header: next header TCP, offset 8 bytes, id 1.
+        let frag = ip(r, l, 44, &[protocol::TCP, 0, 0, 8, 0, 0, 0, 1, 0, 0]);
+        let first = ip(r, l, 44, &[protocol::TCP, 0, 0, 1, 0, 0, 0, 1, 0, 0]);
+        for config in [AclFilterConfig::default(), allow_only(4096)] {
+            let f = filter_with(config);
+            assert_eq!(inbound(&f, PEER, first.clone()), drop(reasons::PROTOCOL));
+            assert_eq!(inbound(&f, PEER, frag.clone()), drop(reasons::PROTOCOL));
+            assert_eq!(allowed_len(&f), 0);
+        }
+    }
+
+    #[test]
+    fn accept_to_local_bypasses_the_policy() {
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let engine = Arc::new(AclEngine::new());
+        let f = AclFilter::with_config(Arc::clone(&engine), identity(), AclFilterConfig::default());
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 9)),
+            drop(reasons::NO_POLICY)
+        );
+
+        let f = AclFilter::with_config(
+            engine,
+            identity(),
+            AclFilterConfig {
+                accept_to_local: Some("10.0.0.2".parse().unwrap()),
+                fragments: FragmentMode::ALLOW_ONLY,
+                ..AclFilterConfig::default()
+            },
+        );
+        // No policy, any port, an orphan fragment, another protocol.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 9)),
+            Verdict::Accept
+        );
+        assert_eq!(inbound(&f, PEER, continuation(3)), Verdict::Accept);
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(8, 1))),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, addr("10.0.0.3"), 9)),
+            drop(reasons::NO_POLICY)
+        );
+        // IPv6 is never bypassed.
+        assert_eq!(
+            inbound(
+                &f,
+                PEER,
+                tcp_packet(addr("fd00::1"), 4000, addr("fd00::2"), 9)
+            ),
+            drop(reasons::NO_POLICY)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.bypassed, stats.accepted, stats.no_policy), (3, 0, 2));
+        // Outbound is unaffected.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 9, r, 4000)),
+            Verdict::Accept
+        );
+    }
+
+    #[test]
+    fn accept_icmp_echo_reply_bypasses_the_policy() {
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let reply = || ip(r, l, protocol::ICMP, &icmp_echo(0, 1));
+        let request = || ip(r, l, protocol::ICMP, &icmp_echo(8, 1));
+        let f = filter();
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::PROTOCOL));
+
+        let f = AclFilter::with_config(
+            Arc::new(AclEngine::new()),
+            identity(),
+            AclFilterConfig {
+                accept_icmp_echo_reply: true,
+                fragments: FragmentMode::ALLOW_ONLY,
+                ..AclFilterConfig::default()
+            },
+        );
+        assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, request()), drop(reasons::NO_POLICY));
+        // As ns: the type byte of a non-first fragment is read too.
+        let tail = ip_frag(
+            r,
+            l,
+            protocol::ICMP,
+            &[0; 8],
+            Some(Frag {
+                id: 1,
+                offset_units: 4,
+                more: false,
+            }),
+        );
+        assert_eq!(inbound(&f, PEER, tail), Verdict::Accept);
+        // Too short for an ICMP header.
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &[0; 4])),
+            drop(reasons::NO_POLICY)
+        );
+        // An ICMPv6 echo reply is not bypassed.
+        let v6 = ip(
+            addr("fd00::1"),
+            addr("fd00::2"),
+            protocol::ICMPV6,
+            &icmp_echo(129, 1),
+        );
+        assert_eq!(inbound(&f, PEER, v6), drop(reasons::NO_POLICY));
+        assert_eq!(f.stats().bypassed, 2);
+    }
+
+    #[test]
+    fn stateless_replies_are_judged_by_the_policy_only() {
+        let f = AclFilter::with_config(
+            loaded_engine(test_policy()),
+            identity(),
+            AclFilterConfig {
+                stateful_replies: false,
+                allow_other_protocols: false,
+                ..AclFilterConfig::default()
+            },
+        );
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        assert_eq!(
+            outbound(&f, PEER, udp_packet(l, 5000, r, 9)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, udp_packet(r, 9, l, 5000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            outbound(&f, PEER, ip(l, r, protocol::ICMP, &icmp_echo(8, 1))),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(0, 1))),
+            drop(reasons::PROTOCOL)
+        );
+        // A reply the policy accepts is accepted as new traffic.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 80, r, 4000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        let stats = f.stats();
+        assert_eq!((stats.replies, stats.accepted), (0, 1));
+        let table = f.inner.table();
+        assert_eq!(table.entries.len(), 0);
+        assert!(table.pending.is_empty());
+    }
+
+    #[test]
+    fn stateless_replies_record_nothing_for_restricted_peers() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace(
+                "nsd:a",
+                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80")])),
+            )
+            .unwrap();
+        let config = AclFilterConfig {
+            stateful_replies: false,
+            ..AclFilterConfig::default()
+        };
+        let f = ns_filter(&engine, config);
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        for _ in 0..2 {
+            assert_eq!(
+                inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+                drop(reasons::OUTBOUND)
+            );
+        }
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 80, local, 5000)),
+            drop(reasons::DENIED)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.outbound_replies, stats.replies), (0, 0));
+        let table = f.inner.table();
+        assert_eq!(table.entries.len(), table.verdicts, "only cached verdicts");
+        assert!(table.pending.is_empty());
+    }
+
+    /// The identities of an ns account: gateways by source, relay clients
+    /// by key.
+    fn crates_acl_identity() -> Arc<PeerIdentityMap> {
+        let map = Arc::new(PeerIdentityMap::new());
+        map.insert_by_source(PEER);
+        map.insert(KEY_PEER, SourceAssertion::WgPeerKey { pubkey: KEY });
+        map
+    }
+
+    #[test]
+    fn crates_acl_preset() {
+        let local = "10.0.0.2".parse().unwrap();
+        let config = AclFilterConfig::crates_acl(Some(local));
+        assert_eq!(
+            config,
+            AclFilterConfig {
+                allow_other_protocols: false,
+                stateful_replies: false,
+                fragments: FragmentMode::ALLOW_ONLY,
+                accept_to_local: Some(local),
+                accept_icmp_echo_reply: true,
+                ..AclFilterConfig::default()
+            }
+        );
+        assert_eq!(AclFilterConfig::crates_acl(None).accept_to_local, None);
+    }
+
+    /// ns `acl_check_packet` (with `is_icmp_echo_reply` before it) through the
+    /// preset; ns has no unit tests of it, so these follow its code.
+    #[test]
+    fn crates_acl_matches_acl_check_packet() {
+        let engine = Arc::new(AclEngine::new());
+        let f = AclFilter::with_config(
+            Arc::clone(&engine),
+            crates_acl_identity(),
+            AclFilterConfig::crates_acl(None),
+        );
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        // No policy: fail closed, except echo replies.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            drop(reasons::NO_POLICY)
+        );
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(0, 1))),
+            Verdict::Accept
+        );
+        engine.load(test_policy()).unwrap();
+        // By source address.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(addr("10.0.0.7"), 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+        // A relay client by its key.
+        assert_eq!(
+            inbound(&f, KEY_PEER, udp_packet(addr("10.0.0.7"), 4000, l, 53)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, udp_packet(addr("10.0.0.7"), 4000, l, 53)),
+            drop(reasons::DENIED)
+        );
+        // Not TCP or UDP.
+        assert_eq!(
+            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(8, 1))),
+            drop(reasons::PROTOCOL)
+        );
+        // No reply allowances.
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 5000, r, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 22, l, 5000)),
+            drop(reasons::DENIED)
+        );
+        // Fragments through the allow-only gate.
+        assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
+        assert_eq!(inbound(&f, OTHER_PEER, continuation(7)), Verdict::Accept);
+        assert_eq!(
+            inbound(&f, PEER, first_fragment(8, 81)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
     }
 }
