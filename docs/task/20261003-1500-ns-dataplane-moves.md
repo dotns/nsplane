@@ -128,7 +128,10 @@ nsplane main as of the traffic-status change; full tables in ns docs/task/202610
       PF1, 7.3 % in PF3).
     - TSO split copy: `VnetReader::segment`, ~5 % of sender samples (4.4-5.7 % in PF1, 7 %
       in PF3).
-    - Find why kernel WireGuard -> nsplane-cli is slower in B in the harness only.
+    - Re-measure kernel WireGuard -> nsplane-cli on a quiet host after the merge (the full
+      harness table, run by L1; the dedicated quiet rerun showed -7 % median with one
+      3.74 Gbit/s outlier, not reproduced in the profiling containers); if confirmed, gate
+      inline delivery while datagrams are waiting.
 - MF-2 user-space mode (nsplane-netstack) is 12-14% below the legacy smoltcp stack; raising
   the TCP buffer to 1 MiB did not close it (4356 vs 4897 Mbit/s, within noise). Cause unknown;
   ask: profile nsplane-netstack under the same single-stream load. MB-x5 stays useful but is
