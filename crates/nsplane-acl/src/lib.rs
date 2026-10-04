@@ -310,7 +310,7 @@ pub use engine::{
 };
 pub use filter::{
     AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
-    PeerIdentity, PeerIdentityMap,
+    OtherProtocol, OtherProtocolRule, PeerIdentity, PeerIdentityMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{

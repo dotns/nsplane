@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use nsplane::{ChannelSink, ChannelSource, ChannelTransport, EngineBuilder, Event, TransportId};
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, IpNet, PeerIdentityMap,
-    SourceAssertion, reasons,
+    AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, IpNet, OtherProtocol,
+    OtherProtocolRule, PeerIdentityMap, SourceAssertion, reasons,
 };
-use nsplane_e2e::{Node, Options, TestResult, introduce, udp};
+use nsplane_e2e::{Node, Options, TestResult, icmp, introduce, udp};
 
 /// Capacity of the channel transport pair.
 const CAPACITY: usize = 1024;
@@ -111,5 +111,93 @@ async fn outbound_from_a_foreign_source_is_dropped() -> TestResult {
 
     assert_eq!(b.drops(reasons::OUTBOUND_SOURCE).await?, 2);
     assert_eq!(filter.stats().outbound_source, 2);
+    Ok(())
+}
+
+/// An echo message (`kind` 8 or 128 for a request, 0 or 129 for a reply) from `src` to `dst`
+/// with identifier `id`.
+fn echo(src: IpAddr, dst: IpAddr, kind: u8, id: u16) -> Vec<u8> {
+    let [hi, lo] = id.to_be_bytes();
+    icmp(src, dst, (kind, 0), [hi, lo, 0, 1], b"ping")
+}
+
+/// Sends `packet` from `from` and checks that `to` delivers it unchanged.
+async fn delivered(from: &AclNode, to: &mut AclNode, packet: &[u8]) -> TestResult {
+    from.send(packet).await?;
+    let (_, got) = to.expect_delivery().await?;
+    if got != packet {
+        return Err("packet changed in transit".into());
+    }
+    Ok(())
+}
+
+/// A scope accepting ICMP echo requests to `destinations`.
+fn echo_scope(destinations: &[&str]) -> TestResult<AclFilterScope> {
+    let destinations = destinations
+        .iter()
+        .map(|net| net.parse::<IpNet>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let rule = OtherProtocolRule::new(OtherProtocol::IcmpEcho, destinations);
+    Ok(AclFilterScope::new().with_other_protocol(rule))
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn echo_to_own_addresses_is_accepted_and_answered() -> TestResult {
+    let scope = echo_scope(&[&format!("{B_IP4}/32"), &format!("{B_IP6}/128")])?;
+    let (mut a, mut b, filter) = scoped_pair(scope).await?;
+    for (from, to, request, reply) in [
+        (IpAddr::V4(a.ip4), IpAddr::V4(b.ip4), 8, 0),
+        (IpAddr::V6(a.ip6), IpAddr::V6(b.ip6), 128, 129),
+    ] {
+        delivered(&a, &mut b, &echo(from, to, request, 1)).await?;
+        delivered(&b, &mut a, &echo(to, from, reply, 1)).await?;
+    }
+    let stats = filter.stats();
+    assert_eq!((stats.accepted, stats.protocol), (2, 0));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn echo_outside_the_rule_is_dropped() -> TestResult {
+    // Only b's IPv4 address: an echo to its IPv6 address is outside the rule.
+    let (a, mut b, filter) = scoped_pair(echo_scope(&[&format!("{B_IP4}/32")])?).await?;
+    let mut events = b.subscribe().await?;
+    a.send(&echo(IpAddr::V6(a.ip6), IpAddr::V6(b.ip6), 128, 1))
+        .await?;
+    events
+        .expect(|e| matches!(e, Event::Dropped { reason, .. } if *reason == reasons::PROTOCOL))
+        .await?;
+    b.expect_no_delivery().await?;
+    // Neither is another ICMP message to the address in the rule.
+    a.send(&icmp(
+        IpAddr::V4(a.ip4),
+        IpAddr::V4(b.ip4),
+        (13, 0),
+        [0; 4],
+        &[0; 12],
+    ))
+    .await?;
+    events
+        .expect(|e| matches!(e, Event::Dropped { reason, .. } if *reason == reasons::PROTOCOL))
+        .await?;
+    b.expect_no_delivery().await?;
+    assert_eq!(b.drops(reasons::PROTOCOL).await?, 2);
+    assert_eq!(filter.stats().protocol, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn replies_to_own_pings_pass_the_reply_table() -> TestResult {
+    let scope = echo_scope(&[&format!("{B_IP4}/32"), &format!("{B_IP6}/128")])?;
+    let (mut a, mut b, filter) = scoped_pair(scope).await?;
+    for (own, remote, request, reply) in [
+        (IpAddr::V4(b.ip4), IpAddr::V4(a.ip4), 8, 0),
+        (IpAddr::V6(b.ip6), IpAddr::V6(a.ip6), 128, 129),
+    ] {
+        delivered(&b, &mut a, &echo(own, remote, request, 9)).await?;
+        delivered(&a, &mut b, &echo(remote, own, reply, 9)).await?;
+    }
+    let stats = filter.stats();
+    assert_eq!((stats.replies, stats.accepted, stats.protocol), (2, 0, 0));
     Ok(())
 }
