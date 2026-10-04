@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covered per carrier by `nsplane-e2e` `wss_keepalive`: `WssDialer` links and
   `WssStreamClient` sessions ping at the configured interval and end after the configured
   read idle.
+- `nsplane-wss`: `WssStreamLimits::open_timeout: Option<Duration>` (setter
+  `open_timeout(Duration)`): with it, `WssStreamClient::connect`, `open_tcp` and
+  `open_udp` fail after the timeout with the last dial error (kind, message and
+  `WssDialError`), or `TimedOut` ("wss open timed out") when no dial failed since the last
+  session, instead of waiting out the backoff or the 401 token wait (up to 300 s); the
+  dial goes on and serves later opens. `None` (the default) keeps opens waiting as before.
+
+### Fixed
+- `nsplane-wss`: a `WssStreamClient` open dropped while its session dial waited no longer
+  resets that dial's backoff or 401 token wait (the next dial went at once): session dials
+  now run in a task of their own that the waiting opens share.
 
 ## [0.8.0] - 2026-10-04
 
