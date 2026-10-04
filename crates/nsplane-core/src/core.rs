@@ -463,14 +463,51 @@ impl Core {
         self.peers.by_destination(dst)
     }
 
+    /// The path `peer`'s next transport data message would leave on: the one the policy
+    /// selects for [`MessageKind::Data`], or the peer's current path. `None` for an unknown
+    /// peer or one without a path.
+    pub fn data_path(&self, peer: PeerId) -> Option<Path> {
+        let current = self.peers.peer(peer)?.path();
+        self.policy.select(peer, MessageKind::Data).or(current)
+    }
+
+    /// Whether `index` is the receiver index `peer`'s current session puts on its transport
+    /// data messages (the index the peer assigned to it), e.g. to check that a quoted
+    /// datagram is ours. `false` for an unknown peer or one without a session.
+    pub fn is_remote_index(&self, peer: PeerId, index: u32) -> bool {
+        self.peers
+            .peer(peer)
+            .is_some_and(|p| p.remote_index() == Some(index))
+    }
+
+    /// Caps the padding of `peer`'s transport data at `limit` bytes of plaintext, as the
+    /// kernel pads to the interface MTU: set it to the peer's inner MTU so that a packet at
+    /// that MTU makes a datagram of exactly the MTU plus 32 bytes. Packets of at least
+    /// `limit` bytes are not padded. `None` (the default) pads every packet to a multiple of
+    /// 16 bytes. Both [`Core::handle_input`] and [`CryptoJob`]s honor it. Unknown peers are
+    /// ignored.
+    pub fn set_peer_pad_limit(&mut self, peer: PeerId, limit: Option<u16>) {
+        if let Some(p) = self.peers.peer_mut(peer) {
+            p.tunnel_mut().set_pad_limit(limit.map(usize::from));
+        }
+    }
+
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
     /// allowed-IP source check.
+    ///
+    /// Part of the contract: no inbound [`PacketFilter`] sees the packet, so a stateful
+    /// filter records nothing about it and a translating filter does not translate it.
     pub fn inject_inbound(&mut self, peer: PeerId, packet: PacketBuf) {
         self.outputs
             .push_back(Output::Deliver { from: peer, packet });
     }
 
     /// Encrypts `packet` like `Input::Local`, bypassing the outbound filters.
+    ///
+    /// Part of the contract, which will not change silently: no outbound [`PacketFilter`]
+    /// sees the packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply
+    /// state for it, so the peer's replies are judged by the inbound rules alone, and a
+    /// translating filter does not translate it.
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
         self.send(packet, false, &mut Lookups::default());
@@ -482,6 +519,10 @@ impl Core {
     /// not changed. The tunnel counts it as sent data like any packet. Without a current
     /// session the packet is dropped as [`reasons::NO_SESSION`], neither queued nor a reason
     /// to start a handshake. Unknown peers are ignored.
+    ///
+    /// Like [`Core::inject_outbound`], part of the contract: no outbound [`PacketFilter`]
+    /// sees the packet, so a stateful filter records no reply state for it (its replies are
+    /// judged by the inbound rules alone) and a translating filter does not translate it.
     pub fn inject_outbound_on(
         &mut self,
         peer: PeerId,
@@ -1358,5 +1399,176 @@ mod tests {
         assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
         assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
         assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
+    }
+
+    /// Sends data on a fixed path, everything else on the current one.
+    struct DataOn(Path);
+
+    impl PathPolicy for DataOn {
+        fn select(&self, _peer: PeerId, kind: MessageKind) -> Option<Path> {
+            (kind == MessageKind::Data).then_some(self.0)
+        }
+
+        fn on_authenticated(&self, _peer: PeerId, _from: &Path, _kind: MessageKind) -> Roam {
+            Roam::Keep
+        }
+    }
+
+    #[test]
+    fn data_path_follows_the_policy_then_the_current_path() {
+        let path = |port| Path {
+            transport: nsplane_packet::TransportId::new(1),
+            addr: std::net::SocketAddr::from(([192, 0, 2, 1], port)),
+            ecn: Ecn::NotEct,
+        };
+        let add = |core: &mut Core, with_path: bool| {
+            let key = x25519::PublicKey::from([7; 32]);
+            let mut config = PeerConfig::new(key);
+            config.path = with_path.then(|| path(1));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core.peer_id(&key).unwrap()
+        };
+        let private_key = Some(x25519::StaticSecret::from([1; 32]));
+
+        let mut core = Core::new(CoreConfig {
+            private_key: private_key.clone(),
+            ..CoreConfig::default()
+        });
+        assert_eq!(core.data_path(PeerId::new(99)), None);
+        let id = add(&mut core, false);
+        assert_eq!(core.data_path(id), None);
+        let id = add(&mut core, true);
+        assert_eq!(core.data_path(id), Some(path(1)));
+        assert!(!core.is_remote_index(id, 0));
+        assert!(!core.is_remote_index(PeerId::new(99), 0));
+
+        let mut core = Core::new(CoreConfig {
+            private_key,
+            policy: Box::new(DataOn(path(2))),
+            ..CoreConfig::default()
+        });
+        let id = add(&mut core, true);
+        assert_eq!(core.data_path(id), Some(path(2)));
+    }
+
+    /// Two cores, `0` at `10.0.0.1` and `1` at `10.0.0.2`, peered with each other.
+    fn core_pair(crypto_jobs: bool) -> [Core; 2] {
+        let secrets = [[1; 32], [2; 32]].map(x25519::StaticSecret::from);
+        let path = |i: u8| Path {
+            transport: nsplane_packet::TransportId::new(u16::from(i)),
+            addr: std::net::SocketAddr::from(([192, 0, 2, i + 1], 51820)),
+            ecn: Ecn::NotEct,
+        };
+        [0u8, 1].map(|i| {
+            let other = usize::from(1 - i);
+            let mut core = Core::new(CoreConfig {
+                private_key: Some(secrets[usize::from(i)].clone()),
+                crypto_jobs,
+                ..CoreConfig::default()
+            });
+            let mut config = PeerConfig::new(x25519::PublicKey::from(&secrets[other]));
+            config.allowed_ips = vec![format!("10.0.0.{}/32", other + 1).parse().unwrap()];
+            config.path = Some(path(1 - i));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core
+        })
+    }
+
+    /// Moves datagrams between the cores until both are quiet; returns what each delivered.
+    fn pump(cores: &mut [Core; 2]) -> [Vec<Vec<u8>>; 2] {
+        let mut delivered = [Vec::new(), Vec::new()];
+        loop {
+            let mut quiet = true;
+            for i in 0..2 {
+                while let Some(output) = cores[i].poll_output() {
+                    match output {
+                        Output::Transmit { data, .. } => {
+                            quiet = false;
+                            // It arrives on the path the receiver has for the sender.
+                            let sender = cores[1 - i].peers().next().unwrap();
+                            let path = cores[1 - i].data_path(sender).unwrap();
+                            cores[1 - i]
+                                .handle_input(Input::Datagram { path, data }, Instant::now());
+                        }
+                        Output::Deliver { packet, .. } => {
+                            delivered[i].push(packet.as_packet().to_vec());
+                        }
+                        Output::Event(_) => {}
+                    }
+                }
+            }
+            if quiet {
+                return delivered;
+            }
+        }
+    }
+
+    /// An IPv4 packet of `len` bytes from `10.0.0.1` to `10.0.0.2`.
+    fn local_packet(len: usize) -> PacketBuf {
+        let mut buf = PacketBuf::with_capacity(2048);
+        buf.set_len(len);
+        let p = buf.as_packet_mut();
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        buf
+    }
+
+    #[test]
+    fn padding_stops_at_the_peer_pad_limit() {
+        for crypto_jobs in [false, true] {
+            let mut cores = core_pair(crypto_jobs);
+            // The first packet waits for the handshake.
+            cores[0].handle_input(
+                Input::Local {
+                    packet: local_packet(100),
+                },
+                Instant::now(),
+            );
+            assert_eq!(pump(&mut cores)[1].len(), 1);
+            let peer = cores[0].peers().next().unwrap();
+
+            // (limit, packet length, padded plaintext)
+            for (limit, len, padded) in [
+                (None, 1001, 1008),
+                (Some(1003), 1001, 1003),
+                (Some(1003), 1003, 1003),
+                (Some(1003), 1010, 1010),
+                (Some(1280), 1001, 1008),
+                (None, 1003, 1008),
+                // A peer at the source MTU: 1420 bytes would pad to 1424.
+                (Some(1420), 1420, 1420),
+                (None, 1420, 1424),
+            ] {
+                cores[0].set_peer_pad_limit(peer, limit);
+                let packet = local_packet(len);
+                let sent = packet.as_packet().to_vec();
+                let input = Input::Local { packet };
+                if crypto_jobs {
+                    let mut job = cores[0]
+                        .handle_input_deferred(input, Instant::now())
+                        .unwrap();
+                    job.run();
+                    cores[0].complete_job(job);
+                } else {
+                    cores[0].handle_input(input, Instant::now());
+                }
+                let Some(Output::Transmit { path, data }) = cores[0].poll_output() else {
+                    unreachable!();
+                };
+                assert_eq!(data.len(), DATA_HEADER_SZ + padded + 16, "{limit:?} {len}");
+                cores[0].outputs.push_front(Output::Transmit { path, data });
+                assert_eq!(pump(&mut cores)[1], [sent], "{limit:?} {len}");
+            }
+        }
     }
 }
