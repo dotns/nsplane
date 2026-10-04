@@ -36,6 +36,11 @@
 //!   picks (e.g. a user-space stack), with the reverse SNAT of the replies
 //!   to the original destination. Like [`Nat64Lan`], it sits on the local
 //!   side (`forward` / `reverse` on a `PacketBuf`).
+//! - **Local-side masquerade** ([`masquerade`]): a stateful IPv6 source
+//!   NAPT ([`Masquerade`]) of routed LAN ingress to a source and route a
+//!   caller-supplied closure picks per flow, with source ports or Echo
+//!   identifiers allocated from a range and the reverse restore of the
+//!   replies. It also sits on the local side.
 //! - **Filter order**: the core's filter chain is installed from the wire side
 //!   to the local side (inbound in install order, outbound in reverse); the
 //!   recommended stack is `[AclFilter, PortMap, Translator]`, so the ACL and
@@ -55,6 +60,7 @@
 
 pub mod checksum;
 pub mod conntrack;
+pub mod masquerade;
 pub mod nat64_lan;
 pub mod port_map;
 pub mod redirect;
@@ -64,6 +70,9 @@ pub mod translate;
 pub use conntrack::{
     Conntrack, ConntrackConfig, ConntrackError, ConntrackStats, Flow, FlowDirection, FlowMatch,
     TcpState,
+};
+pub use masquerade::{
+    Masquerade, MasqueradeConfig, MasqueradeDecision, MasqueradeStats, MasqueradeVerdict,
 };
 pub use nat64_lan::{
     DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanSink,

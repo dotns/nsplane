@@ -431,6 +431,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the queues on the path loses its tail and recovers by retransmission timeout, so the
   default stays (ns's MB-x5; MB-x6 needs no code, `NetStackStats::syn_refused` counts SYNs
   refused for a full listener pool).
+- `nsplane-nat`: `Masquerade`, a local-side IPv6 source NAPT of routed LAN ingress, ported
+  from ns `subnet/ingress.rs` (`SubnetLanIngressTranslator`). A decision closure gives each
+  new TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision { source: Ipv6Addr,
+  route: u64 }`; the contract's `source: IpAddr` became `Ipv6Addr` by L1 decision, so an
+  IPv4 source cannot be expressed), and the source port or Echo identifier becomes a token
+  from `MasqueradeConfig::ports`. `forward` / `reverse` rewrite a `PacketBuf` in place and
+  return a `MasqueradeVerdict`; `reverse` asks the closure again and drops the reply and
+  its flow when the route changed. Flows live in a table of their own (bounded, a full
+  table refuses new flows, per-protocol idle expiry). Drop reasons in
+  `nsplane_nat::masquerade::reasons`: `tcp_not_syn`, `capacity`, `route_changed`,
+  `tokens_exhausted` and `bad_checksum` (the last one beyond the contract; ns drops these
+  too); `MasqueradeStats` counts the outcomes.
+- `nsplane-packet`: `icmp::echo_reply_in_place(&mut [u8]) -> bool` turns an IPv4 ICMP or
+  IPv6 `ICMPv6` Echo request into its Echo reply in the same buffer (addresses swapped,
+  checksums recomputed, TTL / hop limit kept), ported from ns `subnet_icmp_echo_reply`;
+  anything else, IPv4 fragments and buffers longer than the IP length included, returns
+  `false` untouched.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,
