@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-wss`: a `WssStreamClient` open dropped while its session dial waited no longer
   resets that dial's backoff or 401 token wait (the next dial went at once): session dials
   now run in a task of their own that the waiting opens share.
+- `nsplane-acl`: `AclFilterScope` and `AclFilter::with_scope`: an optional outbound source
+  constraint (`outbound_sources`). An outbound packet whose source address is outside the
+  allowed prefixes is dropped with `reasons::OUTBOUND_SOURCE` (counted in
+  `AclFilterStats::outbound_source`) before the destination rules; off by default.
+- `nsplane-acl`: destination-scoped rules for inbound packets that are neither TCP nor UDP
+  (`AclFilterScope::other_protocols`, `with_other_protocol`, `OtherProtocolRule`,
+  `OtherProtocol::{IcmpEcho, Icmp, Ip}`), e.g. ICMP/ICMPv6 Echo to the node's own addresses
+  without `allow_other_protocols`. With stateful replies, an echo accepted from an
+  outbound-restricted peer allows its reply, and the node's own pings get theirs back. Empty
+  by default (today's handling).
 
 ## [0.8.0] - 2026-10-04
 
