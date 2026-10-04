@@ -1112,11 +1112,18 @@ flows 172 / 110 ns (Node Grant, was 396 / 781) and 235 / 121 ns (Service Grant, 
 the gate and 86-90 ns through the filter. A release-mode breakdown (load 5-20) puts
 `evaluate_inbound` at 64-69 ns: the clock 18 ns (`perf`: `clock_gettime` is 46 % of the
 samples), the snapshot load 9 ns, the shard lock 8 ns, the counter 4 ns, the flow and
-binding lookups 4 + 3 ns, parsing 2.4 ns. The clock read and the shard lock are what remain
-above the ACL hook's class (~50-60 ns): expiry needs the time of every packet that reaches
-state, and the state is locked per shard. A gate without snapshot or transport adds
+binding lookups 4 + 3 ns, parsing 2.4 ns. A gate without snapshot or transport adds
 7-17 ns over the `AclFilter`: the peer key lookup (~10 ns, needed to drop unknown peers)
 and the hand-off counter.
+
+Accepted 2026-10-04 as within the ACL hook's class: the established flow at 64-73 ns quiet
+and 90-103 ns at load 23-32 through the gate, 86-90 / 129-134 ns through `NodeL3Filter`, an
+inert gate 2.3 ns, writer contention 87-92 ns. The remaining gap to ~60 ns is mostly the
+per-packet clock read (~18 ns, `__vdso_clock_gettime` 46 % of the `perf` samples), plus the
+`ArcSwap` snapshot load (~9 ns) and the shard mutex (~8 ns). A possible follow-up, not done:
+a per-batch or cached timestamp instead of a clock read per packet. It gives millisecond
+expiry granularity against timeouts of 30 s and more, but differs from ns's per-packet
+`Instant::now`, so it needs an owner decision.
 
 ## nsplane-nat
 
@@ -1362,9 +1369,14 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
   writer contention (a new generation every 1 / 10 ms) 87 / 88 ns and 90 / 92 ns. Keyed
   multiply hashing instead of `SipHash`, one flow lookup, no clock read before the state,
   and an inert flag checked before anything else made the difference. Not installed, the
-  gate costs nothing (no filter on the chain). The established flow stays above the ACL
-  hook's class by the clock read (18 ns quiet, more under load) and the shard lock (8 ns);
-  see [Node L3 gate](#node-l3-gate).
+  gate costs nothing (no filter on the chain). Accepted 2026-10-04 as within the ACL hook's
+  class (gate 64-73 ns quiet / 90-103 ns at load 23-32, `NodeL3Filter` 86-90 / 129-134 ns,
+  inert gate 2.3 ns, writer contention 87-92 ns); the remaining gap to ~60 ns is mostly the
+  per-packet clock read (~18 ns, `__vdso_clock_gettime` 46 % of `perf` samples), plus the
+  `ArcSwap` snapshot load (~9 ns) and the shard mutex (~8 ns). Possible follow-up, not
+  done: a per-batch or cached timestamp (millisecond expiry granularity against timeouts of
+  30 s and more, unlike ns's per-packet `Instant::now`; needs an owner decision); see
+  [Node L3 gate](#node-l3-gate).
 - Worker pool. The batched input and the lock-free pool-off path make every case about
   15-25 % faster than before the follow-ups (1420 B with 2 workers within the noise). The
   pool moves full-size packets up to about 1.4x further, small packets little; 4 workers do
