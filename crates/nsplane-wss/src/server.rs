@@ -849,7 +849,7 @@ impl Drop for Up<'_> {
 ///   bearer, 401/403 as [`LinkState::Rejected`], the doubling backoff, pings and the read
 ///   idle of the [`WssConfig`]). One session at a time carries every stream; when it ends
 ///   (socket error, close, read idle) its streams are closed and the next is dialed after
-///   the backoff.
+///   [`reconnect_delay`](WssConfig::reconnect_delay), or the backoff.
 /// - **OPEN**: an OPEN registers the stream (an id in use, or one over
 ///   [`max_streams`](WssServerLimits::max_streams), is answered with CLOSE) and asks the
 ///   [`WssResolver`] for its backend; a denial is answered with CLOSE. The server connects

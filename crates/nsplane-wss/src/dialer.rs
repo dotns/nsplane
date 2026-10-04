@@ -14,13 +14,13 @@ use nsplane::{
     BoxFuture, LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport,
     TransportId,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::MAX_DATAGRAM;
 use crate::config::WssConfig;
-use crate::connect::{Connector, DialCounters, Ws, bump, get};
+use crate::connect::{Connector, DialCounters, Ws, WssDialEvent, bump, get};
 
 /// The two halves of a link, as [`LinkDialer::dial`] returns them.
 type Link = (Box<dyn LinkSender>, Box<dyn LinkReceiver>);
@@ -124,8 +124,18 @@ impl WssDialer {
         self.connector.state()
     }
 
+    /// Receives the [`WssDialEvent`]s from now on: one per failed, timed out or rejected
+    /// dial, [`Connected`](WssDialEvent::Connected) when the transport reports a link up
+    /// ([`LinkState::Connected`] on [`LinkDialer::on_state`], right after the dial that
+    /// opened it) and [`Lost`](WssDialEvent::Lost) when it reports that link lost, so a
+    /// link's `Connected` always comes before its `Lost`. A dial called directly (not by a
+    /// transport) sends no `Connected`.
+    pub fn events(&self) -> broadcast::Receiver<WssDialEvent> {
+        self.connector.events()
+    }
+
     /// A [`LinkTransport`] to `peer` running on this dialer (inside a tokio runtime); take
-    /// [`stats`](Self::stats) and [`state`](Self::state) first.
+    /// [`stats`](Self::stats), [`state`](Self::state) and [`events`](Self::events) first.
     pub fn into_transport(
         self,
         id: TransportId,
@@ -164,10 +174,12 @@ impl LinkDialer for WssDialer {
             LinkState::Connected => {
                 self.stats.connected.store(true, Ordering::Relaxed);
                 bump(&self.stats.connects);
+                self.connector.emit(WssDialEvent::Connected);
                 tracing::info!(url = %url, "wss connected");
             }
             LinkState::Disconnected => {
                 self.stats.connected.store(false, Ordering::Relaxed);
+                self.connector.emit(WssDialEvent::Lost);
                 tracing::info!(url = %url, "wss disconnected");
             }
             _ => {}

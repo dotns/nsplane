@@ -1,5 +1,5 @@
 //! The connection setup shared by the carriers: URL, TLS, request headers and the bearer,
-//! 401/403 classification and the dial backoff.
+//! 401/403 classification, the dial backoff and the dial events.
 
 use std::fmt;
 use std::io;
@@ -15,7 +15,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -154,6 +154,36 @@ impl fmt::Display for WssDialError {
 
 impl std::error::Error for WssDialError {}
 
+/// One dial or connection of a [`WssDialer`](crate::WssDialer) or a
+/// [`WssStreamClient`](crate::WssStreamClient), as their `events()` receivers see it: one
+/// event per occurrence.
+///
+/// Events go out on a [`broadcast`] channel of [`CAPACITY`](Self::CAPACITY) events; a
+/// receiver that falls further behind loses the oldest ones and sees
+/// [`RecvError::Lagged`](broadcast::error::RecvError::Lagged) with their count. Without a
+/// receiver, nothing is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WssDialEvent {
+    /// A link or session came up.
+    Connected,
+    /// A link or session that came up ended: closed, failed, or silent past
+    /// [`WssConfig::read_idle`].
+    Lost,
+    /// A dial failed: TCP, TLS, the bearer token, or an upgrade refused with an HTTP status
+    /// other than 401 and 403.
+    DialFailed,
+    /// A dial did not finish within [`WssConfig::connect_timeout`].
+    TimedOut,
+    /// A dial was refused with this HTTP status, 401 or 403.
+    Rejected(u16),
+}
+
+impl WssDialEvent {
+    /// How many events a receiver may fall behind before it loses the oldest.
+    pub const CAPACITY: usize = 64;
+}
+
 /// Locks `mutex`, ignoring poisoning: the guarded state stays consistent.
 pub(crate) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -191,6 +221,9 @@ enum Retry {
     Now,
     /// This backoff.
     Backoff(Duration),
+    /// After a connection that came up: [`WssConfig::reconnect_delay`]; a dial failing
+    /// after it backs off from the floor.
+    Reconnect(Duration),
     /// After a 401: a token other than the refused one.
     NewToken(Option<String>),
 }
@@ -246,7 +279,7 @@ fn ws_config() -> WebSocketConfig {
 }
 
 /// Dials the WSS connections of one [`WssConfig`], one at a time, with its backoff and
-/// rejection handling, and owns the state watch.
+/// rejection handling, and owns the state watch and the dial events.
 pub(crate) struct Connector {
     config: WssConfig,
     /// The host and port of the URL, dialed when no connect address is set.
@@ -255,6 +288,7 @@ pub(crate) struct Connector {
     /// The TLS client and server name of a `wss://` URL; `None` for `ws://`.
     tls: Option<(TlsConnector, ServerName<'static>)>,
     state: watch::Sender<LinkState>,
+    events: broadcast::Sender<WssDialEvent>,
     retry: StdMutex<Retry>,
 }
 
@@ -314,6 +348,7 @@ impl Connector {
             port,
             tls,
             state: watch::Sender::new(LinkState::Disconnected),
+            events: broadcast::Sender::new(WssDialEvent::CAPACITY),
             retry: StdMutex::new(Retry::default()),
         })
     }
@@ -331,23 +366,44 @@ impl Connector {
         self.state.send_replace(state);
     }
 
+    /// Receives the dial events from now on.
+    pub(crate) fn events(&self) -> broadcast::Receiver<WssDialEvent> {
+        self.events.subscribe()
+    }
+
+    /// Sends `event` to the event receivers, if any.
+    pub(crate) fn emit(&self, event: WssDialEvent) {
+        let _ = self.events.send(event);
+    }
+
+    /// The wait before the dial after a connection that came up: the reconnect delay, or
+    /// without one the backoff floor (the first step of the failure backoff).
+    fn reconnect(&self) -> Retry {
+        self.config
+            .reconnect_delay
+            .map_or(Retry::Backoff(self.config.backoff_min), Retry::Reconnect)
+    }
+
     /// Lets the next dial go at once (a dial for more capacity, not after a loss).
     pub(crate) fn retry_now(&self) {
         *lock(&self.retry) = Retry::Now;
     }
 
-    /// Records a lost connection: the next dial waits at least the backoff floor.
+    /// Records a lost connection: the next dial waits the reconnect delay, or the backoff
+    /// floor without one, unless it already waits.
     pub(crate) fn lost(&self) {
         let mut retry = lock(&self.retry);
         if matches!(*retry, Retry::Now) {
-            *retry = Retry::Backoff(self.config.backoff_min);
+            *retry = self.reconnect();
         }
     }
 
     /// Waits as the last dial asks, then dials: TCP, TLS (for `wss://`) and the WebSocket
-    /// upgrade. A success makes the next dial wait the backoff floor; a failure doubles the
-    /// wait, and a 401 or 403 also sets [`LinkState::Rejected`]. An upgrade refused with an
-    /// HTTP response fails with a [`WssDialError`] inside.
+    /// upgrade. A success makes the next dial wait the reconnect delay (or the backoff
+    /// floor); a failure doubles the wait, starting from the floor, and a 401 or 403 also
+    /// sets [`LinkState::Rejected`]. An upgrade refused with an HTTP response fails with a
+    /// [`WssDialError`] inside. Every failure sends its event; the carriers send
+    /// [`WssDialEvent::Connected`] themselves.
     pub(crate) async fn connect(&self, counters: &DialCounters) -> io::Result<Ws> {
         let retry = std::mem::take(&mut *lock(&self.retry));
         let (wait, token) = match retry {
@@ -356,19 +412,24 @@ impl Connector {
                 tokio::time::sleep(wait).await;
                 (Some(wait), self.token().await)
             }
+            Retry::Reconnect(delay) => {
+                tokio::time::sleep(delay).await;
+                (None, self.token().await)
+            }
             Retry::NewToken(refused) => (None, self.token_other_than(refused).await),
         };
         let token = match token {
             Ok(token) => token,
             Err(e) => {
-                return Err(self.failed(counters, wait, &format_args!("bearer token: {e}")));
+                let error = format_args!("bearer token: {e}");
+                return Err(self.failed(counters, wait, &error, WssDialEvent::DialFailed));
             }
         };
         let opened =
             tokio::time::timeout(self.config.connect_timeout, self.open(token.as_deref())).await;
         match opened {
             Ok(Ok(ws)) => {
-                *lock(&self.retry) = Retry::Backoff(self.config.backoff_min);
+                *lock(&self.retry) = self.reconnect();
                 Ok(ws)
             }
             Ok(Err(e)) => Err(match refusal(&e) {
@@ -376,12 +437,12 @@ impl Connector {
                     self.rejected(counters, wait, detail, token)
                 }
                 Some(detail) => {
-                    self.count_failure(counters, wait, &e);
+                    self.count_failure(counters, wait, &e, WssDialEvent::DialFailed);
                     io::Error::other(detail)
                 }
-                None => self.failed(counters, wait, &e),
+                None => self.failed(counters, wait, &e, WssDialEvent::DialFailed),
             }),
-            Err(_) => Err(self.failed(counters, wait, &"timed out")),
+            Err(_) => Err(self.failed(counters, wait, &"timed out", WssDialEvent::TimedOut)),
         }
     }
 
@@ -424,25 +485,28 @@ impl Connector {
         Ok(ws)
     }
 
-    /// Records a failed dial that waited `wait` and returns its error.
+    /// Records a failed dial that waited `wait`, sends `event` and returns its error.
     fn failed(
         &self,
         counters: &DialCounters,
         wait: Option<Duration>,
         error: &dyn fmt::Display,
+        event: WssDialEvent,
     ) -> io::Error {
-        self.count_failure(counters, wait, error);
+        self.count_failure(counters, wait, error, event);
         io::Error::other(format!("wss connect failed: {error}"))
     }
 
-    /// Records a failed dial that waited `wait`.
+    /// Records a failed dial that waited `wait` and sends `event`.
     fn count_failure(
         &self,
         counters: &DialCounters,
         wait: Option<Duration>,
         error: &dyn fmt::Display,
+        event: WssDialEvent,
     ) {
         bump(&counters.connect_failures);
+        self.emit(event);
         let config = &self.config;
         *lock(&self.retry) =
             Retry::Backoff(next_backoff(wait, config.backoff_min, config.backoff_max));
@@ -472,6 +536,7 @@ impl Connector {
             Retry::Backoff(next_backoff(wait, config.backoff_min, config.backoff_max))
         };
         self.state.send_replace(LinkState::Rejected(status));
+        self.emit(WssDialEvent::Rejected(status));
         tracing::warn!(url = %config.url, status, "wss upgrade rejected");
         io::Error::new(io::ErrorKind::PermissionDenied, detail)
     }
@@ -545,6 +610,55 @@ mod tests {
         assert!(
             matches!(*lock(&connector.retry), Retry::Backoff(wait) if wait == Duration::from_secs(8))
         );
+    }
+
+    /// A loss after a session came up waits the reconnect delay (when set), and a dial
+    /// failing after it backs off from the floor rather than from that delay; capacity
+    /// dials still go at once. Each failure is one event.
+    #[tokio::test]
+    async fn reconnect_delay_then_failures_back_off_from_the_floor() {
+        let ms = Duration::from_millis;
+        // A port nothing listens on: every dial is refused at once.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let config = WssConfig::new(format!("ws://{addr}/"), roots())
+            .allow_plaintext(true)
+            .backoff(ms(10), ms(40))
+            .reconnect_delay(ms(5));
+        let connector = Connector::new(config).unwrap();
+        let mut events = connector.events();
+        let retry = || match *lock(&connector.retry) {
+            Retry::Now => "now".to_owned(),
+            Retry::Backoff(wait) => format!("backoff {}", wait.as_millis()),
+            Retry::Reconnect(delay) => format!("reconnect {}", delay.as_millis()),
+            Retry::NewToken(_) => "token".to_owned(),
+        };
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
+        // A further loss keeps the pending wait.
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
+
+        let counters = DialCounters::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            assert!(connector.connect(&counters).await.is_err());
+            seen.push(retry());
+            assert_eq!(events.try_recv(), Ok(WssDialEvent::DialFailed));
+        }
+        assert_eq!(
+            seen,
+            ["backoff 10", "backoff 20", "backoff 40", "backoff 40"]
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(get(&counters.connect_failures), 4);
+
+        // A capacity dial goes at once, and a loss then waits the reconnect delay again.
+        connector.retry_now();
+        assert_eq!(retry(), "now");
+        connector.lost();
+        assert_eq!(retry(), "reconnect 5");
     }
 
     fn http(status: u16) -> WsError {
