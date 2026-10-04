@@ -110,6 +110,32 @@ pub trait Transport: Send + Sync + 'static {
             Ok(())
         }
     }
+
+    /// Hands off `datagrams[*sent..]` like [`send_batch`], but never waits.
+    ///
+    /// Synchronous: the call returns as soon as it would have to wait, so the engine may
+    /// call it from its owner task when the transport's transmit task is idle, saving the
+    /// handoff to that task. The datagrams go out in order, and `*sent` and `*failed` are
+    /// advanced as with [`send_batch`] (a failed one is done and dropped, a failed segmented
+    /// send fails its run, [`io::ErrorKind::BrokenPipe`] means the transport is closed).
+    /// When the next datagram cannot be handed off now, this returns
+    /// [`io::ErrorKind::WouldBlock`] with `*sent` just before it and that datagram neither
+    /// sent nor failed: the caller keeps the rest (`datagrams[*sent..]`) and sends it
+    /// later, after the ones before it. On success every datagram is done.
+    ///
+    /// The default hands off nothing and returns [`io::ErrorKind::WouldBlock`], so the
+    /// engine sends every datagram through [`send_batch`] on the transmit task.
+    ///
+    /// [`send_batch`]: Transport::send_batch
+    fn try_send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+        failed: &mut usize,
+    ) -> io::Result<()> {
+        let _ = (datagrams, sent, failed);
+        Err(io::ErrorKind::WouldBlock.into())
+    }
 }
 
 /// The boxed future a [`DynTransport`] method returns.
@@ -150,6 +176,14 @@ pub trait DynTransport: Send + Sync + 'static {
         sent: &'a mut usize,
         failed: &'a mut usize,
     ) -> BoxFuture<'a, io::Result<()>>;
+
+    /// [`Transport::try_send_batch`].
+    fn try_send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+        failed: &mut usize,
+    ) -> io::Result<()>;
 }
 
 impl<T: Transport> DynTransport for T {
@@ -181,6 +215,15 @@ impl<T: Transport> DynTransport for T {
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(Transport::send_batch(self, datagrams, sent, failed))
     }
+
+    fn try_send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+        failed: &mut usize,
+    ) -> io::Result<()> {
+        Transport::try_send_batch(self, datagrams, sent, failed)
+    }
 }
 
 impl Transport for Box<dyn DynTransport> {
@@ -211,6 +254,15 @@ impl Transport for Box<dyn DynTransport> {
         failed: &mut usize,
     ) -> io::Result<()> {
         (**self).send_batch(datagrams, sent, failed).await
+    }
+
+    fn try_send_batch(
+        &self,
+        datagrams: &[(Path, PacketBuf)],
+        sent: &mut usize,
+        failed: &mut usize,
+    ) -> io::Result<()> {
+        (**self).try_send_batch(datagrams, sent, failed)
     }
 }
 
@@ -289,5 +341,71 @@ mod tests {
 
         let boxed: Box<dyn DynTransport> = Box::new(OddFails::default());
         assert_eq!(send_past_errors(&boxed, &batch).await, (4, 4));
+    }
+
+    #[test]
+    fn default_try_send_batch_hands_off_nothing() {
+        let batch = datagrams(&[0, 2]);
+        let transport = OddFails::default();
+        let (mut sent, mut failed) = (0, 0);
+        let error =
+            Transport::try_send_batch(&transport, &batch, &mut sent, &mut failed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!((sent, failed), (0, 0));
+        assert!(transport.0.lock().unwrap().is_empty());
+
+        let boxed: Box<dyn DynTransport> = Box::new(OddFails::default());
+        let error = Transport::try_send_batch(&boxed, &batch, &mut sent, &mut failed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!((sent, failed), (0, 0));
+    }
+
+    /// Hands off what a budget allows, then would block.
+    #[derive(Debug, Default)]
+    struct Budget(Mutex<usize>);
+
+    impl Transport for Budget {
+        fn id(&self) -> TransportId {
+            TransportId::new(1)
+        }
+
+        async fn recv(&self, _buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+            std::future::pending().await
+        }
+
+        fn send(
+            &self,
+            _datagram: &[u8],
+            _to: &Path,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn try_send_batch(
+            &self,
+            datagrams: &[(Path, PacketBuf)],
+            sent: &mut usize,
+            _failed: &mut usize,
+        ) -> io::Result<()> {
+            let mut budget = self.0.lock().unwrap();
+            while *sent < datagrams.len() {
+                if *budget == 0 {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                *budget -= 1;
+                *sent += 1;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn boxed_transport_forwards_try_send_batch() {
+        let batch = datagrams(&[0, 2, 4]);
+        let boxed: Box<dyn DynTransport> = Box::new(Budget(Mutex::new(2)));
+        let (mut sent, mut failed) = (0, 0);
+        let error = Transport::try_send_batch(&boxed, &batch, &mut sent, &mut failed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!((sent, failed), (2, 0));
     }
 }
