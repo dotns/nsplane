@@ -110,6 +110,12 @@
 //! [`AclFilterConfig::allow_other_protocols`] is set) is dropped with
 //! [`reasons::OUTBOUND`].
 //!
+//! Independently of the namespaces, a filter built with
+//! [`AclFilter::with_scope`] can constrain the source address of every
+//! outbound packet ([`AclFilterScope::outbound_sources`]): a packet from
+//! outside the allowed prefixes is dropped with [`reasons::OUTBOUND_SOURCE`]
+//! before any destination rule is consulted.
+//!
 //! A grant stops accepting new flows as soon as it is removed
 //! ([`AclEngine::remove_grant`]). The reply allowances of a flow a grant
 //! accepted depend on that grant, in both directions and whether the peers
@@ -303,8 +309,8 @@ pub use engine::{
     TerminateBinding, wg_peer_anchor,
 };
 pub use filter::{
-    AclFilter, AclFilterConfig, AclFilterStats, FragmentMode, Ipv6Mode, PeerIdentity,
-    PeerIdentityMap,
+    AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
+    PeerIdentity, PeerIdentityMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{
