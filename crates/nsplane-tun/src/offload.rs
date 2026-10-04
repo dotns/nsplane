@@ -12,7 +12,7 @@
 
 use std::iter;
 
-use nsplane::{MAX_BATCH, PacketBatch, PacketBuf, PacketPool};
+use nsplane::{MAX_BATCH, PacketBatch, PacketBuf, PacketPool, TAILROOM};
 
 /// Length of an IPv4 header without options.
 const IPV4_HDR: usize = 20;
@@ -134,12 +134,12 @@ pub(crate) enum OffloadError {
 /// headers are not supported.
 ///
 /// Every packet is taken from `pool` with the standard headroom and a capacity of at
-/// least `capacity` (or its length, if larger), and appended to `out`, starting at
-/// segment index `first`. Segments that do not fit into `out` (at most
-/// [`MAX_BATCH`] packets) are not produced: the call then returns `Ok(Some(next))` and
-/// the caller continues with `first = next` and a batch with room. `Ok(None)` means all
-/// segments were produced. A malformed header or packet is an error and produces
-/// nothing.
+/// least `capacity` (or its length plus [`TAILROOM`], if larger, so it is sealed in
+/// place), and appended to `out`, starting at segment index `first`. Segments that do not
+/// fit into `out` (at most [`MAX_BATCH`] packets) are not produced: the call then returns
+/// `Ok(Some(next))` and the caller continues with `first = next` and a batch with room.
+/// `Ok(None)` means all segments were produced. A malformed header or packet is an error
+/// and produces nothing.
 pub(crate) fn segment(
     hdr: &VirtioNetHdr,
     packet: &[u8],
@@ -166,10 +166,9 @@ pub(crate) fn segment(
         if first > 0 {
             return Ok(None);
         }
-        let mut buf = pool.get(packet.len().max(capacity));
-        buf.set_len(packet.len());
+        let mut buf = pool.get((packet.len() + TAILROOM).max(capacity));
+        buf.extend_from_slice(packet);
         let seg = buf.as_packet_mut();
-        seg.copy_from_slice(packet);
         if let Some((start, field)) = csum {
             let mut csum = !fold(sum(0, &seg[start..]));
             if csum == 0 && l4_protocol(seg) == Some(UDP) {
@@ -207,12 +206,10 @@ pub(crate) fn segment(
             return Ok(Some(i));
         }
         let chunk = &payload[i * gso_size..payload.len().min((i + 1) * gso_size)];
-        let mut buf = pool.get((hlen + chunk.len()).max(capacity));
-        buf.set_len(hlen + chunk.len());
-        let seg = buf.as_packet_mut();
-        seg[..hlen].copy_from_slice(&packet[..hlen]);
-        seg[hlen..].copy_from_slice(chunk);
-        fix_segment(seg, ip_len, proto, i, count, i * gso_size);
+        let mut buf = pool.get((hlen + chunk.len() + TAILROOM).max(capacity));
+        buf.extend_from_slice(&packet[..hlen]);
+        buf.extend_from_slice(chunk);
+        fix_segment(buf.as_packet_mut(), ip_len, proto, i, count, i * gso_size);
         if let Some(next) = push(out, pool, buf, i) {
             return Ok(Some(next));
         }
@@ -1179,9 +1176,33 @@ mod tests {
                 Ok(None)
             );
             for p in out.iter() {
-                assert!(p.capacity() >= capacity.max(p.len()));
+                assert!(p.capacity() >= capacity.max(p.len() + TAILROOM));
                 assert_eq!(p.headroom(), nsplane::HEADROOM);
             }
+        }
+    }
+
+    #[test]
+    fn segments_reuse_pooled_buffers_without_growth() {
+        let s = spec(false, TCP);
+        let (hdr, packet) = super_packet(&s, 3000, 1000);
+        let mut pool = PacketPool::new(8);
+        // Buffers that held larger packets before: reused, overwritten, not grown.
+        for _ in 0..3 {
+            let mut old = pool.get(1600);
+            old.extend_from_slice(&[0xEE; 1600]);
+            pool.put(old);
+        }
+        let mut fresh = PacketBatch::new();
+        segment(&hdr, &packet, 0, 0, &mut PacketPool::new(0), &mut fresh).unwrap();
+        let mut out = PacketBatch::new();
+        segment(&hdr, &packet, 0, 1500 + TAILROOM, &mut pool, &mut out).unwrap();
+        assert_eq!(pool.free_len(), 0);
+        let got: Vec<&[u8]> = out.iter().map(PacketBuf::as_packet).collect();
+        let want: Vec<&[u8]> = fresh.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, want);
+        for p in out.iter() {
+            assert!(p.capacity() >= 1500 + TAILROOM);
         }
     }
 

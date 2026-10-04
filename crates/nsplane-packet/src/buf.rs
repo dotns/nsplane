@@ -9,6 +9,11 @@ use smallvec::SmallVec;
 /// (`DATA_HEADER_SZ`) plus 16 spare bytes for future transports.
 pub const HEADROOM: usize = 32;
 
+/// Bytes sealing needs behind a packet: up to 15 bytes of padding to a multiple of 16 and
+/// the 16-byte AEAD tag. A buffer with this much room behind the packet is sealed in place
+/// without reallocating.
+pub const TAILROOM: usize = 15 + 16;
+
 /// Maximum number of packets in a [`PacketBatch`].
 pub const MAX_BATCH: usize = 64;
 
@@ -29,12 +34,14 @@ impl std::error::Error for BoundsError {}
 /// Fresh buffers start with [`HEADROOM`] zeroed bytes of headroom; [`advance`](Self::advance)
 /// and [`reserve_front`](Self::reserve_front) move the packet start in O(1).
 ///
-/// Invariant: `start <= buf.len()`; bytes `[0, start)` are headroom and
-/// bytes `[start, buf.len())` are the packet.
+/// Invariant: `start <= end <= buf.len()`; bytes `[0, start)` are headroom, bytes
+/// `[start, end)` are the packet, and bytes `[end, buf.len())` are initialized bytes a
+/// pooled buffer kept from earlier use, so growing over them needs no zero-fill.
 #[derive(Debug, Clone)]
 pub struct PacketBuf {
     buf: BytesMut,
     start: usize,
+    end: usize,
     /// Created by [`from_shared`](Self::from_shared); never returned to a [`PacketPool`].
     shared: bool,
 }
@@ -48,17 +55,21 @@ impl PacketBuf {
     /// Creates a packet holding a copy of `packet`.
     pub fn from_packet(packet: &[u8]) -> Self {
         let mut buf = Self::with_capacity(packet.len());
-        buf.buf.extend_from_slice(packet);
+        buf.extend_from_slice(packet);
         buf
     }
 
-    /// Wraps an empty allocation, filling the headroom with zeros.
+    /// Wraps an allocation as an empty packet behind zeroed headroom; bytes the allocation
+    /// already initialized behind the headroom are kept for [`set_len`](Self::set_len).
     fn from_storage(mut buf: BytesMut) -> Self {
-        debug_assert!(buf.is_empty());
-        buf.resize(HEADROOM, 0);
+        if buf.len() < HEADROOM {
+            buf.resize(HEADROOM, 0);
+        }
+        buf[..HEADROOM].fill(0);
         Self {
             buf,
             start: HEADROOM,
+            end: HEADROOM,
             shared: false,
         }
     }
@@ -84,29 +95,29 @@ impl PacketBuf {
         Ok(Self {
             buf,
             start: offset,
+            end,
             shared: true,
         })
     }
 
     /// The packet bytes.
     pub fn as_packet(&self) -> &[u8] {
-        &self.buf[self.start..]
+        &self.buf[self.start..self.end]
     }
 
     /// The packet bytes, mutably.
     pub fn as_packet_mut(&mut self) -> &mut [u8] {
-        let start = self.start;
-        &mut self.buf[start..]
+        &mut self.buf[self.start..self.end]
     }
 
     /// The headroom followed by the packet; `headroom() + len()` bytes.
     pub fn with_headroom_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+        &mut self.buf[..self.end]
     }
 
     /// Packet length in bytes.
-    pub fn len(&self) -> usize {
-        self.buf.len() - self.start
+    pub const fn len(&self) -> usize {
+        self.end - self.start
     }
 
     /// Bytes in front of the packet.
@@ -140,7 +151,7 @@ impl PacketBuf {
     }
 
     /// Whether the packet is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -149,14 +160,35 @@ impl PacketBuf {
         self.buf.capacity() - self.start
     }
 
-    /// Resizes the packet; growing zero-fills, shrinking truncates.
+    /// Resizes the packet; shrinking truncates.
+    ///
+    /// Growing exposes the bytes the buffer already initialized (unspecified: a buffer
+    /// reused by a [`PacketPool`] keeps what it held) and zero-fills only the bytes it
+    /// never initialized, so the new bytes are to be written before they are read.
     pub fn set_len(&mut self, len: usize) {
-        self.buf.resize(self.start + len, 0);
+        let end = self.start + len;
+        if end > self.buf.len() {
+            self.buf.resize(end, 0);
+        }
+        self.end = end;
+    }
+
+    /// Appends `bytes` to the packet without zero-filling first; the headroom is kept.
+    ///
+    /// Reallocates only if the packet grows past [`capacity`](Self::capacity).
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        // Overwrite the initialized bytes behind the packet, then append the rest.
+        let kept = (self.buf.len() - self.end).min(bytes.len());
+        let (over, rest) = bytes.split_at(kept);
+        self.buf[self.end..self.end + kept].copy_from_slice(over);
+        self.buf.extend_from_slice(rest);
+        self.end += bytes.len();
     }
 
     /// The packet bytes without the headroom, without copying.
     pub fn into_bytes(self) -> BytesMut {
         let mut buf = self.buf;
+        buf.truncate(self.end);
         buf.split_off(self.start)
     }
 
@@ -183,13 +215,16 @@ impl PacketPool {
     }
 
     /// Returns an empty packet with `capacity() >= capacity`, reusing an idle buffer if any.
+    ///
+    /// A reused buffer keeps the bytes it already initialized behind the packet, so a later
+    /// [`PacketBuf::set_len`] zero-fills only the bytes it never initialized.
     pub fn get(&mut self, capacity: usize) -> PacketBuf {
         let needed = HEADROOM + capacity;
         let storage = self.free.pop().map_or_else(
             || BytesMut::with_capacity(needed),
             |mut buf| {
-                buf.clear();
-                buf.reserve(needed);
+                // `reserve` counts from the initialized length, which is kept.
+                buf.reserve(needed.saturating_sub(buf.len()));
                 buf
             },
         );
@@ -213,6 +248,7 @@ impl PacketPool {
         PacketBuf {
             buf,
             start: HEADROOM,
+            end: needed,
             shared: false,
         }
     }
@@ -220,7 +256,7 @@ impl PacketPool {
     /// Returns a buffer to the pool, or drops it if the pool already holds `max_free`.
     ///
     /// Buffers created by [`PacketBuf::from_shared`] are always dropped. A pooled buffer keeps
-    /// its bytes for [`get_len`](Self::get_len).
+    /// its bytes for [`get`](Self::get) and [`get_len`](Self::get_len).
     pub fn put(&mut self, buf: PacketBuf) {
         if !buf.shared && self.free.len() < self.max_free {
             self.free.push(buf.buf);
@@ -578,6 +614,91 @@ mod tests {
         let buf = pool.get_len(2048);
         assert_eq!(buf.len(), 2048);
         assert!(buf.capacity() >= 2048);
+    }
+
+    #[test]
+    fn extend_from_slice_appends_behind_headroom() {
+        let mut buf = PacketBuf::with_capacity(8);
+        let capacity = buf.capacity();
+        let ptr = buf.with_headroom_mut().as_ptr();
+        buf.extend_from_slice(&[1, 2, 3]);
+        buf.extend_from_slice(&[]);
+        buf.extend_from_slice(&[4, 5]);
+        assert_eq!(buf.as_packet(), [1, 2, 3, 4, 5]);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert_eq!(buf.with_headroom_mut()[..HEADROOM], [0; HEADROOM]);
+        // Within the capacity: no reallocation.
+        assert_eq!(buf.capacity(), capacity);
+        assert_eq!(buf.with_headroom_mut().as_ptr(), ptr);
+
+        // Past the capacity it grows like a `Vec`.
+        let more = vec![9; capacity];
+        buf.extend_from_slice(&more);
+        assert_eq!(buf.len(), 5 + capacity);
+        assert_eq!(&buf.as_packet()[5..], more);
+        assert_eq!(buf.headroom(), HEADROOM);
+    }
+
+    #[test]
+    fn extend_from_slice_overwrites_kept_bytes() {
+        let mut pool = PacketPool::new(1);
+        let mut buf = pool.get(16);
+        buf.extend_from_slice(&[7; 10]);
+        pool.put(buf);
+
+        // The reused buffer kept ten bytes; appending overwrites them and goes past them.
+        let mut buf = pool.get(16);
+        assert!(buf.is_empty());
+        buf.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(buf.as_packet(), [1, 2, 3]);
+        buf.extend_from_slice(&[4; 9]);
+        assert_eq!(buf.as_packet(), [1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4]);
+        assert_eq!(&buf.clone().freeze()[..], buf.as_packet());
+
+        // After an advance the packet still ends where it ended.
+        buf.advance(2).unwrap();
+        buf.extend_from_slice(&[5]);
+        assert_eq!(buf.as_packet(), [3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5]);
+    }
+
+    #[test]
+    fn set_len_on_a_reused_buffer_zero_fills_only_new_bytes() {
+        let mut pool = PacketPool::new(1);
+        let mut buf = pool.get(16);
+        buf.set_len(8);
+        buf.as_packet_mut().fill(7);
+        buf.set_len(2);
+        // Shrinking keeps the bytes behind the packet initialized.
+        buf.set_len(4);
+        assert_eq!(buf.as_packet(), [7; 4]);
+        pool.put(buf);
+
+        let mut buf = pool.get(16);
+        assert!(buf.is_empty());
+        assert_eq!(buf.with_headroom_mut(), [0; HEADROOM]);
+        buf.set_len(12);
+        assert_eq!(&buf.as_packet()[..8], [7; 8]);
+        assert_eq!(&buf.as_packet()[8..], [0; 4]);
+        let bytes = buf.into_bytes();
+        assert_eq!(bytes[..8], [7; 8]);
+        assert_eq!(bytes[8..], [0; 4]);
+
+        // A fresh buffer zero-fills as before.
+        let mut fresh = PacketBuf::with_capacity(4);
+        fresh.set_len(4);
+        assert_eq!(fresh.as_packet(), [0; 4]);
+    }
+
+    #[test]
+    fn get_reserves_from_the_kept_length() {
+        let mut pool = PacketPool::new(1);
+        let mut buf = pool.get(64);
+        buf.set_len(64);
+        pool.put(buf);
+        // The kept bytes do not count against the requested capacity.
+        let buf = pool.get(2000);
+        assert!(buf.capacity() >= 2000);
+        assert!(buf.is_empty());
     }
 
     #[test]
