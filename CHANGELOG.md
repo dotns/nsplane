@@ -485,6 +485,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`HostTunSource::oversize_drops`, one warning per source), and a `HostTunSink` that calls
   `write` and returns `BrokenPipe` when it returns `false`. `HOST_TUN_DEFAULT_CAPACITY` is
   4096 packets. Built on every target.
+- `nsplane-acl`: the node L3 gate (MD-2), a port of ns tunnel-wg `node_l3`. `NodeL3Gate`
+  applies target-bound `NodeL3Config` snapshots (Node, Service and Subnet Grants, peer
+  bindings, modes `disabled` / `observe` / `enforce`) and the WireGuard projection
+  (`NodeL3Transport`), and judges decrypted inbound and plaintext outbound IPv4 packets:
+  source binding by `(peer key, inner address)`, the same-owner rule, stateful flows with
+  per-protocol idle timeouts, 2,048 flows per peer and 16,384 in all (a full table drops
+  with `state_capacity`, never evicts), orphan fragments, ICMP errors matched to their flow,
+  Provider listeners for Service Grants and the reserved Subnet transport admission.
+  `NodeL3Reason` names every verdict (`as_str`, `drop_reason`); `NodeL3Counters` counts
+  enforced and observed denials. Not installed by default; nothing is on the data path
+  without it.
+- `nsplane-acl`: `NodeL3Filter`, the gate and an optional `AclFilter` as one ordered
+  `PacketFilter`: an enforced allow ends the decision before the ACL, an enforced denial
+  drops with the gate's reason, Legacy and Observe go on to the ACL; outbound is the gate
+  only unless `with_acl_outbound(true)`. Peers resolve to WireGuard keys through
+  `PeerPublicKeys` (`PeerKeyMap`); `NodeL3FilterStats` counts the steps.
+- `nsplane-acl`: gateway-consumer divert (MD-3): `NodeL3Filter::with_divert` hands a
+  `SourceBinding` / `OrphanFragment` denial the gate captures as a gateway return
+  (`GatewayConsumerPacket`) to a `GatewayConsumerSink` and reports it as
+  `Verdict::Handled`; a refused candidate is dropped. Tests: `nsplane-e2e` `node_l3`; bench
+  `cargo bench -p nsplane-acl --bench node_l3`.
 
 ### Changed
 - Breaking: `Transport::send_batch` and `DynTransport::send_batch` take a third argument,

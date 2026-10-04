@@ -29,3 +29,7 @@ serde_json = "1.0.149"
 [[bench]]
 name = "namespaces"
 harness = false
+
+[[bench]]
+name = "node_l3"
+harness = false
