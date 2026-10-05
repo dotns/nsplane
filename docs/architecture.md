@@ -261,12 +261,7 @@ Backpressure:
   largest room, counting one datagram per packet; a transport's room is its free transmit
   slots while its backlog is empty, plus `min(MAX_BATCH, capacity)` minus its backlog. With
   no room it stops reading, which holds back the source, so a saturated transport keeps at
-  most `MAX_BATCH` local datagrams in its backlog. `EngineBuilder::local_transmit_bound`
-  (opt-in, unset by default) lowers that intake: a transport has room for local packets
-  only while its transmit queue (with the batch being sent) and backlog together hold fewer
-  datagrams than the bound; datagrams of received datagrams, timers and handle calls keep
-  the queue capacity. See [Engine and device fast path (OE)](#engine-and-device-fast-path-oe)
-  for its latency / throughput trade-off.
+  most `MAX_BATCH` local datagrams in its backlog.
 - With crypto workers, received datagrams with the workers count against the deliver
   queue's room: the owner reads received datagrams only while the deliver queue has room
   beyond them, so a sink slower than the network holds datagrams back in the transport
