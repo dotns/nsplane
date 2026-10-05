@@ -445,6 +445,11 @@ packet twice, is the limit, so 4 workers do not add to 2. Sharding `Core` itself
 (one owner per shard) would lift that limit, at the cost of splitting the handshake gate,
 the peer table and the allowed IPs across shards.
 
+Since OE-4 the bench also runs a single peer (`worker_pool_one_peer`: the hub linked to a single spoke
+that has as many workers, the same packets per iteration): with 1420 B packets 792 k / 1.30 M / 1.41 M packets per second with 0 /
+2 / 4 workers (2026-10-05, load1 below 4.2; 0.37 M with 2 workers before OE-4, when a peer
+used one worker). The hub cases did not change with it (-4.6 to +1.8 % against main).
+
 The pool off takes no lock (follow-up #17): the core hands out crypto jobs only when built
 with `CoreConfig::crypto_jobs`, which the engine sets for 2 or more workers, and otherwise
 every peer owns its tunnel outright. With the pool, each peer's tunnel is behind a mutex
@@ -1967,6 +1972,7 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Engine fast path (MF-1), TUN, kernel WireGuard -> nsplane-cli | the same | 4.85 / 4.77 Gbit/s; dedicated rerun 5.87 / 5.92 | before: 6.27 / 6.07; rerun 6.32 / 6.12 Gbit/s (-23 % / -21 %; rerun -7 % / -3 %), not reproduced outside the harness |
 | Engine fast path (MF-1), worker pool hub | off / 2 / 4 workers, 64 B and 1420 B, median of 3 quiet pairs | 1.36 / 1.40 / 1.41 Mpps, 784 / 959 / 937 kpps | before: 1.40 / 1.38 / 1.41 Mpps, 788 / 938 / 960 kpps (all within -3 % to +2 %) |
 | Engine fast path (MF-1), engine latency, loaded, no workers | p50 / p99 / lost pings, 3 pairs | 2.25 / 13.5 ms / 76, 2.09 / 4.89 ms / 31, 2.17 / 4.38 ms / 24 | before: 2.29 / 10.6 ms / 17, 2.42 / 16.7 ms / 25, 2.37 / 11.6 ms / 20 |
+| Engine and device fast path (OE), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP P1 / P4 Gbit/s, sender CPU s/GB; default / 2 workers / no offload (2026-10-05, load 2.2-6.4) | 10.33 / 11.38, 0.94; 11.67 / 12.65, 1.07; 3.45 / 3.51, 2.97 | main 20d728c same window: 9.60 / 10.39, 1.24; 8.39 / 8.58, 1.23; 3.10 / 3.35, 3.61; [Engine and device fast path (OE)](#engine-and-device-fast-path-oe) |
 | Netstack TCP stream (PS) | 1 GiB, one connection, over two engines / direct, median of 5, per GiB (2026-10-03, load 20-29) | 309 MB/s, 9.34 s CPU, 38.49 G instructions / 1162 MB/s, 7.54 G instructions | `main`: 306 MB/s, 10.08 s, 39.41 G / 1002 MB/s, 7.72 G; [Single-stream profile (MF-2)](#single-stream-profile-mf-2) |
 | Local-side graph, `pipe` | send + `recv_batch`, 64 B / 1420 B, per packet (1024 packets per iteration, current-thread runtime; 2026-10-03, load 9.99 21.78 29.87; at load 59: ~132 / ~151 ns) | ~68 ns / ~68 ns | |
 | Local-side graph, `pump` | pipe -> pipe, 64 B / 1420 B, per packet (two spawned tasks, allocation excluded; same run; at load 59: ~263 / ~369 ns) | ~146 ns / ~170 ns | |
@@ -2068,7 +2074,31 @@ without the engine batching, two runs each, 1-minute load 2.8-5.9.
 
 ### Against WireGuard implementations
 
-Latest run, main `92652cb` (after the engine fast path, the netstack fixes and the
+Latest run, the OE branch (bkd/smvobr6t, the final A/B of
+[Engine and device fast path (OE)](#engine-and-device-fast-path-oe)), 2026-10-05
+15:51-16:57Z, 1-minute load 2.2-5.9, same harness, CPU sets 2-5 / 6-9, 30 s x 3
+repetitions, medians; kernel-kernel and the netstack pair were not part of this run. The
+last column is main 20d728c in the adjacent half (17:28-18:34Z, load 2.2-6.4):
+
+| Pair (a -> b) | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP loss 1G / 3G % | ping p50 / p99 idle ms | ping p50 / p99 loaded ms | CPU s/GB a / b | main 20d728c: P1 / P4, CPU a / b |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| nsplane-nsplane | 10.33 | 11.38 | 0.06 / 0.10 | 0.686 / 1.390 | 2.470 / 5.220 | 0.94 / 0.89 | 9.60 / 10.39, 1.24 / 0.91 |
+| nsplane-nsplane (w2) | 11.67 | 12.65 | 0.09 / 0.26 | 0.882 / 1.770 | 2.160 / 4.690 | 1.07 / 1.09 | 8.39 / 8.58, 1.23 / 1.10 |
+| nsplane-nsplane (w4) | 11.61 | 12.49 | 0.08 / 0.25 | 0.652 / 1.090 | 2.290 / 4.770 | 1.08 / 1.12 | 8.42 / 8.60, 1.23 / 1.08 |
+| nsplane-nsplane (nooffload) | 3.45 | 3.51 | 0.01 / 0.06 | 0.544 / 1.010 | 1.030 / 2.430 | 2.97 / 2.80 | 3.10 / 3.35, 3.61 / 3.08 |
+| nsplane-nsplane (nooffload-w2) | 4.53 | 4.98 | 0.05 / 0.21 | 0.627 / 0.826 | 1.140 / 2.520 | 3.17 / 3.05 | 3.65 / 4.17, 3.64 / 3.49 |
+| nsplane-kernel | 7.85 | 7.52 | 0.03 / 0.06 | 0.695 / 1.660 | 3.320 / 5.050 | 1.92 / 0.31 † | 7.44 / 7.23, 2.13 / 0.32 † |
+| kernel-nsplane | 7.08 | 7.02 | 0.02 / 0.04 | 0.759 / 1.640 | 1.910 / 4.940 | 0.07 † / 1.65 | 6.97 / 6.80, 0.10 † / 1.70 |
+| wggo-wggo | 8.50 | 10.50 | 0.09 / 0.83 | 0.604 / 0.815 | 2.400 / 6.090 | 1.32 / 1.67 | 8.41 / 9.82, 1.36 / 1.71 (same binary) |
+
+† kernel WireGuard encrypts in kernel threads outside the container cgroup (undercount).
+nsplane-cli now leads wireguard-go on this host at one stream with any configuration that
+has offload (10.33-11.67 against 8.50) and, with 2 or 4 crypto workers, also at four
+streams (12.49-12.65 against 10.50), at lower CPU per GB on the receiver (0.89-1.12 against
+1.67) and a lower loaded p99 (4.69-5.22 against 6.09 ms). wireguard-go's own runs spread
+8.41-9.66 (P1) over the four halves of that A/B.
+
+The run before, main `92652cb` (after the engine fast path, the netstack fixes and the
 `ChannelTransport` fix), 2026-10-04, a quiet host (1-minute load 2-11), same harness, CPU
 sets 2-5 / 6-9, 30 s x 3 repetitions, medians:
 
@@ -2286,6 +2316,188 @@ spreads over 1.5 cores: sealing 39 %, the transmit task 18 % (GSO `sendmsg` 10 %
 split copy 7 % (`VnetReader::segment`), allocation 7 % and handoffs 10 % (mostly the
 transmit task's queue and futex wakes). The cryptography itself (39-51 %) is the floor.
 See also `docs/task/20261003-1500-ns-dataplane-moves.md`, MF-1.
+
+### Engine and device fast path (OE)
+
+Workstream OE (campaign `nsplane-op-202610041900`, 2026-10-04/05) took the five targets of a
+quiet re-baseline of main b5e531f and a profile of each, and changed the engine, the UDP
+transport, the TUN device and the cryptography's split between the owner and the workers.
+Defaults are unchanged except where a change is a pure speedup.
+
+Method. Throughput with `scripts/bench/wg-compare.sh` (CPU sets 2-5 / 6-9, MTU 1420, 30 s x 3
+repetitions, medians; release nsplane-cli built in the dev image); A/B halves alternate, each
+half is one acquisition of the host's bench lock, starts at a 1-minute load below 8 and is
+kept when its load stays at or below 12. Micro benches with criterion, one bench per lock
+acquisition. The profile: `perf record` from a privileged sibling container on each side
+(`--pid=container:<side>`, cycles and `instructions:u`, 1999 Hz, 15 s) of a frame-pointer
+build, plus `pidstat -t`, 2026-10-04 21:55-22:04Z (load 0.9-11).
+
+Targets and the re-baseline (main b5e531f, 2026-10-04 19:18-20:17Z, load1 2.7-6.6):
+
+| Target | Re-baseline | What limited it (profile) |
+| --- | --- | --- |
+| T1 crypto workers | w2 P1 / P4 8.01 / 7.09 Gbit/s, UDP 3G loss 4.03 % | one peer = one worker; the receiver dropped at its own deliver queue (`DROP_SINK_FULL` 2 610 in a P1 run = iperf3's 2 632 retransmits) |
+| T2 no offload | 2.59 / 2.96 Gbit/s, 3.76 / 3.63 s/GB | one system call per packet on each of TUN read, UDP send, UDP receive, TUN write (syscalls 56-66 %) |
+| T3 mixed directions | nsplane -> kernel 7.65, kernel -> nsplane 5.80 Gbit/s | kernel WireGuard's receiver; on our receiver ~0.8 datagram per `recvmmsg` |
+| T4 loaded latency | ping p50 / p99 2.84 / 5.40 ms (wireguard-go 2.56 / 6.09) | queue depth: sender `local` ~830 + `transmit` 1024, receiver `datagrams` ~360 |
+| T5 default P4, CPU per GB | 9.91 / 9.87 Gbit/s, 1.21 / 0.84 s/GB | both owner tasks 82-85 % busy at ~0.95 us per packet, crypto 35 % / 49 % |
+
+Where the cycles went (share of the nsplane-cli process; T5 default pair, T4 loaded ping
+next to one stream, T1 2 workers):
+
+| Case / side | crypto | owner: core w/o crypto | owner: inline delivery | owner: inline send | owner: other | transmit task | source: TSO split | source: other | receive task | sink task | workers w/o crypto | handoffs | malloc / free | libc unresolved (memcpy etc.) | other | syscalls |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T5 P1 sender | 35.1 | 5.9 | 1.7 | 0.0 | 3.9 | 11.9 | 5.4 | 4.0 | 0.2 | 0 | 0 | 15.6 | 8.3 | 6.9 | 1.1 | 22.4 |
+| T5 P1 receiver | 49.4 | 6.8 | 16.8 | 0.6 | 1.6 | 0.6 | 0 | 0.8 | 15.4 | 0 | 0 | 5.0 | 0.8 | 0.6 | 1.6 | 26.6 |
+| T5 P4 sender | 32.8 | 5.5 | 3.1 | 0.0 | 3.6 | 11.2 | 5.0 | 4.7 | 0.3 | 0 | 0 | 17.6 | 8.2 | 7.1 | 0.8 | 26.1 |
+| T5 P4 receiver | 50.4 | 7.1 | 17.6 | 0.7 | 1.6 | 0.7 | 0 | 1.1 | 11.9 | 0 | 0 | 6.6 | 0.7 | 0.6 | 0.9 | 24.8 |
+| T4 loaded sender | 35.4 | 6.4 | 1.7 | 0.0 | 3.8 | 11.6 | 5.6 | 4.1 | 0.2 | 0 | 0 | 14.9 | 8.4 | 6.9 | 1.0 | 21.5 |
+| T4 loaded receiver | 49.6 | 7.2 | 18.2 | 0.5 | 1.6 | 0.7 | 0 | 0.9 | 13.3 | 0 | 0 | 5.2 | 0.8 | 0.6 | 1.2 | 25.3 |
+| T1 w2 P1 sender | 34.2 | 2.6 | 0 | 0 | 7.8 | 11.4 | 4.8 | 5.1 | 0.9 | 3.1 | 3.3 | 14.7 | 6.2 | 5.3 | 0.7 | 21.4 |
+| T1 w2 P1 receiver | 40.6 | 6.5 | 0 | 0 | 6.3 | 2.9 | 0 | 0.8 | 11.3 | 14.3 | 4.5 | 10.4 | 0.6 | 0.7 | 0.9 | 22.3 |
+| T1 w2 P4 sender | 33.1 | 2.6 | 0 | 0 | 7.5 | 11.6 | 4.5 | 6.1 | 1.1 | 3.7 | 2.9 | 14.4 | 6.3 | 5.3 | 0.7 | 23.5 |
+| T1 w2 P4 receiver | 39.9 | 6.2 | 0 | 0 | 6.1 | 3.2 | 0 | 1.0 | 11.6 | 14.3 | 4.3 | 11.2 | 0.7 | 0.8 | 0.8 | 23.6 |
+
+The "syscalls" column overlaps the task columns (a task's system calls are also in its
+share). On the sender, the full-size TSO segments were reallocated when sealed (`realloc`
+4.5 %: the source buffer was 3 bytes short of the tail room) and allocated anew (`malloc`
+3.3 %), since sent buffers never went back to the source; handoffs were one message per
+datagram (369 k futex/s at P1).
+
+The changes:
+
+| Subtask | Change |
+| --- | --- |
+| OE-1 buffers and TUN | `TAILROOM` in `nsplane-packet` (padding + tag) behind every TUN / slot / Wintun read, so sealing never reallocates; `PacketSource::recycle` (default no-op) and `TunSource`'s pool fed from it; batched plain TUN reads (keep reading until `EAGAIN`); `PacketBuf::extend_from_slice` for the TSO split and pooled buffers that keep their initialized bytes (no zero-fill, no `unsafe`) |
+| OE-2 UDP transport | GSO send from the datagram buffers (one iovec each, `nix`), `sendmmsg` / `recvmmsg` without offload, a ring of four GRO storages, `recvmmsg` of up to 16 when no GRO trains arrive |
+| OE-3 engine handoffs | one transmit message per drain and transport, sent buffers back to the source one message per batch (C3, C1); with workers, received datagrams with the workers count against the deliver room (C2) |
+| OE-4 parallel crypto (C7) | one peer's packets on every worker: counter reserved and replay checked on the owner, the job carries the session key, completion in hand-out order (see [Crypto worker pool](#crypto-worker-pool)); 0 workers unchanged |
+| OE-5 | `MapSource` forwards `recycle` to its inner source |
+
+Per change, each A/B against the main of its day (pair kept by the load rule):
+
+- OE-1 (A main b5e531f, pair 2, load1 <= 5.8): default P1 / P4 9.76 / 10.40 -> 9.77 / 11.16
+  Gbit/s, sender CPU 1.24 -> 1.08 s/GB; w2 8.42 / 8.63 -> 9.00 / 9.17; nooffload 3.12 / 3.32
+  -> 3.49 / 3.87, CPU 3.57 / 3.06 -> 3.24 / 2.80; nsplane -> kernel 7.53 / 7.39 -> 7.66 /
+  7.55, CPU 2.23 -> 1.96. TSO split bench -2.8 %, `data_path` within -1.4 to +0.9 %. Its one
+  open item, nooffload UDP 3G loss 0.31 -> 0.88 %, is gone in the final A/B (below).
+- OE-2 (A main b5e531f): without offload the sender makes about 57 datagrams per `sendmmsg`
+  (58x fewer send calls) and the receiver 1.6 per `recvmmsg` (-39 % calls); system calls
+  per GB -33 % (sender) / -22 % (receiver); against the re-baseline nooffload 2.59 / 2.96 ->
+  3.29 / 3.19 Gbit/s at 3.38 / 2.81 s/GB, nooffload-w2 3.67 / 4.22 -> 4.38 / 4.62.
+  `udp_offload` offload off 84.5 -> 51-76 us. kernel -> nsplane par over three kept
+  alternating pairs (A 5.50-6.93, B 5.69-5.83 Gbit/s). The adaptive receive holds 16 slots
+  of 64 KiB (16 x the caller's buffer without offload) per transport, allocated once on the
+  first batched read; the GRO ring at most 4 x 128 KiB. UDP 3G loss, traced with counters
+  around a 30 s run: iperf3's lost datagrams equal the sender's `wg0` `tx_dropped` (the
+  sender's TUN queue, when its engine reads too slowly) plus the receiver's
+  `UdpRcvbufErrors` of the iperf3 socket, exactly, in every run (A and B); the tunnel, the
+  engine and both nsplane UDP sockets lose nothing.
+- OE-3 (A main b5e531f, B with OE-1 and OE-2, so cumulative; halves at load1 <= 9.5):
+  default 9.47 / 10.27 -> 10.46 / 11.49 Gbit/s, sender CPU 1.25 -> 0.95 s/GB, loaded ping
+  2.95 / 5.91 -> 2.39 / 5.02 ms; w2 7.81 / 7.82 -> 9.99 / 10.49 (C2: no receiver
+  `DROP_SINK_FULL`, so no retransmits); nooffload-w2 2.89 / 3.46 -> 4.54 / 4.86, UDP 3G loss
+  3.63 -> 0.22 %; nsplane -> kernel 7.18 -> 7.94, CPU 2.38 -> 1.94. The w2 loaded ping rose
+  from 1.2 / 2.6 to 2.7 / 5.4 ms: without the sink-full drops TCP no longer backs off and
+  fills the queues as on the default pair (the same ~2.5 ms), a consequence of C2 and not a
+  queue regression. Engine latency e2e (`latency.rs`, loaded, 2 pairs): with 2 workers lost
+  pings 327 / 363 -> 47 / 52 (no sink-full drops in B); without workers 344 / 256 -> 703 /
+  736, reproducibly: the test's ponger sink is slower than the link in both builds, every
+  lost ping is a sink-full drop at the receiver, and the faster sender pushes more into the
+  already overloaded pool-off receiver (bulk delivered 727-872 -> 554-579 packets/ms). The
+  pool-off owner still takes at least one datagram per wake; C2 applies only with workers.
+  The futex and context-switch counts of C3 were not measured.
+- OE-4 (C7 alone, A = the OE-3 merge 86c6b75, load1 <= 9): w2 10.03 / 10.50 -> 11.66 / 12.67
+  Gbit/s, w4 9.99 / 10.50 -> 11.47 / 12.49, default 10.15 / 11.48 -> 10.20 / 11.30 (noise);
+  `worker_pool` one peer, 1420 B, 2 workers 0.37 -> 1.30 Melem/s.
+
+Final A/B, 2026-10-05: A = main 20d728c, B = the OE branch (all of the above), both release
+builds. Halves A1 12:53-13:59Z (load1 3.1, highest 7.6), B1 14:31-15:37Z (0.5, highest 13.1:
+discarded), B2 15:51-16:57Z (2.6, highest 5.9), A2 17:28-18:34Z (3.0, highest 6.4); the table
+is the adjacent pair B2 / A2, with A1 in brackets. P1 / P4 Gbit/s, UDP loss %, ping ms, CPU
+s/GB:
+
+| Pair (a -> b) | P1 A -> B | P4 A -> B | UDP 1G / 3G A -> B | loaded ping p50 / p99 A -> B | CPU s/GB a, A -> B | CPU s/GB b, A -> B |
+| --- | --- | --- | --- | --- | --- | --- |
+| nsplane-nsplane | 9.60 [9.49] -> 10.33 (+8 %) | 10.39 [10.27] -> 11.38 (+10 %) | 0.03 / 0.08 -> 0.06 / 0.10 | 2.89 / 5.89 [3.18 / 5.88] -> 2.47 / 5.22 | 1.24 -> 0.94 (-24 %) | 0.91 -> 0.89 |
+| nsplane-nsplane (w2) | 8.39 [7.31] -> 11.67 (+39 %) | 8.58 [7.35] -> 12.65 (+47 %) | 0.02 / 0.09 -> 0.09 / 0.26 | 1.21 / 2.60 -> 2.16 / 4.69 | 1.23 -> 1.07 | 1.10 -> 1.09 |
+| nsplane-nsplane (w4) | 8.42 [7.99] -> 11.61 (+38 %) | 8.60 [7.17] -> 12.49 (+45 %) | 0.04 / 0.11 -> 0.08 / 0.25 | 1.23 / 2.50 -> 2.29 / 4.77 | 1.23 -> 1.08 | 1.08 -> 1.12 |
+| nsplane-nsplane (nooffload) | 3.10 [2.26] -> 3.45 (+11 %) | 3.35 [2.58] -> 3.51 (+5 %) | 0.02 / 0.37 [0.06 / 8.88] -> 0.01 / 0.06 | 1.33 / 2.86 -> 1.03 / 2.43 | 3.61 -> 2.97 (-18 %) | 3.08 -> 2.80 (-9 %) |
+| nsplane-nsplane (nooffload-w2) | 3.65 [3.37] -> 4.53 (+24 %) | 4.17 [3.97] -> 4.98 (+19 %) | 0.02 / 0.42 [0.44 / 14.21] -> 0.05 / 0.21 | 1.25 / 2.86 -> 1.14 / 2.52 | 3.64 -> 3.17 (-13 %) | 3.49 -> 3.05 (-13 %) |
+| nsplane-kernel | 7.44 [6.53] -> 7.85 (+6 %) | 7.23 [6.32] -> 7.52 (+4 %) | 0.03 / 0.09 -> 0.03 / 0.06 | 3.49 / 6.77 -> 3.32 / 5.05 | 2.13 -> 1.92 (-10 %) | 0.32 † -> 0.31 † |
+| kernel-nsplane | 6.97 [7.01] -> 7.08 (+2 %) | 6.80 [6.83] -> 7.02 (+3 %) | 0.01 / 0.05 -> 0.02 / 0.04 | 1.96 / 5.50 -> 1.91 / 4.94 | 0.10 † -> 0.07 † | 1.70 -> 1.65 |
+| wggo-wggo (same binary: spread) | 8.41 [9.66] -> 8.50 | 9.82 [10.14] -> 10.50 | 0.06 / 0.75 -> 0.09 / 0.83 | 2.56 / 6.40 -> 2.40 / 6.09 | 1.36 -> 1.32 | 1.71 -> 1.67 |
+
+† kernel WireGuard encrypts outside the container cgroup (undercount). The discarded B1
+agrees with B2 within 1-4 % (default 10.27 / 10.89, w2 11.58 / 12.49, nooffload 3.45 / 3.47).
+wireguard-go, the same binary in every half, moves up to 15 % (P1) between halves, so
+differences below that on a single pair are not meaningful; the w2 / w4 and no-offload
+gains are well above it and agree in both B halves. Idle ping is 0.5-0.9 ms p50 on every
+nsplane row in both builds. The nooffload UDP 3G loss that OE-1 had raised (0.31 -> 0.88 %)
+is 0.06-0.08 % in B against 0.37-8.88 % in A (nooffload-w2 0.21-0.27 against 0.42-14.21 %):
+not worse than main in any half.
+
+Micro, same day, one bench per lock acquisition, every half at load1 <= 4.2 (A / B):
+`nsplane-core` `data_path` within -1.5 to +0.8 % on all 16 cases (core round trip 530.2 /
+532.1 ns at 64 B, 1.3305 / 1.3346 us at 1420 B; batched 32 at 1420 B 39.36 / 39.07 us);
+`nsplane-noise` `data_path` within 0.3 %; `worker_pool` hub within -4.6 to +1.8 %; one peer
+(B only, the case is new) 1420 B 792 k / 1.30 M / 1.41 M packets/s with 0 / 2 / 4 workers;
+`local_graph` -0.3 to -1.8 %; `udp_offload` offload off 83.9 -> 51.0 us (-39 %), on 7.18 ->
+7.29 us; `nsplane-tun` `offload` TSO split 4.48 -> 4.32 us (-3.8 %), coalescing (unchanged
+code) 4.30 -> 4.47 us with overlapping intervals. No regression.
+
+Where the targets ended (final B2; re-baseline in brackets):
+
+- T1 crypto workers: w2 11.67 / 12.65 Gbit/s, w4 11.61 / 12.49, UDP 3G loss 0.25-0.26 %
+  [8.01 / 7.09, 4.03 %]. Workers are now faster than the default (10.33 / 11.38), and four
+  streams beat one.
+- T2 no offload: 3.45 / 3.51 Gbit/s at 2.97 / 2.80 s/GB [2.59 / 2.96 at 3.76 / 3.63];
+  nooffload-w2 4.53 / 4.98 [3.67 / 4.22]. The UDP side is batched; what is left is one TUN
+  read and one TUN write per packet.
+- T3 mixed directions: nsplane -> kernel 7.85 Gbit/s, sender CPU 1.92 s/GB [7.65, 2.22];
+  kernel -> nsplane 7.08 [5.80; main in the same window 6.97]. nsplane -> kernel is bounded
+  by kernel WireGuard's receiver, not by our sender: kernel WireGuard -> kernel WireGuard
+  moves 4.04-4.88 Gbit/s on this host and harness (4.04 in the run below, 4.88 in the OE
+  re-baseline), below the 7.85 nsplane-cli sends into it, and in the profile the kernel
+  receiver's own cryptography is the limit, outside our reach. Sending without GSO to such
+  peers (`skb_segment` 6.2 % in that profile) was ruled out: the peer type is unknown and
+  the kernel receiver stays the limit. Our side can only lower its CPU per GB, which it did
+  (-10 %).
+- T4 loaded latency: default 2.47 / 5.22 ms [2.84 / 5.40; main same window 2.89 / 5.89],
+  wireguard-go 2.40 / 6.09 in the same half. The sender intake bound proposed for it (C8, a
+  smaller bound on local packets queued for transmission) was tried as an opt-in and
+  dropped: at the bound with an empty backlog nothing woke the owner when the transmit
+  queue drained (loaded p50 / p99 ~750 ms), and the ping only moved from the transmit queue
+  into the local queue (`local` 1024 / 1024). A shallower `queue_capacity` already lowers
+  loaded latency (256: p50 2.1-2.4 -> 1.4-1.6 ms in the latency e2e); C8 is deferred.
+- T5 default: P1 / P4 10.33 / 11.38 Gbit/s, CPU 0.94 / 0.89 s/GB [9.91 / 9.87, 1.21 / 0.84].
+  Sender CPU per GB -24 % against main in the same window.
+
+ns MF-3 (per-peer parallelism, `docs/task/20261003-2200-ns-local-side.md`): one peer's
+throughput was capped by one serial task doing all of that peer's cryptography. Without
+workers that is the owner task, 82-85 % busy at about 0.95 us per packet with crypto 35 %
+(sender) / 49 % (receiver) of its cycles, so iperf3 `-P 4` cannot scale past one stream: the
+streams share the peer. With `crypto_workers` before OE-4, jobs went to worker `peer id % n`,
+so one peer still used one worker (w2 8.01 / 7.09 Gbit/s, below the default). It was not a
+per-peer queue or a lock: without workers the data path takes no lock. C7 spreads one peer's
+cryptography over every worker, with the counters reserved and the replay window checked
+in order on the owner and completion in order: with `crypto_workers` >= 2 the same pair
+moves 11.67 / 12.65 Gbit/s at w2 (main in the same window 8.39 / 8.58: +39 % / +47 %) and
+11.61 / 12.49 at w4, and P4 is now above P1; in process one peer with 1420 B packets goes
+from 792 k to 1.30 M (2 workers) and 1.41 M (4) packets per second. ns should set
+`crypto_workers` to 2 or more for a single busy peer on a multi-threaded runtime.
+
+What is left (from the profile and the design): with the cryptography on the workers the
+owner's work per packet drops to an estimated 0.35-0.45 us (not measured), so the next
+limits are the receiver's TUN delivery (coalescing and the TUN
+write, 17-18 % of the receiver on its owner without workers, the sink task with workers) and
+the sender's TSO split copy (`VnetReader::segment`, 5 % of the sender; splitting in place is
+not possible, each segment needs its own header and headroom). Without workers, a receiver
+whose sink is slower than the network still drops at `DROP_SINK_FULL` (the pool-off owner
+takes at least one datagram per wake); applying C2's deliver-room gate without workers would
+change the default path and is left for a later round. Without offload, one TUN read and one
+TUN write per packet remain. UDP loss at 3 Gbit/s is at the iperf3 socket and the sender's
+TUN queue, not in the tunnel.
 
 ## Unsafe code
 
