@@ -1104,8 +1104,9 @@ impl Workers {
     fn complete(&mut self, batch: JobBatch, core: &mut Core) {
         for (seq, job) in batch {
             // Every job handed back is in `order`: it is only completed from there.
-            if let Some(pending) = usize::try_from(seq - self.first)
-                .ok()
+            if let Some(pending) = seq
+                .checked_sub(self.first)
+                .and_then(|at| usize::try_from(at).ok())
                 .and_then(|at| self.order.get_mut(at))
             {
                 pending.job = Some(job);
