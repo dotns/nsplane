@@ -173,6 +173,11 @@ where
         }
     }
 
+    /// Hands the buffers to `inner`: mapping does not change who owns them.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        self.inner.recycle(bufs);
+    }
+
     fn mtu(&self) -> watch::Receiver<u16> {
         self.inner.mtu()
     }
@@ -351,5 +356,48 @@ mod tests {
         mtu_tx.send(1280)?;
         assert_eq!(*source.mtu().borrow(), 1280);
         Ok(())
+    }
+
+    /// Keeps every buffer it is handed back.
+    struct PoolSource {
+        pool: Vec<PacketBuf>,
+        mtu: watch::Sender<u16>,
+    }
+
+    impl PacketSource for PoolSource {
+        async fn recv(&mut self) -> io::Result<PacketBuf> {
+            std::future::pending().await
+        }
+
+        fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+            self.pool.append(bufs);
+        }
+
+        fn mtu(&self) -> watch::Receiver<u16> {
+            self.mtu.subscribe()
+        }
+    }
+
+    #[test]
+    fn source_recycle_reaches_inner() {
+        let inner = PoolSource {
+            pool: Vec::new(),
+            mtu: watch::channel(1420).0,
+        };
+        let mut source = MapSource::new(inner, rewrite);
+        let mut bufs = vec![PacketBuf::from_packet(&[1]), PacketBuf::from_packet(&[2])];
+        source.recycle(&mut bufs);
+        assert!(bufs.is_empty());
+        let pooled: Vec<_> = source.inner.pool.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(pooled, [&[1][..], &[2]]);
+    }
+
+    #[test]
+    fn source_recycle_default_inner_takes_nothing() {
+        let (inner, _tx, _mtu) = ChannelSource::new(1, 1420);
+        let mut source = MapSource::new(inner, rewrite);
+        let mut bufs = vec![PacketBuf::from_packet(&[1])];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
     }
 }
