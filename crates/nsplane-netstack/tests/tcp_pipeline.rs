@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use nsplane::{PacketBuf, PacketSink, PacketSource, PeerId};
-use nsplane_netstack::{NetStack, NetStackConfig, NetStackSink, NetStackSource};
+use nsplane_netstack::{NetStack, NetStackConfig, NetStackSink, NetStackSource, TcpConnection};
 use nsplane_packet::checksum::{
     ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -234,5 +234,113 @@ async fn syn_ack_advertises_wg_safe_mss() -> TestResult {
         );
         assert!(syn_ack.len() <= usize::from(mtu));
     }
+    Ok(())
+}
+
+/// Completes a handshake from `client` to `server` on the stack's sink and returns the
+/// connection taken from `incoming`.
+async fn accept(
+    incoming: &mut (impl Stream<Item = TcpConnection> + Send + Unpin),
+    source: &mut NetStackSource,
+    sink: &NetStackSink,
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Result<TcpConnection, Box<dyn Error>> {
+    let syn = build_tcp(client, server, 1000, 0, SYN)?;
+    inject(sink, &syn).await?;
+    let syn_ack = egress(source).await?;
+    let (_, server_seq, server_ack) = parse_tcp(syn_ack.as_packet())?;
+    let ack = build_tcp(client, server, server_ack, server_seq + 1, ACK)?;
+    inject(sink, &ack).await?;
+    let conn = timeout(WAIT, poll_fn(|cx| Pin::new(&mut *incoming).poll_next(cx)))
+        .await
+        .map_err(|_| "timed out waiting for the connection")?
+        .ok_or("incoming_tcp ended")?;
+    Ok(conn)
+}
+
+/// Waits until `conn.unacked()` reaches `expected` and stays there for a moment.
+async fn settle_unacked(conn: &TcpConnection, expected: u32) -> TestResult {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while conn.unacked() != expected {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("unacked {} instead of {expected}", conn.unacked()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(conn.unacked(), expected);
+    Ok(())
+}
+
+/// `tcp_send_budget` bounds what the connections take into their send buffers together:
+/// a connection sending alone takes the whole budget, and one that starts sending next to
+/// it takes only its share, half of it.
+#[tokio::test]
+async fn send_budget_splits_between_senders() -> TestResult {
+    const BUDGET: usize = 16 << 10;
+    let server: SocketAddr = "10.0.0.1:8080".parse()?;
+    let config = NetStackConfig {
+        tcp_send_budget: Some(BUDGET),
+        ..v4(Ipv4Addr::new(10, 0, 0, 1), 1360)
+    };
+    let (handle, mut source, sink) = start(config);
+    let mut incoming = handle.incoming_tcp();
+    let mut first = accept(
+        &mut incoming,
+        &mut source,
+        &sink,
+        "10.0.0.2:40010".parse()?,
+        server,
+    )
+    .await?;
+    let mut second = accept(
+        &mut incoming,
+        &mut source,
+        &sink,
+        "10.0.0.2:40011".parse()?,
+        server,
+    )
+    .await?;
+
+    first.write_all(&vec![1; 64 << 10]).await?;
+    settle_unacked(&first, u32::try_from(BUDGET)?).await?;
+    second.write_all(&vec![2; 64 << 10]).await?;
+    settle_unacked(&second, u32::try_from(BUDGET / 2)?).await?;
+    // Nothing is acknowledged, so the first keeps what it took.
+    assert_eq!(first.unacked(), u32::try_from(BUDGET)?);
+    Ok(())
+}
+
+/// Without a budget every connection fills its own send buffer.
+#[tokio::test]
+async fn no_send_budget_by_default() -> TestResult {
+    let server: SocketAddr = "10.0.0.1:8080".parse()?;
+    let config = NetStackConfig {
+        tcp_tx_buffer: Some(16 << 10),
+        ..v4(Ipv4Addr::new(10, 0, 0, 1), 1360)
+    };
+    let (handle, mut source, sink) = start(config);
+    let mut incoming = handle.incoming_tcp();
+    let mut first = accept(
+        &mut incoming,
+        &mut source,
+        &sink,
+        "10.0.0.2:40012".parse()?,
+        server,
+    )
+    .await?;
+    let mut second = accept(
+        &mut incoming,
+        &mut source,
+        &sink,
+        "10.0.0.2:40013".parse()?,
+        server,
+    )
+    .await?;
+    first.write_all(&vec![1; 64 << 10]).await?;
+    second.write_all(&vec![2; 64 << 10]).await?;
+    settle_unacked(&first, 16 << 10).await?;
+    settle_unacked(&second, 16 << 10).await?;
     Ok(())
 }
