@@ -13,7 +13,7 @@ use nsplane_noise::noise::errors::WireGuardError;
 use nsplane_noise::noise::handshake::parse_handshake_anon;
 use nsplane_noise::noise::{DATA_HEADER_SZ, Packet, Tunn, TunnResult};
 use nsplane_noise::x25519;
-use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
+use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId, TAILROOM};
 
 use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
@@ -28,8 +28,6 @@ use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, P
 const TICK: Duration = Duration::from_millis(250);
 /// Interval of the handshake gate's rate limiter reset.
 const RATE_LIMITER_RESET: Duration = Duration::from_secs(1);
-/// Room behind a packet for its padding (up to 15 bytes) and the AEAD tag (16 bytes).
-const TAIL_ROOM: usize = 15 + 16;
 /// Size of a handshake initiation, the largest handshake message.
 const HANDSHAKE_INIT_SZ: usize = 148;
 /// Size of a transport data message without payload.
@@ -1095,12 +1093,12 @@ impl Core {
         if packet.reserve_front(DATA_HEADER_SZ).is_err() {
             // E.g. a slice of a shared buffer: copy it behind the data header of a pooled
             // buffer.
-            let mut copy = self.pool.get((len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+            let mut copy = self.pool.get((len + TAILROOM).max(HANDSHAKE_INIT_SZ));
             copy.set_len(DATA_HEADER_SZ + len);
             copy.as_packet_mut()[DATA_HEADER_SZ..].copy_from_slice(packet.as_packet());
             self.pool.put(mem::replace(&mut packet, copy));
         }
-        packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+        packet.set_len((DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ));
         (packet, len)
     }
 
@@ -1328,6 +1326,31 @@ mod tests {
         let kind = message_kind(&data);
         assert_eq!(kind, MessageKind::Keepalive);
         assert!(roams(kind));
+    }
+
+    #[test]
+    fn layout_for_sealing_fits_a_buffer_with_tailroom() {
+        let mut core = Core::new(CoreConfig::default());
+        for len in [40, 1500] {
+            // As a TUN source hands a read over: headroom in front, room for a full-size
+            // packet and the tail room behind it.
+            let mut packet = PacketBuf::with_capacity(1500 + TAILROOM);
+            packet.set_len(len);
+            let capacity = packet.capacity();
+            let ptr = packet.as_packet().as_ptr();
+            let (packet, got) = core.layout_for_sealing(packet);
+            assert_eq!(got, len);
+            // The data header went into the headroom, nothing was reallocated.
+            assert_eq!(packet.capacity(), capacity + DATA_HEADER_SZ);
+            assert_eq!(
+                packet.as_packet().as_ptr(),
+                ptr.wrapping_sub(DATA_HEADER_SZ)
+            );
+            assert_eq!(
+                packet.len(),
+                (DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ)
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nsplane::{MAX_BATCH, PacketBatch};
-use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId};
+use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
@@ -290,10 +290,29 @@ pub struct TunSource {
     vnet: Option<VnetReader>,
 }
 
+impl TunSource {
+    /// Room each packet split off a virtio-net read gets: the MTU, the translation slack
+    /// and the tail room.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn capacity(&self) -> usize {
+        usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK + TAILROOM
+    }
+
+    /// A pooled buffer for one plain read, its packet region the `mtu` bytes to read into.
+    fn plain_buf(&mut self, mtu: usize) -> PacketBuf {
+        let mut packet = self.pool.get(mtu + TRANSLATION_SLACK + TAILROOM);
+        // `PacketBuf` exposes only initialised bytes; a reused buffer has them already, a
+        // fresh one is zero-filled once.
+        packet.set_len(mtu);
+        packet
+    }
+}
+
 impl PacketSource for TunSource {
     /// Reads exactly one packet into the packet region of a pooled [`PacketBuf`],
     /// leaving the headroom in front free and room for the MTU plus 28 bytes behind it,
-    /// so an IPv4 <-> IPv6 translator can grow a full-size packet in place. A packet
+    /// so an IPv4 <-> IPv6 translator can grow a full-size packet in place, plus
+    /// [`TAILROOM`], so the grown packet is sealed without reallocating. A packet
     /// longer than the MTU is truncated by the OS. A zero-length read (end of stream)
     /// yields [`io::ErrorKind::BrokenPipe`].
     ///
@@ -301,15 +320,14 @@ impl PacketSource for TunSource {
     /// packets; they are queued and returned one per call, before the next read.
     async fn recv(&mut self) -> io::Result<PacketBuf> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(vnet) = &mut self.vnet {
-            let capacity = usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK;
-            return vnet.recv(&self.fd, capacity, &mut self.pool).await;
+        {
+            let capacity = self.capacity();
+            if let Some(vnet) = &mut self.vnet {
+                return vnet.recv(&self.fd, capacity, &mut self.pool).await;
+            }
         }
         let mtu = usize::from(*self.mtu.borrow());
-        let mut packet = self.pool.get(mtu + TRANSLATION_SLACK);
-        // `PacketBuf` exposes only initialised bytes, so the read region is zero-filled
-        // first.
-        packet.set_len(mtu);
+        let mut packet = self.plain_buf(mtu);
         loop {
             let mut guard = self.fd.readable().await?;
             match guard.try_io(|fd| sys::read(fd.get_ref().as_fd(), packet.as_packet_mut())) {
@@ -324,25 +342,62 @@ impl PacketSource for TunSource {
         }
     }
 
-    /// Like [`recv`](Self::recv) for a plain device. With a virtio-net header
-    /// ([`Offload::vnet_hdr`]) one read of up to 65535 packet bytes is split into every
-    /// packet it holds (each no larger than the MTU), and as many as fit are appended;
-    /// the rest are appended by the next call before anything is read. A malformed read
-    /// is dropped.
+    /// Waits for one read like [`recv`](Self::recv), then keeps reading without waiting
+    /// until the device has nothing more to read or `batch` is full, so a lone packet is
+    /// returned at once. With a virtio-net header ([`Offload::vnet_hdr`]) one read of up
+    /// to 65535 packet bytes is split into every packet it holds (each no larger than the
+    /// MTU), and as many as fit are appended; the rest are appended by the next call
+    /// before anything is read, and no further read is made after a split one. A
+    /// malformed read is dropped. Packets read before an error stay in `batch`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn recv_batch(&mut self, batch: &mut PacketBatch) -> io::Result<()> {
+        let capacity = self.capacity();
         if let Some(vnet) = &mut self.vnet {
-            let capacity = usize::from(*self.mtu.borrow()) + TRANSLATION_SLACK;
             return vnet
                 .recv_batch(&self.fd, capacity, &mut self.pool, batch)
                 .await;
         }
-        if !batch.is_full() {
-            let packet = self.recv().await?;
-            // The batch had room, so the push succeeds.
-            let _ = batch.push(packet);
+        if batch.is_full() {
+            return Ok(());
+        }
+        let packet = self.recv().await?;
+        // The batch had room, so the push succeeds.
+        let _ = batch.push(packet);
+        let mtu = usize::from(*self.mtu.borrow());
+        while !batch.is_full() {
+            let mut packet = self.plain_buf(mtu);
+            // Clears the readiness if the read would block.
+            let read = self.fd.try_io(Interest::READABLE, |fd| {
+                sys::read(fd.as_fd(), packet.as_packet_mut())
+            });
+            match read {
+                Ok(0) => {
+                    self.pool.put(packet);
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                Ok(len) => {
+                    packet.set_len(len);
+                    let _ = batch.push(packet);
+                }
+                Err(e) => {
+                    self.pool.put(packet);
+                    return if e.kind() == io::ErrorKind::WouldBlock {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    };
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Returns the buffers to the source's pool, which keeps up to 64 idle ones; the rest
+    /// are dropped.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        for buf in bufs.drain(..) {
+            self.pool.put(buf);
+        }
     }
 
     /// The device MTU. For a real TUN device it follows the interface MTU: the
@@ -530,8 +585,9 @@ impl VnetReader {
     }
 
     /// Appends queued packets and the rest of the last read if there are any; otherwise
-    /// reads until a read yields at least one packet. Packets split off a read get at
-    /// least `capacity` bytes of capacity.
+    /// reads until a read yields at least one packet, then keeps reading without waiting
+    /// until a read would block, one is split (not every segment fit), or `batch` is
+    /// full. Packets split off a read get at least `capacity` bytes of capacity.
     async fn recv_batch(
         &mut self,
         fd: &AsyncFd<OwnedFd>,
@@ -568,13 +624,38 @@ impl VnetReader {
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => continue,
             };
-            match VirtioNetHdr::parse(&self.scratch[..len]) {
-                Ok(hdr) => self.segment(hdr, len, 0, capacity, pool, batch),
-                Err(e) => tracing::debug!(?e, "dropping a TUN read without a vnet header"),
-            }
+            self.split(len, capacity, pool, batch);
             if batch.len() > before {
-                return Ok(());
+                break;
             }
+        }
+        // Keep reading without waiting while the last read was not split and there is room.
+        while self.pending.is_none() && !batch.is_full() {
+            // Clears the readiness if the read would block.
+            match fd.try_io(Interest::READABLE, |fd| {
+                sys::read(fd.as_fd(), &mut self.scratch)
+            }) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                Ok(len) => self.split(len, capacity, pool, batch),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits the `len`-byte read in `scratch` into `batch` (see [`segment`](Self::segment));
+    /// drops a read without a virtio-net header.
+    fn split(
+        &mut self,
+        len: usize,
+        capacity: usize,
+        pool: &mut PacketPool,
+        batch: &mut PacketBatch,
+    ) {
+        match VirtioNetHdr::parse(&self.scratch[..len]) {
+            Ok(hdr) => self.segment(hdr, len, 0, capacity, pool, batch),
+            Err(e) => tracing::debug!(?e, "dropping a TUN read without a vnet header"),
         }
     }
 
@@ -1013,7 +1094,7 @@ mod tests {
         }
         assert_eq!(got[run.len()].as_packet(), udp);
         for p in &got {
-            assert!(p.capacity() >= 1500 + TRANSLATION_SLACK);
+            assert!(p.capacity() >= 1500 + TRANSLATION_SLACK + TAILROOM);
             assert_eq!(p.headroom(), nsplane::HEADROOM);
         }
     }
@@ -1108,8 +1189,128 @@ mod tests {
         // Like the virtio-net path, a full-MTU read gets the translation slack.
         let got = source.recv().await.unwrap();
         assert_eq!(got.as_packet(), full);
-        assert!(got.capacity() >= 1500 + TRANSLATION_SLACK);
+        assert!(got.capacity() >= 1500 + TRANSLATION_SLACK + TAILROOM);
         assert_eq!(got.headroom(), nsplane::HEADROOM);
+    }
+
+    #[tokio::test]
+    async fn plain_recv_batch_takes_every_queued_packet() {
+        let (mut source, _sink, kernel) = device(Offload::default());
+        let udp: Vec<Vec<u8>> = (0..5u8).map(|i| packet(17, 1, 0, &[i; 9])).collect();
+        for p in &udp {
+            kernel.send(p).unwrap();
+        }
+        let mut batch = PacketBatch::new();
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, udp);
+        for p in batch.iter() {
+            assert!(p.capacity() >= 1500 + TRANSLATION_SLACK + TAILROOM);
+        }
+
+        // A lone packet comes back at once.
+        let mut batch = PacketBatch::new();
+        kernel.send(&udp[0]).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), source.recv_batch(&mut batch))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+
+        // Never more than the batch has room for; the rest stay for the next call.
+        let mut batch = PacketBatch::new();
+        while batch.len() < MAX_BATCH - 2 {
+            batch.push(PacketBuf::from_packet(&[])).unwrap();
+        }
+        for p in &udp[..3] {
+            kernel.send(p).unwrap();
+        }
+        source.recv_batch(&mut batch).await.unwrap();
+        assert!(batch.is_full());
+        let got: Vec<Vec<u8>> = batch
+            .drain()
+            .skip(MAX_BATCH - 2)
+            .map(|p| p.as_packet().to_vec())
+            .collect();
+        assert_eq!(got, udp[..2]);
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, [udp[2].as_slice()]);
+
+        // A zero-length read behind a packet ends the batch with the packet kept.
+        batch.clear();
+        kernel.send(&udp[1]).unwrap();
+        kernel.send(&[]).unwrap();
+        let err = source.recv_batch(&mut batch).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, [udp[1].as_slice()]);
+    }
+
+    #[tokio::test]
+    async fn vnet_recv_batch_reads_on_until_a_read_is_split() {
+        let (mut source, sink, kernel) = device(TSO);
+        let udp: Vec<Vec<u8>> = (0..3u8).map(|i| packet(17, 1, 0, &[i; 9])).collect();
+        let framed = |p: &[u8]| {
+            let mut f = VirtioNetHdr::default().encode().to_vec();
+            f.extend_from_slice(p);
+            f
+        };
+        for p in &udp {
+            kernel.send(&framed(p)).unwrap();
+        }
+        let mut batch = PacketBatch::new();
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, udp);
+
+        // A super-packet that does not fit is split; the read behind it waits.
+        let run = tcp_run(4);
+        sink.send_batch(&mut batch_of(&run)).await.unwrap();
+        let (hdr, super_packet) = recv_datagram(&kernel);
+        let mut gso = hdr.encode().to_vec();
+        gso.extend_from_slice(&super_packet);
+        kernel.send(&framed(&udp[0])).unwrap();
+        kernel.send(&gso).unwrap();
+        kernel.send(&framed(&udp[1])).unwrap();
+        let mut batch = PacketBatch::new();
+        while batch.len() < MAX_BATCH - 3 {
+            batch.push(PacketBuf::from_packet(&[])).unwrap();
+        }
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<Vec<u8>> = batch
+            .drain()
+            .skip(MAX_BATCH - 3)
+            .map(|p| p.as_packet().to_vec())
+            .collect();
+        assert_eq!(got, [&udp[..1], &run[..2]].concat());
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, run[2..]);
+        batch.clear();
+        source.recv_batch(&mut batch).await.unwrap();
+        let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(got, [udp[1].as_slice()]);
+    }
+
+    #[tokio::test]
+    async fn recycle_refills_the_pool_up_to_its_bound() {
+        let (mut source, _sink, _kernel) = device(Offload::default());
+        assert_eq!(source.pool.free_len(), 0);
+        let mut bufs: Vec<PacketBuf> = (0..POOL_FREE + 3)
+            .map(|_| PacketBuf::with_capacity(1600))
+            .collect();
+        source.recycle(&mut bufs);
+        assert!(bufs.is_empty());
+        assert_eq!(source.pool.free_len(), POOL_FREE);
+
+        // The next read goes into a recycled buffer.
+        let (mut source, _sink, kernel) = device(Offload::default());
+        source.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
+        let udp = packet(17, 1, 0, b"reuse");
+        kernel.send(&udp).unwrap();
+        assert_eq!(source.recv().await.unwrap().as_packet(), udp);
+        assert_eq!(source.pool.free_len(), 0);
     }
 
     /// Writes small UDP packets with `try_send_batch` until the device would block;
