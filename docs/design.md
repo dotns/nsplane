@@ -236,6 +236,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Release 0.8.0 | first nsplane release (tag `v0.8.0`) | 2026-10-04 |
 | ns requests | per-path MTU and Linux path MTU discovery, padding cap, UDP builder, `send_to_async`, redirect tries, native alias; netstack abort, fragment discard, connected UDP; `nsplane-wss` plain ws, events, keepalive, timeouts; ACL source scope | done (plan `20261004-1100-ns-requests`) |
 | Release 0.9.0 | the remaining ns requests (tag `v0.9.0`) | 2026-10-04 |
+| Optimization | engine fast path and parallel per-peer crypto, UDP batching, TUN buffers; netstack smoltcp fork round; hygiene follow-ups | done (plan `20261004-1730-optimization`) |
+| Release 0.10.0 | the optimization round (tag `v0.10.0`) | 2026-10-05 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

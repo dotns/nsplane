@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-05
+
+The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
+buffers with seal tail room and recycling, batched TUN reads, UDP GSO from datagram buffers and
+`sendmmsg`/`recvmmsg` without offload, batched owner-transmit handoff, receive jobs counted
+against the deliver room, and one peer's crypto spread over all workers when
+`crypto_workers >= 2` (default 10.3 / 11.4 Gbit/s for 1 / 4 TCP streams, 11.7 / 12.7 with two
+workers, above wireguard-go). netstack: smoltcp fork `v0.14.0-nsplane.4` (NewReno partial ACK,
+sender SWS avoidance, Limited Transmit, 64-bit checksum, stable window edge), four streams at
+least as fast as one, opt-in `tcp_send_budget`. Hygiene: no runtime panics in the ACL, a coarse
+clock for the node L3 gate, the WSS overflow race, UAPI rebinds honoring `--no-offload`, the
+translator on the shared reassembler. One breaking change: `AclFilterStats::internal`.
+
 ### Added
 - `nsplane`: `PacketSource::recycle(&mut self, bufs: &mut Vec<PacketBuf>)`, a default no-op:
   the engine hands transmitted buffers back to the source (one message per sent batch, over

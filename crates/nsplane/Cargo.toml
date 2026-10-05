@@ -16,8 +16,8 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-nsplane-core = { path = "../nsplane-core", version = "0.9.0" }
-nsplane-packet = { path = "../nsplane-packet", version = "0.9.0" }
+nsplane-core = { path = "../nsplane-core", version = "0.10.0" }
+nsplane-packet = { path = "../nsplane-packet", version = "0.10.0" }
 quinn-udp = { version = "0.6.3", default-features = false, features = ["tracing"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }

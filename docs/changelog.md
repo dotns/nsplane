@@ -132,3 +132,11 @@ nsplane 7.0, nsplane -> kernel 7.7, wireguard-go 10.0 / 10.1.
 Release 0.9.0 (tag `v0.9.0`): the remaining ns requests (plan `20261004-1100-ns-requests`,
 campaigns RN, RW, RA, RS, RX), all additive. Next: the optimization round (quiet-host
 re-measure, multi-stream throughput against wireguard-go, netstack 4-stream anomaly).
+
+## 2026-10-05 20:30 [release]
+
+Release 0.10.0 (tag `v0.10.0`): the optimization round (plan `20261004-1730-optimization`,
+campaigns OE, ON, OH). Quiet harness against 0.9.0 main: default 9.60 / 10.39 -> 10.33 /
+11.38 Gbit/s (1 / 4 TCP streams), two crypto workers 8.39 / 8.58 -> 11.67 / 12.65, sender CPU
+1.24 -> 0.94 s/GB; netstack 6.21 / 2.48 -> 6.85 / 7.29. Next: the deferred ns requests (MF-4,
+MF-5, MW-7, MB-x7, MQ-17) and the round's follow-ups.
