@@ -7,6 +7,7 @@ use crate::noise::errors::WireGuardError;
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce};
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use zerocopy::FromBytes;
 
 pub(super) struct Session {
@@ -14,8 +15,124 @@ pub(super) struct Session {
     sending_index: u32,
     receiver: LessSafeKey,
     sender: LessSafeKey,
+    /// The same keys for [`SealTicket`]s and [`OpenTicket`]s, which seal and open off the
+    /// tunnel; its identity also tells whether a ticket still belongs to this session.
+    shared: Arc<SharedKeys>,
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
+}
+
+/// The keys of a session, shared with its tickets.
+struct SharedKeys {
+    receiver: LessSafeKey,
+    sender: LessSafeKey,
+}
+
+/// One transport data message reserved in a session.
+///
+/// It holds the session's sending key, the counter (nonce) reserved for the message and its
+/// layout. Sealing it needs no access to
+/// the tunnel, so it can run on any thread; a reserved counter is never handed out again,
+/// whether the ticket is sealed or not.
+pub struct SealTicket {
+    keys: Arc<SharedKeys>,
+    /// Slot of the session in the tunnel's ring.
+    slot: usize,
+    receiver_index: u32,
+    counter: u64,
+    len: usize,
+    padded_len: usize,
+}
+
+impl std::fmt::Debug for SealTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealTicket")
+            .field("receiver_index", &self.receiver_index)
+            .field("counter", &self.counter)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SealTicket {
+    /// Seals the plaintext in `buf[DATA_HEADER_SZ..DATA_HEADER_SZ + len]` in place with the
+    /// reserved counter and writes the data header in front of it; returns the datagram, a
+    /// prefix of `buf`. `buf` must be the buffer the ticket was reserved for.
+    pub fn seal<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], WireGuardError> {
+        if buf.len() < DATA_OFFSET + self.padded_len + AEAD_SIZE {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
+        seal(
+            &self.keys.sender,
+            self.receiver_index,
+            self.counter,
+            buf,
+            self.len,
+            self.padded_len,
+        )
+    }
+
+    /// The counter (nonce) reserved for the message.
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Whether this ticket was reserved in `session`.
+    pub(super) fn of(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.keys, &session.shared)
+    }
+
+    /// Slot of the ticket's session in the tunnel's ring.
+    pub(super) const fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+/// One received transport data message that passed a session's replay check.
+///
+/// It holds the session's receiving key and the message's counter. Opening it needs no
+/// access to the tunnel, so it can run on any thread; the counter is only marked as received
+/// when the tunnel commits the opened message ([`super::Tunn::commit_open`]).
+pub struct OpenTicket {
+    keys: Arc<SharedKeys>,
+    receiver_index: u32,
+    counter: u64,
+}
+
+impl std::fmt::Debug for OpenTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenTicket")
+            .field("receiver_index", &self.receiver_index)
+            .field("counter", &self.counter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenTicket {
+    /// Opens the transport data message in `datagram` in place: the plaintext replaces the
+    /// encrypted packet behind the data header. Returns the length of the plaintext (with
+    /// its padding), which starts at `DATA_HEADER_SZ`.
+    pub fn open(&self, datagram: &mut [u8]) -> Result<usize, WireGuardError> {
+        let ciphertext = datagram
+            .get_mut(DATA_OFFSET..)
+            .ok_or(WireGuardError::InvalidPacket)?;
+        open(&self.keys.receiver, self.counter, ciphertext).map(|plaintext| plaintext.len())
+    }
+
+    /// The message's counter.
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// The index of the receiving session.
+    pub(super) const fn receiver_index(&self) -> u32 {
+        self.receiver_index
+    }
+
+    /// Whether this ticket was handed out by `session`.
+    pub(super) fn of(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.keys, &session.shared)
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -45,6 +162,60 @@ fn nonce(counter: u64) -> Nonce {
 /// Length of a plaintext of `len` bytes after padding to a multiple of 16.
 const fn padded_len(len: usize) -> usize {
     len.next_multiple_of(16)
+}
+
+/// The padded length of a plaintext of `len` bytes sealed in a buffer of `buf_len` bytes:
+/// padded to a multiple of 16 as far as the buffer has room and not past `pad_limit`.
+fn sealed_plaintext_len(
+    buf_len: usize,
+    len: usize,
+    pad_limit: usize,
+) -> Result<usize, WireGuardError> {
+    let room = buf_len
+        .checked_sub(DATA_OFFSET + AEAD_SIZE)
+        .filter(|&room| room >= len)
+        .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+    // The spec pads the plaintext with zeros to a multiple of 16 bytes.
+    Ok(padded_len(len).min(room).min(pad_limit.max(len)))
+}
+
+/// Seals the plaintext in `buf[DATA_OFFSET..DATA_OFFSET + len]`, zero-padded to
+/// `padded_len`, with `key` and `counter`, and writes the data header for `receiver_index`
+/// in front of it; returns the datagram. `buf` has room for the padded plaintext and the tag.
+#[inline]
+fn seal<'a>(
+    key: &LessSafeKey,
+    receiver_index: u32,
+    counter: u64,
+    buf: &'a mut [u8],
+    len: usize,
+    padded_len: usize,
+) -> Result<&'a mut [u8], WireGuardError> {
+    let (header, payload) = DataHeader::mut_from_prefix(&mut *buf)
+        .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
+    header.message_type = DATA.into();
+    header.receiver_index = receiver_index.into();
+    header.counter = counter.into();
+
+    payload[len..padded_len].fill(0);
+    let tag = key
+        .seal_in_place_separate_tag(nonce(counter), Aad::empty(), &mut payload[..padded_len])
+        .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
+    payload[padded_len..padded_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+
+    Ok(&mut buf[..DATA_OFFSET + padded_len + AEAD_SIZE])
+}
+
+/// Opens the encrypted packet and tag in `ciphertext` in place with `key` and `counter`;
+/// returns the plaintext, a prefix of `ciphertext`.
+#[inline]
+fn open<'a>(
+    key: &LessSafeKey,
+    counter: u64,
+    ciphertext: &'a mut [u8],
+) -> Result<&'a mut [u8], WireGuardError> {
+    key.open_in_place(nonce(counter), Aad::empty(), ciphertext)
+        .map_err(|_| WireGuardError::InvalidAeadTag)
 }
 
 /// Where encrypted data resides in a data packet
@@ -195,6 +366,10 @@ impl Session {
             sending_index: peer_index,
             receiver: chacha20_poly1305_key(&receiving_key),
             sender: chacha20_poly1305_key(&sending_key),
+            shared: Arc::new(SharedKeys {
+                receiver: chacha20_poly1305_key(&receiving_key),
+                sender: chacha20_poly1305_key(&sending_key),
+            }),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(ReceivingKeyCounterValidator::default()),
         }
@@ -239,40 +414,49 @@ impl Session {
         len: usize,
         pad_limit: usize,
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let room = buf
-            .len()
-            .checked_sub(DATA_OFFSET + AEAD_SIZE)
-            .filter(|&room| room >= len)
-            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
-        // The spec pads the plaintext with zeros to a multiple of 16 bytes.
-        let padded_len = padded_len(len).min(room).min(pad_limit.max(len));
+        let padded_len = sealed_plaintext_len(buf.len(), len, pad_limit)?;
+        let counter = self.reserve_counter()?;
+        seal(
+            &self.sender,
+            self.sending_index,
+            counter,
+            buf,
+            len,
+            padded_len,
+        )
+    }
 
-        // Never hand out a counter at or past Reject-After-Messages: the nonce must not repeat.
-        let sending_key_counter = self
-            .sending_key_counter
+    /// Reserves the next counter for a message like [`Session::seal_in_place`] would seal it
+    /// in a buffer of `buf_len` bytes, to be sealed with the returned ticket; the session is
+    /// at `slot` in the tunnel's ring.
+    pub(super) fn reserve(
+        &self,
+        slot: usize,
+        buf_len: usize,
+        len: usize,
+        pad_limit: usize,
+    ) -> Result<SealTicket, WireGuardError> {
+        let padded_len = sealed_plaintext_len(buf_len, len, pad_limit)?;
+        let counter = self.reserve_counter()?;
+        Ok(SealTicket {
+            keys: Arc::clone(&self.shared),
+            slot,
+            receiver_index: self.sending_index,
+            counter,
+            len,
+            padded_len,
+        })
+    }
+
+    /// Hands out the next sending counter. Never one at or past Reject-After-Messages: the
+    /// nonce must not repeat.
+    #[inline]
+    fn reserve_counter(&self) -> Result<u64, WireGuardError> {
+        self.sending_key_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                 (c < REJECT_AFTER_MESSAGES).then_some(c + 1)
             })
-            .map_err(|_| WireGuardError::ConnectionExpired)?;
-
-        let (header, payload) = DataHeader::mut_from_prefix(&mut *buf)
-            .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
-        header.message_type = DATA.into();
-        header.receiver_index = self.sending_index.into();
-        header.counter = sending_key_counter.into();
-
-        payload[len..padded_len].fill(0);
-        let tag = self
-            .sender
-            .seal_in_place_separate_tag(
-                nonce(sending_key_counter),
-                Aad::empty(),
-                &mut payload[..padded_len],
-            )
-            .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
-        payload[padded_len..padded_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
-
-        Ok(&mut buf[..DATA_OFFSET + padded_len + AEAD_SIZE])
+            .map_err(|_| WireGuardError::ConnectionExpired)
     }
 
     /// src - an IP packet from the interface
@@ -304,14 +488,35 @@ impl Session {
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
         self.receiving_counter_quick_check(counter)?;
 
-        let plaintext = self
-            .receiver
-            .open_in_place(nonce(counter), Aad::empty(), ciphertext)
-            .map_err(|_| WireGuardError::InvalidAeadTag)?;
+        let plaintext = open(&self.receiver, counter, ciphertext)?;
 
         // After decryption is done, check counter again, and mark as received
         self.receiving_counter_mark(counter)?;
         Ok(plaintext)
+    }
+
+    /// Checks a received message like [`Session::open_in_place`] before decrypting it, and
+    /// returns a ticket to open it with; the counter is marked as received by
+    /// [`Session::commit`] once the message is opened.
+    pub(super) fn open_ticket(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+    ) -> Result<OpenTicket, WireGuardError> {
+        if receiver_idx != self.receiving_index {
+            return Err(WireGuardError::WrongIndex);
+        }
+        self.receiving_counter_quick_check(counter)?;
+        Ok(OpenTicket {
+            keys: Arc::clone(&self.shared),
+            receiver_index: receiver_idx,
+            counter,
+        })
+    }
+
+    /// Marks the counter of a message opened with a ticket as received; fails for a replay.
+    pub(super) fn commit(&self, counter: u64) -> Result<(), WireGuardError> {
+        self.receiving_counter_mark(counter)
     }
 
     /// Whether the sending key reached Reject-After-Messages and must not be used again.
@@ -421,5 +626,55 @@ mod tests {
         assert!(c.mark_did_receive(8000).is_ok());
         assert!(c.mark_did_receive(5).is_ok());
         assert!(c.mark_did_receive(5).is_err());
+    }
+
+    #[test]
+    fn tickets_seal_and_open_byte_for_byte_like_the_session() {
+        let inline = Session::new(1, 2, [1; 32], [2; 32]);
+        let split = Session::new(1, 2, [1; 32], [2; 32]);
+        let peer = Session::new(2, 1, [2; 32], [1; 32]);
+        for (len, pad_limit) in [(0, usize::MAX), (37, usize::MAX), (37, 40), (64, 50)] {
+            let mut a = [0u8; 128];
+            a[DATA_OFFSET..DATA_OFFSET + len].fill(0xab);
+            let mut b = a;
+            let sealed = inline.seal_in_place(&mut a, len, pad_limit).unwrap().len();
+            let ticket = split.reserve(1, b.len(), len, pad_limit).unwrap();
+            assert_eq!(ticket.seal(&mut b).unwrap().len(), sealed);
+            assert_eq!(a[..sealed], b[..sealed]);
+
+            let header = DataHeader::ref_from_prefix(&a[..]).unwrap().0;
+            let counter = header.counter.get();
+            let mut c = b;
+            let plaintext = peer
+                .open_in_place(2, counter, &mut a[DATA_OFFSET..sealed])
+                .unwrap();
+            let expected = plaintext.to_vec();
+            let open = peer.open_ticket(2, counter).unwrap_err();
+            assert!(matches!(open, WireGuardError::DuplicateCounter));
+            let other = Session::new(2, 1, [2; 32], [1; 32]);
+            let ticket = other.open_ticket(2, counter).unwrap();
+            let plain_len = ticket.open(&mut c[..sealed]).unwrap();
+            assert_eq!(c[DATA_OFFSET..DATA_OFFSET + plain_len], expected[..]);
+            assert!(other.commit(counter).is_ok());
+            assert!(other.commit(counter).is_err());
+        }
+    }
+
+    #[test]
+    fn a_ticket_never_takes_a_counter_past_reject_after_messages() {
+        let session = Session::new(1, 2, [1; 32], [2; 32]);
+        session.set_sending_counter(REJECT_AFTER_MESSAGES - 1);
+        let ticket = session.reserve(0, 64, 0, usize::MAX).unwrap();
+        assert_eq!(ticket.counter(), REJECT_AFTER_MESSAGES - 1);
+        assert!(matches!(
+            session.reserve(0, 64, 0, usize::MAX),
+            Err(WireGuardError::ConnectionExpired)
+        ));
+        assert_eq!(session.sending_counter(), REJECT_AFTER_MESSAGES);
+        // A buffer without room reserves nothing.
+        assert!(matches!(
+            session.reserve(0, 16, 0, usize::MAX),
+            Err(WireGuardError::DestinationBufferTooSmall)
+        ));
     }
 }

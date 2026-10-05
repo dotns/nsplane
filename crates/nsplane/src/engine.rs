@@ -6,6 +6,7 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::ops::ControlFlow;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -171,10 +172,14 @@ const PATH_MTU_REPORTS: usize = 16;
 /// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
 /// and finishes each packet when its worker hands it back ([`Core::complete_job`]);
 /// everything else (routing, filters, handshakes, timers, counters, events) stays on the
-/// owner, which then never sends or delivers inline. The pool is sharded by peer:
-/// all packets of a peer, in both directions, go to the same worker (in batches, handed over
-/// when one is full or the owner has nothing else to do), which runs them in arrival order, so each peer's packets leave in the order they came while different peers
-/// are encrypted in parallel (on a multi-threaded runtime). At most queue capacity packets
+/// owner, which then never sends or delivers inline. The owner reserves each local packet's
+/// counter (nonce) in order and checks each received datagram against the replay window
+/// when it hands the job out; the jobs go to the workers in turn, whatever their peer (in
+/// batches, handed over when one is full or the owner has nothing else to do), so one peer's
+/// packets are encrypted on every worker in parallel (on a multi-threaded runtime). The owner
+/// completes the jobs in the order it handed them out, marking each received datagram's
+/// counter as received only then, so each peer's packets leave in the order they came and a
+/// duplicate opened on two workers at once is still rejected. At most queue capacity packets
 /// are with the workers at a time; while that many are, the owner stops reading local
 /// packets and received datagrams. Since each received datagram with the workers may deliver
 /// a packet, the owner reads received datagrams only while the deliver queue has room beyond
@@ -1012,20 +1017,27 @@ impl TransportSlot {
 
 /// The crypto worker tasks and their queues.
 ///
-/// Jobs go to the workers in batches: each worker's batch is handed over once it is full, or
-/// with every other batch once one is full or the owner has nothing else to do, so a busy
-/// owner wakes each worker once per batch rather than once per packet.
+/// Jobs go to the workers in turn, whatever their peer, so even a single peer's packets are
+/// encrypted on every worker. Jobs go to the workers in batches: each worker's batch is
+/// handed over once it is full, or with every other batch once one is full or the owner has
+/// nothing else to do, so a busy owner wakes each worker once per batch rather than once per
+/// packet. The workers hand jobs back in any order; they are completed in the order they
+/// were handed out, so each peer's packets keep their order.
 struct Workers {
-    /// One job queue per worker; a peer's jobs go to worker `peer % n`.
+    /// One job queue per worker.
     queues: Vec<mpsc::Sender<JobBatch>>,
     /// The jobs of each worker not handed over yet, oldest first.
     batches: Vec<JobBatch>,
     /// Batches the workers ran, in the order each worker ran them.
     done: mpsc::Receiver<JobBatch>,
-    /// Jobs batched or with the workers and not completed yet; at most `bound`.
-    in_flight: usize,
-    /// The jobs of `in_flight` that open received datagrams, each of which may deliver a
-    /// packet.
+    /// The worker the next job goes to.
+    next: usize,
+    /// Jobs batched or with the workers and not completed yet, in the order they were
+    /// handed out; at most `bound`. A job is here once its worker handed it back.
+    order: VecDeque<Pending>,
+    /// The sequence number of the front of `order`.
+    first: u64,
+    /// The jobs of `order` that open received datagrams, each of which may deliver a packet.
     opens: usize,
     /// The most jobs in flight since [`Owner::queue_stats`] last took it.
     peak: usize,
@@ -1033,12 +1045,16 @@ struct Workers {
     tasks: Vec<Task>,
 }
 
-/// A batch of jobs for one worker, and how many of them open received datagrams.
-#[derive(Default)]
-struct JobBatch {
-    jobs: Vec<CryptoJob>,
-    opens: usize,
+/// A job handed out and not completed yet.
+struct Pending {
+    /// Whether it opens a received datagram.
+    open: bool,
+    /// The job, once a worker ran it.
+    job: Option<CryptoJob>,
 }
+
+/// A batch of jobs for one worker, each with its sequence number.
+type JobBatch = Vec<(u64, CryptoJob)>;
 
 impl Workers {
     /// Spawns `n` workers, with at most `bound` jobs in flight.
@@ -1053,9 +1069,11 @@ impl Workers {
             .unzip();
         Self {
             queues,
-            batches: (0..n).map(|_| JobBatch::default()).collect(),
+            batches: (0..n).map(|_| JobBatch::new()).collect(),
             done,
-            in_flight: 0,
+            next: 0,
+            order: VecDeque::with_capacity(bound),
+            first: 0,
             opens: 0,
             peak: 0,
             bound,
@@ -1063,47 +1081,71 @@ impl Workers {
         }
     }
 
-    /// Adds `job` to its peer's worker's batch, `open` if it opens a received datagram;
-    /// `true` once that batch is full.
+    /// Jobs batched or with the workers and not completed yet.
+    fn in_flight(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Adds `job` to the next worker's batch, `open` if it opens a received datagram; `true`
+    /// once that batch is full.
     fn dispatch(&mut self, job: CryptoJob, open: bool) -> bool {
-        let worker = job.peer().get() as usize % self.queues.len();
-        let batch = &mut self.batches[worker];
-        batch.jobs.push(job);
-        batch.opens += usize::from(open);
-        self.in_flight += 1;
+        let seq = self.first + self.order.len() as u64;
+        self.order.push_back(Pending { open, job: None });
         self.opens += usize::from(open);
-        self.peak = self.peak.max(self.in_flight);
-        batch.jobs.len() >= MAX_BATCH
+        self.peak = self.peak.max(self.order.len());
+        let batch = &mut self.batches[self.next];
+        self.next = (self.next + 1) % self.queues.len();
+        batch.push((seq, job));
+        batch.len() >= MAX_BATCH
     }
 
-    /// Counts the jobs of `batch` as completed.
-    const fn completed(&mut self, batch: &JobBatch) {
-        self.in_flight -= batch.jobs.len();
-        self.opens -= batch.opens;
+    /// Takes back the jobs of `batch` and completes on `core` every job whose predecessors
+    /// are all completed, in the order they were handed out.
+    fn complete(&mut self, batch: JobBatch, core: &mut Core) {
+        for (seq, job) in batch {
+            // Every job handed back is in `order`: it is only completed from there.
+            if let Some(pending) = usize::try_from(seq - self.first)
+                .ok()
+                .and_then(|at| self.order.get_mut(at))
+            {
+                pending.job = Some(job);
+            }
+        }
+        while let Some(job) = self
+            .order
+            .front_mut()
+            .and_then(|pending| pending.job.take())
+        {
+            if self.order.pop_front().is_some_and(|pending| pending.open) {
+                self.opens -= 1;
+            }
+            self.first += 1;
+            core.complete_job(job);
+        }
     }
 
-    /// Hands every batch of jobs to its worker; completes the jobs of a worker that is gone
-    /// (it panicked) on `core`.
+    /// Hands every batch of jobs to its worker; runs the jobs of a worker that is gone on
+    /// the owner and completes them on `core`.
     fn flush(&mut self, core: &mut Core) {
         for worker in 0..self.queues.len() {
-            if self.batches[worker].jobs.is_empty() {
+            if self.batches[worker].is_empty() {
                 continue;
             }
             // Never full: a queue holds a batch of each job in flight.
-            if let Err(TrySendError::Full(batch) | TrySendError::Closed(batch)) =
+            if let Err(TrySendError::Full(mut batch) | TrySendError::Closed(mut batch)) =
                 self.queues[worker].try_send(std::mem::take(&mut self.batches[worker]))
             {
-                self.completed(&batch);
-                for job in batch.jobs {
-                    core.complete_job(job);
+                for (_, job) in &mut batch {
+                    job.run();
                 }
+                self.complete(batch, core);
             }
         }
     }
 
     /// Whether the bound of jobs in flight is reached.
-    const fn full(&self) -> bool {
-        self.in_flight >= self.bound
+    fn full(&self) -> bool {
+        self.in_flight() >= self.bound
     }
 }
 
@@ -1625,7 +1667,7 @@ impl Owner {
     /// the crypto workers have room for, each item leading to at most one job.
     fn batch_room(&self) -> usize {
         self.workers.as_ref().map_or(MAX_BATCH, |workers| {
-            MAX_BATCH.min(workers.bound.saturating_sub(workers.in_flight))
+            MAX_BATCH.min(workers.bound.saturating_sub(workers.in_flight()))
         })
     }
 
@@ -1683,17 +1725,14 @@ impl Owner {
         self.high_water
             .crypto_done
             .record_received(workers.done.len());
-        workers.completed(&batch);
-        for job in batch.jobs {
-            self.core.complete_job(job);
-        }
+        workers.complete(batch, &mut self.core);
     }
 
     /// Waits for every job with the crypto workers and completes it.
     async fn settle(&mut self) {
         self.flush_jobs();
         while let Some(workers) = &mut self.workers
-            && workers.in_flight > 0
+            && workers.in_flight() > 0
         {
             match workers.done.recv().await {
                 Some(jobs) => self.complete_jobs(jobs),
@@ -1834,7 +1873,7 @@ impl Owner {
         if let Some(workers) = &mut self.workers {
             marks
                 .crypto
-                .record(std::mem::take(&mut workers.peak).max(workers.in_flight));
+                .record(std::mem::take(&mut workers.peak).max(workers.in_flight()));
             marks.crypto_done.record(workers.done.len());
         }
         let stats = *marks;
@@ -2419,11 +2458,14 @@ const fn settles(command: &Command) -> bool {
     )
 }
 
-/// Runs the batches of jobs from the owner, in order, and hands them back until the owner is
-/// gone.
+/// Runs the batches of jobs from the owner and hands them back until the owner is gone.
 async fn crypto_worker(mut jobs: mpsc::Receiver<JobBatch>, done: mpsc::Sender<JobBatch>) {
     while let Some(mut batch) = jobs.recv().await {
-        batch.jobs.iter_mut().for_each(CryptoJob::run);
+        for (_, job) in &mut batch {
+            // A job that panics is handed back all the same, so the jobs behind it in the
+            // owner's order are not held up; its packet is dropped.
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| job.run()));
+        }
         // The queue holds a batch of each job in flight, so this does not wait.
         if done.send(batch).await.is_err() {
             return;
