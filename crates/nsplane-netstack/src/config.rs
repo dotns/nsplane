@@ -82,6 +82,21 @@ pub struct NetStackConfig {
     /// Clamped like [`tcp_rx_buffer`](Self::tcp_rx_buffer). Default `None`: the same
     /// `(mtu - 40) * 512`.
     pub tcp_tx_buffer: Option<usize>,
+    /// Bytes all TCP connections of the stack together hold in their send buffers (sent
+    /// and not acknowledged yet, or waiting for the window), split evenly between the
+    /// connections that have data to send. Each connection gets at least one IPv4 MSS
+    /// (`mtu - 40`) and at most its [`tcp_tx_buffer`](Self::tcp_tx_buffer).
+    ///
+    /// Without it every connection may have its whole send buffer in flight, so `n` bulk
+    /// connections put `n` windows on the path at once. Where the queues on the path hold
+    /// fewer packets (the receiving engine's `queue_capacity`, 1024 by default, holds two
+    /// default windows), the excess is dropped, and smoltcp recovers all but one lost
+    /// segment per window by a retransmission timeout of at least 1 s. A budget of one
+    /// default send buffer keeps parallel streams as fast as one over such a path. It
+    /// also caps all connections together at `budget / RTT`, so on a path whose round trip
+    /// needs more than the budget, parallel connections no longer add throughput.
+    /// Default `None`: no budget, each connection up to its own send buffer.
+    pub tcp_send_budget: Option<usize>,
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
@@ -136,6 +151,7 @@ impl Default for NetStackConfig {
             listener_pool: 32,
             tcp_rx_buffer: None,
             tcp_tx_buffer: None,
+            tcp_send_budget: None,
             max_udp_flows: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
@@ -158,6 +174,7 @@ pub(crate) struct Settings {
     pub(crate) listener_pool: usize,
     tcp_rx_buffer: usize,
     tcp_tx_buffer: usize,
+    pub(crate) tcp_send_budget: Option<usize>,
     pub(crate) max_udp_flows: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
@@ -213,6 +230,7 @@ impl Settings {
             listener_pool: config.listener_pool.max(1),
             tcp_rx_buffer: tcp_buffer(config.tcp_rx_buffer),
             tcp_tx_buffer: tcp_buffer(config.tcp_tx_buffer),
+            tcp_send_budget: config.tcp_send_budget,
             max_udp_flows: config.max_udp_flows.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
