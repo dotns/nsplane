@@ -99,8 +99,8 @@ impl QueueDepth {
 /// [`crate::EngineBuilder::queue_capacity`]). Without crypto workers (fewer than 2, see
 /// [`crate::EngineBuilder::crypto_workers`]), `crypto` and `crypto_done` are
 /// `QueueDepth { capacity: 0, high_water: 0 }`, and the datagrams and packets the owner
-/// task hands to an idle transport or sink itself never enter the `transmit` or `deliver`
-/// queue, so on a path that keeps up those marks stay low or at 0.
+/// task hands to an idle transport or sink itself never enter the `transmit`, `deliver`
+/// or `recycle` queue, so on a path that keeps up those marks stay low or at 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QueueStats {
@@ -112,8 +112,9 @@ pub struct QueueStats {
     pub datagrams: QueueDepth,
     /// Decrypted packets waiting for the sink.
     pub deliver: QueueDepth,
-    /// Transmitted buffers returned for reuse: to the source task, or to the owner task
-    /// when the source takes none. The maximum over the two queues.
+    /// Transmitted buffers returned to the owner task for reuse, which happens only when the
+    /// source takes none ([`crate::PacketSource::recycle`]); the queue returning them to
+    /// the source is not counted.
     pub recycle: QueueDepth,
     /// Datagrams in a transport's transmit queue, counting the batch its transmit task is
     /// sending; the maximum over all transports.

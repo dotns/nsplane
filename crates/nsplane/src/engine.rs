@@ -106,10 +106,10 @@ const PATH_MTU_REPORTS: usize = 16;
 ///
 /// Inline output: without crypto workers, the owner task sends the datagrams of one drain
 /// of the core itself ([`Transport::try_send_batch`]) when nothing of their transport is
-/// waiting in its backlog, queued or being sent by its transmit task, and, with or without
-/// crypto workers, hands the packets of the drain to the sink itself
-/// ([`PacketSink::try_send_batch`]) when nothing is queued for or being delivered by the
-/// sink task, so on an idle path neither task is woken. What the transport or sink does
+/// waiting in its backlog, queued or being sent by its transmit task, and hands the
+/// packets of the drain to the sink itself ([`PacketSink::try_send_batch`]) when nothing
+/// is queued for or being delivered by the sink task, so on an idle path neither task is
+/// woken. What the transport or sink does
 /// not take at once (it would block, or it takes part of the batch) goes to the transmit
 /// queue and backlog, or the deliver queue, in order and under the rules above; later datagrams and packets queue behind it until the
 /// task has drained, so each transport and the sink keep the order of the core's outputs.
@@ -171,7 +171,7 @@ const PATH_MTU_REPORTS: usize = 16;
 /// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
 /// and finishes each packet when its worker hands it back ([`Core::complete_job`]);
 /// everything else (routing, filters, handshakes, timers, counters, events) stays on the
-/// owner, which then never sends inline. The pool is sharded by peer:
+/// owner, which then never sends or delivers inline. The pool is sharded by peer:
 /// all packets of a peer, in both directions, go to the same worker (in batches, handed over
 /// when one is full or the owner has nothing else to do), which runs them in arrival order, so each peer's packets leave in the order they came while different peers
 /// are encrypted in parallel (on a multi-threaded runtime). At most queue capacity packets
@@ -351,7 +351,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         sink: InlineSink {
             try_deliver: Box::new(move |packets| sink.try_send_batch(packets)),
             outstanding: sink_outstanding,
-            allowed: true,
+            allowed: fast_path,
             closed: false,
             backoff: Backoff::default(),
             delivered: VecDeque::with_capacity(MAX_BATCH),
@@ -777,11 +777,6 @@ impl Recycle {
             self.owner.try_send(bufs);
         }
     }
-
-    /// Buffers in the queues, the larger of the two.
-    fn queued(&self) -> usize {
-        self.source.len().max(self.owner.len())
-    }
 }
 
 /// Where transmit tasks report failed sends: a count the owner task takes, and a signal
@@ -1118,7 +1113,7 @@ struct InlineSink {
     /// Packets in the deliver queue or in the batch the sink task is delivering: raised by
     /// the owner per queued packet, lowered by the sink task once it is done with its batch.
     outstanding: Arc<AtomicUsize>,
-    /// Not suspended: the owner task may deliver itself.
+    /// No crypto workers and not suspended: the owner task may deliver itself.
     allowed: bool,
     /// The sink reported [`io::ErrorKind::BrokenPipe`] to the owner task.
     closed: bool,
@@ -1828,7 +1823,7 @@ impl Owner {
         marks
             .deliver
             .record(self.deliver.max_capacity() - self.deliver.capacity());
-        marks.recycle.record(self.recycle.queued());
+        marks.recycle.record(self.recycled.len());
         for slot in self.transports.values() {
             marks.transmit.record(slot.queued());
             marks.backlog.record(slot.pending.len());
@@ -2066,7 +2061,7 @@ impl Owner {
     fn resume(&mut self) {
         if self.suspended.send_replace(false) {
             self.inline.allowed = self.fast_path;
-            self.sink.allowed = true;
+            self.sink.allowed = self.fast_path;
             self.event(Event::Resumed);
             self.core.handle_timeout(now());
             self.drain(true);
@@ -2163,8 +2158,8 @@ impl Owner {
         if !self.sink.delivered.is_empty() {
             self.deliver_inline();
         }
-        self.high_water.recycle.record(self.recycle.queued());
         if !self.recycled.is_empty() {
+            self.high_water.recycle.record(self.recycled.len());
             self.recycled.take_all(&mut self.recycle_bufs);
             self.recycled.release();
             for buf in self.recycle_bufs.drain(..) {
