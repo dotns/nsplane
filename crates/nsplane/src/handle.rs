@@ -112,9 +112,12 @@ pub struct QueueStats {
     pub datagrams: QueueDepth,
     /// Decrypted packets waiting for the sink.
     pub deliver: QueueDepth,
-    /// Transmitted buffers returned to the owner task for reuse.
+    /// Transmitted buffers returned to the owner task for reuse, which happens only when the
+    /// source takes none ([`crate::PacketSource::recycle`]); the queue returning them to
+    /// the source is not counted.
     pub recycle: QueueDepth,
-    /// Datagrams in a transport's transmit queue; the maximum over all transports.
+    /// Datagrams in a transport's transmit queue, counting the batch its transmit task is
+    /// sending; the maximum over all transports.
     pub transmit: QueueDepth,
     /// Datagrams in a transport's backlog in the owner task, waiting for room in its
     /// transmit queue; the maximum over all transports. The capacity is the bound for

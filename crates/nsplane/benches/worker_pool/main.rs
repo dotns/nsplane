@@ -8,6 +8,10 @@
 //! of them are delivered: the hub encrypts and decrypts every packet, while each spoke only
 //! handles its own share, so the hub's crypto is the bottleneck. The runtime is
 //! multi-threaded, one worker thread per core.
+//!
+//! The one-peer case links the hub to a single spoke with as many crypto workers as the hub
+//! and sends `SPOKES * BURST` packets each way per iteration: one peer's packets spread over
+//! the workers.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -105,18 +109,19 @@ const fn at(transport: TransportId, addr: SocketAddr) -> Path {
     }
 }
 
-/// The hub with `workers` crypto workers and its peered spokes, with sessions up.
-async fn star(workers: usize) -> (Node, Vec<Node>) {
+/// The hub with `workers` crypto workers and `count` peered spokes with `spoke_workers`,
+/// with sessions up.
+async fn star(count: u8, workers: usize, spoke_workers: usize) -> (Node, Vec<Node>) {
     let mut hub_links = Vec::new();
     let mut spokes = Vec::new();
-    for seed in 2..2 + SPOKES {
+    for seed in 2..2 + count {
         let (hub_end, spoke_end) = ChannelTransport::pair(
             CAPACITY,
             (TransportId::new(u16::from(seed)), addr(1, u16::from(seed))),
             (SPOKE_LINK, addr(seed, 2000)),
         );
         hub_links.push(hub_end);
-        spokes.push(Node::new(seed, vec![spoke_end], 0));
+        spokes.push(Node::new(seed, vec![spoke_end], spoke_workers));
     }
     let mut hub = Node::new(1, hub_links, workers);
     for spoke in &mut spokes {
@@ -148,9 +153,10 @@ async fn star(workers: usize) -> (Node, Vec<Node>) {
     (hub, spokes)
 }
 
-/// Sends `BURST` packets of `len` bytes each way between the hub and every spoke and waits
+/// Sends `burst` packets of `len` bytes each way between the hub and every spoke and waits
 /// for all of them.
-async fn burst(hub: &mut Node, spokes: &mut [Node], len: usize) {
+async fn burst(hub: &mut Node, spokes: &mut [Node], len: usize, burst: usize) {
+    let to_hub = burst * spokes.len();
     let mut senders = Vec::new();
     for spoke in spokes.iter() {
         for (from, to, local) in [
@@ -159,19 +165,19 @@ async fn burst(hub: &mut Node, spokes: &mut [Node], len: usize) {
         ] {
             let packet = ipv4_packet(ip(from), ip(to), len);
             senders.push(tokio::spawn(async move {
-                for _ in 0..BURST {
+                for _ in 0..burst {
                     local.send(PacketBuf::from_packet(&packet)).await.unwrap();
                 }
             }));
         }
     }
     let spoke_receivers = spokes.iter_mut().map(|spoke| async move {
-        for _ in 0..BURST {
+        for _ in 0..burst {
             spoke.delivered.recv().await.unwrap();
         }
     });
     let hub_receiver = async {
-        for _ in 0..BURST * usize::from(SPOKES) {
+        for _ in 0..to_hub {
             hub.delivered.recv().await.unwrap();
         }
     };
@@ -186,16 +192,25 @@ async fn burst(hub: &mut Node, spokes: &mut [Node], len: usize) {
     }
 }
 
-fn bench_worker_pool(c: &mut Criterion) {
-    let runtime = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("worker_pool");
+/// Measures `group` on a hub with `count` spokes, `per_spoke` packets each way per spoke and
+/// iteration, and with 0, 2 and 4 crypto workers (the spokes with `spoke_workers` of them).
+fn bench_star(
+    c: &mut Criterion,
+    runtime: &Runtime,
+    group: &str,
+    count: u8,
+    per_spoke: usize,
+    spoke_workers: impl Fn(usize) -> usize,
+) {
+    let mut group = c.benchmark_group(group);
     group.measurement_time(Duration::from_secs(5));
     for len in [64, 1420] {
         // Both directions of every spoke.
-        let packets = BURST * usize::from(SPOKES) * 2;
+        let packets = per_spoke * usize::from(count) * 2;
         group.throughput(Throughput::Elements(packets as u64));
         for workers in [0, 2, 4] {
-            let (mut hub, mut spokes) = runtime.block_on(star(workers));
+            let (mut hub, mut spokes) =
+                runtime.block_on(star(count, workers, spoke_workers(workers)));
             group.bench_with_input(
                 BenchmarkId::new(format!("{len}B"), workers),
                 &len,
@@ -204,7 +219,7 @@ fn bench_worker_pool(c: &mut Criterion) {
                         runtime.block_on(async {
                             let start = Instant::now();
                             for _ in 0..iters {
-                                burst(&mut hub, &mut spokes, len).await;
+                                burst(&mut hub, &mut spokes, len, per_spoke).await;
                             }
                             start.elapsed()
                         })
@@ -216,6 +231,20 @@ fn bench_worker_pool(c: &mut Criterion) {
         }
     }
     group.finish();
+}
+
+fn bench_worker_pool(c: &mut Criterion) {
+    let runtime = Runtime::new().unwrap();
+    bench_star(c, &runtime, "worker_pool", SPOKES, BURST, |_| 0);
+    let per_spoke = BURST * usize::from(SPOKES);
+    bench_star(
+        c,
+        &runtime,
+        "worker_pool_one_peer",
+        1,
+        per_spoke,
+        |workers| workers,
+    );
 }
 
 criterion::criterion_group!(worker_pool, bench_worker_pool);

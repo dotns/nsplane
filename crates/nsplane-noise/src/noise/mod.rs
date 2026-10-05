@@ -12,6 +12,8 @@ mod session;
 mod timers;
 mod wire;
 
+pub use session::{OpenTicket, SealTicket};
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -63,6 +65,16 @@ impl From<WireGuardError> for TunnResult<'_> {
     fn from(err: WireGuardError) -> Self {
         TunnResult::Err(err)
     }
+}
+
+/// What [`Tunn::reserve_in_place`] leaves to do with a packet.
+#[derive(Debug)]
+pub enum Reservation<'a> {
+    /// Seal the packet with this ticket, on any thread.
+    Seal(SealTicket),
+    /// Done at once, as [`Tunn::encapsulate_in_place`] would have: e.g. the packet was queued
+    /// and a handshake initiation is to be sent.
+    Done(TunnResult<'a>),
 }
 
 /// Tunnel represents a point-to-point WireGuard connection
@@ -377,6 +389,109 @@ impl Tunn {
         self.queue_packet(packet);
         // Initiate a new handshake if none is in progress
         self.format_handshake_initiation(buf, false)
+    }
+
+    /// Like [`Tunn::encapsulate_in_place`], but instead of sealing the packet, reserves the
+    /// next counter (nonce) of the current session for it and returns a ticket that seals it
+    /// anywhere ([`SealTicket::seal`]); timers and counters are updated as if it was sealed.
+    /// Without a session the packet is queued and a handshake starts, as with
+    /// [`Tunn::encapsulate_in_place`].
+    ///
+    /// Reserve on the thread that owns the tunnel, in the order the packets are to be sent;
+    /// a reserved counter is never handed out again, so a ticket that is never sealed only
+    /// skips its counter. Before sending a sealed datagram, check [`Tunn::is_live`].
+    pub fn reserve_in_place<'a>(&mut self, buf: &'a mut [u8], len: usize) -> Reservation<'a> {
+        let current = self.current % N_SESSIONS;
+        // A sending key that is worn out (Reject-After-Messages) is dropped, so the packet is
+        // queued and a handshake starts, as if there were no session.
+        if self.sessions[current]
+            .as_ref()
+            .is_some_and(session::Session::is_exhausted)
+        {
+            self.sessions[current] = None;
+        }
+
+        if let Some(session) = &self.sessions[current] {
+            let ticket = match session.reserve(current, buf.len(), len, self.pad_limit) {
+                Ok(ticket) => ticket,
+                Err(e) => return Reservation::Done(TunnResult::Err(e)),
+            };
+            self.timer_tick(TimerName::TimeLastPacketSent);
+            // Exclude Keepalive packets from timer update.
+            if len > 0 {
+                self.timer_tick(TimerName::TimeLastDataPacketSent);
+            }
+            self.tx_bytes += len;
+            return Reservation::Seal(ticket);
+        }
+
+        // If there is no session, queue the packet for future retry
+        let Some(packet) = buf.get(DATA_HEADER_SZ..DATA_HEADER_SZ + len) else {
+            return Reservation::Done(TunnResult::Err(WireGuardError::DestinationBufferTooSmall));
+        };
+        self.queue_packet(packet);
+        // Initiate a new handshake if none is in progress
+        Reservation::Done(self.format_handshake_initiation(buf, false))
+    }
+
+    /// Whether the session `ticket` was reserved in is still in the tunnel: a datagram it
+    /// sealed may be sent. A session that expired or was replaced by a newer one in its slot
+    /// fails.
+    pub fn is_live(&self, ticket: &SealTicket) -> bool {
+        self.sessions[ticket.slot() % N_SESSIONS]
+            .as_ref()
+            .is_some_and(|session| ticket.of(session))
+    }
+
+    /// Checks the transport data message `datagram` like [`Tunn::decapsulate_in_place`]
+    /// before decrypting it (its session, and its counter against the replay window), and
+    /// returns a ticket that opens it anywhere ([`OpenTicket::open`]). Hand the opened
+    /// message to [`Tunn::commit_open`] on the thread that owns the tunnel.
+    pub fn open_ticket(&self, datagram: &[u8]) -> Result<OpenTicket, WireGuardError> {
+        let Packet::PacketData(data) = Self::parse_incoming_packet(datagram)? else {
+            return Err(WireGuardError::InvalidPacket);
+        };
+        let r_idx = data.receiver_idx as usize;
+        let session = self.sessions[r_idx % N_SESSIONS].as_ref().ok_or_else(|| {
+            tracing::trace!(message = "No current session available", remote_idx = r_idx);
+            WireGuardError::NoCurrentSession
+        })?;
+        session.open_ticket(data.receiver_idx, data.counter)
+    }
+
+    /// Finishes a message opened with `ticket` in `datagram`, its `plain_len` bytes of
+    /// plaintext behind the data header: marks its counter as received (rejecting a replay,
+    /// e.g. a duplicate opened at the same time) and does everything else
+    /// [`Tunn::decapsulate_in_place`] does after decrypting. Fails if the ticket's session
+    /// is no longer in the tunnel (expired or replaced).
+    ///
+    /// Commit messages in the order they were received to keep them in order.
+    pub fn commit_open<'a>(
+        &mut self,
+        ticket: &OpenTicket,
+        datagram: &'a mut [u8],
+        plain_len: usize,
+    ) -> TunnResult<'a> {
+        let r_idx = ticket.receiver_index() as usize;
+        let Some(session) = self.sessions[r_idx % N_SESSIONS]
+            .as_ref()
+            .filter(|session| ticket.of(session))
+        else {
+            return TunnResult::Err(WireGuardError::NoCurrentSession);
+        };
+        if let Err(e) = session.commit(ticket.counter()) {
+            return TunnResult::Err(e);
+        }
+        let Some(plaintext) = datagram.get_mut(DATA_HEADER_SZ..DATA_HEADER_SZ + plain_len) else {
+            return TunnResult::Err(WireGuardError::InvalidPacket);
+        };
+
+        self.set_current_session(r_idx);
+        self.timer_tick_session_confirmed(r_idx);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        self.validate_decapsulated_packet(plaintext)
     }
 
     /// Decapsulates the datagram in `buf[..len]`. Transport data is decrypted in place, so the
@@ -1410,6 +1525,247 @@ mod tests {
         assert!(matches!(
             my_tun.encapsulate_in_place(&mut buf, sent.len()),
             TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+    }
+
+    /// Reserves a ticket for `packet` laid out in `buf`; panics without a session.
+    fn reserve(tun: &mut Tunn, buf: &mut [u8], len: usize) -> SealTicket {
+        match tun.reserve_in_place(buf, len) {
+            Reservation::Seal(ticket) => ticket,
+            Reservation::Done(result) => panic!("no ticket: {result:?}"),
+        }
+    }
+
+    /// Opens `datagram` with a ticket and commits it on `tun`; returns the plaintext.
+    fn open_and_commit(tun: &mut Tunn, datagram: &mut [u8]) -> Result<Vec<u8>, WireGuardError> {
+        let ticket = tun.open_ticket(datagram)?;
+        let plain_len = ticket.open(datagram)?;
+        match tun.commit_open(&ticket, datagram, plain_len) {
+            TunnResult::WriteToTunnelV4(packet, _) => Ok(packet.to_vec()),
+            TunnResult::Err(e) => Err(e),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tickets_round_trip_with_the_in_place_paths() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet_with_payload(&[7; 33]);
+
+        // Sealed with a ticket, opened in place.
+        let mut buf = in_place_buffer(&sent);
+        let ticket = reserve(&mut my_tun, &mut buf, sent.len());
+        let len = ticket.seal(&mut buf).unwrap().len();
+        let TunnResult::WriteToTunnelV4(received, _) =
+            their_tun.decapsulate_in_place(None, &mut buf, len)
+        else {
+            panic!("expected an IPv4 packet");
+        };
+        assert_eq!(received, &sent[..]);
+
+        // Sealed in place, opened with a ticket.
+        let mut buf = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(datagram) =
+            my_tun.encapsulate_in_place(&mut buf, sent.len())
+        else {
+            panic!("expected a data packet");
+        };
+        let len = datagram.len();
+        assert_eq!(
+            open_and_commit(&mut their_tun, &mut buf[..len]).unwrap(),
+            sent
+        );
+
+        // Both ways with tickets, and the counters went on in order.
+        let mut buf = in_place_buffer(&sent);
+        let ticket = reserve(&mut my_tun, &mut buf, sent.len());
+        // The handshake's keepalive took counter 0.
+        assert_eq!(ticket.counter(), 3);
+        let len = ticket.seal(&mut buf).unwrap().len();
+        assert_eq!(
+            open_and_commit(&mut their_tun, &mut buf[..len]).unwrap(),
+            sent
+        );
+        let (_, tx, rx, ..) = my_tun.stats();
+        assert_eq!(tx, 3 * sent.len());
+        assert_eq!(their_tun.stats().2, 3 * sent.len());
+        assert_eq!(rx, 0);
+    }
+
+    #[test]
+    fn reserved_counters_are_never_handed_out_again() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet();
+        let mut counters = Vec::new();
+        let mut datagrams = Vec::new();
+        for i in 0..6 {
+            let mut buf = in_place_buffer(&sent);
+            if i % 2 == 0 {
+                let ticket = reserve(&mut my_tun, &mut buf, sent.len());
+                counters.push(ticket.counter());
+                if i == 2 {
+                    // Cancelled: its counter is skipped.
+                    continue;
+                }
+                let len = ticket.seal(&mut buf).unwrap().len();
+                buf.truncate(len);
+            } else {
+                let TunnResult::WriteToNetwork(datagram) =
+                    my_tun.encapsulate_in_place(&mut buf, sent.len())
+                else {
+                    panic!("expected a data packet");
+                };
+                let len = datagram.len();
+                counters.push(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
+                buf.truncate(len);
+            }
+            datagrams.push(buf);
+        }
+        // The handshake's keepalive took counter 0.
+        assert_eq!(counters, [1, 2, 3, 4, 5, 6]);
+        for mut datagram in datagrams {
+            assert_eq!(
+                open_and_commit(&mut their_tun, &mut datagram).unwrap(),
+                sent
+            );
+        }
+        // A worn-out key hands out nothing: the packet is queued behind a handshake.
+        current_session(&my_tun).set_sending_counter(session::REJECT_AFTER_MESSAGES);
+        let mut buf = in_place_buffer(&sent);
+        assert!(matches!(
+            my_tun.reserve_in_place(&mut buf, sent.len()),
+            Reservation::Done(ref result) if is_handshake_init(result)
+        ));
+        assert_eq!(my_tun.packet_queue.len(), 1);
+    }
+
+    #[test]
+    fn tickets_run_out_of_order_and_commit_in_order() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let packets: Vec<_> = (0..8u8)
+            .map(|i| create_ipv4_udp_packet_with_payload(&[i; 5]))
+            .collect();
+        let mut bufs: Vec<_> = packets.iter().map(|p| in_place_buffer(p)).collect();
+        let tickets: Vec<_> = bufs
+            .iter_mut()
+            .zip(&packets)
+            .map(|(buf, p)| reserve(&mut my_tun, buf, p.len()))
+            .collect();
+        // Sealed in reverse.
+        for (buf, ticket) in bufs.iter_mut().zip(&tickets).rev() {
+            let len = ticket.seal(buf).unwrap().len();
+            buf.truncate(len);
+        }
+        // Every ticket handed out before any is opened; opened in reverse, committed in order.
+        let tickets: Vec<_> = bufs
+            .iter()
+            .map(|datagram| their_tun.open_ticket(datagram).unwrap())
+            .collect();
+        let lens: Vec<_> = bufs
+            .iter_mut()
+            .zip(&tickets)
+            .rev()
+            .map(|(datagram, ticket)| ticket.open(datagram).unwrap())
+            .collect();
+        for ((datagram, ticket), (len, packet)) in bufs
+            .iter_mut()
+            .zip(&tickets)
+            .zip(lens.into_iter().rev().zip(&packets))
+        {
+            let TunnResult::WriteToTunnelV4(received, _) =
+                their_tun.commit_open(ticket, datagram, len)
+            else {
+                panic!("expected an IPv4 packet");
+            };
+            assert_eq!(received, &packet[..]);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_opened_at_the_same_time_is_rejected_at_commit() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet();
+        let mut buf = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(datagram) =
+            my_tun.encapsulate_in_place(&mut buf, sent.len())
+        else {
+            panic!("expected a data packet");
+        };
+        let mut first = datagram.to_vec();
+        let mut copy = first.clone();
+        // Both pass the replay check while neither is committed.
+        let tickets = [&first, &copy].map(|d| their_tun.open_ticket(d).unwrap());
+        let first_len = tickets[0].open(&mut first).unwrap();
+        let copy_len = tickets[1].open(&mut copy).unwrap();
+        assert!(matches!(
+            their_tun.commit_open(&tickets[0], &mut first, first_len),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+        assert!(matches!(
+            their_tun.commit_open(&tickets[1], &mut copy, copy_len),
+            TunnResult::Err(WireGuardError::InvalidCounter)
+        ));
+        // Once committed, a replay fails the check before it is opened.
+        assert!(matches!(
+            their_tun.open_ticket(&copy),
+            Err(WireGuardError::DuplicateCounter)
+        ));
+    }
+
+    #[test]
+    fn tickets_keep_their_session_through_a_rekey_until_it_is_gone() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent = create_ipv4_udp_packet();
+        let mut buf = in_place_buffer(&sent);
+        let ticket = reserve(&mut my_tun, &mut buf, sent.len());
+        let mut theirs = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(datagram) =
+            their_tun.encapsulate_in_place(&mut theirs, sent.len())
+        else {
+            panic!("expected a data packet");
+        };
+        let len = datagram.len();
+        let open = my_tun.open_ticket(&theirs[..len]).unwrap();
+
+        // A rekey keeps the previous session: the jobs in flight finish with its keys.
+        assert!(rehandshake(&mut my_tun, &mut their_tun));
+        assert!(my_tun.is_live(&ticket));
+        let sealed = ticket.seal(&mut buf).unwrap().len();
+        assert_eq!(
+            open_and_commit(&mut their_tun, &mut buf[..sealed]).unwrap(),
+            sent
+        );
+        let plain_len = open.open(&mut theirs[..len]).unwrap();
+        assert!(matches!(
+            my_tun.commit_open(&open, &mut theirs[..len], plain_len),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+
+        // Once a newer session takes its slot, a ticket of the old one is dead.
+        let mut buf = in_place_buffer(&sent);
+        let ticket = reserve(&mut my_tun, &mut buf, sent.len());
+        let mut rekeys = 0;
+        while my_tun.is_live(&ticket) {
+            assert!(rehandshake(&mut my_tun, &mut their_tun));
+            rekeys += 1;
+            assert!(rekeys <= N_SESSIONS, "the slot was never reused");
+        }
+        let mut theirs = in_place_buffer(&sent);
+        let TunnResult::WriteToNetwork(datagram) =
+            their_tun.encapsulate_in_place(&mut theirs, sent.len())
+        else {
+            panic!("expected a data packet");
+        };
+        let len = datagram.len();
+        let open = my_tun.open_ticket(&theirs[..len]).unwrap();
+        let plain_len = open.open(&mut theirs[..len]).unwrap();
+        // Keys cleared, e.g. on a new private key: the opened message is dropped.
+        let private = x25519::StaticSecret::random_from_rng(OsRng);
+        let public = x25519::PublicKey::from(&private);
+        my_tun.set_static_private(private, public, None);
+        assert!(matches!(
+            my_tun.commit_open(&open, &mut theirs[..len], plain_len),
+            TunnResult::Err(WireGuardError::NoCurrentSession)
         ));
     }
 }
