@@ -2,7 +2,8 @@
 //! channel link, at the default MTU, without and with `NetStackConfig::tcp_send_budget`.
 //! The asserted test checks that four streams arrive intact, in order and with their EOF;
 //! the ignored `streams_throughput` compares the aggregate of one and four streams and the
-//! receiving engine's sink-full drops. Run it in release:
+//! receiving engine's sink-full drops, and checks that without a send budget four streams
+//! reach at least `MIN_FOUR_STREAM_SHARE` of one. Run it in release:
 //!
 //! ```text
 //! cargo test --release -p nsplane-e2e --test netstack_multistream -- --ignored --nocapture
@@ -32,6 +33,10 @@ const MEASURED: usize = 1 << 30;
 const MEASURED_LIMIT: Duration = Duration::from_secs(120);
 /// A send budget of one default send buffer: 512 IPv4-sized segments.
 const BUDGET: usize = (MTU as usize - 40) * 512;
+/// Smallest share of the one-stream aggregate four streams must reach without a send
+/// budget. Measured four- to one-stream ratios were 1.00-1.11 (one stream 730-785 MB/s);
+/// before the smoltcp fork's sender fixes four streams reached 0.2-0.3 of one.
+const MIN_FOUR_STREAM_SHARE: f64 = 0.8;
 
 /// Byte `i` of stream `stream`: a pattern (period 251) that does not line up with any
 /// segment or chunk size and differs between streams, so reordered, duplicated or
@@ -197,11 +202,13 @@ async fn four_streams_intact() -> TestResult {
 
 /// One and four streams over two engines, 1 GiB in total each, with the receiving
 /// engine's sink-full drops, without and with a send budget of one default send buffer:
-/// the four-stream anomaly of the netstack pair in process.
+/// the four-stream anomaly of the netstack pair in process. Without a budget, four streams
+/// must reach at least `MIN_FOUR_STREAM_SHARE` of the one-stream aggregate.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measurement; run in release with --nocapture"]
 async fn streams_throughput() -> TestResult {
     for budget in [None, Some(BUDGET), None, Some(BUDGET)] {
+        let mut rates = Vec::new();
         for count in [1, 4] {
             let (a, b) = pair(budget).await?;
             let elapsed = streams(&a, &b, count, MEASURED / count, false, MEASURED_LIMIT).await?;
@@ -218,6 +225,16 @@ async fn streams_throughput() -> TestResult {
                 MEASURED >> 20,
                 mb_per_s(MEASURED, elapsed)
             );
+            rates.push(mb_per_s(MEASURED, elapsed));
+        }
+        if let [one, four] = rates[..]
+            && budget.is_none()
+            && four < one * MIN_FOUR_STREAM_SHARE
+        {
+            return Err(format!(
+                "four streams {four:.1} MB/s below {MIN_FOUR_STREAM_SHARE} x one stream {one:.1} MB/s"
+            )
+            .into());
         }
     }
     Ok(())

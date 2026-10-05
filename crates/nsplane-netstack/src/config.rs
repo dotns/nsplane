@@ -75,11 +75,13 @@ pub struct NetStackConfig {
     /// A window of more segments than the queues on the way hold costs throughput: the
     /// peer may send the whole window at once, the queue that fills first (the engine's
     /// `queue_capacity`, this stack's `ingress_capacity`, both 1024 packets by default)
-    /// drops the rest, and smoltcp recovers all but one lost segment per window by a
-    /// retransmission timeout of at least 1 s. Measured in-process at the default MTU,
-    /// 4 MiB (about 3000 segments) dropped packets at the receiving engine's full sink in
-    /// most runs and moved 64 MiB at about 50 MB/s instead of 250-450 MB/s; with 8192-packet
-    /// queues it ran without drops. Keep the window in segments (`buffer / (mtu - 40)`)
+    /// drops the rest. smoltcp recovers such losses by fast retransmit and New Reno's
+    /// retransmission on partial ACKs, but without SACK one hole per round trip, and a lost
+    /// retransmission still waits for a retransmission timeout of at least 1 s. Measured
+    /// in-process at the default MTU before the fork had New Reno, 4 MiB (about 3000
+    /// segments) dropped packets at the receiving engine's full sink in most runs and moved
+    /// 64 MiB at about 50 MB/s instead of 250-450 MB/s; with 8192-packet queues it ran
+    /// without drops. Keep the window in segments (`buffer / (mtu - 40)`)
     /// below those capacities, or raise them with it.
     /// Default `None`: 512 IPv4-sized segments, `(mtu - 40) * 512` (about 690 KiB at
     /// [`DEFAULT_MTU`]).
@@ -97,11 +99,14 @@ pub struct NetStackConfig {
     /// Without it every connection may have its whole send buffer in flight, so `n` bulk
     /// connections put `n` windows on the path at once. Where the queues on the path hold
     /// fewer packets (the receiving engine's `queue_capacity`, 1024 by default, holds two
-    /// default windows), the excess is dropped, and smoltcp recovers all but one lost
-    /// segment per window by a retransmission timeout of at least 1 s. A budget of one
-    /// default send buffer keeps parallel streams as fast as one over such a path. It
-    /// also caps all connections together at `budget / RTT`, so on a path whose round trip
-    /// needs more than the budget, parallel connections no longer add throughput.
+    /// default windows), the excess is dropped and has to be recovered (one hole per round
+    /// trip without SACK; a lost retransmission costs a retransmission timeout of at least
+    /// 1 s). A budget of one default send buffer keeps such a path free of these drops.
+    /// Measured in-process with four streams, it was what kept them as fast as one before
+    /// the smoltcp fork's New Reno, sender silly window avoidance and Limited Transmit;
+    /// with those, four streams without a budget match one as well. A budget also caps
+    /// all connections together at `budget / RTT`, so on a path whose round trip needs more
+    /// than the budget, parallel connections no longer add throughput.
     /// Default `None`: no budget, each connection up to its own send buffer.
     pub tcp_send_budget: Option<usize>,
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
