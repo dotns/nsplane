@@ -320,7 +320,11 @@ With capacity 2048, 8 and 16 netstack connections ran without a drop (deliver pe
 494 and 2021); with 512 and 256, even 4 connections dropped at the deliver queue. Once the
 deliver queue drops, the netstack's TCP throughput collapses (to 130-450 Mbit/s), and in
 some runs the connections stalled for good with every engine queue empty, a loss recovery
-problem of the netstack rather than of the queues.
+problem of the netstack rather than of the queues. The stalls were fixed in the smoltcp
+fork (`.3`); the collapse after sink-full drops by `.4`'s NewReno, SWS avoidance and
+Limited Transmit: in process, four bulk streams at the default capacity still drop
+250-580 packets at the sink per GiB but now move 1.00-1.11x the one-stream aggregate
+(0.43x on `.3`), see [Netstack throughput](#netstack-throughput).
 
 Defaults, from these numbers:
 
@@ -338,7 +342,14 @@ Defaults, from these numbers:
 
 Embedders that run many parallel bulk flows through a userspace netstack should raise
 `queue_capacity` (2048 held 16 flows without a drop here) and watch the marks and
-`DROP_SINK_FULL` with `queue_stats` and `drop_counters`.
+`DROP_SINK_FULL` with `queue_stats` and `drop_counters`. The alternative on the sending
+side is `NetStackConfig::tcp_send_budget`, which keeps the stack's connections together
+within one budget instead of one window each: with a budget of one default send buffer
+(512 segments) four in-process streams dropped nothing at the sink and moved 648-671 MB/s
+against 135-188 MB/s without it on smoltcp `.3`, and on `.4` 749-795 MB/s, the same as
+without it (689-841 MB/s, load 3-6). It caps all connections together at
+`budget / RTT` (one default send buffer, about 690 KiB, is about 14 MB/s at 50 ms), so it
+suits stacks whose peers are near; it stays opt-in.
 
 ### Crypto worker pool
 
@@ -864,7 +875,13 @@ connection bytes between smoltcp and the applications, and flushes egress. UDP b
 smoltcp on its own dispatch path.
 
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
-  `NetStackConfig`); the sink waits while ingress is full.
+  `NetStackConfig`); the sink waits while ingress is full. One driver turn routes up to
+  256 ingress packets before any application reads, so a burst to one UDP flow or socket
+  beyond `datagram_capacity` (default 128) loses the excess even when the application
+  keeps up on average (`udp_queue_full`). In the harness's netstack pair that was 100 %
+  of the receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s (per-hop accounting; the
+  kernel, the sender and reordering lost nothing); `netstack_bench`'s server sizes its
+  queue to 1024 and the default stays, so a bulk UDP receiver sets at least 256.
 - A full accept queue closes new TCP connections (`tcp_not_accepted`) by default. With
   `NetStackConfig::accept_backpressure`, bare SYNs are left unanswered while it is full
   (`syn_deferred`; the peer retransmits) and connections that completed their handshake
@@ -894,6 +911,15 @@ smoltcp on its own dispatch path.
   (counting SYNs refused for a full listener pool) needs no code here:
   `NetStackStats::syn_refused` counts them, for a pool sized by
   `NetStackConfig::listener_pool`.
+- `NetStackConfig::tcp_send_budget` (default `None`) bounds the bytes all TCP connections
+  of the stack hold in their send buffers together, split evenly between the connections
+  with data to send (each at least one IPv4 MSS, at most its `tcp_tx_buffer`). Without it
+  `n` bulk connections put `n` windows on the path at once: four default windows are 2048
+  segments against the receiving engine's 1024-packet deliver queue, and the excess is
+  dropped as `DROP_SINK_FULL`. It is opt-in because it also caps all connections together
+  at `budget / RTT`, which limits parallel connections on a long path; see
+  [Queue depths](#queue-depths) for when to set it. Unset, the bridge pass skips counting
+  the senders and every connection's limit is `usize::MAX`.
 - UDP datagrams are built with DF set over IPv4 and an application payload whose packet
   exceeds the MTU fails with `InvalidInput`. With `NetStackConfig::udp_allow_fragmentation`
   an IPv4 one instead leaves as a single oversize packet with DF clear (up to the 65 535-byte
@@ -985,10 +1011,10 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.3`, ADR
-  `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus fixes for four defects that
-  stalled connections for good under loss when both ends send (an echo, request and
-  response).
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.4`, branch
+  `nsplane/v0.14-perf`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
+  fixes for four defects that stalled connections for good under loss when both ends send
+  (an echo, request and response), and five throughput changes (ON) listed after them.
   - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
     oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
     received past that point (only its ACKs were lost), the peer dropped those ACKs as old,
@@ -1009,6 +1035,33 @@ smoltcp on its own dispatch path.
     timer by a fast retransmission, which resends data only (traced: `FIN-WAIT-1`, empty
     send buffer, FIN in flight, timer idle). The fork leaves a FIN to the retransmission
     timer.
+
+  The throughput changes of `v0.14.0-nsplane.4` (the ON round, 5 files, +1031/-33 over
+  `.3`):
+
+  - The TCP/IP checksum sums 64-bit words into two `u128` accumulators (no `unsafe`).
+    It is bit-identical to 0.14's in an equivalence test over lengths 0-2000 at 16
+    offsets, and takes 38 % fewer instructions per 1400-byte call (about 22 % fewer
+    checksum samples in an IBS profile of the stream).
+  - The advertised right edge of the receive window never moves left. Under window
+    scaling 0.14 rounded the free space down at every segment, so the edge shrank (6 -> 5
+    -> 0 units) and in-flight data the sender was allowed to send was trimmed and
+    retransmitted. The fork rounds up when rounding down would shrink the edge, with the
+    window end capped at the buffer. `netstack_lossy` at 1 % loss: 8-15 -> 180-184 MB/s.
+  - Fast recovery retransmits the next hole on a partial ACK (NewReno, RFC 6582, careful
+    variant; Reno and CUBIC `on_partial_ack`), instead of waiting for a timeout of at
+    least 1 s for every loss after the first of a window. The bottleneck case went from
+    15-23 s to 0.8-0.9 s.
+  - The sender avoids the silly window syndrome (Minshall's variant of Nagle): a sub-MSS
+    segment cut by the peer's window is held while an earlier sub-MSS segment is
+    unacknowledged. With nsplane's Nagle off, segments decayed to 275-800 bytes on
+    average after losses with four streams (about 1080 with one).
+  - Limited Transmit (RFC 3042): the first two duplicate ACKs each release one new
+    segment, so small windows still reach the third duplicate ACK and fast retransmit.
+
+  Together they lift four parallel streams to at least the one-stream aggregate with
+  nsplane's defaults (no driver Nagle, `tcp_send_budget` unset); see
+  [Netstack throughput](#netstack-throughput).
 
   Phase 5 worked around the first two in the driver (an outgoing pure-ACK sequence
   rewrite, and a stalled connection taking up to 1 KiB past its application buffer's bound
@@ -1064,6 +1117,50 @@ stay in the same range: 1 % loss completes in 1.1-6.2 s (before 2.1-4.1 s; whole
 are retransmission timeouts), the bottleneck in 15.9-19.8 s (before 18.9-20.9 s), and 3 %
 loss stays timeout-bound right at the 60 s limit, as before.
 
+`v0.14.0-nsplane.4` (ON) changes loss recovery and the sender (see
+[nsplane-netstack](#nsplane-netstack)). The same test, with the step-by-step numbers of the
+fork round (each on a quiet host) and the final gate's run of the merged workspace:
+
+| Case | `.3` | `.4` step by step | `.4`, final gate (load 8.9-9.3) |
+| --- | --- | --- | --- |
+| TCP, 64 MiB, no loss | see above | within noise | 277.0 MB/s |
+| TCP, 16 MiB, 1 % loss | 8-15 MB/s with the shrinking window edge | 180-184 MB/s (window edge); median 1.09 s with all five changes (2.09 s without SWS and Limited Transmit) | 1.14 s (14.8 MB/s, 251 drops) |
+| TCP, 16 MiB, 3 % loss | stalls past 60 s; median 51.2 s with the window-edge change | median 33.1 s with NewReno, 32 s with all five (11-41 s) | 19.2 s (0.9 MB/s, 739 drops) |
+| TCP, 16 MiB, bottleneck | 15-23 s | 0.8-0.9 s with NewReno | 0.82 s (20.5 MB/s, 124 drops) |
+| UDP, 50 000 x 1200 B, no loss | see above | within noise | 449.4 MB/s |
+
+The remaining 3 % loss timeouts are lost retransmissions, which only a timeout recovers
+without SACK or RACK-TLP. With many parallel streams the fork removes the throughput
+collapse after sink-full drops: `tests/netstack_multistream.rs` (two engines in process,
+1 GiB per run split between the streams, default MTU and configuration, release) moved
+one stream at 669-782 MB/s and four at 689-841 MB/s, 1.00-1.11x the single stream in 12
+pairs (load 3.2-5.5), with 251-577 sink-full drops per four-stream run; on `.3` the same
+run gave 629 against 269 MB/s (0.43x). Its ignored `streams_throughput` asserts at least
+0.8x:
+
+```text
+cargo test --release -p nsplane-e2e --test netstack_multistream -- --ignored --nocapture
+```
+
+The harness's netstack pair (`scripts/bench`, `BENCH_PAIRS=netstack`, 30 s x 3, CPU sets
+2-5 / 6-9), `main` b5e531f's `netstack_bench` against the ON branch's in one lock hold,
+2026-10-05, a quiet host (1-minute load 3.53 -> 2.24 for `main`, 2.22 -> 2.58 for the
+branch); medians [repetitions]:
+
+| Build | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP loss 1G / 3G % | CPU s/GB a / b |
+| --- | --- | --- | --- | --- |
+| `main` (smoltcp `.3`, server queue 128) | 6.21 [6.10-6.29] | 2.48 [1.92-3.21] | 2.21 / 5.56 | 1.92 / 1.59 |
+| ON (smoltcp `.4`, server queue 1024) | 6.85 [6.74-6.98] | 7.29 [7.28-7.38] | 0.00 / 0.03 | 1.70 / 1.41 |
+
+Four streams now beat one in every repetition (+6 % on the median), single-stream TCP is
+10 % faster at 11 % less CPU per GB on both sides, and the UDP loss left at 3 Gbit/s is the
+receiving engine's full sink, i.e. the netstack's receive throughput on four CPUs (an
+inline-sink experiment that removed it regressed default-config applications and was
+reverted; follow-up). Idle request/response latency is unchanged (p50 / p99 0.027 /
+0.052 ms against 0.027 / 0.054), but next to a saturating stream it rose from 0.081 /
+0.941 to 0.280 / 1.271 ms in this run: the stream now keeps more in flight (it is 10 %
+faster and no longer backs off after losses). Not analysed further here (follow-up).
+
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
@@ -1100,8 +1197,11 @@ Where the instructions go on main (per GiB):
 
 - smoltcp is the stack's cost. `process_tcp` (21 % of the direct process), the egress
   `dispatch_ip` closure (12 %) and `socket_egress` (10 %) lead, and about 15 % of all
-  instructions are the TCP checksum loop (`smoltcp::wire::ip::checksum::data`, including
-  a bounds-checked `try_into().unwrap()` per 4-byte chunk) in both directions.
+  instructions are the TCP checksum loop (`smoltcp::wire::ip::checksum::data`) in both
+  directions. The profile attributed them to the loop's `try_into().unwrap()` line, but
+  0.14's loop was already auto-vectorized with no bounds check per chunk; that line
+  attribution was an artefact. The fork's `.4` sums 64-bit words instead (38 % fewer
+  instructions per 1400-byte call).
 - The driver's own code is small: the ingress queue (0.49 G, one semaphore lock per
   `try_recv`), its turn bookkeeping (0.27 G) and copies between the sockets and the
   application buffers (0.1 G of instructions; `memmove` is about 5 % of the direct cycles).
@@ -1184,7 +1284,8 @@ size the window, and the window is a trade-off: a peer may send a whole window a
 a window of more segments than the queues between the stacks hold loses its tail there.
 In-process that queue is the receiving engine's 1024-packet sink queue: the excess is
 dropped as `DROP_SINK_FULL`, and smoltcp recovers past the first lost segment of a window
-only by a retransmission timeout of at least 1 s (no SACK, no partial-ACK retransmission).
+only by a retransmission timeout of at least 1 s (no SACK; on `.3` also no partial-ACK
+retransmission).
 `tests/netstack_buffers.rs` `throughput`, the branch only (`main` has no fields), three
 runs, release, load 17-31:
 
@@ -1208,23 +1309,11 @@ window within noise of the default, so this knob is not the MF-2 fix.
 
 Decided for later, not in this workstream:
 
-- smoltcp fork, a later fork round (the fork stays at `v0.14.0-nsplane.3` for now):
-  - `src/wire/ip.rs`, `checksum::data`: sum 8-byte words into a `u64` (or 16-bit words via
-    `as_chunks::<2>` without the `try_into().unwrap()` per chunk) so the loop vectorises; it
-    is about 15 % of the stack's instructions on the direct pairing.
-  - `src/socket/tcp.rs` (the receive window check, around line 1718): the receiver checks
-    segments against the window it advertised last
-    (`remote_last_ack + remote_last_win << shift`), and with window scaling that right
-    edge moves left by up to `2^shift - 1` bytes whenever a segment arrives (the scaled
-    window rounds down), so data the sender was allowed to send is trimmed and
-    retransmitted. Tracking the furthest edge advertised (updated where `remote_last_ack`
-    and `remote_last_win` are set in `ack_reply` and `dispatch`, for non-SYN segments;
-    reset in `reset`) and accepting up to it removed those retransmissions in a local
-    prototype (direct stream with egress drain: 4.5 % to 0.6 % extra segments; main's
-    pacing already stays near zero).
-  - SACK, or NewReno's retransmission on a partial ACK: today any loss past the first
-    segment of a window waits for a timeout of at least 1 s, which keeps 3 % loss at
-    50-60 s and large windows at about 50 MB/s above.
+- smoltcp fork: the checksum over 64-bit words, the non-shrinking advertised window edge
+  and NewReno's partial-ACK retransmission listed here before are in `v0.14.0-nsplane.4`
+  (see [nsplane-netstack](#nsplane-netstack)). What stays: a lost retransmission still
+  waits for a timeout of at least 1 s, which keeps 3 % loss at 11-41 s; SACK or RACK-TLP
+  is the next step.
 - `nsplane-packet`: setting a pooled buffer's length without zero-filling it (smoltcp
   writes every byte of a transmitted packet) would save about 4 % of the direct
   instructions. It is a later design item: it would need `unsafe` in a
@@ -1834,6 +1923,8 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
+| Netstack TCP, smoltcp `.4` (ON) | `netstack_lossy` 1 % loss / 3 % loss / bottleneck, 16 MiB (final gate, load 8.9-9.3) | 1.14 s / 19.2 s / 0.82 s | `.3`: 1.1-6.2 s / stalls past 60 s / 14.9-23.9 s; [Netstack throughput](#netstack-throughput) |
+| Netstack pair (harness, ON) | TCP P1 / P4 Gbit/s, UDP loss 1G / 3G %, 30 s x 3 medians (2026-10-05, load 2.2-3.5) | 6.85 / 7.29, 0.00 / 0.03 | `main` b5e531f same window: 6.21 / 2.48, 2.21 / 5.56 |
 | Engine fast path (MF-1), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP -P1 / -P4, no workers, median of the 3 quiet pairs (load1 <= 12.3) | 9.90 / 10.37 Gbit/s | before: 8.43 / 8.70 Gbit/s (+17 % / +19 %); [Engine fast path (MF-1)](#engine-fast-path-mf-1) |
 | Engine fast path (MF-1), TUN, kernel WireGuard -> nsplane-cli | the same | 4.85 / 4.77 Gbit/s; dedicated rerun 5.87 / 5.92 | before: 6.27 / 6.07; rerun 6.32 / 6.12 Gbit/s (-23 % / -21 %; rerun -7 % / -3 %), not reproduced outside the harness |
 | Engine fast path (MF-1), worker pool hub | off / 2 / 4 workers, 64 B and 1420 B, median of 3 quiet pairs | 1.36 / 1.40 / 1.41 Mpps, 784 / 959 / 937 kpps | before: 1.40 / 1.38 / 1.41 Mpps, 788 / 938 / 960 kpps (all within -3 % to +2 %) |
@@ -1892,7 +1983,10 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
   (crypto 36 %); the PS fixes take 2.2-2.3 % of the instructions and 7-8 % of the CPU time
   off it, and the rest of the stack's cost is smoltcp (see *Known remaining costs* under
   [Netstack throughput](#netstack-throughput)). The gap to ns's legacy stack (MF-2) is to
-  be re-measured with PB's netstack pair.
+  be re-measured with PB's netstack pair. With smoltcp `.4` (ON) the 1 % loss and
+  bottleneck cases finish in about a second, 3 % loss in 11-41 s (lost retransmissions
+  still wait for a timeout), and the harness's netstack pair moves four streams faster
+  than one (7.29 against 6.85 Gbit/s; `main` 2.48 against 6.21).
 
 ### Engine batching under load
 
@@ -1951,16 +2045,20 @@ sets 2-5 / 6-9, 30 s x 3 repetitions, medians:
 | kernel-nsplane | 7.00 | 6.92 | 0.00 / 0.02 | 0.804 / 1.760 | 1.950 / 5.430 | 0.09 † / 1.67 |
 | wggo-wggo | 9.99 | 10.14 | 0.02 / 0.41 | 0.690 / 0.779 | 2.300 / 5.980 | 1.29 / 1.44 |
 | netstack (user-space) | 6.21 | 2.02 | 1.93 / 6.20 | 0.027 / 0.041 | 0.137 / 0.916 | 1.90 / 1.56 |
+| netstack (user-space), ON branch ‡ | 6.85 | 7.29 | 0.00 / 0.03 | 0.027 / 0.052 | 0.280 / 1.271 | 1.70 / 1.41 |
 
 † kernel WireGuard encrypts in kernel threads outside the container cgroup (undercount).
+‡ A separate run, 2026-10-05 (load 2.2-3.5), with smoltcp `v0.14.0-nsplane.4` and
+`netstack_bench`'s 1024-datagram server queue; `main` b5e531f in the same window measured
+6.21 / 2.48 Gbit/s and 2.21 / 5.56 % (see [Netstack throughput](#netstack-throughput)).
 Repetitions were tight for the mixed pairs (kernel -> nsplane 7.02 / 7.00 / 6.99, nsplane ->
 kernel 7.72 / 7.70 / 7.71) and wider for nsplane-nsplane (7.85 / 8.12 / 9.33) and
 wireguard-go (7.75 / 9.99 / 10.79). Kernel WireGuard -> nsplane-cli, left open after the MF-1
 A/B, measures 7.00 Gbit/s here against 3.67 in the first (loaded) run and 6.3 in the MF-1
 "before" reruns: no regression on a quiet host, so the open item is closed. What stays:
 wireguard-go leads on 4 streams (10.1 against 8.9), kernel WireGuard is CPU-pinned by the
-harness (its crypto threads do not run on the pinned sets), and the netstack pair's 4-stream
-result stays below its single stream (follow-up).
+harness (its crypto threads do not run on the pinned sets). The netstack pair's 4-stream
+result, below its single stream here, is above it with the ON changes (‡).
 
 The earlier, loaded run below is kept for its notes.
 
