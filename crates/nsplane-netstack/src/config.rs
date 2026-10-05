@@ -50,6 +50,13 @@ pub struct NetStackConfig {
     pub accept_backpressure: bool,
     /// Datagrams queued per UDP flow or bound socket before new ones are dropped, and UDP
     /// payloads queued for sending before `send` waits. Default 128.
+    ///
+    /// The driver routes up to 256 ingress packets in one step before the application
+    /// can take any, so a burst to one flow or socket beyond this capacity loses the
+    /// excess even when the application keeps up on average. Between two `netstack_bench`
+    /// nodes at 1 Gbit/s of 1380-byte datagrams, that was all of the receiver's UDP loss
+    /// with the default queue and none with one of `ingress_capacity`; a bulk UDP receiver
+    /// wants at least the 256.
     pub datagram_capacity: usize,
     /// Bytes buffered per TCP connection and direction between the stack and the
     /// application. Default 64 KiB.
