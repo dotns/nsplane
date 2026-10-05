@@ -52,10 +52,13 @@ struct NetState {
 /// [`Uapi::with_external_transport`], it never replaces that transport: repeating the
 /// reported `listen_port` or `fwmark` is a no-op, and any other value fails the request
 /// with `EADDRINUSE` (98) and logs the reason.
+///
+/// The transports it binds use segmentation offload unless [`Uapi::offload`] turns it off.
 #[derive(Debug, Clone)]
 pub struct Uapi {
     handle: EngineHandle,
     net: Arc<Mutex<NetState>>,
+    offload: bool,
 }
 
 impl Uapi {
@@ -64,6 +67,7 @@ impl Uapi {
         Self {
             handle,
             net: Arc::new(Mutex::new(NetState::default())),
+            offload: true,
         }
     }
 
@@ -79,6 +83,7 @@ impl Uapi {
                 fwmark: None,
                 external: false,
             })),
+            offload: true,
         }
     }
 
@@ -96,7 +101,17 @@ impl Uapi {
                 fwmark: None,
                 external: true,
             })),
+            offload: true,
         }
+    }
+
+    /// Binds the transports of `listen_port=`, `fwmark=` and [`Uapi::bind_transport`]
+    /// with segmentation offload (the default) or without it, as
+    /// [`UdpTransport::bind_with_offload`] does.
+    #[must_use]
+    pub const fn offload(mut self, enabled: bool) -> Self {
+        self.offload = enabled;
+        self
     }
 
     /// The engine handle requests are applied to.
@@ -285,11 +300,11 @@ impl Uapi {
         check_fwmark_support(fwmark)?;
         if port != 0 && net.port == Some(port) {
             // The current transport holds the port: move to a temporary one to release it.
-            let parked = udp_transport(0)?;
+            let parked = self.bind(0)?;
             net.port = Some(parked.local_addr().port());
             self.install(parked, true).await?;
         }
-        let transport = udp_transport(port)?;
+        let transport = self.bind(port)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(mark) = fwmark {
             transport.set_fwmark(mark)?;
@@ -299,6 +314,15 @@ impl Uapi {
         net.port = Some(bound);
         net.fwmark = fwmark;
         Ok(())
+    }
+
+    /// Binds a transport as [`udp_transport`] does, with [`Uapi::offload`].
+    fn bind(&self, port: u16) -> io::Result<UdpTransport> {
+        UdpTransport::bind_with_offload(
+            TRANSPORT_ID,
+            (Ipv6Addr::UNSPECIFIED, port).into(),
+            self.offload,
+        )
     }
 
     /// Adds `transport` to the engine, or replaces the one already `installed`.
@@ -529,6 +553,28 @@ mod tests {
         // Rebinding on the held port parks the engine on another one to release it.
         assert_eq!(uapi.bind_transport(second).await.unwrap(), second);
         assert_eq!(listen_port(&uapi).await, Some(second));
+        assert!(!port_is_free(second));
+    }
+
+    #[tokio::test]
+    async fn rebinds_honor_offload_off() {
+        let transport = udp_transport(0).unwrap();
+        let port = transport.local_addr().port();
+        let (engine, _ends) = engine(transport);
+        let uapi = Uapi::with_listen_port(engine.handle(), port).offload(false);
+        assert!(!uapi.bind(0).unwrap().offload());
+        assert_eq!(
+            Uapi::new(engine.handle()).bind(0).unwrap().offload(),
+            udp_transport(0).unwrap().offload()
+        );
+
+        // The rebinds go through the same binder and keep working without offload.
+        assert_eq!(
+            request(&uapi, "set=1\nlisten_port=0\n\n").await,
+            "errno=0\n\n"
+        );
+        let second = listen_port(&uapi).await.unwrap();
+        assert_eq!(uapi.bind_transport(second).await.unwrap(), second);
         assert!(!port_is_free(second));
     }
 

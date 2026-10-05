@@ -1067,6 +1067,7 @@ version = "0.9.0"
 dependencies = [
  "arc-swap",
  "criterion",
+ "nix",
  "nsplane-core",
  "nsplane-packet",
  "serde",

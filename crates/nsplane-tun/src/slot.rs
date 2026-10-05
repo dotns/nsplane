@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::Poll;
 
-use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId};
+use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, watch};
@@ -261,7 +261,8 @@ impl SlotSource {
 
 impl PacketSource for SlotSource {
     /// Reads one packet into the packet region of a pooled [`PacketBuf`], leaving the
-    /// headroom in front free and room for the MTU plus 28 bytes behind it.
+    /// headroom in front free and room for the MTU plus 28 bytes plus [`TAILROOM`] behind
+    /// it, so a translated full-size packet is sealed without reallocating.
     ///
     /// Each read gets MTU + 1 bytes of buffer: a read longer than the MTU is dropped and
     /// counted ([`SlotSource::oversize_drops`]) and the next packet is read. A read of 0
@@ -273,7 +274,7 @@ impl PacketSource for SlotSource {
     /// Cancel-safe: a packet is only taken off the fd in the same poll that returns it.
     async fn recv(&mut self) -> io::Result<PacketBuf> {
         let mtu = usize::from(self.mtu);
-        let mut packet = self.pool.get(mtu + TRANSLATION_SLACK);
+        let mut packet = self.pool.get(mtu + TRANSLATION_SLACK + TAILROOM);
         // `PacketBuf` exposes only initialised bytes, so the read region is zero-filled
         // first.
         packet.set_len(mtu + 1);
