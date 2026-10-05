@@ -56,6 +56,19 @@ The first two fix the defects above; the other three were found by running
 for good: `v0.14.0-nsplane.1` (the first two commits) in 3 of 10 debug runs of the
 eight-flow lossy echo, `v0.14.0-nsplane.2` in 1 of 10 debug runs of the loss-free one.
 
+Tag `v0.14.0-nsplane.4` (`b4a44da877b7e2aee07fa232e7a2c6e867bfee3e`, branch
+`nsplane/v0.14-perf` on top of `.3`) adds the throughput round of plan
+`20261004-1730-optimization`, which `nsplane-netstack` uses since then:
+
+- `5d87540` checksum over 64-bit words (bit-identical, about 22 % fewer operations).
+- `a56c712` tcp: the advertised right window edge never moves left under window scaling.
+- `2e165a7` tcp: NewReno partial-ACK retransmission (RFC 6582, careful variant).
+- `01267ee` tcp: sender silly-window avoidance (Minshall).
+- `b4a44da` tcp: Limited Transmit (RFC 3042).
+
+With them four netstack TCP streams reach at least the one-stream rate on the default
+configuration (quiet harness: 6.85 / 7.29 Gbit/s for one / four streams, `.3`: 6.21 / 2.48).
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.
