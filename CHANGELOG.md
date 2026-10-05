@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `nsplane`: `PacketSource::recycle(&mut self, bufs: &mut Vec<PacketBuf>)`, a default no-op:
+  the engine hands transmitted buffers back to the source (one message per sent batch, over
+  a bounded lossy queue that never waits), so it can read into them instead of allocating.
+  `TunSource` keeps them in its pool up to its bound, and `MapSource` forwards them to its
+  inner source. A source that keeps the default gets none after the first offer.
+- `nsplane-packet`: `TAILROOM` (31 bytes: padding to 16 plus the AEAD tag), re-exported by
+  `nsplane`: a buffer with this much room behind the packet is sealed in place without
+  reallocating. `TunSource`, `SlotSource` and the Wintun reader size their reads with it.
+- `nsplane-packet`: `PacketBuf::extend_from_slice` appends without zero-filling first.
+- `nsplane-noise`: `Tunn::reserve_in_place` / `SealTicket`, `Tunn::open_ticket` /
+  `OpenTicket`, `Tunn::commit_open` and `Tunn::is_live` split sealing and opening into an
+  in-order step on the tunnel and a keyed step that runs anywhere.
 - `nsplane-uapi`: `Uapi::offload(bool)` binds the transports of `listen_port=`, `fwmark=` and
   `Uapi::bind_transport` with or without segmentation offload (on by default). `nsplane-cli
   --no-offload` sets it, so a `listen-port` or `fwmark` set over the UAPI no longer turns
@@ -21,6 +33,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   648-671 MB/s against 135-188 MB/s without one on smoltcp `v0.14.0-nsplane.3`.
 
 ### Changed
+- `nsplane`: with `crypto_workers` of 2 or more, one peer's packets are encrypted and
+  decrypted on every worker instead of on worker `peer id % n`: the owner reserves the
+  counters and checks the replay window in order, the jobs carry the session keys, and the
+  owner completes them in the order it handed them out (received counters are committed
+  there, so a duplicate opened on two workers is still rejected). Each peer's order is kept;
+  0 or 1 workers are unchanged. Harness, one peer, 2 workers: P1 / P4 8.39 / 8.58 -> 11.67 /
+  12.65 Gbit/s against main the same day.
+- `nsplane`: with crypto workers, received datagrams with the workers count against the
+  deliver queue's room, so a sink slower than the network holds datagrams back in the
+  transport instead of dropping them under `DROP_SINK_FULL`.
+- `nsplane`: the owner hands one drain's datagrams for a transport to its transmit task as
+  one message (the transmit queue stays bounded in datagrams; `QueueStats::transmit` counts
+  the batch being sent), and `QueueStats::recycle` counts only buffers that go back to the
+  owner, which happens only with a source that keeps the default `recycle`.
+- `nsplane`: `UdpTransport` sends a segmented run as one `sendmsg` with one iovec per
+  datagram (no train copy), takes turns in a ring of four GRO storages, and reads up to 16
+  datagrams per `recvmmsg` while no GRO trains arrive; with offload off it batches with
+  `sendmmsg` / `recvmmsg` (every datagram still its own message). Harness no-offload pair
+  P1 / P4 3.10 / 3.35 -> 3.45 / 3.51 Gbit/s at 18 % less sender CPU per GB.
+- `nsplane-tun`: `TunSource::recv_batch` keeps reading without waiting after a packet until
+  `EAGAIN`, a full batch or a split GSO read; a lone packet still returns at once.
+- `nsplane-packet`: `PacketBuf::set_len` no longer zero-fills bytes the buffer already
+  initialized: a buffer reused through `PacketPool` exposes what it held before (write
+  before reading); `PacketPool::get` keeps those bytes too.
+- Performance (OE): harness nsplane-cli -> nsplane-cli without workers P1 / P4 9.60 / 10.39
+  -> 10.33 / 11.38 Gbit/s at 24 % less sender CPU per GB, loaded ping p50 / p99 2.89 / 5.89
+  -> 2.47 / 5.22 ms; nsplane-cli -> kernel WireGuard 7.44 -> 7.85 Gbit/s (main 20d728c
+  against this branch, 2026-10-05, load 2.2-6.4). See the architecture's *Engine and device
+  fast path (OE)*.
 - `nsplane-acl`: the node L3 gate's default clock is the coarse monotonic clock on Linux and
   Android (one scheduler tick of resolution, invisible to its second-scale timeouts):
   established flows 62.8 -> 49.7 ns through `NodeL3Gate`, 81.7 -> 69.5 ns through

@@ -6,9 +6,10 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::ops::ControlFlow;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,7 +18,9 @@ use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Outp
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::mpsc::{self, OwnedPermit};
-use tokio::sync::{Semaphore, broadcast, oneshot, watch};
+use tokio::sync::{
+    AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError, broadcast, oneshot, watch,
+};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
@@ -53,10 +56,16 @@ const PATH_MTU_REPORTS: usize = 16;
 /// many as the queue has room for); either way the input queues are bounded in items.
 /// I/O tasks surround it, each connected through a bounded queue: the source task
 /// ([`PacketSource::recv`]), the sink task ([`PacketSink::send`]) and, for every transport,
-/// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The core
+/// a receive task ([`Transport::recv`]) and a transmit task ([`Transport::send`]). The owner
+/// hands the datagrams one drain of the core queues for a transport to its transmit task as
+/// one message (up to [`MAX_BATCH`]; the transmit queue stays bounded in datagrams), and the
+/// transmit task sends what is queued in batches of up to [`MAX_BATCH`]. The core
 /// is never shared. Without crypto workers the data path takes no lock: each peer owns its
-/// tunnel. With crypto workers each peer's tunnel is shared with its jobs behind a mutex,
-/// uncontended except while a job of that peer runs.
+/// tunnel. With crypto workers each peer's tunnel stays behind a mutex, but only the owner
+/// locks it: the owner reserves a local packet's counter or checks a received message's
+/// session and replay window, and hands the job a seal or open ticket (session key and
+/// counter), so a job never touches the tunnel; the owner commits each open, in order,
+/// when it completes the job. The mutex is therefore uncontended.
 ///
 /// Transports: the engine runs any number of transports, keyed by [`Transport::id`]. Every
 /// transport's received datagrams feed the core through one queue, so a peer's
@@ -100,9 +109,9 @@ const PATH_MTU_REPORTS: usize = 16;
 /// waiting in its backlog, queued or being sent by its transmit task, and hands the
 /// packets of the drain to the sink itself ([`PacketSink::try_send_batch`]) when nothing
 /// is queued for or being delivered by the sink task, so on an idle path neither task is
-/// woken. What the transport or sink does not take at once (it would block, or it takes
-/// part of the batch) goes to the transmit queue and backlog, or the deliver queue, in
-/// order and under the rules above; later datagrams and packets queue behind it until the
+/// woken. What the transport or sink does
+/// not take at once (it would block, or it takes part of the batch) goes to the transmit
+/// queue and backlog, or the deliver queue, in order and under the rules above; later datagrams and packets queue behind it until the
 /// task has drained, so each transport and the sink keep the order of the core's outputs.
 /// It sends itself only for a drain after which no local packet or received datagram is
 /// waiting (it would wait next): under load it hands the datagrams to the transmit tasks,
@@ -117,10 +126,16 @@ const PATH_MTU_REPORTS: usize = 16;
 /// exactly sized [`PacketBuf`], so queued datagrams do not each pin 64 KiB. The core takes
 /// each datagram by value: it delivers a decrypted packet in the datagram's own buffer and
 /// puts the buffers of all other datagrams into its pool itself. Buffers rejected by a full
-/// sink and transmitted buffers (returned by the transmit task over a bounded queue, dropped
-/// when it is full, or by the owner task at once when it sent them itself) go back to the
-/// core's pool with [`Core::recycle`]. Delivered packets are
-/// owned by the sink.
+/// sink go back to the core's pool with [`Core::recycle`]. Transmitted buffers go back to
+/// the source task, one message per batch sent (by the transmit task, or by the owner task
+/// when it sent them itself), which hands them to [`PacketSource::recycle`] before its next
+/// read, so the source can read into them again. That queue is bounded in buffers and
+/// lossy: a full queue drops them (the owner task puts its own into the core's pool
+/// instead), so returning a buffer never waits, and a stopped or suspended source task
+/// takes none. A source that takes none of the first buffers it is given (it keeps the
+/// default) is given none again: the transmitted buffers then go back to the owner task
+/// over a bounded queue (dropped when it is full) and into the core's pool. Delivered
+/// packets are owned by the sink.
 ///
 /// Suspension: [`EngineHandle::suspend`] pauses the engine without tearing it down. While
 /// suspended, every I/O task waits before its next read or write (one already in progress
@@ -156,12 +171,20 @@ const PATH_MTU_REPORTS: usize = 16;
 /// pool of worker tasks ([`Core::handle_datagrams_deferred`], [`Core::handle_locals_deferred`])
 /// and finishes each packet when its worker hands it back ([`Core::complete_job`]);
 /// everything else (routing, filters, handshakes, timers, counters, events) stays on the
-/// owner, which then never sends or delivers inline. The pool is sharded by peer:
-/// all packets of a peer, in both directions, go to the same worker (in batches, handed over
-/// when one is full or the owner has nothing else to do), which runs them in arrival order, so each peer's packets leave in the order they came while different peers
-/// are encrypted in parallel (on a multi-threaded runtime). At most queue capacity packets
+/// owner, which then never sends or delivers inline. The owner reserves each local packet's
+/// counter (nonce) in order and checks each received datagram against the replay window
+/// when it hands the job out; the jobs go to the workers in turn, whatever their peer (in
+/// batches, handed over when one is full or the owner has nothing else to do), so one peer's
+/// packets are encrypted on every worker in parallel (on a multi-threaded runtime). The owner
+/// completes the jobs in the order it handed them out, marking each received datagram's
+/// counter as received only then, so each peer's packets leave in the order they came and a
+/// duplicate opened on two workers at once is still rejected. At most queue capacity packets
 /// are with the workers at a time; while that many are, the owner stops reading local
-/// packets and received datagrams. Before every handle call that reads or changes peers,
+/// packets and received datagrams. Since each received datagram with the workers may deliver
+/// a packet, the owner reads received datagrams only while the deliver queue has room beyond
+/// them, as many at once, so a sink slower than the network holds the datagrams back in the
+/// transport (for UDP, the socket's buffer) instead of dropping decrypted packets under
+/// [`crate::DROP_SINK_FULL`]. Before every handle call that reads or changes peers,
 /// counters or sessions, the owner waits for the packets with the workers, so the call sees
 /// (and acts after) every packet read before it, as without workers.
 ///
@@ -248,7 +271,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let handoff = if fast_path { MAX_BATCH } else { 1 };
     let (local_tx, local) = batch_queue(capacity, handoff);
     let (datagram_tx, datagrams) = batch_queue(capacity, handoff);
-    let (recycle_tx, recycled) = mpsc::channel(capacity);
+    let (recycle, source_recycled, recycled) = Recycle::new(capacity);
     let (signal, send_error_signal) = mpsc::channel(1);
     let (deliver, deliver_rx) = mpsc::channel(capacity);
     let sink = Arc::new(parts.sink);
@@ -278,7 +301,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         datagrams,
         datagram_tx,
         recycled,
-        recycle_tx,
+        recycle_bufs: Vec::new(),
         send_errors: SendErrors {
             count: Arc::default(),
             signal,
@@ -295,7 +318,13 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         path_mtus: PathMtus::new(mtu, parts.transport_max, parts.path_mtu_expiry),
         tasks: vec![
             Task::spawn(watch_mtu(mtu_watch, mtu_tx, suspended.subscribe())),
-            Task::spawn(read_source(parts.source, local_tx, suspended.subscribe())),
+            Task::spawn(read_source(
+                parts.source,
+                local_tx,
+                source_recycled,
+                Arc::clone(&recycle.declined),
+                suspended.subscribe(),
+            )),
             Task::spawn(write_sink(
                 Arc::clone(&sink),
                 deliver_rx,
@@ -303,19 +332,9 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
                 suspended.subscribe(),
             )),
         ],
+        recycle,
         queue_capacity: capacity,
-        high_water: QueueStats {
-            command: QueueDepth::new(COMMAND_CAPACITY),
-            local: QueueDepth::new(capacity),
-            datagrams: QueueDepth::new(capacity),
-            deliver: QueueDepth::new(capacity),
-            recycle: QueueDepth::new(capacity),
-            transmit: QueueDepth::new(capacity),
-            backlog: QueueDepth::new(capacity),
-            events: QueueDepth::new(parts.event_capacity),
-            crypto: QueueDepth::new(crypto_capacity),
-            crypto_done: QueueDepth::new(crypto_capacity),
-        },
+        high_water: queue_marks(capacity, parts.event_capacity, crypto_capacity),
         local_first: false,
         suspended,
         fast_path,
@@ -325,9 +344,12 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
             queued: false,
             drains: 0,
         },
+        staged: false,
+        deliver_room: None,
         sink: InlineSink {
             try_deliver: Box::new(move |packets| sink.try_send_batch(packets)),
             outstanding: sink_outstanding,
+            allowed: fast_path,
             closed: false,
             backoff: Backoff::default(),
             delivered: VecDeque::with_capacity(MAX_BATCH),
@@ -345,6 +367,22 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     Engine {
         handle: EngineHandle::new(command_tx),
         owner: Some(tokio::spawn(owner.run())),
+    }
+}
+
+/// The queue capacities, with no high-water marks yet.
+const fn queue_marks(capacity: usize, events: usize, crypto: usize) -> QueueStats {
+    QueueStats {
+        command: QueueDepth::new(COMMAND_CAPACITY),
+        local: QueueDepth::new(capacity),
+        datagrams: QueueDepth::new(capacity),
+        deliver: QueueDepth::new(capacity),
+        recycle: QueueDepth::new(capacity),
+        transmit: QueueDepth::new(capacity),
+        backlog: QueueDepth::new(capacity),
+        events: QueueDepth::new(events),
+        crypto: QueueDepth::new(crypto),
+        crypto_done: QueueDepth::new(crypto),
     }
 }
 
@@ -385,6 +423,7 @@ fn batch_queue<T>(capacity: usize, handoff: usize) -> (BatchSender<T>, BatchQueu
             batches,
             permits: Arc::clone(&permits),
             most: handoff.clamp(1, capacity),
+            capacity,
         },
         BatchQueue {
             batches: rx,
@@ -409,6 +448,7 @@ struct BatchSender<T> {
     permits: Arc<Semaphore>,
     /// The most items one message carries, at most the capacity.
     most: usize,
+    capacity: usize,
 }
 
 impl<T> Clone for BatchSender<T> {
@@ -417,6 +457,7 @@ impl<T> Clone for BatchSender<T> {
             batches: self.batches.clone(),
             permits: Arc::clone(&self.permits),
             most: self.most,
+            capacity: self.capacity,
         }
     }
 }
@@ -451,6 +492,41 @@ impl<T> BatchSender<T> {
             self.batches.send(handoff).map_err(drop)?;
         }
         Ok(())
+    }
+
+    /// Hands over as many items from the front of `items` as there are free slots, as one
+    /// message, without waiting; the rest stay in `items`. Items handed to a queue that is
+    /// gone are dropped.
+    fn try_send(&self, items: &mut Vec<T>) {
+        let n = items.len().min(self.permits.available_permits());
+        // Another sender may take the free slots first.
+        let Some(permits) = u32::try_from(n)
+            .ok()
+            .filter(|&n| n > 0)
+            .and_then(|n| self.permits.try_acquire_many(n).ok())
+        else {
+            return;
+        };
+        permits.forget();
+        let handoff = if n == 1 {
+            Handoff::One(items.remove(0))
+        } else if n == items.len() {
+            Handoff::Many(std::mem::take(items))
+        } else {
+            Handoff::Many(items.drain(..n).collect())
+        };
+        // The queue is gone: so are the items.
+        let _ = self.batches.send(handoff);
+    }
+
+    /// Items in the queue, counting those taken whose slots are not freed yet.
+    fn len(&self) -> usize {
+        self.capacity - self.permits.available_permits()
+    }
+
+    /// Whether the receiving side is gone.
+    fn is_closed(&self) -> bool {
+        self.permits.is_closed()
     }
 }
 
@@ -508,6 +584,21 @@ impl<T> BatchQueue<T> {
         Some(item)
     }
 
+    /// Takes every item held or queued and appends it to `out`, in order.
+    fn take_all(&mut self, out: &mut Vec<T>) {
+        let before = out.len();
+        out.extend(self.held.drain(..));
+        while let Ok(handoff) = self.batches.try_recv() {
+            match handoff {
+                Handoff::One(item) => out.push(item),
+                // A whole message moves without copying when it comes first.
+                Handoff::Many(batch) if out.is_empty() => *out = batch,
+                Handoff::Many(mut batch) => out.append(&mut batch),
+            }
+        }
+        self.taken += out.len() - before;
+    }
+
     /// Whether no item is held or queued.
     fn is_empty(&self) -> bool {
         self.held.is_empty() && self.batches.is_empty()
@@ -535,7 +626,7 @@ impl<T> Drop for BatchQueue<T> {
 
 /// What a stopped transmit task hands back: its queue and the datagrams of the batch it was
 /// sending that were not sent, oldest first.
-type Unsent = (mpsc::Receiver<Datagram>, Vec<Datagram>);
+type Unsent = (BatchQueue<Datagram>, Vec<Datagram>);
 
 /// A transport's transmit task, stopped through a signal so that it hands back the datagrams
 /// it did not send; aborted when dropped.
@@ -558,7 +649,7 @@ impl Transmitter {
         // Nothing comes back from a task that ended on its own or failed.
         if let Ok(Some((mut queue, sending))) = (&mut self.task).await {
             unsent.extend(sending);
-            while let Ok(datagram) = queue.try_recv() {
+            while let Some(datagram) = queue.try_recv() {
                 unsent.push_back(datagram);
             }
         }
@@ -575,7 +666,10 @@ impl Drop for Transmitter {
 /// A datagram and the path to send it on.
 type Datagram = (Path, PacketBuf);
 /// Waits for room in the transmit queue.
-type Reserve = Pin<Box<dyn Future<Output = Result<OwnedPermit<Datagram>, SendError<()>>> + Send>>;
+type Reserve = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, AcquireError>> + Send>>;
+/// Waits for room in the deliver queue.
+type DeliverRoom =
+    Pin<Box<dyn Future<Output = Result<OwnedPermit<(PeerId, PacketBuf)>, SendError<()>>> + Send>>;
 
 /// Hands datagrams to a transport without waiting ([`Transport::try_send_batch`]).
 type TrySend = Box<dyn Fn(&[Datagram], &mut usize, &mut usize) -> io::Result<()> + Send>;
@@ -583,15 +677,14 @@ type TrySend = Box<dyn Fn(&[Datagram], &mut usize, &mut usize) -> io::Result<()>
 type TryDeliver = Box<dyn Fn(&mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> + Send>;
 
 /// Spawns a transport's receive and transmit tasks, given the queue receiving its datagrams,
-/// its transmit queue (both ends), the queue returning transmitted buffers, the transport's
-/// traffic counters (which report failed sends) and the suspension state; also returns how
-/// to send on it without waiting and its path MTU reports, if it has any.
+/// its transmit queue, where transmitted buffers go back, the transport's traffic counters
+/// (which report failed sends) and the suspension state; also returns how to send on it
+/// without waiting and its path MTU reports, if it has any.
 type Start = Box<
     dyn FnOnce(
             BatchSender<Datagram>,
-            mpsc::WeakSender<Datagram>,
-            mpsc::Receiver<Datagram>,
-            mpsc::Sender<PacketBuf>,
+            BatchQueue<Datagram>,
+            Recycle,
             Arc<Traffic>,
             watch::Receiver<bool>,
         ) -> (
@@ -613,32 +706,73 @@ impl NewTransport {
     pub(crate) fn new<T: Transport>(transport: T) -> Self {
         Self {
             id: transport.id(),
-            start: Box::new(
-                move |datagrams, slots, queue, recycle, traffic, suspended| {
-                    let reports = transport.path_mtu_reports();
-                    let transport = Arc::new(transport);
-                    let (stop, stopped) = oneshot::channel();
-                    let sender = Arc::clone(&transport);
-                    (
-                        Task::spawn(receive(
-                            Arc::clone(&transport),
-                            datagrams,
-                            Arc::clone(&traffic),
-                            suspended.clone(),
+            start: Box::new(move |datagrams, queue, recycle, traffic, suspended| {
+                let reports = transport.path_mtu_reports();
+                let transport = Arc::new(transport);
+                let (stop, stopped) = oneshot::channel();
+                let sender = Arc::clone(&transport);
+                (
+                    Task::spawn(receive(
+                        Arc::clone(&transport),
+                        datagrams,
+                        Arc::clone(&traffic),
+                        suspended.clone(),
+                    )),
+                    Transmitter {
+                        stop: Some(stop),
+                        task: tokio::spawn(transmit(
+                            transport, queue, recycle, traffic, suspended, stopped,
                         )),
-                        Transmitter {
-                            stop: Some(stop),
-                            task: tokio::spawn(transmit(
-                                transport, slots, queue, recycle, traffic, suspended, stopped,
-                            )),
-                        },
-                        Box::new(move |datagrams, sent, failed| {
-                            sender.try_send_batch(datagrams, sent, failed)
-                        }),
-                        reports,
-                    )
-                },
-            ),
+                    },
+                    Box::new(move |datagrams, sent, failed| {
+                        sender.try_send_batch(datagrams, sent, failed)
+                    }),
+                    reports,
+                )
+            }),
+        }
+    }
+}
+
+/// Where transmitted buffers go back for reuse: to the source task while the source takes
+/// them ([`PacketSource::recycle`]), otherwise to the owner task, which puts them into the
+/// core's pool. Both queues are bounded in buffers and lossy: a buffer that finds no room is
+/// dropped (or, from the owner task, put into the core's pool), so returning never waits.
+#[derive(Clone)]
+struct Recycle {
+    source: BatchSender<PacketBuf>,
+    owner: BatchSender<PacketBuf>,
+    /// Set by the source task once the source took none of the first buffers it was given
+    /// (it keeps the default [`PacketSource::recycle`]).
+    declined: Arc<AtomicBool>,
+}
+
+impl Recycle {
+    /// The queues, each holding `capacity` buffers, and their receiving sides: the source
+    /// task's and the owner task's.
+    fn new(capacity: usize) -> (Self, BatchQueue<PacketBuf>, BatchQueue<PacketBuf>) {
+        let (source, to_source) = batch_queue(capacity, MAX_BATCH);
+        let (owner, to_owner) = batch_queue(capacity, MAX_BATCH);
+        let recycle = Self {
+            source,
+            owner,
+            declined: Arc::default(),
+        };
+        (recycle, to_source, to_owner)
+    }
+
+    /// Whether buffers go to the source.
+    fn to_source(&self) -> bool {
+        !self.declined.load(Ordering::Relaxed)
+    }
+
+    /// Hands back as many buffers from `bufs` as there is room for, without waiting; the
+    /// rest stay in `bufs`.
+    fn give(&self, bufs: &mut Vec<PacketBuf>) {
+        if self.to_source() {
+            self.source.try_send(bufs);
+        } else {
+            self.owner.try_send(bufs);
         }
     }
 }
@@ -676,8 +810,8 @@ struct Traffic {
     tx_bytes: AtomicU64,
     tx_failed: AtomicU64,
     /// Datagrams in the transmit queue or in the batch the transmit task is sending: raised
-    /// by the owner per queued datagram, lowered by the transmit task once it is done with
-    /// its batch.
+    /// by the owner per message it hands over, lowered by the transmit task once it is done
+    /// with its batch.
     outstanding: AtomicUsize,
     errors: SendErrors,
 }
@@ -727,7 +861,12 @@ impl Traffic {
 /// An installed transport: its transmit queue, the datagrams waiting for room in it, its
 /// two tasks and its traffic counters.
 struct TransportSlot {
-    queue: mpsc::Sender<Datagram>,
+    /// Bounded in datagrams; the owner task hands over what one drain queued as one message.
+    queue: BatchSender<Datagram>,
+    /// Datagrams of the current drain that hold a slot of the transmit queue, oldest first,
+    /// handed over at the end of the drain ([`TransportSlot::hand_over`]) or once
+    /// [`MAX_BATCH`] are staged.
+    staged: Vec<Datagram>,
     /// Datagrams waiting for room in the transmit queue, oldest first.
     pending: VecDeque<Datagram>,
     /// Armed while `pending` is not empty.
@@ -747,10 +886,10 @@ struct TransportSlot {
 }
 
 impl TransportSlot {
-    /// Queues `datagram`, or adds it to the waiting datagrams when the queue is full or
-    /// others are waiting. With `droppable`, a datagram that finds `bound` datagrams waiting
-    /// is rejected; a closed queue rejects every datagram. Returns the rejected buffer and
-    /// the reason.
+    /// Stages `datagram` in a free slot of the queue, or adds it to the waiting datagrams
+    /// when the queue is full or others are waiting. With `droppable`, a datagram that finds
+    /// `bound` datagrams waiting is rejected; a closed queue rejects every datagram. Returns
+    /// the rejected buffer and the reason.
     fn transmit(
         &mut self,
         datagram: Datagram,
@@ -760,23 +899,17 @@ impl TransportSlot {
         if self.closed {
             return Err((datagram.1, DROP_TRANSPORT_CLOSED));
         }
-        let datagram = if self.pending.is_empty() {
-            self.traffic.outstanding.fetch_add(1, Ordering::Relaxed);
-            match self.queue.try_send(datagram) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.traffic.outstanding.fetch_sub(1, Ordering::Relaxed);
-                    match error {
-                        TrySendError::Full(datagram) => datagram,
-                        TrySendError::Closed((_, data)) => {
-                            return Err((data, DROP_TRANSPORT_CLOSED));
-                        }
-                    }
+        if self.pending.is_empty() {
+            match self.queue.permits.try_acquire() {
+                Ok(slot) => {
+                    slot.forget();
+                    self.staged.push(datagram);
+                    return Ok(());
                 }
+                Err(TryAcquireError::Closed) => return Err((datagram.1, DROP_TRANSPORT_CLOSED)),
+                Err(TryAcquireError::NoPermits) => {}
             }
-        } else {
-            datagram
-        };
+        }
         if droppable && self.pending.len() >= bound {
             return Err((datagram.1, DROP_TRANSMIT_FULL));
         }
@@ -788,6 +921,7 @@ impl TransportSlot {
     /// may send on it itself without passing any of it.
     fn idle(&self) -> bool {
         self.pending.is_empty()
+            && self.staged.is_empty()
             && !self.closed
             && !self.queue.is_closed()
             && self.traffic.outstanding.load(Ordering::Acquire) == 0
@@ -836,36 +970,84 @@ impl TransportSlot {
         }
         self.receive.stop().await;
         let mut unsent = self.transmit.stop().await;
+        unsent.extend(self.staged.drain(..));
         unsent.append(&mut self.pending);
         unsent.extend(self.inline.drain(..));
         unsent
     }
 
-    /// Datagrams in the transmit queue, counting a reserved slot.
+    /// Datagrams in the transmit queue, counting the staged ones and the batch the transmit
+    /// task is sending.
     fn queued(&self) -> usize {
-        self.queue.max_capacity() - self.queue.capacity()
+        self.queue.len()
+    }
+
+    /// Hands the staged datagrams to the transmit task as one message; returns them if the
+    /// queue is gone.
+    fn hand_over(&mut self) -> Option<Vec<Datagram>> {
+        let n = self.staged.len();
+        let handoff = match n {
+            0 => return None,
+            1 => Handoff::One(self.staged.pop()?),
+            _ => {
+                // Exactly sized; the staging buffer keeps its capacity.
+                let mut datagrams = Vec::with_capacity(n);
+                datagrams.append(&mut self.staged);
+                Handoff::Many(datagrams)
+            }
+        };
+        self.traffic.outstanding.fetch_add(n, Ordering::Relaxed);
+        let Err(SendError(handoff)) = self.queue.batches.send(handoff) else {
+            return None;
+        };
+        self.traffic.outstanding.fetch_sub(n, Ordering::Relaxed);
+        Some(match handoff {
+            Handoff::One(datagram) => vec![datagram],
+            Handoff::Many(datagrams) => datagrams,
+        })
     }
 }
 
 /// The crypto worker tasks and their queues.
 ///
-/// Jobs go to the workers in batches: each worker's batch is handed over once it is full, or
-/// with every other batch once one is full or the owner has nothing else to do, so a busy
-/// owner wakes each worker once per batch rather than once per packet.
+/// Jobs go to the workers in turn, whatever their peer, so even a single peer's packets are
+/// encrypted on every worker. Jobs go to the workers in batches: each worker's batch is
+/// handed over once it is full, or with every other batch once one is full or the owner has
+/// nothing else to do, so a busy owner wakes each worker once per batch rather than once per
+/// packet. The workers hand jobs back in any order; they are completed in the order they
+/// were handed out, so each peer's packets keep their order.
 struct Workers {
-    /// One job queue per worker; a peer's jobs go to worker `peer % n`.
-    queues: Vec<mpsc::Sender<Vec<CryptoJob>>>,
+    /// One job queue per worker.
+    queues: Vec<mpsc::Sender<JobBatch>>,
     /// The jobs of each worker not handed over yet, oldest first.
-    batches: Vec<Vec<CryptoJob>>,
+    batches: Vec<JobBatch>,
     /// Batches the workers ran, in the order each worker ran them.
-    done: mpsc::Receiver<Vec<CryptoJob>>,
-    /// Jobs batched or with the workers and not completed yet; at most `bound`.
-    in_flight: usize,
+    done: mpsc::Receiver<JobBatch>,
+    /// The worker the next job goes to.
+    next: usize,
+    /// Jobs batched or with the workers and not completed yet, in the order they were
+    /// handed out; at most `bound`. A job is here once its worker handed it back.
+    order: VecDeque<Pending>,
+    /// The sequence number of the front of `order`.
+    first: u64,
+    /// The jobs of `order` that open received datagrams, each of which may deliver a packet.
+    opens: usize,
     /// The most jobs in flight since [`Owner::queue_stats`] last took it.
     peak: usize,
     bound: usize,
     tasks: Vec<Task>,
 }
+
+/// A job handed out and not completed yet.
+struct Pending {
+    /// Whether it opens a received datagram.
+    open: bool,
+    /// The job, once a worker ran it.
+    job: Option<CryptoJob>,
+}
+
+/// A batch of jobs for one worker, each with its sequence number.
+type JobBatch = Vec<(u64, CryptoJob)>;
 
 impl Workers {
     /// Spawns `n` workers, with at most `bound` jobs in flight.
@@ -880,47 +1062,84 @@ impl Workers {
             .unzip();
         Self {
             queues,
-            batches: (0..n).map(|_| Vec::new()).collect(),
+            batches: (0..n).map(|_| JobBatch::new()).collect(),
             done,
-            in_flight: 0,
+            next: 0,
+            order: VecDeque::with_capacity(bound),
+            first: 0,
+            opens: 0,
             peak: 0,
             bound,
             tasks,
         }
     }
 
-    /// Adds `job` to its peer's worker's batch; `true` once that batch is full.
-    fn dispatch(&mut self, job: CryptoJob) -> bool {
-        let worker = job.peer().get() as usize % self.queues.len();
-        let batch = &mut self.batches[worker];
-        batch.push(job);
-        self.in_flight += 1;
-        self.peak = self.peak.max(self.in_flight);
+    /// Jobs batched or with the workers and not completed yet.
+    fn in_flight(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Adds `job` to the next worker's batch, `open` if it opens a received datagram; `true`
+    /// once that batch is full.
+    fn dispatch(&mut self, job: CryptoJob, open: bool) -> bool {
+        let seq = self.first + self.order.len() as u64;
+        self.order.push_back(Pending { open, job: None });
+        self.opens += usize::from(open);
+        self.peak = self.peak.max(self.order.len());
+        let batch = &mut self.batches[self.next];
+        self.next = (self.next + 1) % self.queues.len();
+        batch.push((seq, job));
         batch.len() >= MAX_BATCH
     }
 
-    /// Hands every batch of jobs to its worker; completes the jobs of a worker that is gone
-    /// (it panicked) on `core`.
+    /// Takes back the jobs of `batch` and completes on `core` every job whose predecessors
+    /// are all completed, in the order they were handed out.
+    fn complete(&mut self, batch: JobBatch, core: &mut Core) {
+        for (seq, job) in batch {
+            // Every job handed back is in `order`: it is only completed from there.
+            if let Some(pending) = seq
+                .checked_sub(self.first)
+                .and_then(|at| usize::try_from(at).ok())
+                .and_then(|at| self.order.get_mut(at))
+            {
+                pending.job = Some(job);
+            }
+        }
+        while let Some(job) = self
+            .order
+            .front_mut()
+            .and_then(|pending| pending.job.take())
+        {
+            if self.order.pop_front().is_some_and(|pending| pending.open) {
+                self.opens -= 1;
+            }
+            self.first += 1;
+            core.complete_job(job);
+        }
+    }
+
+    /// Hands every batch of jobs to its worker; runs the jobs of a worker that is gone on
+    /// the owner and completes them on `core`.
     fn flush(&mut self, core: &mut Core) {
-        for (queue, batch) in self.queues.iter().zip(&mut self.batches) {
-            if batch.is_empty() {
+        for worker in 0..self.queues.len() {
+            if self.batches[worker].is_empty() {
                 continue;
             }
             // Never full: a queue holds a batch of each job in flight.
-            if let Err(TrySendError::Full(jobs) | TrySendError::Closed(jobs)) =
-                queue.try_send(std::mem::take(batch))
+            if let Err(TrySendError::Full(mut batch) | TrySendError::Closed(mut batch)) =
+                self.queues[worker].try_send(std::mem::take(&mut self.batches[worker]))
             {
-                self.in_flight -= jobs.len();
-                for job in jobs {
-                    core.complete_job(job);
+                for (_, job) in &mut batch {
+                    job.run();
                 }
+                self.complete(batch, core);
             }
         }
     }
 
     /// Whether the bound of jobs in flight is reached.
-    const fn full(&self) -> bool {
-        self.in_flight >= self.bound
+    fn full(&self) -> bool {
+        self.in_flight() >= self.bound
     }
 }
 
@@ -930,6 +1149,8 @@ struct InlineSink {
     /// Packets in the deliver queue or in the batch the sink task is delivering: raised by
     /// the owner per queued packet, lowered by the sink task once it is done with its batch.
     outstanding: Arc<AtomicUsize>,
+    /// No crypto workers and not suspended: the owner task may deliver itself.
+    allowed: bool,
     /// The sink reported [`io::ErrorKind::BrokenPipe`] to the owner task.
     closed: bool,
     backoff: Backoff,
@@ -940,7 +1161,7 @@ struct InlineSink {
 
 /// When the owner task sends and delivers itself.
 struct Inline {
-    /// No crypto workers and not suspended: the owner task may deliver itself.
+    /// No crypto workers and not suspended: the owner task may send itself.
     allowed: bool,
     /// For the current drain: allowed, and no local packet or received datagram is waiting,
     /// so the owner task would wait next and may also send itself. Under load it hands the
@@ -1035,9 +1256,9 @@ enum Wake {
     /// A transmit task reported failed sends.
     SendErrors,
     /// Room in the transmit queue of a transport with waiting datagrams.
-    Flush(TransportId, Option<OwnedPermit<Datagram>>),
+    Flush(TransportId, Option<OwnedSemaphorePermit>),
     /// A crypto worker ran a job.
-    Crypto(Option<Vec<CryptoJob>>),
+    Crypto(Option<JobBatch>),
     Timer,
 }
 
@@ -1052,10 +1273,12 @@ struct Owner {
     datagrams: BatchQueue<Datagram>,
     /// Cloned into every transport receive task.
     datagram_tx: BatchSender<Datagram>,
-    /// Buffers returned by the transmit task.
-    recycled: mpsc::Receiver<PacketBuf>,
-    /// Cloned into every transmit task.
-    recycle_tx: mpsc::Sender<PacketBuf>,
+    /// Transmitted buffers returned to the owner task, while the source takes none.
+    recycled: BatchQueue<PacketBuf>,
+    /// Reused for the buffers taken from `recycled`.
+    recycle_bufs: Vec<PacketBuf>,
+    /// Where transmitted buffers go back; cloned into every transmit task.
+    recycle: Recycle,
     /// Cloned into every transmit task.
     send_errors: SendErrors,
     /// Signalled by [`SendErrors::report`].
@@ -1075,6 +1298,9 @@ struct Owner {
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
+    /// With crypto workers: armed while the deliver queue has no room and no job that may
+    /// deliver is in flight, so only the sink task can make room.
+    deliver_room: Option<DeliverRoom>,
     /// Capacities and high-water marks of the queues, without the current occupancies.
     high_water: QueueStats,
     /// Alternates which of local packets and datagrams is polled first.
@@ -1084,6 +1310,8 @@ struct Owner {
     /// No crypto workers: the owner task may send datagrams and deliver packets itself.
     fast_path: bool,
     inline: Inline,
+    /// Some transport has datagrams in [`TransportSlot::staged`].
+    staged: bool,
     /// How the owner task delivers packets itself.
     sink: InlineSink,
     /// The crypto worker pool, if enabled.
@@ -1151,8 +1379,9 @@ impl Owner {
                         && let Some(slot) = self.transports.get_mut(&id)
                         && let Some(datagram) = slot.pending.pop_front()
                     {
-                        slot.traffic.outstanding.fetch_add(1, Ordering::Relaxed);
-                        permit.send(datagram);
+                        permit.forget();
+                        slot.staged.push(datagram);
+                        self.staged = true;
                         self.high_water.transmit.record(slot.queued());
                     }
                     self.move_pending(id);
@@ -1205,18 +1434,65 @@ impl Owner {
             if let Poll::Ready(wake) = self.poll_local(cx) {
                 return Poll::Ready(wake);
             }
-            if let Poll::Ready(datagram) = self.datagrams.poll_recv(cx) {
-                return Poll::Ready(Wake::Datagram(datagram));
+            if let Poll::Ready(wake) = self.poll_datagrams(cx) {
+                return Poll::Ready(wake);
             }
         } else {
-            if let Poll::Ready(datagram) = self.datagrams.poll_recv(cx) {
-                return Poll::Ready(Wake::Datagram(datagram));
+            if let Poll::Ready(wake) = self.poll_datagrams(cx) {
+                return Poll::Ready(wake);
             }
             if let Poll::Ready(wake) = self.poll_local(cx) {
                 return Poll::Ready(wake);
             }
         }
         self.poll_rest(cx)
+    }
+
+    /// Polls the received datagrams, unless crypto workers run and the deliver queue has no
+    /// room beyond the received datagrams with them ([`Owner::deliver_room`]).
+    fn poll_datagrams(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
+        if self.workers.is_some() && !self.poll_deliver_room(cx) {
+            return Poll::Pending;
+        }
+        self.datagrams.poll_recv(cx).map(Wake::Datagram)
+    }
+
+    /// With crypto workers: whether the deliver queue has room beyond the received
+    /// datagrams with the workers. Without room and with none of them in flight, waits for
+    /// the sink task to make room (a completed job wakes the owner task otherwise).
+    fn poll_deliver_room(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.deliver_room() > 0 {
+            self.deliver_room = None;
+            return true;
+        }
+        if self
+            .workers
+            .as_ref()
+            .is_some_and(|workers| workers.opens > 0)
+        {
+            return false;
+        }
+        let deliver = &self.deliver;
+        let wait = self
+            .deliver_room
+            .get_or_insert_with(|| Box::pin(deliver.clone().reserve_owned()));
+        match wait.as_mut().poll(cx) {
+            Poll::Ready(permit) => {
+                self.deliver_room = None;
+                // Dropping the permit frees the slot it reserved. A closed queue drops every
+                // packet, so it holds nothing back.
+                drop(permit);
+                true
+            }
+            Poll::Pending => false,
+        }
+    }
+
+    /// The free slots of the deliver queue not claimed by received datagrams with the crypto
+    /// workers, each of which may deliver a packet.
+    fn deliver_room(&self) -> usize {
+        let opens = self.workers.as_ref().map_or(0, |workers| workers.opens);
+        self.deliver.capacity().saturating_sub(opens)
     }
 
     /// Polls the MTU changes and the timer.
@@ -1275,12 +1551,13 @@ impl Owner {
     ///
     /// Takes only what is already queued, never waiting for more: at most [`MAX_BATCH`]
     /// datagrams, no more than the crypto workers have room for and, since each may deliver a
-    /// packet, no more than the sink queue has room for (but always `first`).
+    /// packet, no more than the sink queue has room for beyond the received datagrams with
+    /// the crypto workers (but always `first`).
     fn input_datagrams(&mut self, first: Datagram) {
         self.high_water
             .datagrams
             .record_received(self.datagrams.len());
-        let room = self.batch_room().min(self.deliver.capacity());
+        let room = self.batch_room().min(self.deliver_room());
         let batch = &mut self.datagram_batch;
         batch.push(first);
         while batch.len() < room
@@ -1293,7 +1570,7 @@ impl Owner {
         if self.workers.is_some() {
             self.core
                 .handle_datagrams_deferred(batch.drain(..), now, &mut self.jobs);
-            self.dispatch_jobs();
+            self.dispatch_jobs(true);
         } else {
             self.core.handle_datagrams(batch.drain(..), now);
         }
@@ -1371,7 +1648,7 @@ impl Owner {
         if self.workers.is_some() {
             self.core
                 .handle_locals_deferred(batch.drain(..), now, &mut self.jobs);
-            self.dispatch_jobs();
+            self.dispatch_jobs(false);
         } else {
             self.core.handle_locals(batch.drain(..), now);
         }
@@ -1381,7 +1658,7 @@ impl Owner {
     /// the crypto workers have room for, each item leading to at most one job.
     fn batch_room(&self) -> usize {
         self.workers.as_ref().map_or(MAX_BATCH, |workers| {
-            MAX_BATCH.min(workers.bound.saturating_sub(workers.in_flight))
+            MAX_BATCH.min(workers.bound.saturating_sub(workers.in_flight()))
         })
     }
 
@@ -1397,7 +1674,7 @@ impl Owner {
             .map(|slot| {
                 // Waiting datagrams take the queue's free slots first.
                 let free = if slot.pending.is_empty() {
-                    slot.queue.capacity()
+                    slot.queue.permits.available_permits()
                 } else {
                     0
                 };
@@ -1408,13 +1685,13 @@ impl Owner {
     }
 
     /// Adds every job of the current batch to its worker's batch, handing the batches over
-    /// whenever one is full.
-    fn dispatch_jobs(&mut self) {
+    /// whenever one is full; `open` if they open received datagrams.
+    fn dispatch_jobs(&mut self, open: bool) {
         let Some(workers) = &mut self.workers else {
             return;
         };
         for job in self.jobs.drain(..) {
-            if workers.dispatch(job) {
+            if workers.dispatch(job, open) {
                 workers.flush(&mut self.core);
             }
         }
@@ -1428,24 +1705,21 @@ impl Owner {
     }
 
     /// Completes a batch the workers handed back.
-    fn complete_jobs(&mut self, jobs: Vec<CryptoJob>) {
+    fn complete_jobs(&mut self, batch: JobBatch) {
         let Some(workers) = &mut self.workers else {
             return;
         };
         self.high_water
             .crypto_done
             .record_received(workers.done.len());
-        workers.in_flight -= jobs.len();
-        for job in jobs {
-            self.core.complete_job(job);
-        }
+        workers.complete(batch, &mut self.core);
     }
 
     /// Waits for every job with the crypto workers and completes it.
     async fn settle(&mut self) {
         self.flush_jobs();
         while let Some(workers) = &mut self.workers
-            && workers.in_flight > 0
+            && workers.in_flight() > 0
         {
             match workers.done.recv().await {
                 Some(jobs) => self.complete_jobs(jobs),
@@ -1586,7 +1860,7 @@ impl Owner {
         if let Some(workers) = &mut self.workers {
             marks
                 .crypto
-                .record(std::mem::take(&mut workers.peak).max(workers.in_flight));
+                .record(std::mem::take(&mut workers.peak).max(workers.in_flight()));
             marks.crypto_done.record(workers.done.len());
         }
         let stats = *marks;
@@ -1803,6 +2077,7 @@ impl Owner {
     /// Suspends every I/O task and the owner's own polling, unless already suspended.
     fn suspend(&mut self) {
         self.inline.allowed = false;
+        self.sink.allowed = false;
         if !self.suspended.send_replace(true) {
             self.event(Event::Suspended);
         }
@@ -1812,6 +2087,7 @@ impl Owner {
     fn resume(&mut self) {
         if self.suspended.send_replace(false) {
             self.inline.allowed = self.fast_path;
+            self.sink.allowed = self.fast_path;
             self.event(Event::Resumed);
             self.core.handle_timeout(now());
             self.drain(true);
@@ -1827,12 +2103,11 @@ impl Owner {
         traffic: Option<Arc<Traffic>>,
     ) -> TransportSlot {
         let traffic = traffic.unwrap_or_else(|| Arc::new(Traffic::new(self.send_errors.clone())));
-        let (queue, transmit_rx) = mpsc::channel(self.queue_capacity);
+        let (queue, transmit_rx) = batch_queue(self.queue_capacity, MAX_BATCH);
         let (receive, transmit, try_send, reports) = start(
             self.datagram_tx.clone(),
-            queue.downgrade(),
             transmit_rx,
-            self.recycle_tx.clone(),
+            self.recycle.clone(),
             Arc::clone(&traffic),
             self.suspended.subscribe(),
         );
@@ -1849,6 +2124,7 @@ impl Owner {
         });
         TransportSlot {
             queue,
+            staged: Vec::with_capacity(MAX_BATCH),
             pending,
             flush: None,
             receive,
@@ -1902,16 +2178,60 @@ impl Owner {
                 self.send_inline(id, droppable);
             }
         }
+        if std::mem::take(&mut self.staged) {
+            self.hand_over();
+        }
         if !self.sink.delivered.is_empty() {
             self.deliver_inline();
         }
-        self.high_water.recycle.record(self.recycled.len());
-        while let Ok(buf) = self.recycled.try_recv() {
-            self.core.recycle(buf);
+        if !self.recycled.is_empty() {
+            self.high_water.recycle.record(self.recycled.len());
+            self.recycled.take_all(&mut self.recycle_bufs);
+            self.recycled.release();
+            for buf in self.recycle_bufs.drain(..) {
+                self.core.recycle(buf);
+            }
         }
         for slot in self.transports.values_mut() {
             if slot.flush.is_none() && !slot.pending.is_empty() {
-                slot.flush = Some(Box::pin(slot.queue.clone().reserve_owned()));
+                slot.flush = Some(Box::pin(Arc::clone(&slot.queue.permits).acquire_owned()));
+            }
+        }
+    }
+
+    /// Hands the staged datagrams of every transport to its transmit task, one message per
+    /// transport; those of a transport whose queue is gone are dropped.
+    fn hand_over(&mut self) {
+        let mut closed = 0;
+        for slot in self.transports.values_mut() {
+            if let Some(refused) = slot.hand_over() {
+                closed += refused.len();
+                for (_, data) in refused {
+                    self.core.recycle(data);
+                }
+            }
+        }
+        for _ in 0..closed {
+            self.dropped(None, DROP_TRANSPORT_CLOSED);
+        }
+    }
+
+    /// Takes the datagrams the owner task sent itself out of `sent` and returns their
+    /// buffers: to the source while it takes them, otherwise (or when its queue is full) to
+    /// the core's pool.
+    fn give_back(&mut self, sent: &mut Vec<Datagram>) {
+        let to_source = self.recycle.to_source();
+        for (_, data) in sent.drain(..) {
+            if to_source {
+                self.recycle_bufs.push(data);
+            } else {
+                self.core.recycle(data);
+            }
+        }
+        if to_source {
+            self.recycle.give(&mut self.recycle_bufs);
+            for buf in self.recycle_bufs.drain(..) {
+                self.core.recycle(buf);
             }
         }
     }
@@ -1946,9 +2266,7 @@ impl Owner {
         for (path, data) in batch.drain(sent..) {
             self.queue_datagram(path, data, droppable);
         }
-        while let Some((_, data)) = batch.pop() {
-            self.core.recycle(data);
-        }
+        self.give_back(&mut batch);
         if let Some(slot) = self.transports.get_mut(&id) {
             slot.inline = batch;
         }
@@ -1961,6 +2279,19 @@ impl Owner {
                 let result = slot.transmit((path, data), droppable, self.queue_capacity);
                 self.high_water.transmit.record(slot.queued());
                 self.high_water.backlog.record(slot.pending.len());
+                if !slot.staged.is_empty() {
+                    self.staged = true;
+                }
+                // A message carries at most a batch; the transmit task starts on it while the
+                // owner goes on.
+                if slot.staged.len() >= MAX_BATCH
+                    && let Some(refused) = slot.hand_over()
+                {
+                    for (_, data) in refused {
+                        self.core.recycle(data);
+                        self.dropped(None, DROP_TRANSPORT_CLOSED);
+                    }
+                }
                 result
             }
             None => Err((data, DROP_NO_TRANSPORT)),
@@ -1982,12 +2313,12 @@ impl Owner {
         }
     }
 
-    /// Delivers a packet: without crypto workers, the owner task hands it to the sink itself
-    /// at the end of the drain when no packet is queued for or being delivered by the sink
-    /// task, and otherwise queues it.
+    /// Delivers a packet: the owner task hands it to the sink itself at the end of the drain
+    /// when no packet is queued for or being delivered by the sink task, and otherwise
+    /// queues it.
     fn deliver(&mut self, from: PeerId, packet: PacketBuf) {
         let sink = &mut self.sink;
-        if self.inline.allowed
+        if sink.allowed
             && !sink.closed
             && (!sink.delivered.is_empty()
                 || (sink.backoff.ready(self.inline.drains)
@@ -2114,14 +2445,14 @@ const fn settles(command: &Command) -> bool {
     )
 }
 
-/// Runs the batches of jobs from the owner, in order, and hands them back until the owner is
-/// gone.
-async fn crypto_worker(
-    mut jobs: mpsc::Receiver<Vec<CryptoJob>>,
-    done: mpsc::Sender<Vec<CryptoJob>>,
-) {
+/// Runs the batches of jobs from the owner and hands them back until the owner is gone.
+async fn crypto_worker(mut jobs: mpsc::Receiver<JobBatch>, done: mpsc::Sender<JobBatch>) {
     while let Some(mut batch) = jobs.recv().await {
-        batch.iter_mut().for_each(CryptoJob::run);
+        for (_, job) in &mut batch {
+            // A job that panics is handed back all the same, so the jobs behind it in the
+            // owner's order are not held up; its packet is dropped.
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| job.run()));
+        }
         // The queue holds a batch of each job in flight, so this does not wait.
         if done.send(batch).await.is_err() {
             return;
@@ -2167,14 +2498,32 @@ async fn forward_path_mtu(
 }
 
 /// Reads batches of local packets into the owner's queue until the source closes.
+///
+/// Before each read, hands the transmitted buffers queued in `recycled` to the source
+/// ([`PacketSource::recycle`]) and drops what it leaves. Sets `declined` when the source takes
+/// none of the first buffers, so that later ones go to the core's pool instead.
 async fn read_source<Src: PacketSource>(
     mut source: Src,
     local: BatchSender<PacketBuf>,
+    mut recycled: BatchQueue<PacketBuf>,
+    declined: Arc<AtomicBool>,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut batch = PacketBatch::new();
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
+    let mut bufs = Vec::new();
+    let mut offered = false;
     while running(&mut suspended).await {
+        if !recycled.is_empty() {
+            recycled.take_all(&mut bufs);
+            recycled.release();
+            let given = bufs.len();
+            source.recycle(&mut bufs);
+            if !std::mem::replace(&mut offered, true) && bufs.len() == given {
+                declined.store(true, Ordering::Relaxed);
+            }
+            bufs.clear();
+        }
         let result = source.recv_batch(&mut batch).await;
         packets.extend(batch.drain());
         if local.send(&mut packets).await.is_err() {
@@ -2273,39 +2622,31 @@ async fn unless_stopped<F: Future>(
 }
 
 /// Sends queued datagrams in batches of up to [`MAX_BATCH`] until the transport closes;
-/// returns the buffers for reuse and counts the datagrams it is done with, and every failed
-/// one, in `traffic`. Once `stop` fires, hands back its queue and the
-/// datagrams of the batch it was sending that were not sent.
+/// returns the buffers of each batch for reuse as one message and counts the datagrams it is
+/// done with, and every failed one, in `traffic`. Once `stop` fires, hands back its queue and
+/// the datagrams of the batch it was sending that were not sent.
 ///
-/// Every datagram of a batch after the first keeps its slot in the queue reserved (through
-/// `slots`, the queue's sender) until the batch is done, so a batch holds no more of the
-/// transport's datagrams than sending them one by one would; one more only when the owner
-/// takes a freed slot first, which ends the batch.
+/// A batch takes what is queued, across the owner's messages, and keeps the slots of its
+/// datagrams in the queue until it is done, so the queue and the batch together hold no
+/// more than the queue's capacity.
 async fn transmit<T: Transport>(
     transport: Arc<T>,
-    slots: mpsc::WeakSender<Datagram>,
-    mut queue: mpsc::Receiver<Datagram>,
-    recycle: mpsc::Sender<PacketBuf>,
+    mut queue: BatchQueue<Datagram>,
+    recycle: Recycle,
     traffic: Arc<Traffic>,
     mut suspended: watch::Receiver<bool>,
     mut stop: oneshot::Receiver<()>,
 ) -> Option<Unsent> {
     let mut batch = Vec::with_capacity(MAX_BATCH);
-    let mut reserved = Vec::with_capacity(MAX_BATCH);
     loop {
-        let Some(next) = unless_stopped(&mut stop, queue.recv()).await else {
+        let Some(next) = unless_stopped(&mut stop, poll_fn(|cx| queue.poll_recv(cx))).await else {
             return Some((queue, batch));
         };
         batch.push(next?);
-        // Every datagram after the first holds a reserved slot.
-        while reserved.len() + 1 < MAX_BATCH {
-            let Ok(next) = queue.try_recv() else { break };
+        while batch.len() < MAX_BATCH
+            && let Some(next) = queue.try_recv()
+        {
             batch.push(next);
-            // The owner may take the freed slot first; the batch then ends here.
-            match slots.upgrade().map(mpsc::Sender::try_reserve_owned) {
-                Some(Ok(slot)) => reserved.push(slot),
-                _ => break,
-            }
         }
         let mut sent = 0;
         let outcome = unless_stopped(&mut stop, async {
@@ -2337,21 +2678,21 @@ async fn transmit<T: Transport>(
             }
         })
         .await;
-        reserved.clear();
         let done = sent.min(batch.len());
         traffic.sent(&batch[..done]);
         if outcome == Some(false) {
             return None;
         }
-        for (_, data) in batch.drain(..done) {
-            // A full recycle queue just drops the buffer.
-            let _ = recycle.try_send(data);
-        }
+        let mut bufs: Vec<PacketBuf> = batch.drain(..done).map(|(_, data)| data).collect();
+        // What finds no room is dropped.
+        recycle.give(&mut bufs);
         if outcome.is_none() {
             // Stopped: the datagrams not sent go back with the queue, in order.
             return Some((queue, batch));
         }
-        // Done with the batch: the owner may send itself once nothing else is queued.
+        // Done with the batch: its slots are free, and the owner may send itself once
+        // nothing else is queued.
+        queue.release();
         traffic.outstanding.fetch_sub(done, Ordering::Release);
     }
 }

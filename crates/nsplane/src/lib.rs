@@ -60,7 +60,8 @@ pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
 pub use nsplane_packet::{
-    Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TransportId,
+    Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TAILROOM,
+    TransportId,
 };
 pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};

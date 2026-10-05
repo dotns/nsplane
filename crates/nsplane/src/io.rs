@@ -42,6 +42,17 @@ pub trait PacketSource: Send + 'static {
         }
     }
 
+    /// Hands back buffers the engine no longer needs, so the source can read into them
+    /// again instead of allocating.
+    ///
+    /// The source may take buffers out of `bufs` up to the bound of its pool and must drop
+    /// the rest; the caller drops whatever it leaves in `bufs`. It never blocks.
+    ///
+    /// The default takes nothing.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        let _ = bufs;
+    }
+
     /// The current local MTU; the receiver observes every later change.
     ///
     /// The engine calls this once when it starts and watches the receiver: every change to

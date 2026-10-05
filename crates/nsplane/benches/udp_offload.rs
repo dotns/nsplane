@@ -2,9 +2,11 @@
 
 //! `UdpTransport` on the loopback interface: a batch of 64 datagrams of 1420 bytes sent with
 //! `send_batch` and received with `recv_batch`, with segmentation offload on (where the
-//! kernel supports it: one segmented send and one coalesced read) and off (one system call
-//! per datagram each way). The `_side` variants attach a side channel to the receiver that
-//! classifies nothing, to show what classifying every datagram costs.
+//! kernel supports it: one segmented send and one coalesced read) and off (batched without
+//! offload where the platform has the calls: `sendmmsg` for the run, `recvmmsg` of up to 16
+//! datagrams per call; one system call per datagram each way elsewhere). The `_side`
+//! variants attach a side channel to the receiver that classifies nothing, to show what
+//! classifying every datagram costs.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
