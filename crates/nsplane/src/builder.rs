@@ -63,7 +63,6 @@ pub struct EngineBuilder<Src, Snk> {
     crypto_workers: usize,
     transport_max: BTreeMap<TransportId, u16>,
     path_mtu_expiry: Duration,
-    local_transmit_bound: Option<usize>,
 }
 
 impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
@@ -80,7 +79,6 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("crypto_workers", &self.crypto_workers)
             .field("transport_max", &self.transport_max)
             .field("path_mtu_expiry", &self.path_mtu_expiry)
-            .field("local_transmit_bound", &self.local_transmit_bound)
             .finish_non_exhaustive()
     }
 }
@@ -103,7 +101,6 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             crypto_workers: 0,
             transport_max: BTreeMap::new(),
             path_mtu_expiry: path_mtu::DEFAULT_EXPIRY,
-            local_transmit_bound: None,
         }
     }
 
@@ -218,22 +215,6 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         self
     }
 
-    /// Reads local packets only while a transport's transmit queue and backlog together hold
-    /// fewer than `bound` datagrams (at least 1, at most the queue capacity), instead of
-    /// until its transmit queue is full and its backlog at the local threshold. Unset by
-    /// default.
-    ///
-    /// A lower bound keeps fewer local packets queued ahead of a new one, which lowers the
-    /// latency under load at the risk of throughput when the transport sends in bursts. Only
-    /// the reading of local packets follows it: datagrams caused by received datagrams,
-    /// timers and handle calls keep the queue capacity as their bound. See [`Engine`] for
-    /// the whole rule.
-    #[must_use]
-    pub const fn local_transmit_bound(mut self, bound: usize) -> Self {
-        self.local_transmit_bound = Some(bound);
-        self
-    }
-
     /// Spawns the engine's tasks and returns the running engine.
     ///
     /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
@@ -276,9 +257,6 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             crypto_workers: self.crypto_workers,
             transport_max: self.transport_max,
             path_mtu_expiry: self.path_mtu_expiry,
-            local_transmit_bound: self
-                .local_transmit_bound
-                .map(|bound| bound.clamp(1, self.queue_capacity)),
         }))
     }
 }

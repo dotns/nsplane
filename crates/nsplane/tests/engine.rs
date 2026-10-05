@@ -141,7 +141,6 @@ struct Options {
     queue_capacity: usize,
     sink_capacity: usize,
     crypto_workers: usize,
-    local_transmit_bound: Option<usize>,
 }
 
 impl Default for Options {
@@ -150,7 +149,6 @@ impl Default for Options {
             queue_capacity: 1024,
             sink_capacity: 64,
             crypto_workers: 0,
-            local_transmit_bound: None,
         }
     }
 }
@@ -180,15 +178,13 @@ fn node_with<T: Transport, Src: PacketSource>(
 ) -> Node {
     let (source, local, mtu) = ChannelSource::new(4, 1420);
     let (sink, delivered) = ChannelSink::new(options.sink_capacity);
-    let mut builder = EngineBuilder::new(wrap(source), sink)
+    let engine = EngineBuilder::new(wrap(source), sink)
         .transport(transport)
         .private_key(secret(seed))
         .queue_capacity(options.queue_capacity)
-        .crypto_workers(options.crypto_workers);
-    if let Some(bound) = options.local_transmit_bound {
-        builder = builder.local_transmit_bound(bound);
-    }
-    let engine = builder.build().unwrap();
+        .crypto_workers(options.crypto_workers)
+        .build()
+        .unwrap();
     Node {
         handle: engine.handle(),
         engine,
@@ -1220,7 +1216,6 @@ async fn crypto_workers_hold_back_datagrams_for_a_slow_sink() {
         queue_capacity: 16,
         sink_capacity: 1,
         crypto_workers: 2,
-        ..Options::default()
     };
     let mut b = node(2, IP_B, addr_b(), TransportId::new(2), tb, &options);
     introduce(&a, &b).await;
@@ -1389,55 +1384,4 @@ async fn transmitted_buffers_go_back_to_the_source() {
     let largest = largest_offer.load(Ordering::Relaxed);
     assert!((1..=CAPACITY).contains(&largest), "largest offer {largest}");
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn local_transmit_bound_holds_back_the_source() {
-    const CAPACITY: usize = 32;
-    const BOUND: usize = 4;
-    const PACKETS: usize = 80;
-    for bound in [Some(BOUND), None] {
-        let (ta, tb) = link(64);
-        let (ta, gate) = Tapped::new(ta);
-        let (tb, _gate_b) = Tapped::new(tb);
-        let options = Options {
-            queue_capacity: CAPACITY,
-            sink_capacity: PACKETS,
-            local_transmit_bound: bound,
-            ..Options::default()
-        };
-        let (mut a, mut b) = nodes(ta, tb, &options);
-        introduce(&a, &b).await;
-        exchange(&mut a, &mut b).await;
-        a.handle.take_queue_stats().await.unwrap();
-
-        // Nothing leaves `a`: with the bound, local packets stop once its transmit queue
-        // holds that many; without it, they fill the transmit queue and the backlog up to
-        // the local threshold, which here takes every packet.
-        gate.send(false).unwrap();
-        let local = a.local.clone();
-        let sender = tokio::spawn(async move {
-            for i in 0..PACKETS {
-                let packet = PacketBuf::from_packet(&numbered(i));
-                local.send(packet).await.unwrap();
-            }
-        });
-        sleep(QUIET).await;
-        let stats = a.handle.queue_stats().await.unwrap();
-        if bound.is_some() {
-            assert!(!sender.is_finished(), "the source was not held back");
-            assert_eq!(stats.transmit.high_water, BOUND, "{stats:?}");
-            assert_eq!(stats.backlog.high_water, 0, "{stats:?}");
-        } else {
-            assert!(sender.is_finished(), "the source was held back");
-            assert_eq!(stats.transmit.high_water, CAPACITY, "{stats:?}");
-        }
-
-        gate.send(true).unwrap();
-        timeout(WAIT, sender).await.unwrap().unwrap();
-        for i in 0..PACKETS {
-            assert_eq!(b.expect_delivery().await.1, numbered(i));
-        }
-        assert!(a.handle.drop_counters().await.unwrap().is_empty());
-    }
 }

@@ -91,11 +91,7 @@ const PATH_MTU_REPORTS: usize = 16;
 /// does not build a backlog of local traffic ahead of new packets. So an engine with one
 /// transport holds back its local packets instead of dropping them, while with several
 /// transports a stalled one never holds back local packets for the others: those for the
-/// stalled one fill its backlog to the bound and are dropped from then on. With
-/// [`EngineBuilder::local_transmit_bound`] set, a transport has room for local packets only
-/// while its transmit queue (counting the batch being sent) and backlog together hold fewer
-/// datagrams than that bound, so fewer local packets queue ahead of a new one; the other
-/// rules stay. With no
+/// stalled one fill its backlog to the bound and are dropped from then on. With no
 /// transport installed, local reads never pause. Received datagrams, timers and handle calls are served
 /// meanwhile. A transport that never drains keeps its backlog until it closes (the backlog
 /// is then dropped under [`crate::DROP_TRANSPORT_CLOSED`]) or is removed with
@@ -201,7 +197,6 @@ const PATH_MTU_REPORTS: usize = 16;
 /// [`DynTransport`]: crate::DynTransport
 /// [`EngineBuilder::crypto_workers`]: crate::EngineBuilder::crypto_workers
 /// [`EngineBuilder::transport_max_datagram`]: crate::EngineBuilder::transport_max_datagram
-/// [`EngineBuilder::local_transmit_bound`]: crate::EngineBuilder::local_transmit_bound
 pub struct Engine {
     handle: EngineHandle,
     owner: Option<JoinHandle<()>>,
@@ -257,10 +252,6 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) transport_max: BTreeMap<TransportId, u16>,
     /// How long a learned path MTU lasts.
     pub(crate) path_mtu_expiry: Duration,
-    /// The most datagrams in a transport's transmit queue and backlog up to which local
-    /// packets are read, at least 1 and at most the queue capacity; `None` for the default
-    /// rule.
-    pub(crate) local_transmit_bound: Option<usize>,
 }
 
 /// Spawns the owner task and the I/O tasks.
@@ -335,7 +326,6 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         ],
         recycle,
         queue_capacity: capacity,
-        local_bound: parts.local_transmit_bound,
         high_water: queue_marks(capacity, parts.event_capacity, crypto_capacity),
         local_first: false,
         suspended,
@@ -1262,9 +1252,6 @@ struct Owner {
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
-    /// The local transmit bound ([`crate::EngineBuilder::local_transmit_bound`]), at most
-    /// the queue capacity.
-    local_bound: Option<usize>,
     /// With crypto workers: armed while the deliver queue has no room and no job that may
     /// deliver is in flight, so only the sink task can make room.
     deliver_room: Option<DeliverRoom>,
@@ -1632,17 +1619,13 @@ impl Owner {
     /// The local packets to take before every installed transport's transmit queue is full
     /// and its waiting datagrams are at the local threshold ([`MAX_BATCH`], at most the queue
     /// capacity), counting one datagram per packet: the most room over the transports, since
-    /// which transport a packet leads to is only known once the core has handled it. With a
-    /// local transmit bound, a transport's room ends instead once its transmit queue and
-    /// waiting datagrams hold that many. Unbounded without transports.
+    /// which transport a packet leads to is only known once the core has handled it.
+    /// Unbounded without transports.
     fn local_room(&self) -> usize {
         let threshold = self.queue_capacity.min(MAX_BATCH);
         self.transports
             .values()
             .map(|slot| {
-                if let Some(bound) = self.local_bound {
-                    return bound.saturating_sub(slot.queued() + slot.pending.len());
-                }
                 // Waiting datagrams take the queue's free slots first.
                 let free = if slot.pending.is_empty() {
                     slot.queue.permits.available_permits()
