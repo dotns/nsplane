@@ -180,10 +180,11 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
     /// Runs the encryption and decryption of data packets on `n` crypto worker tasks; 0 (the
     /// default) or 1 runs them on the engine's owner task.
     ///
-    /// The workers are sharded by peer, so each peer's packets keep their order in both
-    /// directions while different peers are encrypted in parallel. They run in parallel only
-    /// on a multi-threaded tokio runtime, and only traffic of several peers spreads over
-    /// them: a single peer is encrypted on one worker. See [`Engine`] for the whole rule.
+    /// The packets go to the workers in turn, whatever their peer, so even a single peer's
+    /// traffic spreads over every worker; the owner task reserves the counters and completes
+    /// the packets in the order it handed them out, so each peer's packets keep their order
+    /// in both directions. They run in parallel only on a multi-threaded tokio runtime. See
+    /// [`Engine`] for the whole rule.
     #[must_use]
     pub const fn crypto_workers(mut self, n: usize) -> Self {
         self.crypto_workers = n;

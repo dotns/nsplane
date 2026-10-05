@@ -379,7 +379,8 @@ pub struct CoreConfig {
     /// Maximum number of free packet buffers kept for reuse.
     pub pool_size: usize,
     /// Whether [`Core::handle_input_deferred`] hands out [`CryptoJob`]s: then every peer keeps
-    /// its tunnel behind a lock, shared with its jobs. Otherwise (the default) every peer owns
+    /// its tunnel behind a lock, which the jobs never take (they carry the session keys they
+    /// need), so it is uncontended. Otherwise (the default) every peer owns
     /// its tunnel, the data path takes no lock, and [`Core::handle_input_deferred`] processes
     /// every input at once like [`Core::handle_input`].
     ///
