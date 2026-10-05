@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offload back on.
 - `nsplane-acl`: `reasons::INTERNAL` and `AclFilterStats::internal`. Breaking for code that
   builds `AclFilterStats` with a struct literal.
+- `nsplane-netstack`: `NetStackConfig::tcp_send_budget` (opt-in, default `None`) bounds the
+  send-buffer bytes of all TCP connections of a stack together, split evenly between the
+  connections with data to send (each at least one MSS, at most its `tcp_tx_buffer`). It
+  keeps many parallel bulk connections from putting more windows on the path than its
+  queues hold; it also caps them together at `budget / RTT`, so it is not the default.
+  In process at the default MTU, a budget of one default send buffer moved four streams at
+  648-671 MB/s against 135-188 MB/s without one on smoltcp `v0.14.0-nsplane.3`.
 
 ### Changed
 - `nsplane-acl`: the node L3 gate's default clock is the coarse monotonic clock on Linux and
@@ -28,6 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes of the two copies, but a later copy without MF still marks the end of the datagram);
   and at the byte limit a duplicate is dropped with `reasons::BUDGET_EXCEEDED` instead of
   being ignored.
+- `nsplane-netstack`: smoltcp is the `dotns/smoltcp` fork tag `v0.14.0-nsplane.4` (was
+  `.3`): the TCP/IP checksum sums 64-bit words (bit-identical, 38 % fewer instructions per
+  1400-byte call), the advertised right edge of a scaled receive window never moves left,
+  fast recovery retransmits on partial ACKs (NewReno, RFC 6582), the sender avoids the
+  silly window syndrome (Minshall's Nagle variant) and small windows use Limited Transmit
+  (RFC 3042). With the default configuration, four parallel streams now reach at least
+  the one-stream aggregate (in process 1.00-1.11x of one stream, 0.43x on `.3`; harness
+  netstack pair P1 / P4 6.21 / 2.48 -> 6.85 / 7.29 Gbit/s), and `netstack_lossy`'s 1 % loss
+  and bottleneck cases finish in about a second instead of 1-6 s and 15-24 s.
+- `nsplane-netstack`: the `NetStackConfig::datagram_capacity` docs explain that one driver
+  turn routes up to 256 ingress packets before the application reads, so a bulk UDP
+  receiver wants a queue of at least 256. Defaults are unchanged.
+- `netstack_bench` (examples): the server sizes its UDP socket queue to the stack's
+  ingress capacity (1024), which removed the netstack pair's UDP loss at 1 Gbit/s (2.33 %
+  -> 0 %) and nearly all of it at 3 Gbit/s (5.98 % -> 0.034 %).
 
 ### Fixed
 - `nsplane-acl`: a peer cache entry missing right after it was stored drops the packet with

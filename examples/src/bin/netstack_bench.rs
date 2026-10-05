@@ -54,6 +54,10 @@ const UDP_PAYLOAD: usize = 1380;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the client waits after the last datagram before it asks for the count.
 const UDP_SETTLE: Duration = Duration::from_secs(1);
+/// Datagrams queued for the server's UDP socket: the stack's ingress capacity, so a burst
+/// the driver routes in one step fits even before the counting task runs (see
+/// [`NetStackConfig::datagram_capacity`]); the default 128 loses part of larger bursts.
+const SERVER_DATAGRAM_CAPACITY: usize = 1024;
 
 /// An nsplane node on a userspace TCP/IP stack with an in-process TCP/UDP load generator.
 #[derive(Debug, Parser)]
@@ -367,7 +371,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_logging(&args.node.log)?;
     let addresses = args.address.iter().map(|ip| (ip.addr, ip.cidr)).collect();
-    let (stack, handle) = NetStack::new(NetStackConfig::new(addresses, args.mtu));
+    let mut config = NetStackConfig::new(addresses, args.mtu);
+    if matches!(args.role, Role::Server { .. }) {
+        config.datagram_capacity = SERVER_DATAGRAM_CAPACITY;
+    }
+    let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     let node = build_engine(source, sink, &args.node)?;
     let engine = node.engine.handle();

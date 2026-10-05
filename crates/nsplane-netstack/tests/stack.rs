@@ -335,6 +335,47 @@ async fn ingress_drops_are_counted() -> TestResult {
     .await
 }
 
+/// Sends `burst` datagrams to a socket with a queue of `capacity` while a task waits on it,
+/// all queued before the driver runs: the datagrams received and the counted drops.
+async fn ingress_burst(capacity: usize, burst: u16) -> Result<(u64, u64), Box<dyn Error>> {
+    let (handle, _source, sink) = single(|config| config.datagram_capacity = capacity);
+    let local = addr("10.0.0.1:53")?;
+    let mut socket = handle.bind_udp(local).await?;
+    let received = Arc::new(AtomicUsize::new(0));
+    let reader = Arc::clone(&received);
+    tokio::spawn(async move {
+        while socket.recv_from().await.is_ok() {
+            reader.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    // Without a cooperative yield, every send lands before the driver or the reader runs.
+    tokio::task::unconstrained(async {
+        for port in 1..=burst {
+            sink.send(udp([10, 0, 0, 2], port, [10, 0, 0, 1], 53), PeerId::new(1))
+                .await?;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await?;
+    let total = u64::from(burst);
+    counted(&handle, |stats| {
+        received.load(Ordering::Relaxed) as u64 + stats.udp_queue_full == total
+    })
+    .await?;
+    Ok((
+        received.load(Ordering::Relaxed) as u64,
+        handle.stats().udp_queue_full,
+    ))
+}
+
+#[tokio::test]
+async fn one_driver_turn_drops_a_burst_beyond_the_datagram_queue() -> TestResult {
+    // The driver routes the whole burst in one step, so the waiting reader cannot help.
+    assert_eq!(ingress_burst(8, 32).await?, (8, 24));
+    assert_eq!(ingress_burst(32, 32).await?, (32, 0));
+    Ok(())
+}
+
 #[tokio::test]
 async fn udp_flow_limit_is_counted() -> TestResult {
     let (handle, _source, sink) = single(|config| config.max_udp_flows = 1);
