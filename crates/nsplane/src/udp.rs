@@ -51,9 +51,10 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 ///
 /// Without offload, `quinn-udp` never touches the socket: it keeps the OS's default path
 /// MTU discovery, so a datagram larger than the path MTU leaves in fragments. On Linux and
-/// Android it is driven with `sendmsg` / `recvmsg`, the ECN marks in `IP_TOS` /
-/// `IPV6_TCLASS` control messages (received ones asked for with `IP_RECVTOS` /
-/// `IPV6_RECVTCLASS`); elsewhere with plain `send_to` / `recv_from`, without ECN marks.
+/// Android it is driven with `sendmsg` / `recvmsg` (`sendmmsg` / `recvmmsg` for batches),
+/// the ECN marks in `IP_TOS` / `IPV6_TCLASS` control messages (received ones asked for with
+/// `IP_RECVTOS` / `IPV6_RECVTCLASS`); elsewhere with plain `send_to` / `recv_from`, without
+/// ECN marks.
 ///
 /// ECN: on send, `to.ecn` is set per datagram with an `IP_TOS` / `IPV6_TCLASS` (Windows:
 /// `IP_ECN` / `IPV6_ECN`) control message, so no socket-wide state changes; Windows sets it
@@ -69,22 +70,33 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 ///   into one read, a train of equally sized datagrams of which the last may be shorter.
 ///   [`recv_batch`](Transport::recv_batch) hands out each one as a slice of the read
 ///   ([`PacketBuf::from_shared`]) at the offset it was read to, without headroom, where
-///   the engine opens it in place: no datagram of a train is copied.
+///   the engine opens it in place: no datagram of a train is copied. While trains do not
+///   arrive (four reads in a row of one datagram each, as from senders without
+///   segmentation), [`recv_batch`](Transport::recv_batch) reads up to 16 datagrams with one
+///   `recvmmsg` instead, each into a slot of 64 KiB, and copies them out; the first train
+///   read that way switches back to one 64 KiB read without copies.
 ///   [`recv`](Transport::recv) copies one datagram into the caller's buffer and keeps the
 ///   rest of the train for the next receive.
 /// - Send (Linux and Android `UDP_SEGMENT`, Windows USO):
 ///   [`send_batch`](Transport::send_batch) sends a run of consecutive datagrams to the same
 ///   address with the same ECN mark and of the same size (the last may be shorter) as one
-///   segmented send, up to the kernel's segment limit and 64 KiB, copying the run into one
-///   buffer. Datagrams that start no run are sent one by one. Where segmentation is not
-///   available, or a segmented send fails with `EIO` or `EINVAL` (a device without
-///   segmentation support), sending falls back to one datagram per send. A failed send
+///   segmented send, up to the kernel's segment limit and 64 KiB: on Linux and Android
+///   straight from the datagrams' buffers, one `iovec` each, elsewhere copied into one
+///   buffer the transport keeps. Datagrams that start no run are sent one by one. Where
+///   segmentation is not available, or a segmented send fails with `EIO` or `EINVAL` (a
+///   device without segmentation support), sending falls back to one datagram per send
+///   (the failing run goes through `quinn-udp`, which turns segmentation off). A failed send
 ///   drops and counts exactly the datagrams of its run, so the engine counts each of them
 ///   under [`crate::DROP_TRANSPORT_SEND_ERROR`] and none of the runs handed off before it.
 ///
-/// With offload off every datagram takes one system call in both directions, as without
-/// offload support. Either way the datagrams, their order, sizes, paths and ECN marks are
-/// the same.
+/// With offload off (turned off or bound without), on Linux and Android
+/// [`send_batch`](Transport::send_batch) hands consecutive datagrams to the same address
+/// with the same ECN mark to one `sendmmsg`, up to 64, and
+/// [`recv_batch`](Transport::recv_batch) reads up to 16 datagrams with one `recvmmsg`, each
+/// into a slot as large as the caller's buffer and copied out: batching, not offload, as
+/// every datagram stays its own message (and a failed one fails alone). Elsewhere, or where
+/// those calls do not exist, every datagram takes one system call in both directions.
+/// Either way the datagrams, their order, sizes, paths and ECN marks are the same.
 ///
 /// Socket buffers: binding requests 4 MiB for both the receive (`SO_RCVBUF`)
 /// and the send buffer (`SO_SNDBUF`), so a burst does not overflow the receive queue
@@ -141,6 +153,12 @@ pub struct UdpTransport {
     discovery: Arc<AtomicBool>,
     /// Path MTU reports dropped while their receiver was full or closed.
     pmtu_dropped: AtomicU64,
+    /// The buffer a run is copied into where it is not sent from the datagrams' own
+    /// buffers (see [`UdpTransport::send_run_now`]).
+    train: std::sync::Mutex<Vec<u8>>,
+    /// `sendmmsg` / `recvmmsg` failed with `ENOSYS`: one datagram per system call.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    no_mmsg: AtomicBool,
 }
 
 impl UdpTransport {
@@ -223,6 +241,9 @@ impl UdpTransport {
             pmtu: linux::Pmtu::default(),
             discovery: Arc::default(),
             pmtu_dropped: AtomicU64::new(0),
+            train: std::sync::Mutex::default(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            no_mmsg: AtomicBool::new(false),
         })
     }
 
@@ -479,6 +500,73 @@ impl UdpTransport {
             state.try_send(UdpSockRef::from(&*self.socket), &transmit)
         })
     }
+
+    /// Sends `run`, two or more datagrams to `to` that [`run_len`] put into one run, as
+    /// one segmented send (see [`UdpTransport::send_run_now`]).
+    async fn send_run(
+        &self,
+        state: &UdpSocketState,
+        run: &[(Path, PacketBuf)],
+        to: &Path,
+    ) -> io::Result<()> {
+        let destination = self.target(to.addr)?;
+        write_io(&self.socket, &self.discovery, || {
+            self.send_run_now(state, run, destination, to.ecn)
+        })
+        .await
+    }
+
+    /// [`UdpTransport::send_run`] without waiting: [`io::ErrorKind::WouldBlock`] when the
+    /// socket cannot take it now.
+    fn try_send_run(
+        &self,
+        state: &UdpSocketState,
+        run: &[(Path, PacketBuf)],
+        to: &Path,
+    ) -> io::Result<()> {
+        let destination = self.target(to.addr)?;
+        self.socket.try_io(Interest::WRITABLE, || {
+            self.send_run_now(state, run, destination, to.ecn)
+        })
+    }
+
+    /// One non-blocking segmented send of `run` to `destination`, marked with `ecn`. On
+    /// Linux and Android it goes out straight from the datagrams' buffers (one `iovec`
+    /// each); the transport's train buffer takes a copy for `quinn-udp` elsewhere, for a
+    /// run of more than [`linux::IOVS`] datagrams, and when that send fails with `EIO` or
+    /// `EINVAL`, so that `quinn-udp` meets the error itself and turns segmentation off as
+    /// it does for its own sends.
+    fn send_run_now(
+        &self,
+        state: &UdpSocketState,
+        run: &[(Path, PacketBuf)],
+        destination: SocketAddr,
+        ecn: Ecn,
+    ) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if run.len() <= linux::IOVS {
+            match self.send_gso(run, destination, ecn) {
+                Err(e) if matches!(e.raw_os_error(), Some(nix::libc::EIO | nix::libc::EINVAL)) => {}
+                result => return result,
+            }
+        }
+        let mut train = self
+            .train
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        train.clear();
+        for (_, datagram) in run {
+            train.extend_from_slice(datagram.as_packet());
+        }
+        let transmit = Transmit {
+            destination,
+            ecn: EcnCodepoint::from_bits(ecn.to_bits()),
+            contents: &train,
+            segment_size: run.first().map(|(_, datagram)| datagram.len()),
+            src_ip: None,
+        };
+        state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+    }
 }
 
 impl Transport for UdpTransport {
@@ -509,19 +597,31 @@ impl Transport for UdpTransport {
         sent: &mut usize,
         failed: &mut usize,
     ) -> io::Result<()> {
-        // One buffer for the runs of this batch; encrypting into it directly would save
-        // the copy.
-        let mut train = Vec::new();
         while let Some((to, first)) = datagrams.get(*sent) {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if self.batching() {
+                let run = &datagrams[*sent..*sent + linux::mmsg_len(&datagrams[*sent..])];
+                let result = match self.target(to.addr) {
+                    Ok(destination) => {
+                        write_io(&self.socket, &self.discovery, || {
+                            self.send_mmsg_or_one(run, destination, to.ecn)
+                        })
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                // Each datagram is its own message: a failure loses that one only.
+                *sent += *result.as_ref().unwrap_or(&1);
+                result.inspect_err(|_| *failed += 1)?;
+                continue;
+            }
             let run = run_len(&datagrams[*sent..], self.max_segments());
-            let result = if run == 1 {
-                self.send_segments(first.as_packet(), None, to).await
-            } else {
-                train.clear();
-                for (_, datagram) in &datagrams[*sent..*sent + run] {
-                    train.extend_from_slice(datagram.as_packet());
+            let result = match &self.state {
+                Some(state) if run > 1 => {
+                    self.send_run(state, &datagrams[*sent..*sent + run], to)
+                        .await
                 }
-                self.send_segments(&train, Some(first.len()), to).await
+                _ => self.send_segments(first.as_packet(), None, to).await,
             };
             *sent += run;
             // A failed send loses its run only; the runs before it were handed off.
@@ -539,17 +639,30 @@ impl Transport for UdpTransport {
         sent: &mut usize,
         failed: &mut usize,
     ) -> io::Result<()> {
-        let mut train = Vec::new();
         while let Some((to, first)) = datagrams.get(*sent) {
-            let run = run_len(&datagrams[*sent..], self.max_segments());
-            let result = if run == 1 {
-                self.try_send_segments(first.as_packet(), None, to)
-            } else {
-                train.clear();
-                for (_, datagram) in &datagrams[*sent..*sent + run] {
-                    train.extend_from_slice(datagram.as_packet());
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if self.batching() {
+                let run = &datagrams[*sent..*sent + linux::mmsg_len(&datagrams[*sent..])];
+                let result = self.target(to.addr).and_then(|destination| {
+                    self.socket.try_io(Interest::WRITABLE, || {
+                        self.send_mmsg_or_one(run, destination, to.ecn)
+                    })
+                });
+                if let Err(e) = &result
+                    && e.kind() == io::ErrorKind::WouldBlock
+                {
+                    return Err(io::ErrorKind::WouldBlock.into());
                 }
-                self.try_send_segments(&train, Some(first.len()), to)
+                *sent += *result.as_ref().unwrap_or(&1);
+                result.inspect_err(|_| *failed += 1)?;
+                continue;
+            }
+            let run = run_len(&datagrams[*sent..], self.max_segments());
+            let result = match &self.state {
+                Some(state) if run > 1 => {
+                    self.try_send_run(state, &datagrams[*sent..*sent + run], to)
+                }
+                _ => self.try_send_segments(first.as_packet(), None, to),
             };
             if let Err(e) = &result
                 && e.kind() == io::ErrorKind::WouldBlock
@@ -851,8 +964,8 @@ mod linux {
     use nix::errno::Errno;
     use nix::libc::{SO_EE_ORIGIN_ICMP, SO_EE_ORIGIN_ICMP6, sock_extended_err};
     use nix::sys::socket::{
-        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrStorage, getsockopt, recvmsg,
-        sendmsg, setsockopt, sockopt,
+        ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, getsockopt,
+        recvmmsg, recvmsg, sendmmsg, sendmsg, setsockopt, sockopt,
     };
     use nsplane_packet::{Ecn, MAX_BATCH, PacketBuf, Path};
     use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
@@ -872,6 +985,27 @@ mod linux {
     /// Bytes one coalesced read may fill: the largest datagram, and the most the kernel
     /// coalesces into one read.
     const READ: usize = 1 << 16;
+
+    /// The size of a storage for coalesced reads: twice the read, so small datagrams take
+    /// many reads per refill.
+    const STORAGE: usize = 2 * READ;
+
+    /// The storages coalesced reads take turns in.
+    const RING: usize = 4;
+
+    /// The most datagrams one segmented send takes straight from their buffers, one `iovec`
+    /// each: the kernel's segment limit.
+    pub(super) const IOVS: usize = 64;
+
+    /// The most datagrams one `recvmmsg` reads in batches.
+    const SLOTS: usize = 16;
+
+    /// Coalesced reads of one datagram each in a row after which receive offload reads in
+    /// batches.
+    const SINGLES: u8 = 4;
+
+    /// Control-message space of one batched read: as much as [`CmsgBuf`] holds.
+    const CMSG: usize = 64;
 
     /// Control-message buffer, aligned for `cmsghdr`; holds one TOS or traffic class
     /// message (24 bytes on 64-bit targets) with room to spare.
@@ -898,11 +1032,96 @@ mod linux {
     /// What the receiving side keeps between receives.
     #[derive(Debug, Default)]
     pub(super) struct Rx {
-        /// Storage for coalesced reads; every read takes its datagrams off the front, so
-        /// they share the allocation, which is freed once all of them are dropped.
-        buf: BytesMut,
+        /// Storages for coalesced reads; every read takes its datagrams off the front of the
+        /// current one, so they share its allocation, which is freed once all of them are
+        /// dropped and the ring has let go of it.
+        ring: [BytesMut; RING],
+        /// The storage of `ring` reads go to.
+        current: usize,
         /// Datagrams read but not handed out yet, oldest first.
         pending: VecDeque<(Path, PacketBuf)>,
+        /// The slots of a batched read, as many bytes each as the caller's buffer holds
+        /// (a whole read with receive offload).
+        slots: Vec<u8>,
+        /// Coalesced reads of one datagram each in a row, up to [`SINGLES`].
+        singles: u8,
+        /// With receive offload, batches go to one `recvmmsg` of several slots: no trains
+        /// arrived lately.
+        batched: bool,
+    }
+
+    impl Rx {
+        /// Makes sure the current storage has room for the next coalesced read: keeps it,
+        /// else takes the first storage of the ring, from the current one on, whose
+        /// datagrams are all dropped, reclaimed without allocating and zero-filled again.
+        /// Only while every storage still has datagrams out it allocates a fresh one, in an
+        /// unused place of the ring, else after the current one (the storage there is freed
+        /// once its datagrams are).
+        fn refill(&mut self) {
+            if self.ring[self.current].len() < READ {
+                let reclaimed = (0..RING).map(|i| (self.current + i) % RING).find(|&i| {
+                    let storage = &mut self.ring[i];
+                    storage.clear();
+                    storage.try_reclaim(STORAGE)
+                });
+                if let Some(i) = reclaimed {
+                    self.current = i;
+                    self.ring[i].resize(STORAGE, 0);
+                } else {
+                    let next = (self.current + 1) % RING;
+                    self.current = (1..=RING)
+                        .map(|i| (self.current + i) % RING)
+                        .find(|&i| self.ring[i].capacity() == 0)
+                        .unwrap_or(next);
+                    self.ring[self.current] = BytesMut::zeroed(STORAGE);
+                }
+            }
+        }
+    }
+
+    /// How many datagrams from the start of `datagrams` one `sendmmsg` takes: the first one
+    /// and the ones after it with the same address and ECN mark, up to [`MAX_BATCH`]. `0`
+    /// for no datagrams.
+    pub(super) fn mmsg_len(datagrams: &[(Path, PacketBuf)]) -> usize {
+        let Some((to, _)) = datagrams.first() else {
+            return 0;
+        };
+        datagrams
+            .iter()
+            .take(MAX_BATCH)
+            .take_while(|(path, _)| path.addr == to.addr && path.ecn == to.ecn)
+            .count()
+    }
+
+    /// The control message that marks a datagram to `to` with `ecn`, as
+    /// [`UdpTransport::send_msg`] sends it: none for [`Ecn::NotEct`], else `IP_TOS` for
+    /// IPv4 and IPv4-mapped destinations (even on an IPv6 socket), `IPV6_TCLASS` for IPv6
+    /// ones.
+    fn ecn_cmsg<'a>(
+        to: SocketAddr,
+        ecn: Ecn,
+        tos: &'a u8,
+        tclass: &'a i32,
+    ) -> Option<ControlMessage<'a>> {
+        match to {
+            _ if ecn == Ecn::NotEct => None,
+            SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
+                Some(ControlMessage::Ipv6TClass(tclass))
+            }
+            _ => Some(ControlMessage::Ipv4Tos(tos)),
+        }
+    }
+
+    /// The ECN mark among the control messages of a received datagram; [`Ecn::NotEct`]
+    /// without one.
+    fn received_ecn(cmsgs: impl IntoIterator<Item = ControlMessageOwned>) -> Ecn {
+        cmsgs.into_iter().fold(Ecn::NotEct, |ecn, cmsg| match cmsg {
+            ControlMessageOwned::Ipv4Tos(tos) => Ecn::from_bits(tos),
+            ControlMessageOwned::Ipv6TClass(tclass) => {
+                u8::try_from(tclass & 0xFF).map_or(ecn, Ecn::from_bits)
+            }
+            _ => ecn,
+        })
     }
 
     /// Path MTU discovery ([`UdpTransport::set_path_mtu_discovery`]).
@@ -1053,6 +1272,12 @@ mod linux {
             self.rx.lock().unwrap_or_else(PoisonError::into_inner)
         }
 
+        /// Whether receive offload reads in batches now.
+        #[cfg(test)]
+        pub(super) fn batched(&self) -> bool {
+            self.rx().batched
+        }
+
         /// [`Transport::recv`](crate::Transport::recv).
         pub(super) async fn recv_datagram(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
             loop {
@@ -1098,7 +1323,11 @@ mod linux {
                     }
                 }
                 match &self.state {
+                    Some(_) if self.offload() && self.rx().batched => {
+                        self.read_batch(READ, room).await?;
+                    }
                     Some(state) if self.offload() => self.read_coalesced(state).await?,
+                    _ if self.batching() => self.read_batch(capacity, room).await?,
                     _ => {
                         if let Some((len, path)) = self.read_into(buf).await? {
                             datagrams
@@ -1161,23 +1390,21 @@ mod linux {
                     self.read(|| {
                     let mut rx = self.rx();
                     let rx = &mut *rx;
-                    if rx.buf.len() < READ {
-                        // Reuses the allocation once every slice of it is gone. Twice the
-                        // read, so small datagrams take many reads per refill.
-                        rx.buf.clear();
-                        rx.buf.resize(2 * READ, 0);
-                    }
+                    rx.refill();
+                    let storage = &mut rx.ring[rx.current];
                     let mut meta = [RecvMeta::default()];
-                    let mut bufs = [IoSliceMut::new(&mut rx.buf[..READ])];
+                    let mut bufs = [IoSliceMut::new(&mut storage[..READ])];
                     state.recv(UdpSockRef::from(&*self.socket), &mut bufs, &mut meta)?;
                     let meta = meta[0];
                     let path = self.path(meta.addr, ecn(&meta));
                     let stride = meta.stride.clamp(1, READ);
                     let count = meta.len.div_ceil(stride).max(1);
+                    rx.singles = if count == 1 { rx.singles.saturating_add(1) } else { 0 };
+                    rx.batched = rx.singles >= SINGLES;
                     let len = |i: usize| stride.min(meta.len - i * stride);
                     let side = self.side.as_ref();
                     for i in 0..count {
-                        let slot = rx.buf.split_to(len(i));
+                        let slot = storage.split_to(len(i));
                         if side.is_some_and(|side| side.take(&slot, path.addr)) {
                             continue;
                         }
@@ -1191,6 +1418,124 @@ mod linux {
                     }
                     Ok(())
                 })
+                })
+                .await
+        }
+    }
+
+    impl UdpTransport {
+        /// Whether sends and reads go in batches: with offload off, and while `sendmmsg`
+        /// and `recvmmsg` are available.
+        pub(super) fn batching(&self) -> bool {
+            !self.offload() && !self.no_mmsg.load(Ordering::Relaxed)
+        }
+
+        /// `true` for an error that says `sendmmsg` / `recvmmsg` do not exist, and then
+        /// stops batching for good.
+        fn mmsg_missing(&self, e: Errno) -> bool {
+            let missing = e == Errno::ENOSYS;
+            if missing {
+                tracing::debug!(message = "No sendmmsg / recvmmsg; one datagram per call");
+                self.no_mmsg.store(true, Ordering::Relaxed);
+            }
+            missing
+        }
+
+        /// Reads up to `count` datagrams, at most [`SLOTS`], with one `recvmmsg` (through
+        /// `quinn-udp` where it set the socket up), each into a slot of `capacity` bytes, so
+        /// truncated to it, and queues a copy of each, but for those the side channel
+        /// takes. A train (with receive offload, or coalesced before offload was turned off)
+        /// is split as [`read_into`](Self::read_into) splits it, and with offload ends the
+        /// batched reads.
+        pub(super) async fn read_batch(&self, capacity: usize, count: usize) -> io::Result<()> {
+            let capacity = capacity.max(1);
+            let count = count.clamp(1, SLOTS);
+            let fd = self.socket.as_raw_fd();
+            self.socket
+                .async_io(self.readiness(), || {
+                    self.read(|| {
+                        let mut rx = self.rx();
+                        let rx = &mut *rx;
+                        if rx.slots.len() != SLOTS * capacity {
+                            rx.slots = vec![0; SLOTS * capacity];
+                        }
+                        // Per datagram: its length, sender, mark and stride.
+                        let mut received = [(0, None, Ecn::NotEct, 0); SLOTS];
+                        let read = {
+                            let mut slots = rx.slots.chunks_mut(capacity);
+                            if let Some(state) = &self.state {
+                                let mut bufs: [IoSliceMut<'_>; SLOTS] = std::array::from_fn(|_| {
+                                    IoSliceMut::new(slots.next().unwrap_or_default())
+                                });
+                                let mut meta = [RecvMeta::default(); SLOTS];
+                                let read = state.recv(
+                                    UdpSockRef::from(&*self.socket),
+                                    &mut bufs[..count],
+                                    &mut meta[..count],
+                                )?;
+                                for (received, meta) in received.iter_mut().zip(&meta[..read]) {
+                                    *received = (meta.len, Some(meta.addr), ecn(meta), meta.stride);
+                                }
+                                read
+                            } else {
+                                let mut bufs: [[IoSliceMut<'_>; 1]; SLOTS] =
+                                    std::array::from_fn(|_| {
+                                        [IoSliceMut::new(slots.next().unwrap_or_default())]
+                                    });
+                                let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(
+                                    count,
+                                    Some(vec![0; CMSG]),
+                                );
+                                let msgs = match recvmmsg(
+                                    fd,
+                                    &mut headers,
+                                    bufs[..count].iter_mut(),
+                                    MsgFlags::empty(),
+                                    None,
+                                ) {
+                                    Ok(msgs) => msgs,
+                                    // Read again, one datagram per call.
+                                    Err(e) if self.mmsg_missing(e) => return Ok(()),
+                                    Err(e) => return Err(e.into()),
+                                };
+                                let mut read = 0;
+                                for (received, msg) in received.iter_mut().zip(msgs) {
+                                    // A truncated control buffer only loses the ECN mark.
+                                    let ecn = received_ecn(msg.cmsgs().into_iter().flatten());
+                                    let addr = msg.address.as_ref().and_then(socket_addr);
+                                    *received = (msg.bytes, addr, ecn, msg.bytes);
+                                    read += 1;
+                                }
+                                read
+                            }
+                        };
+                        for (slot, &(len, addr, ecn, stride)) in
+                            rx.slots.chunks(capacity).zip(&received[..read])
+                        {
+                            // Never without one; dropped if it were.
+                            let Some(addr) = addr else { continue };
+                            let path = self.path(addr, ecn);
+                            let datagram = &slot[..len.min(capacity)];
+                            // An empty datagram is one too.
+                            let empty = datagram.is_empty().then_some(datagram);
+                            for datagram in datagram.chunks(stride.clamp(1, capacity)).chain(empty)
+                            {
+                                if !self.side_took(datagram, path.addr) {
+                                    rx.pending
+                                        .push_back((path, PacketBuf::from_packet(datagram)));
+                                }
+                            }
+                        }
+                        // A train: back to coalesced reads, without a copy.
+                        if received[..read]
+                            .iter()
+                            .any(|&(len, _, _, stride)| stride < len)
+                        {
+                            rx.batched = false;
+                            rx.singles = 0;
+                        }
+                        Ok(())
+                    })
                 })
                 .await
         }
@@ -1221,16 +1566,7 @@ mod linux {
                             io::Error::new(io::ErrorKind::InvalidData, "datagram without source")
                         })?;
                         // A truncated control buffer only loses the ECN mark.
-                        let ecn = msg.cmsgs().ok().into_iter().flatten().fold(
-                            Ecn::NotEct,
-                            |ecn, cmsg| match cmsg {
-                                ControlMessageOwned::Ipv4Tos(tos) => Ecn::from_bits(tos),
-                                ControlMessageOwned::Ipv6TClass(tclass) => {
-                                    u8::try_from(tclass & 0xFF).map_or(ecn, Ecn::from_bits)
-                                }
-                                _ => ecn,
-                            },
-                        );
+                        let ecn = received_ecn(msg.cmsgs().ok().into_iter().flatten());
                         Ok((msg.bytes, addr, ecn))
                     })
                 })
@@ -1267,14 +1603,7 @@ mod linux {
             let dest = SockaddrStorage::from(to);
             let tos = ecn.to_bits();
             let tclass = i32::from(tos);
-            // IPv4 and IPv4-mapped destinations take IP_TOS, even on an IPv6 socket.
-            let cmsg = match to {
-                _ if ecn == Ecn::NotEct => None,
-                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
-                    Some(ControlMessage::Ipv6TClass(&tclass))
-                }
-                _ => Some(ControlMessage::Ipv4Tos(&tos)),
-            };
+            let cmsg = ecn_cmsg(to, ecn, &tos, &tclass);
             sendmsg(
                 fd,
                 &[IoSlice::new(datagram)],
@@ -1285,6 +1614,112 @@ mod linux {
             .map_err(io::Error::from)
             .map(drop)
         }
+
+        /// One non-blocking `sendmsg` of `run`, at most [`IOVS`] datagrams of the first
+        /// one's size (the last may be shorter), to `to` as one segmented send
+        /// (`UDP_SEGMENT`) straight from their buffers, one `iovec` each, with the mark
+        /// `quinn-udp` sets: `IP_TOS` for IPv4 and IPv4-mapped destinations, `IPV6_TCLASS`
+        /// for IPv6 ones, also for [`Ecn::NotEct`].
+        pub(super) fn send_gso(
+            &self,
+            run: &[(Path, PacketBuf)],
+            to: SocketAddr,
+            ecn: Ecn,
+        ) -> io::Result<()> {
+            let mut iovs = [IoSlice::new(&[]); IOVS];
+            for (iov, (_, datagram)) in iovs.iter_mut().zip(run) {
+                *iov = IoSlice::new(datagram.as_packet());
+            }
+            let segment = run.first().map_or(0, |(_, datagram)| datagram.len());
+            let segment = u16::try_from(segment).map_err(|_| io::ErrorKind::InvalidInput)?;
+            let tos = ecn.to_bits();
+            let tclass = i32::from(tos);
+            let mark = match to {
+                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
+                    ControlMessage::Ipv6TClass(&tclass)
+                }
+                _ => ControlMessage::Ipv4Tos(&tos),
+            };
+            let cmsgs = [ControlMessage::UdpGsoSegments(&segment), mark];
+            let dest = SockaddrStorage::from(to);
+            loop {
+                match sendmsg(
+                    self.socket.as_raw_fd(),
+                    &iovs[..run.len().min(IOVS)],
+                    &cmsgs,
+                    MsgFlags::empty(),
+                    Some(&dest),
+                ) {
+                    Ok(_) => return Ok(()),
+                    Err(Errno::EINTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        /// One non-blocking `sendmmsg` of `run`, datagrams to `to` with the mark `ecn` that
+        /// [`mmsg_len`] put together, each its own message marked as
+        /// [`send_msg`](Self::send_msg) marks it; how many of them the socket took, at
+        /// least one. When it takes none this fails with the first one's error. Where
+        /// `sendmmsg` does not exist, or on `EIO` or `EINVAL` where `quinn-udp` set the
+        /// socket up, the first datagram goes out as without batching instead.
+        pub(super) fn send_mmsg_or_one(
+            &self,
+            run: &[(Path, PacketBuf)],
+            to: SocketAddr,
+            ecn: Ecn,
+        ) -> io::Result<usize> {
+            let Some((_, first)) = run.first() else {
+                return Ok(0);
+            };
+            let run = &run[..run.len().min(MAX_BATCH)];
+            let tos = ecn.to_bits();
+            let tclass = i32::from(tos);
+            let cmsg = ecn_cmsg(to, ecn, &tos, &tclass);
+            let mut iovs = [[IoSlice::new(&[])]; MAX_BATCH];
+            for (iov, (_, datagram)) in iovs.iter_mut().zip(run) {
+                *iov = [IoSlice::new(datagram.as_packet())];
+            }
+            let dests = [Some(SockaddrStorage::from(to)); MAX_BATCH];
+            // Control space only for a mark: unfilled space fails the send.
+            let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(
+                run.len(),
+                cmsg.is_some().then(|| nix::cmsg_space!(i32)),
+            );
+            let error = loop {
+                match sendmmsg(
+                    self.socket.as_raw_fd(),
+                    &mut headers,
+                    &iovs[..run.len()],
+                    &dests[..run.len()],
+                    cmsg.as_slice(),
+                    MsgFlags::empty(),
+                ) {
+                    Ok(sent) => return Ok(sent.count()),
+                    Err(Errno::EINTR) => {}
+                    Err(e) => break e,
+                }
+            };
+            let single = self.mmsg_missing(error)
+                || (self.state.is_some() && matches!(error, Errno::EIO | Errno::EINVAL));
+            if !single {
+                return Err(error.into());
+            }
+            match &self.state {
+                Some(state) => {
+                    let transmit = quinn_udp::Transmit {
+                        destination: to,
+                        ecn: quinn_udp::EcnCodepoint::from_bits(ecn.to_bits()),
+                        contents: first.as_packet(),
+                        segment_size: None,
+                        src_ip: None,
+                    };
+                    state.try_send(UdpSockRef::from(&*self.socket), &transmit)?;
+                }
+                None => self.send_msg(first.as_packet(), to, ecn)?,
+            }
+            Ok(1)
+        }
     }
 
     fn socket_addr(addr: &SockaddrStorage) -> Option<SocketAddr> {
@@ -1294,6 +1729,50 @@ mod linux {
                 addr.as_sockaddr_in6()
                     .map(|v6| SocketAddrV6::from(*v6).into())
             })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Where the current storage starts.
+        fn start(rx: &mut Rx) -> usize {
+            rx.refill();
+            rx.ring[rx.current].as_ptr().addr()
+        }
+
+        /// Takes all but less than a read off the current storage, as reads do: the
+        /// datagrams still out.
+        fn fill(rx: &mut Rx) -> BytesMut {
+            rx.refill();
+            let mut datagrams = rx.ring[rx.current].split_to(STORAGE - READ + 1);
+            datagrams.fill(0xAA);
+            datagrams
+        }
+
+        #[test]
+        fn coalesced_storage_is_reclaimed_once_released() {
+            let mut rx = Rx::default();
+            let first = start(&mut rx);
+            let out = fill(&mut rx);
+            // The first storage still has datagrams out: another one.
+            let second = start(&mut rx);
+            assert_ne!(second, first);
+            let out_second = fill(&mut rx);
+            // Released: the first storage comes back, no new allocation, zero-filled.
+            drop(out);
+            assert_eq!(start(&mut rx), first);
+            assert_eq!(rx.ring[rx.current].len(), STORAGE);
+            assert!(rx.ring[rx.current].iter().all(|&b| b == 0));
+            // Every storage out: a fresh one; then the second comes back.
+            let out = fill(&mut rx);
+            let third = start(&mut rx);
+            assert!(third != first && third != second);
+            let out_third = fill(&mut rx);
+            drop(out_second);
+            assert_eq!(start(&mut rx), second);
+            drop((out, out_third));
+        }
     }
 }
 
@@ -2378,8 +2857,10 @@ mod tests {
         }
     }
 
+    /// Without offload nothing is segmented or coalesced, but on Linux and Android one
+    /// `recvmmsg` reads several datagrams, each its own exactly sized copy.
     #[tokio::test]
-    async fn offload_off_sends_and_receives_one_datagram_per_call() {
+    async fn offload_off_batches_without_coalescing() {
         let a = bind(1, "127.0.0.1:0");
         let b = bind(2, "127.0.0.1:0");
         assert!(a.offload());
@@ -2391,14 +2872,161 @@ mod tests {
         let batch = batch(b.local_addr(), Ecn::Ce, &datagrams);
         assert_eq!(run_len(&batch, a.max_segments()), 1);
         send_all(&a, &batch).await;
+        // Let every datagram reach the receive queue.
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let calls = recv_batches(&b, datagrams.len()).await;
-        assert!(calls.iter().all(|call| call.len() == 1));
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_eq!(calls[0].len(), 16, "one recvmmsg of 16 datagrams");
+        } else {
+            assert!(calls.iter().all(|call| call.len() == 1));
+        }
+        for (_, datagram) in calls.iter().flatten() {
+            assert_eq!(
+                datagram.headroom(),
+                HEADROOM,
+                "a copy, not a slice of a read"
+            );
+        }
         check(&calls.concat(), &datagrams, a.local_addr(), Ecn::Ce);
 
         // Back on, segmented again.
         a.set_offload(true).unwrap();
         b.set_offload(true).unwrap();
         segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
+    }
+
+    /// Bound without offload, reads batch too; every datagram is truncated to the
+    /// caller's buffer and sizes, order, senders and marks are kept.
+    #[tokio::test]
+    async fn batched_reads_keep_datagrams_apart() {
+        let a = bind_with(1, "[::]:0", false);
+        let b = bind_with(2, "[::]:0", false);
+        let to = seen_as(&b, "127.0.0.1");
+        let ecns = [Ecn::NotEct, Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
+        let mut batch = Vec::new();
+        let mut expected = Vec::new();
+        for seq in 0..40 {
+            let datagram = numbered(seq, seq * 37);
+            batch.push((
+                path_to(to, ecns[seq % 4]),
+                PacketBuf::from_packet(&datagram),
+            ));
+            expected.push((ecns[seq % 4], datagram));
+        }
+        send_all(&a, &batch).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut small = PacketBuf::with_capacity(1000);
+        let capacity = small.capacity();
+        let mut received = VecDeque::new();
+        while received.len() < expected.len() {
+            timeout(
+                Duration::from_secs(5),
+                b.recv_batch(&mut small, &mut received),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(received.len(), expected.len());
+        for ((path, datagram), (ecn, bytes)) in received.iter().zip(&expected) {
+            let ecn = if cfg!(any(target_os = "linux", target_os = "android")) {
+                *ecn
+            } else {
+                Ecn::NotEct
+            };
+            assert_eq!(datagram.as_packet(), &bytes[..bytes.len().min(capacity)]);
+            assert_eq!(path.addr, seen_as(&a, "127.0.0.1"));
+            assert_eq!(path.ecn, ecn);
+        }
+    }
+
+    /// With receive offload, reads of one datagram each switch `recv_batch` to batched
+    /// copies, and the next train switches it back to slices of one read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn receive_offload_batches_while_no_trains_arrive() {
+        let a = bind(1, "127.0.0.1:0");
+        let b = bind(2, "127.0.0.1:0");
+        if !coalescing(&a, &b) {
+            return; // No segmentation offload on this host.
+        }
+        let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let singles: Vec<_> = (0..40).map(|seq| numbered(seq, 1200)).collect();
+        for datagram in &singles {
+            plain.send_to(datagram, b.local_addr()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let calls = recv_batches(&b, singles.len()).await;
+        let from = plain.local_addr().unwrap();
+        check(&calls.concat(), &singles, from, Ecn::NotEct);
+        let lens: Vec<_> = calls.iter().map(Vec::len).collect();
+        assert_eq!(lens[..4], [1; 4], "coalesced reads first: {lens:?}");
+        assert_eq!(lens[4], 16, "then batched: {lens:?}");
+        assert!(b.batched());
+
+        // A train read in a batch is split right and ends the batching.
+        let train1 = train(1280, 20);
+        send_all(&a, &batch(b.local_addr(), Ecn::Ect0, &train1)).await;
+        let calls = recv_batches(&b, train1.len()).await;
+        check(&calls.concat(), &train1, a.local_addr(), Ecn::Ect0);
+        assert!(!b.batched());
+        // The next one is sliced out of one read again.
+        segmented_to_coalesced(&a, a.local_addr(), &b, b.local_addr()).await;
+    }
+
+    /// A segmented run leaves from the datagrams' own buffers on Linux and Android: the
+    /// train buffer stays unallocated, and a plain socket receives each datagram once.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn segmented_run_goes_out_without_a_train() {
+        let sender = bind(1, "[::]:0");
+        let plain = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let datagrams = [train(1420, 30), train(700, 5)].concat();
+        let batch = batch(plain.local_addr().unwrap(), Ecn::Ect0, &datagrams);
+        if sender.max_segments() == 1 {
+            return; // No segmentation offload on this host.
+        }
+        assert!(run_len(&batch, sender.max_segments()) > 1);
+        send_all(&sender, &batch).await;
+        try_send_all(&sender, &batch).await;
+        assert_eq!(sender.train.lock().unwrap().capacity(), 0);
+        let mut buf = [0; 2048];
+        for expected in datagrams.iter().chain(&datagrams) {
+            let (len, _) = timeout(Duration::from_secs(5), plain.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], expected.as_slice());
+        }
+        let extra = timeout(Duration::from_millis(50), plain.recv_from(&mut buf)).await;
+        assert!(extra.is_err(), "no datagram twice");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn mmsg_runs_split_at_path_and_ecn_changes_only() {
+        let a: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:1".parse().unwrap();
+        let datagram = |to, ecn, len| (path_to(to, ecn), PacketBuf::from_packet(&vec![0; len]));
+        let datagrams = [
+            datagram(a, Ecn::NotEct, 100),
+            datagram(a, Ecn::NotEct, 60),
+            datagram(a, Ecn::NotEct, 1400), // longer: same run
+            datagram(a, Ecn::Ect0, 60),     // other ECN
+            datagram(b, Ecn::Ect0, 60),     // other address
+            datagram(b, Ecn::Ect0, 0),
+        ];
+        let mut runs = Vec::new();
+        let mut start = 0;
+        while start < datagrams.len() {
+            let run = linux::mmsg_len(&datagrams[start..]);
+            runs.push(run);
+            start += run;
+        }
+        assert_eq!(runs, [3, 1, 2]);
+        assert_eq!(linux::mmsg_len(&[]), 0);
+        let long: Vec<_> = (0..100).map(|_| datagram(a, Ecn::NotEct, 10)).collect();
+        assert_eq!(linux::mmsg_len(&long), MAX_BATCH);
     }
 
     /// A batch whose middle run goes to the limited broadcast address, which the kernel
