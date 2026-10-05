@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silly window syndrome (Minshall's Nagle variant) and small windows use Limited Transmit
   (RFC 3042). With the default configuration, four parallel streams now reach at least
   the one-stream aggregate (in process 1.00-1.11x of one stream, 0.43x on `.3`; harness
-  netstack pair TCP P4 above P1), and `netstack_lossy`'s 1 % loss and bottleneck cases
-  finish in about a second instead of 2-6 s and 15-23 s.
+  netstack pair P1 / P4 6.21 / 2.48 -> 6.85 / 7.29 Gbit/s), and `netstack_lossy`'s 1 % loss
+  and bottleneck cases finish in about a second instead of 1-6 s and 15-24 s.
 - `nsplane-netstack`: the `NetStackConfig::datagram_capacity` docs explain that one driver
   turn routes up to 256 ingress packets before the application reads, so a bulk UDP
   receiver wants a queue of at least 256. Defaults are unchanged.

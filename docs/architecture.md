@@ -1142,6 +1142,25 @@ run gave 629 against 269 MB/s (0.43x). Its ignored `streams_throughput` asserts 
 cargo test --release -p nsplane-e2e --test netstack_multistream -- --ignored --nocapture
 ```
 
+The harness's netstack pair (`scripts/bench`, `BENCH_PAIRS=netstack`, 30 s x 3, CPU sets
+2-5 / 6-9), `main` b5e531f's `netstack_bench` against the ON branch's in one lock hold,
+2026-10-05, a quiet host (1-minute load 3.53 -> 2.24 for `main`, 2.22 -> 2.58 for the
+branch); medians [repetitions]:
+
+| Build | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP loss 1G / 3G % | CPU s/GB a / b |
+| --- | --- | --- | --- | --- |
+| `main` (smoltcp `.3`, server queue 128) | 6.21 [6.10-6.29] | 2.48 [1.92-3.21] | 2.21 / 5.56 | 1.92 / 1.59 |
+| ON (smoltcp `.4`, server queue 1024) | 6.85 [6.74-6.98] | 7.29 [7.28-7.38] | 0.00 / 0.03 | 1.70 / 1.41 |
+
+Four streams now beat one in every repetition (+6 % on the median), single-stream TCP is
+10 % faster at 11 % less CPU per GB on both sides, and the UDP loss left at 3 Gbit/s is the
+receiving engine's full sink, i.e. the netstack's receive throughput on four CPUs (an
+inline-sink experiment that removed it regressed default-config applications and was
+reverted; follow-up). Idle request/response latency is unchanged (p50 / p99 0.027 /
+0.052 ms against 0.027 / 0.054), but next to a saturating stream it rose from 0.081 /
+0.941 to 0.280 / 1.271 ms in this run: the stream now keeps more in flight (it is 10 %
+faster and no longer backs off after losses). Not analysed further here (follow-up).
+
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the
@@ -1904,6 +1923,8 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, 3 % loss | 16 MiB | not done after 60 s (833 / 715 drops) | 5C-T6: 54.2 / 59.2 s |
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
+| Netstack TCP, smoltcp `.4` (ON) | `netstack_lossy` 1 % loss / 3 % loss / bottleneck, 16 MiB (final gate, load 8.9-9.3) | 1.14 s / 19.2 s / 0.82 s | `.3`: 1.1-6.2 s / stalls past 60 s / 14.9-23.9 s; [Netstack throughput](#netstack-throughput) |
+| Netstack pair (harness, ON) | TCP P1 / P4 Gbit/s, UDP loss 1G / 3G %, 30 s x 3 medians (2026-10-05, load 2.2-3.5) | 6.85 / 7.29, 0.00 / 0.03 | `main` b5e531f same window: 6.21 / 2.48, 2.21 / 5.56 |
 | Engine fast path (MF-1), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP -P1 / -P4, no workers, median of the 3 quiet pairs (load1 <= 12.3) | 9.90 / 10.37 Gbit/s | before: 8.43 / 8.70 Gbit/s (+17 % / +19 %); [Engine fast path (MF-1)](#engine-fast-path-mf-1) |
 | Engine fast path (MF-1), TUN, kernel WireGuard -> nsplane-cli | the same | 4.85 / 4.77 Gbit/s; dedicated rerun 5.87 / 5.92 | before: 6.27 / 6.07; rerun 6.32 / 6.12 Gbit/s (-23 % / -21 %; rerun -7 % / -3 %), not reproduced outside the harness |
 | Engine fast path (MF-1), worker pool hub | off / 2 / 4 workers, 64 B and 1420 B, median of 3 quiet pairs | 1.36 / 1.40 / 1.41 Mpps, 784 / 959 / 937 kpps | before: 1.40 / 1.38 / 1.41 Mpps, 788 / 938 / 960 kpps (all within -3 % to +2 %) |
@@ -1962,7 +1983,10 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
   (crypto 36 %); the PS fixes take 2.2-2.3 % of the instructions and 7-8 % of the CPU time
   off it, and the rest of the stack's cost is smoltcp (see *Known remaining costs* under
   [Netstack throughput](#netstack-throughput)). The gap to ns's legacy stack (MF-2) is to
-  be re-measured with PB's netstack pair.
+  be re-measured with PB's netstack pair. With smoltcp `.4` (ON) the 1 % loss and
+  bottleneck cases finish in about a second, 3 % loss in 11-41 s (lost retransmissions
+  still wait for a timeout), and the harness's netstack pair moves four streams faster
+  than one (7.29 against 6.85 Gbit/s; `main` 2.48 against 6.21).
 
 ### Engine batching under load
 
@@ -2021,16 +2045,20 @@ sets 2-5 / 6-9, 30 s x 3 repetitions, medians:
 | kernel-nsplane | 7.00 | 6.92 | 0.00 / 0.02 | 0.804 / 1.760 | 1.950 / 5.430 | 0.09 † / 1.67 |
 | wggo-wggo | 9.99 | 10.14 | 0.02 / 0.41 | 0.690 / 0.779 | 2.300 / 5.980 | 1.29 / 1.44 |
 | netstack (user-space) | 6.21 | 2.02 | 1.93 / 6.20 | 0.027 / 0.041 | 0.137 / 0.916 | 1.90 / 1.56 |
+| netstack (user-space), ON branch ‡ | 6.85 | 7.29 | 0.00 / 0.03 | 0.027 / 0.052 | 0.280 / 1.271 | 1.70 / 1.41 |
 
 † kernel WireGuard encrypts in kernel threads outside the container cgroup (undercount).
+‡ A separate run, 2026-10-05 (load 2.2-3.5), with smoltcp `v0.14.0-nsplane.4` and
+`netstack_bench`'s 1024-datagram server queue; `main` b5e531f in the same window measured
+6.21 / 2.48 Gbit/s and 2.21 / 5.56 % (see [Netstack throughput](#netstack-throughput)).
 Repetitions were tight for the mixed pairs (kernel -> nsplane 7.02 / 7.00 / 6.99, nsplane ->
 kernel 7.72 / 7.70 / 7.71) and wider for nsplane-nsplane (7.85 / 8.12 / 9.33) and
 wireguard-go (7.75 / 9.99 / 10.79). Kernel WireGuard -> nsplane-cli, left open after the MF-1
 A/B, measures 7.00 Gbit/s here against 3.67 in the first (loaded) run and 6.3 in the MF-1
 "before" reruns: no regression on a quiet host, so the open item is closed. What stays:
 wireguard-go leads on 4 streams (10.1 against 8.9), kernel WireGuard is CPU-pinned by the
-harness (its crypto threads do not run on the pinned sets), and the netstack pair's 4-stream
-result stays below its single stream (follow-up).
+harness (its crypto threads do not run on the pinned sets). The netstack pair's 4-stream
+result, below its single stream here, is above it with the ON changes (‡).
 
 The earlier, loaded run below is kept for its notes.
 
