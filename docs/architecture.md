@@ -200,7 +200,8 @@ idle, and sends itself when the transmit task is idle and no input is waiting (i
 output, below), skipping that hop.
 
 The core is never shared, and without the crypto worker pool the data path takes no lock;
-with the pool, each peer's tunnel is behind a mutex shared with the workers.
+with the pool, each peer's tunnel is behind a mutex that only the owner takes (the jobs
+carry the session keys they need), so it is uncontended.
 
 When the owner wakes for a received datagram or a local packet, it also takes the ones
 already queued behind it (up to `MAX_BATCH`, 64) and feeds them to the core as one batch
@@ -211,7 +212,12 @@ list below). Without crypto workers the source and receive tasks hand over what 
 returned as one message (up to `MAX_BATCH` items, as many as the queue has room for; a
 lone item goes over without an allocation); the input queues stay bounded in items (a
 semaphore of `queue_capacity` permits beside the channel). With crypto workers they hand
-over one item per message.
+over one item per message. The other way, the owner hands the datagrams one drain queued
+for a transport to its transmit task as one message (the transmit queue stays bounded in
+datagrams), and transmitted buffers go back to the source task one message per sent batch,
+over a lossy bounded queue, for `PacketSource::recycle` (`TunSource` reads into them
+again); a source that keeps the default no-op gets none after the first, and the buffers go
+to the core's pool as before.
 
 Inline output: without crypto workers and while not suspended, the owner sends a drain's
 datagrams itself (`Transport::try_send_batch`) when nothing of that transport is in its
@@ -255,7 +261,17 @@ Backpressure:
   largest room, counting one datagram per packet; a transport's room is its free transmit
   slots while its backlog is empty, plus `min(MAX_BATCH, capacity)` minus its backlog. With
   no room it stops reading, which holds back the source, so a saturated transport keeps at
-  most `MAX_BATCH` local datagrams in its backlog.
+  most `MAX_BATCH` local datagrams in its backlog. `EngineBuilder::local_transmit_bound`
+  (opt-in, unset by default) lowers that intake: a transport has room for local packets
+  only while its transmit queue (with the batch being sent) and backlog together hold fewer
+  datagrams than the bound; datagrams of received datagrams, timers and handle calls keep
+  the queue capacity. See [Engine and device fast path (OE)](#engine-and-device-fast-path-oe)
+  for its latency / throughput trade-off.
+- With crypto workers, received datagrams with the workers count against the deliver
+  queue's room: the owner reads received datagrams only while the deliver queue has room
+  beyond them, so a sink slower than the network holds datagrams back in the transport
+  (the UDP socket buffer) instead of dropping decrypted packets under `DROP_SINK_FULL`, as
+  without workers.
 - Datagrams caused by received datagrams or timers that find the waiting datagrams at the
   queue capacity are dropped (`DROP_TRANSMIT_FULL`).
 - A full sink queue drops the decrypted packet (`DROP_SINK_FULL`); a closed sink or
@@ -287,8 +303,8 @@ channel's locks.
 | `local` | `queue_capacity` | source task -> owner |
 | `datagrams` | `queue_capacity` | every receive task -> owner |
 | `deliver` | `queue_capacity` | owner -> sink task |
-| `recycle` | `queue_capacity` | every transmit task -> owner (full: buffer dropped) |
-| `transmit` | `queue_capacity` per transport | owner -> transmit task |
+| `recycle` | `queue_capacity` | every transmit task -> owner (full: buffer dropped); used only when the source keeps the default `PacketSource::recycle`, the lossy queue back to the source is not counted |
+| `transmit` | `queue_capacity` per transport | owner -> transmit task, in datagrams, counting the batch being sent |
 | `backlog` | `queue_capacity` per transport | owner, waiting for room in `transmit` |
 | `events` | `event_capacity` | owner -> subscribers |
 | `crypto` | `queue_capacity` (the bound of jobs in flight) with 2 or more crypto workers, else 0 | owner -> workers -> owner (jobs not completed yet) |
@@ -299,7 +315,10 @@ Without crypto workers, the datagrams and packets the owner sends or delivers in
 owner sends inline only when no input is waiting, so under load `transmit` (and `recycle`)
 rise as before; `deliver` stays low or at 0 while the sink keeps up, and rises only once
 the sink falls behind and packets fall back to the sink task. `recycle` counts only the
-buffers a transmit task returns; inline-sent buffers go back to the core directly.
+buffers a transmit task returns to the owner. With a source that recycles (`TunSource`,
+or a `MapSource` around one) every transmitted buffer, inline-sent ones included, goes back
+to the source instead and `recycle` stays at 0; otherwise inline-sent buffers go back to
+the core directly.
 
 Measured with the default capacity of 1024 on two engines linked in process (release
 build, 4-thread runtime, 32-core host shared with other jobs, so throughput is noisy),
@@ -364,14 +383,20 @@ local packets ─┐           ┌─► worker 0     ─┐
 datagrams     ─┘           └─► worker n - 1 ─┘
 ```
 
-- Sharding by peer. The owner feeds each local packet and received datagram to
+- One peer on every worker (OE-4, C7; until then jobs were sharded by `peer id % n`, so one
+  peer used one worker). The owner feeds each local packet and received datagram to
   `Core::handle_input_deferred`, which routes it (receiver index or destination), runs the
-  outbound filters and returns a `CryptoJob` for the peer's tunnel. The job goes to worker
-  `peer id % n`; each worker runs its jobs in arrival order and hands them back on one done
-  queue, and the owner completes them (`Core::complete_job`) in the order they come back. So
-  all packets of one peer, in both directions, are sealed, opened and emitted in arrival
-  order, while different peers are processed in parallel. Peer ids are handed out in order,
-  so peers spread evenly over the workers; a single peer never uses more than one.
+  outbound filters and prepares a `CryptoJob` on the peer's tunnel: a local packet gets the
+  session's next counter (nonce), in order (`Tunn::reserve_in_place` -> `SealTicket`), and a
+  received message passes the session and replay-window check (`Tunn::open_ticket` ->
+  `OpenTicket`). The job carries the session key and counter, so `CryptoJob::run` never
+  touches the tunnel. Jobs go to the workers in turn, whatever their peer, and the owner
+  completes them (`Core::complete_job`) in the order it handed them out, through a reorder
+  buffer keyed by job sequence: a received message's counter is marked as received only
+  there (`Tunn::commit_open`), so a duplicate opened on two workers at once is still
+  rejected, and a datagram of a session that expired or was replaced meanwhile is dropped
+  and counted. So all packets of one peer, in both directions, are emitted in arrival
+  order, and one peer's cryptography spreads over every worker.
 - Batches. Jobs go to a worker in batches of up to 64 (`MAX_BATCH`): a worker's batch is
   handed over when it is full, together with every other batch, or when the owner has
   nothing else ready, and a worker hands each batch back whole. A busy owner thus wakes each
@@ -379,8 +404,8 @@ datagrams     ─┘           └─► worker n - 1 ─┘
   cost as much as the cryptography it moved and gained nothing.
 - Everything else stays on the owner: handshakes (the gate, the responses, flushing the
   packets queued behind a handshake), timers, configuration, events, drop counters, roaming
-  and the per-peer counters. A handshake or a timer that touches a peer's tunnel while a
-  worker holds it waits for that one packet. The order on the wire stays the arrival order
+  and the per-peer counters. Workers never lock a tunnel, so a handshake or a timer never
+  waits for a worker. The order on the wire stays the arrival order
   even when the owner seals a keepalive or flushes queued packets while newer packets of the
   peer are with a worker: those are emitted only once they come back.
 - Bounds: at most `queue_capacity` jobs are with the workers. While that many are, the owner
@@ -427,8 +452,8 @@ the peer table and the allowed IPs across shards.
 
 The pool off takes no lock (follow-up #17): the core hands out crypto jobs only when built
 with `CoreConfig::crypto_jobs`, which the engine sets for 2 or more workers, and otherwise
-every peer owns its tunnel outright. With the pool, each peer's tunnel is shared with its
-jobs behind a mutex. The lock had cost no more than the run-to-run spread when it was added
+every peer owns its tunnel outright. With the pool, each peer's tunnel is behind a mutex
+that only the owner takes (since OE-4 the jobs carry their keys), so it is uncontended. The lock had cost no more than the run-to-run spread when it was added
 (`core_round_trip` medians 616 -> 569 ns at 64 B and 1347 -> 1362 ns at 1420 B); without it
 the `data_path` core round trip measures 532 ns at 64 B (device-equivalent 474 ns, raw
 `Tunn` 359 ns) and 1.348 us at 1420 B (device-equivalent 1.282 us), against 546 ns and
@@ -436,7 +461,15 @@ the `data_path` core round trip measures 532 ns at 64 B (device-equivalent 474 n
 
 `UdpTransport` is the network side: one dual-stack UDP socket with fwmark and ECN support,
 4 MiB socket buffers requested (clamped by `net.core.rmem_max` / `wmem_max`) and segmentation
-offload through `quinn-udp`.
+offload through `quinn-udp`. Since OE-2, on Linux a segmented run is sent as one `sendmsg`
+with one iovec per datagram and the `UDP_SEGMENT` / TOS control messages (no train buffer
+copy; on `EIO` / `EINVAL` the run goes through `quinn-udp`, which turns segmentation off as
+before); coalesced reads take turns in a ring of four 128 KiB storages instead of
+allocating while slices of the last one are queued, and after four coalesced reads in a row
+of one datagram each (a peer that sends no trains, e.g. kernel WireGuard) `recv_batch`
+reads up to 16 datagrams per `recvmmsg` until a train arrives. With offload off, runs to one
+address and ECN mark go out with `sendmmsg` and `recv_batch` reads up to 16 datagrams per
+`recvmmsg`: batching, not offload, as every datagram stays its own message.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
 and embedders.
 
@@ -823,6 +856,16 @@ yields a `TunSource` and a `TunSink` registered with the tokio reactor.
   10-byte virtio-net header per read and write.
 - `offload`: the virtio-net codec: GSO segmentation of read super-packets and TCP/UDP
   coalescing for writes (one `writev` of header and packet pieces per super-packet).
+  Segments are appended with `PacketBuf::extend_from_slice`, without zero-filling first.
+- Buffers (OE-1): `TunSource`, `SlotSource` and the Wintun reader size every read for the
+  MTU, the translation slack and `TAILROOM` (padding plus AEAD tag, from `nsplane-packet`)
+  behind the packet, so the core seals a full-size packet in place without reallocating.
+  `TunSource` implements `PacketSource::recycle`: the engine hands transmitted buffers back
+  and the source puts them into its pool up to its bound, so reads stop allocating;
+  pooled buffers keep their initialized bytes, so a reused buffer is not zero-filled again.
+  `TunSource::recv_batch` keeps reading without waiting after the first packet, until
+  `EAGAIN`, a full batch or a split GSO read, so plain packets (no TSO: UDP, small packets,
+  no offload) come in batches; a lone packet still returns at once.
 - `darwin` and `utun`: the utun control socket (macOS, iOS), packets framed by a 4-byte
   address-family header.
 - `unix`: non-blocking fd I/O shared by both.
