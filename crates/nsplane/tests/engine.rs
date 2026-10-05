@@ -7,6 +7,7 @@
     reason = "test harness"
 )]
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1384,4 +1385,355 @@ async fn transmitted_buffers_go_back_to_the_source() {
     let largest = largest_offer.load(Ordering::Relaxed);
     assert!((1..=CAPACITY).contains(&largest), "largest offer {largest}");
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
+}
+
+/// A packet from `src` to `dst` carrying the sequence number `n`.
+fn sequenced(src: Ipv4Addr, dst: Ipv4Addr, n: u32) -> Vec<u8> {
+    ipv4(src, dst, &n.to_be_bytes())
+}
+
+/// Sends `count` sequenced packets from `src` to `dst` into `local`, in a task.
+fn flood(
+    local: &mpsc::Sender<PacketBuf>,
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    count: u32,
+) -> tokio::task::JoinHandle<()> {
+    let local = local.clone();
+    tokio::spawn(async move {
+        for n in 0..count {
+            let packet = PacketBuf::from_packet(&sequenced(src, dst, n));
+            if local.send(packet).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// A node's sink.
+type Delivered = mpsc::Receiver<(PeerId, PacketBuf)>;
+
+/// The sequence numbers received from each source, in the order they arrived.
+type Sequences = BTreeMap<Ipv4Addr, Vec<u32>>;
+
+/// Starts receiving at `node` until no packet arrives for a while; the task hands back
+/// the sequence numbers of each source and the node's sink.
+fn receive(node: &mut Node) -> tokio::task::JoinHandle<(Sequences, Delivered)> {
+    let mut delivered = std::mem::replace(&mut node.delivered, mpsc::channel(1).1);
+    tokio::spawn(async move {
+        let mut received = Sequences::new();
+        while let Ok(Some((_, packet))) = timeout(QUIET, delivered.recv()).await {
+            let packet = packet.as_packet();
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let n = u32::from_be_bytes(packet[20..24].try_into().unwrap());
+            received.entry(src).or_default().push(n);
+        }
+        (received, delivered)
+    })
+}
+
+/// Waits for `receiver` of `node` and gives the sink back.
+async fn received(
+    node: &mut Node,
+    receiver: tokio::task::JoinHandle<(Sequences, Delivered)>,
+) -> Sequences {
+    let (received, delivered) = receiver.await.unwrap();
+    node.delivered = delivered;
+    received
+}
+
+/// Every drop the nodes counted; only reasons of a full queue are allowed.
+async fn queue_drops(nodes: &[&Node]) -> u64 {
+    let mut total = 0;
+    for node in nodes {
+        for (reason, count) in node.handle.drop_counters().await.unwrap() {
+            assert!(
+                [DROP_TRANSMIT_FULL, DROP_SINK_FULL].contains(&reason),
+                "{reason}: {count}"
+            );
+            total += count;
+        }
+    }
+    total
+}
+
+/// Checks that every sequence is a strictly increasing run of numbers below `sent` (no
+/// reordering, no duplicate); returns how many packets arrived.
+fn in_order(sequences: &[&Sequences], sent: u32) -> u64 {
+    let mut total = 0;
+    for sequence in sequences.iter().flat_map(|s| s.values()) {
+        assert!(sequence.windows(2).all(|w| w[0] < w[1]), "{sequence:?}");
+        assert!(sequence.iter().all(|&n| n < sent));
+        total += sequence.len() as u64;
+    }
+    total
+}
+
+/// Options of a node with `workers` crypto workers and room for bursts.
+fn pooled(workers: usize) -> Options {
+    Options {
+        sink_capacity: 1024,
+        crypto_workers: workers,
+        ..Options::default()
+    }
+}
+
+/// Two linked peers with `workers` crypto workers each, sessions up.
+async fn pooled_pair(workers: usize) -> (Node, Node) {
+    let (ta, tb) = link(1024);
+    let (mut a, mut b) = nodes(ta, tb, &pooled(workers));
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+    (a, b)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_peer_on_every_crypto_worker_keeps_its_order() {
+    const PACKETS: u32 = 3000;
+    let (mut a, mut b) = pooled_pair(4).await;
+    let (at_a, at_b) = (receive(&mut a), receive(&mut b));
+    let senders = [
+        flood(&a.local, IP_A, IP_B, PACKETS),
+        flood(&b.local, IP_B, IP_A, PACKETS),
+    ];
+    for sender in senders {
+        timeout(WAIT, sender).await.unwrap().unwrap();
+    }
+    let (at_a, at_b) = (received(&mut a, at_a).await, received(&mut b, at_b).await);
+    let arrived = in_order(&[&at_a, &at_b], PACKETS);
+    assert_eq!(
+        arrived + queue_drops(&[&a, &b]).await,
+        2 * u64::from(PACKETS)
+    );
+    // One way at a time, nothing is dropped.
+    let at_b = receive(&mut b);
+    timeout(WAIT, flood(&a.local, IP_A, IP_B, PACKETS))
+        .await
+        .unwrap()
+        .unwrap();
+    let at_b = received(&mut b, at_b).await;
+    assert_eq!(at_b[&IP_A], (0..PACKETS).collect::<Vec<_>>());
+}
+
+/// A hub (key seed 1) and `count` spokes (seeds from 2), each on a link of its own and with
+/// `workers` crypto workers, sessions up.
+async fn star(count: u8, workers: usize) -> (Node, Vec<Node>) {
+    let hub_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let mut links = Vec::new();
+    let mut spokes = Vec::new();
+    for seed in 2..2 + count {
+        let spoke_addr = SocketAddr::from(([192, 0, 2, seed], 2000));
+        let (hub_end, spoke_end) = ChannelTransport::pair(
+            1024,
+            (
+                TransportId::new(u16::from(seed)),
+                SocketAddr::from(([192, 0, 2, 1], u16::from(seed))),
+            ),
+            (TransportId::new(1), spoke_addr),
+        );
+        links.push(hub_end);
+        let ip = Ipv4Addr::new(10, 0, 0, seed);
+        let options = pooled(workers);
+        spokes.push(node(
+            seed,
+            ip,
+            spoke_addr,
+            TransportId::new(1),
+            spoke_end,
+            &options,
+        ));
+    }
+    let (source, local, mtu) = ChannelSource::new(4, 1420);
+    let (sink, delivered) = ChannelSink::new(1024);
+    let engine = links
+        .into_iter()
+        .fold(EngineBuilder::new(source, sink), EngineBuilder::transport)
+        .private_key(secret(1))
+        .crypto_workers(workers)
+        .build()
+        .unwrap();
+    let mut hub = Node {
+        handle: engine.handle(),
+        engine,
+        local,
+        delivered,
+        _mtu: mtu,
+        secret: secret(1),
+        ip: hub_ip,
+        addr: SocketAddr::from(([192, 0, 2, 1], 2)),
+        transport: TransportId::new(1),
+    };
+    for spoke in &mut spokes {
+        let seed = spoke.ip.octets()[3];
+        hub.handle
+            .add_or_update_peer(spoke.as_peer(TransportId::new(u16::from(seed))))
+            .await
+            .unwrap();
+        let mut hub_peer = hub.as_peer(TransportId::new(1));
+        hub_peer.path = Some(Path {
+            transport: TransportId::new(1),
+            addr: SocketAddr::from(([192, 0, 2, 1], u16::from(seed))),
+            ecn: Ecn::NotEct,
+        });
+        spoke.handle.add_or_update_peer(hub_peer).await.unwrap();
+        spoke.send(hub_ip, b"hello").await;
+        hub.expect_delivery().await;
+    }
+    (hub, spokes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_peers_on_many_crypto_workers_lose_and_reorder_nothing() {
+    const SPOKES: u8 = 8;
+    const PACKETS: u32 = 400;
+    let (mut hub, mut spokes) = star(SPOKES, 4).await;
+    let hub_ip = hub.ip;
+
+    // Every spoke to the hub, then the hub to every spoke: each way nothing is dropped.
+    let at_hub = receive(&mut hub);
+    let senders: Vec<_> = spokes
+        .iter()
+        .map(|spoke| flood(&spoke.local, spoke.ip, hub_ip, PACKETS))
+        .collect();
+    for sender in senders {
+        timeout(WAIT, sender).await.unwrap().unwrap();
+    }
+    let at_hub = received(&mut hub, at_hub).await;
+    let all: Vec<u32> = (0..PACKETS).collect();
+    for spoke in &spokes {
+        assert_eq!(at_hub[&spoke.ip], all, "{} -> hub", spoke.ip);
+    }
+    let at_spokes: Vec<_> = spokes.iter_mut().map(receive).collect();
+    let senders: Vec<_> = spokes
+        .iter()
+        .map(|spoke| flood(&hub.local, hub_ip, spoke.ip, PACKETS))
+        .collect();
+    for sender in senders {
+        timeout(WAIT, sender).await.unwrap().unwrap();
+    }
+    for (spoke, at_spoke) in spokes.iter_mut().zip(at_spokes) {
+        let at_spoke = received(spoke, at_spoke).await;
+        assert_eq!(at_spoke[&hub_ip], all, "hub -> {}", spoke.ip);
+    }
+    let nodes: Vec<&Node> = std::iter::once(&hub).chain(&spokes).collect();
+    assert_eq!(queue_drops(&nodes).await, 0);
+
+    // Both ways at once: only full queues drop packets, and they count every one.
+    let at: Vec<_> = std::iter::once(&mut hub)
+        .chain(spokes.iter_mut())
+        .map(receive)
+        .collect();
+    let mut senders = Vec::new();
+    for spoke in &spokes {
+        senders.push(flood(&spoke.local, spoke.ip, hub_ip, PACKETS));
+        senders.push(flood(&hub.local, hub_ip, spoke.ip, PACKETS));
+    }
+    for sender in senders {
+        timeout(WAIT, sender).await.unwrap().unwrap();
+    }
+    let mut sequences = Vec::new();
+    for (node, at) in std::iter::once(&mut hub).chain(spokes.iter_mut()).zip(at) {
+        sequences.push(received(node, at).await);
+    }
+    let arrived = in_order(&sequences.iter().collect::<Vec<_>>(), PACKETS);
+    let nodes: Vec<&Node> = std::iter::once(&hub).chain(&spokes).collect();
+    assert_eq!(
+        arrived + queue_drops(&nodes).await,
+        2 * u64::from(SPOKES) * u64::from(PACKETS)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rekey_under_load_keeps_every_packet_in_order() {
+    const PACKETS: u32 = 4000;
+    let (a, mut b) = pooled_pair(4).await;
+    let mut events = a.handle.subscribe().await.unwrap();
+    let to_b = a.peer_of(&b).await;
+    let at_b = receive(&mut b);
+    let sender = flood(&a.local, IP_A, IP_B, PACKETS);
+    // Jobs of the current session are in flight while the new one is established.
+    sleep(Duration::from_millis(5)).await;
+    a.handle.force_handshake(to_b, None).await.unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    expect_event(&mut events, is_handshake).await;
+    let at_b = received(&mut b, at_b).await;
+    assert_eq!(at_b[&IP_A], (0..PACKETS).collect::<Vec<_>>());
+    assert_eq!(queue_drops(&[&a, &b]).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspend_and_resume_with_jobs_in_flight_lose_nothing() {
+    const PACKETS: u32 = 3000;
+    let (a, mut b) = pooled_pair(4).await;
+    let at_b = receive(&mut b);
+    let sender = flood(&a.local, IP_A, IP_B, PACKETS);
+    sleep(Duration::from_millis(5)).await;
+    a.handle.suspend().await.unwrap();
+    b.handle.suspend().await.unwrap();
+    sleep(QUIET / 3).await;
+    b.handle.resume().await.unwrap();
+    a.handle.resume().await.unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    let at_b = received(&mut b, at_b).await;
+    assert_eq!(at_b[&IP_A], (0..PACKETS).collect::<Vec<_>>());
+    assert_eq!(queue_drops(&[&a, &b]).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_peer_with_jobs_in_flight_counts_every_packet() {
+    const PACKETS: u32 = 3000;
+    let (a, mut b) = pooled_pair(4).await;
+    let at_b = receive(&mut b);
+    let sender = flood(&a.local, IP_A, IP_B, PACKETS);
+    sleep(Duration::from_millis(5)).await;
+    a.handle.remove_peer(b.public()).await.unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    // Every packet read before the removal is delivered, in order; every later one is
+    // dropped for lack of a route.
+    let at_b = received(&mut b, at_b).await;
+    let at_b = at_b.get(&IP_A).cloned().unwrap_or_default();
+    let delivered = u32::try_from(at_b.len()).unwrap();
+    assert_eq!(at_b, (0..delivered).collect::<Vec<_>>());
+    let unrouted = a.drops(nsplane_core::reasons::NO_ROUTE).await;
+    assert_eq!(u64::from(delivered) + unrouted, u64::from(PACKETS));
+    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+}
+
+/// A transport that sends every datagram twice.
+struct Doubling(ChannelTransport);
+
+impl Transport for Doubling {
+    fn id(&self) -> TransportId {
+        self.0.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.0.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        self.0.send(datagram, to).await?;
+        self.0.send(datagram, to).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicates_opened_on_different_workers_are_rejected_as_replays() {
+    const PACKETS: u32 = 2000;
+    let (ta, tb) = link(1024);
+    let (mut a, mut b) = nodes(Doubling(ta), Doubling(tb), &pooled(4));
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+    let replays = b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await;
+
+    let at_b = receive(&mut b);
+    timeout(WAIT, flood(&a.local, IP_A, IP_B, PACKETS))
+        .await
+        .unwrap()
+        .unwrap();
+    let at_b = received(&mut b, at_b).await;
+    assert_eq!(at_b[&IP_A], (0..PACKETS).collect::<Vec<_>>());
+    // Each packet's copy, opened next to it on another worker, is rejected when completed.
+    let replayed = b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await - replays;
+    assert_eq!(replayed, u64::from(PACKETS));
 }
