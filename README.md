@@ -255,9 +255,8 @@ wg setconf wg0 /path/to/wg0.conf
   4 MiB socket buffers.
 - `--no-offload` applies to the device and socket created at startup. With `--tun-fd` the
   adopted device is used as is and only the UDP socket is affected. A `listen-port` or
-  `fwmark` set over the UAPI binds a new socket with offload, so keep the ephemeral port
-  (`wg show <name> listen-port`) when offload must stay off. `-v info` logs the offloads and
-  crypto workers in use (`Data path configured`).
+  `fwmark` set over the UAPI binds its new socket with the same setting. `-v info` logs the
+  offloads and crypto workers in use (`Data path configured`).
 - `--disable-connected-udp` and `--disable-multi-queue` are gone with the synchronous device
   they configured.
 

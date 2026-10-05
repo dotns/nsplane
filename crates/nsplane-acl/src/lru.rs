@@ -171,7 +171,7 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
         let slot = self.index.remove(key)?;
-        Some(self.release(slot).1)
+        self.release(slot).map(|(_, value)| value)
     }
 
     /// Remove and return the least recent entry.
@@ -179,7 +179,7 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
         if self.oldest == NIL {
             return None;
         }
-        let (key, value) = self.release(self.oldest);
+        let (key, value) = self.release(self.oldest)?;
         self.index.remove(&key);
         Some((key, value))
     }
@@ -192,21 +192,25 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
                 break;
             };
             let next = node.next;
-            if !keep(&node.key, &node.value) {
-                let (key, _) = self.release(slot);
+            if !keep(&node.key, &node.value)
+                && let Some((key, _)) = self.release(slot)
+            {
                 self.index.remove(&key);
             }
             slot = next;
         }
     }
 
-    /// Unlink `slot` and free it, returning its entry.
-    fn release(&mut self, slot: usize) -> (K, V) {
+    /// Unlink `slot` and free it, returning its entry; `None`, with nothing
+    /// changed, when the slot holds no entry.
+    fn release(&mut self, slot: usize) -> Option<(K, V)> {
+        if !matches!(self.slots.get(slot), Some(Some(_))) {
+            return None;
+        }
         self.unlink(slot);
+        let node = self.slots[slot].take()?;
         self.free.push(slot);
-        let node = self.slots[slot].take();
-        let node = node.unwrap_or_else(|| unreachable!("a linked slot holds a node"));
-        (node.key, node.value)
+        Some((node.key, node.value))
     }
 
     fn unlink(&mut self, slot: usize) {
@@ -271,5 +275,26 @@ mod tests {
         map.insert(8, 0);
         map.touch(&7);
         assert_eq!(keys(&mut map), [8, 7]);
+    }
+
+    #[test]
+    fn releasing_an_empty_slot_changes_nothing() {
+        let mut map = LruMap::default();
+        for key in 0..4 {
+            map.insert(key, key);
+        }
+        assert_eq!(map.remove(&1), Some(1));
+        assert_eq!(map.release(1), None);
+        assert_eq!(map.release(NIL), None);
+        assert_eq!(map.free, [1]);
+        assert_eq!(map.len(), 3);
+        // The freed slot is reused once, then the slab grows.
+        map.insert(5, 5);
+        map.insert(6, 6);
+        assert_eq!(map.slots.len(), 5);
+        assert_eq!(map.free, [] as [usize; 0]);
+        assert_eq!(keys(&mut map), [0, 2, 3, 5, 6]);
+        assert_eq!(map.release(0), None);
+        assert!(map.is_empty());
     }
 }
