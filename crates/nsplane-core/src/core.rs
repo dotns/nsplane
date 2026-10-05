@@ -13,7 +13,7 @@ use nsplane_noise::noise::errors::WireGuardError;
 use nsplane_noise::noise::handshake::parse_handshake_anon;
 use nsplane_noise::noise::{DATA_HEADER_SZ, Packet, Tunn, TunnResult};
 use nsplane_noise::x25519;
-use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId};
+use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId, TAILROOM};
 
 use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
@@ -28,8 +28,6 @@ use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, P
 const TICK: Duration = Duration::from_millis(250);
 /// Interval of the handshake gate's rate limiter reset.
 const RATE_LIMITER_RESET: Duration = Duration::from_secs(1);
-/// Room behind a packet for its padding (up to 15 bytes) and the AEAD tag (16 bytes).
-const TAIL_ROOM: usize = 15 + 16;
 /// Size of a handshake initiation, the largest handshake message.
 const HANDSHAKE_INIT_SZ: usize = 148;
 /// Size of a transport data message without payload.
@@ -307,25 +305,41 @@ impl Core {
 
     /// Finishes a job from [`Core::handle_input_deferred`], running it first if it has not
     /// run; the results are queued for [`Core::poll_output`] as with [`Core::handle_input`].
+    /// A received message is only now marked as received in its session's replay window, so
+    /// a duplicate is rejected here; a datagram sealed in a session that expired or was
+    /// replaced in the meantime is dropped and counted under [`reasons::ENCAPSULATE_ERROR`].
     /// A job whose peer was removed in the meantime is discarded.
+    ///
+    /// Complete the jobs of one peer in the order they were handed out to keep its packets
+    /// in order; see [`CryptoJob`].
     pub fn complete_job(&mut self, mut job: CryptoJob) {
-        let outcome = job.take_outcome();
         let id = job.peer;
         match job.direction {
-            Direction::Seal { .. } => match self.peers.peer_mut(id) {
-                Some(peer) => sealed(
-                    &mut self.outputs,
-                    &mut self.pool,
-                    self.policy.as_ref(),
-                    id,
-                    peer,
-                    job.buf,
-                    outcome,
-                ),
+            Direction::Seal => match self.peers.peer_mut(id) {
+                Some(peer) => {
+                    let outcome = job.finish(&mut peer.tunnel_mut());
+                    sealed(
+                        &mut self.outputs,
+                        &mut self.pool,
+                        self.policy.as_ref(),
+                        id,
+                        peer,
+                        job.buf,
+                        outcome,
+                    );
+                }
                 None => self.pool.put(job.buf),
             },
             Direction::Open { path } => {
                 let slot = self.peers.slot(id);
+                let outcome = match slot.and_then(|slot| self.peers.at_mut(slot)) {
+                    Some(peer) => job.finish(&mut peer.tunnel_mut()),
+                    // The peer is gone: only a failure is counted.
+                    None => match job.failure() {
+                        Some(e) => Outcome::Failed(e),
+                        None => return self.pool.put(job.buf),
+                    },
+                };
                 let opened =
                     self.opened(id, slot, path, &job.buf, outcome, &mut Lookups::default());
                 match opened {
@@ -803,13 +817,13 @@ impl Core {
     ) -> Option<CryptoJob> {
         let peer = lookups
             .session(&self.peers, receiver_idx)
-            .and_then(|(id, slot)| Some((id, self.peers.at(slot)?.shared_tunnel()?)));
-        let Some((id, tunnel)) = peer else {
+            .and_then(|(id, slot)| Some((id, self.peers.at(slot)?)));
+        let Some((id, peer)) = peer else {
             self.pool.put(data);
             self.dropped(None, reasons::UNKNOWN_SESSION);
             return None;
         };
-        Some(CryptoJob::new(id, tunnel, data, Direction::Open { path }))
+        Some(peer.with_tunnel(|tunnel| CryptoJob::open(id, tunnel, data, path)))
     }
 
     /// Delivers the `plain_len` bytes of plaintext opened in `data` from peer `id` at `slot`,
@@ -1040,11 +1054,11 @@ impl Core {
     /// Hands out the encryption of a local packet as a job.
     fn seal_job(&mut self, packet: PacketBuf, lookups: &mut Lookups) -> Option<CryptoJob> {
         let (id, slot, packet, len) = self.prepare_send(packet, true, lookups)?;
-        let Some(tunnel) = self.peers.at(slot).and_then(Peer::shared_tunnel) else {
+        let Some(peer) = self.peers.at_mut(slot) else {
             self.pool.put(packet);
             return None;
         };
-        Some(CryptoJob::new(id, tunnel, packet, Direction::Seal { len }))
+        Some(CryptoJob::seal(id, &mut peer.tunnel_mut(), packet, len))
     }
 
     /// Routes a local packet, runs the outbound filters with `filter` and lays the packet out
@@ -1095,12 +1109,12 @@ impl Core {
         if packet.reserve_front(DATA_HEADER_SZ).is_err() {
             // E.g. a slice of a shared buffer: copy it behind the data header of a pooled
             // buffer.
-            let mut copy = self.pool.get((len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+            let mut copy = self.pool.get((len + TAILROOM).max(HANDSHAKE_INIT_SZ));
             copy.set_len(DATA_HEADER_SZ + len);
             copy.as_packet_mut()[DATA_HEADER_SZ..].copy_from_slice(packet.as_packet());
             self.pool.put(mem::replace(&mut packet, copy));
         }
-        packet.set_len((DATA_HEADER_SZ + len + TAIL_ROOM).max(HANDSHAKE_INIT_SZ));
+        packet.set_len((DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ));
         (packet, len)
     }
 
@@ -1328,6 +1342,31 @@ mod tests {
         let kind = message_kind(&data);
         assert_eq!(kind, MessageKind::Keepalive);
         assert!(roams(kind));
+    }
+
+    #[test]
+    fn layout_for_sealing_fits_a_buffer_with_tailroom() {
+        let mut core = Core::new(CoreConfig::default());
+        for len in [40, 1500] {
+            // As a TUN source hands a read over: headroom in front, room for a full-size
+            // packet and the tail room behind it.
+            let mut packet = PacketBuf::with_capacity(1500 + TAILROOM);
+            packet.set_len(len);
+            let capacity = packet.capacity();
+            let ptr = packet.as_packet().as_ptr();
+            let (packet, got) = core.layout_for_sealing(packet);
+            assert_eq!(got, len);
+            // The data header went into the headroom, nothing was reallocated.
+            assert_eq!(packet.capacity(), capacity + DATA_HEADER_SZ);
+            assert_eq!(
+                packet.as_packet().as_ptr(),
+                ptr.wrapping_sub(DATA_HEADER_SZ)
+            );
+            assert_eq!(
+                packet.len(),
+                (DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ)
+            );
+        }
     }
 
     #[test]

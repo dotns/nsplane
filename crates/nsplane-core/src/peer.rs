@@ -16,7 +16,8 @@ enum Tunnel {
     /// [`CryptoJob`]: crate::CryptoJob
     // Boxed, so that a peer stays as small as with a shared tunnel.
     Owned(Box<Tunn>),
-    /// Shared with the peer's [`CryptoJob`]s, behind a lock.
+    /// Behind a lock, in a core that hands out [`CryptoJob`]s. The jobs carry the session
+    /// keys they need and never touch the tunnel, so the lock is uncontended.
     ///
     /// [`CryptoJob`]: crate::CryptoJob
     Shared(Arc<Mutex<Tunn>>),
@@ -94,8 +95,8 @@ impl std::fmt::Debug for Peer {
 }
 
 impl Peer {
-    /// Creates a peer around `tunnel`; a `shared` tunnel goes behind a lock, so that
-    /// [`CryptoJob`]s can use it.
+    /// Creates a peer around `tunnel`; a `shared` tunnel goes behind a lock, for a core
+    /// that hands out [`CryptoJob`]s.
     ///
     /// [`CryptoJob`]: crate::CryptoJob
     pub(crate) fn new(
@@ -128,10 +129,7 @@ impl Peer {
         }
     }
 
-    /// The tunnel; a shared one is locked, uncontended unless a [`CryptoJob`] of this peer
-    /// runs elsewhere.
-    ///
-    /// [`CryptoJob`]: crate::CryptoJob
+    /// The tunnel; a shared one is locked (uncontended).
     pub(crate) fn tunnel_mut(&mut self) -> TunnelMut<'_> {
         match &mut self.tunnel {
             Tunnel::Owned(tunnel) => TunnelMut::Owned(tunnel),
@@ -140,16 +138,15 @@ impl Peer {
     }
 
     /// Reads the tunnel with `f`; a shared one is locked meanwhile.
-    fn with_tunnel<R>(&self, f: impl FnOnce(&Tunn) -> R) -> R {
+    pub(crate) fn with_tunnel<R>(&self, f: impl FnOnce(&Tunn) -> R) -> R {
         match &self.tunnel {
             Tunnel::Owned(tunnel) => f(tunnel),
             Tunnel::Shared(tunnel) => f(&lock(tunnel)),
         }
     }
 
-    /// The shared tunnel, for a [`CryptoJob`]; `None` if the peer owns its tunnel.
-    ///
-    /// [`CryptoJob`]: crate::CryptoJob
+    /// The shared tunnel; `None` if the peer owns its tunnel.
+    #[cfg(test)]
     pub(crate) fn shared_tunnel(&self) -> Option<Arc<Mutex<Tunn>>> {
         match &self.tunnel {
             Tunnel::Owned(_) => None,
