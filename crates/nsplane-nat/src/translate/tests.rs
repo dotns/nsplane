@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use nsplane_core::{PacketFilter, Verdict};
-use nsplane_packet::{HEADROOM, PacketBuf, PacketPool, PeerId, protocol};
+use nsplane_packet::{HEADROOM, PacketBuf, PacketPool, PeerId, TAILROOM, protocol};
 
 use super::fragment::{Limits, Reassembly};
 use super::{REASSEMBLY_LIMITS, Translator, TranslatorStats, reasons};
@@ -689,7 +689,8 @@ fn translate_tight(mut packet: PacketBuf, expected: &[u8]) -> u64 {
     let translator = translator();
     assert_eq!(translator.outbound(PEER, &mut packet), Verdict::Accept);
     assert_eq!(packet.as_packet(), expected);
-    assert!(packet.capacity() >= expected.len());
+    // The grown copy keeps tailroom so sealing it does not reallocate.
+    assert!(packet.capacity() >= expected.len() + TAILROOM);
     assert_eq!(packet.headroom(), HEADROOM);
     translator.stats().grown_copies
 }

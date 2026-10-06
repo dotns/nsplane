@@ -2,8 +2,9 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use nsplane_packet::{Ecn, PacketBuf, Path, PeerId, TransportId};
+use nsplane_packet::{Ecn, PacketBuf, Path, PeerId, SharedPacketPool, TransportId};
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::io::{PacketSink, PacketSource};
@@ -15,10 +16,16 @@ fn closed() -> io::Error {
 }
 
 /// A [`PacketSource`] fed through an [`mpsc::Sender`].
+///
+/// The producers holding the sender can allocate their packets from [`pool`](Self::pool),
+/// which the source refills with the buffers its reader is done with.
 #[derive(Debug)]
 pub struct ChannelSource {
     rx: mpsc::Receiver<PacketBuf>,
     mtu: watch::Receiver<u16>,
+    pool: SharedPacketPool,
+    /// Set by [`pool`](Self::pool); until then the source takes no buffers.
+    pooled: AtomicBool,
 }
 
 impl ChannelSource {
@@ -30,13 +37,40 @@ impl ChannelSource {
     pub fn new(capacity: usize, mtu: u16) -> (Self, mpsc::Sender<PacketBuf>, watch::Sender<u16>) {
         let (tx, rx) = mpsc::channel(capacity);
         let (mtu_tx, mtu_rx) = watch::channel(mtu);
-        (Self { rx, mtu: mtu_rx }, tx, mtu_tx)
+        let source = Self {
+            rx,
+            mtu: mtu_rx,
+            pool: SharedPacketPool::new(capacity),
+            pooled: AtomicBool::new(false),
+        };
+        (source, tx, mtu_tx)
+    }
+
+    /// The pool behind this source's [`PacketSource::recycle`], for the producers holding
+    /// its sender to [`alloc`](SharedPacketPool::alloc) their packets from.
+    ///
+    /// The pool keeps up to the source's `capacity` idle buffers. The first call makes the
+    /// source take the buffers handed to its `recycle` (an engine hands it every packet it
+    /// transmitted); before it, the source takes none. Take the pool before moving the
+    /// source into an engine.
+    pub fn pool(&self) -> SharedPacketPool {
+        self.pooled.store(true, Ordering::Relaxed);
+        self.pool.clone()
     }
 }
 
 impl PacketSource for ChannelSource {
     async fn recv(&mut self) -> io::Result<PacketBuf> {
         self.rx.recv().await.ok_or_else(closed)
+    }
+
+    /// Keeps the buffers for [`pool`](ChannelSource::pool), up to the source's `capacity`
+    /// idle ones; the rest are left. Takes none before the first `pool` call, or while the
+    /// pool is busy.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        if self.pooled.load(Ordering::Relaxed) {
+            self.pool.recycle(bufs);
+        }
     }
 
     fn mtu(&self) -> watch::Receiver<u16> {
@@ -222,6 +256,42 @@ mod tests {
             let err = source.recv().await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         }
+    }
+
+    #[tokio::test]
+    async fn source_declines_before_pool() {
+        let (mut source, tx, _mtu) = ChannelSource::new(2, 1420);
+        tx.send(PacketBuf::from_packet(&[1])).await.unwrap();
+        let mut bufs = vec![source.recv().await.unwrap()];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(source.pool.free_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_reuses_what_the_source_recycles() {
+        let (mut source, tx, _mtu) = ChannelSource::new(2, 1420);
+        let pool = source.pool();
+        let mut packet = pool.alloc(1400);
+        assert_eq!(packet.headroom(), HEADROOM);
+        packet.as_packet_mut().fill(3);
+        let addr = packet.as_packet().as_ptr();
+        tx.send(packet).await.unwrap();
+        let packet = source.recv().await.unwrap();
+        assert_eq!(packet.as_packet(), [3; 1400]);
+
+        let mut bufs = vec![
+            PacketBuf::with_capacity(8),
+            PacketBuf::with_capacity(8),
+            packet,
+        ];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(pool.free_len(), 2);
+        let first = pool.alloc(64);
+        let second = pool.alloc(64);
+        assert!([first.as_packet().as_ptr(), second.as_packet().as_ptr()].contains(&addr));
+        assert_eq!(pool.allocated(), 1);
     }
 
     #[tokio::test]
