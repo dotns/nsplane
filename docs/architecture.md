@@ -1027,6 +1027,28 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- Path MTU discovery for the stack's own TCP (ns MB-x7, RFC 1191 / RFC 8201): an ICMP
+  Destination Unreachable / Fragmentation Needed (type 3 code 4, next-hop MTU in bytes 6-7)
+  or an `ICMPv6` Packet Too Big (type 2, MTU in bytes 4-7) to a stack address lowers the
+  MSS of the connection whose segment it quotes to `mtu - 40` (IPv4) or `mtu - 60` (IPv6),
+  so a stack at 1420 over a path whose inner MTU is smaller (a 1376 relay path) does not
+  stall on segments the path drops. The quote must be a TCP segment (IP header and at
+  least 8 bytes: ports and sequence number) of the message's family from the stack's
+  address, on the `(local, remote)` tuple of a live connection (SYN-RECEIVED or later),
+  with its sequence number within `SND.UNA..SND.NXT`; the MTU must be at least 576 (IPv4,
+  the stack's `MIN_MTU`) or 1280 (IPv6), below the configured MTU and below the
+  connection's current path MTU (it never goes up). An IPv4 message with MTU 0 (pre-RFC
+  1191 routers) is ignored, with no plateau guess. Anything else of those two types is
+  dropped and counted in `NetStackStats::icmp_ignored`; other ICMP messages count as
+  `unsupported`, as before. Checksums are not verified, as for the rest of the ingress.
+  Applying a message calls the fork's `tcp::Socket::reduce_mss`, which resends the data in
+  flight at once from `SND.UNA` in segments of the new size, without a congestion window
+  or timer back-off (the drop was not congestion). The connection is found by a scan of
+  the socket set per message, so nothing is stored and the TCP path is unchanged: ICMP was
+  already classified after TCP and UDP. The lowered MSS lasts for the connection (no
+  increase probing, RFC 1191's 10-minute timer is not implemented). UDP is out of scope:
+  datagrams are sent with DF and an oversize one fails with `InvalidInput` at the
+  configured MTU.
 - `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (default `None`: the 512 segments
   above) size every TCP socket's buffers, listener pool sockets included, clamped to one
   IPv4 MSS (`mtu - 40`) at least and `65535 << 14` (the largest window TCP can advertise,
@@ -1140,10 +1162,11 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.4`, branch
-  `nsplane/v0.14-perf`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.5`, branch
+  `nsplane/v0.14-pmtu`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
   fixes for four defects that stalled connections for good under loss when both ends send
-  (an echo, request and response), and five throughput changes (ON) listed after them.
+  (an echo, request and response), five throughput changes (ON) listed after them, and
+  `tcp::Socket::reduce_mss` for path MTU discovery (above).
   - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
     oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
     received past that point (only its ACKs were lost), the peer dropped those ACKs as old,

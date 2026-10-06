@@ -69,6 +69,15 @@ Tag `v0.14.0-nsplane.4` (`b4a44da877b7e2aee07fa232e7a2c6e867bfee3e`, branch
 With them four netstack TCP streams reach at least the one-stream rate on the default
 configuration (quiet harness: 6.85 / 7.29 Gbit/s for one / four streams, `.3`: 6.21 / 2.48).
 
+Tag `v0.14.0-nsplane.5` (`cf04a5b9cb0bf1a206ae0b7cb811c70420a02081`, branch
+`nsplane/v0.14-pmtu` on top of `.4`) adds `tcp::Socket::reduce_mss(timestamp, mss, seq)`
+for path MTU discovery (ns MB-x7): smoltcp has no ICMP handling for its TCP sockets and no
+way to lower a live socket's MSS. The call lowers the MSS of a synchronized connection
+when the quoted `seq` lies within `SND.UNA..SND.NXT` and `mss` is below the current one,
+and resends the data in flight at once in segments of the new size, without a congestion
+or timer back-off (RFC 1191 section 7). `nsplane-netstack` reads the ICMP messages and
+calls it.
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.

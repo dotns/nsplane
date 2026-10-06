@@ -53,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
   `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
 
+- nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
+  two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
+  send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
+  `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
+- `nsplane-netstack`: path MTU discovery for the stack's own TCP (ns MB-x7). An ICMP
+  Fragmentation Needed or `ICMPv6` Packet Too Big that quotes a segment of a live connection
+  (tuple and sequence number checked; MTU at least 576 / 1280, below the configured MTU and
+  the connection's current one) lowers that connection's MSS and resends the data in flight
+  at once in smaller segments, so a stack at 1420 no longer stalls over a 1376 relay path.
+  Other such messages are dropped and counted in the new `NetStackStats::icmp_ignored`;
+  other ICMP still counts as `unsupported` (a new field: breaking for code that builds
+  `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
+  (`tcp::Socket::reduce_mss`).
 ### Changed
 - nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
   so a burst the driver routes in one step fits one UDP flow or socket queue. Harness netstack
