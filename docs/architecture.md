@@ -1287,6 +1287,31 @@ reverted; follow-up). Idle request/response latency is unchanged (p50 / p99 0.02
 0.941 to 0.280 / 1.271 ms in this run: the stream now keeps more in flight (it is 10 %
 faster and no longer backs off after losses). Not analysed further here (follow-up).
 
+The sender alone, without engine, crypto or loss: `benches/send_stream.rs` in
+`nsplane-netstack` (criterion) wires two netstacks back to back in process and sends 8 MiB per
+iteration over one or four persistent connections at the default MTU and configuration, on
+four runtime workers (`netstack_send`) and on one thread (`netstack_send_1cpu`, both ends'
+summed cost):
+
+```text
+cargo bench -p nsplane-netstack --bench send_stream
+```
+
+`.3` against `.4` (MF-5), 15 alternating pairs pinned to CPUs 2-5, 2026-10-06, 1-minute load
+1.6-9.4 (32 cores); medians in MB/s [IQR], and `.4` against `.3` per pair:
+
+| Case | `.3` | `.4` | `.4` vs `.3` (IQR; pairs faster) |
+| --- | --- | --- | --- |
+| 1 stream, 4 workers | 2558 [2500-2692] | 2748 [2659-2764] | +2.1 % (+0.3..+8.9; 12/15) |
+| 4 streams, 4 workers | 3620 [3303-3681] | 4063 [3995-4129] | +12.8 % (+10.0..+16.7; 14/15) |
+| 1 stream, 1 thread | 2501 [2466-2521] | 2538 [2499-2546] | +1.5 % (+0.5..+1.9; 13/15) |
+| 4 streams, 1 thread | 2099 [2055-2116] | 2083 [1953-2091] | -0.9 % (-2.8..-0.2; 4/15) |
+
+One sending stream costs nothing on `.4`: it is 1.5-2 % faster, so the SWS hold and Limited
+Transmit cost the loss-free single stream nothing measurable (not bisected further). The -5.3 % ns measured on a loud host
+(range -28..+16 %) is inside that host's spread; the one pair here below -6 % (-31 %) ran at
+load 9.
+
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
 change (sink drops in one 8-connection run at 512, recovered in 2.2 s); before it, the

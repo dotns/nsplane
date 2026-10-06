@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
 - `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
   segment over a pseudo-header, as a full recomputation returning zero would.
+- nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
+  two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
+  send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
+  `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
 
 ### Changed
 - `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
