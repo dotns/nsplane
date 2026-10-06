@@ -26,12 +26,18 @@ libc = "0.2"
 # JUSTIFICATION: Wintun is the only userspace TUN driver on Windows; the bindings load the
 # signed wintun.dll at runtime (docs/decisions/2026-10-01-wintun.md).
 wintun-bindings = "0.7.40"
+# JUSTIFICATION: hashes wintun.dll against the caller's pin before it is loaded.
+sha2 = "0.10.9"
+# JUSTIFICATION: ConvertInterfaceAliasToLuid for the exclusive adapter-name check; the same
+# version and features wintun-bindings already pulls in.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures-core = "0.3.32"
 nsplane-netstack = { path = "../nsplane-netstack", version = "0.10.0" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.10.0" }
+sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [[bench]]
