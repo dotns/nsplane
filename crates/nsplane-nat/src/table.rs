@@ -117,11 +117,13 @@ impl Lan {
 #[derive(Debug, Clone, Default)]
 pub struct TranslationTable {
     peers: HashMap<PeerId, PeerMapping>,
-    by_alias4: HashMap<Ipv4Addr, PeerId>,
-    by_alias6: HashMap<Ipv6Addr, PeerId>,
-    by_node4: HashMap<Ipv6Addr, PeerId>,
-    by_node6: HashMap<Ipv6Addr, PeerId>,
-    by_native_alias4: HashMap<Ipv4Addr, PeerId>,
+    // The address indexes hold a copy of the mapping: one hash lookup per
+    // translated packet instead of two.
+    by_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
+    by_alias6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
+    by_node4: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
+    by_node6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
+    by_native_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
     native_alias4: HashMap<PeerId, Ipv4Addr>,
     self_mapping: Option<SelfMapping>,
     /// LAN pairs sorted by `start4`, non-overlapping.
@@ -143,29 +145,39 @@ impl TranslationTable {
 
     /// Returns the peer whose `alias4` is `addr`.
     pub fn by_alias4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.resolve(self.by_alias4.get(&addr))
+        self.by_alias4
+            .get(&addr)
+            .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `alias6` is `addr`.
     pub fn by_alias6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.resolve(self.by_alias6.get(&addr))
+        self.by_alias6
+            .get(&addr)
+            .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node4` is `addr` (the self mapping is not included).
     pub fn by_node4(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.resolve(self.by_node4.get(&addr))
+        self.by_node4
+            .get(&addr)
+            .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node6` is `addr`.
     pub fn by_node6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.resolve(self.by_node6.get(&addr))
+        self.by_node6
+            .get(&addr)
+            .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose native IPv4 alias (an IPv4 address translated to
     /// and from its `node6`; see
     /// [`TranslationTableBuilder::peer_with_native_alias4`]) is `addr`.
     pub fn by_native_alias4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.resolve(self.by_native_alias4.get(&addr))
+        self.by_native_alias4
+            .get(&addr)
+            .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the native IPv4 alias of `peer`, if it has one.
@@ -208,11 +220,6 @@ impl TranslationTable {
         self.lans
             .get(index.checked_sub(1)?)
             .filter(|lan| lan.contains4(addr))
-    }
-
-    fn resolve(&self, peer: Option<&PeerId>) -> Option<(PeerId, &PeerMapping)> {
-        let peer = *peer?;
-        self.peers.get(&peer).map(|mapping| (peer, mapping))
     }
 }
 
@@ -306,19 +313,19 @@ impl TranslationTableBuilder {
             }
             unique6(mapping.node6)?;
             unique6(mapping.node4)?;
-            table.by_node6.insert(mapping.node6, id);
-            table.by_node4.insert(mapping.node4, id);
+            table.by_node6.insert(mapping.node6, (id, mapping));
+            table.by_node4.insert(mapping.node4, (id, mapping));
             if let Some(alias6) = mapping.alias6 {
                 unique6(alias6)?;
-                table.by_alias6.insert(alias6, id);
+                table.by_alias6.insert(alias6, (id, mapping));
             }
             if let Some(alias4) = mapping.alias4 {
                 unique4(alias4)?;
-                table.by_alias4.insert(alias4, id);
+                table.by_alias4.insert(alias4, (id, mapping));
             }
             if let Some(alias) = native_alias4 {
                 unique4(alias)?;
-                table.by_native_alias4.insert(alias, id);
+                table.by_native_alias4.insert(alias, (id, mapping));
                 table.native_alias4.insert(id, alias);
             }
         }

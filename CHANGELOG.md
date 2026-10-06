@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConfigChange::SetInboundDestinationSource` and `nsplane`
   `EngineHandle::set_inbound_destination_source` set it, replacing an owned list (and an owned
   list replaces it). Owned lists and unchecked peers cost what they did.
+- `nsplane-wss`: `WssConfig::ping_interval(Option<Duration>)`; `None` (stored as a zero
+  `ping_interval`, as `keepalive(Duration::ZERO, idle)` does) sends no keepalive pings on
+  `WssDialer` links, `WssStreamClient` sessions and `WssStreamServer` sessions, with no ping
+  task or timer; the read idle still ends a silent link. The default stays a 10 s ping.
 - `nsplane`: `Splitter::new_map(route)`, a splitter whose closure
   (`Fn(PeerId, &mut PacketBuf) -> usize`) rewrites each packet in place and then picks the
   sink, e.g. a Redirect or Masquerade decision that routes; otherwise as `Splitter::new`
@@ -45,11 +49,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same name; `mtu(n)` sets the interface MTU and `Tun::mtu` reports the read-back value;
   `offload` is accepted and ignored. Refusals are `WintunError` (`HashMismatch`,
   `DriverVersionMismatch`, `AdapterExists`) inside the `io::Error`. `Tun::create` is unchanged.
+- `nsplane-nat`: a criterion bench of the `Translator` on the `alias4` path
+  (`cargo bench -p nsplane-nat --bench translate`): outbound IPv4 TCP / UDP to an `alias4`
+  and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
+- `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
+  segment over a pseudo-header, as a full recomputation returning zero would.
 
 ### Changed
+- `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
+  transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
+  them too, about 4x faster on a full-size packet), the reassembly clock is read only for
+  fragments, IPv6 to IPv4 writes the IPv4 header in front of the payload and moves the
+  packet start instead of the payload (the headroom grows by 20 or 28 bytes), and a
+  `TranslationTable` address lookup is one hash instead of two. Per packet, 2026-10-06, load
+  2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
+  69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
 - `nsplane-core`: `Event::Authenticated` is emitted once per off-path source change (since the
   peer's path was last set or a handshake completed), not per message; `PathPolicy::on_authenticated`
   is still called per message.
+
+### Fixed
+- `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
+  it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
+  source and it allocated every buffer.
 
 ## [0.10.0] - 2026-10-05
 
