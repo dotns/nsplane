@@ -43,8 +43,13 @@ fn ended(result: io::Result<()>) -> io::Result<bool> {
 /// ```
 ///
 /// Each round takes one [`PacketSource::recv_batch`] and hands it to
-/// [`PacketSink::send_batch`]; the batch and the delivery queue are allocated once. It
+/// [`PacketSink::send_batch_spent`]; the batch and the delivery queue are allocated once. It
 /// awaits the sink while it applies backpressure and never drops a packet.
+///
+/// The buffers the sink appends to `spent` go to [`PacketSource::recycle`] before the next
+/// `recv_batch`, so a source with a pool (a [`pipe`](crate::pipe) whose producers
+/// [`alloc`](crate::PipeSink::alloc)) reads into them again. If the source takes none of
+/// the first buffers offered, the pump calls plain [`PacketSink::send_batch`] from then on.
 ///
 /// It ends with `Ok` once either side returns [`io::ErrorKind::BrokenPipe`]; packets the
 /// source appended before its error are delivered first. Any other error from either side
@@ -53,7 +58,8 @@ fn ended(result: io::Result<()>) -> io::Result<bool> {
 /// Cancellation-safe at batch boundaries: dropping the future while it waits for the source
 /// loses nothing (as far as the source's `recv_batch` is cancellation-safe); dropping it
 /// while it waits for the sink loses at most the batch in flight, the packets taken from the
-/// source but not taken over by the sink yet. Either way it drops the source and the sink.
+/// source but not taken over by the sink yet, and the spent buffers not recycled yet. Either
+/// way it drops the source and the sink.
 pub async fn pump(
     mut source: impl PacketSource,
     sink: impl PacketSink,
@@ -62,19 +68,34 @@ pub async fn pump(
     let mut stats = PumpStats::default();
     let mut batch = PacketBatch::new();
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
+    let mut spent = Vec::new();
+    // Whether spent buffers are still collected, and whether the source took any yet.
+    let (mut recycling, mut recycled) = (true, false);
     loop {
         let received = source.recv_batch(&mut batch).await;
         packets.extend(batch.drain().map(|packet| (from, packet)));
         let mut sent = Ok(());
         if !packets.is_empty() {
             let queued = packets.len();
-            sent = sink.send_batch(&mut packets).await;
+            sent = if recycling {
+                sink.send_batch_spent(&mut packets, &mut spent).await
+            } else {
+                sink.send_batch(&mut packets).await
+            };
             // On an error the packet that failed is dropped, not taken over.
             let taken = queued.saturating_sub(packets.len() + usize::from(sent.is_err()));
             stats.packets += taken as u64;
             if sent.is_ok() {
                 stats.batches += 1;
             }
+        }
+        if !spent.is_empty() {
+            let offered = spent.len();
+            source.recycle(&mut spent);
+            // A source that declines the first offer keeps the default `recycle`.
+            recycled |= spent.len() < offered;
+            recycling = recycled;
+            spent.clear();
         }
         let sink_ended = ended(sent)?;
         if ended(received)? || sink_ended {
@@ -88,6 +109,7 @@ mod tests {
     use super::*;
     use crate::{ChannelSink, ChannelSource};
     use nsplane_packet::PacketBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::watch;
     use tokio::time::timeout;
@@ -129,6 +151,167 @@ mod tests {
         ) -> impl Future<Output = io::Result<()>> + Send {
             std::future::ready(Err(io::Error::other("sink failed")))
         }
+    }
+
+    /// What a [`ScriptSource`] and a [`SpentSink`] saw, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Seen {
+        /// A `recv_batch` call.
+        Recv,
+        /// A `recycle` offer of this many buffers.
+        Recycle(usize),
+        /// A packet the sink took through `send_batch_spent`.
+        Spent(u8),
+        /// A packet the sink took through `send`, i.e. plain `send_batch`.
+        Plain(u8),
+    }
+
+    type Log = Arc<Mutex<Vec<Seen>>>;
+
+    fn log(seen: &Log, event: Seen) {
+        if let Ok(mut seen) = seen.lock() {
+            seen.push(event);
+        }
+    }
+
+    /// A source that yields `packets` one per batch, then ends; takes recycled buffers
+    /// only if `takes`.
+    struct ScriptSource {
+        packets: VecDeque<u8>,
+        takes: bool,
+        seen: Log,
+    }
+
+    impl PacketSource for ScriptSource {
+        fn recv(&mut self) -> impl Future<Output = io::Result<PacketBuf>> + Send {
+            std::future::ready(Err(io::ErrorKind::Unsupported.into()))
+        }
+
+        fn recv_batch(
+            &mut self,
+            batch: &mut PacketBatch,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            log(&self.seen, Seen::Recv);
+            let result = self.packets.pop_front().map_or_else(
+                || Err(io::ErrorKind::BrokenPipe.into()),
+                |byte| {
+                    let _ = batch.push(PacketBuf::from_packet(&[byte]));
+                    Ok(())
+                },
+            );
+            std::future::ready(result)
+        }
+
+        fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+            log(&self.seen, Seen::Recycle(bufs.len()));
+            if self.takes {
+                bufs.clear();
+            }
+        }
+
+        fn mtu(&self) -> watch::Receiver<u16> {
+            watch::channel(1420).1
+        }
+    }
+
+    /// A sink that returns every buffer it took through `send_batch_spent`.
+    struct SpentSink(Log);
+
+    impl PacketSink for SpentSink {
+        fn send(
+            &self,
+            packet: PacketBuf,
+            _from: PeerId,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            log(&self.0, Seen::Plain(packet.as_packet()[0]));
+            std::future::ready(Ok(()))
+        }
+
+        fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            for (_, packet) in packets.drain(..) {
+                log(&self.0, Seen::Spent(packet.as_packet()[0]));
+                spent.push(packet);
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn script(packets: &[u8], takes: bool) -> (ScriptSource, Log) {
+        let seen = Log::default();
+        let source = ScriptSource {
+            packets: packets.iter().copied().collect(),
+            takes,
+            seen: Arc::clone(&seen),
+        };
+        (source, seen)
+    }
+
+    fn seen(log: &Log) -> Vec<Seen> {
+        log.lock().map(|seen| seen.clone()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn default_send_batch_spent_appends_nothing() -> TestResult {
+        let (sink, mut rx) = ChannelSink::new(4);
+        let mut packets: VecDeque<_> = (0..3)
+            .map(|i| (PeerId::new(1), PacketBuf::from_packet(&[i])))
+            .collect();
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert!(spent.is_empty());
+        for i in 0..3 {
+            assert_eq!(rx.recv().await.ok_or("sink closed")?.1.as_packet(), [i]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_buffers_reach_recycle_before_the_next_read() -> TestResult {
+        let (source, seen_log) = script(&[1, 2, 3], true);
+        let stats = pump(source, SpentSink(Arc::clone(&seen_log)), PeerId::new(1)).await?;
+        assert_eq!(stats.packets, 3);
+        let mut expected = Vec::new();
+        for i in 1..=3 {
+            expected.extend([Seen::Recv, Seen::Spent(i), Seen::Recycle(1)]);
+        }
+        expected.push(Seen::Recv);
+        assert_eq!(seen(&seen_log), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declining_source_ends_the_offers() -> TestResult {
+        let (source, seen_log) = script(&[1, 2, 3], false);
+        let stats = pump(source, SpentSink(Arc::clone(&seen_log)), PeerId::new(1)).await?;
+        assert_eq!(stats.packets, 3);
+        assert_eq!(
+            seen(&seen_log),
+            [
+                Seen::Recv,
+                Seen::Spent(1),
+                Seen::Recycle(1),
+                Seen::Recv,
+                Seen::Plain(2),
+                Seen::Recv,
+                Seen::Plain(3),
+                Seen::Recv,
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_sink_offers_nothing() -> TestResult {
+        let (source, seen_log) = script(&[1, 2], true);
+        let (sink, _rx) = ChannelSink::new(4);
+        assert_eq!(pump(source, sink, PeerId::new(1)).await?.packets, 2);
+        assert_eq!(seen(&seen_log), [Seen::Recv; 3]);
+        Ok(())
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nsplane_packet::PeerId;
+use nsplane_packet::hash::KeyedState;
 use thiserror::Error;
 
 /// Prefix length of every LAN IPv6 prefix: the IPv4 address fills the low 32 bits.
@@ -120,16 +121,18 @@ pub struct TranslationTable {
     // The address indexes hold a copy of the mapping: one hash lookup per
     // translated packet instead of two.
     by_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
-    by_alias6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
-    by_node4: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
-    by_node6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
+    // The IPv6 indexes are keyed by the address bits and use the cheaper
+    // [`KeyedState`] hash: the inbound path looks one up per packet.
+    by_alias6: Ipv6Map<(PeerId, PeerMapping)>,
+    by_node4: Ipv6Map<(PeerId, PeerMapping)>,
+    by_node6: Ipv6Map<(PeerId, PeerMapping)>,
     by_native_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
     native_alias4: HashMap<PeerId, Ipv4Addr>,
     self_mapping: Option<SelfMapping>,
     /// LAN pairs sorted by `start4`, non-overlapping.
     lans: Vec<Lan>,
     /// `lan6` prefix to index into `lans`.
-    by_lan6: HashMap<u128, usize>,
+    by_lan6: Ipv6Map<usize>,
 }
 
 impl TranslationTable {
@@ -153,21 +156,21 @@ impl TranslationTable {
     /// Returns the peer whose `alias6` is `addr`.
     pub fn by_alias6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_alias6
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node4` is `addr` (the self mapping is not included).
     pub fn by_node4(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_node4
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node6` is `addr`.
     pub fn by_node6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_node6
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
@@ -313,11 +316,15 @@ impl TranslationTableBuilder {
             }
             unique6(mapping.node6)?;
             unique6(mapping.node4)?;
-            table.by_node6.insert(mapping.node6, (id, mapping));
-            table.by_node4.insert(mapping.node4, (id, mapping));
+            table
+                .by_node6
+                .insert(mapping.node6.to_bits(), (id, mapping));
+            table
+                .by_node4
+                .insert(mapping.node4.to_bits(), (id, mapping));
             if let Some(alias6) = mapping.alias6 {
                 unique6(alias6)?;
-                table.by_alias6.insert(alias6, (id, mapping));
+                table.by_alias6.insert(alias6.to_bits(), (id, mapping));
             }
             if let Some(alias4) = mapping.alias4 {
                 unique4(alias4)?;
@@ -366,6 +373,14 @@ impl TranslationTableBuilder {
     }
 }
 
+/// A map keyed by IPv6 address bits, hashed with [`KeyedState`].
+///
+/// The keys are addresses an attacker chooses, but hash flooding cannot grow
+/// a chain from traffic: the maps are filled only from the operator's model
+/// when a table is built, and packets only look them up, so the worst-case
+/// chain length is bounded by the model.
+type Ipv6Map<V> = HashMap<u128, V, KeyedState>;
+
 /// Checks the shape of one LAN prefix pair and converts it to lookup form.
 fn validate_lan(lan: &LanPrefix) -> Result<Lan, TableError> {
     let (addr4, len4) = lan.lan4;
@@ -388,6 +403,8 @@ fn validate_lan(lan: &LanPrefix) -> Result<Lan, TableError> {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::BuildHasher;
+
     use super::*;
 
     fn v6(s: &str) -> Ipv6Addr {
@@ -799,6 +816,25 @@ mod tests {
         assert_eq!(
             TableError::InvalidLan4(v4("10.0.0.1"), 8).to_string(),
             "invalid LAN IPv4 prefix 10.0.0.1/8"
+        );
+    }
+
+    fn hash(state: &KeyedState, addr: Ipv6Addr) -> u64 {
+        state.hash_one(addr.to_bits())
+    }
+
+    #[test]
+    fn ipv6_hash_is_keyed_per_table() {
+        let (one, two) = (sample(), sample());
+        let (a, b) = (one.by_node6.hasher(), two.by_node6.hasher());
+        let addr = v6("fd00::1");
+        assert_ne!(hash(a, addr), hash(b, addr));
+        // A clone keeps its keys, so its lookups still find the entries.
+        let clone = one.clone();
+        assert_eq!(hash(clone.by_node6.hasher(), addr), hash(a, addr));
+        assert_eq!(
+            clone.by_node6(mapping(1).node6),
+            one.by_node6(mapping(1).node6)
         );
     }
 }

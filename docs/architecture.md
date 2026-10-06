@@ -14,7 +14,7 @@ and narrow trait callbacks. What nsplane does and does not do is listed in ADR
 | Crate | Path | Role |
 |---|---|---|
 | `nsplane-noise` | `crates/nsplane-noise/` | The Noise protocol state machine (`noise`); no I/O |
-| `nsplane-packet` | `crates/nsplane-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `PacketBatch`), IP header views, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
+| `nsplane-packet` | `crates/nsplane-packet/` | Packet buffers (`PacketBuf`, `PacketPool`, `SharedPacketPool`, `PacketBatch`), IP header views, checksums, a keyed hasher, shared value types (`PeerId`, `TransportId`, `Path`, `Ecn`) |
 | `nsplane-core` | `crates/nsplane-core/` | Sans-I/O engine core: peers, cryptokey routing, timers, path policy, packet filters |
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, the fragmentation stage (`FragmentConfig`) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Accept-only ACL policy engine (`AclEngine`), the `AclFilter` and `FlowTracker` packet filters |
@@ -44,16 +44,16 @@ where it is described below.
 | Crate | Entry points | Supporting types |
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`), `MergeSource`, `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`), `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
-| `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
+| `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
+| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink`, `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource`, `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
-| `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
+| `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
@@ -83,6 +83,34 @@ the socket addresses (an IPv4-mapped address in a `SocketAddr::V6` builds IPv6).
 families and payloads beyond the length fields are a `UdpBuildError` and leave the buffer
 unchanged. Ported from ns's control-message builder; nothing calls it unless the application
 does.
+
+`nsplane-packet::pool::SharedPacketPool` (re-exported at the crate root and by `nsplane`) is a
+bounded free list of packet buffers shared by producers and a source, for the local side's
+pooled allocation (MR-1): `new(max_free)`; `alloc(len) -> PacketBuf` returns `len` bytes
+behind `HEADROOM` with `capacity() >= len + TAILROOM`, bytes unspecified (a reused buffer
+that is too small grows; a fresh one is zero-filled to `len`); `alloc_from(&[u8]) ->
+PacketBuf` copies a packet without zero-filling first; `recycle(&mut Vec<PacketBuf>)` takes
+buffers until `max_free` are idle and leaves the rest; `free_len()`; `allocated() -> u64`
+counts the fresh allocations. It is a `Mutex<PacketPool>` that is only ever `try_lock`ed plus
+an `AtomicBool` hint, so `alloc` skips the lock while the list is empty: lossy (a busy or full
+list takes nothing, a busy or empty one makes `alloc` allocate), never waits, callable from
+any thread; clones share the list. No `unsafe`.
+
+`nsplane-packet::checksum::sum_words(acc: u64, data: &[u8]) -> u64` adds `data` as
+big-endian 16-bit words without folding (an odd trailing byte is padded with a zero low byte;
+only the last slice of a chain may be odd); the result is congruent modulo `0xFFFF` to the
+16-bit sum and each call adds less than 2^18, so a chained `u64` does not overflow.
+`checksum::fold(acc: u64) -> u16` (`const`) folds it, not complemented. The bulk is summed as
+native-order 32-bit words (RFC 1071 section 2); `internet_checksum`, the IPv4 header and
+transport checksums and `nsplane-nat`'s `checksum::sum` all use this one implementation.
+
+`nsplane-packet::hash::KeyedState` is a `BuildHasher` (`Default` draws two fresh random keys
+from std's `RandomState`; a clone keeps them; `Debug` does not show them) building
+`hash::KeyedHasher`s: one 64x64->128-bit multiply-fold per word, fast paths for `u8` to
+`u128`, a length-tagged generic `write`. The secret per-instance keys resist hash flooding
+for maps whose contents are not chosen by the party that drives the lookups; it is not a
+cryptographic hash. `nsplane-nat`'s `TranslationTable` IPv6 indexes (`u128` keys) and
+`nsplane-acl`'s node L3 gate use it.
 
 Not public API: `nsplane-cli` (a binary), `nsplane-e2e` (test harness) and
 `nsplane-examples` (example binaries, including the single-port relay and its client
@@ -235,7 +263,9 @@ for a transport to its transmit task as one message (the transmit queue stays bo
 datagrams), and transmitted buffers go back to the source task one message per sent batch,
 over a lossy bounded queue, for `PacketSource::recycle` (`TunSource` reads into them
 again); a source that keeps the default no-op gets none after the first, and the buffers go
-to the core's pool as before.
+to the core's pool as before. Sources that recycle: `TunSource` (Wintun too), `SlotSource`,
+`HostTunSource`, `PipeSource` and `ChannelSource` (once pooled, see below), and the wrappers
+`MapSource`, `MergeSource` and `Nat64LanSource` around them.
 
 Inline output: without crypto workers and while not suspended, the owner sends a drain's
 datagrams itself (`Transport::try_send_batch`) when nothing of that transport is in its
@@ -333,7 +363,7 @@ owner sends inline only when no input is waiting, so under load `transmit` (and 
 rise as before; `deliver` stays low or at 0 while the sink keeps up, and rises only once
 the sink falls behind and packets fall back to the sink task. `recycle` counts only the
 buffers a transmit task returns to the owner. With a source that recycles (`TunSource`,
-or a `MapSource` around one) every transmitted buffer, inline-sent ones included, goes back
+or a `MapSource` around one; the list is above) every transmitted buffer, inline-sent ones included, goes back
 to the source instead and `recycle` stays at 0; otherwise inline-sent buffers go back to
 the core directly.
 
@@ -493,7 +523,12 @@ reads up to 16 datagrams per `recvmmsg` until a train arrives. With offload off,
 address and ECN mark go out with `sendmmsg` and `recv_batch` reads up to 16 datagrams per
 `recvmmsg`: batching, not offload, as every datagram stays its own message.
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
-and embedders.
+and embedders. `ChannelSource::new` returns a raw `mpsc::Sender`, so pooled allocation goes
+through `ChannelSource::pool() -> SharedPacketPool` (MR-1; `max_free` = `capacity`): the
+producers holding the sender `alloc` from it and consumers may `recycle` into it, and
+`ChannelSource::recycle` refills it with the engine's transmitted buffers once `pool()` was
+called (take the pool before moving the source into an engine); before that the source
+declines as before.
 
 **UDP side channel.** Another protocol can share the `UdpTransport`'s port (ns control
 messages next to WireGuard, say). `UdpTransport::with_side_channel(classify, capacity)`
@@ -630,7 +665,11 @@ core whatever their size.
 For a hybrid local side, e.g. a TUN device next to a userspace netstack, `Splitter` is a
 `PacketSink` that routes each delivered packet to one of several sinks by a closure
 (`Fn(PeerId, &PacketBuf) -> usize`) and `MergeSource` is a `PacketSource` that serves
-several sources round-robin and reports the smallest of their MTUs. The splitter awaits
+several sources round-robin and reports the smallest of their MTUs. `MergeSource::recycle`
+holds up to 64 buffers (no allocation until the first) and hands them to the next input
+whose `recv` completes, before re-arming it; that input takes what its pool allows and the
+rest are dropped, ended inputs get none; unused it costs one `is_empty` check per packet.
+The splitter awaits
 only the chosen sink, but a waiting sink still holds back the engine's next delivery;
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
 `Splitter::stats` returns a `SplitterStats` snapshot (`#[non_exhaustive]`): `misrouted`, and
@@ -654,12 +693,34 @@ decisions, not packet loops:
   engine's input without a forwarding task. `send` waits while the pipe is full; once the
   source is dropped it returns `BrokenPipe`, and once every `PipeSink` clone is dropped the
   source returns `BrokenPipe` after draining. The `from` peer is not carried.
-  `PipeSource::mtu_sender` changes the MTU the source reports.
+  `PipeSource::mtu_sender` changes the MTU the source reports. Pooled allocation (MR-1):
+  `PipeSink::alloc(len) -> PacketBuf` takes a packet from the pipe's `SharedPacketPool`
+  (`max_free` = `capacity`; contract as `SharedPacketPool::alloc`), and
+  `PipeSink::recycle(&mut Vec<PacketBuf>)` hands buffers back to it, e.g. a consumer
+  returning what a `ChannelSink` delivered. `PipeSource::recycle` puts the engine's
+  transmitted buffers into that pool once some producer called `alloc`; before that it
+  declines the first offer and the engine stops offering, as before. A producer that starts
+  allocating after traffic began therefore gets only what consumers return. Unused, `send`
+  and `recv` are unchanged.
 - `pump(source, sink, from)` moves every packet from a source into a sink in order, one
   `recv_batch` and one `send_batch` per round, and awaits the sink's backpressure instead of
   dropping. It ends with `Ok(PumpStats { packets, batches })` once either side returns
   `BrokenPipe` and returns any other error. Cancelled while it waits for the source it
   loses nothing; while it waits for the sink, at most the batch in flight.
+  Sink-side return (MR-3): `pump` delivers with `PacketSink::send_batch_spent(&self,
+  packets: &mut VecDeque<(PeerId, PacketBuf)>, spent: &mut Vec<PacketBuf>)`, a default
+  method that delivers like `send_batch` and appends the buffers the sink no longer
+  references (written out or dropped); order, backpressure, errors and cancellation are
+  those of `send_batch`, and `spent` may stay empty (the default calls `send_batch` and
+  appends nothing). `TunSink` overrides it: plain, vnet and Wintun writes append every taken
+  buffer after its write, the TSO writer a coalesced chunk's buffers once the chunk is
+  written, a non-IP packet is dropped without being appended. `pump` hands `spent` to
+  `PacketSource::recycle` before its next `recv_batch`; if the source takes none of the
+  first non-empty offer, it uses plain `send_batch` for the rest of its run (later offers
+  that take nothing do not switch it off). A cancel also drops spent buffers not yet
+  recycled (buffers, never packets); `PumpStats` are unchanged; a default sink costs one
+  `is_empty` branch per batch. The wrappers (`MapSink`, `SwapSink`, `AbortSink`, `Splitter`)
+  keep the default, so the loop closes only for a bare sink or one that forwards it.
 
 ```text
 TUN source ─► pump ─► Splitter ─┬─► pipe ─► MergeSource ─► engine A
@@ -942,6 +1003,10 @@ on Windows), so a caller learns it without opening the device itself (MT-4).
   `TunSource` implements `PacketSource::recycle`: the engine hands transmitted buffers back
   and the source puts them into its pool up to its bound, so reads stop allocating;
   pooled buffers keep their initialized bytes, so a reused buffer is not zero-filled again.
+  `SlotSource` does the same (its pool keeps up to 64 idle buffers, the rest are dropped).
+  The Wintun `TunSource` hands them back to the reader thread over a 64-slot channel, and
+  the thread's pool keeps up to 64 idle ones; excess buffers are dropped and neither side
+  waits (not run on a real Windows host yet).
   `TunSource::recv_batch` keeps reading without waiting after the first packet, until
   `EAGAIN`, a full batch or a split GSO read, so plain packets (no TSO: UDP, small packets,
   no offload) come in batches; a lone packet still returns at once.
@@ -1007,9 +1072,10 @@ on Windows), so a caller learns it without opening the device itself (MT-4).
   through callbacks (iOS `NEPacketTunnelFlow`); platform-independent. It returns a
   `HostTunInput`, a `HostTunSource` and a `HostTunSink`. The contract named it
   `HostTun::new`; it ships as a free function so no `clippy::new_ret_no_self` suppression
-  is needed. `HostTunInput::push` copies the packet once into a bounded queue
-  (`capacity` packets, `HOST_TUN_DEFAULT_CAPACITY` = 4096) without blocking, from any
-  thread, and fails with `PushError::Full` or `PushError::Closed` (source dropped). The
+  is needed. `HostTunInput::push` copies the packet once (`SharedPacketPool::alloc_from` on
+  a pool of up to `capacity` idle buffers, which `HostTunSource::recycle` refills; no
+  zero-fill when it allocates) into a bounded queue (`capacity` packets,
+  `HOST_TUN_DEFAULT_CAPACITY` = 4096) without blocking, from any thread, and fails with `PushError::Full` or `PushError::Closed` (source dropped). The
   source drops and counts packets longer than the MTU (`oversize_drops`), logging the first
   one as a warning, and returns `BrokenPipe` once every input is dropped and the queue is
   drained. `HostTunSource::set_mtu` changes the MTU, e.g. once an iOS host knows its
@@ -1990,6 +2056,7 @@ path, so such a client pays no extra latency for it.
 | Connected UDP sockets | `nsplane-netstack` | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
 | Hybrid local side | `nsplane` | `Splitter::new(route).sink(..)` as the sink, `MergeSource::new().source(..)` as the source | not used | none: plain types, used only when passed to the builder |
 | Local-side graph | `nsplane` | `MapSink::new(sink, f)` / `MapSource::new(source, f)` around a sink or source; `pipe(capacity, mtu)` to feed one engine's output into another's input; `pump(source, sink, from)` spawned between two endpoints | not used | none: plain generic types, used only when passed to the builder or spawned; nothing changes for an engine that does not use them |
+| Pooled producer allocation (MR-1) | `nsplane` | `PipeSink::alloc(len)` / `ChannelSource::pool()` for the producers, `recycle` from consumers | off: the source declines recycled buffers | none per packet: one `Arc` per pipe or channel source; the source declines the engine's first offer |
 | Windows service TUN checks | `nsplane-tun` | `Tun::create_with(name, TunOptions::new().wintun_pin(pin).exclusive(true).mtu(n))` (Windows) | off: `wintun.dll` from the search path, an existing adapter opened, the MTU left as it is | none: `Tun::create` takes the same path as before |
 | TUN segmentation offload | `nsplane-tun` | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 | UDP segmentation offload (GSO/GRO) | `nsplane` | `UdpTransport::bind` turns it on; `UdpTransport::bind_with_offload(id, addr, false)` or `set_offload(false)` opts out | on: GSO where the platform has it, GRO on Linux and Android | off: one system call per datagram |
@@ -2108,6 +2175,12 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP stream (PS) | 1 GiB, one connection, over two engines / direct, median of 5, per GiB (2026-10-03, load 20-29) | 309 MB/s, 9.34 s CPU, 38.49 G instructions / 1162 MB/s, 7.54 G instructions | `main`: 306 MB/s, 10.08 s, 39.41 G / 1002 MB/s, 7.72 G; [Single-stream profile (MF-2)](#single-stream-profile-mf-2) |
 | Local-side graph, `pipe` | send + `recv_batch`, 64 B / 1420 B, per packet (1024 packets per iteration, current-thread runtime; 2026-10-03, load 9.99 21.78 29.87; at load 59: ~132 / ~151 ns) | ~68 ns / ~68 ns | |
 | Local-side graph, `pump` | pipe -> pipe, 64 B / 1420 B, per packet (two spawned tasks, allocation excluded; same run; at load 59: ~263 / ~369 ns) | ~146 ns / ~170 ns | |
+| Local-side graph, pooled `pipe` (MR-1) | `pipe/alloc_send_recv_{64,1420}`: `PipeSink::alloc` + send + `recv_batch` + `recycle`, per packet | about +14 ns over `send_recv` (which never allocates) | `nsplane-e2e` `recycle_loop`: pipe and channel loops allocate nothing after warm-up (10k packets) |
+| `host_tun` push + recv without recycling (MR-2) | per packet | about +1.5 ns (110 -> 112 ns) | the `SharedPacketPool` hint load and `Arc` field; accepted |
+| Checksums (S1) | `internet_checksum` etc., 20 / 64 / 1420 B (`cargo bench -p nsplane-packet --bench checksum`, load 4.0) | about 1.3x / 2.6x / 4.6x faster, bit-identical | `data_path` does not reach checksum code |
+| Translator `alias4` in (S2, S3) | 64 B / 1400-1420 B, per packet | -4..-5 ns / -10..-11 ns | `make_room` grows to `len + TAILROOM`; keyed `u128` IPv6 index hash; `alias4` out unchanged |
+| Local-side graph, `pump` into a device-like sink (MR-3) | `pump/pipe_to_writer_{64,1420}` (sink drops the buffers) vs `pump/pipe_to_writer_spent_{64,1420}` (sink returns them), per 1024 packets, in-run, slot 0, load 9.3 | 99.40 / 98.37 us | 106.86 / 129.53 us (-7 % / -24 %); `nsplane-e2e` `recycle_loop`: `pump(PipeSource, TunSink)` and `pump(ChannelSource, TunSink)` over a socket pair allocate nothing after warm-up (10k packets) |
+| Default path after QR (MR-1/MR-3) vs main | `pump/pipe_to_pipe_{64,1420}`, `host_tun` push + recv without recycling; best of 8 pairs in two orders, slot.sh, load 6-14 | 145.09 / 182.91 us, 113.19 ns | main: 143.64 / 180.41 us (+1.3 % at 1420 B), 111.53 ns (+1.2 ns); noise, no regression shown |
 
 - Data path. Follow-up #1 (5C) removed the rx buffer swap, the `copy_within` shifts and the
   `set_len` zero-fills, leaving ~695 instructions of dispatch per 64 B round trip. The

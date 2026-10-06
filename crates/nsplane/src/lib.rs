@@ -66,8 +66,8 @@ pub use nsplane_core::{
     AllowedIp, InboundDestinations, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519,
 };
 pub use nsplane_packet::{
-    Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, TAILROOM,
-    TransportId,
+    Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, SharedPacketPool,
+    TAILROOM, TransportId,
 };
 pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};
