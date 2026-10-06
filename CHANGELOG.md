@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-core`: `Event::Authenticated` is emitted once per off-path source change (since the
   peer's path was last set or a handshake completed), not per message; `PathPolicy::on_authenticated`
   is still called per message.
+- `nsplane`: without crypto workers a full deliver sink now holds back receive instead of
+  dropping: the owner reads received datagrams only while the deliver queue has room for
+  them, as with workers since 0.10.0, so they wait in the transport (for UDP, the socket
+  buffer) and `DROP_SINK_FULL` (the sink-full drop counter) stays at 0 in that case; only a
+  packet injected with a handle call into a full queue still counts there. A stalled sink
+  also delays the handshakes and keepalives queued behind them; a closed sink holds nothing
+  back. The tests that expected sink-full drops from received traffic,
+  `crates/nsplane-e2e/tests/fast_path.rs` and `crates/nsplane-e2e/tests/queues.rs`, now
+  expect none.
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
