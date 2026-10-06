@@ -314,6 +314,14 @@ impl PacketSource for SlotSource {
         }
     }
 
+    /// Returns the buffers to the source's pool, which keeps up to 64 idle ones; the rest
+    /// are dropped.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        for buf in bufs.drain(..) {
+            self.pool.put(buf);
+        }
+    }
+
     /// The MTU the slot was created with; it never changes.
     fn mtu(&self) -> watch::Receiver<u16> {
         self.mtu_tx.subscribe()
@@ -498,5 +506,27 @@ mod tests {
             slot.replace(fd).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[tokio::test]
+    async fn recycle_refills_the_pool_up_to_its_bound() {
+        let (_slot, mut source, _sink) = TunSlot::new(100);
+        assert_eq!(source.pool.free_len(), 0);
+        let mut bufs: Vec<PacketBuf> = (0..POOL_FREE + 3)
+            .map(|_| PacketBuf::with_capacity(1600))
+            .collect();
+        source.recycle(&mut bufs);
+        assert!(bufs.is_empty());
+        assert_eq!(source.pool.free_len(), POOL_FREE);
+
+        // The next read goes into a recycled buffer.
+        let (slot, mut source, _sink) = TunSlot::new(100);
+        source.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
+        let (fd, host) = pair();
+        slot.replace(fd).unwrap();
+        host.send(b"reuse").unwrap();
+        let packet = timeout(WAIT, source.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.as_packet(), b"reuse");
+        assert_eq!(source.pool.free_len(), 0);
     }
 }
