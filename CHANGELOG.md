@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
 
 ### Changed
+- nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
+  so a burst the driver routes in one step fits one UDP flow or socket queue. Harness netstack
+  pair, server at the stack default: UDP loss at 1 Gbit/s 1.24 % to 0.00 % (old CPU sets) and
+  0.07-0.75 % to 0.00 % (slot 0), TCP unchanged. Memory: the queue grows on demand, so an idle
+  flow or socket costs the same; a full one pins up to 256 ingress buffers (about 512 KiB,
+  256 KiB before).
 - `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
   transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
   them too, about 4x faster on a full-size packet), the reassembly clock is read only for
