@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
   it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
   source and it allocated every buffer.
+
+## [0.10.1] - 2026-10-06
+
+Patch release: one engine fix for `crypto_workers >= 2`.
+
+### Fixed
 - `nsplane`: with `crypto_workers >= 2`, the local packets with the workers count against the
   room for local packets, so a slow transport holds back the source instead of dropping up to
   `queue_capacity` datagrams under `transmit full` (seen as lost packets in
