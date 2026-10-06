@@ -254,6 +254,8 @@ pub enum Event {
     /// accepted and transport data (keepalives included) that decrypted, even if its source
     /// address is then not allowed. Cookie replies never count. Messages on the current path
     /// emit nothing.
+    ///
+    /// [`Core::force_handshake`]: crate::Core::force_handshake
     Authenticated {
         /// The peer.
         peer: PeerId,
