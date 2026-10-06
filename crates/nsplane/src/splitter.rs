@@ -26,8 +26,9 @@ struct Route {
     gone: AtomicBool,
 }
 
-/// The routing closure a [`Splitter`] calls for every packet.
-type RouteFn = dyn Fn(PeerId, &PacketBuf) -> usize + Send + Sync;
+/// The routing closure a [`Splitter`] calls for every packet; a [`Splitter::new`] closure is
+/// wrapped into this form.
+type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 
 /// A [`PacketSink`] that delivers each packet to one of N sinks picked by a closure.
 ///
@@ -47,6 +48,10 @@ type RouteFn = dyn Fn(PeerId, &PacketBuf) -> usize + Send + Sync;
 /// .sink(tun)
 /// .sink(stack);
 /// ```
+///
+/// [`Splitter::new_map`] builds one whose closure may also rewrite each packet in place
+/// before it picks the sink, e.g. a Redirect or Masquerade translation that decides the
+/// route.
 ///
 /// Semantics of [`PacketSink::send`]:
 /// - It awaits only the chosen sink. Backpressure is not isolated: while that sink waits,
@@ -90,6 +95,41 @@ impl Splitter {
     where
         F: Fn(PeerId, &PacketBuf) -> usize + Send + Sync + 'static,
     {
+        Self::new_map(move |from, packet: &mut PacketBuf| route(from, packet))
+    }
+
+    /// Creates a splitter with no sinks whose `route` closure may rewrite each packet in
+    /// place before it returns the sink index; the packet, as rewritten, goes to that sink.
+    ///
+    /// The closure may change the packet's bytes and length (a Redirect or Masquerade
+    /// translation, say) and must leave a packet the chosen sink accepts. It is the first to
+    /// see the packet as the engine delivered it. Everything else is as [`Splitter::new`]:
+    /// a packet routed out of range is dropped already rewritten and counted in
+    /// [`SplitterStats::misrouted`], and once every sink is gone (or none was added) the
+    /// closure is not called at all.
+    ///
+    /// ```
+    /// # use nsplane::{ChannelSink, Splitter};
+    /// let (tun, _tun_rx) = ChannelSink::new(64);
+    /// let (stack, _stack_rx) = ChannelSink::new(64);
+    /// // IPv4 packets to 10.0.4.4 are redirected to 100.64.0.1 and go to the netstack,
+    /// // everything else to the TUN device. (A real translation also fixes the checksums.)
+    /// let splitter = Splitter::new_map(|_peer, packet| {
+    ///     match packet.as_packet_mut().get_mut(16..20) {
+    ///         Some(dst) if *dst == [10, 0, 4, 4] => {
+    ///             dst.copy_from_slice(&[100, 64, 0, 1]);
+    ///             1
+    ///         }
+    ///         _ => 0,
+    ///     }
+    /// })
+    /// .sink(tun)
+    /// .sink(stack);
+    /// ```
+    pub fn new_map<F>(route: F) -> Self
+    where
+        F: Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync + 'static,
+    {
         Self {
             route: Box::new(route),
             routes: Vec::new(),
@@ -128,7 +168,7 @@ impl Splitter {
 }
 
 impl PacketSink for Splitter {
-    async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+    async fn send(&self, mut packet: PacketBuf, from: PeerId) -> io::Result<()> {
         if self.open.load(Ordering::Acquire) == 0 {
             self.failed.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::new(
@@ -136,7 +176,7 @@ impl PacketSink for Splitter {
                 "all splitter sinks closed",
             ));
         }
-        let Some(route) = self.routes.get((self.route)(from, &packet)) else {
+        let Some(route) = self.routes.get((self.route)(from, &mut packet)) else {
             self.misrouted.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
@@ -165,6 +205,8 @@ impl fmt::Debug for Splitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::ChannelSink;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -298,6 +340,123 @@ mod tests {
                 failed: 3
             }
         );
+        Ok(())
+    }
+
+    /// Adds one to the first packet byte, then routes by the new first byte.
+    fn increment_then_route(from: PeerId, packet: &mut PacketBuf) -> usize {
+        if let Some(byte) = packet.as_packet_mut().first_mut() {
+            *byte = byte.wrapping_add(1);
+        }
+        by_first_byte(from, packet)
+    }
+
+    #[tokio::test]
+    async fn map_rewrite_reaches_the_chosen_sink() -> TestResult {
+        let (a, a_rx) = ChannelSink::new(4);
+        let (b, mut b_rx) = ChannelSink::new(4);
+        let (c, mut c_rx) = ChannelSink::new(4);
+        let splitter = Splitter::new_map(|from, packet: &mut PacketBuf| {
+            packet.set_len(2);
+            packet.as_packet_mut()[1] = 0xAA;
+            increment_then_route(from, packet)
+        })
+        .sink(a)
+        .sink(b)
+        .sink(c);
+
+        // Routed on the rewritten byte: 0 -> 1 goes to b, 1 -> 2 to c, never to a.
+        send(&splitter, 0).await?;
+        send(&splitter, 1).await?;
+        let (peer, packet) = b_rx.recv().await.ok_or("b closed")?;
+        assert_eq!((peer, packet.as_packet()), (PeerId::new(0), &[1, 0xAA][..]));
+        let (peer, packet) = c_rx.recv().await.ok_or("c closed")?;
+        assert_eq!((peer, packet.as_packet()), (PeerId::new(1), &[2, 0xAA][..]));
+        assert!(a_rx.is_empty() && b_rx.is_empty() && c_rx.is_empty());
+        assert_eq!(splitter.stats(), SplitterStats::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn map_out_of_range_after_rewrite_is_counted() -> TestResult {
+        let (a, a_rx) = ChannelSink::new(4);
+        let (b, mut b_rx) = ChannelSink::new(4);
+        let splitter = Splitter::new_map(increment_then_route).sink(a).sink(b);
+
+        // 1 would be in range before the rewrite, 2 is not after it.
+        send(&splitter, 1).await?;
+        send(&splitter, 4).await?;
+        send(&splitter, 0).await?;
+        assert_eq!(splitter.misrouted(), 2);
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 2,
+                failed: 0
+            }
+        );
+        assert_eq!(b_rx.recv().await.ok_or("b closed")?.1.as_packet(), [1]);
+        assert!(a_rx.is_empty() && b_rx.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn map_broken_pipe_per_sink_then_all() -> TestResult {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (a, a_rx) = ChannelSink::new(4);
+        let (b, b_rx) = ChannelSink::new(4);
+        let splitter = Splitter::new_map({
+            let calls = Arc::clone(&calls);
+            move |from, packet: &mut PacketBuf| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                increment_then_route(from, packet)
+            }
+        })
+        .sink(a)
+        .sink(b);
+
+        // A packet starting with 0 is routed to b, one starting with 255 to a.
+        drop(b_rx);
+        for _ in 0..2 {
+            let err = send(&splitter, 0).await.err().ok_or("expected an error")?;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        }
+        assert_eq!(splitter.stats().failed, 2);
+        drop(a_rx);
+        let err = send(&splitter, 255)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // Every sink is gone: the closure is no longer called.
+        for byte in [0, 255, 7] {
+            let err = send(&splitter, byte)
+                .await
+                .err()
+                .ok_or("expected an error")?;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 0,
+                failed: 6
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn map_no_sinks_does_not_call_the_closure() -> TestResult {
+        let splitter = Splitter::new_map(|_from, _packet: &mut PacketBuf| -> usize {
+            panic!("the closure ran without sinks")
+        });
+        let err = send(&splitter, 0).await.err().ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(splitter.stats().failed, 1);
         Ok(())
     }
 }
