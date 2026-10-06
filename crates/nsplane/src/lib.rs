@@ -19,10 +19,12 @@
 //! sources fairly into one.
 //! [`MapSink`] and [`MapSource`] rewrite or drop packets in place, [`pipe`] feeds one
 //! engine's output into another's input and [`pump`] moves packets from a source into a
-//! sink: the local-side graph primitives.
+//! sink: the local-side graph primitives. [`SwapSink`] replaces a sink while the engine runs
+//! and [`AbortSink`] cancels a delivery stuck on it, for a local side rebuilt per generation.
 
 #![forbid(unsafe_code)]
 
+mod abort;
 mod builder;
 mod channel;
 mod engine;
@@ -37,9 +39,11 @@ mod path_mtu;
 mod pipe;
 mod pump;
 mod splitter;
+mod swap;
 mod transport;
 mod udp;
 
+pub use abort::{AbortSink, SinkAbort};
 pub use builder::{BuildError, EngineBuilder};
 pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use engine::Engine;
@@ -68,5 +72,6 @@ pub use nsplane_packet::{
 pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};
 pub use splitter::{Splitter, SplitterStats};
+pub use swap::SwapSink;
 pub use transport::{BoxFuture, DynTransport, PathMtuReport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};

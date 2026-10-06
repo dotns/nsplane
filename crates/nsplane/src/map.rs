@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use nsplane_packet::{PacketBatch, PacketBuf, PeerId};
 use tokio::sync::watch;
@@ -31,10 +32,46 @@ pub enum MapVerdict {
 /// The closure gets the packet, which it may rewrite in place, and the peer it was
 /// decrypted for. Kept packets go to `inner`; dropped packets are discarded and counted
 /// in [`MapSink::dropped`], and `send` returns `Ok(())` for them.
-pub struct MapSink<S, F> {
+///
+/// A sink built with [`MapSink::with_after`] also runs an after-delivery hook `A` on every
+/// packet `inner` took over; `MapSink<S, F>` names the sink [`MapSink::new`] builds, which
+/// has none.
+pub struct MapSink<S, F, A = fn(&[u8])> {
     inner: S,
     f: F,
+    after: Option<A>,
     dropped: AtomicU64,
+    /// Spare copy buffers for `after`, reused so a steady stream does not allocate.
+    spare: Mutex<Vec<Copies>>,
+}
+
+/// Spare copy buffers a [`MapSink`] keeps: one per `send` or `send_batch` call in flight at
+/// a time, as the engine's sink task makes, with room for a few concurrent callers.
+const SPARE_COPIES: usize = 4;
+
+/// The bytes of the packets a [`MapSink`] hands to `inner`, kept for its `after` hook.
+#[derive(Default)]
+struct Copies {
+    /// The packets, back to back.
+    bytes: Vec<u8>,
+    /// Where each packet ends in `bytes`.
+    ends: Vec<usize>,
+}
+
+impl Copies {
+    fn push(&mut self, packet: &[u8]) {
+        self.bytes.extend_from_slice(packet);
+        self.ends.push(self.bytes.len());
+    }
+
+    /// Calls `after` for the first `count` packets, in order.
+    fn report(&self, count: usize, after: impl Fn(&[u8])) {
+        let mut start = 0;
+        for &end in self.ends.iter().take(count) {
+            after(self.bytes.get(start..end).unwrap_or_default());
+            start = end;
+        }
+    }
 }
 
 impl<S, F> MapSink<S, F>
@@ -47,10 +84,54 @@ where
         Self {
             inner: sink,
             f,
+            after: None,
             dropped: AtomicU64::new(0),
+            spare: Mutex::new(Vec::new()),
         }
     }
+}
 
+impl<S, F, A> MapSink<S, F, A>
+where
+    S: PacketSink,
+    F: Fn(&mut PacketBuf, PeerId) -> MapVerdict + Send + Sync + 'static,
+    A: Fn(&[u8]) + Send + Sync + 'static,
+{
+    /// Wraps `sink`, running `f` on every packet and `after` on every packet `sink` took
+    /// over.
+    ///
+    /// `after` is called once per delivered packet with its bytes as handed to `sink`
+    /// (after `f`'s rewrite), only once `sink` took the packet over successfully: never for
+    /// a packet `f` dropped, never for the one `sink` failed on. For example, a translation
+    /// can retire a mapping only after the TUN writer took the packet.
+    ///
+    /// Since the packet moves into `sink`, its bytes are copied first: one copy of every
+    /// kept packet, into a buffer reused from call to call, so a steady stream does not
+    /// allocate.
+    ///
+    /// `send_batch` maps every packet, copies the kept ones, hands them to `sink`'s
+    /// `send_batch` and then calls `after` in order for exactly the packets `sink` took
+    /// over: all of them on success; on an error, the ones before the packet that failed.
+    /// If the `send` or `send_batch` future is cancelled, `after` is not called for that
+    /// packet or batch, so a cancelled batch may have delivered packets whose hook did not
+    /// run. `try_send_batch` keeps the default (`WouldBlock`) here too, so the engine
+    /// delivers every packet through `send_batch`.
+    pub const fn with_after(sink: S, f: F, after: A) -> Self {
+        Self {
+            inner: sink,
+            f,
+            after: Some(after),
+            dropped: AtomicU64::new(0),
+            spare: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<S, F, A> MapSink<S, F, A>
+where
+    S: PacketSink,
+    F: Fn(&mut PacketBuf, PeerId) -> MapVerdict + Send + Sync + 'static,
+{
     /// Packets dropped so far because the closure returned [`MapVerdict::Drop`].
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
@@ -64,38 +145,88 @@ where
         }
         keep
     }
+
+    /// An empty copy buffer, a spare one if there is one.
+    fn take_copies(&self) -> Copies {
+        self.spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Keeps `copies` as a spare, unless there are enough.
+    fn put_copies(&self, mut copies: Copies) {
+        copies.bytes.clear();
+        copies.ends.clear();
+        let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
+        if spare.len() < SPARE_COPIES {
+            spare.push(copies);
+        }
+    }
 }
 
-impl<S, F> PacketSink for MapSink<S, F>
+impl<S, F, A> PacketSink for MapSink<S, F, A>
 where
     S: PacketSink,
     F: Fn(&mut PacketBuf, PeerId) -> MapVerdict + Send + Sync + 'static,
+    A: Fn(&[u8]) + Send + Sync + 'static,
 {
     async fn send(&self, mut packet: PacketBuf, from: PeerId) -> io::Result<()> {
         if !self.map(&mut packet, from) {
             return Ok(());
         }
-        self.inner.send(packet, from).await
+        let Some(after) = &self.after else {
+            return self.inner.send(packet, from).await;
+        };
+        let mut copies = self.take_copies();
+        copies.push(packet.as_packet());
+        let result = self.inner.send(packet, from).await;
+        if result.is_ok() {
+            copies.report(1, after);
+        }
+        self.put_copies(copies);
+        result
     }
 
     /// Maps every packet, removes the dropped ones and hands the rest to `inner` in
     /// order. The packets left in `packets` after an error from `inner` are already
     /// mapped; a caller that calls again to deliver them maps them a second time, so a
     /// closure used with a retrying caller must tolerate seeing its own output.
+    ///
+    /// With an `after` hook ([`MapSink::with_after`]) the kept packets are copied before
+    /// `inner` gets them, and once `inner` returns `after` is called in order for the
+    /// packets it took over: all of them on success; on an error, the ones before the
+    /// packet that failed. Cancelling the call skips `after` for the whole batch.
     async fn send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
         packets.retain_mut(|(from, packet)| self.map(packet, *from));
-        self.inner.send_batch(packets).await
+        let Some(after) = &self.after else {
+            return self.inner.send_batch(packets).await;
+        };
+        let mut copies = self.take_copies();
+        for (_, packet) in packets.iter() {
+            copies.push(packet.as_packet());
+        }
+        let kept = packets.len();
+        let result = self.inner.send_batch(packets).await;
+        // On an error the packet that failed was dropped and the rest are left.
+        let delivered = kept.saturating_sub(packets.len() + usize::from(result.is_err()));
+        copies.report(delivered, after);
+        self.put_copies(copies);
+        result
     }
 
     // `try_send_batch` keeps the default (`WouldBlock`, the engine delivers through
-    // `send_batch` on its sink task): forwarding it would map the packets the inner sink
-    // leaves behind, and the engine's later `send_batch` would map them a second time.
+    // `send_batch` on its sink task), with or without an `after` hook: forwarding it would
+    // map the packets the inner sink leaves behind, and the engine's later `send_batch`
+    // would map them a second time.
 }
 
-impl<S: fmt::Debug, F> fmt::Debug for MapSink<S, F> {
+impl<S: fmt::Debug, F, A> fmt::Debug for MapSink<S, F, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapSink")
             .field("inner", &self.inner)
+            .field("after", &self.after.is_some())
             .field("dropped", &self.dropped.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -194,6 +325,8 @@ impl<S: fmt::Debug, F> fmt::Debug for MapSource<S, F> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{ChannelSink, ChannelSource};
 
@@ -300,6 +433,180 @@ mod tests {
             .ok_or("expected an error")?;
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         Ok(())
+    }
+
+    /// Records what `after` is called with.
+    #[derive(Debug, Default)]
+    struct Reported(Mutex<Vec<Vec<u8>>>);
+
+    impl Reported {
+        fn record(&self, packet: &[u8]) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(packet.to_vec());
+        }
+
+        fn take(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    type Rewrite = fn(&mut PacketBuf, PeerId) -> MapVerdict;
+
+    /// A [`MapSink::with_after`] over `inner` running [`rewrite_sink`], reporting into
+    /// `reported`.
+    fn after_sink<S: PacketSink>(
+        inner: S,
+        reported: &Arc<Reported>,
+    ) -> MapSink<S, Rewrite, impl Fn(&[u8]) + Send + Sync + 'static> {
+        let reported = Arc::clone(reported);
+        MapSink::with_after(inner, rewrite_sink as Rewrite, move |packet: &[u8]| {
+            reported.record(packet);
+        })
+    }
+
+    /// Takes over every packet except those whose first byte is 0xEE, which fail with
+    /// [`io::ErrorKind::Other`]; keeps what it took over.
+    #[derive(Debug, Default)]
+    struct FailingSink(Reported);
+
+    impl PacketSink for FailingSink {
+        fn send(
+            &self,
+            packet: PacketBuf,
+            _from: PeerId,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            if packet.as_packet().first() == Some(&0xEE) {
+                return std::future::ready(Err(io::Error::other("refused")));
+            }
+            self.0.record(packet.as_packet());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn batch(packets: &[&[u8]]) -> VecDeque<(PeerId, PacketBuf)> {
+        packets
+            .iter()
+            .map(|p| (PeerId::new(1), PacketBuf::from_packet(p)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn after_reports_delivered_rewritten_packets() -> TestResult {
+        let (inner, mut rx) = ChannelSink::new(4);
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(inner, &reported);
+
+        sink.send(PacketBuf::from_packet(&[1, 2, 3]), PeerId::new(7))
+            .await?;
+        sink.send(PacketBuf::from_packet(&[0, 2]), PeerId::new(7))
+            .await?;
+        sink.send(PacketBuf::from_packet(&[4, 5]), PeerId::new(7))
+            .await?;
+        assert_eq!(reported.take(), [vec![1, 0xFF, 3], vec![4, 0xFF]]);
+        for expected in [&[1, 0xFF, 3][..], &[4, 0xFF]] {
+            let (_, packet) = rx.recv().await.ok_or("closed")?;
+            assert_eq!(packet.as_packet(), expected);
+        }
+        assert!(rx.is_empty());
+        assert_eq!(sink.dropped(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_skips_failed_send() -> TestResult {
+        let (inner, rx) = ChannelSink::new(4);
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(inner, &reported);
+        drop(rx);
+        let err = sink
+            .send(PacketBuf::from_packet(&[1, 1]), PeerId::new(1))
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let mut packets = batch(&[&[1, 1], &[2, 2]]);
+        let err = sink
+            .send_batch(&mut packets)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(reported.take(), Vec::<Vec<u8>>::new());
+
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(FailingSink::default(), &reported);
+        let err = sink
+            .send(PacketBuf::from_packet(&[0xEE, 1]), PeerId::new(1))
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(reported.take(), Vec::<Vec<u8>>::new());
+        sink.send(PacketBuf::from_packet(&[1, 1]), PeerId::new(1))
+            .await?;
+        assert_eq!(reported.take(), [vec![1, 0xFF]]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_batch_reports_in_order() -> TestResult {
+        let (inner, mut rx) = ChannelSink::new(8);
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(inner, &reported);
+
+        let mut packets = batch(&[&[1, 1], &[0, 2], &[3, 3], &[0, 4], &[5, 5]]);
+        sink.send_batch(&mut packets).await?;
+        assert!(packets.is_empty());
+        let expected = [vec![1, 0xFF], vec![3, 0xFF], vec![5, 0xFF]];
+        assert_eq!(reported.take(), expected);
+        for expected in &expected {
+            let (_, packet) = rx.recv().await.ok_or("closed")?;
+            assert_eq!(packet.as_packet(), expected);
+        }
+        assert_eq!(sink.dropped(), 2);
+
+        // A second batch reuses the copy buffer and reports only its own packets.
+        let mut packets = batch(&[&[7, 7]]);
+        sink.send_batch(&mut packets).await?;
+        assert_eq!(reported.take(), [vec![7, 0xFF]]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_batch_error_reports_packets_before_it() -> TestResult {
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(FailingSink::default(), &reported);
+
+        let mut packets = batch(&[&[1, 1], &[0, 2], &[3, 3], &[0xEE, 4], &[5, 5]]);
+        let err = sink
+            .send_batch(&mut packets)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(reported.take(), [vec![1, 0xFF], vec![3, 0xFF]]);
+        assert_eq!(sink.inner.0.take(), [vec![1, 0xFF], vec![3, 0xFF]]);
+        // The rest stays, already mapped; delivering it reports it.
+        let rest: Vec<_> = packets
+            .iter()
+            .map(|(_, p)| p.as_packet().to_vec())
+            .collect();
+        assert_eq!(rest, [vec![5, 0xFF]]);
+        sink.send_batch(&mut packets).await?;
+        assert_eq!(reported.take(), [vec![5, 0xFF]]);
+        Ok(())
+    }
+
+    #[test]
+    fn debug_shows_after() {
+        let (inner, _rx) = ChannelSink::new(1);
+        let sink = after_sink(inner, &Arc::default());
+        assert!(format!("{sink:?}").contains("after: true"));
+        let (inner, _rx) = ChannelSink::new(1);
+        let sink = MapSink::new(inner, rewrite_sink);
+        assert!(format!("{sink:?}").contains("after: false"));
     }
 
     #[tokio::test]
