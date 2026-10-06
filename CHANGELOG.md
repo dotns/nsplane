@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `nsplane-core`: caller-updated inbound destinations: the `InboundDestinations` trait
+  (implemented for closures), consulted once per decrypted data packet of a peer and never
+  cached, so a revoked or new grant applies to the next packet;
+  `ConfigChange::SetInboundDestinationSource` and `nsplane`
+  `EngineHandle::set_inbound_destination_source` set it, replacing an owned list (and an owned
+  list replaces it). Owned lists and unchecked peers cost what they did.
 - `nsplane-wss`: `WssConfig::ping_interval(Option<Duration>)`; `None` (stored as a zero
   `ping_interval`, as `keepalive(Duration::ZERO, idle)` does) sends no keepalive pings on
   `WssDialer` links, `WssStreamClient` sessions and `WssStreamServer` sessions, with no ping
@@ -123,6 +129,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TranslationTable` address lookup is one hash instead of two. Per packet, 2026-10-06, load
   2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
   69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
+- `nsplane-core`: `Event::Authenticated` is emitted once per off-path source change (since the
+  peer's path was last set or a handshake completed), not per message; `PathPolicy::on_authenticated`
+  is still called per message.
+- `nsplane`: without crypto workers a full deliver sink now holds back receive instead of
+  dropping: the owner reads received datagrams only while the deliver queue has room for
+  them, as with workers since 0.10.0, so they wait in the transport (for UDP, the socket
+  buffer) and `DROP_SINK_FULL` (the sink-full drop counter) stays at 0 in that case; only a
+  packet injected with a handle call into a full queue still counts there. A stalled sink
+  also delays the handshakes and keepalives queued behind them; a closed sink holds nothing
+  back. The tests that expected sink-full drops from received traffic,
+  `crates/nsplane-e2e/tests/fast_path.rs` and `crates/nsplane-e2e/tests/queues.rs`, now
+  expect none.
 - `nsplane-packet`: `internet_checksum` and the other checksum helpers sum 32-bit words
   (one implementation, `checksum::sum_words`; `nsplane-nat`'s `checksum::sum` delegates to
   it), bit-identical and about 1.3x / 2.6x / 4.6x faster at 20 / 64 / 1420 B

@@ -76,7 +76,13 @@ const PATH_MTU_REPORTS: usize = 16;
 /// type when it is added, so no datagram goes through a boxed future (unless the transport
 /// is a boxed [`DynTransport`]).
 ///
-/// Backpressure: a full sink queue drops the decrypted packet and counts it under
+/// Backpressure: since each received datagram may deliver a packet, the owner reads received
+/// datagrams only while the deliver queue has room for them (beyond those with the crypto
+/// workers), as many at once, so a sink slower than the network holds the datagrams back in
+/// the transport (for UDP, the socket's buffer) instead of dropping decrypted packets. A
+/// stalled sink so also delays the handshakes and keepalives that arrive behind them; once
+/// the sink is closed, nothing is held back. A packet that still finds the deliver queue full
+/// (one injected with a handle call, say) is dropped and counted under
 /// [`crate::DROP_SINK_FULL`]. Each transport has its own transmit queue and its own backlog
 /// in the owner task: when the queue is full, that transport's datagrams wait in the
 /// backlog, in order, while datagrams to other transports keep going to their own queues,
@@ -180,13 +186,13 @@ const PATH_MTU_REPORTS: usize = 16;
 /// counter as received only then, so each peer's packets leave in the order they came and a
 /// duplicate opened on two workers at once is still rejected. At most queue capacity packets
 /// are with the workers at a time; while that many are, the owner stops reading local
-/// packets and received datagrams. Since each received datagram with the workers may deliver
-/// a packet, the owner reads received datagrams only while the deliver queue has room beyond
-/// them, as many at once, so a sink slower than the network holds the datagrams back in the
-/// transport (for UDP, the socket's buffer) instead of dropping decrypted packets under
-/// [`crate::DROP_SINK_FULL`]. Before every handle call that reads or changes peers,
-/// counters or sessions, the owner waits for the packets with the workers, so the call sees
-/// (and acts after) every packet read before it, as without workers.
+/// packets and received datagrams, and the received datagrams with the workers count
+/// against the deliver queue's room (see Backpressure). Likewise, the local packets with
+/// the workers count against the room for local packets, so a slow transport holds back
+/// the source instead of dropping their datagrams under [`crate::DROP_TRANSMIT_FULL`].
+/// Before every handle call that reads or changes peers, counters or sessions, the owner
+/// waits for the packets with the workers, so the call sees (and acts after) every packet
+/// read before it, as without workers.
 ///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
 /// keeps running without it; other I/O errors are logged and the task continues. A datagram
@@ -1298,8 +1304,8 @@ struct Owner {
     /// The MTU watcher, source and sink tasks.
     tasks: Vec<Task>,
     queue_capacity: usize,
-    /// With crypto workers: armed while the deliver queue has no room and no job that may
-    /// deliver is in flight, so only the sink task can make room.
+    /// Armed while the deliver queue has no room and no job that may deliver is with the
+    /// crypto workers, so only the sink task can make room.
     deliver_room: Option<DeliverRoom>,
     /// Capacities and high-water marks of the queues, without the current occupancies.
     high_water: QueueStats,
@@ -1448,17 +1454,18 @@ impl Owner {
         self.poll_rest(cx)
     }
 
-    /// Polls the received datagrams, unless crypto workers run and the deliver queue has no
-    /// room beyond the received datagrams with them ([`Owner::deliver_room`]).
+    /// Polls the received datagrams, unless the deliver queue has no room beyond the received
+    /// datagrams with the crypto workers ([`Owner::deliver_room`]). Once the sink is closed
+    /// every packet is dropped, so nothing is held back.
     fn poll_datagrams(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
-        if self.workers.is_some() && !self.poll_deliver_room(cx) {
+        if !self.sink.closed && !self.poll_deliver_room(cx) {
             return Poll::Pending;
         }
         self.datagrams.poll_recv(cx).map(Wake::Datagram)
     }
 
-    /// With crypto workers: whether the deliver queue has room beyond the received
-    /// datagrams with the workers. Without room and with none of them in flight, waits for
+    /// Whether the deliver queue has room beyond the received datagrams with the crypto
+    /// workers, if any. Without room and with none of them in flight, waits for
     /// the sink task to make room (a completed job wakes the owner task otherwise).
     fn poll_deliver_room(&mut self, cx: &mut Context<'_>) -> bool {
         if self.deliver_room() > 0 {
@@ -1551,8 +1558,10 @@ impl Owner {
     ///
     /// Takes only what is already queued, never waiting for more: at most [`MAX_BATCH`]
     /// datagrams, no more than the crypto workers have room for and, since each may deliver a
-    /// packet, no more than the sink queue has room for beyond the received datagrams with
-    /// the crypto workers (but always `first`).
+    /// packet, no more than the deliver queue has room for beyond the received datagrams
+    /// with the crypto workers (but always `first`, read only once there is room). Packets
+    /// the owner task delivers itself take no room; those the sink does not take at once
+    /// then fit in the queue.
     fn input_datagrams(&mut self, first: Datagram) {
         self.high_water
             .datagrams
@@ -1665,10 +1674,15 @@ impl Owner {
     /// The local packets to take before every installed transport's transmit queue is full
     /// and its waiting datagrams are at the local threshold ([`MAX_BATCH`], at most the queue
     /// capacity), counting one datagram per packet: the most room over the transports, since
-    /// which transport a packet leads to is only known once the core has handled it.
+    /// which transport a packet leads to is only known once the core has handled it, less
+    /// the local packets with the crypto workers, whose datagrams are still to come.
     /// Unbounded without transports.
     fn local_room(&self) -> usize {
         let threshold = self.queue_capacity.min(MAX_BATCH);
+        let seals = self
+            .workers
+            .as_ref()
+            .map_or(0, |workers| workers.in_flight() - workers.opens);
         self.transports
             .values()
             .map(|slot| {
@@ -1681,7 +1695,7 @@ impl Owner {
                 free + threshold.saturating_sub(slot.pending.len())
             })
             .max()
-            .unwrap_or(usize::MAX)
+            .map_or(usize::MAX, |room| room.saturating_sub(seals))
     }
 
     /// Adds every job of the current batch to its worker's batch, handing the batches over

@@ -70,6 +70,9 @@ Per-source ACL principals, the ns `crates/acl` mode and inbound destinations add
 `AclFilterStats::bypassed` and `ipv6_accepted`; `nsplane-core`
 `PeerConfig::inbound_destinations`, `ConfigChange::SetInboundDestinations` and
 `reasons::DESTINATION_NOT_ALLOWED`; `nsplane` `EngineHandle::set_inbound_destinations`.
+Caller-updated inbound destinations (MD-7) add `nsplane-core` `InboundDestinations` (also
+re-exported by `nsplane`) and `ConfigChange::SetInboundDestinationSource`; `nsplane`
+`EngineHandle::set_inbound_destination_source`.
 
 `nsplane-packet::build` writes whole IPv4 or IPv6 UDP datagrams for packets an application
 injects into the tunnel: `write_udp(buf, src, dst, payload)` into an existing `PacketBuf`
@@ -164,7 +167,9 @@ Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
   makes the core call `on_authenticated` for every authenticated message, on the current path
   too, where the answer changes nothing; by default the core asks only about messages from
   another path, which keeps the steady-state data path free
-  of the call. `Event::Authenticated` stays limited to path changes.
+  of the call. `Event::Authenticated` stays limited to off-path sources, once per change of
+  source: a peer kept on its path by the policy reports a source again only after its path is
+  set (configuration, `force_handshake`, adoption) or a handshake completes.
 
 **Unanswered handshakes.** `Core::unanswered_handshakes(peer)` (`None` for an unknown peer)
 counts the handshake initiations sent to a peer that got no response: one counts when another
@@ -203,6 +208,13 @@ destination of the batch is remembered like the other lookups.
 `ConfigChange::SetInboundDestinations` (`EngineHandle::set_inbound_destinations`) sets or removes them at runtime, and
 `add_or_update_peer` with `Some` replaces them (`None` keeps them). An unchecked peer pays one
 `Option` check per packet; no peer pays an allocation or a lock.
+Instead of an owned list, `ConfigChange::SetInboundDestinationSource`
+(`EngineHandle::set_inbound_destination_source`) gives a peer a caller-updated
+`Arc<dyn InboundDestinations>` (closures implement it): its `allows(dst)` is called once per
+decrypted data packet wherever the owned list is checked (also when a deferred job
+completes), never cached across packets, so a grant the caller revokes or adds in its own
+lock-free snapshot applies to the next packet without a command. A source and an owned list
+replace each other; `None` leaves the peer unchecked. Owned lists keep their cost and cache.
 
 `handle_input_deferred` is the same entry point for a driver that encrypts on several
 threads: the cryptography of a local packet or a received transport data message comes back
@@ -298,14 +310,18 @@ Backpressure:
   slots while its backlog is empty, plus `min(MAX_BATCH, capacity)` minus its backlog. With
   no room it stops reading, which holds back the source, so a saturated transport keeps at
   most `MAX_BATCH` local datagrams in its backlog.
-- With crypto workers, received datagrams with the workers count against the deliver
-  queue's room: the owner reads received datagrams only while the deliver queue has room
-  beyond them, so a sink slower than the network holds datagrams back in the transport
-  (the UDP socket buffer) instead of dropping decrypted packets under `DROP_SINK_FULL`, as
-  without workers.
+- Each received datagram may deliver a packet, so the owner reads received datagrams only
+  while the deliver queue has room for them, beyond the received datagrams with the crypto
+  workers if any, and takes no more at once than that room (at least one once there is
+  room). A sink slower than the network so holds datagrams back in the transport (the UDP
+  socket buffer) instead of dropping decrypted packets under `DROP_SINK_FULL`, with or
+  without workers. Packets the owner delivers inline take no room, and those the sink
+  does not take at once fit in the queue. Handshakes and keepalives arrive on the same
+  queue, so a stalled sink also delays them; a closed sink holds nothing back.
 - Datagrams caused by received datagrams or timers that find the waiting datagrams at the
   queue capacity are dropped (`DROP_TRANSMIT_FULL`).
-- A full sink queue drops the decrypted packet (`DROP_SINK_FULL`); a closed sink or
+- A packet that still finds the sink queue full (one injected with a handle call) is
+  dropped (`DROP_SINK_FULL`); a closed sink or
   transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
@@ -1943,7 +1959,9 @@ which replace the gate's IPv6 Subnet ingress check. ns then deletes tunnel-wg `n
 (gate and tests) and `AccountFilter`'s gate and divert steps (with MD-A, also its ACL step:
 `acl_check_packet` and the `FragmentAclGate` use). ns keeps the policy compilation, the
 `NodeL3Config` / `WgConfig` conversion, the gateway consumer queue and its flow check, and
-the inbound destinations push. The ns `AccountFilter` steps and their nsplane locations are
+the inbound destinations push; with MD-7 it can instead install one
+`set_inbound_destination_source` per peer backed by its lease and grant snapshot and delete
+that push (the `set_inbound_destinations` calls on grant changes). The ns `AccountFilter` steps and their nsplane locations are
 tabled in the `NodeL3Filter` rustdoc.
 
 **Tests.** The 60 tests of ns `tunnel-wg/src/node_l3/tests` are ported
@@ -2140,7 +2158,7 @@ path, so such a client pays no extra latency for it.
 | ACL bypass flags | `nsplane-acl` | `AclFilterConfig::accept_to_local = Some(addr)`, `accept_icmp_echo_reply = true` | off | one branch per inbound packet each |
 | ACL IPv6 mode | `nsplane-acl` | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` | `Ipv6Mode::Evaluate` | one branch per packet |
 | ns `crates/acl` mode | `nsplane-acl` | `AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(local))` | not used | none: a preset of the options above |
-| Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations` | `None`: unchecked | one `Option` check per decrypted packet |
+| Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations`, or a caller-updated `EngineHandle::set_inbound_destination_source` | `None`: unchecked | one `Option` check per decrypted packet; a source adds one `allows` call |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Node L3 gate | `nsplane-acl` | `EngineBuilder::filter(Box::new(NodeL3Filter::new(gate, keys).with_acl(acl)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
@@ -2798,10 +2816,10 @@ owner's work per packet drops to an estimated 0.35-0.45 us (not measured), so th
 limits are the receiver's TUN delivery (coalescing and the TUN
 write, 17-18 % of the receiver on its owner without workers, the sink task with workers) and
 the sender's TSO split copy (`VnetReader::segment`, 5 % of the sender; splitting in place is
-not possible, each segment needs its own header and headroom). Without workers, a receiver
-whose sink is slower than the network still drops at `DROP_SINK_FULL` (the pool-off owner
-takes at least one datagram per wake); applying C2's deliver-room gate without workers would
-change the default path and is left for a later round. Without offload, one TUN read and one
+not possible, each segment needs its own header and headroom). C2's deliver-room gate now
+applies without workers too, so a receiver whose sink is slower than the network holds the
+datagrams back instead of dropping at `DROP_SINK_FULL` (see "Deliver room without crypto
+workers (QE-3 F1)" below). Without offload, one TUN read and one
 TUN write per packet remain. UDP loss at 3 Gbit/s is at the iperf3 socket and the sender's
 TUN queue, not in the tunnel.
 
@@ -2849,6 +2867,57 @@ the ns side: `TranslatorStats::grown_copies` (each one is a fresh allocation and
 the packet source left less than 20 bytes of room), engine fragmentation of translated
 IPv4 (the IPv4 MTU must leave the 20 bytes the header grows by), and TCP segmentation
 offload for IPv4 on the TUN.
+
+### Deliver room without crypto workers (QE-3 F1)
+
+Without crypto workers the owner now reads received datagrams only while the deliver queue
+has room for them, as it did with workers since OE-3 (C2). A = main e381bcf, B = the change;
+2026-10-06, A and B interleaved within one run; load1 at the start / end of each half.
+
+| Measurement | Slot, load1 | A | B |
+|---|---|---|---|
+| `latency.rs` `round_trip_latency`, 0 workers, loaded | unpinned; A 18.3 -> 3.7, B 3.7 -> 3.6 | lost 505 / 2000, p50 3.90 ms, p99 14.2 ms, receiver `DROP_SINK_FULL` 201 M, bulk 567 packets/ms | lost 0, p50 2.16 ms, p99 5.95 ms, no drops, bulk 1169 packets/ms |
+| the same, 2 workers | as above | lost 3, p50 1.43 ms, p99 5.30 ms | lost 3, p50 1.40 ms, p99 5.08 ms |
+| `round_trip_latency_queue_256`, 0 workers, loaded | unpinned; 5.4 -> 6.5 | lost 849, p50 2.16 ms, p99 9.46 ms, `DROP_SINK_FULL` 493 M | lost 0, p50 1.43 ms, p99 3.30 ms, no drops |
+| `data_path` `core_round_trip` 64 B / 1420 B (two halves) | slot 0; 1.7 -> 11.8 | 562 / 944 ns, 1.41 / 1.63 us | 571 / 533 ns, 1.35 / 1.45 us |
+| harness nsplane-nsplane default P1 / P4 Gbit/s (two halves) | slot 1; 6-21 | 8.90 / 8.68, 7.08 / 8.44 | 10.09 / 7.24, 8.50 / 9.10 |
+| harness nsplane-nsplane nooffload P1 / P4 | slot 1; 6-21 | 5.39 / 8.00, 6.91 / 7.75 | 6.13 / 6.69, 9.54 / 10.21 |
+| harness kernel-nsplane P1 / P4 | slot 1; 6-21 | 4.81 / 4.98, 4.00 / 5.24 | 3.66 / 5.28, 4.66 / 5.34 |
+| harness nsplane-kernel P1 / P4 (two runs of two halves) | slot 1 A 6-8, B 13-21; slot 0 A 7-23, B 15-41 | 6.73 / 6.45, 6.84 / 6.52; 6.94 / 5.13, 5.51 / 5.35 | 5.27 / 4.92, 6.06 / 5.29; 5.64 / 5.09, 3.24 / 3.97 |
+
+The latency measurement is the case the change is for: the test's ponger sink is slower
+than the link, and without workers every lost ping was a sink-full drop at the receiver;
+held back in the socket instead, nothing is lost and the bulk flow delivers twice as much.
+`worker_pool` (slot 1 at load 9-27, slot 0 at 14-31) varied up to 3x between halves of
+the same build and is not usable. Most halves ran at load1 above 12, so the harness rows
+are noisy: nsplane-nsplane and kernel-nsplane show no regression, while nsplane-kernel
+(nsplane only sends, receiving TCP ACKs) is lower in B in all four halves, each of which
+ran at a higher load than the A half before it. On that path the deliver queue stays
+nearly empty, so the gate only adds a capacity check per poll; a quiet-host re-run should
+settle it before the default change counts as a pure win.
+
+Quiet re-run #1 of nsplane-kernel (A = e381bcf, B = the change alone, slot 1, interleaved,
+P1 / P4 Gbit/s, load1 at the start and end of each half): A1 4.51 / 5.18 (11.7 -> 14.7),
+B1 6.61 / 6.49 (14.7 -> 19.7), A2 6.64 / 5.37 (19.2 -> 21.7), B2 5.00 / 4.10 (21.7 ->
+20.9); means A 5.58 / 5.28 and B 5.81 / 5.30. `worker_pool` in the same slot (load 4 -> 30)
+was noise again. The change landed as the default on L1's recorded decision (b),
+2026-10-06: the earlier nsplane-kernel loss did not repeat and has no mechanism. The
+release table on an idle host re-checks nsplane-kernel, and the gate becomes opt-in before
+the release if a loss shows there.
+
+The queue-delay bound (QE follow-up F2) was tried as the opt-in
+`EngineBuilder::queue_delay_target(Duration)` and dropped: CoDel head drops of data before
+sealing and decryption, plus a time-sized local intake of 2 x MAX_BATCH with an explicit
+room waker. On top of F1 (A = 9b7e566, B = the F2 tip, target 1 ms, slot 0, load 4-15) the
+default harness lowered loaded p50 3.02 -> 2.13 ms (-29.5 %, lower in every rep) at no
+throughput cost, the only case that met the merge gate (loaded p50 -25 % at <= 5 %
+throughput cost); with 2 workers p50 rose 2.57 -> 2.77 ms (+7.8 %). In the latency e2e w0
+p50 moved -9 / -7 % at -3..-4 % throughput and w2 p50 +25 / +29 % (p99 -35..-41 %). CoDel
+never dropped there (0 `QUEUE_DELAY`): with F1 the effect comes only from the 128-packet
+transmit depth, which with workers counts seals in flight. 25-45 % of that test's delay is
+its own `ChannelSource` mpsc, upstream of the engine, and with workers the backlog sits in
+the kernel UDP receive buffer. The implementation stays on bkd/3wk2cqvs, not merged; a
+later round could try a w0-only variant.
 
 ## Unsafe code
 

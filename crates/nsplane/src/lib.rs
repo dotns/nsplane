@@ -62,7 +62,9 @@ pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, Link
 pub use map::{MapSink, MapSource, MapVerdict};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
-pub use nsplane_core::{AllowedIp, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519};
+pub use nsplane_core::{
+    AllowedIp, InboundDestinations, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519,
+};
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, SharedPacketPool,
     TAILROOM, TransportId,
