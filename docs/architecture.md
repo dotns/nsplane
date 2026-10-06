@@ -2607,10 +2607,10 @@ owner's work per packet drops to an estimated 0.35-0.45 us (not measured), so th
 limits are the receiver's TUN delivery (coalescing and the TUN
 write, 17-18 % of the receiver on its owner without workers, the sink task with workers) and
 the sender's TSO split copy (`VnetReader::segment`, 5 % of the sender; splitting in place is
-not possible, each segment needs its own header and headroom). Without workers, a receiver
-whose sink is slower than the network still drops at `DROP_SINK_FULL` (the pool-off owner
-takes at least one datagram per wake); applying C2's deliver-room gate without workers would
-change the default path and is left for a later round. Without offload, one TUN read and one
+not possible, each segment needs its own header and headroom). C2's deliver-room gate now
+applies without workers too, so a receiver whose sink is slower than the network holds the
+datagrams back instead of dropping at `DROP_SINK_FULL` (see "Deliver room without crypto
+workers (QE-3 F1)" below). Without offload, one TUN read and one
 TUN write per packet remain. UDP loss at 3 Gbit/s is at the iperf3 socket and the sender's
 TUN queue, not in the tunnel.
 
