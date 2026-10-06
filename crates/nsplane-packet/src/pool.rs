@@ -59,6 +59,22 @@ impl SharedPacketPool {
         buf
     }
 
+    /// Returns a packet holding a copy of `packet` behind [`HEADROOM`](crate::HEADROOM), with
+    /// `capacity() >= packet.len() + TAILROOM`, reusing an idle buffer if one is free.
+    ///
+    /// Like [`alloc`](Self::alloc) followed by a copy, without zero-filling first: a reused
+    /// buffer that is too small is grown, and without an idle buffer, or while the list is
+    /// busy, it allocates a new one and counts it in [`allocated`](Self::allocated).
+    pub fn alloc_from(&self, packet: &[u8]) -> PacketBuf {
+        let capacity = packet.len() + TAILROOM;
+        let mut buf = self.take(capacity).unwrap_or_else(|| {
+            self.inner.allocated.fetch_add(1, Ordering::Relaxed);
+            PacketBuf::with_capacity(capacity)
+        });
+        buf.extend_from_slice(packet);
+        buf
+    }
+
     /// An idle buffer with room for `capacity` bytes; `None` if the list is empty or busy.
     fn take(&self, capacity: usize) -> Option<PacketBuf> {
         let inner = &*self.inner;
@@ -127,6 +143,44 @@ mod tests {
         }
         assert_eq!(pool.allocated(), 4);
         assert_eq!(pool.free_len(), 0);
+    }
+
+    #[test]
+    fn alloc_from_copies_behind_headroom() {
+        let pool = SharedPacketPool::new(4);
+        let packet: Vec<u8> = (0..=255).cycle().take(1400).collect();
+        let mut buf = pool.alloc_from(&packet);
+        assert_eq!(buf.as_packet(), packet);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert!(buf.capacity() >= packet.len() + TAILROOM);
+        assert_eq!(buf.with_headroom_mut()[..HEADROOM], [0; HEADROOM]);
+        assert_eq!(pool.allocated(), 1);
+
+        // Reused for a shorter packet, then grown for a longer one.
+        let addr = buf.with_headroom_mut().as_ptr();
+        pool.recycle(&mut vec![buf]);
+        let mut short = pool.alloc_from(&[9; 60]);
+        assert_eq!(short.as_packet(), [9; 60]);
+        assert_eq!(short.with_headroom_mut().as_ptr(), addr);
+        assert_eq!(short.headroom(), HEADROOM);
+        assert_eq!(pool.allocated(), 1);
+
+        pool.recycle(&mut vec![PacketBuf::with_capacity(8)]);
+        let long = pool.alloc_from(&packet);
+        assert_eq!(long.as_packet(), packet);
+        assert!(long.capacity() >= packet.len() + TAILROOM);
+        assert_eq!(pool.allocated(), 1);
+    }
+
+    #[test]
+    fn alloc_from_skips_a_busy_list() {
+        let pool = SharedPacketPool::new(4);
+        pool.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
+        let held = pool.inner.pool.lock();
+        assert_eq!(pool.alloc_from(&[1, 2, 3]).as_packet(), [1, 2, 3]);
+        assert_eq!(pool.allocated(), 1);
+        drop(held);
+        assert_eq!(pool.free_len(), 1);
     }
 
     #[test]

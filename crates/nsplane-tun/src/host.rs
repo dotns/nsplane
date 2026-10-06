@@ -101,8 +101,7 @@ impl HostTunInput {
     /// recycled to the [`HostTunSource`] when one is idle, else a new one. Packets longer
     /// than the MTU are queued too and dropped by the [`HostTunSource`].
     pub fn push(&self, packet: &[u8]) -> Result<(), PushError> {
-        let mut buf = self.free.alloc(packet.len());
-        buf.as_packet_mut().copy_from_slice(packet);
+        let buf = self.free.alloc_from(packet);
         self.tx.try_send(buf).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => PushError::Full,
             mpsc::error::TrySendError::Closed(_) => PushError::Closed,
