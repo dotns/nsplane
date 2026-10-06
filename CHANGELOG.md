@@ -60,9 +60,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
 
 ### Fixed
+- `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
+  (left non-present by a killed process, its alias still resolving): it is replaced, while a
+  live adapter of the same name is still refused with `WintunError::AdapterExists`; new
+  `WintunError::OrphanNotReplaced` when Wintun cannot reclaim the alias. Without
+  `exclusive(true)` an orphan is replaced instead of opened.
+- `nsplane-tun` (Windows): `TunOptions::mtu` now takes effect: the MTU is set after the
+  session starts, on IPv4 and IPv6 (waiting up to 5 s for the IPv4 interface row and 500 ms
+  more for the IPv6 one, which a new adapter creates asynchronously; IPv6 is skipped when
+  its row does not appear), read back on both, and a differing read-back fails with the new
+  `WintunError::MtuMismatch`; `Tun::mtu` reports the read-back value. Without `mtu` nothing
+  waits and the IPv4 MTU is read as before.
 - `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
   it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
   source and it allocated every buffer.
+
+## [0.10.1] - 2026-10-06
+
+Patch release: one engine fix for `crypto_workers >= 2`.
+
+### Fixed
+- `nsplane`: with `crypto_workers >= 2`, the local packets with the workers count against the
+  room for local packets, so a slow transport holds back the source instead of dropping up to
+  `queue_capacity` datagrams under `transmit full` (seen as lost packets in
+  `a_rekey_under_load_keeps_every_packet_in_order` under load).
 
 ## [0.10.0] - 2026-10-05
 
