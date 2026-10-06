@@ -942,17 +942,27 @@ on Windows), so a caller learns it without opening the device itself (MT-4).
   a missing file is `NotFound` with the wintun.net remedy (`bin\<arch>\wintun.dll`, elevated
   terminal), a mismatch `WintunError::HashMismatch`. The file can still be replaced between
   check and load, so it must sit in a directory only administrators can write. With
-  `exclusive(true)` an existing Wintun adapter (`Adapter::open` succeeds; that handle is
-  only closed) or any interface with that alias (`ConvertInterfaceAliasToLuid`) is refused
-  with `WintunError::AdapterExists` instead of opened. Once the adapter is open, a pinned
+  `exclusive(true)` a live Wintun adapter (`Adapter::open` succeeds; that handle is only
+  closed) or any present interface with that alias (`ConvertInterfaceAliasToLuid`) is
+  refused with `WintunError::AdapterExists` instead of opened. With either setting an
+  orphan is replaced: the name resolves to a LUID (Wintun's handle, else the alias) whose
+  interface is not present (`GetIfEntry2` reports `OperStatus` `NotPresent` or has no row),
+  the device of a process that died without closing its adapter; the handle is closed, the
+  adapter created (Wintun cleans up or renames the non-present device) and the assigned
+  alias must equal the name, else the new adapter is removed and
+  `WintunError::OrphanNotReplaced` returned. A present device (any other `OperStatus`,
+  `Down` included) stands in for a live owner, which cannot be observed directly; on the
+  default path a failed IP Helper query counts as present, so it fails no differently than
+  before. The decision (`Existing`, `classify`, `plan`) is pure in `wintun`. Once the adapter is open, a pinned
   `driver_version` is compared with the running driver (`WintunError::DriverVersionMismatch`;
   dropping the handle removes an adapter this call created), then `mtu(n)` sets the
   interface MTU (IPv4, IPv6 where the row exists) and `Tun::mtu` reports the read-back IPv4
   value. The typed errors travel inside `io::Error` (`InvalidData`, `AlreadyExists`) and are
   recovered with `downcast_ref::<WintunError>()`. Verified here: the pure logic in Linux unit
-  tests, the pin-before-load path under wine (no wintun.dll); adapter creation, the
-  exclusive refusal against a live adapter, MTU set/read-back and the driver version query
-  need a real Windows host.
+  tests (including the modeled absent / orphaned / live interface table), the
+  pin-before-load path under wine (no wintun.dll); adapter creation, the exclusive refusal
+  against a live adapter, the orphan replacement, MTU set/read-back and the driver version
+  query need a real Windows host.
 - `slot`: `TunSlot`, an fd local side the host swaps while the engine runs (Android
   `VpnService`). `TunSlot::new(mtu)` returns the control handle, a `SlotSource` and a
   `SlotSink`; built on Linux, Android, macOS and iOS (the cfg of `Tun`), not on other Unix
