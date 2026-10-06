@@ -1,12 +1,13 @@
 //! The Windows service TUN checks that need no Windows API: the `wintun.dll` pin and its
-//! verification, the typed [`WintunError`], the open/create/replace/refuse decision and MTU
-//! validation. Compiled on Windows and, for the unit tests, on every host.
+//! verification, the typed [`WintunError`], the open/create/replace/refuse decision, MTU
+//! validation and its read-back check. Compiled on Windows and, for the unit tests, on every host.
 
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -17,6 +18,17 @@ const MAX_DLL_LEN: u64 = 16 << 20;
 /// The smallest interface MTU accepted: the IPv4 minimum datagram every host must
 /// accept (RFC 791).
 const MIN_MTU: u16 = 576;
+
+/// The pause between two queries for an IP interface row of a new adapter.
+pub(crate) const ROW_POLL: Duration = Duration::from_millis(50);
+
+/// How long `Tun::create_with` waits for the IPv4 interface row of the adapter, which a new
+/// adapter creates asynchronously, before it fails with [`io::ErrorKind::TimedOut`].
+pub(crate) const IPV4_ROW_WAIT: Duration = Duration::from_secs(5);
+
+/// How long `Tun::create_with` waits for the IPv6 interface row once the IPv4 row exists;
+/// still absent then, IPv6 counts as disabled on this host and its MTU is not set.
+pub(crate) const IPV6_ROW_WAIT: Duration = Duration::from_millis(500);
 
 /// The `wintun.dll` the caller expects, for `TunOptions::wintun_pin`.
 ///
@@ -252,6 +264,44 @@ pub(crate) fn validate_mtu(mtu: u16) -> io::Result<u16> {
     Ok(mtu)
 }
 
+/// Polls until `poll` yields a value, pausing `interval` (through `pause`) between polls
+/// until the pauses add up to `wait`; `None` if it never did. A poll error is returned at
+/// once.
+pub(crate) fn wait_for<T>(
+    wait: Duration,
+    interval: Duration,
+    mut poll: impl FnMut() -> io::Result<Option<T>>,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<Option<T>> {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(Some(value));
+        }
+        if waited >= wait {
+            return Ok(None);
+        }
+        pause(interval);
+        waited += interval;
+    }
+}
+
+/// Checks the MTUs read back after setting `requested`: the IPv4 one, and the IPv6 one
+/// unless the interface has no IPv6 row (`None`). A difference fails with
+/// [`WintunError::MtuMismatch`].
+pub(crate) fn check_mtu(requested: u16, ipv4: u32, ipv6: Option<u32>) -> Result<u16, WintunError> {
+    let requested_u32 = u32::from(requested);
+    if ipv4 == requested_u32 && ipv6.is_none_or(|mtu| mtu == requested_u32) {
+        Ok(requested)
+    } else {
+        Err(WintunError::MtuMismatch {
+            requested,
+            ipv4,
+            ipv6,
+        })
+    }
+}
+
 /// A refusal by the Windows service TUN checks of `Tun::create_with`.
 ///
 /// It is returned inside an [`io::Error`] (kind from [`WintunError::kind`]), so the
@@ -290,12 +340,23 @@ pub enum WintunError {
         /// The alias Wintun assigned to the new adapter instead.
         assigned: String,
     },
+    /// The interface MTU read back after setting it differs from the requested one; the
+    /// adapter was closed (and removed, if this call created it).
+    MtuMismatch {
+        /// The MTU of `TunOptions::mtu`.
+        requested: u16,
+        /// The IPv4 MTU read back.
+        ipv4: u32,
+        /// The IPv6 MTU read back, `None` if the interface has no IPv6 row.
+        ipv6: Option<u32>,
+    },
 }
 
 impl WintunError {
     /// The [`io::ErrorKind`] of the [`io::Error`] carrying this error:
     /// [`io::ErrorKind::InvalidData`] for the pins, [`io::ErrorKind::AlreadyExists`] for
-    /// an existing or unreplaceable adapter.
+    /// an existing or unreplaceable adapter, [`io::ErrorKind::Other`] for an MTU that did
+    /// not take effect.
     pub const fn kind(&self) -> io::ErrorKind {
         match self {
             Self::HashMismatch { .. } | Self::DriverVersionMismatch { .. } => {
@@ -304,6 +365,7 @@ impl WintunError {
             Self::AdapterExists { .. } | Self::OrphanNotReplaced { .. } => {
                 io::ErrorKind::AlreadyExists
             }
+            Self::MtuMismatch { .. } => io::ErrorKind::Other,
         }
     }
 }
@@ -336,6 +398,17 @@ impl fmt::Display for WintunError {
                  adapter got {assigned:?}); remove it with pnputil /remove-device or Device \
                  Manager (show hidden devices)"
             ),
+            Self::MtuMismatch {
+                requested,
+                ipv4,
+                ipv6,
+            } => {
+                write!(f, "the adapter MTU reads back as {ipv4} (IPv4)")?;
+                if let Some(ipv6) = ipv6 {
+                    write!(f, ", {ipv6} (IPv6)")?;
+                }
+                write!(f, " after setting {requested}")
+            }
         }
     }
 }
@@ -648,6 +721,25 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("pnputil /remove-device"), "{message}");
+        let mtu = WintunError::MtuMismatch {
+            requested: 1420,
+            ipv4: 65535,
+            ipv6: None,
+        };
+        assert_eq!(mtu.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            mtu.to_string(),
+            "the adapter MTU reads back as 65535 (IPv4) after setting 1420"
+        );
+        let mtu = WintunError::MtuMismatch {
+            requested: 1420,
+            ipv4: 1420,
+            ipv6: Some(65535),
+        };
+        assert_eq!(
+            mtu.to_string(),
+            "the adapter MTU reads back as 1420 (IPv4), 65535 (IPv6) after setting 1420"
+        );
     }
 
     #[test]
@@ -665,5 +757,88 @@ mod tests {
         let e = io::Error::from(orphan.clone());
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(downcast(&e), Some(&orphan));
+    }
+
+    #[test]
+    fn check_mtu_accepts_matching_read_backs() {
+        assert_eq!(check_mtu(1420, 1420, None), Ok(1420));
+        assert_eq!(check_mtu(1420, 1420, Some(1420)), Ok(1420));
+    }
+
+    #[test]
+    fn check_mtu_refuses_a_differing_read_back() {
+        assert_eq!(
+            check_mtu(1420, 65535, Some(65535)),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 65535,
+                ipv6: Some(65535),
+            })
+        );
+        assert_eq!(
+            check_mtu(1420, 65535, None),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 65535,
+                ipv6: None,
+            })
+        );
+        assert_eq!(
+            check_mtu(1420, 1420, Some(65535)),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 1420,
+                ipv6: Some(65535),
+            })
+        );
+    }
+
+    /// Runs `wait_for` over scripted poll results, returning its result, the number of
+    /// polls and the total pause.
+    fn scripted(
+        wait: Duration,
+        script: Vec<io::Result<Option<u32>>>,
+    ) -> (io::Result<Option<u32>>, usize, Duration) {
+        let mut script = script.into_iter();
+        let mut polls = 0;
+        let mut paused = Duration::ZERO;
+        let result = wait_for(
+            wait,
+            ROW_POLL,
+            || {
+                polls += 1;
+                script.next().unwrap_or(Ok(None))
+            },
+            |interval| paused += interval,
+        );
+        (result, polls, paused)
+    }
+
+    #[test]
+    fn wait_for_returns_a_row_that_appears() {
+        let (result, polls, paused) =
+            scripted(IPV4_ROW_WAIT, vec![Ok(None), Ok(None), Ok(Some(1500))]);
+        assert_eq!(result.unwrap(), Some(1500));
+        assert_eq!(polls, 3);
+        assert_eq!(paused, 2 * ROW_POLL);
+    }
+
+    #[test]
+    fn wait_for_gives_up_after_the_wait() {
+        let (result, polls, paused) = scripted(IPV6_ROW_WAIT, Vec::new());
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(polls, 11);
+        assert_eq!(paused, IPV6_ROW_WAIT);
+    }
+
+    #[test]
+    fn wait_for_returns_an_error_at_once() {
+        let (result, polls, paused) = scripted(
+            IPV4_ROW_WAIT,
+            vec![Err(io::Error::from_raw_os_error(5)), Ok(Some(1500))],
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(polls, 1);
+        assert_eq!(paused, Duration::ZERO);
     }
 }

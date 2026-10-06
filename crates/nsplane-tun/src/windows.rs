@@ -23,9 +23,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceAliasToLuid, GetIfEntry2, MIB_IF_ROW2,
+    ConvertInterfaceAliasToLuid, GetIfEntry2, GetIpInterfaceEntry, MIB_IF_ROW2,
+    MIB_IPINTERFACE_ROW, SetIpInterfaceEntry,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::Win32::Networking::WinSock::{ADDRESS_FAMILY, AF_INET, AF_INET6};
 use wintun_bindings::{Adapter, MAX_RING_CAPACITY, Session};
 
 use crate::wintun::{self, Existing, Plan, WintunError, WintunPin};
@@ -113,10 +115,13 @@ impl TunOptions {
         self
     }
 
-    /// Sets the interface MTU (IPv4, and IPv6 where the interface has an IPv6 row) once
-    /// the adapter is open; [`Tun::mtu`] then reports the value read back. Below 576 (the
-    /// IPv4 minimum) [`Tun::create_with`] fails with [`io::ErrorKind::InvalidInput`]
-    /// before loading anything.
+    /// Sets the interface MTU on both families once the session has started, waiting for
+    /// the interface rows a new adapter creates asynchronously (IPv4 up to 5 s, else
+    /// [`io::ErrorKind::TimedOut`]); IPv6 is skipped only when the interface has no IPv6
+    /// row within 500 ms after the IPv4 row. Both are read back and a differing read-back
+    /// fails with [`WintunError::MtuMismatch`]; [`Tun::mtu`] then reports the value read
+    /// back. Below 576 (the IPv4 minimum) [`Tun::create_with`] fails with
+    /// [`io::ErrorKind::InvalidInput`] before loading anything.
     #[must_use]
     pub const fn mtu(mut self, mtu: u16) -> Self {
         self.mtu = Some(mtu);
@@ -125,8 +130,8 @@ impl TunOptions {
 }
 
 impl Tun {
-    /// Opens the Wintun adapter `name`, creating it if needed, reads its MTU and starts
-    /// a session.
+    /// Opens the Wintun adapter `name`, creating it if needed, starts a session and reads
+    /// its MTU.
     ///
     /// `wintun.dll` must sit next to the executable or on the DLL search path; without
     /// it (or without the driver) this fails with an [`io::Error`].
@@ -137,7 +142,9 @@ impl Tun {
     /// Like [`Tun::create`], with the checks of `options`, in this order: MTU
     /// validation, the `wintun.dll` pin (hash, then load of that same absolute path),
     /// the adapter (an orphan is replaced; refused if exclusive and live, else opened or
-    /// created), the running driver version, the MTU (set, then read back), the session.
+    /// created), the running driver version, the session, the MTU (set, then read back).
+    /// On a failure after the adapter step the session and adapter are dropped: a created
+    /// adapter is removed again, an opened one only closed.
     ///
     /// The refusals are [`WintunError`]s inside the [`io::Error`]; see there for the
     /// downcast.
@@ -211,11 +218,11 @@ impl Tun {
                 return Err(WintunError::DriverVersionMismatch { expected, actual }.into());
             }
         }
-        if let Some(mtu) = mtu {
-            adapter.set_mtu(usize::from(mtu))?;
-        }
-        let mtu = u16::try_from(adapter.get_mtu()?).unwrap_or(u16::MAX);
         let session = adapter.start_session(MAX_RING_CAPACITY)?;
+        let mtu = match mtu {
+            Some(mtu) => set_mtu(name, adapter.get_luid(), mtu)?,
+            None => u16::try_from(adapter.get_mtu()?).unwrap_or(u16::MAX),
+        };
         Ok(Self { session, mtu })
     }
 
@@ -225,8 +232,8 @@ impl Tun {
         Ok(self.session.get_adapter().get_name()?)
     }
 
-    /// The IPv4 MTU of the adapter, queried at [`Tun::create`] (after setting it, if
-    /// [`TunOptions::mtu`] asked for that).
+    /// The adapter MTU queried at [`Tun::create`]: with [`TunOptions::mtu`] the value set
+    /// and read back on both families, else the IPv4 MTU.
     pub const fn mtu(&self) -> u16 {
         self.mtu
     }
@@ -303,6 +310,78 @@ fn existing(name: &str, opened: Option<NET_LUID_LH>) -> io::Result<Existing> {
     };
     let present = luid.map(interface_present).transpose()?.flatten();
     Ok(wintun::classify(luid.is_some(), present))
+}
+
+/// The `NlMtu` of the IP interface row of `luid` for `family`; `None` when the interface
+/// has no row for that family (yet).
+fn ip_interface_mtu(luid: NET_LUID_LH, family: ADDRESS_FAMILY) -> io::Result<Option<u32>> {
+    let mut row = MIB_IPINTERFACE_ROW {
+        Family: family,
+        InterfaceLuid: luid,
+        ..Default::default()
+    };
+    #[allow(unsafe_code, reason = "IP Helper FFI call")]
+    // SAFETY: `row` is a writable `MIB_IPINTERFACE_ROW` with `Family` and `InterfaceLuid`
+    // set, as the call requires; it outlives the call.
+    let status = unsafe { GetIpInterfaceEntry(&raw mut row) };
+    match status {
+        NO_ERROR => Ok(Some(row.NlMtu)),
+        ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND => Ok(None),
+        code => Err(io::Error::from_raw_os_error(code.cast_signed())),
+    }
+}
+
+/// Sets the `NlMtu` of the IP interface row of `luid` for `family`.
+fn set_ip_interface_mtu(luid: NET_LUID_LH, family: ADDRESS_FAMILY, mtu: u32) -> io::Result<()> {
+    let mut row = MIB_IPINTERFACE_ROW {
+        Family: family,
+        InterfaceLuid: luid,
+        ..Default::default()
+    };
+    #[allow(unsafe_code, reason = "IP Helper FFI call")]
+    // SAFETY: as in `ip_interface_mtu`.
+    let status = unsafe { GetIpInterfaceEntry(&raw mut row) };
+    if status != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    // SetIpInterfaceEntry requires a zero `SitePrefixLength` for an IPv4 row.
+    row.SitePrefixLength = 0;
+    row.NlMtu = mtu;
+    #[allow(unsafe_code, reason = "IP Helper FFI call")]
+    // SAFETY: `row` is the initialized row just read for this interface and family; it
+    // outlives the call.
+    let status = unsafe { SetIpInterfaceEntry(&raw mut row) };
+    match status {
+        NO_ERROR => Ok(()),
+        code => Err(io::Error::from_raw_os_error(code.cast_signed())),
+    }
+}
+
+/// Sets the MTU of the adapter `name` (`luid`) on IPv4 and, if the interface has an IPv6
+/// row, IPv6, after waiting for the rows; returns the checked read-back.
+fn set_mtu(name: &str, luid: NET_LUID_LH, mtu: u16) -> io::Result<u16> {
+    let ipv4 = || ip_interface_mtu(luid, AF_INET);
+    let ipv6 = || ip_interface_mtu(luid, AF_INET6);
+    let no_ipv4_row = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the adapter {name:?} has no IPv4 interface row after {:?}",
+                wintun::IPV4_ROW_WAIT
+            ),
+        )
+    };
+    wintun::wait_for(wintun::IPV4_ROW_WAIT, wintun::ROW_POLL, ipv4, thread::sleep)?
+        .ok_or_else(no_ipv4_row)?;
+    let has_ipv6 =
+        wintun::wait_for(wintun::IPV6_ROW_WAIT, wintun::ROW_POLL, ipv6, thread::sleep)?.is_some();
+    set_ip_interface_mtu(luid, AF_INET, u32::from(mtu))?;
+    if has_ipv6 {
+        set_ip_interface_mtu(luid, AF_INET6, u32::from(mtu))?;
+    }
+    let read_ipv4 = ipv4()?.ok_or_else(no_ipv4_row)?;
+    let read_ipv6 = if has_ipv6 { ipv6()? } else { None };
+    Ok(wintun::check_mtu(mtu, read_ipv4, read_ipv6)?)
 }
 
 /// Receives packets until the session shuts down or the [`TunSource`] is gone.
