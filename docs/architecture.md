@@ -130,7 +130,9 @@ Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
   makes the core call `on_authenticated` for every authenticated message, on the current path
   too, where the answer changes nothing; by default the core asks only about messages from
   another path, which keeps the steady-state data path free
-  of the call. `Event::Authenticated` stays limited to path changes.
+  of the call. `Event::Authenticated` stays limited to off-path sources, once per change of
+  source: a peer kept on its path by the policy reports a source again only after its path is
+  set (configuration, `force_handshake`, adoption) or a handshake completes.
 
 **Unanswered handshakes.** `Core::unanswered_handshakes(peer)` (`None` for an unknown peer)
 counts the handshake initiations sent to a peer that got no response: one counts when another

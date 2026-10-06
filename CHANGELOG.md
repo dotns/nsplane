@@ -5,6 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `nsplane-core`: `Event::Authenticated` is emitted once per off-path source change (since the
+  peer's path was last set or a handshake completed), not per message; `PathPolicy::on_authenticated`
+  is still called per message.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
