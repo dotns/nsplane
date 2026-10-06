@@ -1003,11 +1003,14 @@ smoltcp on its own dispatch path.
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
   `NetStackConfig`); the sink waits while ingress is full. One driver turn routes up to
   256 ingress packets before any application reads, so a burst to one UDP flow or socket
-  beyond `datagram_capacity` (default 128) loses the excess even when the application
-  keeps up on average (`udp_queue_full`). In the harness's netstack pair that was 100 %
-  of the receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s (per-hop accounting; the
-  kernel, the sender and reordering lost nothing); `netstack_bench`'s server sizes its
-  queue to 1024 and the default stays, so a bulk UDP receiver sets at least 256.
+  beyond `datagram_capacity` loses the excess even when the application keeps up on
+  average (`udp_queue_full`). In the harness's netstack pair that was 100 % of the
+  receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s with the former default of 128
+  (per-hop accounting; the kernel, the sender and reordering lost nothing). The default
+  is 256, one driver step (QN-4, see [Netstack throughput](#netstack-throughput)); the
+  queue grows on demand in 32-entry blocks, so an idle flow costs one block (about
+  1 KiB, 2 KiB per bound socket) at any capacity, and a full one pins up to 256 ingress
+  buffers (about 512 KiB). `netstack_bench`'s server keeps 1024.
 - A full accept queue closes new TCP connections (`tcp_not_accepted`) by default. With
   `NetStackConfig::accept_backpressure`, bare SYNs are left unanswered while it is full
   (`syn_deferred`; the peer retransmits) and connections that completed their handshake
