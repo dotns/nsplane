@@ -16,9 +16,9 @@ use nsplane::{PacketSink, PacketSource};
 use nsplane_packet::reassembly::{Outcome, Reassembler, ReassemblyStats};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId, protocol};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, TcpSeqNumber};
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use crate::config::{NetStackConfig, Settings};
 use crate::device::VirtualDevice;
 use crate::ownership::{Owners, Ownership, Registration};
+use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self, Counters, NetStackStats};
 use crate::tcp::{Progress, Shared, TcpConnection, WriteHalf, lock};
 use crate::udp::{self, Datagram, UdpFlow, UdpOut, UdpReply, UdpSocket};
@@ -485,6 +486,9 @@ enum Class {
     Tcp { dst_port: u16, syn: bool },
     /// Into the UDP dispatch path.
     Udp,
+    /// An ICMP or `ICMPv6` message: a Fragmentation Needed or Packet Too Big may lower a
+    /// connection's MSS.
+    Icmp,
 }
 
 /// Why an ingress packet is dropped.
@@ -513,6 +517,8 @@ fn classify(bytes: &[u8], settings: &Settings) -> Result<Class, Reject> {
     match ip.protocol() {
         protocol::UDP => Ok(Class::Udp),
         protocol::TCP => Err(Reject::Malformed),
+        protocol::ICMP if ip.src().is_ipv4() => Ok(Class::Icmp),
+        protocol::ICMPV6 if ip.src().is_ipv6() => Ok(Class::Icmp),
         _ => Err(Reject::Unsupported),
     }
 }
@@ -891,10 +897,52 @@ impl Driver {
                 Some(datagram) => self.dispatch_udp(datagram),
                 None => stats::add(&self.stats.malformed, 1),
             },
+            Ok(Class::Icmp) => self.icmp(packet.as_packet()),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Applies an ICMP Fragmentation Needed or `ICMPv6` Packet Too Big to the connection
+    /// whose segment it quotes, or counts it in `icmp_ignored`; any other ICMP message
+    /// counts as `unsupported`.
+    fn icmp(&mut self, packet: &[u8]) {
+        match pmtu::parse(packet) {
+            Message::Other => stats::add(&self.stats.unsupported, 1),
+            Message::Ignored => stats::add(&self.stats.icmp_ignored, 1),
+            Message::TooBig(too_big) => {
+                if !self.reduce_mss(&too_big) {
+                    stats::add(&self.stats.icmp_ignored, 1);
+                }
+            }
+        }
+    }
+
+    /// Lowers the MSS of the live connection `too_big` quotes; whether it did. smoltcp
+    /// checks that the quoted sequence number lies within SND.UNA..SND.NXT and that the
+    /// MSS goes down, and resends the data in flight at once in segments of the new size.
+    fn reduce_mss(&mut self, too_big: &TooBig) -> bool {
+        if too_big.mtu >= u32::from(self.settings.mtu)
+            || !self.settings.is_local(too_big.local.ip())
+        {
+            return false;
+        }
+        let (local, remote) = (
+            IpEndpoint::from(too_big.local),
+            IpEndpoint::from(too_big.remote),
+        );
+        let (now, mss) = (self.now(), too_big.mss());
+        // Linear in the sockets, but only per message: no state is kept for the lookup.
+        self.sockets
+            .iter_mut()
+            .filter_map(|(_, socket)| tcp::Socket::downcast_mut(socket))
+            .find(|socket| {
+                socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote)
+            })
+            .is_some_and(|socket| {
+                socket.reduce_mss(now, mss, TcpSeqNumber(too_big.seq.cast_signed()))
+            })
     }
 
     /// Feeds a packet to the stack's address through the reassembler, if there is one:

@@ -5,6 +5,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `nsplane-netstack`: path MTU discovery for the stack's own TCP (ns MB-x7). An ICMP
+  Fragmentation Needed or `ICMPv6` Packet Too Big that quotes a segment of a live connection
+  (tuple and sequence number checked; MTU at least 576 / 1280, below the configured MTU and
+  the connection's current one) lowers that connection's MSS and resends the data in flight
+  at once in smaller segments, so a stack at 1420 no longer stalls over a 1376 relay path.
+  Other such messages are dropped and counted in the new `NetStackStats::icmp_ignored`;
+  other ICMP still counts as `unsupported` (a new field: breaking for code that builds
+  `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
+  (`tcp::Socket::reduce_mss`).
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
