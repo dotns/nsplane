@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-wss`: `WssConfig::ping_interval(Option<Duration>)`; `None` (stored as a zero
+  `ping_interval`, as `keepalive(Duration::ZERO, idle)` does) sends no keepalive pings on
+  `WssDialer` links, `WssStreamClient` sessions and `WssStreamServer` sessions, with no ping
+  task or timer; the read idle still ends a silent link. The default stays a 10 s ping.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
