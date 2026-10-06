@@ -17,9 +17,9 @@ use std::time::Duration;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
-    DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Ecn,
-    Engine, EngineBuilder, EngineError, EngineHandle, Event, PacketBuf, PacketSource, Path, Peer,
-    PeerId, Transport, TransportError, TransportId,
+    DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED,
+    DROP_TRANSPORT_SEND_ERROR, Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event,
+    PacketBuf, PacketSource, Path, Peer, PeerId, Transport, TransportError, TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -1241,6 +1241,126 @@ async fn crypto_workers_hold_back_datagrams_for_a_slow_sink() {
     assert!(b.handle.drop_counters().await.unwrap().is_empty());
     let deliver = b.handle.queue_stats().await.unwrap().deliver;
     assert!(deliver.high_water <= deliver.capacity, "{deliver:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn datagrams_wait_for_a_slow_sink_without_workers() {
+    const PACKETS: usize = 400;
+    let (ta, tb) = link(64);
+    let mut a = node(
+        1,
+        IP_A,
+        addr_a(),
+        TransportId::new(1),
+        ta,
+        &Options::default(),
+    );
+    let options = Options {
+        queue_capacity: 16,
+        sink_capacity: 1,
+        crypto_workers: 0,
+    };
+    let mut b = node(2, IP_B, addr_b(), TransportId::new(2), tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..PACKETS {
+            let packet = PacketBuf::from_packet(&numbered(i));
+            local.send(packet).await.unwrap();
+        }
+    });
+    for i in 0..PACKETS {
+        if i % 8 == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(b.expect_delivery().await.1, numbered(i));
+    }
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+    let deliver = b.handle.queue_stats().await.unwrap().deliver;
+    assert!(deliver.high_water <= deliver.capacity, "{deliver:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_sink_holds_back_the_sender_without_workers() {
+    // More than the sender's queues and the link hold.
+    const PACKETS: usize = 4000;
+    let (ta, tb) = link(64);
+    let mut a = node(
+        1,
+        IP_A,
+        addr_a(),
+        TransportId::new(1),
+        ta,
+        &Options::default(),
+    );
+    let options = Options {
+        queue_capacity: 16,
+        sink_capacity: 1,
+        crypto_workers: 0,
+    };
+    let mut b = node(2, IP_B, addr_b(), TransportId::new(2), tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..PACKETS {
+            let packet = PacketBuf::from_packet(&numbered(i));
+            local.send(packet).await.unwrap();
+        }
+    });
+    // Nothing reads the sink: the datagrams back up through the link into `a`, which holds
+    // back its source, instead of being decrypted into a full deliver queue.
+    sleep(QUIET).await;
+    assert!(!sender.is_finished());
+    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+    assert!(a.handle.drop_counters().await.unwrap().is_empty());
+    for i in 0..PACKETS {
+        assert_eq!(b.expect_delivery().await.1, numbered(i));
+    }
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_sink_holds_nothing_back() {
+    const PACKETS: usize = 400;
+    let (ta, tb) = link(64);
+    let mut a = node(
+        1,
+        IP_A,
+        addr_a(),
+        TransportId::new(1),
+        ta,
+        &Options::default(),
+    );
+    let options = Options {
+        queue_capacity: 16,
+        sink_capacity: 1,
+        crypto_workers: 0,
+    };
+    let mut b = node(2, IP_B, addr_b(), TransportId::new(2), tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    drop(std::mem::replace(&mut b.delivered, mpsc::channel(1).1));
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..PACKETS {
+            let packet = PacketBuf::from_packet(&numbered(i));
+            local.send(packet).await.unwrap();
+        }
+    });
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while b.drops(DROP_SINK_CLOSED).await == 0 {
+        assert!(Instant::now() < deadline, "no packet dropped as closed");
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(b.drops(DROP_SINK_FULL).await, 0);
 }
 
 /// A transport that records how many datagrams each `send_batch` call carries.

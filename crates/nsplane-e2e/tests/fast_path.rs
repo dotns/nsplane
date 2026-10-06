@@ -723,7 +723,7 @@ async fn sink_falls_back_to_the_deliver_queue_and_counts_drops_as_before() -> Te
     next += burst;
 
     // A sink that takes nothing: the sink task holds a batch, the deliver queue fills and
-    // the rest is dropped as before.
+    // the received datagrams wait in the transport instead of being dropped.
     b.sink.set_mode(Mode::Block);
     b.sink.set_open(false);
     let burst = 300;
@@ -733,7 +733,7 @@ async fn sink_falls_back_to_the_deliver_queue_and_counts_drops_as_before() -> Te
     received += u64::from(burst);
     b.wait_received(&a, received).await?;
     let full = b.drops(DROP_SINK_FULL).await? - full;
-    assert!(full > 0);
+    assert_eq!(full, 0);
     b.sink.set_mode(Mode::Accept);
     b.sink.set_open(true);
     let seqs = b.deliveries().await;

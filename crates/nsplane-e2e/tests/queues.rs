@@ -1,7 +1,7 @@
 //! Queue high-water marks: under load the marks of the engine's bounded queues rise but
 //! never pass their capacities, they restart at 0 after `take_queue_stats`, and a sink that
-//! stops draining fills the deliver queue to its capacity while the overflow is counted
-//! under `DROP_SINK_FULL`. With the crypto worker pool on, its job and done queues are
+//! stops draining fills the deliver queue to its capacity while the received datagrams wait
+//! in the transport instead of being dropped under `DROP_SINK_FULL`. With the crypto worker pool on, its job and done queues are
 //! reported too; without it they have no capacity.
 
 use std::net::SocketAddr;
@@ -205,38 +205,31 @@ async fn full_sink_fills_the_deliver_queue() -> TestResult {
     exchange(&mut a, &mut b).await?;
     b.handle.take_queue_stats().await?;
 
-    // The sink channel, the batch the sink task holds while waiting for room in it (the
-    // first packet and at most the `DELIVER` queued behind it) and the deliver queue take at
-    // most this many; the rest is dropped.
+    // More than the sink channel, the batch the sink task holds while waiting for room in it
+    // (the first packet and at most the `DELIVER` queued behind it) and the deliver queue
+    // take: the deliver queue fills and the rest waits in the transport.
     let held = SINK + (DELIVER + 1) + DELIVER;
     let sent = held + 64;
     let packet = a.packet_to(&b, Family::V4, &payload(64));
     for _ in 0..sent {
         a.send(&packet).await?;
     }
-    let least = (sent - held) as u64;
     let deadline = Instant::now() + WAIT;
-    while b.drops(DROP_SINK_FULL).await? < least {
+    while b.handle.queue_stats().await?.deliver.high_water < DELIVER {
         if Instant::now() > deadline {
-            return Err(format!("fewer than {least} sink-full drops within {WAIT:?}").into());
+            return Err(format!("deliver queue not full within {WAIT:?}").into());
         }
         sleep(Duration::from_millis(10)).await;
     }
-    // Draining the sink then accounts for every packet: delivered or dropped, once.
+    // Draining the sink then delivers every packet, none dropped.
     let mut delivered = 0;
-    loop {
-        while b.delivered.try_recv().is_ok() {
-            delivered += 1;
-        }
-        let dropped = b.drops(DROP_SINK_FULL).await?;
-        if delivered + dropped == sent as u64 {
-            break;
-        }
-        if Instant::now() > deadline {
-            return Err(format!("{sent} sent: {delivered} delivered, {dropped} dropped").into());
-        }
-        sleep(Duration::from_millis(10)).await;
+    while delivered < sent {
+        timeout(WAIT, b.delivered.recv())
+            .await?
+            .ok_or("sink closed")?;
+        delivered += 1;
     }
+    assert_eq!(b.drops(DROP_SINK_FULL).await?, 0);
 
     let stats = b.handle.queue_stats().await?;
     assert_eq!(
