@@ -8,7 +8,7 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use nsplane::{PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId};
+use nsplane::{PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId, SharedPacketPool};
 use tokio::sync::{mpsc, watch};
 
 /// The host's packet writer; see [`host_tun`].
@@ -33,6 +33,9 @@ pub const HOST_TUN_DEFAULT_CAPACITY: usize = 4096;
 /// returns `false` once the host can no longer take packets.
 /// `NEPacketTunnelFlow.writePackets` does not block.
 ///
+/// Buffers handed back through [`PacketSource::recycle`] are kept, up to `capacity` idle
+/// ones, for [`HostTunInput::push`] to copy the next packets into.
+///
 /// # Panics
 ///
 /// Panics if `capacity` is 0.
@@ -43,13 +46,18 @@ pub fn host_tun(
 ) -> (HostTunInput, HostTunSource, HostTunSink) {
     let (tx, rx) = mpsc::channel(capacity);
     let (mtu_tx, _) = watch::channel(mtu);
+    let free = SharedPacketPool::new(capacity);
     (
-        HostTunInput { tx },
+        HostTunInput {
+            tx,
+            free: free.clone(),
+        },
         HostTunSource {
             rx,
             mtu,
             mtu_tx,
             oversize_drops: 0,
+            free,
         },
         HostTunSink { write },
     )
@@ -82,21 +90,22 @@ impl std::error::Error for PushError {}
 #[derive(Debug, Clone)]
 pub struct HostTunInput {
     tx: mpsc::Sender<PacketBuf>,
+    free: SharedPacketPool,
 }
 
 impl HostTunInput {
     /// Queues a copy of `packet` for the engine, without blocking; callable from any
     /// thread, inside a tokio runtime or not.
     ///
-    /// The packet is copied once, into a buffer with the engine's headroom. Packets longer
+    /// The packet is copied once, into a buffer with the engine's headroom: a buffer
+    /// recycled to the [`HostTunSource`] when one is idle, else a new one. Packets longer
     /// than the MTU are queued too and dropped by the [`HostTunSource`].
     pub fn push(&self, packet: &[u8]) -> Result<(), PushError> {
-        self.tx
-            .try_send(PacketBuf::from_packet(packet))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => PushError::Full,
-                mpsc::error::TrySendError::Closed(_) => PushError::Closed,
-            })
+        let buf = self.free.alloc_from(packet);
+        self.tx.try_send(buf).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => PushError::Full,
+            mpsc::error::TrySendError::Closed(_) => PushError::Closed,
+        })
     }
 }
 
@@ -113,6 +122,7 @@ pub struct HostTunSource {
     mtu: u16,
     mtu_tx: watch::Sender<u16>,
     oversize_drops: u64,
+    free: SharedPacketPool,
 }
 
 impl HostTunSource {
@@ -183,6 +193,13 @@ impl PacketSource for HostTunSource {
         Ok(())
     }
 
+    /// Keeps the buffers for [`HostTunInput::push`], up to the `capacity` given to
+    /// [`host_tun`] idle ones; the rest are dropped. While a push is taking a buffer it
+    /// takes none, so they are dropped too.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        self.free.recycle(bufs);
+    }
+
     fn mtu(&self) -> watch::Receiver<u16> {
         self.mtu_tx.subscribe()
     }
@@ -228,6 +245,8 @@ fn closed() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use nsplane::{HEADROOM, TAILROOM};
+
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -283,6 +302,72 @@ mod tests {
         assert_eq!(*mtu.borrow_and_update(), 1400);
         // A receiver taken later starts at the current value.
         assert_eq!(*source.mtu().borrow(), 1400);
+        Ok(())
+    }
+
+    fn idle(source: &HostTunSource) -> usize {
+        source.free.free_len()
+    }
+
+    #[test]
+    fn recycle_refills_up_to_the_capacity() {
+        let (_input, mut source) = side(1500);
+        let mut bufs: Vec<_> = (0..19).map(|_| PacketBuf::with_capacity(1600)).collect();
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 3);
+        assert_eq!(idle(&source), 16);
+    }
+
+    #[tokio::test]
+    async fn push_reuses_a_recycled_buffer() -> TestResult {
+        let (input, mut source) = side(1500);
+        input.push(&[1; 100])?;
+        let first = source.recv().await?;
+        let addr = first.as_packet().as_ptr();
+        source.recycle(&mut vec![first]);
+
+        // Fits with its tailroom into the first one's allocation.
+        input.push(&[2; 60])?;
+        let second = source.recv().await?;
+        assert_eq!(second.as_packet(), [2; 60]);
+        assert_eq!(second.as_packet().as_ptr(), addr);
+        assert_eq!(second.headroom(), HEADROOM);
+        assert_eq!(idle(&source), 0);
+        assert_eq!(source.free.allocated(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn push_grows_a_too_small_recycled_buffer() -> TestResult {
+        let (input, mut source) = side(1500);
+        source.recycle(&mut vec![PacketBuf::with_capacity(8)]);
+        let packet: Vec<u8> = (0..=255).cycle().take(1400).collect();
+        input.push(&packet)?;
+        let mut buf = source.recv().await?;
+        assert_eq!(buf.as_packet(), packet);
+        assert_eq!(buf.headroom(), HEADROOM);
+        assert!(buf.capacity() >= packet.len() + TAILROOM);
+        assert!(buf.with_headroom_mut()[..HEADROOM].iter().all(|&b| b == 0));
+        assert_eq!(idle(&source), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn push_without_recycle_allocates() -> TestResult {
+        let (input, mut source) = side(1500);
+        let mut held = Vec::new();
+        for n in 0..4u8 {
+            input.push(&[n; 300])?;
+            let packet = source.recv().await?;
+            assert_eq!(packet.as_packet(), [n; 300]);
+            assert_eq!(packet.headroom(), HEADROOM);
+            assert!(packet.capacity() >= 300 + TAILROOM);
+            held.push(packet);
+        }
+        let addrs: std::collections::HashSet<_> =
+            held.iter().map(|p| p.as_packet().as_ptr()).collect();
+        assert_eq!(addrs.len(), 4);
+        assert_eq!(source.free.allocated(), 4);
         Ok(())
     }
 }

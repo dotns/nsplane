@@ -18,3 +18,7 @@ workspace = true
 bytes = { workspace = true }
 smallvec = { workspace = true }
 zerocopy = { version = "0.8.59", features = ["derive"] }
+
+[[bench]]
+name = "checksum"
+harness = false
