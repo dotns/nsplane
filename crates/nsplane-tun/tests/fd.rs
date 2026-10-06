@@ -82,6 +82,8 @@ async fn adopted_fd_carries_packets_both_ways() {
     assert!(tun.name().is_err(), "a socket pair is not a TUN device");
     let (mut source, sink) = tun.split().unwrap();
     assert_eq!(*source.mtu().borrow(), 1420);
+    assert!(source.name().is_err(), "a socket pair is not a TUN device");
+    assert!(sink.name().is_err(), "a socket pair is not a TUN device");
 
     let packets = [ipv4_udp(*b"hello v4"), ipv6_udp(*b"hello v6")];
 
