@@ -5,6 +5,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-nat`: a criterion bench of the `Translator` on the `alias4` path
+  (`cargo bench -p nsplane-nat --bench translate`): outbound IPv4 TCP / UDP to an `alias4`
+  and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
+- `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
+  segment over a pseudo-header, as a full recomputation returning zero would.
+
+### Changed
+- `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
+  transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
+  them too, about 4x faster on a full-size packet), the reassembly clock is read only for
+  fragments, IPv6 to IPv4 writes the IPv4 header in front of the payload and moves the
+  packet start instead of the payload (the headroom grows by 20 or 28 bytes), and a
+  `TranslationTable` address lookup is one hash instead of two. Per packet, 2026-10-06, load
+  2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
+  69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
