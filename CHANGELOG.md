@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
 
 ### Fixed
+- `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
+  (left non-present by a killed process, its alias still resolving): it is replaced, while a
+  live adapter of the same name is still refused with `WintunError::AdapterExists`; new
+  `WintunError::OrphanNotReplaced` when Wintun cannot reclaim the alias. Without
+  `exclusive(true)` an orphan is replaced instead of opened.
 - `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
   it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
   source and it allocated every buffer.
