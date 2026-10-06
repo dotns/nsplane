@@ -1179,11 +1179,11 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.5`, branch
-  `nsplane/v0.14-pmtu`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.6`, branch
+  `nsplane/v0.14-tlp`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
   fixes for four defects that stalled connections for good under loss when both ends send
-  (an echo, request and response), five throughput changes (ON) listed after them, and
-  `tcp::Socket::reduce_mss` for path MTU discovery (above).
+  (an echo, request and response), five throughput changes (ON) listed after them,
+  `tcp::Socket::reduce_mss` for path MTU discovery (above) and a tail loss probe (below).
   - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
     oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
     received past that point (only its ACKs were lost), the peer dropped those ACKs as old,
@@ -1227,6 +1227,21 @@ smoltcp on its own dispatch path.
     average after losses with four streams (about 1080 with one).
   - Limited Transmit (RFC 3042): the first two duplicate ACKs each release one new
     segment, so small windows still reach the third duplicate ACK and fast retransmit.
+
+  `v0.14.0-nsplane.6` (QN F3) adds a tail loss probe in the manner of RFC 8985 section 7.
+  Next to the retransmission timer runs a probe timeout of two smoothed RTTs plus 10 ms
+  (plus 200 ms for a delayed ACK when one segment is in flight), restarted by every
+  segment sent and every ACK of new data. When it expires, the first unacknowledged
+  segment is resent once, and fast recovery starts unless a recovery is already running;
+  the retransmission timer keeps running for a lost probe. Unlike RFC 8985 the probe
+  resends the first unacknowledged segment rather than the last (smoltcp keeps no SACK
+  scoreboard, so that is where the loss must be) and also runs in fast recovery and after
+  a timeout, where it resends a lost retransmission: the role RACK has in RFC 8985. Before,
+  each lost retransmission waited for a timeout of at least 1 s, doubled after a timeout
+  (and after a timeout every loss among the resent data waited for one); those timeouts
+  were the 3 % loss tail. SACK was not chosen: smoltcp's receiver reports a single SACK
+  block, so a sender scoreboard would see little of the holes, and its assembler keeps four;
+  the probe needs no state beyond one flag and one timer field, and no receiver change.
 
   Together they lift four parallel streams to at least the one-stream aggregate with
   nsplane's defaults (no driver Nagle, `tcp_send_budget` unset); see
@@ -1298,8 +1313,8 @@ fork round (each on a quiet host) and the final gate's run of the merged workspa
 | TCP, 16 MiB, bottleneck | 15-23 s | 0.8-0.9 s with NewReno | 0.82 s (20.5 MB/s, 124 drops) |
 | UDP, 50 000 x 1200 B, no loss | see above | within noise | 449.4 MB/s |
 
-The remaining 3 % loss timeouts are lost retransmissions, which only a timeout recovers
-without SACK or RACK-TLP. With many parallel streams the fork removes the throughput
+The remaining 3 % loss timeouts were lost retransmissions; `.6` resends them by its tail
+loss probe (see below). With many parallel streams the fork removes the throughput
 collapse after sink-full drops: `tests/netstack_multistream.rs` (two engines in process,
 1 GiB per run split between the streams, default MTU and configuration, release) moved
 one stream at 669-782 MB/s and four at 689-841 MB/s, 1.00-1.11x the single stream in 12
@@ -1354,6 +1369,32 @@ is elsewhere on the in-process path. The queue is a tokio channel that grows on 
 a few emptied blocks, so idle cost does not depend on the capacity; a full queue pins one
 ingress buffer (about 2 KiB on the engine path) per datagram: about 256 / 512 / 1024 KiB per
 flow or socket at 128 / 256 / 512, and that times the stalled flows for a whole stack.
+
+The tail loss probe (QN F3, smoltcp `.6`, see [nsplane-netstack](#nsplane-netstack)),
+2026-10-06: `netstack_lossy`'s `throughput`, 10 rounds of `main` (`.4`) and the branch
+interleaved in bench slot 1 (CPUs 8-15, 1-minute load 26.8 -> 11.1), median [range] of the
+10 runs:
+
+| Case | `main` | `.6` |
+| --- | --- | --- |
+| TCP, 64 MiB, no loss | 0.210 s [0.190-0.237] | 0.209 s [0.180-0.242] |
+| TCP, 16 MiB, 1 % loss | 1.13 s [0.09-5.15] | 0.10 s [0.09-1.17] |
+| TCP, 16 MiB, 3 % loss | 12.7 s [7.2-29.2] | 1.01 s [0.30-3.39] |
+| TCP, 16 MiB, bottleneck | 0.86 s [0.83-0.87] | 0.86 s [0.83-0.87] |
+
+Drop counts match (the link drops deterministically); the retransmission timeouts are
+what is gone. One timeout in about 10 runs of 1 % and one to three per 3 % run remain, where
+the probe itself is lost. The harness's netstack pair (10 s x 2 per side, slot 0, interleaved
+`main`, `.5` without the probe and `.6`, 1-minute load 5.9-15.4, medians of 8 repetitions
+each): TCP P1 5.51 / 5.88 / 5.62 Gbit/s, P4 6.86 / 6.78 / 6.77 Gbit/s; earlier runs in
+louder windows (load 9-21 and 6-13, 12 repetitions per side) gave P1 5.43 against 5.53
+(`main` / `.6`) and 5.45 against 5.76 (`.5` / `.6`), P4 5.99 against 5.46 and 7.25 against
+6.60, with ranges of 2.4-9.3 Gbit/s that overlap fully. A build that logs every probe fired
+2 probes in two repetitions of the harness pair (against 8220 fast retransmissions and 9
+timeouts after sink-full drops) and none in the loss-free `send_stream` bench, so the
+probe changes nothing on a loss-free path. `tests/netstack_lossy.rs`
+`bulk_tcp_with_heavy_loss` asserts 8 MiB at 3 % loss within 5 s: 0.87-1.02 s in a debug
+build, 6.9-7.7 s on `main` (five runs each).
 
 The sender alone, without engine, crypto or loss: `benches/send_stream.rs` in
 `nsplane-netstack` (criterion) wires two netstacks back to back in process and sends 8 MiB per
@@ -1530,9 +1571,10 @@ Decided for later, not in this workstream:
 
 - smoltcp fork: the checksum over 64-bit words, the non-shrinking advertised window edge
   and NewReno's partial-ACK retransmission listed here before are in `v0.14.0-nsplane.4`
-  (see [nsplane-netstack](#nsplane-netstack)). What stays: a lost retransmission still
-  waits for a timeout of at least 1 s, which keeps 3 % loss at 11-41 s; SACK or RACK-TLP
-  is the next step.
+  (see [nsplane-netstack](#nsplane-netstack)), and `.6`'s tail loss probe resends a lost
+  retransmission after about two round trips (3 % loss: median 12.7 s to 1.0 s). What
+  stays: a lost probe still waits for a timeout of at least 1 s (one to three per 16 MiB at
+  3 %); SACK (smoltcp's receiver reports one block) or a second probe would be the next step.
 - `nsplane-packet`: setting a pooled buffer's length without zero-filling it (smoltcp
   writes every byte of a transmitted packet) would save about 4 % of the direct
   instructions. It is a later design item: it would need `unsafe` in a
@@ -2157,6 +2199,7 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
 | Netstack TCP, smoltcp `.4` (ON) | `netstack_lossy` 1 % loss / 3 % loss / bottleneck, 16 MiB (final gate, load 8.9-9.3) | 1.14 s / 19.2 s / 0.82 s | `.3`: 1.1-6.2 s / stalls past 60 s / 14.9-23.9 s; [Netstack throughput](#netstack-throughput) |
+| Netstack TCP, smoltcp `.6` (tail loss probe) | `netstack_lossy` 1 % loss / 3 % loss, 16 MiB, median of 10 interleaved (slot 1, load 11-27) | 0.10 s / 1.01 s (worst 3.39 s) | `main` (`.4`): 1.13 s / 12.7 s (worst 29.2 s); [Netstack throughput](#netstack-throughput) |
 | Netstack pair (harness, ON) | TCP P1 / P4 Gbit/s, UDP loss 1G / 3G %, 30 s x 3 medians (2026-10-05, load 2.2-3.5) | 6.85 / 7.29, 0.00 / 0.03 | `main` b5e531f same window: 6.21 / 2.48, 2.21 / 5.56 |
 | Engine fast path (MF-1), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP -P1 / -P4, no workers, median of the 3 quiet pairs (load1 <= 12.3) | 9.90 / 10.37 Gbit/s | before: 8.43 / 8.70 Gbit/s (+17 % / +19 %); [Engine fast path (MF-1)](#engine-fast-path-mf-1) |
 | Engine fast path (MF-1), TUN, kernel WireGuard -> nsplane-cli | the same | 4.85 / 4.77 Gbit/s; dedicated rerun 5.87 / 5.92 | before: 6.27 / 6.07; rerun 6.32 / 6.12 Gbit/s (-23 % / -21 %; rerun -7 % / -3 %), not reproduced outside the harness |

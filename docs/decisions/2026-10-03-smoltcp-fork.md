@@ -78,6 +78,19 @@ and resends the data in flight at once in segments of the new size, without a co
 or timer back-off (RFC 1191 section 7). `nsplane-netstack` reads the ICMP messages and
 calls it.
 
+Tag `v0.14.0-nsplane.6` (`687c56ad47bd831b395bb532da904d20d205140c`, branch
+`nsplane/v0.14-tlp` on top of `.5`) adds a tail loss probe (QN F3, RFC 8985 section 7):
+a probe timeout of two smoothed RTTs plus 10 ms (plus 200 ms with one segment in flight)
+next to the retransmission timer, restarted by every segment sent and every ACK of new
+data, resends the first unacknowledged segment once (fast recovery starts unless one is
+running). It also runs in fast recovery and after a timeout, where it resends a lost
+retransmission, which before waited for a timeout of at least 1 s (doubled after a
+timeout). Chosen over SACK: smoltcp's receiver reports one SACK block and keeps four holes,
+so a sender scoreboard would see little; the probe is one flag and one timer field.
+`netstack_lossy` at 3 % loss: median 12.7 s to 1.0 s over 10 interleaved runs against
+`main`, 1 % loss 1.1 s to 0.1 s, the loss-free and bottleneck rows and the harness's
+netstack pair unchanged (see "Netstack throughput" in `docs/architecture.md`).
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.

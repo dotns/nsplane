@@ -19,7 +19,7 @@ bytes = { workspace = true }
 futures-core = "0.3.32"
 nsplane = { path = "../nsplane", version = "0.10.0" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.10.0" }
-smoltcp = { version = "0.14.0", git = "https://github.com/dotns/smoltcp", tag = "v0.14.0-nsplane.5", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
+smoltcp = { version = "0.14.0", git = "https://github.com/dotns/smoltcp", tag = "v0.14.0-nsplane.6", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1.40"
 

@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.07-0.75 % to 0.00 % (slot 0), TCP unchanged. Memory: the queue grows on demand, so an idle
   flow or socket costs the same; a full one pins up to 256 ingress buffers (about 512 KiB,
   256 KiB before).
+- nsplane-netstack: smoltcp fork `v0.14.0-nsplane.6` (QN F3) adds a tail loss probe (RFC 8985
+  section 7): when no ACK of new data arrives for two smoothed RTTs plus 10 ms, the first
+  unacknowledged segment is resent once, also in fast recovery and after a timeout, so a lost
+  retransmission or a loss at the end of a window no longer waits for a retransmission timeout
+  of at least 1 s. `netstack_lossy` 16 MiB at 3 % loss: median 12.7 s to 1.0 s (worst of 10
+  29.2 s to 3.4 s), at 1 % 1.1 s to 0.1 s; loss-free, bottleneck and harness rows unchanged.
 - `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
   transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
   them too, about 4x faster on a full-size packet), the reassembly clock is read only for
