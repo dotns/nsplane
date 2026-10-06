@@ -2704,6 +2704,15 @@ ran at a higher load than the A half before it. On that path the deliver queue s
 nearly empty, so the gate only adds a capacity check per poll; a quiet-host re-run should
 settle it before the default change counts as a pure win.
 
+Quiet re-run #1 of nsplane-kernel (A = e381bcf, B = the change alone, slot 1, interleaved,
+P1 / P4 Gbit/s, load1 at the start and end of each half): A1 4.51 / 5.18 (11.7 -> 14.7),
+B1 6.61 / 6.49 (14.7 -> 19.7), A2 6.64 / 5.37 (19.2 -> 21.7), B2 5.00 / 4.10 (21.7 ->
+20.9); means A 5.58 / 5.28 and B 5.81 / 5.30. `worker_pool` in the same slot (load 4 -> 30)
+was noise again. The change landed as the default on L1's recorded decision (b),
+2026-10-06: the earlier nsplane-kernel loss did not repeat and has no mechanism. The
+release table on an idle host re-checks nsplane-kernel, and the gate becomes opt-in before
+the release if a loss shows there.
+
 ## Unsafe code
 
 `unsafe` lives only in `nsplane-tun`'s platform
