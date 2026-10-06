@@ -10,6 +10,7 @@ pub mod build;
 pub mod checksum;
 pub mod icmp;
 mod ip;
+mod pool;
 pub mod reassembly;
 mod types;
 
@@ -19,4 +20,5 @@ pub use ip::{
     FiveTuple, Fragment, IcmpHeader, IpPacket, Ipv4Header, Ipv6Header, Malformed, TcpHeader,
     UdpHeader, protocol,
 };
+pub use pool::SharedPacketPool;
 pub use types::{Ecn, Path, PeerId, TransportId};

@@ -6,10 +6,9 @@
 
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use nsplane::{PacketBatch, PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
+use nsplane::{PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId, SharedPacketPool};
 use tokio::sync::{mpsc, watch};
 
 /// The host's packet writer; see [`host_tun`].
@@ -47,14 +46,11 @@ pub fn host_tun(
 ) -> (HostTunInput, HostTunSource, HostTunSink) {
     let (tx, rx) = mpsc::channel(capacity);
     let (mtu_tx, _) = watch::channel(mtu);
-    let free = Arc::new(FreeList {
-        pool: Mutex::new(PacketPool::new(capacity)),
-        stocked: AtomicBool::new(false),
-    });
+    let free = SharedPacketPool::new(capacity);
     (
         HostTunInput {
             tx,
-            free: Arc::clone(&free),
+            free: free.clone(),
         },
         HostTunSource {
             rx,
@@ -87,53 +83,6 @@ impl fmt::Display for PushError {
 
 impl std::error::Error for PushError {}
 
-/// The recycled buffers of a [`host_tun`] local side, shared by the source and every input.
-///
-/// Lossy and never waited on: both sides only `try_lock` the pool, and a push skips it
-/// while `stocked` says it is empty.
-#[derive(Debug)]
-struct FreeList {
-    pool: Mutex<PacketPool>,
-    /// Whether the pool may hold a buffer; a hint, rechecked under the lock.
-    stocked: AtomicBool,
-}
-
-impl FreeList {
-    /// A buffer holding a copy of `packet` behind the full headroom, with room for
-    /// [`TAILROOM`] behind it; `None` if the pool is empty or busy.
-    fn take(&self, packet: &[u8]) -> Option<PacketBuf> {
-        if !self.stocked.load(Ordering::Relaxed) {
-            return None;
-        }
-        let mut pool = self.pool.try_lock().ok()?;
-        if pool.free_len() == 0 {
-            self.stocked.store(false, Ordering::Relaxed);
-            return None;
-        }
-        // Grows a recycled buffer that is too small.
-        let mut buf = pool.get(packet.len() + TAILROOM);
-        if pool.free_len() == 0 {
-            self.stocked.store(false, Ordering::Relaxed);
-        }
-        drop(pool);
-        buf.extend_from_slice(packet);
-        Some(buf)
-    }
-
-    /// Takes buffers out of `bufs` until the pool is full; takes none while it is busy.
-    fn put(&self, bufs: &mut Vec<PacketBuf>) {
-        let Ok(mut pool) = self.pool.try_lock() else {
-            return;
-        };
-        for buf in bufs.drain(..) {
-            pool.put(buf);
-        }
-        if pool.free_len() > 0 {
-            self.stocked.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 /// The host's end of a [`host_tun`] local side: packets the host read for the engine go in here.
 ///
 /// Clones push into the same queue. Once every clone is dropped and the queue is drained,
@@ -141,7 +90,7 @@ impl FreeList {
 #[derive(Debug, Clone)]
 pub struct HostTunInput {
     tx: mpsc::Sender<PacketBuf>,
-    free: Arc<FreeList>,
+    free: SharedPacketPool,
 }
 
 impl HostTunInput {
@@ -152,10 +101,8 @@ impl HostTunInput {
     /// recycled to the [`HostTunSource`] when one is idle, else a new one. Packets longer
     /// than the MTU are queued too and dropped by the [`HostTunSource`].
     pub fn push(&self, packet: &[u8]) -> Result<(), PushError> {
-        let buf = self
-            .free
-            .take(packet)
-            .unwrap_or_else(|| PacketBuf::from_packet(packet));
+        let mut buf = self.free.alloc(packet.len());
+        buf.as_packet_mut().copy_from_slice(packet);
         self.tx.try_send(buf).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => PushError::Full,
             mpsc::error::TrySendError::Closed(_) => PushError::Closed,
@@ -176,7 +123,7 @@ pub struct HostTunSource {
     mtu: u16,
     mtu_tx: watch::Sender<u16>,
     oversize_drops: u64,
-    free: Arc<FreeList>,
+    free: SharedPacketPool,
 }
 
 impl HostTunSource {
@@ -251,7 +198,7 @@ impl PacketSource for HostTunSource {
     /// [`host_tun`] idle ones; the rest are dropped. While a push is taking a buffer it
     /// takes none, so they are dropped too.
     fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
-        self.free.put(bufs);
+        self.free.recycle(bufs);
     }
 
     fn mtu(&self) -> watch::Receiver<u16> {
@@ -299,7 +246,7 @@ fn closed() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use nsplane::HEADROOM;
+    use nsplane::{HEADROOM, TAILROOM};
 
     use super::*;
 
@@ -360,7 +307,7 @@ mod tests {
     }
 
     fn idle(source: &HostTunSource) -> usize {
-        source.free.pool.lock().unwrap().free_len()
+        source.free.free_len()
     }
 
     #[test]
@@ -368,7 +315,7 @@ mod tests {
         let (_input, mut source) = side(1500);
         let mut bufs: Vec<_> = (0..19).map(|_| PacketBuf::with_capacity(1600)).collect();
         source.recycle(&mut bufs);
-        assert!(bufs.is_empty());
+        assert_eq!(bufs.len(), 3);
         assert_eq!(idle(&source), 16);
     }
 
@@ -387,7 +334,7 @@ mod tests {
         assert_eq!(second.as_packet().as_ptr(), addr);
         assert_eq!(second.headroom(), HEADROOM);
         assert_eq!(idle(&source), 0);
-        assert!(!source.free.stocked.load(Ordering::Relaxed));
+        assert_eq!(source.free.allocated(), 1);
         Ok(())
     }
 
@@ -407,36 +354,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_without_recycle_allocates_like_from_packet() -> TestResult {
+    async fn push_without_recycle_allocates() -> TestResult {
         let (input, mut source) = side(1500);
         let mut held = Vec::new();
         for n in 0..4u8 {
             input.push(&[n; 300])?;
             let packet = source.recv().await?;
-            let expected = PacketBuf::from_packet(&[n; 300]);
-            assert_eq!(packet.as_packet(), expected.as_packet());
-            assert_eq!(packet.headroom(), expected.headroom());
-            assert_eq!(packet.capacity(), expected.capacity());
+            assert_eq!(packet.as_packet(), [n; 300]);
+            assert_eq!(packet.headroom(), HEADROOM);
+            assert!(packet.capacity() >= 300 + TAILROOM);
             held.push(packet);
         }
         let addrs: std::collections::HashSet<_> =
             held.iter().map(|p| p.as_packet().as_ptr()).collect();
         assert_eq!(addrs.len(), 4);
-        assert!(!source.free.stocked.load(Ordering::Relaxed));
-        Ok(())
-    }
-
-    #[test]
-    fn a_busy_free_list_is_skipped() -> TestResult {
-        let (input, mut source) = side(1500);
-        source.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
-        let pool = source.free.pool.lock().unwrap();
-        // Neither side waits: the push allocates and the recycle leaves its buffers.
-        input.push(&[0; 10])?;
-        let mut bufs = vec![PacketBuf::with_capacity(1600)];
-        source.free.put(&mut bufs);
-        assert_eq!(bufs.len(), 1);
-        assert_eq!(pool.free_len(), 1);
+        assert_eq!(source.free.allocated(), 4);
         Ok(())
     }
 }
