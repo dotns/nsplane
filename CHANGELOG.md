@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- nsplane-tun: `TunSource::name` and `TunSink::name` return the created interface name after
+  `split` (MT-4): queried from the device like `Tun::name`, so a `"tun%d"` or `"utun"` pattern
+  yields the kernel-assigned name; an adopted fd that is not a TUN device yields the query's
+  OS error.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
