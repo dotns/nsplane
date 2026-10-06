@@ -955,12 +955,19 @@ on Windows), so a caller learns it without opening the device itself (MT-4).
   default path a failed IP Helper query counts as present, so it fails no differently than
   before. The decision (`Existing`, `classify`, `plan`) is pure in `wintun`. Once the adapter is open, a pinned
   `driver_version` is compared with the running driver (`WintunError::DriverVersionMismatch`;
-  dropping the handle removes an adapter this call created), then `mtu(n)` sets the
-  interface MTU (IPv4, IPv6 where the row exists) and `Tun::mtu` reports the read-back IPv4
-  value. The typed errors travel inside `io::Error` (`InvalidData`, `AlreadyExists`) and are
+  dropping the handle removes an adapter this call created), then the session starts. Only
+  then `mtu(n)` sets the interface MTU (`SetIpInterfaceEntry` `NlMtu`) on IPv4 and IPv6:
+  a new adapter creates its IP interface rows asynchronously, so it polls every 50 ms for
+  the IPv4 row (5 s, else `TimedOut`) and then up to 500 ms for the IPv6 row (still absent:
+  IPv6 counts as disabled and is skipped). Both are read back; a difference fails with
+  `WintunError::MtuMismatch` (`Other`; session and adapter are dropped, a created adapter
+  removed) and `Tun::mtu` reports the checked value. Without `mtu(n)` nothing waits and
+  `Tun::mtu` is the IPv4 MTU read once (the ns smoke saw 65535 with `mtu(1420)` when the
+  set preceded the session and the rows). The row wait (`wait_for`) and the check
+  (`check_mtu`) are pure in `wintun`. The typed errors travel inside `io::Error` (`InvalidData`, `AlreadyExists`) and are
   recovered with `downcast_ref::<WintunError>()`. Verified here: the pure logic in Linux unit
-  tests (including the modeled absent / orphaned / live interface table), the
-  pin-before-load path under wine (no wintun.dll); adapter creation, the exclusive refusal
+  tests (including the modeled absent / orphaned / live interface table, the MTU read-back
+  check and the scripted row wait), the pin-before-load path under wine (no wintun.dll); adapter creation, the exclusive refusal
   against a live adapter, the orphan replacement, MTU set/read-back and the driver version
   query need a real Windows host.
 - `slot`: `TunSlot`, an fd local side the host swaps while the engine runs (Android
