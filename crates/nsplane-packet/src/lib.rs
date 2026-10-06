@@ -8,6 +8,7 @@
 mod buf;
 pub mod build;
 pub mod checksum;
+pub mod hash;
 pub mod icmp;
 mod ip;
 pub mod reassembly;
