@@ -42,3 +42,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261003-1300-ns-m4-requests Engine hooks requested by ns account mode (M4)**](20261003-1300-ns-m4-requests.md) `P1`
 - [-] [**20261003-1500-ns-dataplane-moves Data-plane pieces ns still owns, to move into nsplane**](20261003-1500-ns-dataplane-moves.md) `P1`
 - [-] [**20261003-2200-ns-local-side Local-side graph, masquerade, Echo reply, host TUNs and the ACL gate for ns**](20261003-2200-ns-local-side.md) `P1`
+- [ ] [**20261006-1300-nsgw-requests Data-plane items for the nsgw rebuild, in generic form**](20261006-1300-nsgw-requests.md) `P1`
