@@ -244,6 +244,12 @@ pub enum Event {
     /// An authenticated message from `peer` arrived on a path that is not the peer's current
     /// path (or the peer has none); paths are compared on transport and address only.
     ///
+    /// Emitted once per off-path source change, not per message: a source is reported again
+    /// only after another one was, or after the peer's path was set (by configuration,
+    /// [`Core::force_handshake`] or adoption) or a handshake completed. A message whose path
+    /// the [`PathPolicy`] adopts is always reported. The policy is still told about every
+    /// message.
+    ///
     /// Authenticated messages are handshake initiations and responses the peer's tunnel
     /// accepted and transport data (keepalives included) that decrypted, even if its source
     /// address is then not allowed. Cookie replies never count. Messages on the current path
