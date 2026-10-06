@@ -49,14 +49,19 @@ pub struct NetStackConfig {
     /// are dropped as before. Default `false`.
     pub accept_backpressure: bool,
     /// Datagrams queued per UDP flow or bound socket before new ones are dropped, and UDP
-    /// payloads queued for sending before `send` waits. Default 128.
+    /// payloads queued for sending before `send` waits. Default 256.
     ///
     /// The driver routes up to 256 ingress packets in one step before the application
     /// can take any, so a burst to one flow or socket beyond this capacity loses the
-    /// excess even when the application keeps up on average. Between two `netstack_bench`
-    /// nodes at 1 Gbit/s of 1380-byte datagrams, that was all of the receiver's UDP loss
-    /// with the default queue and none with one of `ingress_capacity`; a bulk UDP receiver
-    /// wants at least the 256.
+    /// excess even when the application keeps up on average; the default takes one whole
+    /// step. Between two `netstack_bench` nodes, 1380-byte datagrams lost 1.24 % at
+    /// 1 Gbit/s and 5.21 % at 3 Gbit/s with a queue of 128, 0.00 % and 2.62 % with 256.
+    ///
+    /// The queue grows on demand in blocks of 32 entries, so an idle flow or socket costs
+    /// the same at any capacity (one block, about 1 KiB per flow and 2 KiB per bound
+    /// socket). A full queue also holds each datagram's ingress buffer (about 2 KiB on the
+    /// engine path), so a flow or socket whose application stops reading pins up to about
+    /// 512 KiB at the default (256 KiB at 128).
     pub datagram_capacity: usize,
     /// Bytes buffered per TCP connection and direction between the stack and the
     /// application. Default 64 KiB.
@@ -158,7 +163,7 @@ impl Default for NetStackConfig {
             egress_capacity: 1024,
             accept_capacity: 128,
             accept_backpressure: false,
-            datagram_capacity: 128,
+            datagram_capacity: 256,
             stream_buffer: 64 * 1024,
             listener_pool: 32,
             tcp_rx_buffer: None,

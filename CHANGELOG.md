@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
 - `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
   segment over a pseudo-header, as a full recomputation returning zero would.
+- nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
+  two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
+  send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
+  `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
 
 - nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
   two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
@@ -63,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
   (`tcp::Socket::reduce_mss`).
 ### Changed
+- nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
+  so a burst the driver routes in one step fits one UDP flow or socket queue. Harness netstack
+  pair, server at the stack default: UDP loss at 1 Gbit/s 1.24 % to 0.00 % (old CPU sets) and
+  0.07-0.75 % to 0.00 % (slot 0), TCP unchanged. Memory: the queue grows on demand, so an idle
+  flow or socket costs the same; a full one pins up to 256 ingress buffers (about 512 KiB,
+  256 KiB before).
 - `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
   transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
   them too, about 4x faster on a full-size packet), the reassembly clock is read only for

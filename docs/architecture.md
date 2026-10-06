@@ -1003,11 +1003,14 @@ smoltcp on its own dispatch path.
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
   `NetStackConfig`); the sink waits while ingress is full. One driver turn routes up to
   256 ingress packets before any application reads, so a burst to one UDP flow or socket
-  beyond `datagram_capacity` (default 128) loses the excess even when the application
-  keeps up on average (`udp_queue_full`). In the harness's netstack pair that was 100 %
-  of the receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s (per-hop accounting; the
-  kernel, the sender and reordering lost nothing); `netstack_bench`'s server sizes its
-  queue to 1024 and the default stays, so a bulk UDP receiver sets at least 256.
+  beyond `datagram_capacity` loses the excess even when the application keeps up on
+  average (`udp_queue_full`). In the harness's netstack pair that was 100 % of the
+  receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s with the former default of 128
+  (per-hop accounting; the kernel, the sender and reordering lost nothing). The default
+  is 256, one driver step (QN-4, see [Netstack throughput](#netstack-throughput)); the
+  queue grows on demand in 32-entry blocks, so an idle flow costs one block (about
+  1 KiB, 2 KiB per bound socket) at any capacity, and a full one pins up to 256 ingress
+  buffers (about 512 KiB). `netstack_bench`'s server keeps 1024.
 - A full accept queue closes new TCP connections (`tcp_not_accepted`) by default. With
   `NetStackConfig::accept_backpressure`, bare SYNs are left unanswered while it is full
   (`syn_deferred`; the peer retransmits) and connections that completed their handshake
@@ -1309,6 +1312,31 @@ reverted; follow-up). Idle request/response latency is unchanged (p50 / p99 0.02
 0.052 ms against 0.027 / 0.054), but next to a saturating stream it rose from 0.081 /
 0.941 to 0.280 / 1.271 ms in this run: the stream now keeps more in flight (it is 10 %
 faster and no longer backs off after losses). Not analysed further here (follow-up).
+
+The default `datagram_capacity` (QN-4, 2026-10-06): `netstack_bench`'s server at the stack
+default instead of its 1024, the netstack runtime otherwise `main`'s. A first run on the old
+CPU sets (one lock hold per build, 30 s x 3) and an interleaved A/B in bench slot 0 (CPUs 1-7,
+128, 256, 128, 256, 30 s x 2 each, a loaded host); medians [repetitions], the slot rows
+per run or as the range of all four repetitions:
+
+| Queue | Run (1-minute load) | TCP P1 / P4 Gbit/s | UDP loss 1G % | UDP loss 3G % |
+| --- | --- | --- | --- | --- |
+| 128 | old sets (1.4 -> 4.1) | 6.48 / 7.37 | 1.24 [1.24-1.43] | 5.21 [4.91-8.88] |
+| 256 | old sets (3.1 -> 3.1) | 6.81 / 7.24 | 0.00 [0.00-0.01] | 2.62 [2.54-2.79] |
+| 512 | old sets (15.8 -> 17.4) | 4.83 / 5.34 | 0.00 | 1.14 |
+| 128 | slot 0 (6.9-15.4) | 5.61, 3.89 / 6.89, 4.01 | 0.07-0.75 | 1.00-6.39 |
+| 256 | slot 0 (6.9-15.4) | 6.15, 5.15 / 6.26, 5.10 | 0.00-0.002 | 0.41-2.93 |
+
+256 removes the 1 Gbit/s loss in every repetition; at 3 Gbit/s the rest is mostly the
+receiving engine's full sink and the slot run spreads too far to rank 128 and 256 (512 was
+only measured once, on a loaded host). TCP and request/response latency do not use the queue
+and stay within the host's spread. The in-process `netstack_lossy` UDP burst (50 000 x 1200 B)
+received 45 106-48 768 datagrams at 128 and 44 929-49 149 at 256 over six runs each: its loss
+is elsewhere on the in-process path. The queue is a tokio channel that grows on demand in
+32-entry blocks (32 + 32 x 32 bytes per flow, 32 + 32 x 64 per bound socket) and keeps at most
+a few emptied blocks, so idle cost does not depend on the capacity; a full queue pins one
+ingress buffer (about 2 KiB on the engine path) per datagram: about 256 / 512 / 1024 KiB per
+flow or socket at 128 / 256 / 512, and that times the stalled flows for a whole stack.
 
 The sender alone, without engine, crypto or loss: `benches/send_stream.rs` in
 `nsplane-netstack` (criterion) wires two netstacks back to back in process and sends 8 MiB per
