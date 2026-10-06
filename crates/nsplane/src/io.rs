@@ -95,6 +95,32 @@ pub trait PacketSink: Send + Sync + 'static {
             Ok(())
         }
     }
+
+    /// Delivers `packets` like [`send_batch`], and appends the buffers of delivered packets
+    /// to `spent` so the caller can reuse them.
+    ///
+    /// Only a buffer the sink no longer references may be appended: a packet written out
+    /// (copied to the OS, say), or one it dropped. Ordering, backpressure and errors follow
+    /// [`send_batch`] exactly: on success `packets` is empty; on an error the packet that
+    /// failed is dropped and the rest stay in `packets`, in order. `spent` is only appended
+    /// to, never read or cleared, and the caller must tolerate it staying empty.
+    ///
+    /// The default calls [`send_batch`] and appends nothing; a sink that is done with the
+    /// buffers once it took the packets over, like a TUN device, overrides it. [`pump`]
+    /// hands `spent` to [`PacketSource::recycle`]. Cancelling it is like cancelling
+    /// [`send_batch`]; what was appended to `spent` stays there.
+    ///
+    /// [`send_batch`]: PacketSink::send_batch
+    /// [`pump`]: crate::pump
+    fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        let _ = spent;
+        self.send_batch(packets)
+    }
+
     /// Delivers packets from the front of `packets` like [`send_batch`], but never waits.
     ///
     /// Synchronous: the call returns as soon as it would have to wait, so the engine may
