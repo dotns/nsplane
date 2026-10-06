@@ -9,14 +9,20 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 const IPV4_CHECKSUM: std::ops::Range<usize> = 10..12;
 
 /// Adds `data` as big-endian 16-bit words to `acc`; an odd trailing byte is padded with zero.
+///
+/// The bulk is summed as big-endian 32-bit words: since `2^16 ≡ 1` modulo `2^16 - 1`, that
+/// folds to the same one's-complement sum (RFC 1071 §2(B)), and the u64 cannot overflow
+/// below `2^32` words.
 fn add_words(acc: u64, data: &[u8]) -> u64 {
-    let (words, tail) = data.as_chunks::<2>();
-    let tail = match tail {
-        [last] => u64::from(u16::from_be_bytes([*last, 0])),
+    let (words, tail) = data.as_chunks::<4>();
+    let tail = match *tail {
+        [a, b, c] => u64::from(u16::from_be_bytes([a, b])) + u64::from(u16::from_be_bytes([c, 0])),
+        [a, b] => u64::from(u16::from_be_bytes([a, b])),
+        [a] => u64::from(u16::from_be_bytes([a, 0])),
         _ => 0,
     };
     words.iter().fold(acc + tail, |acc, word| {
-        acc + u64::from(u16::from_be_bytes(*word))
+        acc + u64::from(u32::from_be_bytes(*word))
     })
 }
 
@@ -134,6 +140,86 @@ mod tests {
         let sum = transport_checksum_v6(src, dst, 6, &segment);
         segment[16..18].copy_from_slice(&sum.to_be_bytes());
         assert_eq!(transport_checksum_v6(src, dst, 6, &segment), 0);
+    }
+
+    /// The previous 16-bit word loop, kept as the reference for [`add_words`].
+    fn add_words_16(acc: u64, data: &[u8]) -> u64 {
+        let (words, tail) = data.as_chunks::<2>();
+        let tail = match tail {
+            [last] => u64::from(u16::from_be_bytes([*last, 0])),
+            _ => 0,
+        };
+        words.iter().fold(acc + tail, |acc, word| {
+            acc + u64::from(u16::from_be_bytes(*word))
+        })
+    }
+
+    /// Deterministic xorshift64 PRNG for the equivalence test.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % n as u64).unwrap()
+        }
+    }
+
+    #[test]
+    fn matches_16_bit_reference() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut buf = [0u8; 2048 + 8];
+        for _ in 0..4096 {
+            buf.fill_with(|| rng.next().to_le_bytes()[0]);
+            // Half the cases short, where the tail handling dominates.
+            let len = if rng.next() & 1 == 0 {
+                rng.below(65)
+            } else {
+                rng.below(2049)
+            };
+            // Up to 2^48: room for any realistic chain of further sums.
+            let acc = rng.next() >> 16;
+            let src = Ipv4Addr::from_bits(u32::try_from(rng.next() >> 32).unwrap());
+            let dst = Ipv4Addr::from_bits(u32::try_from(rng.next() >> 32).unwrap());
+            let src6 = Ipv6Addr::from_bits(u128::from(rng.next()) << 64 | u128::from(rng.next()));
+            let dst6 = Ipv6Addr::from_bits(u128::from(rng.next()) << 64 | u128::from(rng.next()));
+            let protocol = rng.next().to_le_bytes()[0];
+            for offset in 0..8 {
+                let data = &buf[offset..offset + len];
+                assert_eq!(
+                    finish(add_words(acc, data)),
+                    finish(add_words_16(acc, data)),
+                    "add_words len {len} offset {offset}"
+                );
+                assert_eq!(internet_checksum(data), finish(add_words_16(0, data)));
+
+                let before = data.get(..IPV4_CHECKSUM.start).unwrap_or(data);
+                let after = data.get(IPV4_CHECKSUM.end..).unwrap_or(&[]);
+                assert_eq!(
+                    ipv4_header_checksum(data),
+                    finish(add_words_16(add_words_16(0, before), after))
+                );
+
+                let mut v4 = add_words_16(add_words_16(0, &src.octets()), &dst.octets());
+                v4 += u64::from(protocol) + data.len() as u64;
+                assert_eq!(
+                    transport_checksum_v4(src, dst, protocol, data),
+                    finish(add_words_16(v4, data))
+                );
+
+                let mut v6 = add_words_16(add_words_16(0, &src6.octets()), &dst6.octets());
+                v6 += u64::from(protocol) + data.len() as u64;
+                assert_eq!(
+                    transport_checksum_v6(src6, dst6, protocol, data),
+                    finish(add_words_16(v6, data))
+                );
+            }
+        }
     }
 
     #[test]
