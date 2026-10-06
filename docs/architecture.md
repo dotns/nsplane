@@ -718,7 +718,9 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
   capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
   (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
-  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. No message
+  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. A zero
+  `ping_interval` (`WssConfig::ping_interval(None)`) sends no pings: the dialer spawns no
+  ping task and the session writers never wake for one; the read idle stays. No message
   above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
 - Events: `WssDialer::events()` and `WssStreamClient::events()` subscribe to a
   `broadcast` channel in the shared connector (`WssDialEvent::CAPACITY` = 64; a lagging
