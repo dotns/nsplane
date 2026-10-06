@@ -10,7 +10,7 @@ const ACK: u8 = 0x10;
 const IPV6_FRAGMENT: u8 = 44;
 
 /// An IPv4 or IPv6 packet from `src` to `dst` carrying `payload` as protocol `proto`.
-fn ip(src: IpAddr, dst: IpAddr, proto: u8, payload: &[u8]) -> Vec<u8> {
+pub(super) fn ip(src: IpAddr, dst: IpAddr, proto: u8, payload: &[u8]) -> Vec<u8> {
     match (src, dst) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             let total = 20 + payload.len();

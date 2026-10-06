@@ -1086,11 +1086,14 @@ smoltcp on its own dispatch path.
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
   `NetStackConfig`); the sink waits while ingress is full. One driver turn routes up to
   256 ingress packets before any application reads, so a burst to one UDP flow or socket
-  beyond `datagram_capacity` (default 128) loses the excess even when the application
-  keeps up on average (`udp_queue_full`). In the harness's netstack pair that was 100 %
-  of the receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s (per-hop accounting; the
-  kernel, the sender and reordering lost nothing); `netstack_bench`'s server sizes its
-  queue to 1024 and the default stays, so a bulk UDP receiver sets at least 256.
+  beyond `datagram_capacity` loses the excess even when the application keeps up on
+  average (`udp_queue_full`). In the harness's netstack pair that was 100 % of the
+  receiver's UDP loss at 1 Gbit/s and 99 % at 3 Gbit/s with the former default of 128
+  (per-hop accounting; the kernel, the sender and reordering lost nothing). The default
+  is 256, one driver step (QN-4, see [Netstack throughput](#netstack-throughput)); the
+  queue grows on demand in 32-entry blocks, so an idle flow costs one block (about
+  1 KiB, 2 KiB per bound socket) at any capacity, and a full one pins up to 256 ingress
+  buffers (about 512 KiB). `netstack_bench`'s server keeps 1024.
 - A full accept queue closes new TCP connections (`tcp_not_accepted`) by default. With
   `NetStackConfig::accept_backpressure`, bare SYNs are left unanswered while it is full
   (`syn_deferred`; the peer retransmits) and connections that completed their handshake
@@ -1107,6 +1110,28 @@ smoltcp on its own dispatch path.
   (IPv4) or `mtu - 60` (IPv6) and no emitted packet exceeds the MTU, which the source
   reports and never changes. Socket buffers hold 512 IPv4-sized segments, so the window
   scales with the MSS.
+- Path MTU discovery for the stack's own TCP (ns MB-x7, RFC 1191 / RFC 8201): an ICMP
+  Destination Unreachable / Fragmentation Needed (type 3 code 4, next-hop MTU in bytes 6-7)
+  or an `ICMPv6` Packet Too Big (type 2, MTU in bytes 4-7) to a stack address lowers the
+  MSS of the connection whose segment it quotes to `mtu - 40` (IPv4) or `mtu - 60` (IPv6),
+  so a stack at 1420 over a path whose inner MTU is smaller (a 1376 relay path) does not
+  stall on segments the path drops. The quote must be a TCP segment (IP header and at
+  least 8 bytes: ports and sequence number) of the message's family from the stack's
+  address, on the `(local, remote)` tuple of a live connection (SYN-RECEIVED or later),
+  with its sequence number within `SND.UNA..SND.NXT`; the MTU must be at least 576 (IPv4,
+  the stack's `MIN_MTU`) or 1280 (IPv6), below the configured MTU and below the
+  connection's current path MTU (it never goes up). An IPv4 message with MTU 0 (pre-RFC
+  1191 routers) is ignored, with no plateau guess. Anything else of those two types is
+  dropped and counted in `NetStackStats::icmp_ignored`; other ICMP messages count as
+  `unsupported`, as before. Checksums are not verified, as for the rest of the ingress.
+  Applying a message calls the fork's `tcp::Socket::reduce_mss`, which resends the data in
+  flight at once from `SND.UNA` in segments of the new size, without a congestion window
+  or timer back-off (the drop was not congestion). The connection is found by a scan of
+  the socket set per message, so nothing is stored and the TCP path is unchanged: ICMP was
+  already classified after TCP and UDP. The lowered MSS lasts for the connection (no
+  increase probing, RFC 1191's 10-minute timer is not implemented). UDP is out of scope:
+  datagrams are sent with DF and an oversize one fails with `InvalidInput` at the
+  configured MTU.
 - `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer` (default `None`: the 512 segments
   above) size every TCP socket's buffers, listener pool sockets included, clamped to one
   IPv4 MSS (`mtu - 40`) at least and `65535 << 14` (the largest window TCP can advertise,
@@ -1220,10 +1245,11 @@ smoltcp on its own dispatch path.
   (32 MiB in 40-41 s with CUBIC, 40-50 s with Reno), CUBIC recovered faster at 1 % random
   loss (16 MiB in 1.1-4.1 s, Reno 4.1-5.1 s) and is the default of Linux, Windows and macOS;
   its `f64` arithmetic is no concern on the targets nsplane runs on.
-- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.4`, branch
-  `nsplane/v0.14-perf`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
+- smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.6`, branch
+  `nsplane/v0.14-tlp`, ADR `docs/decisions/2026-10-03-smoltcp-fork.md`): v0.14.0 plus
   fixes for four defects that stalled connections for good under loss when both ends send
-  (an echo, request and response), and five throughput changes (ON) listed after them.
+  (an echo, request and response), five throughput changes (ON) listed after them,
+  `tcp::Socket::reduce_mss` for path MTU discovery (above) and a tail loss probe (below).
   - After a retransmission timeout smoltcp 0.14 rewound its next sequence number to the
     oldest unacknowledged byte and stamped its pure ACKs with it. If the peer had already
     received past that point (only its ACKs were lost), the peer dropped those ACKs as old,
@@ -1267,6 +1293,21 @@ smoltcp on its own dispatch path.
     average after losses with four streams (about 1080 with one).
   - Limited Transmit (RFC 3042): the first two duplicate ACKs each release one new
     segment, so small windows still reach the third duplicate ACK and fast retransmit.
+
+  `v0.14.0-nsplane.6` (QN F3) adds a tail loss probe in the manner of RFC 8985 section 7.
+  Next to the retransmission timer runs a probe timeout of two smoothed RTTs plus 10 ms
+  (plus 200 ms for a delayed ACK when one segment is in flight), restarted by every
+  segment sent and every ACK of new data. When it expires, the first unacknowledged
+  segment is resent once, and fast recovery starts unless a recovery is already running;
+  the retransmission timer keeps running for a lost probe. Unlike RFC 8985 the probe
+  resends the first unacknowledged segment rather than the last (smoltcp keeps no SACK
+  scoreboard, so that is where the loss must be) and also runs in fast recovery and after
+  a timeout, where it resends a lost retransmission: the role RACK has in RFC 8985. Before,
+  each lost retransmission waited for a timeout of at least 1 s, doubled after a timeout
+  (and after a timeout every loss among the resent data waited for one); those timeouts
+  were the 3 % loss tail. SACK was not chosen: smoltcp's receiver reports a single SACK
+  block, so a sender scoreboard would see little of the holes, and its assembler keeps four;
+  the probe needs no state beyond one flag and one timer field, and no receiver change.
 
   Together they lift four parallel streams to at least the one-stream aggregate with
   nsplane's defaults (no driver Nagle, `tcp_send_budget` unset); see
@@ -1338,8 +1379,8 @@ fork round (each on a quiet host) and the final gate's run of the merged workspa
 | TCP, 16 MiB, bottleneck | 15-23 s | 0.8-0.9 s with NewReno | 0.82 s (20.5 MB/s, 124 drops) |
 | UDP, 50 000 x 1200 B, no loss | see above | within noise | 449.4 MB/s |
 
-The remaining 3 % loss timeouts are lost retransmissions, which only a timeout recovers
-without SACK or RACK-TLP. With many parallel streams the fork removes the throughput
+The remaining 3 % loss timeouts were lost retransmissions; `.6` resends them by its tail
+loss probe (see below). With many parallel streams the fork removes the throughput
 collapse after sink-full drops: `tests/netstack_multistream.rs` (two engines in process,
 1 GiB per run split between the streams, default MTU and configuration, release) moved
 one stream at 669-782 MB/s and four at 689-841 MB/s, 1.00-1.11x the single stream in 12
@@ -1369,6 +1410,82 @@ reverted; follow-up). Idle request/response latency is unchanged (p50 / p99 0.02
 0.052 ms against 0.027 / 0.054), but next to a saturating stream it rose from 0.081 /
 0.941 to 0.280 / 1.271 ms in this run: the stream now keeps more in flight (it is 10 %
 faster and no longer backs off after losses). Not analysed further here (follow-up).
+
+The default `datagram_capacity` (QN-4, 2026-10-06): `netstack_bench`'s server at the stack
+default instead of its 1024, the netstack runtime otherwise `main`'s. A first run on the old
+CPU sets (one lock hold per build, 30 s x 3) and an interleaved A/B in bench slot 0 (CPUs 1-7,
+128, 256, 128, 256, 30 s x 2 each, a loaded host); medians [repetitions], the slot rows
+per run or as the range of all four repetitions:
+
+| Queue | Run (1-minute load) | TCP P1 / P4 Gbit/s | UDP loss 1G % | UDP loss 3G % |
+| --- | --- | --- | --- | --- |
+| 128 | old sets (1.4 -> 4.1) | 6.48 / 7.37 | 1.24 [1.24-1.43] | 5.21 [4.91-8.88] |
+| 256 | old sets (3.1 -> 3.1) | 6.81 / 7.24 | 0.00 [0.00-0.01] | 2.62 [2.54-2.79] |
+| 512 | old sets (15.8 -> 17.4) | 4.83 / 5.34 | 0.00 | 1.14 |
+| 128 | slot 0 (6.9-15.4) | 5.61, 3.89 / 6.89, 4.01 | 0.07-0.75 | 1.00-6.39 |
+| 256 | slot 0 (6.9-15.4) | 6.15, 5.15 / 6.26, 5.10 | 0.00-0.002 | 0.41-2.93 |
+
+256 removes the 1 Gbit/s loss in every repetition; at 3 Gbit/s the rest is mostly the
+receiving engine's full sink and the slot run spreads too far to rank 128 and 256 (512 was
+only measured once, on a loaded host). TCP and request/response latency do not use the queue
+and stay within the host's spread. The in-process `netstack_lossy` UDP burst (50 000 x 1200 B)
+received 45 106-48 768 datagrams at 128 and 44 929-49 149 at 256 over six runs each: its loss
+is elsewhere on the in-process path. The queue is a tokio channel that grows on demand in
+32-entry blocks (32 + 32 x 32 bytes per flow, 32 + 32 x 64 per bound socket) and keeps at most
+a few emptied blocks, so idle cost does not depend on the capacity; a full queue pins one
+ingress buffer (about 2 KiB on the engine path) per datagram: about 256 / 512 / 1024 KiB per
+flow or socket at 128 / 256 / 512, and that times the stalled flows for a whole stack.
+
+The tail loss probe (QN F3, smoltcp `.6`, see [nsplane-netstack](#nsplane-netstack)),
+2026-10-06: `netstack_lossy`'s `throughput`, 10 rounds of `main` (`.4`) and the branch
+interleaved in bench slot 1 (CPUs 8-15, 1-minute load 26.8 -> 11.1), median [range] of the
+10 runs:
+
+| Case | `main` | `.6` |
+| --- | --- | --- |
+| TCP, 64 MiB, no loss | 0.210 s [0.190-0.237] | 0.209 s [0.180-0.242] |
+| TCP, 16 MiB, 1 % loss | 1.13 s [0.09-5.15] | 0.10 s [0.09-1.17] |
+| TCP, 16 MiB, 3 % loss | 12.7 s [7.2-29.2] | 1.01 s [0.30-3.39] |
+| TCP, 16 MiB, bottleneck | 0.86 s [0.83-0.87] | 0.86 s [0.83-0.87] |
+
+Drop counts match (the link drops deterministically); the retransmission timeouts are
+what is gone. One timeout in about 10 runs of 1 % and one to three per 3 % run remain, where
+the probe itself is lost. The harness's netstack pair (10 s x 2 per side, slot 0, interleaved
+`main`, `.5` without the probe and `.6`, 1-minute load 5.9-15.4, medians of 8 repetitions
+each): TCP P1 5.51 / 5.88 / 5.62 Gbit/s, P4 6.86 / 6.78 / 6.77 Gbit/s; earlier runs in
+louder windows (load 9-21 and 6-13, 12 repetitions per side) gave P1 5.43 against 5.53
+(`main` / `.6`) and 5.45 against 5.76 (`.5` / `.6`), P4 5.99 against 5.46 and 7.25 against
+6.60, with ranges of 2.4-9.3 Gbit/s that overlap fully. A build that logs every probe fired
+2 probes in two repetitions of the harness pair (against 8220 fast retransmissions and 9
+timeouts after sink-full drops) and none in the loss-free `send_stream` bench, so the
+probe changes nothing on a loss-free path. `tests/netstack_lossy.rs`
+`bulk_tcp_with_heavy_loss` asserts 8 MiB at 3 % loss within 5 s: 0.87-1.02 s in a debug
+build, 6.9-7.7 s on `main` (five runs each).
+
+The sender alone, without engine, crypto or loss: `benches/send_stream.rs` in
+`nsplane-netstack` (criterion) wires two netstacks back to back in process and sends 8 MiB per
+iteration over one or four persistent connections at the default MTU and configuration, on
+four runtime workers (`netstack_send`) and on one thread (`netstack_send_1cpu`, both ends'
+summed cost):
+
+```text
+cargo bench -p nsplane-netstack --bench send_stream
+```
+
+`.3` against `.4` (MF-5), 15 alternating pairs pinned to CPUs 2-5, 2026-10-06, 1-minute load
+1.6-9.4 (32 cores); medians in MB/s [IQR], and `.4` against `.3` per pair:
+
+| Case | `.3` | `.4` | `.4` vs `.3` (IQR; pairs faster) |
+| --- | --- | --- | --- |
+| 1 stream, 4 workers | 2558 [2500-2692] | 2748 [2659-2764] | +2.1 % (+0.3..+8.9; 12/15) |
+| 4 streams, 4 workers | 3620 [3303-3681] | 4063 [3995-4129] | +12.8 % (+10.0..+16.7; 14/15) |
+| 1 stream, 1 thread | 2501 [2466-2521] | 2538 [2499-2546] | +1.5 % (+0.5..+1.9; 13/15) |
+| 4 streams, 1 thread | 2099 [2055-2116] | 2083 [1953-2091] | -0.9 % (-2.8..-0.2; 4/15) |
+
+One sending stream costs nothing on `.4`: it is 1.5-2 % faster, so the SWS hold and Limited
+Transmit cost the loss-free single stream nothing measurable (not bisected further). The -5.3 % ns measured on a loud host
+(range -28..+16 %) is inside that host's spread; the one pair here below -6 % (-31 %) ran at
+load 9.
 
 L2's queue harness (4 and 8 parallel 32 MiB-total echo connections over two engines at
 queue capacity 512 and 1024, release, 3 runs per cell) completed every run after the
@@ -1520,9 +1637,10 @@ Decided for later, not in this workstream:
 
 - smoltcp fork: the checksum over 64-bit words, the non-shrinking advertised window edge
   and NewReno's partial-ACK retransmission listed here before are in `v0.14.0-nsplane.4`
-  (see [nsplane-netstack](#nsplane-netstack)). What stays: a lost retransmission still
-  waits for a timeout of at least 1 s, which keeps 3 % loss at 11-41 s; SACK or RACK-TLP
-  is the next step.
+  (see [nsplane-netstack](#nsplane-netstack)), and `.6`'s tail loss probe resends a lost
+  retransmission after about two round trips (3 % loss: median 12.7 s to 1.0 s). What
+  stays: a lost probe still waits for a timeout of at least 1 s (one to three per 16 MiB at
+  3 %); SACK (smoltcp's receiver reports one block) or a second probe would be the next step.
 - `nsplane-packet`: setting a pooled buffer's length without zero-filling it (smoltcp
   writes every byte of a transmitted packet) would save about 4 % of the direct
   instructions. It is a later design item: it would need `unsafe` in a
@@ -2148,6 +2266,7 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
 | Netstack TCP, bottleneck | 16 MiB, 25 MB/s, 64-datagram buffer | 12.9 / 16.8 s (1.3 / 1.0 MB/s, 320 / 341 drops) | 5C-T6: 20.9 / 18.9 s |
 | Netstack UDP, no loss | 50 000 x 1200 B | 614.7 / 670.2 MB/s | |
 | Netstack TCP, smoltcp `.4` (ON) | `netstack_lossy` 1 % loss / 3 % loss / bottleneck, 16 MiB (final gate, load 8.9-9.3) | 1.14 s / 19.2 s / 0.82 s | `.3`: 1.1-6.2 s / stalls past 60 s / 14.9-23.9 s; [Netstack throughput](#netstack-throughput) |
+| Netstack TCP, smoltcp `.6` (tail loss probe) | `netstack_lossy` 1 % loss / 3 % loss, 16 MiB, median of 10 interleaved (slot 1, load 11-27) | 0.10 s / 1.01 s (worst 3.39 s) | `main` (`.4`): 1.13 s / 12.7 s (worst 29.2 s); [Netstack throughput](#netstack-throughput) |
 | Netstack pair (harness, ON) | TCP P1 / P4 Gbit/s, UDP loss 1G / 3G %, 30 s x 3 medians (2026-10-05, load 2.2-3.5) | 6.85 / 7.29, 0.00 / 0.03 | `main` b5e531f same window: 6.21 / 2.48, 2.21 / 5.56 |
 | Engine fast path (MF-1), TUN, nsplane-cli -> nsplane-cli | iperf3 TCP -P1 / -P4, no workers, median of the 3 quiet pairs (load1 <= 12.3) | 9.90 / 10.37 Gbit/s | before: 8.43 / 8.70 Gbit/s (+17 % / +19 %); [Engine fast path (MF-1)](#engine-fast-path-mf-1) |
 | Engine fast path (MF-1), TUN, kernel WireGuard -> nsplane-cli | the same | 4.85 / 4.77 Gbit/s; dedicated rerun 5.87 / 5.92 | before: 6.27 / 6.07; rerun 6.32 / 6.12 Gbit/s (-23 % / -21 %; rerun -7 % / -3 %), not reproduced outside the harness |

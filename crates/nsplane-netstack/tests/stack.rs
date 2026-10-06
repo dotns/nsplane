@@ -377,6 +377,45 @@ async fn one_driver_turn_drops_a_burst_beyond_the_datagram_queue() -> TestResult
 }
 
 #[tokio::test]
+async fn one_driver_turn_burst_to_a_flow_fits_the_default_datagram_queue() -> TestResult {
+    let (handle, _source, sink) = single(|_| {});
+    let mut incoming = handle.incoming_udp();
+    let received = Arc::new(AtomicUsize::new(0));
+    let reader = Arc::clone(&received);
+    tokio::spawn(async move {
+        let Ok(mut flow) = next(&mut incoming).await else {
+            return;
+        };
+        while flow.recv().await.is_some() {
+            reader.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    // One driver turn routes 256 ingress packets, all of them to the one flow.
+    let burst = 256;
+    tokio::task::unconstrained(async {
+        for _ in 0..burst {
+            sink.send(udp([10, 0, 0, 2], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+                .await?;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await?;
+    counted(&handle, |stats| {
+        received.load(Ordering::Relaxed) as u64 + stats.udp_queue_full == burst
+    })
+    .await?;
+    assert_eq!(handle.stats().udp_queue_full, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_driver_turn_burst_to_a_socket_fits_the_default_datagram_queue() -> TestResult {
+    let capacity = NetStackConfig::default().datagram_capacity;
+    assert_eq!(ingress_burst(capacity, 256).await?, (256, 0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn udp_flow_limit_is_counted() -> TestResult {
     let (handle, _source, sink) = single(|config| config.max_udp_flows = 1);
     let mut incoming = handle.incoming_udp();

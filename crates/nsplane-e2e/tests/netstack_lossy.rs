@@ -29,6 +29,11 @@ const LOSS_PERMILLE: u64 = 10;
 /// Upper bound for a bulk transfer over the lossy link, well under [`TRANSFER`] even in a
 /// debug build.
 const LOSSY_BOUND: Duration = Duration::from_secs(15);
+/// Data messages dropped per 1000 on each end of the heavily lossy link.
+const HEAVY_LOSS_PERMILLE: u64 = 30;
+/// Upper bound for a bulk transfer over the heavily lossy link: about 1 s in a debug build
+/// with the tail loss probe, 7-8 s without it.
+const HEAVY_LOSS_BOUND: Duration = Duration::from_secs(5);
 /// Bytes sent per measured loss-free bulk transfer.
 const THROUGHPUT_BULK: usize = 64 << 20;
 /// Bytes sent per measured bulk transfer over a lossy link.
@@ -260,14 +265,27 @@ async fn bulk_tcp_without_loss() -> TestResult {
 
 /// 8 MiB over a link that drops 1 % of the data messages in each direction completes intact
 /// within [`LOSSY_BOUND`].
-///
-/// At 2-3 % loss smoltcp recovers mostly through retransmission timeouts (at least 1 s
-/// each; it has no SACK and no retransmission on a partial ACK), so the same transfer takes
-/// 15-40 s in a debug build.
 #[tokio::test]
 async fn bulk_tcp_with_loss() -> TestResult {
     let (a, b, dropped) = lossy_pair(LOSS_PERMILLE).await?;
     bulk_tcp(&b, &a, BULK, LOSSY_BOUND).await?;
+    assert!(
+        dropped.load(Ordering::Relaxed) > 0,
+        "the link dropped nothing"
+    );
+    Ok(())
+}
+
+/// The loss tail: 8 MiB over a link that drops 3 % of the data messages in each direction
+/// completes intact within [`HEAVY_LOSS_BOUND`].
+///
+/// Lost retransmissions and losses at the end of a window are repaired by the tail loss
+/// probe after a few milliseconds. Without it, each waits for a retransmission timeout (at
+/// least 1 s, doubled after a timeout).
+#[tokio::test]
+async fn bulk_tcp_with_heavy_loss() -> TestResult {
+    let (a, b, dropped) = lossy_pair(HEAVY_LOSS_PERMILLE).await?;
+    bulk_tcp(&b, &a, BULK, HEAVY_LOSS_BOUND).await?;
     assert!(
         dropped.load(Ordering::Relaxed) > 0,
         "the link dropped nothing"
