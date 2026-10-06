@@ -8,6 +8,7 @@
 //! `wintun.dll` pin (verified before the DLL is loaded), an exclusive adapter name and
 //! the interface MTU.
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fmt;
 use std::future;
@@ -523,6 +524,32 @@ impl PacketSink for TunSink {
     ) -> impl Future<Output = io::Result<()>> + Send {
         future::ready(self.write(packet.as_packet()))
     }
+
+    /// Like `send_batch`, and appends the buffer of every packet it took over to `spent`
+    /// once it is copied into the send ring or dropped. Never waits, so the returned
+    /// future is already complete.
+    fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        future::ready(write_spent(packets, spent, |bytes| self.write(bytes)))
+    }
+}
+
+/// Writes the packets of `packets` front first with `write`, appending each buffer to
+/// `spent` after its write; stops at the first error, the rest staying in `packets`.
+fn write_spent(
+    packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    spent: &mut Vec<PacketBuf>,
+    mut write: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    while let Some((_, packet)) = packets.pop_front() {
+        let result = write(packet.as_packet());
+        spent.push(packet);
+        result?;
+    }
+    Ok(())
 }
 
 impl TunSink {
@@ -687,6 +714,33 @@ mod tests {
         let mut bufs = vec![PacketBuf::with_capacity(1600)];
         hand_back(&recycled, &mut bufs);
         assert_eq!(bufs.len(), 1);
+    }
+
+    #[test]
+    fn write_spent_returns_every_buffer_taken_over() {
+        let mut packets: VecDeque<_> = (0..4u8)
+            .map(|i| (PeerId::new(0), PacketBuf::from_packet(&[0x45, i])))
+            .collect();
+        let addrs: Vec<_> = packets
+            .iter()
+            .map(|(_, p)| p.as_packet().as_ptr())
+            .collect();
+        let mut written = Vec::new();
+        let mut spent = Vec::new();
+        // The third write fails: its buffer is spent, the fourth packet stays.
+        let err = write_spent(&mut packets, &mut spent, |bytes| {
+            if bytes[1] == 2 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            written.push(bytes[1]);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(written, [0, 1]);
+        let spent_addrs: Vec<_> = spent.iter().map(|p| p.as_packet().as_ptr()).collect();
+        assert_eq!(spent_addrs, addrs[..3]);
+        assert_eq!(packets.len(), 1);
     }
 
     #[test]

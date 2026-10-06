@@ -4,7 +4,10 @@
 //! 1420 B packets: `pipe` sends a batch of packets into a pipe and reads them back with
 //! `recv_batch`, and `alloc_send_recv` also allocates each packet with `PipeSink::alloc`
 //! and recycles it into the source once read; `pump` moves the packets from one pipe into another with `pump` while a
-//! task drains the second pipe.
+//! task drains the second pipe. `pipe_to_writer` has a long-running `pump` move packets a
+//! producer allocates with `PipeSink::alloc` into a sink that consumes them like a device
+//! write and drops the buffers; `pipe_to_writer_spent` has the sink hand them back through
+//! `send_batch_spent`, so `pump` recycles them into the pipe's pool.
 //!
 //! The wrapper groups send through a wrapper into roomy pipes and read the packets back,
 //! each with its baseline next to it: `splitter` compares a reading route closure
@@ -14,6 +17,8 @@
 //! `SwapSink<AbortSink>` before any abort.
 
 use std::collections::VecDeque;
+use std::hint::black_box;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +27,7 @@ use nsplane::{
     AbortSink, MapSink, MapVerdict, PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId,
     PipeSource, Splitter, SwapSink, pipe, pump,
 };
+use tokio::sync::watch;
 
 /// Packets per iteration.
 const PACKETS: usize = 1024;
@@ -60,6 +66,49 @@ fn route(packet: &PacketBuf) -> usize {
             .get(ROUTE_BYTE)
             .is_some_and(|byte| byte & 1 == 1),
     )
+}
+
+/// A sink that consumes every packet like a device write and counts them, per batch; with
+/// `spent` it hands the buffers back through `send_batch_spent`, otherwise it drops them.
+struct Writer {
+    spent: bool,
+    written: watch::Sender<usize>,
+}
+
+impl Writer {
+    fn write(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>, spent: &mut Vec<PacketBuf>) {
+        let count = packets.len();
+        for (_, packet) in packets.drain(..) {
+            black_box(packet.as_packet());
+            if self.spent {
+                spent.push(packet);
+            }
+        }
+        self.written.send_modify(|written| *written += count);
+    }
+}
+
+impl PacketSink for Writer {
+    async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+        self.send_batch(&mut VecDeque::from([(from, packet)])).await
+    }
+
+    fn send_batch(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.write(packets, &mut Vec::new());
+        std::future::ready(Ok(()))
+    }
+
+    fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.write(packets, spent);
+        std::future::ready(Ok(()))
+    }
 }
 
 /// Sends every packet in `held` into `sink` one at a time.
@@ -175,6 +224,25 @@ fn bench_pump(c: &mut Criterion) {
                 BatchSize::SmallInput,
             );
         });
+    }
+    for (name, spent) in [("pipe_to_writer", false), ("pipe_to_writer_spent", true)] {
+        for size in SIZES {
+            let (input, source) = pipe(PACKETS, 1420);
+            let (written, mut counted) = watch::channel(0);
+            runtime.spawn(pump(source, Writer { spent, written }, PeerId::new(1)));
+            let mut target = 0;
+            group.bench_function(format!("{name}_{size}"), |bench| {
+                bench.iter(|| {
+                    runtime.block_on(async {
+                        for _ in 0..PACKETS {
+                            input.send(input.alloc(size), PeerId::new(1)).await.unwrap();
+                        }
+                        target += PACKETS;
+                        counted.wait_for(|&n| n >= target).await.unwrap();
+                    });
+                });
+            });
+        }
     }
     group.finish();
 }
