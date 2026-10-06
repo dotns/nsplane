@@ -5,6 +5,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-core`: caller-updated inbound destinations: the `InboundDestinations` trait
+  (implemented for closures), consulted once per decrypted data packet of a peer and never
+  cached, so a revoked or new grant applies to the next packet;
+  `ConfigChange::SetInboundDestinationSource` and `nsplane`
+  `EngineHandle::set_inbound_destination_source` set it, replacing an owned list (and an owned
+  list replaces it). Owned lists and unchecked peers cost what they did.
+
 ### Changed
 - `nsplane-core`: `Event::Authenticated` is emitted once per off-path source change (since the
   peer's path was last set or a handshake completed), not per message; `PathPolicy::on_authenticated`

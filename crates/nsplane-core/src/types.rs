@@ -3,6 +3,7 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nsplane_noise::x25519;
@@ -61,8 +62,33 @@ pub struct PeerConfig {
     /// them is unchecked; `Some(vec![])` allows no destination. Independent of
     /// `allowed_ips`: they add no routes.
     ///
+    /// [`ConfigChange::SetInboundDestinationSource`] replaces them with a caller-updated
+    /// source, and they replace a source.
+    ///
     /// [`reasons::DESTINATION_NOT_ALLOWED`]: crate::reasons::DESTINATION_NOT_ALLOWED
     pub inbound_destinations: Option<Vec<AllowedIp>>,
+}
+
+/// A caller-updated source of a peer's inbound destinations, consulted per packet.
+///
+/// Set with [`ConfigChange::SetInboundDestinationSource`] instead of an owned list, it is
+/// asked once per decrypted data packet of that peer, so a change the caller makes takes
+/// effect on the next packet, without a configuration change.
+///
+/// Called on the core's task (or its owner's), so it must be cheap and must not block: back
+/// it with whatever lock-free snapshot the caller has. Implemented for closures.
+pub trait InboundDestinations: Send + Sync {
+    /// Whether the peer's decrypted packets may be addressed to `dst`; a packet to a
+    /// destination it does not allow is dropped as [`reasons::DESTINATION_NOT_ALLOWED`].
+    ///
+    /// [`reasons::DESTINATION_NOT_ALLOWED`]: crate::reasons::DESTINATION_NOT_ALLOWED
+    fn allows(&self, dst: IpAddr) -> bool;
+}
+
+impl<F: Fn(IpAddr) -> bool + Send + Sync> InboundDestinations for F {
+    fn allows(&self, dst: IpAddr) -> bool {
+        self(dst)
+    }
 }
 
 impl PeerConfig {
@@ -140,6 +166,15 @@ pub enum ConfigChange {
         /// The new destinations; `None` removes them, leaving the peer unchecked.
         destinations: Option<Vec<AllowedIp>>,
     },
+    /// Sets or removes the caller-updated source of a peer's inbound destinations, consulted
+    /// per packet; it replaces an owned list ([`PeerConfig::inbound_destinations`]) and a
+    /// later owned list replaces it.
+    SetInboundDestinationSource {
+        /// Public key of the peer.
+        peer: x25519::PublicKey,
+        /// The new source; `None` removes it, leaving the peer unchecked.
+        source: Option<Arc<dyn InboundDestinations>>,
+    },
 }
 
 impl fmt::Debug for ConfigChange {
@@ -175,6 +210,11 @@ impl fmt::Debug for ConfigChange {
                 .debug_struct("SetInboundDestinations")
                 .field("peer", peer)
                 .field("destinations", destinations)
+                .finish(),
+            Self::SetInboundDestinationSource { peer, source } => f
+                .debug_struct("SetInboundDestinationSource")
+                .field("peer", peer)
+                .field("source", &source.as_ref().map(|_| "<source>"))
                 .finish(),
         }
     }

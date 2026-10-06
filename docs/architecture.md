@@ -64,6 +64,9 @@ Per-source ACL principals, the ns `crates/acl` mode and inbound destinations add
 `AclFilterStats::bypassed` and `ipv6_accepted`; `nsplane-core`
 `PeerConfig::inbound_destinations`, `ConfigChange::SetInboundDestinations` and
 `reasons::DESTINATION_NOT_ALLOWED`; `nsplane` `EngineHandle::set_inbound_destinations`.
+Caller-updated inbound destinations (MD-7) add `nsplane-core` `InboundDestinations` (also
+re-exported by `nsplane`) and `ConfigChange::SetInboundDestinationSource`; `nsplane`
+`EngineHandle::set_inbound_destination_source`.
 
 `nsplane-packet::build` writes whole IPv4 or IPv6 UDP datagrams for packets an application
 injects into the tunnel: `write_udp(buf, src, dst, payload)` into an existing `PacketBuf`
@@ -171,6 +174,13 @@ destination of the batch is remembered like the other lookups.
 `ConfigChange::SetInboundDestinations` (`EngineHandle::set_inbound_destinations`) sets or removes them at runtime, and
 `add_or_update_peer` with `Some` replaces them (`None` keeps them). An unchecked peer pays one
 `Option` check per packet; no peer pays an allocation or a lock.
+Instead of an owned list, `ConfigChange::SetInboundDestinationSource`
+(`EngineHandle::set_inbound_destination_source`) gives a peer a caller-updated
+`Arc<dyn InboundDestinations>` (closures implement it): its `allows(dst)` is called once per
+decrypted data packet wherever the owned list is checked (also when a deferred job
+completes), never cached across packets, so a grant the caller revokes or adds in its own
+lock-free snapshot applies to the next packet without a command. A source and an owned list
+replace each other; `None` leaves the peer unchecked. Owned lists keep their cost and cache.
 
 `handle_input_deferred` is the same entry point for a driver that encrypts on several
 threads: the cryptography of a local packet or a received transport data message comes back
@@ -1655,7 +1665,9 @@ which replace the gate's IPv6 Subnet ingress check. ns then deletes tunnel-wg `n
 (gate and tests) and `AccountFilter`'s gate and divert steps (with MD-A, also its ACL step:
 `acl_check_packet` and the `FragmentAclGate` use). ns keeps the policy compilation, the
 `NodeL3Config` / `WgConfig` conversion, the gateway consumer queue and its flow check, and
-the inbound destinations push. The ns `AccountFilter` steps and their nsplane locations are
+the inbound destinations push; with MD-7 it can instead install one
+`set_inbound_destination_source` per peer backed by its lease and grant snapshot and delete
+that push (the `set_inbound_destinations` calls on grant changes). The ns `AccountFilter` steps and their nsplane locations are
 tabled in the `NodeL3Filter` rustdoc.
 
 **Tests.** The 60 tests of ns `tunnel-wg/src/node_l3/tests` are ported
@@ -1845,7 +1857,7 @@ path, so such a client pays no extra latency for it.
 | ACL bypass flags | `nsplane-acl` | `AclFilterConfig::accept_to_local = Some(addr)`, `accept_icmp_echo_reply = true` | off | one branch per inbound packet each |
 | ACL IPv6 mode | `nsplane-acl` | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` | `Ipv6Mode::Evaluate` | one branch per packet |
 | ns `crates/acl` mode | `nsplane-acl` | `AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(local))` | not used | none: a preset of the options above |
-| Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations` | `None`: unchecked | one `Option` check per decrypted packet |
+| Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations`, or a caller-updated `EngineHandle::set_inbound_destination_source` | `None`: unchecked | one `Option` check per decrypted packet; a source adds one `allows` call |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Node L3 gate | `nsplane-acl` | `EngineBuilder::filter(Box::new(NodeL3Filter::new(gate, keys).with_acl(acl)))` | not installed | none |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |

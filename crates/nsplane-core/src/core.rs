@@ -19,7 +19,7 @@ use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
 use crate::job::{self, CryptoJob, Direction, Outcome};
 use crate::peer::Peer;
-use crate::peer_table::{PeerTable, PeerTableError};
+use crate::peer_table::{Destinations, PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
 use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, PeerStats};
@@ -703,6 +703,7 @@ impl Core {
             | ConfigChange::SetKeepalive { peer, .. }
             | ConfigChange::SetPath { peer, .. }
             | ConfigChange::SetInboundDestinations { peer, .. }
+            | ConfigChange::SetInboundDestinationSource { peer, .. }
                 if self.peers.get(&peer).is_none() =>
             {
                 return;
@@ -744,6 +745,12 @@ impl Core {
                 if let Some(id) = self.peers.get(&peer) {
                     self.peers
                         .set_inbound_destinations(id, destinations.as_deref());
+                }
+                return;
+            }
+            ConfigChange::SetInboundDestinationSource { peer, source } => {
+                if let Some(id) = self.peers.get(&peer) {
+                    self.peers.set_inbound_destination_source(id, source);
                 }
                 return;
             }
@@ -918,12 +925,17 @@ impl Core {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
         }
-        if let Some(set) = self.peers.inbound_destinations(slot) {
+        if let Some(destinations) = self.peers.inbound_destinations(slot) {
             let dst = datagram
                 .as_packet()
                 .get(DATA_HEADER_SZ..DATA_HEADER_SZ + plain_len)
                 .and_then(Tunn::dst_address);
-            if !dst.is_some_and(|dst| lookups.destination_allowed(set, dst, id)) {
+            // A shared source is consulted per packet, never cached: it may change any time.
+            let allowed = dst.is_some_and(|dst| match destinations {
+                Destinations::Owned(set) => lookups.destination_allowed(set, dst, id),
+                Destinations::Shared(source) => source.allows(dst),
+            });
+            if !allowed {
                 self.dropped(Some(id), reasons::DESTINATION_NOT_ALLOWED);
                 return None;
             }
@@ -1454,6 +1466,50 @@ mod tests {
             Input::Config(ConfigChange::SetInboundDestinations {
                 peer: key,
                 destinations: None,
+            }),
+            Instant::now(),
+        );
+        assert!(core.peers.inbound_destinations(slot).is_none());
+    }
+
+    #[test]
+    fn inbound_destination_sources_of_unknown_peers_are_ignored() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let key = x25519::PublicKey::from([7; 32]);
+        let source: std::sync::Arc<dyn crate::InboundDestinations> =
+            std::sync::Arc::new(|_: IpAddr| false);
+        let change = ConfigChange::SetInboundDestinationSource {
+            peer: key,
+            source: Some(std::sync::Arc::clone(&source)),
+        };
+        assert!(format!("{change:?}").contains("<source>"));
+        core.handle_input(Input::Config(change), Instant::now());
+        assert!(core.poll_output().is_none());
+        assert_eq!(core.peer_id(&key), None);
+
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(PeerConfig::new(key))),
+            Instant::now(),
+        );
+        let slot = core.peers.slot(core.peer_id(&key).unwrap()).unwrap();
+        core.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinationSource {
+                peer: key,
+                source: Some(source),
+            }),
+            Instant::now(),
+        );
+        assert!(matches!(
+            core.peers.inbound_destinations(slot),
+            Some(Destinations::Shared(_))
+        ));
+        core.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinationSource {
+                peer: key,
+                source: None,
             }),
             Instant::now(),
         );

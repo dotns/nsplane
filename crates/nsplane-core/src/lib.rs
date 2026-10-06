@@ -38,4 +38,7 @@ pub use nsplane_noise::{noise, x25519};
 pub use nsplane_packet::PacketBuf;
 pub use nsplane_packet::{Ecn, Path, PeerId, TransportId};
 pub use policy::{MessageKind, PathPolicy, Roam, StandardRoaming};
-pub use types::{AllowedIp, ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, PeerStats};
+pub use types::{
+    AllowedIp, ConfigChange, CoreConfig, Event, InboundDestinations, Input, Output, PeerConfig,
+    PeerStats,
+};
