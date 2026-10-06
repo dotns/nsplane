@@ -15,6 +15,7 @@ use std::io;
 use std::iter;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::Arc;
+use std::sync::mpsc::{self as sync_mpsc, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
@@ -244,10 +245,11 @@ impl Tun {
     /// Dropping the last half shuts the session down and joins the reader thread.
     pub fn split(self) -> io::Result<(TunSource, TunSink)> {
         let (tx, packets) = mpsc::channel(QUEUE_DEPTH);
+        let (recycled, free) = sync_mpsc::sync_channel(POOL_FREE);
         let session = Arc::clone(&self.session);
         let reader = thread::Builder::new()
             .name("nsplane-tun-rx".to_owned())
-            .spawn(move || read_loop(&session, &tx))?;
+            .spawn(move || read_loop(&session, &tx, &free))?;
         let shared = Arc::new(Shared {
             session: self.session,
             reader: Some(reader),
@@ -255,6 +257,7 @@ impl Tun {
         let (mtu, _) = watch::channel(self.mtu);
         let source = TunSource {
             packets,
+            recycled,
             mtu,
             shared: Arc::clone(&shared),
         };
@@ -384,10 +387,16 @@ fn set_mtu(name: &str, luid: NET_LUID_LH, mtu: u16) -> io::Result<u16> {
     Ok(wintun::check_mtu(mtu, read_ipv4, read_ipv6)?)
 }
 
-/// Receives packets until the session shuts down or the [`TunSource`] is gone.
-fn read_loop(session: &Arc<Session>, packets: &mpsc::Sender<PacketBuf>) {
+/// Receives packets until the session shuts down or the [`TunSource`] is gone, reading
+/// them into the buffers recycled through `free` when there are any.
+fn read_loop(
+    session: &Arc<Session>,
+    packets: &mpsc::Sender<PacketBuf>,
+    free: &Receiver<PacketBuf>,
+) {
     let mut pool = PacketPool::new(POOL_FREE);
     while let Ok(received) = session.receive_blocking() {
+        refill(&mut pool, free);
         let bytes = received.bytes();
         let mut packet = pool.get(bytes.len() + TRANSLATION_SLACK + TAILROOM);
         packet.extend_from_slice(bytes);
@@ -395,6 +404,28 @@ fn read_loop(session: &Arc<Session>, packets: &mpsc::Sender<PacketBuf>) {
         drop(received);
         if packets.blocking_send(packet).is_err() {
             return;
+        }
+    }
+}
+
+/// Moves the buffers waiting in `free` into `pool`, without waiting; the pool drops what
+/// it has no room for.
+fn refill(pool: &mut PacketPool, free: &Receiver<PacketBuf>) {
+    while let Ok(buf) = free.try_recv() {
+        pool.put(buf);
+    }
+}
+
+/// Hands `bufs` to the reader thread through `free` until it is full, without waiting; the
+/// rest stay in `bufs`.
+fn hand_back(free: &SyncSender<PacketBuf>, bufs: &mut Vec<PacketBuf>) {
+    while let Some(buf) = bufs.pop() {
+        match free.try_send(buf) {
+            Ok(()) => {}
+            Err(TrySendError::Full(buf) | TrySendError::Disconnected(buf)) => {
+                bufs.push(buf);
+                return;
+            }
         }
     }
 }
@@ -428,6 +459,8 @@ impl Drop for Shared {
 pub struct TunSource {
     /// Declared before `shared` so the channel closes before the session shuts down.
     packets: mpsc::Receiver<PacketBuf>,
+    /// Buffers handed back to the reader thread's pool.
+    recycled: SyncSender<PacketBuf>,
     /// Kept alive so receivers never observe a closed channel; the adapter MTU is not
     /// watched on Windows, so the value never changes.
     mtu: watch::Sender<u16>,
@@ -452,6 +485,13 @@ impl PacketSource for TunSource {
             .recv()
             .await
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    /// Hands the buffers back to the reader thread, which keeps up to 64 idle ones; the
+    /// rest are dropped. Up to 64 wait for the thread's next read; beyond that they are
+    /// dropped without waiting.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        hand_back(&self.recycled, bufs);
     }
 
     /// The adapter MTU read at [`Tun::create`]. It is not watched on Windows (that
@@ -612,6 +652,41 @@ mod tests {
         assert_eq!(options.wintun_pin, Some(pin));
         assert!(options.exclusive);
         assert_eq!(options.mtu, Some(1280));
+    }
+
+    #[test]
+    fn recycled_buffers_reach_the_reader_pool() {
+        let (recycled, free) = sync_mpsc::sync_channel(POOL_FREE);
+        let mut pool = PacketPool::new(POOL_FREE);
+        let mut bufs: Vec<_> = (0..POOL_FREE + 3)
+            .map(|_| PacketBuf::with_capacity(1600))
+            .collect();
+        // Handed back first, so it is one of those the channel takes.
+        let addr = bufs[POOL_FREE + 2].as_packet().as_ptr();
+        hand_back(&recycled, &mut bufs);
+        // The channel is full; the source drops the rest.
+        assert_eq!(bufs.len(), 3);
+
+        refill(&mut pool, &free);
+        assert_eq!(pool.free_len(), POOL_FREE);
+        // Drained, so the next hand-back fits again; the pool, full, drops it.
+        hand_back(&recycled, &mut bufs);
+        assert!(bufs.is_empty());
+        refill(&mut pool, &free);
+        assert_eq!(pool.free_len(), POOL_FREE);
+
+        let packets: Vec<_> = (0..POOL_FREE).map(|_| pool.get(1500)).collect();
+        assert!(packets.iter().any(|p| p.as_packet().as_ptr() == addr));
+        assert_eq!(pool.free_len(), 0);
+    }
+
+    #[test]
+    fn hand_back_after_the_reader_exits_keeps_the_buffers() {
+        let (recycled, free) = sync_mpsc::sync_channel(POOL_FREE);
+        drop(free);
+        let mut bufs = vec![PacketBuf::with_capacity(1600)];
+        hand_back(&recycled, &mut bufs);
+        assert_eq!(bufs.len(), 1);
     }
 
     #[test]
