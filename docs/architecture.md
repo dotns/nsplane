@@ -2659,6 +2659,34 @@ the packet source left less than 20 bytes of room), engine fragmentation of tran
 IPv4 (the IPv4 MTU must leave the 20 bytes the header grows by), and TCP segmentation
 offload for IPv4 on the TUN.
 
+### Deliver room without crypto workers (QE-3 F1)
+
+Without crypto workers the owner now reads received datagrams only while the deliver queue
+has room for them, as it did with workers since OE-3 (C2). A = main e381bcf, B = the change;
+2026-10-06, A and B interleaved within one run; load1 at the start / end of each half.
+
+| Measurement | Slot, load1 | A | B |
+|---|---|---|---|
+| `latency.rs` `round_trip_latency`, 0 workers, loaded | unpinned; A 18.3 -> 3.7, B 3.7 -> 3.6 | lost 505 / 2000, p50 3.90 ms, p99 14.2 ms, receiver `DROP_SINK_FULL` 201 M, bulk 567 packets/ms | lost 0, p50 2.16 ms, p99 5.95 ms, no drops, bulk 1169 packets/ms |
+| the same, 2 workers | as above | lost 3, p50 1.43 ms, p99 5.30 ms | lost 3, p50 1.40 ms, p99 5.08 ms |
+| `round_trip_latency_queue_256`, 0 workers, loaded | unpinned; 5.4 -> 6.5 | lost 849, p50 2.16 ms, p99 9.46 ms, `DROP_SINK_FULL` 493 M | lost 0, p50 1.43 ms, p99 3.30 ms, no drops |
+| `data_path` `core_round_trip` 64 B / 1420 B (two halves) | slot 0; 1.7 -> 11.8 | 562 / 944 ns, 1.41 / 1.63 us | 571 / 533 ns, 1.35 / 1.45 us |
+| harness nsplane-nsplane default P1 / P4 Gbit/s (two halves) | slot 1; 6-21 | 8.90 / 8.68, 7.08 / 8.44 | 10.09 / 7.24, 8.50 / 9.10 |
+| harness nsplane-nsplane nooffload P1 / P4 | slot 1; 6-21 | 5.39 / 8.00, 6.91 / 7.75 | 6.13 / 6.69, 9.54 / 10.21 |
+| harness kernel-nsplane P1 / P4 | slot 1; 6-21 | 4.81 / 4.98, 4.00 / 5.24 | 3.66 / 5.28, 4.66 / 5.34 |
+| harness nsplane-kernel P1 / P4 (two runs of two halves) | slot 1 A 6-8, B 13-21; slot 0 A 7-23, B 15-41 | 6.73 / 6.45, 6.84 / 6.52; 6.94 / 5.13, 5.51 / 5.35 | 5.27 / 4.92, 6.06 / 5.29; 5.64 / 5.09, 3.24 / 3.97 |
+
+The latency measurement is the case the change is for: the test's ponger sink is slower
+than the link, and without workers every lost ping was a sink-full drop at the receiver;
+held back in the socket instead, nothing is lost and the bulk flow delivers twice as much.
+`worker_pool` (slot 1 at load 9-27, slot 0 at 14-31) varied up to 3x between halves of
+the same build and is not usable. Most halves ran at load1 above 12, so the harness rows
+are noisy: nsplane-nsplane and kernel-nsplane show no regression, while nsplane-kernel
+(nsplane only sends, receiving TCP ACKs) is lower in B in all four halves, each of which
+ran at a higher load than the A half before it. On that path the deliver queue stays
+nearly empty, so the gate only adds a capacity check per poll; a quiet-host re-run should
+settle it before the default change counts as a pure win.
+
 ## Unsafe code
 
 `unsafe` lives only in `nsplane-tun`'s platform
