@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same name; `mtu(n)` sets the interface MTU and `Tun::mtu` reports the read-back value;
   `offload` is accepted and ignored. Refusals are `WintunError` (`HashMismatch`,
   `DriverVersionMismatch`, `AdapterExists`) inside the `io::Error`. `Tun::create` is unchanged.
+- nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
+  two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
+  send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
+  `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
 
 ## [0.10.0] - 2026-10-05
 
