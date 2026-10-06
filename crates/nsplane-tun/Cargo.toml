@@ -15,7 +15,7 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-nsplane = { path = "../nsplane", version = "0.10.0" }
+nsplane = { path = "../nsplane", version = "0.10.1" }
 tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"] }
 tracing = "0.1.40"
 
@@ -30,8 +30,8 @@ wintun-bindings = "0.7.40"
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 futures-core = "0.3.32"
-nsplane-netstack = { path = "../nsplane-netstack", version = "0.10.0" }
-nsplane-packet = { path = "../nsplane-packet", version = "0.10.0" }
+nsplane-netstack = { path = "../nsplane-netstack", version = "0.10.1" }
+nsplane-packet = { path = "../nsplane-packet", version = "0.10.1" }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [[bench]]

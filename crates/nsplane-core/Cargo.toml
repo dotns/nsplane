@@ -15,8 +15,8 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-nsplane-noise = { version = "0.10.0", path = "../nsplane-noise" }
-nsplane-packet = { version = "0.10.0", path = "../nsplane-packet" }
+nsplane-noise = { version = "0.10.1", path = "../nsplane-noise" }
+nsplane-packet = { version = "0.10.1", path = "../nsplane-packet" }
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }

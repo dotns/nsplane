@@ -15,8 +15,8 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-nsplane-core = { version = "0.10.0", path = "../nsplane-core" }
-nsplane-packet = { version = "0.10.0", path = "../nsplane-packet" }
+nsplane-core = { version = "0.10.1", path = "../nsplane-core" }
+nsplane-packet = { version = "0.10.1", path = "../nsplane-packet" }
 arc-swap = "1.7.1"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.21"

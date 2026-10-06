@@ -15,7 +15,7 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-nsplane = { path = "../nsplane", version = "0.10.0" }
+nsplane = { path = "../nsplane", version = "0.10.1" }
 bytes = { workspace = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
