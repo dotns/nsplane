@@ -1233,8 +1233,10 @@ dependencies = [
  "nsplane",
  "nsplane-netstack",
  "nsplane-packet",
+ "sha2",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
  "wintun-bindings",
 ]
 
