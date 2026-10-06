@@ -1,12 +1,13 @@
 //! The Windows service TUN checks that need no Windows API: the `wintun.dll` pin and its
-//! verification, the typed [`WintunError`], the open/create/refuse decision and MTU
-//! validation. Compiled on Windows and, for the unit tests, on every host.
+//! verification, the typed [`WintunError`], the open/create/replace/refuse decision, MTU
+//! validation and its read-back check. Compiled on Windows and, for the unit tests, on every host.
 
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -17,6 +18,17 @@ const MAX_DLL_LEN: u64 = 16 << 20;
 /// The smallest interface MTU accepted: the IPv4 minimum datagram every host must
 /// accept (RFC 791).
 const MIN_MTU: u16 = 576;
+
+/// The pause between two queries for an IP interface row of a new adapter.
+pub(crate) const ROW_POLL: Duration = Duration::from_millis(50);
+
+/// How long `Tun::create_with` waits for the IPv4 interface row of the adapter, which a new
+/// adapter creates asynchronously, before it fails with [`io::ErrorKind::TimedOut`].
+pub(crate) const IPV4_ROW_WAIT: Duration = Duration::from_secs(5);
+
+/// How long `Tun::create_with` waits for the IPv6 interface row once the IPv4 row exists;
+/// still absent then, IPv6 counts as disabled on this host and its MTU is not set.
+pub(crate) const IPV6_ROW_WAIT: Duration = Duration::from_millis(500);
 
 /// The `wintun.dll` the caller expects, for `TunOptions::wintun_pin`.
 ///
@@ -177,6 +189,42 @@ fn remedy(path: &Path, arch: &str) -> String {
     )
 }
 
+/// `IfOperStatusNotPresent`: the `OperStatus` of an interface whose device is not present.
+const IF_OPER_STATUS_NOT_PRESENT: i32 = 6;
+
+/// What the name resolves to before `Tun::create_with` opens or creates the adapter.
+///
+/// A process holding the adapter handle cannot be observed directly; a present device is
+/// the observable proxy for a live owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Existing {
+    /// The name does not resolve to a LUID.
+    Absent,
+    /// The name resolves to a LUID whose interface is not present (`OperStatus`
+    /// `NotPresent`, or no interface row for that LUID): the device of a process that died
+    /// without closing its adapter.
+    Orphaned,
+    /// The name resolves and the interface is present (any other `OperStatus`, including
+    /// `Down`: an adapter another process created but has not started yet is live).
+    Live,
+}
+
+/// Whether an interface row's `OperStatus` reports a present device.
+pub(crate) const fn present(oper_status: i32) -> bool {
+    oper_status != IF_OPER_STATUS_NOT_PRESENT
+}
+
+/// Classifies a name by whether it resolves to a LUID (Wintun opened the adapter, or the
+/// interface alias converts) and whether that LUID's interface row reports a present
+/// device (`None`: no row).
+pub(crate) const fn classify(resolves: bool, present: Option<bool>) -> Existing {
+    match (resolves, present) {
+        (false, _) => Existing::Absent,
+        (true, None | Some(false)) => Existing::Orphaned,
+        (true, Some(true)) => Existing::Live,
+    }
+}
+
 /// What `Tun::create_with` does with the adapter name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plan {
@@ -184,17 +232,23 @@ pub(crate) enum Plan {
     Open,
     /// Create the adapter.
     Create,
+    /// Close any handle to the orphan, create the adapter and require the requested
+    /// alias, else fail with [`WintunError::OrphanNotReplaced`].
+    Replace,
     /// Fail with [`WintunError::AdapterExists`].
     Refuse,
 }
 
-/// Decides by whether an adapter or interface with the name exists and whether the
-/// caller asked for an exclusive one.
-pub(crate) const fn plan(existing: bool, exclusive: bool) -> Plan {
-    match (existing, exclusive) {
-        (false, _) => Plan::Create,
-        (true, false) => Plan::Open,
-        (true, true) => Plan::Refuse,
+/// Decides by what the name resolves to, whether Wintun opened it and whether the caller
+/// asked for an exclusive adapter. An orphan is replaced either way (a session on a
+/// non-present device cannot start); a live name that is no Wintun adapter is left to
+/// Wintun's alias choice when not exclusive.
+pub(crate) const fn plan(existing: Existing, opened: bool, exclusive: bool) -> Plan {
+    match (existing, opened, exclusive) {
+        (Existing::Absent, _, _) | (Existing::Live, false, false) => Plan::Create,
+        (Existing::Orphaned, _, _) => Plan::Replace,
+        (Existing::Live, _, true) => Plan::Refuse,
+        (Existing::Live, true, false) => Plan::Open,
     }
 }
 
@@ -208,6 +262,44 @@ pub(crate) fn validate_mtu(mtu: u16) -> io::Result<u16> {
         ));
     }
     Ok(mtu)
+}
+
+/// Polls until `poll` yields a value, pausing `interval` (through `pause`) between polls
+/// until the pauses add up to `wait`; `None` if it never did. A poll error is returned at
+/// once.
+pub(crate) fn wait_for<T>(
+    wait: Duration,
+    interval: Duration,
+    mut poll: impl FnMut() -> io::Result<Option<T>>,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<Option<T>> {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(Some(value));
+        }
+        if waited >= wait {
+            return Ok(None);
+        }
+        pause(interval);
+        waited += interval;
+    }
+}
+
+/// Checks the MTUs read back after setting `requested`: the IPv4 one, and the IPv6 one
+/// unless the interface has no IPv6 row (`None`). A difference fails with
+/// [`WintunError::MtuMismatch`].
+pub(crate) fn check_mtu(requested: u16, ipv4: u32, ipv6: Option<u32>) -> Result<u16, WintunError> {
+    let requested_u32 = u32::from(requested);
+    if ipv4 == requested_u32 && ipv6.is_none_or(|mtu| mtu == requested_u32) {
+        Ok(requested)
+    } else {
+        Err(WintunError::MtuMismatch {
+            requested,
+            ipv4,
+            ipv6,
+        })
+    }
 }
 
 /// A refusal by the Windows service TUN checks of `Tun::create_with`.
@@ -240,18 +332,40 @@ pub enum WintunError {
         /// The requested name.
         name: String,
     },
+    /// An orphaned interface (left non-present by a process that died) holds the
+    /// requested name and Wintun could not reclaim it; the new adapter was removed again.
+    OrphanNotReplaced {
+        /// The requested name.
+        name: String,
+        /// The alias Wintun assigned to the new adapter instead.
+        assigned: String,
+    },
+    /// The interface MTU read back after setting it differs from the requested one; the
+    /// adapter was closed (and removed, if this call created it).
+    MtuMismatch {
+        /// The MTU of `TunOptions::mtu`.
+        requested: u16,
+        /// The IPv4 MTU read back.
+        ipv4: u32,
+        /// The IPv6 MTU read back, `None` if the interface has no IPv6 row.
+        ipv6: Option<u32>,
+    },
 }
 
 impl WintunError {
     /// The [`io::ErrorKind`] of the [`io::Error`] carrying this error:
     /// [`io::ErrorKind::InvalidData`] for the pins, [`io::ErrorKind::AlreadyExists`] for
-    /// an existing adapter.
+    /// an existing or unreplaceable adapter, [`io::ErrorKind::Other`] for an MTU that did
+    /// not take effect.
     pub const fn kind(&self) -> io::ErrorKind {
         match self {
             Self::HashMismatch { .. } | Self::DriverVersionMismatch { .. } => {
                 io::ErrorKind::InvalidData
             }
-            Self::AdapterExists { .. } => io::ErrorKind::AlreadyExists,
+            Self::AdapterExists { .. } | Self::OrphanNotReplaced { .. } => {
+                io::ErrorKind::AlreadyExists
+            }
+            Self::MtuMismatch { .. } => io::ErrorKind::Other,
         }
     }
 }
@@ -277,6 +391,23 @@ impl fmt::Display for WintunError {
             ),
             Self::AdapterExists { name } => {
                 write!(f, "a network interface named {name:?} already exists")
+            }
+            Self::OrphanNotReplaced { name, assigned } => write!(
+                f,
+                "an orphaned network interface named {name:?} could not be replaced (the new \
+                 adapter got {assigned:?}); remove it with pnputil /remove-device or Device \
+                 Manager (show hidden devices)"
+            ),
+            Self::MtuMismatch {
+                requested,
+                ipv4,
+                ipv6,
+            } => {
+                write!(f, "the adapter MTU reads back as {ipv4} (IPv4)")?;
+                if let Some(ipv6) = ipv6 {
+                    write!(f, ", {ipv6} (IPv6)")?;
+                }
+                write!(f, " after setting {requested}")
             }
         }
     }
@@ -435,12 +566,109 @@ mod tests {
         }
     }
 
+    /// `OperStatus` values of the modeled interface rows.
+    const UP: i32 = 1;
+    const DOWN: i32 = 2;
+
+    /// A modeled interface: its alias, the `OperStatus` of its row (`None`: no row) and
+    /// whether Wintun can open it.
+    struct Interface {
+        alias: &'static str,
+        row: Option<i32>,
+        wintun: bool,
+    }
+
+    /// Orphans (alias only, no row, still opened by Wintun), live Wintun adapters (`Up`,
+    /// `Down`) and a live interface that is no Wintun adapter.
+    const TABLE: &[Interface] = &[
+        Interface {
+            alias: "ghost",
+            row: Some(IF_OPER_STATUS_NOT_PRESENT),
+            wintun: false,
+        },
+        Interface {
+            alias: "rowless",
+            row: None,
+            wintun: false,
+        },
+        Interface {
+            alias: "ghost-open",
+            row: Some(IF_OPER_STATUS_NOT_PRESENT),
+            wintun: true,
+        },
+        Interface {
+            alias: "ns0",
+            row: Some(UP),
+            wintun: true,
+        },
+        Interface {
+            alias: "starting",
+            row: Some(DOWN),
+            wintun: true,
+        },
+        Interface {
+            alias: "Ethernet",
+            row: Some(UP),
+            wintun: false,
+        },
+    ];
+
+    /// What `Tun::create_with` sees for `name` in the model: the classification and
+    /// whether Wintun opened it.
+    fn resolve(name: &str) -> (Existing, bool) {
+        TABLE
+            .iter()
+            .find(|i| i.alias == name)
+            .map_or((classify(false, None), false), |i| {
+                (classify(true, i.row.map(present)), i.wintun)
+            })
+    }
+
+    fn plan_for(name: &str, exclusive: bool) -> Plan {
+        let (existing, opened) = resolve(name);
+        plan(existing, opened, exclusive)
+    }
+
+    #[test]
+    fn classify_modeled_interfaces() {
+        assert_eq!(resolve("absent"), (Existing::Absent, false));
+        assert_eq!(resolve("ghost"), (Existing::Orphaned, false));
+        assert_eq!(resolve("rowless"), (Existing::Orphaned, false));
+        assert_eq!(resolve("ghost-open"), (Existing::Orphaned, true));
+        assert_eq!(resolve("ns0"), (Existing::Live, true));
+        assert_eq!(resolve("starting"), (Existing::Live, true));
+        assert_eq!(resolve("Ethernet"), (Existing::Live, false));
+        assert_eq!(classify(false, Some(true)), Existing::Absent);
+    }
+
+    #[test]
+    fn plan_modeled_interfaces() {
+        for exclusive in [false, true] {
+            assert_eq!(plan_for("absent", exclusive), Plan::Create);
+            assert_eq!(plan_for("ghost", exclusive), Plan::Replace);
+            assert_eq!(plan_for("rowless", exclusive), Plan::Replace);
+            assert_eq!(plan_for("ghost-open", exclusive), Plan::Replace);
+        }
+        assert_eq!(plan_for("ns0", true), Plan::Refuse);
+        assert_eq!(plan_for("ns0", false), Plan::Open);
+        assert_eq!(plan_for("starting", true), Plan::Refuse);
+        assert_eq!(plan_for("starting", false), Plan::Open);
+        assert_eq!(plan_for("Ethernet", true), Plan::Refuse);
+        assert_eq!(plan_for("Ethernet", false), Plan::Create);
+    }
+
     #[test]
     fn plan_truth_table() {
-        assert_eq!(plan(false, false), Plan::Create);
-        assert_eq!(plan(false, true), Plan::Create);
-        assert_eq!(plan(true, false), Plan::Open);
-        assert_eq!(plan(true, true), Plan::Refuse);
+        use Existing::{Absent, Live, Orphaned};
+        for opened in [false, true] {
+            for exclusive in [false, true] {
+                assert_eq!(plan(Absent, opened, exclusive), Plan::Create);
+                assert_eq!(plan(Orphaned, opened, exclusive), Plan::Replace);
+                assert_eq!(plan(Live, opened, true), Plan::Refuse);
+            }
+        }
+        assert_eq!(plan(Live, true, false), Plan::Open);
+        assert_eq!(plan(Live, false, false), Plan::Create);
     }
 
     #[test]
@@ -479,6 +707,39 @@ mod tests {
         };
         assert_eq!(hash.kind(), io::ErrorKind::InvalidData);
         assert!(hash.to_string().contains(&"ff".repeat(32)));
+        let orphan = WintunError::OrphanNotReplaced {
+            name: "ns0".to_owned(),
+            assigned: "ns0 2".to_owned(),
+        };
+        assert_eq!(orphan.kind(), io::ErrorKind::AlreadyExists);
+        let message = orphan.to_string();
+        assert!(
+            message.starts_with(
+                "an orphaned network interface named \"ns0\" could not be replaced (the new \
+                 adapter got \"ns0 2\")"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("pnputil /remove-device"), "{message}");
+        let mtu = WintunError::MtuMismatch {
+            requested: 1420,
+            ipv4: 65535,
+            ipv6: None,
+        };
+        assert_eq!(mtu.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            mtu.to_string(),
+            "the adapter MTU reads back as 65535 (IPv4) after setting 1420"
+        );
+        let mtu = WintunError::MtuMismatch {
+            requested: 1420,
+            ipv4: 1420,
+            ipv6: Some(65535),
+        };
+        assert_eq!(
+            mtu.to_string(),
+            "the adapter MTU reads back as 1420 (IPv4), 65535 (IPv6) after setting 1420"
+        );
     }
 
     #[test]
@@ -489,5 +750,95 @@ mod tests {
         let e = io::Error::from(original.clone());
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(downcast(&e), Some(&original));
+        let orphan = WintunError::OrphanNotReplaced {
+            name: "ns0".to_owned(),
+            assigned: "ns0 2".to_owned(),
+        };
+        let e = io::Error::from(orphan.clone());
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(downcast(&e), Some(&orphan));
+    }
+
+    #[test]
+    fn check_mtu_accepts_matching_read_backs() {
+        assert_eq!(check_mtu(1420, 1420, None), Ok(1420));
+        assert_eq!(check_mtu(1420, 1420, Some(1420)), Ok(1420));
+    }
+
+    #[test]
+    fn check_mtu_refuses_a_differing_read_back() {
+        assert_eq!(
+            check_mtu(1420, 65535, Some(65535)),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 65535,
+                ipv6: Some(65535),
+            })
+        );
+        assert_eq!(
+            check_mtu(1420, 65535, None),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 65535,
+                ipv6: None,
+            })
+        );
+        assert_eq!(
+            check_mtu(1420, 1420, Some(65535)),
+            Err(WintunError::MtuMismatch {
+                requested: 1420,
+                ipv4: 1420,
+                ipv6: Some(65535),
+            })
+        );
+    }
+
+    /// Runs `wait_for` over scripted poll results, returning its result, the number of
+    /// polls and the total pause.
+    fn scripted(
+        wait: Duration,
+        script: Vec<io::Result<Option<u32>>>,
+    ) -> (io::Result<Option<u32>>, usize, Duration) {
+        let mut script = script.into_iter();
+        let mut polls = 0;
+        let mut paused = Duration::ZERO;
+        let result = wait_for(
+            wait,
+            ROW_POLL,
+            || {
+                polls += 1;
+                script.next().unwrap_or(Ok(None))
+            },
+            |interval| paused += interval,
+        );
+        (result, polls, paused)
+    }
+
+    #[test]
+    fn wait_for_returns_a_row_that_appears() {
+        let (result, polls, paused) =
+            scripted(IPV4_ROW_WAIT, vec![Ok(None), Ok(None), Ok(Some(1500))]);
+        assert_eq!(result.unwrap(), Some(1500));
+        assert_eq!(polls, 3);
+        assert_eq!(paused, 2 * ROW_POLL);
+    }
+
+    #[test]
+    fn wait_for_gives_up_after_the_wait() {
+        let (result, polls, paused) = scripted(IPV6_ROW_WAIT, Vec::new());
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(polls, 11);
+        assert_eq!(paused, IPV6_ROW_WAIT);
+    }
+
+    #[test]
+    fn wait_for_returns_an_error_at_once() {
+        let (result, polls, paused) = scripted(
+            IPV4_ROW_WAIT,
+            vec![Err(io::Error::from_raw_os_error(5)), Ok(Some(1500))],
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(polls, 1);
+        assert_eq!(paused, Duration::ZERO);
     }
 }

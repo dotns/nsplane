@@ -28,9 +28,10 @@ libc = "0.2"
 wintun-bindings = "0.7.40"
 # JUSTIFICATION: hashes wintun.dll against the caller's pin before it is loaded.
 sha2 = "0.10.9"
-# JUSTIFICATION: ConvertInterfaceAliasToLuid for the exclusive adapter-name check; the same
-# version and features wintun-bindings already pulls in.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+# JUSTIFICATION: ConvertInterfaceAliasToLuid for the exclusive adapter-name check and
+# Get/SetIpInterfaceEntry for the MTU; the same version and features wintun-bindings already
+# pulls in.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
