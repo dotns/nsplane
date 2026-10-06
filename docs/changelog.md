@@ -148,3 +148,9 @@ plane that ns and other products use. The ACL works on flows, opaque labels and 
 product policy is compiled above it. nsgw's requests (docs site `nsgw/next.md` L2, L4, L5, L6)
 are recorded in generic form in task `20261006-1300-nsgw-requests`, with what is not planned
 and why.
+
+## 2026-10-06 08:00 [release]
+
+Release 0.10.1 (tag `v0.10.1`, branch `release/0.10.x` from v0.10.0). It carries one fix: with
+`crypto_workers >= 2`, seals in flight count against the local room, so a full transmit queue
+holds back the source instead of dropping. Found by QE-6, campaign `nsplane-q2-202610060900`.
