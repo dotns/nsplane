@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn verify_reports_expected_and_actual_on_mismatch() {
         let file = TempFile::new("mismatch");
-        std::fs::write(&file.0, b"abd").unwrap();
+        std::fs::write(&file.0, b"xyz").unwrap();
         let pin = WintunPin::from_hex(ABC).unwrap();
         let e = verify(&file.0, pin.sha256()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
@@ -393,8 +393,8 @@ mod tests {
         };
         assert_eq!(path, &file.0);
         assert_eq!(expected, pin.sha256());
-        let abd: [u8; 32] = Sha256::digest(b"abd").into();
-        assert_eq!(actual, &abd);
+        let xyz: [u8; 32] = Sha256::digest(b"xyz").into();
+        assert_eq!(actual, &xyz);
         assert!(e.to_string().contains(ABC), "{e}");
     }
 
