@@ -101,6 +101,11 @@ impl<S: PacketSource> PacketSource for Nat64LanSource<S> {
         }
     }
 
+    /// Forwards to `inner`: translation does not change who owns the buffers.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        self.inner.recycle(bufs);
+    }
+
     fn mtu(&self) -> watch::Receiver<u16> {
         self.inner.mtu()
     }

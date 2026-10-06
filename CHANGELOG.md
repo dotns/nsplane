@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
   69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
 
+### Fixed
+- `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
+  it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
+  source and it allocated every buffer.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
