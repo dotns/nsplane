@@ -1,5 +1,5 @@
 //! The Windows service TUN checks that need no Windows API: the `wintun.dll` pin and its
-//! verification, the typed [`WintunError`], the open/create/refuse decision and MTU
+//! verification, the typed [`WintunError`], the open/create/replace/refuse decision and MTU
 //! validation. Compiled on Windows and, for the unit tests, on every host.
 
 use std::error::Error;
@@ -177,6 +177,42 @@ fn remedy(path: &Path, arch: &str) -> String {
     )
 }
 
+/// `IfOperStatusNotPresent`: the `OperStatus` of an interface whose device is not present.
+const IF_OPER_STATUS_NOT_PRESENT: i32 = 6;
+
+/// What the name resolves to before `Tun::create_with` opens or creates the adapter.
+///
+/// A process holding the adapter handle cannot be observed directly; a present device is
+/// the observable proxy for a live owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Existing {
+    /// The name does not resolve to a LUID.
+    Absent,
+    /// The name resolves to a LUID whose interface is not present (`OperStatus`
+    /// `NotPresent`, or no interface row for that LUID): the device of a process that died
+    /// without closing its adapter.
+    Orphaned,
+    /// The name resolves and the interface is present (any other `OperStatus`, including
+    /// `Down`: an adapter another process created but has not started yet is live).
+    Live,
+}
+
+/// Whether an interface row's `OperStatus` reports a present device.
+pub(crate) const fn present(oper_status: i32) -> bool {
+    oper_status != IF_OPER_STATUS_NOT_PRESENT
+}
+
+/// Classifies a name by whether it resolves to a LUID (Wintun opened the adapter, or the
+/// interface alias converts) and whether that LUID's interface row reports a present
+/// device (`None`: no row).
+pub(crate) const fn classify(resolves: bool, present: Option<bool>) -> Existing {
+    match (resolves, present) {
+        (false, _) => Existing::Absent,
+        (true, None | Some(false)) => Existing::Orphaned,
+        (true, Some(true)) => Existing::Live,
+    }
+}
+
 /// What `Tun::create_with` does with the adapter name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plan {
@@ -184,17 +220,23 @@ pub(crate) enum Plan {
     Open,
     /// Create the adapter.
     Create,
+    /// Close any handle to the orphan, create the adapter and require the requested
+    /// alias, else fail with [`WintunError::OrphanNotReplaced`].
+    Replace,
     /// Fail with [`WintunError::AdapterExists`].
     Refuse,
 }
 
-/// Decides by whether an adapter or interface with the name exists and whether the
-/// caller asked for an exclusive one.
-pub(crate) const fn plan(existing: bool, exclusive: bool) -> Plan {
-    match (existing, exclusive) {
-        (false, _) => Plan::Create,
-        (true, false) => Plan::Open,
-        (true, true) => Plan::Refuse,
+/// Decides by what the name resolves to, whether Wintun opened it and whether the caller
+/// asked for an exclusive adapter. An orphan is replaced either way (a session on a
+/// non-present device cannot start); a live name that is no Wintun adapter is left to
+/// Wintun's alias choice when not exclusive.
+pub(crate) const fn plan(existing: Existing, opened: bool, exclusive: bool) -> Plan {
+    match (existing, opened, exclusive) {
+        (Existing::Absent, _, _) | (Existing::Live, false, false) => Plan::Create,
+        (Existing::Orphaned, _, _) => Plan::Replace,
+        (Existing::Live, _, true) => Plan::Refuse,
+        (Existing::Live, true, false) => Plan::Open,
     }
 }
 
@@ -240,18 +282,28 @@ pub enum WintunError {
         /// The requested name.
         name: String,
     },
+    /// An orphaned interface (left non-present by a process that died) holds the
+    /// requested name and Wintun could not reclaim it; the new adapter was removed again.
+    OrphanNotReplaced {
+        /// The requested name.
+        name: String,
+        /// The alias Wintun assigned to the new adapter instead.
+        assigned: String,
+    },
 }
 
 impl WintunError {
     /// The [`io::ErrorKind`] of the [`io::Error`] carrying this error:
     /// [`io::ErrorKind::InvalidData`] for the pins, [`io::ErrorKind::AlreadyExists`] for
-    /// an existing adapter.
+    /// an existing or unreplaceable adapter.
     pub const fn kind(&self) -> io::ErrorKind {
         match self {
             Self::HashMismatch { .. } | Self::DriverVersionMismatch { .. } => {
                 io::ErrorKind::InvalidData
             }
-            Self::AdapterExists { .. } => io::ErrorKind::AlreadyExists,
+            Self::AdapterExists { .. } | Self::OrphanNotReplaced { .. } => {
+                io::ErrorKind::AlreadyExists
+            }
         }
     }
 }
@@ -278,6 +330,12 @@ impl fmt::Display for WintunError {
             Self::AdapterExists { name } => {
                 write!(f, "a network interface named {name:?} already exists")
             }
+            Self::OrphanNotReplaced { name, assigned } => write!(
+                f,
+                "an orphaned network interface named {name:?} could not be replaced (the new \
+                 adapter got {assigned:?}); remove it with pnputil /remove-device or Device \
+                 Manager (show hidden devices)"
+            ),
         }
     }
 }
@@ -435,12 +493,109 @@ mod tests {
         }
     }
 
+    /// `OperStatus` values of the modeled interface rows.
+    const UP: i32 = 1;
+    const DOWN: i32 = 2;
+
+    /// A modeled interface: its alias, the `OperStatus` of its row (`None`: no row) and
+    /// whether Wintun can open it.
+    struct Interface {
+        alias: &'static str,
+        row: Option<i32>,
+        wintun: bool,
+    }
+
+    /// Orphans (alias only, no row, still opened by Wintun), live Wintun adapters (`Up`,
+    /// `Down`) and a live interface that is no Wintun adapter.
+    const TABLE: &[Interface] = &[
+        Interface {
+            alias: "ghost",
+            row: Some(IF_OPER_STATUS_NOT_PRESENT),
+            wintun: false,
+        },
+        Interface {
+            alias: "rowless",
+            row: None,
+            wintun: false,
+        },
+        Interface {
+            alias: "ghost-open",
+            row: Some(IF_OPER_STATUS_NOT_PRESENT),
+            wintun: true,
+        },
+        Interface {
+            alias: "ns0",
+            row: Some(UP),
+            wintun: true,
+        },
+        Interface {
+            alias: "starting",
+            row: Some(DOWN),
+            wintun: true,
+        },
+        Interface {
+            alias: "Ethernet",
+            row: Some(UP),
+            wintun: false,
+        },
+    ];
+
+    /// What `Tun::create_with` sees for `name` in the model: the classification and
+    /// whether Wintun opened it.
+    fn resolve(name: &str) -> (Existing, bool) {
+        TABLE
+            .iter()
+            .find(|i| i.alias == name)
+            .map_or((classify(false, None), false), |i| {
+                (classify(true, i.row.map(present)), i.wintun)
+            })
+    }
+
+    fn plan_for(name: &str, exclusive: bool) -> Plan {
+        let (existing, opened) = resolve(name);
+        plan(existing, opened, exclusive)
+    }
+
+    #[test]
+    fn classify_modeled_interfaces() {
+        assert_eq!(resolve("absent"), (Existing::Absent, false));
+        assert_eq!(resolve("ghost"), (Existing::Orphaned, false));
+        assert_eq!(resolve("rowless"), (Existing::Orphaned, false));
+        assert_eq!(resolve("ghost-open"), (Existing::Orphaned, true));
+        assert_eq!(resolve("ns0"), (Existing::Live, true));
+        assert_eq!(resolve("starting"), (Existing::Live, true));
+        assert_eq!(resolve("Ethernet"), (Existing::Live, false));
+        assert_eq!(classify(false, Some(true)), Existing::Absent);
+    }
+
+    #[test]
+    fn plan_modeled_interfaces() {
+        for exclusive in [false, true] {
+            assert_eq!(plan_for("absent", exclusive), Plan::Create);
+            assert_eq!(plan_for("ghost", exclusive), Plan::Replace);
+            assert_eq!(plan_for("rowless", exclusive), Plan::Replace);
+            assert_eq!(plan_for("ghost-open", exclusive), Plan::Replace);
+        }
+        assert_eq!(plan_for("ns0", true), Plan::Refuse);
+        assert_eq!(plan_for("ns0", false), Plan::Open);
+        assert_eq!(plan_for("starting", true), Plan::Refuse);
+        assert_eq!(plan_for("starting", false), Plan::Open);
+        assert_eq!(plan_for("Ethernet", true), Plan::Refuse);
+        assert_eq!(plan_for("Ethernet", false), Plan::Create);
+    }
+
     #[test]
     fn plan_truth_table() {
-        assert_eq!(plan(false, false), Plan::Create);
-        assert_eq!(plan(false, true), Plan::Create);
-        assert_eq!(plan(true, false), Plan::Open);
-        assert_eq!(plan(true, true), Plan::Refuse);
+        use Existing::{Absent, Live, Orphaned};
+        for opened in [false, true] {
+            for exclusive in [false, true] {
+                assert_eq!(plan(Absent, opened, exclusive), Plan::Create);
+                assert_eq!(plan(Orphaned, opened, exclusive), Plan::Replace);
+                assert_eq!(plan(Live, opened, true), Plan::Refuse);
+            }
+        }
+        assert_eq!(plan(Live, true, false), Plan::Open);
+        assert_eq!(plan(Live, false, false), Plan::Create);
     }
 
     #[test]
@@ -479,6 +634,20 @@ mod tests {
         };
         assert_eq!(hash.kind(), io::ErrorKind::InvalidData);
         assert!(hash.to_string().contains(&"ff".repeat(32)));
+        let orphan = WintunError::OrphanNotReplaced {
+            name: "ns0".to_owned(),
+            assigned: "ns0 2".to_owned(),
+        };
+        assert_eq!(orphan.kind(), io::ErrorKind::AlreadyExists);
+        let message = orphan.to_string();
+        assert!(
+            message.starts_with(
+                "an orphaned network interface named \"ns0\" could not be replaced (the new \
+                 adapter got \"ns0 2\")"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("pnputil /remove-device"), "{message}");
     }
 
     #[test]
@@ -489,5 +658,12 @@ mod tests {
         let e = io::Error::from(original.clone());
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(downcast(&e), Some(&original));
+        let orphan = WintunError::OrphanNotReplaced {
+            name: "ns0".to_owned(),
+            assigned: "ns0 2".to_owned(),
+        };
+        let e = io::Error::from(orphan.clone());
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(downcast(&e), Some(&orphan));
     }
 }
