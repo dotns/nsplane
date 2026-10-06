@@ -38,7 +38,8 @@
 //!   first step of that doubling. A [`WssStreamClient`] open waits for that dial unless
 //!   [`WssStreamLimits::open_timeout`] is set; past it the open fails with the last dial
 //!   error while the dial goes on.
-//! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`]; the
+//! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`], or never
+//!   when it is zero ([`WssConfig::ping_interval(None)`](WssConfig::ping_interval)); the
 //!   receiving half ends the link when no frame at all (pongs included) arrived for
 //!   [`WssConfig::read_idle`].
 //! - **Events**: [`WssDialer::events`] (and [`WssStreamClient::events`]) receive one
