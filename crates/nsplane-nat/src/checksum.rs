@@ -12,6 +12,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use nsplane_packet::checksum;
 pub use nsplane_packet::checksum::{
     internet_checksum, ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -25,31 +26,9 @@ fn add(a: u16, b: u16) -> u16 {
 /// Returns the folded one's complement sum of `data` (not complemented); an odd
 /// trailing byte is padded with zero.
 ///
-/// Equal to `!internet_checksum(data)`, but about four times faster on a
-/// full-size packet: it adds 32-bit words in native byte order into a 64-bit
-/// accumulator and swaps the folded sum to network order at the end, which
-/// the one's complement sum allows (RFC 1071 section 2).
+/// Equal to `!internet_checksum(data)`; see [`checksum::sum_words`].
 pub fn sum(data: &[u8]) -> u16 {
-    let (words, tail) = data.as_chunks::<4>();
-    let acc = words.iter().fold(0_u64, |acc, word| {
-        acc + u64::from(u32::from_ne_bytes(*word))
-    });
-    let words = u16::from_be_bytes(fold(acc).to_ne_bytes());
-    tail.chunks(2).fold(words, |acc, pair| {
-        add(
-            acc,
-            u16::from_be_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]),
-        )
-    })
-}
-
-/// Folds `acc` into 16 bits with end-around carries; zero only if `acc` is.
-const fn fold(mut acc: u64) -> u16 {
-    while acc > 0xFFFF {
-        acc = (acc & 0xFFFF) + (acc >> 16);
-    }
-    let [.., hi, lo] = acc.to_be_bytes();
-    u16::from_be_bytes([hi, lo])
+    checksum::fold(checksum::sum_words(0, data))
 }
 
 /// Returns whether `data`, including its checksum field, sums to a valid checksum.
@@ -293,6 +272,49 @@ mod tests {
             assert_eq!(sum(data), 0xFFFF, "{data:?}");
             assert_eq!(sum(data), !internet_checksum(data));
             assert!(valid(data));
+        }
+    }
+
+    /// The 16-bit word loop the word-wise [`sum`] replaced, as an independent reference.
+    fn sum_16(data: &[u8]) -> u16 {
+        let (words, tail) = data.as_chunks::<2>();
+        let tail = match tail {
+            [last] => u64::from(u16::from_be_bytes([*last, 0])),
+            _ => 0,
+        };
+        let mut acc = words
+            .iter()
+            .fold(tail, |acc, word| acc + u64::from(u16::from_be_bytes(*word)));
+        while acc > 0xFFFF {
+            acc = (acc & 0xFFFF) + (acc >> 16);
+        }
+        let [.., hi, lo] = acc.to_be_bytes();
+        u16::from_be_bytes([hi, lo])
+    }
+
+    #[test]
+    fn prop_sum_matches_16_bit_reference() {
+        let mut rng = Rng(0x0F1E_2D3C_4B5A_6978);
+        for _ in 0..ROUNDS {
+            let buf = rng.bytes(2048 + 8);
+            let len = if rng.next().is_multiple_of(2) {
+                rng.below(65)
+            } else {
+                rng.below(2049)
+            };
+            let width = rng.below(len / 2 + 1) * 2;
+            let new = rng.bytes(width);
+            let checksum = rng.u16();
+            for offset in 0..8 {
+                let data = &buf[offset..offset + len];
+                assert_eq!(sum(data), sum_16(data), "len {len} offset {offset}");
+                assert_eq!(valid(data), sum_16(data) == 0xFFFF);
+                let old = &data[..width];
+                assert_eq!(
+                    update_bytes(checksum, old, &new),
+                    !add(add(!checksum, !sum_16(old)), sum_16(&new))
+                );
+            }
         }
     }
 

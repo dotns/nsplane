@@ -437,20 +437,7 @@ impl PacketSink for TunSink {
     /// offloads). `from` is unused: the OS device has no notion of peers. A packet that
     /// is neither IPv4 nor IPv6 is dropped with [`io::ErrorKind::InvalidInput`].
     async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
-        let bytes = packet.as_packet();
-        check_ip(bytes)?;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if self.vnet.is_some() {
-            let hdr = VirtioNetHdr::default().encode();
-            return write_vectored(&self.fd, &[IoSlice::new(&hdr), IoSlice::new(bytes)]).await;
-        }
-        loop {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|fd| sys::write(fd.get_ref().as_fd(), bytes)) {
-                Ok(result) => return result.map(drop),
-                Err(_would_block) => {}
-            }
-        }
+        self.write(packet.as_packet()).await
     }
 
     /// Like one [`send`](Self::send) per packet, unless the device uses TCP
@@ -466,7 +453,7 @@ impl PacketSink for TunSink {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
         match &self.vnet {
-            Some(vnet) if vnet.tso => vnet.send_batch(&self.fd, packets).await,
+            Some(vnet) if vnet.tso => vnet.send_batch(&self.fd, packets, None).await,
             _ => {
                 while let Some((from, packet)) = packets.pop_front() {
                     self.send(packet, from).await?;
@@ -474,6 +461,30 @@ impl PacketSink for TunSink {
                 Ok(())
             }
         }
+    }
+
+    /// Like [`send_batch`](Self::send_batch), and appends the buffer of every packet it
+    /// took over to `spent` once its write is done, whether it was written or dropped.
+    /// With TCP segmentation offload the buffers of a coalesced chunk are appended
+    /// together once the chunk is written; a packet that is neither IPv4 nor IPv6 is
+    /// dropped there without being appended.
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(vnet) = &self.vnet
+            && vnet.tso
+        {
+            return vnet.send_batch(&self.fd, packets, Some(spent)).await;
+        }
+        while let Some((_, packet)) = packets.pop_front() {
+            let result = self.write(packet.as_packet()).await;
+            spent.push(packet);
+            result?;
+        }
+        Ok(())
     }
 
     /// Like [`send_batch`](Self::send_batch), but each write is tried once
@@ -510,6 +521,23 @@ impl TunSink {
     /// fd that is not a TUN device it yields the OS error of the query.
     pub fn name(&self) -> io::Result<String> {
         sys::name(self.fd.get_ref().as_fd())
+    }
+
+    /// Writes `packet` as [`PacketSink::send`] does.
+    async fn write(&self, packet: &[u8]) -> io::Result<()> {
+        check_ip(packet)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.vnet.is_some() {
+            let hdr = VirtioNetHdr::default().encode();
+            return write_vectored(&self.fd, &[IoSlice::new(&hdr), IoSlice::new(packet)]).await;
+        }
+        loop {
+            let mut guard = self.fd.writable().await?;
+            match guard.try_io(|fd| sys::write(fd.get_ref().as_fd(), packet)) {
+                Ok(result) => return result.map(drop),
+                Err(_would_block) => {}
+            }
+        }
     }
 
     /// Writes `packet` as [`PacketSink::send`] does, without waiting.
@@ -732,14 +760,16 @@ impl VnetWriter {
         }
     }
 
-    /// [`TunSink::send_batch`] with TCP segmentation offload.
+    /// [`TunSink::send_batch`] with TCP segmentation offload; with `spent`,
+    /// [`TunSink::send_batch_spent`].
     async fn send_batch(
         &self,
         fd: &AsyncFd<OwnedFd>,
         packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: Option<&mut Vec<PacketBuf>>,
     ) -> io::Result<()> {
         let mut state = self.take();
-        let result = state.send_batch(fd, packets).await;
+        let result = state.send_batch(fd, packets, spent).await;
         self.put(state);
         result
     }
@@ -783,10 +813,11 @@ impl WriteState {
         &mut self,
         fd: &AsyncFd<OwnedFd>,
         packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        mut spent: Option<&mut Vec<PacketBuf>>,
     ) -> io::Result<()> {
-        self.finish(fd).await?;
+        self.finish(fd, spent.as_deref_mut()).await?;
         while self.load(packets)? {
-            self.finish(fd).await?;
+            self.finish(fd, spent.as_deref_mut()).await?;
         }
         Ok(())
     }
@@ -834,8 +865,12 @@ impl WriteState {
     }
 
     /// Writes every group of the chunk not written yet; returns the chunk's first error
-    /// once every group was tried.
-    async fn finish(&mut self, fd: &AsyncFd<OwnedFd>) -> io::Result<()> {
+    /// once every group was tried. The chunk's buffers go to `spent`, if given.
+    async fn finish(
+        &mut self,
+        fd: &AsyncFd<OwnedFd>,
+        spent: Option<&mut Vec<PacketBuf>>,
+    ) -> io::Result<()> {
         while self.unfinished() {
             let result = loop {
                 match self.try_write_group(fd) {
@@ -848,7 +883,7 @@ impl WriteState {
             };
             self.wrote(result);
         }
-        self.done()
+        self.done(spent)
     }
 
     /// [`WriteState::finish`] without waiting: a group that would block ends the call
@@ -860,7 +895,7 @@ impl WriteState {
                 result => self.wrote(result),
             }
         }
-        self.done()
+        self.done(None)
     }
 
     /// Writes the next group once, as one `writev` of its virtio-net header and pieces.
@@ -887,9 +922,13 @@ impl WriteState {
         }
     }
 
-    /// Ends the written chunk; its first error, if any.
-    fn done(&mut self) -> io::Result<()> {
-        self.chunk.clear();
+    /// Ends the written chunk, moving its buffers to `spent` if given; its first error,
+    /// if any.
+    fn done(&mut self, spent: Option<&mut Vec<PacketBuf>>) -> io::Result<()> {
+        match spent {
+            Some(spent) => spent.append(&mut self.chunk),
+            None => self.chunk.clear(),
+        }
         self.error.take().map_or(Ok(()), Err)
     }
 }
@@ -1036,6 +1075,88 @@ mod tests {
         let got: Vec<&[u8]> = batch.iter().map(PacketBuf::as_packet).collect();
         assert_eq!(got, run);
         assert!(batch.iter().all(|p| p.headroom() == nsplane::HEADROOM));
+    }
+
+    /// The addresses of the packets' buffers, to recognize them in `spent`.
+    fn addrs<'a>(packets: impl IntoIterator<Item = &'a PacketBuf>) -> Vec<*const u8> {
+        packets
+            .into_iter()
+            .map(|p| p.as_packet().as_ptr())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_batch_spent_returns_written_buffers() {
+        for offload in [
+            Offload::default(),
+            Offload {
+                vnet_hdr: true,
+                ..Offload::default()
+            },
+        ] {
+            let (_source, sink, kernel) = device(offload);
+            let udp: Vec<Vec<u8>> = (0..3u8).map(|i| packet(17, 1, 0, &[i; 9])).collect();
+            let mut packets = batch_of(&udp);
+            let sent = addrs(packets.iter().map(|(_, p)| p));
+            let mut spent = Vec::new();
+            sink.send_batch_spent(&mut packets, &mut spent)
+                .await
+                .unwrap();
+            assert!(packets.is_empty());
+            assert_eq!(addrs(&spent), sent);
+            let header = if offload.vnet_hdr {
+                VirtioNetHdr::LEN
+            } else {
+                0
+            };
+            let got: Vec<Vec<u8>> = drain(&kernel)
+                .iter()
+                .map(|d| d[header..].to_vec())
+                .collect();
+            assert_eq!(got, udp);
+
+            // A dropped packet's buffer is spent too; the rest stay.
+            let mut packets = batch_of(&udp);
+            packets.push_front((PeerId::new(0), PacketBuf::from_packet(&[0x10, 0])));
+            let mut spent = Vec::new();
+            let err = sink
+                .send_batch_spent(&mut packets, &mut spent)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!((spent.len(), packets.len()), (1, udp.len()));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_batch_spent_returns_a_coalesced_chunk() {
+        let (_source, sink, kernel) = device(TSO);
+        let run = tcp_run(5);
+        let udp = packet(17, 1, 0, b"datagram");
+        let mut packets = batch_of(&run);
+        packets.extend(batch_of(std::slice::from_ref(&udp)));
+        let sent = addrs(packets.iter().map(|(_, p)| p));
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent)
+            .await
+            .unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(addrs(&spent), sent);
+        let (hdr, super_packet) = recv_datagram(&kernel);
+        assert_eq!(hdr.gso_type, VirtioNetHdr::GSO_TCPV4);
+        assert_eq!(super_packet.len(), 40 + 5000);
+        assert_eq!(recv_datagram(&kernel).1, udp);
+
+        // A non-IP packet ends the call without being spent; the chunk before it is.
+        let mut packets = batch_of(&run);
+        packets.push_back((PeerId::new(0), PacketBuf::from_packet(&[0x10, 0])));
+        let mut spent = Vec::new();
+        let err = sink
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!((spent.len(), packets.len()), (run.len(), 0));
     }
 
     #[tokio::test]
