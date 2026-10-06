@@ -262,14 +262,18 @@ Backpressure:
   slots while its backlog is empty, plus `min(MAX_BATCH, capacity)` minus its backlog. With
   no room it stops reading, which holds back the source, so a saturated transport keeps at
   most `MAX_BATCH` local datagrams in its backlog.
-- With crypto workers, received datagrams with the workers count against the deliver
-  queue's room: the owner reads received datagrams only while the deliver queue has room
-  beyond them, so a sink slower than the network holds datagrams back in the transport
-  (the UDP socket buffer) instead of dropping decrypted packets under `DROP_SINK_FULL`, as
-  without workers.
+- Each received datagram may deliver a packet, so the owner reads received datagrams only
+  while the deliver queue has room for them, beyond the received datagrams with the crypto
+  workers if any, and takes no more at once than that room (at least one once there is
+  room). A sink slower than the network so holds datagrams back in the transport (the UDP
+  socket buffer) instead of dropping decrypted packets under `DROP_SINK_FULL`, with or
+  without workers. Packets the owner delivers inline take no room, and those the sink
+  does not take at once fit in the queue. Handshakes and keepalives arrive on the same
+  queue, so a stalled sink also delays them; a closed sink holds nothing back.
 - Datagrams caused by received datagrams or timers that find the waiting datagrams at the
   queue capacity are dropped (`DROP_TRANSMIT_FULL`).
-- A full sink queue drops the decrypted packet (`DROP_SINK_FULL`); a closed sink or
+- A packet that still finds the sink queue full (one injected with a handle call) is
+  dropped (`DROP_SINK_FULL`); a closed sink or
   transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
   datagrams are dropped with `DROP_NO_TRANSPORT`.
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.

@@ -5,6 +5,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `nsplane`: without crypto workers a full sink holds received datagrams back in the
+  transport (for UDP, the socket buffer) instead of dropping decrypted packets under
+  `DROP_SINK_FULL`: the owner reads received datagrams only while the deliver queue has room
+  for them, as with workers since 0.10.0. A stalled sink also delays the handshakes and
+  keepalives queued behind them; a closed sink holds nothing back.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
