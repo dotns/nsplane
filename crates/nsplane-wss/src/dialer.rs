@@ -153,10 +153,11 @@ impl LinkDialer for WssDialer {
             let config = self.connector.config();
             let (sink, stream) = ws.split();
             let sink = Arc::new(Mutex::new(sink));
+            let interval = config.ping_interval;
             let sender = WssSender {
                 sink: Arc::clone(&sink),
                 stats: Arc::clone(&self.stats),
-                pings: tokio::spawn(ping(sink, config.ping_interval)),
+                pings: (!interval.is_zero()).then(|| tokio::spawn(ping(sink, interval))),
             };
             let receiver = WssReceiver {
                 stream,
@@ -210,16 +211,18 @@ async fn ping(sink: Sink, interval: Duration) {
     }
 }
 
-/// Sends datagrams as binary messages; owns the link's ping task.
+/// Sends datagrams as binary messages; owns the link's ping task, if pings are on.
 struct WssSender {
     sink: Sink,
     stats: Arc<WssStats>,
-    pings: JoinHandle<()>,
+    pings: Option<JoinHandle<()>>,
 }
 
 impl Drop for WssSender {
     fn drop(&mut self) {
-        self.pings.abort();
+        if let Some(pings) = &self.pings {
+            pings.abort();
+        }
     }
 }
 
@@ -274,5 +277,57 @@ impl LinkReceiver for WssReceiver {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WssTls;
+    use rustls::RootCertStore;
+    use tokio::time::{Instant, timeout};
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// With pings off a link sends no ping over many would-be intervals, and a silent peer
+    /// still ends it after the read idle.
+    #[tokio::test]
+    async fn pings_off_sends_no_ping_and_keeps_the_read_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Six would-be 50 ms intervals before the read idle.
+        let config = WssConfig::new(
+            format!("ws://{addr}/"),
+            WssTls::Roots(RootCertStore::empty()),
+        )
+        .allow_plaintext(true)
+        .keepalive(Duration::from_millis(50), Duration::from_millis(300))
+        .ping_interval(None);
+        let dialer = WssDialer::new(config).unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(tcp).await.unwrap()
+        });
+        let (sender, mut receiver) = timeout(WAIT, dialer.dial()).await.unwrap().unwrap();
+        let mut peer = peer.await.unwrap();
+        let started = Instant::now();
+        // The peer reads (without writing) until the link is dropped.
+        let reading = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(Ok(message)) = timeout(WAIT, peer.next()).await.unwrap() {
+                received.push(message);
+            }
+            received
+        });
+
+        let err = timeout(WAIT, receiver.recv()).await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        drop((sender, receiver));
+        let received = timeout(WAIT, reading).await.unwrap().unwrap();
+        assert!(
+            !received.iter().any(|m| matches!(m, Message::Ping(_))),
+            "{received:?}"
+        );
     }
 }

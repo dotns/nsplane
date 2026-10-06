@@ -498,16 +498,15 @@ impl Session {
             mut shutdown,
         } = queues;
         let config = self.connector.config();
-        let (ping_interval, read_idle) = (config.ping_interval, config.read_idle);
+        let read_idle = config.read_idle;
         let (mut sink, mut stream) = ws.split();
         let writer = async {
-            let mut pings = tokio::time::interval(ping_interval);
-            pings.tick().await;
+            let mut pings = config.pings();
             loop {
                 let message = tokio::select! {
                     biased;
                     Some(message) = control_rx.recv() => message,
-                    _ = pings.tick() => Message::Ping(Bytes::new()),
+                    () = pings.tick() => Message::Ping(Bytes::new()),
                     Some(message) = data_rx.recv() => message,
                 };
                 if let Err(error) = sink.send(message).await {

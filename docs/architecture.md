@@ -770,7 +770,9 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
   capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
   (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
-  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. No message
+  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. A zero
+  `ping_interval` (`WssConfig::ping_interval(None)`) sends no pings: the dialer spawns no
+  ping task and the session writers never wake for one; the read idle stays. No message
   above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
 - Events: `WssDialer::events()` and `WssStreamClient::events()` subscribe to a
   `broadcast` channel in the shared connector (`WssDialEvent::CAPACITY` = 64; a lagging
@@ -1804,7 +1806,14 @@ to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent over
 `TranslatorStats` counts `fragments_held` (exact duplicates, ignored, included), `fragment_timeouts`, `fragment_budget_drops`,
 `fragment_marker_evictions` and `reassembled_too_big`. A translated packet grows by 20
 bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied
-into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. Since the core routes and checks sources before the
+into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. A
+translated IPv6 packet shrinks without moving its payload: the IPv4 header is written in
+front of it and the packet start moves forward (the headroom grows by 20 or 28 bytes).
+Transport checksums are verified with `checksum::transport_valid` (32-bit word sums, about
+four times faster than the 16-bit full recomputation) and then moved to the new
+pseudo-header incrementally; the reassembly clock is read only for fragments, and the
+table's address indexes hold the mapping, so a lookup is one hash. Per-packet costs are in
+[nsplane-nat translator (MF-4)](#nsplane-nat-translator-mf-4). Since the core routes and checks sources before the
 filters, each peer's allowed IPs must contain its `alias4/32`, its native IPv4 alias as a /32
 if any, the LAN IPv4 prefixes behind it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
 
@@ -2574,6 +2583,51 @@ takes at least one datagram per wake); applying C2's deliver-room gate without w
 change the default path and is left for a later round. Without offload, one TUN read and one
 TUN write per packet remain. UDP loss at 3 Gbit/s is at the iperf3 socket and the sender's
 TUN queue, not in the tunnel.
+
+### nsplane-nat translator (MF-4)
+
+ns measured direct traffic through `alias4` at about 3.4 Gbit/s against 5.0 Gbit/s for N6
+(MF-4). `cargo bench -p nsplane-nat --bench translate` measures `Translator::outbound` of
+IPv4 TCP / UDP from `self4` to a peer's `alias4` (to IPv6 `node4`) and `inbound` of the
+IPv6 reply, 64 B and 1400 B (TCP) / 1420 B (UDP) payloads, with 1 and 1000 peers in the
+table, in a buffer with the TUN reader's room (no grown copy). A/B on 2026-10-06 against
+the translator of main (e381bcf; the bench commit 8af9712), three interleaved rounds in one
+bench-lock acquisition, 1-minute load 2.3-5.2; criterion means, the range over the rounds
+(the third "after" round was cut short):
+
+| Case | Before | After | Change |
+| --- | --- | --- | --- |
+| out, TCP / UDP 64 B | 72-86 ns | 42-43 ns | -42 % |
+| out, TCP 1400 B / UDP 1420 B | 197-228 ns | 79-93 ns | -60 % |
+| in, TCP / UDP 64 B | 69-74 ns | 62-73 ns | -11 % |
+| in, TCP 1400 B / UDP 1420 B | 191-210 ns | 88-102 ns | -54 % |
+
+1 and 1000 peers cost the same. Where the time went (variants measured in a scratch bench
+under the same lock, load 77-94, so about twice the quiet values): the full transport
+checksum verification was most of it (`internet_checksum` over 1428 B 282 ns, a 64-bit sum
+of 32-bit words 80 ns, a 1428 B `copy_within` 67 ns), then `SipHash` lookups (16 ns for an
+IPv4 key, 22 ns for an IPv6 key, two per packet) and `Instant::now()` for the reassembly
+clock on every outbound packet. Changes: verification with the word-wise sum
+(`checksum::transport_valid`; `checksum::sum` and `valid` use it too), the clock read only
+for fragments, IPv6 to IPv4 without moving the payload, one hash per table lookup. The
+output is byte-identical (the translator's unit and RFC 7915 vector tests, the
+`nsplane-e2e` translate tests and property tests of the new sums against the full ones).
+`perf` is not in the dev image; the attribution comes from those variants.
+
+End-to-end effect. Per full-size packet the translator now costs about 0.08 us on the
+sender (was 0.20) and 0.09 us on the receiver (was 0.19), plus 0.04-0.06 us (was 0.07) per
+ACK. Against the engine's own per-packet cost (`data_path` core round trip 0.10.0: 1.334 us
+at 1420 B, about 0.67 us per side) the translator added about 30 % per side and now adds
+about 12-13 %; that bounds the gain at about +15 % (3.4 to about 3.9 Gbit/s) when the
+thread that runs the filters is the limit. At ns's measured 5.0 Gbit/s the bottleneck
+spends about 2.3 us per 1448 B packet, and the alias4 path 3.4 us: the old translator's
+0.2-0.27 us per side explains only a fifth to a quarter of that 1.1 us gap if the rest of
+the path costs the same, and the change gains about +4 % there. So the translator was not
+the whole 30 %: the rest is outside `nsplane-nat` and was not measured here. To check on
+the ns side: `TranslatorStats::grown_copies` (each one is a fresh allocation and a copy:
+the packet source left less than 20 bytes of room), engine fragmentation of translated
+IPv4 (the IPv4 MTU must leave the 20 bytes the header grows by), and TCP segmentation
+offload for IPv4 on the TUN.
 
 ## Unsafe code
 

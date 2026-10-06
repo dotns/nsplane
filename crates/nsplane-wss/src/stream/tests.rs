@@ -1,7 +1,10 @@
 use super::*;
 use crate::WssTls;
+use crate::connect::Carrier;
 use rustls::RootCertStore;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+const WAIT: Duration = Duration::from_secs(5);
 
 const TARGET: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 7);
 
@@ -405,5 +408,45 @@ async fn session_loss_fails_every_flow() {
     assert_eq!(
         flow.send(b"x").await.unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
+    );
+}
+
+/// With pings off the session sends no ping over many would-be intervals, and a silent
+/// peer still ends it after the read idle.
+#[tokio::test]
+async fn pings_off_sends_no_ping_and_keeps_the_read_idle() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(tcp).await.unwrap()
+    });
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (ours, _) = tokio_tungstenite::client_async(format!("ws://{addr}/"), Carrier::Plain(tcp))
+        .await
+        .unwrap();
+    let mut peer = peer.await.unwrap();
+
+    // Six would-be 50 ms intervals before the read idle.
+    let config = config()
+        .keepalive(Duration::from_millis(50), Duration::from_millis(300))
+        .ping_interval(None);
+    let connector = Arc::new(Connector::new(config).unwrap());
+    let stats = Arc::new(WssStreamStats::default());
+    stats.active_sessions.fetch_add(1, Ordering::Relaxed);
+    let (session, queues) = Session::new(1, WssStreamLimits::default(), stats, connector);
+    let started = tokio::time::Instant::now();
+    let run = tokio::spawn(Arc::clone(&session).run(ours, queues));
+    // The peer reads (without writing) until the session closes the socket.
+    let mut received = Vec::new();
+    while let Some(Ok(message)) = tokio::time::timeout(WAIT, peer.next()).await.unwrap() {
+        received.push(message);
+    }
+    tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(session.is_closed());
+    assert!(
+        !received.iter().any(|m| matches!(m, Message::Ping(_))),
+        "{received:?}"
     );
 }
