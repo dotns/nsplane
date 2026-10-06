@@ -48,6 +48,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
 - `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
   segment over a pseudo-header, as a full recomputation returning zero would.
+- `nsplane-packet`: `SharedPacketPool` (re-exported by `nsplane`), a bounded free list of
+  packet buffers shared by producers and a source (MR-1): lossy, never waits (the lock is
+  only tried), clones share it. `new(max_free)`; `alloc(len)` returns `len` bytes behind
+  `HEADROOM` with `capacity() >= len + TAILROOM`, bytes unspecified (a fresh buffer is
+  zero-filled to `len`); `alloc_from(&[u8])` copies without zero-filling; `recycle(&mut
+  Vec<PacketBuf>)` takes buffers up to the bound and leaves the rest; `free_len()`;
+  `allocated()` counts fresh allocations.
+- `nsplane`: pooled producer allocation for the local side (MR-1): `PipeSink::alloc(len)`
+  and `PipeSink::recycle(&mut Vec<PacketBuf>)` on the pipe's pool, `ChannelSource::pool()
+  -> SharedPacketPool`; both pools keep up to the queue capacity idle buffers.
+  `PipeSource` and `ChannelSource` implement `PacketSource::recycle` into that pool, opt-in:
+  only after the first `PipeSink::alloc` / `ChannelSource::pool` call; before it they decline
+  as before and the engine stops offering. Unused, sends and receives cost nothing more.
+- `nsplane`: `MergeSource` implements `PacketSource::recycle` (MR-2): it holds up to 64
+  buffers and hands them to the next input whose `recv` completes, which takes what its
+  pool allows; ended inputs get none. Round robin and cancel safety are unchanged.
+- `nsplane-tun`: `PacketSource::recycle` for `SlotSource` (its pool keeps up to 64 idle
+  buffers), `HostTunSource` (a `SharedPacketPool` of the `host_tun` capacity, which
+  `HostTunInput::push` copies into without zero-filling) and the Wintun `TunSource` (a
+  64-slot hand-back to the reader thread's 64-buffer pool; excess dropped, neither side
+  waits) (MR-2). The Wintun path is not run on a real Windows host.
+- TODO(QR-6): `PacketSink::send_batch_spent` (default method), the `TunSink` overrides and
+  `pump` handing spent buffers to `PacketSource::recycle` (MR-3).
+- `nsplane-packet`: `checksum::sum_words(acc: u64, data: &[u8]) -> u64`, an unfolded sum of
+  big-endian 16-bit words (odd trailing byte padded with zero; only the last slice of a
+  chain may be odd), and `const fn checksum::fold(acc: u64) -> u16` (folded, not
+  complemented).
+- `nsplane-packet`: `hash::KeyedState` (a `BuildHasher`, random per-instance keys from std
+  `RandomState`, redacted `Debug`) and its `hash::KeyedHasher`: a keyed multiply-fold hasher
+  for maps on per-packet lookup paths whose contents are not chosen by the party driving the
+  lookups; not cryptographic.
 
 ### Changed
 - `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
@@ -58,6 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TranslationTable` address lookup is one hash instead of two. Per packet, 2026-10-06, load
   2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
   69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
+- `nsplane-packet`: `internet_checksum` and the other checksum helpers sum 32-bit words
+  (one implementation, `checksum::sum_words`; `nsplane-nat`'s `checksum::sum` delegates to
+  it), bit-identical and about 1.3x / 2.6x / 4.6x faster at 20 / 64 / 1420 B
+  (`cargo bench -p nsplane-packet --bench checksum`).
+- `nsplane-nat`: the `Translator`'s grown-copy slow path allocates `len + TAILROOM`, so
+  sealing a grown translated packet does not reallocate again; output byte-identical.
+- `nsplane-nat` and `nsplane-acl`: `TranslationTable`'s IPv6 indexes (`u128` keys) and the
+  node L3 gate's maps hash with `hash::KeyedState`; the ACL's private copy is removed.
+  Inbound `alias4` translation 4-5 ns faster at 64 B and 10-11 ns at 1400/1420 B.
+- `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
+  recycling costs about 1.5 ns more.
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
