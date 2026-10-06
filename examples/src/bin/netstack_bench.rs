@@ -56,7 +56,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_SETTLE: Duration = Duration::from_secs(1);
 /// Datagrams queued for the server's UDP socket: the stack's ingress capacity, so a burst
 /// the driver routes in one step fits even before the counting task runs (see
-/// [`NetStackConfig::datagram_capacity`]); the default 128 loses part of larger bursts.
+/// [`NetStackConfig::datagram_capacity`]); the default 256 covers one driver step.
 const SERVER_DATAGRAM_CAPACITY: usize = 1024;
 
 /// An nsplane node on a userspace TCP/IP stack with an in-process TCP/UDP load generator.

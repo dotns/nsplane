@@ -41,6 +41,7 @@
 mod config;
 mod device;
 mod ownership;
+mod pmtu;
 mod stack;
 mod stats;
 mod tcp;

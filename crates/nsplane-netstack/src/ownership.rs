@@ -161,7 +161,7 @@ const ICMP_ERRORS: [u8; 3] = [3, 11, 12];
 /// big, time exceeded, parameter problem.
 const ICMPV6_ERRORS: [u8; 4] = [1, 2, 3, 4];
 /// ICMP header length before the quoted packet.
-const ICMP_HEADER: usize = 8;
+pub(crate) const ICMP_HEADER: usize = 8;
 
 impl Owners {
     pub(crate) fn new(
@@ -403,7 +403,7 @@ impl Owners {
         if !errors.contains(&header.icmp_type()) {
             return Ownership::None;
         }
-        let Some((proto, local, remote)) = icmp.get(ICMP_HEADER..).and_then(quoted_tuple) else {
+        let Some((proto, local, remote, _)) = icmp.get(ICMP_HEADER..).and_then(quoted_tuple) else {
             return Ownership::None;
         };
         if !self.is_local(local.ip()) {
@@ -484,9 +484,10 @@ fn tcp_ports_flags(segment: &[u8]) -> Option<(u16, u16, u8)> {
     ))
 }
 
-/// The protocol and `(source, destination)` of the TCP or UDP packet an ICMP error quotes,
-/// which may be truncated after the ports. A non-first IPv4 fragment carries no ports.
-fn quoted_tuple(quoted: &[u8]) -> Option<(u8, SocketAddr, SocketAddr)> {
+/// The protocol, `(source, destination)` and transport header bytes of the TCP or UDP
+/// packet an ICMP error quotes, which may be truncated after the ports. A non-first IPv4
+/// fragment carries no ports.
+pub(crate) fn quoted_tuple(quoted: &[u8]) -> Option<(u8, SocketAddr, SocketAddr, &[u8])> {
     let (proto, src, dst, transport) = match quoted.first()? >> 4 {
         4 => {
             let header = quoted.get(..20)?;
@@ -527,5 +528,6 @@ fn quoted_tuple(quoted: &[u8]) -> Option<(u8, SocketAddr, SocketAddr)> {
         proto,
         SocketAddr::new(src, src_port),
         SocketAddr::new(dst, dst_port),
+        transport,
     ))
 }
