@@ -63,7 +63,8 @@ impl Tun {
         Ok(Self { session, mtu })
     }
 
-    /// The adapter's interface alias (friendly name).
+    /// The created adapter's interface alias (friendly name). After [`Tun::split`] the
+    /// halves report it through [`TunSource::name`] and [`TunSink::name`].
     pub fn name(&self) -> io::Result<String> {
         Ok(self.session.get_adapter().get_name()?)
     }
@@ -91,7 +92,7 @@ impl Tun {
         let source = TunSource {
             packets,
             mtu,
-            _shared: Arc::clone(&shared),
+            shared: Arc::clone(&shared),
         };
         Ok((source, TunSink { shared }))
     }
@@ -139,12 +140,20 @@ impl Drop for Shared {
 /// The receiving half of a [`Tun`]: packets the OS routed into the adapter.
 #[derive(Debug)]
 pub struct TunSource {
-    /// Declared before `_shared` so the channel closes before the session shuts down.
+    /// Declared before `shared` so the channel closes before the session shuts down.
     packets: mpsc::Receiver<PacketBuf>,
     /// Kept alive so receivers never observe a closed channel; the adapter MTU is not
     /// watched on Windows, so the value never changes.
     mtu: watch::Sender<u16>,
-    _shared: Arc<Shared>,
+    shared: Arc<Shared>,
+}
+
+impl TunSource {
+    /// The created adapter's interface alias (friendly name), queried from the session
+    /// like [`Tun::name`].
+    pub fn name(&self) -> io::Result<String> {
+        Ok(self.shared.session.get_adapter().get_name()?)
+    }
 }
 
 impl PacketSource for TunSource {
@@ -191,6 +200,12 @@ impl PacketSink for TunSink {
 }
 
 impl TunSink {
+    /// The created adapter's interface alias (friendly name), queried from the session
+    /// like [`Tun::name`].
+    pub fn name(&self) -> io::Result<String> {
+        Ok(self.shared.session.get_adapter().get_name()?)
+    }
+
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
         if !matches!(bytes.first().map(|b| b >> 4), Some(4 | 6)) {
             return Err(io::Error::new(
