@@ -2716,14 +2716,16 @@ the release if a loss shows there.
 The queue-delay bound (QE follow-up F2) was tried as the opt-in
 `EngineBuilder::queue_delay_target(Duration)` and dropped: CoDel head drops of data before
 sealing and decryption, plus a time-sized local intake of 2 x MAX_BATCH with an explicit
-room waker. At a 1 ms target the w0 harness (slot 0, load 10-14) lowered loaded p50 by 18 %
-at no throughput cost, but with 2 workers P1 / P4 fell 17 / 25 % and p50 rose 14 %: the
-depth bound counts seals in flight and starves the worker pool. In the latency e2e (slot 1,
-load 9-19) w0 p50 moved -6 / -9 % and w2 was mixed. 25-45 % of that test's delay is its own
-`ChannelSource` mpsc, upstream of the engine, and with workers the backlog sits in the
-kernel UDP receive buffer. The merge gate (loaded p50 -25 % at <= 5 % throughput cost) was
-not met; the implementation stays on bkd/3wk2cqvs, not merged. A later round could try a
-w0-only variant, or no depth bound in worker mode.
+room waker. On top of F1 (A = 9b7e566, B = the F2 tip, target 1 ms, slot 0, load 4-15) the
+default harness lowered loaded p50 3.02 -> 2.13 ms (-29.5 %, lower in every rep) at no
+throughput cost, the only case that met the merge gate (loaded p50 -25 % at <= 5 %
+throughput cost); with 2 workers p50 rose 2.57 -> 2.77 ms (+7.8 %). In the latency e2e w0
+p50 moved -9 / -7 % at -3..-4 % throughput and w2 p50 +25 / +29 % (p99 -35..-41 %). CoDel
+never dropped there (0 `QUEUE_DELAY`): with F1 the effect comes only from the 128-packet
+transmit depth, which with workers counts seals in flight. 25-45 % of that test's delay is
+its own `ChannelSource` mpsc, upstream of the engine, and with workers the backlog sits in
+the kernel UDP receive buffer. The implementation stays on bkd/3wk2cqvs, not merged; a
+later round could try a w0-only variant.
 
 ## Unsafe code
 
