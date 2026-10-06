@@ -2,12 +2,15 @@
 //!
 //! IPv4 to IPv6 grows a packet by 20 bytes (28 with a fragment header) plus
 //! the length of any IPv4 options, which are dropped; IPv6 to IPv4 shrinks it.
-//! The payload is moved inside the buffer; a packet that would outgrow the
-//! buffer's capacity is first copied into a larger buffer.
+//! A growing packet's payload is moved inside the buffer; a packet that would
+//! outgrow the buffer's capacity is first copied into a larger buffer. A
+//! shrinking packet keeps its payload in place: the new header is written in
+//! front of it and the packet start moves forward into the headroom.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
 use nsplane_packet::{PacketBuf, protocol};
 
@@ -16,7 +19,7 @@ use super::parse::{Fragment, Ipv4, Ipv6, be16, put16};
 use super::{Result, icmp, reasons};
 use crate::TranslationTable;
 use crate::checksum::{
-    PseudoHeader, transport_checksum_v4, transport_checksum_v6, udp_wire, update_ipv6,
+    PseudoHeader, transport_checksum_v6, transport_valid, udp_wire, update_ipv6,
     update_pseudo_header, update_udp,
 };
 
@@ -42,8 +45,8 @@ pub(super) struct Context<'a> {
     /// Maps the addresses quoted in ICMP errors.
     pub(super) table: &'a TranslationTable,
     pub(super) reassembly: &'a Mutex<Reassembly>,
-    /// Seconds on the reassembly clock.
-    pub(super) now: u64,
+    /// The start of the reassembly clock, read only for fragments.
+    pub(super) epoch: Instant,
     /// The largest IPv6 packet a reassembled datagram may become.
     pub(super) mtu: usize,
 }
@@ -77,6 +80,26 @@ impl Addrs {
             protocol,
             len: 0,
         }
+    }
+
+    /// The full IPv4 pseudo-header of `segment`, to verify it.
+    fn v4_len(&self, protocol: u8, segment: &[u8]) -> Result<PseudoHeader> {
+        Ok(PseudoHeader::V4 {
+            src: self.src4,
+            dst: self.dst4,
+            protocol,
+            len: u16::try_from(segment.len()).map_err(|_| reasons::LENGTH_MISMATCH)?,
+        })
+    }
+
+    /// The IPv6 counterpart of [`v4_len`](Self::v4_len).
+    fn v6_len(&self, protocol: u8, segment: &[u8]) -> Result<PseudoHeader> {
+        Ok(PseudoHeader::V6 {
+            src: self.src6,
+            dst: self.dst6,
+            protocol,
+            len: u32::try_from(segment.len()).map_err(|_| reasons::LENGTH_MISMATCH)?,
+        })
     }
 }
 
@@ -249,21 +272,22 @@ fn reassemble(
         identification: v4.identification,
         protocol: v4.protocol,
     };
+    let now = cx.epoch.elapsed().as_secs();
     let mut state = cx.reassembly.lock().unwrap_or_else(PoisonError::into_inner);
-    state.cleanup(cx.now);
+    state.cleanup(now);
     if v4.fragment_offset == 0 {
         if payload.len() < 8 {
             return Err(reasons::TINY_FRAGMENT);
         }
         if be16(payload, 6) != 0 && !state.contains(&key) {
-            state.mark_passed(key, cx.now);
+            state.mark_passed(key, now);
             return Ok(None);
         }
     } else if !state.contains(&key) && state.passed(&key) {
         return Ok(None);
     }
     let len = payload.len();
-    let outcome = state.observe(key, packet.as_packet(), len, cx.now)?;
+    let outcome = state.observe(key, packet.as_packet(), len, now)?;
     drop(state);
     let Outcome::Complete(mut body) = outcome else {
         return Ok(Some(Done::Pending));
@@ -416,9 +440,7 @@ fn transport_v4_to_v6(
         put16(segment, at, udp_wire(checksum));
         return Ok(());
     }
-    if old == 0
-        || (!fragmented && transport_checksum_v4(addrs.src4, addrs.dst4, protocol, segment) != 0)
-    {
+    if old == 0 || (!fragmented && !transport_valid(addrs.v4_len(protocol, segment)?, segment)) {
         return Err(reasons::INVALID_CHECKSUM);
     }
     let new = update_pseudo_header(old, addrs.v4(protocol), addrs.v6(protocol));
@@ -436,9 +458,7 @@ fn transport_v6_to_v4(
 ) -> Result<()> {
     let at = checked_transport(segment, protocol, fragmented)?;
     let old = be16(segment, at);
-    if old == 0
-        || (!fragmented && transport_checksum_v6(addrs.src6, addrs.dst6, protocol, segment) != 0)
-    {
+    if old == 0 || (!fragmented && !transport_valid(addrs.v6_len(protocol, segment)?, segment)) {
         return Err(reasons::INVALID_CHECKSUM);
     }
     let new = update_pseudo_header(old, addrs.v6(protocol), addrs.v4(protocol));
@@ -501,8 +521,15 @@ fn make_room(packet: &mut PacketBuf, len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Replaces everything in front of `payload` with `header`, moving the payload.
+/// Replaces everything in front of `payload` with `header`. A header that
+/// fits in front of the payload is written there and the packet start moves
+/// to it (the headroom grows); a longer one moves the payload.
 fn replace_header(packet: &mut PacketBuf, payload: Range<usize>, header: &[u8]) -> Result<()> {
+    if let Some(start) = payload.start.checked_sub(header.len()) {
+        packet.as_packet_mut()[start..payload.start].copy_from_slice(header);
+        packet.set_len(payload.end);
+        return packet.advance(start).map_err(|_| reasons::TRUNCATED);
+    }
     let len = header.len() + payload.len();
     make_room(packet, len)?;
     if len > packet.len() {
