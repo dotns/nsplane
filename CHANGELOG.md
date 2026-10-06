@@ -69,8 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HostTunInput::push` copies into without zero-filling) and the Wintun `TunSource` (a
   64-slot hand-back to the reader thread's 64-buffer pool; excess dropped, neither side
   waits) (MR-2). The Wintun path is not run on a real Windows host.
-- TODO(QR-6): `PacketSink::send_batch_spent` (default method), the `TunSink` overrides and
-  `pump` handing spent buffers to `PacketSource::recycle` (MR-3).
+- `nsplane`: `PacketSink::send_batch_spent(&self, packets: &mut VecDeque<(PeerId,
+  PacketBuf)>, spent: &mut Vec<PacketBuf>)`, a default method (MR-3): delivers like
+  `send_batch` and appends to `spent` the buffers of delivered packets the sink no longer
+  references; order, backpressure, errors and cancellation as `send_batch`, and `spent` may
+  stay empty. The default calls `send_batch` and appends nothing. `nsplane-tun`'s `TunSink`
+  overrides it (Unix plain, vnet and TSO writes; Wintun): a written or dropped packet's
+  buffer is appended, a TSO chunk's buffers once the chunk is written, a non-IP packet is
+  not. `pump` calls it and hands `spent` to `PacketSource::recycle` before its next
+  `recv_batch`; if the source takes none of the first non-empty offer, `pump` uses plain
+  `send_batch` for the rest of its run. A pump into a device-like sink that returns its
+  buffers runs 7 % (64 B) to 24 % (1420 B) faster; `PumpStats` are unchanged.
 - `nsplane-packet`: `checksum::sum_words(acc: u64, data: &[u8]) -> u64`, an unfolded sum of
   big-endian 16-bit words (odd trailing byte padded with zero; only the last slice of a
   chain may be odd), and `const fn checksum::fold(acc: u64) -> u16` (folded, not
