@@ -17,7 +17,7 @@ use rand_core::{OsRng, RngCore};
 
 use crate::allowed_ips::AllowedIps;
 use crate::peer::Peer;
-use crate::types::{AllowedIp, PeerConfig};
+use crate::types::{AllowedIp, InboundDestinations, PeerConfig};
 
 /// Why a [`PeerConfig`] could not be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub(crate) struct PeerTable {
     peers: Vec<Peer>,
     /// The inbound destinations of the peers, at the position of their id in `ids`; `None`
     /// for an unchecked peer.
-    destinations: Vec<Option<AllowedIps<()>>>,
+    destinations: Vec<Option<Destinations>>,
     by_key: HashMap<PublicKey, PeerId>,
     by_index: HashMap<u32, PeerId, BuildHasherDefault<IndexHasher>>,
     by_ip: AllowedIps<PeerId>,
@@ -219,8 +219,12 @@ impl PeerTable {
             self.next_id = next_id;
             self.ids.push(id);
             self.peers.push(peer);
-            self.destinations
-                .push(config.inbound_destinations.as_deref().map(destination_set));
+            self.destinations.push(
+                config
+                    .inbound_destinations
+                    .as_deref()
+                    .map(|nets| Destinations::Owned(Box::new(destination_set(nets)))),
+            );
             self.by_key.insert(config.public_key, id);
             self.by_index.insert(index, id);
             tracing::info!("Peer added");
@@ -329,12 +333,26 @@ impl PeerTable {
         if let Some(slot) = self.slot(peer)
             && let Some(set) = self.destinations.get_mut(slot)
         {
-            *set = destinations.map(destination_set);
+            *set = destinations.map(|nets| Destinations::Owned(Box::new(destination_set(nets))));
+        }
+    }
+
+    /// Sets the caller-updated source of the inbound destinations of `peer`, replacing an
+    /// owned list, or with `None` removes it.
+    pub(crate) fn set_inbound_destination_source(
+        &mut self,
+        peer: PeerId,
+        source: Option<Arc<dyn InboundDestinations>>,
+    ) {
+        if let Some(slot) = self.slot(peer)
+            && let Some(set) = self.destinations.get_mut(slot)
+        {
+            *set = source.map(Destinations::Shared);
         }
     }
 
     /// The inbound destinations of the peer at `slot`; `None` if it is unchecked.
-    pub(crate) fn inbound_destinations(&self, slot: usize) -> Option<&AllowedIps<()>> {
+    pub(crate) fn inbound_destinations(&self, slot: usize) -> Option<&Destinations> {
         self.destinations.get(slot)?.as_ref()
     }
 
@@ -352,6 +370,14 @@ impl PeerTable {
     pub(crate) const fn len(&self) -> usize {
         self.peers.len()
     }
+}
+
+/// The inbound destinations of a checked peer.
+pub(crate) enum Destinations {
+    /// An owned list, replaced by configuration changes; boxed to keep the slots small.
+    Owned(Box<AllowedIps<()>>),
+    /// A caller-updated source, consulted per packet.
+    Shared(Arc<dyn InboundDestinations>),
 }
 
 /// The networks of `destinations` as a lookup table.
@@ -624,8 +650,16 @@ mod tests {
     }
 
     /// The inbound destinations of `id`; `None` if it is unchecked.
+    /// The owned inbound destinations of `id`.
+    fn owned(table: &PeerTable, id: PeerId) -> Option<&AllowedIps<()>> {
+        match table.inbound_destinations(table.slot(id)?)? {
+            Destinations::Owned(set) => Some(set),
+            Destinations::Shared(_) => panic!("a shared source"),
+        }
+    }
+
     fn destinations(table: &PeerTable, id: PeerId) -> Option<Vec<AllowedIp>> {
-        let set = table.inbound_destinations(table.slot(id)?)?;
+        let set = owned(table, id)?;
         Some(
             set.iter()
                 .map(|(&(), addr, cidr)| AllowedIp { addr, cidr })
@@ -650,7 +684,7 @@ mod tests {
     fn inbound_destinations_match_by_prefix_and_add_no_routes() {
         let mut table = table();
         let id = add_with_destinations(&mut table, key(), &["10.1.0.0/16", "fd01::/64"]);
-        let set = table.inbound_destinations(table.slot(id).unwrap()).unwrap();
+        let set = owned(&table, id).unwrap();
 
         assert!(set.find(ip("10.1.2.3")).is_some());
         assert!(set.find(ip("10.2.0.1")).is_none());
@@ -699,6 +733,35 @@ mod tests {
         table.clear();
         let peer_b = add(&mut table, b, &[]);
         assert_eq!(destinations(&table, peer_b), None);
+    }
+
+    #[test]
+    fn a_source_and_an_owned_list_replace_each_other() {
+        let mut table = table();
+        let a = key();
+        let id = add_with_destinations(&mut table, a, &["10.1.0.0/16"]);
+        let shared = |table: &PeerTable| {
+            matches!(
+                table.inbound_destinations(table.slot(id).unwrap()),
+                Some(Destinations::Shared(_))
+            )
+        };
+
+        let source: Arc<dyn InboundDestinations> = Arc::new(|_: IpAddr| true);
+        table.set_inbound_destination_source(id, Some(Arc::clone(&source)));
+        assert!(shared(&table));
+        // An update without inbound destinations keeps the source.
+        add(&mut table, a, &["10.0.0.0/24"]);
+        assert!(shared(&table));
+        // An owned list replaces it.
+        add_with_destinations(&mut table, a, &["10.2.0.0/16"]);
+        assert_eq!(destinations(&table, id), Some(vec![net("10.2.0.0/16")]));
+
+        table.set_inbound_destination_source(id, Some(source));
+        table.set_inbound_destinations(id, Some(&[net("10.3.0.0/16")]));
+        assert_eq!(destinations(&table, id), Some(vec![net("10.3.0.0/16")]));
+        table.set_inbound_destination_source(id, None);
+        assert_eq!(destinations(&table, id), None);
     }
 
     #[test]
