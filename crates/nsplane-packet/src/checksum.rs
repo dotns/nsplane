@@ -8,36 +8,50 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// Byte range of the checksum field inside an IPv4 header.
 const IPV4_CHECKSUM: std::ops::Range<usize> = 10..12;
 
-/// Adds `data` as big-endian 16-bit words to `acc`; an odd trailing byte is padded with zero.
+/// Adds `data` to `acc` as big-endian 16-bit words; an odd trailing byte is padded with a
+/// zero low byte.
 ///
-/// The bulk is summed as big-endian 32-bit words: since `2^16 ≡ 1` modulo `2^16 - 1`, that
-/// folds to the same one's-complement sum (RFC 1071 §2(B)), and the u64 cannot overflow
-/// below `2^32` words.
-fn add_words(acc: u64, data: &[u8]) -> u64 {
+/// The result is not folded: pass it to [`fold`], or chain it into further calls. It is
+/// congruent modulo `0xFFFF` to the plain 16-bit word sum, and zero only if `acc` is zero and
+/// `data` is all zeros. Each call adds less than `2^18` beyond `acc`, so a chained u64 does
+/// not overflow. Only the last slice of a chain may have an odd length.
+///
+/// The bulk is summed as 32-bit words in native byte order, folded, and swapped to network
+/// order, which the one's complement sum allows (RFC 1071 section 2).
+pub fn sum_words(acc: u64, data: &[u8]) -> u64 {
     let (words, tail) = data.as_chunks::<4>();
+    let words = words.iter().fold(0_u64, |acc, word| {
+        acc + u64::from(u32::from_ne_bytes(*word))
+    });
+    let words = u16::from_be_bytes(fold(words).to_ne_bytes());
     let tail = match *tail {
         [a, b, c] => u64::from(u16::from_be_bytes([a, b])) + u64::from(u16::from_be_bytes([c, 0])),
         [a, b] => u64::from(u16::from_be_bytes([a, b])),
         [a] => u64::from(u16::from_be_bytes([a, 0])),
         _ => 0,
     };
-    words.iter().fold(acc + tail, |acc, word| {
-        acc + u64::from(u32::from_be_bytes(*word))
-    })
+    acc + u64::from(words) + tail
 }
 
-/// Folds the carries of `acc` into 16 bits and returns the one's complement.
-const fn finish(mut acc: u64) -> u16 {
+/// Folds the carries of `acc` into 16 bits: the one's complement sum, not complemented.
+///
+/// Zero only if `acc` is.
+pub const fn fold(mut acc: u64) -> u16 {
     while acc > 0xFFFF {
         acc = (acc & 0xFFFF) + (acc >> 16);
     }
     let [.., hi, lo] = acc.to_be_bytes();
-    !u16::from_be_bytes([hi, lo])
+    u16::from_be_bytes([hi, lo])
+}
+
+/// Returns the one's complement of the folded `acc`.
+const fn finish(acc: u64) -> u16 {
+    !fold(acc)
 }
 
 /// Returns the Internet checksum of `data` (odd length is padded with a zero byte).
 pub fn internet_checksum(data: &[u8]) -> u16 {
-    finish(add_words(0, data))
+    finish(sum_words(0, data))
 }
 
 /// Returns the checksum of an IPv4 header, treating its checksum field (bytes 10..12)
@@ -47,7 +61,7 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
     let before = header.get(..IPV4_CHECKSUM.start).unwrap_or(header);
     let after = header.get(IPV4_CHECKSUM.end..).unwrap_or(&[]);
-    finish(add_words(add_words(0, before), after))
+    finish(sum_words(sum_words(0, before), after))
 }
 
 /// Returns the TCP/UDP/ICMPv6-style checksum of `segment` over an IPv4 pseudo-header.
@@ -55,10 +69,10 @@ pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
 /// The caller must zero the segment's own checksum field first. A UDP result of
 /// `0x0000` is not mapped to `0xFFFF` here (RFC 768); that is the caller's job.
 pub fn transport_checksum_v4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut acc = add_words(0, &src.octets());
-    acc = add_words(acc, &dst.octets());
+    let mut acc = sum_words(0, &src.octets());
+    acc = sum_words(acc, &dst.octets());
     acc += u64::from(protocol) + segment.len() as u64;
-    finish(add_words(acc, segment))
+    finish(sum_words(acc, segment))
 }
 
 /// Returns the TCP/UDP/ICMPv6 checksum of `segment` over an IPv6 pseudo-header.
@@ -66,10 +80,10 @@ pub fn transport_checksum_v4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, segment
 /// The caller must zero the segment's own checksum field first. A UDP result of
 /// `0x0000` is not mapped to `0xFFFF` here; that is the caller's job.
 pub fn transport_checksum_v6(src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut acc = add_words(0, &src.octets());
-    acc = add_words(acc, &dst.octets());
+    let mut acc = sum_words(0, &src.octets());
+    acc = sum_words(acc, &dst.octets());
     acc += u64::from(protocol) + segment.len() as u64;
-    finish(add_words(acc, segment))
+    finish(sum_words(acc, segment))
 }
 
 #[cfg(test)]
@@ -142,7 +156,7 @@ mod tests {
         assert_eq!(transport_checksum_v6(src, dst, 6, &segment), 0);
     }
 
-    /// The previous 16-bit word loop, kept as the reference for [`add_words`].
+    /// The previous 16-bit word loop, kept as the reference for [`sum_words`].
     fn add_words_16(acc: u64, data: &[u8]) -> u64 {
         let (words, tail) = data.as_chunks::<2>();
         let tail = match tail {
@@ -192,9 +206,9 @@ mod tests {
             for offset in 0..8 {
                 let data = &buf[offset..offset + len];
                 assert_eq!(
-                    finish(add_words(acc, data)),
+                    finish(sum_words(acc, data)),
                     finish(add_words_16(acc, data)),
-                    "add_words len {len} offset {offset}"
+                    "sum_words len {len} offset {offset}"
                 );
                 assert_eq!(internet_checksum(data), finish(add_words_16(0, data)));
 
