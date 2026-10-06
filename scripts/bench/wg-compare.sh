@@ -16,8 +16,8 @@
 #   BENCH_REPS         repetitions; the table reports medians (default 3)
 #   BENCH_UDP_RATES    comma-separated UDP rates, iperf3 -b syntax (default 1G,3G)
 #   BENCH_PING_COUNT   pings per latency run at 10 ms intervals (default 1000)
-#   BENCH_CPUS_A       --cpuset-cpus of side a (default 2-5)
-#   BENCH_CPUS_B       --cpuset-cpus of side b (default 6-9)
+#   BENCH_CPUS_A       --cpuset-cpus of side a (default 8-11, slot 1; see slot.sh)
+#   BENCH_CPUS_B       --cpuset-cpus of side b (default 12-15, slot 1; see slot.sh)
 #   BENCH_NSPLANE_VARIANTS
 #                      ';'-separated nsplane-nsplane variants NAME[:ENV[:ARGS]], ENV and ARGS
 #                      space-separated, applied to nsplane-cli on both sides, e.g.
@@ -39,8 +39,8 @@ DURATION=${BENCH_DURATION:-30}
 REPS=${BENCH_REPS:-3}
 UDP_RATES=${BENCH_UDP_RATES:-1G,3G}
 PING_COUNT=${BENCH_PING_COUNT:-1000}
-CPUS_A=${BENCH_CPUS_A:-2-5}
-CPUS_B=${BENCH_CPUS_B:-6-9}
+CPUS_A=${BENCH_CPUS_A:-8-11}
+CPUS_B=${BENCH_CPUS_B:-12-15}
 # "default" is the stock configuration (offload on, no crypto workers).
 DEFAULT_VARIANTS='default;w2:WG_CRYPTO_WORKERS=2;nooffload:WG_NO_OFFLOAD=1;nooffload-w2:WG_NO_OFFLOAD=1 WG_CRYPTO_WORKERS=2'
 VARIANTS=${BENCH_NSPLANE_VARIANTS:-$DEFAULT_VARIANTS}

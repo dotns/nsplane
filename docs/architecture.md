@@ -3,6 +3,12 @@
 This page describes what is on `main`. The target design and roadmap are in
 [design.md](design.md).
 
+Scope: nsplane is a business-agnostic data plane. ns is one product built on it, and other
+libraries and products may use it. Product models (identities, subjects, groups, realms,
+services, grants) are compiled above nsplane into generic inputs: flow rules, opaque labels
+and narrow trait callbacks. What nsplane does and does not do is listed in ADR
+[2026-10-06-business-agnostic-scope](decisions/2026-10-06-business-agnostic-scope.md).
+
 ## Crates
 
 | Crate | Path | Role |
@@ -1465,6 +1471,12 @@ builds an engine on it, binds an ephemeral UDP port, serves the UAPI, drops priv
 `SUDO_UID`/`SUDO_GID`, and runs until SIGINT or SIGTERM.
 
 ## nsplane-acl
+
+The ACL evaluates business-agnostic flows. Product policy (subjects, groups, realms) is
+compiled above nsplane into rules, and new product concepts are not added here (ADR
+`2026-10-06-business-agnostic-scope`). The ns-specific pieces described below
+(`SourceAssertion::Terminate` / `External`, `crates_acl()`, the node L3 gate's grant model)
+predate that rule and stay for ns.
 
 `AclEngine` holds its whole state (the compiled default `AclPolicy`, the rule namespaces,
 the directed grants and the open pinholes) as one immutable snapshot behind an `ArcSwap`:
