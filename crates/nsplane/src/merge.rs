@@ -13,12 +13,17 @@ use crate::transport::BoxFuture;
 /// A pending `recv` on one source; it owns the source and hands it back when done.
 type Recv = BoxFuture<'static, (io::Result<PacketBuf>, Box<dyn Arm>)>;
 
+/// Recycled buffers a [`MergeSource`] holds until a source can take them.
+const RECYCLE_PENDING: usize = 64;
+
 /// A pending wait for one source's next MTU change; `None` once its sender is gone.
 type MtuChange = BoxFuture<'static, Option<watch::Receiver<u16>>>;
 
-/// A type-erased source that can start its next owned `recv`.
+/// A type-erased source that can start its next owned `recv` and take recycled buffers.
 trait Arm: Send + 'static {
     fn arm(self: Box<Self>) -> Recv;
+
+    fn take_recycled(&mut self, bufs: &mut Vec<PacketBuf>);
 }
 
 impl<S: PacketSource> Arm for S {
@@ -28,6 +33,10 @@ impl<S: PacketSource> Arm for S {
             let result = PacketSource::recv(&mut *source).await;
             (result, source as Box<dyn Arm>)
         })
+    }
+
+    fn take_recycled(&mut self, bufs: &mut Vec<PacketBuf>) {
+        PacketSource::recycle(self, bufs);
     }
 }
 
@@ -68,10 +77,22 @@ struct Slot {
 /// `recv` is being polled, so they reach the receiver while the engine reads from the merge
 /// (it always has one `recv` in progress when running) and are applied on the next `recv`
 /// otherwise. A source whose MTU sender is dropped keeps its last MTU.
+///
+/// Semantics of [`PacketSource::recycle`]:
+/// - A source cannot take buffers while its `recv` is in progress, which is always the
+///   case between calls, so the merge holds up to 64 recycled buffers and leaves the rest
+///   in `bufs` for the caller to drop. It never blocks.
+/// - When a source's `recv` completes, before its next one starts, the held buffers are
+///   handed to that source's `recycle`; it takes what its pool allows and the rest are
+///   dropped. A source removed for [`io::ErrorKind::BrokenPipe`] gets none.
+/// - A merge that is never handed buffers holds none and does no extra work per packet.
 pub struct MergeSource {
     slots: Vec<Slot>,
     next: usize,
     mtu: watch::Sender<u16>,
+    /// Recycled buffers for the next source whose `recv` completes; at most
+    /// [`RECYCLE_PENDING`].
+    recycled: Vec<PacketBuf>,
 }
 
 impl MergeSource {
@@ -81,6 +102,7 @@ impl MergeSource {
             slots: Vec::new(),
             next: 0,
             mtu: watch::Sender::new(u16::MAX),
+            recycled: Vec::new(),
         }
     }
 
@@ -150,7 +172,11 @@ impl MergeSource {
                     self.slots.remove(index);
                     self.publish_mtu();
                 }
-                Poll::Ready((result, source)) => {
+                Poll::Ready((result, mut source)) => {
+                    if !self.recycled.is_empty() {
+                        source.take_recycled(&mut self.recycled);
+                        self.recycled.clear();
+                    }
                     slot.recv = source.arm();
                     self.next = index + 1;
                     return Poll::Ready(result);
@@ -179,6 +205,13 @@ impl PacketSource for MergeSource {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
+    /// Holds up to 64 buffers until a source's `recv` completes, then hands them to that
+    /// source; the rest are left in `bufs` (see [`MergeSource`]).
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        let take = (RECYCLE_PENDING - self.recycled.len()).min(bufs.len());
+        self.recycled.extend(bufs.drain(..take));
+    }
+
     fn mtu(&self) -> watch::Receiver<u16> {
         self.mtu.subscribe()
     }
@@ -197,6 +230,8 @@ impl fmt::Debug for MergeSource {
 mod tests {
     use super::*;
     use crate::ChannelSource;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -296,6 +331,105 @@ mod tests {
                 .is_err()
         );
         assert_eq!(*mtu.borrow(), 1420);
+        Ok(())
+    }
+
+    /// A channel source that takes up to `bound` recycled buffers in total and counts them.
+    struct Counting {
+        inner: ChannelSource,
+        bound: usize,
+        taken: Arc<AtomicUsize>,
+    }
+
+    impl Counting {
+        fn new(inner: ChannelSource, bound: usize) -> (Self, Arc<AtomicUsize>) {
+            let taken = Arc::new(AtomicUsize::new(0));
+            let source = Self {
+                inner,
+                bound,
+                taken: Arc::clone(&taken),
+            };
+            (source, taken)
+        }
+    }
+
+    impl PacketSource for Counting {
+        async fn recv(&mut self) -> io::Result<PacketBuf> {
+            self.inner.recv().await
+        }
+
+        fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+            let room = self.bound - self.taken.load(Ordering::Relaxed);
+            let take = room.min(bufs.len());
+            bufs.drain(..take);
+            self.taken.fetch_add(take, Ordering::Relaxed);
+        }
+
+        fn mtu(&self) -> watch::Receiver<u16> {
+            self.inner.mtu()
+        }
+    }
+
+    fn bufs(count: usize) -> Vec<PacketBuf> {
+        (0..count).map(|_| PacketBuf::with_capacity(1600)).collect()
+    }
+
+    #[tokio::test]
+    async fn recycle_reaches_the_source_whose_recv_completes() -> TestResult {
+        let (a, a_tx, _a_mtu) = ChannelSource::new(4, 1420);
+        let (a, taken) = Counting::new(a, 3);
+        let mut merge = MergeSource::new().source(a);
+
+        let mut recycled = bufs(5);
+        merge.recycle(&mut recycled);
+        assert!(recycled.is_empty());
+        // Held while the source's `recv` is in progress.
+        assert_eq!(taken.load(Ordering::Relaxed), 0);
+
+        a_tx.send(PacketBuf::from_packet(&[1])).await?;
+        assert_eq!(merge.recv().await?.as_packet(), [1]);
+        // The source took what its bound allows; the rest were dropped.
+        assert_eq!(taken.load(Ordering::Relaxed), 3);
+        assert!(merge.recycled.is_empty());
+
+        a_tx.send(PacketBuf::from_packet(&[2])).await?;
+        assert_eq!(merge.recv().await?.as_packet(), [2]);
+        assert_eq!(taken.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recycle_holds_at_most_its_bound() -> TestResult {
+        let (a, a_tx, _a_mtu) = ChannelSource::new(4, 1420);
+        let (a, taken) = Counting::new(a, usize::MAX);
+        let mut merge = MergeSource::new().source(a);
+
+        let mut recycled = bufs(RECYCLE_PENDING + 6);
+        merge.recycle(&mut recycled);
+        assert_eq!(recycled.len(), 6);
+        merge.recycle(&mut recycled);
+        assert_eq!(recycled.len(), 6, "a full merge takes nothing");
+
+        a_tx.send(PacketBuf::from_packet(&[1])).await?;
+        merge.recv().await?;
+        assert_eq!(taken.load(Ordering::Relaxed), RECYCLE_PENDING);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recycle_skips_an_ended_source() -> TestResult {
+        let (a, a_tx, _a_mtu) = ChannelSource::new(4, 1420);
+        let (b, b_tx, _b_mtu) = ChannelSource::new(4, 1420);
+        let (a, a_taken) = Counting::new(a, usize::MAX);
+        let (b, b_taken) = Counting::new(b, usize::MAX);
+        let mut merge = MergeSource::new().source(a).source(b);
+
+        merge.recycle(&mut bufs(2));
+        drop(a_tx);
+        b_tx.send(PacketBuf::from_packet(&[2])).await?;
+        assert_eq!(merge.recv().await?.as_packet(), [2]);
+        assert_eq!(a_taken.load(Ordering::Relaxed), 0);
+        assert_eq!(b_taken.load(Ordering::Relaxed), 2);
         Ok(())
     }
 }
