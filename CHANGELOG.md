@@ -5,6 +5,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane`: `Splitter::new_map(route)`, a splitter whose closure
+  (`Fn(PeerId, &mut PacketBuf) -> usize`) rewrites each packet in place and then picks the
+  sink, e.g. a Redirect or Masquerade decision that routes; otherwise as `Splitter::new`
+  (out of range = dropped as misrouted and `Ok`, only the chosen sink awaited).
+- `nsplane`: `MapSink::with_after(sink, f, after)`, an after-delivery hook `Fn(&[u8])` called
+  with each packet's bytes (after `f`) once the inner sink took it over, never for dropped or
+  failed packets. Kept packets are copied into a reused buffer first. `send_batch` reports in
+  order exactly the packets taken over (all on success, those before the failed one on an
+  error); a cancelled call reports none of its packets; `try_send_batch` keeps the default.
+  `MapSink::new` is unchanged and pays nothing.
+- `nsplane`: `SwapSink<S>`, a sink whose inner sink is replaced while the engine runs:
+  `new(Option<S>)`, `replace(Option<S>) -> Option<Arc<S>>`, `dropped()`; clones share the
+  slot. An empty slot drops and counts; a call in flight finishes on the old sink; an error
+  from a replaced sink is counted as dropped and returns `Ok`.
+- `nsplane`: `AbortSink<S>` and its `SinkAbort` handle (`abort`, `is_aborted`):
+  `abort()` cancels a pending inner `send` / `send_batch`, counts the packets it carried in
+  `AbortSink::dropped` and returns `Ok` (not `BrokenPipe`, which would tear down the engine's
+  local side mid-swap); later calls drop and count at once. A sink rebuilt per generation is
+  a `SwapSink<AbortSink<S>>`: `replace(Some(next))`, then abort the old generation.
+- `nsplane`: `local_graph` bench groups `splitter` (`new` vs `new_map`), `map_sink` (`new`
+  vs `with_after`, `send` and `send_batch`) and `swap_sink` (bare sink vs `SwapSink` vs
+  `SwapSink<AbortSink>` before an abort).
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
