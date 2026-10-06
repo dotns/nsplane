@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsFd;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -97,6 +98,27 @@ async fn adopted_tun_fds_round_trip() {
     drop(created);
     assert_eq!(adopted.offload(), Offload::default());
     round_trip(adopted, "nsplaneplfd", 3).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
+async fn split_halves_report_the_created_name() {
+    for (prefix, options) in [
+        ("nsplc6name", TunOptions::new()),
+        ("nsplc6plain", TunOptions::new().offload(false)),
+    ] {
+        let pattern = format!("{prefix}%d");
+        let tun = Tun::create_with(&pattern, options).unwrap();
+        let other = Tun::create_with(&pattern, options).unwrap();
+        let name = tun.name().unwrap();
+        assert!(name.starts_with(prefix) && !name.contains('%'), "{name}");
+        assert!(Path::new("/sys/class/net").join(&name).exists(), "{name}");
+        assert_ne!(other.name().unwrap(), name);
+
+        let (source, sink) = tun.split().unwrap();
+        assert_eq!(source.name().unwrap(), name);
+        assert_eq!(sink.name().unwrap(), name);
+    }
 }
 
 /// A datagram from a kernel socket read from `tun`, and a crafted datagram written to
