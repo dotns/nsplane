@@ -17,6 +17,11 @@
 //! these features get a plain device. `Tun::create_with` with `TunOptions::offload(false)`
 //! opts out, and `Tun::offload` reports what is in use.
 //!
+//! Windows service TUN: `Tun::create_with` with `TunOptions` verifies `wintun.dll`
+//! against a `WintunPin` (SHA-256, optionally the running driver version) before loading
+//! it, can refuse an existing adapter or interface of the same name (`exclusive`) and
+//! sets the interface MTU; refusals are `WintunError`s inside the `io::Error`.
+//!
 //! Raw fds (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
 //! (a parent process, the CLI's `--tun-fd` and `--uapi-fd`) so that callers need no
 //! `unsafe`. Either call takes ownership: the fd must be one the process inherited or
@@ -81,6 +86,8 @@ mod utun;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod wintun;
 
 #[cfg(any(
     target_os = "linux",
@@ -97,7 +104,11 @@ pub use tun::{MTU_POLL_INTERVAL, Offload, Tun, TunOptions, TunSink, TunSource};
 ))]
 pub use unix::adopt_fd;
 #[cfg(windows)]
-pub use windows::{Tun, TunSink, TunSource};
+pub use windows::{Tun, TunOptions, TunSink, TunSource};
+// Public on Windows; also re-exported in Linux unit-test builds so the module's public
+// items stay reachable there.
+#[cfg(any(windows, test))]
+pub use wintun::{WintunError, WintunPin};
 #[cfg(any(
     target_os = "linux",
     target_os = "android",

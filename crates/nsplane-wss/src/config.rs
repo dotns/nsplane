@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use nsplane::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
+use tokio::time::{Instant, Interval};
 
 /// Supplies the bearer token of each dial.
 pub trait BearerProvider: Send + Sync + 'static {
@@ -92,7 +93,8 @@ pub struct WssConfig {
     /// How long to wait for a new token after a 401 before dialing with the old one.
     /// 300 s by default.
     pub token_wait: Duration,
-    /// The interval of keepalive pings. 10 s by default.
+    /// The interval of keepalive pings; [`Duration::ZERO`] sends no pings at all (the
+    /// [`read_idle`](Self::read_idle) still applies). 10 s by default.
     pub ping_interval: Duration,
     /// Ends the link when no frame at all (pongs included) arrived for this long. 35 s by
     /// default.
@@ -181,7 +183,8 @@ impl WssConfig {
         self
     }
 
-    /// Sets [`ping_interval`](Self::ping_interval) and [`read_idle`](Self::read_idle).
+    /// Sets [`ping_interval`](Self::ping_interval) and [`read_idle`](Self::read_idle); a
+    /// zero `ping_interval` sends no pings.
     #[must_use]
     pub const fn keepalive(mut self, ping_interval: Duration, read_idle: Duration) -> Self {
         self.ping_interval = ping_interval;
@@ -189,11 +192,47 @@ impl WssConfig {
         self
     }
 
+    /// Sets [`ping_interval`](Self::ping_interval): `None` sends no pings (stored as
+    /// [`Duration::ZERO`]); [`read_idle`](Self::read_idle) is left as is.
+    #[must_use]
+    pub const fn ping_interval(mut self, interval: Option<Duration>) -> Self {
+        self.ping_interval = match interval {
+            Some(interval) => interval,
+            None => Duration::ZERO,
+        };
+        self
+    }
+
+    /// The keepalive ping timer of [`ping_interval`](Self::ping_interval), started now.
+    pub(crate) fn pings(&self) -> Pings {
+        let interval = self.ping_interval;
+        Pings(
+            (!interval.is_zero())
+                .then(|| tokio::time::interval_at(Instant::now() + interval, interval)),
+        )
+    }
+
     /// Sets [`connect_timeout`](Self::connect_timeout).
     #[must_use]
     pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
+    }
+}
+
+/// A keepalive ping timer; with pings off it never fires and sets no timer.
+pub(crate) struct Pings(Option<Interval>);
+
+impl Pings {
+    /// Waits for the next ping: every interval, the first one interval after the start;
+    /// forever with pings off.
+    pub(crate) async fn tick(&mut self) {
+        match &mut self.0 {
+            Some(interval) => {
+                interval.tick().await;
+            }
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -265,6 +304,12 @@ mod tests {
         assert_eq!((config.token_poll, config.token_wait), (ms(3), ms(4)));
         assert_eq!((config.ping_interval, config.read_idle), (ms(5), ms(6)));
         assert_eq!(config.connect_timeout, ms(7));
+        assert_eq!(
+            config.clone().ping_interval(None).ping_interval,
+            Duration::ZERO
+        );
+        let config = config.ping_interval(Some(ms(9)));
+        assert_eq!((config.ping_interval, config.read_idle), (ms(9), ms(6)));
         // Header values (tokens, say) stay out of the debug output.
         let config = config.header("X-Secret", "hidden");
         assert!(!format!("{config:?}").contains("hidden"));

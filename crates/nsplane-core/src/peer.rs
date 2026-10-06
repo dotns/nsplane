@@ -9,6 +9,8 @@ use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::PublicKey;
 use nsplane_packet::Path;
 
+use crate::core::same_route;
+
 /// Where a peer keeps its tunnel, chosen once by the core.
 enum Tunnel {
     /// Owned by the peer, reached without a lock: the core hands out no [`CryptoJob`]s.
@@ -64,6 +66,9 @@ pub(crate) struct Peer {
     /// The index the tunnel uses
     index: u32,
     path: Option<Path>,
+    /// The off-path source last reported in an `Event::Authenticated`; cleared when the
+    /// path is set or a handshake completes, so the next off-path message reports again.
+    last_reported_from: Option<Path>,
     preshared_key: Option<[u8; 32]>,
     /// Bytes received on the wire: the full datagram of every handshake initiation, handshake
     /// response and transport data message (keepalives included) accepted from this peer.
@@ -118,6 +123,7 @@ impl Peer {
             public_key,
             index,
             path,
+            last_reported_from: None,
             preshared_key,
             rx: 0,
             tx: 0,
@@ -176,9 +182,28 @@ impl Peer {
         self.path
     }
 
-    /// Replaces the current path.
+    /// Replaces the current path; the next off-path source is reported again.
     pub(crate) const fn set_path(&mut self, path: Path) {
         self.path = Some(path);
+        self.last_reported_from = None;
+    }
+
+    /// Records `from` as the reported off-path source; `false` if it already was (compared
+    /// on transport and address only).
+    pub(crate) fn report_from(&mut self, from: Path) -> bool {
+        if self
+            .last_reported_from
+            .is_some_and(|last| same_route(&last, &from))
+        {
+            return false;
+        }
+        self.last_reported_from = Some(from);
+        true
+    }
+
+    /// Forgets the reported off-path source: the next one is reported again.
+    pub(crate) const fn forget_reported_from(&mut self) {
+        self.last_reported_from = None;
     }
 
     /// Counts a datagram of `bytes` accepted from this peer.

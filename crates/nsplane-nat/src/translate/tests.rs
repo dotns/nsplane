@@ -736,6 +736,33 @@ fn packets_without_room_are_translated_in_a_grown_copy() {
 }
 
 #[test]
+fn inbound_translation_shrinks_in_place() {
+    let (src, dst) = (peer_mapping().node4, self_node4());
+    let plain = ipv6_simple(
+        src,
+        dst,
+        protocol::UDP,
+        &udp6(src, dst, b"a payload of two fragments"),
+    );
+    let mut extension = vec![44, protocol::UDP, 0, 0, 1];
+    extension.extend_from_slice(&7_u32.to_be_bytes());
+    let first = ipv6(src, dst, protocol::UDP, 64, 0, &extension, &plain[40..56]);
+    let translator = translator();
+    for (packet, shrink) in [(plain, 20), (first, 28)] {
+        let expected = in_ok(&packet);
+        // An exact-size buffer has no room to spare, and needs none.
+        let mut exact = PacketBuf::from_packet(&packet);
+        let payload = exact.as_packet()[packet.len() - 8..].as_ptr();
+        assert_eq!(translator.inbound(PEER, &mut exact), Verdict::Accept);
+        assert_eq!(exact.as_packet(), expected);
+        assert_eq!(exact.headroom(), HEADROOM + shrink);
+        assert_eq!(exact.as_packet()[expected.len() - 8..].as_ptr(), payload);
+    }
+    assert_eq!(translator.stats().translated_in, 2);
+    assert_eq!(translator.stats().grown_copies, 0);
+}
+
+#[test]
 fn stats_count_each_outcome() {
     let translator = translator();
     let out = ipv4_simple(

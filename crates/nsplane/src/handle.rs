@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
-use nsplane_core::{AllowedIp, ConfigChange, Event, PeerConfig, PeerStats};
+use nsplane_core::{AllowedIp, ConfigChange, Event, InboundDestinations, PeerConfig, PeerStats};
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -356,6 +357,20 @@ impl EngineHandle {
         destinations: Option<Vec<AllowedIp>>,
     ) -> Result<(), EngineError> {
         self.config(ConfigChange::SetInboundDestinations { peer, destinations })
+            .await
+    }
+
+    /// Sets the caller-updated source of a peer's inbound destinations, consulted once per
+    /// decrypted packet of the peer, so a change to it applies to the next packet without a
+    /// call here. It replaces the destinations of [`EngineHandle::set_inbound_destinations`]
+    /// (and later ones replace it); `None` removes it, so the peer is unchecked again. Ignored
+    /// for an unknown peer.
+    pub async fn set_inbound_destination_source(
+        &self,
+        peer: PublicKey,
+        source: Option<Arc<dyn InboundDestinations>>,
+    ) -> Result<(), EngineError> {
+        self.config(ConfigChange::SetInboundDestinationSource { peer, source })
             .await
     }
 

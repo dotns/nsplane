@@ -9,6 +9,9 @@ Per pair the script starts two fresh containers from `ai-agent/nsplane-bench`
 (`scripts/bench/Dockerfile`: debian trixie-slim with iperf3, wireguard-tools, iproute2,
 iputils-ping, jq, procps) on a dedicated docker network it creates (`<prefix>-net`):
 
+- run through `scripts/bench/slot.sh`, which picks one of two bench slots (one CCD each:
+  slot 0 = CPUs 1-3 / 4-7, slot 1 = CPUs 8-11 / 12-15, SMT siblings unused) and exports the CPU
+  sets, so two measurements can run at once; compare A and B only within one slot run;
 - side a (sender, iperf3 client) pinned to `BENCH_CPUS_A`, side b (receiver, iperf3 server)
   pinned to `BENCH_CPUS_B` with `--cpuset-cpus`; the two sets must not overlap;
 - `--cap-add NET_ADMIN --device /dev/net/tun`, real TUN devices, nothing on the host is
@@ -92,8 +95,8 @@ Per pair and repetition (the table reports the median of `BENCH_REPS`):
 | `BENCH_REPS` | `3` | repetitions; medians are reported |
 | `BENCH_UDP_RATES` | `1G,3G` | comma-separated UDP rates, iperf3 `-b` units |
 | `BENCH_PING_COUNT` | `1000` | pings (or rr round trips) per latency run, 10 ms apart |
-| `BENCH_CPUS_A` | `2-5` | `--cpuset-cpus` of side a |
-| `BENCH_CPUS_B` | `6-9` | `--cpuset-cpus` of side b |
+| `BENCH_CPUS_A` | `8-11` | `--cpuset-cpus` of side a (set by `slot.sh`) |
+| `BENCH_CPUS_B` | `12-15` | `--cpuset-cpus` of side b (set by `slot.sh`) |
 | `BENCH_NSPLANE_VARIANTS` | the four variants under Pairs | `;`-separated `NAME[:ENV[:ARGS]]`; ENV (space-separated `KEY=VALUE`) and ARGS are given to nsplane-cli on both sides of `nsplane-nsplane`, one row each |
 | `NSPLANE_CLI_BIN` | `target/release/nsplane-cli` | nsplane-cli under test, e.g. built in another worktree |
 | `NETSTACK_BENCH_BIN` | `target/release/netstack_bench` | netstack pair binary |

@@ -147,8 +147,10 @@ impl Tun {
         Self::from_fd(adopt_fd(fd)?, mtu)
     }
 
-    /// The interface name, queried from the fd (Linux/Android `TUNGETIFF`, macOS/iOS
-    /// `UTUN_OPT_IFNAME`).
+    /// The created interface name, queried from the fd (Linux/Android `TUNGETIFF`,
+    /// macOS/iOS `UTUN_OPT_IFNAME`): for a pattern such as `"tun%d"` or `"utun"` it is
+    /// the name the kernel assigned, e.g. `tun0` or `utun3`. After [`Tun::split`] the
+    /// halves report it through [`TunSource::name`] and [`TunSink::name`].
     ///
     /// For an adopted fd this works only if it is a real TUN device or utun socket;
     /// anything else yields the OS error of the query.
@@ -291,6 +293,14 @@ pub struct TunSource {
 }
 
 impl TunSource {
+    /// The created interface name, queried from the shared fd like [`Tun::name`] on
+    /// every call: a caller that created the device with a pattern (`"tun%d"`,
+    /// `"utun"`) learns the kernel-assigned name after [`Tun::split`]. For an adopted
+    /// fd that is not a TUN device it yields the OS error of the query.
+    pub fn name(&self) -> io::Result<String> {
+        sys::name(self.fd.get_ref().as_fd())
+    }
+
     /// Room each packet split off a virtio-net read gets: the MTU, the translation slack
     /// and the tail room.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -494,6 +504,14 @@ impl PacketSink for TunSink {
 }
 
 impl TunSink {
+    /// The created interface name, queried from the shared fd like [`Tun::name`] on
+    /// every call: a caller that created the device with a pattern (`"tun%d"`,
+    /// `"utun"`) learns the kernel-assigned name after [`Tun::split`]. For an adopted
+    /// fd that is not a TUN device it yields the OS error of the query.
+    pub fn name(&self) -> io::Result<String> {
+        sys::name(self.fd.get_ref().as_fd())
+    }
+
     /// Writes `packet` as [`PacketSink::send`] does, without waiting.
     fn try_write(&self, packet: &[u8]) -> io::Result<()> {
         check_ip(packet)?;

@@ -19,7 +19,7 @@ use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
 use crate::job::{self, CryptoJob, Direction, Outcome};
 use crate::peer::Peer;
-use crate::peer_table::{PeerTable, PeerTableError};
+use crate::peer_table::{Destinations, PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
 use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, PeerStats};
@@ -703,6 +703,7 @@ impl Core {
             | ConfigChange::SetKeepalive { peer, .. }
             | ConfigChange::SetPath { peer, .. }
             | ConfigChange::SetInboundDestinations { peer, .. }
+            | ConfigChange::SetInboundDestinationSource { peer, .. }
                 if self.peers.get(&peer).is_none() =>
             {
                 return;
@@ -744,6 +745,12 @@ impl Core {
                 if let Some(id) = self.peers.get(&peer) {
                     self.peers
                         .set_inbound_destinations(id, destinations.as_deref());
+                }
+                return;
+            }
+            ConfigChange::SetInboundDestinationSource { peer, source } => {
+                if let Some(id) = self.peers.get(&peer) {
+                    self.peers.set_inbound_destination_source(id, source);
                 }
                 return;
             }
@@ -918,12 +925,17 @@ impl Core {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
         }
-        if let Some(set) = self.peers.inbound_destinations(slot) {
+        if let Some(destinations) = self.peers.inbound_destinations(slot) {
             let dst = datagram
                 .as_packet()
                 .get(DATA_HEADER_SZ..DATA_HEADER_SZ + plain_len)
                 .and_then(Tunn::dst_address);
-            if !dst.is_some_and(|dst| lookups.destination_allowed(set, dst, id)) {
+            // A shared source is consulted per packet, never cached: it may change any time.
+            let allowed = dst.is_some_and(|dst| match destinations {
+                Destinations::Owned(set) => lookups.destination_allowed(set, dst, id),
+                Destinations::Shared(source) => source.allows(dst),
+            });
+            if !allowed {
                 self.dropped(Some(id), reasons::DESTINATION_NOT_ALLOWED);
                 return None;
             }
@@ -1146,8 +1158,8 @@ impl Core {
     }
 
     /// Records an authenticated message of `kind` from `peer` on `path`: reports the
-    /// handshakes the message `completed` and a new source, and lets the policy decide about
-    /// roaming.
+    /// handshakes the message `completed` and a new off-path source, and lets the policy
+    /// decide about roaming.
     fn authenticated(&mut self, id: PeerId, path: Path, kind: MessageKind, completed: u64) {
         let Some(peer) = self.peers.peer_mut(id) else {
             return;
@@ -1156,6 +1168,7 @@ impl Core {
         if completed > 0 {
             peer.expired = false;
             peer.initiation_answered();
+            peer.forget_reported_from();
             let rtt = (kind == MessageKind::HandshakeResponse)
                 .then(|| peer.tunnel_mut().stats().4)
                 .flatten()
@@ -1177,11 +1190,16 @@ impl Core {
             }
             return;
         }
-        self.outputs.push_back(Output::Event(Event::Authenticated {
-            peer: id,
-            from: path,
-        }));
-        if self.policy.on_authenticated(id, &path, kind) == Roam::Adopt {
+        // The policy sees every message, but a source is reported once until the path
+        // changes or a handshake completes; an adoption is always reported first.
+        let roam = self.policy.on_authenticated(id, &path, kind);
+        if peer.report_from(path) || roam == Roam::Adopt {
+            self.outputs.push_back(Output::Event(Event::Authenticated {
+                peer: id,
+                from: path,
+            }));
+        }
+        if roam == Roam::Adopt {
             // The ECN mark of a received datagram says nothing about what to send.
             let path = Path {
                 ecn: Ecn::NotEct,
@@ -1321,7 +1339,7 @@ const fn roams(kind: MessageKind) -> bool {
 }
 
 /// Whether two paths lead to the same place; their ECN marks may differ.
-fn same_route(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_route(a: &Path, b: &Path) -> bool {
     a.transport == b.transport && a.addr == b.addr
 }
 
@@ -1448,6 +1466,50 @@ mod tests {
             Input::Config(ConfigChange::SetInboundDestinations {
                 peer: key,
                 destinations: None,
+            }),
+            Instant::now(),
+        );
+        assert!(core.peers.inbound_destinations(slot).is_none());
+    }
+
+    #[test]
+    fn inbound_destination_sources_of_unknown_peers_are_ignored() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let key = x25519::PublicKey::from([7; 32]);
+        let source: std::sync::Arc<dyn crate::InboundDestinations> =
+            std::sync::Arc::new(|_: IpAddr| false);
+        let change = ConfigChange::SetInboundDestinationSource {
+            peer: key,
+            source: Some(std::sync::Arc::clone(&source)),
+        };
+        assert!(format!("{change:?}").contains("<source>"));
+        core.handle_input(Input::Config(change), Instant::now());
+        assert!(core.poll_output().is_none());
+        assert_eq!(core.peer_id(&key), None);
+
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(PeerConfig::new(key))),
+            Instant::now(),
+        );
+        let slot = core.peers.slot(core.peer_id(&key).unwrap()).unwrap();
+        core.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinationSource {
+                peer: key,
+                source: Some(source),
+            }),
+            Instant::now(),
+        );
+        assert!(matches!(
+            core.peers.inbound_destinations(slot),
+            Some(Destinations::Shared(_))
+        ));
+        core.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinationSource {
+                peer: key,
+                source: None,
             }),
             Instant::now(),
         );
@@ -1776,5 +1838,208 @@ mod tests {
                 assert_eq!(pump(&mut cores)[1], [sent], "{limit:?} {len}");
             }
         }
+    }
+
+    /// Keeps the current path unless told to adopt; counts what it is told about.
+    #[derive(Default, Clone)]
+    struct Counting {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        adopt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Counting {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl PathPolicy for Counting {
+        fn select(&self, _peer: PeerId, _kind: MessageKind) -> Option<Path> {
+            None
+        }
+
+        fn on_authenticated(&self, _peer: PeerId, _from: &Path, _kind: MessageKind) -> Roam {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.adopt.load(std::sync::atomic::Ordering::Relaxed) {
+                Roam::Adopt
+            } else {
+                Roam::Keep
+            }
+        }
+    }
+
+    /// The datagrams and events `core` queued, its deliveries discarded.
+    fn drain(core: &mut Core) -> (Vec<PacketBuf>, Vec<Event>) {
+        let (mut sent, mut events) = (Vec::new(), Vec::new());
+        while let Some(output) = core.poll_output() {
+            match output {
+                Output::Transmit { data, .. } => sent.push(data),
+                Output::Event(event) => events.push(event),
+                Output::Deliver { .. } => {}
+            }
+        }
+        (sent, events)
+    }
+
+    /// Hands `datagrams` to `core` as arriving on `on`.
+    fn arrive(core: &mut Core, datagrams: Vec<PacketBuf>, on: Path) {
+        for data in datagrams {
+            core.handle_input(Input::Datagram { path: on, data }, Instant::now());
+        }
+    }
+
+    /// The sources of the `Authenticated` events among `events`.
+    fn reported(events: &[Event]) -> Vec<Path> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Authenticated { from, .. } => Some(*from),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `a` (with peer `b` at `path(2)`) and `b` (with `policy` and peer `a` at `path(1)`)
+    /// after a handshake and the first data on `b`'s path for `a`.
+    fn pinned_pair(policy: Counting) -> (Core, Core, PeerId) {
+        let now = Instant::now();
+        let (mut a, _) = core_with_peer(1, 2, path(2), now);
+        let mut config = PeerConfig::new(x25519::PublicKey::from(&x25519::StaticSecret::from(
+            [2; 32],
+        )));
+        config.allowed_ips = vec!["10.0.0.2/32".parse().unwrap()];
+        a.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(config)), now);
+
+        let mut b = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([2; 32])),
+            policy: Box::new(policy),
+            ..CoreConfig::default()
+        });
+        let key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        let mut config = PeerConfig::new(key);
+        config.path = Some(path(1));
+        b.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(config)), now);
+        let a_id = b.peer_id(&key).unwrap();
+
+        a.handle_input(
+            Input::Local {
+                packet: local_packet(100),
+            },
+            now,
+        );
+        let (init, _) = drain(&mut a);
+        arrive(&mut b, init, path(1));
+        let (response, _) = drain(&mut b);
+        arrive(&mut a, response, path(2));
+        let (data, _) = drain(&mut a);
+        arrive(&mut b, data, path(1));
+        assert_eq!(reported(&drain(&mut b).1), []);
+        (a, b, a_id)
+    }
+
+    /// Sends `n` data packets from `a` to `b`, arriving on `on`; returns `b`'s events.
+    fn data(a: &mut Core, b: &mut Core, on: Path, n: usize) -> Vec<Event> {
+        for _ in 0..n {
+            a.handle_input(
+                Input::Local {
+                    packet: local_packet(100),
+                },
+                Instant::now(),
+            );
+            let (sent, _) = drain(a);
+            assert_eq!(sent.len(), 1);
+            arrive(b, sent, on);
+        }
+        drain(b).1
+    }
+
+    #[test]
+    fn an_off_path_source_is_reported_once_per_change() {
+        let policy = Counting::default();
+        let (mut a, mut b, a_id) = pinned_pair(policy.clone());
+
+        // A path the policy keeps: one event, but every message reaches the policy.
+        let calls = policy.calls();
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 10)), [path(3)]);
+        assert_eq!(policy.calls() - calls, 10);
+        assert_eq!(b.data_path(a_id), Some(path(1)));
+
+        // Each change of source is reported once, back to an earlier one included.
+        assert_eq!(reported(&data(&mut a, &mut b, path(4), 5)), [path(4)]);
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 5)), [path(3)]);
+        // ECN marks do not make a new source.
+        let marked = Path {
+            ecn: Ecn::Ect0,
+            ..path(3)
+        };
+        assert_eq!(reported(&data(&mut a, &mut b, marked, 3)), []);
+
+        // The current path reports nothing and does not reach this policy.
+        let calls = policy.calls();
+        assert_eq!(reported(&data(&mut a, &mut b, path(1), 5)), []);
+        assert_eq!(policy.calls(), calls);
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 5)), []);
+    }
+
+    #[test]
+    fn a_path_change_or_handshake_reports_the_source_again() {
+        let policy = Counting::default();
+        let (mut a, mut b, a_id) = pinned_pair(policy.clone());
+        let a_key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), [path(3)]);
+
+        // A path set by configuration, even the same one.
+        b.handle_input(
+            Input::Config(ConfigChange::SetPath {
+                peer: a_key,
+                path: path(1),
+            }),
+            Instant::now(),
+        );
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), [path(3)]);
+        let mut config = PeerConfig::new(a_key);
+        config.path = Some(path(1));
+        b.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), [path(3)]);
+
+        // A forced handshake with a path.
+        b.force_handshake(a_id, Some(path(1)), Instant::now());
+        let (init, _) = drain(&mut b);
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), [path(3)]);
+
+        // A completed handshake, its response arriving from the reported source.
+        arrive(&mut a, init, path(2));
+        let (response, _) = drain(&mut a);
+        arrive(&mut b, response, path(3));
+        let events = drain(&mut b).1;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::HandshakeCompleted { .. }))
+        );
+        assert_eq!(reported(&events), [path(3)]);
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), []);
+
+        // An adoption is reported even from the reported source, then the new path's
+        // sources start over.
+        policy
+            .adopt
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let events = data(&mut a, &mut b, path(3), 1);
+        policy
+            .adopt
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reported(&events), [path(3)]);
+        assert!(matches!(
+            events.get(1),
+            Some(Event::PathAdopted { path: adopted, .. }) if *adopted == path(3)
+        ));
+        assert_eq!(b.data_path(a_id), Some(path(3)));
+        assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), []);
+        assert_eq!(reported(&data(&mut a, &mut b, path(1), 2)), [path(1)]);
     }
 }

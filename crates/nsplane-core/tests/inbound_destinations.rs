@@ -1,17 +1,21 @@
 //! Per-peer inbound destinations: core 1 restricts where core 0's decrypted packets may go,
 //! on every receive path (per packet, batched, deferred), and changes the set at runtime.
 //! Core 0 routes `10.1.0.0/16` and `fd01::/64` to core 1 besides core 1's own addresses, so
-//! it can send to destinations core 1 does not own.
+//! it can send to destinations core 1 does not own. A caller-updated source is consulted on
+//! the next packet after it changes.
 
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test harness")]
 
 mod common;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{Net, ip4, ip6, udp4, udp6};
 use nsplane_core::{
-    AllowedIp, ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, PeerConfig, reasons,
+    AllowedIp, ConfigChange, Core, CoreConfig, CryptoJob, Event, InboundDestinations, Input,
+    PeerConfig, reasons,
 };
 
 const OTHER4: Ipv4Addr = Ipv4Addr::new(10, 1, 0, 5);
@@ -244,4 +248,121 @@ fn every_receive_path_checks_every_packet() {
             "{crypto_jobs} {batch}"
         );
     }
+}
+
+/// Sets on core 1 a source for core 0 that allows core 1's address, and `OTHER4` while
+/// `granted` is set.
+fn share(net: &mut Net, granted: &Arc<AtomicBool>) {
+    let granted = Arc::clone(granted);
+    let source = move |dst: IpAddr| {
+        dst == IpAddr::V4(ip4(1)) || (dst == IpAddr::V4(OTHER4) && granted.load(Ordering::Relaxed))
+    };
+    let source: Arc<dyn InboundDestinations> = Arc::new(source);
+    net.configure(
+        1,
+        ConfigChange::SetInboundDestinationSource {
+            peer: net.public_key(0),
+            source: Some(source),
+        },
+    );
+}
+
+#[test]
+fn a_shared_source_decides_the_next_packet() {
+    for crypto_jobs in [false, true] {
+        let mut net = pair(crypto_jobs, None);
+        let granted = Arc::new(AtomicBool::new(true));
+        share(&mut net, &granted);
+        assert!(passes(&mut net, &v4(OTHER4)));
+        assert!(passes(&mut net, &v4(ip4(1))));
+        assert!(!passes(&mut net, &v6(OTHER6)));
+
+        // A revocation drops the next packet to the destination just accepted.
+        granted.store(false, Ordering::Relaxed);
+        assert!(!passes(&mut net, &v4(OTHER4)));
+        assert!(passes(&mut net, &v4(ip4(1))));
+        granted.store(true, Ordering::Relaxed);
+        assert!(passes(&mut net, &v4(OTHER4)));
+    }
+}
+
+#[test]
+fn a_shared_source_decides_when_a_job_completes() {
+    let mut net = pair(true, None);
+    let granted = Arc::new(AtomicBool::new(true));
+    share(&mut net, &granted);
+    net.handshake(0, 1);
+    net.take_events(1);
+    let packet = v4(OTHER4);
+    for _ in 0..4 {
+        net.send_local(0, &packet);
+    }
+    let in_flight: Vec<_> = net
+        .drain()
+        .into_iter()
+        .map(|d| (d.arrival, d.data))
+        .collect();
+    let now = net.now;
+    let core = &mut net.cores[1];
+    let mut jobs = Vec::new();
+    core.handle_datagrams_deferred(in_flight, now, &mut jobs);
+    assert_eq!(jobs.len(), 4);
+    jobs.iter_mut().for_each(CryptoJob::run);
+    // The jobs were handed out while granted; the verdict is the one at completion, and a
+    // flip between two completions decides the next one.
+    for (i, job) in jobs.into_iter().enumerate() {
+        granted.store(i != 1, Ordering::Relaxed);
+        core.complete_job(job);
+    }
+    net.pump();
+
+    let peer = net.peer_id(1, 0);
+    assert_eq!(net.take_delivered(1), vec![(peer, packet); 3]);
+    assert_eq!(drops(&mut net), [reasons::DESTINATION_NOT_ALLOWED]);
+}
+
+#[test]
+fn a_shared_source_and_an_owned_list_replace_each_other() {
+    let mut net = pair(false, Some(vec![cidr("10.1.0.0/16")]));
+    let a = net.public_key(0);
+    assert!(passes(&mut net, &v4(OTHER4)));
+    assert!(!passes(&mut net, &v4(ip4(1))));
+
+    let granted = Arc::new(AtomicBool::new(false));
+    share(&mut net, &granted);
+    assert!(!passes(&mut net, &v4(OTHER4)));
+    assert!(passes(&mut net, &v4(ip4(1))));
+
+    // An update without inbound destinations keeps the source; one with them replaces it.
+    net.configure(1, ConfigChange::AddOrUpdatePeer(PeerConfig::new(a)));
+    assert!(!passes(&mut net, &v4(OTHER4)));
+    let config = PeerConfig {
+        inbound_destinations: Some(vec![cidr("10.1.0.0/16")]),
+        ..PeerConfig::new(a)
+    };
+    net.configure(1, ConfigChange::AddOrUpdatePeer(config));
+    assert!(passes(&mut net, &v4(OTHER4)));
+    assert!(!passes(&mut net, &v4(ip4(1))));
+
+    share(&mut net, &granted);
+    net.configure(
+        1,
+        ConfigChange::SetInboundDestinations {
+            peer: a,
+            destinations: Some(vec![cidr("fd01::/64")]),
+        },
+    );
+    assert!(!passes(&mut net, &v4(ip4(1))));
+    assert!(passes(&mut net, &v6(OTHER6)));
+
+    share(&mut net, &granted);
+    net.configure(
+        1,
+        ConfigChange::SetInboundDestinationSource {
+            peer: a,
+            source: None,
+        },
+    );
+    assert!(passes(&mut net, &v4(OTHER4)));
+    assert!(passes(&mut net, &v6(OTHER6)));
 }

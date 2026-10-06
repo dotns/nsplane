@@ -602,6 +602,43 @@ async fn full_transmit_queue_holds_back_the_source() {
     assert!(a.handle.drop_counters().await.unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_transmit_queue_holds_back_the_source_with_crypto_workers() {
+    const PACKETS: usize = 2000;
+    let (ta, tb) = link(PACKETS);
+    let (ta, gate) = Tapped::new(ta);
+    let (tb, _gate_b) = Tapped::new(tb);
+    let options = Options {
+        queue_capacity: 256,
+        sink_capacity: PACKETS,
+        crypto_workers: 2,
+    };
+    let (mut a, mut b) = nodes(ta, tb, &options);
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    // The local packets with the workers count against the room for local packets, so
+    // none is dropped, neither while the transport is stalled nor while it drains.
+    gate.send(false).unwrap();
+    let local = a.local.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..PACKETS {
+            let packet = PacketBuf::from_packet(&numbered(i));
+            local.send(packet).await.unwrap();
+        }
+    });
+    sleep(QUIET).await;
+    assert!(!sender.is_finished(), "the source was not held back");
+    assert!(a.handle.drop_counters().await.unwrap().is_empty());
+
+    gate.send(true).unwrap();
+    timeout(WAIT, sender).await.unwrap().unwrap();
+    for i in 0..PACKETS {
+        assert_eq!(b.expect_delivery().await.1, numbered(i));
+    }
+    assert!(a.handle.drop_counters().await.unwrap().is_empty());
+}
+
 /// A transport whose sends fail, as for a datagram too large for the path, once `failing`
 /// is set.
 struct Failing {

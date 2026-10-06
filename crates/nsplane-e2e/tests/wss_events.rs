@@ -81,6 +81,10 @@ impl Relay {
     }
 
     async fn serve(self: Arc<Self>, mut tcp: TcpStream) {
+        // Subscribed before the upgrade is answered: a kick sent once the carrier saw the
+        // connection up drops it. Subscribed after, the kick could land first and be missed,
+        // leaving the connection held until the carrier's read idle.
+        let mut kick = self.kick.subscribe();
         let mode = *lock(&self.mode);
         lock(&self.log).push(mode);
         match mode {
@@ -94,7 +98,6 @@ impl Relay {
                 let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(tcp, upgrade).await else {
                     return;
                 };
-                let mut kick = self.kick.subscribe();
                 loop {
                     tokio::select! {
                         message = ws.next() => if !matches!(message, Some(Ok(_))) {
