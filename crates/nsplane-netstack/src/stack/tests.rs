@@ -17,6 +17,7 @@ mod half_close;
 mod listener_integration;
 mod listener_pool;
 mod ownership;
+mod pmtu;
 mod progress;
 mod reassembly;
 
@@ -70,6 +71,11 @@ struct RawPeer {
 impl RawPeer {
     /// Starts a stack with `config` and a client at `client_ip` wired to it.
     fn start(config: NetStackConfig, client_ip: Ipv4Addr, seed: u64) -> (NetStackHandle, Self) {
+        Self::start_at(config, IpAddr::V4(client_ip), seed)
+    }
+
+    /// [`start`](Self::start) with a client address of either family.
+    fn start_at(config: NetStackConfig, client_ip: IpAddr, seed: u64) -> (NetStackHandle, Self) {
         let (stack, handle) = NetStack::new(config);
         let (source, sink) = stack.split();
         let mut device = VirtualDevice::new(1360, usize::MAX, Arc::default());
@@ -77,7 +83,8 @@ impl RawPeer {
         iface_config.random_seed = seed;
         let mut iface = Interface::new(iface_config, &mut device, SmolInstant::ZERO);
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(client_ip), 32));
+            let prefix = if client_ip.is_ipv4() { 32 } else { 128 };
+            let _ = addrs.push(IpCidr::new(IpAddress::from(client_ip), prefix));
         });
         let peer = Self {
             iface,
@@ -97,7 +104,7 @@ impl RawPeer {
     /// Opens a client socket to `server:port` from `local_port`.
     fn connect(
         &mut self,
-        server: Ipv4Addr,
+        server: impl Into<IpAddress>,
         port: u16,
         local_port: u16,
     ) -> Result<SocketHandle, Box<dyn Error>> {
@@ -106,7 +113,7 @@ impl RawPeer {
         let mut socket = client_tcp::Socket::new(rx_buf, tx_buf);
         socket.connect(
             self.iface.context(),
-            (IpAddress::Ipv4(server), port),
+            (server.into(), port),
             IpListenEndpoint {
                 addr: None,
                 port: local_port,
@@ -246,6 +253,9 @@ fn classify_counts_every_reject() -> TestResult {
     assert_eq!(classify(&[0x45, 0], &settings), Err(Reject::Malformed));
     let mut icmp = udp.as_packet().to_vec();
     icmp[9] = protocol::ICMP;
+    // `ingest` counts it as unsupported unless it is a Fragmentation Needed.
+    assert_eq!(classify(&icmp, &settings), Ok(Class::Icmp));
+    icmp[9] = protocol::ICMPV6;
     assert_eq!(classify(&icmp, &settings), Err(Reject::Unsupported));
     let mut fragment = udp.as_packet().to_vec();
     fragment[6] = 0x20; // More fragments.
