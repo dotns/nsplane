@@ -2,8 +2,10 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use nsplane_packet::{PacketBatch, PacketBuf, PeerId};
+use nsplane_packet::{PacketBatch, PacketBuf, PeerId, SharedPacketPool};
 use tokio::sync::{mpsc, watch};
 
 use crate::io::{PacketSink, PacketSource};
@@ -35,11 +37,24 @@ fn closed() -> io::Error {
 /// If `capacity` is 0.
 pub fn pipe(capacity: usize, mtu: u16) -> (PipeSink, PipeSource) {
     let (tx, rx) = mpsc::channel(capacity);
+    let pool = Arc::new(Pool {
+        shared: SharedPacketPool::new(capacity),
+        allocating: AtomicBool::new(false),
+    });
     let source = PipeSource {
         rx,
         mtu: watch::Sender::new(mtu),
+        pool: Arc::clone(&pool),
     };
-    (PipeSink { tx }, source)
+    (PipeSink { tx, pool }, source)
+}
+
+/// The buffer pool of a [`pipe`], shared by every [`PipeSink`] clone and the [`PipeSource`].
+#[derive(Debug)]
+struct Pool {
+    shared: SharedPacketPool,
+    /// Set by the first [`PipeSink::alloc`]; until then the source takes no buffers.
+    allocating: AtomicBool,
 }
 
 /// The [`PacketSink`] end of a [`pipe`].
@@ -48,9 +63,41 @@ pub fn pipe(capacity: usize, mtu: u16) -> (PipeSink, PipeSource) {
 /// [`PipeSource`] is dropped, also when it was waiting. The `from` peer is not carried: a
 /// [`PacketSource`] yields packets only. Clones feed the same pipe, so several producers
 /// can share one input.
+///
+/// Producers can [`alloc`](Self::alloc) their packets from the pipe's pool, which the
+/// [`PipeSource`] refills with the buffers its reader is done with.
 #[derive(Debug, Clone)]
 pub struct PipeSink {
     tx: mpsc::Sender<PacketBuf>,
+    pool: Arc<Pool>,
+}
+
+impl PipeSink {
+    /// Returns a packet of `len` bytes from the pipe's pool, as [`SharedPacketPool::alloc`]:
+    /// [`HEADROOM`](crate::HEADROOM) in front, `capacity() >= len + TAILROOM`
+    /// ([`TAILROOM`](crate::TAILROOM)), packet bytes unspecified.
+    ///
+    /// The pool keeps up to the pipe's `capacity` idle buffers. The first call makes the
+    /// [`PipeSource`] take the buffers handed to its [`PacketSource::recycle`] (an engine
+    /// hands it every packet it transmitted); before it, the source takes none, so a
+    /// producer that starts allocating after traffic started gets only what is returned
+    /// through [`recycle`](Self::recycle).
+    pub fn alloc(&self, len: usize) -> PacketBuf {
+        if !self.pool.allocating.load(Ordering::Relaxed) {
+            self.pool.allocating.store(true, Ordering::Relaxed);
+        }
+        self.pool.shared.alloc(len)
+    }
+
+    /// Hands buffers back to the pipe's pool for [`alloc`](Self::alloc), as
+    /// [`SharedPacketPool::recycle`]: takes them until the pool is full and leaves the
+    /// rest, takes none while the pool is busy, never waits.
+    ///
+    /// For a consumer returning the packets it is done with, e.g. the ones a
+    /// [`ChannelSink`](crate::ChannelSink) delivered to it.
+    pub fn recycle(&self, bufs: &mut Vec<PacketBuf>) {
+        self.pool.shared.recycle(bufs);
+    }
 }
 
 impl PacketSink for PipeSink {
@@ -84,6 +131,7 @@ impl PacketSink for PipeSink {
 pub struct PipeSource {
     rx: mpsc::Receiver<PacketBuf>,
     mtu: watch::Sender<u16>,
+    pool: Arc<Pool>,
 }
 
 impl PipeSource {
@@ -113,6 +161,15 @@ impl PacketSource for PipeSource {
             let _ = batch.push(packet);
         }
         Ok(())
+    }
+
+    /// Keeps the buffers for [`PipeSink::alloc`], up to the pipe's `capacity` idle ones;
+    /// the rest are left. Takes none before the first [`PipeSink::alloc`], or while the
+    /// pool is busy.
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        if self.pool.allocating.load(Ordering::Relaxed) {
+            self.pool.shared.recycle(bufs);
+        }
     }
 
     fn mtu(&self) -> watch::Receiver<u16> {
@@ -287,6 +344,66 @@ mod tests {
         let mut more: VecDeque<_> = [(PeerId::new(1), PacketBuf::from_packet(&[4]))].into();
         let err = sink.try_send_batch(&mut more).err().ok_or("no error")?;
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_declines_before_the_first_alloc() -> TestResult {
+        let (sink, mut source) = pipe(4, 1420);
+        send(&sink, 1).await?;
+        let mut bufs = vec![source.recv().await?];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(sink.pool.shared.free_len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alloc_reuses_what_the_source_recycles() -> TestResult {
+        let (sink, mut source) = pipe(2, 1420);
+        let other = sink.clone();
+        let mut packet = sink.alloc(1400);
+        assert_eq!(packet.headroom(), nsplane_packet::HEADROOM);
+        assert!(packet.capacity() >= 1400 + nsplane_packet::TAILROOM);
+        packet.as_packet_mut().fill(7);
+        let addr = packet.as_packet().as_ptr();
+        sink.send(packet, PeerId::new(1)).await?;
+        let packet = source.recv().await?;
+        assert_eq!(packet.as_packet(), [7; 1400]);
+
+        // Up to the capacity is kept, the rest is left.
+        let mut bufs = vec![
+            PacketBuf::with_capacity(8),
+            PacketBuf::with_capacity(8),
+            packet,
+        ];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(sink.pool.shared.free_len(), 2);
+
+        // A clone allocates from the same pool.
+        let first = other.alloc(64);
+        let second = other.alloc(64);
+        assert!([first.as_packet().as_ptr(), second.as_packet().as_ptr()].contains(&addr));
+        assert_eq!(sink.pool.shared.allocated(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sink_recycle_refills_without_opening_the_source() -> TestResult {
+        let (sink, mut source) = pipe(4, 1420);
+        sink.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
+        assert_eq!(sink.pool.shared.free_len(), 1);
+        let mut bufs = vec![PacketBuf::with_capacity(1600)];
+        source.recycle(&mut bufs);
+        assert_eq!(bufs.len(), 1);
+
+        let packet = sink.alloc(100);
+        assert_eq!(packet.len(), 100);
+        assert_eq!(sink.pool.shared.allocated(), 0);
+        source.recycle(&mut bufs);
+        assert!(bufs.is_empty());
+        assert_eq!(sink.pool.shared.free_len(), 1);
         Ok(())
     }
 }

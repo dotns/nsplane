@@ -2,7 +2,8 @@
 
 //! Local-side graph primitives on a current-thread runtime, per packet, for 64 B and
 //! 1420 B packets: `pipe` sends a batch of packets into a pipe and reads them back with
-//! `recv_batch`; `pump` moves the packets from one pipe into another with `pump` while a
+//! `recv_batch`, and `alloc_send_recv` also allocates each packet with `PipeSink::alloc`
+//! and recycles it into the source once read; `pump` moves the packets from one pipe into another with `pump` while a
 //! task drains the second pipe.
 //!
 //! The wrapper groups send through a wrapper into roomy pipes and read the packets back,
@@ -112,6 +113,26 @@ fn bench_pipe(c: &mut Criterion) {
                         source.recv_batch(&mut batch).await.unwrap();
                         held.extend(batch.drain());
                     }
+                });
+            });
+        });
+    }
+    for size in SIZES {
+        let (sink, mut source) = pipe(PACKETS, 1420);
+        let mut held = Vec::with_capacity(PACKETS);
+        let mut batch = PacketBatch::new();
+        group.bench_function(format!("alloc_send_recv_{size}"), |bench| {
+            bench.iter(|| {
+                runtime.block_on(async {
+                    for _ in 0..PACKETS {
+                        sink.send(sink.alloc(size), PeerId::new(1)).await.unwrap();
+                    }
+                    while held.len() < PACKETS {
+                        source.recv_batch(&mut batch).await.unwrap();
+                        held.extend(batch.drain());
+                    }
+                    source.recycle(&mut held);
+                    held.clear();
                 });
             });
         });
