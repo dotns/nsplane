@@ -66,10 +66,16 @@ nsplane.
 
 ### Existing product concepts
 
-`SourceAssertion::Terminate` / `External`, `crates_acl()` and the node L3 gate's grant model
-predate this decision and ns depends on them. They stay until they can be expressed through
-the generic API. Then they move to a preset outside the generic core, or to ns, without a
-behavior change for ns. No new feature builds on them.
+The product concepts listed in the context (`SourceAssertion::Terminate` / `External` and the
+`"terminate"` / `"external-idp"` source classes, `crates_acl()` and the `AclPolicy` document
+format with host aliases and self-tests, the node L3 gate's configuration and reason model with
+the gateway consumer, and the Quick v2 address names in the translator) are removed from
+nsplane. They do not move to another crate. Each one is written down as a specification:
+its semantics, how to build it from the generic API, and the parity cases. Products such as
+ns and nsgw implement it themselves on top of nsplane (owner, 2026-10-06). There is no
+compatibility layer: the next release switches directly, and its changelog lists every
+removed item with its generic replacement. This work runs as its own round after plan
+`20261006-0900-ns-requests-2` (task `20261006-1500-business-agnostic-cleanup`).
 
 ## Consequences
 
