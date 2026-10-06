@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-use nsplane_packet::{PacketBuf, protocol};
+use nsplane_packet::{PacketBuf, TAILROOM, protocol};
 
 use super::fragment::{Key, Outcome, Reassembly};
 use super::parse::{Fragment, Ipv4, Ipv6, be16, put16};
@@ -505,7 +505,8 @@ fn forwarded_hop(value: u8) -> Result<u8> {
 const MAX_LEN: usize = 40 + 65535;
 
 /// Makes room for `len` packet bytes: a buffer with less capacity is replaced
-/// by a fresh one with the standard headroom that holds a copy of the packet
+/// by a fresh one with the standard headroom and [`TAILROOM`] that holds a
+/// copy of the packet, so sealing the grown packet does not reallocate again
 /// (the slow path [`TranslatorStats::grown_copies`](super::TranslatorStats)
 /// counts). Fails with [`NO_ROOM`](reasons::NO_ROOM) beyond [`MAX_LEN`].
 fn make_room(packet: &mut PacketBuf, len: usize) -> Result<()> {
@@ -513,7 +514,7 @@ fn make_room(packet: &mut PacketBuf, len: usize) -> Result<()> {
         return Err(reasons::NO_ROOM);
     }
     if len > packet.capacity() {
-        let mut grown = PacketBuf::with_capacity(len);
+        let mut grown = PacketBuf::with_capacity(len + TAILROOM);
         grown.set_len(packet.len());
         grown.as_packet_mut().copy_from_slice(packet.as_packet());
         *packet = grown;
