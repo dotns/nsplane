@@ -19,8 +19,9 @@
 //!
 //! Windows service TUN: `Tun::create_with` with `TunOptions` verifies `wintun.dll`
 //! against a `WintunPin` (SHA-256, optionally the running driver version) before loading
-//! it, can refuse an existing adapter or interface of the same name (`exclusive`) and
-//! sets the interface MTU; refusals are `WintunError`s inside the `io::Error`.
+//! it, can refuse a live adapter or interface of the same name (`exclusive`), replaces an
+//! orphaned (non-present) one and sets the interface MTU; refusals are `WintunError`s
+//! inside the `io::Error`.
 //!
 //! Raw fds (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
 //! (a parent process, the CLI's `--tun-fd` and `--uapi-fd`) so that callers need no
