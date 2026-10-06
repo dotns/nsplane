@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `nsplane-wss`: `WssConfig::ping_interval(Option<Duration>)`; `None` (stored as a zero
+  `ping_interval`, as `keepalive(Duration::ZERO, idle)` does) sends no keepalive pings on
+  `WssDialer` links, `WssStreamClient` sessions and `WssStreamServer` sessions, with no ping
+  task or timer; the read idle still ends a silent link. The default stays a 10 s ping.
 - `nsplane`: `Splitter::new_map(route)`, a splitter whose closure
   (`Fn(PeerId, &mut PacketBuf) -> usize`) rewrites each packet in place and then picks the
   sink, e.g. a Redirect or Masquerade decision that routes; otherwise as `Splitter::new`
@@ -39,10 +43,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same name; `mtu(n)` sets the interface MTU and `Tun::mtu` reports the read-back value;
   `offload` is accepted and ignored. Refusals are `WintunError` (`HashMismatch`,
   `DriverVersionMismatch`, `AdapterExists`) inside the `io::Error`. `Tun::create` is unchanged.
+- `nsplane-nat`: a criterion bench of the `Translator` on the `alias4` path
+  (`cargo bench -p nsplane-nat --bench translate`): outbound IPv4 TCP / UDP to an `alias4`
+  and the inbound IPv6 reply, 64 B and full-size payloads, 1 and 1000 peers.
+- `nsplane-nat`: `checksum::transport_valid(pseudo, segment)` verifies a TCP/UDP/ICMPv6-style
+  segment over a pseudo-header, as a full recomputation returning zero would.
 - nsplane-netstack: `send_stream` criterion bench (MF-5): one and four bulk TCP streams between
   two netstacks wired back to back in process (`cargo bench -p nsplane-netstack --bench
   send_stream`). It rules out a single-stream send cost of smoltcp fork `.4`: +1.5-2.1 % against
   `.3` over 15 pairs (see "Netstack throughput" in `docs/architecture.md`).
+
+### Changed
+- nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
+  so a burst the driver routes in one step fits one UDP flow or socket queue. Harness netstack
+  pair, server at the stack default: UDP loss at 1 Gbit/s 1.24 % to 0.00 % (old CPU sets) and
+  0.07-0.75 % to 0.00 % (slot 0), TCP unchanged. Memory: the queue grows on demand, so an idle
+  flow or socket costs the same; a full one pins up to 256 ingress buffers (about 512 KiB,
+  256 KiB before).
+- `nsplane-nat`: faster `Translator` on the `alias4` path, byte-identical output (MF-4):
+  transport checksums are verified with 32-bit word sums (`checksum::sum` and `valid` use
+  them too, about 4x faster on a full-size packet), the reassembly clock is read only for
+  fragments, IPv6 to IPv4 writes the IPv4 header in front of the payload and moves the
+  packet start instead of the payload (the headroom grows by 20 or 28 bytes), and a
+  `TranslationTable` address lookup is one hash instead of two. Per packet, 2026-10-06, load
+  2.3-5.2: outbound 64 B 72-86 to 42-43 ns, full size 197-228 to 79-93 ns; inbound 64 B
+  69-74 to 62-73 ns, full size 191-210 to 88-102 ns.
+
+### Fixed
+- `nsplane-nat`: `Nat64LanSource` forwards `PacketSource::recycle` to its inner source;
+  it took nothing before, so the engine's recycled buffers never reached the inner (TUN)
+  source and it allocated every buffer.
 
 ## [0.10.0] - 2026-10-05
 

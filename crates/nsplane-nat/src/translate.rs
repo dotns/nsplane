@@ -82,7 +82,10 @@
 //! [`TranslatorStats::grown_copies`] counts; sources that leave 28 bytes of
 //! room past the MTU keep translation in place. Callers that fragment IPv4
 //! before the core can use [`Translator::ipv4_translated_predicate`] to
-//! reserve the 28 bytes only for translated destinations.
+//! reserve the 28 bytes only for translated destinations. A translated IPv6
+//! packet shrinks without moving its payload: the IPv4 header is written
+//! right in front of it and the packet start moves forward, so the headroom
+//! grows by 20 bytes (28 with a fragment header).
 //!
 //! # Routing and filter order
 //!
@@ -316,9 +319,9 @@ impl Translator {
     }
 
     /// Counts a packet whose buffer the translation replaced: a grown copy
-    /// starts at a new address.
+    /// has a new allocation (a shrunk packet only moves its start).
     fn count_grown(&self, start: *const u8, packet: &PacketBuf) {
-        if packet.as_packet().as_ptr() != start {
+        if allocation(packet) != start {
             self.grown_copies.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -348,7 +351,7 @@ impl Translator {
         let cx = Context {
             table,
             reassembly: &self.reassembly,
-            now: self.epoch.elapsed().as_secs(),
+            epoch: self.epoch,
             mtu: usize::from(self.mtu()),
         };
         let result = rfc7915::v4_to_v6(packet, src6, dst6, cx);
@@ -362,7 +365,7 @@ impl Translator {
 impl PacketFilter for Translator {
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
         let table = self.table.load();
-        let start = packet.as_packet().as_ptr();
+        let start = allocation(packet);
         let result = match packet.as_packet().first().map(|byte| byte >> 4) {
             Some(4) => inbound_v4(&table, packet),
             Some(6) => inbound_v6(&table, peer, packet),
@@ -374,7 +377,7 @@ impl PacketFilter for Translator {
 
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
         let table = self.table.load();
-        let start = packet.as_packet().as_ptr();
+        let start = allocation(packet);
         let result = match packet.as_packet().first().map(|byte| byte >> 4) {
             Some(4) => self.outbound_v4(&table, peer, packet),
             Some(6) => outbound_v6(&table, peer, packet),
@@ -533,6 +536,11 @@ fn map6to4(table: &TranslationTable, addr: Ipv6Addr) -> Option<Ipv4Addr> {
         .and_then(|(_, mapping)| mapping.alias4)
         .or_else(|| table.lan6_to_lan4(addr).map(|(lan4, _)| lan4))
         .or_else(|| native6_to_4(table, addr).map(|(_, alias)| alias))
+}
+
+/// The start of `packet`'s allocation (its headroom).
+fn allocation(packet: &PacketBuf) -> *const u8 {
+    packet.as_packet().as_ptr().wrapping_sub(packet.headroom())
 }
 
 /// The source and destination of an IPv4 packet, if it holds a full header.

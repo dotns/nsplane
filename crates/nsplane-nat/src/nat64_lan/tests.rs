@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use nsplane::{PacketSink, PacketSource};
 use nsplane_packet::{PacketBatch, PacketBuf, PeerId, protocol};
+use tokio::sync::watch;
 
 use super::*;
 use crate::checksum::{
@@ -982,4 +983,49 @@ async fn source_reverses_in_order_and_keeps_the_mtu() {
     assert_eq!(*source.mtu().borrow(), 1280);
     let stats = nat.stats();
     assert_eq!((stats.reversed, stats.not_ours), (1, 1));
+}
+
+/// Keeps every buffer it is handed back.
+struct PoolSource {
+    pool: Arc<Mutex<Vec<PacketBuf>>>,
+    mtu: watch::Sender<u16>,
+}
+
+impl PacketSource for PoolSource {
+    async fn recv(&mut self) -> std::io::Result<PacketBuf> {
+        std::future::pending().await
+    }
+
+    fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
+        self.pool.lock().unwrap().append(bufs);
+    }
+
+    fn mtu(&self) -> watch::Receiver<u16> {
+        self.mtu.subscribe()
+    }
+}
+
+#[test]
+fn source_recycle_reaches_inner() {
+    let pool = Arc::new(Mutex::new(Vec::new()));
+    let inner = PoolSource {
+        pool: Arc::clone(&pool),
+        mtu: watch::channel(1420).0,
+    };
+    let mut source = Nat64LanSource::new(inner, Arc::new(lan()));
+    let mut bufs = vec![
+        PacketBuf::with_capacity(2048),
+        PacketBuf::with_capacity(4096),
+    ];
+    bufs[0].extend_from_slice(&[1]);
+    bufs[1].extend_from_slice(&[2]);
+    let identity = |buf: &PacketBuf| (buf.as_packet().as_ptr(), buf.capacity());
+    let handed: Vec<_> = bufs.iter().map(identity).collect();
+    source.recycle(&mut bufs);
+    assert!(bufs.is_empty());
+    let pool = pool.lock().unwrap();
+    assert_eq!(pool.iter().map(identity).collect::<Vec<_>>(), handed);
+    assert!(pool[0].capacity() >= 2048 && pool[1].capacity() >= 4096);
+    let pooled: Vec<_> = pool.iter().map(PacketBuf::as_packet).collect();
+    assert_eq!(pooled, [&[1][..], &[2]]);
 }

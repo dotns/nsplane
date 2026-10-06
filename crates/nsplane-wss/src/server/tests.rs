@@ -598,6 +598,34 @@ async fn silent_peer_ends_the_session_after_the_read_idle() {
     assert!(started.elapsed() >= std::time::Duration::from_millis(300));
 }
 
+/// With pings off the session sends no ping over many would-be intervals, and a silent
+/// peer still ends it after the read idle.
+#[tokio::test]
+async fn pings_off_sends_no_ping_and_keeps_the_read_idle() {
+    let (ours, mut peer) = ws_pair().await;
+    let (session, queues) = new_session(WssServerLimits::default(), Allow::with(&[]));
+    // Six would-be 50 ms intervals before the read idle.
+    let config = config()
+        .keepalive(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(300),
+        )
+        .ping_interval(None);
+    let started = Instant::now();
+    let run = spawn_session(session, queues, ours, config, std::future::pending());
+    // The peer reads (without writing) until the session closes the socket.
+    let mut received = Vec::new();
+    while let Some(Ok(message)) = timeout(WAIT, peer.next()).await.unwrap() {
+        received.push(message);
+    }
+    assert!(!timeout(WAIT, run).await.unwrap().unwrap());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    assert!(
+        !received.iter().any(|m| matches!(m, Message::Ping(_))),
+        "{received:?}"
+    );
+}
+
 /// ns `session_stays_up_while_peer_pongs`.
 #[tokio::test]
 async fn session_stays_up_while_the_peer_pongs() {

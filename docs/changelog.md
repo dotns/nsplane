@@ -140,3 +140,11 @@ campaigns OE, ON, OH). Quiet harness against 0.9.0 main: default 9.60 / 10.39 ->
 11.38 Gbit/s (1 / 4 TCP streams), two crypto workers 8.39 / 8.58 -> 11.67 / 12.65, sender CPU
 1.24 -> 0.94 s/GB; netstack 6.21 / 2.48 -> 6.85 / 7.29. Next: the deferred ns requests (MF-4,
 MF-5, MW-7, MB-x7, MQ-17) and the round's follow-ups.
+
+## 2026-10-06 13:00 [decision]
+
+ADR `2026-10-06-business-agnostic-scope` (owner): nsplane stays a business-agnostic data
+plane that ns and other products use. The ACL works on flows, opaque labels and rule IDs, and
+product policy is compiled above it. nsgw's requests (docs site `nsgw/next.md` L2, L4, L5, L6)
+are recorded in generic form in task `20261006-1300-nsgw-requests`, with what is not planned
+and why.
