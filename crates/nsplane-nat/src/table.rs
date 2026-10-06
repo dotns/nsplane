@@ -13,7 +13,9 @@
 //! packets. It is immutable once built and validated by
 //! [`TranslationTableBuilder::build`].
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nsplane_packet::PeerId;
@@ -120,16 +122,18 @@ pub struct TranslationTable {
     // The address indexes hold a copy of the mapping: one hash lookup per
     // translated packet instead of two.
     by_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
-    by_alias6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
-    by_node4: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
-    by_node6: HashMap<Ipv6Addr, (PeerId, PeerMapping)>,
+    // The IPv6 indexes are keyed by the address bits and use the cheaper
+    // [`Ipv6State`] hash: the inbound path looks one up per packet.
+    by_alias6: Ipv6Map<(PeerId, PeerMapping)>,
+    by_node4: Ipv6Map<(PeerId, PeerMapping)>,
+    by_node6: Ipv6Map<(PeerId, PeerMapping)>,
     by_native_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
     native_alias4: HashMap<PeerId, Ipv4Addr>,
     self_mapping: Option<SelfMapping>,
     /// LAN pairs sorted by `start4`, non-overlapping.
     lans: Vec<Lan>,
     /// `lan6` prefix to index into `lans`.
-    by_lan6: HashMap<u128, usize>,
+    by_lan6: Ipv6Map<usize>,
 }
 
 impl TranslationTable {
@@ -153,21 +157,21 @@ impl TranslationTable {
     /// Returns the peer whose `alias6` is `addr`.
     pub fn by_alias6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_alias6
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node4` is `addr` (the self mapping is not included).
     pub fn by_node4(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_node4
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
     /// Returns the peer whose `node6` is `addr`.
     pub fn by_node6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
         self.by_node6
-            .get(&addr)
+            .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
@@ -313,11 +317,15 @@ impl TranslationTableBuilder {
             }
             unique6(mapping.node6)?;
             unique6(mapping.node4)?;
-            table.by_node6.insert(mapping.node6, (id, mapping));
-            table.by_node4.insert(mapping.node4, (id, mapping));
+            table
+                .by_node6
+                .insert(mapping.node6.to_bits(), (id, mapping));
+            table
+                .by_node4
+                .insert(mapping.node4.to_bits(), (id, mapping));
             if let Some(alias6) = mapping.alias6 {
                 unique6(alias6)?;
-                table.by_alias6.insert(alias6, (id, mapping));
+                table.by_alias6.insert(alias6.to_bits(), (id, mapping));
             }
             if let Some(alias4) = mapping.alias4 {
                 unique4(alias4)?;
@@ -364,6 +372,104 @@ impl TranslationTableBuilder {
         }
         Ok(table)
     }
+}
+
+/// A map keyed by IPv6 address bits, hashed with [`Ipv6State`].
+type Ipv6Map<V> = HashMap<u128, V, Ipv6State>;
+
+/// Odd multiplier with well-spread bits (PCG's).
+const MULTIPLE: u64 = 0x5851_f42d_4c95_7f2d;
+
+/// Builds [`Ipv6Hasher`]s keyed with two random words, a cheaper hash than
+/// std's `SipHash` for the 16-byte IPv6 keys looked up per packet.
+///
+/// The keys are addresses an attacker chooses, so the hash is keyed: every
+/// map draws two fresh random words from std's [`RandomState`] when it is
+/// created and never exposes them (neither type implements `Debug`). A key is mixed
+/// with one keyed 64x64->128-bit multiply whose halves are folded (the
+/// wyhash / foldhash construction), and the result once more. Hash flooding cannot
+/// grow a chain from traffic anyway: the maps are filled only from the
+/// operator's model when a table is built, and packets only look them up, so
+/// the worst-case chain length is bounded by the model.
+#[derive(Clone, Copy)]
+struct Ipv6State {
+    seed: u64,
+    pad: u64,
+}
+
+impl Default for Ipv6State {
+    /// A state keyed with random words derived from a fresh std
+    /// [`RandomState`] (each one is keyed differently).
+    fn default() -> Self {
+        let random = RandomState::new();
+        Self {
+            seed: random.hash_one(0_u8),
+            pad: random.hash_one(1_u8) | 1,
+        }
+    }
+}
+
+impl BuildHasher for Ipv6State {
+    type Hasher = Ipv6Hasher;
+
+    fn build_hasher(&self) -> Ipv6Hasher {
+        Ipv6Hasher {
+            buffer: self.seed,
+            pad: self.pad,
+        }
+    }
+}
+
+/// The hasher of [`Ipv6State`].
+#[derive(Clone)]
+struct Ipv6Hasher {
+    buffer: u64,
+    pad: u64,
+}
+
+impl Ipv6Hasher {
+    fn mix(&mut self, word: u64) {
+        self.buffer = folded_multiply(word ^ self.buffer, MULTIPLE);
+    }
+}
+
+impl Hasher for Ipv6Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.mix(u64::from_le_bytes(*word));
+        }
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            // The length keeps a short tail distinct from its zero padding.
+            word[7] = u8::try_from(rest.len()).unwrap_or(u8::MAX);
+            self.mix(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    /// The map keys: both halves go through one keyed multiply.
+    fn write_u128(&mut self, value: u128) {
+        let low = u64::try_from(value & u128::from(u64::MAX)).unwrap_or(0);
+        let high = u64::try_from(value >> 64).unwrap_or(0);
+        self.buffer = folded_multiply(low ^ self.buffer, high ^ self.pad);
+    }
+
+    fn finish(&self) -> u64 {
+        folded_multiply(self.buffer, self.pad)
+    }
+}
+
+/// The high and low halves of the full product, folded.
+fn folded_multiply(a: u64, b: u64) -> u64 {
+    let full = u128::from(a) * u128::from(b);
+    let low = u64::try_from(full & u128::from(u64::MAX)).unwrap_or(0);
+    let high = u64::try_from(full >> 64).unwrap_or(0);
+    low ^ high
 }
 
 /// Checks the shape of one LAN prefix pair and converts it to lookup form.
@@ -800,5 +906,60 @@ mod tests {
             TableError::InvalidLan4(v4("10.0.0.1"), 8).to_string(),
             "invalid LAN IPv4 prefix 10.0.0.1/8"
         );
+    }
+
+    fn hash(state: &Ipv6State, addr: Ipv6Addr) -> u64 {
+        state.hash_one(addr.to_bits())
+    }
+
+    #[test]
+    fn ipv6_hash_is_keyed_per_table() {
+        let (one, two) = (sample(), sample());
+        let (a, b) = (one.by_node6.hasher(), two.by_node6.hasher());
+        assert_ne!((a.seed, a.pad), (b.seed, b.pad));
+        let addr = v6("fd00::1");
+        assert_ne!(hash(a, addr), hash(b, addr));
+        // A clone keeps its keys, so its lookups still find the entries.
+        let clone = one.clone();
+        assert_eq!(hash(clone.by_node6.hasher(), addr), hash(a, addr));
+        assert_eq!(
+            clone.by_node6(mapping(1).node6),
+            one.by_node6(mapping(1).node6)
+        );
+    }
+
+    #[test]
+    fn ipv6_hash_is_deterministic_per_state() {
+        let state = Ipv6State::default();
+        let addr = v6("2001:db8::42");
+        assert_eq!(hash(&state, addr), hash(&state, addr));
+        assert_ne!(hash(&state, addr), hash(&state, v6("2001:db8::43")));
+        // Byte input goes through `write`, also deterministically.
+        assert_eq!(state.hash_one(addr), state.hash_one(addr));
+    }
+
+    #[test]
+    fn ipv6_hash_spreads_sequential_addresses() {
+        // 4096 addresses that differ in a few low bits, as one LAN or a
+        // block of node addresses does. A uniform hash puts 64 in each of 64
+        // buckets (sd 8); the bounds are 5 sd wide.
+        let state = Ipv6State::default();
+        let base = v6("fd00:1:2:3::").to_bits();
+        let hashes: Vec<u64> = (0..4096_u128)
+            .map(|n| state.hash_one(base | (n << 64) | n))
+            .collect();
+        let unique: HashSet<u64> = hashes.iter().copied().collect();
+        assert_eq!(unique.len(), hashes.len());
+        // Low bits pick a bucket, the top 7 bits are hashbrown's tag.
+        for shift in [0, 57] {
+            let mut buckets = [0_u32; 64];
+            for hash in &hashes {
+                buckets[usize::try_from((hash >> shift) & 63).unwrap()] += 1;
+            }
+            assert!(
+                buckets.iter().all(|&count| (24..=104).contains(&count)),
+                "shift {shift}: {buckets:?}"
+            );
+        }
     }
 }
