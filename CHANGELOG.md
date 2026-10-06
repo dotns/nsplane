@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- nsplane-tun: `TunSource::name` and `TunSink::name` return the created interface name after
+  `split` (MT-4): queried from the device like `Tun::name`, so a `"tun%d"` or `"utun"` pattern
+  yields the kernel-assigned name; an adopted fd that is not a TUN device yields the query's
+  OS error.
+- nsplane-tun (Windows): `Tun::create_with(name, TunOptions)` with the service TUN checks
+  (MT-3): `TunOptions::wintun_pin(WintunPin)` hashes `wintun.dll` (SHA-256, at the pin's path,
+  default next to the executable) before loading that same path and optionally checks the
+  running driver version; `exclusive(true)` refuses an existing adapter or interface of the
+  same name; `mtu(n)` sets the interface MTU and `Tun::mtu` reports the read-back value;
+  `offload` is accepted and ignored. Refusals are `WintunError` (`HashMismatch`,
+  `DriverVersionMismatch`, `AdapterExists`) inside the `io::Error`. `Tun::create` is unchanged.
+
 ## [0.10.0] - 2026-10-05
 
 The optimization round (plan `20261004-1730-optimization`). Engine and devices: source
