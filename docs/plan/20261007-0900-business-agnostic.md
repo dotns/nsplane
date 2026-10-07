@@ -61,3 +61,8 @@ nsplane-kernel for F1.
   WebSockets. Each session is a synthetic, never-reused endpoint in 100::/64 (RFC 6666). Replies
   follow the engine's existing roaming on authenticated messages (no nsplane hook). Queues are
   bounded per session, and `max_sessions` has a finite default.
+- 2026-10-07: AC design note `docs/specs/acl-generic-api.md` approved. It adds labels, rule IDs,
+  `RuleSet`, `PolicyState`/`NotInstalled` and `Flow`-based evaluation, and the generic `gate`
+  (scopes, bindings by PeerId, label grants, unbound pass/divert, holds; IPv4-only), with a
+  22-row ns compile table. Q1-Q8 go as recommended. Two deviations are accepted and documented in
+  node-l3.md: divert currency within one gate generation, and no unknown-peer drop in the gate.
