@@ -1,7 +1,7 @@
 use super::*;
 use std::net::IpAddr;
 
-// ── Encode/decode roundtrips (ns tunnel-ws frame/tests.rs) ─────────────────
+// ── Encode/decode roundtrips ──────────────────────────────────────────────
 
 fn roundtrip(frame: &WsFrame) -> WsFrame {
     WsFrame::decode(&frame.encode()).unwrap()
@@ -136,9 +136,9 @@ fn data_frame_with_empty_payload_roundtrips() {
     assert!(decoded.payload.is_empty());
 }
 
-// ── Wire vectors: exact bytes, as ns encodes them ─────────────────────────
+// ── Wire vectors: exact bytes of the reference encoding ───────────────────
 
-/// ns `proxy/wire.rs` `build_open_frame`, extended to IPv6 as `tunnel-ws` encodes it.
+/// The reference bytes of an OPEN frame, IPv4 or IPv6.
 fn ns_open(stream_id: u32, target_ip: IpAddr, target_port: u16, proto: u8) -> Vec<u8> {
     let mut frame = Vec::with_capacity(24);
     frame.extend_from_slice(&stream_id.to_be_bytes());
@@ -157,7 +157,7 @@ fn ns_open(stream_id: u32, target_ip: IpAddr, target_port: u16, proto: u8) -> Ve
     frame
 }
 
-/// ns `proxy/wire.rs` `build_data_frame`.
+/// The reference bytes of a DATA frame.
 fn ns_data(stream_id: u32, data: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(5 + data.len());
     frame.extend_from_slice(&stream_id.to_be_bytes());
@@ -166,7 +166,7 @@ fn ns_data(stream_id: u32, data: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// ns `proxy/wire.rs` `build_close_frame`, and the `CLOSE_ACK` `tunnel-ws` sends.
+/// The reference bytes of a CLOSE or `CLOSE_ACK` frame.
 fn ns_close(stream_id: u32, cmd: u8) -> Vec<u8> {
     let mut frame = Vec::with_capacity(5);
     frame.extend_from_slice(&stream_id.to_be_bytes());
@@ -174,7 +174,7 @@ fn ns_close(stream_id: u32, cmd: u8) -> Vec<u8> {
     frame
 }
 
-/// Every command encodes to the exact bytes of the ns frame vectors, and those bytes
+/// Every command encodes to the exact bytes of the reference vectors, and those bytes
 /// decode back to the frame.
 #[test]
 fn wire_vectors_match_ns() {
@@ -217,7 +217,7 @@ fn wire_vectors_match_ns() {
     }
 }
 
-/// The codec agrees with the ns builders over ids, addresses, ports and protocols.
+/// The codec agrees with the reference builders over ids, addresses, ports and protocols.
 #[test]
 fn encoding_matches_the_ns_builders() {
     let ips = [
@@ -246,7 +246,7 @@ fn encoding_matches_the_ns_builders() {
     }
 }
 
-/// Decoding is as lenient as ns: any protocol byte but 1 is TCP, bytes after a complete
+/// Decoding is lenient: any protocol byte but 1 is TCP, bytes after a complete
 /// OPEN or CLOSE are ignored, and a DATA payload shares the message buffer.
 #[test]
 fn decoding_is_as_lenient_as_ns() {
@@ -271,7 +271,7 @@ fn decoding_is_as_lenient_as_ns() {
     assert_eq!(decoded.payload.as_ptr(), message[HEADER_LEN..].as_ptr());
 }
 
-/// The payload of a non-DATA frame is not encoded, as in ns.
+/// The payload of a non-DATA frame is not encoded.
 #[test]
 fn only_data_frames_carry_a_payload() {
     let mut frame = WsFrame::close(1);
