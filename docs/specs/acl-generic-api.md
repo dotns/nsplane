@@ -644,7 +644,8 @@ Tests and fixtures:
 
 - `tests/crates_acl_parity.rs` and `tests/fixtures/crates_acl_parity.json`. They move to
   the product side through the AG-3 spec `docs/specs/acl-policy-document.md`, which keeps
-  the fixture under `docs/specs/fixtures/` together with the rule compilation (4.2).
+  the fixture as `docs/specs/data/acl-crates-acl-parity.json` together with the rule
+  compilation (4.2).
 
 Docs:
 
@@ -1205,7 +1206,7 @@ changes.
   - `src/namespace.rs` (`rules`, typed `OutboundRule` and `Grant`);
   - `src/differential.rs` (typed rules, the old-preset configuration);
   - `tests/crates_acl_parity.rs` and its fixture deleted. The fixture moves to
-    `docs/specs/fixtures/acl/crates_acl_parity.json`;
+    `docs/specs/data/acl-crates-acl-parity.json`;
   - `benches/namespaces.rs` (`stateless/*`), `benches/node_l3.rs`;
   - e2e `acl.rs` (`AclTest` cases become `RuleSet::matching` cases), `acl_hook.rs`,
     `acl_namespaces.rs`, `acl_parity.rs` (renamed `acl_options.rs`, with the options set
@@ -1236,11 +1237,11 @@ changes.
     revalidation). `projection.rs` and `subnet.rs` are deleted, and `clock.rs` and
     `hash.rs` are kept;
   - the tests under `src/gate/tests/` (5.3). `fixtures/differential.json` moves to
-    `docs/specs/fixtures/acl/node_l3_differential.json`;
+    `docs/specs/data/node-l3-differential.json`;
   - `benches/node_l3.rs` -> `benches/gate.rs`, and the `[[bench]]` entry in
     `crates/nsplane-acl/Cargo.toml`;
   - e2e `node_l3.rs` -> `flow_gate.rs`.
-- **Spec**: `docs/specs/acl-node-l3.md`. It covers the 5.2 table in full: label scheme,
+- **Spec**: `docs/specs/node-l3.md`. It covers the 5.2 table in full: label scheme,
   grant ids, holds derivation, divert, subnet queries, readiness, and reason and counter
   mapping, plus the fixture.
 - **Generic tests**: 5.3.
