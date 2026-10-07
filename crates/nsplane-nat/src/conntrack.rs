@@ -247,7 +247,7 @@ impl Conntrack {
     /// or removed by [`retain`](Self::retain) or [`remove`](Self::remove).
     /// Replaces an earlier hook.
     ///
-    /// The hook runs under the table lock, so it must be quick and must not
+    /// The hook runs under the table lock, so it must be fast and must not
     /// call back into this `Conntrack` (that would deadlock). Without a hook
     /// a removal costs one `Option` check more.
     #[must_use]

@@ -1,5 +1,5 @@
-//! The session tests of ns `tunnel-ws` (dispatch, lifecycle, and the behavior its logging
-//! test exercises), ported to the server with a test resolver for ns's policy.
+//! The session tests of the server: dispatch and lifecycle, with a test resolver for the
+//! policy.
 
 use super::*;
 use crate::WssTls;
@@ -165,9 +165,9 @@ fn zero_queues_and_stream_maximum_are_refused() {
     assert!(!server.stats().connected());
 }
 
-/// ns `payload_queue_enforces_and_releases_byte_budgets`: a frame over the stream or the
-/// session budget closes its stream and charges nothing; a queued frame costs its payload
-/// plus the frame overhead on both budgets until it is taken.
+/// A frame over the stream or the session budget closes its stream and charges nothing; a
+/// queued frame costs its payload plus the frame overhead on both budgets until it is
+/// taken.
 #[test]
 fn payload_queue_enforces_and_releases_byte_budgets() {
     let limits = WssServerLimits::default().stream_buffer(FRAME_OVERHEAD + 3);
@@ -221,7 +221,7 @@ fn stream_queue_caps_frames_including_empty_ones() {
     assert_eq!(session.stats.buffered(), 2 * FRAME_OVERHEAD);
 }
 
-/// ns `saturated_stream_closes_without_blocking_another_stream`.
+/// A saturated stream closes without blocking another stream.
 #[tokio::test]
 async fn saturated_stream_closes_without_blocking_another_stream() {
     let limits = WssServerLimits::default().session_buffer(FRAME_OVERHEAD + 3);
@@ -238,8 +238,7 @@ async fn saturated_stream_closes_without_blocking_another_stream() {
     assert_eq!(healthy.recv().await.unwrap().payload, &b"ok"[..]);
 }
 
-/// ns `open_denied_by_services_sends_close_frame`: the resolver's denial is answered with
-/// CLOSE and leaves no stream; no event reports it.
+/// The resolver's denial is answered with CLOSE and leaves no stream; no event reports it.
 #[tokio::test]
 async fn open_denied_sends_close_frame() {
     let (session, mut queues, mut events) = with_events(
@@ -257,7 +256,7 @@ async fn open_denied_sends_close_frame() {
     assert!(events.try_recv().is_err());
 }
 
-/// ns `duplicate_open_sends_close_without_replacing_stream`.
+/// A duplicate OPEN is answered with CLOSE and does not replace the stream.
 #[tokio::test]
 async fn duplicate_open_sends_close_without_replacing_stream() {
     let (session, mut queues) = new_session(WssServerLimits::default(), Allow::with(&[]));
@@ -275,7 +274,7 @@ async fn duplicate_open_sends_close_without_replacing_stream() {
     );
 }
 
-/// ns `stream_limit_sends_close_without_registering_stream`.
+/// An OPEN over the stream limit is answered with CLOSE and registers no stream.
 #[tokio::test]
 async fn stream_limit_sends_close_without_registering_stream() {
     let limits = WssServerLimits::default().max_streams(3);
@@ -292,9 +291,8 @@ async fn stream_limit_sends_close_without_registering_stream() {
     assert_eq!(session.stats.streams_refused(), 1);
 }
 
-/// ns `open_allowed_by_services_does_not_send_close` and
-/// `later_open_reads_the_latest_shared_services_snapshot`: an allowed OPEN sends no CLOSE
-/// on its own, and each OPEN asks the resolver as it is then.
+/// An allowed OPEN sends no CLOSE on its own, and each OPEN asks the resolver as it is
+/// then.
 #[tokio::test]
 async fn allowed_open_relays_and_later_opens_see_the_latest_policy() {
     let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -328,7 +326,7 @@ async fn allowed_open_relays_and_later_opens_see_the_latest_policy() {
 }
 
 /// Every CLOSE is acknowledged, known or not; a `CLOSE_ACK` or DATA for an unknown id
-/// changes nothing (ns logging test: DATA for an unknown stream registers nothing).
+/// changes nothing (DATA for an unknown stream registers nothing).
 #[test]
 fn unknown_ids_and_invalid_frames() {
     let (session, mut queues) = new_session(WssServerLimits::default(), Allow::with(&[]));
@@ -562,7 +560,7 @@ fn spawn_session(
     })
 }
 
-/// ns `session_peer_close_runs_cleanup`.
+/// The peer's close ends the session and runs its cleanup.
 #[tokio::test]
 async fn peer_close_ends_the_session() {
     let (ours, mut peer) = ws_pair().await;
@@ -572,7 +570,7 @@ async fn peer_close_ends_the_session() {
     assert!(!timeout(WAIT, run).await.unwrap().unwrap());
 }
 
-/// ns `session_eof_runs_cleanup`.
+/// The end of the socket ends the session and runs its cleanup.
 #[tokio::test]
 async fn eof_ends_the_session() {
     let (ours, mut peer) = ws_pair().await;
@@ -582,8 +580,7 @@ async fn eof_ends_the_session() {
     assert!(!timeout(WAIT, run).await.unwrap().unwrap());
 }
 
-/// ns `session_silent_half_open_triggers_idle_timeout`: a peer that never answers ends
-/// the session after the read idle.
+/// A peer that never answers ends the session after the read idle.
 #[tokio::test]
 async fn silent_peer_ends_the_session_after_the_read_idle() {
     let (ours, _peer) = ws_pair().await;
@@ -626,7 +623,7 @@ async fn pings_off_sends_no_ping_and_keeps_the_read_idle() {
     );
 }
 
-/// ns `session_stays_up_while_peer_pongs`.
+/// The session stays up while the peer answers pings.
 #[tokio::test]
 async fn session_stays_up_while_the_peer_pongs() {
     let (ours, mut peer) = ws_pair().await;
@@ -646,8 +643,7 @@ async fn session_stays_up_while_the_peer_pongs() {
     pump.abort();
 }
 
-/// ns `session_shutdown_clears_registry_and_drains_idle_relay` and its UDP twin: a
-/// shutdown ends the relays (each reported closed), empties the table and closes the
+/// A shutdown ends the relays (each reported closed), empties the table and closes the
 /// socket.
 #[tokio::test]
 async fn shutdown_closes_every_stream_and_the_session() {
@@ -713,7 +709,7 @@ async fn shutdown_closes_every_stream_and_the_session() {
     assert!(ended);
 }
 
-/// ns logging test: a shutdown that is already done ends the run at once.
+/// A shutdown that is already done ends the run at once.
 #[tokio::test]
 async fn completed_shutdown_ends_the_run_at_once() {
     let (ours, _peer) = ws_pair().await;

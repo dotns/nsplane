@@ -44,26 +44,20 @@ where it is described below.
 | Crate | Entry points | Supporting types |
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`), `noise::rate_limiter::RateLimiter`, `x25519` keys | `TunnResult`, `noise::errors::WireGuardError` |
-| `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
-| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`), `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
-| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
-| `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 | `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `reasons` |
 | `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
-| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
+| `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
+| `nsplane-wss` (server transport) | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; identity `PeerIdentity`, `PeerLabelMap`; namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
-| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; identity `PeerIdentity`, `PeerLabelMap`; namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
-| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_native_alias4`) / `TranslationTable` (`native_alias4`, `by_native_alias4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
+| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_peer6_eam4`) / `TranslationTable` (`peer6_eam4`, `by_peer6_eam4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `with_endpoint_tries`, `endpoint_in_use`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig` (`recheck_route_on_forward`), `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
 
-ACL labels per source address, the ns `crates/acl` mode and inbound destinations add:
+ACL labels per source address, the `crates_acl` filter mode and inbound destinations add:
 `nsplane-acl` `PeerIdentity::labels_for` / `by_source`, `PeerLabelMap::insert_by_source`,
 `AclFilterConfig::crates_acl` with the fields `fragments` (`FragmentMode`, `ALLOW_ONLY`),
 `accept_to_local`, `accept_icmp_echo_reply` and `ipv6` (`Ipv6Mode`), and
@@ -81,8 +75,7 @@ crate root. Checksums are always computed (a zero UDP checksum goes out as `0xFF
 gets IHL 5, DF and TTL 64, IPv6 hop limit 64 and no extension headers; the family follows
 the socket addresses (an IPv4-mapped address in a `SocketAddr::V6` builds IPv6). Mixed
 families and payloads beyond the length fields are a `UdpBuildError` and leave the buffer
-unchanged. Ported from ns's control-message builder; nothing calls it unless the application
-does.
+unchanged. Nothing calls it unless the application does.
 
 `nsplane-packet::pool::SharedPacketPool` (re-exported at the crate root and by `nsplane`) is a
 bounded free list of packet buffers shared by producers and a source, for the local side's
@@ -835,7 +828,7 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - An upgrade answered with any HTTP response (no 101) fails the dial with a public
   `WssDialError` inside the `io::Error` (`get_ref()` + `downcast_ref`): `status`, the
   response `headers` (non-UTF-8 values lossily) and the start of the `body`, the bytes
-  that arrived with the head up to `WssDialError::MAX_BODY` (512, ns's log cut). The kind
+  that arrived with the head up to `WssDialError::MAX_BODY` (512). The kind
   and message are unchanged: `PermissionDenied`, "wss upgrade rejected with HTTP {status}"
   for 401/403; `Other`, "wss connect failed: HTTP error: {status}" otherwise. Stream
   client opens waiting behind that dial get a copy with the detail.
@@ -853,7 +846,7 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
   capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
   (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
-  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. A zero
+  (`WssConfig::keepalive`). A zero
   `ping_interval` (`WssConfig::ping_interval(None)`) sends no pings: the dialer spawns no
   ping task and the session writers never wake for one; the read idle stays. No message
   above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
@@ -869,16 +862,16 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
   takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
   default protocol versions and no client auth); `WssTls::Config` takes a complete
-  `Arc<rustls::ClientConfig>` used as is (ns passes its `control::tls::client_config()`).
+  `Arc<rustls::ClientConfig>` used as is (an application with its own TLS setup passes it).
   Built-in roots may become an optional feature later if a consumer needs them.
 
 **Datagram carrier.** `WssDialer` is a `LinkDialer`: `into_transport(id, peer, config)`
 returns a `LinkTransport` whose links are WSS connections. Each datagram is one binary
-message carrying its raw bytes (the wire of ns `OpaquePump` and the examples' relay); text
+message carrying its raw bytes (the wire of the examples' relay); text
 messages and messages above `MAX_DATAGRAM` (65 535) are dropped and counted in
 `WssStats`, a close frame or the end of the stream ends the link.
 
-**Stream carrier wire.** `WsFrame` (module `frame`) is ns `tunnel-ws`'s and NSGW's protocol,
+**Stream carrier wire.** `WsFrame` (module `frame`) is an existing stream relay protocol, kept
 byte for byte: every binary message is one frame, big-endian.
 
 | Field / command | Bytes | Content |
@@ -891,33 +884,31 @@ byte for byte: every binary message is one frame, big-endian.
 | `CLOSE` (`0x20`) | 0 | close the stream |
 | `CLOSE_ACK` (`0x21`) | 0 | acknowledge a CLOSE |
 
-As in ns, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
+As in that protocol, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
 byte but `0x01` is TCP. The protocol has no open reply and no flow control: a refused
 OPEN is answered with CLOSE, and a stream whose peer outruns its receive budget is closed.
 
-**Stream client.** `WssStreamClient` (the client leg, ns `proxy/wire.rs` and
-`wss_flow.rs`) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
+**Stream client.** `WssStreamClient` (the client leg) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
 `AsyncWrite`) and UDP flows (`open_udp`, a `WssUdpFlow` with `send` / `recv`) to targets
-behind a terminate (NSGW, or `WssStreamServer`).
+behind a stream server (`WssStreamServer`, or any other server of the protocol).
 
 - Sessions: dialed lazily on the first open (or `connect`). Every TCP stream and UDP flow
   is multiplexed over one session until it holds
-  `WssStreamLimits::max_streams_per_session` live ones (default 1024, NSGW's default
-  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time,
+  `WssStreamLimits::max_streams_per_session` live ones (default 1024); only then is one more session dialed. One dial runs at a time,
   in a task of its own (one per dial, not per open), and waiting opens share its outcome;
   an open dropped while it waits therefore loses neither the backoff nor the 401 token
-  wait, and never starts a second dial. The wire format is ns's, unchanged. NSGW caveats: it rejects
-  OPENs beyond its own per-session cap, which its operator can set below 1024 (keep
-  `max_streams_per_session` at most the gateway's cap), and it writes all streams of a
+  wait, and never starts a second dial. The wire format is unchanged. Server caveats: a server may reject
+  OPENs beyond its own per-session cap, which can be below 1024 (keep
+  `max_streams_per_session` at most the server's cap), and may write all streams of a
   session through one shared writer queue.
 - Stream ids count up from 1 per session, skipping ids still in use; an id stays in use
   until the peer's CLOSE or `CLOSE_ACK`. An open returns once its OPEN is queued.
 - Half-close: `shutdown` sends CLOSE behind the data already written (the wire has no
   other half-close) and the stream keeps reading until the peer's CLOSE or `CLOSE_ACK`,
-  then reads EOF; this matches the ns terminate and `WssStreamServer`, which drain the
+  then reads EOF; this matches `WssStreamServer`, which drains the
   stream to the backend before ending it. A peer's CLOSE reads as EOF after the bytes
   before it and is answered with `CLOSE_ACK`; dropping a stream sends CLOSE.
-- Queues and bounds (`WssStreamLimits`, ns's defaults): a control queue (OPEN,
+- Queues and bounds (`WssStreamLimits`): a control queue (OPEN,
   `CLOSE_ACK`, reset CLOSE, pings; 64 messages) written before the data queue (DATA and
   orderly CLOSE; 256 messages), and receive budgets of 4 MiB per stream
   (`stream_buffer`) and 32 MiB per session (`session_buffer`), each received frame
@@ -933,13 +924,13 @@ behind a terminate (NSGW, or `WssStreamServer`).
   on it fails; the next open dials again after `reconnect_delay` (or the backoff). Frames
   for unknown stream ids are ignored and counted in `WssStreamStats`.
 
-**Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
+**Server leg.** `WssStreamServer` dials the
 relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
 
 - Resolution is the embedder's: `WssResolver::resolve(WssOpen { session, stream_id,
   target, protocol })` returns the backend `SocketAddr` or `Denied` (answered with CLOSE).
-  It runs on the stream's own task, so a slow answer delays only that stream. ns keeps its
-  resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) behind it.
+  It runs on the stream's own task, so a slow answer delays only that stream. Name
+  resolution, access control and identity checks stay the embedder's, behind it.
 - An OPEN for an id in use, or beyond `max_streams` (1024), is answered with CLOSE. The
   server connects a TCP stream or a connected UDP socket (bound to the backend's address
   family) and relays: TCP bytes in DATA frames of at most `MAX_DATA_PAYLOAD`, one datagram
@@ -948,7 +939,7 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   to the backend, then its write side is shut. A backend EOF sends CLOSE behind the
   stream's data; a failed connect, a backend error (a failed UDP receive included) sends
   CLOSE at once.
-- Queues and bounds (`WssServerLimits`, ns's defaults): 4 MiB per stream
+- Queues and bounds (`WssServerLimits`): 4 MiB per stream
   (`stream_buffer`), 32 MiB per session (`session_buffer`), 64 frames per stream
   (`stream_queue`), each received frame costing its payload plus 64 bytes until written;
   a frame over a bound closes its stream only (`WssCloseReason::Overflow`). Control queue
@@ -961,19 +952,16 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   closed (`WssCloseReason::SessionEnded`) and the next session is dialed after
   `reconnect_delay` (or the backoff); a shutdown closes the open streams and the session.
 
-ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
-here, ns can delete `tunnel-ws` whole.
-
-**Deviations from ns.** An orderly CLOSE is queued behind the stream's data on both legs.
+**Deviations from the original implementation.** An orderly CLOSE is queued behind the stream's data on both legs.
 Client: an over-budget UDP datagram is dropped and the flow kept, and the receive budgets
-count payload plus 64 bytes per frame instead of ns's 64-message cap per stream. Server:
-on a peer's CLOSE the queued data is drained to the backend and its write side shut (ns
+count payload plus 64 bytes per frame instead of a 64-message cap per stream. Server:
+on a peer's CLOSE the queued data is drained to the backend and its write side shut (the original
 dropped it), the half-close the client relies on; a failed UDP backend receive sends
 CLOSE; the UDP socket binds to the backend's address family.
 
 **Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
 `crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
-relay (and a plain one for `ws://`) and checks the frames against the ns layouts;
+relay (and a plain one for `ws://`) and checks the frames against the reference layouts;
 `nsplane-e2e` `wss_datagram` runs two engines over `WssDialer` (401, 403, reconnect, read
 idle), `wss_plain` over `ws://`, `wss_dial_error` checks the `WssDialError` of a 401
 and a 503 (header, truncated body) from the dialer and the stream client,
@@ -983,6 +971,56 @@ the reconnect delay against the doubling backoff on both carriers, and `wss_stre
 the stream client's `open_timeout` (relay down, 403, relay coming up, and the default
 waiting open); `examples/tests/wss.rs` and the
 `relay-wss` cells of `just e2e-examples` run the examples' relay client on it.
+
+### Server transport
+
+`WssServerTransport` (module `accept`) is the server side of `WssDialer`'s links: a
+`Transport` over WebSocket sessions the embedder accepts. `WssServerTransport::new(id,
+WssServerConfig)` returns the transport and a `WssAcceptor` (`Clone`); the embedder runs
+the listener, TLS, its own request checks (path, token) and the upgrade with
+`WssAcceptor::ws_config()` (messages and frames up to `MAX_MESSAGE`), then calls
+`accept(ws)`. The crate does no authentication. The wire is the datagram carrier's: one
+binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and counted.
+
+- **Endpoints.** Each accepted session gets `[100::n]:0`: IPv6 in 100::/64 (RFC 6666
+  discard-only), `n` a 64-bit count of the sessions accepted, so an address is never
+  reused while the transport lives. Received datagrams carry `Path { transport: id,
+  addr, ecn: NotEct }`. A peer's endpoint in the engine's status and in UAPI shows such an
+  address; it names a session, not a host.
+- **Routing.** `nsplane` is unchanged: replies go to the engine's path, which roams on
+  authenticated messages (`StandardRoaming`), so they reach the session the peer last
+  authenticated on. A send to an address without a live session fails at once with
+  `NotConnected` (the engine counts `DROP_TRANSPORT_SEND_ERROR`, the transport
+  `sent_to_closed`). Between a session closing and the peer's redial, datagrams to that
+  peer are lost by design; WireGuard retransmits handshakes, and the peer's next
+  authenticated datagram on the new session moves its path.
+- **Tasks and queues.** One task per session reads, writes and pings. Outbound: a bounded
+  queue per session (`queue`, 256; 0 taken as 1) drained by that task; a full queue fails
+  `send` at once with `WouldBlock`, as `LinkTransport` does, counted in
+  `dropped_queue_full`. Inbound: one shared bounded channel (`inbound_queue`, 1024) feeds
+  `recv`; a session's reader waits for room, so a slow engine pushes back per session onto
+  TCP. Batch methods are the trait defaults.
+- **Lifecycle.** A close frame or end of stream (peer close), a read or write error, no
+  frame for `read_idle` (35 s; pongs count) or `WssSession::close` / dropping the transport
+  (local close) ends a session; except after an error it then tries a close frame for at
+  most 1 s. Pings go out every `ping_interval` (10 s; `None` sends none). Dropping the
+  `WssSession` handle does not close it. `max_sessions` (4096) bounds the open sessions:
+  `accept` beyond it fails with `ConnectionRefused` before any task starts, and after the
+  transport is dropped with `BrokenPipe`. Worst-case buffered memory is `max_sessions` x
+  `queue` x `MAX_DATAGRAM` plus `inbound_queue` x `MAX_DATAGRAM` (64 GiB + 64 MiB at the
+  defaults; about 1.5 GiB with WireGuard-sized datagrams).
+- **Counters.** `WssServerTransportStats`: active, accepted, refused (limit, closed),
+  closed by reason (idle, error, peer, local), rx/tx datagrams and bytes, dropped text,
+  oversized and queue-full, `sent_to_closed`; `WssSessionStats` per session (rx/tx,
+  drops).
+- **Tests.** `crates/nsplane-wss/src/accept/tests.rs`: a `WssDialer` link against the
+  transport over loopback `ws://`, and sessions over in-memory streams (distinct
+  addresses, sends to closed sessions, queue full, read idle and pings, dropped messages,
+  the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
+  `WssDialer`s against one engine on the transport: several nodes on distinct session
+  addresses, a server-side close and redial moving the endpoint, the transport next to a
+  `UdpTransport`, no endpoint takeover by garbage or an unknown key on another session,
+  and a session that stops reading without holding up the others.
 
 ## nsplane-tun
 
@@ -2056,26 +2094,28 @@ expiry granularity against timeouts of 30 s and more, but differs from ns's per-
 
 Packet filters for the engine's filter chain; they rewrite packets in place and keep no I/O.
 
-**Address model.** Every peer owns a /127 IPv6 group, `node6` (native) and `node4` (its IPv4
-side). This node presents a peer to local applications as an IPv4 alias (`alias4 <-> node4`)
-and optionally an IPv6 alias (`alias6 <-> node6`) and a native IPv4 alias (an IPv4 address
-translated to and from `node6`, quick-v2 `alias6(b)`); the node itself is `self4 <-> node4`, and
-IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the IPv4 address in the low 32 bits
-(`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
+**Address model.** The translator's addresses are explicit address mappings (EAM, RFC 7757).
+Every peer has its own IPv6 address on the tunnel, `peer6`, and an EAM `eam4 <-> eam6`: a
+local IPv4 address translated to and from the IPv6 side of the mapping. Optionally it also has
+a second EAM `peer6_eam4 <-> peer6` (a local IPv4 address translated to and from `peer6`) and
+a local IPv6 rewrite `local6 <-> peer6` (rewritten, not translated). The node's own EAM is
+`SelfMapping` `eam4 <-> eam6`, and IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the
+IPv4 address in the low 32 bits (`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
 by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
 atomically while traffic flows.
 
-**Translator.** A stateless RFC 7915 translator: local IPv4 to an `alias4` or a peer's LAN
-leaves as IPv6 to `node4` / `lan6`, IPv6 to `alias6` is rewritten to `node6`, and the
-replies are mapped back; local IPv4 to a peer's native IPv4 alias
-(`TranslationTableBuilder::peer_with_native_alias4(id, mapping, alias)`; looked up with
-`TranslationTable::native_alias4` / `by_native_alias4`) leaves as IPv6 to its `node6`, from
-`node4` for `self4` or from the `lan6` address of a local LAN source, and IPv6 from that
-`node6` comes back as IPv4 from the alias, ICMP errors and fragments included (ns's MQ-9).
-The native alias coexists with `alias4` and `alias6`, must not collide with `self4`, another
-peer's `alias4` or native alias, or a LAN IPv4 prefix, and is covered by
-`Translator::ipv4_translated_predicate`; pinned by `nsplane-e2e`'s `translate_native_alias`
-tests (UDP, TCP, ICMP Echo, coexistence with `alias4`); native IPv4 and IPv6 pass unchanged and packets spoofing a
+**Translator.** A stateless RFC 7915 translator: local IPv4 to an `eam4` or a peer's LAN
+leaves as IPv6 to `eam6` / `lan6`, IPv6 to `local6` is rewritten to `peer6`, and the
+replies are mapped back; local IPv4 to a peer's `peer6_eam4`
+(`TranslationTableBuilder::peer_with_peer6_eam4(id, mapping, peer6_eam4)`; looked up with
+`TranslationTable::peer6_eam4` / `by_peer6_eam4`) leaves as IPv6 to its `peer6`, from the
+self `eam6` for the self `eam4` or from the `lan6` address of a local LAN source, and IPv6
+from that `peer6` comes back as IPv4 from the `peer6_eam4`, ICMP errors and fragments
+included. The `peer6_eam4` coexists with `eam4` and `local6`, must not collide with the self
+`eam4`, another peer's `eam4` or `peer6_eam4`, or a LAN IPv4 prefix
+(`TableError::Eam4IsSelf`, `DuplicateAddress`, `Lan4Overlap`), and is covered by
+`Translator::ipv4_translated_predicate`; pinned by `nsplane-e2e`'s `translate_peer6_eam4`
+tests (UDP, TCP, ICMP Echo, coexistence with `eam4`); native IPv4 and IPv6 pass unchanged and packets spoofing a
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
@@ -2099,8 +2139,8 @@ four times faster than the 16-bit full recomputation) and then moved to the new
 pseudo-header incrementally; the reassembly clock is read only for fragments, and the
 table's address indexes hold the mapping, so a lookup is one hash. Per-packet costs are in
 [nsplane-nat translator (MF-4)](#nsplane-nat-translator-mf-4). Since the core routes and checks sources before the
-filters, each peer's allowed IPs must contain its `alias4/32`, its native IPv4 alias as a /32
-if any, the LAN IPv4 prefixes behind it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
+filters, each peer's allowed IPs must contain its `eam4/32`, its `peer6_eam4/32`
+if any, the LAN IPv4 prefixes behind it, its `local6`, `eam6`, `peer6` and the `lan6` prefixes behind it.
 
 **PortMap and Conntrack.** `PortMap` publishes local services to peers: a `PortMapRule` maps a
 tunnel-facing `listen` address and port (TCP or UDP) to a local `target` of the same family,
@@ -2111,8 +2151,8 @@ recently seen flow evicted), expires flows on per-protocol idle timeouts (TCP st
 without a background task, and takes an injectable clock. `PortMap::set_rules` swaps rules
 atomically and drops the flows of changed rules.
 
-**Nat64Lan.** A stateful NAT64 to an IPv4 LAN (NAPT) for a subnet gateway, ported from ns
-`SubnetRoute`. A `LanRoute` maps an IPv6 /96 (`mapped`) to an IPv4 prefix (`real`); the
+**Nat64Lan.** A stateful NAT64 to an IPv4 LAN (NAPT) for a subnet gateway. A
+`LanRoute` maps an IPv6 /96 (`mapped`) to an IPv4 prefix (`real`); the
 prefixes are `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
 `LanPrefix`, since no IP network crate is a dependency. IPv6 TCP, UDP and ICMPv6 echo to
 `mapped` plus a safe address of `real` (not broadcast, loopback, link-local, multicast or
@@ -2121,8 +2161,8 @@ unspecified; other mapped targets are dropped and counted) become IPv4 from the 
 `SnatPorts` and given back when the flow expires, is evicted or is removed
 (`Nat64Lan::remove_flow`, built on `Conntrack::remove` and its removal hook); a saturated
 range drops the packet rather than aliasing a flow. Replies and Fragmentation Needed (as
-Packet Too Big) are translated back; TCP MSS can be clamped. As in ns, translated packets
-leave DF clear (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
+Packet Too Big) are translated back; TCP MSS can be clamped. Translated packets
+leave DF clear by default (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
 fragmentation for a PMTU black hole when the LAN filters ICMP), and a destination that more
 than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`). The routes gate
 every forward packet; a flow keeps its SNAT address across a route replacement, and the
@@ -2143,7 +2183,7 @@ endpoint a caller-supplied closure picks for each new flow (`RedirectDecision::R
 rewrites the replies so they come from the service address; the source is kept. Flows
 live in a `Conntrack` (translated tuple: application to endpoint; `Flow::peer` unused); an
 endpoint already used by a live flow from the same source is refused and the closure asked
-again, up to 32 times by default (`Redirect::with_endpoint_tries(NonZeroUsize)`, ns's MQ-6).
+again, up to 32 times by default (`Redirect::with_endpoint_tries(NonZeroUsize)`).
 A closure with a small endpoint pool can scan it with `Redirect::endpoint_in_use(original,
 endpoint)` and offer a free endpoint first, or offer each in turn with as many tries as the
 pool has endpoints. `endpoint_in_use` looks the flow up with `Conntrack::peek`, which skips a
@@ -2157,24 +2197,24 @@ protocols and untracked replies pass unchanged.
 
 **Masquerade.** `Masquerade` also runs on the local side: on the IPv6 packets a routed LAN
 host sends towards the tunnel (`forward`) and on their replies (`reverse`). It is a source
-NAPT ported from ns `SubnetLanIngressTranslator`: a caller-supplied closure gives each new
+NAPT: a caller-supplied closure gives each new
 TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision::source`, an `Ipv6Addr`: the
 contract's `IpAddr` was narrowed by L1 decision, so an IPv4 source cannot be expressed) and
 a `route` fingerprint, and the source port or Echo identifier becomes a token from
 `MasqueradeConfig::ports`, unique per destination and source. `reverse` restores the LAN
 host's address and port or identifier, after asking the closure again: a reply whose flow
-now gets `None` or another `route` is dropped and the flow removed (`route_changed`, ns's
-rule that the route fingerprint must stay current). With
+now gets `None` or another `route` is dropped and the flow removed (`route_changed`: the
+route fingerprint must stay current). With
 `MasqueradeConfig::recheck_route_on_forward` (default `false`), forward asks the closure for
-every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`), as ns did. The transport checksum is recomputed
+every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`). The transport checksum is recomputed
 over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
 `MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
 flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
-`verify_checksums`, an invalid transport checksum; beyond the contract, ns drops these
-too). Forward verifies the checksum only for packets it masquerades: for a new flow after the
+`verify_checksums`, an invalid transport checksum; beyond the contract, these are
+dropped too). Forward verifies the checksum only for packets it masquerades: for a new flow after the
 closure returned `Some` (a corrupt first packet records no flow), for a recorded flow before
 the route recheck; a packet that passes unchanged is never dropped for its checksum. Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
-refuses new flows, as the contract and ns require, while a `Conntrack` evicts its least
+refuses new flows, as the contract requires, while a `Conntrack` evicts its least
 recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
 protocols and replies of unknown flows pass unchanged. A local side that answers pings
 itself can recognize a forwarded `ICMPv6` Echo request with the read-only
@@ -2185,7 +2225,7 @@ itself can recognize a forwarded `ICMPv6` Echo request with the read-only
 
 **Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
 next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
-ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
+ACL policies need no rules for the local IPv4 EAM addresses. With the engine's fragmentation stage and
 `Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
 fragmented to fit the MTU after translation.
 
@@ -2880,9 +2920,10 @@ TUN queue, not in the tunnel.
 
 ### nsplane-nat translator (MF-4)
 
-ns measured direct traffic through `alias4` at about 3.4 Gbit/s against 5.0 Gbit/s for N6
-(MF-4). `cargo bench -p nsplane-nat --bench translate` measures `Translator::outbound` of
-IPv4 TCP / UDP from `self4` to a peer's `alias4` (to IPv6 `node4`) and `inbound` of the
+An embedding application measured direct traffic through `eam4` at about 3.4 Gbit/s against
+5.0 Gbit/s for native IPv6 (MF-4). `cargo bench -p nsplane-nat --bench translate` measures
+`Translator::outbound` (group `eam4_out`) of IPv4 TCP / UDP from the self `eam4` to a peer's
+`eam4` (to IPv6 `eam6`) and `inbound` (group `eam4_in`) of the
 IPv6 reply, 64 B and 1400 B (TCP) / 1420 B (UDP) payloads, with 1 and 1000 peers in the
 table, in a buffer with the TUN reader's room (no grown copy). A/B on 2026-10-06 against
 the translator of main (e381bcf; the bench commit 8af9712), three interleaved rounds in one
@@ -2913,12 +2954,12 @@ sender (was 0.20) and 0.09 us on the receiver (was 0.19), plus 0.04-0.06 us (was
 ACK. Against the engine's own per-packet cost (`data_path` core round trip 0.10.0: 1.334 us
 at 1420 B, about 0.67 us per side) the translator added about 30 % per side and now adds
 about 12-13 %; that bounds the gain at about +15 % (3.4 to about 3.9 Gbit/s) when the
-thread that runs the filters is the limit. At ns's measured 5.0 Gbit/s the bottleneck
-spends about 2.3 us per 1448 B packet, and the alias4 path 3.4 us: the old translator's
+thread that runs the filters is the limit. At the measured 5.0 Gbit/s the bottleneck
+spends about 2.3 us per 1448 B packet, and the `eam4` path 3.4 us: the old translator's
 0.2-0.27 us per side explains only a fifth to a quarter of that 1.1 us gap if the rest of
 the path costs the same, and the change gains about +4 % there. So the translator was not
 the whole 30 %: the rest is outside `nsplane-nat` and was not measured here. To check on
-the ns side: `TranslatorStats::grown_copies` (each one is a fresh allocation and a copy:
+the application side: `TranslatorStats::grown_copies` (each one is a fresh allocation and a copy:
 the packet source left less than 20 bytes of room), engine fragmentation of translated
 IPv4 (the IPv4 MTU must leave the 20 bytes the header grows by), and TCP segmentation
 offload for IPv4 on the TUN.

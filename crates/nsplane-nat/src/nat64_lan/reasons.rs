@@ -7,7 +7,7 @@
 /// outside the prefix, or unspecified, loopback, link-local, multicast or a
 /// broadcast address.
 pub const UNSAFE_TARGET: &str = "nat64 lan unsafe target";
-/// More than one route resolves the destination; as ns, it is dropped
+/// More than one route resolves the destination; it is dropped
 /// rather than translated through whichever route comes first.
 pub const AMBIGUOUS_ROUTE: &str = "nat64 lan ambiguous route";
 /// A new flow found no free SNAT port within `port_tries` candidates.

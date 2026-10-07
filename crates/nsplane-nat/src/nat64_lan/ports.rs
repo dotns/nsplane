@@ -16,8 +16,8 @@ use std::sync::{Mutex, PoisonError};
 /// flow (6, 17 or 1).
 ///
 /// `reserve` and `release` may run under the flow table's lock, so they must
-/// be quick and must not call back into the [`Nat64Lan`](crate::Nat64Lan).
-/// An implementation can couple reservations to host sockets, as ns does.
+/// be fast and must not call back into the [`Nat64Lan`](crate::Nat64Lan).
+/// An implementation can couple reservations to host sockets.
 pub trait SnatPorts: Send + Sync + 'static {
     /// Reserves `snat` for a new flow; `false` when it is taken.
     fn reserve(&self, protocol: u8, snat: SocketAddrV4) -> bool;
@@ -28,7 +28,7 @@ pub trait SnatPorts: Send + Sync + 'static {
     /// The port to try next for a new flow from `snat_source`; `seq` grows by
     /// one with every candidate the [`Nat64Lan`](crate::Nat64Lan) asks for.
     ///
-    /// The default is ns's round robin over the upper half of the port range:
+    /// The default is a round robin over the upper half of the port range:
     /// `32768 + seq % 32768`.
     fn candidate(&self, protocol: u8, snat_source: Ipv4Addr, seq: u32) -> u16 {
         let _ = (protocol, snat_source);
@@ -38,8 +38,7 @@ pub trait SnatPorts: Send + Sync + 'static {
 }
 
 /// The default [`SnatPorts`]: an in-memory set of reserved
-/// `(snat_source, port)` pairs, shared by all protocols as ns
-/// `reserved_snat_ports` does.
+/// `(snat_source, port)` pairs, shared by all protocols.
 #[derive(Debug, Default)]
 pub struct DefaultSnatPorts {
     reserved: Mutex<HashSet<SocketAddrV4>>,

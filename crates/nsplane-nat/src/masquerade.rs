@@ -5,8 +5,7 @@
 //! `fd00:aa::10` port 10 000 to `fd00:1:2:1::b01` port 53) to a source the
 //! caller picks per flow (say the gateway's return identity
 //! `fd00:1:2:2::6440:1`) and a source port allocated from a range, so the
-//! replies come back to this node; ported from ns `subnet/ingress.rs`
-//! (`SubnetLanIngressTranslator`):
+//! replies come back to this node:
 //!
 //! - **Forward** ([`Masquerade::forward`]): an IPv6 TCP, UDP or `ICMPv6`
 //!   Echo request (type 128) packet of an untracked flow asks the decision
@@ -23,15 +22,15 @@
 //!   the LAN host's address and port or identifier back as its destination.
 //!   Before that, the decision closure is asked again with the flow's
 //!   original tuple: when it answers [`None`] or another `route`, the flow is
-//!   removed and the reply dropped ([`reasons::ROUTE_CHANGED`]), ns's "route
-//!   fingerprint must remain current" rule.
+//!   removed and the reply dropped ([`reasons::ROUTE_CHANGED`]): the route
+//!   fingerprint must remain current.
 //! - Everything else passes unchanged ([`MasqueradeVerdict::Pass`]): IPv4,
 //!   IPv6 with extension headers (fragments included), other protocols and
 //!   `ICMPv6` types, unparsable packets, packets whose length differs from
-//!   their IPv6 payload length, and replies of unknown flows. ns drops these.
+//!   their IPv6 payload length, and replies of unknown flows.
 //!
 //! The transport checksum of a rewritten packet is recomputed over the IPv6
-//! pseudo-header, as ns (a result of zero is written as `0xffff`). With
+//! pseudo-header (a result of zero is written as `0xffff`). With
 //! [`MasqueradeConfig::verify_checksums`], a packet that would be rewritten
 //! with an invalid transport checksum (a zero checksum field included) is
 //! dropped ([`reasons::BAD_CHECKSUM`]); the recomputation would otherwise
@@ -40,7 +39,6 @@
 //! records no flow), a later packet of a recorded flow before any route
 //! recheck, and a reply of a recorded flow before its route check. A packet
 //! the closure answers [`None`] for passes unchanged whatever its checksum.
-//! ns verifies every packet before its decision.
 //!
 //! # Flows
 //!
@@ -49,26 +47,25 @@
 //! unique per (protocol, original destination, destination port, source), so
 //! replies map back to exactly one flow. Tokens are searched from a cursor
 //! that walks [`MasqueradeConfig::ports`] and wraps from its end to its
-//! start, as ns; after [`MasqueradeConfig::tries`] tokens in use the packet
+//! start; after [`MasqueradeConfig::tries`] tokens in use the packet
 //! is dropped ([`reasons::TOKENS_EXHAUSTED`]).
 //!
 //! - **Idle timeouts** per protocol (TCP, UDP, `ICMPv6`); every hit in either
 //!   direction refreshes a flow. Expiry is lazy: an expired flow goes when a
 //!   packet finds it, when its token is needed, when the table is full and
-//!   by [`Masquerade::len`]. ns sweeps the whole table on every packet.
+//!   by [`Masquerade::len`]; no packet sweeps the whole table.
 //! - **Bounded**: a new flow when [`MasqueradeConfig::max_flows`] flows are
-//!   live is dropped ([`reasons::CAPACITY`]); no flow is evicted, matching
-//!   ns.
+//!   live is dropped ([`reasons::CAPACITY`]); no flow is evicted.
 //! - **TCP**: with [`MasqueradeConfig::tcp_new_flow_requires_syn`], only a
 //!   SYN (SYN set, ACK clear) opens a flow; another TCP packet the closure
 //!   would masquerade without a flow is dropped ([`reasons::TCP_NOT_SYN`]).
 //!   TCP flows keep no state beyond their idle time.
-//! - By default, unlike ns, the forward direction does not ask the decision
+//! - By default, the forward direction does not ask the decision
 //!   closure again for a recorded flow; a changed route is noticed on the
 //!   next reply. With [`MasqueradeConfig::recheck_route_on_forward`], every
 //!   forward packet of a recorded flow asks it with the flow's original
 //!   tuple, as a reply does, and on [`None`] or another `route` the flow is
-//!   removed and the packet dropped ([`reasons::ROUTE_CHANGED`]), as ns.
+//!   removed and the packet dropped ([`reasons::ROUTE_CHANGED`]).
 //!
 //! The flows do not live in a [`Conntrack`](crate::Conntrack): a full
 //! `Conntrack` evicts its least recently seen flow, while the masquerade must
@@ -81,8 +78,8 @@
 //! A [`MasqueradeVerdict::Drop`] carries one of the [`reasons`], each
 //! counted in [`MasqueradeStats`]: [`reasons::TCP_NOT_SYN`],
 //! [`reasons::CAPACITY`], [`reasons::ROUTE_CHANGED`],
-//! [`reasons::TOKENS_EXHAUSTED`] and [`reasons::BAD_CHECKSUM`]. ns drops in
-//! all five cases; `bad_checksum` is the one the contract did not list. The
+//! [`reasons::TOKENS_EXHAUSTED`] and [`reasons::BAD_CHECKSUM`];
+//! `bad_checksum` is the one the contract did not list. The
 //! new source is an [`Ipv6Addr`], so the closure cannot answer a source the
 //! masquerade could not write.
 //!
@@ -142,33 +139,33 @@ pub struct MasqueradeDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasqueradeConfig {
     /// The source ports (TCP/UDP) and Echo identifiers (`ICMPv6`) handed out
-    /// as tokens. Default `49152..=65535`, as ns.
+    /// as tokens. Default `49152..=65535`.
     pub ports: RangeInclusive<u16>,
     /// Tokens tried for a new flow before it is dropped with
-    /// [`reasons::TOKENS_EXHAUSTED`]. Default 16 384, as ns.
+    /// [`reasons::TOKENS_EXHAUSTED`]. Default 16 384.
     pub tries: u16,
     /// Maximum number of live flows; a new flow beyond it is dropped with
-    /// [`reasons::CAPACITY`]. Default 4096, as ns.
+    /// [`reasons::CAPACITY`]. Default 4096.
     pub max_flows: usize,
-    /// Idle timeout of a TCP flow. Default 5 min, as ns.
+    /// Idle timeout of a TCP flow. Default 5 min.
     pub tcp_timeout: Duration,
-    /// Idle timeout of a UDP flow. Default 2 min, as ns.
+    /// Idle timeout of a UDP flow. Default 2 min.
     pub udp_timeout: Duration,
-    /// Idle timeout of an `ICMPv6` Echo flow. Default 30 s, as ns.
+    /// Idle timeout of an `ICMPv6` Echo flow. Default 30 s.
     pub icmp_timeout: Duration,
     /// Whether only a TCP SYN (SYN set, ACK clear) opens a flow; another TCP
     /// packet without a flow is dropped with [`reasons::TCP_NOT_SYN`].
-    /// Default `true`, as ns.
+    /// Default `true`.
     pub tcp_new_flow_requires_syn: bool,
     /// Whether the transport checksum of a packet is verified before it is
     /// rewritten; packets that pass unchanged are not verified. See the
-    /// [module docs](self). Default `true`, as ns.
+    /// [module docs](self). Default `true`.
     pub verify_checksums: bool,
     /// Whether every forward packet of a recorded flow asks the decision
     /// closure again, dropping it with [`reasons::ROUTE_CHANGED`] and
     /// removing the flow when the route changed; see the
     /// [module docs](self#flows). Default `false`: the route is checked on
-    /// replies only, at no cost to forward packets. ns checks it on both.
+    /// replies only, at no cost to forward packets.
     pub recheck_route_on_forward: bool,
 }
 

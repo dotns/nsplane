@@ -118,24 +118,24 @@ sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key-file a.key
 ### translate_node
 
 A TUN node with an `nsplane-nat` `Translator`: local IPv4 packets to a peer leave as IPv6 in
-the tunnel and the peer's IPv6 replies arrive as IPv4. Every peer owns a /127 IPv6 group,
-`node6` (native) and `node4` (its IPv4 side); `--map` names them and the local aliases:
-IPv4 to `alias4` becomes IPv6 to `node4`, and `alias6` is rewritten to and from `node6`.
-`--self <SELF4>=<NODE4>` maps this node's IPv4 address to its own `node4` (`self4/32` is
-added to the interface unless an `--address` covers it). `--lan <LAN4>=<LAN6>[@<PUBKEY>]`
-pairs an IPv4 prefix with an IPv6 /96 (the IPv4 address in the low 32 bits); without `@`
-the LAN is behind this node, whose hosts route the aliases through it (IP forwarding on).
-Each mapped peer's allowed IPs get its `alias4/32`, `alias6`, `node4`, `node6` and the LAN
-prefixes behind it, since the core routes and checks sources before the filter runs; the
-interface gets the routes. Status: `extra.translate` (translated, rewritten and dropped
-counters per direction). Needs root.
+the tunnel and the peer's IPv6 replies arrive as IPv4. Every peer has `peer6`, its own IPv6
+address on the tunnel, and `eam6`, the IPv6 side of its explicit address mapping (EAM); `--map`
+names them and the local addresses: IPv4 to `eam4` becomes IPv6 to `eam6`, and `local6` is
+rewritten to and from `peer6`. `--self <EAM4>=<EAM6>` maps this node's IPv4 address to its own
+IPv6 address (`eam4/32` is added to the interface unless an `--address` covers it).
+`--lan <LAN4>=<LAN6>[@<PUBKEY>]` pairs an IPv4 prefix with an IPv6 /96 (the IPv4 address in the
+low 32 bits); without `@` the LAN is behind this node, whose hosts route the peers' local
+addresses through it (IP forwarding on). Each mapped peer's allowed IPs get its `eam4/32`,
+`local6`, `eam6`, `peer6` and the LAN prefixes behind it, since the core routes and checks
+sources before the filter runs; the interface gets the routes. Status: `extra.translate`
+(translated, rewritten and dropped counters per direction). Needs root.
 
 Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
-`--self <SELF4>=<NODE4>`, `--map <PUBKEY>,node6=<IPv6>,node4=<IPv6>[,alias4=<IPv4>][,alias6=<IPv6>]`
+`--self <EAM4>=<EAM6>`, `--map <PUBKEY>,peer6=<IPv6>,eam6=<IPv6>[,eam4=<IPv4>][,local6=<IPv6>]`
 (repeatable), `--lan <IPv4>/<len>=<IPv6>/96[@<PUBKEY>]` (repeatable).
 
 ```sh
-sudo cargo run -p nsplane-examples --bin translate_node -- --private-key-file a.key --self 10.200.0.1=fd00:a::1:1 --peer <B_PUB>,endpoint=192.0.2.2:51820 --map <B_PUB>,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2 --lan 192.168.50.0/24=fd00:1::/96
+sudo cargo run -p nsplane-examples --bin translate_node -- --private-key-file a.key --self 10.200.0.1=fd00:a::1:1 --peer <B_PUB>,endpoint=192.0.2.2:51820 --map <B_PUB>,peer6=fd00:a::2:0,eam6=fd00:a::2:1,eam4=10.200.0.2 --lan 192.168.50.0/24=fd00:1::/96
 ```
 
 ### port_map
@@ -459,7 +459,7 @@ both directions), `ladder_tun`, `ladder_netstack` (direct -> relay -> direct),
 extension against a plain WireGuard server), `app_session` (self-checks), `app_session_tun`
 (`app_session --tun`: `STEP tun-outbound` and `extra.acl.outbound_denied` in the status),
 `translate_node` (an IPv4-only client container on the node's LAN reaches an IPv6-only
-kernel WireGuard peer through its `alias4`: ping, TCP and UDP echo), `port_map` (a kernel
+kernel WireGuard peer through its `eam4`: ping, TCP and UDP echo), `port_map` (a kernel
 WireGuard peer reaches the echo service through the listen port, a rule for another peer
 refuses it, an idle UDP flow expires after `--udp-timeout`), `subnet_gateway` (an
 IPv6-only kernel WireGuard peer reaches an IPv4 host on the node's LAN through the mapped
