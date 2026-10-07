@@ -726,7 +726,7 @@ scenario_acl_gateway() {
   local a_pub k_pub a_ip k_ip
   a_pub=$(pub a); k_pub=$(pub k); a_ip=$(ip_of a); k_ip=$(ip_of k)
   local sample=examples/policies/acl_gateway.json
-  # Allows only port 9: port 7 is denied. The sample's built-in tests no longer hold.
+  # Narrows every port range of the sample's typed rules to port 9, so port 7 is denied.
   local deny7
   deny7=$(jq '.[].protocols[][].Ranges = [{"start": 9, "end": 9}]' "$sample")
   put a /policy.json < "$sample"

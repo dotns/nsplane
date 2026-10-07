@@ -67,7 +67,7 @@ and only installs a session-scoped peer for an unpaired one.
    addresses to hide relayed peers.
 4. **Filters, not special cases.** Everything between decrypt and deliver, or between
    local read and seal, is a `PacketFilter` returning `Accept`, `Drop`, or `Handled`:
-   ACL, NAT, 4↔6 translation, node-L3 gates, probe responders, flow accounting.
+   ACL, NAT, 4↔6 translation, flow gates, probe responders, flow accounting.
 5. **Zero copy and bounded queues.** `PacketBuf` (a `BytesMut` with 32 bytes of headroom)
    is sealed and opened in place; batches are `smallvec`s; every channel is bounded, drops
    are counted, a full network queue holds back the local source.
@@ -231,7 +231,7 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | ns M4 hooks | `inject_outbound_on`, `PacketFilter::inbound_from`, `PathPolicy::observe_every_message`, netstack accept backpressure, `connect_tcp_from`, random ephemeral start | done (task `20261003-1300-ns-m4-requests`) |
 | ns data-plane moves | `owns()`, reassembly, send progress, oversize UDP (netstack); UDP side channel, `LinkTransport`; `Nat64Lan`, `Redirect` (nsplane-nat); `force_handshake_on` | done (plan `20261003-1600-ns-dataplane-moves`) |
 | Throughput and WSS | benchmark harness against kernel WireGuard and wireguard-go; engine fast path (batched handoff, inline output); netstack fixes and TCP buffers; `nsplane-wss` (datagram carrier, WsFrame stream client and server) | done (plan `20261003-1630-perf-and-wss`) |
-| ACL and node L3 gate | per-source principals, fragment modes, bypass flags, `Ipv6Mode`, `crates_acl()` preset, inbound destinations; `NodeL3Gate`, `NodeL3Filter`, divert; differential fixtures against ns | done (plan `20261003-2300-acl-l3-gate`) |
+| ACL and node L3 gate | per-source identities (now `LabelSet`s), fragment modes, bypass flags, `Ipv6Mode`, a stateless option preset (removed; its field values are in `docs/specs/acl-policy-document.md`), inbound destinations; the node L3 gate with divert (replaced by the generic flow gate `gate::FlowGate`, plan `20261007-0900-business-agnostic`; product mapping in `docs/specs/node-l3.md`); differential fixtures against ns (now `docs/specs/data/`) | done (plan `20261003-2300-acl-l3-gate`) |
 | Local side | `MapSink` / `MapSource`, `pump`, `pipe`; `Masquerade`, `echo_reply_in_place`; `TunSlot`, `host_tun` | done (plan `20261003-2330-local-side`) |
 | Release 0.8.0 | first nsplane release (tag `v0.8.0`) | 2026-10-04 |
 | ns requests | per-path MTU and Linux path MTU discovery, padding cap, UDP builder, `send_to_async`, redirect tries, native alias; netstack abort, fragment discard, connected UDP; `nsplane-wss` plain ws, events, keepalive, timeouts; ACL source scope | done (plan `20261004-1100-ns-requests`) |

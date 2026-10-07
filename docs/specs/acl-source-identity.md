@@ -202,7 +202,7 @@ The id stays the product's (`"app:<session>"` is fine) but no longer carries mea
 engine.store_namespace("app:s1", NamespacePolicy {
     kind: NamespaceKind::Pinholes,
     members: vec![NamespaceMember { label: key_label(&k), addresses }],
-    policy: AclPolicy::default(),        // no rules (C4: `rules: vec![]`)
+    rules: vec![],                       // no rules
     pinhole_kinds: BTreeSet::new(),      // must be empty
     outbound: Some(vec![]),
 })?;
@@ -274,7 +274,7 @@ the default rule set is installed.
 | 20 | same | same key, not a relay client (`{A}`) | same | not delivered | same test |
 | 21 | `sources 100.64.0.0/10, labels [A]` -> any | non-relay peer `{A}` from its tunnel address | UDP to 10.9.0.5:5000 | delivered | ns `acl_relay.rs` `a_peer_outside_the_relay_client_set_is_judged_by_its_source_address` |
 | 22 | same | relay client `{key(..)}` | same | not delivered | same test |
-| 23 | fixture `recorded/relay_keys`: `key(ka1) -> *:22,80 tcp`; `key(kb2) -> 10.1.0.0/16 udp any port`; `10.0.0.0/24 -> 10.1.0.1:53 udp`; `192.168.0.0/16 -> 10.1.2.0/23:1-1024` | peers 1-2 `{A}`, 3 `{key(ka1)}`, 4 `{key(kb2)}`, 5 `{key(kc3)}` | TCP 10.9.9.9 -> 10.1.0.1:22 and :80 | only peer 3 accepted; port 81 nobody | nsplane `crates/nsplane-acl/tests/crates_acl_parity.rs` `crates_acl_mode_matches_ns_acl_check_packet` (fixture `tests/fixtures/crates_acl_parity.json`) |
+| 23 | fixture `recorded/relay_keys`: `key(ka1) -> *:22,80 tcp`; `key(kb2) -> 10.1.0.0/16 udp any port`; `10.0.0.0/24 -> 10.1.0.1:53 udp`; `192.168.0.0/16 -> 10.1.2.0/23:1-1024` | peers 1-2 `{A}`, 3 `{key(ka1)}`, 4 `{key(kb2)}`, 5 `{key(kc3)}` | TCP 10.9.9.9 -> 10.1.0.1:22 and :80 | only peer 3 accepted; port 81 nobody | fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed per `docs/specs/acl-policy-document.md` section 7 (was nsplane `tests/crates_acl_parity.rs` `crates_acl_mode_matches_ns_acl_check_packet`, removed in C4) |
 | 24 | same | same | UDP 10.9.9.9 -> 10.1.0.1:22, -> 10.1.255.255:9; -> 10.2.0.0:9 | only peer 4 accepted; nobody | same |
 | 25 | same | same | UDP 10.0.0.7 -> 10.1.0.1:53 | peer 1 (by source, inside 10.0.0.0/24) and peer 4 (lan rule) accepted; peer 3 denied although its source is inside the prefix; peer 5 denied | same |
 | 26 | same | same | TCP 192.168.4.4 -> 10.1.3.1:1024 | only peer 1 (by source) accepted; UDP to :1 accepts peers 1 and 4 | same |
@@ -293,17 +293,19 @@ the AG-3 spec (`docs/specs/acl-policy-document.md`). Cases 15-18 use member labe
 `addr:<ip>` per 3.4.
 
 After C3 these nsplane tests carry the cases on labels: `engine.rs`
-`key_rules_match_the_label_and_cidr_rules_the_flow_source` (1-3; the document compiler's
+`label_rules_match_the_label_and_prefix_rules_the_flow_source` (1-3; the document compiler's
 CIDR sources no longer carry `A`), `rules_of_all_namespaces_of_a_label_apply` (31),
 `pinhole_namespaces_never_widen_permissions` (32), `grants_cannot_name_pinhole_namespaces`
 (33); `filter.rs` `key_label_and_address_label` (6-8, typed rules with `A` on the prefix
-rules), `unknown_peer_is_dropped` (9), `closure_identity` (10),
+rules), `unknown_peer_and_empty_labels` (9), `closure_identity` (10),
 `identity_map_updates_through_shared_handle` (11), `by_source_peer_is_judged_by_each_source`
 (12-13), `by_source_cache_is_bounded` (14),
 `switching_between_by_source_and_by_key_applies_to_the_next_packet` (15-16),
 `bypass_is_never_shared_across_sources` (17-18), `pinhole_namespace_member_gets_nothing_inbound`
-(34), `session_only_peer_works_only_through_its_inbound_pinhole` (35); and
-`tests/crates_acl_parity.rs` with its test-local 4.2 compiler (23-27).
+(34), `session_only_peer_works_only_through_its_inbound_pinhole` (35). Cases 23-27 are the
+parity fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed by the product with a
+4.2 compiler (`docs/specs/acl-policy-document.md` section 7); the crate's
+`tests/crates_acl_parity.rs` was removed in C4.
 
 ## 5. Edge cases
 
