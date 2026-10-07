@@ -163,6 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Inbound `alias4` translation 4-5 ns faster at 64 B and 10-11 ns at 1400/1420 B.
 - `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
   recycling costs about 1.5 ns more.
+- rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
+  nsplane-wss no longer cites a product; provenance is in the task documents.
 - Breaking: `nsplane-nat`'s translator address model is named after RFC 7757 explicit
   address mappings (EAM); behaviour, validation order, errors, reason strings and memory
   layout are unchanged. `PeerMapping`: `node6` -> `peer6`, `node4` -> `eam6`, `alias4` ->
@@ -177,8 +179,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `peer6_eam4.rs` and `translate_peer6_eam4.rs`. The `translate_node` example's
   `--map` keys are `peer6=`, `eam6=`, `eam4=`, `local6=` (were `node6=`, `node4=`,
   `alias4=`, `alias6=`).
-- rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
-  nsplane-wss no longer cites a product; provenance is in the task documents.
 
 ### Deprecated
 - `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,
