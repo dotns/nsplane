@@ -245,11 +245,9 @@ pub struct AclFilterConfig {
     ///
     /// [`Ipv6Mode::Accept`] passes every IPv6 packet (version nibble 6), in
     /// both directions, before anything else and without recording any
-    /// state (counted in [`AclFilterStats::ipv6_accepted`]). ns runs no ACL
-    /// on IPv6: its account filter only checks where an inbound IPv6 packet
-    /// is addressed, which nsplane does in the core with a peer's
-    /// `inbound_destinations` (`nsplane-core` `PeerConfig`), and it has no
-    /// outbound ACL.
+    /// state (counted in [`AclFilterStats::ipv6_accepted`]). Where an
+    /// inbound IPv6 packet may be addressed can still be checked in the core
+    /// with a peer's `inbound_destinations` (`nsplane-core` `PeerConfig`).
     pub ipv6: Ipv6Mode,
 }
 
@@ -265,30 +263,6 @@ impl Default for AclFilterConfig {
             accept_to_local: None,
             accept_icmp_echo_reply: false,
             ipv6: Ipv6Mode::Evaluate,
-        }
-    }
-}
-
-impl AclFilterConfig {
-    /// A stateless preset for inbound IPv4: no reply allowances
-    /// ([`stateful_replies`](Self::stateful_replies) off), protocols other
-    /// than TCP and UDP dropped, IPv4 fragments gated by
-    /// [`FragmentMode::ALLOW_ONLY`], `local` in
-    /// [`accept_to_local`](Self::accept_to_local) and
-    /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on, and IPv6
-    /// packets accepted unevaluated ([`Ipv6Mode::Accept`]; an IPv6
-    /// destination is then checked by the core's inbound destinations).
-    /// Outbound IPv4 packets keep this filter's handling. The labels of the
-    /// filter's [`PeerLabelMap`] and the rules decide the rest.
-    pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
-        Self {
-            allow_other_protocols: false,
-            stateful_replies: false,
-            fragments: FragmentMode::ALLOW_ONLY,
-            accept_to_local: local,
-            accept_icmp_echo_reply: true,
-            ipv6: Ipv6Mode::Accept,
-            ..Self::default()
         }
     }
 }
@@ -426,7 +400,7 @@ pub enum FragmentMode {
     /// [`AclFilterConfig::fragment_capacity`] entries, evicting the oldest.
     #[default]
     Outcome,
-    /// The ns `FragmentAclGate`: only accepted first fragments are recorded,
+    /// Allow-only gating: only accepted first fragments are recorded,
     /// keyed by (source, destination, protocol, identification) without the
     /// peer, until `ttl` after the first fragment on the engine clock
     /// ([`AclEngine::with_clock`]); the last fragment does not free the
@@ -442,15 +416,6 @@ pub enum FragmentMode {
         /// Maximum number of recorded first fragments.
         capacity: usize,
     },
-}
-
-impl FragmentMode {
-    /// [`AllowOnly`](Self::AllowOnly) with the values of ns: a TTL of 15 s
-    /// and a capacity of 4096.
-    pub const ALLOW_ONLY: Self = Self::AllowOnly {
-        ttl: Duration::from_secs(15),
-        capacity: 4096,
-    };
 }
 
 /// Counters of an [`AclFilter`], in packets unless stated otherwise.
@@ -652,9 +617,9 @@ struct AllowedKey {
     id: u16,
 }
 
-/// The fragment fields of a raw IPv4 header (at least 20 bytes, version 4),
-/// as ns `ipv4_fragment_meta` reads them: the key, the offset is non-zero,
-/// the first fragment of several.
+/// The fragment fields of a raw IPv4 header (at least 20 bytes, version 4):
+/// the key, whether the offset is non-zero, and whether it is the first
+/// fragment of several.
 const fn ipv4_fragment(bytes: &[u8]) -> Option<(AllowedKey, bool, bool)> {
     if bytes.len() < 20 || bytes[0] >> 4 != 4 {
         return None;
@@ -670,7 +635,7 @@ const fn ipv4_fragment(bytes: &[u8]) -> Option<(AllowedKey, bool, bool)> {
     Some((key, offset > 0, offset == 0 && flags & 0x2000 != 0))
 }
 
-/// ns `is_local_node_packet`: an IPv4 packet addressed to `local`.
+/// Whether a raw IPv4 packet is addressed to `local`.
 fn is_to_local(bytes: &[u8], local: Ipv4Addr) -> bool {
     bytes.len() >= 20 && bytes[0] >> 4 == 4 && bytes[16..20] == local.octets()
 }
@@ -693,8 +658,8 @@ fn source_in(bytes: &[u8], prefixes: &[IpNet]) -> bool {
     source.is_some_and(|source| prefixes.iter().any(|net| net.contains(&source)))
 }
 
-/// ns `is_icmp_echo_reply`: an IPv4 ICMP echo reply, read from the raw
-/// header whatever its fragment offset.
+/// Whether a packet is an IPv4 ICMP echo reply, read from the raw header
+/// whatever its fragment offset.
 fn is_icmp_echo_reply(bytes: &[u8]) -> bool {
     if bytes.len() < 20 || bytes[0] >> 4 != 4 {
         return false;
@@ -2046,14 +2011,12 @@ impl PacketFilter for AclFilter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::net::IpAddr;
 
     use super::*;
     use crate::namespace::{
         Grant, GrantEnd, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule,
     };
-    use crate::policy::{AclAction, AclPolicy, AclRule};
     use crate::rules::{Label, NotInstalled, PortSet, ProtocolMatch, Rule, RuleSet};
     use crate::test_packets::{Frag, icmp_echo, ip, ip_frag, tcp, tcp_packet, udp_packet};
 
@@ -2080,21 +2043,14 @@ mod tests {
         labels.iter().map(|&label| Label::from(label)).collect()
     }
 
-    fn rule(src: &str, dst: &str, proto: &str) -> AclRule {
-        AclRule {
-            action: AclAction::Accept,
-            src: vec![src.to_owned()],
-            dst: vec![dst.to_owned()],
-            proto: Some(proto.to_owned()),
-        }
+    /// Rule `"0"` accepting TCP to `ports` from anyone.
+    fn tcp_rule(ports: PortSet) -> Rule {
+        Rule::new("0", vec![ProtocolMatch::Tcp(ports)])
     }
 
-    fn policy(acls: Vec<AclRule>) -> AclPolicy {
-        AclPolicy {
-            hosts: HashMap::new(),
-            acls,
-            tests: Vec::new(),
-        }
+    /// Rule `"0"` accepting UDP to `ports` from anyone.
+    fn udp_rule(ports: PortSet) -> Rule {
+        Rule::new("0", vec![ProtocolMatch::Udp(ports)])
     }
 
     /// An `ADDR`-labelled source at `10.0.0.1` (or `fd00::1`) may reach
@@ -2126,10 +2082,8 @@ mod tests {
         map
     }
 
-    fn loaded_engine(policy: AclPolicy) -> Arc<AclEngine> {
-        let engine = Arc::new(AclEngine::new());
-        engine.load(policy).unwrap();
-        engine
+    fn loaded_engine(rules: Vec<Rule>) -> Arc<AclEngine> {
+        rules_engine(RuleSet::new(rules).unwrap())
     }
 
     fn rules_engine(rules: RuleSet) -> Arc<AclEngine> {
@@ -2242,14 +2196,37 @@ mod tests {
     }
 
     #[test]
-    fn unknown_peer_is_dropped() {
+    fn unknown_peer_and_empty_labels() {
         let f = filter();
-        let packet = tcp_packet(addr("10.0.0.1"), 4000, addr("10.0.0.2"), 80);
+        let packet = || tcp_packet(addr("10.0.0.1"), 4000, addr("10.0.0.2"), 80);
         assert_eq!(
-            inbound(&f, PeerId::new(99), packet),
+            inbound(&f, PeerId::new(99), packet()),
             drop(reasons::UNKNOWN_PEER)
         );
         assert_eq!(f.stats().unknown_peer, 1);
+
+        // An empty label set is known: it matches label-free rules only.
+        let map = Arc::new(PeerLabelMap::new());
+        map.insert(PEER, LabelSet::empty());
+        let engine = rules_engine(
+            RuleSet::new([
+                Rule::new("labelled", vec![ProtocolMatch::Tcp(PortSet::single(80))])
+                    .with_labels([ADDR.into()]),
+                Rule::new("free", vec![ProtocolMatch::Tcp(PortSet::single(81))]),
+            ])
+            .unwrap(),
+        );
+        let f = AclFilter::new(engine, map);
+        assert_eq!(inbound(&f, PEER, packet()), drop(reasons::DENIED));
+        assert_eq!(
+            inbound(
+                &f,
+                PEER,
+                tcp_packet(addr("10.0.0.1"), 4000, addr("10.0.0.2"), 81)
+            ),
+            Verdict::Accept
+        );
+        assert_eq!(f.stats().unknown_peer, 0);
     }
 
     #[test]
@@ -2317,16 +2294,51 @@ mod tests {
     }
 
     #[test]
-    fn malformed_is_dropped() {
+    fn malformed_ipv4_is_dropped() {
         let f = filter();
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
         assert_eq!(
             inbound(&f, PEER, PacketBuf::from_packet(&[0x45, 0, 0])),
             drop(reasons::MALFORMED)
         );
-        // Truncated TCP header.
-        let packet = ip(addr("10.0.0.1"), addr("10.0.0.2"), protocol::TCP, &[0; 4]);
+        // Truncated TCP and UDP headers.
+        let packet = ip(r, l, protocol::TCP, &[0; 4]);
         assert_eq!(inbound(&f, PEER, packet), drop(reasons::MALFORMED));
-        assert_eq!(f.stats().malformed, 2);
+        let packet = ip(r, l, protocol::UDP, &[0; 4]);
+        assert_eq!(inbound(&f, PEER, packet), drop(reasons::MALFORMED));
+        // A total length beyond the buffer or below the header.
+        for total in [1000_u16, 12] {
+            let mut bytes = tcp_packet(r, 4000, l, 80).as_packet().to_vec();
+            bytes[2..4].copy_from_slice(&total.to_be_bytes());
+            assert_eq!(
+                inbound(&f, PEER, PacketBuf::from_packet(&bytes)),
+                drop(reasons::MALFORMED),
+                "total length {total}"
+            );
+        }
+        assert_eq!(f.stats().malformed, 5);
+    }
+
+    #[test]
+    fn fragments_of_a_malformed_first_are_dropped() {
+        // `Outcome` gives the later fragments the first one's outcome;
+        // `AllowOnly` records nothing for it, so they have no first fragment.
+        for (config, later) in [
+            (AclFilterConfig::default(), reasons::MALFORMED),
+            (allow_only(4096), reasons::FRAGMENT),
+        ] {
+            let f = filter_with(config);
+            // A first fragment too short for its TCP header.
+            assert_eq!(
+                inbound(&f, PEER, fragment(9, 0, true, &[0; 8])),
+                drop(reasons::MALFORMED)
+            );
+            assert_eq!(inbound(&f, PEER, continuation(9)), drop(later));
+            assert_eq!(
+                inbound(&f, PEER, fragment(9, 6, false, &[0; 8])),
+                drop(later)
+            );
+        }
     }
 
     #[test]
@@ -2456,8 +2468,8 @@ mod tests {
         assert_eq!(f.stats(), AclFilterStats::default());
     }
 
-    fn deny_all() -> AclPolicy {
-        policy(Vec::new())
+    fn deny_all() -> Vec<Rule> {
+        Vec::new()
     }
 
     #[test]
@@ -2480,7 +2492,7 @@ mod tests {
             drop(reasons::NO_POLICY)
         );
 
-        engine.load(deny_all()).unwrap();
+        engine.install(RuleSet::new(deny_all()).unwrap());
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 22, l, 40000)),
             Verdict::Accept
@@ -2705,17 +2717,20 @@ mod tests {
     fn namespace(peers: &[PeerId], outbound: Option<Vec<OutboundRule>>) -> NamespacePolicy {
         NamespacePolicy {
             members: members(peers),
-            policy: policy(vec![rule("*", "*:22", "tcp")]),
+            rules: vec![tcp_rule(PortSet::single(22))],
             outbound,
             ..NamespacePolicy::default()
         }
     }
 
-    fn outbound_rule(proto: Option<&str>, ports: &str) -> OutboundRule {
-        OutboundRule {
-            proto: proto.map(str::to_owned),
-            ports: ports.to_owned(),
+    /// Outbound rule `"out"` to `ports`: TCP only when `tcp_only`, else TCP
+    /// and UDP.
+    fn outbound_rule(tcp_only: bool, ports: PortSet) -> OutboundRule {
+        let mut protocols = vec![ProtocolMatch::Tcp(ports.clone())];
+        if !tcp_only {
+            protocols.push(ProtocolMatch::Udp(ports));
         }
+        OutboundRule::new("out", protocols)
     }
 
     /// Identities: the peers of `identity()` plus `A..=E` by their label.
@@ -2774,8 +2789,7 @@ mod tests {
                 Grant {
                     from: GrantEnd::Namespace("nsd:a".into()),
                     to: GrantEnd::Label(label(B)),
-                    proto: Some("tcp".to_owned()),
-                    ports: Some("443".to_owned()),
+                    protocols: vec![ProtocolMatch::Tcp(PortSet::single(443))],
                 },
             )
             .unwrap();
@@ -2818,8 +2832,10 @@ mod tests {
         let grant = Grant {
             from: GrantEnd::Label(label(A)),
             to: GrantEnd::Namespace("nsd:b".into()),
-            proto: None,
-            ports: Some("443".to_owned()),
+            protocols: vec![
+                ProtocolMatch::Tcp(PortSet::single(443)),
+                ProtocolMatch::Udp(PortSet::single(443)),
+            ],
         };
         engine.store_grant("g", grant.clone()).unwrap();
         let f = ns_filter(&engine, AclFilterConfig::default());
@@ -2871,7 +2887,10 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A, D], Some(vec![outbound_rule(None, "80")])),
+                namespace(
+                    &[A, D],
+                    Some(vec![outbound_rule(false, PortSet::single(80))]),
+                ),
             )
             .unwrap();
         engine
@@ -2916,7 +2935,10 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80,443")])),
+                namespace(
+                    &[A],
+                    Some(vec![outbound_rule(true, PortSet::list([80, 443]))]),
+                ),
             )
             .unwrap();
         let f = ns_filter(&engine, AclFilterConfig::default());
@@ -2994,7 +3016,7 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A], Some(vec![outbound_rule(None, "80")])),
+                namespace(&[A], Some(vec![outbound_rule(false, PortSet::single(80))])),
             )
             .unwrap();
         let f = ns_filter(&engine, AclFilterConfig::default());
@@ -3048,7 +3070,7 @@ mod tests {
 
     #[test]
     fn pinhole_namespace_member_gets_nothing_inbound() {
-        let engine = loaded_engine(policy(vec![rule("*", "*:*", "tcp")]));
+        let engine = loaded_engine(vec![tcp_rule(PortSet::Any)]);
         engine
             .store_namespace(
                 "s1",
@@ -3152,8 +3174,7 @@ mod tests {
                 Grant {
                     from: GrantEnd::Label(label(A)),
                     to: GrantEnd::Namespace("nsd:c".into()),
-                    proto: Some("tcp".to_owned()),
-                    ports: Some("443".to_owned()),
+                    protocols: vec![ProtocolMatch::Tcp(PortSet::single(443))],
                 },
             )
             .unwrap();
@@ -3495,8 +3516,7 @@ mod tests {
                 Grant {
                     from: GrantEnd::Label(label(A)),
                     to: GrantEnd::Label(label(B)),
-                    proto: Some("tcp".to_owned()),
-                    ports: Some("443".to_owned()),
+                    protocols: vec![ProtocolMatch::Tcp(PortSet::single(443))],
                 },
             )
             .unwrap();
@@ -3604,10 +3624,10 @@ mod tests {
     }
 
     /// A namespace whose only member is the label of the source address
-    /// `member`, with `acls` and the given outbound rules.
+    /// `member`, with `rules` and the given outbound rules.
     fn address_namespace(
         member: IpAddr,
-        acls: Vec<AclRule>,
+        rules: Vec<Rule>,
         outbound: Option<Vec<OutboundRule>>,
     ) -> NamespacePolicy {
         NamespacePolicy {
@@ -3615,7 +3635,7 @@ mod tests {
                 label: address_label(member),
                 addresses: vec![host(member)],
             }],
-            policy: policy(acls),
+            rules,
             outbound,
             ..NamespacePolicy::default()
         }
@@ -3756,7 +3776,7 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                address_namespace(member, vec![rule("*", "*:22", "tcp")], None),
+                address_namespace(member, vec![tcp_rule(PortSet::single(22))], None),
             )
             .unwrap();
         let map = by_source_identity();
@@ -3787,12 +3807,13 @@ mod tests {
     fn bypass_is_never_shared_across_sources() {
         let engine = Arc::new(AclEngine::new());
         let open = addr("fd00::b");
-        let accept_all = AclRule {
-            action: AclAction::Accept,
-            src: vec!["*".to_owned()],
-            dst: vec!["*:*".to_owned()],
-            proto: None,
-        };
+        let accept_all = Rule::new(
+            "0",
+            vec![
+                ProtocolMatch::Tcp(PortSet::Any),
+                ProtocolMatch::Udp(PortSet::Any),
+            ],
+        );
         engine
             .store_namespace("nsd:a", address_namespace(open, vec![accept_all], None))
             .unwrap();
@@ -3808,7 +3829,7 @@ mod tests {
         );
 
         // A default policy that accepts everything bypasses every source in no namespace.
-        engine.load(policy(vec![rule("*", "*:*", "udp")])).unwrap();
+        engine.install(RuleSet::new([udp_rule(PortSet::Any)]).unwrap());
         assert_eq!(
             inbound(&f, GATEWAY, udp_packet(addr("fd00::c"), 4000, local, 9999)),
             Verdict::Accept
@@ -3839,8 +3860,8 @@ mod tests {
                 "nsd:a",
                 address_namespace(
                     restricted,
-                    vec![rule("*", "*:22", "tcp")],
-                    Some(vec![outbound_rule(Some("tcp"), "80")]),
+                    vec![tcp_rule(PortSet::single(22))],
+                    Some(vec![outbound_rule(true, PortSet::single(80))]),
                 ),
             )
             .unwrap();
@@ -3880,7 +3901,7 @@ mod tests {
         }
     }
 
-    // ── crates/acl mode: allow-only fragments, bypass flags ───────────────
+    // ── allow-only fragments, bypass flags, stateless replies ─────────────
 
     /// An engine with `rules` installed whose clock is moved by hand.
     fn clocked_engine(rules: RuleSet) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
@@ -3915,22 +3936,14 @@ mod tests {
     }
 
     #[test]
-    fn allow_only_constants_are_those_of_ns() {
+    fn bypass_and_fragment_defaults() {
         assert_eq!(FragmentMode::default(), FragmentMode::Outcome);
-        assert_eq!(
-            FragmentMode::ALLOW_ONLY,
-            FragmentMode::AllowOnly {
-                ttl: Duration::from_secs(15),
-                capacity: 4096,
-            }
-        );
         let config = AclFilterConfig::default();
         assert_eq!(config.fragments, FragmentMode::Outcome);
         assert_eq!(config.accept_to_local, None);
         assert!(!config.accept_icmp_echo_reply);
     }
 
-    /// ns `fragment_gate_remembers_until_ttl_then_expires`.
     #[test]
     fn allow_only_remembers_until_ttl_then_expires() {
         let (engine, clock) = clocked_engine(test_policy());
@@ -3954,8 +3967,8 @@ mod tests {
         assert_eq!((stats.accepted, stats.fragment), (3, 2));
     }
 
-    /// ns `fragment_gate_is_bounded_and_prunes_expired_under_pressure`, with
-    /// a small capacity.
+    /// A small capacity: expired entries are removed first, and nothing is
+    /// recorded while the table is still full.
     #[test]
     fn allow_only_is_bounded_and_prunes_expired_under_pressure() {
         let (engine, clock) = clocked_engine(test_policy());
@@ -4059,7 +4072,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_to_local_bypasses_the_policy() {
+    fn accept_to_local_precedes_the_policy() {
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
         let engine = Arc::new(AclEngine::new());
         let f = AclFilter::with_config(Arc::clone(&engine), identity(), AclFilterConfig::default());
@@ -4073,7 +4086,7 @@ mod tests {
             identity(),
             AclFilterConfig {
                 accept_to_local: Some("10.0.0.2".parse().unwrap()),
-                fragments: FragmentMode::ALLOW_ONLY,
+                fragments: allow_only(4096).fragments,
                 ..AclFilterConfig::default()
             },
         );
@@ -4110,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_icmp_echo_reply_bypasses_the_policy() {
+    fn echo_reply_bypass_reads_the_raw_header() {
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
         let reply = || ip(r, l, protocol::ICMP, &icmp_echo(0, 1));
         let request = || ip(r, l, protocol::ICMP, &icmp_echo(8, 1));
@@ -4122,13 +4135,13 @@ mod tests {
             identity(),
             AclFilterConfig {
                 accept_icmp_echo_reply: true,
-                fragments: FragmentMode::ALLOW_ONLY,
+                fragments: allow_only(4096).fragments,
                 ..AclFilterConfig::default()
             },
         );
         assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
         assert_eq!(inbound(&f, PEER, request()), drop(reasons::NO_POLICY));
-        // As ns: the type byte of a non-first fragment is read too.
+        // The type byte of a non-first fragment is read too.
         let tail = ip_frag(
             r,
             l,
@@ -4155,10 +4168,37 @@ mod tests {
         );
         assert_eq!(inbound(&f, PEER, v6), drop(reasons::NO_POLICY));
         assert_eq!(f.stats().bypassed, 2);
+        // The header length comes from the IHL: with 4 option bytes the type
+        // byte follows them, and a header below 20 bytes is never bypassed.
+        let with_options = |ihl: u8, icmp_type: u8| {
+            let mut bytes = reply().as_packet().to_vec();
+            bytes.splice(20..20, [1, 1, 1, 1]);
+            bytes[0] = 0x40 | ihl;
+            let total = u16::try_from(bytes.len()).unwrap();
+            bytes[2..4].copy_from_slice(&total.to_be_bytes());
+            bytes[24] = icmp_type;
+            PacketBuf::from_packet(&bytes)
+        };
+        assert_eq!(inbound(&f, PEER, with_options(6, 0)), Verdict::Accept);
+        assert_ne!(inbound(&f, PEER, with_options(6, 8)), Verdict::Accept);
+        let mut short = reply().as_packet().to_vec();
+        short[0] = 0x44;
+        assert_ne!(
+            inbound(&f, PEER, PacketBuf::from_packet(&short)),
+            Verdict::Accept
+        );
+        // Fewer than 8 bytes after the header.
+        let mut truncated = reply().as_packet().to_vec();
+        truncated.truncate(27);
+        assert_ne!(
+            inbound(&f, PEER, PacketBuf::from_packet(&truncated)),
+            Verdict::Accept
+        );
+        assert_eq!(f.stats().bypassed, 3);
     }
 
     #[test]
-    fn stateless_replies_are_judged_by_the_policy_only() {
+    fn stateless_replies_are_judged_by_the_rules() {
         let f = AclFilter::with_config(
             rules_engine(test_policy()),
             identity(),
@@ -4207,7 +4247,7 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80")])),
+                namespace(&[A], Some(vec![outbound_rule(true, PortSet::single(80))])),
             )
             .unwrap();
         let config = AclFilterConfig {
@@ -4241,46 +4281,40 @@ mod tests {
         assert!(table.pending.is_empty());
     }
 
-    /// The identities of an ns account: the address label for the peers
-    /// judged by source address, the key label for relay clients.
-    fn crates_acl_identity() -> Arc<PeerLabelMap> {
+    /// Stateless replies, allow-only fragments (15 s, 4096), `local` in
+    /// `accept_to_local`, echo replies and IPv6 accepted unevaluated.
+    fn stateless_options(local: Option<Ipv4Addr>) -> AclFilterConfig {
+        AclFilterConfig {
+            allow_other_protocols: false,
+            stateful_replies: false,
+            fragments: allow_only(4096).fragments,
+            accept_to_local: local,
+            accept_icmp_echo_reply: true,
+            ipv6: Ipv6Mode::Accept,
+            ..AclFilterConfig::default()
+        }
+    }
+
+    /// The address label for a peer judged by source address, a key label
+    /// for another.
+    fn stateless_identity() -> Arc<PeerLabelMap> {
         let map = Arc::new(PeerLabelMap::new());
         map.insert(PEER, label_set(&[ADDR]));
         map.insert(KEY_PEER, LabelSet::new([key_label()]));
         map
     }
 
+    /// The options combined: each keeps its own semantics.
     #[test]
-    fn crates_acl_preset() {
-        let local = "10.0.0.2".parse().unwrap();
-        let config = AclFilterConfig::crates_acl(Some(local));
-        assert_eq!(
-            config,
-            AclFilterConfig {
-                allow_other_protocols: false,
-                stateful_replies: false,
-                fragments: FragmentMode::ALLOW_ONLY,
-                accept_to_local: Some(local),
-                accept_icmp_echo_reply: true,
-                ipv6: Ipv6Mode::Accept,
-                ..AclFilterConfig::default()
-            }
-        );
-        assert_eq!(AclFilterConfig::crates_acl(None).accept_to_local, None);
-    }
-
-    /// ns `acl_check_packet` (with `is_icmp_echo_reply` before it) through the
-    /// preset; ns has no unit tests of it, so these follow its code.
-    #[test]
-    fn crates_acl_matches_acl_check_packet() {
+    fn stateless_options_combine() {
         let engine = Arc::new(AclEngine::new());
         let f = AclFilter::with_config(
             Arc::clone(&engine),
-            crates_acl_identity(),
-            AclFilterConfig::crates_acl(None),
+            stateless_identity(),
+            stateless_options(None),
         );
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
-        // No policy: fail closed, except echo replies.
+        // Not installed: fail closed, except echo replies.
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             drop(reasons::NO_POLICY)
@@ -4290,7 +4324,7 @@ mod tests {
             Verdict::Accept
         );
         engine.install(test_policy());
-        // By source address.
+        // By label and source prefix.
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             Verdict::Accept
@@ -4303,7 +4337,7 @@ mod tests {
             inbound(&f, PEER, tcp_packet(addr("10.0.0.7"), 4000, l, 80)),
             drop(reasons::DENIED)
         );
-        // A relay client by its key.
+        // By label alone, whatever the source address.
         assert_eq!(
             inbound(&f, KEY_PEER, udp_packet(addr("10.0.0.7"), 4000, l, 53)),
             Verdict::Accept
@@ -4326,7 +4360,7 @@ mod tests {
             inbound(&f, PEER, tcp_packet(r, 22, l, 5000)),
             drop(reasons::DENIED)
         );
-        // Fragments through the allow-only gate.
+        // Fragments through the allow-only gate, keyed without the peer.
         assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
         assert_eq!(inbound(&f, OTHER_PEER, continuation(7)), Verdict::Accept);
         assert_eq!(
@@ -4334,6 +4368,16 @@ mod tests {
             drop(reasons::DENIED)
         );
         assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
+        // The local address skips the rules.
+        let f = AclFilter::with_config(
+            engine,
+            stateless_identity(),
+            stateless_options(Some("10.0.0.2".parse().unwrap())),
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 81)),
+            Verdict::Accept
+        );
     }
 
     fn ipv6_accept() -> AclFilterConfig {
@@ -4361,7 +4405,7 @@ mod tests {
         let frag = ip(r, l, 44, &[protocol::TCP, 0, 0, 8, 0, 0, 0, 1, 0, 0]);
         let echo = ip(r, l, protocol::ICMPV6, &icmp_echo(128, 1));
         let truncated = || PacketBuf::from_packet(&[0x60, 0, 0]);
-        for config in [ipv6_accept(), AclFilterConfig::crates_acl(None)] {
+        for config in [ipv6_accept(), stateless_options(None)] {
             // No policy loaded.
             let engine = Arc::new(AclEngine::new());
             let f = AclFilter::with_config(Arc::clone(&engine), identity(), config);
@@ -4412,7 +4456,7 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A], Some(vec![outbound_rule(Some("tcp"), "80")])),
+                namespace(&[A], Some(vec![outbound_rule(true, PortSet::single(80))])),
             )
             .unwrap();
         let (a, local) = (peer_addr(A), addr(LOCAL));
@@ -4468,7 +4512,10 @@ mod tests {
         engine
             .store_namespace(
                 "nsd:a",
-                namespace(&[A, C], Some(vec![outbound_rule(Some("tcp"), "80")])),
+                namespace(
+                    &[A, C],
+                    Some(vec![outbound_rule(true, PortSet::single(80))]),
+                ),
             )
             .unwrap();
         engine
@@ -5166,7 +5213,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_with_labels_and_prefixes_needs_both() {
+    fn prefix_and_label_rule_needs_both() {
         use crate::{PortSet, ProtocolMatch, Rule};
         let engine = typed_rules([Rule::new("both", vec![ProtocolMatch::Tcp(PortSet::Any)])
             .with_labels([key_label()])

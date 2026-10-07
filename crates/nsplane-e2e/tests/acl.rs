@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use nsplane::{ChannelSink, ChannelSource, ChannelTransport, EngineBuilder, Event, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, AclTest, FlowKey,
-    FlowStats, FlowTracker, Label, LabelSet, PeerLabelMap, reasons,
+    AclEngine, AclFilter, AclFilterConfig, Error, Flow, FlowKey, FlowStats, FlowTracker, IpNet,
+    Label, LabelSet, PeerLabelMap, PortSet, ProtocolMatch, Rule, RuleId, RuleSet, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, introduce, payload, udp};
 use nsplane_packet::checksum::{
@@ -45,7 +45,7 @@ struct Acl {
     filter: AclFilter,
 }
 
-/// The label a policy's `key:<hex>` source of `key` compiles to.
+/// The label `a` carries: `key:` and the lowercase hex of its public key.
 fn key_label(key: &[u8; 32]) -> Label {
     Label::from(key.iter().fold(String::from("key:"), |mut text, b| {
         let _ = write!(text, "{b:02x}");
@@ -100,27 +100,21 @@ async fn acl_pair(
     ))
 }
 
-/// An accept rule; `proto` `None` matches TCP and UDP.
-fn rule(src: &str, dst: &str, proto: Option<&str>) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![dst.to_owned()],
-        proto: proto.map(str::to_owned),
-    }
+/// The host network of `ip`.
+fn host(ip: impl Into<IpAddr>) -> TestResult<IpNet> {
+    Ok(ip.into().to_string().parse()?)
 }
 
-fn policy(acls: Vec<AclRule>) -> AclPolicy {
-    AclPolicy {
-        acls,
-        ..AclPolicy::default()
-    }
+/// A rule accepting `protocol` to the host `dst`.
+fn to_host(id: &str, protocol: ProtocolMatch, dst: impl Into<IpAddr>) -> TestResult<Rule> {
+    Ok(Rule::new(id, vec![protocol]).with_destinations([host(dst)?]))
 }
 
-/// A policy allowing `a`'s key UDP to `b`'s IPv4 address on `port`.
-fn udp_policy(a: &AclNode, b: &AclNode, port: u16) -> AclPolicy {
-    let src = key_label(&a.public().to_bytes()).to_string();
-    policy(vec![rule(&src, &format!("{}:{port}", b.ip4), Some("udp"))])
+/// Rules allowing `a`'s key label UDP to `b`'s IPv4 address on `port`.
+fn udp_rules(a: &AclNode, b: &AclNode, port: u16) -> TestResult<RuleSet> {
+    let rule = to_host("udp", ProtocolMatch::Udp(PortSet::single(port)), b.ip4)?
+        .with_labels([key_label(&a.public().to_bytes())]);
+    Ok(RuleSet::new([rule])?)
 }
 
 const fn v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
@@ -232,11 +226,12 @@ async fn dropped(
 async fn policy_allows_and_denies_by_key_label_and_source_prefix() -> TestResult {
     let (mut a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
-    let src = key_label(&a.public().to_bytes()).to_string();
-    acl.engine.load(policy(vec![
-        rule(&src, &format!("{}:{ALLOWED}", b.ip4), Some("udp")),
-        rule(&src, &format!("{}:{ALLOWED}", b.ip6), Some("udp")),
-    ]))?;
+    let key = key_label(&a.public().to_bytes());
+    let allowed = ProtocolMatch::Udp(PortSet::single(ALLOWED));
+    acl.engine.install(RuleSet::new([
+        to_host("v4", allowed.clone(), b.ip4)?.with_labels([key.clone()]),
+        to_host("v6", allowed, b.ip6)?.with_labels([key]),
+    ])?);
 
     for (from, to) in [
         (IpAddr::V4(a.ip4), IpAddr::V4(b.ip4)),
@@ -256,18 +251,19 @@ async fn policy_allows_and_denies_by_key_label_and_source_prefix() -> TestResult
     }
     assert_eq!(b.drops(reasons::DENIED).await?, 2);
 
-    // Another label: the key rules no longer match `a`, a CIDR rule matches its packets'
+    // Another label: the key rules no longer match `a`, a prefix rule matches its packets'
     // source address. A new source port keeps `b`'s replies above from allowing it.
     let peer_a = b.peer_of(&a).await?;
     acl.identities
         .insert(peer_a, LabelSet::new([Label::from("tunnel-a")]));
     let to_allowed = udp(v4(a.ip4, SRC_PORT + 1), v4(b.ip4, ALLOWED), b"in");
     dropped(&a, &mut b, &mut events, &to_allowed, reasons::DENIED).await?;
-    acl.engine.load(policy(vec![rule(
-        &format!("{}/32", a.ip4),
-        &format!("{}:{ALLOWED}", b.ip4),
-        Some("udp"),
-    )]))?;
+    acl.engine.install(RuleSet::new([to_host(
+        "prefix",
+        ProtocolMatch::Udp(PortSet::single(ALLOWED)),
+        b.ip4,
+    )?
+    .with_sources([host(a.ip4)?])])?);
     delivered(&a, &mut b, &to_allowed).await?;
     let to_denied = udp(v4(a.ip4, SRC_PORT + 1), v4(b.ip4, DENIED), b"in");
     dropped(&a, &mut b, &mut events, &to_denied, reasons::DENIED).await?;
@@ -281,11 +277,12 @@ async fn policy_allows_and_denies_by_key_label_and_source_prefix() -> TestResult
 async fn tcp_rules_match_tcp_only() -> TestResult {
     let (a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
-    let src = key_label(&a.public().to_bytes()).to_string();
-    acl.engine.load(policy(vec![
-        rule(&src, &format!("{}:{ALLOWED}", b.ip4), Some("tcp")),
-        rule(&src, &format!("{}:{ALLOWED}", b.ip6), Some("tcp")),
-    ]))?;
+    let key = key_label(&a.public().to_bytes());
+    let allowed = ProtocolMatch::Tcp(PortSet::single(ALLOWED));
+    acl.engine.install(RuleSet::new([
+        to_host("v4", allowed.clone(), b.ip4)?.with_labels([key.clone()]),
+        to_host("v6", allowed, b.ip6)?.with_labels([key]),
+    ])?);
 
     for (from, to) in [
         (IpAddr::V4(a.ip4), IpAddr::V4(b.ip4)),
@@ -307,44 +304,54 @@ async fn tcp_rules_match_tcp_only() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn reload_swaps_the_policy_and_a_rejected_reload_keeps_it() -> TestResult {
+async fn install_swaps_the_rules_and_rejected_rules_keep_them() -> TestResult {
     let (a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
     let (p1, p2) = (ALLOWED, ALLOWED + 10);
     let to_p1 = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, p1), b"p1");
     let to_p2 = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, p2), b"p2");
 
-    acl.engine.load(udp_policy(&a, &b, p1))?;
+    acl.engine.install(udp_rules(&a, &b, p1)?);
     delivered(&a, &mut b, &to_p1).await?;
     dropped(&a, &mut b, &mut events, &to_p2, reasons::DENIED).await?;
 
-    acl.engine.load(udp_policy(&a, &b, p2))?;
+    acl.engine.install(udp_rules(&a, &b, p2)?);
     dropped(&a, &mut b, &mut events, &to_p1, reasons::DENIED).await?;
     delivered(&a, &mut b, &to_p2).await?;
 
-    // A policy whose built-in test fails is rejected; `p2` stays open.
-    let mut failing = udp_policy(&a, &b, p1);
-    failing.tests.push(AclTest {
-        src: a.ip4.to_string(),
-        dst: format!("{}:{p1}", b.ip4),
-        proto: Some("udp".to_owned()),
-        allow: true,
-    });
-    if acl.engine.load(failing).is_ok() {
-        return Err("a policy failing its tests was loaded".into());
+    // A caller checks its rules before installing them: `RuleSet::matching` decides flows
+    // without packets. The `p1` rules accept `a`'s key label only, not a source without
+    // labels at `a`'s address.
+    let candidate = udp_rules(&a, &b, p1)?;
+    let key = LabelSet::new([key_label(&a.public().to_bytes())]);
+    let flow = |port| Flow::udp(v4(a.ip4, SRC_PORT), v4(b.ip4, port));
+    let cases = [
+        (&key, flow(p1), Some("udp")),
+        (&key, flow(p2), None),
+        (&LabelSet::empty(), flow(p1), None),
+    ];
+    for (labels, flow, expected) in cases {
+        if candidate.matching(labels, &flow).map(RuleId::as_str) != expected {
+            return Err(format!("{flow:?} from {labels:?}: expected {expected:?}").into());
+        }
+    }
+    // Invalid rules never reach the engine; `p2` stays open.
+    let invalid = RuleSet::new([Rule::new("empty", Vec::new())]);
+    if !matches!(invalid, Err(Error::InvalidRule { .. })) {
+        return Err(format!("empty protocol list accepted: {invalid:?}").into());
     }
     delivered(&a, &mut b, &to_p2).await?;
     dropped(&a, &mut b, &mut events, &to_p1, reasons::DENIED).await
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn fail_closed_until_a_policy_loads_and_unknown_peers_are_dropped() -> TestResult {
+async fn fail_closed_until_rules_are_installed_and_unknown_peers_are_dropped() -> TestResult {
     let (a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
     let packet = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, ALLOWED), b"in");
 
     dropped(&a, &mut b, &mut events, &packet, reasons::NO_POLICY).await?;
-    acl.engine.load(udp_policy(&a, &b, ALLOWED))?;
+    acl.engine.install(udp_rules(&a, &b, ALLOWED)?);
     delivered(&a, &mut b, &packet).await?;
 
     acl.identities.remove(b.peer_of(&a).await?);
@@ -364,7 +371,7 @@ async fn fail_closed_until_a_policy_loads_and_unknown_peers_are_dropped() -> Tes
 async fn fragments_follow_their_first_fragment() -> TestResult {
     let (a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(udp_policy(&a, &b, ALLOWED))?;
+    acl.engine.install(udp_rules(&a, &b, ALLOWED)?);
     let data = payload(64);
     let a_end = v4(a.ip4, SRC_PORT);
 
@@ -388,7 +395,7 @@ async fn fragments_follow_their_first_fragment() -> TestResult {
 async fn replies_to_flows_b_opened_pass_a_deny_all_policy() -> TestResult {
     let (mut a, mut b, acl) = acl_pair(AclFilterConfig::default(), None).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     let (b_end, a_end) = (v4(b.ip4, 5000), v4(a.ip4, 6000));
     let stranger = v4(a.ip4, 6001);
 
@@ -431,7 +438,7 @@ async fn reply_allowances_expire_when_idle() -> TestResult {
     };
     let (mut a, mut b, acl) = acl_pair(config, None).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     let (b_end, a_end) = (v4(b.ip4, 5000), v4(a.ip4, 6000));
     let reply = udp(a_end, b_end, b"reply");
 
@@ -453,7 +460,7 @@ async fn flow_tracker_counts_flows_the_acl_lets_through() -> TestResult {
     let tracker = FlowTracker::new(2);
     let (mut a, mut b, acl) = acl_pair(AclFilterConfig::default(), Some(tracker.clone())).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(udp_policy(&a, &b, ALLOWED))?;
+    acl.engine.install(udp_rules(&a, &b, ALLOWED)?);
     let (a_end, b_end) = (v4(a.ip4, SRC_PORT), v4(b.ip4, ALLOWED));
     let peer_a = b.peer_of(&a).await?;
     let flow = |src: SocketAddr| FlowKey {

@@ -1,16 +1,16 @@
-//! The ACL filter in the `crates/acl` mode (`AclFilterConfig::crates_acl`), at engine
-//! level over an in-memory channel transport: two nodes `a` and `b`, where `b` runs an
-//! `AclFilter` with that preset on its packets and `a` runs no filter. The tests keep the
-//! shared `AclEngine`, the `PeerLabelMap` giving `a`'s labels and a clone of the filter for
-//! its counters, and check deliveries and `Event::Dropped` reasons for peers judged by
-//! their packets' source address (the address label) and by their key label, the
-//! allow-only fragment gate, the bypass flags,
-//! the absence of reply allowances, IPv6 passing unevaluated and policy reloads under
-//! traffic.
+//! The ACL filter with its stateless options set explicitly in `AclFilterConfig` (no reply
+//! allowances, allow-only IPv4 fragments, the `accept_to_local` and `accept_icmp_echo_reply`
+//! bypasses, IPv6 accepted unevaluated), at engine level over an in-memory channel transport:
+//! two nodes `a` and `b`, where `b` runs an `AclFilter` with these options on its packets and
+//! `a` runs no filter. The tests keep the shared `AclEngine`, the `PeerLabelMap` giving `a`'s
+//! labels and a clone of the filter for its counters, and check deliveries and
+//! `Event::Dropped` reasons for peers judged by their packets' source address (a prefix rule)
+//! and by their key label, the allow-only fragment gate, the bypass options, the absence of
+//! reply allowances, IPv6 passing unevaluated and rule updates under traffic.
 //!
 //! The runtime's clock is paused and the `AclEngine` reads tokio's clock, so the fragment
-//! TTL elapses with `tokio::time::advance`. The preset is built without a local address
-//! (every packet to `b` would bypass the policy) except in the bypass test.
+//! TTL elapses with `tokio::time::advance`. The options are built without a local address
+//! (every packet to `b` would bypass the rules) except in the bypass test.
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use nsplane::{AllowedIp, ChannelTransport, Event, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Ipv6Mode, Label,
-    LabelSet, PeerLabelMap, reasons,
+    AclEngine, AclFilter, AclFilterConfig, FragmentMode, IpNet, Ipv6Mode, Label, LabelSet,
+    PeerLabelMap, PortSet, ProtocolMatch, Rule, RuleSet, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, payload, tcp, udp};
 use nsplane_packet::checksum::ipv4_header_checksum;
@@ -30,18 +30,20 @@ use nsplane_packet::protocol;
 const CAPACITY: usize = 1024;
 /// The port `a`'s packets come from.
 const SRC_PORT: u16 = 40000;
-/// A port the policies of the tests allow on `b`.
+/// A port the rules of the tests allow on `b`.
 const ALLOWED: u16 = 7000;
-/// A port no policy allows.
+/// A port no rule allows.
 const DENIED: u16 = 7001;
 /// ICMP echo reply and echo request (type, code).
 const ECHO_REPLY: (u8, u8) = (0, 0);
 const ECHO_REQUEST: (u8, u8) = (8, 0);
-/// Just under the TTL of `FragmentMode::ALLOW_ONLY` (15 s).
+/// How long an accepted first fragment admits its later fragments.
+const FRAGMENT_TTL: Duration = Duration::from_secs(15);
+/// Just under [`FRAGMENT_TTL`].
 const UNDER_TTL: Duration = Duration::from_secs(14);
 /// A key that is not `a`'s.
 const OTHER_KEY: [u8; 32] = [0xaa; 32];
-/// The label of the peers judged by their packets' source address.
+/// A label of a peer judged by its packets' source address.
 const ADDRESS: &str = "addr";
 
 type AclNode = Node<ChannelTransport>;
@@ -53,7 +55,7 @@ struct Acl {
     filter: AclFilter,
 }
 
-/// The label a policy's `key:<hex>` source of `key` compiles to.
+/// The label of a peer known by its key: `key:` and the lowercase hex of `key`.
 fn key_label(key: &[u8; 32]) -> Label {
     Label::from(key.iter().fold(String::from("key:"), |mut text, b| {
         let _ = write!(text, "{b:02x}");
@@ -62,7 +64,7 @@ fn key_label(key: &[u8; 32]) -> Label {
 }
 
 /// Two peers linked like `channel_pair`, `b` with an `AclFilter` configured by `config`
-/// (no policy loaded yet, no identity for `a` yet) whose engine reads tokio's clock.
+/// (no rules installed yet, no identity for `a` yet) whose engine reads tokio's clock.
 async fn acl_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)> {
     let engine = Arc::new(AclEngine::with_clock(|| {
         tokio::time::Instant::now().into_std()
@@ -98,8 +100,7 @@ async fn acl_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)
     ))
 }
 
-/// [`acl_pair`] with `a` known to `b`'s filter by the label of its WireGuard key, as a
-/// relay client.
+/// [`acl_pair`] with `a` known to `b`'s filter by the label of its WireGuard key.
 async fn key_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)> {
     let (a, b, acl) = acl_pair(config).await?;
     acl.identities.insert(
@@ -110,7 +111,7 @@ async fn key_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)
 }
 
 /// [`acl_pair`] with `a` carrying the address label on `b`'s filter, and `a`'s allowed IPs
-/// on `b` widened by `10.1.0.0/24`, the gateway subnet `a`'s packets come from.
+/// on `b` widened by `10.1.0.0/24`, the subnet behind `a` its packets come from.
 async fn by_source_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)> {
     let (a, b, acl) = acl_pair(config).await?;
     let mut to_a = a.as_peer(b.path.transport);
@@ -129,31 +130,57 @@ const fn gateway(host: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 1, 0, host)
 }
 
-/// The `crates/acl` preset without a local address.
-fn preset() -> AclFilterConfig {
-    AclFilterConfig::crates_acl(None)
-}
-
-/// An accept rule for UDP.
-fn rule(src: &str, dst: &str) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![dst.to_owned()],
-        proto: Some("udp".to_owned()),
+/// The stateless options with `local` in `accept_to_local`: no reply allowances, protocols
+/// other than TCP and UDP dropped, allow-only fragments ([`FRAGMENT_TTL`], 4096 entries),
+/// echo replies and IPv6 accepted unevaluated.
+fn options_with(local: Option<Ipv4Addr>) -> AclFilterConfig {
+    AclFilterConfig {
+        stateful_replies: false,
+        allow_other_protocols: false,
+        fragments: FragmentMode::AllowOnly {
+            ttl: FRAGMENT_TTL,
+            capacity: 4096,
+        },
+        accept_to_local: local,
+        accept_icmp_echo_reply: true,
+        ipv6: Ipv6Mode::Accept,
+        ..AclFilterConfig::default()
     }
 }
 
-fn policy(acls: Vec<AclRule>) -> AclPolicy {
-    AclPolicy {
-        acls,
-        ..AclPolicy::default()
-    }
+/// [`options_with`] without a local address.
+fn options() -> AclFilterConfig {
+    options_with(None)
 }
 
-/// A policy allowing the source `src` UDP to `b`'s IPv4 address on `port`.
-fn udp_policy(src: &str, b: &AclNode, port: u16) -> AclPolicy {
-    policy(vec![rule(src, &format!("{}:{port}", b.ip4))])
+/// The host network of `ip`.
+fn host(ip: Ipv4Addr) -> TestResult<IpNet> {
+    Ok(ip.to_string().parse()?)
+}
+
+/// A rule accepting UDP to `dst`'s address and port, from any source.
+fn udp_to(dst: SocketAddr) -> TestResult<Rule> {
+    let IpAddr::V4(ip) = dst.ip() else {
+        return Err("IPv4 only".into());
+    };
+    Ok(
+        Rule::new("udp", vec![ProtocolMatch::Udp(PortSet::single(dst.port()))])
+            .with_destinations([host(ip)?]),
+    )
+}
+
+/// Rules allowing UDP from the source address `src` to `b`'s IPv4 address on `port`.
+fn from_source(src: Ipv4Addr, b: &AclNode, port: u16) -> TestResult<RuleSet> {
+    Ok(RuleSet::new([
+        udp_to(v4(b.ip4, port))?.with_sources([host(src)?])
+    ])?)
+}
+
+/// Rules allowing UDP from sources labelled `label` to `b`'s IPv4 address on `port`.
+fn from_label(label: Label, b: &AclNode, port: u16) -> TestResult<RuleSet> {
+    Ok(RuleSet::new([
+        udp_to(v4(b.ip4, port))?.with_labels([label])
+    ])?)
 }
 
 const fn v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
@@ -248,11 +275,10 @@ async fn dropped(
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn cidr_rules_judge_the_packet_sources() -> TestResult {
-    let (a, mut b, acl) = by_source_pair(preset()).await?;
+async fn prefix_rules_judge_the_packet_sources() -> TestResult {
+    let (a, mut b, acl) = by_source_pair(options()).await?;
     let mut events = b.subscribe().await?;
-    acl.engine
-        .load(udp_policy(&format!("{}/32", gateway(1)), &b, ALLOWED))?;
+    acl.engine.install(from_source(gateway(1), &b, ALLOWED)?);
     let to_b = v4(b.ip4, ALLOWED);
 
     delivered(&a, &mut b, &udp(v4(gateway(1), SRC_PORT), to_b, b"one")).await?;
@@ -272,19 +298,19 @@ async fn cidr_rules_judge_the_packet_sources() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn relay_client_key_labels_follow_identity_changes() -> TestResult {
-    let (a, mut b, acl) = key_pair(preset()).await?;
+async fn key_labels_follow_identity_changes() -> TestResult {
+    let (a, mut b, acl) = key_pair(options()).await?;
     let mut events = b.subscribe().await?;
     let packet = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, ALLOWED), b"key");
-    let a_key = key_label(&a.public().to_bytes()).to_string();
-    let other_key = key_label(&OTHER_KEY).to_string();
+    let a_key = key_label(&a.public().to_bytes());
 
-    acl.engine.load(udp_policy(&a_key, &b, ALLOWED))?;
+    acl.engine.install(from_label(a_key, &b, ALLOWED)?);
     delivered(&a, &mut b, &packet).await?;
-    acl.engine.load(udp_policy(&other_key, &b, ALLOWED))?;
+    acl.engine
+        .install(from_label(key_label(&OTHER_KEY), &b, ALLOWED)?);
     dropped(&a, &mut b, &mut events, &packet, reasons::DENIED).await?;
 
-    // The policy stays; `a`'s identity switches to the other key and back.
+    // The rules stay; `a`'s identity switches to the other key and back.
     let peer_a = b.peer_of(&a).await?;
     acl.identities
         .insert(peer_a, LabelSet::new([key_label(&OTHER_KEY)]));
@@ -304,13 +330,10 @@ async fn relay_client_key_labels_follow_identity_changes() -> TestResult {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn fragments_follow_an_accepted_first_fragment_within_the_ttl() -> TestResult {
-    let (a, mut b, acl) = key_pair(preset()).await?;
+    let (a, mut b, acl) = key_pair(options()).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(udp_policy(
-        &key_label(&a.public().to_bytes()).to_string(),
-        &b,
-        ALLOWED,
-    ))?;
+    acl.engine
+        .install(from_label(key_label(&a.public().to_bytes()), &b, ALLOWED)?);
     let data = payload(64);
     let a_end = v4(a.ip4, SRC_PORT);
     let (allowed, denied) = (v4(b.ip4, ALLOWED), v4(b.ip4, DENIED));
@@ -346,18 +369,18 @@ async fn fragments_follow_an_accepted_first_fragment_within_the_ttl() -> TestRes
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
-    // `accept_to_local`: packets to `b`'s address pass with and without a policy, and
-    // packets to its other address do not (IPv6 evaluated, so the flag alone decides).
+async fn bypass_options_skip_the_rules_only_when_set() -> TestResult {
+    // `accept_to_local`: packets to `b`'s address pass with and without rules, and
+    // packets to its other address do not (IPv6 evaluated, so the option alone decides).
     let config = AclFilterConfig {
         ipv6: Ipv6Mode::Evaluate,
-        ..AclFilterConfig::crates_acl(Some(Ipv4Addr::new(10, 0, 0, 2)))
+        ..options_with(Some(Ipv4Addr::new(10, 0, 0, 2)))
     };
     let (a, mut b, acl) = key_pair(config).await?;
     let mut events = b.subscribe().await?;
     let to_local = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, DENIED), b"local");
     delivered(&a, &mut b, &to_local).await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     delivered(&a, &mut b, &to_local).await?;
     let to_v6 = udp(
         SocketAddr::new(IpAddr::V6(a.ip6), SRC_PORT),
@@ -368,10 +391,10 @@ async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
     let stats = acl.filter.stats();
     assert_eq!((stats.bypassed, stats.denied), (2, 1));
 
-    // `accept_icmp_echo_reply`: an echo reply passes a deny-all policy, a request does not.
-    let (a, mut b, acl) = key_pair(preset()).await?;
+    // `accept_icmp_echo_reply`: an echo reply passes an empty rule set, a request does not.
+    let (a, mut b, acl) = key_pair(options()).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     let reply = echo(a.ip4, b.ip4, ECHO_REPLY);
     delivered(&a, &mut b, &reply).await?;
     let request = echo(a.ip4, b.ip4, ECHO_REQUEST);
@@ -379,15 +402,15 @@ async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
     let stats = acl.filter.stats();
     assert_eq!((stats.bypassed, stats.protocol), (1, 1));
 
-    // Both off: the same packets are judged by the policy.
+    // Both off: the same packets are judged by the rules.
     let config = AclFilterConfig {
         accept_to_local: None,
         accept_icmp_echo_reply: false,
-        ..preset()
+        ..options()
     };
     let (a, mut b, acl) = key_pair(config).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     dropped(&a, &mut b, &mut events, &to_local, reasons::DENIED).await?;
     let reply = echo(a.ip4, b.ip4, ECHO_REPLY);
     dropped(&a, &mut b, &mut events, &reply, reasons::PROTOCOL).await?;
@@ -397,10 +420,10 @@ async fn bypass_flags_skip_the_policy_only_when_set() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn ipv6_passes_unevaluated_in_the_preset_only() -> TestResult {
+async fn ipv6_passes_unevaluated_with_ipv6_accept_only() -> TestResult {
     let syn = 0x02;
-    let (a, mut b, acl) = key_pair(preset()).await?;
-    acl.engine.load(AclPolicy::default())?;
+    let (a, mut b, acl) = key_pair(options()).await?;
+    acl.engine.install(RuleSet::empty());
     let packet = tcp(
         SocketAddr::new(IpAddr::V6(a.ip6), SRC_PORT),
         SocketAddr::new(IpAddr::V6(b.ip6), DENIED),
@@ -412,10 +435,10 @@ async fn ipv6_passes_unevaluated_in_the_preset_only() -> TestResult {
     let stats = acl.filter.stats();
     assert_eq!((stats.ipv6_accepted, stats.accepted), (1, 0));
 
-    // The default config judges the same packet by the policy.
+    // The default config judges the same packet by the rules.
     let (a, mut b, acl) = key_pair(AclFilterConfig::default()).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     let packet = tcp(
         SocketAddr::new(IpAddr::V6(a.ip6), SRC_PORT),
         SocketAddr::new(IpAddr::V6(b.ip6), DENIED),
@@ -430,7 +453,7 @@ async fn ipv6_passes_unevaluated_in_the_preset_only() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn replies_are_judged_by_the_policy_without_stateful_replies() -> TestResult {
+async fn replies_are_judged_by_the_rules_without_stateful_replies() -> TestResult {
     let (b_end, a_end) = (
         v4(Ipv4Addr::new(10, 0, 0, 2), 5000),
         v4(Ipv4Addr::new(10, 0, 0, 1), 6000),
@@ -438,23 +461,21 @@ async fn replies_are_judged_by_the_policy_without_stateful_replies() -> TestResu
     let request = udp(b_end, a_end, b"request");
     let reply = udp(a_end, b_end, b"reply");
 
-    // Control: the default config lets the reply through a deny-all policy.
+    // Control: the default config lets the reply through an empty rule set.
     let (mut a, mut b, acl) = key_pair(AclFilterConfig::default()).await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     delivered(&b, &mut a, &request).await?;
     delivered(&a, &mut b, &reply).await?;
     assert_eq!(acl.filter.stats().replies, 1);
 
-    let (mut a, mut b, acl) = key_pair(preset()).await?;
+    let (mut a, mut b, acl) = key_pair(options()).await?;
     let mut events = b.subscribe().await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     delivered(&b, &mut a, &request).await?;
     dropped(&a, &mut b, &mut events, &reply, reasons::DENIED).await?;
-    // A policy accepting the reply's flow lets it in as a new flow.
-    acl.engine.load(policy(vec![rule(
-        &key_label(&a.public().to_bytes()).to_string(),
-        &b_end.to_string(),
-    )]))?;
+    // A rule accepting the reply's flow lets it in as a new flow.
+    let rule = udp_to(b_end)?.with_labels([key_label(&a.public().to_bytes())]);
+    acl.engine.install(RuleSet::new([rule])?);
     delivered(&a, &mut b, &reply).await?;
 
     let stats = acl.filter.stats();
@@ -463,19 +484,18 @@ async fn replies_are_judged_by_the_policy_without_stateful_replies() -> TestResu
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn policy_updates_apply_to_the_next_packet_under_traffic() -> TestResult {
-    let (a, mut b, acl) = by_source_pair(preset()).await?;
+async fn rule_updates_apply_to_the_next_packet_under_traffic() -> TestResult {
+    let (a, mut b, acl) = by_source_pair(options()).await?;
     let mut events = b.subscribe().await?;
     let sources = [gateway(1), gateway(2)];
     let to_b = v4(b.ip4, ALLOWED);
     let packet = |src: Ipv4Addr| udp(v4(src, SRC_PORT), to_b, b"traffic");
 
-    // Each round lets one source in; both send before and after every reload, so a
-    // cached verdict of the previous policy would show.
+    // Each round lets one source in; both send before and after every install, so a
+    // cached verdict of the previous rules would show.
     for round in 0..6 {
         let open = sources[round % 2];
-        acl.engine
-            .load(udp_policy(&format!("{open}/32"), &b, ALLOWED))?;
+        acl.engine.install(from_source(open, &b, ALLOWED)?);
         for _ in 0..3 {
             for src in sources {
                 if src == open {

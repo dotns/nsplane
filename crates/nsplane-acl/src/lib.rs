@@ -11,16 +11,6 @@
 //!   source label, source and destination prefix, and [`ProtocolMatch`]
 //!   (TCP or UDP ports, ICMP types, other IP protocols); validated into an
 //!   immutable [`RuleSet`]. See [Typed rules](#typed-rules).
-//! - **Policy model** ([`AclPolicy`]): named host aliases, ordered accept
-//!   rules (`src`, `dst` as `host:ports`, optional protocol) and built-in
-//!   tests that must pass before a policy is accepted.
-//! - **Layered merge** ([`merge_layered`]): combines an optional local policy
-//!   with any number of remote policies into one deduplicated policy with
-//!   per-rule provenance.
-//! - **Deny scope** ([`apply_deny_scope`]): an operator-authored post-filter
-//!   that removes rules reaching forbidden CIDRs. It edits the policy text
-//!   before compilation, so matching itself stays accept-only.
-//!   [`RuleSet::from_document`] compiles it into typed rules.
 //! - **Engine** ([`AclEngine`]): shares the default rule set with its
 //!   [`PolicyState`], the rule namespaces and the directed grants across
 //!   threads as one snapshot and swaps it atomically on every update. It is
@@ -60,8 +50,8 @@
 //! namespace (an opaque [`NamespaceId`], e.g. `team-a`) stored with
 //! [`AclEngine::store_namespace`]: its kind ([`NamespaceKind`]), its members
 //! ([`NamespaceMember`], a [`Label`] plus the addresses it owns), its accept
-//! rules (an [`AclPolicy`] with the usual semantics) and optional outbound
-//! rules ([`OutboundRule`]).
+//! accept rules (typed [`Rule`]s) and optional outbound rules
+//! ([`OutboundRule`]).
 //! Storing, replacing or removing one namespace leaves the others untouched.
 //! The engine's default rule set ([`AclEngine::install`]) applies only to
 //! sources whose labels are members of no namespace, exactly as before
@@ -248,7 +238,7 @@
 //! - **Generations.** [`AclEngine::generation`] increases on every published
 //!   change: [`install`](AclEngine::install),
 //!   [`uninstall`](AclEngine::uninstall), [`fail`](AclEngine::fail),
-//!   [`load`](AclEngine::load), [`clear_all`](AclEngine::clear_all),
+//!   [`clear_all`](AclEngine::clear_all),
 //!   storing or removing a namespace or a grant, and opening, closing,
 //!   sweeping or revoking a pinhole. A versioned [`PeerIdentity`] (its
 //!   [`generation`](PeerIdentity::generation), bumped by every
@@ -299,22 +289,6 @@
 //! packet. A [`PeerIdentity`] that is not versioned (generation 0, e.g. a
 //! closure) gets no cache: every packet is evaluated.
 //!
-//! # The ns `crates/acl` mode
-//!
-//! [`AclFilterConfig::crates_acl`] makes the filter judge inbound IPv4
-//! packets as the ACL step of an ns account (`is_local_node_packet ||
-//! is_icmp_echo_reply || acl_check_packet`): packets to the local tunnel
-//! address and ICMP echo replies pass without the policy
-//! ([`AclFilterConfig::accept_to_local`],
-//! [`AclFilterConfig::accept_icmp_echo_reply`]), non-first fragments pass
-//! only after an accepted first fragment of the same datagram within 15 s
-//! ([`FragmentMode::AllowOnly`]), and there are no reply allowances
-//! ([`AclFilterConfig::stateful_replies`] off). IPv6 packets pass in both
-//! directions without the policy ([`Ipv6Mode::Accept`]): ns runs no ACL on
-//! IPv6 and authorizes it only by destination, which the core's per-peer
-//! inbound destinations do. Each of these settings is off by default and
-//! costs one branch when off.
-//!
 //! # Performance
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
@@ -331,7 +305,7 @@
 //! | same, outbound-restricted peer (outbound rule) | | | 156 ns |
 //! | Bypass (a namespace accepting everything) | 38 ns | 37 ns | 77 ns |
 //! | Default policy, by-source peer (best of 3 runs) | 79 ns | 79 ns | |
-//! | `crates_acl` preset, by-source peer, IPv4 TCP (best of 3 runs) | 71 ns | 80 ns | |
+//! | Stateless options (no reply allowances, `AllowOnly` fragments, the local and echo-reply bypasses, IPv6 accepted), by-source peer, IPv4 TCP (best of 3 runs) | 71 ns | 80 ns | |
 //! | same, non-first fragment after an accepted first fragment | | 29 ns | |
 //!
 //! Before the hook every packet was a new flow: 71 ns (default policy),
@@ -348,36 +322,27 @@
 //!
 //! [`Instant::now`]: std::time::Instant::now
 
-pub mod deny_scope;
 #[cfg(test)]
 mod differential;
 pub mod engine;
 mod filter;
 mod flow;
 mod lru;
-mod matcher;
-pub mod merge;
 pub mod namespace;
 pub mod net;
 mod node_l3;
 pub mod pinhole;
-pub mod policy;
 pub mod reasons;
 pub mod rules;
 #[cfg(test)]
 mod test_packets;
 
-pub use deny_scope::{DenyScope, DenyScopeOutcome, DropReason, DroppedRule, apply_deny_scope};
-pub use engine::{AclEngine, AclTestFailure};
+pub use engine::AclEngine;
 pub use filter::{
     AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
     OtherProtocol, OtherProtocolRule, PeerIdentity, PeerLabelMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
-pub use merge::{
-    MergeStats, MergedPolicy, PolicyLayers, RemotePolicy, RuleProvenance, acl_rule_key,
-    acl_test_key, merge_layered,
-};
 pub use namespace::{
     Grant, GrantEnd, NamespaceId, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule,
 };
@@ -391,7 +356,6 @@ pub use node_l3::{
     NodeL3Transport, NodeL3TransportError, NodeL3TransportPeer, PeerKeyMap, PeerPublicKeys,
 };
 pub use pinhole::{Direction, PinholeError, PinholeGuard, PinholeId, PinholeSpec, PinholeStats};
-pub use policy::{AclAction, AclPolicy, AclRule, AclTest};
 pub use rules::{
     Decision, Flow, IcmpTypes, Label, LabelSet, Matched, NotInstalled, PolicyState, PortSet,
     ProtocolMatch, Rule, RuleId, RuleSet, Transport,
@@ -403,39 +367,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A host alias or deny-scope entry is not a valid CIDR.
-    #[error("invalid CIDR '{addr}': {reason}")]
-    InvalidCidr {
-        /// The offending CIDR text.
-        addr: String,
-        /// Why it failed to parse.
-        reason: String,
-    },
-
-    /// A rule destination is not a valid `host:ports` matcher.
-    #[error("invalid destination '{dst}': {reason}")]
-    InvalidDst {
-        /// The offending destination text.
-        dst: String,
-        /// Why it failed to parse.
-        reason: String,
-    },
-
-    /// A rule references a host alias that the policy does not define.
-    #[error("unknown host alias: '{0}'")]
-    UnknownAlias(String),
-
-    /// One or more built-in policy tests failed.
-    #[error("{count} policy test(s) failed")]
-    TestsFailed {
-        /// Number of failed tests.
-        count: usize,
-    },
-
-    /// The policy is malformed (bad rule source, destination or protocol).
-    #[error("invalid policy: {0}")]
-    InvalidPolicy(String),
-
     /// A typed rule is invalid ([`RuleSet::new`]).
     #[error("invalid rule '{id}': {reason}")]
     InvalidRule {

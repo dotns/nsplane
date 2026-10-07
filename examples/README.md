@@ -98,16 +98,17 @@ sudo cargo run -p nsplane-examples --bin hybrid -- --private-key-file a.key --tu
 ### acl_gateway
 
 A TUN node with an `nsplane-acl` `AclFilter` and a `FlowTracker`: inbound packets pass only as
-the JSON `--policy` allows for the peer's `--identity` labels; replies to connections the gateway
-opens always pass (stateful replies). The policy file is re-read every second and swapped in
-atomically (`policy reloaded (N rules)`; a broken file keeps the previous policy); before the
-first valid policy everything inbound is dropped. Status: `extra.acl` (filter counters,
+the `--policy` rules (a JSON list of `nsplane_acl::Rule`) allow for the peer's `--identity`
+labels; replies to connections the gateway opens always pass (stateful replies). The policy file
+is re-read every second, validated and installed atomically (`policy reloaded (N rules)`; a
+broken file keeps the previous rules); before the first valid file everything inbound is
+dropped. Status: `extra.acl` (filter counters,
 `policy_loaded`, `rules`, `reloads`, `reload_errors`) and `extra.flows`. Needs root.
 
 Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
 `--policy <PATH>`, `--identity <WG_PUBKEY>=<LABEL>[,<LABEL>]` (repeatable; the peer's
-opaque ACL labels: a `key:<hex>` policy source matches the label `key:<lowercase hex>`, CIDR
-and host-alias sources match the packet's source address). The sample
+opaque ACL labels: a rule's `labels` match a peer carrying one of them, its `sources` match the
+packet's source address). The sample
 [`policies/acl_gateway.json`](policies/acl_gateway.json) allows TCP and UDP port 7 from the
 peer address `10.0.0.2` to the gateway `10.0.0.1` and denies everything else (e.g. TCP 8).
 

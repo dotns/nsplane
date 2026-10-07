@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use nsplane::{ChannelSink, ChannelSource, ChannelTransport, EngineBuilder, Event, TransportId};
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, IpNet, Label, LabelSet,
-    OtherProtocol, OtherProtocolRule, PeerLabelMap, reasons,
+    AclEngine, AclFilter, AclFilterConfig, AclFilterScope, IpNet, Label, LabelSet, OtherProtocol,
+    OtherProtocolRule, PeerLabelMap, RuleSet, reasons,
 };
 use nsplane_e2e::{Node, Options, TestResult, icmp, introduce, udp};
 
@@ -27,11 +27,11 @@ const B_IP6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
 type AclNode = Node<ChannelTransport>;
 
 /// Two peers linked like `channel_pair`, `b` with an `AclFilter` built with `scope` and a
-/// deny-all policy (outbound packets to the unrestricted `a` pass it). `a` carries the
+/// empty rule set (outbound packets to the unrestricted `a` pass it). `a` carries the
 /// label `node-a`.
 async fn scoped_pair(scope: AclFilterScope) -> TestResult<(AclNode, AclNode, AclFilter)> {
     let engine = Arc::new(AclEngine::new());
-    engine.load(AclPolicy::default())?;
+    engine.install(RuleSet::empty());
     let identities = Arc::new(PeerLabelMap::new());
     let filter = AclFilter::with_scope(
         engine,

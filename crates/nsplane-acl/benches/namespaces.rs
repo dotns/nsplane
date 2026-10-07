@@ -13,10 +13,10 @@
 //!   (`PeerLabelMap::insert_by_source`), resolved per packet source address.
 //! - `other`: the `default` policy and an `ICMPv6` echo request to the local address accepted by
 //!   an other-protocol scope rule (`AclFilterScope::other_protocols`).
-//! - `crates_acl`: the ns `crates/acl` preset (`AclFilterConfig::crates_acl`: allow-only IPv4
-//!   fragments, the bypass flags on) for a peer with the address label sending IPv4 TCP to another
-//!   address than the local one, and a non-first fragment of a datagram whose first fragment it
-//!   accepted.
+//! - `stateless`: no reply allowances, allow-only IPv4 fragments (15 s, 4096), `accept_to_local`,
+//!   `accept_icmp_echo_reply` and `Ipv6Mode::Accept`, all set explicitly, for a peer with the
+//!   address label sending IPv4 TCP to another address than the local one, and a non-first
+//!   fragment of a datagram whose first fragment it accepted.
 //!
 //! `floor` measures what every packet pays before the filter's tables: parsing the five-tuple
 //! and loading the engine snapshot.
@@ -25,7 +25,6 @@
 //! evaluated against the policy; `*_established` benches repeat one five-tuple, the established
 //! flow the filter's verdict cache serves. Outbound benches repeat one five-tuple.
 
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -33,8 +32,8 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, AclRule,
-    Direction, Grant, GrantEnd, Label, LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy,
+    AclEngine, AclFilter, AclFilterConfig, AclFilterScope, Direction, FragmentMode, Grant,
+    GrantEnd, Ipv6Mode, Label, LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy,
     OtherProtocol, OtherProtocolRule, OutboundRule, PeerLabelMap, PinholeGuard, PinholeSpec,
     PortSet, Protocol, ProtocolMatch, Rule, RuleSet,
 };
@@ -99,33 +98,12 @@ fn tcp4(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, fragment: Option<(u16, bool
     PacketBuf::from_packet(&bytes)
 }
 
-fn rule(src: &str, dst: &str) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![dst.to_owned()],
-        proto: Some("tcp".to_owned()),
-    }
-}
-
-fn policy() -> AclPolicy {
-    AclPolicy {
-        hosts: HashMap::new(),
-        acls: vec![
-            rule("10.0.0.0/8", "*:80,443"),
-            rule("fd00:ffff::/32", "*:8000-8999"),
-            rule("*", "*:22"),
-        ],
-        tests: Vec::new(),
-    }
-}
-
-/// [`policy`] as typed rules: the prefix rules also need the address label.
-fn default_rules() -> RuleSet {
-    let address = || [Label::from(ADDRESS)];
-    let rules = RuleSet::new([
+/// Three TCP rules: from `10.0.0.0/8` to ports 80 and 443, from `fd00:ffff::/32` to ports
+/// 8000-8999, and from anyone to port 22. With `labels`, the prefix rules also need them.
+fn three_rules(labels: &[Label]) -> Vec<Rule> {
+    vec![
         Rule::new("0", vec![ProtocolMatch::Tcp(PortSet::list([80, 443]))])
-            .with_labels(address())
+            .with_labels(labels.iter().cloned())
             .with_sources("10.0.0.0/8".parse()),
         Rule::new(
             "1",
@@ -133,10 +111,15 @@ fn default_rules() -> RuleSet {
                 RangeInclusive::new(8000, 8999),
             ]))],
         )
-        .with_labels(address())
+        .with_labels(labels.iter().cloned())
         .with_sources("fd00:ffff::/32".parse()),
         Rule::new("2", vec![ProtocolMatch::Tcp(PortSet::single(22))]),
-    ]);
+    ]
+}
+
+/// The default rule set: [`three_rules`] whose prefix rules also need the address label.
+fn default_rules() -> RuleSet {
+    let rules = RuleSet::new(three_rules(&[Label::from(ADDRESS)]));
     assert!(rules.is_ok());
     rules.unwrap_or_else(|_| RuleSet::empty())
 }
@@ -170,12 +153,12 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
                     addresses: address(ns, i).to_string().parse().into_iter().collect(),
                 })
                 .collect(),
-            policy: policy(),
+            rules: three_rules(&[]),
             outbound: (ns == 0).then(|| {
-                vec![OutboundRule {
-                    proto: Some("tcp".to_owned()),
-                    ports: "80,443".to_owned(),
-                }]
+                vec![OutboundRule::new(
+                    "web",
+                    vec![ProtocolMatch::Tcp(PortSet::list([80, 443]))],
+                )]
             }),
             pinhole_kinds: ["transfer".to_owned()].into(),
             ..NamespacePolicy::default()
@@ -190,8 +173,7 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
         let grant = Grant {
             from: GrantEnd::Namespace(format!("nsd:{g}").into()),
             to: GrantEnd::Namespace(format!("nsd:{}", g + 1).into()),
-            proto: Some("tcp".to_owned()),
-            ports: Some("443".to_owned()),
+            protocols: vec![ProtocolMatch::Tcp(PortSet::single(443))],
         };
         assert!(engine.store_grant(format!("g{g}"), grant).is_ok());
     }
@@ -299,16 +281,13 @@ fn bypass_engine() -> Arc<AclEngine> {
                 addresses: address(0, i).to_string().parse().into_iter().collect(),
             })
             .collect(),
-        policy: AclPolicy {
-            hosts: HashMap::new(),
-            acls: vec![AclRule {
-                action: AclAction::Accept,
-                src: vec!["*".to_owned()],
-                dst: vec!["*:*".to_owned()],
-                proto: None,
-            }],
-            tests: Vec::new(),
-        },
+        rules: vec![Rule::new(
+            "all",
+            vec![
+                ProtocolMatch::Tcp(PortSet::Any),
+                ProtocolMatch::Udp(PortSet::Any),
+            ],
+        )],
         ..NamespacePolicy::default()
     };
     assert!(engine.store_namespace("quick", quick).is_ok());
@@ -461,7 +440,7 @@ fn bench_other_scope(c: &mut Criterion) {
     bench_established(c, "other/icmp_echo_scope", &filter, last, true, &echo);
 }
 
-/// The `by_source` and `crates_acl` scenarios.
+/// The `by_source` and `stateless` scenarios.
 fn bench_by_source(c: &mut Criterion) {
     let (last, last_addr) = (
         peer(NAMESPACES - 1, MEMBERS - 1),
@@ -489,7 +468,7 @@ fn bench_by_source(c: &mut Criterion) {
         &inbound_v6,
     );
 
-    // The ns `crates/acl` preset for the same peer with the address label, IPv4 TCP from
+    // The stateless options for the same peer with the address label, IPv4 TCP from
     // 10.0.0.2 to 10.0.0.3:443 (not the local 10.0.0.1), and a non-first fragment after an
     // accepted first fragment. The engine clock stands still, so the fragment entry never
     // expires.
@@ -498,14 +477,25 @@ fn bench_by_source(c: &mut Criterion) {
     engine.install(default_rules());
     let address = Arc::new(PeerLabelMap::new());
     address.insert(last, LabelSet::new([Label::from(ADDRESS)]));
-    let config = AclFilterConfig::crates_acl(Some(Ipv4Addr::new(10, 0, 0, 1)));
+    let config = AclFilterConfig {
+        allow_other_protocols: false,
+        stateful_replies: false,
+        fragments: FragmentMode::AllowOnly {
+            ttl: Duration::from_secs(15),
+            capacity: 4096,
+        },
+        accept_to_local: Some(Ipv4Addr::new(10, 0, 0, 1)),
+        accept_icmp_echo_reply: true,
+        ipv6: Ipv6Mode::Accept,
+        ..AclFilterConfig::default()
+    };
     let filter = AclFilter::with_config(engine, address, config);
     let (src, dst) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
     let tcp_v4 = tcp4(src, dst, 443, None);
-    bench_packet(c, "crates_acl/inbound", &filter, last, true, &tcp_v4);
+    bench_packet(c, "stateless/inbound", &filter, last, true, &tcp_v4);
     bench_established(
         c,
-        "crates_acl/inbound_established",
+        "stateless/inbound_established",
         &filter,
         last,
         true,
@@ -518,14 +508,7 @@ fn bench_by_source(c: &mut Criterion) {
         "first fragment"
     );
     let later = tcp4(src, dst, 443, Some((3, true)));
-    bench_established(
-        c,
-        "crates_acl/inbound_fragment",
-        &filter,
-        last,
-        true,
-        &later,
-    );
+    bench_established(c, "stateless/inbound_fragment", &filter, last, true, &later);
 }
 
 criterion_group!(

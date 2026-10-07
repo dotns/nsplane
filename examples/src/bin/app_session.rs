@@ -94,9 +94,9 @@ use nsplane::{
     PacketSink, PacketSource, Path, Peer, Splitter, UdpTransport,
 };
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet, Label,
-    LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule, PeerLabelMap,
-    PinholeError, PinholeGuard, PinholeSpec, Protocol, reasons,
+    AclEngine, AclFilter, Direction, Grant, GrantEnd, IpNet, Label, LabelSet, NamespaceKind,
+    NamespaceMember, NamespacePolicy, OutboundRule, PeerLabelMap, PinholeError, PinholeGuard,
+    PinholeSpec, PortSet, Protocol, ProtocolMatch, Rule, RuleSet, reasons,
 };
 use nsplane_examples::echo::{self, Backend, Check, Proto};
 use nsplane_examples::node::{UDP_TRANSPORT, generate_key, init_logging};
@@ -617,10 +617,14 @@ impl Node {
 
     /// Lets every source in no namespace in (a leaf whose hub does the enforcing).
     fn permit_all(&self) -> anyhow::Result<()> {
-        self.acl.load(AclPolicy {
-            acls: vec![accept("*:*")],
-            ..AclPolicy::default()
-        })?;
+        let all = Rule::new(
+            "all",
+            vec![
+                ProtocolMatch::Tcp(PortSet::Any),
+                ProtocolMatch::Udp(PortSet::Any),
+            ],
+        );
+        self.acl.install(RuleSet::new([all])?);
         Ok(())
     }
 
@@ -721,16 +725,6 @@ fn open_tun(
     bail!("--tun runs on Linux only")
 }
 
-/// An accept rule for TCP to `dst` from anyone.
-fn accept(dst: &str) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec!["*".to_owned()],
-        dst: vec![dst.to_owned()],
-        proto: None,
-    }
-}
-
 /// The `quick` namespace with `peer` as its member: TCP echo allowed, the transfer app
 /// allowed iff `transfer`, outbound to the peer restricted to `outbound` if set.
 fn quick(
@@ -738,14 +732,9 @@ fn quick(
     transfer: bool,
     outbound: Option<Vec<OutboundRule>>,
 ) -> NamespacePolicy {
-    let mut echo = accept(&format!("*:{ECHO_PORT}"));
-    echo.proto = Some("tcp".to_owned());
     NamespacePolicy {
         members: vec![peer],
-        policy: AclPolicy {
-            acls: vec![echo],
-            ..AclPolicy::default()
-        },
+        rules: vec![Rule::new("echo", tcp_echo())],
         outbound,
         pinhole_kinds: if transfer {
             BTreeSet::from([APP_KIND.to_owned()])
@@ -756,12 +745,14 @@ fn quick(
     }
 }
 
+/// TCP to [`ECHO_PORT`].
+fn tcp_echo() -> Vec<ProtocolMatch> {
+    vec![ProtocolMatch::Tcp(PortSet::single(ECHO_PORT))]
+}
+
 /// B's outbound rules towards A: TCP echo only.
 fn echo_only() -> Vec<OutboundRule> {
-    vec![OutboundRule {
-        proto: Some("tcp".to_owned()),
-        ports: ECHO_PORT.to_string(),
-    }]
+    vec![OutboundRule::new("echo", tcp_echo())]
 }
 
 /// A and B as peers in their `quick` namespaces.
@@ -1380,8 +1371,7 @@ async fn cross_namespace(h: &Node, s: &Node, c: &Node, v6: bool) -> anyhow::Resu
     let grant = Grant {
         from: GrantEnd::Label(s.label()),
         to: GrantEnd::Namespace(NSD_C.into()),
-        proto: Some("tcp".to_owned()),
-        ports: Some(ECHO_PORT.to_string()),
+        protocols: tcp_echo(),
     };
     h.acl.store_grant("s-to-c", grant)?;
     out::line(format_args!("GRANT h s -> {NSD_C} tcp/{ECHO_PORT}"));

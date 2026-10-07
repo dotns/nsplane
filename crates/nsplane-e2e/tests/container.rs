@@ -28,7 +28,8 @@ use nsplane::{
     PeerStats, UdpTransport,
 };
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, PeerLabelMap, reasons,
+    AclEngine, AclFilter, IpNet, Label, LabelSet, PeerLabelMap, PortSet, ProtocolMatch, Rule,
+    RuleSet, reasons,
 };
 use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, serve_udp_echo, udp};
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, TcpConnection};
@@ -944,14 +945,17 @@ async fn expect_dropped(events: &mut broadcast::Receiver<Event>, reason: &str) -
     }
 }
 
-/// An accept rule from `src` to `dst` for TCP and UDP.
-fn accept(src: &str, dst: String) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![dst],
-        proto: None,
-    }
+/// An accept rule from sources labelled `label` to the host `dst` on `port`, for TCP and
+/// UDP.
+fn accept(label: &Label, dst: IpAddr, port: u16) -> TestResult<Rule> {
+    let host: IpNet = dst.to_string().parse()?;
+    let ports = PortSet::single(port);
+    Ok(Rule::new(
+        dst.to_string(),
+        vec![ProtocolMatch::Tcp(ports.clone()), ProtocolMatch::Udp(ports)],
+    )
+    .with_labels([label.clone()])
+    .with_destinations([host]))
 }
 
 /// The kernel peer's TCP connection to [`ALLOWED`] on `local4` carries its data; the one to
@@ -1085,7 +1089,7 @@ async fn kernel_peer_through_acl_filter() -> TestResult {
     )
     .await?;
     let peer = the_peer(&handle).await?;
-    // The label the policy's `key:<hex>` source compiles to.
+    // The peer's label: `key:` and the lowercase hex of its public key.
     let src = peer
         .public_key
         .to_bytes()
@@ -1095,16 +1099,14 @@ async fn kernel_peer_through_acl_filter() -> TestResult {
             let _ = write!(text, "{b:02x}");
             text
         });
-    identities.insert(peer.peer, LabelSet::new([Label::from(src.as_str())]));
+    let label = Label::from(src);
+    identities.insert(peer.peer, LabelSet::new([label.clone()]));
     let local4: Ipv4Addr = env.addr_v4.split('/').next().unwrap_or_default().parse()?;
     let local6: Ipv6Addr = env.addr_v6.split('/').next().unwrap_or_default().parse()?;
-    acl.load(AclPolicy {
-        acls: vec![
-            accept(&src, format!("{local4}:{ALLOWED}")),
-            accept(&src, format!("{local6}:{ALLOWED}")),
-        ],
-        ..AclPolicy::default()
-    })?;
+    acl.install(RuleSet::new([
+        accept(&label, IpAddr::V4(local4), ALLOWED)?,
+        accept(&label, IpAddr::V6(local6), ALLOWED)?,
+    ])?);
 
     step("this side initiates the handshake")?;
     handle.force_handshake(peer.peer, None).await?;

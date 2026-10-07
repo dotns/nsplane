@@ -13,31 +13,18 @@ use tracing::{debug, warn};
 
 use crate::{
     Error,
-    matcher::{parse_ports, parse_protocol, protocols},
     namespace::{Grant, GrantEnd, NamespaceId, NamespaceKind, NamespacePolicy},
     net::{IpNet, Protocol},
     pinhole::{
         Direction, Pinhole, PinholeCounters, PinholeError, PinholeGuard, PinholeId, PinholeSpec,
         PinholeStats,
     },
-    policy::{AclPolicy, AclTest},
     reasons,
     rules::{
-        Decision, Flow, Label, LabelSet, Matched, NotInstalled, PolicyState, PortSet, Protocols,
-        RuleId, RuleSet, Transport,
+        Decision, Flow, Label, LabelSet, Matched, NotInstalled, PolicyState, Protocols, RuleId,
+        RuleSet, Transport,
     },
 };
-
-// ── Public types ──────────────────────────────────────────────────────────────
-
-/// A failed built-in policy test.
-#[derive(Debug, Clone)]
-pub struct AclTestFailure {
-    /// The test that failed.
-    pub test: AclTest,
-    /// Why it failed.
-    pub reason: String,
-}
 
 // ── Evaluation ────────────────────────────────────────────────────────────────
 
@@ -127,19 +114,6 @@ impl Evaluation<'_> {
 
 // ── Namespaces, grants and the engine snapshot ────────────────────────────────
 
-/// Compile string protocol and ports (outbound rules, grants); `Err` holds
-/// the reason.
-fn compile_ports(proto: Option<&str>, ports: Option<&str>) -> Result<Protocols, String> {
-    let proto = proto
-        .map(parse_protocol)
-        .transpose()
-        .map_err(|e| format!("proto: {e}"))?;
-    let ports = ports
-        .map_or(Ok(PortSet::Any), parse_ports)
-        .map_err(|e| format!("ports: {e}"))?;
-    Protocols::compile(&protocols(proto, ports))
-}
-
 #[derive(Debug)]
 struct CompiledNamespace {
     source: NamespacePolicy,
@@ -159,23 +133,22 @@ impl CompiledNamespace {
             reason,
         };
         if source.kind == NamespaceKind::Pinholes
-            && (!source.policy.acls.is_empty() || !source.pinhole_kinds.is_empty())
+            && (!source.rules.is_empty() || !source.pinhole_kinds.is_empty())
         {
             return Err(invalid(
                 "a pinhole namespace cannot have accept rules or pinhole kinds".to_owned(),
             ));
         }
-        let rules = RuleSet::from_document(source.policy.clone())?;
+        let rules = RuleSet::new(source.rules.iter().cloned())?;
         let outbound = source
             .outbound
             .as_ref()
             .map(|rules| {
                 rules
                     .iter()
-                    .enumerate()
-                    .map(|(i, rule)| {
-                        compile_ports(rule.proto.as_deref(), Some(&rule.ports))
-                            .map_err(|e| invalid(format!("outbound rule {i} {e}")))
+                    .map(|rule| {
+                        Protocols::compile(&rule.protocols)
+                            .map_err(|e| invalid(format!("outbound rule '{}': {e}", rule.id)))
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -776,24 +749,6 @@ impl AclEngine {
         self
     }
 
-    /// Compile `policy` and install it as the default rule set (see
-    /// [`RuleSet::from_document`]).
-    ///
-    /// On error (invalid policy or failed built-in tests) the previous state
-    /// stays in effect.
-    pub fn load(&self, policy: AclPolicy) -> Result<(), Error> {
-        match RuleSet::from_document(policy) {
-            Ok(rules) => {
-                self.install(rules);
-                Ok(())
-            }
-            Err(err) => {
-                warn!(error = %err, "ACL policy rejected; keeping the previous policy");
-                Err(err)
-            }
-        }
-    }
-
     /// Install `rules` as the default rule set, which applies to sources in
     /// no namespace, in one atomic swap. The state becomes
     /// [`PolicyState::Installed`]; an empty set denies every new flow.
@@ -904,12 +859,12 @@ impl AclEngine {
         }
     }
 
-    /// Compile `policy` and store it as namespace `id`, replacing only that
+    /// Validate `policy` and store it as namespace `id`, replacing only that
     /// namespace.
     ///
-    /// The namespace's rules are compiled and their built-in tests run, as
-    /// [`load`](Self::load) does. A [`NamespaceKind::Pinholes`] namespace
-    /// with accept rules or pinhole kinds, or an invalid outbound rule, is
+    /// The namespace's rules are validated as [`RuleSet::new`] does
+    /// ([`Error::InvalidRule`]). A [`NamespaceKind::Pinholes`] namespace with
+    /// accept rules or pinhole kinds, or an invalid outbound rule, is
     /// rejected with [`Error::InvalidNamespace`]. On error the previous state
     /// stays in effect.
     pub fn store_namespace(
@@ -964,7 +919,8 @@ impl AclEngine {
 
     /// Store a directed grant under `id`, replacing any grant with that id.
     ///
-    /// Returns [`Error::InvalidGrant`] for an invalid protocol or port syntax,
+    /// Returns [`Error::InvalidGrant`] for invalid protocols (validated as
+    /// [`Rule::protocols`](crate::Rule::protocols)),
     /// or when an end names a stored [`NamespaceKind::Pinholes`] namespace
     /// (its members get access only through pinholes); the previous state
     /// then stays in effect. A namespace end matches only while the
@@ -985,8 +941,7 @@ impl AclEngine {
             }
         }
         drop(snapshot);
-        let protocols =
-            compile_ports(grant.proto.as_deref(), grant.ports.as_deref()).map_err(invalid)?;
+        let protocols = Protocols::compile(&grant.protocols).map_err(invalid)?;
         let compiled = Arc::new(CompiledGrant {
             id: id.clone(),
             from: End::new(&grant.from),
@@ -1168,29 +1123,12 @@ impl AclEngine {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::ops::RangeInclusive;
     use std::time::Duration;
 
     use super::*;
     use crate::namespace::{NamespaceMember, OutboundRule};
-    use crate::policy::{AclAction, AclRule};
-    use crate::rules::{IcmpTypes, ProtocolMatch, Rule};
-
-    fn make_policy(acls: Vec<AclRule>, tests: Vec<AclTest>) -> AclPolicy {
-        AclPolicy {
-            hosts: HashMap::new(),
-            acls,
-            tests,
-        }
-    }
-
-    fn accept_rule(src: &[&str], dst: &[&str], proto: Option<&str>) -> AclRule {
-        AclRule {
-            action: AclAction::Accept,
-            src: src.iter().map(ToString::to_string).collect(),
-            dst: dst.iter().map(ToString::to_string).collect(),
-            proto: proto.map(str::to_owned),
-        }
-    }
+    use crate::rules::{IcmpTypes, PortSet, ProtocolMatch, Rule};
 
     fn flow(src: &str, dst: &str, port: u16, proto: Protocol) -> Flow {
         let src = SocketAddr::new(src.parse().unwrap(), 4000);
@@ -1227,179 +1165,9 @@ mod tests {
         })
     }
 
-    // ── documents ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn empty_policy_denies_everything() {
-        let rules = RuleSet::from_document(make_policy(vec![], vec![])).unwrap();
-        assert!(!allowed(
-            &rules,
-            &req("10.0.0.1", "192.168.1.1", 80, Protocol::Tcp)
-        ));
-    }
-
-    #[test]
-    fn wildcard_rule_allows_any_connection() {
-        let rules = RuleSet::from_document(make_policy(
-            vec![accept_rule(&["*"], &["*:*"], None)],
-            vec![],
-        ))
-        .unwrap();
-        assert!(allowed(
-            &rules,
-            &req("1.2.3.4", "5.6.7.8", 9999, Protocol::Udp)
-        ));
-    }
-
-    #[test]
-    fn cidr_rule_allows_in_range_denies_outside() {
-        let rules = RuleSet::from_document(make_policy(
-            vec![accept_rule(&["10.0.0.0/24"], &["192.168.1.0/24:80"], None)],
-            vec![],
-        ))
-        .unwrap();
-        assert!(allowed(
-            &rules,
-            &req("10.0.0.5", "192.168.1.5", 80, Protocol::Tcp)
-        ));
-        // src outside range
-        assert!(!allowed(
-            &rules,
-            &req("10.0.1.5", "192.168.1.5", 80, Protocol::Tcp)
-        ));
-        // dst outside range
-        assert!(!allowed(
-            &rules,
-            &req("10.0.0.5", "192.168.2.5", 80, Protocol::Tcp)
-        ));
-        // wrong port
-        assert!(!allowed(
-            &rules,
-            &req("10.0.0.5", "192.168.1.5", 443, Protocol::Tcp)
-        ));
-    }
-
-    #[test]
-    fn host_alias_resolves_correctly() {
-        let mut policy = make_policy(
-            vec![accept_rule(&["10.0.0.0/24"], &["db:5432"], Some("tcp"))],
-            vec![],
-        );
-        policy
-            .hosts
-            .insert("db".to_owned(), "192.168.1.10/32".to_owned());
-        let rules = RuleSet::from_document(policy).unwrap();
-        assert!(allowed(
-            &rules,
-            &req("10.0.0.2", "192.168.1.10", 5432, Protocol::Tcp)
-        ));
-        assert!(!allowed(
-            &rules,
-            &req("10.0.0.2", "192.168.1.11", 5432, Protocol::Tcp)
-        ));
-    }
-
-    #[test]
-    fn document_protocols_and_ports() {
-        let rules = RuleSet::from_document(make_policy(
-            vec![
-                accept_rule(&["*"], &["*:80"], Some("tcp")),
-                accept_rule(&["*"], &["*:53"], None),
-                accept_rule(&["*"], &["*:8000-8999"], Some("udp")),
-                accept_rule(&["*"], &["*:443,8443"], Some("tcp")),
-            ],
-            vec![],
-        ))
-        .unwrap();
-        let check = |port, proto| matched(&rules, &req("1.2.3.4", "5.6.7.8", port, proto));
-        assert_eq!(check(80, Protocol::Tcp).as_deref(), Some("0"));
-        assert_eq!(check(80, Protocol::Udp), None);
-        assert_eq!(check(53, Protocol::Tcp).as_deref(), Some("1"));
-        assert_eq!(check(53, Protocol::Udp).as_deref(), Some("1"));
-        assert_eq!(check(8080, Protocol::Udp).as_deref(), Some("2"));
-        assert_eq!(check(8080, Protocol::Tcp), None);
-        assert_eq!(check(8443, Protocol::Tcp).as_deref(), Some("3"));
-        assert_eq!(check(444, Protocol::Tcp), None);
-    }
-
-    #[test]
-    fn first_matching_rule_wins() {
-        let rules = RuleSet::from_document(make_policy(
-            vec![
-                accept_rule(&["10.0.0.0/24"], &["*:80"], None),
-                accept_rule(&["*"], &["*:*"], None),
-            ],
-            vec![],
-        ))
-        .unwrap();
-        let first = req("10.0.0.5", "1.2.3.4", 80, Protocol::Tcp);
-        assert_eq!(matched(&rules, &first).as_deref(), Some("0"));
-        let second = req("172.16.0.1", "1.2.3.4", 9090, Protocol::Tcp);
-        assert_eq!(matched(&rules, &second).as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn builtin_tests_run_on_compilation() {
-        let test = |dst: &str, proto: Option<&str>, allow| AclTest {
-            src: "10.0.0.2".to_owned(),
-            dst: dst.to_owned(),
-            proto: proto.map(str::to_owned),
-            allow,
-        };
-        let tcp = make_policy(
-            vec![accept_rule(&["10.0.0.0/24"], &["192.168.1.0/24:80"], None)],
-            vec![
-                test("192.168.1.5:80", None, true),
-                test("192.168.1.5:443", None, false),
-            ],
-        );
-        assert!(RuleSet::from_document(tcp).is_ok());
-        let udp = make_policy(
-            vec![accept_rule(
-                &["10.0.0.0/24"],
-                &["192.168.1.0/24:53"],
-                Some("udp"),
-            )],
-            vec![
-                test("192.168.1.5:53", Some("udp"), true),
-                test("192.168.1.5:53", Some("tcp"), false),
-            ],
-        );
-        assert!(RuleSet::from_document(udp).is_ok());
-        // Expects allow, but an empty policy denies; unparsable tests fail too.
-        let failing = make_policy(
-            vec![],
-            vec![
-                test("192.168.1.5:80", None, true),
-                test("192.168.1.5", None, false),
-                test("192.168.1.5:80", Some("icmp"), false),
-            ],
-        );
-        assert!(matches!(
-            RuleSet::from_document(failing),
-            Err(Error::TestsFailed { count: 3 })
-        ));
-    }
-
-    #[test]
-    fn invalid_documents_return_errors() {
-        assert!(
-            RuleSet::from_document(make_policy(
-                vec![accept_rule(&["does-not-exist"], &["*:80"], None)],
-                vec![],
-            ))
-            .is_err()
-        );
-        let mut policy = make_policy(vec![], vec![]);
-        policy
-            .hosts
-            .insert("bad".to_owned(), "not-a-cidr".to_owned());
-        assert!(RuleSet::from_document(policy).is_err());
-    }
-
     // ── labels ────────────────────────────────────────────────────────────
 
-    /// The `key:<hex>` text of the document's key source `[byte; 32]`.
+    /// The key label text `key:<hex>` of `[byte; 32]`.
     fn anchor(byte: u8) -> String {
         format!("key:{}", format!("{byte:02x}").repeat(32))
     }
@@ -1418,15 +1186,13 @@ mod tests {
     }
 
     #[test]
-    fn key_rules_match_the_label_and_cidr_rules_the_flow_source() {
-        let key_src = format!("key:{}", "07".repeat(32));
-        let rules = RuleSet::from_document(make_policy(
-            vec![
-                accept_rule(&[&key_src], &["*:80"], None),
-                accept_rule(&["fd00::/16"], &["*:443"], None),
-            ],
-            vec![],
-        ))
+    fn label_rules_match_the_label_and_prefix_rules_the_flow_source() {
+        let rules = RuleSet::new([
+            Rule::new("0", vec![ProtocolMatch::Tcp(PortSet::single(80))])
+                .with_labels([key_label(7)]),
+            Rule::new("1", vec![ProtocolMatch::Tcp(PortSet::single(443))])
+                .with_sources(["fd00::/16".parse().unwrap()]),
+        ])
         .unwrap();
         assert!(allowed(&rules, &key_req(7, "fd00::2", 80, Protocol::Tcp)));
         // A different key is denied (default-deny).
@@ -1450,11 +1216,15 @@ mod tests {
 
     // ── policy states ─────────────────────────────────────────────────────
 
-    fn port_policy(port: u16) -> AclPolicy {
-        make_policy(
-            vec![accept_rule(&["*"], &[&format!("*:{port}")], None)],
-            vec![],
-        )
+    /// Rule `"0"` accepting TCP and UDP to `port` from anyone.
+    fn port_rule(port: u16) -> Vec<Rule> {
+        vec![Rule::new(
+            "0",
+            vec![
+                ProtocolMatch::Tcp(PortSet::single(port)),
+                ProtocolMatch::Udp(PortSet::single(port)),
+            ],
+        )]
     }
 
     fn port_rules(id: &str, port: u16) -> RuleSet {
@@ -1540,8 +1310,8 @@ mod tests {
         assert_eq!(engine.policy_state(), PolicyState::Installed { rules: 0 });
         assert!(engine.is_loaded());
         assert_eq!(evaluate(&engine, &web), Decision::Deny(reasons::DENIED));
-        // `load` installs a compiled document.
-        engine.load(port_policy(80)).unwrap();
+        // A rule list is validated, then installed.
+        engine.install(RuleSet::new(port_rule(80)).unwrap());
         assert_eq!(evaluate(&engine, &web), rule(None, "0"));
     }
 
@@ -1625,8 +1395,7 @@ mod tests {
                 Grant {
                     from: GrantEnd::Label(key_label(1)),
                     to: GrantEnd::Label(key_label(2)),
-                    proto: None,
-                    ports: None,
+                    protocols: vec![ProtocolMatch::Any],
                 },
             )
             .unwrap();
@@ -1654,37 +1423,32 @@ mod tests {
     }
 
     #[test]
-    fn engine_failed_reload_keeps_previous_rules() {
+    fn invalid_rules_never_reach_the_engine() {
         let engine = AclEngine::new();
-        engine.load(port_policy(80)).unwrap();
+        engine.install(RuleSet::new(port_rule(80)).unwrap());
         let before = engine.rules().unwrap();
+        let generation = engine.generation();
 
-        // Built-in test failure.
-        let failing = make_policy(
-            vec![],
-            vec![AclTest {
-                src: "10.0.0.2".to_owned(),
-                dst: "192.168.1.5:80".to_owned(),
-                proto: None,
-                allow: true,
-            }],
-        );
-        assert!(matches!(
-            engine.load(failing),
-            Err(Error::TestsFailed { count: 1 })
-        ));
-        // Compile failure.
-        assert!(
-            engine
-                .load(make_policy(
-                    vec![accept_rule(&["does-not-exist"], &["*:80"], None)],
-                    vec![],
-                ))
-                .is_err()
-        );
+        // Validation fails before anything is published.
+        let invalid = [
+            Rule::new("empty", Vec::new()),
+            Rule::new(
+                "range",
+                vec![ProtocolMatch::Tcp(PortSet::Ranges(vec![
+                    RangeInclusive::new(9, 1),
+                ]))],
+            ),
+        ];
+        for rule in invalid {
+            let id = rule.id.clone();
+            assert!(matches!(
+                RuleSet::new(port_rule(80).into_iter().chain([rule])),
+                Err(Error::InvalidRule { id: bad, .. }) if bad == id
+            ));
+        }
 
-        let after = engine.rules().unwrap();
-        assert!(Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(&before, &engine.rules().unwrap()));
+        assert_eq!(engine.generation(), generation);
         assert!(evaluate(&engine, &req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp)).is_accept());
     }
 
@@ -1761,7 +1525,7 @@ mod tests {
                     addresses: vec![address.parse().unwrap()],
                 })
                 .collect(),
-            policy: port_policy(port),
+            rules: port_rule(port),
             ..NamespacePolicy::default()
         }
     }
@@ -1826,30 +1590,36 @@ mod tests {
         let before = namespace_ptr(&engine, "nsd:a");
 
         let mut failing = ns(&[(1, "fd00::1")], 443);
-        failing.policy.tests.push(AclTest {
-            src: "10.0.0.2".to_owned(),
-            dst: "192.168.1.5:80".to_owned(),
-            proto: None,
-            allow: true,
-        });
+        failing
+            .rules
+            .push(Rule::new("bad", vec![ProtocolMatch::Ip(6)]));
         assert!(matches!(
             engine.store_namespace("nsd:a", failing.clone()),
-            Err(Error::TestsFailed { count: 1 })
+            Err(Error::InvalidRule { id, .. }) if id.as_str() == "bad"
         ));
         assert!(engine.store_namespace("nsd:new", failing).is_err());
         let mut bad_outbound = ns(&[(1, "fd00::1")], 443);
-        bad_outbound.outbound = Some(vec![OutboundRule {
-            proto: Some("icmp".to_owned()),
-            ports: "*".to_owned(),
-        }]);
+        bad_outbound.outbound = Some(vec![OutboundRule::new("none", Vec::new())]);
         assert!(matches!(
             engine.store_namespace("nsd:a", bad_outbound.clone()),
-            Err(Error::InvalidNamespace { id, .. }) if id.as_str() == "nsd:a"
+            Err(Error::InvalidNamespace { id, reason })
+                if id.as_str() == "nsd:a" && reason.contains("'none'")
         ));
-        bad_outbound.outbound = Some(vec![OutboundRule {
-            proto: None,
-            ports: "9-1".to_owned(),
-        }]);
+        bad_outbound.outbound = Some(vec![OutboundRule::new(
+            "range",
+            vec![ProtocolMatch::Tcp(PortSet::Ranges(vec![
+                RangeInclusive::new(9, 1),
+            ]))],
+        )]);
+        assert!(
+            engine
+                .store_namespace("nsd:a", bad_outbound.clone())
+                .is_err()
+        );
+        bad_outbound.outbound = Some(vec![OutboundRule::new(
+            "types",
+            vec![ProtocolMatch::Icmp(IcmpTypes::Only(Vec::new()))],
+        )]);
         assert!(engine.store_namespace("nsd:a", bad_outbound).is_err());
 
         assert!(Arc::ptr_eq(&before, &namespace_ptr(&engine, "nsd:a")));
@@ -1969,7 +1739,7 @@ mod tests {
     #[test]
     fn sources_in_no_namespace_use_the_default_rules() {
         let engine = AclEngine::new();
-        engine.load(port_policy(80)).unwrap();
+        engine.install(RuleSet::new(port_rule(80)).unwrap());
         engine
             .store_namespace("nsd:a", ns(&[(1, "fd00::1")], 22))
             .unwrap();
@@ -2006,13 +1776,20 @@ mod tests {
         let grant = Grant {
             from: GrantEnd::Namespace("nsd:a".into()),
             to: GrantEnd::Label(key_label(2)),
-            proto: Some("udp".to_owned()),
-            ports: Some("5000-5010".to_owned()),
+            protocols: vec![ProtocolMatch::Udp(PortSet::Ranges(vec![
+                RangeInclusive::new(5000, 5010),
+            ]))],
         };
-        for (proto, ports) in [(Some("icmp"), None), (None, Some("x")), (None, Some("9-1"))] {
+        for protocols in [
+            Vec::new(),
+            vec![ProtocolMatch::Udp(PortSet::Ranges(vec![
+                RangeInclusive::new(9, 1),
+            ]))],
+            vec![ProtocolMatch::Udp(PortSet::Ranges(Vec::new()))],
+            vec![ProtocolMatch::Ip(17)],
+        ] {
             let bad = Grant {
-                proto: proto.map(str::to_owned),
-                ports: ports.map(str::to_owned),
+                protocols,
                 ..grant.clone()
             };
             assert!(matches!(
@@ -2076,7 +1853,10 @@ mod tests {
         // namespace never changes. Readers only ever see whole versions.
         let ns_a = ns(&[(1, "fd00::1")], 80);
         let mut ns_b = ns(&[(1, "fd00::1")], 443);
-        ns_b.policy.acls.push(accept_rule(&["*"], &["*:80"], None));
+        ns_b.rules.push(Rule {
+            id: "1".into(),
+            ..port_rule(80).remove(0)
+        });
         let engine = AclEngine::new();
         engine.store_namespace("nsd:a", ns_a.clone()).unwrap();
         engine
@@ -2145,8 +1925,7 @@ mod tests {
             let grant = Grant {
                 from,
                 to,
-                proto: None,
-                ports: None,
+                protocols: vec![ProtocolMatch::Any],
             };
             assert!(matches!(
                 engine.store_grant("g", grant),
@@ -2159,8 +1938,7 @@ mod tests {
         let grant = Grant {
             from: GrantEnd::Namespace("team-a".into()),
             to: GrantEnd::Label(key_label(2)),
-            proto: None,
-            ports: None,
+            protocols: vec![ProtocolMatch::Any],
         };
         engine.store_grant("g", grant).unwrap();
         let to_peer2 = key_req(1, "fd00::2", 22, Protocol::Tcp);
@@ -2201,8 +1979,7 @@ mod tests {
         let grant = |to: &str| Grant {
             from: GrantEnd::Label("team-c".into()),
             to: GrantEnd::Label(to.into()),
-            proto: Some("tcp".to_owned()),
-            ports: Some("80".to_owned()),
+            protocols: vec![ProtocolMatch::Tcp(PortSet::single(80))],
         };
         let source = LabelSet::new(["team-c".into(), "extra".into()]);
         let to_shared = flow("fd00::9", "fd00::5", 80, Protocol::Tcp);
@@ -2239,7 +2016,13 @@ mod tests {
     fn a_multi_label_source_bypasses_when_its_open_namespaces_cover_every_owner() {
         let engine = AclEngine::new();
         let open = |members: &[(u8, &str)]| NamespacePolicy {
-            policy: make_policy(vec![accept_rule(&["*"], &["*:*"], None)], vec![]),
+            rules: vec![Rule::new(
+                "0",
+                vec![
+                    ProtocolMatch::Tcp(PortSet::Any),
+                    ProtocolMatch::Udp(PortSet::Any),
+                ],
+            )],
             ..ns(members, 0)
         };
         engine
@@ -2336,7 +2119,7 @@ mod tests {
     /// `kinds`.
     fn source(members: &[(u8, &str)], kinds: &[&str]) -> NamespacePolicy {
         NamespacePolicy {
-            policy: AclPolicy::default(),
+            rules: Vec::new(),
             pinhole_kinds: kinds.iter().map(ToString::to_string).collect(),
             ..ns(members, 0)
         }

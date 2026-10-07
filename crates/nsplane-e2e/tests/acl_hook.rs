@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use nsplane::x25519::PublicKey;
 use nsplane::{AllowedIp, ChannelTransport, Event, Path, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, Label,
-    LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy, PeerLabelMap, PinholeSpec, Protocol,
-    reasons,
+    AclEngine, AclFilter, Direction, Grant, GrantEnd, Label, LabelSet, NamespaceKind,
+    NamespaceMember, NamespacePolicy, PeerLabelMap, PinholeSpec, PortSet, Protocol, ProtocolMatch,
+    Rule, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, introduce, udp};
 use nsplane_packet::PeerId;
@@ -93,29 +93,12 @@ fn member(key: &PublicKey, ip4: Ipv4Addr, ip6: Ipv6Addr) -> TestResult<Namespace
     })
 }
 
-/// A namespace with `members` whose rule accepts `dst` (`host:ports`) from anyone over
-/// `proto` (`None`: TCP and UDP), or no rule; pinholes of the kinds `apps` are permitted.
-fn namespace(
-    members: Vec<NamespaceMember>,
-    dst: Option<&str>,
-    proto: Option<&str>,
-    apps: &[&str],
-) -> NamespacePolicy {
-    let acls = dst
-        .map(|dst| AclRule {
-            action: AclAction::Accept,
-            src: vec!["*".to_owned()],
-            dst: vec![dst.to_owned()],
-            proto: proto.map(str::to_owned),
-        })
-        .into_iter()
-        .collect();
+/// A namespace with `members` and `rule`, if any; pinholes of the kinds `apps` are
+/// permitted.
+fn namespace(members: Vec<NamespaceMember>, rule: Option<Rule>, apps: &[&str]) -> NamespacePolicy {
     NamespacePolicy {
         members,
-        policy: AclPolicy {
-            acls,
-            ..AclPolicy::default()
-        },
+        rules: rule.into_iter().collect(),
         pinhole_kinds: apps.iter().map(|app| (*app).to_owned()).collect(),
         ..NamespacePolicy::default()
     }
@@ -123,11 +106,13 @@ fn namespace(
 
 /// The "quick" namespace of `a` accepting UDP to [`QUICK_PORT`] (or nothing).
 fn quick(a: &AclNode, open: bool) -> TestResult<NamespacePolicy> {
-    let dst = format!("*:{QUICK_PORT}");
+    let rule = Rule::new(
+        "quick",
+        vec![ProtocolMatch::Udp(PortSet::single(QUICK_PORT))],
+    );
     Ok(namespace(
         vec![member(&a.public(), a.ip4, a.ip6)?],
-        open.then_some(dst.as_str()),
-        Some("udp"),
+        open.then_some(rule),
         &[TRANSFER_KIND],
     ))
 }
@@ -280,17 +265,16 @@ async fn removed_grant_applies_to_the_next_packet() -> TestResult {
     acl.identify(b.peer_of(&c).await?, &c.public());
     acl.engine.store_namespace(
         "quick",
-        namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, None, &[]),
+        namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, &[]),
     )?;
     acl.engine.store_namespace(
         "nsd:x",
-        namespace(vec![member(&c.public(), c.ip4, c.ip6)?], None, None, &[]),
+        namespace(vec![member(&c.public(), c.ip4, c.ip6)?], None, &[]),
     )?;
     let grant = Grant {
         from: GrantEnd::Namespace("quick".into()),
         to: GrantEnd::Label(label(&c.public())),
-        proto: Some("udp".to_owned()),
-        ports: Some(QUICK_PORT.to_string()),
+        protocols: vec![ProtocolMatch::Udp(PortSet::single(QUICK_PORT))],
     };
     acl.engine.store_grant("quick-to-c", grant.clone())?;
     let mut events = b.subscribe().await?;
@@ -325,7 +309,7 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
         "s1",
         NamespacePolicy {
             kind: NamespaceKind::Pinholes,
-            ..namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, None, &[])
+            ..namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, &[])
         },
     )?;
     let spec = PinholeSpec {
@@ -391,10 +375,16 @@ async fn bypass_peer_traffic_is_delivered() -> TestResult {
     let (mut a, mut b) = packet_pair(&acl).await?;
     let mut events = b.subscribe().await?;
     let everything = |a: &AclNode| -> TestResult<NamespacePolicy> {
+        let rule = Rule::new(
+            "all",
+            vec![
+                ProtocolMatch::Tcp(PortSet::Any),
+                ProtocolMatch::Udp(PortSet::Any),
+            ],
+        );
         Ok(namespace(
             vec![member(&a.public(), a.ip4, a.ip6)?],
-            Some("*:*"),
-            None,
+            Some(rule),
             &[],
         ))
     };

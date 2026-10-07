@@ -18,8 +18,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::net::IpNet;
-use crate::policy::AclPolicy;
-use crate::rules::Label;
+use crate::rules::{Label, ProtocolMatch, Rule, RuleId};
 
 /// The opaque identifier of a rule namespace, e.g. `"team-a"`. nsplane
 /// compares identifiers for equality and never interprets them.
@@ -85,16 +84,25 @@ pub struct NamespaceMember {
 }
 
 /// An outbound rule: what the local node may send to the members of an
-/// outbound-restricted namespace.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// outbound-restricted namespace, by protocol and destination port (or ICMP
+/// type).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OutboundRule {
-    /// `"tcp"`, `"udp"`, or `None` for both.
-    #[serde(default)]
-    pub proto: Option<String>,
-    /// Destination ports in the rule port syntax: `"*"`, `"22"`, `"80,443"`,
-    /// `"8000-8999"`.
-    #[serde(default)]
-    pub ports: String,
+    /// The rule's identifier, reported in validation errors.
+    pub id: RuleId,
+    /// Protocols (with ports or ICMP types); must not be empty. Validated as
+    /// [`Rule::protocols`].
+    pub protocols: Vec<ProtocolMatch>,
+}
+
+impl OutboundRule {
+    /// An outbound rule `id` accepting `protocols`.
+    pub fn new(id: impl Into<RuleId>, protocols: Vec<ProtocolMatch>) -> Self {
+        Self {
+            id: id.into(),
+            protocols,
+        }
+    }
 }
 
 /// The policy of one namespace.
@@ -108,9 +116,10 @@ pub struct NamespacePolicy {
     #[serde(default)]
     pub members: Vec<NamespaceMember>,
     /// The accept rules applying between the namespace's members and the
-    /// local node; its built-in tests must pass for the namespace to be stored.
+    /// local node, validated as [`RuleSet::new`](crate::RuleSet::new) does.
+    /// Must be empty on a [`NamespaceKind::Pinholes`] namespace.
     #[serde(default)]
-    pub policy: AclPolicy,
+    pub rules: Vec<Rule>,
     /// `None`: outbound traffic to the members is unrestricted. `Some(rules)`:
     /// outbound traffic to the members is restricted to these rules (plus
     /// replies to accepted inbound flows). A source is restricted only when
@@ -144,12 +153,9 @@ pub struct Grant {
     pub from: GrantEnd,
     /// The receiving side.
     pub to: GrantEnd,
-    /// `"tcp"`, `"udp"`, or `None` for both.
-    #[serde(default)]
-    pub proto: Option<String>,
-    /// Destination ports in the rule port syntax, or `None` for any port.
-    #[serde(default)]
-    pub ports: Option<String>,
+    /// Protocols (with ports or ICMP types); must not be empty. Validated as
+    /// [`Rule::protocols`].
+    pub protocols: Vec<ProtocolMatch>,
 }
 
 impl Serialize for NamespaceId {
@@ -193,6 +199,7 @@ pub(crate) mod ip_nets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::PortSet;
 
     #[test]
     fn namespace_id_basics() {
@@ -213,7 +220,7 @@ mod tests {
         assert_eq!(policy.members[0].addresses.len(), 2);
         assert!(policy.outbound.is_none());
         assert!(policy.pinhole_kinds.is_empty());
-        assert!(policy.policy.acls.is_empty());
+        assert_eq!(policy.rules, Vec::new());
 
         let json = serde_json::to_string(&policy).unwrap();
         assert!(json.contains("\"fd00::1/128\""), "{json}");
@@ -232,12 +239,35 @@ mod tests {
     #[test]
     fn grant_serde_round_trip() {
         let grant = Grant {
-            from: GrantEnd::Namespace("quick".into()),
+            from: GrantEnd::Namespace("team-b".into()),
             to: GrantEnd::Label("team-a".into()),
-            proto: Some("tcp".to_owned()),
-            ports: None,
+            protocols: vec![ProtocolMatch::Tcp(PortSet::Any)],
         };
         let json = serde_json::to_string(&grant).unwrap();
         assert_eq!(serde_json::from_str::<Grant>(&json).unwrap(), grant);
+        // A grant needs its protocols.
+        assert!(
+            serde_json::from_str::<Grant>(r#"{"from": {"Label": "a"}, "to": {"Label": "b"}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rules_and_outbound_rules_serde_round_trip() {
+        let policy = NamespacePolicy {
+            rules: vec![Rule::new(
+                "web",
+                vec![ProtocolMatch::Tcp(PortSet::single(80))],
+            )],
+            outbound: Some(vec![OutboundRule::new(
+                "ssh",
+                vec![ProtocolMatch::Tcp(PortSet::single(22))],
+            )]),
+            ..NamespacePolicy::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: NamespacePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rules, policy.rules);
+        assert_eq!(back.outbound, policy.outbound);
     }
 }

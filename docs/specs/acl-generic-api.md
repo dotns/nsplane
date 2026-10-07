@@ -665,7 +665,7 @@ These mappings go into the specs, not into nsplane:
   `destinations: [cidr]` (none for `*`). A port list or range becomes `PortSet::Ranges`,
   and `*` becomes `PortSet::Any`.
 - **`proto`**: `tcp` gives `Tcp(p)`, `udp` gives `Udp(p)`, and absent gives both.
-- **Rule id**: `"<source>#<index>"`.
+- **Rule id**: `"<layer>:<index>"` (`acl-policy-document.md` section 3).
 - **Tests**: evaluated by the product with `RuleSet::matching` on `Flow`s built from
   `src` / `dst` / `proto`.
 - **The `crates_acl` preset** sets these `AclFilterConfig` fields explicitly:
