@@ -2026,9 +2026,13 @@ divert with generation staleness, unbound addresses, and outbound.
 **Measured.** `cargo bench -p nsplane-acl --bench gate` keeps the scenarios of the former
 `node_l3` bench like for like (mapping table in its module docs: `new_flow/node_grant` ->
 `new_flow/any_grant`, `new_flow/service_grant` -> `new_flow/port_grant`,
-`baseline/legacy_*` -> `baseline/pass_*`). Gate numbers are pending (plan slice C7); the
-2026-10-04 figures under [Performance](#performance) are historical numbers of the removed
-node L3 gate.
+`baseline/legacy_*` -> `baseline/pass_*`). Against `main`'s `node_l3` (C7, 2026-10-07, three
+interleaved A/B rounds in one `scripts/bench/slot.sh` invocation, slot 0, load 0.5-1.4): the
+established flow through the filter 52.6 ns (main 68.3), through the gate 49.9 ns (49.6) and
+outbound 49.9 ns (49.4); new flows 91.5 ns under a grant of every protocol (89.4) and 92.0 ns
+under a port grant (99.0); the `AclFilter` alone 36.7 ns (35.9); an inert gate in front of
+it 41.3 ns (52.6) and alone 0.9 ns (2.1); writer contention every 1 / 10 ms 53.4 / 53.3 ns
+(68.4 / 68.2). See [Performance](#performance).
 
 ## nsplane-nat
 
@@ -2356,22 +2360,19 @@ cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
   unidirectional traffic, so it stays. Exactness was not weakened: a differential test
   checks verdicts and counters against a full evaluation of every packet. See
   [nsplane-acl](#nsplane-acl).
-- Former node L3 gate, historical (removed in plan `20261007-0900-business-agnostic` slice
-  C5 and replaced by the flow gate; slice C7 replaces these with `gate` bench numbers).
-  `cargo bench -p nsplane-acl --bench node_l3`, 2026-10-04, load 23-32, two runs
-  interleaved with the previous code. Established flow: 129 / 134 ns through its filter
-  (was 214 / 429), 90 / 103 ns through its inbound evaluation (was 229 / 350; 69-73 ns at
-  load 13); new flow 172 / 110 ns (any-destination grant), 235 / 121 ns (port grant), about
-  half to a sixth of before; baseline `AclFilter` alone 50 / 34 ns (the namespaces bench's
-  established cases ran at 82 / 52 ns namespaces, 71 / 56 ns default in the same run); a
-  gate without snapshot in front of the ACL 57 / 50 ns, alone 2.3 ns; writer contention (a
-  new generation every 1 / 10 ms) 87 / 88 ns and 90 / 92 ns. Keyed multiply hashing instead
-  of `SipHash`, one flow lookup, no clock read before the state, and an inert flag checked
-  before anything else made the difference. Accepted 2026-10-04 as within the ACL hook's
-  class; the remaining gap to ~60 ns was mostly the per-packet clock read (~18 ns,
-  `__vdso_clock_gettime` 46 % of `perf` samples), plus the `ArcSwap` snapshot load (~9 ns)
-  and the shard mutex (~8 ns). The flow gate reads the coarse monotonic clock instead; see
-  [Flow gate](#flow-gate).
+- nsplane-acl after the business-agnostic rework (plan `20261007-0900-business-agnostic`,
+  slice C7, 2026-10-07): `namespaces` and `gate` (against `main`'s `node_l3`) A/B against
+  `main` 929c366, three interleaved rounds per `scripts/bench/slot.sh` invocation, slot 0,
+  load 0.5-2.2. No scenario is slower than `main` beyond the A-vs-A spread: the filter's
+  new and established flows are 2-27 % faster (default rules 50 ns, namespace member
+  established 51 ns, bypass 39 ns, stateless options 52-53 ns), outbound cases are within
+  +2.6 % (noise 2.7-3.1 %), the flow gate's established flow through its filter takes
+  52.6 ns (main 68.3) and an inert gate alone 0.9 ns (2.1). Two regressions found on the way
+  were fixed: an inert gate returned its `Pass` decision through memory (5.3 ns), and the
+  filter built each TCP/UDP flow before the flow-table lookup, so cached verdicts and bypass
+  peers paid for it (+2.5-3 ns, 12 instructions). `data_path` is unchanged (core round trip
+  531 ns at 64 B, 1.339 us at 1420 B; main 530 ns, 1.337 us). The node L3 gate's 2026-10-04
+  numbers this replaces are in the history of this file.
 - Worker pool. The batched input and the lock-free pool-off path make every case about
   15-25 % faster than before the follow-ups (1420 B with 2 workers within the noise). The
   pool moves full-size packets up to about 1.4x further, small packets little; 4 workers do
