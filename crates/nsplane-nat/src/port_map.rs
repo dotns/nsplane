@@ -2,7 +2,7 @@
 //!
 //! A [`PortMap`] publishes local services to tunnel peers. Each
 //! [`PortMapRule`] maps a tunnel-facing `listen` address and port (e.g. this
-//! node's `node6`) to a local `target` service, optionally for a set of peers
+//! node's own IPv6 address) to a local `target` service, optionally for a set of peers
 //! only:
 //!
 //! - **Inbound**, a TCP or UDP packet to a `listen` address and port from an
@@ -19,8 +19,7 @@
 //!   big) get their quoted packet rewritten the same way, and the outer
 //!   address too when it is the `target` (outbound) or `listen` (inbound)
 //!   address, so path MTU discovery and port-unreachable errors work through
-//!   the mapping. ns `packet_nat` leaves ICMP errors alone; this is an
-//!   addition.
+//!   the mapping.
 //! - Everything else, including packets of recorded flows going the wrong
 //!   way, passes unchanged.
 //!
@@ -45,8 +44,9 @@
 //! the packet as it came out of the tunnel (and the ACL accepted it) and
 //! DNATs it before the `Translator` runs; outbound, it SNATs the local reply
 //! after the `Translator` has run, right before the ACL. Rules
-//! therefore name tunnel-side addresses (`listen`, e.g. this node's `node6`)
-//! and a `target` of the same family (e.g. `node6` on another port, or
+//! therefore name tunnel-side addresses (`listen`, e.g. this node's own IPv6
+//! address) and a `target` of the same family (e.g. that address on another
+//! port, or
 //! `[::1]`); 4 <-> 6 translation of a published service is not done here. The
 //! ACL, closest to the wire, judges the `listen` address inbound and the
 //! reply after SNAT outbound, so it sees overlay IPv6 in both directions.
@@ -105,7 +105,7 @@ pub struct PortMapRule {
     /// The transport protocol.
     pub protocol: PortMapProtocol,
     /// The tunnel-facing address and port peers send to, e.g. this node's
-    /// `node6`. Only the IP address and port are used.
+    /// own IPv6 address. Only the IP address and port are used.
     pub listen: SocketAddr,
     /// The local service, of the same address family as `listen`. Only the
     /// IP address and port are used.

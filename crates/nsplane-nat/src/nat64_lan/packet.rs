@@ -1,7 +1,7 @@
 //! Parsing and in-place rewriting of the packets [`Nat64Lan`](super::Nat64Lan)
-//! translates (ns `subnet_route` packet helpers).
+//! translates.
 //!
-//! Checksums are recomputed in full, as ns does, after the ports and the TCP
+//! Checksums are recomputed in full after the ports and the TCP
 //! MSS are rewritten; the payload is never copied except for the one-time
 //! reallocation of a reply whose buffer lacks 20 bytes of headroom.
 
@@ -30,7 +30,7 @@ const DF_THRESHOLD: usize = 1260;
 /// The IPv6 minimum link MTU.
 const IPV6_MINIMUM_MTU: u32 = 1280;
 /// A Packet Too Big: IPv6 header, `ICMPv6` header, quoted IPv6 header and
-/// 8 bytes of its transport header (ns `restore_packet_too_big`).
+/// 8 bytes of its transport header.
 const PACKET_TOO_BIG_LEN: usize = 40 + 8 + 48;
 
 const fn be16(bytes: &[u8], at: usize) -> u16 {
@@ -201,8 +201,7 @@ pub(super) fn to_ipv4(
 }
 
 /// An unfragmented IPv4 header without options whose total length matches
-/// the packet (ns `exact_unfragmented_ipv4` and the length check of
-/// `parse_ipv4_reply_flow`).
+/// the packet.
 fn plain_ipv4(bytes: &[u8]) -> bool {
     bytes.len() >= 20
         && bytes[0] == 0x45
@@ -217,7 +216,7 @@ const fn unfragmented(flags_offset: u16) -> bool {
 }
 
 /// The tuple and TCP flags of an IPv4 TCP or UDP packet or ICMP echo reply
-/// that may answer a flow (ns `parse_ipv4_reply_flow`).
+/// that may answer a flow.
 pub(super) fn reply_tuple(bytes: &[u8]) -> Option<(FiveTuple, u8)> {
     if bytes.len() < 28 || !plain_ipv4(bytes) {
         return None;
@@ -294,8 +293,7 @@ pub(super) fn to_ipv6(packet: &mut PacketBuf, original: &FiveTuple, max_tcp_mss:
 
 /// An ICMP Fragmentation Needed quoting a translated packet: the reply tuple
 /// of the quoted flow, the hop limit and the next-hop MTU of the error, and
-/// the 4 bytes after the quoted ports or echo identifier (ns
-/// `parse_ipv4_fragmentation_needed`).
+/// the 4 bytes after the quoted ports or echo identifier.
 pub(super) struct FragmentationNeeded {
     pub(super) reply: FiveTuple,
     pub(super) hop_limit: u8,
@@ -347,8 +345,7 @@ pub(super) fn fragmentation_needed(bytes: &[u8]) -> Option<FragmentationNeeded> 
 }
 
 /// Replaces `packet` with the `ICMPv6` Packet Too Big that tells the sender
-/// of `original` about `error` (ns `restore_packet_too_big` and
-/// `original_ipv6_quote`): from the mapped LAN host to the original source,
+/// of `original` about `error`: from the mapped LAN host to the original source,
 /// with the MTU raised by the header difference (at least 1280) and a quote
 /// of the original IPv6 header and 8 bytes of its transport header.
 pub(super) fn packet_too_big(
@@ -402,7 +399,7 @@ const fn finish(protocol: u8, checksum: u16) -> u16 {
 }
 
 /// Lowers the MSS option of a TCP SYN (or SYN-ACK) `segment` to `maximum`
-/// (ns `clamp_tcp_mss`). The caller recomputes the checksum.
+/// The caller recomputes the checksum.
 fn clamp_tcp_mss(segment: &mut [u8], maximum: u16) {
     if segment.len() < 20 || segment[13] & TCP_SYN == 0 {
         return;
