@@ -51,7 +51,7 @@ where it is described below.
 | `nsplane-wss` (server transport) | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity`, `PeerLabelMap`; namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
+| `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity`, `PeerLabelMap`; namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow`, `counters`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding`, `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters`, `LiveFlow`, `GateFilterStats`, `GatePolicyError` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_peer6_eam4`) / `TranslationTable` (`peer6_eam4`, `by_peer6_eam4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `with_endpoint_tries`, `endpoint_in_use`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig` (`recheck_route_on_forward`), `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
@@ -1955,122 +1955,102 @@ nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and 
 pairing and transfer state machines stay in ns, which stores namespaces, grants and pinholes
 through this API. `examples/src/bin/app_session.rs` shows a file transfer on it.
 
-### Node L3 gate
+### Flow gate
 
-`NodeL3Gate` (`crates/nsplane-acl/src/node_l3*`) is the port of ns tunnel-wg `node_l3`
-(MD-2, plan `20261003-2300-acl-l3-gate`): an authenticated, target-bound policy on the Node
-address plane, judged on decrypted inbound and plaintext outbound IPv4 packets. Its
-configuration types (`NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`,
-`NodeL3ServiceEndpoint`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Transport`,
-`NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`) mirror ns `control::messages`, which
-nsplane cannot depend on.
+`gate::FlowGate` (`crates/nsplane-acl/src/gate*`, slice C5 of plan
+`20261007-0900-business-agnostic`, design note `docs/specs/acl-generic-api.md` section 5) is a
+generic stateful gate for decrypted inbound and plaintext outbound IPv4 packets. It replaced
+the former node L3 gate; how a product rebuilds that model on it (labels, grant ids, holds,
+divert, the queries it now computes itself) is `docs/specs/node-l3.md`.
 
-- **Snapshots.** `apply` / `apply_from_source` validate a per-Network snapshot (schema,
-  target machine, generation, source authority, references) and publish it atomically; a
-  Network stays pinned to its first source, and its tombstone (generation, phase, content)
-  outlives `disabled` and `withdraw_source`, so stale snapshots cannot resurrect access.
-  `replace_transport_projection` installs the WireGuard projection (local address, peers'
-  routes, gateway role, policy markers); `replace_provider_listeners` the local Service
-  listeners.
-- **Grants.** Nodes of one owner reach each other; otherwise a Node Grant opens the whole
-  target Node, a Service Grant one exact listener (inbound only while the local Provider
-  listener is installed, else `service_projection`), and Subnet Grants are exposed through
-  the `enforced_subnet_*` queries and the reserved Subnet transport admission
-  (`evaluate_subnet_transport_*`, `NodeL3Filter::with_subnet_transport_port`).
-- **Source binding.** A packet belongs to a Network only through the exact
-  `(peer key, inner Node address)` pair of a binding; anything else is `source_binding`. A
-  peer carrying a policy marker fails closed (`policy_pending`) until the matching snapshot
-  is applied.
-- **State.** An allowed new flow creates state that admits its replies, later fragments
-  and ICMP errors (matched through the quoted header): idle timeouts TCP 2 h, half-closed
-  5 min, closed 30 s, UDP 2 min, ICMP 30 s, other 60 s, fragments 30 s. A reply-only packet
-  without state is `reverse_new_flow`, as is a new SYN on a closing flow; a later fragment
-  without its first is `orphan_fragment`. Limits: 2,048 flows per peer, 16,384 in all and
-  4,096 fragments (`with_limits`); a full table sweeps expired entries and then fails
-  closed with `state_capacity`, never evicting a live flow.
-- **Modes.** No snapshot (or `disabled`) is `NodeL3Decision::Legacy`; `observe` reports
-  the prospective verdict and counts denials (`NodeL3Counters::observed_denied`) without
-  enforcing; `enforce` is authoritative. `NodeL3Reason` maps 1:1 to ns's reasons
-  (`as_str`, and `drop_reason` = `node l3: <reason>` for drops).
+- **Policy.** `replace(GatePolicy)` validates and publishes one whole policy atomically and
+  returns the new gate generation (`generation()`); a rejected policy
+  (`GatePolicyError`: duplicate scope, duplicate binding, invalid protocols, any IPv6
+  entry) changes nothing. A policy is a list of `GateScope`s plus `GateHolds`. A scope has
+  an opaque `ScopeId`, a `GateMode` (`Off`, `Observe`, `Enforce`), the local addresses it
+  governs, `GateBinding`s (`PeerId` + remote addresses -> `LabelSet`), accept-only
+  `GateGrant`s (direction, labels, destination prefixes, `ProtocolMatch`es, `suspended`)
+  and `UnboundRule`s (`Pass` or `Divert` for designated peers).
+- **Binding.** A packet belongs to a scope only through the exact `(PeerId, remote address)`
+  pair of one of its bindings, the scope governing the packet's other address. Two scopes
+  binding it is `Ambiguous`; none is `Unbound` under the mode of the scopes governing the
+  local address (inbound) or holding the remote address as a binding address (outbound),
+  and `Pass` off the governed addresses. With exactly one enforcing scope at the local
+  address, an `UnboundAction::Pass` rule passes matching packets of its peers on (first
+  fragments remember that disposition for their later fragments).
+- **Grants.** The first matching grant that is not suspended admits a new flow and its
+  `RuleId` is reported (`GateReason::Granted`); only suspended matches give `Suspended`,
+  none `NoGrant`. Grants never admit a reply-only packet.
+- **State.** An admitted flow creates state that admits its replies, later fragments and ICMP
+  errors (matched through the quoted header): idle timeouts (`GateTimeouts`, defaults TCP
+  2 h, half-closed 5 min, closed 30 s, UDP 2 min, ICMP 30 s, other 60 s, fragments 30 s). A
+  reply-only packet without state is `ReverseNewFlow`, as is a new SYN on a closing flow or
+  from the responder; a later fragment without its first is `OrphanFragment`. Limits
+  (`GateLimits`, defaults 16,384 flows, 2,048 per peer, 4,096 fragments): a full table
+  sweeps expired entries and then fails closed with `StateCapacity`, never evicting a live
+  entry.
+- **Holds.** Inbound and outbound `HoldRule`s (peers, local and remote prefixes) deny with
+  `Held` in every mode before any scope is consulted, malformed packets with readable
+  addresses included; `GateHolds::release` exempts exact `(PeerId, address)` pairs from the
+  inbound holds.
+- **Modes.** No scope and no hold (or only `Off` scopes) is inert: `GateDecision::Pass`
+  without parsing or a clock read. `Observe` reports `GateDecision::Observe` and counts
+  denials (`GateCounters::observed_denied`) but keeps state; `Enforce` is authoritative.
+  `GateReason` has stable names (`as_str`) and drop reasons (`drop_reason`, `flow gate:
+  <reason>`).
+- **Queries.** `find_flow(remote, local, Protocol)` returns the live flow of a five-tuple
+  (`LiveFlow`: scope, grant id, enforced) and refreshes it.
 
-**State and locking.** Packet paths take one lock-free load of an immutable `Snapshot`
-(behind an `ArcSwap`) holding the compiled policies, keyed by interned Network ids, and the
-projection, and then lock only the state shard of the remote peer: 64 shards by peer key,
-each tagged with the snapshot epoch it was migrated to. Writers serialize on one mutex,
-build the next snapshot, and migrate the state (revalidate or drop flows) with every shard
-locked; a packet whose shard epoch differs from its snapshot retries, so it never sees a
-policy together with state of another one. Expired entries are swept only when a limit is
-reached (the peer's shard first, every shard for the global limit). The gate's clock is
-`Instant::now` or injected (`with_clock`) for tests and benches. Every policy or transport
-change that can alter the usable Subnet Grants bumps `authorization_generation` and calls
-`set_on_authorization_change`.
+**Migration and locking.** Packet paths take one lock-free load of an immutable snapshot
+(behind an `ArcSwap`) with the compiled scopes and their indexes (`(PeerId, address)` to
+scopes, local and binding addresses to scopes) and the holds, and then lock only the state
+shard of their peer: 64 shards by `PeerId`, each tagged with the generation it was migrated
+to. Flow keys carry a scope slot that stays stable while the scope id stays in the policy.
+Writers serialize on one mutex, compile the next snapshot, and with every shard locked
+publish it and migrate the state: an unchanged scope keeps its flows and fragments; a
+removed or `Off` scope loses them; each flow of a changed scope is re-authorized as a new
+flow by its initiator (binding, local address, a matching grant that is not suspended) and
+keeps its five-tuple and deadline with the new grant id and mode, or is dropped; the
+fragments of a changed scope are dropped. A packet whose shard generation differs from its
+snapshot retries, so it never sees a policy together with state of another one. The clock is
+the coarse monotonic clock on Linux and Android (`Instant::now` elsewhere), or injected
+(`with_clock`) for tests and benches.
 
-**Composition.** `NodeL3Filter` runs the gate as one `PacketFilter`, with an optional
+**Composition.** `GateFilter` runs the gate as one `PacketFilter`, with an optional
 `AclFilter` behind it (`with_acl`), because an enforced allow must end the decision before
-the L4 ACL, which an accept-means-continue chain cannot express. Inbound: an unknown peer
-(no key in `PeerPublicKeys` / `PeerKeyMap`) is dropped; IPv4 goes through the Subnet
-transport admission (when a port is set) and `evaluate_inbound`; an enforced allow is
-`Accept` without the ACL, an enforced denial drops with the gate's reason, and Legacy,
-Observe, IPv6 and non-IP go on to the ACL (or are accepted without one). Outbound is the
-gate only, as in ns; `with_acl_outbound(true)` also runs the ACL's outbound for packets the
-gate did not deny. `NodeL3FilterStats` counts the steps.
+the L4 ACL, which an accept-means-continue chain cannot express. Inbound: an enforced allow
+is `Accept` without the ACL, an enforced denial drops with the gate's reason, and `Pass` and
+`Observe` go on to the ACL (or are accepted without one). Outbound: an enforced denial drops;
+`with_acl_outbound(true)` also runs the ACL's outbound for the rest. There is no peer table
+in the filter: the wrapped `AclFilter` drops unknown peers inbound (`reasons::UNKNOWN_PEER`).
+`GateFilterStats` counts the steps.
 
-**Divert (MD-3).** With `with_divert(sink)`, an inbound `source_binding` or
-`orphan_fragment` denial that the gate captures as a gateway return
-(`gateway_consumer_packet`: an installed, non-relayed gateway carrier and an Enforce
-policy) is offered to the `GatewayConsumerSink`; accepted, it is `Verdict::Handled` (no
-delivery, no drop event); refused (full or closed), it is dropped with the gate's reason.
-The consumer rechecks `gateway_consumer_authority_current` and its exact flow before
-delivery.
+**Divert.** With `with_divert(divert)`, an inbound enforced `Unbound` or `OrphanFragment`
+denial of a TCP or UDP packet that matches an `UnboundAction::Divert` rule of the one
+enforcing scope at its destination, from an address that is no local or binding address of
+any scope and that no hold matches, is offered to the `GateDivert` as a `DivertedPacket`
+(generation, peer, scope, rule id, packet): taken, it is `Verdict::Handled` (no delivery, no
+drop event); refused, it is counted and dropped with the gate's reason. The taker treats a
+packet as current only while its `generation()` equals `FlowGate::generation()`.
 
-**ns wiring.** ns keeps policy compilation: it converts its `NodeL3Config` and `WgConfig`
-to the mirror types, applies them, and installs `NodeL3Filter::new(gate, keys).with_acl(acl)`
-(plus `with_subnet_transport_port(53535)` and `with_divert`) on its engine. On an
-`authorization_generation` change it recomputes `enforced_subnet_ingress_prefixes` into
-nsplane-core's per-peer inbound destinations (`PeerConfig::inbound_destinations` through
-`EngineHandle::set_inbound_destinations` / `ConfigChange::SetInboundDestinations`, MD-6),
-which replace the gate's IPv6 Subnet ingress check. ns then deletes tunnel-wg `node_l3*`
-(gate and tests) and `AccountFilter`'s gate and divert steps (with MD-A, also its ACL step:
-`acl_check_packet` and the `FragmentAclGate` use). ns keeps the policy compilation, the
-`NodeL3Config` / `WgConfig` conversion, the gateway consumer queue and its flow check, and
-the inbound destinations push; with MD-7 it can instead install one
-`set_inbound_destination_source` per peer backed by its lease and grant snapshot and delete
-that push (the `set_inbound_destinations` calls on grant changes). The ns `AccountFilter` steps and their nsplane locations are
-tabled in the `NodeL3Filter` rustdoc.
+**Tests.** `src/gate/tests/` covers grants and flow state (`grants_flow`), suspended, port,
+ICMP and outbound grants (`grant_kinds`), ICMP errors, fragments and malformed packets
+(`packets_fragments`), holds and unbound rules (`holds_and_unbound`), the state limits,
+validation and the epoch retry (`state_table`), a writer racing packet threads
+(`concurrency`), the filter (`filter`), and `model`, which compares the gate on seeded
+random sequences of packets, `replace` calls and clock steps against a reference model of
+the design note (one map, no shards, no lazy expiry) for equal decisions and counters.
+`nsplane-e2e` `flow_gate` runs the filter on one of two engines: grants, suspension,
+bindings, state, limits and expiry (injected clock), modes, holds, unbound pass, ICMP errors,
+divert with generation staleness, and outbound. The node L3 parity data recorded from ns is
+`docs/specs/data/node-l3-differential.json`, replayed by the product (`docs/specs/node-l3.md`
+section 5).
 
-**Tests.** The 60 tests of ns `tunnel-wg/src/node_l3/tests` are ported
-(`node_l3/tests/{grants_flow,packets_fragments,subnet,transport_policy,gateway_consumer}.rs`),
-plus state-table and concurrency tests (writers publishing while packet threads evaluate,
-checking the epoch invariant and the counts) and the `NodeL3Filter` tests ported from ns
-`AccountFilter`. A differential fixture recorded from ns
-(`crates/nsplane-acl/src/node_l3/fixtures/differential.json`) is replayed by
-`node_l3/tests/differential.rs`. `nsplane-e2e` `node_l3` runs the filter on one of two
-engines: Grants, source binding, state, limits and expiry (injected clock), modes, ICMP
-errors, divert and outbound.
-
-**Measured** (`cargo bench -p nsplane-acl --bench node_l3`, see [Performance](#performance)):
-2026-10-04 on the shared host (1-minute load 23-32), two runs interleaved with the previous
-code: an established flow costs 129 / 134 ns through `NodeL3Filter` (was 214 / 429) and
-90 / 103 ns through `evaluate_inbound` alone (was 229 / 350), 128 / 81 ns outbound; new
-flows 172 / 110 ns (Node Grant, was 396 / 781) and 235 / 121 ns (Service Grant, was
-476 / 795); the `AclFilter` alone 50 / 34 ns, `NodeL3Filter` with a gate without snapshot
-57 / 50 ns (was 114 / 170), that gate alone 2.3 ns; with a writer publishing every 1 ms /
-10 ms 87 / 88 ns and 90 / 92 ns. At load 13 the established flow measured 69-73 ns through
-the gate and 86-90 ns through the filter. A release-mode breakdown (load 5-20) puts
-`evaluate_inbound` at 64-69 ns: the clock 18 ns (`perf`: `clock_gettime` is 46 % of the
-samples), the snapshot load 9 ns, the shard lock 8 ns, the counter 4 ns, the flow and
-binding lookups 4 + 3 ns, parsing 2.4 ns. A gate without snapshot or transport adds
-7-17 ns over the `AclFilter`: the peer key lookup (~10 ns, needed to drop unknown peers)
-and the hand-off counter.
-
-Accepted 2026-10-04 as within the ACL hook's class: the established flow at 64-73 ns quiet
-and 90-103 ns at load 23-32 through the gate, 86-90 / 129-134 ns through `NodeL3Filter`, an
-inert gate 2.3 ns, writer contention 87-92 ns. The remaining gap to ~60 ns is mostly the
-per-packet clock read (~18 ns, `__vdso_clock_gettime` 46 % of the `perf` samples), plus the
-`ArcSwap` snapshot load (~9 ns) and the shard mutex (~8 ns). A possible follow-up, not done:
-a per-batch or cached timestamp instead of a clock read per packet. It gives millisecond
-expiry granularity against timeouts of 30 s and more, but differs from ns's per-packet
-`Instant::now`, so it needs an owner decision.
+**Measured.** `cargo bench -p nsplane-acl --bench gate` keeps the scenarios of the former
+`node_l3` bench like for like (mapping table in its module docs: `new_flow/node_grant` ->
+`new_flow/any_grant`, `new_flow/service_grant` -> `new_flow/port_grant`,
+`baseline/legacy_*` -> `baseline/pass_*`). The A/B against the former gate is pending (plan
+slice C7); its 2026-10-04 figures are under [Performance](#performance).
 
 ## nsplane-nat
 
@@ -2236,7 +2216,7 @@ path, so such a client pays no extra latency for it.
 | ACL IPv6 mode | `nsplane-acl` | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` | `Ipv6Mode::Evaluate` | one branch per packet |
 | Inbound destinations | `nsplane-core` | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations`, or a caller-updated `EngineHandle::set_inbound_destination_source` | `None`: unchecked | one `Option` check per decrypted packet; a source adds one `allows` call |
 | Flow accounting | `nsplane-acl` | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
-| Node L3 gate | `nsplane-acl` | `EngineBuilder::filter(Box::new(NodeL3Filter::new(gate, keys).with_acl(acl)))` | not installed | none |
+| Flow gate | `nsplane-acl` | `EngineBuilder::filter(Box::new(GateFilter::new(gate).with_acl(acl)))` with `FlowGate::new(GateConfig::default())` and `FlowGate::replace(policy)` | not installed; constructed without a policy, inert | none; an inert gate passes every packet after one flag load |
 | Fragmentation stage | `nsplane` | `EngineBuilder::fragmenter(FragmentConfig::default())`; `FragmentConfig::translated` for destinations a translator turns into IPv6 | off | one `Option` check per local packet; local packets enter the core whatever their size |
 | Per-path MTU | `nsplane` | `EngineBuilder::transport_max_datagram` / `EngineHandle::set_transport_max_datagram`, `EngineHandle::report_path_mtu`, or a transport whose `path_mtu_reports` returns a receiver; `EngineBuilder::fragmenter` to make it reach the local side | off: every peer at the source MTU, padding to 16 bytes | none: no table, padding limit or report task until a ceiling is set or a report arrives; the fragmentation stage looks a peer up only for packets above the lowest MTU |
 | Crypto worker pool | `nsplane` | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0: the owner task encrypts and decrypts | one `Option` check per packet, no tasks spawned; without crypto workers each peer owns its tunnel and the data path takes no lock (with workers it is shared behind a `Mutex`) |

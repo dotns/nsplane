@@ -136,6 +136,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `PeerLabelMap::insert_by_source(peer, Vec<(IpNet, LabelSet)>)`: labels per
   remote address, the longest prefix containing it wins (the first listed among equal
   prefixes) and an address outside every prefix is an unknown source (`UNKNOWN_PEER`).
+- `nsplane-acl`: the generic stateful flow gate (`gate` module, AG-4): `FlowGate` (`new(GateConfig)`,
+  `with_clock`, `replace(GatePolicy) -> Result<u64, GatePolicyError>`, `generation`,
+  `evaluate_inbound` / `evaluate_outbound(PeerId, &[u8]) -> GateDecision`, `find_flow(remote,
+  local, Protocol) -> Option<LiveFlow>`, `counters`). A `GatePolicy` is `GateScope`s (`ScopeId`,
+  `GateMode::{Off, Observe, Enforce}`, local addresses, `GateBinding`s from `PeerId` and remote
+  addresses to a `LabelSet`, accept-only `GateGrant`s with direction, labels, destinations,
+  `ProtocolMatch`es and `suspended`, and `UnboundRule`s with `UnboundAction::{Pass, Divert}`)
+  plus `GateHolds` (`HoldRule`s and `release` pairs), replaced atomically; flows of unchanged
+  scopes are kept and those of changed scopes re-authorized. `GateConfig` (`GateLimits`,
+  `GateTimeouts`; the defaults are the former constants), `GateDecision::{Pass, Observe,
+  Enforce}` with `GateReason` and the admitting `RuleId`, `GateCounters`, `GatePolicyError`
+  (IPv6 entries are rejected: the gate handles IPv4 only). `GateFilter` (`new`, `with_acl`,
+  `with_acl_outbound`, `with_divert`, `gate`, `stats` / `GateFilterStats`) composes it with an
+  `AclFilter`; `GateDivert` takes the `DivertedPacket`s (`generation`, `peer`, `scope`, `rule`,
+  `packet`, `into_packet`) of `UnboundAction::Divert` rules. Bench `cargo bench -p nsplane-acl
+  --bench gate`, e2e `nsplane-e2e` `flow_gate`.
 - `nsplane-wss`: `WssServerTransport`, the server side of `WssDialer` links (NG-7): a
   `Transport` over WebSocket sessions the embedder accepts (TLS, request checks and the
   upgrade stay the embedder's) and hands to a `WssAcceptor` (`accept`, `ws_config`).
@@ -313,6 +329,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   InvalidPolicy}`; only the document produced them. Typed input fails with
   `Error::InvalidRule`, `Error::InvalidNamespace` or `Error::InvalidGrant`, and prefixes are
   parsed by the caller (`IpNet: FromStr`, `ParseIpNetError`).
+- `nsplane-acl`: the node L3 model, replaced by the generic flow gate (`gate` module). The ns
+  model and how a product compiles it onto the gate (labels, grant ids, holds, divert,
+  queries) are `docs/specs/node-l3.md`; its parity data is
+  `docs/specs/data/node-l3-differential.json` (the crate's fixture and differential test are
+  gone). Item by item:
+  - `NodeL3Gate` -> `gate::FlowGate`; `new`, `new_for_targets`, `with_limits`, `with_clock`
+    -> `FlowGate::new(GateConfig)` / `FlowGate::with_clock(GateConfig, clock)` (limits in
+    `GateLimits`; target machine ids stay with the caller).
+  - `NodeL3Gate::{apply, apply_from_source, withdraw_source}`, `NodeL3Config`,
+    `NodeL3ConfigError`, `NodeL3Applied`, `NODE_L3_SCHEMA_VERSION` -> `FlowGate::replace(
+    GatePolicy)`, `GatePolicyError` (generic validation only) and the returned generation;
+    sources, tombstones, generations, phases and the schema version are the caller's.
+  - `NodeL3Mode::{Disabled, Observe, Enforce}` -> `GateMode::{Off, Observe, Enforce}`.
+  - `NodeL3Node`, `NodeL3PeerBinding` -> `GateScope::local` and `GateBinding { peer, addresses,
+    labels }`; `NodeL3Grant`, `NodeL3Resource`, `NodeL3ServiceEndpoint`,
+    `NodeL3ServiceProtocol` -> `GateGrant { id, direction, labels, destinations, protocols,
+    suspended }` with `ProtocolMatch` / `Protocol`.
+  - `NodeL3PeerPolicyRequirement`, `NodeL3Transport`, `NodeL3TransportPeer`,
+    `NodeL3TransportError`, `NodeL3Gate::{replace_transport_projection,
+    replace_transport_projection_after_build, stage_transport_projection,
+    withdraw_transport_projection}` -> `GateHolds` / `HoldRule` and `UnboundRule`s the caller
+    derives from its own device projection.
+  - `NodeL3Gate::replace_provider_listeners` -> `GateGrant::suspended` and `UnboundRule`
+    protocols, recompiled and `replace`d.
+  - `NodeL3Gate::{ready_for_ack, peer_readiness_snapshot}`, `NodeL3PeerReadiness`,
+    `NodeL3PeerReadinessReason`, `NodeL3Gate::{enforced_subnet_authorizations,
+    enforced_subnet_return_peer_key, enforced_subnet_return_owners,
+    enforced_subnet_ingress_authorized, enforced_subnet_ingress_prefixes,
+    authorization_generation, set_on_authorization_change}`, `NodeL3SubnetAuthorization`:
+    pure functions of the caller's configuration, no gate replacement.
+  - `NodeL3Gate::{evaluate_subnet_transport_inbound, evaluate_subnet_transport_outbound}`,
+    `NodeL3Filter::with_subnet_transport_port` -> ordinary `GateGrant`s.
+  - `NodeL3Gate::{evaluate_inbound, evaluate_outbound}(peer_key, packet)` ->
+    `FlowGate::{evaluate_inbound, evaluate_outbound}(PeerId, packet)`.
+  - `NodeL3Gate::service_flow_authorized` -> `FlowGate::find_flow` (`LiveFlow { scope, rule,
+    enforced }`).
+  - `NodeL3Decision::{Legacy, Observe { would_allow, reason }, Enforce { allow, reason }}` ->
+    `GateDecision::{Pass, Observe { allow, reason, rule }, Enforce { allow, reason, rule }}`;
+    `NodeL3Reason` -> `GateReason` (`same_owner`, `node_grant`, `service_grant` and
+    `subnet_grant` are `Granted` with the grant's `RuleId`; `source_binding` -> `Unbound`,
+    `service_projection` -> `Suspended`, `policy_pending` -> `Held`, `ambiguous_network` ->
+    `Ambiguous`, `malformed_packet` -> `Malformed`); drop reasons `node l3: *` -> `flow gate:
+    *`.
+  - `NodeL3Gate::counters`, `NodeL3Counters` -> `FlowGate::counters`, `GateCounters`
+    (`source_binding_denied` -> `unbound_denied`).
+  - `NodeL3Filter` -> `GateFilter` (`new(gate)` without a key map); `NodeL3FilterStats` ->
+    `GateFilterStats` without `unknown_peer`: the filter no longer drops packets of a peer
+    without a key (inbound, the wrapped `AclFilter` drops unknown peers as
+    `reasons::UNKNOWN_PEER` and a governed address answers `Unbound`).
+  - `PeerPublicKeys`, `PeerKeyMap` -> bindings by `PeerId` in the `GatePolicy`.
+  - `GatewayConsumerSink` (`try_divert`) -> `GateDivert` (`divert`); `GatewayConsumerPacket`
+    -> `DivertedPacket`; `GatewayConsumerAuthority` (`gateway_id`, `source_id`,
+    `same_snapshot`) and `NodeL3Gate::{gateway_consumer_packet,
+    gateway_consumer_authority_current}` -> `UnboundRule { action: Divert }`,
+    `DivertedPacket::{generation, peer, scope, rule}` and `FlowGate::generation` (a diverted
+    packet is current while its generation equals the gate's).
+  - Bench `node_l3` -> `gate` (`new_flow/node_grant` -> `new_flow/any_grant`,
+    `new_flow/service_grant` -> `new_flow/port_grant`, `baseline/legacy_*` ->
+    `baseline/pass_*`); e2e `node_l3` -> `flow_gate`.
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
