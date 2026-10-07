@@ -83,7 +83,7 @@ struct Server {
 
 impl Server {
     /// The listener and the transport it feeds.
-    async fn start(config: WssServerConfig) -> TestResult<(Self, WssServerTransport)> {
+    fn start(config: WssServerConfig) -> TestResult<(Self, WssServerTransport)> {
         let socket = TcpSocket::new_v4()?;
         socket.set_send_buffer_size(4096)?;
         socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
@@ -264,7 +264,7 @@ async fn via_hub(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_server_transport_serves_several_nodes() -> TestResult {
-    let (server, wss) = Server::start(WssServerConfig::new()).await?;
+    let (server, wss) = Server::start(WssServerConfig::new())?;
     let mut hub = hub(wss, None)?;
     let mut nodes = Vec::new();
     for seed in 2..=4 {
@@ -298,7 +298,7 @@ async fn one_server_transport_serves_several_nodes() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_session_redials_and_the_endpoint_moves() -> TestResult {
-    let (server, wss) = Server::start(WssServerConfig::new()).await?;
+    let (server, wss) = Server::start(WssServerConfig::new())?;
     let mut hub = hub(wss, None)?;
     let (mut x, x_stats) = wss_node(2, server.addr)?;
     let (mut y, _) = wss_node(3, server.addr)?;
@@ -335,7 +335,7 @@ async fn closed_session_redials_and_the_endpoint_moves() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wss_and_udp_nodes_on_one_engine() -> TestResult {
-    let (server, wss) = Server::start(WssServerConfig::new()).await?;
+    let (server, wss) = Server::start(WssServerConfig::new())?;
     let udp = UdpTransport::bind(UDP, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let hub_udp = at(UDP, udp.local_addr());
     let mut hub = hub(wss, Some(udp))?;
@@ -361,7 +361,7 @@ async fn wss_and_udp_nodes_on_one_engine() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn other_sessions_do_not_take_over_an_endpoint() -> TestResult {
-    let (server, wss) = Server::start(WssServerConfig::new()).await?;
+    let (server, wss) = Server::start(WssServerConfig::new())?;
     let mut hub = hub(wss, None)?;
     let (mut x, x_stats) = wss_node(2, server.addr)?;
     join(&hub, &x, None, at(WSS, hub_link())).await?;
@@ -485,7 +485,7 @@ const TO_STALLED: usize = 4;
 /// `dropped_queue_full` and as the engine's send errors instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_session_does_not_block_the_others() -> TestResult {
-    let (server, wss) = Server::start(WssServerConfig::new().queue(STALL_QUEUE)).await?;
+    let (server, wss) = Server::start(WssServerConfig::new().queue(STALL_QUEUE))?;
     let mut hub = hub(wss, None)?;
     let proxy = Proxy::start(server.addr).await?;
     let mut healthy = Vec::new();
