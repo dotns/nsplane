@@ -33,9 +33,6 @@ crates/nsplane-cli/src/main.rs|group|and group IDs|Unix user and group IDs of a 
 crates/nsplane-uapi/src/pipe.rs|group|Administrators group|the Windows built-in Administrators security group
 
 # A user-space stack terminates the connections addressed to it (TCP endpoint language).
-crates/nsplane-netstack/src/lib.rs|terminate|terminates the plaintext IP packets|the stack is the endpoint that terminates the decrypted traffic
-crates/nsplane-netstack/src/stack.rs|terminate|The stack terminates TCP and UDP|the stack is the endpoint that terminates TCP and UDP
-crates/nsplane-netstack/src/tcp.rs|terminate|A TCP connection terminated by the stack|TCP connection terminated at this endpoint
 crates/nsplane-netstack/src/tcp.rs|terminate|pub async fn terminated(&self)|TcpConnection::terminated(): standard TCP state language (connection terminated)
 crates/nsplane-netstack/src/tcp.rs|terminate|[`terminated`](Self::terminated)|rustdoc of TcpConnection::terminated(): TCP connection state
 
