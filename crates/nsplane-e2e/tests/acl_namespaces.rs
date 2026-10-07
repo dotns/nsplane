@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use nsplane::x25519::PublicKey;
 use nsplane::{AllowedIp, ChannelTransport, EngineHandle, Event, Path, Peer, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet, Label,
-    LabelSet, NamespaceId, NamespaceKind, NamespaceMember, NamespacePolicy, PeerLabelMap,
-    PinholeError, PinholeSpec, PinholeStats, Protocol, reasons,
+    AclEngine, AclFilter, Direction, Grant, GrantEnd, IpNet, Label, LabelSet, NamespaceId,
+    NamespaceKind, NamespaceMember, NamespacePolicy, PeerLabelMap, PinholeError, PinholeSpec,
+    PinholeStats, PortSet, Protocol, ProtocolMatch, Rule, reasons,
 };
 use nsplane_e2e::{
     Events, Family, Node, Options, StackNode, TRANSFER, TestResult, introduce, serve_tcp_echo, udp,
@@ -87,7 +87,7 @@ fn end(id: u16, host: u8) -> (TransportId, SocketAddr) {
     )
 }
 
-/// The label of a node's key: the label a policy's `key:<hex>` source compiles to.
+/// The label of a node's key: `key:` and the lowercase hex of the key.
 fn label(key: &PublicKey) -> Label {
     Label::from(
         key.to_bytes()
@@ -107,40 +107,37 @@ fn member(key: &PublicKey, ip4: Ipv4Addr, ip6: Ipv6Addr) -> TestResult<Namespace
     })
 }
 
-/// An accept rule from `src` to `port` on any local address; `proto` `None` matches TCP
-/// and UDP.
-fn rule(src: &str, port: u16, proto: Option<&str>) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![format!("*:{port}")],
-        proto: proto.map(str::to_owned),
-    }
+/// An accept rule to `port` on any destination; `proto` `None` matches TCP and UDP.
+fn rule(port: u16, proto: Option<Protocol>) -> Rule {
+    let ports = PortSet::single(port);
+    let protocols = match proto {
+        Some(Protocol::Tcp) => vec![ProtocolMatch::Tcp(ports)],
+        Some(Protocol::Udp) => vec![ProtocolMatch::Udp(ports)],
+        None => vec![ProtocolMatch::Tcp(ports.clone()), ProtocolMatch::Udp(ports)],
+    };
+    Rule::new(port.to_string(), protocols)
 }
 
-/// A rule namespace with `members`, rules accepting the first member on `ports` with
-/// `proto`, and pinholes of the kinds `apps` permitted.
+/// A rule namespace with `members`, rules accepting the first member's label on `ports`
+/// with `proto`, and pinholes of the kinds `apps` permitted.
 fn source(
     members: Vec<NamespaceMember>,
     ports: &[u16],
-    proto: Option<&str>,
+    proto: Option<Protocol>,
     apps: &[&str],
 ) -> NamespacePolicy {
-    let acls = members
+    let rules = members
         .first()
         .map(|m| {
             ports
                 .iter()
-                .map(|port| rule(m.label.as_str(), *port, proto))
+                .map(|port| rule(*port, proto).with_labels([m.label.clone()]))
                 .collect()
         })
         .unwrap_or_default();
     NamespacePolicy {
         members,
-        policy: AclPolicy {
-            acls,
-            ..AclPolicy::default()
-        },
+        rules,
         pinhole_kinds: apps.iter().map(|app| (*app).to_owned()).collect(),
         ..NamespacePolicy::default()
     }
@@ -260,11 +257,21 @@ async fn namespaces_union_and_replace_independently() -> TestResult {
 
     acl.engine.store_namespace(
         "quick",
-        source(vec![a_member.clone()], &[QUICK_PORT], Some("udp"), &[]),
+        source(
+            vec![a_member.clone()],
+            &[QUICK_PORT],
+            Some(Protocol::Udp),
+            &[],
+        ),
     )?;
     acl.engine.store_namespace(
         "nsd:x",
-        source(vec![a_member.clone()], &[NSD_PORT], Some("udp"), &[]),
+        source(
+            vec![a_member.clone()],
+            &[NSD_PORT],
+            Some(Protocol::Udp),
+            &[],
+        ),
     )?;
     assert_eq!(
         acl.engine.memberships(&label(&a.public())),
@@ -310,10 +317,7 @@ async fn a_two_label_peer_is_a_member_through_each_label() -> TestResult {
             label: label.clone(),
             addresses: addresses.clone(),
         }],
-        policy: AclPolicy {
-            acls: vec![rule("*", port, Some("udp"))],
-            ..AclPolicy::default()
-        },
+        rules: vec![rule(port, Some(Protocol::Udp))],
         outbound: restricted.then(Vec::new),
         ..NamespacePolicy::default()
     };
@@ -426,8 +430,7 @@ async fn hub_drops_cross_namespace_and_follows_a_directed_grant() -> TestResult 
         Grant {
             from: GrantEnd::Namespace("quick".into()),
             to: GrantEnd::Label(label(&c.public())),
-            proto: Some("udp".to_owned()),
-            ports: Some(QUICK_PORT.to_string()),
+            protocols: vec![ProtocolMatch::Udp(PortSet::single(QUICK_PORT))],
         },
     )?;
     relayed(&a, &mut b, &mut c, &a_to_c).await?;
@@ -469,7 +472,7 @@ async fn pinhole_expires_on_the_engine_clock() -> TestResult {
         source(
             vec![a_member.clone()],
             &[QUICK_PORT],
-            Some("udp"),
+            Some(Protocol::Udp),
             &[TRANSFER_KIND],
         ),
     )?;
@@ -648,7 +651,7 @@ async fn quick_source_allows_a_transfer_pinhole() -> TestResult {
         source(
             vec![a_member.clone()],
             &[QUICK_PORT],
-            Some("tcp"),
+            Some(Protocol::Tcp),
             &[TRANSFER_KIND],
         ),
     )?;
@@ -691,7 +694,12 @@ async fn nsd_source_without_permission_refuses_the_pinhole() -> TestResult {
     let a_label = label(&a.public());
     acl.engine.store_namespace(
         "nsd:x",
-        source(vec![a_member.clone()], &[NSD_PORT], Some("tcp"), &[]),
+        source(
+            vec![a_member.clone()],
+            &[NSD_PORT],
+            Some(Protocol::Tcp),
+            &[],
+        ),
     )?;
     acl.engine.store_namespace("app:s1", app(vec![a_member]))?;
     let at = |port| b.socket_addr(Family::V4, port);
@@ -731,7 +739,7 @@ async fn nsd_source_withdrawing_permission_revokes_the_pinhole() -> TestResult {
         source(
             vec![a_member.clone()],
             &[NSD_PORT],
-            Some("tcp"),
+            Some(Protocol::Tcp),
             &[TRANSFER_KIND],
         ),
     )?;
@@ -758,7 +766,7 @@ async fn nsd_source_withdrawing_permission_revokes_the_pinhole() -> TestResult {
 
     acl.engine.store_namespace(
         "nsd:x",
-        source(vec![a_member], &[NSD_PORT], Some("tcp"), &[]),
+        source(vec![a_member], &[NSD_PORT], Some(Protocol::Tcp), &[]),
     )?;
     assert!(!guard.is_open());
     assert_eq!(
@@ -892,13 +900,18 @@ async fn session_reuses_an_existing_tunnel() -> TestResult {
         source(
             vec![a_member.clone()],
             &[QUICK_PORT],
-            Some("tcp"),
+            Some(Protocol::Tcp),
             &[TRANSFER_KIND],
         ),
     )?;
     acl.engine.store_namespace(
         "nsd:x",
-        source(vec![a_member.clone()], &[NSD_PORT], Some("tcp"), &[]),
+        source(
+            vec![a_member.clone()],
+            &[NSD_PORT],
+            Some(Protocol::Tcp),
+            &[],
+        ),
     )?;
     let at = |port| b.socket_addr(Family::V6, port);
     transfer(&a.stack, at(QUICK_PORT), PROBE).await?;

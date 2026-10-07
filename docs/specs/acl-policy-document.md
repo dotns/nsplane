@@ -1,12 +1,14 @@
 # ACL policy document and the `crates_acl` preset (AG-3) — product specification
 
 - **Status**: specification of items removed from `nsplane-acl` in slice C4 of plan
-  `20261007-0900-business-agnostic`.
+  `20261007-0900-business-agnostic` (removed; `CHANGELOG.md` `[Unreleased]` lists each item
+  with its replacement).
 - **Audience**: a product (ns first) that keeps the JSON policy document, its self-tests,
   layered merge, deny scope and the ns `crates/acl` filter mode on top of the generic API.
 - **Generic API**: [`acl-generic-api.md`](acl-generic-api.md) (typed `Rule` / `RuleSet`,
-  `PolicyState`, `PeerLabelMap`, `AclEngine::evaluate`). Snippets are illustrative; the
-  final names follow the merged code.
+  `PolicyState`, `PeerLabelMap`, `AclEngine::evaluate`). Snippets are illustrative (the
+  product's own parsers and error types are elided); the nsplane names are those of the
+  merged code.
 - **Parity data**: [`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json),
   see [`data/README.md`](data/README.md).
 
@@ -169,13 +171,12 @@ fn compile(doc: &Document, layer: &str) -> Result<Vec<Rule>, DocError> {
         for d in &r.dst {
             let (host, ports) = parse_dst(d, &hosts)?;          // Option<IpNet>, PortSet
             let id = format!("{layer}:{i}");
-            let base = Rule::new(id.as_str(), ports_proto(ports)?)
-                .with_destinations(host.into_iter().collect());
+            let base = Rule::new(id.as_str(), ports_proto(ports)?).with_destinations(host);
             if src.iter().any(Src::is_any) { out.push(base); continue; }
             let keys: Vec<Label> = src.iter().filter_map(Src::key_label).collect();
             let nets: Vec<IpNet> = src.iter().filter_map(Src::cidr).collect();
             if !keys.is_empty() { out.push(base.clone().with_labels(keys)); }
-            if !nets.is_empty() { out.push(base.with_labels(vec![ADDR.into()]).with_sources(nets)); }
+            if !nets.is_empty() { out.push(base.with_labels([Label::from(ADDR)]).with_sources(nets)); }
         }
     }
     Ok(out)
@@ -309,6 +310,14 @@ header) is dropped `MALFORMED` and later fragments of such a first fragment `FRA
 ns allows some of these (section 7.1). No policy installed: `NO_POLICY` for every packet
 except the two bypasses and IPv6.
 
+nsplane tests each of these semantics on explicit options, not on this combination as a
+preset: the `AclFilter` unit tests (`accept_to_local_precedes_the_policy`,
+`echo_reply_bypass_reads_the_raw_header`, `allow_only_*`,
+`stateless_replies_are_judged_by_the_rules`, `ipv6_accept_*`, `malformed_ipv4_is_dropped`,
+`fragments_of_a_malformed_first_are_dropped`, `stateless_options_combine`), the
+differential test with this configuration on generated rules, and `nsplane-e2e`'s
+`acl_options` between two engines.
+
 ### 6.2 Identity
 
 - A relay client (ns `relay_client_keys`): `PeerLabelMap::insert(peer, {"key:<hex>"})`.
@@ -337,7 +346,8 @@ engine.install(RuleSet::new(compile(&doc, "local")?)?);         // after the sel
 ## 7. Parity data
 
 [`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json) is byte-identical to
-`crates/nsplane-acl/tests/fixtures/crates_acl_parity.json` as last changed in commit
+`crates/nsplane-acl/tests/fixtures/crates_acl_parity.json` (deleted in C4) as last changed in
+commit
 `b548bebc297c4cf14e7b6e9eae878ae5b8e7b26d` (sha256 in [`data/README.md`](data/README.md)).
 It records the verdicts ns gave to IPv4 packet sequences in the ns `crates/acl` step.
 
@@ -395,8 +405,8 @@ commit above).
 ### 7.3 Replay procedure
 
 A product proves its compiler plus nsplane reproduces the old mode by replaying every
-sequence (nsplane keeps this as a test with a test-local compiler, slice C3; design
-note 4.3 lists the generic tests that replace it after C4):
+sequence (nsplane ran this as a test with a test-local compiler from slice C3 until C4
+removed it; the generic tests of section 6.1 and design note 4.3 replace it):
 
 1. Parse the fixture; for each sequence create an `AclEngine::with_clock` on a manual
    clock set to `start`.

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsplane::{ChannelTransport, Event, PacketFilter, PeerId};
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclPolicy, Label, LabelSet, PeerLabelMap, reasons,
+    AclEngine, AclFilter, AclFilterConfig, Label, LabelSet, PeerLabelMap, RuleSet, reasons,
 };
 use nsplane_core::Verdict;
 use nsplane_e2e::{
@@ -139,7 +139,7 @@ async fn an_acl_keeps_no_reply_state_for_injected_packets() -> TestResult {
     let peer_b = a.peer_of(&b).await?;
     identities.insert(peer_b, LabelSet::new([Label::from("node-b")]));
     // Deny all: only reply state admits `b`'s packets.
-    engine.load(AclPolicy::default())?;
+    engine.install(RuleSet::empty());
     let mut events = a.subscribe().await?;
     let b_end = v4(b.ip4, 5000);
 

@@ -115,8 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, inverted port range, empty `PortSet::Ranges` / `IcmpTypes::Only`, `Ip(1 | 6 | 17 |
   58)` are `Error::InvalidRule`), `matching(&LabelSet, &Flow)` reports the first matching
   rule's id; serde on `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`,
-  `IcmpTypes`. `RuleSet::from_document(AclPolicy)` compiles a policy document into typed
-  rules (temporary).
+  `IcmpTypes`.
 - `nsplane-acl`: policy states of the default rule set: `PolicyState::{NotInstalled,
   Installed { rules }, Failed}` and `NotInstalled::{Deny, Accept}`. `AclEngine::install`,
   `uninstall`, `fail`, `policy_state`, `with_not_installed`, `rules`; new drop reason
@@ -198,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule or grant with an `Icmp`, `Ip` or `Any` entry accepts them (pinholes stay TCP and UDP
   only); every other one is still dropped with `reasons::PROTOCOL`. Outbound such packets to
   an outbound-restricted peer are also accepted by a matching outbound rule. Rule sets
-  without such entries (every policy document) behave as before.
+  without such entries behave as before.
 - `nsplane-acl`: `AclEngine::clear_all` leaves the default rules in `PolicyState::Failed`:
   every inbound packet is dropped with `reasons::POLICY_FAILED` (was `NO_POLICY`), also on an
   engine built with `NotInstalled::Accept`; `uninstall` returns to `NotInstalled`.
@@ -227,11 +226,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PinholeError::NotPinholeNamespace` replaces `NotAppNamespace`. `AclEngine::store_grant`
   rejects a grant naming a stored `Pinholes` namespace, and a namespace grant end matches
   only `Rules` namespaces.
-- `nsplane-acl`: CIDR and host-alias sources of a policy document compile to `sources` only
-  and match the flow's source address, whatever the source's labels (they matched only the
-  IP of a terminate binding). A product that keeps CIDR rules from key-labelled sources adds
-  its own address label to the rule and to the address-bound sources
-  (`docs/specs/acl-source-identity.md`).
+- `nsplane-acl`: `NamespacePolicy::rules: Vec<Rule>` replaces `policy: AclPolicy`. The rules
+  are validated as by `RuleSet::new` (`Error::InvalidRule`); a `Pinholes` namespace must have
+  none.
+- `nsplane-acl`: `OutboundRule` and `Grant` are typed: `OutboundRule { id: RuleId, protocols:
+  Vec<ProtocolMatch> }` (`OutboundRule::new`; was `proto: Option<String>`, `ports: String`)
+  and `Grant::protocols: Vec<ProtocolMatch>` (was `proto: Option<String>`, `ports:
+  Option<String>`). Both are validated as `Rule::protocols`; an empty list is invalid, so
+  the old "TCP and UDP, any port" is `[Tcp(PortSet::Any), Udp(PortSet::Any)]`. Errors are
+  `Error::InvalidNamespace` (naming the outbound rule's id) and `Error::InvalidGrant`.
+- examples: `acl_gateway`'s `--policy` file is a JSON list of `nsplane_acl::Rule`, validated
+  with `RuleSet::new` and installed with `AclEngine::install`
+  (`examples/policies/acl_gateway.json` rewritten; it has no built-in tests any more).
+- `nsplane-acl`: the `crates_acl/*` scenarios of the `namespaces` bench are `stateless/*`,
+  with the options set explicitly.
 - rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
   nsplane-wss no longer cites a product; provenance is in the task documents.
 - Breaking: `nsplane-nat`'s translator address model is named after RFC 7757 explicit
@@ -266,8 +274,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `AclDecision`; use `Decision` (the accepting `RuleId` in `Matched`, the
   `reasons` constant of a denial).
 - `nsplane-acl`: `CompiledPolicy` with `compile`, `is_allowed` and `validate_tests`; use
-  `RuleSet` (`RuleSet::new` for typed rules, `RuleSet::from_document` for a policy document,
-  which runs its tests) and `RuleSet::matching`.
+  `RuleSet` (`RuleSet::new`) and `RuleSet::matching`.
 - `nsplane-acl`: `CompiledPolicy::permit_all`; use
   `AclEngine::with_not_installed(NotInstalled::Accept)`, or install a rule with
   `ProtocolMatch::Any`.
@@ -277,10 +284,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `SourceAssertion` (`WgPeerKey`, `Terminate`, `External`, with
   `source_class`, `source_anchor` and `ip`) and `TerminateBinding`; a `PeerIdentity` returns
   the source's `LabelSet` instead, built by the caller.
-- `nsplane-acl`: `wg_peer_anchor`; the caller formats its own label text (a policy
-  document's `key:<hex>` source matches the label `key:<lowercase hex>`).
+- `nsplane-acl`: `wg_peer_anchor`; the caller formats its own label text (e.g.
+  `key:<lowercase hex>`).
 - `nsplane-acl`: `NamespaceId::is_app` and the meaning of the `"app:"` id prefix; use
   `NamespaceKind::Pinholes` (namespace ids are opaque).
+- `nsplane-acl`: the policy document: the `policy` module with `AclPolicy` (`hosts`, `acls`,
+  `tests`), `AclRule`, `AclAction` and `AclTest`. Build a `Vec<Rule>` (one typed rule per
+  source kind and destination) and validate it with `RuleSet::new`; host aliases are
+  expanded by the caller, and self-tests are `RuleSet::matching` or `AclEngine::evaluate`
+  on `Flow`s the caller builds. The document format, its compilation to typed rules and
+  labels, and its parity fixture are a product-side spec:
+  `docs/specs/acl-policy-document.md` (the crate's `tests/crates_acl_parity.rs` and its
+  fixture are gone; the fixture is `docs/specs/data/acl-crates-acl-parity.json`).
+- `nsplane-acl`: `AclEngine::load`, `RuleSet::from_document` and `AclTestFailure`; use
+  `RuleSet::new` and `AclEngine::install` (a rejected `RuleSet::new` changes nothing), and
+  `AclEngine::fail` when the caller's own compilation fails.
+- `nsplane-acl`: the `merge` module: `merge_layered`, `PolicyLayers`, `RemotePolicy`,
+  `MergedPolicy`, `MergeStats`, `RuleProvenance`, `acl_rule_key` and `acl_test_key`. Store
+  one namespace per rule source (`AclEngine::store_namespace`), or merge the sources into one
+  rule list before `RuleSet::new`; provenance goes into each rule's `RuleId`.
+- `nsplane-acl`: the `deny_scope` module: `apply_deny_scope`, `DenyScope`,
+  `DenyScopeOutcome`, `DroppedRule` and `DropReason`; drop the rules before `RuleSet::new`.
+- `nsplane-acl`: `AclFilterConfig::crates_acl(local)` and `FragmentMode::ALLOW_ONLY`; set the
+  fields explicitly: `stateful_replies: false`, `allow_other_protocols: false`, `fragments:
+  FragmentMode::AllowOnly { ttl: 15 s, capacity: 4096 }`, `accept_to_local: local`,
+  `accept_icmp_echo_reply: true`, `ipv6: Ipv6Mode::Accept`.
+- `nsplane-acl`: `Error::{InvalidCidr, InvalidDst, UnknownAlias, TestsFailed,
+  InvalidPolicy}`; only the document produced them. Typed input fails with
+  `Error::InvalidRule`, `Error::InvalidNamespace` or `Error::InvalidGrant`, and prefixes are
+  parsed by the caller (`IpNet: FromStr`, `ParseIpNetError`).
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter

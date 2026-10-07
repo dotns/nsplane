@@ -1,14 +1,14 @@
 //! Differential test of the ACL hook: an [`AclFilter`] with its label cache,
 //! flow verdict cache and bypass against the uncached filter (full
-//! evaluation of every packet), on generated policies (documents and typed
-//! rules with ICMP, other-protocol and label-plus-prefix entries, the policy
+//! evaluation of every packet), on generated policies (typed rules with
+//! ICMP, other-protocol and label-plus-prefix entries, the policy
 //! states, rule and pinhole namespaces), identities (sources with one,
 //! several or no labels, and peers labelled per source address through a
 //! prefix table) and packet sequences with policy changes in the middle of
 //! flows. The first packet of every new inbound flow is also checked against
 //! [`AclEngine::evaluate`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,8 +20,8 @@ use nsplane_packet::{IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 use crate::filter::PeerIdentity;
 use crate::test_packets::{Frag, icmp_echo, ip, ip_frag, tcp, udp};
 use crate::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclFilterStats, AclPolicy, AclRule, Decision,
-    Direction, Grant, GrantEnd, IcmpTypes, IpNet, Label, LabelSet, NamespaceKind, NamespaceMember,
+    AclEngine, AclFilter, AclFilterConfig, AclFilterStats, Decision, Direction, FragmentMode,
+    Grant, GrantEnd, IcmpTypes, IpNet, Ipv6Mode, Label, LabelSet, NamespaceKind, NamespaceMember,
     NamespacePolicy, NotInstalled, OutboundRule, PeerLabelMap, PinholeGuard, PinholeSpec, PortSet,
     Protocol, ProtocolMatch, Rule, RuleSet, Transport, reasons,
 };
@@ -72,8 +72,7 @@ fn address(peer: u32) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, u8::try_from(peer).unwrap()))
 }
 
-/// The key label of `peer`: the label a document's `key:<hex>` source of
-/// `[peer; 32]` compiles to.
+/// The key label of `peer`.
 fn key(peer: u32) -> Label {
     Label::from(format!("key:{}", format!("{peer:02x}").repeat(32)))
 }
@@ -128,32 +127,33 @@ fn any_label(rng: &mut Lcg) -> Label {
     }
 }
 
-fn rule(src: &str, dst: &str, proto: Option<&str>) -> AclRule {
-    AclRule {
-        action: AclAction::Accept,
-        src: vec![src.to_owned()],
-        dst: vec![dst.to_owned()],
-        proto: proto.map(str::to_owned),
-    }
+/// TCP and UDP to `ports`.
+fn tcp_udp(ports: &PortSet) -> Vec<ProtocolMatch> {
+    vec![
+        ProtocolMatch::Tcp(ports.clone()),
+        ProtocolMatch::Udp(ports.clone()),
+    ]
 }
 
-fn random_policy(rng: &mut Lcg) -> AclPolicy {
+/// Up to two TCP and UDP rules: label-free, by key label or by source
+/// prefix.
+fn random_tcp_udp_rules(rng: &mut Lcg) -> Vec<Rule> {
+    let net = |s: &str| s.parse().unwrap();
     let pool = [
-        rule("*", "*:*", None),
-        rule("*", "*:80", Some("tcp")),
-        rule("*", "10.0.0.0/24:*", Some("udp")),
-        rule("10.0.0.0/24", "*:22", None),
-        rule(key(2).as_str(), "*:443", Some("tcp")),
-        rule("10.0.0.3/32", "*:*", Some("tcp")),
-        rule("*", "*:*", Some("tcp")),
-        rule("*", "*:*", Some("udp")),
+        Rule::new("all", tcp_udp(&PortSet::Any)),
+        Rule::new("tcp80", vec![ProtocolMatch::Tcp(PortSet::single(80))]),
+        Rule::new("udp-members", vec![ProtocolMatch::Udp(PortSet::Any)])
+            .with_destinations([net("10.0.0.0/24")]),
+        Rule::new("members22", tcp_udp(&PortSet::single(22))).with_sources([net("10.0.0.0/24")]),
+        Rule::new("key2", vec![ProtocolMatch::Tcp(PortSet::single(443))]).with_labels([key(2)]),
+        Rule::new("peer3", vec![ProtocolMatch::Tcp(PortSet::Any)])
+            .with_sources([net("10.0.0.3/32")]),
+        Rule::new("tcp", vec![ProtocolMatch::Tcp(PortSet::Any)]),
+        Rule::new("udp", vec![ProtocolMatch::Udp(PortSet::Any)]),
     ];
-    let acls = (0..rng.below(3)).map(|_| pool[rng.index(pool.len())].clone());
-    AclPolicy {
-        hosts: HashMap::new(),
-        acls: acls.collect(),
-        tests: Vec::new(),
-    }
+    (0..rng.below(3))
+        .map(|_| pool[rng.index(pool.len())].clone())
+        .collect()
 }
 
 fn random_rules(rng: &mut Lcg) -> RuleSet {
@@ -196,10 +196,10 @@ fn random_rules(rng: &mut Lcg) -> RuleSet {
     RuleSet::new(rules).unwrap()
 }
 
-/// Install a random document or typed rule set as the default rules.
+/// Install a random rule set as the default rules.
 fn random_default(rng: &mut Lcg, engine: &AclEngine) {
     if rng.chance(50) {
-        let _ = engine.load(random_policy(rng));
+        engine.install(RuleSet::new(random_tcp_udp_rules(rng)).unwrap());
     } else {
         engine.install(random_rules(rng));
     }
@@ -240,17 +240,17 @@ fn random_namespace(rng: &mut Lcg, pinholes: bool) -> NamespacePolicy {
         };
     }
     let outbound = match rng.below(4) {
-        0 => Some(vec![OutboundRule {
-            proto: Some("tcp".to_owned()),
-            ports: "80".to_owned(),
-        }]),
+        0 => Some(vec![OutboundRule::new(
+            "tcp80",
+            vec![ProtocolMatch::Tcp(PortSet::single(80))],
+        )]),
         1 => Some(Vec::new()),
         _ => None,
     };
     NamespacePolicy {
         kind: NamespaceKind::Rules,
         members,
-        policy: random_policy(rng),
+        rules: random_tcp_udp_rules(rng),
         outbound,
         pinhole_kinds: if rng.chance(50) {
             BTreeSet::from(["t".to_owned()])
@@ -328,12 +328,15 @@ impl World {
                 let grant = Grant {
                     from: random_end(rng),
                     to: random_end(rng),
-                    proto: rng
-                        .pick(&[None, Some("tcp"), Some("udp")])
-                        .map(str::to_owned),
-                    ports: rng
-                        .pick(&[None, Some("80"), Some("443")])
-                        .map(str::to_owned),
+                    protocols: {
+                        let ports = rng.pick(&[None, Some(80), Some(443)]);
+                        let ports = ports.map_or(PortSet::Any, PortSet::single);
+                        match rng.below(3) {
+                            0 => vec![ProtocolMatch::Tcp(ports)],
+                            1 => vec![ProtocolMatch::Udp(ports)],
+                            _ => tcp_udp(&ports),
+                        }
+                    },
                 };
                 let id = rng.pick(&["g0", "g1"]);
                 let _ = self.engine.store_grant(id, grant);
@@ -610,8 +613,11 @@ fn run(seed: u64, steps: usize, config: AclFilterConfig) {
             world.engine.generation()
         );
         let after = reference.stats();
-        // A reply allowance takes the packet before the evaluation.
-        if let Some((decision, verdict)) = expected.filter(|_| after.replies == before.replies) {
+        // A reply allowance or a bypass option takes the packet before the
+        // evaluation.
+        if let Some((decision, verdict)) = expected
+            .filter(|_| after.replies == before.replies && after.bypassed == before.bypassed)
+        {
             assert_eq!(
                 verdicts[1], verdict,
                 "seed {seed} step {step}: filter vs evaluate {decision:?} (peer {})",
@@ -662,8 +668,21 @@ fn cached_verdicts_match_other_configs() {
         stateful_replies: false,
         ..AclFilterConfig::default()
     };
+    // Stateless replies with allow-only fragments and every bypass option.
+    let stateless_bypass = AclFilterConfig {
+        stateful_replies: false,
+        fragments: FragmentMode::AllowOnly {
+            ttl: Duration::from_secs(15),
+            capacity: 4096,
+        },
+        accept_to_local: Some(LOCAL),
+        accept_icmp_echo_reply: true,
+        ipv6: Ipv6Mode::Accept,
+        ..AclFilterConfig::default()
+    };
     for seed in 2000..2100 {
         run(seed, 400, other_protocols);
         run(seed, 400, stateless);
+        run(seed, 400, stateless_bypass);
     }
 }

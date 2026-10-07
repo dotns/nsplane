@@ -1,20 +1,20 @@
-//! A TUN node that filters what its peers send with an `nsplane-acl` policy.
+//! A TUN node that filters what its peers send with `nsplane-acl` rules.
 //!
 //! Runs like `tun_node` (TUN device, `ip` configuration on Linux, UAPI on the standard
 //! socket, echo and checks on the kernel stack) with two packet filters in the engine: an
-//! [`AclFilter`] that accepts inbound packets only as the `--policy` allows, then a
+//! [`AclFilter`] that accepts inbound packets only as the `--policy` rules allow, then a
 //! [`FlowTracker`] that counts the accepted traffic per flow. Needs root (or
 //! `CAP_NET_ADMIN`).
 //!
 //! - Identities: each `--identity <WG_PUBKEY>=<LABEL>[,<LABEL>]` gives the ACL labels of a
-//!   `--peer` ([`PeerLabelMap`], a [`LabelSet`]). Labels are opaque: a policy rule with the
-//!   source `key:<hex>` matches the label `key:<lowercase hex>`, and CIDR and host-alias
-//!   sources match the packet's source address whatever the labels. Packets from a peer
-//!   without identity are dropped.
-//! - Live reload: the policy file (JSON [`AclPolicy`]) is read every second; when its
-//!   content changed it is parsed and swapped into the [`AclEngine`] atomically, logging
-//!   `policy reloaded (N rules)`, or the error while the previous policy stays in effect.
-//!   Until the first valid policy, every inbound packet is dropped (fail closed).
+//!   `--peer` ([`PeerLabelMap`], a [`LabelSet`]). Labels are opaque: a rule's `labels`
+//!   match a peer carrying one of them, and its `sources` match the packet's source address
+//!   whatever the labels. Packets from a peer without identity are dropped.
+//! - Live reload: the policy file (a JSON list of [`Rule`]s) is read every second; when its
+//!   content changed it is parsed, validated ([`RuleSet::new`]) and installed into the
+//!   [`AclEngine`] atomically, logging `policy reloaded (N rules)`, or the error while the
+//!   previous rules stay in effect. Until the first valid file, every inbound packet is
+//!   dropped (fail closed).
 //! - Stateful replies: connections the gateway side opens get their replies even when
 //!   the policy does not allow that inbound flow ([`AclFilterConfig::stateful_replies`]).
 //! - Status: `extra.acl` holds the [`AclFilter::stats`] counters and the policy state,
@@ -22,10 +22,10 @@
 //!
 //! The sample policy `examples/policies/acl_gateway.json` is written for a gateway at
 //! `10.0.0.1` and its peer at `10.0.0.2`: it allows TCP and UDP port 7 (echo) from the peer
-//! address `10.0.0.2` to the gateway and denies everything else (e.g. TCP port 8). Its
-//! built-in tests must pass for it to load.
+//! address `10.0.0.2` to the gateway and denies everything else (e.g. TCP port 8).
 //!
-//! APIs shown: [`AclEngine::load`], [`AclFilter::with_config`], [`PeerLabelMap`],
+//! APIs shown: [`RuleSet::new`], [`AclEngine::install`], [`AclFilter::with_config`],
+//! [`PeerLabelMap`],
 //! [`LabelSet`], [`FlowTracker`], `EngineBuilder::filter` (through `build_engine_with`), and
 //! the shared TUN node assembly.
 //!
@@ -34,15 +34,16 @@
 //! --identity <PUBKEY>=peer-a --policy examples/policies/acl_gateway.json --echo-port 7`
 //!
 //! [`AclEngine`]: nsplane_acl::AclEngine
-//! [`AclEngine::load`]: nsplane_acl::AclEngine::load
+//! [`AclEngine::install`]: nsplane_acl::AclEngine::install
 //! [`AclFilter`]: nsplane_acl::AclFilter
 //! [`AclFilter::stats`]: nsplane_acl::AclFilter::stats
 //! [`AclFilter::with_config`]: nsplane_acl::AclFilter::with_config
 //! [`AclFilterConfig::stateful_replies`]: nsplane_acl::AclFilterConfig::stateful_replies
-//! [`AclPolicy`]: nsplane_acl::AclPolicy
 //! [`FlowTracker`]: nsplane_acl::FlowTracker
 //! [`LabelSet`]: nsplane_acl::LabelSet
 //! [`PeerLabelMap`]: nsplane_acl::PeerLabelMap
+//! [`Rule`]: nsplane_acl::Rule
+//! [`RuleSet::new`]: nsplane_acl::RuleSet::new
 
 #[cfg(unix)]
 mod unix {
@@ -58,8 +59,8 @@ mod unix {
     use clap::Parser;
     use nsplane::x25519::PublicKey;
     use nsplane_acl::{
-        AclEngine, AclFilter, AclFilterConfig, AclPolicy, FlowTracker, Label, LabelSet,
-        PeerLabelMap,
+        AclEngine, AclFilter, AclFilterConfig, FlowTracker, Label, LabelSet, PeerLabelMap, Rule,
+        RuleSet,
     };
     use nsplane_examples::echo::{Backend, EchoArgs};
     use nsplane_examples::node::{
@@ -170,12 +171,13 @@ mod unix {
         }
 
         fn load(&self, content: &[u8]) {
-            let loaded = serde_json::from_slice::<AclPolicy>(content)
+            let loaded = serde_json::from_slice::<Vec<Rule>>(content)
                 .map_err(anyhow::Error::from)
-                .and_then(|policy| {
-                    let rules = policy.acls.len();
-                    self.engine.load(policy)?;
-                    Ok(rules)
+                .and_then(|rules| {
+                    let rules = RuleSet::new(rules)?;
+                    let len = rules.len();
+                    self.engine.install(rules);
+                    Ok(len)
                 });
             match loaded {
                 Ok(rules) => {
@@ -317,10 +319,23 @@ mod unix {
 
         #[test]
         fn sample_policy_loads() {
+            use nsplane_acl::Flow;
+
             let content = include_bytes!("../../policies/acl_gateway.json");
-            let policy: AclPolicy = serde_json::from_slice(content).unwrap();
-            assert_eq!(policy.acls.len(), 2);
-            AclEngine::new().load(policy).unwrap();
+            let rules: Vec<Rule> = serde_json::from_slice(content).unwrap();
+            let rules = RuleSet::new(rules).unwrap();
+            assert_eq!(rules.len(), 1);
+            let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+            let labels = LabelSet::empty();
+            for (flow, allow) in [
+                (Flow::tcp(addr("10.0.0.2:4000"), addr("10.0.0.1:7")), true),
+                (Flow::udp(addr("10.0.0.2:4000"), addr("10.0.0.1:7")), true),
+                (Flow::tcp(addr("10.0.0.2:4000"), addr("10.0.0.1:8")), false),
+                (Flow::tcp(addr("10.0.0.3:4000"), addr("10.0.0.1:7")), false),
+            ] {
+                assert_eq!(rules.matching(&labels, &flow).is_some(), allow, "{flow:?}");
+            }
+            AclEngine::new().install(rules);
         }
 
         #[test]

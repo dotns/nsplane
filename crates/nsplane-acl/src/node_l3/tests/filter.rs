@@ -25,7 +25,6 @@
 //! | `a_denied_gateway_return_is_handled_by_the_gateway_consumer` | [`a_denied_gateway_return_is_handled_by_the_gateway_consumer`] |
 //! | `enforced_subnet_ipv6_follows_the_grant` | not applicable: inbound destinations and routing; IPv6 here: [`ipv6_skips_the_gate_and_goes_to_the_acl`] |
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -41,9 +40,8 @@ use crate::node_l3::{
     NodeL3PeerPolicyRequirement, NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol,
     NodeL3Transport, NodeL3TransportPeer,
 };
-use crate::policy::{AclAction, AclPolicy, AclRule};
 use crate::reasons;
-use crate::rules::{Label, LabelSet};
+use crate::rules::{Label, LabelSet, PortSet, ProtocolMatch, Rule, RuleSet};
 use crate::test_packets::udp_packet;
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
@@ -324,26 +322,21 @@ fn acl_filter(engine: AclEngine) -> AclFilter {
     AclFilter::with_config(Arc::new(engine), identity, AclFilterConfig::default())
 }
 
-fn acl_policy(acls: Vec<AclRule>) -> AclEngine {
+fn acl_policy(rules: Vec<Rule>) -> AclEngine {
     let engine = AclEngine::new();
-    engine
-        .load(AclPolicy {
-            hosts: HashMap::new(),
-            acls,
-            tests: Vec::new(),
-        })
-        .unwrap();
+    engine.install(RuleSet::new(rules).unwrap());
     engine
 }
 
 /// An ACL accepting everything.
 fn accept_acl() -> AclFilter {
-    acl_filter(acl_policy(vec![AclRule {
-        action: AclAction::Accept,
-        src: vec!["*".to_owned()],
-        dst: vec!["*:*".to_owned()],
-        proto: None,
-    }]))
+    acl_filter(acl_policy(vec![Rule::new(
+        "0",
+        vec![
+            ProtocolMatch::Tcp(PortSet::Any),
+            ProtocolMatch::Udp(PortSet::Any),
+        ],
+    )]))
 }
 
 /// An ACL denying everything ([`reasons::DENIED`]).
@@ -362,10 +355,10 @@ fn outbound_restricted_acl() -> AclFilter {
                     label: key_label(&PEER),
                     addresses: vec![format!("{REMOTE}/32").parse().unwrap()],
                 }],
-                outbound: Some(vec![OutboundRule {
-                    proto: Some("tcp".to_owned()),
-                    ports: "443".to_owned(),
-                }]),
+                outbound: Some(vec![OutboundRule::new(
+                    "0",
+                    vec![ProtocolMatch::Tcp(PortSet::single(443))],
+                )]),
                 ..NamespacePolicy::default()
             },
         )

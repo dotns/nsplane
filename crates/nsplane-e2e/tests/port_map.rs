@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use nsplane::{AllowedIp, ChannelTransport, Event};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, PeerLabelMap,
+    AclEngine, AclFilter, Label, LabelSet, PeerLabelMap, PortSet, ProtocolMatch, Rule, RuleSet,
 };
 use nsplane_e2e::{
     Node, Options, SharedFilter, TestResult, channel_pair_with, introduce, payload, tcp, udp,
@@ -315,7 +315,7 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
             )
             .build()?,
     );
-    // The label the policy's `key:<hex>` source compiles to.
+    // `b`'s label: `key:` and the lowercase hex of its public key.
     let key = b
         .public()
         .to_bytes()
@@ -325,16 +325,12 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
             let _ = write!(text, "{byte:02x}");
             text
         });
-    identities.insert(peer_b, LabelSet::new([Label::from(key.as_str())]));
-    acl_engine.load(AclPolicy {
-        acls: vec![AclRule {
-            action: AclAction::Accept,
-            src: vec![key],
-            dst: vec![format!("{SELF_EAM6}:{acl_port}")],
-            proto: Some("udp".to_owned()),
-        }],
-        ..AclPolicy::default()
-    })?;
+    let label = Label::from(key);
+    identities.insert(peer_b, LabelSet::new([label.clone()]));
+    let rule = Rule::new("udp", vec![ProtocolMatch::Udp(PortSet::single(acl_port))])
+        .with_labels([label])
+        .with_destinations([SELF_EAM6.to_string().parse()?]);
+    acl_engine.install(RuleSet::new([rule])?);
     Ok((a, b, acl))
 }
 
