@@ -66,3 +66,8 @@ nsplane-kernel for F1.
   (scopes, bindings by PeerId, label grants, unbound pass/divert, holds; IPv4-only), with a
   22-row ns compile table. Q1-Q8 go as recommended. Two deviations are accepted and documented in
   node-l3.md: divert currency within one gate generation, and no unknown-peer drop in the gate.
+- 2026-10-07: AC C5 deviations: 1 (counter once), 2 (Subnet flows follow the current grant), 3
+  (fragment/pass state kept up to 30 s across a no-op recompile) and 5 (reason granularity)
+  accepted. 4 (outbound to addresses without a PeerId binding fell open) reworked fail-closed: a
+  per-scope list of such addresses is governed under the scope's mode and is never a divert
+  candidate. The default is empty.
