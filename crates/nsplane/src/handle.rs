@@ -715,7 +715,7 @@ impl EngineHandle {
     /// The sum of [`EngineHandle::unanswered_handshakes`] over every peer, including the peers
     /// removed since the engine started: monotonic.
     ///
-    /// Cheap to poll: a consumer that keeps a registry of its peers (e.g. ns) can watch this
+    /// Cheap to poll: a consumer that keeps a registry of its peers (e.g. a control plane) can watch this
     /// total and act on an increase, such as a registry resync when a peer stops answering,
     /// then find the peer with [`EngineHandle::unanswered_handshakes`].
     pub async fn total_unanswered_handshakes(&self) -> Result<u64, EngineError> {
