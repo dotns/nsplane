@@ -270,21 +270,16 @@ impl Default for AclFilterConfig {
 }
 
 impl AclFilterConfig {
-    /// The settings of the ACL step of an ns account: for inbound IPv4
-    /// packets the filter equals ns `is_local_node_packet(pkt, local) ||
-    /// is_icmp_echo_reply(pkt) || acl_check_packet(..)` (the first term only
-    /// when `local` is set), with the labels of a [`PeerLabelMap`] built as
-    /// `docs/specs/acl-source-identity.md` describes.
-    ///
-    /// That is: no reply allowances ([`stateful_replies`](Self::stateful_replies)
-    /// off), protocols other than TCP and UDP dropped, IPv4 fragments gated by
+    /// A stateless preset for inbound IPv4: no reply allowances
+    /// ([`stateful_replies`](Self::stateful_replies) off), protocols other
+    /// than TCP and UDP dropped, IPv4 fragments gated by
     /// [`FragmentMode::ALLOW_ONLY`], `local` in
     /// [`accept_to_local`](Self::accept_to_local) and
     /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on, and IPv6
-    /// packets accepted unevaluated ([`Ipv6Mode::Accept`], as ns: IPv6 is
-    /// authorized by the core's inbound destinations). Drop reasons follow
-    /// this filter (a packet ns drops is dropped here, possibly with another
-    /// reason), and outbound IPv4 packets keep this filter's handling.
+    /// packets accepted unevaluated ([`Ipv6Mode::Accept`]; an IPv6
+    /// destination is then checked by the core's inbound destinations).
+    /// Outbound IPv4 packets keep this filter's handling. The labels of the
+    /// filter's [`PeerLabelMap`] and the rules decide the rest.
     pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
         Self {
             allow_other_protocols: false,
