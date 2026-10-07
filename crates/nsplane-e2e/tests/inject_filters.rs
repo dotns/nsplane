@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsplane::{ChannelTransport, Event, PacketFilter, PeerId};
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclPolicy, PeerIdentityMap, SourceAssertion, reasons,
+    AclEngine, AclFilter, AclFilterConfig, Label, LabelSet, PeerLabelMap, RuleSet, reasons,
 };
 use nsplane_core::Verdict;
 use nsplane_e2e::{
@@ -121,7 +121,7 @@ async fn injected_packets_skip_a_dropping_filter() -> TestResult {
 #[tokio::test]
 async fn an_acl_keeps_no_reply_state_for_injected_packets() -> TestResult {
     let engine = Arc::new(AclEngine::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let filter = AclFilter::with_config(
         Arc::clone(&engine),
         Arc::clone(&identities),
@@ -137,14 +137,9 @@ async fn an_acl_keeps_no_reply_state_for_injected_packets() -> TestResult {
     })?;
     introduce(&a, &b, None).await?;
     let peer_b = a.peer_of(&b).await?;
-    identities.insert(
-        peer_b,
-        SourceAssertion::WgPeerKey {
-            pubkey: b.public().to_bytes(),
-        },
-    );
+    identities.insert(peer_b, LabelSet::new([Label::from("node-b")]));
     // Deny all: only reply state admits `b`'s packets.
-    engine.load(AclPolicy::default())?;
+    engine.install(RuleSet::empty());
     let mut events = a.subscribe().await?;
     let b_end = v4(b.ip4, 5000);
 
