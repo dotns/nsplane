@@ -107,6 +107,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other ICMP still counts as `unsupported` (a new field: breaking for code that builds
   `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
   (`tcp::Socket::reduce_mss`).
+- `nsplane-acl`: typed rules (`rules` module): `Label` (opaque, compared by a precomputed
+  hash and its text) and `LabelSet` (sorted, `Arc`-backed); `RuleId`; `Rule` (`id`, `labels`,
+  `sources`, `destinations`, `protocols`, with `new` and `with_*` builders) matching by label
+  (any-match), source and destination prefix and `ProtocolMatch` (`Any`, `Tcp(PortSet)`,
+  `Udp(PortSet)`, `Icmp(IcmpTypes)`, `Ip(u8)`); `RuleSet::new` validates (empty protocol
+  list, inverted port range, empty `PortSet::Ranges` / `IcmpTypes::Only`, `Ip(1 | 6 | 17 |
+  58)` are `Error::InvalidRule`), `matching(&LabelSet, &Flow)` reports the first matching
+  rule's id; serde on `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`,
+  `IcmpTypes`.
+- `nsplane-acl`: policy states of the default rule set: `PolicyState::{NotInstalled,
+  Installed { rules }, Failed}` and `NotInstalled::{Deny, Accept}`. `AclEngine::install`,
+  `uninstall`, `fail`, `policy_state`, `with_not_installed`, `rules`; new drop reason
+  `reasons::POLICY_FAILED` (`"acl policy failed"`); `AclFilterStats::policy_failed` and
+  `AclFilterStats::policy_state` (breaking for code that builds `AclFilterStats` with a struct
+  literal).
+- `nsplane-acl`: packet-independent evaluation: `AclEngine::evaluate(&LabelSet, &Flow) ->
+  Decision`, with `Flow` (`tcp`, `udp`, `icmp`, `ip`), `Transport`, `Decision::{Accept(Matched),
+  Deny(&'static str)}` (`is_accept`, `rule_id`, `reason`) and `Matched::{Rule { namespace, id
+  }, Grant(RuleId), Pinhole(PinholeId), NotInstalled}`. It equals the filter's decision for
+  the first packet of a new inbound flow; every full evaluation logs the rule, grant, pinhole
+  or reason at debug level.
+- `nsplane-acl`: `Error::InvalidRule`, `Error::InvalidNamespace` and `Error::InvalidGrant`
+  (with the offending id and a reason).
+- `nsplane-acl`: `NamespaceKind::{Rules, Pinholes}` (`NamespacePolicy::kind`, default
+  `Rules`): a `Pinholes` namespace carries no rules or pinhole kinds, no grant may name it,
+  and its members get access only through pinholes.
+- `nsplane-acl`: `PeerLabelMap::insert_by_source(peer, Vec<(IpNet, LabelSet)>)`: labels per
+  remote address, the longest prefix containing it wins (the first listed among equal
+  prefixes) and an address outside every prefix is an unknown source (`UNKNOWN_PEER`).
+- `nsplane-acl`: the generic stateful flow gate (`gate` module, AG-4): `FlowGate` (`new(GateConfig)`,
+  `with_clock`, `replace(GatePolicy) -> Result<u64, GatePolicyError>`, `generation`,
+  `evaluate_inbound` / `evaluate_outbound(PeerId, &[u8]) -> GateDecision`, `find_flow(remote,
+  local, Protocol) -> Option<LiveFlow>`, `counters`). A `GatePolicy` is `GateScope`s (`ScopeId`,
+  `GateMode::{Off, Observe, Enforce}`, local addresses, `GateBinding`s from `PeerId` and remote
+  addresses to a `LabelSet`, `unbound_addresses` (remote addresses of the scope without a
+  `PeerId` binding: outbound packets to them are denied `Unbound` under the scope's mode and
+  no divert candidate comes from them; default empty), accept-only `GateGrant`s with
+  direction, labels, destinations,
+  `ProtocolMatch`es and `suspended`, and `UnboundRule`s with `UnboundAction::{Pass, Divert}`)
+  plus `GateHolds` (`HoldRule`s and `release` pairs), replaced atomically; flows of unchanged
+  scopes are kept and those of changed scopes re-authorized. `GateConfig` (`GateLimits`,
+  `GateTimeouts`; the defaults are the former constants), `GateDecision::{Pass, Observe,
+  Enforce}` with `GateReason` and the admitting `RuleId`, `GateCounters`, `GatePolicyError`
+  (IPv6 entries are rejected: the gate handles IPv4 only; `ConflictingAddress` for an unbound
+  address listed twice or also bound in its scope). `GateFilter` (`new`, `with_acl`,
+  `with_acl_outbound`, `with_divert`, `gate`, `stats` / `GateFilterStats`) composes it with an
+  `AclFilter`; `GateDivert` takes the `DivertedPacket`s (`generation`, `peer`, `scope`, `rule`,
+  `packet`, `into_packet`) of `UnboundAction::Divert` rules. Bench `cargo bench -p nsplane-acl
+  --bench gate`, e2e `nsplane-e2e` `flow_gate`.
 - `nsplane-wss`: `WssServerTransport`, the server side of `WssDialer` links (NG-7): a
   `Transport` over WebSocket sessions the embedder accepts (TLS, request checks and the
   upgrade stay the embedder's) and hands to a `WssAcceptor` (`accept`, `ws_config`).
@@ -163,6 +212,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Inbound `alias4` translation 4-5 ns faster at 64 B and 10-11 ns at 1400/1420 B.
 - `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
   recycling costs about 1.5 ns more.
+- `nsplane-acl`: inbound packets that are neither TCP nor UDP now reach the rules after the
+  reply allowances, `allow_other_protocols` and the scope rules: a default rule, namespace
+  rule or grant with an `Icmp`, `Ip` or `Any` entry accepts them (pinholes stay TCP and UDP
+  only); every other one is still dropped with `reasons::PROTOCOL`. Outbound such packets to
+  an outbound-restricted peer are also accepted by a matching outbound rule. Rule sets
+  without such entries behave as before.
+- `nsplane-acl`: `AclEngine::clear_all` leaves the default rules in `PolicyState::Failed`:
+  every inbound packet is dropped with `reasons::POLICY_FAILED` (was `NO_POLICY`), also on an
+  engine built with `NotInstalled::Accept`; `uninstall` returns to `NotInstalled`.
+- `nsplane-acl`: an invalid namespace (a pinhole namespace with rules or pinhole kinds, an
+  invalid outbound rule) is `Error::InvalidNamespace`, an invalid grant `Error::InvalidGrant`
+  (both were `Error::InvalidPolicy`); `Error` is `#[non_exhaustive]`.
+- `nsplane-acl`: `AclEngine::evaluate` takes `(&LabelSet, &Flow)` and returns a `Decision`
+  (was `&AccessRequest` to `AclDecision`).
+- `nsplane-acl`: `AclEngine::store_grant` takes `impl Into<RuleId>` and `AclEngine::grants`
+  returns `Vec<(RuleId, Grant)>`.
+- `nsplane-acl`: `PeerIdentity` yields labels: `labels(peer) -> Option<LabelSet>` and
+  `labels_for(peer, remote) -> Option<LabelSet>` (were `assertion` / `assertion_for`),
+  `by_source` and `generation` as before; `None` is an unknown peer (`UNKNOWN_PEER`).
+  Closures are `Fn(PeerId) -> Option<LabelSet>`. The filter caches each peer's label set
+  and the union of its labels' namespaces as before.
+- `nsplane-acl`: `PeerIdentityMap` is renamed `PeerLabelMap`; `insert(peer, LabelSet)` (was a
+  `SourceAssertion`), `insert_by_source` takes a prefix table (see Added; was "every remote
+  address is its own principal").
+- `nsplane-acl`: namespace membership, grants and pinholes are keyed by label:
+  `NamespaceMember::label: Label` (was `principal: String`), `GrantEnd::Label(Label)` (was
+  `GrantEnd::Peer(String)`), `PinholeSpec::label: Label` (was `peer: String`),
+  `AclEngine::memberships(&Label)` (was `&str`). A source is a member of the union of the
+  namespaces of all its labels; a destination address resolves to its owner label (longest
+  prefix, then the smallest label).
+- `nsplane-acl`: `NamespacePolicy::pinhole_kinds` replaces `allow_app_pinholes`, and
+  `PinholeError::NotPinholeNamespace` replaces `NotAppNamespace`. `AclEngine::store_grant`
+  rejects a grant naming a stored `Pinholes` namespace, and a namespace grant end matches
+  only `Rules` namespaces.
+- `nsplane-acl`: `NamespacePolicy::rules: Vec<Rule>` replaces `policy: AclPolicy`. The rules
+  are validated as by `RuleSet::new` (`Error::InvalidRule`); a `Pinholes` namespace must have
+  none.
+- `nsplane-acl`: `OutboundRule` and `Grant` are typed: `OutboundRule { id: RuleId, protocols:
+  Vec<ProtocolMatch> }` (`OutboundRule::new`; was `proto: Option<String>`, `ports: String`)
+  and `Grant::protocols: Vec<ProtocolMatch>` (was `proto: Option<String>`, `ports:
+  Option<String>`). Both are validated as `Rule::protocols`; an empty list is invalid, so
+  the old "TCP and UDP, any port" is `[Tcp(PortSet::Any), Udp(PortSet::Any)]`. Errors are
+  `Error::InvalidNamespace` (naming the outbound rule's id) and `Error::InvalidGrant`.
+- examples: `acl_gateway`'s `--policy` file is a JSON list of `nsplane_acl::Rule`, validated
+  with `RuleSet::new` and installed with `AclEngine::install`
+  (`examples/policies/acl_gateway.json` rewritten; it has no built-in tests any more).
+- `nsplane-acl`: the `crates_acl/*` scenarios of the `namespaces` bench are `stateless/*`,
+  with the options set explicitly.
 - rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
   nsplane-wss no longer cites a product; provenance is in the task documents.
 - Breaking: `nsplane-nat`'s translator address model is named after RFC 7757 explicit
@@ -190,6 +287,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WssDialer` (and the upcoming WSS datagram server transport). Nothing else changes:
   `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`, `WssDialError`, `WssDialEvent`,
   `WssStats`, `MAX_DATAGRAM` and `MAX_MESSAGE` stay.
+
+### Removed
+- `nsplane-acl`: `AccessRequest` (`from_ip`, `with_wg_peer_key`); use a `Flow` and the
+  source's `LabelSet` with `AclEngine::evaluate`.
+- `nsplane-acl`: `AclDecision`; use `Decision` (the accepting `RuleId` in `Matched`, the
+  `reasons` constant of a denial).
+- `nsplane-acl`: `CompiledPolicy` with `compile`, `is_allowed` and `validate_tests`; use
+  `RuleSet` (`RuleSet::new`) and `RuleSet::matching`.
+- `nsplane-acl`: `CompiledPolicy::permit_all`; use
+  `AclEngine::with_not_installed(NotInstalled::Accept)`, or install a rule with
+  `ProtocolMatch::Any`.
+- `nsplane-acl`: `AclEngine::store`, `clear`, `policy` and `is_allowed`; use `install`,
+  `uninstall`, `rules` and `rules()` with `RuleSet::matching`.
+- `nsplane-acl`: the public `matcher` module (it exported nothing public).
+- `nsplane-acl`: `SourceAssertion` (`WgPeerKey`, `Terminate`, `External`, with
+  `source_class`, `source_anchor` and `ip`) and `TerminateBinding`; a `PeerIdentity` returns
+  the source's `LabelSet` instead, built by the caller.
+- `nsplane-acl`: `wg_peer_anchor`; the caller formats its own label text (e.g.
+  `key:<lowercase hex>`).
+- `nsplane-acl`: `NamespaceId::is_app` and the meaning of the `"app:"` id prefix; use
+  `NamespaceKind::Pinholes` (namespace ids are opaque).
+- `nsplane-acl`: the policy document: the `policy` module with `AclPolicy` (`hosts`, `acls`,
+  `tests`), `AclRule`, `AclAction` and `AclTest`. Build a `Vec<Rule>` (one typed rule per
+  source kind and destination) and validate it with `RuleSet::new`; host aliases are
+  expanded by the caller, and self-tests are `RuleSet::matching` or `AclEngine::evaluate`
+  on `Flow`s the caller builds. The document format, its compilation to typed rules and
+  labels, and its parity fixture are a product-side spec:
+  `docs/specs/acl-policy-document.md` (the crate's `tests/crates_acl_parity.rs` and its
+  fixture are gone; the fixture is `docs/specs/data/acl-crates-acl-parity.json`).
+- `nsplane-acl`: `AclEngine::load`, `RuleSet::from_document` and `AclTestFailure`; use
+  `RuleSet::new` and `AclEngine::install` (a rejected `RuleSet::new` changes nothing), and
+  `AclEngine::fail` when the caller's own compilation fails.
+- `nsplane-acl`: the `merge` module: `merge_layered`, `PolicyLayers`, `RemotePolicy`,
+  `MergedPolicy`, `MergeStats`, `RuleProvenance`, `acl_rule_key` and `acl_test_key`. Store
+  one namespace per rule source (`AclEngine::store_namespace`), or merge the sources into one
+  rule list before `RuleSet::new`; provenance goes into each rule's `RuleId`.
+- `nsplane-acl`: the `deny_scope` module: `apply_deny_scope`, `DenyScope`,
+  `DenyScopeOutcome`, `DroppedRule` and `DropReason`; drop the rules before `RuleSet::new`.
+- `nsplane-acl`: `AclFilterConfig::crates_acl(local)` and `FragmentMode::ALLOW_ONLY`; set the
+  fields explicitly: `stateful_replies: false`, `allow_other_protocols: false`, `fragments:
+  FragmentMode::AllowOnly { ttl: 15 s, capacity: 4096 }`, `accept_to_local: local`,
+  `accept_icmp_echo_reply: true`, `ipv6: Ipv6Mode::Accept`.
+- `nsplane-acl`: `Error::{InvalidCidr, InvalidDst, UnknownAlias, TestsFailed,
+  InvalidPolicy}`; only the document produced them. Typed input fails with
+  `Error::InvalidRule`, `Error::InvalidNamespace` or `Error::InvalidGrant`, and prefixes are
+  parsed by the caller (`IpNet: FromStr`, `ParseIpNetError`).
+- `nsplane-acl`: the node L3 model, replaced by the generic flow gate (`gate` module). The ns
+  model and how a product compiles it onto the gate (labels, grant ids, holds, divert,
+  queries) are `docs/specs/node-l3.md`; its parity data is
+  `docs/specs/data/node-l3-differential.json` (the crate's fixture and differential test are
+  gone). Item by item:
+  - `NodeL3Gate` -> `gate::FlowGate`; `new`, `new_for_targets`, `with_limits`, `with_clock`
+    -> `FlowGate::new(GateConfig)` / `FlowGate::with_clock(GateConfig, clock)` (limits in
+    `GateLimits`; target machine ids stay with the caller).
+  - `NodeL3Gate::{apply, apply_from_source, withdraw_source}`, `NodeL3Config`,
+    `NodeL3ConfigError`, `NodeL3Applied`, `NODE_L3_SCHEMA_VERSION` -> `FlowGate::replace(
+    GatePolicy)`, `GatePolicyError` (generic validation only) and the returned generation;
+    sources, tombstones, generations, phases and the schema version are the caller's.
+  - `NodeL3Mode::{Disabled, Observe, Enforce}` -> `GateMode::{Off, Observe, Enforce}`.
+  - `NodeL3Node`, `NodeL3PeerBinding` -> `GateScope::local` and `GateBinding { peer, addresses,
+    labels }`; `NodeL3Grant`, `NodeL3Resource`, `NodeL3ServiceEndpoint`,
+    `NodeL3ServiceProtocol` -> `GateGrant { id, direction, labels, destinations, protocols,
+    suspended }` with `ProtocolMatch` / `Protocol`.
+  - `NodeL3PeerPolicyRequirement`, `NodeL3Transport`, `NodeL3TransportPeer`,
+    `NodeL3TransportError`, `NodeL3Gate::{replace_transport_projection,
+    replace_transport_projection_after_build, stage_transport_projection,
+    withdraw_transport_projection}` -> `GateHolds` / `HoldRule` and `UnboundRule`s the caller
+    derives from its own device projection.
+  - `NodeL3Gate::replace_provider_listeners` -> `GateGrant::suspended` and `UnboundRule`
+    protocols, recompiled and `replace`d.
+  - `NodeL3Gate::{ready_for_ack, peer_readiness_snapshot}`, `NodeL3PeerReadiness`,
+    `NodeL3PeerReadinessReason`, `NodeL3Gate::{enforced_subnet_authorizations,
+    enforced_subnet_return_peer_key, enforced_subnet_return_owners,
+    enforced_subnet_ingress_authorized, enforced_subnet_ingress_prefixes,
+    authorization_generation, set_on_authorization_change}`, `NodeL3SubnetAuthorization`:
+    pure functions of the caller's configuration, no gate replacement.
+  - `NodeL3Gate::{evaluate_subnet_transport_inbound, evaluate_subnet_transport_outbound}`,
+    `NodeL3Filter::with_subnet_transport_port` -> ordinary `GateGrant`s.
+  - `NodeL3Gate::{evaluate_inbound, evaluate_outbound}(peer_key, packet)` ->
+    `FlowGate::{evaluate_inbound, evaluate_outbound}(PeerId, packet)`.
+  - `NodeL3Gate::service_flow_authorized` -> `FlowGate::find_flow` (`LiveFlow { scope, rule,
+    enforced }`).
+  - `NodeL3Decision::{Legacy, Observe { would_allow, reason }, Enforce { allow, reason }}` ->
+    `GateDecision::{Pass, Observe { allow, reason, rule }, Enforce { allow, reason, rule }}`;
+    `NodeL3Reason` -> `GateReason` (`same_owner`, `node_grant`, `service_grant` and
+    `subnet_grant` are `Granted` with the grant's `RuleId`; `source_binding` -> `Unbound`,
+    `service_projection` -> `Suspended`, `policy_pending` -> `Held`, `ambiguous_network` ->
+    `Ambiguous`, `malformed_packet` -> `Malformed`); drop reasons `node l3: *` -> `flow gate:
+    *`.
+  - `NodeL3Gate::counters`, `NodeL3Counters` -> `FlowGate::counters`, `GateCounters`
+    (`source_binding_denied` -> `unbound_denied`).
+  - `NodeL3Filter` -> `GateFilter` (`new(gate)` without a key map); `NodeL3FilterStats` ->
+    `GateFilterStats` without `unknown_peer`: the filter no longer drops packets of a peer
+    without a key (inbound, the wrapped `AclFilter` drops unknown peers as
+    `reasons::UNKNOWN_PEER` and a governed address answers `Unbound`).
+  - `PeerPublicKeys`, `PeerKeyMap` -> bindings by `PeerId` in the `GatePolicy`.
+  - `GatewayConsumerSink` (`try_divert`) -> `GateDivert` (`divert`); `GatewayConsumerPacket`
+    -> `DivertedPacket`; `GatewayConsumerAuthority` (`gateway_id`, `source_id`,
+    `same_snapshot`) and `NodeL3Gate::{gateway_consumer_packet,
+    gateway_consumer_authority_current}` -> `UnboundRule { action: Divert }`,
+    `DivertedPacket::{generation, peer, scope, rule}` and `FlowGate::generation` (a diverted
+    packet is current while its generation equals the gate's).
+  - Bench `node_l3` -> `gate` (`new_flow/node_grant` -> `new_flow/any_grant`,
+    `new_flow/service_grant` -> `new_flow/port_grant`, `baseline/legacy_*` ->
+    `baseline/pass_*`); e2e `node_l3` -> `flow_gate`.
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
