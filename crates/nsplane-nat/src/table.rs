@@ -1,13 +1,15 @@
-//! The translation address model: per-peer aliases, the self mapping and LAN
-//! prefix pairs.
+//! The translation address model: per-peer explicit address mappings (EAM,
+//! RFC 7757), the self mapping and LAN prefix pairs.
 //!
-//! A peer has up to three local aliases: `alias4` (IPv4, stands for its
-//! `node4`), `alias6` (IPv6, stands for its `node6`; [`PeerMapping::alias6`])
-//! and a native IPv4 alias (IPv4, stands for its `node6`; added with
-//! [`TranslationTableBuilder::peer_with_native_alias4`]). The native IPv4
-//! alias lets IPv4 applications reach the peer's native IPv6 address: unlike
-//! `alias6`, which keeps the packet IPv6 and only rewrites the address, it is
-//! translated between IPv4 and IPv6.
+//! A peer has its own IPv6 address on the tunnel, `peer6`, and up to three
+//! local addresses for it: an EAM `eam4 <-> eam6` (a local IPv4 address
+//! translated to and from the IPv6 side of the mapping), an optional second
+//! EAM `peer6_eam4 <-> peer6` (a local IPv4 address translated to and from
+//! `peer6`; added with [`TranslationTableBuilder::peer_with_peer6_eam4`]) and
+//! an optional local IPv6 address `local6 <-> peer6` ([`PeerMapping::local6`]).
+//! The IPv4 EAM to `peer6` lets IPv4 applications reach the peer's own IPv6
+//! address: unlike `local6`, which keeps the packet IPv6 and only rewrites the
+//! address, it is translated between IPv4 and IPv6.
 //!
 //! A [`TranslationTable`] holds data and lookups only; it never rewrites
 //! packets. It is immutable once built and validated by
@@ -26,26 +28,29 @@ pub const LAN6_PREFIX_LEN: u8 = 96;
 /// Mask of the low 32 bits of a LAN IPv6 address (the embedded IPv4 address).
 const LAN6_HOST_MASK: u128 = 0xFFFF_FFFF;
 
-/// The addresses of one peer: its /127 IPv6 group and the local aliases for it.
+/// The addresses of one peer: its own IPv6 address, its EAM and its local
+/// addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerMapping {
-    /// The peer's native IPv6 address.
-    pub node6: Ipv6Addr,
-    /// The peer's IPv6 address that stands for its IPv4 side.
-    pub node4: Ipv6Addr,
-    /// Local IPv6 alias of the peer, translated to and from `node6`.
-    pub alias6: Option<Ipv6Addr>,
-    /// Local IPv4 alias of the peer, translated to and from `node4`.
-    pub alias4: Option<Ipv4Addr>,
+    /// The peer's own IPv6 address on the tunnel.
+    pub peer6: Ipv6Addr,
+    /// The IPv6 side of the peer's explicit address mapping (EAM).
+    pub eam6: Ipv6Addr,
+    /// A local IPv6 address for the peer, rewritten (not translated) to and
+    /// from `peer6`.
+    pub local6: Option<Ipv6Addr>,
+    /// The local IPv4 side of the peer's EAM, translated to and from `eam6`.
+    pub eam4: Option<Ipv4Addr>,
 }
 
-/// The node's own IPv4 address and the `node4` of its own /127 group.
+/// This node's own EAM: its local IPv4 address and the IPv6 address it
+/// translates to and from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfMapping {
-    /// The node's local IPv4 address.
-    pub self4: Ipv4Addr,
-    /// The node's own `node4`, translated to and from `self4`.
-    pub node4: Ipv6Addr,
+    /// This node's local IPv4 address.
+    pub eam4: Ipv4Addr,
+    /// This node's IPv6 address that `eam4` translates to and from.
+    pub eam6: Ipv6Addr,
 }
 
 /// An IPv4 LAN prefix and the IPv6 /96 prefix it is translated to.
@@ -67,22 +72,22 @@ pub enum TableError {
     /// The same peer was given more than one mapping.
     #[error("duplicate mapping for peer {0:?}")]
     DuplicatePeer(PeerId),
-    /// An alias, node or self address is used more than once.
+    /// A peer, EAM, local or self address is used more than once.
     #[error("duplicate address {0}")]
     DuplicateAddress(IpAddr),
-    /// A peer's IPv4 alias equals the self address.
-    #[error("IPv4 alias {0} equals the self address")]
-    Alias4IsSelf4(Ipv4Addr),
+    /// A peer's IPv4 EAM address equals the self mapping's `eam4`.
+    #[error("IPv4 EAM address {0} equals the self address")]
+    Eam4IsSelf(Ipv4Addr),
     /// A LAN IPv4 prefix is longer than 32 bits or has host bits set.
     #[error("invalid LAN IPv4 prefix {0}/{1}")]
     InvalidLan4(Ipv4Addr, u8),
     /// A LAN IPv6 prefix is not a /96 or has low 32 bits set.
     #[error("invalid LAN IPv6 prefix {0}/{1}: must be a /96 with zero low 32 bits")]
     InvalidLan6(Ipv6Addr, u8),
-    /// A LAN IPv4 prefix overlaps another one or an alias/self address.
+    /// A LAN IPv4 prefix overlaps another one or an IPv4 EAM/self address.
     #[error("LAN IPv4 prefix {0}/{1} overlaps another prefix or address")]
     Lan4Overlap(Ipv4Addr, u8),
-    /// A LAN IPv6 prefix overlaps another one or a node/alias address.
+    /// A LAN IPv6 prefix overlaps another one or a peer, EAM or local address.
     #[error("LAN IPv6 prefix {0}/96 overlaps another prefix or address")]
     Lan6Overlap(Ipv6Addr),
 }
@@ -120,14 +125,14 @@ pub struct TranslationTable {
     peers: HashMap<PeerId, PeerMapping>,
     // The address indexes hold a copy of the mapping: one hash lookup per
     // translated packet instead of two.
-    by_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
+    by_eam4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
     // The IPv6 indexes are keyed by the address bits and use the cheaper
     // [`KeyedState`] hash: the inbound path looks one up per packet.
-    by_alias6: Ipv6Map<(PeerId, PeerMapping)>,
-    by_node4: Ipv6Map<(PeerId, PeerMapping)>,
-    by_node6: Ipv6Map<(PeerId, PeerMapping)>,
-    by_native_alias4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
-    native_alias4: HashMap<PeerId, Ipv4Addr>,
+    by_local6: Ipv6Map<(PeerId, PeerMapping)>,
+    by_eam6: Ipv6Map<(PeerId, PeerMapping)>,
+    by_peer6: Ipv6Map<(PeerId, PeerMapping)>,
+    by_peer6_eam4: HashMap<Ipv4Addr, (PeerId, PeerMapping)>,
+    peer6_eam4: HashMap<PeerId, Ipv4Addr>,
     self_mapping: Option<SelfMapping>,
     /// LAN pairs sorted by `start4`, non-overlapping.
     lans: Vec<Lan>,
@@ -146,46 +151,46 @@ impl TranslationTable {
         self.peers.get(&peer)
     }
 
-    /// Returns the peer whose `alias4` is `addr`.
-    pub fn by_alias4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.by_alias4
+    /// Returns the peer whose `eam4` is `addr`.
+    pub fn by_eam4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
+        self.by_eam4
             .get(&addr)
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
-    /// Returns the peer whose `alias6` is `addr`.
-    pub fn by_alias6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.by_alias6
+    /// Returns the peer whose `local6` is `addr`.
+    pub fn by_local6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
+        self.by_local6
             .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
-    /// Returns the peer whose `node4` is `addr` (the self mapping is not included).
-    pub fn by_node4(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.by_node4
+    /// Returns the peer whose `eam6` is `addr` (the self mapping is not included).
+    pub fn by_eam6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
+        self.by_eam6
             .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
-    /// Returns the peer whose `node6` is `addr`.
-    pub fn by_node6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.by_node6
+    /// Returns the peer whose `peer6` is `addr`.
+    pub fn by_peer6(&self, addr: Ipv6Addr) -> Option<(PeerId, &PeerMapping)> {
+        self.by_peer6
             .get(&addr.to_bits())
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
-    /// Returns the peer whose native IPv4 alias (an IPv4 address translated to
-    /// and from its `node6`; see
-    /// [`TranslationTableBuilder::peer_with_native_alias4`]) is `addr`.
-    pub fn by_native_alias4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
-        self.by_native_alias4
+    /// Returns the peer whose IPv4 EAM to `peer6` (an IPv4 address translated
+    /// to and from its `peer6`; see
+    /// [`TranslationTableBuilder::peer_with_peer6_eam4`]) is `addr`.
+    pub fn by_peer6_eam4(&self, addr: Ipv4Addr) -> Option<(PeerId, &PeerMapping)> {
+        self.by_peer6_eam4
             .get(&addr)
             .map(|(peer, mapping)| (*peer, mapping))
     }
 
-    /// Returns the native IPv4 alias of `peer`, if it has one.
-    pub fn native_alias4(&self, peer: PeerId) -> Option<Ipv4Addr> {
-        self.native_alias4.get(&peer).copied()
+    /// Returns the IPv4 EAM to `peer6` of `peer`, if it has one.
+    pub fn peer6_eam4(&self, peer: PeerId) -> Option<Ipv4Addr> {
+        self.peer6_eam4.get(&peer).copied()
     }
 
     /// Returns the self mapping, if configured.
@@ -230,7 +235,7 @@ impl TranslationTable {
 /// validates them all at once.
 #[derive(Debug, Clone, Default)]
 pub struct TranslationTableBuilder {
-    /// Each peer with its native IPv4 alias, if any.
+    /// Each peer with its IPv4 EAM to `peer6`, if any.
     peers: Vec<(PeerId, PeerMapping, Option<Ipv4Addr>)>,
     self_mapping: Option<SelfMapping>,
     lans: Vec<LanPrefix>,
@@ -244,25 +249,24 @@ impl TranslationTableBuilder {
         self
     }
 
-    /// Adds the mapping of `id`, as [`peer`](Self::peer), with `alias` as its
-    /// native IPv4 alias: a local IPv4 address translated to and from the
-    /// peer's `node6` (quick-v2 `alias6(b)`), so IPv4 applications reach the
-    /// peer's native IPv6 address.
+    /// Adds the mapping of `id`, as [`peer`](Self::peer), with a second EAM:
+    /// `peer6_eam4`, a local IPv4 address translated to and from the peer's
+    /// `peer6`, so IPv4 applications reach the peer's own IPv6 address.
     ///
-    /// This differs from [`PeerMapping::alias6`], a local IPv6 address that
-    /// stays IPv6 and is only rewritten to and from `node6`, and from
-    /// [`PeerMapping::alias4`], which is translated to and from `node4`. All
-    /// three may be set for one peer. Like `alias4`, the native alias must
-    /// not be `self4`, another peer's `alias4` or native alias, or inside a
-    /// LAN IPv4 prefix.
+    /// This differs from [`PeerMapping::local6`], a local IPv6 address that
+    /// stays IPv6 and is only rewritten to and from `peer6`, and from
+    /// [`PeerMapping::eam4`], which is translated to and from `eam6`. All
+    /// three may be set for one peer. Like `eam4`, `peer6_eam4` must not be
+    /// the self mapping's `eam4`, another peer's `eam4` or `peer6_eam4`, or
+    /// inside a LAN IPv4 prefix.
     #[must_use]
-    pub fn peer_with_native_alias4(
+    pub fn peer_with_peer6_eam4(
         mut self,
         id: PeerId,
         mapping: PeerMapping,
-        alias: Ipv4Addr,
+        peer6_eam4: Ipv4Addr,
     ) -> Self {
-        self.peers.push((id, mapping, Some(alias)));
+        self.peers.push((id, mapping, Some(peer6_eam4)));
         self
     }
 
@@ -286,10 +290,10 @@ impl TranslationTableBuilder {
             self_mapping: self.self_mapping,
             ..TranslationTable::default()
         };
-        // Every IPv6 address (node6, node4, alias6, self node4) must be unique,
+        // Every IPv6 address (peer6, eam6, local6, self eam6) must be unique,
         // so a lookup never depends on which role is checked first.
         let mut v6 = HashSet::new();
-        let mut aliases4 = HashSet::new();
+        let mut eams4 = HashSet::new();
         let mut unique6 = |addr: Ipv6Addr| {
             if v6.insert(addr) {
                 Ok(())
@@ -298,42 +302,41 @@ impl TranslationTableBuilder {
             }
         };
         if let Some(own) = self.self_mapping {
-            unique6(own.node4)?;
+            unique6(own.eam6)?;
         }
-        // Every IPv4 alias (alias4 or native) must be unique and not `self4`.
+        // Every IPv4 EAM address (eam4 or peer6_eam4) must be unique and not
+        // the self `eam4`.
         let mut unique4 = |addr: Ipv4Addr| {
-            if self.self_mapping.is_some_and(|own| own.self4 == addr) {
-                Err(TableError::Alias4IsSelf4(addr))
-            } else if aliases4.insert(addr) {
+            if self.self_mapping.is_some_and(|own| own.eam4 == addr) {
+                Err(TableError::Eam4IsSelf(addr))
+            } else if eams4.insert(addr) {
                 Ok(())
             } else {
                 Err(TableError::DuplicateAddress(addr.into()))
             }
         };
-        for (id, mapping, native_alias4) in self.peers {
+        for (id, mapping, peer6_eam4) in self.peers {
             if table.peers.insert(id, mapping).is_some() {
                 return Err(TableError::DuplicatePeer(id));
             }
-            unique6(mapping.node6)?;
-            unique6(mapping.node4)?;
+            unique6(mapping.peer6)?;
+            unique6(mapping.eam6)?;
             table
-                .by_node6
-                .insert(mapping.node6.to_bits(), (id, mapping));
-            table
-                .by_node4
-                .insert(mapping.node4.to_bits(), (id, mapping));
-            if let Some(alias6) = mapping.alias6 {
-                unique6(alias6)?;
-                table.by_alias6.insert(alias6.to_bits(), (id, mapping));
+                .by_peer6
+                .insert(mapping.peer6.to_bits(), (id, mapping));
+            table.by_eam6.insert(mapping.eam6.to_bits(), (id, mapping));
+            if let Some(local6) = mapping.local6 {
+                unique6(local6)?;
+                table.by_local6.insert(local6.to_bits(), (id, mapping));
             }
-            if let Some(alias4) = mapping.alias4 {
-                unique4(alias4)?;
-                table.by_alias4.insert(alias4, (id, mapping));
+            if let Some(eam4) = mapping.eam4 {
+                unique4(eam4)?;
+                table.by_eam4.insert(eam4, (id, mapping));
             }
-            if let Some(alias) = native_alias4 {
-                unique4(alias)?;
-                table.by_native_alias4.insert(alias, (id, mapping));
-                table.native_alias4.insert(id, alias);
+            if let Some(eam4) = peer6_eam4 {
+                unique4(eam4)?;
+                table.by_peer6_eam4.insert(eam4, (id, mapping));
+                table.peer6_eam4.insert(id, eam4);
             }
         }
         table.lans = self
@@ -349,10 +352,10 @@ impl TranslationTableBuilder {
                 return Err(next.overlap4());
             }
         }
-        let addrs4 = aliases4
+        let addrs4 = eams4
             .iter()
             .copied()
-            .chain(self.self_mapping.map(|own| own.self4));
+            .chain(self.self_mapping.map(|own| own.eam4));
         for addr in addrs4 {
             if let Some(lan) = table.lan4(addr.to_bits()) {
                 return Err(lan.overlap4());
@@ -417,17 +420,17 @@ mod tests {
 
     fn mapping(n: u16) -> PeerMapping {
         PeerMapping {
-            node6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 0),
-            node4: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 1),
-            alias6: Some(Ipv6Addr::new(0xfd99, 0, 0, 0, 0, 0, 0, n)),
-            alias4: Some(Ipv4Addr::new(100, 64, 0, u8::try_from(n).unwrap())),
+            peer6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 0),
+            eam6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 1),
+            local6: Some(Ipv6Addr::new(0xfd99, 0, 0, 0, 0, 0, 0, n)),
+            eam4: Some(Ipv4Addr::new(100, 64, 0, u8::try_from(n).unwrap())),
         }
     }
 
     fn own() -> SelfMapping {
         SelfMapping {
-            self4: v4("100.64.0.100"),
-            node4: v6("fd00::ff:1"),
+            eam4: v4("100.64.0.100"),
+            eam6: v6("fd00::ff:1"),
         }
     }
 
@@ -445,8 +448,8 @@ mod tests {
             .peer(
                 PeerId::new(2),
                 PeerMapping {
-                    alias6: None,
-                    alias4: None,
+                    local6: None,
+                    eam4: None,
                     ..mapping(2)
                 },
             )
@@ -468,7 +471,7 @@ mod tests {
     fn empty_table_finds_nothing() {
         let table = TranslationTable::builder().build().unwrap();
         assert!(table.peer(PeerId::new(1)).is_none());
-        assert!(table.by_alias4(v4("100.64.0.1")).is_none());
+        assert!(table.by_eam4(v4("100.64.0.1")).is_none());
         assert!(table.self_mapping().is_none());
         assert!(table.lan4_to_lan6(v4("10.0.0.1")).is_none());
         assert!(table.lan6_to_lan4(v6("fd64:2::a00:1")).is_none());
@@ -480,21 +483,21 @@ mod tests {
         let one = mapping(1);
         let id = PeerId::new(1);
         assert_eq!(table.peer(id), Some(&one));
-        assert_eq!(table.by_alias4(one.alias4.unwrap()), Some((id, &one)));
-        assert_eq!(table.by_alias6(one.alias6.unwrap()), Some((id, &one)));
-        assert_eq!(table.by_node4(one.node4), Some((id, &one)));
-        assert_eq!(table.by_node6(one.node6), Some((id, &one)));
+        assert_eq!(table.by_eam4(one.eam4.unwrap()), Some((id, &one)));
+        assert_eq!(table.by_local6(one.local6.unwrap()), Some((id, &one)));
+        assert_eq!(table.by_eam6(one.eam6), Some((id, &one)));
+        assert_eq!(table.by_peer6(one.peer6), Some((id, &one)));
         // Roles do not mix.
-        assert!(table.by_node4(one.node6).is_none());
-        assert!(table.by_node6(one.node4).is_none());
-        assert!(table.by_alias6(one.node6).is_none());
+        assert!(table.by_eam6(one.peer6).is_none());
+        assert!(table.by_peer6(one.eam6).is_none());
+        assert!(table.by_local6(one.peer6).is_none());
 
         let two = table.peer(PeerId::new(2)).unwrap();
         assert_eq!(
-            table.by_node6(two.node6).map(|(id, _)| id),
+            table.by_peer6(two.peer6).map(|(id, _)| id),
             Some(PeerId::new(2))
         );
-        assert!(table.by_alias4(v4("100.64.0.2")).is_none());
+        assert!(table.by_eam4(v4("100.64.0.2")).is_none());
         assert!(table.peer(PeerId::new(3)).is_none());
     }
 
@@ -502,8 +505,8 @@ mod tests {
     fn self_mapping_lookup() {
         let table = sample();
         assert_eq!(table.self_mapping(), Some(own()));
-        // The self node4 is not a peer node4.
-        assert!(table.by_node4(own().node4).is_none());
+        // The self eam6 is not a peer eam6.
+        assert!(table.by_eam6(own().eam6).is_none());
     }
 
     #[test]
@@ -577,13 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_alias4() {
+    fn rejects_duplicate_eam4() {
         let builder = TranslationTable::builder()
             .peer(PeerId::new(1), mapping(1))
             .peer(
                 PeerId::new(2),
                 PeerMapping {
-                    alias4: mapping(1).alias4,
+                    eam4: mapping(1).eam4,
                     ..mapping(2)
                 },
             );
@@ -597,31 +600,31 @@ mod tests {
     fn rejects_duplicate_ipv6_addresses() {
         let one = mapping(1);
         let cases = [
-            // alias6, node4 and node6 reused by another peer.
+            // local6, eam6 and peer6 reused by another peer.
             PeerMapping {
-                alias6: one.alias6,
+                local6: one.local6,
                 ..mapping(2)
             },
             PeerMapping {
-                node4: one.node4,
+                eam6: one.eam6,
                 ..mapping(2)
             },
             PeerMapping {
-                node6: one.node6,
+                peer6: one.peer6,
                 ..mapping(2)
             },
             // An address reused in another role.
             PeerMapping {
-                node4: one.node6,
+                eam6: one.peer6,
                 ..mapping(2)
             },
             PeerMapping {
-                alias6: Some(one.node4),
+                local6: Some(one.eam6),
                 ..mapping(2)
             },
-            // The self node4.
+            // The self eam6.
             PeerMapping {
-                node4: own().node4,
+                eam6: own().eam6,
                 ..mapping(2)
             },
         ];
@@ -639,26 +642,26 @@ mod tests {
         let builder = TranslationTable::builder().peer(
             PeerId::new(1),
             PeerMapping {
-                node4: one.node6,
+                eam6: one.peer6,
                 ..one
             },
         );
         assert_eq!(
             err(builder),
-            TableError::DuplicateAddress(IpAddr::V6(one.node6))
+            TableError::DuplicateAddress(IpAddr::V6(one.peer6))
         );
     }
 
     #[test]
-    fn rejects_alias4_equal_to_self4() {
+    fn rejects_eam4_equal_to_self_eam4() {
         let builder = TranslationTable::builder().self_mapping(own()).peer(
             PeerId::new(1),
             PeerMapping {
-                alias4: Some(own().self4),
+                eam4: Some(own().eam4),
                 ..mapping(1)
             },
         );
-        assert_eq!(err(builder), TableError::Alias4IsSelf4(own().self4));
+        assert_eq!(err(builder), TableError::Eam4IsSelf(own().eam4));
     }
 
     #[test]
@@ -699,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lan4_covering_alias4_or_self4() {
+    fn rejects_lan4_covering_eam4_or_self_eam4() {
         let builder = TranslationTable::builder()
             .peer(PeerId::new(1), mapping(1))
             .lan(lan("100.64.0.0", 24, "fd64:1::", None));
@@ -725,9 +728,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lan6_covering_node_or_alias() {
+    fn rejects_lan6_covering_a_peer_eam_or_local_address() {
         let one = mapping(1);
-        for addr in [one.node6, one.node4, one.alias6.unwrap(), own().node4] {
+        for addr in [one.peer6, one.eam6, one.local6.unwrap(), own().eam6] {
             let prefix = Ipv6Addr::from_bits(addr.to_bits() & !LAN6_HOST_MASK);
             let builder = TranslationTable::builder()
                 .self_mapping(own())
@@ -741,67 +744,70 @@ mod tests {
     }
 
     #[test]
-    fn native_alias4_lookups() {
-        let native = v4("100.64.0.50");
+    fn peer6_eam4_lookups() {
+        let peer6_eam4 = v4("100.64.0.50");
         let one = mapping(1);
         let table = TranslationTable::builder()
-            .peer_with_native_alias4(PeerId::new(1), one, native)
+            .peer_with_peer6_eam4(PeerId::new(1), one, peer6_eam4)
             .peer(PeerId::new(2), mapping(2))
             .build()
             .unwrap();
-        assert_eq!(table.by_native_alias4(native), Some((PeerId::new(1), &one)));
-        assert_eq!(table.native_alias4(PeerId::new(1)), Some(native));
+        assert_eq!(
+            table.by_peer6_eam4(peer6_eam4),
+            Some((PeerId::new(1), &one))
+        );
+        assert_eq!(table.peer6_eam4(PeerId::new(1)), Some(peer6_eam4));
         assert_eq!(table.peer(PeerId::new(1)), Some(&one));
         // The other roles of the peer are unchanged, and roles do not mix.
         assert_eq!(
-            table.by_alias4(one.alias4.unwrap()).map(|(id, _)| id),
+            table.by_eam4(one.eam4.unwrap()).map(|(id, _)| id),
             Some(PeerId::new(1))
         );
-        assert!(table.by_alias4(native).is_none());
-        assert!(table.by_native_alias4(one.alias4.unwrap()).is_none());
-        assert!(table.native_alias4(PeerId::new(2)).is_none());
-        assert!(table.native_alias4(PeerId::new(3)).is_none());
+        assert!(table.by_eam4(peer6_eam4).is_none());
+        assert!(table.by_peer6_eam4(one.eam4.unwrap()).is_none());
+        assert!(table.peer6_eam4(PeerId::new(2)).is_none());
+        assert!(table.peer6_eam4(PeerId::new(3)).is_none());
     }
 
     #[test]
-    fn rejects_a_native_alias4_in_use() {
+    fn rejects_a_peer6_eam4_in_use() {
         let one = mapping(1);
         let cases = [
-            // Its own alias4, another peer's alias4, another native alias.
-            (one.alias4.unwrap(), None),
-            (mapping(2).alias4.unwrap(), None),
+            // Its own eam4, another peer's eam4, another peer6_eam4.
+            (one.eam4.unwrap(), None),
+            (mapping(2).eam4.unwrap(), None),
             (v4("100.64.0.50"), Some(v4("100.64.0.50"))),
         ];
-        for (native, other_native) in cases {
+        for (peer6_eam4, other_peer6_eam4) in cases {
             let builder =
-                TranslationTable::builder().peer_with_native_alias4(PeerId::new(1), one, native);
-            let builder = match other_native {
-                Some(alias) => builder.peer_with_native_alias4(PeerId::new(2), mapping(2), alias),
+                TranslationTable::builder().peer_with_peer6_eam4(PeerId::new(1), one, peer6_eam4);
+            let builder = match other_peer6_eam4 {
+                Some(eam4) => builder.peer_with_peer6_eam4(PeerId::new(2), mapping(2), eam4),
                 None => builder.peer(PeerId::new(2), mapping(2)),
             };
             assert_eq!(
                 err(builder),
-                TableError::DuplicateAddress(IpAddr::V4(native)),
-                "{native}"
+                TableError::DuplicateAddress(IpAddr::V4(peer6_eam4)),
+                "{peer6_eam4}"
             );
         }
-        // self4.
+        // The self eam4.
         let builder = TranslationTable::builder()
             .self_mapping(own())
-            .peer_with_native_alias4(PeerId::new(1), one, own().self4);
-        assert_eq!(err(builder), TableError::Alias4IsSelf4(own().self4));
+            .peer_with_peer6_eam4(PeerId::new(1), one, own().eam4);
+        assert_eq!(err(builder), TableError::Eam4IsSelf(own().eam4));
         // A duplicate peer stays a duplicate peer.
         let builder = TranslationTable::builder()
             .peer(PeerId::new(1), one)
-            .peer_with_native_alias4(PeerId::new(1), mapping(2), v4("100.64.0.50"));
+            .peer_with_peer6_eam4(PeerId::new(1), mapping(2), v4("100.64.0.50"));
         assert_eq!(err(builder), TableError::DuplicatePeer(PeerId::new(1)));
     }
 
     #[test]
-    fn rejects_lan4_covering_a_native_alias4() {
+    fn rejects_lan4_covering_a_peer6_eam4() {
         for peer in [None, Some(1)] {
             let builder = TranslationTable::builder()
-                .peer_with_native_alias4(PeerId::new(1), mapping(1), v4("10.9.0.1"))
+                .peer_with_peer6_eam4(PeerId::new(1), mapping(1), v4("10.9.0.1"))
                 .lan(lan("10.0.0.0", 8, "fd64:1::", peer));
             assert_eq!(err(builder), TableError::Lan4Overlap(v4("10.0.0.0"), 8));
         }
@@ -810,8 +816,8 @@ mod tests {
     #[test]
     fn errors_display() {
         assert_eq!(
-            TableError::Alias4IsSelf4(v4("100.64.0.1")).to_string(),
-            "IPv4 alias 100.64.0.1 equals the self address"
+            TableError::Eam4IsSelf(v4("100.64.0.1")).to_string(),
+            "IPv4 EAM address 100.64.0.1 equals the self address"
         );
         assert_eq!(
             TableError::InvalidLan4(v4("10.0.0.1"), 8).to_string(),
@@ -826,15 +832,15 @@ mod tests {
     #[test]
     fn ipv6_hash_is_keyed_per_table() {
         let (one, two) = (sample(), sample());
-        let (a, b) = (one.by_node6.hasher(), two.by_node6.hasher());
+        let (a, b) = (one.by_peer6.hasher(), two.by_peer6.hasher());
         let addr = v6("fd00::1");
         assert_ne!(hash(a, addr), hash(b, addr));
         // A clone keeps its keys, so its lookups still find the entries.
         let clone = one.clone();
-        assert_eq!(hash(clone.by_node6.hasher(), addr), hash(a, addr));
+        assert_eq!(hash(clone.by_peer6.hasher(), addr), hash(a, addr));
         assert_eq!(
-            clone.by_node6(mapping(1).node6),
-            one.by_node6(mapping(1).node6)
+            clone.by_peer6(mapping(1).peer6),
+            one.by_peer6(mapping(1).peer6)
         );
     }
 }

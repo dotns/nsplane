@@ -2,12 +2,13 @@
 
 //! IPv4/IPv6 translation and service-publishing NAT packet filters for nsplane.
 //!
-//! Applications that only speak IPv4 reach IPv6-only peers through local
-//! aliases: every peer owns a /127 IPv6 group (`node6` and `node4`), and this
-//! node presents it as an IPv6 alias (`alias6 <-> node6`) and an IPv4 alias
-//! (`alias4 <-> node4`). The node itself is reachable as `self4 <-> node4`,
-//! and IPv4 LAN prefixes map to IPv6 /96 prefixes by placing the IPv4 address
-//! in the low 32 bits (`lan4 <-> lan6`).
+//! Applications that only speak IPv4 reach IPv6-only peers through explicit
+//! address mappings (EAM, RFC 7757). Per peer, with its own IPv6 address
+//! `peer6`, the model holds an EAM `eam4 <-> eam6`, an optional second EAM
+//! `peer6_eam4 <-> peer6` and an optional local IPv6 rewrite
+//! `local6 <-> peer6`. This node's own EAM is `eam4 <-> eam6`, and IPv4 LAN
+//! prefixes map to IPv6 /96 prefixes by placing the IPv4 address in the low
+//! 32 bits (`lan4 <-> lan6`).
 //!
 //! - **Translation table** ([`TranslationTable`]): the immutable, validated
 //!   address model above, with O(1) / O(log n) lookups. Built with
@@ -47,8 +48,9 @@
 //!   the port map see overlay IPv6 in both directions.
 //! - **Allowed IPs**: the core routes local packets and checks the sources of
 //!   decrypted packets before the filters run, so each peer's allowed IPs
-//!   must contain its `alias4/32`, the LAN IPv4 prefixes behind it, its
-//!   `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
+//!   must contain its `eam4/32`, its `peer6_eam4/32`, the LAN IPv4 prefixes
+//!   behind it, its `local6`, `eam6`, `peer6` and the `lan6` prefixes behind
+//!   it.
 //! - **Buffer room**: a translated IPv4 packet grows by 20 bytes (28 with a
 //!   fragment header) inside its buffer. To keep translated packets within
 //!   the MTU, install the engine's fragmentation stage

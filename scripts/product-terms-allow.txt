@@ -1,0 +1,44 @@
+# Allowlist of scripts/check-product-terms.sh.
+#
+# Format, one entry per line:
+#
+#   <path>|<term>|<fixed substring of the offending line>|<reason>
+#
+# A hit is suppressed when its path and term match and its line contains the substring. A
+# substring of `*` covers every line of that path and term; use it only where a whole file
+# uses the word in one generic sense. The reason is mandatory. An entry that suppresses
+# nothing is stale and fails the gate: delete it. No field may contain `|`.
+#
+# Review rule: each entry is a legitimate generic use (networking, OS or measurement
+# vocabulary). Product uses are reworded, not allowlisted.
+
+# Nanoseconds in the benchmark table and notes of the crate docs.
+crates/nsplane-acl/src/lib.rs|ns|(default policy, 3 rules, not cached)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|16 pinholes: local rule|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|through a grant (peer to peer)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|through an inbound pinhole|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|outbound-restricted peer (outbound rule)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|Bypass (a namespace accepting everything)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|Default policy, by-source peer (best of 3 runs)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|IPv4 TCP (best of 3 runs)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|non-first fragment after an accepted first fragment|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|71 ns (default policy)|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|669 ns (namespaces)|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|580/623 ns outbound|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|(6-7.5 ns)|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|(9-11.5 ns), 16-19 ns|benchmark timing in nanoseconds
+
+# Unix and Windows security groups.
+crates/nsplane-cli/src/main.rs|group|and group IDs|Unix user and group IDs of a process
+crates/nsplane-uapi/src/pipe.rs|group|Administrators group|the Windows built-in Administrators security group
+
+# A user-space stack terminates the connections addressed to it (TCP endpoint language).
+crates/nsplane-netstack/src/lib.rs|terminate|terminates the plaintext IP packets|the stack is the endpoint that terminates the decrypted traffic
+crates/nsplane-netstack/src/stack.rs|terminate|The stack terminates TCP and UDP|the stack is the endpoint that terminates TCP and UDP
+crates/nsplane-netstack/src/tcp.rs|terminate|A TCP connection terminated by the stack|TCP connection terminated at this endpoint
+crates/nsplane-netstack/src/tcp.rs|terminate|pub async fn terminated(&self)|TcpConnection::terminated(): standard TCP state language (connection terminated)
+crates/nsplane-netstack/src/tcp.rs|terminate|[`terminated`](Self::terminated)|rustdoc of TcpConnection::terminated(): TCP connection state
+
+# GSO/GRO segment groups of the TUN offload path.
+crates/nsplane-tun/src/offload.rs|group|*|GSO/GRO coalescing groups of packets written as one super-packet
+crates/nsplane-tun/src/tun.rs|group|*|groups of the GSO-coalesced chunk written to the TUN device
