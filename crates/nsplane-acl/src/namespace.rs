@@ -157,19 +157,19 @@ impl<'de> Deserialize<'de> for NamespaceId {
 }
 
 /// Serde for `Vec<IpNet>` as a list of CIDR strings.
-mod ip_nets {
+pub(crate) mod ip_nets {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     use crate::net::IpNet;
 
-    pub(super) fn serialize<S: Serializer>(
+    pub(crate) fn serialize<S: Serializer>(
         nets: &[IpNet],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(nets.iter().map(ToString::to_string))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<IpNet>, D::Error> {
         Vec::<String>::deserialize(deserializer)?
