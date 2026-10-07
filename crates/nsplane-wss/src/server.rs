@@ -1,7 +1,9 @@
-//! [`WssStreamServer`]: the terminate leg of the stream carrier. It dials the relay like a
+//! [`WssStreamServer`]: the server side of the stream carrier. It dials the relay like a
 //! [`WssStreamClient`](crate::WssStreamClient) and serves the `WsFrame` protocol of the
 //! [`frame`](crate::frame) module on the session, relaying each opened stream to a backend
 //! the embedder's [`WssResolver`] picks.
+
+#![expect(deprecated, reason = "the deprecated stream server and its tests")]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -30,7 +32,11 @@ use crate::frame::{self, FrameCommand, Protocol, WsFrame};
 use crate::stream::{CLOSE_WAIT, FRAME_OVERHEAD};
 use crate::{MAX_DATA_PAYLOAD, MAX_DATAGRAM};
 
-/// The bounds of a [`WssStreamServer`] session; the defaults are ns `tunnel-ws`'s.
+/// The bounds of a [`WssStreamServer`] session.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WssServerLimits {
@@ -112,6 +118,10 @@ impl WssServerLimits {
 }
 
 /// An OPEN a [`WssResolver`] decides on.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WssOpen {
@@ -126,12 +136,20 @@ pub struct WssOpen {
 }
 
 /// A [`WssResolver`]'s refusal of an OPEN: the stream is answered with CLOSE.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Error)]
 #[error("wss stream open denied")]
 pub struct Denied;
 
 /// The embedder's policy of a [`WssStreamServer`]: maps each OPEN to the backend the
 /// server connects to, or denies it.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 pub trait WssResolver: Send + Sync + 'static {
     /// The backend of `open` (a TCP connection or a connected UDP socket to it carries the
     /// stream), or [`Denied`]. Called once per OPEN, on the stream's own task: a slow
@@ -140,6 +158,10 @@ pub trait WssResolver: Send + Sync + 'static {
 }
 
 /// Why a relayed stream ended.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WssCloseReason {
@@ -159,6 +181,10 @@ pub enum WssCloseReason {
 }
 
 /// What a [`WssStreamEvent`] reports.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WssStreamEventKind {
@@ -177,6 +203,10 @@ pub enum WssStreamEventKind {
 
 /// A stream lifecycle event of a [`WssStreamServer`]; see
 /// [`with_events`](WssStreamServer::with_events).
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WssStreamEvent {
@@ -195,6 +225,10 @@ pub struct WssStreamEvent {
 }
 
 /// The counters of a [`WssStreamServer`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Default)]
 pub struct WssServerStats {
     sessions: AtomicU64,
@@ -499,7 +533,7 @@ impl Session {
     }
 
     /// Queues `payload` for the stream `id` within its bounds; over a bound the stream is
-    /// closed (only that stream), as ns does.
+    /// closed (only that stream).
     fn deliver(&self, id: u32, payload: Bytes) {
         let table = lock(&self.table);
         let Some(entry) = table.get(&id) else {
@@ -736,7 +770,7 @@ impl Session {
                             .to_backend
                             .fetch_add(queued.payload.len() as u64, Ordering::Relaxed);
                     }
-                    // As ns: a datagram that cannot be sent is dropped; the flow stays.
+                    // A datagram that cannot be sent is dropped; the flow stays.
                     Err(error) => {
                         tracing::debug!(session = self.number, stream_id = id, %error, "wss udp send failed");
                     }
@@ -841,9 +875,9 @@ impl Drop for Up<'_> {
     }
 }
 
-/// The terminate leg of the stream carrier: dials the relay and serves the `WsFrame`
+/// The server side of the stream carrier: dials the relay and serves the `WsFrame`
 /// protocol of the [`frame`](crate::frame) module on the session, the peer of a
-/// [`WssStreamClient`](crate::WssStreamClient) (ns `WsTunnel`'s role).
+/// [`WssStreamClient`](crate::WssStreamClient).
 ///
 /// - **Session**: dialed like [`WssDialer`](crate::WssDialer) links (URL, TLS, headers,
 ///   bearer, 401/403 as [`LinkState::Rejected`], the doubling backoff, pings and the read
@@ -866,6 +900,10 @@ impl Drop for Up<'_> {
 ///
 /// [`run`](Self::run) drives it until a shutdown; [`stats`](Self::stats),
 /// [`state`](Self::state) and [`with_events`](Self::with_events) observe it.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 pub struct WssStreamServer {
     connector: Connector,
     limits: WssServerLimits,

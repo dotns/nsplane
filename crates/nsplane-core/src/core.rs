@@ -490,9 +490,10 @@ impl Core {
     /// The sum of [`Core::unanswered_handshakes`] over every peer, including the peers
     /// removed since the core was created: monotonic.
     ///
-    /// Cheap to poll (one pass over the peers, without locks): a consumer that keeps a registry of its peers (e.g. ns) can watch this
-    /// total and act on an increase, such as a registry resync when a peer stops answering,
-    /// then find the peer with [`Core::unanswered_handshakes`].
+    /// Cheap to poll (one pass over the peers, without locks): a consumer that keeps a
+    /// registry of its peers (e.g. a control plane) can watch this total and act on an
+    /// increase, such as a registry resync when a peer stops answering, then find the peer
+    /// with [`Core::unanswered_handshakes`].
     pub fn total_unanswered_handshakes(&self) -> u64 {
         self.peers
             .iter()

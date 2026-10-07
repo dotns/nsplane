@@ -60,7 +60,7 @@ fn stack_gone() -> io::Error {
 /// [`PacketSource`] and [`PacketSink`] an `nsplane::EngineBuilder` takes, and the
 /// returned [`NetStackHandle`] accepts and opens TCP connections and UDP flows.
 ///
-/// The stack terminates TCP and UDP addressed to its own addresses (any port), for IPv4
+/// The stack is the endpoint for TCP and UDP addressed to its own addresses (any port), for IPv4
 /// and IPv6. Everything else it receives is dropped and counted in
 /// [`NetStackHandle::stats`].
 #[derive(Debug)]

@@ -10,7 +10,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::{LinkConfig, TransportId};
 use nsplane_e2e::{TestResult, WAIT};
-use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssStreamClient, WssStreamLimits, WssTls};
+use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
+use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
@@ -169,6 +171,7 @@ async fn dialer_case(ping: Duration, idle: Duration) -> TestResult {
     Ok(())
 }
 
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 async fn stream_client_case(ping: Duration, idle: Duration) -> TestResult {
     let relay = Relay::start().await?;
     let client = WssStreamClient::new(relay.config(ping, idle), WssStreamLimits::default())?;

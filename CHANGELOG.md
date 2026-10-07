@@ -153,6 +153,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
   recycling costs about 1.5 ns more.
 
+### Deprecated
+- `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,
+  `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
+  `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
+  `Denied`, `WssStreamEvent`, `WssStreamEventKind`, `WssCloseReason`, and every public item
+  of the `frame` module (the `WsFrame` codec). It has no remaining consumer and will be
+  removed once its users have switched; the replacement is a WireGuard peer over
+  `WssDialer` (and the upcoming WSS datagram server transport). Nothing else changes:
+  `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`, `WssDialError`, `WssDialEvent`,
+  `WssStats`, `MAX_DATAGRAM` and `MAX_MESSAGE` stay.
+
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
   (left non-present by a killed process, its alias still resolving): it is replaced, while a
