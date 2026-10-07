@@ -5,8 +5,18 @@
 
 /// The policy has no rule accepting the packet.
 pub const DENIED: &str = "acl denied";
-/// No policy is loaded, so every inbound packet is dropped (fail-closed).
+/// No rule set is installed and the engine denies meanwhile.
+///
+/// Under [`NotInstalled::Deny`](crate::NotInstalled::Deny), new flows from
+/// sources in no namespace are dropped, and every inbound packet is dropped
+/// while nothing else is loaded (fail-closed).
 pub const NO_POLICY: &str = "acl no policy";
+/// The caller reported that its rules failed.
+///
+/// In [`PolicyState::Failed`](crate::PolicyState::Failed), new flows from
+/// sources in no namespace are dropped, and every inbound packet is dropped
+/// while nothing else is loaded (fail-closed).
+pub const POLICY_FAILED: &str = "acl policy failed";
 /// The sending peer has no source assertion in the [`PeerIdentity`](crate::PeerIdentity).
 pub const UNKNOWN_PEER: &str = "acl unknown peer";
 /// The packet is neither TCP nor UDP, other protocols are not allowed and no
