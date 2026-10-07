@@ -44,7 +44,7 @@ const TRANSLATION_SLACK: usize = 28;
 /// Packets queued between the reader thread and the [`TunSource`].
 const QUEUE_DEPTH: usize = 64;
 
-/// `ERROR_HANDLE_EOF`: the Wintun session is terminating.
+/// `ERROR_HANDLE_EOF`: the Wintun session is ending.
 const ERROR_HANDLE_EOF: i32 = 38;
 
 /// `ERROR_BUFFER_OVERFLOW`: the Wintun send ring is full.
@@ -275,7 +275,7 @@ fn interface_alias_luid(name: &str) -> io::Result<Option<NET_LUID_LH>> {
         .collect();
     let mut luid = NET_LUID_LH { Value: 0 };
     #[allow(unsafe_code, reason = "IP Helper FFI call")]
-    // SAFETY: `alias` is a NUL-terminated UTF-16 string that outlives the call, and
+    // SAFETY: `alias` is a UTF-16 string ending in NUL that outlives the call, and
     // `luid` is writable storage for one `NET_LUID_LH`.
     let status = unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &raw mut luid) };
     match status {
@@ -515,7 +515,7 @@ impl PacketSink for TunSink {
     ///
     /// A packet that is neither IPv4 nor IPv6 is dropped with
     /// [`io::ErrorKind::InvalidInput`]. When the send ring is full the packet is dropped
-    /// with [`io::ErrorKind::WouldBlock`]; once the session is terminating it is dropped
+    /// with [`io::ErrorKind::WouldBlock`]; once the session is ending it is dropped
     /// with [`io::ErrorKind::BrokenPipe`].
     fn send(
         &self,
