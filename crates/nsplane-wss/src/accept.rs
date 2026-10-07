@@ -300,9 +300,9 @@ fn session_addr(n: u64) -> SocketAddr {
 /// A [`Transport`] over the WebSocket sessions the embedder accepts: the server side of
 /// [`WssDialer`](crate::WssDialer).
 ///
-/// The embedder runs the listener: it accepts the connection, terminates TLS, checks the
-/// request (path, token) and does the WebSocket upgrade, then hands the session to
-/// [`WssAcceptor::accept`]. This crate does no authentication. Each session carries one
+/// The embedder runs the listener: it accepts the connection, runs the TLS handshake,
+/// checks the request (path, token) and does the WebSocket upgrade, then hands the session
+/// to [`WssAcceptor::accept`]. This crate does no authentication. Each session carries one
 /// datagram per binary message, raw bytes as with [`WssDialer`](crate::WssDialer).
 ///
 /// - **Endpoints**: each session gets its own address, never reused while the transport

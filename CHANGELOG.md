@@ -165,6 +165,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recycling costs about 1.5 ns more.
 - rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
   nsplane-wss no longer cites a product; provenance is in the task documents.
+- Breaking: `nsplane-nat`'s translator address model is named after RFC 7757 explicit
+  address mappings (EAM); behaviour, validation order, errors, reason strings and memory
+  layout are unchanged. `PeerMapping`: `node6` -> `peer6`, `node4` -> `eam6`, `alias4` ->
+  `eam4`, `alias6` -> `local6`. `SelfMapping`: `self4` -> `eam4`, `node4` -> `eam6`.
+  `TranslationTableBuilder::peer_with_native_alias4` -> `peer_with_peer6_eam4`.
+  `TranslationTable`: `native_alias4` -> `peer6_eam4`, `by_native_alias4` ->
+  `by_peer6_eam4`, `by_alias4` -> `by_eam4`, `by_alias6` -> `by_local6`, `by_node4` ->
+  `by_eam6`, `by_node6` -> `by_peer6`. `TableError::Alias4IsSelf4` -> `Eam4IsSelf` (message
+  "IPv4 EAM address {0} equals the self address"). The "native IPv4 alias" is now the IPv4
+  EAM to `peer6`; the `translate` bench groups are `eam4_out` / `eam4_in`; the tests
+  `translate/tests/native_alias.rs` and `nsplane-e2e/tests/translate_native_alias.rs` are
+  `peer6_eam4.rs` and `translate_peer6_eam4.rs`. The `translate_node` example's
+  `--map` keys are `peer6=`, `eam6=`, `eam4=`, `local6=` (were `node6=`, `node4=`,
+  `alias4=`, `alias6=`).
 
 ### Deprecated
 - `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,
