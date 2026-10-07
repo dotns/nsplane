@@ -98,19 +98,22 @@ sudo cargo run -p nsplane-examples --bin hybrid -- --private-key-file a.key --tu
 ### acl_gateway
 
 A TUN node with an `nsplane-acl` `AclFilter` and a `FlowTracker`: inbound packets pass only as
-the JSON `--policy` allows for the peer's `--identity`; replies to connections the gateway
-opens always pass (stateful replies). The policy file is re-read every second and swapped in
-atomically (`policy reloaded (N rules)`; a broken file keeps the previous policy); before the
-first valid policy everything inbound is dropped. Status: `extra.acl` (filter counters,
+the `--policy` rules (a JSON list of `nsplane_acl::Rule`) allow for the peer's `--identity`
+labels; replies to connections the gateway opens always pass (stateful replies). The policy file
+is re-read every second, validated and installed atomically (`policy reloaded (N rules)`; a
+broken file keeps the previous rules); before the first valid file everything inbound is
+dropped. Status: `extra.acl` (filter counters,
 `policy_loaded`, `rules`, `reloads`, `reload_errors`) and `extra.flows`. Needs root.
 
 Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
-`--policy <PATH>`, `--identity <WG_PUBKEY>=<IP|key>` (repeatable). The sample
+`--policy <PATH>`, `--identity <WG_PUBKEY>=<LABEL>[,<LABEL>]` (repeatable; the peer's
+opaque ACL labels: a rule's `labels` match a peer carrying one of them, its `sources` match the
+packet's source address). The sample
 [`policies/acl_gateway.json`](policies/acl_gateway.json) allows TCP and UDP port 7 from the
-peer identity `10.0.0.2` to the gateway `10.0.0.1` and denies everything else (e.g. TCP 8).
+peer address `10.0.0.2` to the gateway `10.0.0.1` and denies everything else (e.g. TCP 8).
 
 ```sh
-sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --identity <B_PUB>=10.0.0.2 --policy examples/policies/acl_gateway.json --echo-port 7
+sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --identity <B_PUB>=peer-b --policy examples/policies/acl_gateway.json --echo-port 7
 ```
 
 ### translate_node
@@ -351,9 +354,10 @@ authenticates. Status:
 ### app_session
 
 App sessions on `nsplane-acl` rule namespaces, in one process on loopback UDP with netstacks
-(no root). Every node has its own `AclEngine` and `AclFilter`, principals are WireGuard keys,
-and an in-process mailbox stands in for the rendezvous. A session adds an `app:<id>`
-namespace with the peer as member, opens pinholes on the app port (`open_pinhole`) and sends
+(no root). Every node has its own `AclEngine` and `AclFilter`, each peer is labelled by its
+WireGuard key, and an in-process mailbox stands in for the rendezvous. A session adds an
+`app:<id>` pinhole namespace (`NamespaceKind::Pinholes`) with the peer's label as member, opens
+pinholes on the app port (`open_pinhole`) and sends
 a generated file over in-tunnel TCP, verified by SHA-256; ending the session drops the
 guards and removes the namespace. Prints `STEP <name> PASS|FAIL` for `a` (reuse: existing
 peers in `quick`, no new peer or handshake), `b` (not-permitted: `quick` no longer allows

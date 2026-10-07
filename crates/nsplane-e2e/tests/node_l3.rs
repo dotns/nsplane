@@ -15,16 +15,18 @@ use std::time::{Duration, Instant};
 
 use nsplane::{AllowedIp, ChannelTransport, Event, PeerId, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, GatewayConsumerPacket,
-    GatewayConsumerSink, NODE_L3_SCHEMA_VERSION, NamespaceMember, NamespacePolicy, NodeL3Config,
+    AclEngine, AclFilter, AclFilterConfig, GatewayConsumerPacket, GatewayConsumerSink, Label,
+    LabelSet, NODE_L3_SCHEMA_VERSION, NamespaceMember, NamespacePolicy, NodeL3Config,
     NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
     NodeL3PeerBinding, NodeL3PeerPolicyRequirement, NodeL3Reason, NodeL3Resource,
     NodeL3ServiceEndpoint, NodeL3ServiceProtocol, NodeL3Transport, NodeL3TransportPeer,
-    OutboundRule, PeerIdentityMap, PeerKeyMap, SourceAssertion, reasons, wg_peer_anchor,
+    OutboundRule, PeerKeyMap, PeerLabelMap, PortSet, ProtocolMatch, Rule, RuleSet, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, tcp, udp};
 
 /// Capacity of the channel transport pair.
+/// The ACL label of `a`.
+const A_LABEL: &str = "node-a";
 const CAPACITY: usize = 1024;
 /// The machine `b`'s gate is bound to.
 const MACHINE: &str = "machine-b";
@@ -105,7 +107,7 @@ async fn l3_pair(
     configure: impl FnOnce(NodeL3Filter) -> NodeL3Filter,
 ) -> TestResult<(L3Node, L3Node, L3)> {
     let keys = Arc::new(PeerKeyMap::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let acl = with_acl.then(|| {
         let engine = Arc::new(AclEngine::new());
         let filter = AclFilter::with_config(
@@ -150,7 +152,7 @@ async fn l3_pair(
     let a_key = a.public().to_bytes();
     let peer_a = b.peer_of(&a).await?;
     keys.insert(peer_a, a_key);
-    identities.insert(peer_a, SourceAssertion::WgPeerKey { pubkey: a_key });
+    identities.insert(peer_a, LabelSet::new([Label::from(A_LABEL)]));
     Ok((
         a,
         b,
@@ -273,18 +275,17 @@ fn enforce(
     Ok(())
 }
 
-// ── ACL policies ─────────────────────────────────────────────────────────────
+// ── ACL rules ────────────────────────────────────────────────────────────────
 
-fn accept_all() -> AclPolicy {
-    AclPolicy {
-        acls: vec![AclRule {
-            action: AclAction::Accept,
-            src: vec!["*".to_owned()],
-            dst: vec!["*:*".to_owned()],
-            proto: None,
-        }],
-        ..AclPolicy::default()
-    }
+/// One rule accepting every TCP and UDP flow.
+fn accept_all() -> TestResult<RuleSet> {
+    Ok(RuleSet::new([Rule::new(
+        "all",
+        vec![
+            ProtocolMatch::Tcp(PortSet::Any),
+            ProtocolMatch::Udp(PortSet::Any),
+        ],
+    )])?)
 }
 
 fn acl(l3: &L3) -> TestResult<&Acl> {
@@ -533,10 +534,10 @@ async fn observe_leaves_the_verdict_to_the_acl_and_counts() -> TestResult {
     l3.gate
         .apply(config(&a, &b, &l3, NodeL3Mode::Observe, false, Vec::new()))?;
 
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     let first = tcp4(v4(a.ip4, 40000), v4(b.ip4, SSH), SYN);
     dropped(&a, &mut b, &mut events, &first, reasons::DENIED).await?;
-    acl.engine.load(accept_all())?;
+    acl.engine.install(accept_all()?);
     let packet = tcp4(v4(a.ip4, 40001), v4(b.ip4, SSH), SYN);
     delivered(&a, &mut b, &packet).await?;
 
@@ -555,7 +556,7 @@ async fn observe_leaves_the_verdict_to_the_acl_and_counts() -> TestResult {
 async fn an_enforced_allow_skips_an_acl_that_would_deny() -> TestResult {
     let (a, mut b, l3) = l3_pair(NodeL3Gate::new(MACHINE), true, |f| f).await?;
     let acl = acl(&l3)?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     enforce(&a, &b, &l3, true, Vec::new())?;
     let packet = tcp4(v4(a.ip4, 40000), v4(b.ip4, SSH), SYN);
     delivered(&a, &mut b, &packet).await?;
@@ -571,7 +572,7 @@ async fn disabled_and_withdrawn_snapshots_leave_the_verdict_to_the_acl() -> Test
     let (a, mut b, l3) = l3_pair(NodeL3Gate::new(MACHINE), true, |f| f).await?;
     let mut events = b.subscribe().await?;
     let acl = acl(&l3)?;
-    acl.engine.load(accept_all())?;
+    acl.engine.install(accept_all()?);
     let (a_ip, b_ip) = (a.ip4, b.ip4);
     let packet = |port| tcp4(v4(a_ip, port), v4(b_ip, SSH), SYN);
     let no_grant = NodeL3Reason::NoGrant.drop_reason();
@@ -588,7 +589,7 @@ async fn disabled_and_withdrawn_snapshots_leave_the_verdict_to_the_acl() -> Test
     snapshot.mode = NodeL3Mode::Disabled;
     l3.gate.apply(snapshot.clone())?;
     delivered(&a, &mut b, &packet(40002)).await?;
-    acl.engine.load(AclPolicy::default())?;
+    acl.engine.install(RuleSet::empty());
     dropped(&a, &mut b, &mut events, &packet(40003), reasons::DENIED).await?;
 
     // Enforce again, then the source is withdrawn.
@@ -731,7 +732,7 @@ async fn a_gateway_return_is_diverted_to_the_consumer() -> TestResult {
 async fn outbound_to_a_node_without_a_grant_is_dropped_by_the_gate() -> TestResult {
     let (mut a, b, l3) = l3_pair(NodeL3Gate::new(MACHINE), true, |f| f).await?;
     let mut events = b.subscribe().await?;
-    acl(&l3)?.engine.load(accept_all())?;
+    acl(&l3)?.engine.install(accept_all()?);
     // Only `a` may open flows to `b`.
     enforce(&a, &b, &l3, false, vec![node_grant("node-a", "node-b")])?;
     let packet = tcp4(v4(b.ip4, 5000), v4(a.ip4, SSH), SYN);
@@ -756,13 +757,13 @@ async fn the_acl_outbound_runs_only_when_opted_in() -> TestResult {
             "nsd:a",
             NamespacePolicy {
                 members: vec![NamespaceMember {
-                    principal: wg_peer_anchor(&l3.a_key),
+                    label: Label::from(A_LABEL),
                     addresses: vec![format!("{}/32", a.ip4).parse()?],
                 }],
-                outbound: Some(vec![OutboundRule {
-                    proto: Some("tcp".to_owned()),
-                    ports: "443".to_owned(),
-                }]),
+                outbound: Some(vec![OutboundRule::new(
+                    "https",
+                    vec![ProtocolMatch::Tcp(PortSet::single(443))],
+                )]),
                 ..NamespacePolicy::default()
             },
         )?;

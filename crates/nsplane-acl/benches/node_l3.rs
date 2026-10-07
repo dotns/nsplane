@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, NODE_L3_SCHEMA_VERSION, NodeL3Config,
-    NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
-    NodeL3PeerBinding, NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol,
-    PeerIdentityMap, PeerKeyMap, SourceAssertion,
+    AclEngine, AclFilter, Label, LabelSet, NODE_L3_SCHEMA_VERSION, NodeL3Config, NodeL3Decision,
+    NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node, NodeL3PeerBinding,
+    NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol, PeerKeyMap, PeerLabelMap,
+    PortSet, ProtocolMatch, Rule, RuleSet,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -150,18 +150,17 @@ fn keys() -> Arc<PeerKeyMap> {
 /// An `AclFilter` accepting everything from the remote peer.
 fn accept_acl() -> AclFilter {
     let engine = Arc::new(AclEngine::new());
-    let loaded = engine.load(AclPolicy {
-        acls: vec![AclRule {
-            action: AclAction::Accept,
-            src: vec!["*".to_owned()],
-            dst: vec!["*:*".to_owned()],
-            proto: None,
-        }],
-        ..AclPolicy::default()
-    });
-    assert!(loaded.is_ok());
-    let identities = Arc::new(PeerIdentityMap::new());
-    identities.insert(peer(), SourceAssertion::WgPeerKey { pubkey: REMOTE_KEY });
+    let rules = RuleSet::new([Rule::new(
+        "all",
+        vec![
+            ProtocolMatch::Tcp(PortSet::Any),
+            ProtocolMatch::Udp(PortSet::Any),
+        ],
+    )]);
+    assert!(rules.is_ok());
+    engine.install(rules.unwrap_or_else(|_| RuleSet::empty()));
+    let identities = Arc::new(PeerLabelMap::new());
+    identities.insert(peer(), LabelSet::new([Label::from("remote")]));
     AclFilter::new(engine, identities)
 }
 
