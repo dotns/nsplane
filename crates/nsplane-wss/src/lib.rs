@@ -6,11 +6,14 @@
 //!
 //! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport),
 //!   below.
-//! - [`WssStreamClient`], the stream carrier: TCP streams ([`WssTcpStream`]) and UDP flows
-//!   ([`WssUdpFlow`]) to targets behind a WSS terminate, multiplexed over sessions with the
-//!   `WsFrame` protocol of the [`frame`] module (the wire of ns and NSGW).
-//! - [`WssStreamServer`], the terminate leg of that protocol: it dials the relay too and
-//!   relays each opened stream to the backend a [`WssResolver`] picks.
+//! - [`WssStreamClient`], the stream carrier (deprecated): TCP streams ([`WssTcpStream`])
+//!   and UDP flows ([`WssUdpFlow`]) to targets behind a WSS server, multiplexed over
+//!   sessions with the `WsFrame` protocol of the [`frame`] module.
+//! - [`WssStreamServer`], the server side of that protocol (deprecated): it dials the relay
+//!   too and relays each opened stream to the backend a [`WssResolver`] picks.
+//!
+//! The stream carrier has no remaining consumer and will be removed once its users have
+//! switched; a WireGuard peer over [`WssDialer`] replaces it.
 //!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each
@@ -73,6 +76,7 @@
 //! The stream carrier on the same kind of configuration:
 //!
 //! ```no_run
+//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
 //! use nsplane_wss::{WssConfig, WssStreamClient, WssStreamLimits, WssTls};
 //! use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 //!
@@ -93,9 +97,10 @@
 //! # }
 //! ```
 //!
-//! The terminate leg, on its own configuration:
+//! The server side, on its own configuration:
 //!
 //! ```no_run
+//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
@@ -119,7 +124,7 @@
 //! }
 //!
 //! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
-//! let config = WssConfig::new("wss://relay.example/terminate", WssTls::Roots(roots));
+//! let config = WssConfig::new("wss://relay.example/server", WssTls::Roots(roots));
 //! let server = WssStreamServer::new(config, WssServerLimits::default(), Arc::new(Web))?;
 //! let stats = server.stats();
 //! let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -139,10 +144,12 @@ mod stream;
 pub use config::{BearerProvider, WssConfig, WssTls};
 pub use connect::{WssDialError, WssDialEvent};
 pub use dialer::{WssDialer, WssStats};
+#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
 pub use server::{
     Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,
     WssStreamEventKind, WssStreamServer,
 };
+#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
 pub use stream::{
     MAX_DATA_PAYLOAD, WssStreamClient, WssStreamLimits, WssStreamStats, WssTcpStream, WssUdpFlow,
 };

@@ -1,4 +1,7 @@
-//! The `WsFrame` codec of the stream carrier, byte-identical to ns `tunnel-ws` and NSGW.
+//! The `WsFrame` codec of the stream carrier.
+//!
+//! Deprecated with the stream carrier: it has no remaining consumer and will be removed
+//! once its users have switched.
 //!
 //! Every binary WebSocket message is one frame (big-endian):
 //!
@@ -14,8 +17,10 @@
 //! | [`CLOSE`] | `0x20` | none |
 //! | [`CLOSE_ACK`] | `0x21` | none |
 //!
-//! As in ns, decoding ignores bytes after a complete OPEN, CLOSE or `CLOSE_ACK`, and any
-//! protocol byte but [`PROTO_UDP`] is TCP.
+//! Decoding ignores bytes after a complete OPEN, CLOSE or `CLOSE_ACK`, and any protocol
+//! byte but [`PROTO_UDP`] is TCP.
+
+#![expect(deprecated, reason = "the deprecated WsFrame codec and its tests")]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -23,22 +28,54 @@ use bytes::{BufMut as _, Bytes, BytesMut};
 use thiserror::Error;
 
 /// Open a stream to an IPv4 target.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const OPEN_V4: u8 = 0x01;
 /// Open a stream to an IPv6 target.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const OPEN_V6: u8 = 0x02;
 /// Bytes of a stream.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const DATA: u8 = 0x10;
 /// Close a stream.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const CLOSE: u8 = 0x20;
 /// Acknowledge a [`CLOSE`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const CLOSE_ACK: u8 = 0x21;
 
 /// The protocol byte of TCP.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const PROTO_TCP: u8 = 0x00;
 /// The protocol byte of UDP.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const PROTO_UDP: u8 = 0x01;
 
 /// The length of the stream id and the command byte that start every frame.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub const HEADER_LEN: usize = 5;
 
 /// The length of an [`OPEN_V4`] frame.
@@ -47,6 +84,10 @@ const OPEN_V4_LEN: usize = HEADER_LEN + 4 + 2 + 1;
 const OPEN_V6_LEN: usize = HEADER_LEN + 16 + 2 + 1;
 
 /// The transport protocol of an opened stream.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     /// A byte stream ([`PROTO_TCP`]).
@@ -75,6 +116,10 @@ impl Protocol {
 }
 
 /// The command of a [`WsFrame`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameCommand {
     /// Open a stream to `target` ([`OPEN_V4`] or [`OPEN_V6`] by its address family; the
@@ -94,6 +139,10 @@ pub enum FrameCommand {
 }
 
 /// Why bytes are not a [`WsFrame`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum FrameError {
@@ -117,6 +166,10 @@ pub enum FrameError {
 }
 
 /// One frame of the stream carrier; see the [module documentation](self).
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsFrame {
     /// The stream the frame belongs to.
@@ -263,6 +316,10 @@ impl WsFrame {
 /// Encodes a DATA frame of `stream_id` carrying `payload` in one allocation: what
 /// [`WsFrame::data`] and [`WsFrame::encode`] give, without first copying the payload into
 /// a [`Bytes`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WsFrame codec of the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; WssDialer carries raw datagrams without it"
+)]
 pub fn encode_data(stream_id: u32, payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(HEADER_LEN + payload.len());
     buf.put_u32(stream_id);

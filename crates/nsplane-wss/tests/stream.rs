@@ -2,7 +2,9 @@
 //! WebSocket server that forwards frames verbatim between a client session and a server
 //! session, or a plain one for `ws://`), and the client's TCP streams and UDP flows run
 //! through the server to local backends. The relay checks every frame it forwards against
-//! the ns frame layout.
+//! the reference frame layout.
+
+#![expect(deprecated, reason = "tests of the deprecated stream carrier")]
 
 use std::collections::HashMap;
 use std::io;
@@ -50,7 +52,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 enum Role {
     /// A `WssStreamClient` session (`/client`).
     Client,
-    /// A `WssStreamServer` session (`/terminate`).
+    /// A `WssStreamServer` session (`/server`).
     Server,
 }
 
@@ -178,7 +180,7 @@ impl Relay {
         token: &Arc<Token>,
     ) -> TestResult<Terminate> {
         let config = self
-            .config("terminate", token)
+            .config("server", token)
             .header("X-Slot", slot.to_string());
         let (events, events_rx) = mpsc::channel(1024);
         let server =
@@ -207,7 +209,7 @@ impl Relay {
                 .map(str::to_owned)
         };
         let authorization = header("authorization");
-        let role = if req.uri().path() == "/terminate" {
+        let role = if req.uri().path() == "/server" {
             Role::Server
         } else {
             Role::Client
@@ -337,8 +339,8 @@ impl Relay {
             .collect()
     }
 
-    /// Every forwarded message is a frame with the exact bytes the ns builders give it
-    /// (W2's wire vectors), and the client sends no `CLOSE_ACK` but for a server's CLOSE.
+    /// Every forwarded message is a frame with the exact bytes of the reference layout
+    /// (the wire vectors of the codec tests), and the client sends no `CLOSE_ACK` but for a server's CLOSE.
     fn check_wire(&self) -> TestResult {
         let wire = lock(&self.wire).clone();
         if wire.is_empty() {
@@ -349,7 +351,7 @@ impl Relay {
                 .map_err(|e| format!("{:?} sent a message that is no frame: {e}", seen.from))?;
             if seen.bytes[..] != ns_frame(&frame)[..] {
                 return Err(format!(
-                    "{:?} frame bytes differ from the ns layout: {:?}",
+                    "{:?} frame bytes differ from the reference layout: {:?}",
                     seen.from,
                     &seen.bytes[..seen.bytes.len().min(32)]
                 )
@@ -384,9 +386,8 @@ impl Callback for Upgrader<'_> {
     }
 }
 
-/// The ns bytes of `frame`: `proxy/wire.rs` `build_open_frame` (and its IPv6 form in
-/// `tunnel-ws`), `build_data_frame`, `build_close_frame` and the `CLOSE_ACK` `tunnel-ws`
-/// sends, as the W2 wire vectors.
+/// The reference bytes of `frame`, built field by field as the wire vectors of the codec
+/// tests.
 fn ns_frame(frame: &WsFrame) -> Vec<u8> {
     let mut bytes = frame.stream_id.to_be_bytes().to_vec();
     match frame.command {
@@ -681,8 +682,8 @@ async fn setup(map: &Arc<Map>, limits: WssServerLimits) -> TestResult<(Arc<Relay
 }
 
 /// Large payloads both ways: 8 MiB up to a backend that reads to the end, 8 MiB down
-/// from one that writes and closes, and an echo. The protocol has no flow control (as in
-/// ns): an echo is kept within the 4 MiB stream budget, since a larger one can outrun the
+/// from one that writes and closes, and an echo. The protocol has no flow control: an
+/// echo is kept within the 4 MiB stream budget, since a larger one can outrun the
 /// backend's echo and is then closed at the budget (see the budget tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tcp_large_payloads() -> TestResult {
@@ -1021,8 +1022,7 @@ async fn write_until_closed(mut stream: WssTcpStream, len: usize) -> TestResult 
 }
 
 /// A backend that does not read: its stream's queue grows to the 4 MiB stream budget and
-/// no further, then the server closes that stream (ns `MAX_STREAM_BUFFER_BYTES`); another
-/// stream of the session goes on.
+/// no further, then the server closes that stream; another stream of the session goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stalled_backend_is_closed_at_the_stream_budget() -> TestResult {
     let map = Map::new();
@@ -1050,7 +1050,7 @@ async fn stalled_backend_is_closed_at_the_stream_budget() -> TestResult {
     terminate.stop().await
 }
 
-/// The session budget bounds all streams together (ns `MAX_SESSION_BUFFER_BYTES`): two
+/// The session budget bounds all streams together: two
 /// stalled streams under a 1 MiB session budget never hold more, and each is closed; a
 /// third stream goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

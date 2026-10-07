@@ -11,8 +11,11 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::LinkDialer as _;
 use nsplane_e2e::{TestResult, WAIT};
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 use nsplane_wss::frame::{FrameCommand, WsFrame};
-use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssStreamClient, WssStreamLimits, WssTls};
+use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
+use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -71,6 +74,7 @@ impl Relay {
         Ok(relay)
     }
 
+    #[expect(deprecated, reason = "tests of the deprecated stream carrier")]
     async fn serve(self: Arc<Self>, tcp: TcpStream) {
         let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
             return;
@@ -216,6 +220,7 @@ async fn dialer_case(on: bool) -> TestResult {
         .await
 }
 
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 async fn stream_client_case(on: bool) -> TestResult {
     let relay = Relay::start().await?;
     let config = relay.config();
