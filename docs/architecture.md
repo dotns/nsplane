@@ -2059,8 +2059,8 @@ recently seen flow evicted), expires flows on per-protocol idle timeouts (TCP st
 without a background task, and takes an injectable clock. `PortMap::set_rules` swaps rules
 atomically and drops the flows of changed rules.
 
-**Nat64Lan.** A stateful NAT64 to an IPv4 LAN (NAPT) for a subnet gateway, ported from ns
-`SubnetRoute`. A `LanRoute` maps an IPv6 /96 (`mapped`) to an IPv4 prefix (`real`); the
+**Nat64Lan.** A stateful NAT64 to an IPv4 LAN (NAPT) for a subnet gateway. A
+`LanRoute` maps an IPv6 /96 (`mapped`) to an IPv4 prefix (`real`); the
 prefixes are `(Ipv6Addr, u8)` / `(Ipv4Addr, u8)` pairs validated by `LanRoute::new`, like
 `LanPrefix`, since no IP network crate is a dependency. IPv6 TCP, UDP and ICMPv6 echo to
 `mapped` plus a safe address of `real` (not broadcast, loopback, link-local, multicast or
@@ -2069,8 +2069,8 @@ unspecified; other mapped targets are dropped and counted) become IPv4 from the 
 `SnatPorts` and given back when the flow expires, is evicted or is removed
 (`Nat64Lan::remove_flow`, built on `Conntrack::remove` and its removal hook); a saturated
 range drops the packet rather than aliasing a flow. Replies and Fragmentation Needed (as
-Packet Too Big) are translated back; TCP MSS can be clamped. As in ns, translated packets
-leave DF clear (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
+Packet Too Big) are translated back; TCP MSS can be clamped. Translated packets
+leave DF clear by default (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
 fragmentation for a PMTU black hole when the LAN filters ICMP), and a destination that more
 than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`). The routes gate
 every forward packet; a flow keeps its SNAT address across a route replacement, and the
@@ -2091,7 +2091,7 @@ endpoint a caller-supplied closure picks for each new flow (`RedirectDecision::R
 rewrites the replies so they come from the service address; the source is kept. Flows
 live in a `Conntrack` (translated tuple: application to endpoint; `Flow::peer` unused); an
 endpoint already used by a live flow from the same source is refused and the closure asked
-again, up to 32 times by default (`Redirect::with_endpoint_tries(NonZeroUsize)`, ns's MQ-6).
+again, up to 32 times by default (`Redirect::with_endpoint_tries(NonZeroUsize)`).
 A closure with a small endpoint pool can scan it with `Redirect::endpoint_in_use(original,
 endpoint)` and offer a free endpoint first, or offer each in turn with as many tries as the
 pool has endpoints. `endpoint_in_use` looks the flow up with `Conntrack::peek`, which skips a
@@ -2105,24 +2105,24 @@ protocols and untracked replies pass unchanged.
 
 **Masquerade.** `Masquerade` also runs on the local side: on the IPv6 packets a routed LAN
 host sends towards the tunnel (`forward`) and on their replies (`reverse`). It is a source
-NAPT ported from ns `SubnetLanIngressTranslator`: a caller-supplied closure gives each new
+NAPT: a caller-supplied closure gives each new
 TCP, UDP or `ICMPv6` Echo flow a source (`MasqueradeDecision::source`, an `Ipv6Addr`: the
 contract's `IpAddr` was narrowed by L1 decision, so an IPv4 source cannot be expressed) and
 a `route` fingerprint, and the source port or Echo identifier becomes a token from
 `MasqueradeConfig::ports`, unique per destination and source. `reverse` restores the LAN
 host's address and port or identifier, after asking the closure again: a reply whose flow
-now gets `None` or another `route` is dropped and the flow removed (`route_changed`, ns's
-rule that the route fingerprint must stay current). With
+now gets `None` or another `route` is dropped and the flow removed (`route_changed`: the
+route fingerprint must stay current). With
 `MasqueradeConfig::recheck_route_on_forward` (default `false`), forward asks the closure for
-every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`), as ns did. The transport checksum is recomputed
+every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`). The transport checksum is recomputed
 over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
 `MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
 flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
-`verify_checksums`, an invalid transport checksum; beyond the contract, ns drops these
-too). Forward verifies the checksum only for packets it masquerades: for a new flow after the
+`verify_checksums`, an invalid transport checksum; beyond the contract, these are
+dropped too). Forward verifies the checksum only for packets it masquerades: for a new flow after the
 closure returned `Some` (a corrupt first packet records no flow), for a recorded flow before
 the route recheck; a packet that passes unchanged is never dropped for its checksum. Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
-refuses new flows, as the contract and ns require, while a `Conntrack` evicts its least
+refuses new flows, as the contract requires, while a `Conntrack` evicts its least
 recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
 protocols and replies of unknown flows pass unchanged. A local side that answers pings
 itself can recognize a forwarded `ICMPv6` Echo request with the read-only

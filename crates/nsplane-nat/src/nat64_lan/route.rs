@@ -35,7 +35,7 @@ pub struct LanRoute {
 }
 
 impl LanRoute {
-    /// A validated route, as ns `SubnetRoute::new`: `mapped` must be a /96
+    /// A validated route: `mapped` must be a /96
     /// with zero low 32 bits and `real` an IPv4 prefix without host bits.
     ///
     /// # Errors
@@ -63,7 +63,7 @@ impl LanRoute {
     /// IPv4 address in its low 32 bits inside `real` and a safe LAN target
     /// (not unspecified, loopback, link-local, multicast, the limited
     /// broadcast, nor the broadcast address of `real` when it is a /30 or
-    /// shorter), exactly as ns `SubnetRoute::resolve`.
+    /// shorter).
     pub fn resolve(&self, dst: Ipv6Addr) -> Option<Ipv4Addr> {
         if !self.maps(dst) {
             return None;
@@ -98,7 +98,7 @@ fn mask6(len: u8) -> u128 {
         .unwrap_or(0)
 }
 
-/// ns `safe_lan_target`.
+/// Whether `address` is a safe LAN target inside `real`; see [`LanRoute::resolve`].
 fn safe_lan_target(address: Ipv4Addr, (real, len): (Ipv4Addr, u8)) -> bool {
     let broadcast = Ipv4Addr::from(u32::from(real) | !mask4(len));
     !address.is_unspecified()

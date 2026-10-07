@@ -3,8 +3,7 @@
 //!
 //! A [`Redirect`] sends the flows a local application opens to a service
 //! address (say `100.64.0.10:80`) to an endpoint the caller picks per flow
-//! (say a user-space stack listening on `10.99.0.1:40000`), ported from ns
-//! `tun_service/rewrite.rs`:
+//! (say a user-space stack listening on `10.99.0.1:40000`):
 //!
 //! - **Forward** ([`Redirect::forward`]): a packet from the application gets
 //!   the flow's endpoint as its destination; the source is kept. The first
@@ -22,7 +21,7 @@
 //!
 //! Packets are rewritten in place with RFC 1624 incremental checksum updates
 //! (the IPv4 header and the transport checksum); a UDP packet without a
-//! checksum (zero) keeps it zero. ns recomputes both checksums.
+//! checksum (zero) keeps it zero.
 //!
 //! [`Pass`]: RedirectDecision::Pass
 //! [`Drop`]: RedirectDecision::Drop
@@ -30,8 +29,8 @@
 //! # Flows
 //!
 //! Flows live in a [`Conntrack`]: bounded (the least recently seen flow is
-//! evicted from a full table) with idle timeouts per protocol and TCP state;
-//! ns keeps flows until they are removed. A flow's `original` tuple is its
+//! evicted from a full table) with idle timeouts per protocol and TCP state.
+//! A flow's `original` tuple is its
 //! first packet (application -> service), its `translated` tuple the same
 //! packet after the rewrite (application -> endpoint); [`Flow::peer`] is
 //! always `PeerId::new(0)` and carries no meaning here.
@@ -82,7 +81,7 @@ use crate::port_map::rewrite::{self, End};
 const PEER: PeerId = PeerId::new(0);
 
 /// Decisions asked for a new flow before it is dropped with
-/// [`reasons::ENDPOINT_EXHAUSTED`], as ns tries its endpoint pool, unless
+/// [`reasons::ENDPOINT_EXHAUSTED`], unless
 /// [`Redirect::with_endpoint_tries`] says otherwise.
 const ENDPOINT_TRIES: usize = 32;
 
@@ -274,7 +273,7 @@ impl Redirect {
     }
 
     /// Removes the flow between `endpoint` and `remote` (the application's
-    /// address), as the endpoint sees it, as ns `remove_netstack_flow`.
+    /// address), as the endpoint sees it.
     /// Returns whether a flow was removed; the next packet of the flow asks
     /// the decision closure again.
     pub fn remove_flow(&self, protocol: u8, endpoint: SocketAddrV4, remote: SocketAddrV4) -> bool {
