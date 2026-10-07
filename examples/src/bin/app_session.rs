@@ -2,7 +2,7 @@
 //! existing peers and between session-only peers.
 //!
 //! Every node is an engine on loopback UDP with an `nsplane-netstack`, an [`AclFilter`], a
-//! [`PeerIdentityMap`] (each peer's principal is its WireGuard key, `key:<hex>`) and its
+//! [`PeerLabelMap`] (each peer carries one label, its WireGuard key as `key:<hex>`) and its
 //! own [`AclEngine`]. A minimal in-process mailbox (tokio channels) stands in for the
 //! rendezvous: it carries the session offer, the receiver's app port and, for
 //! session-only peers, fresh keys. Each step prints `STEP <name> PASS|FAIL`; the run ends
@@ -10,7 +10,8 @@
 //!
 //! - `a` reuse: A and B are already peers in their `quick` namespace (TCP echo on port 7
 //!   allowed, app kind `transfer` allowed; B restricts its outbound traffic to A to port
-//!   7). A session adds `app:<id>` with the peer as member on both sides, the receiver A
+//!   7). A session adds the pinhole namespace `app:<id>` ([`NamespaceKind::Pinholes`]) with
+//!   the peer's label as member on both sides, the receiver A
 //!   opens an inbound pinhole on its app port and the sender B an outbound one; a
 //!   generated file (1 MiB and a bit) crosses an in-tunnel TCP connection, acknowledged by
 //!   the receiver every 32 KiB, and its SHA-256 is verified. No peer is added and no handshake runs, the echo still works, and once
@@ -43,10 +44,10 @@
 //! `extra.pinhole_stats` ([`AclEngine::pinhole_stats`]).
 //!
 //! APIs shown: [`AclEngine::store_namespace`] and [`AclEngine::remove_namespace`] with
-//! [`NamespacePolicy`] (members, rules, `outbound`, `allow_app_pinholes`),
+//! [`NamespacePolicy`] (kind, member labels, rules, `outbound`, `pinhole_kinds`),
 //! [`AclEngine::open_pinhole`] with [`PinholeSpec`] and [`PinholeGuard`],
 //! [`AclEngine::store_grant`] and [`AclEngine::remove_grant`], [`AclFilter`] as an engine
-//! filter, [`PeerIdentityMap`], `EngineHandle::add_or_update_peer` / `remove_peer` with a
+//! filter, [`PeerLabelMap`], `EngineHandle::add_or_update_peer` / `remove_peer` with a
 //! preshared key, [`Splitter`], [`MergeSource`], [`ChannelSource`] and [`ChannelSink`].
 //!
 //! Usage: `cargo run -p nsplane-examples --bin app_session -- [--step a|b|c|d|e|all]
@@ -62,8 +63,9 @@
 //! [`AclFilter`]: nsplane_acl::AclFilter
 //! [`AclFilter::stats`]: nsplane_acl::AclFilter::stats
 //! [`Grant`]: nsplane_acl::Grant
+//! [`NamespaceKind::Pinholes`]: nsplane_acl::NamespaceKind::Pinholes
 //! [`NamespacePolicy`]: nsplane_acl::NamespacePolicy
-//! [`PeerIdentityMap`]: nsplane_acl::PeerIdentityMap
+//! [`PeerLabelMap`]: nsplane_acl::PeerLabelMap
 //! [`PinholeError::NotPermitted`]: nsplane_acl::PinholeError::NotPermitted
 //! [`PinholeGuard`]: nsplane_acl::PinholeGuard
 //! [`PinholeSpec`]: nsplane_acl::PinholeSpec
@@ -92,9 +94,9 @@ use nsplane::{
     PacketSink, PacketSource, Path, Peer, Splitter, UdpTransport,
 };
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet,
-    NamespaceMember, NamespacePolicy, OutboundRule, PeerIdentityMap, PinholeError, PinholeGuard,
-    PinholeSpec, Protocol, SourceAssertion, reasons, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet, Label,
+    LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule, PeerLabelMap,
+    PinholeError, PinholeGuard, PinholeSpec, Protocol, reasons,
 };
 use nsplane_examples::echo::{self, Backend, Check, Proto};
 use nsplane_examples::node::{UDP_TRANSPORT, generate_key, init_logging};
@@ -305,7 +307,7 @@ struct Node {
     v4: IpAddr,
     v6: IpAddr,
     acl: Arc<AclEngine>,
-    identities: Arc<PeerIdentityMap>,
+    identities: Arc<PeerLabelMap>,
     filter: AclFilter,
     apps: Apps,
     handshakes: Arc<AtomicU64>,
@@ -403,10 +405,22 @@ fn host_net(addr: IpAddr) -> anyhow::Result<IpNet> {
         .map_err(|e| anyhow!("invalid address {addr}: {e}"))
 }
 
-/// A namespace member: `public_key`'s principal with `addresses`.
+/// The ACL label of the peer with `public_key`: `key:<hex>`.
+fn key_label(public_key: &PublicKey) -> Label {
+    let text = public_key
+        .as_bytes()
+        .iter()
+        .fold(String::from("key:"), |mut text, b| {
+            let _ = write!(text, "{b:02x}");
+            text
+        });
+    Label::from(text)
+}
+
+/// A namespace member: `public_key`'s label with `addresses`.
 fn member(public_key: &PublicKey, addresses: &[IpAddr]) -> anyhow::Result<NamespaceMember> {
     Ok(NamespaceMember {
-        principal: wg_peer_anchor(public_key.as_bytes()),
+        label: key_label(public_key),
         addresses: addresses
             .iter()
             .map(|addr| host_net(*addr))
@@ -455,7 +469,7 @@ impl Node {
             NetStack::new(NetStackConfig::new(vec![(v4, 24), (v6, 64)], DEFAULT_MTU));
         let (stack_source, stack_sink) = stack.split();
         let acl = Arc::new(AclEngine::new());
-        let identities = Arc::new(PeerIdentityMap::new());
+        let identities = Arc::new(PeerLabelMap::new());
         let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&identities));
         let engine_filter = filter.clone();
         let mut tun = None;
@@ -546,8 +560,8 @@ impl Node {
         if v6 { self.v6 } else { self.v4 }
     }
 
-    fn principal(&self) -> String {
-        wg_peer_anchor(self.public_key.as_bytes())
+    fn label(&self) -> Label {
+        key_label(&self.public_key)
     }
 
     /// This node as a namespace member with both its addresses.
@@ -564,7 +578,7 @@ impl Node {
         }
     }
 
-    /// Adds the peer of `contact` with `allowed` host routes and its identity (its key).
+    /// Adds the peer of `contact` with `allowed` host routes and its label (its key).
     async fn add_peer(
         &self,
         contact: &Contact,
@@ -586,12 +600,8 @@ impl Node {
             .peer_id(contact.public_key)
             .await?
             .context("the peer just added is gone")?;
-        self.identities.insert(
-            id,
-            SourceAssertion::WgPeerKey {
-                pubkey: contact.public_key.to_bytes(),
-            },
-        );
+        self.identities
+            .insert(id, LabelSet::new([key_label(&contact.public_key)]));
         Ok(())
     }
 
@@ -605,7 +615,7 @@ impl Node {
         Ok(())
     }
 
-    /// Lets every principal in no namespace in (a leaf whose hub does the enforcing).
+    /// Lets every source in no namespace in (a leaf whose hub does the enforcing).
     fn permit_all(&self) -> anyhow::Result<()> {
         self.acl.load(AclPolicy {
             acls: vec![accept("*:*")],
@@ -737,11 +747,12 @@ fn quick(
             ..AclPolicy::default()
         },
         outbound,
-        allow_app_pinholes: if transfer {
+        pinhole_kinds: if transfer {
             BTreeSet::from([APP_KIND.to_owned()])
         } else {
             BTreeSet::new()
         },
+        ..NamespacePolicy::default()
     }
 }
 
@@ -782,14 +793,16 @@ struct Session {
 }
 
 impl Session {
-    /// Stores `app:<session>` on `node` with `peer` as its only member. The members of an
-    /// app namespace get nothing through it, and `outbound: Some([])` keeps it from
-    /// lifting an outbound restriction of the peer's other namespaces.
+    /// Stores the pinhole namespace `app:<session>` on `node` with `peer` as its only
+    /// member. The members of a pinhole namespace get nothing through it, and
+    /// `outbound: Some([])` keeps it from lifting an outbound restriction of the peer's
+    /// other namespaces.
     fn open(node: &Node, session: &str, peer: NamespaceMember) -> anyhow::Result<Self> {
         let id = format!("app:{session}");
         node.acl.store_namespace(
             id.as_str(),
             NamespacePolicy {
+                kind: NamespaceKind::Pinholes,
                 members: vec![peer],
                 outbound: Some(Vec::new()),
                 ..NamespacePolicy::default()
@@ -803,12 +816,17 @@ impl Session {
         })
     }
 
-    /// Opens a TCP pinhole to or from `peer` on `port`.
-    fn pinhole(&mut self, peer: &str, direction: Direction, port: u16) -> Result<(), PinholeError> {
+    /// Opens a TCP pinhole to or from the peer labelled `label` on `port`.
+    fn pinhole(
+        &mut self,
+        label: &Label,
+        direction: Direction,
+        port: u16,
+    ) -> Result<(), PinholeError> {
         let guard = self.acl.open_pinhole(
             self.id.as_str(),
             PinholeSpec {
-                peer: peer.to_owned(),
+                label: label.clone(),
                 kind: APP_KIND.to_owned(),
                 protocol: Protocol::Tcp,
                 direction,
@@ -1050,7 +1068,7 @@ async fn step_reuse(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
     })?;
     let (session, _, _) = at_a.offer().await?;
     let mut on_a = Session::open(a, &session, b.member()?)?;
-    on_a.pinhole(&b.principal(), Direction::Inbound, APP_PORT)?;
+    on_a.pinhole(&b.label(), Direction::Inbound, APP_PORT)?;
     let conns = a.apps.listen(APP_PORT);
     at_a.send(Message::Accept { port: APP_PORT })?;
 
@@ -1059,7 +1077,7 @@ async fn step_reuse(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
         bail!("the receiver did not accept");
     };
     let mut on_b = Session::open(b, &session, a.member()?)?;
-    on_b.pinhole(&a.principal(), Direction::Outbound, port)?;
+    on_b.pinhole(&a.label(), Direction::Outbound, port)?;
     let target = SocketAddr::new(a.addr(v6), port);
     transfer(b, target, conns, data, digest).await?;
 
@@ -1121,7 +1139,7 @@ async fn not_permitted(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
     })?;
     let (session, _, _) = at_a.offer().await?;
     let mut on_a = Session::open(a, &session, b.member()?)?;
-    match on_a.pinhole(&b.principal(), Direction::Inbound, APP_PORT) {
+    match on_a.pinhole(&b.label(), Direction::Inbound, APP_PORT) {
         Err(PinholeError::NotPermitted) => {}
         other => bail!("open_pinhole gave {other:?}, not NotPermitted"),
     }
@@ -1140,7 +1158,7 @@ async fn not_permitted(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
     };
     out::line(format_args!("REJECT b: {reason}"));
     let mut on_b = Session::open(b, &session, a.member()?)?;
-    on_b.pinhole(&a.principal(), Direction::Outbound, APP_PORT)?;
+    on_b.pinhole(&a.label(), Direction::Outbound, APP_PORT)?;
     let before = a.drops().await?;
     b.unreachable(SocketAddr::new(a.addr(v6), APP_PORT)).await?;
     ensure!(
@@ -1161,9 +1179,9 @@ async fn step_revoke(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
 async fn revoke(a: &Node, b: &Node, v6: bool) -> anyhow::Result<()> {
     let session = session_id();
     let mut on_a = Session::open(a, &session, b.member()?)?;
-    on_a.pinhole(&b.principal(), Direction::Inbound, APP_PORT)?;
+    on_a.pinhole(&b.label(), Direction::Inbound, APP_PORT)?;
     let mut on_b = Session::open(b, &session, a.member()?)?;
-    on_b.pinhole(&a.principal(), Direction::Outbound, APP_PORT)?;
+    on_b.pinhole(&a.label(), Direction::Outbound, APP_PORT)?;
     let receiver = receive(a.apps.listen(APP_PORT), SLOW_FILE_LEN);
     let target = SocketAddr::new(a.addr(v6), APP_PORT);
     let sender = tokio::spawn(send(
@@ -1253,9 +1271,9 @@ async fn session_only(r: &Node, s: &Node) -> anyhow::Result<()> {
     // R: the sender becomes a session-only peer with an inbound pinhole on the app port.
     let (sender, psk) = at_r.hello().await?;
     let (session, _, _) = at_r.offer().await?;
-    let sender_principal = wg_peer_anchor(sender.public_key.as_bytes());
+    let sender_label = key_label(&sender.public_key);
     let mut on_r = Session::open(r, &session, member(&sender.public_key, &[sender.address])?)?;
-    on_r.pinhole(&sender_principal, Direction::Inbound, APP_PORT)?;
+    on_r.pinhole(&sender_label, Direction::Inbound, APP_PORT)?;
     r.add_peer(&sender, &[sender.address], psk).await?;
     let conns = r.apps.listen(APP_PORT);
     at_r.send(Message::Hello {
@@ -1269,13 +1287,13 @@ async fn session_only(r: &Node, s: &Node) -> anyhow::Result<()> {
     let Message::Accept { port } = at_s.recv().await? else {
         bail!("the receiver did not accept");
     };
-    let receiver_principal = wg_peer_anchor(receiver.public_key.as_bytes());
+    let receiver_label = key_label(&receiver.public_key);
     let mut on_s = Session::open(
         s,
         &session,
         member(&receiver.public_key, &[receiver.address])?,
     )?;
-    on_s.pinhole(&receiver_principal, Direction::Outbound, port)?;
+    on_s.pinhole(&receiver_label, Direction::Outbound, port)?;
     s.add_peer(&receiver, &[receiver.address], Some(session_psk))
         .await?;
     let target = SocketAddr::new(receiver.address, port);
@@ -1360,7 +1378,7 @@ async fn cross_namespace(h: &Node, s: &Node, c: &Node, v6: bool) -> anyhow::Resu
     );
 
     let grant = Grant {
-        from: GrantEnd::Peer(s.principal()),
+        from: GrantEnd::Label(s.label()),
         to: GrantEnd::Namespace(NSD_C.into()),
         proto: Some("tcp".to_owned()),
         ports: Some(ECHO_PORT.to_string()),
@@ -1410,7 +1428,7 @@ async fn tun_outbound(a: &Node, t: &Node, v6: bool) -> anyhow::Result<()> {
     let (sender, psk) = at_a.hello().await?;
     let (session, _, _) = at_a.offer().await?;
     let mut on_a = Session::open(a, &session, member(&t.public_key, &[t_addr])?)?;
-    on_a.pinhole(&t.principal(), Direction::Inbound, APP_PORT)?;
+    on_a.pinhole(&t.label(), Direction::Inbound, APP_PORT)?;
     a.add_peer(&sender, &[t_addr], psk).await?;
     route_to_tun(tun, t_addr)?;
     let conns = a.apps.listen(APP_PORT);
@@ -1421,7 +1439,7 @@ async fn tun_outbound(a: &Node, t: &Node, v6: bool) -> anyhow::Result<()> {
     at_a.send(Message::Accept { port: APP_PORT })?;
     let (receiver, _) = at_t.hello().await?;
     let mut on_t = Session::open(t, &session, member(&a.public_key, &[a_addr])?)?;
-    on_t.pinhole(&a.principal(), Direction::Outbound, APP_PORT)?;
+    on_t.pinhole(&a.label(), Direction::Outbound, APP_PORT)?;
     t.add_peer(&receiver, &[a_addr], psk).await?;
     transfer(t, SocketAddr::new(a_addr, APP_PORT), conns, data, digest).await?;
 

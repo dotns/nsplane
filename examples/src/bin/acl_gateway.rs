@@ -6,10 +6,11 @@
 //! [`FlowTracker`] that counts the accepted traffic per flow. Needs root (or
 //! `CAP_NET_ADMIN`).
 //!
-//! - Identities: each `--identity <WG_PUBKEY>=<IDENTITY>` names the ACL principal of a
-//!   `--peer` ([`PeerIdentityMap`]). `<IDENTITY>` is an IP address (a terminate binding:
-//!   CIDR and host-alias rules match it) or `key` (the peer's WireGuard key: rules match it
-//!   as `key:<hex>`). Packets from a peer without identity are dropped.
+//! - Identities: each `--identity <WG_PUBKEY>=<LABEL>[,<LABEL>]` gives the ACL labels of a
+//!   `--peer` ([`PeerLabelMap`], a [`LabelSet`]). Labels are opaque: a policy rule with the
+//!   source `key:<hex>` matches the label `key:<lowercase hex>`, and CIDR and host-alias
+//!   sources match the packet's source address whatever the labels. Packets from a peer
+//!   without identity are dropped.
 //! - Live reload: the policy file (JSON [`AclPolicy`]) is read every second; when its
 //!   content changed it is parsed and swapped into the [`AclEngine`] atomically, logging
 //!   `policy reloaded (N rules)`, or the error while the previous policy stays in effect.
@@ -21,16 +22,16 @@
 //!
 //! The sample policy `examples/policies/acl_gateway.json` is written for a gateway at
 //! `10.0.0.1` and its peer at `10.0.0.2`: it allows TCP and UDP port 7 (echo) from the peer
-//! identity `10.0.0.2` to the gateway and denies everything else (e.g. TCP port 8). Its
+//! address `10.0.0.2` to the gateway and denies everything else (e.g. TCP port 8). Its
 //! built-in tests must pass for it to load.
 //!
-//! APIs shown: [`AclEngine::load`], [`AclFilter::with_config`], [`PeerIdentityMap`],
-//! [`SourceAssertion`], [`FlowTracker`], `EngineBuilder::filter` (through
-//! `build_engine_with`), and the shared TUN node assembly.
+//! APIs shown: [`AclEngine::load`], [`AclFilter::with_config`], [`PeerLabelMap`],
+//! [`LabelSet`], [`FlowTracker`], `EngineBuilder::filter` (through `build_engine_with`), and
+//! the shared TUN node assembly.
 //!
 //! Usage: `sudo cargo run -p nsplane-examples --bin acl_gateway -- --private-key <KEY>
 //! --address 10.0.0.1/24 --peer <PUBKEY>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32
-//! --identity <PUBKEY>=10.0.0.2 --policy examples/policies/acl_gateway.json --echo-port 7`
+//! --identity <PUBKEY>=peer-a --policy examples/policies/acl_gateway.json --echo-port 7`
 //!
 //! [`AclEngine`]: nsplane_acl::AclEngine
 //! [`AclEngine::load`]: nsplane_acl::AclEngine::load
@@ -40,12 +41,12 @@
 //! [`AclFilterConfig::stateful_replies`]: nsplane_acl::AclFilterConfig::stateful_replies
 //! [`AclPolicy`]: nsplane_acl::AclPolicy
 //! [`FlowTracker`]: nsplane_acl::FlowTracker
-//! [`PeerIdentityMap`]: nsplane_acl::PeerIdentityMap
-//! [`SourceAssertion`]: nsplane_acl::SourceAssertion
+//! [`LabelSet`]: nsplane_acl::LabelSet
+//! [`PeerLabelMap`]: nsplane_acl::PeerLabelMap
 
 #[cfg(unix)]
 mod unix {
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::str::FromStr;
@@ -53,12 +54,12 @@ mod unix {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use anyhow::{Context as _, anyhow};
+    use anyhow::{Context as _, anyhow, ensure};
     use clap::Parser;
     use nsplane::x25519::PublicKey;
     use nsplane_acl::{
-        AclEngine, AclFilter, AclFilterConfig, AclPolicy, FlowTracker, PeerIdentityMap,
-        SourceAssertion, TerminateBinding,
+        AclEngine, AclFilter, AclFilterConfig, AclPolicy, FlowTracker, Label, LabelSet,
+        PeerLabelMap,
     };
     use nsplane_examples::echo::{Backend, EchoArgs};
     use nsplane_examples::node::{
@@ -91,9 +92,9 @@ mod unix {
         #[arg(long, value_name = "PATH")]
         policy: PathBuf,
 
-        /// The ACL principal of a peer, repeatable: `<base64 pubkey>=<IP>` (terminate
-        /// binding) or `<base64 pubkey>=key` (its WireGuard key)
-        #[arg(long, value_name = "WG_PUBKEY=IDENTITY")]
+        /// The ACL labels of a peer, repeatable: `<base64 pubkey>=<label>[,<label>]` (labels
+        /// contain neither `=` nor `,`)
+        #[arg(long, value_name = "WG_PUBKEY=LABELS")]
         identity: Vec<Identity>,
     }
 
@@ -101,36 +102,26 @@ mod unix {
     #[derive(Debug, Clone)]
     pub(crate) struct Identity {
         public_key: PublicKey,
-        assertion: SourceAssertion,
+        labels: LabelSet,
     }
 
     impl FromStr for Identity {
         type Err = anyhow::Error;
 
         fn from_str(s: &str) -> anyhow::Result<Self> {
-            // The base64 key may end in `=` padding; the identity never contains `=`.
-            let (key, identity) = s
+            // The base64 key may end in `=` padding; the labels never contain `=`.
+            let (key, labels) = s
                 .rsplit_once('=')
-                .ok_or_else(|| anyhow!("`{s}` is not `<pubkey>=<identity>`"))?;
+                .ok_or_else(|| anyhow!("`{s}` is not `<pubkey>=<label>[,<label>]`"))?;
             let public_key = PublicKey::from(decode_key(key)?);
-            let assertion = if identity == "key" {
-                SourceAssertion::WgPeerKey {
-                    pubkey: public_key.to_bytes(),
-                }
-            } else {
-                let ip: IpAddr = identity
-                    .parse()
-                    .with_context(|| format!("identity `{identity}` is neither an IP nor `key`"))?;
-                SourceAssertion::Terminate {
-                    binding: TerminateBinding {
-                        ip: Some(ip),
-                        anchor: ip.to_string(),
-                    },
-                }
-            };
+            let labels: Vec<Label> = labels.split(',').map(Label::from).collect();
+            ensure!(
+                labels.iter().all(|label| !label.as_str().is_empty()),
+                "`{s}` has an empty label"
+            );
             Ok(Self {
                 public_key,
-                assertion,
+                labels: LabelSet::new(labels),
             })
         }
     }
@@ -265,7 +256,7 @@ mod unix {
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
         let acl = Arc::new(AclEngine::new());
-        let identities = Arc::new(PeerIdentityMap::new());
+        let identities = Arc::new(PeerLabelMap::new());
         let config = AclFilterConfig {
             stateful_replies: true,
             ..AclFilterConfig::default()
@@ -303,8 +294,8 @@ mod unix {
                         encode_public_key(&identity.public_key)
                     )
                 })?;
-            identities.insert(peer, identity.assertion.clone());
-            tracing::info!(peer = %encode_public_key(&identity.public_key), anchor = %identity.assertion.source_anchor(), "identity set");
+            identities.insert(peer, identity.labels.clone());
+            tracing::info!(peer = %encode_public_key(&identity.public_key), labels = ?identity.labels, "identity set");
         }
         tokio::spawn(policy.watch());
 
@@ -335,15 +326,17 @@ mod unix {
         #[test]
         fn identity_forms() {
             let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
-            let ip: Identity = format!("{key}=10.0.0.2").parse().unwrap();
-            assert_eq!(ip.public_key.to_bytes(), [1; 32]);
-            assert!(matches!(ip.assertion, SourceAssertion::Terminate { .. }));
-            assert_eq!(ip.assertion.source_anchor(), "10.0.0.2");
-            let by_key: Identity = format!("{key}=key").parse().unwrap();
-            assert!(
-                matches!(by_key.assertion, SourceAssertion::WgPeerKey { pubkey } if pubkey == [1; 32])
+            let one: Identity = format!("{key}=10.0.0.2").parse().unwrap();
+            assert_eq!(one.public_key.to_bytes(), [1; 32]);
+            assert_eq!(one.labels, LabelSet::new([Label::from("10.0.0.2")]));
+            let two: Identity = format!("{key}=team-a,host:web").parse().unwrap();
+            assert_eq!(
+                two.labels,
+                LabelSet::new([Label::from("host:web"), Label::from("team-a")])
             );
-            assert!(format!("{key}=nobody").parse::<Identity>().is_err());
+            assert!(format!("{key}=").parse::<Identity>().is_err());
+            assert!(format!("{key}=a,,b").parse::<Identity>().is_err());
+            assert!("nokey".parse::<Identity>().is_err());
         }
     }
 }
