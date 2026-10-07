@@ -107,6 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other ICMP still counts as `unsupported` (a new field: breaking for code that builds
   `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
   (`tcp::Socket::reduce_mss`).
+- `nsplane-wss`: `WssServerTransport`, the server side of `WssDialer` links (NG-7): a
+  `Transport` over WebSocket sessions the embedder accepts (TLS, request checks and the
+  upgrade stay the embedder's) and hands to a `WssAcceptor` (`accept`, `ws_config`).
+  Same wire as `WssDialer` (one binary message per datagram; text and longer than
+  `MAX_DATAGRAM` dropped and counted). Each session gets a never-reused address in
+  100::/64 (RFC 6666), port 0; replies follow the engine's roaming path, and a send to a
+  closed session fails with `NotConnected`. `WssServerConfig`: per-session queue (256,
+  full = `WouldBlock` at once), shared inbound queue (1024, backpressure onto the sessions),
+  ping interval (10 s), read idle (35 s), `max_sessions` (4096, refused before any task).
+  Counters in `WssServerTransportStats` and, per session, `WssSessionStats` (`WssSession`:
+  `addr`, `close`, `stats`; dropping it does not close the session).
 
 ### Changed
 - nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
@@ -152,6 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Inbound `alias4` translation 4-5 ns faster at 64 B and 10-11 ns at 1400/1420 B.
 - `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
   recycling costs about 1.5 ns more.
+- rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
+  nsplane-wss no longer cites a product; provenance is in the task documents.
 
 ### Deprecated
 - `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,

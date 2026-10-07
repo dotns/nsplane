@@ -272,7 +272,7 @@ fn request(url: &str, headers: &[(String, String)], token: Option<&str>) -> io::
 }
 
 /// The WebSocket limits of a connection.
-fn ws_config() -> WebSocketConfig {
+pub(crate) fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
         .max_frame_size(Some(MAX_MESSAGE))
