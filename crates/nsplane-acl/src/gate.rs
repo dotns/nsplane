@@ -366,23 +366,38 @@ impl FlowGate {
 
     /// Evaluate a packet received from `peer`.
     #[must_use]
+    #[inline]
     pub fn evaluate_inbound(&self, peer: PeerId, packet: &[u8]) -> GateDecision {
         self.evaluate(PacketDirection::Inbound, peer, packet)
     }
 
     /// Evaluate a packet to be sent to `peer`.
     #[must_use]
+    #[inline]
     pub fn evaluate_outbound(&self, peer: PeerId, packet: &[u8]) -> GateDecision {
         self.evaluate(PacketDirection::Outbound, peer, packet)
     }
 
     /// Evaluate and count one packet. An inert gate passes it without
     /// parsing, loading the snapshot or reading the clock; otherwise the
-    /// clock is read only once the packet reaches the state.
+    /// clock is read only once the packet reaches the state. Inlined, so a
+    /// caller of an inert gate sees a constant [`GateDecision::Pass`] instead
+    /// of reading it back from memory.
+    #[inline]
     fn evaluate(&self, direction: PacketDirection, peer: PeerId, packet: &[u8]) -> GateDecision {
         if self.inert.load(Ordering::Acquire) {
             return GateDecision::Pass;
         }
+        self.evaluate_active(direction, peer, packet)
+    }
+
+    /// [`evaluate`](Self::evaluate) of a gate that is not inert.
+    fn evaluate_active(
+        &self,
+        direction: PacketDirection,
+        peer: PeerId,
+        packet: &[u8],
+    ) -> GateDecision {
         let decision = self.evaluate_with(direction, peer, packet, OnceCell::new());
         self.record_decision(&decision);
         decision
