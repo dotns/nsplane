@@ -2002,26 +2002,28 @@ expiry granularity against timeouts of 30 s and more, but differs from ns's per-
 
 Packet filters for the engine's filter chain; they rewrite packets in place and keep no I/O.
 
-**Address model.** Every peer owns a /127 IPv6 group, `node6` (native) and `node4` (its IPv4
-side). This node presents a peer to local applications as an IPv4 alias (`alias4 <-> node4`)
-and optionally an IPv6 alias (`alias6 <-> node6`) and a native IPv4 alias (an IPv4 address
-translated to and from `node6`, quick-v2 `alias6(b)`); the node itself is `self4 <-> node4`, and
-IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the IPv4 address in the low 32 bits
-(`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
+**Address model.** The translator's addresses are explicit address mappings (EAM, RFC 7757).
+Every peer has its own IPv6 address on the tunnel, `peer6`, and an EAM `eam4 <-> eam6`: a
+local IPv4 address translated to and from the IPv6 side of the mapping. Optionally it also has
+a second EAM `peer6_eam4 <-> peer6` (a local IPv4 address translated to and from `peer6`) and
+a local IPv6 rewrite `local6 <-> peer6` (rewritten, not translated). The node's own EAM is
+`SelfMapping` `eam4 <-> eam6`, and IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the
+IPv4 address in the low 32 bits (`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
 by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
 atomically while traffic flows.
 
-**Translator.** A stateless RFC 7915 translator: local IPv4 to an `alias4` or a peer's LAN
-leaves as IPv6 to `node4` / `lan6`, IPv6 to `alias6` is rewritten to `node6`, and the
-replies are mapped back; local IPv4 to a peer's native IPv4 alias
-(`TranslationTableBuilder::peer_with_native_alias4(id, mapping, alias)`; looked up with
-`TranslationTable::native_alias4` / `by_native_alias4`) leaves as IPv6 to its `node6`, from
-`node4` for `self4` or from the `lan6` address of a local LAN source, and IPv6 from that
-`node6` comes back as IPv4 from the alias, ICMP errors and fragments included (ns's MQ-9).
-The native alias coexists with `alias4` and `alias6`, must not collide with `self4`, another
-peer's `alias4` or native alias, or a LAN IPv4 prefix, and is covered by
-`Translator::ipv4_translated_predicate`; pinned by `nsplane-e2e`'s `translate_native_alias`
-tests (UDP, TCP, ICMP Echo, coexistence with `alias4`); native IPv4 and IPv6 pass unchanged and packets spoofing a
+**Translator.** A stateless RFC 7915 translator: local IPv4 to an `eam4` or a peer's LAN
+leaves as IPv6 to `eam6` / `lan6`, IPv6 to `local6` is rewritten to `peer6`, and the
+replies are mapped back; local IPv4 to a peer's `peer6_eam4`
+(`TranslationTableBuilder::peer_with_peer6_eam4(id, mapping, peer6_eam4)`; looked up with
+`TranslationTable::peer6_eam4` / `by_peer6_eam4`) leaves as IPv6 to its `peer6`, from the
+self `eam6` for the self `eam4` or from the `lan6` address of a local LAN source, and IPv6
+from that `peer6` comes back as IPv4 from the `peer6_eam4`, ICMP errors and fragments
+included. The `peer6_eam4` coexists with `eam4` and `local6`, must not collide with the self
+`eam4`, another peer's `eam4` or `peer6_eam4`, or a LAN IPv4 prefix
+(`TableError::Eam4IsSelf`, `DuplicateAddress`, `Lan4Overlap`), and is covered by
+`Translator::ipv4_translated_predicate`; pinned by `nsplane-e2e`'s `translate_peer6_eam4`
+tests (UDP, TCP, ICMP Echo, coexistence with `eam4`); native IPv4 and IPv6 pass unchanged and packets spoofing a
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
@@ -2045,8 +2047,8 @@ four times faster than the 16-bit full recomputation) and then moved to the new
 pseudo-header incrementally; the reassembly clock is read only for fragments, and the
 table's address indexes hold the mapping, so a lookup is one hash. Per-packet costs are in
 [nsplane-nat translator (MF-4)](#nsplane-nat-translator-mf-4). Since the core routes and checks sources before the
-filters, each peer's allowed IPs must contain its `alias4/32`, its native IPv4 alias as a /32
-if any, the LAN IPv4 prefixes behind it, its `alias6`, `node4`, `node6` and the `lan6` prefixes behind it.
+filters, each peer's allowed IPs must contain its `eam4/32`, its `peer6_eam4/32`
+if any, the LAN IPv4 prefixes behind it, its `local6`, `eam6`, `peer6` and the `lan6` prefixes behind it.
 
 **PortMap and Conntrack.** `PortMap` publishes local services to peers: a `PortMapRule` maps a
 tunnel-facing `listen` address and port (TCP or UDP) to a local `target` of the same family,
@@ -2131,7 +2133,7 @@ itself can recognize a forwarded `ICMPv6` Echo request with the read-only
 
 **Order.** The recommended chain is `[AclFilter, PortMap, Translator]`: the translator sits
 next to the local side, so the ACL and the port map see overlay IPv6 in both directions and
-ACL policies need no rules for the IPv4 aliases. With the engine's fragmentation stage and
+ACL policies need no rules for the local IPv4 EAM addresses. With the engine's fragmentation stage and
 `Translator::ipv4_translated_predicate`, oversized local IPv4 to translated destinations is
 fragmented to fit the MTU after translation.
 
@@ -2825,9 +2827,10 @@ TUN queue, not in the tunnel.
 
 ### nsplane-nat translator (MF-4)
 
-ns measured direct traffic through `alias4` at about 3.4 Gbit/s against 5.0 Gbit/s for N6
-(MF-4). `cargo bench -p nsplane-nat --bench translate` measures `Translator::outbound` of
-IPv4 TCP / UDP from `self4` to a peer's `alias4` (to IPv6 `node4`) and `inbound` of the
+An embedding application measured direct traffic through `eam4` at about 3.4 Gbit/s against
+5.0 Gbit/s for native IPv6 (MF-4). `cargo bench -p nsplane-nat --bench translate` measures
+`Translator::outbound` (group `eam4_out`) of IPv4 TCP / UDP from the self `eam4` to a peer's
+`eam4` (to IPv6 `eam6`) and `inbound` (group `eam4_in`) of the
 IPv6 reply, 64 B and 1400 B (TCP) / 1420 B (UDP) payloads, with 1 and 1000 peers in the
 table, in a buffer with the TUN reader's room (no grown copy). A/B on 2026-10-06 against
 the translator of main (e381bcf; the bench commit 8af9712), three interleaved rounds in one
@@ -2858,12 +2861,12 @@ sender (was 0.20) and 0.09 us on the receiver (was 0.19), plus 0.04-0.06 us (was
 ACK. Against the engine's own per-packet cost (`data_path` core round trip 0.10.0: 1.334 us
 at 1420 B, about 0.67 us per side) the translator added about 30 % per side and now adds
 about 12-13 %; that bounds the gain at about +15 % (3.4 to about 3.9 Gbit/s) when the
-thread that runs the filters is the limit. At ns's measured 5.0 Gbit/s the bottleneck
-spends about 2.3 us per 1448 B packet, and the alias4 path 3.4 us: the old translator's
+thread that runs the filters is the limit. At the measured 5.0 Gbit/s the bottleneck
+spends about 2.3 us per 1448 B packet, and the `eam4` path 3.4 us: the old translator's
 0.2-0.27 us per side explains only a fifth to a quarter of that 1.1 us gap if the rest of
 the path costs the same, and the change gains about +4 % there. So the translator was not
 the whole 30 %: the rest is outside `nsplane-nat` and was not measured here. To check on
-the ns side: `TranslatorStats::grown_copies` (each one is a fresh allocation and a copy:
+the application side: `TranslatorStats::grown_copies` (each one is a fresh allocation and a copy:
 the packet source left less than 20 bytes of room), engine fragmentation of translated
 IPv4 (the IPv4 MTU must leave the 20 bytes the header grows by), and TCP segmentation
 offload for IPv4 on the TUN.

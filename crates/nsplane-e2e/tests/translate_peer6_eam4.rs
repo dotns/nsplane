@@ -1,9 +1,9 @@
-//! A native IPv4 alias through the `Translator` between two engines over a channel
+//! An IPv4 EAM to `peer6` through the `Translator` between two engines over a channel
 //! transport: node `a` runs IPv4-only applications and translates, node `b` is IPv6-only
-//! and runs no filter. `a` reaches `b`'s native IPv6 address `node6` at a local IPv4
-//! address (quick-v2 `alias6(b)`, `TranslationTableBuilder::peer_with_native_alias4`):
-//! `b` sees `a`'s `node4` talking to its `node6`, and `a` sees `b`'s replies come from the
-//! native alias. Covers UDP, TCP and ICMP echo, next to the peer's `alias4` and `alias6`.
+//! and runs no filter. `a` reaches `b`'s own IPv6 address `peer6` at a local IPv4
+//! address (`TranslationTableBuilder::peer_with_peer6_eam4`):
+//! `b` sees `a`'s `eam6` talking to its `peer6`, and `a` sees `b`'s replies come from the
+//! `peer6_eam4`. Covers UDP, TCP and ICMP echo, next to the peer's `eam4` and `local6`.
 //! Every packet is checked by recomputing its checksums in full where it arrives.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -17,16 +17,16 @@ use nsplane_e2e::{
 use nsplane_nat::{PeerMapping, SelfMapping, TranslationTable, Translator};
 use nsplane_packet::{Ipv4Header, Ipv6Header, PeerId, protocol};
 
-/// Node `a`'s own IPv4 address, translated to and from `SELF_NODE4`.
-const SELF4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
-const SELF_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
-/// Node `b`'s /127 group and node `a`'s aliases for it.
-const PEER_NODE6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
-const PEER_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
-const PEER_ALIAS4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
-const PEER_ALIAS6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 2);
-/// The native IPv4 alias: a local IPv4 address for `b`'s `node6`.
-const PEER_NATIVE4: Ipv4Addr = Ipv4Addr::new(100, 64, 1, 2);
+/// Node `a`'s own IPv4 address, translated to and from `SELF_EAM6`.
+const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
+const SELF_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
+/// Node `b`'s `peer6`, `eam6` and node `a`'s local addresses for it.
+const PEER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
+const PEER_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
+const PEER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+const PEER_LOCAL6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 2);
+/// The IPv4 EAM to `peer6`: a local IPv4 address for `b`'s `peer6`.
+const PEER6_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 1, 2);
 
 /// TCP flags.
 const SYN: u8 = 0x02;
@@ -39,18 +39,18 @@ type TestNode = Node<ChannelTransport>;
 fn table(peer: PeerId) -> TestResult<TranslationTable> {
     Ok(TranslationTable::builder()
         .self_mapping(SelfMapping {
-            self4: SELF4,
-            node4: SELF_NODE4,
+            eam4: SELF_EAM4,
+            eam6: SELF_EAM6,
         })
-        .peer_with_native_alias4(
+        .peer_with_peer6_eam4(
             peer,
             PeerMapping {
-                node6: PEER_NODE6,
-                node4: PEER_NODE4,
-                alias6: Some(PEER_ALIAS6),
-                alias4: Some(PEER_ALIAS4),
+                peer6: PEER6,
+                eam6: PEER_EAM6,
+                local6: Some(PEER_LOCAL6),
+                eam4: Some(PEER_EAM4),
             },
-            PEER_NATIVE4,
+            PEER6_EAM4,
         )
         .build()?)
 }
@@ -72,8 +72,8 @@ const fn v6(ip: Ipv6Addr, port: u16) -> SocketAddr {
 
 /// Two peers, `a` translating with the table above and `b` IPv6-only.
 ///
-/// `a` routes `b`'s aliases (`alias4`, the native alias, `alias6`) to `b` and accepts
-/// `b`'s `node4` and `node6`; `b` routes and accepts `a`'s `node4`.
+/// `a` routes `b`'s local addresses (`eam4`, `peer6_eam4`, `local6`) to `b` and accepts
+/// `b`'s `eam6` and `peer6`; `b` routes and accepts `a`'s `eam6`.
 async fn pair() -> TestResult<(TestNode, TestNode, Arc<Translator>)> {
     // A placeholder peer until `b` has an id on `a`.
     let translator = Arc::new(Translator::new(table(PeerId::new(u32::MAX))?));
@@ -85,15 +85,15 @@ async fn pair() -> TestResult<(TestNode, TestNode, Arc<Translator>)> {
     introduce(&a, &b, None).await?;
     let mut peer = b.as_peer(a.path.transport);
     peer.allowed_ips = vec![
-        allowed(PEER_ALIAS4, 32),
-        allowed(PEER_NATIVE4, 32),
-        allowed(PEER_ALIAS6, 128),
-        allowed(PEER_NODE4, 128),
-        allowed(PEER_NODE6, 128),
+        allowed(PEER_EAM4, 32),
+        allowed(PEER6_EAM4, 32),
+        allowed(PEER_LOCAL6, 128),
+        allowed(PEER_EAM6, 128),
+        allowed(PEER6, 128),
     ];
     a.handle.add_or_update_peer(peer).await?;
     let mut peer = a.as_peer(b.path.transport);
-    peer.allowed_ips = vec![allowed(SELF_NODE4, 128)];
+    peer.allowed_ips = vec![allowed(SELF_EAM6, 128)];
     b.handle.add_or_update_peer(peer).await?;
     translator.store(table(a.peer_of(&b).await?)?);
     Ok((a, b, translator))
@@ -149,14 +149,14 @@ fn assert_same_segment(got: &[u8], sent: &[u8], checksum: usize) {
 #[tokio::test]
 async fn ipv4_app_reaches_native_ipv6_over_udp() -> TestResult {
     let (mut a, mut b, translator) = pair().await?;
-    let request = udp(v4(SELF4, 41001), v4(PEER_NATIVE4, 6001), &payload(300));
+    let request = udp(v4(SELF_EAM4, 41001), v4(PEER6_EAM4, 6001), &payload(300));
     a.send_with_room(&request).await?;
-    let got = expect_v6(&mut b, (SELF_NODE4, PEER_NODE6), protocol::UDP).await?;
+    let got = expect_v6(&mut b, (SELF_EAM6, PEER6), protocol::UDP).await?;
     assert_same_segment(&got, &request, 6);
 
-    let reply = udp(v6(PEER_NODE6, 6001), v6(SELF_NODE4, 41001), &payload(700));
+    let reply = udp(v6(PEER6, 6001), v6(SELF_EAM6, 41001), &payload(700));
     b.send(&reply).await?;
-    let got = expect_v4(&mut a, (PEER_NATIVE4, SELF4), protocol::UDP).await?;
+    let got = expect_v4(&mut a, (PEER6_EAM4, SELF_EAM4), protocol::UDP).await?;
     assert_same_segment(&got, &reply, 6);
 
     let stats = translator.stats();
@@ -168,8 +168,8 @@ async fn ipv4_app_reaches_native_ipv6_over_udp() -> TestResult {
 #[tokio::test]
 async fn ipv4_app_reaches_native_ipv6_over_tcp() -> TestResult {
     let (mut a, mut b, _translator) = pair().await?;
-    let (client, server) = (v4(SELF4, 41002), v4(PEER_NATIVE4, 6002));
-    let (client6, server6) = (v6(SELF_NODE4, 41002), v6(PEER_NODE6, 6002));
+    let (client, server) = (v4(SELF_EAM4, 41002), v4(PEER6_EAM4, 6002));
+    let (client6, server6) = (v6(SELF_EAM6, 41002), v6(PEER6, 6002));
     let request = payload(500);
     let response = payload(900);
 
@@ -185,11 +185,11 @@ async fn ipv4_app_reaches_native_ipv6_over_tcp() -> TestResult {
     ];
     for (i, sent) in outbound.iter().enumerate() {
         a.send_with_room(sent).await?;
-        let got = expect_v6(&mut b, (SELF_NODE4, PEER_NODE6), protocol::TCP).await?;
+        let got = expect_v6(&mut b, (SELF_EAM6, PEER6), protocol::TCP).await?;
         assert_same_segment(&got, sent, 16);
         if let Some(reply) = inbound.get(i) {
             b.send(reply).await?;
-            let got = expect_v4(&mut a, (PEER_NATIVE4, SELF4), protocol::TCP).await?;
+            let got = expect_v4(&mut a, (PEER6_EAM4, SELF_EAM4), protocol::TCP).await?;
             assert_same_segment(&got, reply, 16);
         }
     }
@@ -197,21 +197,21 @@ async fn ipv4_app_reaches_native_ipv6_over_tcp() -> TestResult {
 }
 
 #[tokio::test]
-async fn icmp_echo_to_the_native_alias_is_translated_both_ways() -> TestResult {
+async fn icmp_echo_to_the_peer6_eam4_is_translated_both_ways() -> TestResult {
     let (mut a, mut b, _translator) = pair().await?;
     let rest = [0x12, 0x34, 0, 1];
     let data = payload(56);
 
-    let request = icmp(SELF4.into(), PEER_NATIVE4.into(), (8, 0), rest, &data);
+    let request = icmp(SELF_EAM4.into(), PEER6_EAM4.into(), (8, 0), rest, &data);
     a.send_with_room(&request).await?;
-    let got = expect_v6(&mut b, (SELF_NODE4, PEER_NODE6), protocol::ICMPV6).await?;
+    let got = expect_v6(&mut b, (SELF_EAM6, PEER6), protocol::ICMPV6).await?;
     assert_eq!(got[..2], [128, 0]);
     assert_eq!(got[4..8], rest);
     assert_eq!(got[8..], data);
 
-    let reply = icmp(PEER_NODE6.into(), SELF_NODE4.into(), (129, 0), rest, &data);
+    let reply = icmp(PEER6.into(), SELF_EAM6.into(), (129, 0), rest, &data);
     b.send(&reply).await?;
-    let got = expect_v4(&mut a, (PEER_NATIVE4, SELF4), protocol::ICMP).await?;
+    let got = expect_v4(&mut a, (PEER6_EAM4, SELF_EAM4), protocol::ICMP).await?;
     assert_eq!(got[..2], [0, 0]);
     assert_eq!(got[4..8], rest);
     assert_eq!(got[8..], data);
@@ -219,18 +219,18 @@ async fn icmp_echo_to_the_native_alias_is_translated_both_ways() -> TestResult {
 }
 
 #[tokio::test]
-async fn the_native_alias_coexists_with_alias4() -> TestResult {
+async fn the_peer6_eam4_coexists_with_eam4() -> TestResult {
     let (mut a, mut b, _translator) = pair().await?;
-    // The same application port to both IPv4 aliases of `b`: `alias4` reaches `node4`,
-    // the native alias reaches `node6`, and each reply comes back from its own alias.
-    for (alias, node) in [(PEER_ALIAS4, PEER_NODE4), (PEER_NATIVE4, PEER_NODE6)] {
-        let request = udp(v4(SELF4, 41003), v4(alias, 6003), &payload(64));
+    // The same application port to both IPv4 EAM addresses of `b`: `eam4` reaches `eam6`,
+    // `peer6_eam4` reaches `peer6`, and each reply comes back from its own address.
+    for (dst4, dst6) in [(PEER_EAM4, PEER_EAM6), (PEER6_EAM4, PEER6)] {
+        let request = udp(v4(SELF_EAM4, 41003), v4(dst4, 6003), &payload(64));
         a.send_with_room(&request).await?;
-        let got = expect_v6(&mut b, (SELF_NODE4, node), protocol::UDP).await?;
+        let got = expect_v6(&mut b, (SELF_EAM6, dst6), protocol::UDP).await?;
         assert_same_segment(&got, &request, 6);
-        let reply = udp(v6(node, 6003), v6(SELF_NODE4, 41003), &payload(64));
+        let reply = udp(v6(dst6, 6003), v6(SELF_EAM6, 41003), &payload(64));
         b.send(&reply).await?;
-        let got = expect_v4(&mut a, (alias, SELF4), protocol::UDP).await?;
+        let got = expect_v4(&mut a, (dst4, SELF_EAM4), protocol::UDP).await?;
         assert_same_segment(&got, &reply, 6);
     }
     Ok(())
