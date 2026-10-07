@@ -188,11 +188,6 @@ impl LabelSet {
         }
         false
     }
-
-    /// Whether a label with the text `text` is in the set.
-    pub(crate) fn contains_text(&self, text: &str) -> bool {
-        self.0.iter().any(|label| label.as_str() == text)
-    }
 }
 
 impl fmt::Debug for LabelSet {

@@ -30,15 +30,15 @@
 //!   from a source with a [`LabelSet`] and reports the [`Decision`] with the
 //!   accepting rule's [`RuleId`].
 //! - **Namespaces** ([`namespace`]): per-source rule sets with their member
-//!   peers, opt-in outbound rules and directed [`Grant`]s between them; see
+//!   labels, opt-in outbound rules and directed [`Grant`]s between them; see
 //!   [Namespaces](#namespaces).
 //! - **Pinholes** ([`pinhole`]): short-lived, source-gated openings for one
-//!   app session, closed by dropping a [`PinholeGuard`]; see
+//!   session, closed by dropping a [`PinholeGuard`]; see
 //!   [Pinholes](#pinholes).
 //! - **Packet filter** ([`AclFilter`]): a sans-I/O
 //!   [`PacketFilter`](nsplane_core::PacketFilter) that evaluates inbound
-//!   packets against the engine, with the principal of each peer resolved by
-//!   a [`PeerIdentity`] (for example a [`PeerIdentityMap`]). It gates IPv4
+//!   packets against the engine, with the [`LabelSet`] of each peer resolved
+//!   by a [`PeerIdentity`] (for example a [`PeerLabelMap`]). It gates IPv4
 //!   fragments on their first fragment and accepts replies to flows the local
 //!   side opened (stateful replies, not a conntrack/NAT). Drop reasons are in
 //!   [`reasons`].
@@ -56,12 +56,12 @@
 //!
 //! # Namespaces
 //!
-//! A node can hold peers from several sources (NSDs, the Quick allow list,
-//! app sessions). Each source is a rule namespace ([`NamespaceId`]: e.g.
-//! `nsd:<uuid>`, `quick`, `app:<session>`) stored with
-//! [`AclEngine::store_namespace`]: its members ([`NamespaceMember`], a
-//! principal plus its tunnel addresses), its accept rules (an [`AclPolicy`]
-//! with the usual semantics) and optional outbound rules ([`OutboundRule`]).
+//! A node can hold peers from several sources. Each source is a rule
+//! namespace (an opaque [`NamespaceId`], e.g. `team-a`) stored with
+//! [`AclEngine::store_namespace`]: its kind ([`NamespaceKind`]), its members
+//! ([`NamespaceMember`], a [`Label`] plus the addresses it owns), its accept
+//! rules (an [`AclPolicy`] with the usual semantics) and optional outbound
+//! rules ([`OutboundRule`]).
 //! Storing, replacing or removing one namespace leaves the others untouched.
 //! The engine's default rule set ([`AclEngine::install`]) applies only to
 //! sources whose labels are members of no namespace, exactly as before
@@ -93,41 +93,46 @@
 //! reported by [`AclEngine::policy_state`] and
 //! [`AclFilterStats::policy_state`].
 //!
-//! The principal of a peer is its [`SourceAssertion::source_anchor`]; the
-//! filter turns it into the peer's label set, the principal plus an internal
-//! address label for IP-bearing assertions, which the document's CIDR
-//! sources require. A source whose labels are members of several
-//! namespaces is a member of their union. An
-//! inbound packet from a namespace member `P` to address `d` is evaluated
-//! after the reply table, in this order:
+//! **Membership is keyed by label.** Every [`NamespaceMember`] places its
+//! label in the namespace; a source whose [`LabelSet`] is `S` is a member of
+//! the union of the namespaces of every label in `S` (computed once when the
+//! filter resolves the source, never per packet). A destination address
+//! resolves to the member label owning it: the longest member prefix, and the
+//! smallest label (in [`Label`] order) when several labels own it. An
+//! inbound packet from a namespace member with labels `S` to address `d` is
+//! evaluated after the reply table, in this order:
 //!
-//! 1. `d` is resolved to a member peer `Q` (longest matching member address);
-//!    otherwise `d` is local and the local node is in every namespace.
-//! 2. The common namespaces are `P`'s non-app namespaces that also contain
-//!    `Q` (all of them when `d` is local). A rule of any common namespace
-//!    accepts the packet (the union across namespaces).
-//! 3. When `d` is another peer, a directed [`Grant`] whose `from` is `P` or
-//!    one of its namespaces and whose `to` is `Q` or one of its namespaces,
-//!    with matching protocol and ports, accepts the packet. Grants are
-//!    one-way and never open the local node.
-//! 4. When `d` is local, an open inbound pinhole of `P` for the packet's
-//!    protocol and destination port accepts it (see [Pinholes](#pinholes)).
+//! 1. `d` is resolved to its owner label `Q`; otherwise `d` is local and the
+//!    local node is in every namespace.
+//! 2. The common namespaces are the source's [`NamespaceKind::Rules`]
+//!    namespaces that also contain `Q` (all of them when `d` is local). A
+//!    rule of any common namespace accepts the packet (the union across
+//!    namespaces).
+//! 3. When `d` is another member, a directed [`Grant`] whose `from` is a
+//!    label in `S` ([`GrantEnd::Label`]) or one of the source's rule
+//!    namespaces and whose `to` is `Q` or one of `Q`'s rule namespaces, with
+//!    matching protocol and ports, accepts the packet. Grants are one-way and
+//!    never open the local node.
+//! 4. When `d` is local, an open inbound pinhole of a label in `S` for the
+//!    packet's protocol and destination port accepts it (see
+//!    [Pinholes](#pinholes)).
 //! 5. Otherwise the packet is dropped with [`reasons::CROSS_NAMESPACE`] when
-//!    `d` is another peer sharing no namespace with `P`, else with
+//!    `d` is another member sharing no namespace with the source, else with
 //!    [`reasons::DENIED`].
 //!
-//! Cross-namespace traffic is therefore denied by default. App namespaces
-//! ([`NamespaceId::is_app`]) never widen permissions on their own: they
-//! cannot carry accept rules or allow app pinholes and no grant can name
-//! them, so a member only of app namespaces gets nothing inbound except
+//! Cross-namespace traffic is therefore denied by default.
+//! [`NamespaceKind::Pinholes`] namespaces never widen permissions on their
+//! own: they cannot carry accept rules or pinhole kinds and no grant can name
+//! them, so a member only of pinhole namespaces gets nothing inbound except
 //! through its pinholes.
 //!
-//! Outbound traffic is unrestricted by default. A peer is
+//! Outbound traffic is unrestricted by default. A source is
 //! **outbound-restricted** when it is a member of at least one namespace and
 //! every namespace it belongs to sets [`NamespacePolicy::outbound`]. An
-//! outbound packet to a restricted peer is accepted when it matches an
-//! outbound rule of one of its namespaces, an open outbound pinhole of that
-//! peer, or is a reply to an inbound flow from that peer the filter accepted;
+//! outbound packet to a restricted peer (its labels resolved for the
+//! packet's destination address) is accepted when it matches an outbound
+//! rule of one of its namespaces, an open outbound pinhole of one of its
+//! labels, or is a reply to an inbound flow from that peer the filter accepted;
 //! anything else (including non-TCP/UDP packets unless
 //! [`AclFilterConfig::allow_other_protocols`] is set or an outbound rule
 //! accepts them) is dropped with [`reasons::OUTBOUND`].
@@ -183,11 +188,12 @@
 //!
 //! # Pinholes
 //!
-//! An app session (a file transfer, ...) gets access to a peer only through
-//! pinholes in its app namespace, never through the namespace itself.
-//! [`AclEngine::open_pinhole`] opens one for a [`PinholeSpec`]: one peer (by
-//! principal), one [`Direction`], one protocol and one destination port, with
-//! a caller-chosen maximum lifetime (`expires_at`). There is no reverse rule:
+//! A session gets access to a source only through pinholes in a
+//! [`NamespaceKind::Pinholes`] namespace, never through the namespace
+//! itself. [`AclEngine::open_pinhole`] opens one for a [`PinholeSpec`]: one
+//! [`Label`] (every source carrying it uses the pinhole), one [`Direction`],
+//! one protocol and one destination port, with a caller-chosen maximum
+//! lifetime (`expires_at`). There is no reverse rule:
 //! the opened flows' replies pass only through the filter's reply allowances,
 //! which depend on the pinhole (an inbound pinhole records an outbound reply
 //! allowance when the peer is outbound-restricted; an outbound pinhole records
@@ -195,14 +201,14 @@
 //! pinhole matters for outbound-restricted peers (outbound to an unrestricted
 //! peer is accepted anyway, but its replies still depend on the pinhole).
 //!
-//! **Permissions.** The app namespace must be stored, be an app namespace,
-//! and contain the peer; `expires_at` must be in the future. The pinhole is
-//! source-gated: when the peer is a member of at least one source (non-app)
-//! namespace, one of them must list the app kind in
-//! [`NamespacePolicy::allow_app_pinholes`], else the request fails with
-//! [`PinholeError::NotPermitted`] and nothing changes. A peer that is only in
-//! app namespaces (a session-only peer) is governed by its own pinholes. Each
-//! failure is a [`PinholeError`] variant.
+//! **Permissions.** The namespace must be stored, be of kind
+//! [`NamespaceKind::Pinholes`], and contain the label; `expires_at` must be
+//! in the future. The pinhole is source-gated: when the label is a member of
+//! at least one [`NamespaceKind::Rules`] namespace, one of them must list the
+//! pinhole kind in [`NamespacePolicy::pinhole_kinds`], else the request fails
+//! with [`PinholeError::NotPermitted`] and nothing changes. A label that is
+//! only in pinhole namespaces is governed by its own pinholes. Each failure
+//! is a [`PinholeError`] variant.
 //!
 //! **Lifecycle and close reasons** (counted in [`PinholeStats`], each pinhole
 //! exactly once):
@@ -212,12 +218,12 @@
 //!   guard holds a weak reference; a guard outliving its engine is harmless.
 //! - `expired`: the engine clock reached `expires_at`, the safety net for a
 //!   session that crashed without dropping its guard.
-//! - `namespace_removed`: the app namespace was removed.
+//! - `namespace_removed`: the pinhole namespace was removed.
 //! - `cleared`: [`AclEngine::clear_all`] removed everything.
-//! - `revoked`: the peer left the app namespace, or its source namespaces no
-//!   longer allow the app kind (a source namespace changed or was removed,
-//!   including a peer dropped from its last source namespace when the pinhole
-//!   was opened under one).
+//! - `revoked`: the label left the pinhole namespace, or its rule namespaces
+//!   no longer permit the pinhole kind (a rule namespace changed or was
+//!   removed, including a label dropped from its last rule namespace when the
+//!   pinhole was opened under one).
 //!
 //! After a pinhole closes, new flows are dropped ([`reasons::DENIED`]
 //! inbound, [`reasons::OUTBOUND`] outbound to a restricted peer), the reply
@@ -245,13 +251,13 @@
 //!   storing or removing a namespace or a grant, and opening, closing,
 //!   sweeping or revoking a pinhole. A versioned [`PeerIdentity`] (its
 //!   [`generation`](PeerIdentity::generation), bumped by every
-//!   [`PeerIdentityMap`] change) versions the identities.
-//! - **Principal cache.** Per peer, the filter keeps its label set (one
-//!   `Arc`, no allocation per packet), its namespace membership and flags
-//!   (outbound-restricted, pinholes, bypass) under both generations. A peer
-//!   terminating by source address
-//!   ([`PeerIdentityMap::insert_by_source`], [`PeerIdentity::by_source`]) has
-//!   one principal per remote address ([`PeerIdentity::assertion_for`]),
+//!   [`PeerLabelMap`] change) versions the identities.
+//! - **Label cache.** Per peer, the filter keeps its [`LabelSet`] (one
+//!   `Arc`, no allocation per packet), its namespace membership (the union
+//!   over its labels) and flags (outbound-restricted, pinholes, bypass) under
+//!   both generations. A peer whose labels depend on the remote address
+//!   ([`PeerLabelMap::insert_by_source`], [`PeerIdentity::by_source`]) has
+//!   one label set per remote address ([`PeerIdentity::labels_for`]),
 //!   cached per peer and address in a least-recently-used table bounded by
 //!   [`AclFilterConfig::reply_capacity`], and is bypassed per address.
 //! - **Flow verdict cache.** The reply table also holds, per peer, direction
@@ -271,15 +277,16 @@
 //!   is evicted, so allowances behave as without the cache. The tables keep
 //!   their entries in recency order, so evicting the least recently seen
 //!   allowance or pending dependency (or the oldest fragment) is O(1).
-//! - **Bypass.** On every update the engine computes the source namespaces
+//! - **Bypass.** On every update the engine computes the rule namespaces
 //!   with a rule accepting every TCP and UDP flow from any source to any
 //!   destination, the distinct namespace sets of the address owners, and
 //!   whether the default rules accept everything (installed rules with such
 //!   a rule, or nothing installed under [`NotInstalled::Accept`]). When a
 //!   peer is resolved it bypasses if it is not outbound-restricted and one
-//!   of those namespaces it shares with every destination (the local node
-//!   and every member address); a peer in no namespace bypasses when the
-//!   default rules accept everything. A new inbound TCP or UDP flow from
+//!   of those namespaces of its labels it shares with every destination (the
+//!   local node and every member address); a peer in no namespace bypasses
+//!   when the default rules accept everything, and an unknown peer never
+//!   does. A new inbound TCP or UDP flow from
 //!   such a peer is accepted without evaluation (counted in
 //!   [`AclFilterStats::accepted`] as before). The reply table is still
 //!   consulted first, so replies and the dependencies they carry behave as
@@ -333,7 +340,7 @@
 //! every packet pays is parsing its five-tuple (6-7.5 ns) and loading the
 //! engine snapshot (9-11.5 ns), 16-19 ns; an established flow adds one
 //! flow-table lookup under its lock, and a bypass peer the reply check and
-//! its cached principal under that lock. Skipping the reply check would be
+//! its cached labels under that lock. Skipping the reply check would be
 //! exact only for unidirectional traffic, so it stays: verdicts and counters
 //! equal a full evaluation (checked by a differential test). A new flow
 //! accepted through a grant or a pinhole also records a pending dependency.
@@ -360,17 +367,19 @@ pub mod rules;
 mod test_packets;
 
 pub use deny_scope::{DenyScope, DenyScopeOutcome, DropReason, DroppedRule, apply_deny_scope};
-pub use engine::{AclEngine, AclTestFailure, SourceAssertion, TerminateBinding, wg_peer_anchor};
+pub use engine::{AclEngine, AclTestFailure};
 pub use filter::{
     AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
-    OtherProtocol, OtherProtocolRule, PeerIdentity, PeerIdentityMap,
+    OtherProtocol, OtherProtocolRule, PeerIdentity, PeerLabelMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use merge::{
     MergeStats, MergedPolicy, PolicyLayers, RemotePolicy, RuleProvenance, acl_rule_key,
     acl_test_key, merge_layered,
 };
-pub use namespace::{Grant, GrantEnd, NamespaceId, NamespaceMember, NamespacePolicy, OutboundRule};
+pub use namespace::{
+    Grant, GrantEnd, NamespaceId, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule,
+};
 pub use net::{IpNet, ParseIpNetError, Protocol};
 pub use node_l3::{
     GatewayConsumerAuthority, GatewayConsumerPacket, GatewayConsumerSink, NODE_L3_SCHEMA_VERSION,

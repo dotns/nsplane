@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, NODE_L3_SCHEMA_VERSION, NodeL3Config,
-    NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
-    NodeL3PeerBinding, NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol,
-    PeerIdentityMap, PeerKeyMap, SourceAssertion,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, NODE_L3_SCHEMA_VERSION,
+    NodeL3Config, NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
+    NodeL3PeerBinding, NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol, PeerKeyMap,
+    PeerLabelMap,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -160,8 +160,8 @@ fn accept_acl() -> AclFilter {
         ..AclPolicy::default()
     });
     assert!(loaded.is_ok());
-    let identities = Arc::new(PeerIdentityMap::new());
-    identities.insert(peer(), SourceAssertion::WgPeerKey { pubkey: REMOTE_KEY });
+    let identities = Arc::new(PeerLabelMap::new());
+    identities.insert(peer(), LabelSet::new([Label::from("remote")]));
     AclFilter::new(engine, identities)
 }
 

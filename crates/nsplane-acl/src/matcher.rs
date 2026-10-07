@@ -1,11 +1,11 @@
 //! The text parsers of the policy document and its compilation into typed
 //! [`Rule`]s.
 //!
-//! A `key:<hex>` source becomes a label; a CIDR or host alias source becomes
-//! `sources` plus the crate-private [`ADDRESS_LABEL`], which only IP-bearing
-//! source assertions carry, so a CIDR source still matches only them. Each
-//! document rule becomes one typed rule per kind of source and per port set
-//! of its destinations, all with the document rule's index as their id.
+//! A `key:<hex>` source becomes the label `key:<lowercase hex>`; a CIDR or
+//! host alias source becomes `sources`, which match the flow's source
+//! address whatever its labels. Each document rule becomes one typed rule per
+//! kind of source and per port set of its destinations, all with the
+//! document rule's index as their id.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -14,20 +14,16 @@ use std::ops::RangeInclusive;
 use tracing::warn;
 
 use crate::Error;
-use crate::engine::{AclTestFailure, SourceAssertion};
+use crate::engine::AclTestFailure;
 use crate::net::{IpNet, Protocol};
 use crate::policy::{AclPolicy, AclRule, AclTest};
 use crate::rules::{Flow, Label, LabelSet, PortSet, ProtocolMatch, Rule, RuleId, RuleSet};
-
-/// The label of every IP-bearing source assertion; the document's CIDR
-/// sources require it.
-pub(crate) const ADDRESS_LABEL: &str = "\0address";
 
 /// A parsed document source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DocSource {
     Any,
-    /// A client WireGuard public key, as its `key:<hex>` label.
+    /// A 32-byte key, as its `key:<lowercase hex>` label.
     Key(Label),
     Cidr(IpNet),
 }
@@ -38,7 +34,7 @@ pub(crate) enum DocSource {
 ///
 /// Accepted forms:
 /// - `*` — any source
-/// - `key:<64-hex>` — a client WireGuard public key principal
+/// - `key:<64-hex>` — a 32-byte key, matched as a label
 /// - `10.0.0.0/24` — CIDR
 /// - `alias` — host alias from the `hosts` map
 pub(crate) fn parse_src(s: &str, hosts: &HashMap<String, IpNet>) -> Result<DocSource, Error> {
@@ -47,8 +43,13 @@ pub(crate) fn parse_src(s: &str, hosts: &HashMap<String, IpNet>) -> Result<DocSo
     }
     if let Some(hex) = s.strip_prefix("key:") {
         let key = parse_hex32(hex).ok_or_else(|| Error::UnknownAlias(s.to_owned()))?;
-        let anchor = SourceAssertion::WgPeerKey { pubkey: key }.source_anchor();
-        return Ok(DocSource::Key(Label::from(anchor)));
+        let mut label = String::with_capacity(4 + 64);
+        label.push_str("key:");
+        for b in key {
+            use std::fmt::Write as _;
+            let _ = write!(label, "{b:02x}");
+        }
+        return Ok(DocSource::Key(Label::from(label)));
     }
     if let Ok(net) = s.parse::<IpNet>() {
         return Ok(DocSource::Cidr(net));
@@ -240,7 +241,7 @@ fn compile_rule(
             source_groups.push((keys, Vec::new()));
         }
         if !cidrs.is_empty() {
-            source_groups.push((vec![Label::from(ADDRESS_LABEL)], cidrs));
+            source_groups.push((Vec::new(), cidrs));
         }
     }
     // One group per port set: `None` destinations mean any host.
@@ -306,12 +307,8 @@ impl RuleSet {
     }
 }
 
-/// The source labels of a bare source IP: an IP-bearing source.
-pub(crate) fn address_labels(ip: IpAddr) -> LabelSet {
-    LabelSet::new([Label::from(ip.to_string()), Label::from(ADDRESS_LABEL)])
-}
-
-/// Run the document tests against `rules`, as requests from a bare source IP.
+/// Run the document tests against `rules`, as requests from a source
+/// without labels at the test's source address.
 fn test_failures(rules: &RuleSet, tests: Vec<AclTest>) -> Vec<AclTestFailure> {
     tests
         .into_iter()
@@ -344,7 +341,7 @@ fn test_failure(rules: &RuleSet, test: &AclTest) -> Option<String> {
         Protocol::Tcp => Flow::tcp(src, dst),
         Protocol::Udp => Flow::udp(src, dst),
     };
-    let allowed = rules.matching(&address_labels(src_ip), &flow).is_some();
+    let allowed = rules.matching(&LabelSet::empty(), &flow).is_some();
     (allowed != test.allow).then(|| {
         format!(
             "expected {}, got {}",
@@ -484,7 +481,6 @@ mod tests {
             Some("tcp"),
         ))
         .unwrap();
-        let address = vec![Label::from(ADDRESS_LABEL)];
         let expected = [
             (
                 vec![Label::from(key.as_str())],
@@ -494,13 +490,13 @@ mod tests {
             ),
             (vec![Label::from(key.as_str())], vec![], vec![], 443),
             (
-                address.clone(),
+                vec![],
                 vec![net("10.0.0.0/8"), net("192.168.1.0/24")],
                 vec![net("10.1.0.0/16"), net("10.2.0.0/16")],
                 80,
             ),
             (
-                address,
+                vec![],
                 vec![net("10.0.0.0/8"), net("192.168.1.0/24")],
                 vec![],
                 443,
