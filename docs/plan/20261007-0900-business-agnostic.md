@@ -57,3 +57,7 @@ nsplane-kernel for F1.
 ## Annotations
 - 2026-10-07: dispatched (campaign `nsplane-ba-202610070900`): AC `sot3v70g`, AN `b4d7qyct`, AW
   `bckqkh2q`; watchdog every 30 min with stuck-process checks.
+- 2026-10-07: AW NG-7 design approved. `WssServerTransport` + `WssAcceptor` take caller-upgraded
+  WebSockets. Each session is a synthetic, never-reused endpoint in 100::/64 (RFC 6666). Replies
+  follow the engine's existing roaming on authenticated messages (no nsplane hook). Queues are
+  bounded per session, and `max_sessions` has a finite default.
