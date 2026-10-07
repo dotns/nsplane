@@ -2,10 +2,15 @@
 
 //! Accept-only ACL policy engine and packet filters for nsplane.
 //!
-//! Evaluates per-connection access requests against an [`AclPolicy`]. The
-//! model is **accept-only with default deny**: rules can only grant access to
-//! specific source/destination pairs, and anything no rule accepts is denied.
+//! Evaluates flows against typed accept rules ([`Rule`]). The model is
+//! **accept-only with default deny**: rules can only grant access to
+//! specific flows, and anything no rule accepts is denied.
 //!
+//! - **Typed rules** ([`rules`]): opaque source [`Label`]s carried in a
+//!   [`LabelSet`], and [`Rule`]s with an opaque [`RuleId`] matching a flow by
+//!   source label, source and destination prefix, and [`ProtocolMatch`]
+//!   (TCP or UDP ports, ICMP types, other IP protocols); validated into an
+//!   immutable [`RuleSet`]. See [Typed rules](#typed-rules).
 //! - **Policy model** ([`AclPolicy`]): named host aliases, ordered accept
 //!   rules (`src`, `dst` as `host:ports`, optional protocol) and built-in
 //!   tests that must pass before a policy is accepted.
@@ -15,13 +20,15 @@
 //! - **Deny scope** ([`apply_deny_scope`]): an operator-authored post-filter
 //!   that removes rules reaching forbidden CIDRs. It edits the policy text
 //!   before compilation, so matching itself stays accept-only.
-//! - **Compiled policy** ([`CompiledPolicy`]): an immutable, validated policy
-//!   ready for evaluation.
-//! - **Engine** ([`AclEngine`]): shares the current compiled policy, the rule
-//!   namespaces and the directed grants across threads as one snapshot and
-//!   swaps it atomically on every update. It is fail-closed: with nothing
-//!   loaded every request is denied, and a rejected update keeps the previous
-//!   state in effect.
+//!   [`RuleSet::from_document`] compiles it into typed rules.
+//! - **Engine** ([`AclEngine`]): shares the default rule set with its
+//!   [`PolicyState`], the rule namespaces and the directed grants across
+//!   threads as one snapshot and swaps it atomically on every update. It is
+//!   fail-closed: with nothing loaded every flow is denied, and a rejected
+//!   update keeps the previous state in effect.
+//!   [`AclEngine::evaluate`] decides a [`Flow`] described without a packet
+//!   from a source with a [`LabelSet`] and reports the [`Decision`] with the
+//!   accepting rule's [`RuleId`].
 //! - **Namespaces** ([`namespace`]): per-source rule sets with their member
 //!   peers, opt-in outbound rules and directed [`Grant`]s between them; see
 //!   [Namespaces](#namespaces).
@@ -56,26 +63,41 @@
 //! principal plus its tunnel addresses), its accept rules (an [`AclPolicy`]
 //! with the usual semantics) and optional outbound rules ([`OutboundRule`]).
 //! Storing, replacing or removing one namespace leaves the others untouched.
-//! The engine's default policy ([`AclEngine::load`]) applies only to
-//! principals that are members of no namespace, exactly as before namespaces
-//! existed.
+//! The engine's default rule set ([`AclEngine::install`]) applies only to
+//! sources whose labels are members of no namespace, exactly as before
+//! namespaces existed.
 //!
-//! **Fail-closed with namespaces.** "No policy" means:
+//! **Policy states.** The default rule set is in one [`PolicyState`]:
 //!
-//! - A principal in no namespace, while no default policy is loaded, has its
-//!   new inbound flows dropped with [`reasons::NO_POLICY`] (replies to flows
-//!   the local side opened still pass while anything else is loaded).
-//! - A principal that is a member of a namespace is governed by its
-//!   namespaces' rules, plus grants and pinholes, whether or not a default
-//!   policy is loaded.
-//! - When nothing at all is loaded (no default policy and no namespace),
-//!   every inbound packet, replies included, is dropped with
-//!   [`reasons::NO_POLICY`].
-//! - [`AclEngine::clear`] removes only the default policy;
-//!   [`AclEngine::clear_all`] is the emergency stop that removes the default
-//!   policy, every namespace, grant and pinhole in one atomic swap.
+//! - [`PolicyState::NotInstalled`] (the start, and after
+//!   [`AclEngine::uninstall`]): the engine's [`NotInstalled`] action applies
+//!   to sources in no namespace. [`NotInstalled::Deny`] (the default) drops
+//!   their new inbound flows with [`reasons::NO_POLICY`];
+//!   [`NotInstalled::Accept`] ([`AclEngine::with_not_installed`]) accepts
+//!   every flow they send.
+//! - [`PolicyState::Installed`] ([`AclEngine::install`]): the rules decide;
+//!   an empty rule set denies every new flow with [`reasons::DENIED`].
+//! - [`PolicyState::Failed`] ([`AclEngine::fail`], for a caller whose own
+//!   rule compilation failed): new flows of sources in no namespace are
+//!   dropped with [`reasons::POLICY_FAILED`].
 //!
-//! The principal of a peer is its [`SourceAssertion::source_anchor`]. An
+//! The engine counts as loaded when rules are installed, a namespace is
+//! stored, or nothing is installed under [`NotInstalled::Accept`]. While it
+//! is not loaded every inbound packet, replies included, is dropped with
+//! [`reasons::NO_POLICY`] (or [`reasons::POLICY_FAILED`] when failed);
+//! otherwise replies to flows the local side opened still pass. A source
+//! that is a member of a namespace is governed by its namespaces' rules,
+//! plus grants and pinholes, in every state. [`AclEngine::clear_all`] is the
+//! emergency stop that removes the default rules, every namespace, grant and
+//! pinhole in one atomic swap and leaves the state failed. The state is
+//! reported by [`AclEngine::policy_state`] and
+//! [`AclFilterStats::policy_state`].
+//!
+//! The principal of a peer is its [`SourceAssertion::source_anchor`]; the
+//! filter turns it into the peer's label set, the principal plus an internal
+//! address label for IP-bearing assertions, which the document's CIDR
+//! sources require. A source whose labels are members of several
+//! namespaces is a member of their union. An
 //! inbound packet from a namespace member `P` to address `d` is evaluated
 //! after the reply table, in this order:
 //!
@@ -107,8 +129,21 @@
 //! outbound rule of one of its namespaces, an open outbound pinhole of that
 //! peer, or is a reply to an inbound flow from that peer the filter accepted;
 //! anything else (including non-TCP/UDP packets unless
-//! [`AclFilterConfig::allow_other_protocols`] is set) is dropped with
-//! [`reasons::OUTBOUND`].
+//! [`AclFilterConfig::allow_other_protocols`] is set or an outbound rule
+//! accepts them) is dropped with [`reasons::OUTBOUND`].
+//!
+//! **Protocols other than TCP and UDP.** An inbound packet that is neither
+//! TCP nor UDP is accepted by, in this order: a reply allowance,
+//! [`AclFilterConfig::allow_other_protocols`], an
+//! [`AclFilterScope::other_protocols`] rule, or the rule evaluation above
+//! (default rules, namespace rules and grants with [`ProtocolMatch::Icmp`],
+//! [`ProtocolMatch::Ip`] or [`ProtocolMatch::Any`] entries; pinholes are TCP
+//! and UDP only). Otherwise it is dropped with [`reasons::PROTOCOL`], which
+//! also reports every denial of the rule evaluation. Such flows get no
+//! verdict cache; an accepted one has the side effects of an accepted TCP or
+//! UDP flow (a grant dependency, the outbound allowance of a restricted
+//! peer). Rules without such entries therefore behave as for TCP and UDP
+//! only.
 //!
 //! Independently of the namespaces, a filter built with
 //! [`AclFilter::with_scope`] can constrain the source address of every
@@ -129,6 +164,22 @@
 //! grant therefore stops passing `C`'s replies to `A` as soon as the grant is
 //! removed. Other outbound packets to unrestricted peers record allowances
 //! without a dependency, as they always have.
+//!
+//! # Typed rules
+//!
+//! A [`Rule`] matches a [`Flow`] from a source with label set `S` when all of
+//! these hold: its `labels` are empty or `S` contains one of them (a source
+//! with an empty set matches only label-free rules); its `sources` are empty
+//! or contain the flow's source address; its `destinations` are empty or
+//! contain the flow's destination address; and one of its `protocols`
+//! matches. Rules are a union: the verdict does not depend on their order,
+//! and the reported [`RuleId`] is that of the first matching rule. Rule IDs
+//! need not be unique. [`RuleSet::new`] rejects invalid rules with
+//! [`Error::InvalidRule`] before anything is published.
+//!
+//! Every full evaluation logs at debug level the flow's addresses, protocol
+//! and port, and the accepting rule, grant or pinhole or the denial reason.
+//! Drop verdicts carry the [`reasons`] constant only.
 //!
 //! # Pinholes
 //!
@@ -188,14 +239,15 @@
 //! engine's filter chain costs nothing.
 //!
 //! - **Generations.** [`AclEngine::generation`] increases on every published
-//!   change: [`load`](AclEngine::load), [`store`](AclEngine::store),
-//!   [`clear`](AclEngine::clear), [`clear_all`](AclEngine::clear_all),
+//!   change: [`install`](AclEngine::install),
+//!   [`uninstall`](AclEngine::uninstall), [`fail`](AclEngine::fail),
+//!   [`load`](AclEngine::load), [`clear_all`](AclEngine::clear_all),
 //!   storing or removing a namespace or a grant, and opening, closing,
 //!   sweeping or revoking a pinhole. A versioned [`PeerIdentity`] (its
 //!   [`generation`](PeerIdentity::generation), bumped by every
 //!   [`PeerIdentityMap`] change) versions the identities.
-//! - **Principal cache.** Per peer, the filter keeps its source assertion,
-//!   principal (an `Arc<str>`, no allocation per packet) and flags
+//! - **Principal cache.** Per peer, the filter keeps its label set (one
+//!   `Arc`, no allocation per packet), its namespace membership and flags
 //!   (outbound-restricted, pinholes, bypass) under both generations. A peer
 //!   terminating by source address
 //!   ([`PeerIdentityMap::insert_by_source`], [`PeerIdentity::by_source`]) has
@@ -205,7 +257,7 @@
 //! - **Flow verdict cache.** The reply table also holds, per peer, direction
 //!   and five-tuple, the verdict of a namespace member's TCP or UDP flow's
 //!   first packet (accepted with its grant or pinhole dependency, or dropped
-//!   with its reason; a peer under the default policy is evaluated on every
+//!   with its reason; a peer under the default rules is evaluated on every
 //!   packet, as a few rules cost less than the cache) under both
 //!   generations: one table, one lock, one capacity
 //!   ([`AclFilterConfig::reply_capacity`]). A hit under other generations is
@@ -219,12 +271,15 @@
 //!   is evicted, so allowances behave as without the cache. The tables keep
 //!   their entries in recency order, so evicting the least recently seen
 //!   allowance or pending dependency (or the oldest fragment) is O(1).
-//! - **Bypass.** On every update the engine computes the principals whose
-//!   inbound flows are all accepted by a rule (a common source namespace
-//!   with an accept rule from `*` to `*:*` for TCP and UDP for every
-//!   destination: the local node and every member address) and that are not
-//!   outbound-restricted, and whether the default policy accepts everything
-//!   (for principals in no namespace). A new inbound TCP or UDP flow from
+//! - **Bypass.** On every update the engine computes the source namespaces
+//!   with a rule accepting every TCP and UDP flow from any source to any
+//!   destination, the distinct namespace sets of the address owners, and
+//!   whether the default rules accept everything (installed rules with such
+//!   a rule, or nothing installed under [`NotInstalled::Accept`]). When a
+//!   peer is resolved it bypasses if it is not outbound-restricted and one
+//!   of those namespaces it shares with every destination (the local node
+//!   and every member address); a peer in no namespace bypasses when the
+//!   default rules accept everything. A new inbound TCP or UDP flow from
 //!   such a peer is accepted without evaluation (counted in
 //!   [`AclFilterStats::accepted`] as before). The reply table is still
 //!   consulted first, so replies and the dependencies they carry behave as
@@ -232,7 +287,7 @@
 //!
 //! Fragments, malformed packets, protocols other than TCP and UDP and the
 //! fail-closed rules (nothing loaded: every inbound packet dropped) are
-//! unchanged, and verdicts and counters equal a full evaluation of every
+//! never cached, and verdicts and counters equal a full evaluation of every
 //! packet. A [`PeerIdentity`] that is not versioned (generation 0, e.g. a
 //! closure) gets no cache: every packet is evaluated.
 //!
@@ -292,7 +347,7 @@ pub mod engine;
 mod filter;
 mod flow;
 mod lru;
-pub mod matcher;
+mod matcher;
 pub mod merge;
 pub mod namespace;
 pub mod net;
@@ -300,14 +355,12 @@ mod node_l3;
 pub mod pinhole;
 pub mod policy;
 pub mod reasons;
+pub mod rules;
 #[cfg(test)]
 mod test_packets;
 
 pub use deny_scope::{DenyScope, DenyScopeOutcome, DropReason, DroppedRule, apply_deny_scope};
-pub use engine::{
-    AccessRequest, AclDecision, AclEngine, AclTestFailure, CompiledPolicy, SourceAssertion,
-    TerminateBinding, wg_peer_anchor,
-};
+pub use engine::{AclEngine, AclTestFailure, SourceAssertion, TerminateBinding, wg_peer_anchor};
 pub use filter::{
     AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
     OtherProtocol, OtherProtocolRule, PeerIdentity, PeerIdentityMap,
@@ -329,11 +382,16 @@ pub use node_l3::{
 };
 pub use pinhole::{Direction, PinholeError, PinholeGuard, PinholeId, PinholeSpec, PinholeStats};
 pub use policy::{AclAction, AclPolicy, AclRule, AclTest};
+pub use rules::{
+    Decision, Flow, IcmpTypes, Label, LabelSet, Matched, NotInstalled, PolicyState, PortSet,
+    ProtocolMatch, Rule, RuleId, RuleSet, Transport,
+};
 
 use thiserror::Error;
 
 /// Errors produced by the ACL crate.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A host alias or deny-scope entry is not a valid CIDR.
     #[error("invalid CIDR '{addr}': {reason}")]
@@ -367,4 +425,31 @@ pub enum Error {
     /// The policy is malformed (bad rule source, destination or protocol).
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
+
+    /// A typed rule is invalid ([`RuleSet::new`]).
+    #[error("invalid rule '{id}': {reason}")]
+    InvalidRule {
+        /// The rule's identifier.
+        id: RuleId,
+        /// Why it is invalid.
+        reason: String,
+    },
+
+    /// A namespace is invalid ([`AclEngine::store_namespace`]).
+    #[error("invalid namespace '{id}': {reason}")]
+    InvalidNamespace {
+        /// The namespace's identifier.
+        id: NamespaceId,
+        /// Why it is invalid.
+        reason: String,
+    },
+
+    /// A grant is invalid ([`AclEngine::store_grant`]).
+    #[error("invalid grant '{id}': {reason}")]
+    InvalidGrant {
+        /// The grant's identifier.
+        id: RuleId,
+        /// Why it is invalid.
+        reason: String,
+    },
 }

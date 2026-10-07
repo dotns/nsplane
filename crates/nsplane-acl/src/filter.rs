@@ -12,13 +12,25 @@ use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::engine::{
-    AccessRequest, AclEngine, MemberVerdict, PinholeMatch, ReplyDependency, Snapshot,
-    SourceAssertion,
+    AclEngine, Evaluation, Membership, PinholeMatch, ReplyDependency, Snapshot, SourceAssertion,
 };
 use crate::lru::{FlowHash, LruMap};
+use crate::matcher::ADDRESS_LABEL;
 use crate::net::{IpNet, Protocol};
 use crate::pinhole::Direction;
 use crate::reasons;
+use crate::rules::{Flow, Label, LabelSet, PolicyState, Transport};
+
+/// The label set of a source assertion: its principal, plus the internal
+/// address label when the assertion carries an IP (the document's CIDR
+/// sources require it).
+pub(crate) fn assertion_labels(assertion: &SourceAssertion) -> LabelSet {
+    let principal = Label::from(assertion.source_anchor());
+    match assertion.ip() {
+        Some(_) => LabelSet::new([principal, Label::from(ADDRESS_LABEL)]),
+        None => LabelSet::new([principal]),
+    }
+}
 
 // ── Peer identity ─────────────────────────────────────────────────────────────
 
@@ -142,8 +154,8 @@ impl PeerIdentityMap {
     /// Make `peer` terminate by source address, replacing any previous
     /// assertion: the principal of each of its packets is the packet's
     /// remote address (see [`PeerIdentity::assertion_for`]), a
-    /// [`SourceAssertion::Terminate`] binding of that address as
-    /// [`AccessRequest::from_ip`] builds it. For a gateway whose packets
+    /// [`SourceAssertion::Terminate`] binding of that address (anchored by
+    /// the address text). For a gateway whose packets
     /// carry several source addresses. [`assertion`](PeerIdentity::assertion)
     /// of such a peer is `None`.
     pub fn insert_by_source(&self, peer: PeerId) {
@@ -475,6 +487,8 @@ pub struct AclFilterStats {
     pub denied: u64,
     /// Inbound packets dropped with [`reasons::NO_POLICY`].
     pub no_policy: u64,
+    /// Inbound packets dropped with [`reasons::POLICY_FAILED`].
+    pub policy_failed: u64,
     /// Inbound packets dropped with [`reasons::UNKNOWN_PEER`].
     pub unknown_peer: u64,
     /// Inbound packets dropped with [`reasons::PROTOCOL`].
@@ -518,6 +532,8 @@ pub struct AclFilterStats {
     pub outbound_source: u64,
     /// Packets, inbound and outbound, dropped with [`reasons::INTERNAL`].
     pub internal: u64,
+    /// The engine's [`PolicyState`] when the stats were read.
+    pub policy_state: PolicyState,
 }
 
 #[derive(Debug, Default)]
@@ -526,6 +542,7 @@ struct Counters {
     replies: AtomicU64,
     denied: AtomicU64,
     no_policy: AtomicU64,
+    policy_failed: AtomicU64,
     unknown_peer: AtomicU64,
     protocol: AtomicU64,
     fragment: AtomicU64,
@@ -561,6 +578,7 @@ enum Outcome {
     Denied,
     CrossNamespace,
     NoPolicy,
+    PolicyFailed,
     UnknownPeer,
     Protocol,
     Fragment,
@@ -589,6 +607,7 @@ impl Outcome {
             Self::Denied => reasons::DENIED,
             Self::CrossNamespace => reasons::CROSS_NAMESPACE,
             Self::NoPolicy => reasons::NO_POLICY,
+            Self::PolicyFailed => reasons::POLICY_FAILED,
             Self::UnknownPeer => reasons::UNKNOWN_PEER,
             Self::Protocol => reasons::PROTOCOL,
             Self::Fragment => reasons::FRAGMENT,
@@ -609,6 +628,7 @@ impl Outcome {
             Self::Denied => &counters.denied,
             Self::CrossNamespace => &counters.cross_namespace,
             Self::NoPolicy => &counters.no_policy,
+            Self::PolicyFailed => &counters.policy_failed,
             Self::UnknownPeer => &counters.unknown_peer,
             Self::Protocol => &counters.protocol,
             Self::Fragment => &counters.fragment,
@@ -817,10 +837,13 @@ struct PeerInfo {
     /// A marker: the peer's principal depends on the packet's address and is
     /// resolved per address. Its other fields are those of an unknown peer.
     by_source: bool,
-    /// `None` for an unknown peer.
-    source: Option<SourceAssertion>,
-    /// The source anchor of `source`.
-    principal: Option<Arc<str>>,
+    /// The labels of the peer's source assertion, `None` for an unknown peer.
+    labels: Option<LabelSet>,
+    /// The address of an IP-bearing assertion: the source address its rules
+    /// match.
+    address: Option<IpAddr>,
+    /// The peer's namespaces, `None` when it is in no namespace.
+    membership: Option<Arc<Membership>>,
     /// How the policy governs the peer.
     governed: Governed,
     /// Some pinhole belongs to the peer.
@@ -851,7 +874,7 @@ impl PeerInfo {
         generation: u64,
     ) -> Self {
         Self::new(
-            identity.assertion_for(peer, src),
+            identity.assertion_for(peer, src).as_ref(),
             snapshot,
             generation,
             false,
@@ -859,28 +882,68 @@ impl PeerInfo {
     }
 
     fn new(
-        source: Option<SourceAssertion>,
+        source: Option<&SourceAssertion>,
         snapshot: &Snapshot,
         generation: u64,
         by_source: bool,
     ) -> Self {
-        let principal: Option<Arc<str>> = source.as_ref().map(|s| s.source_anchor().into());
-        let principal_str = principal.as_deref();
-        let membership = principal_str.and_then(|principal| snapshot.membership(principal));
+        let labels = source.map(assertion_labels);
+        let membership = labels
+            .as_ref()
+            .and_then(|labels| snapshot.membership_of(labels));
         Self {
             generation: snapshot.generation(),
             identity: generation,
             by_source,
-            governed: match membership {
+            governed: match &membership {
                 None => Governed::Default,
                 Some(membership) if membership.outbound_restricted() => Governed::Restricted,
                 Some(_) => Governed::Member,
             },
-            pinholes: principal_str.is_some_and(|principal| snapshot.has_pinholes_of(principal)),
-            bypass: source.is_some() && snapshot.bypasses(principal_str),
-            source,
-            principal,
+            pinholes: labels
+                .as_ref()
+                .is_some_and(|labels| snapshot.has_pinholes_of(labels)),
+            bypass: labels.is_some() && snapshot.bypasses(membership.as_deref()),
+            address: source.and_then(SourceAssertion::ip),
+            labels,
+            membership,
         }
+    }
+
+    /// `flow` as the peer's rules see it: from the address of an IP-bearing
+    /// assertion.
+    fn flow(&self, flow: Flow) -> Flow {
+        Flow {
+            src: self.address.unwrap_or(flow.src),
+            ..flow
+        }
+    }
+}
+
+/// The flow of a TCP or UDP five-tuple.
+const fn tcp_udp_flow(tuple: &FiveTuple, protocol: Protocol) -> Flow {
+    let (src_port, dst_port) = (tuple.src_port, tuple.dst_port);
+    Flow {
+        src: tuple.src,
+        dst: tuple.dst,
+        transport: match protocol {
+            Protocol::Tcp => Transport::Tcp { src_port, dst_port },
+            Protocol::Udp => Transport::Udp { src_port, dst_port },
+        },
+    }
+}
+
+/// The transport of a packet that is neither TCP nor UDP: ICMP on IPv4 and
+/// `ICMPv6` on IPv6 by message type, any other protocol by number.
+fn other_transport(packet: &IpPacket<'_>, protocol: u8) -> Option<Transport> {
+    match (packet.src(), protocol) {
+        (IpAddr::V4(_), protocol::ICMP) | (IpAddr::V6(_), protocol::ICMPV6) => {
+            let (icmp, _) = IcmpHeader::parse(packet.payload()).ok()?;
+            Some(Transport::Icmp {
+                icmp_type: icmp.icmp_type(),
+            })
+        }
+        (_, number) => Some(Transport::Ip(number)),
     }
 }
 
@@ -888,10 +951,12 @@ impl PeerInfo {
 
 /// A [`PacketFilter`] enforcing an [`AclEngine`] policy on inbound packets.
 ///
-/// Inbound packets from a peer are evaluated as an [`AccessRequest`] whose
-/// principal comes from a [`PeerIdentity`]; anything the policy does not
-/// accept is dropped with a [`reasons`] constant. With no policy loaded every
-/// inbound packet is dropped (fail-closed). Outbound packets are accepted,
+/// Inbound packets from a peer are evaluated as a new [`Flow`] from the
+/// peer's labels (its [`PeerIdentity`] assertion) unless a reply allowance or
+/// a cached verdict holds them, exactly as
+/// [`AclEngine::evaluate`] decides; anything the policy does not accept is
+/// dropped with a [`reasons`] constant. With nothing loaded every inbound
+/// packet is dropped (fail-closed). Outbound packets are accepted,
 /// except to outbound-restricted peers (see the crate docs on namespaces) and
 /// from sources outside [`AclFilterScope::outbound_sources`] when set.
 ///
@@ -1023,6 +1088,7 @@ impl AclFilter {
             replies: load(&c.replies),
             denied: load(&c.denied),
             no_policy: load(&c.no_policy),
+            policy_failed: load(&c.policy_failed),
             unknown_peer: load(&c.unknown_peer),
             protocol: load(&c.protocol),
             fragment: load(&c.fragment),
@@ -1040,6 +1106,7 @@ impl AclFilter {
             ipv6_accepted: load(&c.ipv6_accepted),
             outbound_source: load(&c.outbound_source),
             internal: load(&c.internal),
+            policy_state: self.inner.engine.policy_state(),
         }
     }
 }
@@ -1095,7 +1162,10 @@ impl Inner {
         }
         let snapshot = self.engine.snapshot();
         if !snapshot.is_loaded() {
-            return Outcome::NoPolicy;
+            return match snapshot.policy_state() {
+                PolicyState::Failed => Outcome::PolicyFailed,
+                PolicyState::NotInstalled | PolicyState::Installed { .. } => Outcome::NoPolicy,
+            };
         }
         let Ok(packet) = IpPacket::parse(bytes) else {
             return Outcome::Malformed;
@@ -1191,6 +1261,7 @@ impl Inner {
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
             return self.evaluate_other(snapshot, peer, packet, tuple);
         };
+        let flow = tcp_udp_flow(&tuple, protocol);
         let identity = self.identity_generation();
         let key = EntryKey {
             peer,
@@ -1227,10 +1298,9 @@ impl Inner {
                     return Outcome::Accepted;
                 }
                 if info.governed == Governed::Default {
-                    // The default policy: a few rules and no side effects,
+                    // The default rules: a few rules and no side effects,
                     // cheaper to evaluate under this lock than to cache.
-                    let (verdict, _) =
-                        self.evaluate_new(snapshot, info.source.clone(), None, tuple, protocol);
+                    let (verdict, _) = self.evaluate_new(snapshot, info, flow);
                     drop(table);
                     self.sweep_if(sweep);
                     return verdict.outcome;
@@ -1240,20 +1310,16 @@ impl Inner {
         };
         drop(table);
         self.sweep_if(sweep);
-        let (verdict, cacheable) = info.map_or_else(
-            || {
-                let source = self.identity.assertion_for(peer, tuple.src);
-                let principal = source
-                    .as_ref()
-                    .filter(|_| snapshot.has_members())
-                    .map(SourceAssertion::source_anchor);
-                self.evaluate_new(snapshot, source, principal.as_deref(), tuple, protocol)
-            },
-            |info| {
-                let principal = info.principal.as_deref();
-                self.evaluate_new(snapshot, info.source.clone(), principal, tuple, protocol)
-            },
-        );
+        let info = info.unwrap_or_else(|| {
+            Arc::new(PeerInfo::resolve(
+                &*self.identity,
+                snapshot,
+                peer,
+                tuple.src,
+                0,
+            ))
+        });
+        let (verdict, cacheable) = self.evaluate_new(snapshot, &info, flow);
         let cache = cacheable && identity != 0;
         if cache || verdict.dependency.is_some() || verdict.restricted {
             let mut table = self.table();
@@ -1306,13 +1372,69 @@ impl Inner {
         if self.config.allow_other_protocols {
             return Outcome::Accepted;
         }
-        if !self.other_protocols.iter().any(|rule| rule.accepts(packet)) {
+        // An ICMP message other than an echo request records no reply
+        // allowance.
+        let allows_reply = self.config.stateful_replies
+            && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Request));
+        if self.other_protocols.iter().any(|rule| rule.accepts(packet)) {
+            if allows_reply {
+                self.allow_restricted_reply(snapshot, peer, tuple);
+            }
+            return Outcome::Accepted;
+        }
+        self.evaluate_other_rules(snapshot, peer, packet, tuple, allows_reply)
+    }
+
+    /// The rule step of an inbound packet that is neither TCP nor UDP: the
+    /// evaluation of a new flow, without a verdict cache; every denial is
+    /// [`Outcome::Protocol`].
+    fn evaluate_other_rules(
+        &self,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        packet: &IpPacket<'_>,
+        tuple: FiveTuple,
+        allows_reply: bool,
+    ) -> Outcome {
+        let Some(transport) = other_transport(packet, tuple.protocol) else {
+            return Outcome::Protocol;
+        };
+        let flow = Flow {
+            src: tuple.src,
+            dst: tuple.dst,
+            transport,
+        };
+        let identity = self.identity_generation();
+        let mut table = self.table();
+        let info = if identity == 0 {
+            Arc::new(PeerInfo::resolve(
+                &*self.identity,
+                snapshot,
+                peer,
+                tuple.src,
+                0,
+            ))
+        } else {
+            let Some(info) =
+                self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity)
+            else {
+                return Outcome::Internal;
+            };
+            Arc::clone(info)
+        };
+        drop(table);
+        let (verdict, _) = self.evaluate_new(snapshot, &info, flow);
+        if verdict.outcome != Outcome::Accepted {
             return Outcome::Protocol;
         }
-        if self.config.stateful_replies
-            && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Request))
-        {
-            self.allow_restricted_reply(snapshot, peer, tuple);
+        if verdict.dependency.is_some() || (verdict.restricted && allows_reply) {
+            let mut table = self.table();
+            if let Some(dependency) = &verdict.dependency {
+                self.record_pending(&mut table, tuple, dependency.clone());
+            }
+            if verdict.restricted && allows_reply {
+                self.record_reply(&mut table, peer, true, reversed(tuple), verdict.dependency);
+            }
         }
         Outcome::Accepted
     }
@@ -1336,57 +1458,44 @@ impl Inner {
         }
     }
 
-    /// Evaluate a new inbound TCP or UDP flow from `source`, whose principal
-    /// is `principal` (`None` when there are no namespace members). Returns
-    /// the verdict and whether it may be cached.
+    /// Evaluate a new inbound `flow` from the resolved peer `info`, as
+    /// [`AclEngine::evaluate`] does. Returns the verdict and whether it may
+    /// be cached.
     fn evaluate_new(
         &self,
         snapshot: &Snapshot,
-        source: Option<SourceAssertion>,
-        principal: Option<&str>,
-        tuple: FiveTuple,
-        protocol: Protocol,
+        info: &PeerInfo,
+        flow: Flow,
     ) -> (FlowVerdict, bool) {
-        let Some(source) = source else {
+        let Some(labels) = &info.labels else {
             return (FlowVerdict::new(Outcome::UnknownPeer), true);
         };
-        let request = AccessRequest {
-            src_ip: tuple.src,
-            source,
-            dst_ip: tuple.dst,
-            dst_port: tuple.dst_port,
-            protocol,
-        };
-        let member =
-            principal.and_then(|principal| Some((principal, snapshot.membership(principal)?)));
-        let Some((principal, membership)) = member else {
-            // A principal in no namespace: the default policy.
-            let outcome = match snapshot.default_policy() {
-                None => Outcome::NoPolicy,
-                Some(policy) if policy.matched_rule(&request).is_some() => Outcome::Accepted,
-                Some(_) => Outcome::Denied,
-            };
-            return (FlowVerdict::new(outcome), true);
-        };
-        let verdict =
-            snapshot.evaluate_member(&request, principal, membership, || self.engine.now());
-        let dependency = match verdict {
-            MemberVerdict::Rule { .. } => None,
-            MemberVerdict::Grant(id) => Some(ReplyDependency::Grant(id)),
-            MemberVerdict::Pinhole(id) => Some(ReplyDependency::Pinhole(id)),
-            MemberVerdict::PinholeExpired => {
+        let membership = info.membership.as_deref();
+        let evaluation =
+            snapshot.evaluate(labels, membership, &info.flow(flow), || self.engine.now());
+        let outcome = match evaluation {
+            Evaluation::Rule { .. }
+            | Evaluation::Grant(_)
+            | Evaluation::Pinhole(_)
+            | Evaluation::NotInstalled => Outcome::Accepted,
+            Evaluation::PinholeExpired => {
                 self.engine.expire_pinholes();
                 return (FlowVerdict::new(Outcome::Denied), false);
             }
-            MemberVerdict::Denied => return (FlowVerdict::new(Outcome::Denied), true),
-            MemberVerdict::CrossNamespace => {
-                return (FlowVerdict::new(Outcome::CrossNamespace), true);
+            Evaluation::Deny(reason) => {
+                let outcome = match reason {
+                    reasons::CROSS_NAMESPACE => Outcome::CrossNamespace,
+                    reasons::NO_POLICY => Outcome::NoPolicy,
+                    reasons::POLICY_FAILED => Outcome::PolicyFailed,
+                    _ => Outcome::Denied,
+                };
+                return (FlowVerdict::new(outcome), true);
             }
         };
         let verdict = FlowVerdict {
-            outcome: Outcome::Accepted,
-            dependency,
-            restricted: membership.outbound_restricted(),
+            outcome,
+            dependency: evaluation.dependency(),
+            restricted: membership.is_some_and(Membership::outbound_restricted),
         };
         (verdict, true)
     }
@@ -1434,7 +1543,12 @@ impl Inner {
             let info = match src {
                 _ if self.identity.by_source(peer) => PeerInfo::new(None, snapshot, identity, true),
                 Some(src) => PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity),
-                None => PeerInfo::new(self.identity.assertion(peer), snapshot, identity, false),
+                None => PeerInfo::new(
+                    self.identity.assertion(peer).as_ref(),
+                    snapshot,
+                    identity,
+                    false,
+                ),
             };
             Arc::new(info)
         };
@@ -1617,7 +1731,12 @@ impl Inner {
                 || self.identity.assertion(peer),
                 |dst| self.identity.assertion_for(peer, dst),
             );
-            Some(Arc::new(PeerInfo::new(source, &snapshot, 0, false)))
+            Some(Arc::new(PeerInfo::new(
+                source.as_ref(),
+                &snapshot,
+                0,
+                false,
+            )))
         } else {
             None
         };
@@ -1631,41 +1750,56 @@ impl Inner {
                 Outcome::OutboundAccepted
             };
         };
-        let principal = info.as_ref().and_then(|info| info.principal.as_deref());
-        let Some(principal) = principal.filter(|_| restricted) else {
-            if let Some(tuple) = packet.five_tuple() {
-                // Accepted anyway; an outbound pinhole still owns the replies.
-                let mut sweep = false;
-                let dependency = principal.and_then(|principal| {
-                    self.outbound_pinhole(&snapshot, principal, &tuple, &mut sweep)
-                });
-                self.track_outbound(&mut table, peer, tuple, &packet, dependency);
-                drop(table);
-                self.sweep_if(sweep);
+        let info = match info {
+            Some(info) if restricted => info,
+            info => {
+                self.outbound_unrestricted(&snapshot, peer, info.as_deref(), &packet, table);
+                return Outcome::OutboundAccepted;
             }
-            return Outcome::OutboundAccepted;
         };
         if packet.fragment().is_none() {
-            return self.evaluate_outbound(&snapshot, peer, principal, identity, &packet, table);
+            return self.evaluate_outbound(&snapshot, peer, &info, identity, &packet, table);
         }
         drop(table);
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(&snapshot, peer, principal, identity, packet, self.table())
+            self.evaluate_outbound(&snapshot, peer, &info, identity, packet, self.table())
         })
     }
 
-    /// The open outbound pinhole of `principal` for `tuple`, as a reply
+    /// An outbound packet to an unrestricted peer (`info`: with pinholes):
+    /// accepted anyway; an outbound pinhole still owns the replies.
+    fn outbound_unrestricted(
+        &self,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        info: Option<&PeerInfo>,
+        packet: &IpPacket<'_>,
+        mut table: MutexGuard<'_, FlowTable>,
+    ) {
+        let Some(tuple) = packet.five_tuple() else {
+            return;
+        };
+        let mut sweep = false;
+        let dependency = info
+            .and_then(|info| info.labels.as_ref())
+            .and_then(|labels| self.outbound_pinhole(snapshot, labels, &tuple, &mut sweep));
+        self.track_outbound(&mut table, peer, tuple, packet, dependency);
+        drop(table);
+        self.sweep_if(sweep);
+    }
+
+    /// The open outbound pinhole of `labels` for `tuple`, as a reply
     /// dependency. Sets `sweep` when only expired pinholes match.
     fn outbound_pinhole(
         &self,
         snapshot: &Snapshot,
-        principal: &str,
+        labels: &LabelSet,
         tuple: &FiveTuple,
         sweep: &mut bool,
     ) -> Option<ReplyDependency> {
         let protocol = Protocol::from_ip_number(tuple.protocol)?;
         match snapshot.match_pinhole(
-            principal,
+            labels,
             Direction::Outbound,
             protocol,
             tuple.dst_port,
@@ -1680,13 +1814,13 @@ impl Inner {
         }
     }
 
-    /// Evaluate an outbound packet to an outbound-restricted peer, holding
-    /// the flow table.
+    /// Evaluate an outbound packet to the outbound-restricted peer `info`,
+    /// holding the flow table.
     fn evaluate_outbound(
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
-        principal: &str,
+        info: &PeerInfo,
         identity: u64,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
@@ -1699,7 +1833,7 @@ impl Inner {
                 self.track_outbound(&mut table, peer, tuple, packet, None);
                 return Outcome::OutboundAccepted;
             }
-            return self.outbound_other_reply(snapshot, peer, tuple, packet, table);
+            return self.outbound_other(snapshot, peer, info, tuple, packet, table);
         };
         let key = EntryKey {
             peer,
@@ -1716,7 +1850,7 @@ impl Inner {
             Some(Hit::Verdict(verdict)) => verdict,
             None => {
                 let (verdict, cacheable) =
-                    self.evaluate_new_outbound(snapshot, principal, protocol, &tuple, &mut sweep);
+                    self.evaluate_new_outbound(snapshot, info, protocol, &tuple, &mut sweep);
                 if cacheable && identity != 0 {
                     let cached = CachedVerdict {
                         generation: snapshot.generation(),
@@ -1736,60 +1870,73 @@ impl Inner {
         verdict.outcome
     }
 
-    /// An outbound packet to an outbound-restricted peer that is neither TCP
-    /// nor UDP, without `allow_other_protocols`: accepted only as the reply
-    /// allowed by an inbound packet a scope rule accepted.
-    fn outbound_other_reply(
+    /// An outbound packet to the outbound-restricted peer `info` that is
+    /// neither TCP nor UDP, without `allow_other_protocols`: accepted as the
+    /// reply allowed by an accepted inbound packet, or by an outbound rule.
+    fn outbound_other(
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
+        info: &PeerInfo,
         tuple: FiveTuple,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
     ) -> Outcome {
-        if self.other_protocols.is_empty()
-            || !self.config.stateful_replies
-            || (is_icmp(tuple.protocol) && echo_type(packet) != Some(EchoType::Reply))
+        if self.config.stateful_replies
+            && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Reply))
         {
+            let key = EntryKey {
+                peer,
+                outbound: true,
+                tuple,
+            };
+            let mut sweep = false;
+            let reply = matches!(
+                self.lookup(&mut table, snapshot, key, 0, &mut sweep),
+                Some(Hit::Allowance(_))
+            );
+            if reply {
+                drop(table);
+                self.sweep_if(sweep);
+                return Outcome::OutboundReply;
+            }
+            self.sweep_if(sweep);
+        }
+        let rule = other_transport(packet, tuple.protocol).is_some_and(|transport| {
+            info.membership
+                .as_deref()
+                .is_some_and(|membership| snapshot.outbound_rule_accepts(membership, transport))
+        });
+        if !rule {
             return Outcome::OutboundDenied;
         }
-        let key = EntryKey {
-            peer,
-            outbound: true,
-            tuple,
-        };
-        let mut sweep = false;
-        let reply = matches!(
-            self.lookup(&mut table, snapshot, key, 0, &mut sweep),
-            Some(Hit::Allowance(_))
-        );
-        drop(table);
-        self.sweep_if(sweep);
-        if reply {
-            Outcome::OutboundReply
-        } else {
-            Outcome::OutboundDenied
-        }
+        self.track_outbound(&mut table, peer, tuple, packet, None);
+        Outcome::OutboundAccepted
     }
 
     /// Evaluate a new outbound TCP or UDP flow to the outbound-restricted
-    /// `principal`. Returns the verdict and whether it may be cached.
+    /// peer `info`. Returns the verdict and whether it may be cached.
     fn evaluate_new_outbound(
         &self,
         snapshot: &Snapshot,
-        principal: &str,
+        info: &PeerInfo,
         protocol: Protocol,
         tuple: &FiveTuple,
         sweep: &mut bool,
     ) -> (FlowVerdict, bool) {
-        let rule = snapshot.membership(principal).is_some_and(|membership| {
-            snapshot.outbound_rule_accepts(membership, protocol, tuple.dst_port)
-        });
+        let transport = tcp_udp_flow(tuple, protocol).transport;
+        let rule = info
+            .membership
+            .as_deref()
+            .is_some_and(|membership| snapshot.outbound_rule_accepts(membership, transport));
         if rule {
             return (FlowVerdict::new(Outcome::OutboundAccepted), true);
         }
         let mut expired = false;
-        let dependency = self.outbound_pinhole(snapshot, principal, tuple, &mut expired);
+        let dependency = info
+            .labels
+            .as_ref()
+            .and_then(|labels| self.outbound_pinhole(snapshot, labels, tuple, &mut expired));
         let outcome = if dependency.is_some() {
             Outcome::OutboundAccepted
         } else {
@@ -1955,6 +2102,7 @@ mod tests {
     use crate::engine::{TerminateBinding, wg_peer_anchor};
     use crate::namespace::{Grant, GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule};
     use crate::policy::{AclAction, AclPolicy, AclRule};
+    use crate::rules::{NotInstalled, RuleSet};
     use crate::test_packets::{Frag, icmp_echo, ip, ip_frag, tcp, tcp_packet, udp_packet};
 
     const PEER: PeerId = PeerId::new(1);
@@ -2188,7 +2336,7 @@ mod tests {
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             Verdict::Accept
         );
-        engine.clear();
+        engine.uninstall();
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             drop(reasons::NO_POLICY)
@@ -3013,7 +3161,7 @@ mod tests {
         );
 
         // Without a default policy they are fail-closed while namespaces exist.
-        engine.clear();
+        engine.uninstall();
         assert!(engine.is_loaded());
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
@@ -3414,6 +3562,7 @@ mod tests {
 
         engine.clear_all();
         assert!(!engine.is_loaded());
+        assert_eq!(engine.policy_state(), PolicyState::Failed);
         assert!(engine.namespaces().is_empty() && engine.grants().is_empty());
         assert!(!guard.is_open());
         for (peer, packet) in [
@@ -3423,9 +3572,11 @@ mod tests {
             (B, tcp_packet(b, 443, a, 4000)),
             (A, tcp_packet(a, 4000, local, 22)),
         ] {
-            assert_eq!(inbound(&f, peer, packet), drop(reasons::NO_POLICY));
+            assert_eq!(inbound(&f, peer, packet), drop(reasons::POLICY_FAILED));
         }
-        assert_eq!(f.stats().no_policy, 5);
+        let stats = f.stats();
+        assert_eq!((stats.policy_failed, stats.no_policy), (5, 0));
+        assert_eq!(stats.policy_state, PolicyState::Failed);
 
         // Dropping the guard afterwards is a no-op.
         std::mem::drop(guard);
@@ -3486,10 +3637,10 @@ mod tests {
     fn by_source_peer_is_judged_by_each_source() {
         let map = by_source_identity();
         let (r, other, l) = (addr("10.0.0.1"), addr("10.0.0.5"), addr("10.0.0.2"));
-        // The principal of `AccessRequest::from_ip`, and no address-independent one.
+        // The principal of a bare source IP, and no address-independent one.
         assert!(map.assertion(GATEWAY).is_none());
         let source = map.assertion_for(GATEWAY, r).unwrap();
-        let expected = AccessRequest::from_ip(r, l, 80, Protocol::Tcp).source;
+        let expected = SourceAssertion::from_ip(r);
         assert_eq!(source.source_anchor(), expected.source_anchor());
         assert_eq!(source.ip(), expected.ip());
         assert_eq!(source.source_class(), "terminate-binding");
@@ -3851,7 +4002,7 @@ mod tests {
         let engine = loaded_engine(test_policy());
         let f = AclFilter::with_config(Arc::clone(&engine), identity(), allow_only(4096));
         assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
-        engine.clear();
+        engine.uninstall();
         assert_eq!(inbound(&f, PEER, continuation(7)), Verdict::Accept);
         assert_eq!(inbound(&f, PEER, continuation(8)), drop(reasons::FRAGMENT));
         assert_eq!(
@@ -4779,5 +4930,241 @@ mod tests {
         );
         let stats = f.stats();
         assert_eq!((stats.accepted, stats.protocol), (2, 2));
+    }
+
+    // ── Policy states and typed rules ──
+
+    #[test]
+    fn policy_states_decide_sources_in_no_namespace() {
+        let engine = Arc::new(AclEngine::new());
+        let f = AclFilter::new(Arc::clone(&engine), identity());
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let new_flow = |port| tcp_packet(r, 4000, l, port);
+        assert_eq!(f.stats().policy_state, PolicyState::NotInstalled);
+
+        // Installed and empty: new flows denied, replies still pass.
+        engine.install(RuleSet::empty());
+        assert_eq!(inbound(&f, PEER, new_flow(80)), drop(reasons::DENIED));
+        assert_eq!(
+            outbound(&f, PEER, tcp_packet(l, 40000, r, 22)),
+            Verdict::Accept
+        );
+        let reply = || tcp_packet(r, 22, l, 40000);
+        assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
+        assert_eq!(f.stats().policy_state, PolicyState::Installed { rules: 0 });
+
+        // Failed with nothing else loaded: everything dropped, replies too.
+        engine.fail();
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::POLICY_FAILED));
+        assert_eq!(
+            inbound(&f, PEER, new_flow(80)),
+            drop(reasons::POLICY_FAILED)
+        );
+        let ping = ip(r, l, protocol::ICMP, &icmp_echo(8, 1));
+        assert_eq!(inbound(&f, PEER, ping), drop(reasons::POLICY_FAILED));
+        assert_eq!(f.stats().policy_state, PolicyState::Failed);
+
+        // Not installed, deny: as before any policy was loaded.
+        engine.uninstall();
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::NO_POLICY));
+        let stats = f.stats();
+        assert_eq!(
+            (
+                stats.denied,
+                stats.replies,
+                stats.policy_failed,
+                stats.no_policy
+            ),
+            (1, 1, 3, 1)
+        );
+    }
+
+    #[test]
+    fn not_installed_accept_lets_every_known_peer_in() {
+        let engine = Arc::new(AclEngine::new().with_not_installed(NotInstalled::Accept));
+        let f = AclFilter::new(Arc::clone(&engine), identity());
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        for packet in [
+            tcp_packet(r, 4000, l, 80),
+            udp_packet(r, 4000, l, 9),
+            ip(r, l, protocol::ICMP, &icmp_echo(8, 1)),
+            ip(r, l, 47, &[0; 8]),
+        ] {
+            assert_eq!(inbound(&f, PEER, packet), Verdict::Accept);
+        }
+        // An unknown peer is still unknown; the protocol step reports it.
+        let unknown = PeerId::new(99);
+        assert_eq!(
+            inbound(&f, unknown, tcp_packet(r, 4000, l, 80)),
+            drop(reasons::UNKNOWN_PEER)
+        );
+        assert_eq!(
+            inbound(&f, unknown, ip(r, l, 47, &[0; 8])),
+            drop(reasons::PROTOCOL)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.accepted, stats.bypassed), (4, 0));
+        // Namespace members are governed by their namespaces.
+        engine
+            .store_namespace(
+                "nsd:a",
+                NamespacePolicy {
+                    members: vec![NamespaceMember {
+                        principal: "10.0.0.1".to_owned(),
+                        addresses: Vec::new(),
+                    }],
+                    ..NamespacePolicy::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4001, l, 80)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, OTHER_PEER, tcp_packet(addr("10.0.0.9"), 4000, l, 80)),
+            Verdict::Accept
+        );
+    }
+
+    fn typed_rules(rules: impl IntoIterator<Item = crate::Rule>) -> Arc<AclEngine> {
+        let engine = Arc::new(AclEngine::new());
+        engine.install(RuleSet::new(rules).unwrap());
+        engine
+    }
+
+    #[test]
+    fn other_protocols_reach_the_rules() {
+        use crate::{IcmpTypes, ProtocolMatch, Rule};
+        let engine = typed_rules([
+            Rule::new(
+                "ping",
+                vec![ProtocolMatch::Icmp(IcmpTypes::Only(vec![8, 128]))],
+            )
+            .with_destinations(["10.0.0.2/32".parse().unwrap(), "fd00::/64".parse().unwrap()]),
+            Rule::new("gre", vec![ProtocolMatch::Ip(47)]).with_labels(["10.0.0.1".into()]),
+        ]);
+        let f = AclFilter::new(Arc::clone(&engine), identity());
+        let (r, l, other) = (addr("10.0.0.1"), addr("10.0.0.2"), addr("10.0.0.3"));
+        let icmp = |dst, icmp_type| ip(r, dst, protocol::ICMP, &icmp_echo(icmp_type, 1));
+        assert_eq!(inbound(&f, PEER, icmp(l, 8)), Verdict::Accept);
+        // Another type, another destination.
+        assert_eq!(inbound(&f, PEER, icmp(l, 13)), drop(reasons::PROTOCOL));
+        assert_eq!(inbound(&f, PEER, icmp(other, 8)), drop(reasons::PROTOCOL));
+        // ICMPv6 by its own type numbers.
+        let (r6, l6) = (addr("fd00::1"), addr("fd00::2"));
+        let ping6 = ip(r6, l6, protocol::ICMPV6, &icmp_echo(128, 1));
+        assert_eq!(inbound(&f, KEY_PEER, ping6), Verdict::Accept);
+        // A labelled rule: only the labelled peer.
+        let gre = |src| ip(src, l, 47, &[0; 8]);
+        assert_eq!(inbound(&f, PEER, gre(r)), Verdict::Accept);
+        assert_eq!(
+            inbound(&f, OTHER_PEER, gre(addr("10.0.0.9"))),
+            drop(reasons::PROTOCOL)
+        );
+        assert_eq!(inbound(&f, KEY_PEER, gre(r)), drop(reasons::PROTOCOL));
+        assert_eq!(
+            inbound(&f, PeerId::new(99), gre(r)),
+            drop(reasons::PROTOCOL)
+        );
+        // A non-first fragment follows its first fragment.
+        let first = ip_frag(
+            r,
+            l,
+            47,
+            &[0; 16],
+            Some(Frag {
+                id: 3,
+                offset_units: 0,
+                more: true,
+            }),
+        );
+        let later = ip_frag(
+            r,
+            l,
+            47,
+            &[0; 8],
+            Some(Frag {
+                id: 3,
+                offset_units: 2,
+                more: false,
+            }),
+        );
+        assert_eq!(inbound(&f, PEER, first), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, later), Verdict::Accept);
+        let stats = f.stats();
+        assert_eq!((stats.accepted, stats.protocol, stats.denied), (5, 5, 0));
+
+        // TCP and UDP are unaffected by such rules.
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+    }
+
+    #[test]
+    fn other_protocol_steps_come_first() {
+        use crate::{ProtocolMatch, Rule};
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let ping = || ip(r, l, protocol::ICMP, &icmp_echo(8, 1));
+        // Without a matching rule a scope rule or `allow_other_protocols`
+        // still accepts.
+        let engine = typed_rules([Rule::new("gre", vec![ProtocolMatch::Ip(47)])]);
+        let scope = AclFilterScope::new().with_other_protocol(OtherProtocolRule::new(
+            OtherProtocol::IcmpEcho,
+            ["10.0.0.0/24".parse().unwrap()],
+        ));
+        let f = AclFilter::with_scope(
+            Arc::clone(&engine),
+            identity(),
+            AclFilterConfig::default(),
+            scope,
+        );
+        assert_eq!(inbound(&f, PEER, ping()), Verdict::Accept);
+        let open = AclFilter::with_config(
+            Arc::clone(&engine),
+            identity(),
+            AclFilterConfig {
+                allow_other_protocols: true,
+                ..AclFilterConfig::default()
+            },
+        );
+        assert_eq!(inbound(&open, PEER, ping()), Verdict::Accept);
+        // A rule set without ICMP entries leaves ICMP dropped.
+        let plain = AclFilter::new(engine, identity());
+        assert_eq!(inbound(&plain, PEER, ping()), drop(reasons::PROTOCOL));
+    }
+
+    #[test]
+    fn a_rule_with_labels_and_prefixes_needs_both() {
+        use crate::{PortSet, ProtocolMatch, Rule};
+        let engine = typed_rules([Rule::new("both", vec![ProtocolMatch::Tcp(PortSet::Any)])
+            .with_labels([wg_peer_anchor(&KEY).into()])
+            .with_sources(["fd00::/64".parse().unwrap()])]);
+        let f = AclFilter::new(engine, identity());
+        let l = addr("fd00::2");
+        assert_eq!(
+            inbound(&f, KEY_PEER, tcp_packet(addr("fd00::7"), 4000, l, 80)),
+            Verdict::Accept
+        );
+        // The labelled peer outside the prefix, another peer inside it.
+        assert_eq!(
+            inbound(&f, KEY_PEER, tcp_packet(addr("fd01::7"), 4000, l, 80)),
+            drop(reasons::DENIED)
+        );
+        let map = identity();
+        map.insert(
+            PeerId::new(8),
+            SourceAssertion::External { idp: "x".into() },
+        );
+        let f = AclFilter::new(
+            typed_rules([Rule::new("any", vec![ProtocolMatch::Any])
+                .with_sources(["fd00::/64".parse().unwrap()])]),
+            map,
+        );
+        assert_eq!(
+            inbound(&f, PeerId::new(8), tcp_packet(addr("fd00::7"), 4000, l, 80)),
+            Verdict::Accept
+        );
     }
 }
