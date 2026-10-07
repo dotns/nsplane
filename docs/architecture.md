@@ -828,7 +828,7 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - An upgrade answered with any HTTP response (no 101) fails the dial with a public
   `WssDialError` inside the `io::Error` (`get_ref()` + `downcast_ref`): `status`, the
   response `headers` (non-UTF-8 values lossily) and the start of the `body`, the bytes
-  that arrived with the head up to `WssDialError::MAX_BODY` (512, ns's log cut). The kind
+  that arrived with the head up to `WssDialError::MAX_BODY` (512). The kind
   and message are unchanged: `PermissionDenied`, "wss upgrade rejected with HTTP {status}"
   for 401/403; `Other`, "wss connect failed: HTTP error: {status}" otherwise. Stream
   client opens waiting behind that dial get a copy with the detail.
@@ -846,7 +846,7 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
   capacity dial (another session while one is up) goes at once.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
   (pongs included) arrived for `read_idle` (35 s). Every carrier reads both per dial
-  (`WssConfig::keepalive`); ns sets its ping interval and a 45 s read idle. A zero
+  (`WssConfig::keepalive`). A zero
   `ping_interval` (`WssConfig::ping_interval(None)`) sends no pings: the dialer spawns no
   ping task and the session writers never wake for one; the read idle stays. No message
   above `MAX_MESSAGE` (4 x 65 535 bytes) is read.
@@ -862,16 +862,16 @@ WebSocket and TLS; only an application that adds it pulls in `tokio-tungstenite`
 - TLS trust is the caller's: there are no built-in system or web PKI roots. `WssTls::Roots`
   takes a `RootCertStore` (the client configuration is built with aws-lc-rs, the safe
   default protocol versions and no client auth); `WssTls::Config` takes a complete
-  `Arc<rustls::ClientConfig>` used as is (ns passes its `control::tls::client_config()`).
+  `Arc<rustls::ClientConfig>` used as is (an application with its own TLS setup passes it).
   Built-in roots may become an optional feature later if a consumer needs them.
 
 **Datagram carrier.** `WssDialer` is a `LinkDialer`: `into_transport(id, peer, config)`
 returns a `LinkTransport` whose links are WSS connections. Each datagram is one binary
-message carrying its raw bytes (the wire of ns `OpaquePump` and the examples' relay); text
+message carrying its raw bytes (the wire of the examples' relay); text
 messages and messages above `MAX_DATAGRAM` (65 535) are dropped and counted in
 `WssStats`, a close frame or the end of the stream ends the link.
 
-**Stream carrier wire.** `WsFrame` (module `frame`) is ns `tunnel-ws`'s and NSGW's protocol,
+**Stream carrier wire.** `WsFrame` (module `frame`) is an existing stream relay protocol, kept
 byte for byte: every binary message is one frame, big-endian.
 
 | Field / command | Bytes | Content |
@@ -884,33 +884,31 @@ byte for byte: every binary message is one frame, big-endian.
 | `CLOSE` (`0x20`) | 0 | close the stream |
 | `CLOSE_ACK` (`0x21`) | 0 | acknowledge a CLOSE |
 
-As in ns, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
+As in that protocol, bytes after a complete OPEN, CLOSE or `CLOSE_ACK` are ignored and any protocol
 byte but `0x01` is TCP. The protocol has no open reply and no flow control: a refused
 OPEN is answered with CLOSE, and a stream whose peer outruns its receive budget is closed.
 
-**Stream client.** `WssStreamClient` (the client leg, ns `proxy/wire.rs` and
-`wss_flow.rs`) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
+**Stream client.** `WssStreamClient` (the client leg) opens TCP streams (`open_tcp`, a `WssTcpStream` with `AsyncRead` and
 `AsyncWrite`) and UDP flows (`open_udp`, a `WssUdpFlow` with `send` / `recv`) to targets
-behind a terminate (NSGW, or `WssStreamServer`).
+behind a stream server (`WssStreamServer`, or any other server of the protocol).
 
 - Sessions: dialed lazily on the first open (or `connect`). Every TCP stream and UDP flow
   is multiplexed over one session until it holds
-  `WssStreamLimits::max_streams_per_session` live ones (default 1024, NSGW's default
-  `PER_SESSION_STREAM_CAP`); only then is one more session dialed. One dial runs at a time,
+  `WssStreamLimits::max_streams_per_session` live ones (default 1024); only then is one more session dialed. One dial runs at a time,
   in a task of its own (one per dial, not per open), and waiting opens share its outcome;
   an open dropped while it waits therefore loses neither the backoff nor the 401 token
-  wait, and never starts a second dial. The wire format is ns's, unchanged. NSGW caveats: it rejects
-  OPENs beyond its own per-session cap, which its operator can set below 1024 (keep
-  `max_streams_per_session` at most the gateway's cap), and it writes all streams of a
+  wait, and never starts a second dial. The wire format is unchanged. Server caveats: a server may reject
+  OPENs beyond its own per-session cap, which can be below 1024 (keep
+  `max_streams_per_session` at most the server's cap), and may write all streams of a
   session through one shared writer queue.
 - Stream ids count up from 1 per session, skipping ids still in use; an id stays in use
   until the peer's CLOSE or `CLOSE_ACK`. An open returns once its OPEN is queued.
 - Half-close: `shutdown` sends CLOSE behind the data already written (the wire has no
   other half-close) and the stream keeps reading until the peer's CLOSE or `CLOSE_ACK`,
-  then reads EOF; this matches the ns terminate and `WssStreamServer`, which drain the
+  then reads EOF; this matches `WssStreamServer`, which drains the
   stream to the backend before ending it. A peer's CLOSE reads as EOF after the bytes
   before it and is answered with `CLOSE_ACK`; dropping a stream sends CLOSE.
-- Queues and bounds (`WssStreamLimits`, ns's defaults): a control queue (OPEN,
+- Queues and bounds (`WssStreamLimits`): a control queue (OPEN,
   `CLOSE_ACK`, reset CLOSE, pings; 64 messages) written before the data queue (DATA and
   orderly CLOSE; 256 messages), and receive budgets of 4 MiB per stream
   (`stream_buffer`) and 32 MiB per session (`session_buffer`), each received frame
@@ -926,13 +924,13 @@ behind a terminate (NSGW, or `WssStreamServer`).
   on it fails; the next open dials again after `reconnect_delay` (or the backoff). Frames
   for unknown stream ids are ignored and counted in `WssStreamStats`.
 
-**Terminate leg.** `WssStreamServer` (ported from ns `tunnel-ws` `WsTunnel`) dials the
+**Server leg.** `WssStreamServer` dials the
 relay like the client and serves the protocol on the session; `run(shutdown)` drives it.
 
 - Resolution is the embedder's: `WssResolver::resolve(WssOpen { session, stream_id,
   target, protocol })` returns the backend `SocketAddr` or `Denied` (answered with CLOSE).
-  It runs on the stream's own task, so a slow answer delays only that stream. ns keeps its
-  resolution (`OverlayResolver`, services.toml, FQID, ACL, gateway identity) behind it.
+  It runs on the stream's own task, so a slow answer delays only that stream. Name
+  resolution, access control and identity checks stay the embedder's, behind it.
 - An OPEN for an id in use, or beyond `max_streams` (1024), is answered with CLOSE. The
   server connects a TCP stream or a connected UDP socket (bound to the backend's address
   family) and relays: TCP bytes in DATA frames of at most `MAX_DATA_PAYLOAD`, one datagram
@@ -941,7 +939,7 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   to the backend, then its write side is shut. A backend EOF sends CLOSE behind the
   stream's data; a failed connect, a backend error (a failed UDP receive included) sends
   CLOSE at once.
-- Queues and bounds (`WssServerLimits`, ns's defaults): 4 MiB per stream
+- Queues and bounds (`WssServerLimits`): 4 MiB per stream
   (`stream_buffer`), 32 MiB per session (`session_buffer`), 64 frames per stream
   (`stream_queue`), each received frame costing its payload plus 64 bytes until written;
   a frame over a bound closes its stream only (`WssCloseReason::Overflow`). Control queue
@@ -954,19 +952,16 @@ relay like the client and serves the protocol on the session; `run(shutdown)` dr
   closed (`WssCloseReason::SessionEnded`) and the next session is dialed after
   `reconnect_delay` (or the backoff); a shutdown closes the open streams and the session.
 
-ns `WsTunnel` has had no consumer since ns 0aef94a0 (2026-08-28); with the terminate leg
-here, ns can delete `tunnel-ws` whole.
-
-**Deviations from ns.** An orderly CLOSE is queued behind the stream's data on both legs.
+**Deviations from the original implementation.** An orderly CLOSE is queued behind the stream's data on both legs.
 Client: an over-budget UDP datagram is dropped and the flow kept, and the receive budgets
-count payload plus 64 bytes per frame instead of ns's 64-message cap per stream. Server:
-on a peer's CLOSE the queued data is drained to the backend and its write side shut (ns
+count payload plus 64 bytes per frame instead of a 64-message cap per stream. Server:
+on a peer's CLOSE the queued data is drained to the backend and its write side shut (the original
 dropped it), the half-close the client relies on; a failed UDP backend receive sends
 CLOSE; the UDP socket binds to the backend's address family.
 
 **Tests.** Unit tests next to the code (`frame`, `stream`, `server`, `connect`, `config`);
 `crates/nsplane-wss/tests/stream.rs` runs the client and the server through a TLS test
-relay (and a plain one for `ws://`) and checks the frames against the ns layouts;
+relay (and a plain one for `ws://`) and checks the frames against the reference layouts;
 `nsplane-e2e` `wss_datagram` runs two engines over `WssDialer` (401, 403, reconnect, read
 idle), `wss_plain` over `ws://`, `wss_dial_error` checks the `WssDialError` of a 401
 and a 503 (header, truncated body) from the dialer and the stream client,
@@ -1021,7 +1016,11 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
 - **Tests.** `crates/nsplane-wss/src/accept/tests.rs`: a `WssDialer` link against the
   transport over loopback `ws://`, and sessions over in-memory streams (distinct
   addresses, sends to closed sessions, queue full, read idle and pings, dropped messages,
-  the session limit and dropping the transport).
+  the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
+  `WssDialer`s against one engine on the transport: several nodes on distinct session
+  addresses, a server-side close and redial moving the endpoint, the transport next to a
+  `UdpTransport`, no endpoint takeover by garbage or an unknown key on another session,
+  and a session that stops reading without holding up the others.
 
 ## nsplane-tun
 
