@@ -84,7 +84,7 @@ fn bump(counter: &AtomicU64) {
 /// the packet is TCP or UDP and matches an
 /// [`UnboundAction::Divert`](super::UnboundAction::Divert) rule for the peer
 /// of the one enforcing scope governing its destination, its source is no
-/// local or binding address of any scope, and no hold matches: taken, it is
+/// local, binding or unbound address of any scope, and no hold matches: taken, it is
 /// [`Verdict::Handled`]; refused, it is counted in
 /// [`GateFilterStats::divert_rejected`] and dropped. Every other enforced
 /// denial is dropped with [`GateReason::drop_reason`].

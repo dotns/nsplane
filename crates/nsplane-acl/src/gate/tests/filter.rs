@@ -118,6 +118,7 @@ fn scope(mode: GateMode, grants: Vec<GateGrant>) -> GateScope {
             addresses: vec![IpAddr::V4(REMOTE)],
             labels: LabelSet::new([Label::from("remote")]),
         }],
+        unbound_addresses: Vec::new(),
         grants,
         unbound: vec![
             UnboundRule {

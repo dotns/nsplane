@@ -261,6 +261,7 @@ fn scope(
             addresses: vec![IpAddr::V4(a.ip4)],
             labels: LabelSet::new([Label::from("source:a"), Label::from(owner)]),
         }],
+        unbound_addresses: Vec::new(),
         grants,
         unbound: Vec::new(),
     }
@@ -698,6 +699,7 @@ fn unbound_policy(b: &GateNode, unbound: Vec<UnboundRule>) -> GatePolicy {
         mode: GateMode::Enforce,
         local: vec![IpAddr::V4(b.ip4)],
         bindings: Vec::new(),
+        unbound_addresses: Vec::new(),
         grants: Vec::new(),
         unbound,
     })
@@ -875,6 +877,38 @@ async fn a_diverted_packet_is_stale_after_a_replace() -> TestResult {
         .collect();
     assert_eq!(generations.len(), 2);
     assert_eq!(generations.last(), Some(&gated.gate.generation()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unbound_address_is_governed_and_never_diverted() -> TestResult {
+    let queue = Queue::new(8);
+    let divert = queue.clone();
+    let (mut a, mut b, gated) = gated_pair(gate(), false, |f| f.with_divert(divert)).await?;
+    let mut events = b.subscribe().await?;
+    // `BEHIND_A` belongs to the scope without a binding; `a` also has a divert rule.
+    let mut scope = scope(&a, &b, &gated, GateMode::Enforce, false, vec![b_to_a(&a)?]);
+    scope.unbound_addresses = vec![IpAddr::V4(BEHIND_A)];
+    scope.unbound = vec![divert_rule(gated.a_peer)];
+    gated.gate.replace(policy(scope.clone()))?;
+
+    // Enforce: outbound to it is denied as unbound.
+    let to_it = udp(v4(b.ip4, 5000), v4(BEHIND_A, 53), b"out");
+    let unbound = GateReason::Unbound.drop_reason();
+    dropped(&b, &mut a, &mut events, &to_it, unbound).await?;
+    // No divert: a packet from it is dropped, not handed to the divert.
+    let from_it = udp(v4(BEHIND_A, 19999), v4(b.ip4, 49152), b"reply");
+    dropped(&a, &mut b, &mut events, &from_it, unbound).await?;
+    assert!(queue.taken().is_empty());
+    assert_eq!(gated.gate.counters().unbound_denied, 2);
+
+    // Observe: reported, delivered.
+    scope.mode = GateMode::Observe;
+    gated.gate.replace(policy(scope))?;
+    delivered(&b, &mut a, &to_it).await?;
+    assert_eq!(gated.gate.counters().observed_denied, 1);
+    let stats = gated.filter.stats();
+    assert_eq!((stats.diverted, stats.gate_denied), (0, 2));
     Ok(())
 }
 

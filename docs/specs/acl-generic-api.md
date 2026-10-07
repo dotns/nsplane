@@ -1087,6 +1087,7 @@ precisions:
 - **Divert source check**: the filter offers a denial only when its source is no local *or*
   binding address of any scope (5.1 says binding address). This reproduces the old "no Node
   address of any Network" check.
+- **`GateScope::unbound_addresses: Vec<IpAddr>`** (new, default empty): remote addresses of a scope without a `PeerId` binding; outbound (and outbound malformed) packets to them are `Unbound` / `Malformed` under the scope's mode, no divert candidate comes from them, and `replace` rejects one listed twice or also bound in the scope (`GatePolicyError::ConflictingAddress`) or IPv6.
 - **Outbound malformed packets** (step 2, open point O4): outbound, the mode is that of the
   scopes holding the destination as a binding address, as for an unbound outbound packet,
   not of the scopes whose `local` contains it.

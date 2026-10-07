@@ -351,3 +351,119 @@ fn a_divert_candidate_is_current_for_one_generation() {
         generation
     );
 }
+
+/// [`open_scope`] in `mode` holding [`UNBOUND_SOURCE`] without a binding.
+fn scope_with_unbound_address(mode: GateMode) -> GateScope {
+    let mut scope = unbound_scope(mode);
+    scope.unbound_addresses = vec![IpAddr::V4(UNBOUND_SOURCE)];
+    scope
+}
+
+#[test]
+fn outbound_to_an_unbound_address_is_governed_by_its_scope() {
+    let to_it = tcp(LOCAL, UNBOUND_SOURCE, 50_000, 443, 0x02);
+    let mut malformed = to_it.clone();
+    malformed.truncate(30);
+    malformed[2..4].copy_from_slice(&30_u16.to_be_bytes());
+
+    let gate = gate_with(policy(vec![unbound_scope(GateMode::Enforce)]));
+    assert_eq!(
+        gate.evaluate_outbound(PEER, &to_it),
+        GateDecision::Pass,
+        "without the field the address is not governed"
+    );
+
+    gate.replace(policy(vec![scope_with_unbound_address(GateMode::Enforce)]))
+        .unwrap();
+    for peer in [PEER, CARRIER, OTHER_PEER] {
+        assert_eq!(
+            gate.evaluate_outbound(peer, &to_it),
+            denied(GateReason::Unbound)
+        );
+    }
+    assert_eq!(
+        gate.evaluate_outbound(PEER, &malformed),
+        denied(GateReason::Malformed)
+    );
+    assert_eq!(
+        gate.evaluate_inbound(OTHER_PEER, &tcp(UNBOUND_SOURCE, LOCAL, 40_000, 22, 0x02)),
+        denied(GateReason::Unbound),
+        "inbound from it is unbound, as before"
+    );
+
+    gate.replace(policy(vec![scope_with_unbound_address(GateMode::Observe)]))
+        .unwrap();
+    assert_eq!(
+        gate.evaluate_outbound(PEER, &to_it),
+        observe(false, GateReason::Unbound, None)
+    );
+    assert_eq!(
+        gate.evaluate_outbound(PEER, &malformed),
+        observe(false, GateReason::Malformed, None)
+    );
+
+    gate.replace(policy(vec![scope_with_unbound_address(GateMode::Off)]))
+        .unwrap();
+    assert_eq!(gate.evaluate_outbound(PEER, &to_it), GateDecision::Pass);
+    assert_eq!(gate.evaluate_outbound(PEER, &malformed), GateDecision::Pass);
+}
+
+#[test]
+fn no_divert_candidate_comes_from_an_unbound_address() {
+    let reply = udp(UNBOUND_SOURCE, LOCAL, 19_999, 49_152);
+    let gate = gate_with(policy(vec![unbound_scope(GateMode::Enforce)]));
+    assert!(gate.divert_candidate(CARRIER, &reply).is_some());
+    let mut other = open_scope(GateMode::Observe);
+    other.id = "scope-2".into();
+    other.local = vec![IpAddr::V4(Ipv4Addr::new(100, 65, 0, 1))];
+    other.unbound_addresses = vec![IpAddr::V4(UNBOUND_SOURCE)];
+    gate.replace(policy(vec![unbound_scope(GateMode::Enforce), other]))
+        .unwrap();
+    assert_eq!(
+        gate.evaluate_inbound(CARRIER, &reply),
+        denied(GateReason::Unbound)
+    );
+    assert!(
+        gate.divert_candidate(CARRIER, &reply).is_none(),
+        "an unbound address of any scope is refused"
+    );
+}
+
+#[test]
+fn unbound_addresses_are_validated() {
+    let gate = gate_with(policy(vec![open_scope(GateMode::Enforce)]));
+    let mut twice = scope_with_unbound_address(GateMode::Enforce);
+    twice.unbound_addresses.push(IpAddr::V4(UNBOUND_SOURCE));
+    let mut bound = open_scope(GateMode::Off);
+    bound.unbound_addresses = vec![IpAddr::V4(REMOTE)];
+    for scope in [twice, bound] {
+        let address = *scope.unbound_addresses.last().unwrap();
+        assert_eq!(
+            gate.replace(policy(vec![scope])),
+            Err(GatePolicyError::ConflictingAddress {
+                scope: "scope-1".into(),
+                address,
+            })
+        );
+    }
+    let mut v6 = open_scope(GateMode::Enforce);
+    v6.unbound_addresses = vec!["fd00::1".parse().unwrap()];
+    assert!(matches!(
+        gate.replace(policy(vec![v6])),
+        Err(GatePolicyError::Ipv6 {
+            field: "unbound_addresses",
+            ..
+        })
+    ));
+    assert_eq!(gate.generation(), 1, "nothing published");
+
+    // Another scope may bind the address.
+    let mut other = open_scope(GateMode::Enforce);
+    other.id = "scope-2".into();
+    other.bindings.clear();
+    other.unbound_addresses = vec![IpAddr::V4(REMOTE)];
+    assert!(
+        gate.replace(policy(vec![open_scope(GateMode::Enforce), other]))
+            .is_ok()
+    );
+}

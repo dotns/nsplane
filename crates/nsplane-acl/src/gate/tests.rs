@@ -89,6 +89,7 @@ fn scope(id: &str, mode: GateMode, grants: Vec<GateGrant>) -> GateScope {
         mode,
         local: vec![IpAddr::V4(LOCAL)],
         bindings: vec![binding(PEER, REMOTE, &["remote"])],
+        unbound_addresses: Vec::new(),
         grants,
         unbound: Vec::new(),
     }

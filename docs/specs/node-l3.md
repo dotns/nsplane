@@ -364,6 +364,7 @@ GateScope {
             format!("o/{net}/{}", b.owner_id),         // owner label
         ] + live_label(n, b)),                         // 3.5
     })).collect(),
+    unbound_addresses: unbound_addresses(n),           // keys without a PeerId, below
     grants: grants(n),                                 // 3.3 .. 3.5
     unbound: unbound(n),                               // 3.7
 }
@@ -378,7 +379,14 @@ Label scheme (product strings; nsplane never parses them):
 | `l/<network>/<node>` | only bindings of `node` that are live (2.3.1) in an enforced Network | Subnet admission grants (3.5) |
 
 A key that ns cannot map to a `PeerId` (the peer is not on the engine) carries no
-traffic, so leaving its binding out is equivalent. Several bindings of one key (several
+traffic, so its binding is left out. Its address still belongs to the Network: ns lists
+it in `GateScope::unbound_addresses`, namely the addresses of the snapshot's bindings
+whose key has no `PeerId`, minus the addresses another binding of the snapshot holds under
+a key with a `PeerId` (the gate rejects an address that is both, `ConflictingAddress`).
+The gate then treats them as the old gate treated a Node address without a usable binding:
+an outbound packet to one (malformed or not) is `Unbound` (old `source_binding`) or
+`Malformed` under the scope's mode, an inbound packet from one is `Unbound` as before, and
+the filter never offers a divert candidate from one. Several bindings of one key (several
 Nodes) are several `GateBinding`s with the same `peer`.
 
 ### 3.3 Grant list and ids
@@ -493,7 +501,7 @@ a peer that an unbound rule of that scope names follows its first fragment's pas
 disposition or is `OrphanFragment`, which equals the old carrier rule since every carrier
 is in a divert rule. `GateFilter::with_divert(divert)` replaces `with_divert(sink)`; the
 filter offers a denial when the source is no local or binding address of any scope, which
-is the old "no Node address of any Network" check (see 4.4 for bindings left out). The
+is the old "no Node address of any Network" check (unbound addresses, 3.2, included). The
 consumer maps the candidate:
 
 | Old | New |
@@ -684,17 +692,13 @@ by the compile procedure or stated as a difference:
   listeners and markers) keeps them, at most 30 s; a later fragment is then `valid_state` or
   passed where the old gate said `orphan_fragment`. A withdrawal removes the unbound rules,
   which changes the scope, so the "re-install within 30 s" case stays closed.
-- **Divert source check** — reproduced. The merged filter refuses a source that is a local or
-  binding address of any scope, which is the old "no Node address of any Network" check
-  (design note 5.4).
-- **Bindings left out for keys without a `PeerId`** (3.2) — difference, found by C5. Their
-  addresses are no binding address of the gate. Inbound nothing changes (a packet from such
-  an address to a local address is still `Unbound`). Outbound to such an address, an
-  outbound malformed packet to it, and a divert candidate from it differ: old `source_binding`
-  / `malformed_packet` under the Network's mode and no candidate; new `Pass` (or the
-  decision of another scope binding the address) and a candidate. ns can keep the old
-  verdicts by emitting the address in an outbound `HoldRule` (enforced in every mode) or by
-  binding it under a `PeerId` its engine never assigns.
+- **Divert source check** — reproduced. The merged filter refuses a source that is a local,
+  binding or unbound address of any scope, which is the old "no Node address of any
+  Network" check (design note 5.4).
+- **Bindings left out for keys without a `PeerId`** — reproduced through
+  `GateScope::unbound_addresses` (3.2): outbound and outbound malformed packets to those
+  addresses keep the old denial under the Network's mode, and no divert candidate comes
+  from them.
 - **Outbound malformed packets** (O4) — reproduced. The gate keeps the old rule: an outbound
   packet whose header is unparsable but whose addresses are readable takes the mode of the
   scopes holding its destination as a binding address (not of the scopes whose `local`

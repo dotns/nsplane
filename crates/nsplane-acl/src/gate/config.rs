@@ -91,6 +91,15 @@ pub struct GateScope {
     pub local: Vec<IpAddr>,
     /// The remote sources bound to the scope.
     pub bindings: Vec<GateBinding>,
+    /// Remote addresses that belong to the scope without a peer binding:
+    /// outbound packets to them (malformed ones included) are
+    /// [`GateReason::Unbound`](super::GateReason::Unbound) (or
+    /// [`GateReason::Malformed`](super::GateReason::Malformed)) under the
+    /// scope's mode, and no packet from them is offered to a
+    /// [`GateDivert`](super::GateDivert). Inbound packets from them are
+    /// unbound anyway. An address must not be listed twice nor also be a
+    /// binding address of the scope. Empty by default.
+    pub unbound_addresses: Vec<IpAddr>,
     /// Accept-only grants for new flows, in precedence order.
     pub grants: Vec<GateGrant>,
     /// What happens to unbound inbound packets of designated peers.
@@ -281,12 +290,22 @@ pub enum GatePolicyError {
         /// Why it is invalid.
         reason: String,
     },
+    /// An address listed twice in a scope's
+    /// [`GateScope::unbound_addresses`], or listed there and as a binding
+    /// address of the same scope.
+    #[error("gate scope '{scope}' lists {address} twice among its unbound and binding addresses")]
+    ConflictingAddress {
+        /// The scope.
+        scope: ScopeId,
+        /// The address.
+        address: IpAddr,
+    },
     /// An IPv6 address or prefix: the gate handles IPv4 only.
     #[error("IPv6 entry {value} in {field}: the flow gate handles IPv4 only")]
     Ipv6 {
         /// The policy field (`local`, `bindings.addresses`,
-        /// `grants.destinations`, `holds.local`, `holds.remote` or
-        /// `holds.release`).
+        /// `unbound_addresses`, `grants.destinations`, `holds.local`,
+        /// `holds.remote` or `holds.release`).
         field: &'static str,
         /// The entry.
         value: String,

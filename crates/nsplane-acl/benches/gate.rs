@@ -163,6 +163,7 @@ fn policy(same_owner: bool, grants: Vec<GateGrant>) -> GatePolicy {
                     "owner:unrelated",
                 ),
             ],
+            unbound_addresses: Vec::new(),
             grants,
             unbound: Vec::new(),
         }],

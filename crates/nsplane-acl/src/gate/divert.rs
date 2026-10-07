@@ -67,7 +67,8 @@ impl FlowGate {
     /// The divert candidate of an enforced inbound denial: a TCP or UDP
     /// packet matching an [`UnboundAction::Divert`] rule for `peer` of the
     /// one enforcing scope governing its destination, whose source is no
-    /// local or binding address of any scope and that no hold matches.
+    /// local, binding or unbound address of any scope and that no hold
+    /// matches.
     pub(super) fn divert_candidate(&self, peer: PeerId, packet: &[u8]) -> Option<DivertedPacket> {
         let meta = PacketMeta::parse(packet)?;
         if !matches!(meta.protocol, 6 | 17) {

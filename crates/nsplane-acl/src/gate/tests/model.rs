@@ -117,11 +117,19 @@ fn random_scope(rng: &mut Rng, index: usize) -> GateScope {
             protocols: random_protocols(rng),
         })
         .collect();
+    // Remote addresses of the scope without a binding: any remote address
+    // this scope does not bind (another scope may bind it).
+    let unbound_addresses = REMOTES
+        .iter()
+        .filter(|ip| !seen.iter().any(|(_, bound)| bound == *ip) && rng.chance(25))
+        .map(|ip| IpAddr::V4(*ip))
+        .collect();
     GateScope {
         id: format!("s{index}").into(),
         mode,
         local,
         bindings,
+        unbound_addresses,
         grants,
         unbound,
     }
@@ -681,10 +689,11 @@ impl Model {
             model
                 .active()
                 .filter(|scope| {
-                    scope
-                        .bindings
-                        .iter()
-                        .any(|b| b.addresses.contains(&IpAddr::V4(remote)))
+                    scope.unbound_addresses.contains(&IpAddr::V4(remote))
+                        || scope
+                            .bindings
+                            .iter()
+                            .any(|b| b.addresses.contains(&IpAddr::V4(remote)))
                 })
                 .cloned()
                 .collect()
@@ -1022,8 +1031,9 @@ impl Model {
 
 // ── The test ─────────────────────────────────────────────────────────────────
 
-/// Run one seeded sequence; every decision seen is added to `seen`.
-fn run(seed: u64, seen: &mut std::collections::HashSet<String>) {
+/// Run one seeded sequence; every decision seen is added to `seen`. Without
+/// `unbound_addresses` every generated scope has that list emptied.
+fn run(seed: u64, seen: &mut std::collections::HashSet<String>, unbound_addresses: bool) {
     let mut rng = Rng(seed);
     let start = Instant::now();
     let clock = Arc::new(Mutex::new(start));
@@ -1040,7 +1050,12 @@ fn run(seed: u64, seen: &mut std::collections::HashSet<String>) {
     for step in 0..STEPS {
         match rng.below(20) {
             0 => {
-                let policy = next_policy(&mut rng, &model.policy);
+                let mut policy = next_policy(&mut rng, &model.policy);
+                if !unbound_addresses {
+                    for scope in &mut policy.scopes {
+                        scope.unbound_addresses.clear();
+                    }
+                }
                 gate.replace(policy.clone())
                     .expect("generated policies are valid");
                 model.replace(policy);
@@ -1096,7 +1111,7 @@ fn run(seed: u64, seen: &mut std::collections::HashSet<String>) {
 fn the_gate_matches_the_reference_model() {
     let mut seen = std::collections::HashSet::new();
     for seed in 0..SEEDS {
-        run(seed, &mut seen);
+        run(seed, &mut seen, true);
     }
     let reasons = [
         GateReason::ValidState,
@@ -1121,4 +1136,14 @@ fn the_gate_matches_the_reference_model() {
         seen.contains("pass") && seen.contains("observe:granted"),
         "{seen:?}"
     );
+}
+
+/// Policies that never list unbound addresses behave as before the field
+/// existed.
+#[test]
+fn the_gate_matches_the_reference_model_without_unbound_addresses() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, false);
+    }
 }

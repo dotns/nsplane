@@ -23,7 +23,7 @@ pub(super) struct Snapshot {
     by_binding: FastMap<BindingKey, Vec<usize>>,
     /// Scope indexes governing a local address.
     by_local: FastMap<Ipv4Addr, Vec<usize>>,
-    /// Scope indexes holding an address as a binding address.
+    /// Scope indexes holding an address as a binding or unbound address.
     by_remote: FastMap<Ipv4Addr, Vec<usize>>,
     /// The slot of every scope id.
     pub(super) slots: FastMap<ScopeId, Slot>,
@@ -53,6 +53,9 @@ impl Snapshot {
             for binding in scope.bindings.keys() {
                 by_binding.entry(*binding).or_default().push(index);
                 push_once(by_remote.entry(binding.ip).or_default(), index);
+            }
+            for ip in &scope.unbound_addresses {
+                push_once(by_remote.entry(*ip).or_default(), index);
             }
         }
         let slots = policy
@@ -92,12 +95,12 @@ impl Snapshot {
         self.resolve(self.by_local.get(&ip))
     }
 
-    /// Scopes holding `ip` as a binding address.
+    /// Scopes holding `ip` as a binding or unbound address.
     pub(super) fn with_remote(&self, ip: Ipv4Addr) -> impl Iterator<Item = &CompiledScope> {
         self.resolve(self.by_remote.get(&ip))
     }
 
-    /// Whether `ip` is a local or binding address of any scope.
+    /// Whether `ip` is a local, binding or unbound address of any scope.
     pub(super) fn is_scope_address(&self, ip: Ipv4Addr) -> bool {
         self.by_local.contains_key(&ip) || self.by_remote.contains_key(&ip)
     }

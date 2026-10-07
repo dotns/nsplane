@@ -141,13 +141,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `evaluate_inbound` / `evaluate_outbound(PeerId, &[u8]) -> GateDecision`, `find_flow(remote,
   local, Protocol) -> Option<LiveFlow>`, `counters`). A `GatePolicy` is `GateScope`s (`ScopeId`,
   `GateMode::{Off, Observe, Enforce}`, local addresses, `GateBinding`s from `PeerId` and remote
-  addresses to a `LabelSet`, accept-only `GateGrant`s with direction, labels, destinations,
+  addresses to a `LabelSet`, `unbound_addresses` (remote addresses of the scope without a
+  `PeerId` binding: outbound packets to them are denied `Unbound` under the scope's mode and
+  no divert candidate comes from them; default empty), accept-only `GateGrant`s with
+  direction, labels, destinations,
   `ProtocolMatch`es and `suspended`, and `UnboundRule`s with `UnboundAction::{Pass, Divert}`)
   plus `GateHolds` (`HoldRule`s and `release` pairs), replaced atomically; flows of unchanged
   scopes are kept and those of changed scopes re-authorized. `GateConfig` (`GateLimits`,
   `GateTimeouts`; the defaults are the former constants), `GateDecision::{Pass, Observe,
   Enforce}` with `GateReason` and the admitting `RuleId`, `GateCounters`, `GatePolicyError`
-  (IPv6 entries are rejected: the gate handles IPv4 only). `GateFilter` (`new`, `with_acl`,
+  (IPv6 entries are rejected: the gate handles IPv4 only; `ConflictingAddress` for an unbound
+  address listed twice or also bound in its scope). `GateFilter` (`new`, `with_acl`,
   `with_acl_outbound`, `with_divert`, `gate`, `stats` / `GateFilterStats`) composes it with an
   `AclFilter`; `GateDivert` takes the `DivertedPacket`s (`generation`, `peer`, `scope`, `rule`,
   `packet`, `into_packet`) of `UnboundAction::Divert` rules. Bench `cargo bench -p nsplane-acl

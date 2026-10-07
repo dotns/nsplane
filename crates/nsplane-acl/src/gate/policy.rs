@@ -113,6 +113,8 @@ pub(super) struct CompiledScope {
     pub(super) enforce: bool,
     pub(super) local: Box<[Ipv4Addr]>,
     pub(super) bindings: FastMap<BindingKey, LabelSet>,
+    /// Remote addresses of the scope without a binding.
+    pub(super) unbound_addresses: Box<[Ipv4Addr]>,
     pub(super) grants: Box<[CompiledGrant]>,
     pub(super) unbound: Box<[CompiledUnbound]>,
     /// The scope as given, to detect a changed scope on the next replace.
@@ -342,6 +344,17 @@ fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
             }
         }
     }
+    let mut unbound_addresses: Vec<Ipv4Addr> = Vec::new();
+    for address in &scope.unbound_addresses {
+        let ip = ipv4(*address, "unbound_addresses")?;
+        if unbound_addresses.contains(&ip) || bindings.keys().any(|binding| binding.ip == ip) {
+            return Err(GatePolicyError::ConflictingAddress {
+                scope: scope.id.clone(),
+                address: *address,
+            });
+        }
+        unbound_addresses.push(ip);
+    }
     let grants = scope
         .grants
         .iter()
@@ -358,6 +371,7 @@ fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
         enforce: scope.mode == GateMode::Enforce,
         local,
         bindings,
+        unbound_addresses: unbound_addresses.into(),
         grants,
         unbound,
         source: scope,

@@ -72,7 +72,8 @@
 //! [`GateHolds::release`]; grants of [`Direction::Outbound`](crate::Direction)
 //! check `destinations` against `remote`; there are no unbound rules; and an
 //! unbound or malformed packet takes the mode of the scopes holding `remote`
-//! as a binding address (a packet to another destination passes).
+//! as a binding address or in [`GateScope::unbound_addresses`] (a packet to
+//! another destination passes).
 //!
 //! Decisions take each scope's mode: [`GateMode::Observe`] gives
 //! [`GateDecision::Observe`] and [`GateMode::Enforce`] gives
