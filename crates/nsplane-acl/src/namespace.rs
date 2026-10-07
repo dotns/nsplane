@@ -1,8 +1,10 @@
-//! Rule namespaces: per-source policies, their members, outbound rules and
-//! directed grants between namespaces.
+//! Rule namespaces: per-source policies, their member labels, outbound rules
+//! and directed grants between namespaces.
 //!
-//! A namespace is the rule set one peer source (an NSD, the Quick allow list,
-//! an app session) contributes. The [`AclEngine`](crate::AclEngine) stores
+//! A namespace is the rule set one source of peers contributes; its members
+//! are source [`Label`]s. A [`NamespaceKind::Pinholes`] namespace carries no
+//! rules: its members get access only through pinholes. The
+//! [`AclEngine`](crate::AclEngine) stores
 //! namespaces with [`store_namespace`](crate::AclEngine::store_namespace) and
 //! grants with [`store_grant`](crate::AclEngine::store_grant); the
 //! [`AclFilter`](crate::AclFilter) enforces them. See the crate docs for the
@@ -17,12 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::net::IpNet;
 use crate::policy::AclPolicy;
+use crate::rules::Label;
 
-/// The identifier of a rule namespace, e.g. `"nsd:<uuid>"`, `"quick"` or
-/// `"app:<session>"`.
-///
-/// Identifiers starting with `app:` name app namespaces (see
-/// [`is_app`](Self::is_app)).
+/// The opaque identifier of a rule namespace, e.g. `"team-a"`. nsplane
+/// compares identifiers for equality and never interprets them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NamespaceId(Arc<str>);
 
@@ -31,16 +31,6 @@ impl NamespaceId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// Whether this is an app namespace (the identifier starts with `app:`).
-    ///
-    /// App namespaces never widen permissions on their own: they carry no
-    /// accept rules and allow no app pinholes, and their members get access
-    /// only through pinholes.
-    #[must_use]
-    pub fn is_app(&self) -> bool {
-        self.0.starts_with("app:")
     }
 }
 
@@ -68,16 +58,28 @@ impl Borrow<str> for NamespaceId {
     }
 }
 
-/// A peer that belongs to a namespace.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// How a namespace governs its members.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NamespaceKind {
+    /// Members are governed by the namespace's rules.
+    #[default]
+    Rules,
+    /// No rules: members get access only through pinholes. Such a namespace
+    /// never widens permissions on its own: it carries no accept rules and no
+    /// [`pinhole_kinds`](NamespacePolicy::pinhole_kinds), and no grant can
+    /// name it.
+    Pinholes,
+}
+
+/// A member of a namespace: a source label and the addresses it owns.
+///
+/// Every source carrying `label` is a member of the namespace.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NamespaceMember {
-    /// The peer's principal: its source anchor
-    /// ([`SourceAssertion::source_anchor`](crate::SourceAssertion::source_anchor)),
-    /// e.g. [`wg_peer_anchor`](crate::wg_peer_anchor) = `key:<hex>`.
-    #[serde(default)]
-    pub principal: String,
-    /// The peer's tunnel addresses (its `node6` /128 etc.), used to resolve a
-    /// destination address to this peer.
+    /// The member label, e.g. `"host:web"`.
+    pub label: Label,
+    /// The addresses the member owns, used to resolve a destination address
+    /// to this member label.
     #[serde(default, with = "ip_nets")]
     pub addresses: Vec<IpNet>,
 }
@@ -98,7 +100,11 @@ pub struct OutboundRule {
 /// The policy of one namespace.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct NamespacePolicy {
-    /// The peers belonging to the namespace.
+    /// How the namespace governs its members. Default
+    /// [`NamespaceKind::Rules`].
+    #[serde(default)]
+    pub kind: NamespaceKind,
+    /// The member labels of the namespace.
     #[serde(default)]
     pub members: Vec<NamespaceMember>,
     /// The accept rules applying between the namespace's members and the
@@ -107,27 +113,29 @@ pub struct NamespacePolicy {
     pub policy: AclPolicy,
     /// `None`: outbound traffic to the members is unrestricted. `Some(rules)`:
     /// outbound traffic to the members is restricted to these rules (plus
-    /// replies to accepted inbound flows). A peer is restricted only when every
-    /// namespace it belongs to opts in.
+    /// replies to accepted inbound flows). A source is restricted only when
+    /// every namespace it belongs to opts in.
     #[serde(default)]
     pub outbound: Option<Vec<OutboundRule>>,
-    /// App kinds (e.g. `"transfer"`) for which pinholes may be opened to the
-    /// namespace's members. Empty (the default) denies every app.
+    /// Pinhole kinds (opaque, e.g. `"transfer"`) that may be opened for the
+    /// namespace's members in a [`NamespaceKind::Pinholes`] namespace. Empty
+    /// (the default) permits none. Must be empty on a `Pinholes` namespace.
     #[serde(default)]
-    pub allow_app_pinholes: BTreeSet<String>,
+    pub pinhole_kinds: BTreeSet<String>,
 }
 
 /// One end of a directed [`Grant`].
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum GrantEnd {
-    /// Every member of a namespace.
+    /// Every member of a [`NamespaceKind::Rules`] namespace.
     Namespace(NamespaceId),
-    /// One peer, by principal.
-    Peer(String),
+    /// One label: as the source end, a source carrying it; as the
+    /// destination end, the destination address owned by this member label.
+    Label(Label),
 }
 
-/// A directed grant letting peers of one namespace (or one peer) reach peers
-/// of another across the default cross-namespace deny.
+/// A directed grant letting the members of one namespace (or one label)
+/// reach those of another across the default cross-namespace deny.
 ///
 /// Grants are one-way: traffic from `to` to `from` needs its own grant.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -157,19 +165,19 @@ impl<'de> Deserialize<'de> for NamespaceId {
 }
 
 /// Serde for `Vec<IpNet>` as a list of CIDR strings.
-mod ip_nets {
+pub(crate) mod ip_nets {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     use crate::net::IpNet;
 
-    pub(super) fn serialize<S: Serializer>(
+    pub(crate) fn serialize<S: Serializer>(
         nets: &[IpNet],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(nets.iter().map(ToString::to_string))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<IpNet>, D::Error> {
         Vec::<String>::deserialize(deserializer)?
@@ -188,29 +196,32 @@ mod tests {
 
     #[test]
     fn namespace_id_basics() {
-        let id = NamespaceId::from("app:s1");
-        assert!(id.is_app());
-        assert_eq!(id.as_str(), "app:s1");
-        assert_eq!(id.to_string(), "app:s1");
-        assert!(!NamespaceId::from(String::from("quick")).is_app());
-        assert!(!NamespaceId::from("nsd:app:x").is_app());
+        let id = NamespaceId::from("team-a");
+        assert_eq!(id.as_str(), "team-a");
+        assert_eq!(id.to_string(), "team-a");
+        assert_eq!(NamespaceId::from(String::from("team-a")), id);
     }
 
     #[test]
     fn namespace_policy_serde_defaults() {
         let policy: NamespacePolicy = serde_json::from_str(
-            r#"{"members": [{"principal": "key:00", "addresses": ["fd00::1", "10.0.0.0/24"]}]}"#,
+            r#"{"members": [{"label": "host:web", "addresses": ["fd00::1", "10.0.0.0/24"]}]}"#,
         )
         .unwrap();
+        assert_eq!(policy.kind, NamespaceKind::Rules);
+        assert_eq!(policy.members[0].label, Label::from("host:web"));
         assert_eq!(policy.members[0].addresses.len(), 2);
         assert!(policy.outbound.is_none());
-        assert!(policy.allow_app_pinholes.is_empty());
+        assert!(policy.pinhole_kinds.is_empty());
         assert!(policy.policy.acls.is_empty());
 
         let json = serde_json::to_string(&policy).unwrap();
         assert!(json.contains("\"fd00::1/128\""), "{json}");
         let back: NamespacePolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.members[0].addresses, policy.members[0].addresses);
+        let pinholes: NamespacePolicy =
+            serde_json::from_str(r#"{"kind": "Pinholes", "pinhole_kinds": []}"#).unwrap();
+        assert_eq!(pinholes.kind, NamespaceKind::Pinholes);
 
         assert!(
             serde_json::from_str::<NamespacePolicy>(r#"{"members": [{"addresses": ["x"]}]}"#)
@@ -222,7 +233,7 @@ mod tests {
     fn grant_serde_round_trip() {
         let grant = Grant {
             from: GrantEnd::Namespace("quick".into()),
-            to: GrantEnd::Peer("key:01".to_owned()),
+            to: GrantEnd::Label("team-a".into()),
             proto: Some("tcp".to_owned()),
             ports: None,
         };

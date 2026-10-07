@@ -16,15 +16,17 @@ use std::time::{Duration, Instant};
 use nsplane::{AllowedIp, ChannelTransport, Event, PeerId, TransportId};
 use nsplane_acl::{
     AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, GatewayConsumerPacket,
-    GatewayConsumerSink, NODE_L3_SCHEMA_VERSION, NamespaceMember, NamespacePolicy, NodeL3Config,
-    NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
+    GatewayConsumerSink, Label, LabelSet, NODE_L3_SCHEMA_VERSION, NamespaceMember, NamespacePolicy,
+    NodeL3Config, NodeL3Decision, NodeL3Filter, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node,
     NodeL3PeerBinding, NodeL3PeerPolicyRequirement, NodeL3Reason, NodeL3Resource,
     NodeL3ServiceEndpoint, NodeL3ServiceProtocol, NodeL3Transport, NodeL3TransportPeer,
-    OutboundRule, PeerIdentityMap, PeerKeyMap, SourceAssertion, reasons, wg_peer_anchor,
+    OutboundRule, PeerKeyMap, PeerLabelMap, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, tcp, udp};
 
 /// Capacity of the channel transport pair.
+/// The ACL label of `a`.
+const A_LABEL: &str = "node-a";
 const CAPACITY: usize = 1024;
 /// The machine `b`'s gate is bound to.
 const MACHINE: &str = "machine-b";
@@ -105,7 +107,7 @@ async fn l3_pair(
     configure: impl FnOnce(NodeL3Filter) -> NodeL3Filter,
 ) -> TestResult<(L3Node, L3Node, L3)> {
     let keys = Arc::new(PeerKeyMap::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let acl = with_acl.then(|| {
         let engine = Arc::new(AclEngine::new());
         let filter = AclFilter::with_config(
@@ -150,7 +152,7 @@ async fn l3_pair(
     let a_key = a.public().to_bytes();
     let peer_a = b.peer_of(&a).await?;
     keys.insert(peer_a, a_key);
-    identities.insert(peer_a, SourceAssertion::WgPeerKey { pubkey: a_key });
+    identities.insert(peer_a, LabelSet::new([Label::from(A_LABEL)]));
     Ok((
         a,
         b,
@@ -756,7 +758,7 @@ async fn the_acl_outbound_runs_only_when_opted_in() -> TestResult {
             "nsd:a",
             NamespacePolicy {
                 members: vec![NamespaceMember {
-                    principal: wg_peer_anchor(&l3.a_key),
+                    label: Label::from(A_LABEL),
                     addresses: vec![format!("{}/32", a.ip4).parse()?],
                 }],
                 outbound: Some(vec![OutboundRule {

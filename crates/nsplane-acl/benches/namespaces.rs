@@ -1,20 +1,22 @@
 //! Per-packet cost of the `AclFilter`, inbound and outbound, with the default policy only and
 //! with rule namespaces, grants and pinholes.
 //!
-//! - `default`: no namespaces; a peer in no namespace is evaluated against a few-rule default
-//!   policy. `default/outbound_source_scope` adds an outbound source constraint
-//!   (`AclFilterScope::outbound_sources`) the packet passes.
-//! - `namespaces`: 8 source namespaces of 64 members each (one restricting outbound traffic), 4
-//!   grants and 16 pinholes in one app namespace.
-//! - `bypass`: one namespace of 64 members accepting everything (a Quick-style namespace), so its
-//!   members bypass the evaluation.
-//! - `by_source`: the `default` policy for a peer terminating by source address, whose principal
-//!   is each packet's source address.
+//! - `default`: no namespaces; a peer in no namespace is evaluated against a three-rule default
+//!   rule set (two prefix rules that also need the address label `addr`, which the `k<i>`
+//!   labelled peers do not carry). `default/outbound_source_scope` adds an outbound source
+//!   constraint (`AclFilterScope::outbound_sources`) the packet passes.
+//! - `namespaces`: 8 rule namespaces of 64 member labels each (one restricting outbound
+//!   traffic), 4 grants and 16 pinholes in one pinhole namespace.
+//! - `bypass`: one namespace of 64 members accepting everything, so its members bypass the
+//!   evaluation.
+//! - `by_source`: the `default` rules for a peer labelled per source address
+//!   (`PeerLabelMap::insert_by_source`), resolved per packet source address.
 //! - `other`: the `default` policy and an `ICMPv6` echo request to the local address accepted by
 //!   an other-protocol scope rule (`AclFilterScope::other_protocols`).
 //! - `crates_acl`: the ns `crates/acl` preset (`AclFilterConfig::crates_acl`: allow-only IPv4
-//!   fragments, the bypass flags on) for a by-source peer sending IPv4 TCP to another address
-//!   than the local one, and a non-first fragment of a datagram whose first fragment it accepted.
+//!   fragments, the bypass flags on) for a peer with the address label sending IPv4 TCP to another
+//!   address than the local one, and a non-first fragment of a datagram whose first fragment it
+//!   accepted.
 //!
 //! `floor` measures what every packet pays before the filter's tables: parsing the five-tuple
 //! and loading the engine snapshot.
@@ -25,15 +27,16 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::{
     AclAction, AclEngine, AclFilter, AclFilterConfig, AclFilterScope, AclPolicy, AclRule,
-    Direction, Grant, GrantEnd, NamespaceMember, NamespacePolicy, OtherProtocol, OtherProtocolRule,
-    OutboundRule, PeerIdentityMap, PinholeGuard, PinholeSpec, Protocol, SourceAssertion,
-    wg_peer_anchor,
+    Direction, Grant, GrantEnd, Label, LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy,
+    OtherProtocol, OtherProtocolRule, OutboundRule, PeerLabelMap, PinholeGuard, PinholeSpec,
+    PortSet, Protocol, ProtocolMatch, Rule, RuleSet,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{IpPacket, PacketBuf, PeerId};
@@ -49,15 +52,13 @@ fn peer(ns: u16, i: u16) -> PeerId {
     PeerId::new(u32::from(ns) * u32::from(MEMBERS) + u32::from(i) + 1)
 }
 
-fn key(peer: PeerId) -> [u8; 32] {
-    let mut key = [0; 32];
-    key[..4].copy_from_slice(&peer.get().to_be_bytes());
-    key
+/// The label of `peer`.
+fn label(peer: PeerId) -> Label {
+    Label::from(format!("k{}", peer.get()))
 }
 
-fn principal(peer: PeerId) -> String {
-    wg_peer_anchor(&key(peer))
-}
+/// The address label: what the default rules' prefix rules require.
+const ADDRESS: &str = "addr";
 
 /// The tunnel address of member `i` of namespace `ns`.
 const fn address(ns: u16, i: u16) -> Ipv6Addr {
@@ -119,12 +120,40 @@ fn policy() -> AclPolicy {
     }
 }
 
-fn identity() -> Arc<PeerIdentityMap> {
-    let map = Arc::new(PeerIdentityMap::new());
+/// [`policy`] as typed rules: the prefix rules also need the address label.
+fn default_rules() -> RuleSet {
+    let address = || [Label::from(ADDRESS)];
+    let rules = RuleSet::new([
+        Rule::new("0", vec![ProtocolMatch::Tcp(PortSet::list([80, 443]))])
+            .with_labels(address())
+            .with_sources("10.0.0.0/8".parse()),
+        Rule::new(
+            "1",
+            vec![ProtocolMatch::Tcp(PortSet::Ranges(vec![
+                RangeInclusive::new(8000, 8999),
+            ]))],
+        )
+        .with_labels(address())
+        .with_sources("fd00:ffff::/32".parse()),
+        Rule::new("2", vec![ProtocolMatch::Tcp(PortSet::single(22))]),
+    ]);
+    assert!(rules.is_ok());
+    rules.unwrap_or_else(|_| RuleSet::empty())
+}
+
+/// An engine with [`default_rules`] installed.
+fn default_engine() -> Arc<AclEngine> {
+    let engine = Arc::new(AclEngine::new());
+    engine.install(default_rules());
+    engine
+}
+
+fn identity() -> Arc<PeerLabelMap> {
+    let map = Arc::new(PeerLabelMap::new());
     for ns in 0..NAMESPACES {
         for i in 0..MEMBERS {
             let peer = peer(ns, i);
-            map.insert(peer, SourceAssertion::WgPeerKey { pubkey: key(peer) });
+            map.insert(peer, LabelSet::new([label(peer)]));
         }
     }
     map
@@ -137,7 +166,7 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
         let namespace = NamespacePolicy {
             members: (0..MEMBERS)
                 .map(|i| NamespaceMember {
-                    principal: principal(peer(ns, i)),
+                    label: label(peer(ns, i)),
                     addresses: address(ns, i).to_string().parse().into_iter().collect(),
                 })
                 .collect(),
@@ -148,7 +177,8 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
                     ports: "80,443".to_owned(),
                 }]
             }),
-            allow_app_pinholes: ["transfer".to_owned()].into(),
+            pinhole_kinds: ["transfer".to_owned()].into(),
+            ..NamespacePolicy::default()
         };
         assert!(
             engine
@@ -166,30 +196,31 @@ fn namespaces_engine() -> (Arc<AclEngine>, Vec<PinholeGuard>) {
         assert!(engine.store_grant(format!("g{g}"), grant).is_ok());
     }
     let session: Vec<PeerId> = (0..PINHOLES).map(|i| peer(i % NAMESPACES, i)).collect();
-    let app = NamespacePolicy {
+    let sessions = NamespacePolicy {
+        kind: NamespaceKind::Pinholes,
         members: session
             .iter()
             .map(|&peer| NamespaceMember {
-                principal: principal(peer),
+                label: label(peer),
                 addresses: Vec::new(),
             })
             .collect(),
         ..NamespacePolicy::default()
     };
-    assert!(engine.store_namespace("app:bench", app).is_ok());
+    assert!(engine.store_namespace("sessions", sessions).is_ok());
     let expires_at = Instant::now() + Duration::from_secs(3600);
     let guards = session
         .iter()
         .map(|&peer| {
             let spec = PinholeSpec {
-                peer: principal(peer),
+                label: label(peer),
                 kind: "transfer".to_owned(),
                 protocol: Protocol::Tcp,
                 direction: Direction::Inbound,
                 dst_port: 9000,
                 expires_at,
             };
-            engine.open_pinhole("app:bench", spec)
+            engine.open_pinhole("sessions", spec)
         })
         .collect::<Result<Vec<_>, _>>();
     assert!(guards.is_ok());
@@ -264,7 +295,7 @@ fn bypass_engine() -> Arc<AclEngine> {
     let quick = NamespacePolicy {
         members: (0..MEMBERS)
             .map(|i| NamespaceMember {
-                principal: principal(peer(0, i)),
+                label: label(peer(0, i)),
                 addresses: address(0, i).to_string().parse().into_iter().collect(),
             })
             .collect(),
@@ -290,10 +321,8 @@ fn bench_namespaces(c: &mut Criterion) {
     let last_addr = address(NAMESPACES - 1, MEMBERS - 1);
     let restricted_addr = address(0, MEMBERS - 1);
 
-    // (a) The default policy only.
-    let engine = Arc::new(AclEngine::new());
-    assert!(engine.load(policy()).is_ok());
-    let filter = AclFilter::new(engine, identity());
+    // (a) The default rules only.
+    let filter = AclFilter::new(default_engine(), identity());
     let inbound = tcp(last_addr, 40000, LOCAL, 22);
     bench_packet(c, "default/inbound", &filter, last, true, &inbound);
     bench_established(
@@ -395,8 +424,7 @@ fn bench_source_scope(c: &mut Criterion) {
         peer(NAMESPACES - 1, MEMBERS - 1),
         address(NAMESPACES - 1, MEMBERS - 1),
     );
-    let engine = Arc::new(AclEngine::new());
-    assert!(engine.load(policy()).is_ok());
+    let engine = default_engine();
     let scope = AclFilterScope::new().with_outbound_sources(
         ["fd00:ffff::/32", "10.0.0.0/8"]
             .iter()
@@ -421,8 +449,7 @@ fn bench_other_scope(c: &mut Criterion) {
         peer(NAMESPACES - 1, MEMBERS - 1),
         address(NAMESPACES - 1, MEMBERS - 1),
     );
-    let engine = Arc::new(AclEngine::new());
-    assert!(engine.load(policy()).is_ok());
+    let engine = default_engine();
     let rule = OtherProtocolRule::new(OtherProtocol::IcmpEcho, format!("{LOCAL}/128").parse());
     let scope = AclFilterScope::new().with_other_protocol(rule);
     let filter = AclFilter::with_scope(engine, identity(), AclFilterConfig::default(), scope);
@@ -441,12 +468,16 @@ fn bench_by_source(c: &mut Criterion) {
         address(NAMESPACES - 1, MEMBERS - 1),
     );
 
-    // The default policy for a peer terminating by source address.
-    let engine = Arc::new(AclEngine::new());
-    assert!(engine.load(policy()).is_ok());
-    let by_source = Arc::new(PeerIdentityMap::new());
-    by_source.insert_by_source(last);
-    let filter = AclFilter::new(engine, Arc::clone(&by_source));
+    // The default rules for a peer labelled per source address.
+    let by_source = Arc::new(PeerLabelMap::new());
+    let prefix = "fd00::/16".parse().into_iter();
+    by_source.insert_by_source(
+        last,
+        prefix
+            .map(|net| (net, LabelSet::new([Label::from(ADDRESS)])))
+            .collect(),
+    );
+    let filter = AclFilter::new(default_engine(), by_source);
     let inbound_v6 = tcp(last_addr, 40000, LOCAL, 22);
     bench_packet(c, "by_source/inbound", &filter, last, true, &inbound_v6);
     bench_established(
@@ -458,14 +489,17 @@ fn bench_by_source(c: &mut Criterion) {
         &inbound_v6,
     );
 
-    // The ns `crates/acl` preset for the same peer, IPv4 TCP from 10.0.0.2 to 10.0.0.3:443
-    // (not the local 10.0.0.1), and a non-first fragment after an accepted first fragment. The
-    // engine clock stands still, so the fragment entry never expires.
+    // The ns `crates/acl` preset for the same peer with the address label, IPv4 TCP from
+    // 10.0.0.2 to 10.0.0.3:443 (not the local 10.0.0.1), and a non-first fragment after an
+    // accepted first fragment. The engine clock stands still, so the fragment entry never
+    // expires.
     let now = Instant::now();
     let engine = Arc::new(AclEngine::with_clock(move || now));
-    assert!(engine.load(policy()).is_ok());
+    engine.install(default_rules());
+    let address = Arc::new(PeerLabelMap::new());
+    address.insert(last, LabelSet::new([Label::from(ADDRESS)]));
     let config = AclFilterConfig::crates_acl(Some(Ipv4Addr::new(10, 0, 0, 1)));
-    let filter = AclFilter::with_config(engine, by_source, config);
+    let filter = AclFilter::with_config(engine, address, config);
     let (src, dst) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
     let tcp_v4 = tcp4(src, dst, 443, None);
     bench_packet(c, "crates_acl/inbound", &filter, last, true, &tcp_v4);

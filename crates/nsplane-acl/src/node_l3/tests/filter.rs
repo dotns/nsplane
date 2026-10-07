@@ -33,7 +33,7 @@ use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{Ecn, PacketBuf, Path, PeerId, TransportId};
 
 use super::*;
-use crate::engine::{AclEngine, SourceAssertion, wg_peer_anchor};
+use crate::engine::AclEngine;
 use crate::filter::{AclFilter, AclFilterConfig};
 use crate::namespace::{NamespaceMember, NamespacePolicy, OutboundRule};
 use crate::node_l3::{
@@ -43,6 +43,7 @@ use crate::node_l3::{
 };
 use crate::policy::{AclAction, AclPolicy, AclRule};
 use crate::reasons;
+use crate::rules::{Label, LabelSet};
 use crate::test_packets::udp_packet;
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
@@ -304,11 +305,21 @@ impl GatewayConsumerSink for Queue {
 
 // ── ACLs ─────────────────────────────────────────────────────────────────────
 
+/// The ACL label of the peer with `key`.
+fn key_label(key: &[u8; 32]) -> Label {
+    use std::fmt::Write as _;
+    let hex = key.iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    });
+    Label::from(format!("key:{hex}"))
+}
+
 fn acl_filter(engine: AclEngine) -> AclFilter {
-    let identity = |peer: PeerId| -> Option<SourceAssertion> {
+    let identity = |peer: PeerId| -> Option<LabelSet> {
         KEYS.iter()
             .find(|key| peer_id(**key) == peer)
-            .map(|key| SourceAssertion::WgPeerKey { pubkey: *key })
+            .map(|key| LabelSet::new([key_label(key)]))
     };
     AclFilter::with_config(Arc::new(engine), identity, AclFilterConfig::default())
 }
@@ -348,7 +359,7 @@ fn outbound_restricted_acl() -> AclFilter {
             "nsd:a",
             NamespacePolicy {
                 members: vec![NamespaceMember {
-                    principal: wg_peer_anchor(&PEER),
+                    label: key_label(&PEER),
                     addresses: vec![format!("{REMOTE}/32").parse().unwrap()],
                 }],
                 outbound: Some(vec![OutboundRule {

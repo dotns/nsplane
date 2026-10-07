@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 
 use nsplane::{AllowedIp, ChannelTransport, Event};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, PeerIdentityMap, SourceAssertion,
-    wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, PeerLabelMap,
 };
 use nsplane_e2e::{
     Node, Options, SharedFilter, TestResult, channel_pair_with, introduce, payload, tcp, udp,
@@ -260,7 +259,7 @@ const PEER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 /// reach `SELF_EAM6:acl_port` over UDP; `b` is IPv6-only and runs no filter.
 async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)> {
     let acl_engine = Arc::new(AclEngine::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let acl = AclFilter::new(Arc::clone(&acl_engine), Arc::clone(&identities));
     let port_map = PortMap::new([rule(
         PortMapProtocol::Udp,
@@ -316,16 +315,21 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
             )
             .build()?,
     );
-    identities.insert(
-        peer_b,
-        SourceAssertion::WgPeerKey {
-            pubkey: b.public().to_bytes(),
-        },
-    );
+    // The label the policy's `key:<hex>` source compiles to.
+    let key = b
+        .public()
+        .to_bytes()
+        .iter()
+        .fold(String::from("key:"), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+    identities.insert(peer_b, LabelSet::new([Label::from(key.as_str())]));
     acl_engine.load(AclPolicy {
         acls: vec![AclRule {
             action: AclAction::Accept,
-            src: vec![wg_peer_anchor(&b.public().to_bytes())],
+            src: vec![key],
             dst: vec![format!("{SELF_EAM6}:{acl_port}")],
             proto: Some("udp".to_owned()),
         }],

@@ -1,6 +1,6 @@
 //! The ACL as a per-flow hook, at engine level over in-memory channel transports. Node `b`
-//! runs an `AclFilter` over a shared `AclEngine` and a `PeerIdentityMap` naming its peers'
-//! WireGuard keys as principals; its peers run no filter.
+//! runs an `AclFilter` over a shared `AclEngine` and a `PeerLabelMap` labelling its peers by
+//! their WireGuard keys; its peers run no filter.
 //!
 //! The filter caches each flow's verdict after its first packet. Every test sends a flow
 //! (single UDP packets with the runtime's clock paused) until it is established, changes the
@@ -10,6 +10,7 @@
 //! that re-allowing it restores delivery on the next packet. A peer of a namespace accepting
 //! everything bypasses the evaluation: its traffic is delivered both ways.
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,9 +18,9 @@ use std::time::{Duration, Instant};
 use nsplane::x25519::PublicKey;
 use nsplane::{AllowedIp, ChannelTransport, Event, Path, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd,
-    NamespaceMember, NamespacePolicy, PeerIdentityMap, PinholeSpec, Protocol, SourceAssertion,
-    reasons, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, Label,
+    LabelSet, NamespaceKind, NamespaceMember, NamespacePolicy, PeerLabelMap, PinholeSpec, Protocol,
+    reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, introduce, udp};
 use nsplane_packet::PeerId;
@@ -42,14 +43,14 @@ type AclNode = Node<ChannelTransport>;
 /// The ACL state of `b` the tests keep.
 struct Acl {
     engine: Arc<AclEngine>,
-    identities: Arc<PeerIdentityMap>,
+    identities: Arc<PeerLabelMap>,
     filter: AclFilter,
 }
 
 impl Acl {
     fn new() -> Self {
         let engine = Arc::new(AclEngine::new());
-        let identities = Arc::new(PeerIdentityMap::new());
+        let identities = Arc::new(PeerLabelMap::new());
         let filter = AclFilter::new(Arc::clone(&engine), Arc::clone(&identities));
         Self {
             engine,
@@ -58,14 +59,9 @@ impl Acl {
         }
     }
 
-    /// Names the peer `peer` of `b` by its WireGuard key.
+    /// Labels the peer `peer` of `b` by its WireGuard key.
     fn identify(&self, peer: PeerId, key: &PublicKey) {
-        self.identities.insert(
-            peer,
-            SourceAssertion::WgPeerKey {
-                pubkey: key.to_bytes(),
-            },
-        );
+        self.identities.insert(peer, LabelSet::new([label(key)]));
     }
 }
 
@@ -77,21 +73,28 @@ fn end(id: u16, host: u8) -> (TransportId, SocketAddr) {
     )
 }
 
-/// The principal of a node's key.
-fn principal(key: &PublicKey) -> String {
-    wg_peer_anchor(&key.to_bytes())
+/// The label of a node's key.
+fn label(key: &PublicKey) -> Label {
+    Label::from(
+        key.to_bytes()
+            .iter()
+            .fold(String::from("key:"), |mut text, b| {
+                let _ = write!(text, "{b:02x}");
+                text
+            }),
+    )
 }
 
 /// A namespace member with both tunnel addresses of a node.
 fn member(key: &PublicKey, ip4: Ipv4Addr, ip6: Ipv6Addr) -> TestResult<NamespaceMember> {
     Ok(NamespaceMember {
-        principal: principal(key),
+        label: label(key),
         addresses: vec![format!("{ip4}/32").parse()?, format!("{ip6}/128").parse()?],
     })
 }
 
 /// A namespace with `members` whose rule accepts `dst` (`host:ports`) from anyone over
-/// `proto` (`None`: TCP and UDP), or no rule; app pinholes of `apps` are allowed.
+/// `proto` (`None`: TCP and UDP), or no rule; pinholes of the kinds `apps` are permitted.
 fn namespace(
     members: Vec<NamespaceMember>,
     dst: Option<&str>,
@@ -113,7 +116,7 @@ fn namespace(
             acls,
             ..AclPolicy::default()
         },
-        allow_app_pinholes: apps.iter().map(|app| (*app).to_owned()).collect(),
+        pinhole_kinds: apps.iter().map(|app| (*app).to_owned()).collect(),
         ..NamespacePolicy::default()
     }
 }
@@ -285,7 +288,7 @@ async fn removed_grant_applies_to_the_next_packet() -> TestResult {
     )?;
     let grant = Grant {
         from: GrantEnd::Namespace("quick".into()),
-        to: GrantEnd::Peer(principal(&c.public())),
+        to: GrantEnd::Label(label(&c.public())),
         proto: Some("udp".to_owned()),
         ports: Some(QUICK_PORT.to_string()),
     };
@@ -319,11 +322,14 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
     let mut events = b.subscribe().await?;
     acl.engine.store_namespace("quick", quick(&a, false)?)?;
     acl.engine.store_namespace(
-        "app:s1",
-        namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, None, &[]),
+        "s1",
+        NamespacePolicy {
+            kind: NamespaceKind::Pinholes,
+            ..namespace(vec![member(&a.public(), a.ip4, a.ip6)?], None, None, &[])
+        },
     )?;
     let spec = PinholeSpec {
-        peer: principal(&a.public()),
+        label: label(&a.public()),
         kind: TRANSFER_KIND.to_owned(),
         protocol: Protocol::Udp,
         direction: Direction::Inbound,
@@ -332,11 +338,11 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
     };
     let flow = udp_to(&a, SRC_PORT, b.ip4, APP_PORT);
 
-    let guard = acl.engine.open_pinhole("app:s1", spec.clone())?;
+    let guard = acl.engine.open_pinhole("s1", spec.clone())?;
     established(&a, &mut b, &flow).await?;
     drop(guard);
     dropped(&a, &mut b, &mut events, &flow, reasons::DENIED).await?;
-    let guard = acl.engine.open_pinhole("app:s1", spec)?;
+    let guard = acl.engine.open_pinhole("s1", spec)?;
     delivered(&a, &mut b, &flow).await?;
     drop(guard);
 
@@ -347,7 +353,7 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
     Ok(())
 }
 
-/// `clear_all` drops the established flow on its next packet with `NO_POLICY`; storing the
+/// `clear_all` drops the established flow on its next packet with `POLICY_FAILED`; storing the
 /// namespace again restores it. Forgetting the peer's identity drops it as unknown.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult {
@@ -359,7 +365,7 @@ async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult
     acl.engine.store_namespace("quick", quick(&a, true)?)?;
     established(&a, &mut b, &flow).await?;
     acl.engine.clear_all();
-    dropped(&a, &mut b, &mut events, &flow, reasons::NO_POLICY).await?;
+    dropped(&a, &mut b, &mut events, &flow, reasons::POLICY_FAILED).await?;
     acl.engine.store_namespace("quick", quick(&a, true)?)?;
     delivered(&a, &mut b, &flow).await?;
 
@@ -371,7 +377,7 @@ async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult
 
     let stats = acl.filter.stats();
     assert_eq!(
-        (stats.accepted, stats.no_policy, stats.unknown_peer),
+        (stats.accepted, stats.policy_failed, stats.unknown_peer),
         (ESTABLISH as u64 + 2, 1, 1)
     );
     Ok(())

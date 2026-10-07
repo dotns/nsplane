@@ -1,9 +1,10 @@
 //! The ACL filter in the `crates/acl` mode (`AclFilterConfig::crates_acl`), at engine
 //! level over an in-memory channel transport: two nodes `a` and `b`, where `b` runs an
 //! `AclFilter` with that preset on its packets and `a` runs no filter. The tests keep the
-//! shared `AclEngine`, the `PeerIdentityMap` naming `a`'s principals and a clone of the
-//! filter for its counters, and check deliveries and `Event::Dropped` reasons for
-//! by-source and relay-key principals, the allow-only fragment gate, the bypass flags,
+//! shared `AclEngine`, the `PeerLabelMap` giving `a`'s labels and a clone of the filter for
+//! its counters, and check deliveries and `Event::Dropped` reasons for peers judged by
+//! their packets' source address (the address label) and by their key label, the
+//! allow-only fragment gate, the bypass flags,
 //! the absence of reply allowances, IPv6 passing unevaluated and policy reloads under
 //! traffic.
 //!
@@ -11,14 +12,15 @@
 //! TTL elapses with `tokio::time::advance`. The preset is built without a local address
 //! (every packet to `b` would bypass the policy) except in the bypass test.
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use nsplane::{AllowedIp, ChannelTransport, Event, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Ipv6Mode,
-    PeerIdentityMap, SourceAssertion, reasons, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclFilterConfig, AclPolicy, AclRule, Ipv6Mode, Label,
+    LabelSet, PeerLabelMap, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, payload, tcp, udp};
 use nsplane_packet::checksum::ipv4_header_checksum;
@@ -39,14 +41,24 @@ const ECHO_REQUEST: (u8, u8) = (8, 0);
 const UNDER_TTL: Duration = Duration::from_secs(14);
 /// A key that is not `a`'s.
 const OTHER_KEY: [u8; 32] = [0xaa; 32];
+/// The label of the peers judged by their packets' source address.
+const ADDRESS: &str = "addr";
 
 type AclNode = Node<ChannelTransport>;
 
 /// The ACL state of `b` the tests keep.
 struct Acl {
     engine: Arc<AclEngine>,
-    identities: Arc<PeerIdentityMap>,
+    identities: Arc<PeerLabelMap>,
     filter: AclFilter,
+}
+
+/// The label a policy's `key:<hex>` source of `key` compiles to.
+fn key_label(key: &[u8; 32]) -> Label {
+    Label::from(key.iter().fold(String::from("key:"), |mut text, b| {
+        let _ = write!(text, "{b:02x}");
+        text
+    }))
 }
 
 /// Two peers linked like `channel_pair`, `b` with an `AclFilter` configured by `config`
@@ -55,7 +67,7 @@ async fn acl_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)
     let engine = Arc::new(AclEngine::with_clock(|| {
         tokio::time::Instant::now().into_std()
     }));
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let filter = AclFilter::with_config(Arc::clone(&engine), Arc::clone(&identities), config);
 
     let a_end = (
@@ -86,20 +98,19 @@ async fn acl_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)
     ))
 }
 
-/// [`acl_pair`] with `a` known to `b`'s filter by its WireGuard key, as a relay client.
+/// [`acl_pair`] with `a` known to `b`'s filter by the label of its WireGuard key, as a
+/// relay client.
 async fn key_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)> {
     let (a, b, acl) = acl_pair(config).await?;
     acl.identities.insert(
         b.peer_of(&a).await?,
-        SourceAssertion::WgPeerKey {
-            pubkey: a.public().to_bytes(),
-        },
+        LabelSet::new([key_label(&a.public().to_bytes())]),
     );
     Ok((a, b, acl))
 }
 
-/// [`acl_pair`] with `a` marked by source on `b`'s filter, and `a`'s allowed IPs on `b`
-/// widened by `10.1.0.0/24`, the gateway subnet `a`'s packets come from.
+/// [`acl_pair`] with `a` carrying the address label on `b`'s filter, and `a`'s allowed IPs
+/// on `b` widened by `10.1.0.0/24`, the gateway subnet `a`'s packets come from.
 async fn by_source_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode, Acl)> {
     let (a, b, acl) = acl_pair(config).await?;
     let mut to_a = a.as_peer(b.path.transport);
@@ -108,7 +119,8 @@ async fn by_source_pair(config: AclFilterConfig) -> TestResult<(AclNode, AclNode
         cidr: 24,
     });
     b.handle.add_or_update_peer(to_a).await?;
-    acl.identities.insert_by_source(b.peer_of(&a).await?);
+    acl.identities
+        .insert(b.peer_of(&a).await?, LabelSet::new([Label::from(ADDRESS)]));
     Ok((a, b, acl))
 }
 
@@ -139,7 +151,7 @@ fn policy(acls: Vec<AclRule>) -> AclPolicy {
     }
 }
 
-/// A policy allowing the principal `src` UDP to `b`'s IPv4 address on `port`.
+/// A policy allowing the source `src` UDP to `b`'s IPv4 address on `port`.
 fn udp_policy(src: &str, b: &AclNode, port: u16) -> AclPolicy {
     policy(vec![rule(src, &format!("{}:{port}", b.ip4))])
 }
@@ -236,7 +248,7 @@ async fn dropped(
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn by_source_principals_are_the_packet_sources() -> TestResult {
+async fn cidr_rules_judge_the_packet_sources() -> TestResult {
     let (a, mut b, acl) = by_source_pair(preset()).await?;
     let mut events = b.subscribe().await?;
     acl.engine
@@ -246,7 +258,7 @@ async fn by_source_principals_are_the_packet_sources() -> TestResult {
     delivered(&a, &mut b, &udp(v4(gateway(1), SRC_PORT), to_b, b"one")).await?;
     let from_two = udp(v4(gateway(2), SRC_PORT), to_b, b"two");
     dropped(&a, &mut b, &mut events, &from_two, reasons::DENIED).await?;
-    // `a`'s own tunnel address is just another source; its key is no principal.
+    // `a`'s own tunnel address is just another source; its key plays no part.
     let from_a = udp(v4(a.ip4, SRC_PORT), to_b, b"a");
     dropped(&a, &mut b, &mut events, &from_a, reasons::DENIED).await?;
     // Each source keeps its own verdict when they interleave.
@@ -260,12 +272,12 @@ async fn by_source_principals_are_the_packet_sources() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn relay_client_keys_are_principals_and_follow_identity_changes() -> TestResult {
+async fn relay_client_key_labels_follow_identity_changes() -> TestResult {
     let (a, mut b, acl) = key_pair(preset()).await?;
     let mut events = b.subscribe().await?;
     let packet = udp(v4(a.ip4, SRC_PORT), v4(b.ip4, ALLOWED), b"key");
-    let a_key = wg_peer_anchor(&a.public().to_bytes());
-    let other_key = wg_peer_anchor(&OTHER_KEY);
+    let a_key = key_label(&a.public().to_bytes()).to_string();
+    let other_key = key_label(&OTHER_KEY).to_string();
 
     acl.engine.load(udp_policy(&a_key, &b, ALLOWED))?;
     delivered(&a, &mut b, &packet).await?;
@@ -275,17 +287,14 @@ async fn relay_client_keys_are_principals_and_follow_identity_changes() -> TestR
     // The policy stays; `a`'s identity switches to the other key and back.
     let peer_a = b.peer_of(&a).await?;
     acl.identities
-        .insert(peer_a, SourceAssertion::WgPeerKey { pubkey: OTHER_KEY });
+        .insert(peer_a, LabelSet::new([key_label(&OTHER_KEY)]));
     delivered(&a, &mut b, &packet).await?;
-    acl.identities.insert(
-        peer_a,
-        SourceAssertion::WgPeerKey {
-            pubkey: a.public().to_bytes(),
-        },
-    );
+    acl.identities
+        .insert(peer_a, LabelSet::new([key_label(&a.public().to_bytes())]));
     dropped(&a, &mut b, &mut events, &packet, reasons::DENIED).await?;
-    // Marked by source, the principal is `a`'s tunnel address, which no rule names.
-    acl.identities.insert_by_source(peer_a);
+    // With the address label only, the key rule no longer matches.
+    acl.identities
+        .insert(peer_a, LabelSet::new([Label::from(ADDRESS)]));
     dropped(&a, &mut b, &mut events, &packet, reasons::DENIED).await?;
 
     let stats = acl.filter.stats();
@@ -298,7 +307,7 @@ async fn fragments_follow_an_accepted_first_fragment_within_the_ttl() -> TestRes
     let (a, mut b, acl) = key_pair(preset()).await?;
     let mut events = b.subscribe().await?;
     acl.engine.load(udp_policy(
-        &wg_peer_anchor(&a.public().to_bytes()),
+        &key_label(&a.public().to_bytes()).to_string(),
         &b,
         ALLOWED,
     ))?;
@@ -443,7 +452,7 @@ async fn replies_are_judged_by_the_policy_without_stateful_replies() -> TestResu
     dropped(&a, &mut b, &mut events, &reply, reasons::DENIED).await?;
     // A policy accepting the reply's flow lets it in as a new flow.
     acl.engine.load(policy(vec![rule(
-        &wg_peer_anchor(&a.public().to_bytes()),
+        &key_label(&a.public().to_bytes()).to_string(),
         &b_end.to_string(),
     )]))?;
     delivered(&a, &mut b, &reply).await?;
