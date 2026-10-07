@@ -1,6 +1,6 @@
 # 20261006-1500-business-agnostic-cleanup Remove product concepts from nsplane
 
-- **status**: pending
+- **status**: completed
 - **priority**: P1
 - **owner**: L1 (7f5cstru); runs after plan 20261006-0900-ns-requests-2
 - **createdAt**: 2026-10-06 15:00

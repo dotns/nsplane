@@ -1,6 +1,6 @@
 # 20261007-0900-business-agnostic Remove product concepts from nsplane; WSS server transport
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-07 09:00
 - **approvedAt**: 2026-10-07 09:00 (user: "开始处理"; the scope and owner decisions are in ADR
   `2026-10-06-business-agnostic-scope` and tasks `20261006-1500` / `20261006-1300`; auto mode,
@@ -71,3 +71,10 @@ nsplane-kernel for F1.
   accepted. 4 (outbound to addresses without a PeerId binding fell open) reworked fail-closed: a
   per-scope list of such addresses is governed under the scope's mode and is never a divert
   candidate. The default is empty.
+- 2026-10-07: completed (campaign `nsplane-ba-202610070900`). Merges into main: AN (EAM renames,
+  term scan, address-plan spec), AW (WSS datagram server transport NG-7, WsFrame stream carrier
+  deprecated, generic rustdoc), AC (labels, rule IDs, policy states, Flow evaluation, generic
+  flow gate; identity, policy document and node L3 moved to specs with parity data), and AN-5
+  (the term scan as the last step of `just check`). Main: just check 1707 tests with a clean
+  strict scan, cargo doc, cross and test-windows green. Next: release 0.11.0 (breaking) on the
+  owner's go, with an idle-host release table that re-checks nsplane-kernel for F1.
