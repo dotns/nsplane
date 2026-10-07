@@ -119,7 +119,7 @@ fn broken_pipe() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
 }
 
-/// A TCP connection terminated by the stack.
+/// A TCP connection whose local endpoint is the stack.
 ///
 /// Reads return the bytes the peer sent and then `Ok(0)` once the peer's FIN arrived
 /// (and every byte before it was read); writes keep working after that, so a peer that
