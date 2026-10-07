@@ -343,6 +343,31 @@ let filter = AclFilter::with_config(Arc::clone(&engine), labels, config);
 engine.install(RuleSet::new(compile(&doc, "local")?)?);         // after the self-tests
 ```
 
+### 6.3 Mapping of the ns account filter onto nsplane
+
+The account filter's ACL and destination steps become nsplane calls. File references are to
+ns `refactor/nsplane` (`crates/ns/src/account_engine/filters.rs`, `crates/tunnel-wg`).
+
+| ns today | nsplane |
+| --- | --- |
+| `tunnel_wg::acl_check_packet` (`tun_io.rs`) on the `crates/acl` `AclEngine` | An `AclFilter` (`AclFilter::with_config`) with the `AclFilterConfig` fields of 6.1 (`accept_to_local = Some(tun_ip)`) on an `nsplane-acl` `AclEngine`. The policy is compiled to typed rules (section 3, with the address label `A` on CIDR sources), validated with `RuleSet::new` and published with `AclEngine::install`; a rejected `RuleSet::new` changes nothing. No policy, or a failed compilation: `AclEngine::fail` (or `clear_all`), fail-closed with `reasons::POLICY_FAILED` |
+| `nat::FragmentAclGate`, one per filter | `AclFilterConfig::fragments = FragmentMode::AllowOnly { ttl: 15 s, capacity: 4096 }` inside that filter |
+| `tunnel_wg::is_local_node_packet(pkt, tun_ip)` | `AclFilterConfig::accept_to_local = Some(tun_ip)` |
+| `tunnel_wg::is_icmp_echo_reply` | `AclFilterConfig::accept_icmp_echo_reply = true` |
+| The `relay_client_keys` set and the `PeerKeys` map (engine `PeerId` to key; an unmapped peer dropped) | `PeerLabelMap` (6.2): `insert(peer, {key:<hex>})` for a relay client key, `insert(peer, {A})` for every other peer, `remove` with the peer; an unknown peer is dropped as `reasons::UNKNOWN_PEER` |
+| `AccountFilter` ACL step (`inbound_ipv4` after the Node L3 step; `account: acl denied`) | That `AclFilter`. The Node L3 step before it is the flow gate: `GateFilter::new(gate).with_acl(filter)`, compiled as `docs/specs/node-l3.md` describes |
+| `DynamicL3RouteTable` leases (`peer_key_for`) and Subnet return identities (`return_node_ip`, `enforced_subnet_return_peer_key`) in `AccountFilter::outbound_route`, and the outbound `account: route owner mismatch` drop | The lease prefixes and return identities in the owning peer's `allowed_ips`: routing picks the owner, so the outbound check disappears |
+| `AccountFilter` inbound IPv6 step (`inbound_ipv6`: `allows_inbound_subnet_packet`, a lease owned by this node, or this node's `:2::<tun IPv4>` return identity from the lease's peer; `enforced_subnet_ingress_authorized`; no ACL) and the `account: ipv6 not authorized` drop | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` (the filter does not judge IPv6) plus each peer's `nsplane-core` `PeerConfig::inbound_destinations`, set from the same leases and grants (`Some` for every peer, also with no lease, since ns drops all unauthorized IPv6; with `0.0.0.0/0` because ns checks no IPv4 destination), dropped as `reasons::DESTINATION_NOT_ALLOWED`; updated with `EngineHandle::set_inbound_destinations` or `add_or_update_peer` when leases or Subnet returns change. The ingress prefixes are the ns query `enforced_subnet_ingress_prefixes` (`docs/specs/node-l3.md` 3.8) |
+
+ns keeps the policy compilation and projection: the control-plane policy into typed `Rule`s
+(sections 2-4 for its document), the relay-client key set into `PeerLabelMap` labels, and
+leases and Subnet returns into allowed IPs and inbound destinations, plus the conversion of
+each into the calls above. The Node L3 step's mapping is `docs/specs/node-l3.md`.
+
+nsplane only enforces: the peer source lifecycle (`PeerSource`), rendezvous and the pairing
+and transfer state machines stay in ns, which stores namespaces, grants and pinholes through
+the `AclEngine` API.
+
 ## 7. Parity data
 
 [`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json) is byte-identical to
