@@ -441,7 +441,14 @@ fn outbound_lan4_becomes_lan6_on_both_sides() {
 
 #[test]
 fn outbound_mapping_of_another_peer_is_dropped() {
-    let udp = |dst| ipv4_simple(SELF_EAM4, dst, protocol::UDP, &udp4(SELF_EAM4, dst, b"x", false));
+    let udp = |dst| {
+        ipv4_simple(
+            SELF_EAM4,
+            dst,
+            protocol::UDP,
+            &udp4(SELF_EAM4, dst, b"x", false),
+        )
+    };
     assert_eq!(out_drop(&udp(OTHER_EAM4)), reasons::PEER_MISMATCH);
     assert_eq!(out_drop(&udp(ip4("172.16.0.9"))), reasons::PEER_MISMATCH);
     let local6 = peer_mapping().local6.unwrap();
@@ -472,7 +479,12 @@ fn outbound_unmapped_source_is_dropped() {
 fn native_packets_pass_unchanged() {
     let translator = translator();
     let dst = ip4("198.51.100.1");
-    let native4 = ipv4_simple(SELF_EAM4, dst, protocol::UDP, &udp4(SELF_EAM4, dst, b"x", false));
+    let native4 = ipv4_simple(
+        SELF_EAM4,
+        dst,
+        protocol::UDP,
+        &udp4(SELF_EAM4, dst, b"x", false),
+    );
     let (dst6, own6) = (ip6("2001:db8::1"), ip6("fd00::ff:0"));
     let native6 = ipv6_simple(own6, dst6, protocol::UDP, &udp6(own6, dst6, b"x"));
     // A local LAN destination is not a translated one either.
@@ -611,7 +623,12 @@ fn inbound_peer6_is_rewritten_to_local6() {
 #[test]
 fn inbound_spoofed_local_view_sources_are_dropped() {
     for src in [EAM4, OTHER_EAM4, ip4("10.0.0.1"), ip4("192.168.1.1")] {
-        let packet = ipv4_simple(src, SELF_EAM4, protocol::UDP, &udp4(src, SELF_EAM4, b"x", false));
+        let packet = ipv4_simple(
+            src,
+            SELF_EAM4,
+            protocol::UDP,
+            &udp4(src, SELF_EAM4, b"x", false),
+        );
         assert_eq!(in_drop(&packet), reasons::SPOOFED_SOURCE, "{src}");
     }
     let (local6, dst) = (peer_mapping().local6.unwrap(), ip6("fd00::ff:0"));

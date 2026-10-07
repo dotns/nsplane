@@ -258,11 +258,7 @@ async fn ipv4_app_reaches_ipv6_only_peer_over_tcp() -> TestResult {
 #[tokio::test]
 async fn local6_and_peer6_are_rewritten_both_ways() -> TestResult {
     let (mut a, mut b, translator) = pair().await?;
-    let (client, local6, peer6) = (
-        v6(a.ip6, 40004),
-        v6(PEER_LOCAL6, 5004),
-        v6(PEER6, 5004),
-    );
+    let (client, local6, peer6) = (v6(a.ip6, 40004), v6(PEER_LOCAL6, 5004), v6(PEER6, 5004));
 
     let request = udp(client, local6, &payload(256));
     a.send(&request).await?;

@@ -324,9 +324,7 @@ impl TranslationTableBuilder {
             table
                 .by_peer6
                 .insert(mapping.peer6.to_bits(), (id, mapping));
-            table
-                .by_eam6
-                .insert(mapping.eam6.to_bits(), (id, mapping));
+            table.by_eam6.insert(mapping.eam6.to_bits(), (id, mapping));
             if let Some(local6) = mapping.local6 {
                 unique6(local6)?;
                 table.by_local6.insert(local6.to_bits(), (id, mapping));
@@ -754,7 +752,10 @@ mod tests {
             .peer(PeerId::new(2), mapping(2))
             .build()
             .unwrap();
-        assert_eq!(table.by_peer6_eam4(peer6_eam4), Some((PeerId::new(1), &one)));
+        assert_eq!(
+            table.by_peer6_eam4(peer6_eam4),
+            Some((PeerId::new(1), &one))
+        );
         assert_eq!(table.peer6_eam4(PeerId::new(1)), Some(peer6_eam4));
         assert_eq!(table.peer(PeerId::new(1)), Some(&one));
         // The other roles of the peer are unchanged, and roles do not mix.

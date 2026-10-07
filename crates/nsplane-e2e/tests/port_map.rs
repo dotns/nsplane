@@ -381,12 +381,8 @@ async fn full_stack_drops_a_peer_the_acl_denies() -> TestResult {
     let mut events = a.subscribe().await?;
     let peer_b = a.peer_of(&b).await?;
 
-    b.send(&udp(
-        v6(PEER_EAM6, 40030),
-        v6(SELF_EAM6, LISTEN),
-        b"denied",
-    ))
-    .await?;
+    b.send(&udp(v6(PEER_EAM6, 40030), v6(SELF_EAM6, LISTEN), b"denied"))
+        .await?;
     events
         .expect(|e| {
             matches!(e, Event::Dropped { peer: Some(p), reason } if *p == peer_b

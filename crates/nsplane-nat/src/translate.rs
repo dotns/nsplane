@@ -517,11 +517,7 @@ fn map4to6(table: &TranslationTable, addr: Ipv4Addr) -> Option<Ipv6Addr> {
         .by_eam4(addr)
         .map(|(_, mapping)| mapping.eam6)
         .or_else(|| table.lan4_to_lan6(addr).map(|(lan6, _)| lan6))
-        .or_else(|| {
-            table
-                .by_peer6_eam4(addr)
-                .map(|(_, mapping)| mapping.peer6)
-        })
+        .or_else(|| table.by_peer6_eam4(addr).map(|(_, mapping)| mapping.peer6))
 }
 
 /// Maps any IPv6 address of the table to IPv4 (for packets quoted in ICMP errors).

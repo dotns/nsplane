@@ -215,7 +215,12 @@ fn peer6_eam4_fragments_are_translated_both_ways() {
 #[test]
 fn a_peer6_eam4_source_is_a_spoof() {
     for src in [PEER6_EAM4, OTHER_PEER6_EAM4] {
-        let packet = ipv4_simple(src, SELF_EAM4, protocol::UDP, &udp4(src, SELF_EAM4, b"x", false));
+        let packet = ipv4_simple(
+            src,
+            SELF_EAM4,
+            protocol::UDP,
+            &udp4(src, SELF_EAM4, b"x", false),
+        );
         assert_eq!(
             in_peer6_eam4(PEER, &packet).0,
             dropped(reasons::SPOOFED_SOURCE),
@@ -233,11 +238,17 @@ fn a_peer6_eam4_of_another_peer_is_dropped() {
         protocol::UDP,
         &udp4(SELF_EAM4, OTHER_PEER6_EAM4, b"x", false),
     );
-    assert_eq!(out_peer6_eam4(PEER, &packet).0, dropped(reasons::PEER_MISMATCH));
+    assert_eq!(
+        out_peer6_eam4(PEER, &packet).0,
+        dropped(reasons::PEER_MISMATCH)
+    );
     // Inbound: PEER's peer6 arriving from OTHER.
     let (src, dst) = (peer6(), self_eam6());
     let packet = ipv6_simple(src, dst, protocol::UDP, &udp6(src, dst, b"x"));
-    assert_eq!(in_peer6_eam4(OTHER, &packet).0, dropped(reasons::PEER_MISMATCH));
+    assert_eq!(
+        in_peer6_eam4(OTHER, &packet).0,
+        dropped(reasons::PEER_MISMATCH)
+    );
     // An unmapped source is still refused.
     let packet = ipv4_simple(
         ip4("198.51.100.7"),
@@ -257,7 +268,12 @@ fn peer6_eam4_coexists_with_eam4_and_local6() {
 
     // eam4 still goes to eam6, the `peer6_eam4` to peer6.
     for (dst, expected) in [(EAM4, mapping.eam6), (PEER6_EAM4, mapping.peer6)] {
-        let packet = ipv4_simple(SELF_EAM4, dst, protocol::UDP, &udp4(SELF_EAM4, dst, b"x", false));
+        let packet = ipv4_simple(
+            SELF_EAM4,
+            dst,
+            protocol::UDP,
+            &udp4(SELF_EAM4, dst, b"x", false),
+        );
         let (verdict, v6) = outbound(&translator, PEER, &packet);
         assert_eq!(verdict, Verdict::Accept, "{dst}");
         check_v6(&v6);
