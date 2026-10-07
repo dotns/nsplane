@@ -1,5 +1,5 @@
-//! Access requests, compiled policies and the shared [`AclEngine`] with its
-//! namespaces, grants and pinholes.
+//! Source assertions, policy states and the shared [`AclEngine`] with its
+//! default rules, namespaces, grants and pinholes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -13,10 +13,7 @@ use tracing::{debug, warn};
 
 use crate::{
     Error,
-    matcher::{
-        DstMatcher, HostMatcher, PortMatcher, SrcMatcher, parse_dst, parse_ports, parse_protocol,
-        parse_src,
-    },
+    matcher::{parse_ports, parse_protocol, protocols},
     namespace::{Grant, GrantEnd, NamespaceId, NamespacePolicy},
     net::{IpNet, Protocol},
     pinhole::{
@@ -24,17 +21,21 @@ use crate::{
         PinholeStats,
     },
     policy::{AclPolicy, AclTest},
+    reasons,
+    rules::{
+        Decision, Flow, Label, LabelSet, Matched, NotInstalled, PolicyState, PortSet, Protocols,
+        RuleId, RuleSet, Transport,
+    },
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// How the source identity of an access request was established.
+/// How the source identity of a peer was established.
 ///
 /// The ACL judge keys on a **principal**, not a bare IP. For the relay/direct
 /// link modes the caller resolves the end-to-end client's WireGuard key and
 /// builds [`SourceAssertion::WgPeerKey`]; for the terminate mode the gateway
-/// asserted a binding. [`AccessRequest`] still carries `src_ip` for legacy CIDR rules and
-/// logging, but the assertion is what carries the key principal + the
+/// asserted a binding. The assertion carries the key principal + the
 /// `source_class`/`source_anchor` used in decision logs.
 #[derive(Debug, Clone)]
 pub enum SourceAssertion {
@@ -85,8 +86,7 @@ impl SourceAssertion {
         }
     }
 
-    /// The terminate binding of a bare source IP: the principal of
-    /// [`AccessRequest::from_ip`].
+    /// The terminate binding of a bare source IP.
     pub(crate) fn from_ip(ip: IpAddr) -> Self {
         Self::Terminate {
             binding: TerminateBinding {
@@ -121,68 +121,6 @@ pub fn wg_peer_anchor(pubkey: &[u8; 32]) -> String {
     s
 }
 
-/// A connection access request to evaluate against the policy.
-#[derive(Debug, Clone)]
-pub struct AccessRequest {
-    /// Legacy source IP (tunnel/inner src) — still used by CIDR rules + logs.
-    pub src_ip: IpAddr,
-    /// Typed source assertion: the principal + how it was established.
-    pub source: SourceAssertion,
-    /// Destination IP address.
-    pub dst_ip: IpAddr,
-    /// Destination port.
-    pub dst_port: u16,
-    /// Transport protocol.
-    pub protocol: Protocol,
-}
-
-impl AccessRequest {
-    /// Build a request from a bare source IP (the legacy/terminate path): the
-    /// assertion is a [`SourceAssertion::Terminate`] binding carrying that IP.
-    /// Behaviour-preserving for IP/CIDR rules.
-    #[must_use]
-    pub fn from_ip(src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16, protocol: Protocol) -> Self {
-        Self {
-            src_ip,
-            source: SourceAssertion::from_ip(src_ip),
-            dst_ip,
-            dst_port,
-            protocol,
-        }
-    }
-
-    /// Build a request whose source is an end-to-end client WireGuard key
-    /// (wg-relay / wss-relay / direct). `src_ip` is retained for legacy CIDR
-    /// rules + logs; the key is what the subject principals match against.
-    #[must_use]
-    pub const fn with_wg_peer_key(
-        pubkey: [u8; 32],
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        dst_port: u16,
-        protocol: Protocol,
-    ) -> Self {
-        Self {
-            src_ip,
-            source: SourceAssertion::WgPeerKey { pubkey },
-            dst_ip,
-            dst_port,
-            protocol,
-        }
-    }
-}
-
-/// Result of an ACL evaluation.
-#[derive(Debug, Clone)]
-pub struct AclDecision {
-    /// `true` if an accept rule matched; `false` means default deny.
-    pub allowed: bool,
-    /// Index of the matched rule within the compiled rule list (if any).
-    pub matched_rule_index: Option<usize>,
-    /// Human-readable explanation.
-    pub reason: String,
-}
-
 /// A failed built-in policy test.
 #[derive(Debug, Clone)]
 pub struct AclTestFailure {
@@ -192,243 +130,7 @@ pub struct AclTestFailure {
     pub reason: String,
 }
 
-// ── Internal compiled rule ────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct CompiledRule {
-    src: Vec<SrcMatcher>,
-    dst: Vec<DstMatcher>,
-    /// `None` means match both TCP and UDP.
-    proto: Option<Protocol>,
-}
-
-impl CompiledRule {
-    fn matches(&self, req: &AccessRequest) -> bool {
-        if !self.src.iter().any(|m| m.matches(&req.source)) {
-            return false;
-        }
-        if !self.dst.iter().any(|m| m.matches(req.dst_ip, req.dst_port)) {
-            return false;
-        }
-        self.proto.is_none_or(|proto| proto == req.protocol)
-    }
-
-    /// Whether the rule accepts every `protocol` request, whatever its
-    /// source, destination and port.
-    fn accepts_everything(&self, protocol: Protocol) -> bool {
-        self.src.iter().any(|src| matches!(src, SrcMatcher::Any))
-            && self.dst.iter().any(|dst| {
-                matches!(dst.host, HostMatcher::Any) && matches!(dst.ports, PortMatcher::Any)
-            })
-            && self.proto.is_none_or(|proto| proto == protocol)
-    }
-}
-
-// ── CompiledPolicy ────────────────────────────────────────────────────────────
-
-/// A validated, compiled policy: evaluate connection requests against it.
-///
-/// Default policy is **deny** — traffic is blocked unless an explicit `accept`
-/// rule matches. Immutable once compiled; share it through an [`AclEngine`].
-#[derive(Debug)]
-pub struct CompiledPolicy {
-    compiled_rules: Vec<CompiledRule>,
-    tests: Vec<AclTest>,
-}
-
-impl CompiledPolicy {
-    /// Resolve and compile an [`AclPolicy`].
-    ///
-    /// Runs the built-in tests and returns [`Error::TestsFailed`] if any fail.
-    pub fn compile(policy: AclPolicy) -> Result<Self, Error> {
-        let hosts = resolve_hosts(&policy.hosts)?;
-
-        let mut compiled_rules = Vec::with_capacity(policy.acls.len());
-        for (i, rule) in policy.acls.iter().enumerate() {
-            let src = rule
-                .src
-                .iter()
-                .map(|s| parse_src(s, &hosts))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Error::InvalidPolicy(format!("rule {i} src: {e}")))?;
-
-            let dst = rule
-                .dst
-                .iter()
-                .map(|s| parse_dst(s, &hosts))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Error::InvalidPolicy(format!("rule {i} dst: {e}")))?;
-
-            let proto = rule
-                .proto
-                .as_deref()
-                .map(parse_protocol)
-                .transpose()
-                .map_err(|e| Error::InvalidPolicy(format!("rule {i} proto: {e}")))?;
-
-            compiled_rules.push(CompiledRule { src, dst, proto });
-        }
-
-        let engine = Self {
-            compiled_rules,
-            tests: policy.tests,
-        };
-
-        let failures = engine.validate_tests();
-        if !failures.is_empty() {
-            for f in &failures {
-                warn!(
-                    src = %f.test.src,
-                    dst = %f.test.dst,
-                    expected = f.test.allow,
-                    reason = %f.reason,
-                    "ACL policy test failed"
-                );
-            }
-            return Err(Error::TestsFailed {
-                count: failures.len(),
-            });
-        }
-
-        Ok(engine)
-    }
-
-    /// A policy that permits every flow. For an endpoint that does not filter
-    /// its inbound — e.g. a wss-relay client decrypting responses to connections
-    /// it originated. The shared WG decrypt path is otherwise fail-closed when no
-    /// policy is loaded, which would drop the client's return traffic.
-    #[must_use]
-    pub fn permit_all() -> Self {
-        Self {
-            compiled_rules: vec![CompiledRule {
-                src: vec![SrcMatcher::Any],
-                dst: vec![DstMatcher {
-                    host: HostMatcher::Any,
-                    ports: PortMatcher::Any,
-                }],
-                proto: None,
-            }],
-            tests: Vec::new(),
-        }
-    }
-
-    /// Evaluate whether `request` is allowed by the policy.
-    ///
-    /// Returns `allowed = true` only when an explicit accept rule matches.
-    /// If no rule matches, the result is a default deny.
-    pub fn is_allowed(&self, request: &AccessRequest) -> AclDecision {
-        self.matched_rule(request).map_or_else(
-            || AclDecision {
-                allowed: false,
-                matched_rule_index: None,
-                reason: "denied: no matching accept rule".to_owned(),
-            },
-            |idx| AclDecision {
-                allowed: true,
-                matched_rule_index: Some(idx),
-                reason: format!("accepted by rule {idx}"),
-            },
-        )
-    }
-
-    /// The index of the first rule accepting `request`, without building an
-    /// [`AclDecision`] (the data path).
-    pub(crate) fn matched_rule(&self, request: &AccessRequest) -> Option<usize> {
-        for (idx, rule) in self.compiled_rules.iter().enumerate() {
-            if rule.matches(request) {
-                debug!(
-                    src = %request.src_ip,
-                    dst = %request.dst_ip,
-                    port = request.dst_port,
-                    proto = ?request.protocol,
-                    rule = idx,
-                    "ACL accept"
-                );
-                return Some(idx);
-            }
-        }
-
-        // `debug!`, not `warn!`: the data path evaluates every packet, so a
-        // warning per denied packet would flood the log.
-        debug!(
-            src = %request.src_ip,
-            dst = %request.dst_ip,
-            port = request.dst_port,
-            proto = ?request.protocol,
-            "ACL deny: no matching rule"
-        );
-        None
-    }
-
-    /// Whether every TCP and UDP request is accepted, whatever its source,
-    /// destination and port.
-    fn accepts_everything(&self) -> bool {
-        [Protocol::Tcp, Protocol::Udp].into_iter().all(|protocol| {
-            self.compiled_rules
-                .iter()
-                .any(|rule| rule.accepts_everything(protocol))
-        })
-    }
-
-    /// Run the built-in policy tests and return a list of failures.
-    pub fn validate_tests(&self) -> Vec<AclTestFailure> {
-        let mut failures = Vec::new();
-
-        for test in &self.tests {
-            let Ok(src_ip) = test.src.parse::<IpAddr>() else {
-                failures.push(AclTestFailure {
-                    test: test.clone(),
-                    reason: format!("cannot parse src IP '{}'", test.src),
-                });
-                continue;
-            };
-
-            let (dst_ip, dst_port) = match parse_test_dst(&test.dst) {
-                Ok(pair) => pair,
-                Err(reason) => {
-                    failures.push(AclTestFailure {
-                        test: test.clone(),
-                        reason,
-                    });
-                    continue;
-                }
-            };
-
-            let protocol = match test.proto.as_deref() {
-                Some(raw) => match parse_protocol(raw) {
-                    Ok(proto) => proto,
-                    Err(reason) => {
-                        failures.push(AclTestFailure {
-                            test: test.clone(),
-                            reason: format!("cannot parse test proto '{raw}': {reason}"),
-                        });
-                        continue;
-                    }
-                },
-                None => Protocol::Tcp,
-            };
-
-            let req = AccessRequest::from_ip(src_ip, dst_ip, dst_port, protocol);
-            let decision = self.is_allowed(&req);
-
-            if decision.allowed != test.allow {
-                failures.push(AclTestFailure {
-                    test: test.clone(),
-                    reason: format!(
-                        "expected {}, got {} ({})",
-                        if test.allow { "allow" } else { "deny" },
-                        if decision.allowed { "allow" } else { "deny" },
-                        decision.reason,
-                    ),
-                });
-            }
-        }
-
-        failures
-    }
-}
-
-// ── Namespaces, grants and the engine snapshot ────────────────────────────────
+// ── Evaluation ────────────────────────────────────────────────────────────────
 
 /// What a reply allowance depends on. An allowance whose dependency is gone
 /// from the current [`Snapshot`] (or, for a pinhole, expired) is revoked on
@@ -453,70 +155,103 @@ pub(crate) enum PinholeMatch {
     Absent,
 }
 
-/// The outcome of evaluating an inbound request from a namespace member.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MemberVerdict {
-    /// Accepted by rule `index` of `namespace`.
+/// The outcome of evaluating a new inbound flow, borrowing the snapshot (no
+/// rule ID is cloned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Evaluation<'s> {
+    /// Accepted by a default rule (`namespace: None`) or a namespace rule.
     Rule {
-        namespace: NamespaceId,
-        index: usize,
+        namespace: Option<&'s NamespaceId>,
+        id: &'s RuleId,
     },
     /// Accepted by the directed grant with this id.
-    Grant(Arc<str>),
+    Grant(&'s RuleId),
     /// Accepted by an inbound pinhole.
     Pinhole(PinholeId),
-    /// Nothing accepts the request, but an expired inbound pinhole matched:
-    /// denied, and the caller sweeps expired pinholes.
+    /// Accepted by [`NotInstalled::Accept`].
+    NotInstalled,
+    /// Nothing accepts the flow, but an expired inbound pinhole matched:
+    /// denied with [`reasons::DENIED`], and the caller sweeps expired
+    /// pinholes.
     PinholeExpired,
-    /// Nothing accepts the request.
-    Denied,
-    /// The destination is another peer sharing no namespace with the source,
-    /// and no grant accepts the request.
-    CrossNamespace,
+    /// Denied with this reason.
+    Deny(&'static str),
 }
 
-/// A compiled protocol and port matcher (outbound rules, grants).
-#[derive(Debug)]
-struct CompiledPorts {
-    /// `None` means both TCP and UDP.
-    proto: Option<Protocol>,
-    ports: PortMatcher,
+impl Evaluation<'_> {
+    /// The reply dependency of an accepted flow.
+    pub(crate) fn dependency(&self) -> Option<ReplyDependency> {
+        match self {
+            Self::Grant(id) => Some(ReplyDependency::Grant(id.shared())),
+            Self::Pinhole(id) => Some(ReplyDependency::Pinhole(*id)),
+            Self::Rule { .. } | Self::NotInstalled | Self::PinholeExpired | Self::Deny(_) => None,
+        }
+    }
+
+    fn log(&self, flow: &Flow) {
+        let (proto, port) = match flow.transport {
+            Transport::Tcp { dst_port, .. } => (6, Some(dst_port)),
+            Transport::Udp { dst_port, .. } => (17, Some(dst_port)),
+            Transport::Icmp { .. } if flow.src.is_ipv4() => (1, None),
+            Transport::Icmp { .. } => (58, None),
+            Transport::Ip(number) => (number, None),
+        };
+        let (src, dst) = (flow.src, flow.dst);
+        // `debug!`, not `warn!`: the data path evaluates new flows, so a
+        // warning per denied flow would flood the log.
+        match self {
+            Self::Rule { namespace, id } => {
+                debug!(%src, %dst, proto, ?port, rule = %id, namespace = ?namespace.map(NamespaceId::as_str), "ACL accept");
+            }
+            Self::Grant(id) => debug!(%src, %dst, proto, ?port, grant = %id, "ACL accept"),
+            Self::Pinhole(id) => debug!(%src, %dst, proto, ?port, pinhole = %id, "ACL accept"),
+            Self::NotInstalled => {
+                debug!(%src, %dst, proto, ?port, reason = "not installed", "ACL accept");
+            }
+            Self::PinholeExpired => {
+                debug!(%src, %dst, proto, ?port, reason = reasons::DENIED, "ACL deny");
+            }
+            Self::Deny(reason) => debug!(%src, %dst, proto, ?port, reason, "ACL deny"),
+        }
+    }
 }
 
-impl CompiledPorts {
-    fn compile(proto: Option<&str>, ports: Option<&str>, what: &str) -> Result<Self, Error> {
-        let proto = proto
-            .map(parse_protocol)
-            .transpose()
-            .map_err(|e| Error::InvalidPolicy(format!("{what} proto: {e}")))?;
-        let ports = ports
-            .map_or(Ok(PortMatcher::Any), parse_ports)
-            .map_err(|e| Error::InvalidPolicy(format!("{what} ports: {e}")))?;
-        Ok(Self { proto, ports })
-    }
+// ── Namespaces, grants and the engine snapshot ────────────────────────────────
 
-    fn matches(&self, protocol: Protocol, port: u16) -> bool {
-        self.proto.is_none_or(|proto| proto == protocol) && self.ports.matches(port)
-    }
+/// Compile string protocol and ports (outbound rules, grants); `Err` holds
+/// the reason.
+fn compile_ports(proto: Option<&str>, ports: Option<&str>) -> Result<Protocols, String> {
+    let proto = proto
+        .map(parse_protocol)
+        .transpose()
+        .map_err(|e| format!("proto: {e}"))?;
+    let ports = ports
+        .map_or(Ok(PortSet::Any), parse_ports)
+        .map_err(|e| format!("ports: {e}"))?;
+    Protocols::compile(&protocols(proto, ports))
 }
 
 #[derive(Debug)]
 struct CompiledNamespace {
     source: NamespacePolicy,
-    rules: CompiledPolicy,
+    rules: RuleSet,
     /// `None`: outbound to the members is unrestricted.
-    outbound: Option<Vec<CompiledPorts>>,
+    outbound: Option<Vec<Protocols>>,
 }
 
 impl CompiledNamespace {
     fn compile(id: &NamespaceId, source: NamespacePolicy) -> Result<Self, Error> {
+        let invalid = |reason: String| Error::InvalidNamespace {
+            id: id.clone(),
+            reason,
+        };
         if id.is_app() && (!source.policy.acls.is_empty() || !source.allow_app_pinholes.is_empty())
         {
-            return Err(Error::InvalidPolicy(format!(
-                "app namespace '{id}' cannot have accept rules or allow app pinholes"
-            )));
+            return Err(invalid(
+                "an app namespace cannot have accept rules or allow app pinholes".to_owned(),
+            ));
         }
-        let rules = CompiledPolicy::compile(source.policy.clone())?;
+        let rules = RuleSet::from_document(source.policy.clone())?;
         let outbound = source
             .outbound
             .as_ref()
@@ -525,11 +260,8 @@ impl CompiledNamespace {
                     .iter()
                     .enumerate()
                     .map(|(i, rule)| {
-                        CompiledPorts::compile(
-                            rule.proto.as_deref(),
-                            Some(&rule.ports),
-                            &format!("outbound rule {i}"),
-                        )
+                        compile_ports(rule.proto.as_deref(), Some(&rule.ports))
+                            .map_err(|e| invalid(format!("outbound rule {i} {e}")))
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -542,19 +274,53 @@ impl CompiledNamespace {
     }
 }
 
+/// One end of a compiled grant.
 #[derive(Debug)]
-struct CompiledGrant {
-    id: Arc<str>,
-    grant: Grant,
-    ports: CompiledPorts,
+enum End {
+    Label(Label),
+    Namespace(NamespaceId),
 }
 
-/// The namespaces a principal belongs to.
+impl End {
+    fn new(end: &GrantEnd) -> Self {
+        match end {
+            GrantEnd::Peer(principal) => Self::Label(Label::from(principal.as_str())),
+            GrantEnd::Namespace(id) => Self::Namespace(id.clone()),
+        }
+    }
+
+    /// Whether the source end matches a source with `labels`.
+    fn matches_source(&self, labels: &LabelSet, membership: &Membership) -> bool {
+        match self {
+            Self::Label(label) => labels.contains(label),
+            Self::Namespace(id) => membership.contains(id),
+        }
+    }
+
+    /// Whether the destination end matches the member label `owner`.
+    fn matches_owner(&self, owner: &str, membership: &Membership) -> bool {
+        match self {
+            Self::Label(label) => label.as_str() == owner,
+            Self::Namespace(id) => membership.contains(id),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompiledGrant {
+    id: RuleId,
+    grant: Grant,
+    from: End,
+    to: End,
+    protocols: Protocols,
+}
+
+/// The namespaces of a member label, or the union over a source's labels.
 #[derive(Debug, Clone)]
 pub(crate) struct Membership {
     /// Sorted, without duplicates.
     namespaces: Vec<NamespaceId>,
-    /// Every namespace of the principal restricts outbound traffic.
+    /// Every namespace restricts outbound traffic.
     outbound_restricted: bool,
 }
 
@@ -568,54 +334,70 @@ impl Membership {
         self.namespaces.iter().filter(|id| !id.is_app())
     }
 
-    /// Whether outbound traffic to the principal is restricted.
+    /// Whether outbound traffic to the source is restricted.
     pub(crate) const fn outbound_restricted(&self) -> bool {
         self.outbound_restricted
     }
 }
 
-fn grant_end_matches(end: &GrantEnd, principal: &str, membership: &Membership) -> bool {
-    match end {
-        GrantEnd::Peer(peer) => peer == principal,
-        GrantEnd::Namespace(id) => membership.contains(id),
-    }
+/// The default rule set.
+#[derive(Debug, Clone, Default)]
+enum DefaultRules {
+    #[default]
+    NotInstalled,
+    Installed(Arc<RuleSet>),
+    Failed,
 }
 
 /// The whole engine state: published as one immutable value, so a reader
-/// sees the default policy, namespaces and grants of a single update.
+/// sees the default rules, namespaces and grants of a single update.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Snapshot {
-    default: Option<Arc<CompiledPolicy>>,
+    default: DefaultRules,
+    /// What applies to sources in no namespace while nothing is installed.
+    not_installed: NotInstalled,
     namespaces: BTreeMap<NamespaceId, Arc<CompiledNamespace>>,
-    /// Principal -> its namespaces (derived from `namespaces`).
-    memberships: HashMap<String, Membership>,
-    /// Member host addresses (`/32`, `/128`) with their principal (derived).
+    /// Member label -> its namespaces (derived from `namespaces`).
+    memberships: HashMap<String, Arc<Membership>>,
+    /// Member host addresses (`/32`, `/128`) with their member label (derived).
     hosts: HashMap<IpAddr, String>,
-    /// The other member addresses with their principal, longest prefix first
-    /// (derived).
+    /// The other member addresses with their member label, longest prefix
+    /// first (derived).
     addresses: Vec<(IpNet, String)>,
-    /// Whether some principal is outbound-restricted (derived).
+    /// Whether some member label is outbound-restricted (derived).
     outbound_restrictions: bool,
-    grants: BTreeMap<String, Arc<CompiledGrant>>,
+    grants: BTreeMap<RuleId, Arc<CompiledGrant>>,
     pinholes: BTreeMap<PinholeId, Arc<Pinhole>>,
     /// Bumped on every published update ([`AclEngine::generation`]).
     generation: u64,
-    /// The default policy accepts every inbound request (derived).
+    /// Sources in no namespace accept every inbound TCP and UDP flow
+    /// (derived).
     default_bypass: bool,
-    /// The members whose inbound requests are all accepted by a namespace
-    /// rule and that are not outbound-restricted (derived).
-    bypass: HashSet<String>,
+    /// The source namespaces accepting every inbound TCP and UDP flow
+    /// (derived).
+    open: HashSet<NamespaceId>,
+    /// The distinct namespace sets of the members owning an address
+    /// (derived, empty while `open` is).
+    owner_sets: Vec<Vec<NamespaceId>>,
 }
 
 impl Snapshot {
-    /// Whether a default policy or at least one namespace is stored.
+    /// Whether rules are installed, a namespace is stored, or nothing is
+    /// installed and [`NotInstalled::Accept`] applies.
     pub(crate) fn is_loaded(&self) -> bool {
-        self.default.is_some() || !self.namespaces.is_empty()
+        match self.default {
+            DefaultRules::Installed(_) => true,
+            DefaultRules::NotInstalled if self.not_installed == NotInstalled::Accept => true,
+            DefaultRules::NotInstalled | DefaultRules::Failed => !self.namespaces.is_empty(),
+        }
     }
 
-    /// The default policy, for principals in no namespace.
-    pub(crate) fn default_policy(&self) -> Option<&CompiledPolicy> {
-        self.default.as_deref()
+    pub(crate) fn policy_state(&self) -> PolicyState {
+        match &self.default {
+            DefaultRules::NotInstalled => PolicyState::NotInstalled,
+            DefaultRules::Installed(rules) => PolicyState::Installed { rules: rules.len() },
+            DefaultRules::Failed => PolicyState::Failed,
+        }
     }
 
     /// The generation of this snapshot.
@@ -623,39 +405,68 @@ impl Snapshot {
         self.generation
     }
 
-    /// Whether every inbound TCP or UDP request from `principal` (`None`: a
-    /// peer whose principal is not resolved because there are no members) is
-    /// accepted without a dependency and without recording an outbound reply
-    /// allowance, so the filter can skip its evaluation.
-    pub(crate) fn bypasses(&self, principal: Option<&str>) -> bool {
-        principal
-            .filter(|principal| self.memberships.contains_key(*principal))
-            .map_or(self.default_bypass, |principal| {
-                self.bypass.contains(principal)
-            })
+    /// Whether every inbound TCP or UDP flow from a known source with
+    /// `membership` (`None`: in no namespace) is accepted without a
+    /// dependency and without recording an outbound reply allowance, so the
+    /// filter can skip its evaluation.
+    pub(crate) fn bypasses(&self, membership: Option<&Membership>) -> bool {
+        let Some(membership) = membership else {
+            return self.default_bypass;
+        };
+        let open = |id: &NamespaceId| self.open.contains(id) && membership.contains(id);
+        // The local node is in every namespace; each owner must share one.
+        !membership.outbound_restricted
+            && membership.namespaces.iter().any(open)
+            && self
+                .owner_sets
+                .iter()
+                .all(|namespaces| namespaces.iter().any(open))
     }
 
-    /// Whether some pinhole (open or expired but not yet swept) belongs to
-    /// `principal`.
-    pub(crate) fn has_pinholes_of(&self, principal: &str) -> bool {
-        self.pinholes
-            .values()
-            .any(|pinhole| pinhole.spec.peer == principal)
+    /// Whether some pinhole (open or expired but not yet swept) belongs to a
+    /// label of `labels`.
+    pub(crate) fn has_pinholes_of(&self, labels: &LabelSet) -> bool {
+        !self.pinholes.is_empty()
+            && self
+                .pinholes
+                .values()
+                .any(|pinhole| labels.contains_text(&pinhole.spec.peer))
     }
 
-    /// Whether any principal is a namespace member.
-    pub(crate) fn has_members(&self) -> bool {
-        !self.memberships.is_empty()
-    }
-
-    /// Whether any principal is outbound-restricted.
+    /// Whether any member label is outbound-restricted.
     pub(crate) const fn has_outbound_restrictions(&self) -> bool {
         self.outbound_restrictions
     }
 
-    /// The namespaces of `principal`, `None` when it is in no namespace.
-    pub(crate) fn membership(&self, principal: &str) -> Option<&Membership> {
+    /// The namespaces of the member label `principal`, `None` when it is in
+    /// no namespace.
+    fn membership(&self, principal: &str) -> Option<&Arc<Membership>> {
         self.memberships.get(principal)
+    }
+
+    /// The namespaces of a source with `labels`: the union over its member
+    /// labels, `None` when it is in no namespace.
+    pub(crate) fn membership_of(&self, labels: &LabelSet) -> Option<Arc<Membership>> {
+        if self.memberships.is_empty() {
+            return None;
+        }
+        let mut found = labels
+            .iter()
+            .filter_map(|label| self.memberships.get(label.as_str()));
+        let first = found.next()?;
+        let Some(second) = found.next() else {
+            return Some(Arc::clone(first));
+        };
+        let mut union = Membership::clone(first);
+        for membership in std::iter::once(second).chain(found) {
+            union
+                .namespaces
+                .extend(membership.namespaces.iter().cloned());
+            union.outbound_restricted &= membership.outbound_restricted;
+        }
+        union.namespaces.sort_unstable();
+        union.namespaces.dedup();
+        Some(Arc::new(union))
     }
 
     /// Whether any pinhole is stored (open or expired but not yet swept).
@@ -679,11 +490,11 @@ impl Snapshot {
         }
     }
 
-    /// The pinhole of `principal` opening `direction` flows of `protocol` to
-    /// `port`. The clock is read only when a pinhole matches.
+    /// The pinhole of a label of `labels` opening `direction` flows of
+    /// `protocol` to `port`. The clock is read only when a pinhole matches.
     pub(crate) fn match_pinhole(
         &self,
-        principal: &str,
+        labels: &LabelSet,
         direction: Direction,
         protocol: Protocol,
         port: u16,
@@ -692,7 +503,9 @@ impl Snapshot {
         let mut at = None;
         let mut found = PinholeMatch::Absent;
         for pinhole in self.pinholes.values() {
-            if !pinhole.matches(principal, direction, protocol, port) {
+            if !pinhole.matches(&pinhole.spec.peer, direction, protocol, port)
+                || !labels.contains_text(&pinhole.spec.peer)
+            {
                 continue;
             }
             if pinhole.is_open_at(*at.get_or_insert_with(&now)) {
@@ -703,101 +516,113 @@ impl Snapshot {
         found
     }
 
-    /// The member owning `ip` (longest prefix), with its namespaces.
+    /// The member label owning `ip` (longest prefix), with its namespaces.
     fn member_at(&self, ip: IpAddr) -> Option<(&str, &Membership)> {
         // A host address is always the longest prefix.
-        let principal = match self.hosts.get(&ip) {
-            Some(principal) => principal,
+        let owner = match self.hosts.get(&ip) {
+            Some(owner) => owner,
             None => &self.addresses.iter().find(|(net, _)| net.contains(&ip))?.1,
         };
-        Some((principal, self.memberships.get(principal)?))
+        Some((owner, self.memberships.get(owner)?))
     }
 
-    /// Evaluate an inbound `request` from `principal`, a namespace member.
-    /// `now` is read only when a pinhole matches.
-    pub(crate) fn evaluate_member(
+    /// Evaluate a new inbound `flow` from a source with `labels` and
+    /// `membership` (`None`: in no namespace). `now` is read only when a
+    /// pinhole matches.
+    pub(crate) fn evaluate(
         &self,
-        request: &AccessRequest,
-        principal: &str,
-        membership: &Membership,
+        labels: &LabelSet,
+        membership: Option<&Membership>,
+        flow: &Flow,
         now: impl Fn() -> Instant,
-    ) -> MemberVerdict {
-        let dst = self.member_at(request.dst_ip);
+    ) -> Evaluation<'_> {
+        let evaluation = membership.map_or_else(
+            || self.evaluate_default(labels, flow),
+            |membership| self.evaluate_member(labels, membership, flow, now),
+        );
+        evaluation.log(flow);
+        evaluation
+    }
+
+    fn evaluate_default(&self, labels: &LabelSet, flow: &Flow) -> Evaluation<'_> {
+        match &self.default {
+            DefaultRules::NotInstalled => match self.not_installed {
+                NotInstalled::Accept => Evaluation::NotInstalled,
+                NotInstalled::Deny => Evaluation::Deny(reasons::NO_POLICY),
+            },
+            DefaultRules::Installed(rules) => {
+                rules
+                    .first_match(labels, flow)
+                    .map_or(Evaluation::Deny(reasons::DENIED), |id| Evaluation::Rule {
+                        namespace: None,
+                        id,
+                    })
+            }
+            DefaultRules::Failed => Evaluation::Deny(reasons::POLICY_FAILED),
+        }
+    }
+
+    fn evaluate_member(
+        &self,
+        labels: &LabelSet,
+        membership: &Membership,
+        flow: &Flow,
+        now: impl Fn() -> Instant,
+    ) -> Evaluation<'_> {
+        let dst = self.member_at(flow.dst);
         let mut common = false;
-        for id in membership.namespaces.iter().filter(|id| !id.is_app()) {
+        for id in membership.sources() {
             // A local destination is in every namespace.
             if dst.is_some_and(|(_, dst)| !dst.contains(id)) {
                 continue;
             }
             common = true;
-            let Some(namespace) = self.namespaces.get(id) else {
+            let Some((id, namespace)) = self.namespaces.get_key_value(id) else {
                 continue;
             };
-            if let Some(index) = namespace.rules.matched_rule(request) {
-                return MemberVerdict::Rule {
-                    namespace: id.clone(),
-                    index,
+            if let Some(rule) = namespace.rules.first_match(labels, flow) {
+                return Evaluation::Rule {
+                    namespace: Some(id),
+                    id: rule,
                 };
             }
         }
-        let Some((dst_principal, dst_membership)) = dst else {
-            // Pinholes open the local node only.
-            return match self.match_pinhole(
-                principal,
-                Direction::Inbound,
-                request.protocol,
-                request.dst_port,
-                now,
-            ) {
-                PinholeMatch::Open(id) => MemberVerdict::Pinhole(id),
-                PinholeMatch::Expired => MemberVerdict::PinholeExpired,
-                PinholeMatch::Absent => MemberVerdict::Denied,
+        let Some((owner, dst_membership)) = dst else {
+            // Pinholes open the local node only, for TCP and UDP.
+            let Some((protocol, port)) = flow.port() else {
+                return Evaluation::Deny(reasons::DENIED);
+            };
+            return match self.match_pinhole(labels, Direction::Inbound, protocol, port, now) {
+                PinholeMatch::Open(id) => Evaluation::Pinhole(id),
+                PinholeMatch::Expired => Evaluation::PinholeExpired,
+                PinholeMatch::Absent => Evaluation::Deny(reasons::DENIED),
             };
         };
         let granted = self.grants.values().find(|grant| {
-            grant_end_matches(&grant.grant.from, principal, membership)
-                && grant_end_matches(&grant.grant.to, dst_principal, dst_membership)
-                && grant.ports.matches(request.protocol, request.dst_port)
+            grant.from.matches_source(labels, membership)
+                && grant.to.matches_owner(owner, dst_membership)
+                && grant.protocols.matches(flow.transport)
         });
         match granted {
-            Some(grant) => MemberVerdict::Grant(Arc::clone(&grant.id)),
-            None if common => MemberVerdict::Denied,
-            None => MemberVerdict::CrossNamespace,
+            Some(grant) => Evaluation::Grant(&grant.id),
+            None if common => Evaluation::Deny(reasons::DENIED),
+            None => Evaluation::Deny(reasons::CROSS_NAMESPACE),
         }
     }
 
     /// Whether an outbound rule of one of `membership`'s namespaces accepts
-    /// `protocol` to `port`.
+    /// `transport`.
     pub(crate) fn outbound_rule_accepts(
         &self,
         membership: &Membership,
-        protocol: Protocol,
-        port: u16,
+        transport: Transport,
     ) -> bool {
         membership
             .namespaces
             .iter()
             .filter_map(|id| self.namespaces.get(id)?.outbound.as_deref())
             .flatten()
-            .any(|rule| rule.matches(protocol, port))
-    }
-
-    fn evaluate_default(&self, request: &AccessRequest) -> AclDecision {
-        if let Some(policy) = self.default_policy() {
-            return policy.is_allowed(request);
-        }
-        debug!(
-            src = %request.src_ip,
-            dst = %request.dst_ip,
-            port = request.dst_port,
-            proto = ?request.protocol,
-            "ACL deny: no policy loaded"
-        );
-        AclDecision {
-            allowed: false,
-            matched_rule_index: None,
-            reason: "denied: no policy loaded".to_owned(),
-        }
+            .any(|rule| rule.matches(transport))
     }
 
     /// Rebuild the indexes derived from `namespaces`.
@@ -826,79 +651,61 @@ impl Snapshot {
                 );
             }
         }
-        addresses.sort_by(|(a, a_principal), (b, b_principal)| {
+        addresses.sort_by(|(a, a_owner), (b, b_owner)| {
             b.prefix_len()
                 .cmp(&a.prefix_len())
-                .then_with(|| a_principal.cmp(b_principal))
+                .then_with(|| a_owner.cmp(b_owner))
         });
         addresses.dedup();
         let mut hosts = HashMap::new();
-        addresses.retain(|(net, principal)| {
+        addresses.retain(|(net, owner)| {
             let host = net.prefix_len() == if net.network().is_ipv4() { 32 } else { 128 };
             if host {
-                // Sorted by principal: the smallest one owns a shared address.
-                hosts
-                    .entry(net.network())
-                    .or_insert_with(|| principal.clone());
+                // Sorted by label: the smallest one owns a shared address.
+                hosts.entry(net.network()).or_insert_with(|| owner.clone());
             }
             !host
         });
         self.outbound_restrictions = memberships.values().any(|m| m.outbound_restricted);
-        self.memberships = memberships;
+        self.memberships = memberships
+            .into_iter()
+            .map(|(label, membership)| (label, Arc::new(membership)))
+            .collect();
         self.hosts = hosts;
         self.addresses = addresses;
     }
 
-    /// Recompute the bypass flags. A member bypasses when it is not
-    /// outbound-restricted and, for every destination (the local node and
-    /// every member address), a common source namespace accepts everything
-    /// (an accept rule from `*` to `*:*` for TCP and UDP).
+    /// Recompute the bypass inputs: whether sources in no namespace accept
+    /// everything, the open source namespaces (an accept rule from any source
+    /// to any destination for every TCP and UDP port), and the distinct
+    /// namespace sets of the address owners.
     fn rebypass(&mut self) {
-        self.default_bypass = self
-            .default
-            .as_ref()
-            .is_some_and(|policy| policy.accepts_everything());
-        let open: HashSet<&NamespaceId> = self
+        self.default_bypass = match &self.default {
+            DefaultRules::NotInstalled => self.not_installed == NotInstalled::Accept,
+            DefaultRules::Installed(rules) => rules.accepts_everything(),
+            DefaultRules::Failed => false,
+        };
+        self.open = self
             .namespaces
             .iter()
             .filter(|(id, namespace)| !id.is_app() && namespace.rules.accepts_everything())
-            .map(|(id, _)| id)
+            .map(|(id, _)| id.clone())
             .collect();
-        let mut bypass = HashSet::new();
-        if !open.is_empty() {
+        self.owner_sets = if self.open.is_empty() {
+            Vec::new()
+        } else {
             let owners: HashSet<&str> = self
                 .hosts
                 .values()
-                .chain(self.addresses.iter().map(|(_, principal)| principal))
+                .chain(self.addresses.iter().map(|(_, owner)| owner))
                 .map(String::as_str)
                 .collect();
-            // Members with the same open namespaces share the outcome.
-            let mut outcomes: HashMap<Vec<&NamespaceId>, bool> = HashMap::new();
-            for (principal, membership) in &self.memberships {
-                if membership.outbound_restricted {
-                    continue;
-                }
-                let mine: Vec<&NamespaceId> = membership
-                    .namespaces
-                    .iter()
-                    .filter(|id| open.contains(id))
-                    .collect();
-                if mine.is_empty() {
-                    continue;
-                }
-                let reaches_all = *outcomes.entry(mine).or_insert_with_key(|mine| {
-                    owners.iter().all(|owner| {
-                        self.memberships
-                            .get(*owner)
-                            .is_some_and(|m| mine.iter().any(|id| m.contains(id)))
-                    })
-                });
-                if reaches_all {
-                    bypass.insert(principal.clone());
-                }
-            }
-        }
-        self.bypass = bypass;
+            let sets: HashSet<&[NamespaceId]> = owners
+                .into_iter()
+                .filter_map(|owner| Some(&*self.memberships.get(owner)?.namespaces))
+                .collect();
+            sets.into_iter().map(<[NamespaceId]>::to_vec).collect()
+        };
     }
 
     /// Whether `peer` may hold a pinhole of `kind` in `app_namespace`
@@ -973,27 +780,22 @@ impl Snapshot {
 
 // ── AclEngine ─────────────────────────────────────────────────────────────────
 
-/// Shared ACL engine: the default [`CompiledPolicy`], rule namespaces,
-/// directed grants and app pinholes.
+/// Shared ACL engine: the default [`RuleSet`], rule namespaces, directed
+/// grants and app pinholes.
 ///
-/// Fail-closed: until a policy or namespace is loaded (and after
-/// [`clear`](Self::clear) with no namespace stored, or after
-/// [`clear_all`](Self::clear_all)) every request is denied. A principal in
-/// no namespace is denied while no default policy is loaded; a namespace
-/// member is governed by its namespaces (plus grants and pinholes) either
-/// way.
+/// The default rule set applies to sources in no namespace and has a
+/// [`PolicyState`]: not installed (the engine's [`NotInstalled`] action
+/// applies, deny by default), installed ([`install`](Self::install)), or
+/// failed ([`fail`](Self::fail), fail closed). A namespace member is
+/// governed by its namespaces (plus grants and pinholes) in every state.
 /// The whole state is one immutable snapshot: writers serialize on a mutex
 /// and publish a new snapshot atomically, readers take one lock-free load, so
 /// the engine can be shared through an `Arc` and queried per packet while
 /// another thread updates it.
 ///
-/// The default policy ([`load`](Self::load), [`store`](Self::store),
-/// [`clear`](Self::clear), [`policy`](Self::policy),
-/// [`is_allowed`](Self::is_allowed)) applies to principals that are members
-/// of no namespace. [`evaluate`](Self::evaluate) evaluates a request with
-/// namespaces, grants and pinholes, as [`AclFilter`](crate::AclFilter) does
-/// for inbound packets. See the crate docs for the namespace model and
-/// pinholes.
+/// [`evaluate`](Self::evaluate) decides a new inbound flow with namespaces,
+/// grants and pinholes, as [`AclFilter`](crate::AclFilter) does for inbound
+/// packets. See the crate docs for the namespace model and pinholes.
 pub struct AclEngine {
     snapshot: ArcSwap<Snapshot>,
     writer: Mutex<()>,
@@ -1017,13 +819,13 @@ impl fmt::Debug for AclEngine {
 }
 
 impl AclEngine {
-    /// An engine with no policy loaded (denies everything).
+    /// An engine with nothing installed (denies everything).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// An engine with no policy loaded whose pinhole expiry follows `clock`
+    /// An engine with nothing installed whose pinhole expiry follows `clock`
     /// instead of [`Instant::now`]; e.g. `|| tokio::time::Instant::now().into_std()`
     /// to follow paused tokio time in tests.
     pub fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
@@ -1035,16 +837,28 @@ impl AclEngine {
         }
     }
 
-    /// Compile `policy` and make it the active default policy, which applies
-    /// to principals in no namespace (namespace members are governed by their
-    /// namespaces whether or not a default policy is loaded).
+    /// Sets what applies to sources in no namespace while no rule set is
+    /// installed. Default [`NotInstalled::Deny`]: their new flows are denied
+    /// with [`reasons::NO_POLICY`]. With [`NotInstalled::Accept`] every flow
+    /// they send is accepted.
+    #[must_use]
+    pub fn with_not_installed(self, action: NotInstalled) -> Self {
+        let mut snapshot = Snapshot::clone(&self.snapshot.load());
+        snapshot.not_installed = action;
+        snapshot.rebypass();
+        self.snapshot.store(Arc::new(snapshot));
+        self
+    }
+
+    /// Compile `policy` and install it as the default rule set (see
+    /// [`RuleSet::from_document`]).
     ///
-    /// On error (invalid policy or failed built-in tests) the previously
-    /// loaded policy, if any, stays in effect.
+    /// On error (invalid policy or failed built-in tests) the previous state
+    /// stays in effect.
     pub fn load(&self, policy: AclPolicy) -> Result<(), Error> {
-        match CompiledPolicy::compile(policy) {
-            Ok(compiled) => {
-                self.store(Arc::new(compiled));
+        match RuleSet::from_document(policy) {
+            Ok(rules) => {
+                self.install(rules);
                 Ok(())
             }
             Err(err) => {
@@ -1054,101 +868,113 @@ impl AclEngine {
         }
     }
 
-    /// Make an already compiled policy the active default policy (see
-    /// [`load`](Self::load)).
-    pub fn store(&self, policy: Arc<CompiledPolicy>) {
-        self.publish(|snapshot| snapshot.default = Some(policy));
+    /// Install `rules` as the default rule set, which applies to sources in
+    /// no namespace, in one atomic swap. The state becomes
+    /// [`PolicyState::Installed`]; an empty set denies every new flow.
+    pub fn install(&self, rules: impl Into<Arc<RuleSet>>) {
+        let rules = rules.into();
+        self.publish(|snapshot| snapshot.default = DefaultRules::Installed(rules));
     }
 
-    /// Unload the default policy only. Principals in no namespace return to
-    /// fail-closed (their new flows are dropped with
-    /// [`reasons::NO_POLICY`](crate::reasons::NO_POLICY) by the filter);
-    /// namespaces, grants and pinholes stay, and their members are evaluated
-    /// as before. See [`clear_all`](Self::clear_all) to remove everything.
-    pub fn clear(&self) {
-        self.publish(|snapshot| snapshot.default = None);
+    /// Remove the default rule set: the state becomes
+    /// [`PolicyState::NotInstalled`] and the engine's [`NotInstalled`] action
+    /// applies to sources in no namespace. Namespaces, grants and pinholes
+    /// stay. See [`clear_all`](Self::clear_all) to remove everything.
+    pub fn uninstall(&self) {
+        self.publish(|snapshot| snapshot.default = DefaultRules::NotInstalled);
     }
 
-    /// Emergency stop: remove the default policy and every namespace, grant
-    /// and pinhole in one atomic snapshot swap, so the engine is unloaded and
-    /// the filter drops every inbound packet, replies included, with
-    /// [`reasons::NO_POLICY`](crate::reasons::NO_POLICY).
+    /// Report that the caller failed to build its rules: the state becomes
+    /// [`PolicyState::Failed`] and new flows of sources in no namespace are
+    /// denied with [`reasons::POLICY_FAILED`] (fail closed). With nothing
+    /// else loaded every inbound packet, replies included, is dropped. The
+    /// engine never enters this state on its own.
+    pub fn fail(&self) {
+        warn!("ACL default rules failed: sources in no namespace fail closed");
+        self.publish(|snapshot| snapshot.default = DefaultRules::Failed);
+    }
+
+    /// The state of the default rule set.
+    pub fn policy_state(&self) -> PolicyState {
+        self.snapshot.load().policy_state()
+    }
+
+    /// Emergency stop: remove the default rule set and every namespace, grant
+    /// and pinhole in one atomic snapshot swap and enter
+    /// [`PolicyState::Failed`], so the filter drops every inbound packet,
+    /// replies included, with [`reasons::POLICY_FAILED`] (even with
+    /// [`NotInstalled::Accept`]).
     ///
     /// Open pinholes are counted in [`PinholeStats::cleared`] (pinholes
     /// already expired are counted as expired); their guards become no-ops.
-    /// Later updates ([`load`](Self::load),
+    /// Later updates ([`install`](Self::install),
     /// [`store_namespace`](Self::store_namespace), ...) work as usual.
     pub fn clear_all(&self) {
         let cleared = self.publish(|snapshot| {
             let cleared = snapshot.pinholes.len() as u64;
-            *snapshot = Snapshot::default();
+            *snapshot = Snapshot {
+                default: DefaultRules::Failed,
+                not_installed: snapshot.not_installed,
+                ..Snapshot::default()
+            };
             cleared
         });
         PinholeCounters::add(&self.pinholes.cleared, cleared);
         warn!(
             pinholes = cleared,
-            "ACL cleared: every policy, namespace, grant and pinhole removed"
+            "ACL cleared: every rule, namespace, grant and pinhole removed"
         );
     }
 
-    /// Whether the default policy is loaded or at least one namespace is
-    /// stored. When `false`, the filter drops every inbound packet, replies
-    /// included, with [`reasons::NO_POLICY`](crate::reasons::NO_POLICY).
+    /// Whether anything is loaded: rules are installed, a namespace is
+    /// stored, or nothing is installed under [`NotInstalled::Accept`]. When
+    /// `false`, the filter drops every inbound packet, replies included, with
+    /// [`reasons::NO_POLICY`] (or [`reasons::POLICY_FAILED`] in
+    /// [`PolicyState::Failed`]).
     pub fn is_loaded(&self) -> bool {
         self.snapshot.load().is_loaded()
     }
 
-    /// The active default policy, if any.
-    pub fn policy(&self) -> Option<Arc<CompiledPolicy>> {
-        self.snapshot.load().default.clone()
+    /// The installed default rule set, if any.
+    pub fn rules(&self) -> Option<Arc<RuleSet>> {
+        match &self.snapshot.load().default {
+            DefaultRules::Installed(rules) => Some(Arc::clone(rules)),
+            DefaultRules::NotInstalled | DefaultRules::Failed => None,
+        }
     }
 
-    /// Evaluate `request` against the active default policy, ignoring
-    /// namespaces.
+    /// The decision for a new inbound flow `flow` from a source with
+    /// `labels`, with namespaces, grants and pinholes.
     ///
-    /// With no policy loaded the request is denied.
-    pub fn is_allowed(&self, request: &AccessRequest) -> AclDecision {
-        self.snapshot.load().evaluate_default(request)
-    }
-
-    /// Evaluate `request` as an inbound flow, with namespaces and grants.
-    ///
-    /// The principal is `request.source`'s source anchor. A principal in no
-    /// namespace is evaluated against the default policy, like
-    /// [`is_allowed`](Self::is_allowed). For a namespace member the
-    /// destination address is resolved to a member peer (longest prefix) or
-    /// the local node, and the request is accepted by a rule of a shared
-    /// namespace (`matched_rule_index` is the index within that namespace) or
-    /// by a directed grant (`matched_rule_index` is `None`). This is the
-    /// decision [`AclFilter`](crate::AclFilter) applies to a new inbound flow;
-    /// the filter's reply table is not consulted.
-    pub fn evaluate(&self, request: &AccessRequest) -> AclDecision {
+    /// A source whose labels are members of no namespace is decided by the
+    /// default rule set and its [`PolicyState`]. For a namespace member the
+    /// destination address is resolved to a member (longest prefix) or the
+    /// local node, and the flow is accepted by a rule of a shared namespace,
+    /// a directed grant or an inbound pinhole. This is the decision
+    /// [`AclFilter`](crate::AclFilter) applies to the first packet of a new
+    /// inbound flow; the filter's reply table is not consulted and nothing is
+    /// cached. A flow whose addresses are of different families is denied
+    /// with [`reasons::MALFORMED`].
+    pub fn evaluate(&self, labels: &LabelSet, flow: &Flow) -> Decision {
+        if flow.is_mixed() {
+            return Decision::Deny(reasons::MALFORMED);
+        }
         let snapshot = self.snapshot.load();
-        let principal = request.source.source_anchor();
-        let Some(membership) = snapshot.membership(&principal) else {
-            return snapshot.evaluate_default(request);
-        };
-        let verdict = snapshot.evaluate_member(request, &principal, membership, || self.now());
-        let (allowed, matched_rule_index, reason) = match verdict {
-            MemberVerdict::Rule { namespace, index } => (
-                true,
-                Some(index),
-                format!("accepted by namespace {namespace} rule {index}"),
-            ),
-            MemberVerdict::Grant(id) => (true, None, format!("accepted by grant {id}")),
-            MemberVerdict::Pinhole(id) => (true, None, format!("accepted by pinhole {id}")),
-            MemberVerdict::PinholeExpired | MemberVerdict::Denied => {
-                if verdict == MemberVerdict::PinholeExpired {
-                    self.expire_pinholes();
-                }
-                (false, None, "denied: no matching accept rule".to_owned())
+        let membership = snapshot.membership_of(labels);
+        let evaluation = snapshot.evaluate(labels, membership.as_deref(), flow, || self.now());
+        match evaluation {
+            Evaluation::Rule { namespace, id } => Decision::Accept(Matched::Rule {
+                namespace: namespace.cloned(),
+                id: id.clone(),
+            }),
+            Evaluation::Grant(id) => Decision::Accept(Matched::Grant(id.clone())),
+            Evaluation::Pinhole(id) => Decision::Accept(Matched::Pinhole(id)),
+            Evaluation::NotInstalled => Decision::Accept(Matched::NotInstalled),
+            Evaluation::PinholeExpired => {
+                self.expire_pinholes();
+                Decision::Deny(reasons::DENIED)
             }
-            MemberVerdict::CrossNamespace => (false, None, "denied: cross namespace".to_owned()),
-        };
-        AclDecision {
-            allowed,
-            matched_rule_index,
-            reason,
+            Evaluation::Deny(reason) => Decision::Deny(reason),
         }
     }
 
@@ -1157,8 +983,9 @@ impl AclEngine {
     ///
     /// The namespace's rules are compiled and their built-in tests run, as
     /// [`load`](Self::load) does. An app namespace ([`NamespaceId::is_app`])
-    /// with accept rules or allowed app pinholes is rejected with
-    /// [`Error::InvalidPolicy`]. On error the previous state stays in effect.
+    /// with accept rules or allowed app pinholes, or an invalid outbound
+    /// rule, is rejected with [`Error::InvalidNamespace`]. On error the
+    /// previous state stays in effect.
     pub fn store_namespace(
         &self,
         id: impl Into<NamespaceId>,
@@ -1211,30 +1038,31 @@ impl AclEngine {
 
     /// Store a directed grant under `id`, replacing any grant with that id.
     ///
-    /// Returns [`Error::InvalidPolicy`] for an invalid protocol or port syntax,
+    /// Returns [`Error::InvalidGrant`] for an invalid protocol or port syntax,
     /// or when an end is an app namespace (app access goes only through
     /// pinholes); the previous state then stays in effect. Reply allowances
     /// that depend on a grant survive its replacement under the same id.
-    pub fn store_grant(&self, id: impl Into<String>, grant: Grant) -> Result<(), Error> {
+    pub fn store_grant(&self, id: impl Into<RuleId>, grant: Grant) -> Result<(), Error> {
         let id = id.into();
+        let invalid = |reason: String| Error::InvalidGrant {
+            id: id.clone(),
+            reason,
+        };
         for end in [&grant.from, &grant.to] {
             if let GrantEnd::Namespace(ns) = end
                 && ns.is_app()
             {
-                return Err(Error::InvalidPolicy(format!(
-                    "grant '{id}' cannot name app namespace '{ns}'"
-                )));
+                return Err(invalid(format!("cannot name app namespace '{ns}'")));
             }
         }
-        let ports = CompiledPorts::compile(
-            grant.proto.as_deref(),
-            grant.ports.as_deref(),
-            &format!("grant '{id}'"),
-        )?;
+        let protocols =
+            compile_ports(grant.proto.as_deref(), grant.ports.as_deref()).map_err(invalid)?;
         let compiled = Arc::new(CompiledGrant {
-            id: Arc::from(id.as_str()),
+            id: id.clone(),
+            from: End::new(&grant.from),
+            to: End::new(&grant.to),
             grant,
-            ports,
+            protocols,
         });
         self.publish(|snapshot| {
             snapshot.grants.insert(id, compiled);
@@ -1250,7 +1078,7 @@ impl AclEngine {
     }
 
     /// The stored grants, sorted by id.
-    pub fn grants(&self) -> Vec<(String, Grant)> {
+    pub fn grants(&self) -> Vec<(RuleId, Grant)> {
         self.snapshot
             .load()
             .grants
@@ -1335,11 +1163,12 @@ impl AclEngine {
     }
 
     /// The policy generation: starts at 0 and increases on every published
-    /// change (default policy, namespaces, grants, pinholes opened, closed,
-    /// swept after expiry or revoked, [`clear_all`](Self::clear_all)). The
-    /// filter tags its cached verdicts with it, so no cached verdict outlives
-    /// a change; a pinhole that expired but is not swept yet is caught by the
-    /// filter's expiry check instead.
+    /// change (default rules and their state, namespaces, grants, pinholes
+    /// opened, closed, swept after expiry or revoked,
+    /// [`clear_all`](Self::clear_all)). The filter tags its cached verdicts
+    /// with it, so no cached verdict outlives a change; a pinhole that
+    /// expired but is not swept yet is caught by the filter's expiry check
+    /// instead.
     pub fn generation(&self) -> u64 {
         self.snapshot.load().generation
     }
@@ -1404,42 +1233,18 @@ impl AclEngine {
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn resolve_hosts(raw: &HashMap<String, String>) -> Result<HashMap<String, IpNet>, Error> {
-    raw.iter()
-        .map(|(alias, cidr)| {
-            let net = cidr.parse::<IpNet>().map_err(|e| Error::InvalidCidr {
-                addr: cidr.clone(),
-                reason: e.to_string(),
-            })?;
-            Ok((alias.clone(), net))
-        })
-        .collect()
-}
-
-/// Parse a test destination string like `"192.168.1.10:5432"`.
-fn parse_test_dst(s: &str) -> Result<(IpAddr, u16), String> {
-    let colon = s
-        .rfind(':')
-        .ok_or_else(|| format!("missing ':' in test dst '{s}'"))?;
-    let ip_str = &s[..colon];
-    let port_str = &s[colon + 1..];
-    let ip = ip_str
-        .parse::<IpAddr>()
-        .map_err(|_| format!("invalid IP '{ip_str}' in test dst '{s}'"))?;
-    let port = port_str
-        .parse::<u16>()
-        .map_err(|_| format!("invalid port '{port_str}' in test dst '{s}'"))?;
-    Ok((ip, port))
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
     use super::*;
-    use crate::policy::{AclAction, AclRule, AclTest};
+    use crate::matcher::address_labels;
+    use crate::namespace::{NamespaceMember, OutboundRule};
+    use crate::policy::{AclAction, AclRule};
+    use crate::rules::{IcmpTypes, ProtocolMatch, Rule};
 
     fn make_policy(acls: Vec<AclRule>, tests: Vec<AclTest>) -> AclPolicy {
         AclPolicy {
@@ -1447,25 +1252,6 @@ mod tests {
             acls,
             tests,
         }
-    }
-
-    #[test]
-    fn permit_all_allows_every_flow() {
-        let e = CompiledPolicy::permit_all();
-        let a = AccessRequest::from_ip(
-            "1.2.3.4".parse().unwrap(),
-            "5.6.7.8".parse().unwrap(),
-            443,
-            Protocol::Tcp,
-        );
-        assert!(e.is_allowed(&a).allowed);
-        let b = AccessRequest::from_ip(
-            "10.0.0.112".parse().unwrap(),
-            "10.0.0.111".parse().unwrap(),
-            18888,
-            Protocol::Udp,
-        );
-        assert!(e.is_allowed(&b).allowed);
     }
 
     fn accept_rule(src: &[&str], dst: &[&str], proto: Option<&str>) -> AclRule {
@@ -1477,72 +1263,95 @@ mod tests {
         }
     }
 
-    fn req(src: &str, dst: &str, port: u16, proto: Protocol) -> AccessRequest {
-        AccessRequest::from_ip(src.parse().unwrap(), dst.parse().unwrap(), port, proto)
+    fn flow(src: &str, dst: &str, port: u16, proto: Protocol) -> Flow {
+        let src = SocketAddr::new(src.parse().unwrap(), 4000);
+        let dst = SocketAddr::new(dst.parse().unwrap(), port);
+        match proto {
+            Protocol::Tcp => Flow::tcp(src, dst),
+            Protocol::Udp => Flow::udp(src, dst),
+        }
     }
 
-    // ── default deny ──────────────────────────────────────────────────────
+    /// A flow from a bare source IP (an IP-bearing source).
+    fn req(src: &str, dst: &str, port: u16, proto: Protocol) -> (LabelSet, Flow) {
+        (
+            address_labels(src.parse().unwrap()),
+            flow(src, dst, port, proto),
+        )
+    }
+
+    fn allowed(rules: &RuleSet, (labels, flow): &(LabelSet, Flow)) -> bool {
+        rules.matching(labels, flow).is_some()
+    }
+
+    fn matched(rules: &RuleSet, (labels, flow): &(LabelSet, Flow)) -> Option<String> {
+        rules
+            .matching(labels, flow)
+            .map(|id| id.as_str().to_owned())
+    }
+
+    fn evaluate(engine: &AclEngine, (labels, flow): &(LabelSet, Flow)) -> Decision {
+        engine.evaluate(labels, flow)
+    }
+
+    fn rule(namespace: Option<&str>, id: &str) -> Decision {
+        Decision::Accept(Matched::Rule {
+            namespace: namespace.map(NamespaceId::from),
+            id: id.into(),
+        })
+    }
+
+    // ── documents ─────────────────────────────────────────────────────────
 
     #[test]
     fn empty_policy_denies_everything() {
-        let engine = CompiledPolicy::compile(make_policy(vec![], vec![])).unwrap();
-        let d = engine.is_allowed(&req("10.0.0.1", "192.168.1.1", 80, Protocol::Tcp));
-        assert!(!d.allowed);
-        assert!(d.matched_rule_index.is_none());
+        let rules = RuleSet::from_document(make_policy(vec![], vec![])).unwrap();
+        assert!(!allowed(
+            &rules,
+            &req("10.0.0.1", "192.168.1.1", 80, Protocol::Tcp)
+        ));
     }
-
-    // ── wildcard accept ───────────────────────────────────────────────────
 
     #[test]
     fn wildcard_rule_allows_any_connection() {
-        let engine = CompiledPolicy::compile(make_policy(
+        let rules = RuleSet::from_document(make_policy(
             vec![accept_rule(&["*"], &["*:*"], None)],
             vec![],
         ))
         .unwrap();
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 9999, Protocol::Udp))
-                .allowed
-        );
+        assert!(allowed(
+            &rules,
+            &req("1.2.3.4", "5.6.7.8", 9999, Protocol::Udp)
+        ));
     }
-
-    // ── CIDR src/dst matching ─────────────────────────────────────────────
 
     #[test]
     fn cidr_rule_allows_in_range_denies_outside() {
-        let engine = CompiledPolicy::compile(make_policy(
+        let rules = RuleSet::from_document(make_policy(
             vec![accept_rule(&["10.0.0.0/24"], &["192.168.1.0/24:80"], None)],
             vec![],
         ))
         .unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("10.0.0.5", "192.168.1.5", 80, Protocol::Tcp))
-                .allowed
-        );
+        assert!(allowed(
+            &rules,
+            &req("10.0.0.5", "192.168.1.5", 80, Protocol::Tcp)
+        ));
         // src outside range
-        assert!(
-            !engine
-                .is_allowed(&req("10.0.1.5", "192.168.1.5", 80, Protocol::Tcp))
-                .allowed
-        );
+        assert!(!allowed(
+            &rules,
+            &req("10.0.1.5", "192.168.1.5", 80, Protocol::Tcp)
+        ));
         // dst outside range
-        assert!(
-            !engine
-                .is_allowed(&req("10.0.0.5", "192.168.2.5", 80, Protocol::Tcp))
-                .allowed
-        );
+        assert!(!allowed(
+            &rules,
+            &req("10.0.0.5", "192.168.2.5", 80, Protocol::Tcp)
+        ));
         // wrong port
-        assert!(
-            !engine
-                .is_allowed(&req("10.0.0.5", "192.168.1.5", 443, Protocol::Tcp))
-                .allowed
-        );
+        assert!(!allowed(
+            &rules,
+            &req("10.0.0.5", "192.168.1.5", 443, Protocol::Tcp)
+        ));
     }
-
-    // ── host alias resolution ─────────────────────────────────────────────
 
     #[test]
     fn host_alias_resolves_correctly() {
@@ -1553,114 +1362,43 @@ mod tests {
         policy
             .hosts
             .insert("db".to_owned(), "192.168.1.10/32".to_owned());
-        let engine = CompiledPolicy::compile(policy).unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("10.0.0.2", "192.168.1.10", 5432, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .is_allowed(&req("10.0.0.2", "192.168.1.11", 5432, Protocol::Tcp))
-                .allowed
-        );
-    }
-
-    // ── protocol filtering ────────────────────────────────────────────────
-
-    #[test]
-    fn proto_tcp_rule_rejects_udp() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["*"], &["*:80"], Some("tcp"))],
-            vec![],
-        ))
-        .unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 80, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 80, Protocol::Udp))
-                .allowed
-        );
+        let rules = RuleSet::from_document(policy).unwrap();
+        assert!(allowed(
+            &rules,
+            &req("10.0.0.2", "192.168.1.10", 5432, Protocol::Tcp)
+        ));
+        assert!(!allowed(
+            &rules,
+            &req("10.0.0.2", "192.168.1.11", 5432, Protocol::Tcp)
+        ));
     }
 
     #[test]
-    fn no_proto_rule_matches_tcp_and_udp() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["*"], &["*:53"], None)],
+    fn document_protocols_and_ports() {
+        let rules = RuleSet::from_document(make_policy(
+            vec![
+                accept_rule(&["*"], &["*:80"], Some("tcp")),
+                accept_rule(&["*"], &["*:53"], None),
+                accept_rule(&["*"], &["*:8000-8999"], Some("udp")),
+                accept_rule(&["*"], &["*:443,8443"], Some("tcp")),
+            ],
             vec![],
         ))
         .unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "8.8.8.8", 53, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "8.8.8.8", 53, Protocol::Udp))
-                .allowed
-        );
+        let check = |port, proto| matched(&rules, &req("1.2.3.4", "5.6.7.8", port, proto));
+        assert_eq!(check(80, Protocol::Tcp).as_deref(), Some("0"));
+        assert_eq!(check(80, Protocol::Udp), None);
+        assert_eq!(check(53, Protocol::Tcp).as_deref(), Some("1"));
+        assert_eq!(check(53, Protocol::Udp).as_deref(), Some("1"));
+        assert_eq!(check(8080, Protocol::Udp).as_deref(), Some("2"));
+        assert_eq!(check(8080, Protocol::Tcp), None);
+        assert_eq!(check(8443, Protocol::Tcp).as_deref(), Some("3"));
+        assert_eq!(check(444, Protocol::Tcp), None);
     }
-
-    // ── port ranges and lists ─────────────────────────────────────────────
-
-    #[test]
-    fn port_range_rule() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["*"], &["*:8000-8999"], None)],
-            vec![],
-        ))
-        .unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 8080, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 80, Protocol::Tcp))
-                .allowed
-        );
-    }
-
-    #[test]
-    fn port_list_rule() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["*"], &["*:80,443"], None)],
-            vec![],
-        ))
-        .unwrap();
-
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 80, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 443, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 8080, Protocol::Tcp))
-                .allowed
-        );
-    }
-
-    // ── priority ordering ─────────────────────────────────────────────────
 
     #[test]
     fn first_matching_rule_wins() {
-        let engine = CompiledPolicy::compile(make_policy(
+        let rules = RuleSet::from_document(make_policy(
             vec![
                 accept_rule(&["10.0.0.0/24"], &["*:80"], None),
                 accept_rule(&["*"], &["*:*"], None),
@@ -1668,102 +1406,72 @@ mod tests {
             vec![],
         ))
         .unwrap();
-
-        let d = engine.is_allowed(&req("10.0.0.5", "1.2.3.4", 80, Protocol::Tcp));
-        assert!(d.allowed);
-        assert_eq!(d.matched_rule_index, Some(0));
-
-        let d2 = engine.is_allowed(&req("172.16.0.1", "1.2.3.4", 9090, Protocol::Tcp));
-        assert!(d2.allowed);
-        assert_eq!(d2.matched_rule_index, Some(1));
+        let first = req("10.0.0.5", "1.2.3.4", 80, Protocol::Tcp);
+        assert_eq!(matched(&rules, &first).as_deref(), Some("0"));
+        let second = req("172.16.0.1", "1.2.3.4", 9090, Protocol::Tcp);
+        assert_eq!(matched(&rules, &second).as_deref(), Some("1"));
     }
 
-    // ── built-in tests ────────────────────────────────────────────────────
-
     #[test]
-    fn builtin_tests_pass_on_valid_policy() {
-        let policy = make_policy(
+    fn builtin_tests_run_on_compilation() {
+        let test = |dst: &str, proto: Option<&str>, allow| AclTest {
+            src: "10.0.0.2".to_owned(),
+            dst: dst.to_owned(),
+            proto: proto.map(str::to_owned),
+            allow,
+        };
+        let tcp = make_policy(
             vec![accept_rule(&["10.0.0.0/24"], &["192.168.1.0/24:80"], None)],
             vec![
-                AclTest {
-                    src: "10.0.0.2".to_owned(),
-                    dst: "192.168.1.5:80".to_owned(),
-                    proto: None,
-                    allow: true,
-                },
-                AclTest {
-                    src: "10.0.0.2".to_owned(),
-                    dst: "192.168.1.5:443".to_owned(),
-                    proto: None,
-                    allow: false,
-                },
+                test("192.168.1.5:80", None, true),
+                test("192.168.1.5:443", None, false),
             ],
         );
-        assert!(CompiledPolicy::compile(policy).is_ok());
-    }
-
-    #[test]
-    fn builtin_tests_can_validate_udp_policy() {
-        let policy = make_policy(
+        assert!(RuleSet::from_document(tcp).is_ok());
+        let udp = make_policy(
             vec![accept_rule(
                 &["10.0.0.0/24"],
                 &["192.168.1.0/24:53"],
                 Some("udp"),
             )],
             vec![
-                AclTest {
-                    src: "10.0.0.2".to_owned(),
-                    dst: "192.168.1.5:53".to_owned(),
-                    proto: Some("udp".to_owned()),
-                    allow: true,
-                },
-                AclTest {
-                    src: "10.0.0.2".to_owned(),
-                    dst: "192.168.1.5:53".to_owned(),
-                    proto: Some("tcp".to_owned()),
-                    allow: false,
-                },
+                test("192.168.1.5:53", Some("udp"), true),
+                test("192.168.1.5:53", Some("tcp"), false),
             ],
         );
-        assert!(CompiledPolicy::compile(policy).is_ok());
-    }
-
-    #[test]
-    fn builtin_tests_fail_returns_error() {
-        let policy = make_policy(
+        assert!(RuleSet::from_document(udp).is_ok());
+        // Expects allow, but an empty policy denies; unparsable tests fail too.
+        let failing = make_policy(
             vec![],
-            vec![AclTest {
-                src: "10.0.0.2".to_owned(),
-                dst: "192.168.1.5:80".to_owned(),
-                proto: None,
-                allow: true, // expects allow, but empty policy denies
-            }],
+            vec![
+                test("192.168.1.5:80", None, true),
+                test("192.168.1.5", None, false),
+                test("192.168.1.5:80", Some("icmp"), false),
+            ],
         );
-        let err = CompiledPolicy::compile(policy).unwrap_err();
-        assert!(matches!(err, crate::Error::TestsFailed { count: 1 }));
-    }
-
-    // ── invalid policy ────────────────────────────────────────────────────
-
-    #[test]
-    fn invalid_host_alias_in_rule_returns_error() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["does-not-exist"], &["*:80"], None)],
-            vec![],
+        assert!(matches!(
+            RuleSet::from_document(failing),
+            Err(Error::TestsFailed { count: 3 })
         ));
-        assert!(engine.is_err());
     }
 
     #[test]
-    fn invalid_cidr_in_hosts_returns_error() {
+    fn invalid_documents_return_errors() {
+        assert!(
+            RuleSet::from_document(make_policy(
+                vec![accept_rule(&["does-not-exist"], &["*:80"], None)],
+                vec![],
+            ))
+            .is_err()
+        );
         let mut policy = make_policy(vec![], vec![]);
         policy
             .hosts
             .insert("bad".to_owned(), "not-a-cidr".to_owned());
-        assert!(CompiledPolicy::compile(policy).is_err());
+        assert!(RuleSet::from_document(policy).is_err());
     }
 
-    // ── subject-key source matching ───────────────────────────────────────
+    // ── source assertions ─────────────────────────────────────────────────
 
     #[test]
     fn source_class_and_anchor_strings() {
@@ -1784,66 +1492,48 @@ mod tests {
         assert_eq!(e.source_anchor(), "idp:okta");
     }
 
+    fn anchor(byte: u8) -> String {
+        wg_peer_anchor(&[byte; 32])
+    }
+
+    fn key_labels(byte: u8) -> LabelSet {
+        LabelSet::new([Label::from(anchor(byte))])
+    }
+
+    /// A flow from the WireGuard key `[byte; 32]` (a source without an
+    /// address label).
+    fn key_req(byte: u8, dst: &str, port: u16, proto: Protocol) -> (LabelSet, Flow) {
+        (key_labels(byte), flow("fd00::ff", dst, port, proto))
+    }
+
     #[test]
-    fn key_principal_rule_matches_wg_peer_key_only() {
-        let key = [7u8; 32];
+    fn key_rules_match_the_key_and_cidr_rules_need_an_address() {
         let key_src = format!("key:{}", "07".repeat(32));
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&[&key_src], &["*:*"], None)],
+        let rules = RuleSet::from_document(make_policy(
+            vec![
+                accept_rule(&[&key_src], &["*:80"], None),
+                accept_rule(&["fd00::/16"], &["*:443"], None),
+            ],
             vec![],
         ))
         .unwrap();
-
-        // A request from the matching WG key is accepted.
-        let allowed = engine.is_allowed(&AccessRequest::with_wg_peer_key(
-            key,
-            "0.0.0.0".parse().unwrap(),
-            "10.0.0.2".parse().unwrap(),
-            80,
-            Protocol::Tcp,
-        ));
-        assert!(allowed.allowed, "matching client-wg-key must be accepted");
-
+        assert!(allowed(&rules, &key_req(7, "fd00::2", 80, Protocol::Tcp)));
         // A different key is denied (default-deny).
-        let other = engine.is_allowed(&AccessRequest::with_wg_peer_key(
-            [9u8; 32],
-            "0.0.0.0".parse().unwrap(),
-            "10.0.0.2".parse().unwrap(),
-            80,
-            Protocol::Tcp,
+        assert!(!allowed(&rules, &key_req(9, "fd00::2", 80, Protocol::Tcp)));
+        // An IP-bearing source never matches a key rule.
+        assert!(!allowed(
+            &rules,
+            &req("fd00::7", "fd00::2", 80, Protocol::Tcp)
         ));
-        assert!(!other.allowed, "a non-authorised key must be denied");
-
-        // An IP/terminate source never matches a key principal.
-        let ip_src = engine.is_allowed(&req("10.0.0.2", "10.0.0.2", 80, Protocol::Tcp));
-        assert!(
-            !ip_src.allowed,
-            "a CIDR/terminate source must not match a key rule"
-        );
+        // A CIDR rule matches an IP-bearing source only, never a key.
+        assert!(allowed(
+            &rules,
+            &req("fd00::7", "fd00::2", 443, Protocol::Tcp)
+        ));
+        assert!(!allowed(&rules, &key_req(7, "fd00::2", 443, Protocol::Tcp)));
     }
 
-    #[test]
-    fn cidr_rule_does_not_match_a_keyed_source() {
-        let engine = CompiledPolicy::compile(make_policy(
-            vec![accept_rule(&["10.0.0.0/24"], &["*:*"], None)],
-            vec![],
-        ))
-        .unwrap();
-        // A WgPeerKey source carries no IP → a CIDR rule cannot match it.
-        let d = engine.is_allowed(&AccessRequest::with_wg_peer_key(
-            [1u8; 32],
-            "10.0.0.7".parse().unwrap(),
-            "10.0.0.2".parse().unwrap(),
-            80,
-            Protocol::Tcp,
-        ));
-        assert!(
-            !d.allowed,
-            "CIDR rule must not match a key-only source even with a legacy src_ip"
-        );
-    }
-
-    // ── AclEngine (shared, atomic reload) ─────────────────────────────────
+    // ── policy states ─────────────────────────────────────────────────────
 
     fn port_policy(port: u16) -> AclPolicy {
         make_policy(
@@ -1852,38 +1542,207 @@ mod tests {
         )
     }
 
+    fn port_rules(id: &str, port: u16) -> RuleSet {
+        RuleSet::new([Rule::new(
+            id,
+            vec![ProtocolMatch::Tcp(PortSet::single(port))],
+        )])
+        .unwrap()
+    }
+
     #[test]
-    fn engine_is_fail_closed_before_first_load() {
+    fn not_installed_denies_by_default() {
         let engine = AclEngine::new();
+        assert_eq!(engine.policy_state(), PolicyState::NotInstalled);
         assert!(!engine.is_loaded());
-        assert!(engine.policy().is_none());
-        let d = engine.is_allowed(&req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp));
-        assert!(!d.allowed);
-        assert!(d.matched_rule_index.is_none());
-        assert_eq!(d.reason, "denied: no policy loaded");
+        assert!(engine.rules().is_none());
+        let request = req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp);
+        assert_eq!(
+            evaluate(&engine, &request),
+            Decision::Deny(reasons::NO_POLICY)
+        );
         assert!(!AclEngine::default().is_loaded());
     }
 
     #[test]
-    fn engine_load_then_allow() {
-        let engine = AclEngine::new();
-        engine.load(port_policy(80)).unwrap();
+    fn not_installed_can_accept() {
+        let engine = AclEngine::new().with_not_installed(NotInstalled::Accept);
+        assert_eq!(engine.policy_state(), PolicyState::NotInstalled);
         assert!(engine.is_loaded());
-        let d = engine.is_allowed(&req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp));
-        assert!(d.allowed);
-        assert_eq!(d.matched_rule_index, Some(0));
-        assert!(
-            !engine
-                .is_allowed(&req("10.0.0.1", "10.0.0.2", 443, Protocol::Tcp))
-                .allowed
+        assert!(engine.snapshot().bypasses(None));
+        for request in [
+            req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp),
+            key_req(1, "fd00::2", 9, Protocol::Udp),
+            (
+                LabelSet::empty(),
+                Flow::icmp("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap(), 8),
+            ),
+        ] {
+            assert_eq!(
+                evaluate(&engine, &request),
+                Decision::Accept(Matched::NotInstalled)
+            );
+        }
+        // Installed rules take over; uninstalling returns to the action.
+        engine.install(port_rules("web", 80));
+        let other = req("10.0.0.1", "10.0.0.2", 81, Protocol::Tcp);
+        assert_eq!(evaluate(&engine, &other), Decision::Deny(reasons::DENIED));
+        engine.uninstall();
+        assert_eq!(
+            evaluate(&engine, &other),
+            Decision::Accept(Matched::NotInstalled)
         );
     }
 
     #[test]
-    fn engine_failed_reload_keeps_previous_policy() {
+    fn installed_rules_decide_and_report_their_id() {
+        let engine = AclEngine::new();
+        let generation = engine.generation();
+        engine.install(port_rules("web", 80));
+        assert!(engine.generation() > generation);
+        assert_eq!(engine.policy_state(), PolicyState::Installed { rules: 1 });
+        assert!(engine.is_loaded());
+        assert_eq!(engine.rules().unwrap().rules()[0].id.as_str(), "web");
+        let web = req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp);
+        let decision = evaluate(&engine, &web);
+        assert_eq!(decision, rule(None, "web"));
+        assert_eq!(decision.rule_id().map(RuleId::as_str), Some("web"));
+        assert_eq!(
+            evaluate(&engine, &req("10.0.0.1", "10.0.0.2", 443, Protocol::Tcp)),
+            Decision::Deny(reasons::DENIED)
+        );
+        // A family-mixed flow is malformed.
+        let mixed = (
+            LabelSet::empty(),
+            flow("10.0.0.1", "fd00::2", 80, Protocol::Tcp),
+        );
+        assert_eq!(
+            evaluate(&engine, &mixed),
+            Decision::Deny(reasons::MALFORMED)
+        );
+        // An installed empty set denies every new flow but counts as loaded.
+        engine.install(Arc::new(RuleSet::empty()));
+        assert_eq!(engine.policy_state(), PolicyState::Installed { rules: 0 });
+        assert!(engine.is_loaded());
+        assert_eq!(evaluate(&engine, &web), Decision::Deny(reasons::DENIED));
+        // `load` installs a compiled document.
+        engine.load(port_policy(80)).unwrap();
+        assert_eq!(evaluate(&engine, &web), rule(None, "0"));
+    }
+
+    #[test]
+    fn typed_rules_accept_icmp_and_other_protocols() {
+        let engine = AclEngine::new();
+        engine.install(
+            RuleSet::new([
+                Rule::new("echo", vec![ProtocolMatch::Icmp(IcmpTypes::Only(vec![8]))]),
+                Rule::new("gre", vec![ProtocolMatch::Ip(47)]).with_labels(["a".into()]),
+            ])
+            .unwrap(),
+        );
+        let (a, b) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let labels = LabelSet::new(["a".into()]);
+        assert_eq!(
+            engine.evaluate(&labels, &Flow::icmp(a, b, 8)),
+            rule(None, "echo")
+        );
+        assert_eq!(
+            engine.evaluate(&labels, &Flow::icmp(a, b, 0)),
+            Decision::Deny(reasons::DENIED)
+        );
+        assert_eq!(
+            engine.evaluate(&labels, &Flow::ip(a, b, 47)),
+            rule(None, "gre")
+        );
+        assert_eq!(
+            engine.evaluate(&LabelSet::empty(), &Flow::ip(a, b, 47)),
+            Decision::Deny(reasons::DENIED)
+        );
+    }
+
+    #[test]
+    fn failed_state_fails_closed() {
+        let engine = AclEngine::new().with_not_installed(NotInstalled::Accept);
+        engine.install(port_rules("web", 80));
+        let generation = engine.generation();
+        engine.fail();
+        assert!(engine.generation() > generation);
+        assert_eq!(engine.policy_state(), PolicyState::Failed);
+        assert!(engine.rules().is_none());
+        assert!(!engine.is_loaded());
+        let web = req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp);
+        assert_eq!(
+            evaluate(&engine, &web),
+            Decision::Deny(reasons::POLICY_FAILED)
+        );
+        // Namespace members are still governed by their namespaces.
+        engine
+            .store_namespace("nsd:a", ns(&[(1, "fd00::1")], 22))
+            .unwrap();
+        assert!(engine.is_loaded());
+        assert_eq!(
+            evaluate(&engine, &key_req(1, "fd00::99", 22, Protocol::Tcp)),
+            rule(Some("nsd:a"), "0")
+        );
+        assert_eq!(
+            evaluate(&engine, &web),
+            Decision::Deny(reasons::POLICY_FAILED)
+        );
+        // Installing recovers.
+        engine.install(port_rules("web", 80));
+        assert_eq!(evaluate(&engine, &web), rule(None, "web"));
+    }
+
+    #[test]
+    fn clear_all_leaves_the_state_failed() {
+        let (engine, clock) = manual_engine();
+        let engine = Arc::try_unwrap(engine)
+            .unwrap()
+            .with_not_installed(NotInstalled::Accept);
+        let engine = Arc::new(engine);
+        engine.install(port_rules("web", 80));
+        engine
+            .store_namespace("app:s1", app(&[(2, "fd00::2")]))
+            .unwrap();
+        engine
+            .store_grant(
+                "g",
+                Grant {
+                    from: GrantEnd::Peer(anchor(1)),
+                    to: GrantEnd::Peer(anchor(2)),
+                    proto: None,
+                    ports: None,
+                },
+            )
+            .unwrap();
+        let guard = engine
+            .open_pinhole("app:s1", spec(2, 80, now(&clock) + Duration::from_secs(60)))
+            .unwrap();
+        engine.clear_all();
+        assert_eq!(engine.policy_state(), PolicyState::Failed);
+        assert!(!engine.is_loaded());
+        assert!(engine.namespaces().is_empty() && engine.grants().is_empty());
+        assert!(!guard.is_open());
+        assert_eq!(engine.pinhole_stats().cleared, 1);
+        // Fail closed even with `NotInstalled::Accept`.
+        assert_eq!(
+            evaluate(&engine, &req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp)),
+            Decision::Deny(reasons::POLICY_FAILED)
+        );
+        // `uninstall` returns to `NotInstalled`, whose action is kept.
+        engine.uninstall();
+        assert_eq!(engine.policy_state(), PolicyState::NotInstalled);
+        assert_eq!(
+            evaluate(&engine, &req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp)),
+            Decision::Accept(Matched::NotInstalled)
+        );
+    }
+
+    #[test]
+    fn engine_failed_reload_keeps_previous_rules() {
         let engine = AclEngine::new();
         engine.load(port_policy(80)).unwrap();
-        let before = engine.policy().unwrap();
+        let before = engine.rules().unwrap();
 
         // Built-in test failure.
         let failing = make_policy(
@@ -1897,7 +1756,7 @@ mod tests {
         );
         assert!(matches!(
             engine.load(failing),
-            Err(crate::Error::TestsFailed { count: 1 })
+            Err(Error::TestsFailed { count: 1 })
         ));
         // Compile failure.
         assert!(
@@ -1909,49 +1768,28 @@ mod tests {
                 .is_err()
         );
 
-        let after = engine.policy().unwrap();
+        let after = engine.rules().unwrap();
         assert!(Arc::ptr_eq(&before, &after));
-        assert!(
-            engine
-                .is_allowed(&req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp))
-                .allowed
-        );
-    }
-
-    #[test]
-    fn engine_store_and_clear() {
-        let engine = AclEngine::new();
-        engine.store(Arc::new(CompiledPolicy::permit_all()));
-        assert!(
-            engine
-                .is_allowed(&req("1.2.3.4", "5.6.7.8", 9, Protocol::Udp))
-                .allowed
-        );
-
-        engine.clear();
-        assert!(!engine.is_loaded());
-        let d = engine.is_allowed(&req("1.2.3.4", "5.6.7.8", 9, Protocol::Udp));
-        assert!(!d.allowed);
-        assert_eq!(d.reason, "denied: no policy loaded");
+        assert!(evaluate(&engine, &req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp)).is_accept());
     }
 
     #[test]
     fn engine_concurrent_readers_during_reload() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Policy A accepts port 80 by rule 0; policy B accepts it by rule 1.
-        // Readers must only ever observe one of the two whole policies (or
-        // the fail-closed state while cleared), never a mix.
-        let policy_a = port_policy(80);
-        let policy_b = make_policy(
-            vec![
-                accept_rule(&["*"], &["*:443"], None),
-                accept_rule(&["*"], &["*:80"], None),
-            ],
-            vec![],
+        // Set A accepts port 80 by rule "a"; set B by rule "b" (after a rule
+        // for 443). Readers must only ever observe one of the two whole sets
+        // (or the not-installed state), never a mix.
+        let set_a = Arc::new(port_rules("a", 80));
+        let set_b = Arc::new(
+            RuleSet::new([
+                Rule::new("b443", vec![ProtocolMatch::Tcp(PortSet::single(443))]),
+                Rule::new("b", vec![ProtocolMatch::Tcp(PortSet::single(80))]),
+            ])
+            .unwrap(),
         );
         let engine = AclEngine::new();
-        engine.load(policy_a.clone()).unwrap();
+        engine.install(Arc::clone(&set_a));
         let stop = AtomicBool::new(false);
         let request = req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp);
 
@@ -1961,20 +1799,17 @@ mod tests {
                     s.spawn(|| {
                         let mut seen = 0u64;
                         loop {
-                            let d = engine.is_allowed(&request);
-                            if let Some(idx) = d.matched_rule_index {
-                                assert!(d.allowed);
-                                assert!(idx <= 1, "unexpected rule {idx}");
-                                assert_eq!(d.reason, format!("accepted by rule {idx}"));
-                            } else {
-                                assert!(!d.allowed);
-                                assert_eq!(d.reason, "denied: no policy loaded");
-                            }
+                            let d = evaluate(&engine, &request);
+                            assert!(
+                                d == rule(None, "a")
+                                    || d == rule(None, "b")
+                                    || d == Decision::Deny(reasons::NO_POLICY),
+                                "{d:?}"
+                            );
                             // A snapshot stays stable across evaluations.
-                            if let Some(p) = engine.policy() {
-                                let first = p.is_allowed(&request).matched_rule_index;
-                                let second = p.is_allowed(&request).matched_rule_index;
-                                assert_eq!(first, second);
+                            if let Some(rules) = engine.rules() {
+                                let first = matched(&rules, &request);
+                                assert_eq!(first, matched(&rules, &request));
                             }
                             seen += 1;
                             if stop.load(Ordering::Relaxed) {
@@ -1987,9 +1822,9 @@ mod tests {
 
             for i in 0..2000 {
                 match i % 3 {
-                    0 => engine.load(policy_b.clone()).unwrap(),
-                    1 => engine.load(policy_a.clone()).unwrap(),
-                    _ => engine.clear(),
+                    0 => engine.install(Arc::clone(&set_b)),
+                    1 => engine.install(Arc::clone(&set_a)),
+                    _ => engine.uninstall(),
                 }
             }
             stop.store(true, Ordering::Relaxed);
@@ -2000,22 +1835,6 @@ mod tests {
     }
 
     // ── namespaces and grants ─────────────────────────────────────────────
-
-    use crate::namespace::{NamespaceMember, OutboundRule};
-
-    fn anchor(byte: u8) -> String {
-        wg_peer_anchor(&[byte; 32])
-    }
-
-    fn key_req(byte: u8, dst: &str, port: u16, proto: Protocol) -> AccessRequest {
-        AccessRequest::with_wg_peer_key(
-            [byte; 32],
-            "fd00::ff".parse().unwrap(),
-            dst.parse().unwrap(),
-            port,
-            proto,
-        )
-    }
 
     /// A namespace with members `(key byte, address)` accepting `port` from anyone.
     fn ns(members: &[(u8, &str)], port: u16) -> NamespacePolicy {
@@ -2047,7 +1866,7 @@ mod tests {
             .store_namespace("quick", ns(&[(2, "fd00::2")], 22))
             .unwrap();
         assert!(engine.is_loaded());
-        assert!(engine.policy().is_none());
+        assert!(engine.rules().is_none());
         assert_eq!(
             engine.namespaces(),
             vec![NamespaceId::from("nsd:a"), NamespaceId::from("quick")]
@@ -2059,21 +1878,9 @@ mod tests {
             .store_namespace("nsd:a", ns(&[(1, "fd00::1"), (3, "fd00::3")], 443))
             .unwrap();
         assert!(Arc::ptr_eq(&quick, &namespace_ptr(&engine, "quick")));
-        assert!(
-            engine
-                .evaluate(&key_req(1, "fd00::99", 443, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .evaluate(&key_req(1, "fd00::99", 80, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            engine
-                .evaluate(&key_req(2, "fd00::99", 22, Protocol::Tcp))
-                .allowed
-        );
+        assert!(evaluate(&engine, &key_req(1, "fd00::99", 443, Protocol::Tcp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(1, "fd00::99", 80, Protocol::Tcp)).is_accept());
+        assert!(evaluate(&engine, &key_req(2, "fd00::99", 22, Protocol::Tcp)).is_accept());
         assert_eq!(
             engine.memberships(&anchor(3)),
             vec![NamespaceId::from("nsd:a")]
@@ -2085,9 +1892,11 @@ mod tests {
         assert!(Arc::ptr_eq(&quick, &namespace_ptr(&engine, "quick")));
         assert_eq!(engine.namespaces(), vec![NamespaceId::from("quick")]);
         assert_eq!(engine.memberships(&anchor(1)), Vec::<NamespaceId>::new());
-        // A former member falls back to the (unloaded) default policy.
-        let d = engine.evaluate(&key_req(1, "fd00::99", 443, Protocol::Tcp));
-        assert_eq!(d.reason, "denied: no policy loaded");
+        // A former member falls back to the (not installed) default rules.
+        assert_eq!(
+            evaluate(&engine, &key_req(1, "fd00::99", 443, Protocol::Tcp)),
+            Decision::Deny(reasons::NO_POLICY)
+        );
 
         assert!(engine.remove_namespace("quick"));
         assert!(!engine.is_loaded());
@@ -2110,7 +1919,7 @@ mod tests {
         });
         assert!(matches!(
             engine.store_namespace("nsd:a", failing.clone()),
-            Err(crate::Error::TestsFailed { count: 1 })
+            Err(Error::TestsFailed { count: 1 })
         ));
         assert!(engine.store_namespace("nsd:new", failing).is_err());
         let mut bad_outbound = ns(&[(1, "fd00::1")], 443);
@@ -2120,7 +1929,7 @@ mod tests {
         }]);
         assert!(matches!(
             engine.store_namespace("nsd:a", bad_outbound.clone()),
-            Err(crate::Error::InvalidPolicy(_))
+            Err(Error::InvalidNamespace { id, .. }) if id.as_str() == "nsd:a"
         ));
         bad_outbound.outbound = Some(vec![OutboundRule {
             proto: None,
@@ -2130,11 +1939,7 @@ mod tests {
 
         assert!(Arc::ptr_eq(&before, &namespace_ptr(&engine, "nsd:a")));
         assert_eq!(engine.namespaces(), vec![NamespaceId::from("nsd:a")]);
-        assert!(
-            engine
-                .evaluate(&key_req(1, "fd00::99", 80, Protocol::Tcp))
-                .allowed
-        );
+        assert!(evaluate(&engine, &key_req(1, "fd00::99", 80, Protocol::Tcp)).is_accept());
     }
 
     #[test]
@@ -2150,25 +1955,44 @@ mod tests {
             engine.memberships(&anchor(1)),
             vec![NamespaceId::from("nsd:a"), NamespaceId::from("quick")]
         );
-        let to_local = |port| engine.evaluate(&key_req(1, "fd00::99", port, Protocol::Tcp));
-        let d = to_local(80);
-        assert!(d.allowed);
-        assert_eq!(d.reason, "accepted by namespace nsd:a rule 0");
-        let d = to_local(22);
-        assert!(d.allowed);
-        assert_eq!(d.reason, "accepted by namespace quick rule 0");
-        assert!(!to_local(443).allowed);
+        let to_local = |port| evaluate(&engine, &key_req(1, "fd00::99", port, Protocol::Tcp));
+        assert_eq!(to_local(80), rule(Some("nsd:a"), "0"));
+        assert_eq!(to_local(22), rule(Some("quick"), "0"));
+        assert_eq!(to_local(443), Decision::Deny(reasons::DENIED));
         // Towards peer 2 only the shared namespace applies.
-        assert!(
-            engine
-                .evaluate(&key_req(1, "fd00::2", 22, Protocol::Tcp))
-                .allowed
+        assert!(evaluate(&engine, &key_req(1, "fd00::2", 22, Protocol::Tcp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(1, "fd00::2", 80, Protocol::Tcp)).is_accept());
+    }
+
+    #[test]
+    fn a_source_is_a_member_through_each_of_its_labels() {
+        let engine = AclEngine::new();
+        engine
+            .store_namespace("nsd:a", ns(&[(1, "fd00::1")], 80))
+            .unwrap();
+        let mut restricted = ns(&[(2, "fd00::2")], 22);
+        restricted.outbound = Some(Vec::new());
+        engine.store_namespace("quick", restricted).unwrap();
+        let both = LabelSet::new([Label::from(anchor(1)), Label::from(anchor(2))]);
+        let to_local =
+            |port| engine.evaluate(&both, &flow("fd00::ff", "fd00::99", port, Protocol::Tcp));
+        assert_eq!(to_local(80), rule(Some("nsd:a"), "0"));
+        assert_eq!(to_local(22), rule(Some("quick"), "0"));
+        let snapshot = engine.snapshot();
+        let union = snapshot.membership_of(&both).unwrap();
+        assert_eq!(
+            union.namespaces,
+            vec![NamespaceId::from("nsd:a"), NamespaceId::from("quick")]
         );
+        // Restricted only when every namespace is.
+        assert!(!union.outbound_restricted());
         assert!(
-            !engine
-                .evaluate(&key_req(1, "fd00::2", 80, Protocol::Tcp))
-                .allowed
+            snapshot
+                .membership_of(&key_labels(2))
+                .unwrap()
+                .outbound_restricted()
         );
+        assert!(snapshot.membership_of(&key_labels(3)).is_none());
     }
 
     #[test]
@@ -2184,23 +2008,13 @@ mod tests {
             .store_namespace("nsd:c", ns(&[(3, "fd00::3")], 22))
             .unwrap();
         // fd00::3 is peer 3 (/128), not peer 2 (/64).
-        let d = engine.evaluate(&key_req(1, "fd00::3", 22, Protocol::Tcp));
-        assert_eq!(d.reason, "denied: cross namespace");
-        assert!(
-            engine
-                .evaluate(&key_req(3, "fd00::3", 22, Protocol::Tcp))
-                .allowed
+        assert_eq!(
+            evaluate(&engine, &key_req(1, "fd00::3", 22, Protocol::Tcp)),
+            Decision::Deny(reasons::CROSS_NAMESPACE)
         );
-        assert!(
-            !engine
-                .evaluate(&key_req(3, "fd00::4", 22, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            engine
-                .evaluate(&key_req(2, "fd00::4", 22, Protocol::Tcp))
-                .allowed
-        );
+        assert!(evaluate(&engine, &key_req(3, "fd00::3", 22, Protocol::Tcp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(3, "fd00::4", 22, Protocol::Tcp)).is_accept());
+        assert!(evaluate(&engine, &key_req(2, "fd00::4", 22, Protocol::Tcp)).is_accept());
     }
 
     #[test]
@@ -2208,14 +2022,14 @@ mod tests {
         let engine = AclEngine::new();
         assert!(matches!(
             engine.store_namespace("app:s1", ns(&[(1, "fd00::1")], 22)),
-            Err(crate::Error::InvalidPolicy(_))
+            Err(Error::InvalidNamespace { .. })
         ));
         let mut pinholes = ns(&[(1, "fd00::1")], 22);
         pinholes.policy = AclPolicy::default();
         pinholes.allow_app_pinholes.insert("transfer".to_owned());
         assert!(matches!(
             engine.store_namespace("app:s1", pinholes.clone()),
-            Err(crate::Error::InvalidPolicy(_))
+            Err(Error::InvalidNamespace { .. })
         ));
         // Allowed on a non-app namespace.
         engine.store_namespace("nsd:a", pinholes).unwrap();
@@ -2228,54 +2042,38 @@ mod tests {
             engine.memberships(&anchor(2)),
             vec![NamespaceId::from("app:s1")]
         );
-        // A member only of an app namespace gets nothing, even with a
-        // permissive default policy.
-        engine.store(Arc::new(CompiledPolicy::permit_all()));
-        assert!(
-            !engine
-                .evaluate(&key_req(2, "fd00::99", 22, Protocol::Tcp))
-                .allowed
-        );
+        // A member only of an app namespace gets nothing, even with
+        // permissive default rules.
+        engine.install(RuleSet::new([Rule::new("all", vec![ProtocolMatch::Any])]).unwrap());
+        assert!(!evaluate(&engine, &key_req(2, "fd00::99", 22, Protocol::Tcp)).is_accept());
     }
 
     #[test]
-    fn principals_in_no_namespace_use_the_default_policy() {
+    fn sources_in_no_namespace_use_the_default_rules() {
         let engine = AclEngine::new();
         engine.load(port_policy(80)).unwrap();
         engine
             .store_namespace("nsd:a", ns(&[(1, "fd00::1")], 22))
             .unwrap();
+        let rules = engine.rules().unwrap();
         for request in [
             req("10.0.0.1", "10.0.0.2", 80, Protocol::Tcp),
-            req("10.0.0.1", "fd00::1", 22, Protocol::Tcp),
+            req("fd00::5", "fd00::1", 22, Protocol::Tcp),
             key_req(2, "fd00::1", 80, Protocol::Tcp),
             key_req(2, "fd00::1", 22, Protocol::Tcp),
         ] {
-            let evaluated = engine.evaluate(&request);
-            let default = engine.is_allowed(&request);
-            assert_eq!(evaluated.allowed, default.allowed);
-            assert_eq!(evaluated.matched_rule_index, default.matched_rule_index);
-            assert_eq!(evaluated.reason, default.reason);
+            // `RuleSet::matching` equals `evaluate` for them.
+            let expected = matched(&rules, &request)
+                .map_or(Decision::Deny(reasons::DENIED), |id| rule(None, &id));
+            assert_eq!(evaluate(&engine, &request), expected);
         }
-        // is_allowed ignores namespaces, even for members.
-        assert!(
-            !engine
-                .is_allowed(&key_req(1, "fd00::99", 22, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            engine
-                .evaluate(&key_req(1, "fd00::99", 22, Protocol::Tcp))
-                .allowed
-        );
-        // clear unloads only the default policy.
-        engine.clear();
+        // The default rules ignore namespaces, even for members.
+        assert!(!allowed(&rules, &key_req(1, "fd00::99", 22, Protocol::Tcp)));
+        assert!(evaluate(&engine, &key_req(1, "fd00::99", 22, Protocol::Tcp)).is_accept());
+        // uninstall removes only the default rules.
+        engine.uninstall();
         assert!(engine.is_loaded());
-        assert!(
-            engine
-                .evaluate(&key_req(1, "fd00::99", 22, Protocol::Tcp))
-                .allowed
-        );
+        assert!(evaluate(&engine, &key_req(1, "fd00::99", 22, Protocol::Tcp)).is_accept());
     }
 
     #[test]
@@ -2301,46 +2099,26 @@ mod tests {
             };
             assert!(matches!(
                 engine.store_grant("bad", bad),
-                Err(crate::Error::InvalidPolicy(_))
+                Err(Error::InvalidGrant { id, .. }) if id.as_str() == "bad"
             ));
         }
         assert_eq!(engine.grants(), Vec::new());
 
         assert_eq!(
-            engine
-                .evaluate(&key_req(1, "fd00::2", 5005, Protocol::Udp))
-                .reason,
-            "denied: cross namespace"
+            evaluate(&engine, &key_req(1, "fd00::2", 5005, Protocol::Udp)),
+            Decision::Deny(reasons::CROSS_NAMESPACE)
         );
         engine.store_grant("g1", grant.clone()).unwrap();
-        assert_eq!(engine.grants(), vec![("g1".to_owned(), grant)]);
-        let d = engine.evaluate(&key_req(1, "fd00::2", 5005, Protocol::Udp));
-        assert!(d.allowed);
-        assert_eq!(d.reason, "accepted by grant g1");
-        assert_eq!(d.matched_rule_index, None);
-        assert!(
-            !engine
-                .evaluate(&key_req(1, "fd00::2", 5011, Protocol::Udp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .evaluate(&key_req(1, "fd00::2", 5005, Protocol::Tcp))
-                .allowed
-        );
-        assert!(
-            !engine
-                .evaluate(&key_req(2, "fd00::1", 5005, Protocol::Udp))
-                .allowed
-        );
-
+        assert_eq!(engine.grants(), vec![(RuleId::from("g1"), grant)]);
+        let d = evaluate(&engine, &key_req(1, "fd00::2", 5005, Protocol::Udp));
+        assert_eq!(d, Decision::Accept(Matched::Grant("g1".into())));
+        assert_eq!(d.rule_id().map(RuleId::as_str), Some("g1"));
+        assert!(!evaluate(&engine, &key_req(1, "fd00::2", 5011, Protocol::Udp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(1, "fd00::2", 5005, Protocol::Tcp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(2, "fd00::1", 5005, Protocol::Udp)).is_accept());
         assert!(engine.remove_grant("g1"));
         assert_eq!(engine.grants(), Vec::new());
-        assert!(
-            !engine
-                .evaluate(&key_req(1, "fd00::2", 5005, Protocol::Udp))
-                .allowed
-        );
+        assert!(!evaluate(&engine, &key_req(1, "fd00::2", 5005, Protocol::Udp)).is_accept());
     }
 
     #[test]
@@ -2396,19 +2174,14 @@ mod tests {
                     s.spawn(|| {
                         let mut seen = 0u64;
                         loop {
-                            let d = engine.evaluate(&request);
-                            if let Some(idx) = d.matched_rule_index {
-                                assert!(d.allowed);
-                                assert!(idx <= 1, "unexpected rule {idx}");
-                                assert_eq!(
-                                    d.reason,
-                                    format!("accepted by namespace nsd:a rule {idx}")
-                                );
-                            } else {
-                                assert!(!d.allowed);
-                                assert_eq!(d.reason, "denied: no policy loaded");
-                            }
-                            assert!(engine.evaluate(&other).allowed);
+                            let d = evaluate(&engine, &request);
+                            assert!(
+                                d == rule(Some("nsd:a"), "0")
+                                    || d == rule(Some("nsd:a"), "1")
+                                    || d == Decision::Deny(reasons::NO_POLICY),
+                                "{d:?}"
+                            );
+                            assert!(evaluate(&engine, &other).is_accept());
                             seen += 1;
                             if stop.load(Ordering::Relaxed) {
                                 break seen;
@@ -2453,7 +2226,7 @@ mod tests {
             };
             assert!(matches!(
                 engine.store_grant("g", grant),
-                Err(crate::Error::InvalidPolicy(_))
+                Err(Error::InvalidGrant { .. })
             ));
         }
         assert_eq!(engine.grants(), Vec::new());
@@ -2501,8 +2274,6 @@ mod tests {
             expires_at,
         }
     }
-
-    use std::time::Duration;
 
     #[test]
     fn open_pinhole_errors() {
@@ -2572,34 +2343,33 @@ mod tests {
             .unwrap();
         let later = now(&clock) + Duration::from_secs(60);
         let request = key_req(2, "fd00::99", 80, Protocol::Tcp);
-        assert!(!engine.evaluate(&request).allowed);
+        assert!(!evaluate(&engine, &request).is_accept());
 
         let guard = engine.open_pinhole("app:s1", spec(2, 80, later)).unwrap();
-        let d = engine.evaluate(&request);
-        assert!(d.allowed);
-        assert_eq!(d.reason, format!("accepted by pinhole {}", guard.id()));
-        // Only that port, protocol and direction, and only to the local node.
-        assert!(
-            !engine
-                .evaluate(&key_req(2, "fd00::99", 81, Protocol::Tcp))
-                .allowed
+        assert_eq!(
+            evaluate(&engine, &request),
+            Decision::Accept(Matched::Pinhole(guard.id()))
         );
-        assert!(
-            !engine
-                .evaluate(&key_req(2, "fd00::99", 80, Protocol::Udp))
-                .allowed
+        // Only that port, protocol and direction, and only to the local node.
+        assert!(!evaluate(&engine, &key_req(2, "fd00::99", 81, Protocol::Tcp)).is_accept());
+        assert!(!evaluate(&engine, &key_req(2, "fd00::99", 80, Protocol::Udp)).is_accept());
+        let (labels, _) = &request;
+        let icmp = Flow::icmp(
+            "fd00::ff".parse().unwrap(),
+            "fd00::99".parse().unwrap(),
+            128,
+        );
+        assert_eq!(
+            engine.evaluate(labels, &icmp),
+            Decision::Deny(reasons::DENIED)
         );
         engine
             .store_namespace("nsd:x", ns(&[(5, "fd00::5")], 22))
             .unwrap();
-        assert!(
-            !engine
-                .evaluate(&key_req(2, "fd00::5", 80, Protocol::Tcp))
-                .allowed
-        );
+        assert!(!evaluate(&engine, &key_req(2, "fd00::5", 80, Protocol::Tcp)).is_accept());
 
         guard.close();
-        assert!(!engine.evaluate(&request).allowed);
+        assert!(!evaluate(&engine, &request).is_accept());
         assert_eq!(engine.pinhole_stats().closed, 1);
     }
 
@@ -2621,14 +2391,14 @@ mod tests {
         advance(&clock, 10);
         // Absent immediately, swept by the evaluation that sees it.
         assert!(!short.is_open());
-        assert!(!engine.evaluate(&request).allowed);
+        assert_eq!(evaluate(&engine, &request), Decision::Deny(reasons::DENIED));
         assert_eq!(engine.pinhole_stats().expired, 1);
         assert_eq!(engine.expire_pinholes(), 0);
         assert!(long.is_open());
 
         // Swept by the next mutation.
         advance(&clock, 20);
-        engine.clear();
+        engine.uninstall();
         assert_eq!(engine.pinhole_stats().expired, 2);
         assert_eq!(engine.expire_pinholes(), 0);
 

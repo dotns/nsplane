@@ -1,104 +1,60 @@
-//! Compiled source/destination matchers and the rule text parsers.
+//! The text parsers of the policy document and its compilation into typed
+//! [`Rule`]s.
+//!
+//! A `key:<hex>` source becomes a label; a CIDR or host alias source becomes
+//! `sources` plus the crate-private [`ADDRESS_LABEL`], which only IP-bearing
+//! source assertions carry, so a CIDR source still matches only them. Each
+//! document rule becomes one typed rule per kind of source and per port set
+//! of its destinations, all with the document rule's index as their id.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::RangeInclusive;
+
+use tracing::warn;
 
 use crate::Error;
-use crate::engine::SourceAssertion;
+use crate::engine::{AclTestFailure, SourceAssertion};
 use crate::net::{IpNet, Protocol};
+use crate::policy::{AclPolicy, AclRule, AclTest};
+use crate::rules::{Flow, Label, LabelSet, PortSet, ProtocolMatch, Rule, RuleId, RuleSet};
 
-// ── Source matcher ────────────────────────────────────────────────────────────
+/// The label of every IP-bearing source assertion; the document's CIDR
+/// sources require it.
+pub(crate) const ADDRESS_LABEL: &str = "\0address";
 
-/// Compiled source matcher (host aliases already resolved to CIDRs).
-#[derive(Debug, Clone)]
-pub(crate) enum SrcMatcher {
+/// A parsed document source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DocSource {
     Any,
+    /// A client WireGuard public key, as its `key:<hex>` label.
+    Key(Label),
     Cidr(IpNet),
-    /// A client WireGuard public key principal. Matches a request
-    /// whose source assertion is `WgPeerKey{pubkey}` with the same key.
-    Key([u8; 32]),
-}
-
-impl SrcMatcher {
-    pub(crate) fn matches(&self, source: &SourceAssertion) -> bool {
-        match self {
-            Self::Any => true,
-            // CIDR rules match only IP-bearing sources (terminate bindings);
-            // a key/IdP assertion carries no IP and never matches a CIDR.
-            Self::Cidr(net) => source.ip().is_some_and(|ip| net.contains(&ip)),
-            Self::Key(want) => {
-                matches!(source, SourceAssertion::WgPeerKey { pubkey } if pubkey == want)
-            }
-        }
-    }
-}
-
-// ── Destination matcher ───────────────────────────────────────────────────────
-
-/// Compiled destination matcher.
-#[derive(Debug, Clone)]
-pub(crate) struct DstMatcher {
-    pub(crate) host: HostMatcher,
-    pub(crate) ports: PortMatcher,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum HostMatcher {
-    Any,
-    Cidr(IpNet),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum PortMatcher {
-    Any,
-    Single(u16),
-    Range(u16, u16),
-    List(Vec<u16>),
-}
-
-impl DstMatcher {
-    pub(crate) fn matches(&self, ip: IpAddr, port: u16) -> bool {
-        let host_ok = match &self.host {
-            HostMatcher::Any => true,
-            HostMatcher::Cidr(net) => net.contains(&ip),
-        };
-        host_ok && self.ports.matches(port)
-    }
-}
-
-impl PortMatcher {
-    pub(crate) fn matches(&self, port: u16) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Single(p) => port == *p,
-            Self::Range(lo, hi) => port >= *lo && port <= *hi,
-            Self::List(ports) => ports.contains(&port),
-        }
-    }
 }
 
 // ── Parser functions ──────────────────────────────────────────────────────────
 
-/// Parse a source string into a `SrcMatcher` with aliases resolved from `hosts`.
+/// Parse a source string with aliases resolved from `hosts`.
 ///
 /// Accepted forms:
 /// - `*` — any source
 /// - `key:<64-hex>` — a client WireGuard public key principal
 /// - `10.0.0.0/24` — CIDR
 /// - `alias` — host alias from the `hosts` map
-pub(crate) fn parse_src(s: &str, hosts: &HashMap<String, IpNet>) -> Result<SrcMatcher, Error> {
+pub(crate) fn parse_src(s: &str, hosts: &HashMap<String, IpNet>) -> Result<DocSource, Error> {
     if s == "*" {
-        return Ok(SrcMatcher::Any);
+        return Ok(DocSource::Any);
     }
     if let Some(hex) = s.strip_prefix("key:") {
         let key = parse_hex32(hex).ok_or_else(|| Error::UnknownAlias(s.to_owned()))?;
-        return Ok(SrcMatcher::Key(key));
+        let anchor = SourceAssertion::WgPeerKey { pubkey: key }.source_anchor();
+        return Ok(DocSource::Key(Label::from(anchor)));
     }
     if let Ok(net) = s.parse::<IpNet>() {
-        return Ok(SrcMatcher::Cidr(net));
+        return Ok(DocSource::Cidr(net));
     }
     if let Some(net) = hosts.get(s) {
-        return Ok(SrcMatcher::Cidr(*net));
+        return Ok(DocSource::Cidr(*net));
     }
     Err(Error::UnknownAlias(s.to_owned()))
 }
@@ -115,7 +71,8 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Parse a destination string (`host:ports`) into a `DstMatcher`.
+/// Parse a destination string (`host:ports`): the host prefix (`None` for
+/// any host) and the ports.
 ///
 /// Accepted forms:
 /// - `*:*` — any host, any port
@@ -124,7 +81,10 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
 /// - `alias:80,443` — host alias + port list
 /// - `alias:8000-8999` — host alias + port range
 /// - `alias:*` — host alias + any port
-pub(crate) fn parse_dst(s: &str, hosts: &HashMap<String, IpNet>) -> Result<DstMatcher, Error> {
+pub(crate) fn parse_dst(
+    s: &str,
+    hosts: &HashMap<String, IpNet>,
+) -> Result<(Option<IpNet>, PortSet), Error> {
     let colon = s.rfind(':').ok_or_else(|| Error::InvalidDst {
         dst: s.to_owned(),
         reason: "missing ':' between host and port".to_owned(),
@@ -139,26 +99,26 @@ pub(crate) fn parse_dst(s: &str, hosts: &HashMap<String, IpNet>) -> Result<DstMa
         reason,
     })?;
 
-    Ok(DstMatcher { host, ports })
+    Ok((host, ports))
 }
 
-fn parse_host(s: &str, hosts: &HashMap<String, IpNet>) -> Result<HostMatcher, Error> {
+fn parse_host(s: &str, hosts: &HashMap<String, IpNet>) -> Result<Option<IpNet>, Error> {
     if s == "*" {
-        return Ok(HostMatcher::Any);
+        return Ok(None);
     }
     if let Ok(net) = s.parse::<IpNet>() {
-        return Ok(HostMatcher::Cidr(net));
+        return Ok(Some(net));
     }
     if let Some(net) = hosts.get(s) {
-        return Ok(HostMatcher::Cidr(*net));
+        return Ok(Some(*net));
     }
     Err(Error::UnknownAlias(s.to_owned()))
 }
 
 /// Parse a port matcher: `*`, `22`, `80,443` or `8000-8999`.
-pub(crate) fn parse_ports(s: &str) -> Result<PortMatcher, String> {
+pub(crate) fn parse_ports(s: &str) -> Result<PortSet, String> {
     if s == "*" {
-        return Ok(PortMatcher::Any);
+        return Ok(PortSet::Any);
     }
     // Port list: "80,443,8080"
     if s.contains(',') {
@@ -170,7 +130,7 @@ pub(crate) fn parse_ports(s: &str) -> Result<PortMatcher, String> {
                     .map_err(|_| format!("invalid port '{p}'"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(PortMatcher::List(ports));
+        return Ok(PortSet::list(ports));
     }
     // Port range: "8000-8999"
     if let Some((lo_s, hi_s)) = s.split_once('-') {
@@ -183,13 +143,13 @@ pub(crate) fn parse_ports(s: &str) -> Result<PortMatcher, String> {
         if lo > hi {
             return Err(format!("range start {lo} > end {hi}"));
         }
-        return Ok(PortMatcher::Range(lo, hi));
+        return Ok(PortSet::Ranges(vec![RangeInclusive::new(lo, hi)]));
     }
     // Single port.
     let p = s
         .parse::<u16>()
         .map_err(|_| format!("invalid port '{s}'"))?;
-    Ok(PortMatcher::Single(p))
+    Ok(PortSet::single(p))
 }
 
 /// Parse a protocol string (`"tcp"` / `"udp"`) into a `Protocol`.
@@ -203,11 +163,218 @@ pub(crate) fn parse_protocol(s: &str) -> Result<Protocol, Error> {
     }
 }
 
+/// The typed protocols of a document protocol (`None`: TCP and UDP) and
+/// port set.
+pub(crate) fn protocols(proto: Option<Protocol>, ports: PortSet) -> Vec<ProtocolMatch> {
+    match proto {
+        Some(Protocol::Tcp) => vec![ProtocolMatch::Tcp(ports)],
+        Some(Protocol::Udp) => vec![ProtocolMatch::Udp(ports)],
+        None => vec![ProtocolMatch::Tcp(ports.clone()), ProtocolMatch::Udp(ports)],
+    }
+}
+
+// ── Document compilation ──────────────────────────────────────────────────────
+
+fn resolve_hosts(raw: &HashMap<String, String>) -> Result<HashMap<String, IpNet>, Error> {
+    raw.iter()
+        .map(|(alias, cidr)| {
+            let net = cidr.parse::<IpNet>().map_err(|e| Error::InvalidCidr {
+                addr: cidr.clone(),
+                reason: e.to_string(),
+            })?;
+            Ok((alias.clone(), net))
+        })
+        .collect()
+}
+
+/// The typed rules of `policy`'s accept rules, in order.
+pub(crate) fn compile_rules(policy: &AclPolicy) -> Result<Vec<Rule>, Error> {
+    let hosts = resolve_hosts(&policy.hosts)?;
+    let mut rules = Vec::new();
+    for (i, rule) in policy.acls.iter().enumerate() {
+        compile_rule(i, rule, &hosts, &mut rules)?;
+    }
+    Ok(rules)
+}
+
+fn compile_rule(
+    i: usize,
+    rule: &AclRule,
+    hosts: &HashMap<String, IpNet>,
+    out: &mut Vec<Rule>,
+) -> Result<(), Error> {
+    let sources = rule
+        .src
+        .iter()
+        .map(|s| parse_src(s, hosts))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::InvalidPolicy(format!("rule {i} src: {e}")))?;
+    let destinations = rule
+        .dst
+        .iter()
+        .map(|s| parse_dst(s, hosts))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::InvalidPolicy(format!("rule {i} dst: {e}")))?;
+    let proto = rule
+        .proto
+        .as_deref()
+        .map(parse_protocol)
+        .transpose()
+        .map_err(|e| Error::InvalidPolicy(format!("rule {i} proto: {e}")))?;
+
+    // One group per kind of source: any source matches any of them.
+    let mut source_groups: Vec<(Vec<Label>, Vec<IpNet>)> = Vec::new();
+    if sources.contains(&DocSource::Any) {
+        source_groups.push((Vec::new(), Vec::new()));
+    } else {
+        let mut keys = Vec::new();
+        let mut cidrs = Vec::new();
+        for source in sources {
+            match source {
+                DocSource::Key(label) => keys.push(label),
+                DocSource::Cidr(net) => cidrs.push(net),
+                DocSource::Any => {}
+            }
+        }
+        if !keys.is_empty() {
+            source_groups.push((keys, Vec::new()));
+        }
+        if !cidrs.is_empty() {
+            source_groups.push((vec![Label::from(ADDRESS_LABEL)], cidrs));
+        }
+    }
+    // One group per port set: `None` destinations mean any host.
+    let mut destination_groups: Vec<(PortSet, Option<Vec<IpNet>>)> = Vec::new();
+    for (host, ports) in destinations {
+        let index = destination_groups
+            .iter()
+            .position(|(p, _)| *p == ports)
+            .unwrap_or_else(|| {
+                destination_groups.push((ports, Some(Vec::new())));
+                destination_groups.len() - 1
+            });
+        let hosts = &mut destination_groups[index].1;
+        match host {
+            None => *hosts = None,
+            Some(net) => {
+                if let Some(nets) = hosts {
+                    nets.push(net);
+                }
+            }
+        }
+    }
+
+    let id = RuleId::from(i.to_string());
+    for (labels, sources) in &source_groups {
+        for (ports, hosts) in &destination_groups {
+            out.push(Rule {
+                id: id.clone(),
+                labels: labels.clone(),
+                sources: sources.clone(),
+                destinations: hosts.clone().unwrap_or_default(),
+                protocols: protocols(proto, ports.clone()),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl RuleSet {
+    /// Compile a policy document ([`AclPolicy`]) into typed rules and run its
+    /// built-in tests (temporary, until the document is removed).
+    ///
+    /// Each rule of the document gets its index as [`RuleId`]. Returns
+    /// [`Error::TestsFailed`] when a test fails.
+    pub fn from_document(policy: AclPolicy) -> Result<Self, Error> {
+        let rules = Self::new(compile_rules(&policy)?)?;
+        let failures = test_failures(&rules, policy.tests);
+        if !failures.is_empty() {
+            for f in &failures {
+                warn!(
+                    src = %f.test.src,
+                    dst = %f.test.dst,
+                    expected = f.test.allow,
+                    reason = %f.reason,
+                    "ACL policy test failed"
+                );
+            }
+            return Err(Error::TestsFailed {
+                count: failures.len(),
+            });
+        }
+        Ok(rules)
+    }
+}
+
+/// The source labels of a bare source IP: an IP-bearing source.
+pub(crate) fn address_labels(ip: IpAddr) -> LabelSet {
+    LabelSet::new([Label::from(ip.to_string()), Label::from(ADDRESS_LABEL)])
+}
+
+/// Run the document tests against `rules`, as requests from a bare source IP.
+fn test_failures(rules: &RuleSet, tests: Vec<AclTest>) -> Vec<AclTestFailure> {
+    tests
+        .into_iter()
+        .filter_map(|test| {
+            let reason = test_failure(rules, &test)?;
+            Some(AclTestFailure { test, reason })
+        })
+        .collect()
+}
+
+/// Why `test` fails against `rules`, `None` when it passes.
+fn test_failure(rules: &RuleSet, test: &AclTest) -> Option<String> {
+    let Ok(src_ip) = test.src.parse::<IpAddr>() else {
+        return Some(format!("cannot parse src IP '{}'", test.src));
+    };
+    let dst = match parse_test_dst(&test.dst) {
+        Ok(dst) => dst,
+        Err(reason) => return Some(reason),
+    };
+    let protocol = match test.proto.as_deref() {
+        Some(raw) => match parse_protocol(raw) {
+            Ok(proto) => proto,
+            Err(reason) => return Some(format!("cannot parse test proto '{raw}': {reason}")),
+        },
+        None => Protocol::Tcp,
+    };
+
+    let src = SocketAddr::new(src_ip, 0);
+    let flow = match protocol {
+        Protocol::Tcp => Flow::tcp(src, dst),
+        Protocol::Udp => Flow::udp(src, dst),
+    };
+    let allowed = rules.matching(&address_labels(src_ip), &flow).is_some();
+    (allowed != test.allow).then(|| {
+        format!(
+            "expected {}, got {}",
+            if test.allow { "allow" } else { "deny" },
+            if allowed { "allow" } else { "deny" },
+        )
+    })
+}
+
+/// Parse a test destination string like `"192.168.1.10:5432"`.
+fn parse_test_dst(s: &str) -> Result<SocketAddr, String> {
+    let colon = s
+        .rfind(':')
+        .ok_or_else(|| format!("missing ':' in test dst '{s}'"))?;
+    let ip_str = &s[..colon];
+    let port_str = &s[colon + 1..];
+    let ip = ip_str
+        .parse::<IpAddr>()
+        .map_err(|_| format!("invalid IP '{ip_str}' in test dst '{s}'"))?;
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port '{port_str}' in test dst '{s}'"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::AclAction;
     use std::collections::HashMap;
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn hosts() -> HashMap<String, IpNet> {
         let mut m = HashMap::new();
@@ -216,124 +383,181 @@ mod tests {
         m
     }
 
-    // ── SrcMatcher ────────────────────────────────────────────────────────
-
-    /// A terminate-binding source carrying `ip` (the legacy/IP path).
-    fn ip_src(ip: IpAddr) -> SourceAssertion {
-        SourceAssertion::Terminate {
-            binding: crate::engine::TerminateBinding {
-                ip: Some(ip),
-                anchor: ip.to_string(),
-            },
-        }
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
     }
 
-    #[test]
-    fn src_wildcard_matches_any_ip() {
-        let m = parse_src("*", &HashMap::new()).unwrap();
-        assert!(m.matches(&ip_src("1.2.3.4".parse().unwrap())));
-    }
+    // ── Sources ───────────────────────────────────────────────────────────
 
     #[test]
-    fn src_cidr_matches_contained_ip() {
-        let m = parse_src("10.0.0.0/24", &HashMap::new()).unwrap();
-        assert!(m.matches(&ip_src(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))));
-        assert!(!m.matches(&ip_src(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5)))));
-    }
-
-    #[test]
-    fn src_alias_resolves_to_cidr() {
-        let m = parse_src("web", &hosts()).unwrap();
-        assert!(m.matches(&ip_src(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)))));
-        assert!(!m.matches(&ip_src(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 5)))));
-    }
-
-    #[test]
-    fn src_unknown_alias_returns_error() {
+    fn src_forms() {
+        assert_eq!(parse_src("*", &HashMap::new()).unwrap(), DocSource::Any);
+        assert_eq!(
+            parse_src("10.0.0.0/24", &HashMap::new()).unwrap(),
+            DocSource::Cidr(net("10.0.0.0/24"))
+        );
+        assert_eq!(
+            parse_src("web", &hosts()).unwrap(),
+            DocSource::Cidr(net("192.168.1.0/24"))
+        );
         assert!(parse_src("unknown", &HashMap::new()).is_err());
     }
 
     #[test]
-    fn src_key_parses_and_matches_wg_peer_key() {
-        let m = parse_src(&format!("key:{}", "0a".repeat(32)), &HashMap::new()).unwrap();
-        assert!(m.matches(&SourceAssertion::WgPeerKey { pubkey: [0x0a; 32] }));
-        assert!(!m.matches(&SourceAssertion::WgPeerKey { pubkey: [0x0b; 32] }));
-        assert!(!m.matches(&ip_src("10.0.0.5".parse().unwrap())));
+    fn src_key_becomes_its_lowercase_label() {
+        let upper = format!("key:{}", "0A".repeat(32));
+        assert_eq!(
+            parse_src(&upper, &HashMap::new()).unwrap(),
+            DocSource::Key(Label::from(format!("key:{}", "0a".repeat(32))))
+        );
         // Malformed key hex → parse error.
         assert!(parse_src("key:nothex", &HashMap::new()).is_err());
     }
 
-    // ── DstMatcher ────────────────────────────────────────────────────────
+    // ── Destinations ──────────────────────────────────────────────────────
 
     #[test]
-    fn dst_wildcard_matches_anything() {
-        let m = parse_dst("*:*", &HashMap::new()).unwrap();
-        assert!(m.matches("1.2.3.4".parse().unwrap(), 9999));
+    fn dst_forms() {
+        assert_eq!(
+            parse_dst("*:*", &HashMap::new()).unwrap(),
+            (None, PortSet::Any)
+        );
+        assert_eq!(
+            parse_dst("192.168.1.0/24:80", &HashMap::new()).unwrap(),
+            (Some(net("192.168.1.0/24")), PortSet::single(80))
+        );
+        assert_eq!(
+            parse_dst("web:80,443", &hosts()).unwrap(),
+            (Some(net("192.168.1.0/24")), PortSet::list([80, 443]))
+        );
+        assert_eq!(
+            parse_dst("web:8000-8999", &hosts()).unwrap(),
+            (
+                Some(net("192.168.1.0/24")),
+                PortSet::Ranges(vec![RangeInclusive::new(8000, 8999)])
+            )
+        );
+        assert_eq!(
+            parse_dst("db:*", &hosts()).unwrap(),
+            (Some(net("192.168.1.10/32")), PortSet::Any)
+        );
     }
 
     #[test]
-    fn dst_cidr_single_port() {
-        let m = parse_dst("192.168.1.0/24:80", &HashMap::new()).unwrap();
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 80));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 443));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 5)), 80));
-    }
-
-    #[test]
-    fn dst_alias_port_list() {
-        let m = parse_dst("web:80,443", &hosts()).unwrap();
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 80));
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 443));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 8080));
-    }
-
-    #[test]
-    fn dst_alias_port_range() {
-        let m = parse_dst("web:8000-8999", &hosts()).unwrap();
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8000));
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8500));
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8999));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 7999));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 9000));
-    }
-
-    #[test]
-    fn dst_alias_wildcard_port() {
-        let m = parse_dst("db:*", &hosts()).unwrap();
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 1));
-        assert!(m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 65535));
-        assert!(!m.matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 11)), 80));
-    }
-
-    #[test]
-    fn dst_missing_colon_returns_error() {
+    fn dst_errors() {
         assert!(parse_dst("192.168.1.1", &HashMap::new()).is_err());
-    }
-
-    #[test]
-    fn dst_invalid_port_returns_error() {
         assert!(parse_dst("*:notaport", &HashMap::new()).is_err());
-    }
-
-    #[test]
-    fn dst_range_inverted_returns_error() {
         assert!(parse_dst("*:9000-8000", &HashMap::new()).is_err());
+        assert!(parse_dst("nohost:80", &HashMap::new()).is_err());
     }
 
     // ── parse_protocol ────────────────────────────────────────────────────
 
     #[test]
-    fn parse_protocol_tcp() {
+    fn parse_protocol_values() {
         assert_eq!(parse_protocol("tcp").unwrap(), Protocol::Tcp);
-    }
-
-    #[test]
-    fn parse_protocol_udp() {
-        assert_eq!(parse_protocol("udp").unwrap(), Protocol::Udp);
-    }
-
-    #[test]
-    fn parse_protocol_unknown_returns_error() {
+        assert_eq!(parse_protocol("UDP").unwrap(), Protocol::Udp);
         assert!(parse_protocol("icmp").is_err());
+    }
+
+    // ── Compilation ───────────────────────────────────────────────────────
+
+    fn doc(src: &[&str], dst: &[&str], proto: Option<&str>) -> AclPolicy {
+        AclPolicy {
+            hosts: HashMap::from([("web".to_owned(), "192.168.1.0/24".to_owned())]),
+            acls: vec![AclRule {
+                action: AclAction::Accept,
+                src: src.iter().map(ToString::to_string).collect(),
+                dst: dst.iter().map(ToString::to_string).collect(),
+                proto: proto.map(str::to_owned),
+            }],
+            tests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_rule_splits_by_source_kind_and_port_set() {
+        let key = format!("key:{}", "01".repeat(32));
+        let rules = compile_rules(&doc(
+            &[&key, "10.0.0.0/8", "web"],
+            &["10.1.0.0/16:80", "*:443", "10.2.0.0/16:80"],
+            Some("tcp"),
+        ))
+        .unwrap();
+        let address = vec![Label::from(ADDRESS_LABEL)];
+        let expected = [
+            (
+                vec![Label::from(key.as_str())],
+                vec![],
+                vec![net("10.1.0.0/16"), net("10.2.0.0/16")],
+                80,
+            ),
+            (vec![Label::from(key.as_str())], vec![], vec![], 443),
+            (
+                address.clone(),
+                vec![net("10.0.0.0/8"), net("192.168.1.0/24")],
+                vec![net("10.1.0.0/16"), net("10.2.0.0/16")],
+                80,
+            ),
+            (
+                address,
+                vec![net("10.0.0.0/8"), net("192.168.1.0/24")],
+                vec![],
+                443,
+            ),
+        ];
+        assert_eq!(rules.len(), expected.len());
+        for (rule, (labels, sources, destinations, port)) in rules.iter().zip(expected) {
+            assert_eq!(rule.id.as_str(), "0");
+            assert_eq!(rule.labels, labels);
+            assert_eq!(rule.sources, sources);
+            assert_eq!(rule.destinations, destinations);
+            assert_eq!(
+                rule.protocols,
+                vec![ProtocolMatch::Tcp(PortSet::single(port))]
+            );
+        }
+    }
+
+    #[test]
+    fn wildcards_and_both_protocols() {
+        let rules = compile_rules(&doc(&["10.0.0.1/32", "*"], &["*:*", "web:*"], None)).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].labels, Vec::new());
+        assert_eq!(rules[0].sources, Vec::new());
+        assert_eq!(rules[0].destinations, Vec::new());
+        assert_eq!(
+            rules[0].protocols,
+            vec![
+                ProtocolMatch::Tcp(PortSet::Any),
+                ProtocolMatch::Udp(PortSet::Any)
+            ]
+        );
+        // A rule with no source or no destination matches nothing.
+        assert_eq!(
+            compile_rules(&doc(&[], &["*:*"], None)).unwrap(),
+            Vec::new()
+        );
+        assert_eq!(compile_rules(&doc(&["*"], &[], None)).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn compile_errors() {
+        assert!(matches!(
+            compile_rules(&doc(&["nope"], &["*:*"], None)),
+            Err(Error::InvalidPolicy(_))
+        ));
+        assert!(matches!(
+            compile_rules(&doc(&["*"], &["*:*"], Some("icmp"))),
+            Err(Error::InvalidPolicy(_))
+        ));
+        let mut bad_hosts = doc(&["*"], &["*:*"], None);
+        bad_hosts
+            .hosts
+            .insert("x".to_owned(), "not-a-cidr".to_owned());
+        assert!(matches!(
+            compile_rules(&bad_hosts),
+            Err(Error::InvalidCidr { .. })
+        ));
     }
 }

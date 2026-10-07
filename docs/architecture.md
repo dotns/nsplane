@@ -55,9 +55,9 @@ where it is described below.
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig`, `WssTls`, `WssStats`, `WssStreamLimits`, `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
+| `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; sources `SourceAssertion`, `TerminateBinding`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`), `UdpFlow`, `UdpReply`, `UdpSocket`, `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| `nsplane-acl` | `AclEngine` (`load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `is_allowed`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; requests `AccessRequest`, `SourceAssertion`, `TerminateBinding`, `AclDecision`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `CompiledPolicy`, `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
+| `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `load`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; policy model `AclPolicy`, `AclRule`, `AclAction`, `AclTest`, `Protocol`, `IpNet`; sources `SourceAssertion`, `TerminateBinding`; identity `PeerIdentity`, `PeerIdentityMap`, `wg_peer_anchor`; namespaces `NamespaceId`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; layering `PolicyLayers`, `RemotePolicy`, `merge_layered`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `apply_deny_scope`, `DenyScope`; scopes `AclFilterScope`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; node L3 gate `NodeL3Gate`, `NodeL3Filter`, `PeerPublicKeys`, `PeerKeyMap`, `GatewayConsumerSink`, `GatewayConsumerPacket`, `GatewayConsumerAuthority`, `NodeL3FilterStats`, `NodeL3Config`, `NodeL3Node`, `NodeL3PeerBinding`, `NodeL3ServiceEndpoint`, `NodeL3ServiceProtocol`, `NodeL3Grant`, `NodeL3Resource`, `NodeL3Mode`, `NodeL3Transport`, `NodeL3TransportPeer`, `NodeL3PeerPolicyRequirement`, `NodeL3Decision`, `NodeL3Reason`, `NodeL3Applied`, `NodeL3Counters`, `NodeL3SubnetAuthorization`, `NodeL3PeerReadiness`, `NodeL3PeerReadinessReason`, `NodeL3ConfigError`, `NodeL3TransportError`, `NODE_L3_SCHEMA_VERSION` |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_native_alias4`) / `TranslationTable` (`native_alias4`, `by_native_alias4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `with_endpoint_tries`, `endpoint_in_use`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig` (`recheck_route_on_forward`), `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
@@ -1695,18 +1695,55 @@ compiled above nsplane into rules, and new product concepts are not added here (
 (`SourceAssertion::Terminate` / `External`, `crates_acl()`, the node L3 gate's grant model)
 predate that rule and stay for ns.
 
-`AclEngine` holds its whole state (the compiled default `AclPolicy`, the rule namespaces,
-the directed grants and the open pinholes) as one immutable snapshot behind an `ArcSwap`:
-writers serialize on a mutex and publish a new snapshot, and evaluation takes one lock-free
-load per packet. `load` compiles and runs the policy's tests and swaps it in atomically, and
-a rejected update leaves the previous state in effect. With nothing loaded every request is
-denied; `clear_all` removes everything in one swap. `merge_layered` combines a local and
-remote policies with per-rule provenance; `apply_deny_scope` removes rules reaching
+`AclEngine` holds its whole state (the default `RuleSet` and its policy state, the rule
+namespaces, the directed grants and the open pinholes) as one immutable snapshot behind an
+`ArcSwap`: writers serialize on a mutex and publish a new snapshot, and evaluation takes one
+lock-free load per packet. `install` swaps a validated `RuleSet` in atomically; `load`
+compiles a policy document (`RuleSet::from_document`, which runs its tests) and installs
+it, and a rejected update leaves the previous state in effect. With nothing loaded every
+flow is denied; `clear_all` removes everything in one swap. `merge_layered` combines a local
+and remote policies with per-rule provenance; `apply_deny_scope` removes rules reaching
 forbidden CIDRs before compilation, so matching stays accept-only.
 
-`AclFilter` is a `PacketFilter` for the engine's filter chain. Inbound packets become
-`AccessRequest`s whose principal (a WireGuard key or a terminate binding with a tunnel IP)
-comes from a `PeerIdentity`; anything not accepted is dropped with a `reasons` constant.
+**Typed rules.** A `Rule` carries an opaque `RuleId` and matches a flow when all of these
+hold: its `labels` are empty or the source's `LabelSet` holds one of them (opaque strings
+compared by a precomputed hash and the text; the sets are `Arc`-backed and sorted, so a
+match is a merge over two sorted slices); its `sources` and `destinations` prefixes are
+empty or contain the flow's addresses; and one of its `protocols` (`ProtocolMatch::Any`,
+`Tcp` / `Udp` with a `PortSet`, `Icmp` with `IcmpTypes`, `Ip(number)`) matches. Rules are a
+union; the first match in list order reports its id, and ids need not be unique.
+`RuleSet::new` validates a list and compiles each rule's protocols to a flat form;
+`RuleSet::matching(&LabelSet, &Flow)` is the rule-only check. A document rule becomes one
+typed rule per kind of source and port set: `key:<hex>` becomes a label, a CIDR or alias
+`sources` plus an internal address label that only IP-bearing assertions carry, so CIDR
+sources still match only those.
+
+**Policy states.** The default rule set, for sources whose labels are in no namespace, is
+`PolicyState::NotInstalled` (the engine's `NotInstalled` action applies: `Deny`, the
+default, drops their new flows with `reasons::NO_POLICY`; `Accept`, set with
+`with_not_installed`, accepts every flow), `Installed { rules }` (`install`; an empty set
+denies every new flow with `reasons::DENIED`), or `Failed` (`fail`, for a caller whose own
+compilation failed: `reasons::POLICY_FAILED`, counted in `AclFilterStats::policy_failed`).
+`uninstall` returns to `NotInstalled`; `clear_all` leaves `Failed`, so the emergency stop
+stays fail-closed under `NotInstalled::Accept`. The engine is loaded when rules are
+installed, a namespace is stored, or nothing is installed under `Accept`; while it is not,
+every inbound packet, replies included, is dropped with the state's reason. The state is
+read with `AclEngine::policy_state` and `AclFilterStats::policy_state`.
+
+**Evaluation without a packet.** `AclEngine::evaluate(&LabelSet, &Flow)` returns the
+`Decision` the filter applies to the first packet of a new inbound flow, with namespaces,
+grants and pinholes: `Accept(Matched)` names the accepting rule (and its namespace), grant,
+pinhole or the not-installed action, `Deny` carries the `reasons` constant. A
+family-mixed flow is `reasons::MALFORMED`. Every full evaluation logs the flow and the rule,
+grant, pinhole or reason at debug level; drop events keep their `&'static str` reason, and
+rule ids travel only in decisions and logs.
+
+`AclFilter` is a `PacketFilter` for the engine's filter chain. The principal of an inbound
+packet's peer (a WireGuard key or a terminate binding with a tunnel IP) comes from a
+`PeerIdentity` and becomes the peer's label set (the principal, plus the address label for
+an IP-bearing assertion, whose binding address is the source its rules see); a new flow is
+evaluated as `evaluate` does, and anything not accepted is dropped with a `reasons`
+constant.
 Non-first IPv4 fragments follow the outcome of their first fragment, and outbound TCP/UDP
 packets record reply allowances (with an idle timeout) so replies to flows the local side
 opened pass. `FlowTracker` placed after it counts packets and bytes per flow in a bounded
@@ -1719,9 +1756,10 @@ A `NamespacePolicy` names its members by principal (the peer's `source_anchor`, 
 `key:<hex>`) with their tunnel addresses, its accept rules (an `AclPolicy`), optional
 `outbound` rules and the app kinds allowed to open pinholes (`allow_app_pinholes`). App
 namespaces never widen permissions: they carry no accept rules, allow no pinholes and no
-grant names them. The default policy applies only to principals that are members of no
-namespace, so a node without namespaces behaves as before. An inbound packet from member
-`P` to address `d` is evaluated after the reply table:
+grant names them. The default rules apply only to sources whose labels are members of no
+namespace, so a node without namespaces behaves as before; a source with several member
+labels is a member of the union of their namespaces. An inbound packet from member `P` to
+address `d` is evaluated after the reply table:
 
 1. `d` resolves to a member peer `Q` by longest address match; otherwise it is local, and
    the local node is in every namespace.
@@ -1755,6 +1793,12 @@ packets that are neither TCP nor UDP. After the reply allowances and `allow_othe
 (which still accepts everything), and behind a loaded policy, a packet some rule matches by
 protocol and destination address is accepted (`AclFilterStats::accepted`); anything else is
 dropped with `reasons::PROTOCOL` as before. Non-first fragments follow their first fragment.
+After the scope rules such a packet is evaluated against the rules as a new flow (default
+rules, namespace rules and grants with `Icmp`, `Ip` or `Any` entries; pinholes are TCP and
+UDP only, and there is no verdict cache); an accepted one has the side effects of an
+accepted TCP or UDP flow, and every denial is reported as `reasons::PROTOCOL`. Outbound such
+packets to a restricted peer pass `allow_other_protocols`, a reply allowance or an outbound
+rule. Rules without such entries (every policy document) change nothing.
 With `stateful_replies`, an accepted packet from an outbound-restricted peer (an echo request,
 or a non-ICMP packet) records the outbound allowance its reply passes through
 (`outbound_replies`), and an outbound ICMP echo request records the inbound allowance of its
@@ -1778,18 +1822,19 @@ allowance is removed on its next lookup (`AclFilterStats::reply_revoked`) and th
 packets are evaluated from scratch.
 
 **ACL hook.** The filter evaluates a flow once, not every packet. `AclEngine::generation`
-increases on every published change (default policy, namespaces, grants, pinholes opened,
-closed, swept or revoked, `clear_all`), and a versioned `PeerIdentity`
+increases on every published change (default rules and their state, namespaces, grants,
+pinholes opened, closed, swept or revoked, `clear_all`), and a versioned `PeerIdentity`
 (`PeerIdentity::generation`, bumped by `PeerIdentityMap`) on every identity change. The
-filter caches per peer its resolved principal and flags, and per peer, direction and
+filter caches per peer its label set, namespace membership and flags, and per peer, direction and
 five-tuple the verdict of a namespace member's TCP/UDP flow's first packet (the default
 policy is cheaper to evaluate than to cache), in the reply table (one lock, one
 capacity, cached verdicts flushed first when full), both tagged with the two generations: a
 hit under other generations is evaluated again, so a change applies to the very next
 packet, and a verdict accepted through a pinhole is also checked against the pinhole's
-expiry. Peers whose namespaces (or the default policy) accept every destination, port and
-protocol and are not outbound-restricted, as computed on every update, bypass the
-evaluation. The reply table, fragments and fail-closed rules are unchanged, and verdicts and
+expiry. Peers whose namespaces (or the default rules, or `NotInstalled::Accept`) accept
+every destination and TCP and UDP port and are not outbound-restricted bypass the
+evaluation: every update computes the open namespaces and the distinct namespace sets of the
+address owners, and each peer resolution intersects them. The reply table, fragments and fail-closed rules are unchanged, and verdicts and
 counters equal a full evaluation (a differential test checks it). The full rules and
 per-packet bench numbers (`cargo bench -p nsplane-acl --bench namespaces`) are in the crate
 docs (`crates/nsplane-acl/src/lib.rs`, *Namespaces*, *Pinholes*, *ACL hook* and
@@ -1807,7 +1852,7 @@ traffic. Exactness was not weakened (differential test).
 the packet's remote address (the source of an inbound packet, the destination of an outbound
 one); its default ignores the address. `PeerIdentityMap::insert_by_source` makes a peer
 terminate by source address, so each packet's principal is a terminate binding of its
-address, as `AccessRequest::from_ip` builds it (an ns gateway, whose packets carry several
+address, anchored by the address text (an ns gateway, whose packets carry several
 sources); `insert` with a `SourceAssertion::WgPeerKey` keeps a key principal (an ns relay
 client). The filter asks `PeerIdentity::by_source` once per peer and identity generation and
 caches such a peer's principal per address in a least-recently-used table bounded by
@@ -1863,7 +1908,7 @@ the file references are to ns `refactor/nsplane` (`crates/ns/src/account_engine/
 
 | ns today | nsplane |
 | --- | --- |
-| `tunnel_wg::acl_check_packet` (`tun_io.rs`) on the `crates/acl` `AclEngine` | `AclFilter` with `AclFilterConfig::crates_acl(Some(tun_ip))` on an `nsplane-acl` `AclEngine` (same policy model; `load` for a policy, `clear_all` for none: fail-closed, `reasons::NO_POLICY`) |
+| `tunnel_wg::acl_check_packet` (`tun_io.rs`) on the `crates/acl` `AclEngine` | `AclFilter` with `AclFilterConfig::crates_acl(Some(tun_ip))` on an `nsplane-acl` `AclEngine` (same policy model; `load` for a policy, `clear_all` for none: fail-closed, `reasons::POLICY_FAILED`) |
 | `nat::FragmentAclGate`, one per filter | `FragmentMode::ALLOW_ONLY` inside that filter |
 | `tunnel_wg::is_local_node_packet(pkt, tun_ip)` | `AclFilterConfig::accept_to_local = Some(tun_ip)` |
 | `tunnel_wg::is_icmp_echo_reply` | `AclFilterConfig::accept_icmp_echo_reply = true` |
@@ -2153,6 +2198,7 @@ path, so such a client pays no extra latency for it.
 | ICMP Echo reply synthesis | `nsplane-packet` | call `icmp::echo_reply_in_place` on a request for an address the local side answers | not used | none: a plain function, only called if the embedder wires it |
 | UDP datagram builder | `nsplane-packet` | `build::udp_packet` / `build::write_udp` for packets to inject | not used | none: plain functions, only called if the embedder wires them |
 | ACL | `nsplane-acl` | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` (`AclFilter::with_config`) | not installed | none |
+| ACL not-installed action | `nsplane-acl` | `AclEngine::new().with_not_installed(NotInstalled::Accept)` | `NotInstalled::Deny` | none: the same branch as a missing rule set |
 | ACL principal by source address | `nsplane-acl` | `PeerIdentityMap::insert_by_source(peer)` (or a `PeerIdentity` overriding `assertion_for` and `by_source`) | per peer: one principal per peer | one cached flag per peer; no per-address table is filled |
 | ACL fragment mode | `nsplane-acl` | `AclFilterConfig::fragments = FragmentMode::ALLOW_ONLY` (or `AllowOnly { ttl, capacity }`) | `FragmentMode::Outcome` | none: the same gate as before |
 | ACL bypass flags | `nsplane-acl` | `AclFilterConfig::accept_to_local = Some(addr)`, `accept_icmp_echo_reply = true` | off | one branch per inbound packet each |

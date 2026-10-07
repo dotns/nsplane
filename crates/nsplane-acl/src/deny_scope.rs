@@ -2,7 +2,7 @@
 //!
 //! The matching engine stays accept-only. Deny-scope instead edits the
 //! text-form [`AclPolicy`] before it is compiled (see
-//! [`CompiledPolicy::compile`](crate::CompiledPolicy::compile)), removing
+//! [`RuleSet::from_document`](crate::RuleSet::from_document)), removing
 //! destination / source CIDRs that the operator forbids, regardless of what
 //! any remote policy source ships.
 //!

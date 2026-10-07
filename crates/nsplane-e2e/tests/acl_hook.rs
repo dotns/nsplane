@@ -347,7 +347,7 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
     Ok(())
 }
 
-/// `clear_all` drops the established flow on its next packet with `NO_POLICY`; storing the
+/// `clear_all` drops the established flow on its next packet with `POLICY_FAILED`; storing the
 /// namespace again restores it. Forgetting the peer's identity drops it as unknown.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult {
@@ -359,7 +359,7 @@ async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult
     acl.engine.store_namespace("quick", quick(&a, true)?)?;
     established(&a, &mut b, &flow).await?;
     acl.engine.clear_all();
-    dropped(&a, &mut b, &mut events, &flow, reasons::NO_POLICY).await?;
+    dropped(&a, &mut b, &mut events, &flow, reasons::POLICY_FAILED).await?;
     acl.engine.store_namespace("quick", quick(&a, true)?)?;
     delivered(&a, &mut b, &flow).await?;
 
@@ -371,7 +371,7 @@ async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult
 
     let stats = acl.filter.stats();
     assert_eq!(
-        (stats.accepted, stats.no_policy, stats.unknown_peer),
+        (stats.accepted, stats.policy_failed, stats.unknown_peer),
         (ESTABLISH as u64 + 2, 1, 1)
     );
     Ok(())
