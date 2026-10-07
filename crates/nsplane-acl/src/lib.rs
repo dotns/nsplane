@@ -295,27 +295,29 @@
 //!
 //! `cargo bench -p nsplane-acl --bench namespaces` measures the filter per
 //! packet (IPv6 TCP; "new flow": the source port changes with every packet,
-//! "established": one five-tuple repeated; release, dev image, x86-64, mean
-//! of two runs):
+//! "established": one five-tuple repeated; release, dev image, x86-64; mean
+//! of three runs interleaved A/B against `main` in one `scripts/bench/slot.sh`
+//! invocation, 2026-10-07, slot 0, 1-minute load 1.0-2.2; no scenario slower
+//! than `main` beyond the run-to-run noise):
 //!
 //! | Scenario | New flow | Established | Outbound |
 //! | --- | --- | --- | --- |
-//! | No namespaces (default policy, 3 rules, not cached) | 55 ns | 55 ns | 76 ns |
-//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 184 ns | 51 ns | 95 ns |
-//! | same, through a grant (peer to peer) | 343 ns | 272 ns | |
-//! | same, through an inbound pinhole | 210 ns | | |
-//! | same, outbound-restricted peer (outbound rule) | | | 156 ns |
-//! | Bypass (a namespace accepting everything) | 38 ns | 37 ns | 77 ns |
-//! | Default policy, by-source peer (best of 3 runs) | 79 ns | 79 ns | |
-//! | Stateless options (no reply allowances, `AllowOnly` fragments, the local and echo-reply bypasses, IPv6 accepted), by-source peer, IPv4 TCP (best of 3 runs) | 71 ns | 80 ns | |
-//! | same, non-first fragment after an accepted first fragment | | 29 ns | |
+//! | No namespaces (default policy, 3 rules, not cached) | 50 ns | 50 ns | 82 ns |
+//! | 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 172 ns | 51 ns | 100 ns |
+//! | same, through a grant (peer to peer) | 353 ns | 244 ns | |
+//! | same, through an inbound pinhole | 213 ns | | |
+//! | same, outbound-restricted peer (outbound rule) | | | 135 ns |
+//! | Bypass (a namespace accepting everything) | 39 ns | 39 ns | 82 ns |
+//! | Default policy, by-source peer | 74 ns | 73 ns | |
+//! | Stateless options (no reply allowances, `AllowOnly` fragments, the local and echo-reply bypasses, IPv6 accepted), by-source peer, IPv4 TCP | 53 ns | 52 ns | |
+//! | same, non-first fragment after an accepted first fragment | | 26 ns | |
 //!
 //! Before the hook every packet was a new flow: 71 ns (default policy),
 //! 669 ns (namespaces), 1.75 us (grant, established), 937 ns (bypass peer),
 //! 580/623 ns outbound; a new flow through a grant took 38 us and through a
 //! pinhole 15-20 us before full tables evicted in O(1). The floor
-//! every packet pays is parsing its five-tuple (6-7.5 ns) and loading the
-//! engine snapshot (9-11.5 ns), 16-19 ns; an established flow adds one
+//! every packet pays is parsing its five-tuple (5.7 ns) and loading the
+//! engine snapshot (8.8 ns), 14.5 ns; an established flow adds one
 //! flow-table lookup under its lock, and a bypass peer the reply check and
 //! its cached labels under that lock. Skipping the reply check would be
 //! exact only for unidirectional traffic, so it stays: verdicts and counters

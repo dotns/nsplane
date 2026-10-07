@@ -1188,7 +1188,6 @@ impl Inner {
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
             return self.evaluate_other(snapshot, peer, packet, tuple);
         };
-        let flow = tcp_udp_flow(&tuple, protocol);
         let identity = self.identity_generation();
         let key = EntryKey {
             peer,
@@ -1227,6 +1226,7 @@ impl Inner {
                 if info.governed == Governed::Default {
                     // The default rules: a few rules and no side effects,
                     // cheaper to evaluate under this lock than to cache.
+                    let flow = tcp_udp_flow(&tuple, protocol);
                     let (verdict, _) = self.evaluate_new(snapshot, info, flow);
                     drop(table);
                     self.sweep_if(sweep);
@@ -1246,6 +1246,7 @@ impl Inner {
                 0,
             ))
         });
+        let flow = tcp_udp_flow(&tuple, protocol);
         let (verdict, cacheable) = self.evaluate_new(snapshot, &info, flow);
         let cache = cacheable && identity != 0;
         if cache || verdict.dependency.is_some() || verdict.restricted {
