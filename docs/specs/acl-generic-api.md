@@ -1075,6 +1075,35 @@ compares the gate against a simple reference model of 5.1 (one map, no shards, n
 expiry) on seeded random sequences of packets, `replace` calls and clock steps. It requires
 equal decisions and counters, so that migration and lazy expiry never change a verdict.
 
+### 5.4 Differences of the merged code (C5)
+
+The merged code (`crates/nsplane-acl/src/gate*`, public as the module `nsplane_acl::gate`;
+nothing is re-exported at the crate root) implements 5.1 with these differences and
+precisions:
+
+- **IPv6 entries** (Q5, open point O1 of `node-l3.md`): `replace` rejects them with a new
+  variant `GatePolicyError::Ipv6 { field: &'static str, value: String }`, fail closed; the
+  check covers `Off` scopes too.
+- **Divert source check**: the filter offers a denial only when its source is no local *or*
+  binding address of any scope (5.1 says binding address). This reproduces the old "no Node
+  address of any Network" check.
+- **`GateScope::unbound_addresses: Vec<IpAddr>`** (new, default empty): remote addresses of a scope without a `PeerId` binding; outbound (and outbound malformed) packets to them are `Unbound` / `Malformed` under the scope's mode, no divert candidate comes from them, and `replace` rejects one listed twice or also bound in the scope (`GatePolicyError::ConflictingAddress`) or IPv6.
+- **Outbound malformed packets** (step 2, open point O4): outbound, the mode is that of the
+  scopes holding the destination as a binding address, as for an unbound outbound packet,
+  not of the scopes whose `local` contains it.
+- **Later fragments of unbound peers**: with one enforcing scope at the local address, a
+  later fragment from a peer that any `UnboundRule` of that scope names (pass or divert)
+  follows its first fragment's pass disposition or is `OrphanFragment`; from any other peer
+  it is `Unbound`. A divert rule matches a later fragment when it covers every port of its
+  protocol (`Tcp(Any)` / `Udp(Any)`).
+- **`GateDecision::rule`** is `Some` for `Granted` (the admitting grant) and for `Suspended`
+  (the first matching suspended grant), `None` otherwise.
+- **`find_flow`** prefers an enforced flow when several peers share the five-tuple.
+- **`ScopeId`** has `new`, `as_str`, `Display` and `From<&str>` / `From<String>`, like
+  `RuleId`. `FlowGate::new` and `with_clock` return `Arc<FlowGate>`.
+- **Subnet transport admission** (1.6, "compiled as ordinary `GateGrant`s"): see
+  `node-l3.md` 3.5; those grants come first in the grant list.
+
 ## 6. Data path
 
 The A/B runs against main with like-for-like setups through `scripts/bench/slot.sh`

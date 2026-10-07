@@ -8,7 +8,9 @@
 - **Generic API**: [`acl-generic-api.md`](acl-generic-api.md) section 5 (`gate::FlowGate`,
   `GatePolicy`, `GateScope`, `GateBinding`, `GateGrant`, `UnboundRule`, `GateHolds`,
   `GateFilter`, `GateDivert`). Section 5 and its compile table (5.2) are approved as
-  written. Snippets here are illustrative; the final names follow the merged C5 code.
+  written; the merged code is `crates/nsplane-acl/src/gate*` (module `nsplane_acl::gate`),
+  and its few differences from section 5 are listed in the design note's 5.4. Snippets here
+  use the merged names; helper calls such as `labels(..)` or `peer_id_of(..)` are ns's.
 - **Parity data**: [`data/node-l3-differential.json`](data/node-l3-differential.json),
   see [`data/README.md`](data/README.md) and section 5.
 
@@ -362,6 +364,7 @@ GateScope {
             format!("o/{net}/{}", b.owner_id),         // owner label
         ] + live_label(n, b)),                         // 3.5
     })).collect(),
+    unbound_addresses: unbound_addresses(n),           // keys without a PeerId, below
     grants: grants(n),                                 // 3.3 .. 3.5
     unbound: unbound(n),                               // 3.7
 }
@@ -376,23 +379,31 @@ Label scheme (product strings; nsplane never parses them):
 | `l/<network>/<node>` | only bindings of `node` that are live (2.3.1) in an enforced Network | Subnet admission grants (3.5) |
 
 A key that ns cannot map to a `PeerId` (the peer is not on the engine) carries no
-traffic, so leaving its binding out is equivalent. Several bindings of one key (several
+traffic, so its binding is left out. Its address still belongs to the Network: ns lists
+it in `GateScope::unbound_addresses`, namely the addresses of the snapshot's bindings
+whose key has no `PeerId`, minus the addresses another binding of the snapshot holds under
+a key with a `PeerId` (the gate rejects an address that is both, `ConflictingAddress`).
+The gate then treats them as the old gate treated a Node address without a usable binding:
+an outbound packet to one (malformed or not) is `Unbound` (old `source_binding`) or
+`Malformed` under the scope's mode, an inbound packet from one is `Unbound` as before, and
+the filter never offers a divert candidate from one. Several bindings of one key (several
 Nodes) are several `GateBinding`s with the same `peer`.
 
 ### 3.3 Grant list and ids
 
 Grants are emitted in this order; the gate reports the first match's id, which gives the
-old precedence (same owner, then Node, then Service, then Subnet):
+old precedence: the Subnet LAN DNS admission, which the old filter tried before the
+evaluation, then same owner, Node and Service:
 
 | Order | ns semantic | `GateGrant` | Id |
 | --- | --- | --- | --- |
+| 0 | Subnet admission | 3.5 | `subnet:<grant_id>` |
 | 1 | Same owner, inbound | `Inbound`, labels `[o/<net>/<local owner>]`, destinations `[local/32]`, `[Any]` | `owner` |
 | 2 | Same owner, outbound | `Outbound`, labels `[o/<net>/<local owner>]`, destinations `[]`, `[Any]` | `owner` |
 | 3 | Node grant `X -> local` | `Inbound`, labels `[n/<net>/X]`, `[local/32]`, `[Any]` | `node:<grant_id>` |
 | 3 | Node grant `local -> T` | `Outbound`, labels `[n/<net>/T]`, `[T ip/32]`, `[Any]` | `node:<grant_id>` |
 | 4 | Service grant `X -> (local, p, port)` | `Inbound`, labels `[n/<net>/X]`, `[local/32]`, `[Tcp(port)]` or `[Udp(port)]`, `suspended` per 3.4 | `service:<service_id>:<grant_id>` |
 | 4 | Service grant `local -> (T, p, port)` | `Outbound`, labels `[n/<net>/T]`, `[T ip/32]`, `[Tcp(port)]` or `[Udp(port)]`, never suspended | `service:<service_id>:<grant_id>` |
-| 5 | Subnet admission | 3.5 | `subnet:<grant_id>` |
 
 Grants whose source and target are both remote are not emitted (the old gate never
 consulted them). A Node grant from the local Node to itself is not emitted. Grants with
@@ -419,13 +430,17 @@ transport installed on its local address, and for each Subnet grant `S -> R` (ro
 - `S` is the local Node: `Outbound { labels: [l/<net>/R], destinations: [R ip/32],
   protocols: [Udp(53535)] }`.
 
-Id `subnet:<grant_id>`, emitted after the Service grants. The `l/` label is carried only by
-the live bindings (installed, exact `enforce` marker of this generation), which makes the
-grant exactly the old `binding_live` condition. The design note's 5.2 row writes
-`labels: [n/S]` "with the binding live"; the two are equal when every binding of `S` in
-the scope is live, and the `l/` form keeps them equal when a Node also has a non-live
-binding (open point O3). A later fragment is not a new flow, so the grant needs no
-fragment check.
+Id `subnet:<grant_id>`, emitted first (order 0 of 3.3), so a request that a same-owner or
+Node grant would also admit reports `subnet:<grant_id>`, as the old filter's admission did
+(it ran before the evaluation and reported `subnet_grant`). These grants match only UDP to
+53535 from or to live bindings, so their position changes nothing else. The `l/` label is
+carried only by the live bindings (installed, exact `enforce` marker of this generation),
+which makes the grant exactly the old `binding_live` condition. The design note's 5.2 row
+writes `labels: [n/S]` "with the binding live"; the two are equal when every binding of `S`
+in the scope is live, and the `l/` form keeps them equal when a Node also has a non-live
+binding. The gate supports this refinement as it is: labels are opaque, a binding carries
+any `LabelSet`, and a grant matches when one of its labels is in the set (O3, confirmed by
+C5). A later fragment is not a new flow, so the grant needs no fragment check.
 
 ### 3.6 Holds (policy pending)
 
@@ -481,8 +496,13 @@ unbound: vec![
 
 The pass rule is omitted when there are no listeners, and both are omitted when the
 projection is not installed or `N` observes. The gate applies them only when exactly one
-scope holds the local address and it enforces, as the old gate did. `GateFilter::
-with_divert(sink)` replaces `with_divert`. The consumer maps the candidate:
+scope holds the local address and it enforces, as the old gate did. A later fragment from
+a peer that an unbound rule of that scope names follows its first fragment's pass
+disposition or is `OrphanFragment`, which equals the old carrier rule since every carrier
+is in a divert rule. `GateFilter::with_divert(divert)` replaces `with_divert(sink)`; the
+filter offers a denial when the source is no local or binding address of any scope, which
+is the old "no Node address of any Network" check (unbound addresses, 3.2, included). The
+consumer maps the candidate:
 
 | Old | New |
 | --- | --- |
@@ -544,18 +564,20 @@ ns ACKs after `replace` returned. The gate generation is not part of the ACK.
 `service_flow_authorized(remote, local, target, protocol, service_id)` becomes:
 
 ```rust
-let ok = gate.find_flow(remote, local, protocol.into()).is_some_and(|f| {
+let ok = gate.find_flow(remote, local, protocol.into()).is_some_and(|f| {  // nsplane_acl::Protocol
     let n = ns.network_of_scope(&f.scope);
+    let rule = f.rule.as_str();
     f.enforced
         && n.target_machine_id == target
         && IpAddr::V4(n.local_node.ip) == local.ip()
         && n.service_for(n.local_node, protocol, local.port()) == Some(service_id)
-        && (f.rule == "owner" || f.rule.starts_with("node:")
-            || f.rule.starts_with(&format!("service:{service_id}:")))
+        && (rule == "owner" || rule.starts_with("node:")
+            || rule.starts_with(&format!("service:{service_id}:")))
 });
 ```
 
-`find_flow` refreshes the flow and ignores expired ones. The projection check makes the
+`find_flow` refreshes the flow, ignores expired ones and prefers an enforced flow when
+several peers share the five-tuple. The projection check makes the
 `service:` prefix match unambiguous (one listener has one service id). Subnet flows
 (`subnet:*`) never authorize a Provider socket, as before. Non-IPv4 addresses give
 `false`.
@@ -571,7 +593,7 @@ let ok = gate.find_flow(remote, local, protocol.into()).is_some_and(|f| {
 | `source_binding` | `Unbound` |
 | `reverse_new_flow` | `ReverseNewFlow` |
 | `no_grant` | `NoGrant` |
-| `service_projection` | `Suspended` |
+| `service_projection` | `Suspended` (`rule`: the first matching suspended grant) |
 | `policy_pending` | `Held` |
 | `orphan_fragment` | `OrphanFragment` |
 | `state_capacity` | `StateCapacity` |
@@ -637,49 +659,63 @@ plane, is no longer dropped by the gate filter; that is ns's routing concern.
 
 The gate handles IPv4 only; every other packet (IPv6, non-IP) is `GateDecision::Pass`,
 which equals the old behaviour (`legacy`, and the filter skipped IPv6 inbound). The
-policy types use `IpAddr` and `IpNet`. The design note does not say whether `replace`
-rejects or ignores IPv6 entries in `local`, `addresses`, `destinations`, holds or
-`release`: **to be fixed by C5** (open point O1). ns emits IPv4 only.
+policy types use `IpAddr` and `IpNet`. **Decision (O1, C5)**: `replace` rejects a policy
+with any IPv6 entry, fail closed, with `GatePolicyError::Ipv6 { field, value }` (`field` is
+`local`, `bindings.addresses`, `grants.destinations`, `holds.local`, `holds.remote` or
+`holds.release`); nothing is published. The check covers `Off` scopes too. ns emits IPv4
+only, so this is not visible to it; a compiler bug fails closed instead of being ignored.
 
 ### 4.4 Further differences
 
-Found while writing this spec, not listed in the design note; C5 confirms or closes them
-(open point O2):
+Found while writing this spec and closed by C5 (open point O2). Each is either reproduced
+by the compile procedure or stated as a difference:
 
-- **Subnet admission order and reason.** Old: a 53535 request was tried as a Subnet
-  admission first and reported `subnet_grant`. New: Subnet grants come last, so a request
-  that a same-owner or Node grant also admits reports that grant's id. The verdict is the
-  same.
-- **Subnet admission counters.** Old: a full table bumped only `state_capacity_denied`,
-  then the packet fell through to the normal evaluation and was counted again. New: one
-  decision, counted once.
-- **Subnet flow migration.** Old: an apply dropped flows that only a Subnet admission
-  covered, and a transport change left them alone. New:
-  they are re-authorized like any flow: kept while the `subnet:` grant still matches,
-  dropped when a transport change removes the `l/` label or the grant.
-- **Pass dispositions.** Old: every transport replacement forgot them. New: they are
-  dropped when their scope changes; a transport replacement that leaves the carriers and
-  listeners unchanged keeps them (at most 30 s). A withdrawal removes the unbound rules,
+- **Subnet admission order and reason** — reproduced. The Subnet admission grants come
+  first (3.3, 3.5), so a 53535 request reports `subnet:<grant_id>` as the old filter's
+  admission did, also when a same-owner or Node grant would admit it.
+- **Subnet admission counters** — difference (counters only). Old: a full table bumped
+  only `state_capacity_denied`, then the request fell through to the normal evaluation,
+  which counted it again. New: one decision, counted once (`state_capacity_denied` and
+  `enforced_denied`). The verdict is the same.
+- **Subnet flow migration** — difference. Old: an apply dropped flows that only a Subnet
+  admission covered, and a transport change left them alone. New: they are re-authorized
+  like any flow on every `replace` that changes their scope: kept while the `subnet:` grant
+  still matches, dropped when a transport change removes the `l/` label or the grant. Their
+  replies are therefore admitted across an apply that keeps the grant, where the old gate
+  denied them (`reverse_new_flow`).
+- **Fragment and pass-disposition state across a recompile** — difference. Old: every apply
+  of a Network dropped its fragments, every listener change dropped the fragments of the
+  target's Networks, and every transport replacement forgot the pass dispositions. New:
+  fragments and pass dispositions are dropped only when their scope changes. A recompile that
+  leaves a scope unchanged (an apply that only bumps the generation, a listener change that
+  no grant or pass rule of the scope names, a transport replacement that keeps the carriers,
+  listeners and markers) keeps them, at most 30 s; a later fragment is then `valid_state` or
+  passed where the old gate said `orphan_fragment`. A withdrawal removes the unbound rules,
   which changes the scope, so the "re-install within 30 s" case stays closed.
-- **Divert source check.** Old: the source must be no Node address of any Network, local
-  addresses included. New (note 5.1, `GateFilter`): no binding address of any scope. A
-  carrier packet whose source is another Network's local Node address is now offered.
+- **Divert source check** — reproduced. The merged filter refuses a source that is a local,
+  binding or unbound address of any scope, which is the old "no Node address of any
+  Network" check (design note 5.4).
+- **Bindings left out for keys without a `PeerId`** — reproduced through
+  `GateScope::unbound_addresses` (3.2): outbound and outbound malformed packets to those
+  addresses keep the old denial under the Network's mode, and no divert candidate comes
+  from them.
+- **Outbound malformed packets** (O4) — reproduced. The gate keeps the old rule: an outbound
+  packet whose header is unparsable but whose addresses are readable takes the mode of the
+  scopes holding its destination as a binding address (not of the scopes whose `local`
+  contains it), after the outbound holds (design note 5.4).
 - **Drop strings** change from `node l3: *` to `flow gate: *` (3.11).
 
 ### 4.5 Open points
 
-- **O1**: IPv6 entries in a `GatePolicy`: rejected by `replace` or ignored (4.3).
-- **O2**: the differences of 4.4.
-- **O3**: the `l/<network>/<node>` live label of 3.5, which refines the note's
-  `labels: [n/S]`.
-- **O4**: outbound malformed packets. The old gate took the Networks holding the
-  destination as a remote Node address; note 5.1 step 2 speaks of the scopes whose `local`
-  contains the destination. C5 keeps the old rule for outbound (the scopes holding the
-  destination as a binding address) or states the change.
-- **Paths**: note section 7 (C5) names this spec `docs/specs/acl-node-l3.md` and the data
-  `docs/specs/fixtures/acl/node_l3_differential.json`; the files are
-  `docs/specs/node-l3.md` and `docs/specs/data/node-l3-differential.json`. C5 references
-  these.
+All closed by C5:
+
+- **O1** (IPv6 in a `GatePolicy`): rejected by `replace` (4.3).
+- **O2** (the differences of 4.4): each reproduced or stated in 4.4.
+- **O3** (the `l/<network>/<node>` live label): supported as specified (3.5).
+- **O4** (outbound malformed packets): keyed on the remote binding address, as before (4.4).
+- **Paths**: the design note's section 7 (C5) named this spec `docs/specs/acl-node-l3.md`
+  and the data `docs/specs/fixtures/acl/node_l3_differential.json`; the files are
+  `docs/specs/node-l3.md` and `docs/specs/data/node-l3-differential.json`.
 
 ## 5. Parity data
 
@@ -781,8 +817,8 @@ filter combined them as "admission, then evaluation":
   `subnet_transport_publisher` step 7, port 53). The compiled grants carry the product's
   one reserved port, so only the 2.3.1 precondition is compared.
 - **`subnet-admission-in-gate`**: an `inbound` / `outbound` step that the gate admits with
-  a `subnet:` rule while the fixture recorded the raw evaluation (`no_grant` or a
-  reverse/denial reason). Example: `subnet_transport_consumer` step 13, an outbound UDP
+  a `subnet:` rule while the fixture recorded the raw evaluation (`no_grant`, a
+  reverse/denial reason, or the same-owner or Node grant that the evaluation alone found). Example: `subnet_transport_consumer` step 13, an outbound UDP
   request to 53535 from a new source port with the routing Node's binding live. The old
   filter would have admitted it through the admission, so the new verdict equals the old
   production verdict. A later step of the same five-tuple then sees `valid_state` where

@@ -34,5 +34,5 @@ name = "namespaces"
 harness = false
 
 [[bench]]
-name = "node_l3"
+name = "gate"
 harness = false

@@ -2,9 +2,12 @@
 
 use std::net::Ipv4Addr;
 
+use nsplane_packet::PeerId;
+
 use super::PacketDirection;
-use super::policy::{BindingKey, CompiledPolicy};
+use super::policy::Slot;
 use super::state::{FlowKey, FragmentKey};
+use crate::rules::Transport;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PacketMeta {
@@ -117,37 +120,39 @@ impl PacketMeta {
         self.protocol == 1 && matches!(self.icmp_type, Some(3 | 4 | 11 | 12))
     }
 
-    /// The remote Node binding `(peer key, remote address)` of this packet
-    /// and its local address.
-    pub(super) const fn remote_binding(
-        self,
-        direction: PacketDirection,
-        peer_key: [u8; 32],
-    ) -> (BindingKey, Ipv4Addr) {
-        let (remote, local) = match direction {
+    /// The packet's `(remote, local)` addresses.
+    pub(super) const fn endpoints(self, direction: PacketDirection) -> (Ipv4Addr, Ipv4Addr) {
+        match direction {
             PacketDirection::Inbound => (self.source, self.destination),
             PacketDirection::Outbound => (self.destination, self.source),
-        };
-        (
-            BindingKey {
-                peer_key,
-                ip: remote,
+        }
+    }
+
+    /// The transport a grant or rule matches; `None` for a later fragment.
+    pub(super) const fn transport(self) -> Option<Transport> {
+        if self.fragment_offset != 0 {
+            return None;
+        }
+        Some(
+            match (self.protocol, self.src_port, self.dst_port, self.icmp_type) {
+                (6, Some(src_port), Some(dst_port), _) => Transport::Tcp { src_port, dst_port },
+                (17, Some(src_port), Some(dst_port), _) => Transport::Udp { src_port, dst_port },
+                (1, _, _, Some(icmp_type)) => Transport::Icmp { icmp_type },
+                (protocol, ..) => Transport::Ip(protocol),
             },
-            local,
         )
     }
 
     pub(super) const fn fragment_key(
         self,
-        policy: &CompiledPolicy,
+        slot: Slot,
         direction: PacketDirection,
-        peer_key: [u8; 32],
+        peer: PeerId,
     ) -> FragmentKey {
         FragmentKey {
-            net: policy.net,
-            generation: policy.generation,
+            slot,
             direction,
-            remote_peer: peer_key,
+            peer,
             source: self.source,
             destination: self.destination,
             protocol: self.protocol,
@@ -167,9 +172,9 @@ pub(super) const fn packet_ipv4_endpoints(packet: &[u8]) -> Option<(Ipv4Addr, Ip
 }
 
 pub(super) fn flow_key(
-    policy: &CompiledPolicy,
+    slot: Slot,
     direction: PacketDirection,
-    peer_key: [u8; 32],
+    peer: PeerId,
     packet: &PacketMeta,
 ) -> Option<FlowKey> {
     let (remote_ip, local_ip, remote_port, local_port) = match direction {
@@ -190,9 +195,8 @@ pub(super) fn flow_key(
         return None;
     }
     Some(FlowKey {
-        net: policy.net,
-        generation: policy.generation,
-        remote_peer: peer_key,
+        slot,
+        peer,
         remote_ip,
         local_ip,
         protocol: packet.protocol,
@@ -204,9 +208,9 @@ pub(super) fn flow_key(
 /// Resolve the original flow quoted by an `ICMPv4` error. The quoted packet is
 /// checked against the opposite direction and never creates state of its own.
 pub(super) fn related_flow_key(
-    policy: &CompiledPolicy,
+    slot: Slot,
     direction: PacketDirection,
-    peer_key: [u8; 32],
+    peer: PeerId,
     packet: &[u8],
 ) -> Option<FlowKey> {
     let outer_ihl = usize::from(*packet.first()? & 0x0f) * 4;
@@ -237,10 +241,7 @@ pub(super) fn related_flow_key(
     };
     let (remote_ip, local_ip, remote_port, local_port) = match direction {
         PacketDirection::Inbound => {
-            if inner_source != policy.local.ip
-                || outer_destination != policy.local.ip
-                || outer_source != inner_destination
-            {
+            if inner_source != outer_destination || outer_source != inner_destination {
                 return None;
             }
             (
@@ -251,10 +252,7 @@ pub(super) fn related_flow_key(
             )
         }
         PacketDirection::Outbound => {
-            if inner_destination != policy.local.ip
-                || outer_source != policy.local.ip
-                || outer_destination != inner_source
-            {
+            if inner_destination != outer_source || outer_destination != inner_source {
                 return None;
             }
             (
@@ -266,9 +264,8 @@ pub(super) fn related_flow_key(
         }
     };
     Some(FlowKey {
-        net: policy.net,
-        generation: policy.generation,
-        remote_peer: peer_key,
+        slot,
+        peer,
         remote_ip,
         local_ip,
         protocol,
