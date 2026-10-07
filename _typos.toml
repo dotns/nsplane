@@ -1,6 +1,6 @@
 [default]
-# Windows SDDL security descriptor strings (`BA` = built-in Administrators)
-extend-ignore-re = ["\"O:SY[^\"]*\""]
+# Windows SDDL security descriptor strings (`BA` = built-in Administrators); BKD campaign IDs (nsplane-ba-*)
+extend-ignore-re = ["\"O:SY[^\"]*\"", "nsplane-ba-[0-9]+"]
 
 [default.extend-words]
 # Mullvad's traffic-analysis defense, mentioned in docs
