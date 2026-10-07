@@ -1,7 +1,7 @@
 //! User-space TCP/IP stack for the nsplane data plane, built on smoltcp.
 //!
-//! A [`NetStack`] terminates the plaintext IP packets an `nsplane` engine decrypts and
-//! presents them as async TCP connections and UDP flows, for IPv4 and IPv6. It plugs into
+//! A [`NetStack`] is the endpoint for the plaintext IP packets an `nsplane` engine decrypts
+//! and presents them as async TCP connections and UDP flows, for IPv4 and IPv6. It plugs into
 //! the engine through the local-side traits: [`NetStack::split`] yields a
 //! [`NetStackSource`] ([`nsplane::PacketSource`], the stack's egress) and a
 //! [`NetStackSink`] ([`nsplane::PacketSink`], packets into the stack), the pair an

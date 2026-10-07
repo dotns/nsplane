@@ -2,8 +2,8 @@
 //!
 //! [`write_udp`] writes a whole IPv4 or IPv6 UDP datagram from (source, destination,
 //! payload) into a [`PacketBuf`], and [`udp_packet`] returns a fresh buffer sized for it,
-//! ready for `EngineHandle::inject_outbound` or `inject_outbound_on`. Ported from ns
-//! `overlay::control::filter::datagram`, generalized to both IP versions and any ports:
+//! ready for `EngineHandle::inject_outbound` or `inject_outbound_on`, for both IP versions
+//! and any ports:
 //!
 //! - **IPv6** (RFC 8200): version 6, traffic class 0, flow label 0, next header 17, hop
 //!   limit 64, no extension headers; the UDP checksum is always computed.
@@ -46,7 +46,7 @@ use crate::protocol;
 const IPV4_HEADER_LEN: u16 = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
-/// TTL / hop limit of every built datagram (as ns).
+/// TTL / hop limit of every built datagram.
 const HOP_LIMIT: u8 = 64;
 /// Byte range of the checksum field in the IPv4 header and the UDP header.
 const IPV4_CHECKSUM: Range<usize> = 10..12;

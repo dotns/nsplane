@@ -152,7 +152,7 @@ async fn received_data_reads_in_order_and_releases_the_budgets() {
     assert_eq!(session.stats.rx_bytes(), 11);
 }
 
-/// A stream over its buffer is reset alone, as the ns terminate closes only the affected
+/// A stream over its buffer is reset alone, as the server side closes only the affected
 /// stream: CLOSE goes out on the control queue, its queued bytes still read, then the
 /// reset; the other stream keeps receiving.
 #[tokio::test]
