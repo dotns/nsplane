@@ -142,8 +142,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local, Protocol) -> Option<LiveFlow>`, `counters`). A `GatePolicy` is `GateScope`s (`ScopeId`,
   `GateMode::{Off, Observe, Enforce}`, local addresses, `GateBinding`s from `PeerId` and remote
   addresses to a `LabelSet`, `unbound_addresses` (remote addresses of the scope without a
-  `PeerId` binding: outbound packets to them are denied `Unbound` under the scope's mode and
-  no divert candidate comes from them; default empty), accept-only `GateGrant`s with
+  `PeerId` binding: outbound packets to them are denied `Unbound` (malformed ones
+  `Malformed`) under the scope's mode and no divert candidate comes from them; default
+  empty), accept-only `GateGrant`s with
   direction, labels, destinations,
   `ProtocolMatch`es and `suspended`, and `UnboundRule`s with `UnboundAction::{Pass, Divert}`)
   plus `GateHolds` (`HoldRule`s and `release` pairs), replaced atomically; flows of unchanged
@@ -208,19 +209,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-nat`: the `Translator`'s grown-copy slow path allocates `len + TAILROOM`, so
   sealing a grown translated packet does not reallocate again; output byte-identical.
 - `nsplane-nat` and `nsplane-acl`: `TranslationTable`'s IPv6 indexes (`u128` keys) and the
-  node L3 gate's maps hash with `hash::KeyedState`; the ACL's private copy is removed.
+  flow gate's maps hash with `hash::KeyedState`; the ACL's private copy is removed.
   Inbound `alias4` translation 4-5 ns faster at 64 B and 10-11 ns at 1400/1420 B.
 - `nsplane-tun`: `host_tun`'s private free list is a `SharedPacketPool`; a `push` without
   recycling costs about 1.5 ns more.
-- `nsplane-acl`: inbound packets that are neither TCP nor UDP now reach the rules after the
-  reply allowances, `allow_other_protocols` and the scope rules: a default rule, namespace
-  rule or grant with an `Icmp`, `Ip` or `Any` entry accepts them (pinholes stay TCP and UDP
-  only); every other one is still dropped with `reasons::PROTOCOL`. Outbound such packets to
-  an outbound-restricted peer are also accepted by a matching outbound rule. Rule sets
-  without such entries behave as before.
-- `nsplane-acl`: `AclEngine::clear_all` leaves the default rules in `PolicyState::Failed`:
-  every inbound packet is dropped with `reasons::POLICY_FAILED` (was `NO_POLICY`), also on an
-  engine built with `NotInstalled::Accept`; `uninstall` returns to `NotInstalled`.
+- `nsplane-acl` (behaviour change): inbound packets that are neither TCP nor UDP now reach
+  the rules after the reply allowances, `allow_other_protocols` and the scope rules: a
+  default rule, namespace rule or grant with an `Icmp`, `Ip` or `Any` entry accepts them
+  (pinholes stay TCP and UDP only); every other one is still dropped with
+  `reasons::PROTOCOL`. Outbound such packets to an outbound-restricted peer are also
+  accepted by a matching outbound rule. Rule sets without such entries behave as before.
+- `nsplane-acl` (behaviour change): `AclEngine::clear_all` leaves the default rules in
+  `PolicyState::Failed`: every inbound packet is dropped with `reasons::POLICY_FAILED` (was
+  `NO_POLICY`), also on an engine built with `NotInstalled::Accept`; `uninstall` returns to
+  `NotInstalled`.
 - `nsplane-acl`: an invalid namespace (a pinhole namespace with rules or pinhole kinds, an
   invalid outbound rule) is `Error::InvalidNamespace`, an invalid grant `Error::InvalidGrant`
   (both were `Error::InvalidPolicy`); `Error` is `#[non_exhaustive]`.
@@ -299,7 +301,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AclEngine::with_not_installed(NotInstalled::Accept)`, or install a rule with
   `ProtocolMatch::Any`.
 - `nsplane-acl`: `AclEngine::store`, `clear`, `policy` and `is_allowed`; use `install`,
-  `uninstall`, `rules` and `rules()` with `RuleSet::matching`.
+  `uninstall` and `rules`, and `rules()` with `RuleSet::matching` for `is_allowed`.
 - `nsplane-acl`: the public `matcher` module (it exported nothing public).
 - `nsplane-acl`: `SourceAssertion` (`WgPeerKey`, `Terminate`, `External`, with
   `source_class`, `source_anchor` and `ip`) and `TerminateBinding`; a `PeerIdentity` returns
@@ -370,7 +372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `NodeL3Gate::service_flow_authorized` -> `FlowGate::find_flow` (`LiveFlow { scope, rule,
     enforced }`).
   - `NodeL3Decision::{Legacy, Observe { would_allow, reason }, Enforce { allow, reason }}` ->
-    `GateDecision::{Pass, Observe { allow, reason, rule }, Enforce { allow, reason, rule }}`;
+    `GateDecision::{Pass, Observe { allow, reason, rule }, Enforce { allow, reason, rule }}`
+    (`enforced_verdict` kept);
     `NodeL3Reason` -> `GateReason` (`same_owner`, `node_grant`, `service_grant` and
     `subnet_grant` are `Granted` with the grant's `RuleId`; `source_binding` -> `Unbound`,
     `service_projection` -> `Suspended`, `policy_pending` -> `Held`, `ambiguous_network` ->

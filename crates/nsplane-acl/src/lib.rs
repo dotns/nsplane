@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Accept-only ACL policy engine and packet filters for nsplane.
+//! Label-based flow ACL, stateful flow gate and packet filters for nsplane.
 //!
 //! Evaluates flows against typed accept rules ([`Rule`]). The model is
 //! **accept-only with default deny**: rules can only grant access to
@@ -52,7 +52,7 @@
 //! namespace (an opaque [`NamespaceId`], e.g. `team-a`) stored with
 //! [`AclEngine::store_namespace`]: its kind ([`NamespaceKind`]), its members
 //! ([`NamespaceMember`], a [`Label`] plus the addresses it owns), its accept
-//! accept rules (typed [`Rule`]s) and optional outbound rules
+//! rules (typed [`Rule`]s) and optional outbound rules
 //! ([`OutboundRule`]).
 //! Storing, replacing or removing one namespace leaves the others untouched.
 //! The engine's default rule set ([`AclEngine::install`]) applies only to
