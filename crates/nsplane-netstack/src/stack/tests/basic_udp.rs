@@ -1,6 +1,6 @@
 use super::*;
 
-/// A raw IPv4/UDP packet with a zero UDP checksum, as the ns tests crafted it.
+/// A raw IPv4/UDP packet with a zero UDP checksum (checksum disabled).
 fn raw_udp(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let total = 28 + payload.len();
     let mut pkt = vec![0u8; total];

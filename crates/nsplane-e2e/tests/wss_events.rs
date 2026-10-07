@@ -9,7 +9,9 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use nsplane::{LinkConfig, TransportId};
 use nsplane_e2e::{TestResult, WAIT};
-use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssStreamClient, WssStreamLimits, WssTls};
+use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
+use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -269,6 +271,7 @@ async fn dialer_sends_one_event_per_occurrence() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 async fn stream_client_sends_one_event_per_occurrence() -> TestResult {
     let relay = Relay::start().await?;
     let config = relay
@@ -357,6 +360,7 @@ async fn dialer_reconnects_after_the_delay_then_backs_off_from_the_floor() -> Te
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 async fn stream_client_reconnects_after_the_delay_then_backs_off_from_the_floor() -> TestResult {
     use WssDialEvent::{Connected, Lost};
 

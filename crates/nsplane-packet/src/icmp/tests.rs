@@ -152,7 +152,7 @@ fn v6_echo_request_becomes_reply() {
 
 #[test]
 fn ns_parity_v4_cases() {
-    // ns `subnet_icmp_echo_reply`: the minimum 28-byte request, an odd-length
+    // IPv4 edge cases: the minimum 28-byte request, an odd-length
     // payload (zero-padded in the checksum), IPv4 options kept as they are and
     // the don't-fragment flag of a whole datagram.
     let options = [0x94, 0x04, 0x00, 0x00]; // Router Alert
@@ -177,7 +177,7 @@ fn ns_parity_v4_cases() {
 
 #[test]
 fn ns_parity_v6_cases() {
-    // ns `is_icmpv6_echo_request`: the minimum 48-byte request and an
+    // IPv6 edge cases: the minimum 48-byte request and an
     // odd-length payload.
     for payload in [&[][..], &b"odd"[..]] {
         let mut packet = icmp_v6(V6_CLIENT, V6_TARGET, 128, 0, payload);

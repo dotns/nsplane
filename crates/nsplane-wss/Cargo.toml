@@ -1,6 +1,6 @@
 [package]
 name = "nsplane-wss"
-description = "WebSocket-over-TLS (WSS) carriers for nsplane: a datagram link dialer for LinkTransport, and a multiplexed TCP/UDP stream client and terminate"
+description = "WebSocket-over-TLS (WSS) carriers for nsplane: a datagram link dialer for LinkTransport, a server transport over accepted WebSocket sessions, and a deprecated multiplexed TCP/UDP stream client and server"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
