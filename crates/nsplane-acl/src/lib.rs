@@ -223,7 +223,8 @@
 //! - `revoked`: the label left the pinhole namespace, or its rule namespaces
 //!   no longer permit the pinhole kind (a rule namespace changed or was
 //!   removed, including a label dropped from its last rule namespace when the
-//!   pinhole was opened under one).
+//!   pinhole was opened under one), or the pinhole namespace was stored again
+//!   as a [`NamespaceKind::Rules`] namespace.
 //!
 //! After a pinhole closes, new flows are dropped ([`reasons::DENIED`]
 //! inbound, [`reasons::OUTBOUND`] outbound to a restricted peer), the reply

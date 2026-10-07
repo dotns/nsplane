@@ -674,23 +674,26 @@ impl Snapshot {
     }
 
     /// After a namespace change, remove the pinholes whose namespace is gone
-    /// or that are no longer permitted; returns how many of each.
+    /// or that are no longer permitted (including a namespace that is no
+    /// longer a pinhole namespace); returns how many of each.
     fn recheck_pinholes(&mut self) -> (u64, u64) {
         let (mut namespace_removed, mut revoked) = (0, 0);
         let mut pinholes = std::mem::take(&mut self.pinholes);
         pinholes.retain(|_, pinhole| {
-            if !self.namespaces.contains_key(&pinhole.namespace) {
+            let Some(namespace) = self.namespaces.get(&pinhole.namespace) else {
                 namespace_removed += 1;
                 return false;
-            }
-            let permitted = self
-                .pinhole_permission(
-                    &pinhole.namespace,
-                    &pinhole.spec.label,
-                    &pinhole.spec.kind,
-                    pinhole.source_gated,
-                )
-                .is_ok();
+            };
+            // A namespace stored again as a rule namespace holds no pinholes.
+            let permitted = !namespace.is_rules()
+                && self
+                    .pinhole_permission(
+                        &pinhole.namespace,
+                        &pinhole.spec.label,
+                        &pinhole.spec.kind,
+                        pinhole.source_gated,
+                    )
+                    .is_ok();
             if !permitted {
                 revoked += 1;
             }
@@ -2303,6 +2306,12 @@ mod tests {
             engine.evaluate(&key_labels(2), &flow),
             Decision::Deny(reasons::DENIED)
         );
+        // Stored again as a rule namespace, it holds no pinhole.
+        engine
+            .store_namespace("s1", source(&[(1, "fd00::1"), (2, "fd00::2")], &[]))
+            .unwrap();
+        assert!(!first.is_open());
+        assert_eq!(engine.pinhole_stats().revoked, 1);
     }
 
     // ── pinholes ──────────────────────────────────────────────────────────

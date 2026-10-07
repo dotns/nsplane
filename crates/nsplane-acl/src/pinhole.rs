@@ -111,8 +111,9 @@ pub struct PinholeStats {
     pub expired: u64,
     /// Pinholes closed because their pinhole namespace was removed.
     pub namespace_removed: u64,
-    /// Pinholes closed because the label left the pinhole namespace or its
-    /// rule namespaces no longer permit the pinhole kind.
+    /// Pinholes closed because the label left the pinhole namespace, its
+    /// rule namespaces no longer permit the pinhole kind, or the namespace is
+    /// no longer a pinhole namespace.
     pub revoked: u64,
     /// Pinholes closed by [`AclEngine::clear_all`].
     pub cleared: u64,
