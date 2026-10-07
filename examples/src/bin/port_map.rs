@@ -9,7 +9,7 @@
 //! `listen` are dropped. Everything else passes unchanged. Needs root (or `CAP_NET_ADMIN`).
 //!
 //! `listen` and `target` are of the same address family, as the tunnel side sees them:
-//! `listen` is typically an interface `--address` (or this node's `node6` with
+//! `listen` is typically an interface `--address` (or this node's own IPv6 address with
 //! `translate_node`'s address model) and `target` a service on the same address, e.g. the
 //! `--echo-port`. Only unfragmented TCP and UDP packets are mapped.
 //!

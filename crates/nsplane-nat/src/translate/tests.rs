@@ -1,8 +1,8 @@
 //! Translator tests: filter behaviour per mapping kind, and (in `vectors`)
-//! the ported ns translation tests and RFC 7915 vectors. Every translated
+//! translation tests and RFC 7915 vectors. Every translated
 //! packet's checksums are verified by a full recompute.
 
-mod native_alias;
+mod peer6_eam4;
 mod vectors;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -28,29 +28,29 @@ pub(super) fn ip6(s: &str) -> Ipv6Addr {
     s.parse().unwrap()
 }
 
-pub(super) const SELF4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
-pub(super) const ALIAS4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
-pub(super) const OTHER_ALIAS4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+pub(super) const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
+pub(super) const EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+pub(super) const OTHER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 
-pub(super) fn self_node4() -> Ipv6Addr {
+pub(super) fn self_eam6() -> Ipv6Addr {
     ip6("fd00::ff:1")
 }
 
 pub(super) fn peer_mapping() -> PeerMapping {
     PeerMapping {
-        node6: ip6("fd00::1:0"),
-        node4: ip6("fd00::1:1"),
-        alias6: Some(ip6("fd99::1")),
-        alias4: Some(ALIAS4),
+        peer6: ip6("fd00::1:0"),
+        eam6: ip6("fd00::1:1"),
+        local6: Some(ip6("fd99::1")),
+        eam4: Some(EAM4),
     }
 }
 
 pub(super) fn other_mapping() -> PeerMapping {
     PeerMapping {
-        node6: ip6("fd00::2:0"),
-        node4: ip6("fd00::2:1"),
-        alias6: None,
-        alias4: Some(OTHER_ALIAS4),
+        peer6: ip6("fd00::2:0"),
+        eam6: ip6("fd00::2:1"),
+        local6: None,
+        eam4: Some(OTHER_EAM4),
     }
 }
 
@@ -69,8 +69,8 @@ pub(super) fn table() -> TranslationTable {
         .peer(PEER, peer_mapping())
         .peer(OTHER, other_mapping())
         .self_mapping(SelfMapping {
-            self4: SELF4,
-            node4: self_node4(),
+            eam4: SELF_EAM4,
+            eam6: self_eam6(),
         })
         .lan(lan("192.168.1.0", 24, "fd64:1::", None))
         .lan(lan("10.0.0.0", 8, "fd64:2::", Some(PEER)))
@@ -83,7 +83,7 @@ pub(super) fn translator() -> Translator {
     Translator::new(table())
 }
 
-// --- Packet builders (ported from the ns test helpers) ---
+// --- Packet builders ---
 
 /// The IPv4 header fields the tests vary.
 #[derive(Debug, Clone, Copy)]
@@ -393,23 +393,23 @@ fn traffic_class(packet: &[u8]) -> u8 {
 // --- Outbound ---
 
 #[test]
-fn outbound_alias4_from_self4_becomes_ipv6_to_node4() {
+fn outbound_eam4_from_self_eam4_becomes_ipv6_to_eam6() {
     for proto in [protocol::TCP, protocol::UDP] {
         let body = if proto == protocol::TCP {
-            tcp4(SELF4, ALIAS4, b"odd")
+            tcp4(SELF_EAM4, EAM4, b"odd")
         } else {
-            udp4(SELF4, ALIAS4, b"odd", false)
+            udp4(SELF_EAM4, EAM4, b"odd", false)
         };
         let hdr = Hdr4 {
             tos: 0xeb,
             id: 7,
             ..Hdr4::default()
         };
-        let packet = ipv4(SELF4, ALIAS4, proto, hdr, &body);
+        let packet = ipv4(SELF_EAM4, EAM4, proto, hdr, &body);
         let v6 = out_ok(&packet);
         assert_eq!(v6.len(), packet.len() + 20);
         check_v6(&v6);
-        assert_eq!((src6(&v6), dst6(&v6)), (self_node4(), peer_mapping().node4));
+        assert_eq!((src6(&v6), dst6(&v6)), (self_eam6(), peer_mapping().eam6));
         assert_eq!((v6[6], v6[7], traffic_class(&v6)), (proto, 63, 0xeb));
         assert_eq!(&v6[40..], {
             let mut expected = body.clone();
@@ -429,27 +429,27 @@ fn outbound_lan4_becomes_lan6_on_both_sides() {
     assert_eq!(src6(&v6), ip6("fd64:1::c0a8:114"));
     assert_eq!(dst6(&v6), ip6("fd64:2::a01:203"));
 
-    // A LAN source towards a peer alias.
-    let packet = ipv4_simple(src, ALIAS4, protocol::UDP, &udp4(src, ALIAS4, b"x", false));
+    // A LAN source towards a peer eam4.
+    let packet = ipv4_simple(src, EAM4, protocol::UDP, &udp4(src, EAM4, b"x", false));
     let v6 = out_ok(&packet);
     check_v6(&v6);
     assert_eq!(
         (src6(&v6), dst6(&v6)),
-        (ip6("fd64:1::c0a8:114"), peer_mapping().node4)
+        (ip6("fd64:1::c0a8:114"), peer_mapping().eam6)
     );
 }
 
 #[test]
 fn outbound_mapping_of_another_peer_is_dropped() {
-    let udp = |dst| ipv4_simple(SELF4, dst, protocol::UDP, &udp4(SELF4, dst, b"x", false));
-    assert_eq!(out_drop(&udp(OTHER_ALIAS4)), reasons::PEER_MISMATCH);
+    let udp = |dst| ipv4_simple(SELF_EAM4, dst, protocol::UDP, &udp4(SELF_EAM4, dst, b"x", false));
+    assert_eq!(out_drop(&udp(OTHER_EAM4)), reasons::PEER_MISMATCH);
     assert_eq!(out_drop(&udp(ip4("172.16.0.9"))), reasons::PEER_MISMATCH);
-    let alias6 = peer_mapping().alias6.unwrap();
+    let local6 = peer_mapping().local6.unwrap();
     let packet = ipv6_simple(
         ip6("fd00::ff:0"),
-        alias6,
+        local6,
         protocol::UDP,
-        &udp6(ip6("fd00::ff:0"), alias6, b"x"),
+        &udp6(ip6("fd00::ff:0"), local6, b"x"),
     );
     let (verdict, _) = outbound(&translator(), OTHER, &packet);
     assert_eq!(
@@ -462,8 +462,8 @@ fn outbound_mapping_of_another_peer_is_dropped() {
 
 #[test]
 fn outbound_unmapped_source_is_dropped() {
-    for src in [ip4("198.51.100.7"), ALIAS4, ip4("10.0.0.5")] {
-        let packet = ipv4_simple(src, ALIAS4, protocol::UDP, &udp4(src, ALIAS4, b"x", false));
+    for src in [ip4("198.51.100.7"), EAM4, ip4("10.0.0.5")] {
+        let packet = ipv4_simple(src, EAM4, protocol::UDP, &udp4(src, EAM4, b"x", false));
         assert_eq!(out_drop(&packet), reasons::UNMAPPED, "{src}");
     }
 }
@@ -472,12 +472,12 @@ fn outbound_unmapped_source_is_dropped() {
 fn native_packets_pass_unchanged() {
     let translator = translator();
     let dst = ip4("198.51.100.1");
-    let native4 = ipv4_simple(SELF4, dst, protocol::UDP, &udp4(SELF4, dst, b"x", false));
+    let native4 = ipv4_simple(SELF_EAM4, dst, protocol::UDP, &udp4(SELF_EAM4, dst, b"x", false));
     let (dst6, own6) = (ip6("2001:db8::1"), ip6("fd00::ff:0"));
     let native6 = ipv6_simple(own6, dst6, protocol::UDP, &udp6(own6, dst6, b"x"));
     // A local LAN destination is not a translated one either.
     let local_lan = ipv4_simple(
-        SELF4,
+        SELF_EAM4,
         ip4("192.168.1.9"),
         protocol::ICMP,
         &echo4(false, b""),
@@ -499,10 +499,10 @@ fn native_packets_pass_unchanged() {
             (Verdict::Accept, packet)
         );
     }
-    // Native IPv6 between the peer's node6 and ours, and to a node4 that is
+    // Native IPv6 between the peer's peer6 and ours, and to an eam6 that is
     // not ours, passes inbound.
-    let node6 = other_mapping().node6;
-    let packet = ipv6_simple(node6, own6, protocol::UDP, &udp6(node6, own6, b"x"));
+    let peer6 = other_mapping().peer6;
+    let packet = ipv6_simple(peer6, own6, protocol::UDP, &udp6(peer6, own6, b"x"));
     assert_eq!(
         inbound(&translator, OTHER, &packet),
         (Verdict::Accept, packet)
@@ -511,21 +511,21 @@ fn native_packets_pass_unchanged() {
 }
 
 #[test]
-fn outbound_alias6_is_rewritten_to_node6() {
-    let (src, alias6, node6) = (
+fn outbound_local6_is_rewritten_to_peer6() {
+    let (src, local6, peer6) = (
         ip6("fd00::ff:0"),
-        peer_mapping().alias6.unwrap(),
-        peer_mapping().node6,
+        peer_mapping().local6.unwrap(),
+        peer_mapping().peer6,
     );
     for (proto, body) in [
-        (protocol::TCP, tcp6(src, alias6, b"tcp")),
-        (protocol::UDP, udp6(src, alias6, b"udp")),
-        (protocol::ICMPV6, echo6(src, alias6, false, b"ping")),
+        (protocol::TCP, tcp6(src, local6, b"tcp")),
+        (protocol::UDP, udp6(src, local6, b"udp")),
+        (protocol::ICMPV6, echo6(src, local6, false, b"ping")),
     ] {
-        let packet = ipv6_simple(src, alias6, proto, &body);
+        let packet = ipv6_simple(src, local6, proto, &body);
         let rewritten = out_ok(&packet);
         assert_eq!(rewritten.len(), packet.len());
-        assert_eq!((src6(&rewritten), dst6(&rewritten)), (src, node6));
+        assert_eq!((src6(&rewritten), dst6(&rewritten)), (src, peer6));
         assert_eq!(rewritten[7], 64, "6 -> 6 keeps the hop limit");
         check_v6(&rewritten);
     }
@@ -534,8 +534,8 @@ fn outbound_alias6_is_rewritten_to_node6() {
 // --- Inbound ---
 
 #[test]
-fn inbound_node4_to_self_becomes_ipv4_from_alias4() {
-    let (src, dst) = (peer_mapping().node4, self_node4());
+fn inbound_eam6_to_self_becomes_ipv4_from_eam4() {
+    let (src, dst) = (peer_mapping().eam6, self_eam6());
     for (proto, body) in [
         (protocol::TCP, tcp6(src, dst, b"odd")),
         (protocol::UDP, udp6(src, dst, b"odd")),
@@ -545,7 +545,7 @@ fn inbound_node4_to_self_becomes_ipv4_from_alias4() {
         let v4 = in_ok(&packet);
         assert_eq!(v4.len(), packet.len() - 20);
         check_v4(&v4);
-        assert_eq!((src4(&v4), dst4(&v4)), (ALIAS4, SELF4));
+        assert_eq!((src4(&v4), dst4(&v4)), (EAM4, SELF_EAM4));
         let proto4 = if proto == protocol::ICMPV6 {
             protocol::ICMP
         } else {
@@ -566,42 +566,42 @@ fn inbound_lan6_becomes_lan4_on_both_sides() {
         (ip4("10.1.2.3"), ip4("192.168.1.20"))
     );
 
-    // The peer's node4 towards a local LAN host.
-    let src = peer_mapping().node4;
+    // The peer's eam6 towards a local LAN host.
+    let src = peer_mapping().eam6;
     let packet = ipv6_simple(src, dst, protocol::UDP, &udp6(src, dst, b"x"));
     let v4 = in_ok(&packet);
     check_v4(&v4);
-    assert_eq!((src4(&v4), dst4(&v4)), (ALIAS4, ip4("192.168.1.20")));
+    assert_eq!((src4(&v4), dst4(&v4)), (EAM4, ip4("192.168.1.20")));
 }
 
 #[test]
 fn inbound_source_must_belong_to_the_peer() {
-    let dst = self_node4();
+    let dst = self_eam6();
     let udp = |src| ipv6_simple(src, dst, protocol::UDP, &udp6(src, dst, b"x"));
-    assert_eq!(in_drop(&udp(other_mapping().node4)), reasons::PEER_MISMATCH);
+    assert_eq!(in_drop(&udp(other_mapping().eam6)), reasons::PEER_MISMATCH);
     assert_eq!(in_drop(&udp(ip6("fd64:3::ac10:1"))), reasons::PEER_MISMATCH);
     assert_eq!(
         in_drop(&udp(ip6("fd64:1::c0a8:101"))),
         reasons::SPOOFED_SOURCE
     );
-    assert_eq!(in_drop(&udp(peer_mapping().node6)), reasons::UNMAPPED);
+    assert_eq!(in_drop(&udp(peer_mapping().peer6)), reasons::UNMAPPED);
     assert_eq!(in_drop(&udp(ip6("2001:db8::1"))), reasons::UNMAPPED);
 }
 
 #[test]
-fn inbound_node6_is_rewritten_to_alias6() {
-    let (node6, dst) = (peer_mapping().node6, ip6("fd00::ff:0"));
-    let packet = ipv6_simple(node6, dst, protocol::TCP, &tcp6(node6, dst, b"hello"));
+fn inbound_peer6_is_rewritten_to_local6() {
+    let (peer6, dst) = (peer_mapping().peer6, ip6("fd00::ff:0"));
+    let packet = ipv6_simple(peer6, dst, protocol::TCP, &tcp6(peer6, dst, b"hello"));
     let rewritten = in_ok(&packet);
     check_v6(&rewritten);
     assert_eq!(
         (src6(&rewritten), dst6(&rewritten)),
-        (peer_mapping().alias6.unwrap(), dst)
+        (peer_mapping().local6.unwrap(), dst)
     );
 
-    // A peer without an alias6 keeps its node6.
-    let node6 = other_mapping().node6;
-    let packet = ipv6_simple(node6, dst, protocol::UDP, &udp6(node6, dst, b"x"));
+    // A peer without an local6 keeps its peer6.
+    let peer6 = other_mapping().peer6;
+    let packet = ipv6_simple(peer6, dst, protocol::UDP, &udp6(peer6, dst, b"x"));
     assert_eq!(
         inbound(&translator(), OTHER, &packet),
         (Verdict::Accept, packet)
@@ -610,12 +610,12 @@ fn inbound_node6_is_rewritten_to_alias6() {
 
 #[test]
 fn inbound_spoofed_local_view_sources_are_dropped() {
-    for src in [ALIAS4, OTHER_ALIAS4, ip4("10.0.0.1"), ip4("192.168.1.1")] {
-        let packet = ipv4_simple(src, SELF4, protocol::UDP, &udp4(src, SELF4, b"x", false));
+    for src in [EAM4, OTHER_EAM4, ip4("10.0.0.1"), ip4("192.168.1.1")] {
+        let packet = ipv4_simple(src, SELF_EAM4, protocol::UDP, &udp4(src, SELF_EAM4, b"x", false));
         assert_eq!(in_drop(&packet), reasons::SPOOFED_SOURCE, "{src}");
     }
-    let (alias6, dst) = (peer_mapping().alias6.unwrap(), ip6("fd00::ff:0"));
-    let packet = ipv6_simple(alias6, dst, protocol::UDP, &udp6(alias6, dst, b"x"));
+    let (local6, dst) = (peer_mapping().local6.unwrap(), ip6("fd00::ff:0"));
+    let packet = ipv6_simple(local6, dst, protocol::UDP, &udp6(local6, dst, b"x"));
     assert_eq!(in_drop(&packet), reasons::SPOOFED_SOURCE);
 }
 
@@ -625,26 +625,26 @@ fn inbound_spoofed_local_view_sources_are_dropped() {
 fn store_swaps_the_table_atomically() {
     let translator = translator();
     let packet = ipv4_simple(
-        SELF4,
-        ALIAS4,
+        SELF_EAM4,
+        EAM4,
         protocol::UDP,
-        &udp4(SELF4, ALIAS4, b"x", false),
+        &udp4(SELF_EAM4, EAM4, b"x", false),
     );
     assert_eq!(
         dst6(&outbound(&translator, PEER, &packet).1),
-        peer_mapping().node4
+        peer_mapping().eam6
     );
 
     let moved = PeerMapping {
-        node6: ip6("fd00::9:0"),
-        node4: ip6("fd00::9:1"),
+        peer6: ip6("fd00::9:0"),
+        eam6: ip6("fd00::9:1"),
         ..peer_mapping()
     };
     let next = TranslationTable::builder()
         .peer(PEER, moved)
         .self_mapping(SelfMapping {
-            self4: SELF4,
-            node4: self_node4(),
+            eam4: SELF_EAM4,
+            eam6: self_eam6(),
         })
         .build()
         .unwrap();
@@ -657,7 +657,7 @@ fn store_swaps_the_table_atomically() {
     assert!(translator.table().peer(OTHER).is_none());
     let (verdict, v6) = outbound(&translator, PEER, &packet);
     assert_eq!(verdict, Verdict::Accept);
-    assert_eq!(dst6(&v6), moved.node4);
+    assert_eq!(dst6(&v6), moved.eam6);
     check_v6(&v6);
 }
 
@@ -666,21 +666,21 @@ fn predicate_follows_the_current_table() {
     let translator = translator();
     let translated = translator.ipv4_translated_predicate();
     for (addr, expected) in [
-        (ALIAS4, true),
-        (OTHER_ALIAS4, true),
+        (EAM4, true),
+        (OTHER_EAM4, true),
         (ip4("10.200.0.1"), true),
         (ip4("172.16.255.255"), true),
         (ip4("192.168.1.1"), false),
-        (SELF4, false),
+        (SELF_EAM4, false),
         (ip4("198.51.100.1"), false),
     ] {
         assert_eq!(translated(addr), expected, "{addr}");
     }
     translator.store(TranslationTable::default());
-    assert!(!translated(ALIAS4));
+    assert!(!translated(EAM4));
     assert!(!translated(ip4("10.200.0.1")));
     translator.store(table());
-    assert!(translated(ALIAS4));
+    assert!(translated(EAM4));
 }
 
 /// Translates `packet` outbound and checks it against the in-place result;
@@ -698,10 +698,10 @@ fn translate_tight(mut packet: PacketBuf, expected: &[u8]) -> u64 {
 #[test]
 fn packets_without_room_are_translated_in_a_grown_copy() {
     let packet = ipv4_simple(
-        SELF4,
-        ALIAS4,
+        SELF_EAM4,
+        EAM4,
         protocol::UDP,
-        &udp4(SELF4, ALIAS4, b"x", false),
+        &udp4(SELF_EAM4, EAM4, b"x", false),
     );
     let translator = translator();
     let (verdict, expected) = outbound(&translator, PEER, &packet);
@@ -738,7 +738,7 @@ fn packets_without_room_are_translated_in_a_grown_copy() {
 
 #[test]
 fn inbound_translation_shrinks_in_place() {
-    let (src, dst) = (peer_mapping().node4, self_node4());
+    let (src, dst) = (peer_mapping().eam6, self_eam6());
     let plain = ipv6_simple(
         src,
         dst,
@@ -767,26 +767,26 @@ fn inbound_translation_shrinks_in_place() {
 fn stats_count_each_outcome() {
     let translator = translator();
     let out = ipv4_simple(
-        SELF4,
-        ALIAS4,
+        SELF_EAM4,
+        EAM4,
         protocol::UDP,
-        &udp4(SELF4, ALIAS4, b"x", false),
+        &udp4(SELF_EAM4, EAM4, b"x", false),
     );
     let mismatch = ipv4_simple(
-        SELF4,
-        OTHER_ALIAS4,
+        SELF_EAM4,
+        OTHER_EAM4,
         protocol::UDP,
-        &udp4(SELF4, OTHER_ALIAS4, b"x", false),
+        &udp4(SELF_EAM4, OTHER_EAM4, b"x", false),
     );
-    let (node4, own) = (peer_mapping().node4, self_node4());
-    let back = ipv6_simple(node4, own, protocol::UDP, &udp6(node4, own, b"x"));
-    let (node6, dst) = (peer_mapping().node6, ip6("fd00::ff:0"));
-    let rewrite = ipv6_simple(node6, dst, protocol::UDP, &udp6(node6, dst, b"x"));
+    let (eam6, own) = (peer_mapping().eam6, self_eam6());
+    let back = ipv6_simple(eam6, own, protocol::UDP, &udp6(eam6, own, b"x"));
+    let (peer6, dst) = (peer_mapping().peer6, ip6("fd00::ff:0"));
+    let rewrite = ipv6_simple(peer6, dst, protocol::UDP, &udp6(peer6, dst, b"x"));
     let spoof = ipv4_simple(
-        ALIAS4,
-        SELF4,
+        EAM4,
+        SELF_EAM4,
         protocol::UDP,
-        &udp4(ALIAS4, SELF4, b"x", false),
+        &udp4(EAM4, SELF_EAM4, b"x", false),
     );
     outbound(&translator, PEER, &out);
     outbound(&translator, PEER, &out);
@@ -825,13 +825,13 @@ fn fragment4(id: u16, offset_units: u16, more: bool, ttl: u8, bytes: &[u8]) -> V
         fragment: flags,
         options: &[],
     };
-    ipv4(SELF4, ALIAS4, protocol::UDP, hdr, bytes)
+    ipv4(SELF_EAM4, EAM4, protocol::UDP, hdr, bytes)
 }
 
 #[test]
 fn zero_checksum_udp_fragments_are_reassembled_in_order() {
     let translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let first = fragment4(77, 0, true, 2, &udp[..16]);
     let middle = fragment4(77, 2, true, 64, &udp[16..24]);
     let last = fragment4(77, 3, false, 64, &udp[24..]);
@@ -851,7 +851,7 @@ fn zero_checksum_udp_fragments_are_reassembled_in_order() {
 fn reassembled_datagram_larger_than_its_last_fragment_grows() {
     let translator = translator();
     let data: Vec<u8> = (0..400u16).map(|i| i.to_le_bytes()[0]).collect();
-    let udp = udp4(SELF4, ALIAS4, &data, true);
+    let udp = udp4(SELF_EAM4, EAM4, &data, true);
     let first = fragment4(79, 0, true, 64, &udp[..400]);
     let last = fragment4(79, 50, false, 64, &udp[400..]);
     assert_eq!(outbound(&translator, PEER, &first).0, Verdict::Handled);
@@ -895,7 +895,7 @@ fn reassemble_in(translator: &Translator, packets: &[Vec<u8>], order: &[usize]) 
 
 #[test]
 fn zero_checksum_udp_fragments_are_reassembled_in_any_order() {
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let pieces = [
         fragment4(80, 0, true, 2, &udp[..16]),
         fragment4(80, 2, true, 64, &udp[16..24]),
@@ -926,7 +926,7 @@ fn zero_checksum_udp_fragments_are_reassembled_in_any_order() {
 #[test]
 fn zero_checksum_tail_before_its_first_fragment_is_held() {
     let translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let pieces = [
         fragment4(78, 0, true, 64, &udp[..16]),
         fragment4(78, 2, false, 64, &udp[16..]),
@@ -940,7 +940,7 @@ fn zero_checksum_tail_before_its_first_fragment_is_held() {
 #[test]
 fn checksummed_udp_fragments_before_their_first_are_reassembled() {
     let translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", false);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", false);
     let pieces = [
         fragment4(81, 0, true, 64, &udp[..16]),
         fragment4(81, 2, true, 64, &udp[16..24]),
@@ -971,7 +971,7 @@ fn checksummed_udp_fragments_before_their_first_are_reassembled() {
 #[test]
 fn held_duplicates_are_ignored_and_overlaps_drop_the_datagram() {
     let translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let pieces = [
         fragment4(83, 0, true, 64, &udp[..16]),
         fragment4(83, 2, true, 64, &udp[16..24]),
@@ -1001,7 +1001,7 @@ fn held_fragments_are_bounded_in_entries() {
         max_entries: 2,
         ..REASSEMBLY_LIMITS
     });
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     for id in [90, 91] {
         let tail = fragment4(id, 2, false, 64, &udp[16..]);
         assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Handled);
@@ -1024,7 +1024,7 @@ fn held_fragments_are_bounded_in_bytes() {
         max_bytes: 24,
         ..REASSEMBLY_LIMITS
     });
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let middle = fragment4(93, 2, true, 64, &udp[16..24]);
     let last = fragment4(93, 3, false, 64, &udp[24..]);
     let other = fragment4(94, 2, false, 64, &udp[16..]);
@@ -1046,7 +1046,7 @@ fn passed_markers_are_bounded() {
         max_entries: 1,
         ..REASSEMBLY_LIMITS
     });
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", false);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", false);
     for id in [95, 96] {
         let first = fragment4(id, 0, true, 64, &udp[..16]);
         assert_eq!(outbound(&translator, PEER, &first).0, Verdict::Accept);
@@ -1063,7 +1063,7 @@ fn passed_markers_are_bounded() {
 #[test]
 fn held_fragments_expire() {
     let mut translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", true);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", true);
     let tail = fragment4(97, 2, false, 64, &udp[16..]);
     assert_eq!(outbound(&translator, PEER, &tail).0, Verdict::Handled);
     advance(&mut translator, 60);
@@ -1077,7 +1077,7 @@ fn held_fragments_expire() {
 /// The fragments of a zero-checksum datagram with `len` UDP payload bytes.
 fn zero_checksum_pieces(id: u16, len: usize) -> [Vec<u8>; 2] {
     let data: Vec<u8> = (0..len).map(|i| i.to_le_bytes()[0]).collect();
-    let udp = udp4(SELF4, ALIAS4, &data, true);
+    let udp = udp4(SELF_EAM4, EAM4, &data, true);
     [
         fragment4(id, 0, true, 64, &udp[..1000]),
         fragment4(id, 125, false, 64, &udp[1000..]),
@@ -1128,7 +1128,7 @@ fn reassembled_datagrams_fit_the_set_mtu() {
 #[test]
 fn checksummed_udp_fragments_are_translated_one_by_one() {
     let translator = translator();
-    let udp = udp4(SELF4, ALIAS4, b"abcdefghijklmnopqrstuvwx", false);
+    let udp = udp4(SELF_EAM4, EAM4, b"abcdefghijklmnopqrstuvwx", false);
     let pieces = [
         fragment4(100, 0, true, 2, &udp[..16]),
         fragment4(100, 2, true, 64, &udp[16..24]),
@@ -1148,7 +1148,7 @@ fn checksummed_udp_fragments_are_translated_one_by_one() {
         joined.extend_from_slice(&v6[48..]);
     }
     assert_eq!(
-        transport_checksum_v6(self_node4(), peer_mapping().node4, protocol::UDP, &joined),
+        transport_checksum_v6(self_eam6(), peer_mapping().eam6, protocol::UDP, &joined),
         0
     );
     // Nothing waited: no fragment was held or reassembled.
@@ -1159,7 +1159,7 @@ fn checksummed_udp_fragments_are_translated_one_by_one() {
 
 #[test]
 fn ipv6_fragments_become_ipv4_fragments_inbound() {
-    let (src, dst) = (peer_mapping().node4, self_node4());
+    let (src, dst) = (peer_mapping().eam6, self_eam6());
     let udp = udp6(src, dst, b"abcdefghijklmnopqrstuvwx");
     let mut joined = Vec::new();
     for (offset, more, bytes) in [(0_u16, true, &udp[..16]), (2, false, &udp[16..])] {
@@ -1177,7 +1177,7 @@ fn ipv6_fragments_become_ipv4_fragments_inbound() {
         joined.extend_from_slice(&v4[20..]);
     }
     assert_eq!(
-        transport_checksum_v4(ALIAS4, SELF4, protocol::UDP, &joined),
+        transport_checksum_v4(EAM4, SELF_EAM4, protocol::UDP, &joined),
         0
     );
 }

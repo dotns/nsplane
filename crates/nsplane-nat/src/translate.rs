@@ -1,34 +1,34 @@
 //! The stateless IPv4 <-> IPv6 translator (RFC 7915), as a [`PacketFilter`].
 //!
 //! [`Translator`] rewrites packets in place according to a
-//! [`TranslationTable`]: local applications use IPv4 (and IPv6 aliases),
+//! [`TranslationTable`]: local applications use IPv4 (and local IPv6 addresses),
 //! the tunnel carries IPv6 only.
 //!
 //! # Outbound (local -> tunnel, after the core routed the packet to `peer`)
 //!
-//! - IPv4 to a peer's `alias4` -> IPv6 to that peer's `node4`.
+//! - IPv4 to a peer's `eam4` -> IPv6 to that peer's `eam6`.
 //! - IPv4 into a LAN prefix behind a peer -> IPv6 to the paired `lan6` address.
-//! - IPv4 to a peer's native IPv4 alias
-//!   ([`TranslationTableBuilder::peer_with_native_alias4`]) -> IPv6 to that
-//!   peer's `node6`.
-//! - In all three cases the source must be `self4` (-> the self `node4`) or
+//! - IPv4 to a peer's `peer6_eam4`
+//!   ([`TranslationTableBuilder::peer_with_peer6_eam4`]) -> IPv6 to that
+//!   peer's `peer6`.
+//! - In all three cases the source must be the self `eam4` (-> the self `eam6`) or
 //!   inside a local LAN prefix (-> its `lan6` address), and the destination
 //!   mapping must belong to `peer`; otherwise the packet is dropped.
-//! - IPv6 to a peer's `alias6` -> destination rewritten to its `node6`.
+//! - IPv6 to a peer's `local6` -> destination rewritten to its `peer6`.
 //! - Everything else passes unchanged, so native IPv4 and IPv6 tunnels keep
 //!   working.
 //!
 //! # Inbound (tunnel -> local, after decryption)
 //!
-//! - IPv6 to the self `node4` or into a local `lan6` prefix -> IPv4 to `self4`
-//!   or the paired `lan4` address. The source must be `peer`'s `node4`
-//!   (-> its `alias4`), inside a `lan6` prefix behind `peer` (-> `lan4`), or
-//!   `peer`'s `node6` when the peer has a native IPv4 alias (-> that alias).
-//! - IPv6 from `peer`'s `node6` to anything else, when the peer has an
-//!   `alias6` -> source rewritten to the `alias6`.
+//! - IPv6 to the self `eam6` or into a local `lan6` prefix -> IPv4 to the self
+//!   `eam4` or the paired `lan4` address. The source must be `peer`'s `eam6`
+//!   (-> its `eam4`), inside a `lan6` prefix behind `peer` (-> `lan4`), or
+//!   `peer`'s `peer6` when the peer has a `peer6_eam4` (-> that address).
+//! - IPv6 from `peer`'s `peer6` to anything else, when the peer has a
+//!   `local6` -> source rewritten to the `local6`.
 //! - A packet whose source is one of this node's local-view addresses (an
-//!   `alias4`, a native IPv4 alias, an address inside a LAN IPv4 prefix, an
-//!   `alias6`) is a spoof and is dropped.
+//!   `eam4`, a `peer6_eam4`, an address inside a LAN IPv4 prefix, a
+//!   `local6`) is a spoof and is dropped.
 //! - Everything else passes unchanged.
 //!
 //! # Translation
@@ -91,9 +91,9 @@
 //!
 //! The core routes a local packet by its destination before the filters run,
 //! and checks a decrypted packet's source against the peer's allowed IPs
-//! before them. So each peer's allowed IPs must contain its `alias4/32`, its
-//! native IPv4 alias as a /32 if any, the LAN IPv4 prefixes behind it (for
-//! outbound routing), its `alias6` if any, and as usual its `node4`, `node6`
+//! before them. So each peer's allowed IPs must contain its `eam4/32`, its
+//! `peer6_eam4/32` if any, the LAN IPv4 prefixes behind it (for
+//! outbound routing), its `local6` if any, and as usual its `eam6`, `peer6`
 //! and the `lan6` prefixes behind it (for the inbound source check).
 //!
 //! The core's filter chain is an onion: filters are installed from the wire
@@ -102,10 +102,10 @@
 //! to the local side; the recommended stack is
 //! `[AclFilter, PortMap, Translator]`. The ACL and the `PortMap` then see
 //! tunnel-side IPv6 in both directions: inbound before the translator maps
-//! the peer's real `node4`/`node6`/`lan6` addresses (which policies and
-//! source assertions name) to node-local aliases (which differ per node),
+//! the peer's real `eam6`/`peer6`/`lan6` addresses (which policies and
+//! source assertions name) to node-local addresses (which differ per node),
 //! outbound after it has mapped the local view back. Policies need no rules
-//! for the IPv4 aliases, and the ACL's stateful-reply tracking matches the
+//! for the local IPv4 EAM addresses, and the ACL's stateful-reply tracking matches the
 //! replies of translated flows, because it records and looks up the same
 //! IPv6 five-tuple both ways.
 
@@ -153,7 +153,7 @@ enum Action {
     Pass,
     /// Translated between IPv4 and IPv6.
     Translated,
-    /// An IPv6 address rewritten between `alias6` and `node6`.
+    /// An IPv6 address rewritten between `local6` and `peer6`.
     Rewritten,
     /// A fragment stored for reassembly.
     Pending,
@@ -200,9 +200,9 @@ pub struct TranslatorStats {
     pub translated_out: u64,
     /// Inbound IPv6 packets translated to IPv4.
     pub translated_in: u64,
-    /// Outbound IPv6 packets whose `alias6` destination became `node6`.
+    /// Outbound IPv6 packets whose `local6` destination became `peer6`.
     pub rewritten_out: u64,
-    /// Inbound IPv6 packets whose `node6` source became `alias6`.
+    /// Inbound IPv6 packets whose `peer6` source became `local6`.
     pub rewritten_in: u64,
     /// Outbound packets dropped.
     pub dropped_out: u64,
@@ -285,7 +285,7 @@ impl Translator {
     }
 
     /// Returns a predicate that is true for the IPv4 destinations this
-    /// translator turns into IPv6 (a peer's `alias4` or native IPv4 alias, or
+    /// translator turns into IPv6 (a peer's `eam4` or `peer6_eam4`, or
     /// an address inside a LAN prefix behind a peer), always reading the
     /// current table: it follows later [`store`](Self::store) calls.
     pub fn ipv4_translated_predicate(&self) -> Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync> {
@@ -335,15 +335,15 @@ impl Translator {
         let Some((src, dst)) = addrs4(packet.as_packet()) else {
             return Ok(Action::Pass);
         };
-        let dst6 = if let Some((owner, mapping)) = table.by_alias4(dst) {
+        let dst6 = if let Some((owner, mapping)) = table.by_eam4(dst) {
             same_peer(owner, peer)?;
-            mapping.node4
+            mapping.eam6
         } else if let Some((lan6, Some(owner))) = table.lan4_to_lan6(dst) {
             same_peer(owner, peer)?;
             lan6
-        } else if let Some((owner, mapping)) = table.by_native_alias4(dst) {
+        } else if let Some((owner, mapping)) = table.by_peer6_eam4(dst) {
             same_peer(owner, peer)?;
-            mapping.node6
+            mapping.peer6
         } else {
             return Ok(Action::Pass);
         };
@@ -392,12 +392,12 @@ fn outbound_v6(table: &TranslationTable, peer: PeerId, packet: &mut PacketBuf) -
     let Some((src, dst)) = addrs6(packet.as_packet()) else {
         return Ok(Action::Pass);
     };
-    let Some((owner, mapping)) = table.by_alias6(dst) else {
+    let Some((owner, mapping)) = table.by_local6(dst) else {
         return Ok(Action::Pass);
     };
     same_peer(owner, peer)?;
-    let quoted = |addr| table.by_alias6(addr).map(|(_, mapping)| mapping.node6);
-    rfc7915::rewrite_v6(packet, src, mapping.node6, &quoted)?;
+    let quoted = |addr| table.by_local6(addr).map(|(_, mapping)| mapping.peer6);
+    rfc7915::rewrite_v6(packet, src, mapping.peer6, &quoted)?;
     Ok(Action::Rewritten)
 }
 
@@ -405,9 +405,9 @@ fn inbound_v4(table: &TranslationTable, packet: &PacketBuf) -> Result<Action> {
     let Some((src, _)) = addrs4(packet.as_packet()) else {
         return Ok(Action::Pass);
     };
-    if table.by_alias4(src).is_some()
+    if table.by_eam4(src).is_some()
         || table.lan4_to_lan6(src).is_some()
-        || table.by_native_alias4(src).is_some()
+        || table.by_peer6_eam4(src).is_some()
     {
         return Err(reasons::SPOOFED_SOURCE);
     }
@@ -418,7 +418,7 @@ fn inbound_v6(table: &TranslationTable, peer: PeerId, packet: &mut PacketBuf) ->
     let Some((src, dst)) = addrs6(packet.as_packet()) else {
         return Ok(Action::Pass);
     };
-    if table.by_alias6(src).is_some() {
+    if table.by_local6(src).is_some() {
         return Err(reasons::SPOOFED_SOURCE);
     }
     if let Some(dst4) = local6_to_4(table, dst) {
@@ -426,13 +426,13 @@ fn inbound_v6(table: &TranslationTable, peer: PeerId, packet: &mut PacketBuf) ->
         rfc7915::v6_to_v4(packet, src4, dst4, table)?;
         return Ok(Action::Translated);
     }
-    match table.by_node6(src) {
+    match table.by_peer6(src) {
         Some((owner, mapping)) if owner == peer => {
-            let Some(alias6) = mapping.alias6 else {
+            let Some(local6) = mapping.local6 else {
                 return Ok(Action::Pass);
             };
-            let quoted = |addr| table.by_node6(addr).and_then(|(_, mapping)| mapping.alias6);
-            rfc7915::rewrite_v6(packet, alias6, dst, &quoted)?;
+            let quoted = |addr| table.by_peer6(addr).and_then(|(_, mapping)| mapping.local6);
+            rfc7915::rewrite_v6(packet, local6, dst, &quoted)?;
             Ok(Action::Rewritten)
         }
         _ => Ok(Action::Pass),
@@ -441,11 +441,11 @@ fn inbound_v6(table: &TranslationTable, peer: PeerId, packet: &mut PacketBuf) ->
 
 /// Whether `dst` is an IPv4 destination the translator turns into IPv6.
 fn translated_ipv4(table: &TranslationTable, dst: Ipv4Addr) -> bool {
-    table.by_alias4(dst).is_some()
+    table.by_eam4(dst).is_some()
         || table
             .lan4_to_lan6(dst)
             .is_some_and(|(_, owner)| owner.is_some())
-        || table.by_native_alias4(dst).is_some()
+        || table.by_peer6_eam4(dst).is_some()
 }
 
 fn same_peer(owner: PeerId, peer: PeerId) -> Result<()> {
@@ -456,12 +456,12 @@ fn same_peer(owner: PeerId, peer: PeerId) -> Result<()> {
     }
 }
 
-/// Maps a local IPv4 source (`self4` or the local LAN) to IPv6.
+/// Maps a local IPv4 source (the self `eam4` or the local LAN) to IPv6.
 fn local4_to_6(table: &TranslationTable, addr: Ipv4Addr) -> Option<Ipv6Addr> {
     if let Some(own) = table.self_mapping()
-        && own.self4 == addr
+        && own.eam4 == addr
     {
-        return Some(own.node4);
+        return Some(own.eam6);
     }
     match table.lan4_to_lan6(addr) {
         Some((lan6, None)) => Some(lan6),
@@ -469,12 +469,12 @@ fn local4_to_6(table: &TranslationTable, addr: Ipv4Addr) -> Option<Ipv6Addr> {
     }
 }
 
-/// Maps a local IPv6 destination (the self `node4` or the local LAN) to IPv4.
+/// Maps a local IPv6 destination (the self `eam6` or the local LAN) to IPv4.
 fn local6_to_4(table: &TranslationTable, addr: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(own) = table.self_mapping()
-        && own.node4 == addr
+        && own.eam6 == addr
     {
-        return Some(own.self4);
+        return Some(own.eam4);
     }
     match table.lan6_to_lan4(addr) {
         Some((lan4, None)) => Some(lan4),
@@ -482,60 +482,60 @@ fn local6_to_4(table: &TranslationTable, addr: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
-/// Maps the IPv6 source of a packet from `peer` to IPv4: its `node4` to its
-/// `alias4`, an address of a LAN behind it to `lan4`, or its `node6` to its
-/// native IPv4 alias.
+/// Maps the IPv6 source of a packet from `peer` to IPv4: its `eam6` to its
+/// `eam4`, an address of a LAN behind it to `lan4`, or its `peer6` to its
+/// `peer6_eam4`.
 fn peer6_to_4(table: &TranslationTable, peer: PeerId, addr: Ipv6Addr) -> Result<Ipv4Addr> {
-    if let Some((owner, mapping)) = table.by_node4(addr) {
+    if let Some((owner, mapping)) = table.by_eam6(addr) {
         same_peer(owner, peer)?;
-        return mapping.alias4.ok_or(reasons::UNMAPPED);
+        return mapping.eam4.ok_or(reasons::UNMAPPED);
     }
     match table.lan6_to_lan4(addr) {
         Some((lan4, Some(owner))) => same_peer(owner, peer).map(|()| lan4),
         Some((_, None)) => Err(reasons::SPOOFED_SOURCE),
         None => {
-            let (owner, alias) = native6_to_4(table, addr).ok_or(reasons::UNMAPPED)?;
-            same_peer(owner, peer).map(|()| alias)
+            let (owner, eam4) = peer6_to_eam4(table, addr).ok_or(reasons::UNMAPPED)?;
+            same_peer(owner, peer).map(|()| eam4)
         }
     }
 }
 
-/// Maps a peer's `node6` to its native IPv4 alias, with the peer.
-fn native6_to_4(table: &TranslationTable, addr: Ipv6Addr) -> Option<(PeerId, Ipv4Addr)> {
-    let (owner, _) = table.by_node6(addr)?;
-    table.native_alias4(owner).map(|alias| (owner, alias))
+/// Maps a peer's `peer6` to its `peer6_eam4`, with the peer.
+fn peer6_to_eam4(table: &TranslationTable, addr: Ipv6Addr) -> Option<(PeerId, Ipv4Addr)> {
+    let (owner, _) = table.by_peer6(addr)?;
+    table.peer6_eam4(owner).map(|eam4| (owner, eam4))
 }
 
 /// Maps any IPv4 address of the table to IPv6 (for packets quoted in ICMP errors).
 fn map4to6(table: &TranslationTable, addr: Ipv4Addr) -> Option<Ipv6Addr> {
     if let Some(own) = table.self_mapping()
-        && own.self4 == addr
+        && own.eam4 == addr
     {
-        return Some(own.node4);
+        return Some(own.eam6);
     }
     table
-        .by_alias4(addr)
-        .map(|(_, mapping)| mapping.node4)
+        .by_eam4(addr)
+        .map(|(_, mapping)| mapping.eam6)
         .or_else(|| table.lan4_to_lan6(addr).map(|(lan6, _)| lan6))
         .or_else(|| {
             table
-                .by_native_alias4(addr)
-                .map(|(_, mapping)| mapping.node6)
+                .by_peer6_eam4(addr)
+                .map(|(_, mapping)| mapping.peer6)
         })
 }
 
 /// Maps any IPv6 address of the table to IPv4 (for packets quoted in ICMP errors).
 fn map6to4(table: &TranslationTable, addr: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(own) = table.self_mapping()
-        && own.node4 == addr
+        && own.eam6 == addr
     {
-        return Some(own.self4);
+        return Some(own.eam4);
     }
     table
-        .by_node4(addr)
-        .and_then(|(_, mapping)| mapping.alias4)
+        .by_eam6(addr)
+        .and_then(|(_, mapping)| mapping.eam4)
         .or_else(|| table.lan6_to_lan4(addr).map(|(lan4, _)| lan4))
-        .or_else(|| native6_to_4(table, addr).map(|(_, alias)| alias))
+        .or_else(|| peer6_to_eam4(table, addr).map(|(_, eam4)| eam4))
 }
 
 /// The start of `packet`'s allocation (its headroom).
