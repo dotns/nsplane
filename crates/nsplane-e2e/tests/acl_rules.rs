@@ -1,6 +1,6 @@
 //! Typed ACL rules and policy states at engine level, over an in-memory channel transport:
-//! two nodes `a` and `b`, where `b` runs an `AclFilter` and `a` runs none. `a`'s source
-//! labels are its WireGuard key label. The tests install typed rules, move the default rule
+//! two nodes `a` and `b`, where `b` runs an `AclFilter` and `a` runs none. `a` carries the
+//! label `node-a`. The tests install typed rules, move the default rule
 //! set through its states (not installed, installed, failed) and check deliveries,
 //! `Event::Dropped` reasons, the filter counters, and that `AclEngine::evaluate` gives the
 //! decision the filter applies to the first packet of a flow.
@@ -11,8 +11,7 @@ use std::sync::Arc;
 use nsplane::{ChannelTransport, Event, TransportId};
 use nsplane_acl::{
     AclEngine, AclFilter, Decision, Flow, IcmpTypes, IpNet, Label, LabelSet, Matched, NotInstalled,
-    PeerIdentityMap, PolicyState, PortSet, ProtocolMatch, Rule, RuleId, RuleSet, SourceAssertion,
-    reasons, wg_peer_anchor,
+    PeerLabelMap, PolicyState, PortSet, ProtocolMatch, Rule, RuleId, RuleSet, reasons,
 };
 use nsplane_e2e::{Events, Node, Options, TestResult, icmp, introduce, udp};
 
@@ -28,9 +27,9 @@ const DENIED: u16 = 7001;
 type AclNode = Node<ChannelTransport>;
 
 /// Two peers linked by a channel transport, `b` with an `AclFilter` over `engine`; `a` is
-/// known to `b` by its WireGuard key. Returns `a`'s source labels too.
+/// known to `b` with the label `node-a`. Returns `a`'s source labels too.
 async fn acl_pair(engine: &Arc<AclEngine>) -> TestResult<(AclNode, AclNode, AclFilter, LabelSet)> {
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let filter = AclFilter::new(Arc::clone(engine), Arc::clone(&identities));
     let a_end = (
         TransportId::new(1),
@@ -49,12 +48,8 @@ async fn acl_pair(engine: &Arc<AclEngine>) -> TestResult<(AclNode, AclNode, AclF
         builder.transport(link_b).filter(Box::new(b_filter))
     })?;
     introduce(&a, &b, None).await?;
-    let key = a.public().to_bytes();
-    identities.insert(
-        b.peer_of(&a).await?,
-        SourceAssertion::WgPeerKey { pubkey: key },
-    );
-    let labels = LabelSet::new([Label::from(wg_peer_anchor(&key))]);
+    let labels = LabelSet::new([Label::from("node-a")]);
+    identities.insert(b.peer_of(&a).await?, labels.clone());
     Ok((a, b, filter, labels))
 }
 

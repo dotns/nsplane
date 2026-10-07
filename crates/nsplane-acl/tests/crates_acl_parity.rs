@@ -7,13 +7,34 @@
 //! `inbound_ipv4` in ns `crates/ns/src/account_engine/filters.rs` (the Node
 //! L3 gate and the recovery probe before it are not part of the ACL step;
 //! no fixture packet is a recovery probe). For each sequence the test builds
-//! one [`AclEngine`] on a manual clock (with the sequence's policy loaded, or
-//! none), one [`PeerIdentityMap`] (a `by_source` peer through
-//! [`PeerIdentityMap::insert_by_source`], a `relay_key` peer with its
-//! [`SourceAssertion::WgPeerKey`]) and one [`AclFilter`], feeds every packet
-//! in order with the clock at `t_ms`, and requires [`Verdict::Accept`]
-//! exactly when the packet's expected verdict is `allowed` (any drop counts
-//! as denied): ns's verdict, except for the [deviations](#deviations).
+//! one [`AclEngine`] on a manual clock (with the sequence's policy compiled
+//! into typed rules by the [test-local compiler](#compiling-the-policies)
+//! and installed, or none), one [`PeerLabelMap`] (a `by_source` peer with the
+//! address label, a `relay_key` peer with its key label) and one
+//! [`AclFilter`], feeds every packet in order with the clock at `t_ms`, and
+//! requires [`Verdict::Accept`] exactly when the packet's expected verdict is
+//! `allowed` (any drop counts as denied): ns's verdict, except for the
+//! [deviations](#deviations). This proves that the label model reproduces
+//! the preset (`docs/specs/acl-source-identity.md`).
+//!
+//! # Compiling the policies
+//!
+//! The test compiles each document as `docs/specs/acl-generic-api.md` 4.2
+//! describes, without the crate's own document compiler:
+//!
+//! - host aliases are expanded to their CIDR;
+//! - a `*` source gives a rule without labels or sources; a `key:<hex>`
+//!   source the label `key:<lowercase hex>`; a CIDR or alias source
+//!   `sources: [cidr]` plus the address label [`ADDRESS`], which only the
+//!   `by_source` peers carry, so such a rule never matches a relay key;
+//! - each `host:ports` destination becomes its own rule with
+//!   `destinations: [cidr]` (none for `*`) and the ports as a
+//!   [`PortSet`] (`*`: any);
+//! - `tcp` gives [`ProtocolMatch::Tcp`], `udp` [`ProtocolMatch::Udp`], and
+//!   no protocol both;
+//! - every typed rule of document rule `i` gets the id `"parity#<i>"`;
+//! - the policy tests must pass: [`RuleSet::matching`] on a flow from the
+//!   test's source address with the address label.
 //!
 //! # Deviations
 //!
@@ -142,12 +163,16 @@
 //!   `main` also writes their count as `deviations`;
 //! - `main`: writes the fixture in the line-oriented form above.
 
-use std::net::Ipv4Addr;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nsplane_acl::{
-    AclEngine, AclFilter, AclFilterConfig, AclPolicy, PeerIdentityMap, SourceAssertion, reasons,
+    AclEngine, AclFilter, AclFilterConfig, AclPolicy, Flow, IpNet, Label, LabelSet, PeerLabelMap,
+    PortSet, ProtocolMatch, Rule, RuleSet, reasons,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -225,6 +250,123 @@ enum PeerKind {
     RelayKey,
 }
 
+/// The label of the peers judged by their source address; CIDR sources
+/// require it.
+const ADDRESS: &str = "addr";
+
+/// The key label of a 32-byte key given as hex (either case).
+fn key_label(hex: &str) -> Option<Label> {
+    let key = unhex(hex).filter(|key| key.len() == 32)?;
+    let hex = key.iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    });
+    Some(Label::from(format!("key:{hex}")))
+}
+
+/// A host: `*` (`None`), a CIDR or an alias of `hosts`.
+fn host(s: &str, hosts: &HashMap<String, IpNet>) -> Result<Option<IpNet>, String> {
+    if s == "*" {
+        return Ok(None);
+    }
+    s.parse()
+        .ok()
+        .or_else(|| hosts.get(s).copied())
+        .map(Some)
+        .ok_or_else(|| format!("unknown host '{s}'"))
+}
+
+/// Ports: `*`, `22`, `80,443` or `8000-8999`.
+fn ports(s: &str) -> Result<PortSet, String> {
+    let port = |p: &str| {
+        p.trim()
+            .parse::<u16>()
+            .map_err(|_| format!("bad port '{p}'"))
+    };
+    if s == "*" {
+        return Ok(PortSet::Any);
+    }
+    if let Some((lo, hi)) = s.split_once('-') {
+        return Ok(PortSet::Ranges(vec![RangeInclusive::new(
+            port(lo)?,
+            port(hi)?,
+        )]));
+    }
+    s.split(',')
+        .map(port)
+        .collect::<Result<Vec<_>, _>>()
+        .map(PortSet::list)
+}
+
+/// The protocol entries of a document `proto` (`None`: TCP and UDP).
+fn protocols(proto: Option<&str>, ports: &PortSet) -> Result<Vec<ProtocolMatch>, String> {
+    match proto.map(str::to_lowercase).as_deref() {
+        Some("tcp") => Ok(vec![ProtocolMatch::Tcp(ports.clone())]),
+        Some("udp") => Ok(vec![ProtocolMatch::Udp(ports.clone())]),
+        None => Ok(vec![
+            ProtocolMatch::Tcp(ports.clone()),
+            ProtocolMatch::Udp(ports.clone()),
+        ]),
+        Some(other) => Err(format!("bad protocol '{other}'")),
+    }
+}
+
+/// The typed rules of `policy` (see [Compiling the policies](self#compiling-the-policies)),
+/// its tests checked.
+fn compile(policy: &AclPolicy) -> Result<RuleSet, String> {
+    let hosts = policy
+        .hosts
+        .iter()
+        .map(|(alias, cidr)| Ok((alias.clone(), cidr.parse().map_err(|_| cidr.clone())?)))
+        .collect::<Result<HashMap<String, IpNet>, String>>()?;
+    let mut rules = Vec::new();
+    for (i, acl) in policy.acls.iter().enumerate() {
+        for src in &acl.src {
+            let source = if src == "*" {
+                Rule::new("", Vec::new())
+            } else if let Some(hex) = src.strip_prefix("key:") {
+                let label = key_label(hex).ok_or_else(|| format!("bad key '{src}'"))?;
+                Rule::new("", Vec::new()).with_labels([label])
+            } else {
+                let net = host(src, &hosts)?.ok_or("'*' is not a source prefix")?;
+                Rule::new("", Vec::new())
+                    .with_labels([Label::from(ADDRESS)])
+                    .with_sources([net])
+            };
+            for dst in &acl.dst {
+                let (host_part, port_part) = dst
+                    .rsplit_once(':')
+                    .ok_or_else(|| format!("bad dst '{dst}'"))?;
+                let ports = ports(port_part)?;
+                let mut rule = Rule {
+                    id: format!("parity#{i}").into(),
+                    protocols: protocols(acl.proto.as_deref(), &ports)?,
+                    ..source.clone()
+                };
+                if let Some(net) = host(host_part, &hosts)? {
+                    rule = rule.with_destinations([net]);
+                }
+                rules.push(rule);
+            }
+        }
+    }
+    let rules = RuleSet::new(rules).map_err(|e| e.to_string())?;
+    let address = LabelSet::new([Label::from(ADDRESS)]);
+    for test in &policy.tests {
+        let src: IpAddr = test.src.parse().map_err(|_| test.src.clone())?;
+        let dst: SocketAddr = test.dst.parse().map_err(|_| test.dst.clone())?;
+        let src = SocketAddr::new(src, 0);
+        let flow = match test.proto.as_deref().map(str::to_lowercase).as_deref() {
+            Some("udp") => Flow::udp(src, dst),
+            _ => Flow::tcp(src, dst),
+        };
+        if rules.matching(&address, &flow).is_some() != test.allow {
+            return Err(format!("policy test {} -> {} failed", test.src, test.dst));
+        }
+    }
+    Ok(rules)
+}
+
 /// The bytes of `s` (hex digits, optionally `0x`-prefixed).
 fn unhex(s: &str) -> Option<Vec<u8>> {
     let digits = s.strip_prefix("0x").unwrap_or(s);
@@ -248,22 +390,18 @@ fn replay(seq: &Sequence) -> Result<(Vec<String>, usize), String> {
         *handle.lock().unwrap_or_else(PoisonError::into_inner)
     }));
     if let Some(policy) = &seq.policy {
-        engine
-            .load(policy.clone())
-            .map_err(|e| format!("{}: policy rejected: {e}", seq.name))?;
+        let rules = compile(policy).map_err(|e| format!("{}: policy rejected: {e}", seq.name))?;
+        engine.install(rules);
     }
-    let identity = Arc::new(PeerIdentityMap::new());
+    let identity = Arc::new(PeerLabelMap::new());
     for peer in &seq.peers {
-        let id = PeerId::new(peer.id);
-        match peer.kind {
-            PeerKind::BySource => identity.insert_by_source(id),
+        let label = match peer.kind {
+            PeerKind::BySource => Label::from(ADDRESS),
             PeerKind::RelayKey => {
-                let pubkey = unhex(&peer.key)
-                    .and_then(|key| key.try_into().ok())
-                    .ok_or_else(|| format!("{}: bad key {}", seq.name, peer.key))?;
-                identity.insert(id, SourceAssertion::WgPeerKey { pubkey });
+                key_label(&peer.key).ok_or_else(|| format!("{}: bad key {}", seq.name, peer.key))?
             }
-        }
+        };
+        identity.insert(PeerId::new(peer.id), LabelSet::new([label]));
     }
     let filter =
         AclFilter::with_config(engine, identity, AclFilterConfig::crates_acl(seq.local_ip));

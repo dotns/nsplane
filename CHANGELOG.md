@@ -131,6 +131,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or reason at debug level.
 - `nsplane-acl`: `Error::InvalidRule`, `Error::InvalidNamespace` and `Error::InvalidGrant`
   (with the offending id and a reason).
+- `nsplane-acl`: `NamespaceKind::{Rules, Pinholes}` (`NamespacePolicy::kind`, default
+  `Rules`): a `Pinholes` namespace carries no rules or pinhole kinds, no grant may name it,
+  and its members get access only through pinholes.
+- `nsplane-acl`: `PeerLabelMap::insert_by_source(peer, Vec<(IpNet, LabelSet)>)`: labels per
+  remote address, the longest prefix containing it wins (the first listed among equal
+  prefixes) and an address outside every prefix is an unknown source (`UNKNOWN_PEER`).
+- `nsplane-wss`: `WssServerTransport`, the server side of `WssDialer` links (NG-7): a
+  `Transport` over WebSocket sessions the embedder accepts (TLS, request checks and the
+  upgrade stay the embedder's) and hands to a `WssAcceptor` (`accept`, `ws_config`).
+  Same wire as `WssDialer` (one binary message per datagram; text and longer than
+  `MAX_DATAGRAM` dropped and counted). Each session gets a never-reused address in
+  100::/64 (RFC 6666), port 0; replies follow the engine's roaming path, and a send to a
+  closed session fails with `NotConnected`. `WssServerConfig`: per-session queue (256,
+  full = `WouldBlock` at once), shared inbound queue (1024, backpressure onto the sessions),
+  ping interval (10 s), read idle (35 s), `max_sessions` (4096, refused before any task).
+  Counters in `WssServerTransportStats` and, per session, `WssSessionStats` (`WssSession`:
+  `addr`, `close`, `stats`; dropping it does not close the session).
 
 ### Changed
 - nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
@@ -185,16 +202,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `AclEngine::clear_all` leaves the default rules in `PolicyState::Failed`:
   every inbound packet is dropped with `reasons::POLICY_FAILED` (was `NO_POLICY`), also on an
   engine built with `NotInstalled::Accept`; `uninstall` returns to `NotInstalled`.
-- `nsplane-acl`: an invalid namespace (an app namespace with rules or app pinholes, an
+- `nsplane-acl`: an invalid namespace (a pinhole namespace with rules or pinhole kinds, an
   invalid outbound rule) is `Error::InvalidNamespace`, an invalid grant `Error::InvalidGrant`
   (both were `Error::InvalidPolicy`); `Error` is `#[non_exhaustive]`.
 - `nsplane-acl`: `AclEngine::evaluate` takes `(&LabelSet, &Flow)` and returns a `Decision`
   (was `&AccessRequest` to `AclDecision`).
 - `nsplane-acl`: `AclEngine::store_grant` takes `impl Into<RuleId>` and `AclEngine::grants`
   returns `Vec<(RuleId, Grant)>`.
-- `nsplane-acl`: the filter resolves each peer to a label set (its source anchor, plus an
-  internal address label for IP-bearing assertions, which the document's CIDR sources
-  require); a source is a member of the union of its labels' namespaces.
+- `nsplane-acl`: `PeerIdentity` yields labels: `labels(peer) -> Option<LabelSet>` and
+  `labels_for(peer, remote) -> Option<LabelSet>` (were `assertion` / `assertion_for`),
+  `by_source` and `generation` as before; `None` is an unknown peer (`UNKNOWN_PEER`).
+  Closures are `Fn(PeerId) -> Option<LabelSet>`. The filter caches each peer's label set
+  and the union of its labels' namespaces as before.
+- `nsplane-acl`: `PeerIdentityMap` is renamed `PeerLabelMap`; `insert(peer, LabelSet)` (was a
+  `SourceAssertion`), `insert_by_source` takes a prefix table (see Added; was "every remote
+  address is its own principal").
+- `nsplane-acl`: namespace membership, grants and pinholes are keyed by label:
+  `NamespaceMember::label: Label` (was `principal: String`), `GrantEnd::Label(Label)` (was
+  `GrantEnd::Peer(String)`), `PinholeSpec::label: Label` (was `peer: String`),
+  `AclEngine::memberships(&Label)` (was `&str`). A source is a member of the union of the
+  namespaces of all its labels; a destination address resolves to its owner label (longest
+  prefix, then the smallest label).
+- `nsplane-acl`: `NamespacePolicy::pinhole_kinds` replaces `allow_app_pinholes`, and
+  `PinholeError::NotPinholeNamespace` replaces `NotAppNamespace`. `AclEngine::store_grant`
+  rejects a grant naming a stored `Pinholes` namespace, and a namespace grant end matches
+  only `Rules` namespaces.
+- `nsplane-acl`: CIDR and host-alias sources of a policy document compile to `sources` only
+  and match the flow's source address, whatever the source's labels (they matched only the
+  IP of a terminate binding). A product that keeps CIDR rules from key-labelled sources adds
+  its own address label to the rule and to the address-bound sources
+  (`docs/specs/acl-source-identity.md`).
+- rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
+  nsplane-wss no longer cites a product; provenance is in the task documents.
+- Breaking: `nsplane-nat`'s translator address model is named after RFC 7757 explicit
+  address mappings (EAM); behaviour, validation order, errors, reason strings and memory
+  layout are unchanged. `PeerMapping`: `node6` -> `peer6`, `node4` -> `eam6`, `alias4` ->
+  `eam4`, `alias6` -> `local6`. `SelfMapping`: `self4` -> `eam4`, `node4` -> `eam6`.
+  `TranslationTableBuilder::peer_with_native_alias4` -> `peer_with_peer6_eam4`.
+  `TranslationTable`: `native_alias4` -> `peer6_eam4`, `by_native_alias4` ->
+  `by_peer6_eam4`, `by_alias4` -> `by_eam4`, `by_alias6` -> `by_local6`, `by_node4` ->
+  `by_eam6`, `by_node6` -> `by_peer6`. `TableError::Alias4IsSelf4` -> `Eam4IsSelf` (message
+  "IPv4 EAM address {0} equals the self address"). The "native IPv4 alias" is now the IPv4
+  EAM to `peer6`; the `translate` bench groups are `eam4_out` / `eam4_in`; the tests
+  `translate/tests/native_alias.rs` and `nsplane-e2e/tests/translate_native_alias.rs` are
+  `peer6_eam4.rs` and `translate_peer6_eam4.rs`. The `translate_node` example's
+  `--map` keys are `peer6=`, `eam6=`, `eam4=`, `local6=` (were `node6=`, `node4=`,
+  `alias4=`, `alias6=`).
+
+### Deprecated
+- `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,
+  `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
+  `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
+  `Denied`, `WssStreamEvent`, `WssStreamEventKind`, `WssCloseReason`, and every public item
+  of the `frame` module (the `WsFrame` codec). It has no remaining consumer and will be
+  removed once its users have switched; the replacement is a WireGuard peer over
+  `WssDialer` (and the upcoming WSS datagram server transport). Nothing else changes:
+  `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`, `WssDialError`, `WssDialEvent`,
+  `WssStats`, `MAX_DATAGRAM` and `MAX_MESSAGE` stay.
 
 ### Removed
 - `nsplane-acl`: `AccessRequest` (`from_ip`, `with_wg_peer_key`); use a `Flow` and the
@@ -210,6 +274,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `AclEngine::store`, `clear`, `policy` and `is_allowed`; use `install`,
   `uninstall`, `rules` and `rules()` with `RuleSet::matching`.
 - `nsplane-acl`: the public `matcher` module (it exported nothing public).
+- `nsplane-acl`: `SourceAssertion` (`WgPeerKey`, `Terminate`, `External`, with
+  `source_class`, `source_anchor` and `ip`) and `TerminateBinding`; a `PeerIdentity` returns
+  the source's `LabelSet` instead, built by the caller.
+- `nsplane-acl`: `wg_peer_anchor`; the caller formats its own label text (a policy
+  document's `key:<hex>` source matches the label `key:<lowercase hex>`).
+- `nsplane-acl`: `NamespaceId::is_app` and the meaning of the `"app:"` id prefix; use
+  `NamespaceKind::Pinholes` (namespace ids are opaque).
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter

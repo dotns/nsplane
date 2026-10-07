@@ -1,6 +1,6 @@
 use super::*;
 
-/// The ns per-port and global listener ceilings; both are the configured pool size.
+/// The per-port and global listener ceilings; both are the configured pool size.
 const MAX_LISTENERS_PER_PORT: usize = 32;
 const MAX_LISTENERS_TOTAL: usize = 32;
 const POOL: Pool = Pool {

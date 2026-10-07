@@ -1,5 +1,5 @@
-//! Source assertions, policy states and the shared [`AclEngine`] with its
-//! default rules, namespaces, grants and pinholes.
+//! The shared [`AclEngine`] with its default rules and their policy state,
+//! namespaces, grants and pinholes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use crate::{
     Error,
     matcher::{parse_ports, parse_protocol, protocols},
-    namespace::{Grant, GrantEnd, NamespaceId, NamespacePolicy},
+    namespace::{Grant, GrantEnd, NamespaceId, NamespaceKind, NamespacePolicy},
     net::{IpNet, Protocol},
     pinhole::{
         Direction, Pinhole, PinholeCounters, PinholeError, PinholeGuard, PinholeId, PinholeSpec,
@@ -29,97 +29,6 @@ use crate::{
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
-
-/// How the source identity of a peer was established.
-///
-/// The ACL judge keys on a **principal**, not a bare IP. For the relay/direct
-/// link modes the caller resolves the end-to-end client's WireGuard key and
-/// builds [`SourceAssertion::WgPeerKey`]; for the terminate mode the gateway
-/// asserted a binding. The assertion carries the key principal + the
-/// `source_class`/`source_anchor` used in decision logs.
-#[derive(Debug, Clone)]
-pub enum SourceAssertion {
-    /// An end-to-end client WireGuard public key (wg-relay / wss-relay / direct).
-    WgPeerKey {
-        /// The client's 32-byte WireGuard public key.
-        pubkey: [u8; 32],
-    },
-    /// The gateway terminated the client tunnel and asserted this binding.
-    Terminate {
-        /// The asserted binding (an optional tunnel IP + a stable anchor).
-        binding: TerminateBinding,
-    },
-    /// An external identity-provider assertion.
-    External {
-        /// The identity-provider identifier.
-        idp: String,
-    },
-}
-
-/// A gateway-asserted terminate binding.
-#[derive(Debug, Clone)]
-pub struct TerminateBinding {
-    /// The tunnel IP the gateway assigned, when present (kept for CIDR rules).
-    pub ip: Option<IpAddr>,
-    /// A stable identity string for rules/logs.
-    pub anchor: String,
-}
-
-impl SourceAssertion {
-    /// The decision-log source class string.
-    #[must_use]
-    pub const fn source_class(&self) -> &'static str {
-        match self {
-            Self::WgPeerKey { .. } => "client-wg-key",
-            Self::Terminate { .. } => "terminate-binding",
-            Self::External { .. } => "external-idp",
-        }
-    }
-
-    /// A stable identity string for rules/logs.
-    #[must_use]
-    pub fn source_anchor(&self) -> String {
-        match self {
-            Self::WgPeerKey { pubkey } => wg_peer_anchor(pubkey),
-            Self::Terminate { binding } => binding.anchor.clone(),
-            Self::External { idp } => format!("idp:{idp}"),
-        }
-    }
-
-    /// The terminate binding of a bare source IP.
-    pub(crate) fn from_ip(ip: IpAddr) -> Self {
-        Self::Terminate {
-            binding: TerminateBinding {
-                ip: Some(ip),
-                anchor: ip.to_string(),
-            },
-        }
-    }
-
-    /// The IP-bearing source, when any (terminate bindings). `None` for
-    /// key/IdP assertions — those match by anchor, not CIDR.
-    #[must_use]
-    pub const fn ip(&self) -> Option<IpAddr> {
-        match self {
-            Self::Terminate { binding } => binding.ip,
-            Self::WgPeerKey { .. } | Self::External { .. } => None,
-        }
-    }
-}
-
-/// Canonical anchor encoding for a WireGuard peer key: `key:<hex>` (64 lowercase
-/// hex chars). This is the `src` form key principals use in rules, so an
-/// inbound client key can be matched against a rule.
-#[must_use]
-pub fn wg_peer_anchor(pubkey: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(4 + 64);
-    s.push_str("key:");
-    for b in pubkey {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
 
 /// A failed built-in policy test.
 #[derive(Debug, Clone)]
@@ -139,7 +48,7 @@ pub struct AclTestFailure {
 pub(crate) enum ReplyDependency {
     /// A directed grant, by id.
     Grant(Arc<str>),
-    /// An app pinhole.
+    /// A pinhole.
     Pinhole(PinholeId),
 }
 
@@ -240,15 +149,20 @@ struct CompiledNamespace {
 }
 
 impl CompiledNamespace {
+    fn is_rules(&self) -> bool {
+        self.source.kind == NamespaceKind::Rules
+    }
+
     fn compile(id: &NamespaceId, source: NamespacePolicy) -> Result<Self, Error> {
         let invalid = |reason: String| Error::InvalidNamespace {
             id: id.clone(),
             reason,
         };
-        if id.is_app() && (!source.policy.acls.is_empty() || !source.allow_app_pinholes.is_empty())
+        if source.kind == NamespaceKind::Pinholes
+            && (!source.policy.acls.is_empty() || !source.pinhole_kinds.is_empty())
         {
             return Err(invalid(
-                "an app namespace cannot have accept rules or allow app pinholes".to_owned(),
+                "a pinhole namespace cannot have accept rules or pinhole kinds".to_owned(),
             ));
         }
         let rules = RuleSet::from_document(source.policy.clone())?;
@@ -284,7 +198,7 @@ enum End {
 impl End {
     fn new(end: &GrantEnd) -> Self {
         match end {
-            GrantEnd::Peer(principal) => Self::Label(Label::from(principal.as_str())),
+            GrantEnd::Label(label) => Self::Label(label.clone()),
             GrantEnd::Namespace(id) => Self::Namespace(id.clone()),
         }
     }
@@ -293,15 +207,15 @@ impl End {
     fn matches_source(&self, labels: &LabelSet, membership: &Membership) -> bool {
         match self {
             Self::Label(label) => labels.contains(label),
-            Self::Namespace(id) => membership.contains(id),
+            Self::Namespace(id) => membership.has_rules(id),
         }
     }
 
     /// Whether the destination end matches the member label `owner`.
-    fn matches_owner(&self, owner: &str, membership: &Membership) -> bool {
+    fn matches_owner(&self, owner: &Label, membership: &Membership) -> bool {
         match self {
-            Self::Label(label) => label.as_str() == owner,
-            Self::Namespace(id) => membership.contains(id),
+            Self::Label(label) => label == owner,
+            Self::Namespace(id) => membership.has_rules(id),
         }
     }
 }
@@ -320,6 +234,8 @@ struct CompiledGrant {
 pub(crate) struct Membership {
     /// Sorted, without duplicates.
     namespaces: Vec<NamespaceId>,
+    /// The [`NamespaceKind::Rules`] namespaces among them, sorted.
+    rules: Vec<NamespaceId>,
     /// Every namespace restricts outbound traffic.
     outbound_restricted: bool,
 }
@@ -329,9 +245,9 @@ impl Membership {
         self.namespaces.binary_search(id).is_ok()
     }
 
-    /// The source (non-app) namespaces.
-    fn sources(&self) -> impl Iterator<Item = &NamespaceId> {
-        self.namespaces.iter().filter(|id| !id.is_app())
+    /// Whether `id` is one of the [`NamespaceKind::Rules`] namespaces.
+    fn has_rules(&self, id: &NamespaceId) -> bool {
+        self.rules.binary_search(id).is_ok()
     }
 
     /// Whether outbound traffic to the source is restricted.
@@ -358,12 +274,12 @@ pub(crate) struct Snapshot {
     not_installed: NotInstalled,
     namespaces: BTreeMap<NamespaceId, Arc<CompiledNamespace>>,
     /// Member label -> its namespaces (derived from `namespaces`).
-    memberships: HashMap<String, Arc<Membership>>,
+    memberships: HashMap<Label, Arc<Membership>>,
     /// Member host addresses (`/32`, `/128`) with their member label (derived).
-    hosts: HashMap<IpAddr, String>,
+    hosts: HashMap<IpAddr, Label>,
     /// The other member addresses with their member label, longest prefix
     /// first (derived).
-    addresses: Vec<(IpNet, String)>,
+    addresses: Vec<(IpNet, Label)>,
     /// Whether some member label is outbound-restricted (derived).
     outbound_restrictions: bool,
     grants: BTreeMap<RuleId, Arc<CompiledGrant>>,
@@ -373,7 +289,7 @@ pub(crate) struct Snapshot {
     /// Sources in no namespace accept every inbound TCP and UDP flow
     /// (derived).
     default_bypass: bool,
-    /// The source namespaces accepting every inbound TCP and UDP flow
+    /// The rule namespaces accepting every inbound TCP and UDP flow
     /// (derived).
     open: HashSet<NamespaceId>,
     /// The distinct namespace sets of the members owning an address
@@ -430,7 +346,7 @@ impl Snapshot {
             && self
                 .pinholes
                 .values()
-                .any(|pinhole| labels.contains_text(&pinhole.spec.peer))
+                .any(|pinhole| labels.contains(&pinhole.spec.label))
     }
 
     /// Whether any member label is outbound-restricted.
@@ -438,10 +354,10 @@ impl Snapshot {
         self.outbound_restrictions
     }
 
-    /// The namespaces of the member label `principal`, `None` when it is in
-    /// no namespace.
-    fn membership(&self, principal: &str) -> Option<&Arc<Membership>> {
-        self.memberships.get(principal)
+    /// The namespaces of the member label `label`, `None` when it is in no
+    /// namespace.
+    fn membership(&self, label: &Label) -> Option<&Arc<Membership>> {
+        self.memberships.get(label)
     }
 
     /// The namespaces of a source with `labels`: the union over its member
@@ -452,7 +368,7 @@ impl Snapshot {
         }
         let mut found = labels
             .iter()
-            .filter_map(|label| self.memberships.get(label.as_str()));
+            .filter_map(|label| self.memberships.get(label));
         let first = found.next()?;
         let Some(second) = found.next() else {
             return Some(Arc::clone(first));
@@ -462,10 +378,13 @@ impl Snapshot {
             union
                 .namespaces
                 .extend(membership.namespaces.iter().cloned());
+            union.rules.extend(membership.rules.iter().cloned());
             union.outbound_restricted &= membership.outbound_restricted;
         }
         union.namespaces.sort_unstable();
         union.namespaces.dedup();
+        union.rules.sort_unstable();
+        union.rules.dedup();
         Some(Arc::new(union))
     }
 
@@ -503,8 +422,7 @@ impl Snapshot {
         let mut at = None;
         let mut found = PinholeMatch::Absent;
         for pinhole in self.pinholes.values() {
-            if !pinhole.matches(&pinhole.spec.peer, direction, protocol, port)
-                || !labels.contains_text(&pinhole.spec.peer)
+            if !pinhole.matches(direction, protocol, port) || !labels.contains(&pinhole.spec.label)
             {
                 continue;
             }
@@ -517,7 +435,7 @@ impl Snapshot {
     }
 
     /// The member label owning `ip` (longest prefix), with its namespaces.
-    fn member_at(&self, ip: IpAddr) -> Option<(&str, &Membership)> {
+    fn member_at(&self, ip: IpAddr) -> Option<(&Label, &Membership)> {
         // A host address is always the longest prefix.
         let owner = match self.hosts.get(&ip) {
             Some(owner) => owner,
@@ -571,7 +489,7 @@ impl Snapshot {
     ) -> Evaluation<'_> {
         let dst = self.member_at(flow.dst);
         let mut common = false;
-        for id in membership.sources() {
+        for id in &membership.rules {
             // A local destination is in every namespace.
             if dst.is_some_and(|(_, dst)| !dst.contains(id)) {
                 continue;
@@ -627,27 +545,32 @@ impl Snapshot {
 
     /// Rebuild the indexes derived from `namespaces`.
     fn reindex(&mut self) {
-        let mut memberships: HashMap<String, Membership> = HashMap::new();
+        let mut memberships: HashMap<Label, Membership> = HashMap::new();
         let mut addresses = Vec::new();
         for (id, namespace) in &self.namespaces {
             let restricts = namespace.outbound.is_some();
             for member in &namespace.source.members {
-                let membership = memberships
-                    .entry(member.principal.clone())
-                    .or_insert_with(|| Membership {
-                        namespaces: Vec::new(),
-                        outbound_restricted: true,
-                    });
-                // `namespaces` iterates in order, so the list stays sorted.
+                let membership =
+                    memberships
+                        .entry(member.label.clone())
+                        .or_insert_with(|| Membership {
+                            namespaces: Vec::new(),
+                            rules: Vec::new(),
+                            outbound_restricted: true,
+                        });
+                // `namespaces` iterates in order, so the lists stay sorted.
                 if membership.namespaces.last() != Some(id) {
                     membership.namespaces.push(id.clone());
+                    if namespace.is_rules() {
+                        membership.rules.push(id.clone());
+                    }
                     membership.outbound_restricted &= restricts;
                 }
                 addresses.extend(
                     member
                         .addresses
                         .iter()
-                        .map(|net| (*net, member.principal.clone())),
+                        .map(|net| (*net, member.label.clone())),
                 );
             }
         }
@@ -676,7 +599,7 @@ impl Snapshot {
     }
 
     /// Recompute the bypass inputs: whether sources in no namespace accept
-    /// everything, the open source namespaces (an accept rule from any source
+    /// everything, the open rule namespaces (an accept rule from any source
     /// to any destination for every TCP and UDP port), and the distinct
     /// namespace sets of the address owners.
     fn rebypass(&mut self) {
@@ -688,17 +611,16 @@ impl Snapshot {
         self.open = self
             .namespaces
             .iter()
-            .filter(|(id, namespace)| !id.is_app() && namespace.rules.accepts_everything())
+            .filter(|(_, namespace)| namespace.is_rules() && namespace.rules.accepts_everything())
             .map(|(id, _)| id.clone())
             .collect();
         self.owner_sets = if self.open.is_empty() {
             Vec::new()
         } else {
-            let owners: HashSet<&str> = self
+            let owners: HashSet<&Label> = self
                 .hosts
                 .values()
                 .chain(self.addresses.iter().map(|(_, owner)| owner))
-                .map(String::as_str)
                 .collect();
             let sets: HashSet<&[NamespaceId]> = owners
                 .into_iter()
@@ -708,33 +630,34 @@ impl Snapshot {
         };
     }
 
-    /// Whether `peer` may hold a pinhole of `kind` in `app_namespace`
-    /// (`source_gated`: it held a source namespace when the pinhole opened).
+    /// Whether `label` may hold a pinhole of `kind` in the pinhole namespace
+    /// `namespace` (`source_gated`: it held a rule namespace when the
+    /// pinhole opened).
     fn pinhole_permission(
         &self,
-        app_namespace: &NamespaceId,
-        peer: &str,
+        namespace: &NamespaceId,
+        label: &Label,
         kind: &str,
         source_gated: bool,
     ) -> Result<(), PinholeError> {
-        let membership = self.membership(peer).filter(|m| m.contains(app_namespace));
+        let membership = self.membership(label).filter(|m| m.contains(namespace));
         let Some(membership) = membership else {
             return Err(PinholeError::NotMember);
         };
-        let mut sources = membership.sources().peekable();
-        if sources.peek().is_none() {
-            // A session-only peer is governed by its own pinholes, unless it
-            // has lost the source namespace that permitted the pinhole.
+        if membership.rules.is_empty() {
+            // A label only in pinhole namespaces is governed by its own
+            // pinholes, unless it has lost the rule namespace that permitted
+            // the pinhole.
             return if source_gated {
                 Err(PinholeError::NotPermitted)
             } else {
                 Ok(())
             };
         }
-        let permitted = sources.any(|id| {
+        let permitted = membership.rules.iter().any(|id| {
             self.namespaces
                 .get(id)
-                .is_some_and(|ns| ns.source.allow_app_pinholes.contains(kind))
+                .is_some_and(|ns| ns.source.pinhole_kinds.contains(kind))
         });
         if permitted {
             Ok(())
@@ -750,24 +673,27 @@ impl Snapshot {
         (before - self.pinholes.len()) as u64
     }
 
-    /// After a namespace change, remove the pinholes whose app namespace is
-    /// gone or that are no longer permitted; returns how many of each.
+    /// After a namespace change, remove the pinholes whose namespace is gone
+    /// or that are no longer permitted (including a namespace that is no
+    /// longer a pinhole namespace); returns how many of each.
     fn recheck_pinholes(&mut self) -> (u64, u64) {
         let (mut namespace_removed, mut revoked) = (0, 0);
         let mut pinholes = std::mem::take(&mut self.pinholes);
         pinholes.retain(|_, pinhole| {
-            if !self.namespaces.contains_key(&pinhole.app_namespace) {
+            let Some(namespace) = self.namespaces.get(&pinhole.namespace) else {
                 namespace_removed += 1;
                 return false;
-            }
-            let permitted = self
-                .pinhole_permission(
-                    &pinhole.app_namespace,
-                    &pinhole.spec.peer,
-                    &pinhole.spec.kind,
-                    pinhole.source_gated,
-                )
-                .is_ok();
+            };
+            // A namespace stored again as a rule namespace holds no pinholes.
+            let permitted = !namespace.is_rules()
+                && self
+                    .pinhole_permission(
+                        &pinhole.namespace,
+                        &pinhole.spec.label,
+                        &pinhole.spec.kind,
+                        pinhole.source_gated,
+                    )
+                    .is_ok();
             if !permitted {
                 revoked += 1;
             }
@@ -781,7 +707,7 @@ impl Snapshot {
 // ── AclEngine ─────────────────────────────────────────────────────────────────
 
 /// Shared ACL engine: the default [`RuleSet`], rule namespaces, directed
-/// grants and app pinholes.
+/// grants and pinholes.
 ///
 /// The default rule set applies to sources in no namespace and has a
 /// [`PolicyState`]: not installed (the engine's [`NotInstalled`] action
@@ -982,10 +908,10 @@ impl AclEngine {
     /// namespace.
     ///
     /// The namespace's rules are compiled and their built-in tests run, as
-    /// [`load`](Self::load) does. An app namespace ([`NamespaceId::is_app`])
-    /// with accept rules or allowed app pinholes, or an invalid outbound
-    /// rule, is rejected with [`Error::InvalidNamespace`]. On error the
-    /// previous state stays in effect.
+    /// [`load`](Self::load) does. A [`NamespaceKind::Pinholes`] namespace
+    /// with accept rules or pinhole kinds, or an invalid outbound rule, is
+    /// rejected with [`Error::InvalidNamespace`]. On error the previous state
+    /// stays in effect.
     pub fn store_namespace(
         &self,
         id: impl Into<NamespaceId>,
@@ -1009,7 +935,7 @@ impl AclEngine {
 
     /// Remove namespace `id`. Returns whether it existed.
     ///
-    /// Removing an app namespace closes its pinholes; removing a source
+    /// Removing a pinhole namespace closes its pinholes; removing a rule
     /// namespace revokes the pinholes it permitted.
     pub fn remove_namespace(&self, id: &str) -> bool {
         self.publish(|snapshot| {
@@ -1027,11 +953,11 @@ impl AclEngine {
         self.snapshot.load().namespaces.keys().cloned().collect()
     }
 
-    /// The namespaces `principal` is a member of, sorted.
-    pub fn memberships(&self, principal: &str) -> Vec<NamespaceId> {
+    /// The namespaces the member label `label` is in, sorted.
+    pub fn memberships(&self, label: &Label) -> Vec<NamespaceId> {
         self.snapshot
             .load()
-            .membership(principal)
+            .membership(label)
             .map(|m| m.namespaces.clone())
             .unwrap_or_default()
     }
@@ -1039,22 +965,26 @@ impl AclEngine {
     /// Store a directed grant under `id`, replacing any grant with that id.
     ///
     /// Returns [`Error::InvalidGrant`] for an invalid protocol or port syntax,
-    /// or when an end is an app namespace (app access goes only through
-    /// pinholes); the previous state then stays in effect. Reply allowances
-    /// that depend on a grant survive its replacement under the same id.
+    /// or when an end names a stored [`NamespaceKind::Pinholes`] namespace
+    /// (its members get access only through pinholes); the previous state
+    /// then stays in effect. A namespace end matches only while the
+    /// namespace is of kind [`NamespaceKind::Rules`]. Reply allowances that
+    /// depend on a grant survive its replacement under the same id.
     pub fn store_grant(&self, id: impl Into<RuleId>, grant: Grant) -> Result<(), Error> {
         let id = id.into();
         let invalid = |reason: String| Error::InvalidGrant {
             id: id.clone(),
             reason,
         };
+        let snapshot = self.snapshot.load();
         for end in [&grant.from, &grant.to] {
             if let GrantEnd::Namespace(ns) = end
-                && ns.is_app()
+                && snapshot.namespaces.get(ns).is_some_and(|ns| !ns.is_rules())
             {
-                return Err(invalid(format!("cannot name app namespace '{ns}'")));
+                return Err(invalid(format!("cannot name pinhole namespace '{ns}'")));
             }
         }
+        drop(snapshot);
         let protocols =
             compile_ports(grant.proto.as_deref(), grant.ports.as_deref()).map_err(invalid)?;
         let compiled = Arc::new(CompiledGrant {
@@ -1087,33 +1017,33 @@ impl AclEngine {
             .collect()
     }
 
-    /// Open a pinhole in app namespace `app_namespace` for `spec`: one peer,
-    /// one direction, one protocol and one destination port, until the
-    /// returned guard is dropped or `spec.expires_at` passes.
+    /// Open a pinhole in the pinhole namespace `namespace` for `spec`: one
+    /// label, one direction, one protocol and one destination port, until
+    /// the returned guard is dropped or `spec.expires_at` passes.
     ///
-    /// The namespace must be a stored app namespace with `spec.peer` as a
-    /// member, and `spec.expires_at` must be in the future per the engine
-    /// clock. When the peer is a member of at least one source (non-app)
-    /// namespace, one of them must list `spec.kind` in
-    /// [`allow_app_pinholes`](NamespacePolicy::allow_app_pinholes); a peer
-    /// only in app namespaces is governed by its own pinholes. On error
-    /// nothing changes.
+    /// The namespace must be a stored [`NamespaceKind::Pinholes`] namespace
+    /// with `spec.label` as a member, and `spec.expires_at` must be in the
+    /// future per the engine clock. When the label is a member of at least
+    /// one [`NamespaceKind::Rules`] namespace, one of them must list
+    /// `spec.kind` in [`pinhole_kinds`](NamespacePolicy::pinhole_kinds); a
+    /// label only in pinhole namespaces is governed by its own pinholes. On
+    /// error nothing changes.
     pub fn open_pinhole(
         self: &Arc<Self>,
-        app_namespace: impl Into<NamespaceId>,
+        namespace: impl Into<NamespaceId>,
         spec: PinholeSpec,
     ) -> Result<PinholeGuard, PinholeError> {
-        let app_namespace = app_namespace.into();
+        let namespace = namespace.into();
         let id = self.publish(|snapshot| {
-            if !snapshot.namespaces.contains_key(&app_namespace) {
+            let Some(stored) = snapshot.namespaces.get(&namespace) else {
                 return Err(PinholeError::UnknownNamespace);
-            }
-            if !app_namespace.is_app() {
-                return Err(PinholeError::NotAppNamespace);
+            };
+            if stored.is_rules() {
+                return Err(PinholeError::NotPinholeNamespace);
             }
             if !snapshot
-                .membership(&spec.peer)
-                .is_some_and(|m| m.contains(&app_namespace))
+                .membership(&spec.label)
+                .is_some_and(|m| m.contains(&namespace))
             {
                 return Err(PinholeError::NotMember);
             }
@@ -1121,10 +1051,10 @@ impl AclEngine {
                 return Err(PinholeError::Expired);
             }
             let source_gated = snapshot
-                .membership(&spec.peer)
-                .is_some_and(|m| m.sources().next().is_some());
+                .membership(&spec.label)
+                .is_some_and(|m| !m.rules.is_empty());
             if let Err(err) =
-                snapshot.pinhole_permission(&app_namespace, &spec.peer, &spec.kind, source_gated)
+                snapshot.pinhole_permission(&namespace, &spec.label, &spec.kind, source_gated)
             {
                 PinholeCounters::add(&self.pinholes.not_permitted, 1);
                 return Err(err);
@@ -1134,7 +1064,7 @@ impl AclEngine {
                 id,
                 Arc::new(Pinhole {
                     id,
-                    app_namespace,
+                    namespace,
                     spec,
                     source_gated,
                 }),
@@ -1241,7 +1171,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::matcher::address_labels;
     use crate::namespace::{NamespaceMember, OutboundRule};
     use crate::policy::{AclAction, AclRule};
     use crate::rules::{IcmpTypes, ProtocolMatch, Rule};
@@ -1272,12 +1201,9 @@ mod tests {
         }
     }
 
-    /// A flow from a bare source IP (an IP-bearing source).
+    /// A flow from a source without labels.
     fn req(src: &str, dst: &str, port: u16, proto: Protocol) -> (LabelSet, Flow) {
-        (
-            address_labels(src.parse().unwrap()),
-            flow(src, dst, port, proto),
-        )
+        (LabelSet::empty(), flow(src, dst, port, proto))
     }
 
     fn allowed(rules: &RuleSet, (labels, flow): &(LabelSet, Flow)) -> bool {
@@ -1471,43 +1397,28 @@ mod tests {
         assert!(RuleSet::from_document(policy).is_err());
     }
 
-    // ── source assertions ─────────────────────────────────────────────────
+    // ── labels ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn source_class_and_anchor_strings() {
-        let key = [0xABu8; 32];
-        let wg = SourceAssertion::WgPeerKey { pubkey: key };
-        assert_eq!(wg.source_class(), "client-wg-key");
-        assert_eq!(wg.source_anchor(), format!("key:{}", "ab".repeat(32)));
-        let t = SourceAssertion::Terminate {
-            binding: TerminateBinding {
-                ip: Some("10.0.0.5".parse().unwrap()),
-                anchor: "10.0.0.5".into(),
-            },
-        };
-        assert_eq!(t.source_class(), "terminate-binding");
-        assert_eq!(t.source_anchor(), "10.0.0.5");
-        let e = SourceAssertion::External { idp: "okta".into() };
-        assert_eq!(e.source_class(), "external-idp");
-        assert_eq!(e.source_anchor(), "idp:okta");
+    /// The `key:<hex>` text of the document's key source `[byte; 32]`.
+    fn anchor(byte: u8) -> String {
+        format!("key:{}", format!("{byte:02x}").repeat(32))
     }
 
-    fn anchor(byte: u8) -> String {
-        wg_peer_anchor(&[byte; 32])
+    fn key_label(byte: u8) -> Label {
+        Label::from(anchor(byte))
     }
 
     fn key_labels(byte: u8) -> LabelSet {
-        LabelSet::new([Label::from(anchor(byte))])
+        LabelSet::new([key_label(byte)])
     }
 
-    /// A flow from the WireGuard key `[byte; 32]` (a source without an
-    /// address label).
+    /// A flow from a source labelled with the key `[byte; 32]`.
     fn key_req(byte: u8, dst: &str, port: u16, proto: Protocol) -> (LabelSet, Flow) {
         (key_labels(byte), flow("fd00::ff", dst, port, proto))
     }
 
     #[test]
-    fn key_rules_match_the_key_and_cidr_rules_need_an_address() {
+    fn key_rules_match_the_label_and_cidr_rules_the_flow_source() {
         let key_src = format!("key:{}", "07".repeat(32));
         let rules = RuleSet::from_document(make_policy(
             vec![
@@ -1520,17 +1431,21 @@ mod tests {
         assert!(allowed(&rules, &key_req(7, "fd00::2", 80, Protocol::Tcp)));
         // A different key is denied (default-deny).
         assert!(!allowed(&rules, &key_req(9, "fd00::2", 80, Protocol::Tcp)));
-        // An IP-bearing source never matches a key rule.
+        // A source without the label never matches a key rule.
         assert!(!allowed(
             &rules,
             &req("fd00::7", "fd00::2", 80, Protocol::Tcp)
         ));
-        // A CIDR rule matches an IP-bearing source only, never a key.
+        // A CIDR rule reads the flow's source address, whatever the labels.
         assert!(allowed(
             &rules,
             &req("fd00::7", "fd00::2", 443, Protocol::Tcp)
         ));
-        assert!(!allowed(&rules, &key_req(7, "fd00::2", 443, Protocol::Tcp)));
+        assert!(allowed(&rules, &key_req(7, "fd00::2", 443, Protocol::Tcp)));
+        assert!(!allowed(
+            &rules,
+            &req("fd01::7", "fd00::2", 443, Protocol::Tcp)
+        ));
     }
 
     // ── policy states ─────────────────────────────────────────────────────
@@ -1708,8 +1623,8 @@ mod tests {
             .store_grant(
                 "g",
                 Grant {
-                    from: GrantEnd::Peer(anchor(1)),
-                    to: GrantEnd::Peer(anchor(2)),
+                    from: GrantEnd::Label(key_label(1)),
+                    to: GrantEnd::Label(key_label(2)),
                     proto: None,
                     ports: None,
                 },
@@ -1842,7 +1757,7 @@ mod tests {
             members: members
                 .iter()
                 .map(|(byte, address)| NamespaceMember {
-                    principal: anchor(*byte),
+                    label: key_label(*byte),
                     addresses: vec![address.parse().unwrap()],
                 })
                 .collect(),
@@ -1882,7 +1797,7 @@ mod tests {
         assert!(!evaluate(&engine, &key_req(1, "fd00::99", 80, Protocol::Tcp)).is_accept());
         assert!(evaluate(&engine, &key_req(2, "fd00::99", 22, Protocol::Tcp)).is_accept());
         assert_eq!(
-            engine.memberships(&anchor(3)),
+            engine.memberships(&key_label(3)),
             vec![NamespaceId::from("nsd:a")]
         );
 
@@ -1891,7 +1806,7 @@ mod tests {
         assert!(!engine.remove_namespace("nsd:a"));
         assert!(Arc::ptr_eq(&quick, &namespace_ptr(&engine, "quick")));
         assert_eq!(engine.namespaces(), vec![NamespaceId::from("quick")]);
-        assert_eq!(engine.memberships(&anchor(1)), Vec::<NamespaceId>::new());
+        assert_eq!(engine.memberships(&key_label(1)), Vec::<NamespaceId>::new());
         // A former member falls back to the (not installed) default rules.
         assert_eq!(
             evaluate(&engine, &key_req(1, "fd00::99", 443, Protocol::Tcp)),
@@ -1943,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn rules_of_all_namespaces_of_a_principal_apply() {
+    fn rules_of_all_namespaces_of_a_label_apply() {
         let engine = AclEngine::new();
         engine
             .store_namespace("nsd:a", ns(&[(1, "fd00::1")], 80))
@@ -1952,7 +1867,7 @@ mod tests {
             .store_namespace("quick", ns(&[(1, "fd00::1"), (2, "fd00::2")], 22))
             .unwrap();
         assert_eq!(
-            engine.memberships(&anchor(1)),
+            engine.memberships(&key_label(1)),
             vec![NamespaceId::from("nsd:a"), NamespaceId::from("quick")]
         );
         let to_local = |port| evaluate(&engine, &key_req(1, "fd00::99", port, Protocol::Tcp));
@@ -2018,31 +1933,34 @@ mod tests {
     }
 
     #[test]
-    fn app_namespaces_never_widen_permissions() {
+    fn pinhole_namespaces_never_widen_permissions() {
         let engine = AclEngine::new();
+        let with_rules = NamespacePolicy {
+            kind: NamespaceKind::Pinholes,
+            ..ns(&[(1, "fd00::1")], 22)
+        };
         assert!(matches!(
-            engine.store_namespace("app:s1", ns(&[(1, "fd00::1")], 22)),
+            engine.store_namespace("s1", with_rules),
             Err(Error::InvalidNamespace { .. })
         ));
-        let mut pinholes = ns(&[(1, "fd00::1")], 22);
-        pinholes.policy = AclPolicy::default();
-        pinholes.allow_app_pinholes.insert("transfer".to_owned());
+        let mut pinholes = app(&[(1, "fd00::1")]);
+        pinholes.pinhole_kinds.insert("transfer".to_owned());
         assert!(matches!(
-            engine.store_namespace("app:s1", pinholes.clone()),
+            engine.store_namespace("s1", pinholes.clone()),
             Err(Error::InvalidNamespace { .. })
         ));
-        // Allowed on a non-app namespace.
-        engine.store_namespace("nsd:a", pinholes).unwrap();
-        // Outbound rules are allowed on an app namespace.
-        let mut session = ns(&[(2, "fd00::2")], 22);
-        session.policy = AclPolicy::default();
+        // Allowed on a rule namespace; the id means nothing.
+        pinholes.kind = NamespaceKind::Rules;
+        engine.store_namespace("app:x", pinholes).unwrap();
+        // Outbound rules are allowed on a pinhole namespace.
+        let mut session = app(&[(2, "fd00::2")]);
         session.outbound = Some(Vec::new());
-        engine.store_namespace("app:s1", session).unwrap();
+        engine.store_namespace("s1", session).unwrap();
         assert_eq!(
-            engine.memberships(&anchor(2)),
-            vec![NamespaceId::from("app:s1")]
+            engine.memberships(&key_label(2)),
+            vec![NamespaceId::from("s1")]
         );
-        // A member only of an app namespace gets nothing, even with
+        // A member only of a pinhole namespace gets nothing, even with
         // permissive default rules.
         engine.install(RuleSet::new([Rule::new("all", vec![ProtocolMatch::Any])]).unwrap());
         assert!(!evaluate(&engine, &key_req(2, "fd00::99", 22, Protocol::Tcp)).is_accept());
@@ -2087,7 +2005,7 @@ mod tests {
             .unwrap();
         let grant = Grant {
             from: GrantEnd::Namespace("nsd:a".into()),
-            to: GrantEnd::Peer(anchor(2)),
+            to: GrantEnd::Label(key_label(2)),
             proto: Some("udp".to_owned()),
             ports: Some("5000-5010".to_owned()),
         };
@@ -2134,17 +2052,17 @@ mod tests {
         assert!(snapshot.has_outbound_restrictions());
         assert!(
             snapshot
-                .membership(&anchor(1))
+                .membership(&key_label(1))
                 .unwrap()
                 .outbound_restricted()
         );
         assert!(
             !snapshot
-                .membership(&anchor(2))
+                .membership(&key_label(2))
                 .unwrap()
                 .outbound_restricted()
         );
-        assert!(snapshot.membership(&anchor(3)).is_none());
+        assert!(snapshot.membership(&key_label(3)).is_none());
         drop(snapshot);
         engine.remove_namespace("nsd:a");
         assert!(!engine.snapshot().has_outbound_restrictions());
@@ -2206,16 +2124,22 @@ mod tests {
     }
 
     #[test]
-    fn grants_cannot_name_app_namespaces() {
+    fn grants_cannot_name_pinhole_namespaces() {
         let engine = AclEngine::new();
+        engine
+            .store_namespace("s1", app(&[(1, "fd00::1"), (2, "fd00::2")]))
+            .unwrap();
+        engine
+            .store_namespace("team-a", ns(&[(1, "fd00::1")], 22))
+            .unwrap();
         for (from, to) in [
             (
-                GrantEnd::Namespace("app:s1".into()),
-                GrantEnd::Peer(anchor(2)),
+                GrantEnd::Namespace("s1".into()),
+                GrantEnd::Label(key_label(2)),
             ),
             (
-                GrantEnd::Peer(anchor(1)),
-                GrantEnd::Namespace("app:s1".into()),
+                GrantEnd::Label(key_label(1)),
+                GrantEnd::Namespace("s1".into()),
             ),
         ] {
             let grant = Grant {
@@ -2230,6 +2154,164 @@ mod tests {
             ));
         }
         assert_eq!(engine.grants(), Vec::new());
+        // A grant naming a namespace that later becomes a pinhole namespace
+        // stops matching it.
+        let grant = Grant {
+            from: GrantEnd::Namespace("team-a".into()),
+            to: GrantEnd::Label(key_label(2)),
+            proto: None,
+            ports: None,
+        };
+        engine.store_grant("g", grant).unwrap();
+        let to_peer2 = key_req(1, "fd00::2", 22, Protocol::Tcp);
+        assert_eq!(
+            evaluate(&engine, &to_peer2),
+            Decision::Accept(Matched::Grant("g".into()))
+        );
+        engine
+            .store_namespace("team-a", app(&[(1, "fd00::1")]))
+            .unwrap();
+        assert_eq!(
+            evaluate(&engine, &to_peer2),
+            Decision::Deny(reasons::CROSS_NAMESPACE)
+        );
+    }
+
+    #[test]
+    fn label_grant_ends_and_the_smallest_owner_of_a_shared_address() {
+        let engine = AclEngine::new();
+        // "host:a" and "host:b" both own fd00::5; "host:a" is the smaller.
+        let member = |label: &str, address: &str| NamespaceMember {
+            label: label.into(),
+            addresses: vec![address.parse().unwrap()],
+        };
+        let namespace = |members| NamespacePolicy {
+            members,
+            ..NamespacePolicy::default()
+        };
+        engine
+            .store_namespace("team-a", namespace(vec![member("host:a", "fd00::5")]))
+            .unwrap();
+        engine
+            .store_namespace("team-b", namespace(vec![member("host:b", "fd00::5")]))
+            .unwrap();
+        engine
+            .store_namespace("team-c", namespace(vec![member("team-c", "fd00::9")]))
+            .unwrap();
+        let grant = |to: &str| Grant {
+            from: GrantEnd::Label("team-c".into()),
+            to: GrantEnd::Label(to.into()),
+            proto: Some("tcp".to_owned()),
+            ports: Some("80".to_owned()),
+        };
+        let source = LabelSet::new(["team-c".into(), "extra".into()]);
+        let to_shared = flow("fd00::9", "fd00::5", 80, Protocol::Tcp);
+        engine.store_grant("to-b", grant("host:b")).unwrap();
+        assert_eq!(
+            engine.evaluate(&source, &to_shared),
+            Decision::Deny(reasons::CROSS_NAMESPACE)
+        );
+        engine.store_grant("to-a", grant("host:a")).unwrap();
+        assert_eq!(
+            engine.evaluate(&source, &to_shared),
+            Decision::Accept(Matched::Grant("to-a".into()))
+        );
+        // The source end matches any label of the source's set.
+        assert_eq!(
+            engine.evaluate(&LabelSet::new(["extra".into()]), &to_shared),
+            Decision::Deny(reasons::NO_POLICY)
+        );
+        // A namespace end matches the owner's namespaces.
+        engine.remove_grant("to-a");
+        engine
+            .store_grant(
+                "ns",
+                Grant {
+                    to: GrantEnd::Namespace("team-a".into()),
+                    ..grant("host:a")
+                },
+            )
+            .unwrap();
+        assert!(engine.evaluate(&source, &to_shared).is_accept());
+    }
+
+    #[test]
+    fn a_multi_label_source_bypasses_when_its_open_namespaces_cover_every_owner() {
+        let engine = AclEngine::new();
+        let open = |members: &[(u8, &str)]| NamespacePolicy {
+            policy: make_policy(vec![accept_rule(&["*"], &["*:*"], None)], vec![]),
+            ..ns(members, 0)
+        };
+        engine
+            .store_namespace("team-a", open(&[(1, "fd00::1")]))
+            .unwrap();
+        engine
+            .store_namespace("team-b", open(&[(2, "fd00::2")]))
+            .unwrap();
+        let snapshot = engine.snapshot();
+        let bypasses =
+            |labels: &LabelSet| snapshot.bypasses(snapshot.membership_of(labels).as_deref());
+        // Each label alone shares an open namespace with one owner only.
+        assert!(!bypasses(&key_labels(1)));
+        assert!(!bypasses(&key_labels(2)));
+        let both = LabelSet::new([key_label(1), key_label(2)]);
+        assert!(bypasses(&both));
+        drop(snapshot);
+        // Restricted through every namespace: no bypass.
+        let mut restricted = open(&[(1, "fd00::1")]);
+        restricted.outbound = Some(Vec::new());
+        engine.store_namespace("team-a", restricted).unwrap();
+        let mut restricted = open(&[(2, "fd00::2")]);
+        restricted.outbound = Some(Vec::new());
+        engine.store_namespace("team-b", restricted).unwrap();
+        let snapshot = engine.snapshot();
+        assert!(!snapshot.bypasses(snapshot.membership_of(&both).as_deref()));
+    }
+
+    #[test]
+    fn a_pinhole_serves_every_source_carrying_its_label() {
+        let (engine, clock) = manual_engine();
+        engine
+            .store_namespace("team-a", source(&[(1, "fd00::1")], &["transfer"]))
+            .unwrap();
+        engine
+            .store_namespace("s1", app(&[(1, "fd00::1"), (2, "fd00::2")]))
+            .unwrap();
+        let later = now(&clock) + Duration::from_secs(60);
+        // Label 1 is permitted by team-a's pinhole kinds; label 2 is only in
+        // the pinhole namespace.
+        let first = engine.open_pinhole("s1", spec(1, 80, later)).unwrap();
+        assert_eq!(
+            engine
+                .open_pinhole("s1", spec(1, 81, later))
+                .map(|g| g.id()),
+            Ok(PinholeId::new(2))
+        );
+        let other = PinholeSpec {
+            kind: "chat".to_owned(),
+            ..spec(1, 82, later)
+        };
+        assert_eq!(
+            engine.open_pinhole("s1", other).map(|g| g.id()),
+            Err(PinholeError::NotPermitted)
+        );
+        let flow = flow("fd00::ff", "fd00::99", 80, Protocol::Tcp);
+        let both = LabelSet::new([key_label(3), key_label(1)]);
+        assert_eq!(
+            engine.evaluate(&both, &flow),
+            Decision::Accept(Matched::Pinhole(first.id()))
+        );
+        // A source without the label does not use it.
+        assert_eq!(
+            engine.evaluate(&key_labels(2), &flow),
+            Decision::Deny(reasons::DENIED)
+        );
+        // Stored again as a rule namespace, it holds no pinhole.
+        engine
+            .store_namespace("s1", source(&[(1, "fd00::1"), (2, "fd00::2")], &[]))
+            .unwrap();
+        assert!(!first.is_open());
+        assert_eq!(engine.pinhole_stats().revoked, 1);
     }
 
     // ── pinholes ──────────────────────────────────────────────────────────
@@ -2250,23 +2332,27 @@ mod tests {
         *clock.lock().unwrap()
     }
 
-    /// A namespace of `members` without rules, allowing pinholes of `kinds`.
+    /// A rule namespace of `members` without rules, permitting pinholes of
+    /// `kinds`.
     fn source(members: &[(u8, &str)], kinds: &[&str]) -> NamespacePolicy {
         NamespacePolicy {
             policy: AclPolicy::default(),
-            allow_app_pinholes: kinds.iter().map(ToString::to_string).collect(),
+            pinhole_kinds: kinds.iter().map(ToString::to_string).collect(),
             ..ns(members, 0)
         }
     }
 
-    /// An app namespace of `members`.
+    /// A pinhole namespace of `members`.
     fn app(members: &[(u8, &str)]) -> NamespacePolicy {
-        source(members, &[])
+        NamespacePolicy {
+            kind: NamespaceKind::Pinholes,
+            ..source(members, &[])
+        }
     }
 
     fn spec(peer: u8, port: u16, expires_at: Instant) -> PinholeSpec {
         PinholeSpec {
-            peer: anchor(peer),
+            label: key_label(peer),
             kind: "transfer".to_owned(),
             protocol: Protocol::Tcp,
             direction: Direction::Inbound,
@@ -2302,7 +2388,7 @@ mod tests {
         );
         assert_eq!(
             open("nsd:a", spec(1, 80, later)),
-            Err(PinholeError::NotAppNamespace)
+            Err(PinholeError::NotPinholeNamespace)
         );
         assert_eq!(
             open("app:s1", spec(4, 80, later)),

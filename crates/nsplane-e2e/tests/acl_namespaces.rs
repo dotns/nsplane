@@ -1,7 +1,7 @@
 //! ACL rule namespaces, directed grants and app pinholes at engine level, over in-memory
 //! channel transports. Node `b` runs an `AclFilter` over a shared `AclEngine` and a
-//! `PeerIdentityMap` naming its peers' WireGuard keys as principals; its peers run no
-//! filter. The tests change namespaces, grants and pinholes under the running engines and
+//! `PeerLabelMap` labelling its peers by their WireGuard keys (one test gives a peer two
+//! labels); its peers run no filter. The tests change namespaces, grants and pinholes under the running engines and
 //! check deliveries, `Event::Dropped` reasons, the engine's drop counters and the filter and
 //! pinhole counters.
 //!
@@ -12,6 +12,7 @@
 //! `b` drops. "Handshake counter" is the `Event::HandshakeCompleted`s on `b`'s subscription
 //! together with the peer's `last_handshake`; "peer count" is `b`'s number of peers.
 
+use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -20,9 +21,9 @@ use std::time::{Duration, Instant};
 use nsplane::x25519::PublicKey;
 use nsplane::{AllowedIp, ChannelTransport, EngineHandle, Event, Path, Peer, TransportId};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet,
-    NamespaceId, NamespaceMember, NamespacePolicy, PeerIdentityMap, PinholeError, PinholeSpec,
-    PinholeStats, Protocol, SourceAssertion, reasons, wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Direction, Grant, GrantEnd, IpNet, Label,
+    LabelSet, NamespaceId, NamespaceKind, NamespaceMember, NamespacePolicy, PeerLabelMap,
+    PinholeError, PinholeSpec, PinholeStats, Protocol, reasons,
 };
 use nsplane_e2e::{
     Events, Family, Node, Options, StackNode, TRANSFER, TestResult, introduce, serve_tcp_echo, udp,
@@ -56,14 +57,14 @@ type AclNode = Node<ChannelTransport>;
 /// The ACL state of `b` the tests keep.
 struct Acl {
     engine: Arc<AclEngine>,
-    identities: Arc<PeerIdentityMap>,
+    identities: Arc<PeerLabelMap>,
     filter: AclFilter,
 }
 
 impl Acl {
     fn new(engine: AclEngine) -> Self {
         let engine = Arc::new(engine);
-        let identities = Arc::new(PeerIdentityMap::new());
+        let identities = Arc::new(PeerLabelMap::new());
         let filter = AclFilter::new(Arc::clone(&engine), Arc::clone(&identities));
         Self {
             engine,
@@ -72,14 +73,9 @@ impl Acl {
         }
     }
 
-    /// Names the peer `peer` of `b` by its WireGuard key.
+    /// Labels the peer `peer` of `b` by its WireGuard key.
     fn identify(&self, peer: PeerId, key: &PublicKey) {
-        self.identities.insert(
-            peer,
-            SourceAssertion::WgPeerKey {
-                pubkey: key.to_bytes(),
-            },
-        );
+        self.identities.insert(peer, LabelSet::new([label(key)]));
     }
 }
 
@@ -91,15 +87,22 @@ fn end(id: u16, host: u8) -> (TransportId, SocketAddr) {
     )
 }
 
-/// The principal of a node's key.
-fn principal(key: &PublicKey) -> String {
-    wg_peer_anchor(&key.to_bytes())
+/// The label of a node's key: the label a policy's `key:<hex>` source compiles to.
+fn label(key: &PublicKey) -> Label {
+    Label::from(
+        key.to_bytes()
+            .iter()
+            .fold(String::from("key:"), |mut text, b| {
+                let _ = write!(text, "{b:02x}");
+                text
+            }),
+    )
 }
 
 /// A namespace member with both tunnel addresses of a node.
 fn member(key: &PublicKey, ip4: Ipv4Addr, ip6: Ipv6Addr) -> TestResult<NamespaceMember> {
     Ok(NamespaceMember {
-        principal: principal(key),
+        label: label(key),
         addresses: vec![format!("{ip4}/32").parse()?, format!("{ip6}/128").parse()?],
     })
 }
@@ -115,8 +118,8 @@ fn rule(src: &str, port: u16, proto: Option<&str>) -> AclRule {
     }
 }
 
-/// A source namespace with `members`, rules accepting the first member on `ports` with
-/// `proto`, and pinholes allowed for `apps`.
+/// A rule namespace with `members`, rules accepting the first member on `ports` with
+/// `proto`, and pinholes of the kinds `apps` permitted.
 fn source(
     members: Vec<NamespaceMember>,
     ports: &[u16],
@@ -128,7 +131,7 @@ fn source(
         .map(|m| {
             ports
                 .iter()
-                .map(|port| rule(&m.principal, *port, proto))
+                .map(|port| rule(m.label.as_str(), *port, proto))
                 .collect()
         })
         .unwrap_or_default();
@@ -138,23 +141,24 @@ fn source(
             acls,
             ..AclPolicy::default()
         },
-        allow_app_pinholes: apps.iter().map(|app| (*app).to_owned()).collect(),
+        pinhole_kinds: apps.iter().map(|app| (*app).to_owned()).collect(),
         ..NamespacePolicy::default()
     }
 }
 
-/// An app namespace with `members` and no rules.
+/// A pinhole namespace with `members` and no rules.
 fn app(members: Vec<NamespaceMember>) -> NamespacePolicy {
     NamespacePolicy {
+        kind: NamespaceKind::Pinholes,
         members,
         ..NamespacePolicy::default()
     }
 }
 
-/// An inbound TCP pinhole of `peer` to the local [`APP_PORT`] until `expires_at`.
-fn inbound_pinhole(peer: String, protocol: Protocol, expires_at: Instant) -> PinholeSpec {
+/// An inbound TCP pinhole of `label` to the local [`APP_PORT`] until `expires_at`.
+fn inbound_pinhole(label: Label, protocol: Protocol, expires_at: Instant) -> PinholeSpec {
     PinholeSpec {
-        peer,
+        label,
         kind: TRANSFER_KIND.to_owned(),
         protocol,
         direction: Direction::Inbound,
@@ -263,7 +267,7 @@ async fn namespaces_union_and_replace_independently() -> TestResult {
         source(vec![a_member.clone()], &[NSD_PORT], Some("udp"), &[]),
     )?;
     assert_eq!(
-        acl.engine.memberships(&principal(&a.public())),
+        acl.engine.memberships(&label(&a.public())),
         ids(&["nsd:x", "quick"])
     );
     delivered(&a, &mut b, &quick).await?;
@@ -278,16 +282,72 @@ async fn namespaces_union_and_replace_independently() -> TestResult {
 
     assert!(acl.engine.remove_namespace("nsd:x"));
     assert_eq!(acl.engine.namespaces(), ids(&["quick"]));
-    assert_eq!(
-        acl.engine.memberships(&principal(&a.public())),
-        ids(&["quick"])
-    );
+    assert_eq!(acl.engine.memberships(&label(&a.public())), ids(&["quick"]));
     delivered(&a, &mut b, &quick).await?;
     dropped(&a, &mut b, &mut events, &nsd, reasons::DENIED).await?;
 
     let stats = acl.filter.stats();
     assert_eq!((stats.accepted, stats.denied), (4, 3));
     assert_eq!(b.drops(reasons::DENIED).await?, 3);
+    Ok(())
+}
+
+/// One peer with two labels is a member of two namespaces through different labels: it gets
+/// the rules of both, it is outbound-restricted only while both namespaces restrict, and
+/// losing one label loses that namespace's rules on the next packet.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_two_label_peer_is_a_member_through_each_label() -> TestResult {
+    let acl = Acl::new(AclEngine::new());
+    let (mut a, mut b) = packet_pair(&acl).await?;
+    let mut events = b.subscribe().await?;
+    let (first, second) = (Label::from("team-a"), Label::from("team-b"));
+    let peer_a = b.peer_of(&a).await?;
+    acl.identities
+        .insert(peer_a, LabelSet::new([first.clone(), second.clone()]));
+    let addresses = member(&a.public(), a.ip4, a.ip6)?.addresses;
+    let namespace = |label: &Label, port: u16, restricted: bool| NamespacePolicy {
+        members: vec![NamespaceMember {
+            label: label.clone(),
+            addresses: addresses.clone(),
+        }],
+        policy: AclPolicy {
+            acls: vec![rule("*", port, Some("udp"))],
+            ..AclPolicy::default()
+        },
+        outbound: restricted.then(Vec::new),
+        ..NamespacePolicy::default()
+    };
+    acl.engine
+        .store_namespace("ns-1", namespace(&first, QUICK_PORT, true))?;
+    acl.engine
+        .store_namespace("ns-2", namespace(&second, NSD_PORT, false))?;
+    assert_eq!(acl.engine.memberships(&first), ids(&["ns-1"]));
+    assert_eq!(acl.engine.memberships(&second), ids(&["ns-2"]));
+    let to = |src_port, port| udp_to(&a, src_port, b.ip4, port);
+    let (first_port, second_port) = (to(SRC_PORT, QUICK_PORT), to(SRC_PORT, NSD_PORT));
+    let other = to(SRC_PORT, QUICK_PORT + 1);
+    let (first_later, second_later) = (to(SRC_PORT + 1, QUICK_PORT), to(SRC_PORT + 1, NSD_PORT));
+    let (old_flow, new_flow) = (udp_to(&b, 5000, a.ip4, 6000), udp_to(&b, 5001, a.ip4, 6000));
+    delivered(&a, &mut b, &first_port).await?;
+    delivered(&a, &mut b, &second_port).await?;
+    dropped(&a, &mut b, &mut events, &other, reasons::DENIED).await?;
+
+    // Outbound-restricted only when every namespace of every label restricts.
+    delivered(&b, &mut a, &old_flow).await?;
+    acl.engine
+        .store_namespace("ns-2", namespace(&second, NSD_PORT, true))?;
+    dropped(&b, &mut a, &mut events, &new_flow, reasons::OUTBOUND).await?;
+
+    // Without the second label only the first namespace applies.
+    acl.identities.insert(peer_a, LabelSet::new([first]));
+    dropped(&a, &mut b, &mut events, &second_later, reasons::DENIED).await?;
+    delivered(&a, &mut b, &first_later).await?;
+
+    let stats = acl.filter.stats();
+    assert_eq!(
+        (stats.accepted, stats.denied, stats.outbound_denied),
+        (3, 2, 1)
+    );
     Ok(())
 }
 
@@ -365,7 +425,7 @@ async fn hub_drops_cross_namespace_and_follows_a_directed_grant() -> TestResult 
         "quick-to-c",
         Grant {
             from: GrantEnd::Namespace("quick".into()),
-            to: GrantEnd::Peer(principal(&c.public())),
+            to: GrantEnd::Label(label(&c.public())),
             proto: Some("udp".to_owned()),
             ports: Some(QUICK_PORT.to_string()),
         },
@@ -418,7 +478,7 @@ async fn pinhole_expires_on_the_engine_clock() -> TestResult {
     let expires_at = tokio::time::Instant::now().into_std() + lifetime;
     let guard = acl.engine.open_pinhole(
         "app:s1",
-        inbound_pinhole(principal(&a.public()), Protocol::Udp, expires_at),
+        inbound_pinhole(label(&a.public()), Protocol::Udp, expires_at),
     )?;
 
     let packet = udp_to(&a, SRC_PORT, b.ip4, APP_PORT);
@@ -582,7 +642,7 @@ async fn quick_source_allows_a_transfer_pinhole() -> TestResult {
     let (a, b) = stack_pair(&acl, true).await?;
     let mut events = b.subscribe().await?;
     let a_member = member(&a.public(), a.ip4, a.ip6)?;
-    let a_principal = principal(&a.public());
+    let a_label = label(&a.public());
     acl.engine.store_namespace(
         "quick",
         source(
@@ -600,13 +660,10 @@ async fn quick_source_allows_a_transfer_pinhole() -> TestResult {
     refused(&a.stack, at(APP_PORT), &b.handle, reasons::DENIED).await?;
 
     acl.engine.store_namespace("app:s1", app(vec![a_member]))?;
-    assert_eq!(
-        acl.engine.memberships(&a_principal),
-        ids(&["app:s1", "quick"])
-    );
+    assert_eq!(acl.engine.memberships(&a_label), ids(&["app:s1", "quick"]));
     let guard = acl.engine.open_pinhole(
         "app:s1",
-        inbound_pinhole(a_principal.clone(), Protocol::Tcp, in_an_hour()),
+        inbound_pinhole(a_label.clone(), Protocol::Tcp, in_an_hour()),
     )?;
     transfer(&a.stack, at(APP_PORT), FILE).await?;
     transfer(&a.stack, at(QUICK_PORT), PROBE).await?;
@@ -619,7 +676,7 @@ async fn quick_source_allows_a_transfer_pinhole() -> TestResult {
     transfer(&a.stack, at(QUICK_PORT), PROBE).await?;
 
     assert!(acl.engine.remove_namespace("app:s1"));
-    assert_eq!(acl.engine.memberships(&a_principal), ids(&["quick"]));
+    assert_eq!(acl.engine.memberships(&a_label), ids(&["quick"]));
     transfer(&a.stack, at(QUICK_PORT), PROBE).await?;
     same_tunnel(&before, &tunnel(&b, &a).await?, &mut events).await
 }
@@ -631,7 +688,7 @@ async fn nsd_source_without_permission_refuses_the_pinhole() -> TestResult {
     let acl = Acl::new(AclEngine::new());
     let (a, b) = stack_pair(&acl, true).await?;
     let a_member = member(&a.public(), a.ip4, a.ip6)?;
-    let a_principal = principal(&a.public());
+    let a_label = label(&a.public());
     acl.engine.store_namespace(
         "nsd:x",
         source(vec![a_member.clone()], &[NSD_PORT], Some("tcp"), &[]),
@@ -642,7 +699,7 @@ async fn nsd_source_without_permission_refuses_the_pinhole() -> TestResult {
 
     let refusal = acl.engine.open_pinhole(
         "app:s1",
-        inbound_pinhole(a_principal.clone(), Protocol::Tcp, in_an_hour()),
+        inbound_pinhole(a_label.clone(), Protocol::Tcp, in_an_hour()),
     );
     assert!(
         matches!(refusal, Err(PinholeError::NotPermitted)),
@@ -656,10 +713,7 @@ async fn nsd_source_without_permission_refuses_the_pinhole() -> TestResult {
         }
     );
     assert_eq!(acl.engine.namespaces(), ids(&["app:s1", "nsd:x"]));
-    assert_eq!(
-        acl.engine.memberships(&a_principal),
-        ids(&["app:s1", "nsd:x"])
-    );
+    assert_eq!(acl.engine.memberships(&a_label), ids(&["app:s1", "nsd:x"]));
     refused(&a.stack, at(APP_PORT), &b.handle, reasons::DENIED).await?;
     transfer(&a.stack, at(NSD_PORT), PROBE).await
 }
@@ -671,7 +725,7 @@ async fn nsd_source_withdrawing_permission_revokes_the_pinhole() -> TestResult {
     let acl = Acl::new(AclEngine::new());
     let (a, b) = stack_pair(&acl, true).await?;
     let a_member = member(&a.public(), a.ip4, a.ip6)?;
-    let a_principal = principal(&a.public());
+    let a_label = label(&a.public());
     acl.engine.store_namespace(
         "nsd:x",
         source(
@@ -686,7 +740,7 @@ async fn nsd_source_withdrawing_permission_revokes_the_pinhole() -> TestResult {
     let at = |port| b.socket_addr(Family::V6, port);
     let guard = acl.engine.open_pinhole(
         "app:s1",
-        inbound_pinhole(a_principal, Protocol::Tcp, in_an_hour()),
+        inbound_pinhole(a_label, Protocol::Tcp, in_an_hour()),
     )?;
     transfer(&a.stack, at(APP_PORT), FILE).await?;
 
@@ -768,8 +822,9 @@ async fn session_only_peer_gets_the_pinhole_and_nothing_else() -> TestResult {
     acl.engine.store_namespace(
         "app:s2",
         NamespacePolicy {
+            kind: NamespaceKind::Pinholes,
             members: vec![NamespaceMember {
-                principal: principal(&d.public()),
+                label: label(&d.public()),
                 addresses: vec![d_net],
             }],
             outbound: Some(vec![]),
@@ -778,7 +833,7 @@ async fn session_only_peer_gets_the_pinhole_and_nothing_else() -> TestResult {
     )?;
     let guard = acl.engine.open_pinhole(
         "app:s2",
-        inbound_pinhole(principal(&d.public()), Protocol::Tcp, in_an_hour()),
+        inbound_pinhole(label(&d.public()), Protocol::Tcp, in_an_hour()),
     )?;
     assert_eq!(b.handle.peers().await?.len(), 1);
 
@@ -831,7 +886,7 @@ async fn session_reuses_an_existing_tunnel() -> TestResult {
     let (a, b) = stack_pair(&acl, true).await?;
     let mut events = b.subscribe().await?;
     let a_member = member(&a.public(), a.ip4, a.ip6)?;
-    let a_principal = principal(&a.public());
+    let a_label = label(&a.public());
     acl.engine.store_namespace(
         "quick",
         source(
@@ -853,7 +908,7 @@ async fn session_reuses_an_existing_tunnel() -> TestResult {
     acl.engine.store_namespace("app:s3", app(vec![a_member]))?;
     let guard = acl.engine.open_pinhole(
         "app:s3",
-        inbound_pinhole(a_principal.clone(), Protocol::Tcp, in_an_hour()),
+        inbound_pinhole(a_label.clone(), Protocol::Tcp, in_an_hour()),
     )?;
     transfer(&a.stack, at(APP_PORT), FILE).await?;
     for port in [QUICK_PORT, NSD_PORT] {
@@ -864,10 +919,7 @@ async fn session_reuses_an_existing_tunnel() -> TestResult {
     drop(guard);
     assert!(acl.engine.remove_namespace("app:s3"));
     assert_eq!(acl.engine.namespaces(), ids(&["nsd:x", "quick"]));
-    assert_eq!(
-        acl.engine.memberships(&a_principal),
-        ids(&["nsd:x", "quick"])
-    );
+    assert_eq!(acl.engine.memberships(&a_label), ids(&["nsd:x", "quick"]));
     for port in [QUICK_PORT, NSD_PORT] {
         transfer(&a.stack, at(port), PROBE).await?;
     }

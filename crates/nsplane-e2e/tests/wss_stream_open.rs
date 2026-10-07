@@ -2,6 +2,8 @@
 //! dial error (its `WssDialError` included) instead of waiting out the backoff, a relay
 //! coming up later serves later opens, and without it an open waits for the dial.
 
+#![expect(deprecated, reason = "tests of the deprecated stream carrier")]
+
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

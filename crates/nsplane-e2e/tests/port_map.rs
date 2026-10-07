@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 
 use nsplane::{AllowedIp, ChannelTransport, Event};
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, PeerIdentityMap, SourceAssertion,
-    wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, PeerLabelMap,
 };
 use nsplane_e2e::{
     Node, Options, SharedFilter, TestResult, channel_pair_with, introduce, payload, tcp, udp,
@@ -247,30 +246,30 @@ async fn a_full_table_evicts_the_least_recently_seen_flow() -> TestResult {
     Ok(())
 }
 
-/// Node `a`'s own IPv4 address and its `node4`, which `b` reaches the service on.
-const SELF4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
-const SELF_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
-/// Node `b`'s /127 group and `a`'s IPv4 alias for it.
-const PEER_NODE6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
-const PEER_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
-const PEER_ALIAS4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+/// Node `a`'s own IPv4 address and its `eam6`, which `b` reaches the service on.
+const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
+const SELF_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
+/// Node `b`'s `peer6`, `eam6` and `a`'s `eam4` for it.
+const PEER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
+const PEER_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
+const PEER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 
 /// `a` with the full stack `[AclFilter, PortMap, Translator]` (wire side to local side),
-/// publishing its IPv4-only service on `SELF_NODE4:LISTEN` with the ACL allowing `b` to
-/// reach `SELF_NODE4:acl_port` over UDP; `b` is IPv6-only and runs no filter.
+/// publishing its IPv4-only service on `SELF_EAM6:LISTEN` with the ACL allowing `b` to
+/// reach `SELF_EAM6:acl_port` over UDP; `b` is IPv6-only and runs no filter.
 async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)> {
     let acl_engine = Arc::new(AclEngine::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let acl = AclFilter::new(Arc::clone(&acl_engine), Arc::clone(&identities));
     let port_map = PortMap::new([rule(
         PortMapProtocol::Udp,
-        v6(SELF_NODE4, LISTEN),
-        v6(SELF_NODE4, SERVICE),
+        v6(SELF_EAM6, LISTEN),
+        v6(SELF_EAM6, SERVICE),
         None,
     )])?;
     let self_mapping = SelfMapping {
-        self4: SELF4,
-        node4: SELF_NODE4,
+        eam4: SELF_EAM4,
+        eam6: SELF_EAM6,
     };
     let translator = Arc::new(Translator::new(
         TranslationTable::builder()
@@ -292,13 +291,13 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
     introduce(&a, &b, None).await?;
     let mut peer = b.as_peer(a.path.transport);
     peer.allowed_ips = vec![
-        allowed(PEER_ALIAS4, 32),
-        allowed(PEER_NODE4, 128),
-        allowed(PEER_NODE6, 128),
+        allowed(PEER_EAM4, 32),
+        allowed(PEER_EAM6, 128),
+        allowed(PEER6, 128),
     ];
     a.handle.add_or_update_peer(peer).await?;
     let mut peer = a.as_peer(b.path.transport);
-    peer.allowed_ips = vec![allowed(SELF_NODE4, 128)];
+    peer.allowed_ips = vec![allowed(SELF_EAM6, 128)];
     b.handle.add_or_update_peer(peer).await?;
 
     let peer_b = a.peer_of(&b).await?;
@@ -308,25 +307,30 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
             .peer(
                 peer_b,
                 PeerMapping {
-                    node6: PEER_NODE6,
-                    node4: PEER_NODE4,
-                    alias6: None,
-                    alias4: Some(PEER_ALIAS4),
+                    peer6: PEER6,
+                    eam6: PEER_EAM6,
+                    local6: None,
+                    eam4: Some(PEER_EAM4),
                 },
             )
             .build()?,
     );
-    identities.insert(
-        peer_b,
-        SourceAssertion::WgPeerKey {
-            pubkey: b.public().to_bytes(),
-        },
-    );
+    // The label the policy's `key:<hex>` source compiles to.
+    let key = b
+        .public()
+        .to_bytes()
+        .iter()
+        .fold(String::from("key:"), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+    identities.insert(peer_b, LabelSet::new([Label::from(key.as_str())]));
     acl_engine.load(AclPolicy {
         acls: vec![AclRule {
             action: AclAction::Accept,
-            src: vec![wg_peer_anchor(&b.public().to_bytes())],
-            dst: vec![format!("{SELF_NODE4}:{acl_port}")],
+            src: vec![key],
+            dst: vec![format!("{SELF_EAM6}:{acl_port}")],
             proto: Some("udp".to_owned()),
         }],
         ..AclPolicy::default()
@@ -337,37 +341,37 @@ async fn full_stack(acl_port: u16) -> TestResult<(TestNode, TestNode, AclFilter)
 #[tokio::test]
 async fn full_stack_lets_an_allowed_peer_reach_an_ipv4_service() -> TestResult {
     let (mut a, mut b, acl) = full_stack(LISTEN).await?;
-    let client6 = v6(PEER_NODE4, 40020);
-    let client4 = v4(PEER_ALIAS4, 40020);
+    let client6 = v6(PEER_EAM6, 40020);
+    let client4 = v4(PEER_EAM4, 40020);
 
     // `b` reaches the published listen address; the ACL accepts it on the overlay
     // address, the port map maps it to the service port, the translator hands it to the
     // IPv4-only service.
-    b.send(&udp(client6, v6(SELF_NODE4, LISTEN), &payload(100)))
+    b.send(&udp(client6, v6(SELF_EAM6, LISTEN), &payload(100)))
         .await?;
     let (src, dst, segment) = expect_endpoints(&mut a).await?;
-    assert_eq!((src, dst), (client4, v4(SELF4, SERVICE)));
+    assert_eq!((src, dst), (client4, v4(SELF_EAM4, SERVICE)));
     assert_eq!(segment[8..], payload(100));
 
     // The IPv4 reply is translated, mapped back to the listen port and passes the ACL.
-    a.send_with_room(&udp(v4(SELF4, SERVICE), client4, &payload(300)))
+    a.send_with_room(&udp(v4(SELF_EAM4, SERVICE), client4, &payload(300)))
         .await?;
     let (src, dst, segment) = expect_endpoints(&mut b).await?;
-    assert_eq!((src, dst), (v6(SELF_NODE4, LISTEN), client6));
+    assert_eq!((src, dst), (v6(SELF_EAM6, LISTEN), client6));
     assert_eq!(segment[8..], payload(300));
 
-    // An IPv4-only client on `a` reaches `b` through the alias; `b`'s reply passes the
+    // An IPv4-only client on `a` reaches `b` through its `eam4`; `b`'s reply passes the
     // ACL as a reply although no rule allows it, since the ACL saw the same IPv6 flow
     // leave.
-    let app = v4(SELF4, 40021);
-    a.send_with_room(&udp(app, v4(PEER_ALIAS4, 7000), b"request"))
+    let app = v4(SELF_EAM4, 40021);
+    a.send_with_room(&udp(app, v4(PEER_EAM4, 7000), b"request"))
         .await?;
     let (src, dst, _) = expect_endpoints(&mut b).await?;
-    assert_eq!((src, dst), (v6(SELF_NODE4, 40021), v6(PEER_NODE4, 7000)));
-    b.send(&udp(v6(PEER_NODE4, 7000), v6(SELF_NODE4, 40021), b"reply"))
+    assert_eq!((src, dst), (v6(SELF_EAM6, 40021), v6(PEER_EAM6, 7000)));
+    b.send(&udp(v6(PEER_EAM6, 7000), v6(SELF_EAM6, 40021), b"reply"))
         .await?;
     let (src, dst, _) = expect_endpoints(&mut a).await?;
-    assert_eq!((src, dst), (v4(PEER_ALIAS4, 7000), app));
+    assert_eq!((src, dst), (v4(PEER_EAM4, 7000), app));
 
     let stats = acl.stats();
     assert_eq!((stats.accepted, stats.replies, stats.denied), (1, 1, 0));
@@ -381,12 +385,8 @@ async fn full_stack_drops_a_peer_the_acl_denies() -> TestResult {
     let mut events = a.subscribe().await?;
     let peer_b = a.peer_of(&b).await?;
 
-    b.send(&udp(
-        v6(PEER_NODE4, 40030),
-        v6(SELF_NODE4, LISTEN),
-        b"denied",
-    ))
-    .await?;
+    b.send(&udp(v6(PEER_EAM6, 40030), v6(SELF_EAM6, LISTEN), b"denied"))
+        .await?;
     events
         .expect(|e| {
             matches!(e, Event::Dropped { peer: Some(p), reason } if *p == peer_b

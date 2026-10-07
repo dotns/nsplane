@@ -1,6 +1,8 @@
 //! [`WssStreamClient`]: TCP streams and UDP flows multiplexed over WSS sessions with the
 //! `WsFrame` protocol of the [`frame`](crate::frame) module.
 
+#![expect(deprecated, reason = "the deprecated stream client and its tests")]
+
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -27,8 +29,12 @@ use crate::connect::{
 };
 use crate::frame::{self, FrameCommand, HEADER_LEN, Protocol, WsFrame};
 
-/// The most stream bytes one DATA frame carries: a frame is at most 65536 bytes, as the
-/// ns client reads.
+/// The most stream bytes one DATA frame carries: a frame is at most 65536 bytes, the most
+/// a peer reads.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 pub const MAX_DATA_PAYLOAD: usize = 65_536 - HEADER_LEN;
 
 /// What each queued received frame costs on top of its payload, so that empty or tiny
@@ -38,7 +44,11 @@ pub(crate) const FRAME_OVERHEAD: usize = 64;
 /// How long a session closing on its own waits for the WebSocket close handshake.
 pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(1);
 
-/// The bounds of a [`WssStreamClient`]; the defaults are ns `tunnel-ws`'s.
+/// The bounds of a [`WssStreamClient`].
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WssStreamLimits {
@@ -56,9 +66,9 @@ pub struct WssStreamLimits {
     /// The most live streams (TCP streams and UDP flows) on one session; an open beyond it
     /// goes to another session, dialed when none has room. 1024 by default.
     ///
-    /// NSGW rejects OPENs beyond its own per-session stream cap (1024 by default,
-    /// configurable by its operator), so keep this at most the gateway's cap. NSGW writes
-    /// all streams of a session through one shared writer queue.
+    /// A server may reject OPENs beyond its own per-session stream cap (commonly 1024),
+    /// so keep this at most the server's cap. A server may also write all streams of a
+    /// session through one shared writer queue.
     pub max_streams_per_session: usize,
     /// How long [`connect`](WssStreamClient::connect), [`open_tcp`](WssStreamClient::open_tcp)
     /// and [`open_udp`](WssStreamClient::open_udp) wait for a session. Past it they fail
@@ -113,7 +123,7 @@ impl WssStreamLimits {
     }
 
     /// Sets [`max_streams_per_session`](Self::max_streams_per_session); see there for the
-    /// NSGW caveats.
+    /// server caveats.
     #[must_use]
     pub const fn max_streams_per_session(mut self, streams: usize) -> Self {
         self.max_streams_per_session = streams;
@@ -129,6 +139,10 @@ impl WssStreamLimits {
 }
 
 /// The counters of a [`WssStreamClient`] and its sessions.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Debug, Default)]
 pub struct WssStreamStats {
     sessions: AtomicU64,
@@ -401,7 +415,7 @@ impl Session {
                 }
             }
             FrameCommand::Close => {
-                // Acknowledged whether known or not, as the ns terminate does.
+                // Acknowledged whether known or not, as the server side does.
                 self.send_control(&WsFrame::close_ack(id));
                 self.finish(id);
             }
@@ -425,7 +439,7 @@ impl Session {
     /// Queues `payload` for `flow` within the stream and session bounds.
     ///
     /// Over a bound, a TCP stream is reset (only that stream: a CLOSE goes out and its
-    /// reads fail once the queued bytes are read), as the ns terminate closes a stream it
+    /// reads fail once the queued bytes are read), as the server side closes a stream it
     /// cannot buffer for; a UDP datagram is dropped and the flow stays.
     fn deliver(&self, flow: &Flow, payload: Bytes) {
         let mut state = lock(&flow.state);
@@ -854,8 +868,8 @@ type Reserve = Pin<
 ///
 /// Writes go out as DATA frames of at most [`MAX_DATA_PAYLOAD`] bytes, waiting for room on
 /// the session's data queue. [`poll_shutdown`](AsyncWrite::poll_shutdown) sends CLOSE
-/// behind the data already written: the wire has no other half-close, and the ns
-/// terminate tears the stream down on it, so the stream keeps reading until the peer's
+/// behind the data already written: the wire has no other half-close, and the server
+/// side may tear the stream down on it, so the stream keeps reading until the peer's
 /// CLOSE or `CLOSE_ACK` and then reads EOF. A CLOSE from the peer reads as EOF (after the
 /// bytes before it) and is answered with `CLOSE_ACK`. Dropping the stream without a
 /// shutdown sends CLOSE too.
@@ -864,6 +878,10 @@ type Reserve = Pin<
 /// the peer sent more than the stream's receive buffer holds; writes then fail with
 /// [`io::ErrorKind::BrokenPipe`] (or the reset), as they do after a shutdown or the
 /// peer's CLOSE.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 pub struct WssTcpStream {
     handle: Handle,
     reserve: Option<Reserve>,
@@ -970,6 +988,10 @@ impl AsyncWrite for WssTcpStream {
 ///
 /// A datagram arriving while the flow's receive buffer is full is dropped (and counted in
 /// [`WssStreamStats::overflows`]); the flow stays open.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 pub struct WssUdpFlow {
     handle: Handle,
 }
@@ -1035,8 +1057,9 @@ impl WssUdpFlow {
     }
 }
 
-/// Opens TCP streams and UDP flows to targets behind a WSS terminate (NSGW, or the ns
-/// terminate), multiplexed over WSS sessions with the `WsFrame` protocol.
+/// Opens TCP streams and UDP flows to targets behind a WSS server (such as a
+/// [`WssStreamServer`](crate::WssStreamServer)), multiplexed over WSS sessions with the
+/// `WsFrame` protocol.
 ///
 /// - **Sessions**: dialed like [`WssDialer`](crate::WssDialer) links (URL, TLS, headers,
 ///   bearer, 401/403 as [`LinkState::Rejected`], the doubling backoff, pings and the read
@@ -1058,6 +1081,10 @@ impl WssUdpFlow {
 ///
 /// Clones share the sessions. Dropping the last clone ends them, failing the streams
 /// still open.
+#[deprecated(
+    since = "0.11.0",
+    note = "the WebSocket stream carrier has no remaining consumer and will be removed once its users have switched; use a WireGuard peer over WssDialer instead"
+)]
 #[derive(Clone)]
 pub struct WssStreamClient {
     inner: Arc<Inner>,
@@ -1127,7 +1154,7 @@ impl WssStreamClient {
 
     /// Opens a TCP stream to `target` (an OPEN with protocol TCP).
     ///
-    /// Returns once the OPEN is queued: the protocol has no open reply, and a terminate
+    /// Returns once the OPEN is queued: the protocol has no open reply, and a server
     /// refusing the target answers with CLOSE, which reads as EOF.
     pub async fn open_tcp(&self, target: SocketAddr) -> io::Result<WssTcpStream> {
         let handle = self.inner.open(target, Protocol::Tcp).await?;

@@ -1,7 +1,7 @@
 //! Stateful NAT64 to a LAN (NAPT) for subnet routing (`Nat64Lan`).
 //!
-//! A [`Nat64Lan`] lets IPv6 peers reach an IPv4 LAN behind this node, ported
-//! from ns `SubnetRoute` / `SubnetConntrack`. Each [`LanRoute`] maps an IPv6
+//! A [`Nat64Lan`] lets IPv6 peers reach an IPv4 LAN behind this node. Each
+//! [`LanRoute`] maps an IPv6
 //! /96 (`mapped`) to an IPv4 prefix (`real`); the low 32 bits of a mapped
 //! address are the LAN host:
 //!
@@ -9,8 +9,7 @@
 //!   `ICMPv6` echo request to an address of a route's `mapped` prefix becomes
 //!   an IPv4 packet to the embedded LAN host, from the route's `snat_source`
 //!   with a source port (or ICMP echo identifier) reserved for the flow.
-//!   Exactly one route must resolve the destination, as ns
-//!   `SubnetRouteSet::route_for`: a destination that several routes resolve
+//!   Exactly one route must resolve the destination: a destination that several routes resolve
 //!   is dropped ([`reasons::AMBIGUOUS_ROUTE`]), and a destination inside a
 //!   `mapped` prefix that no route resolves to a safe address of its `real`
 //!   prefix (see [`LanRoute::resolve`]) is dropped
@@ -31,9 +30,8 @@
 //! (its start moves forward inside the buffer) and a reply grows by 20 bytes
 //! into its headroom; a reply whose buffer has less than 20 bytes of headroom
 //! is copied once into a buffer with the standard headroom. Checksums are
-//! recomputed, as ns does. Translated IPv4 packets leave DF clear, as ns
-//! does, unless [`Nat64LanConfig::set_df`] is on. The hop limit and TTL are
-//! copied, as ns does: the node forwarding the translated packet decrements
+//! recomputed. Translated IPv4 packets leave DF clear unless
+//! [`Nat64LanConfig::set_df`] is on. The hop limit and TTL are copied: the node forwarding the translated packet decrements
 //! them.
 //!
 //! # Routes
@@ -43,7 +41,7 @@
 //! not translated, even if its flow is still tracked. A flow whose
 //! destination still resolves after a route replacement keeps the SNAT
 //! address it was created with; to revoke the flows of a removed route, call
-//! [`Nat64Lan::remove_flow`] for them, as ns does.
+//! [`Nat64Lan::remove_flow`] for them.
 //!
 //! # Flows and limits
 //!
@@ -57,12 +55,11 @@
 //! is released through [`SnatPorts::release`] whenever the flow goes: idle
 //! expiry, eviction, or [`Nat64Lan::remove_flow`]. Ports are reserved per
 //! `(snat_source, port)` for the flow's lifetime, so a caller can couple
-//! them to host sockets, as ns does with [`SnatPorts`].
+//! them to host sockets through [`SnatPorts`].
 //!
-//! Differences from ns: routes are replaced through the caller's
-//! [`ArcSwap`]; flows expire when idle (ns keeps them until
-//! `remove_translated_flow`); DF can be turned on with
-//! [`Nat64LanConfig::set_df`].
+//! Routes are replaced through the caller's [`ArcSwap`]; flows expire when
+//! idle, not only through [`Nat64Lan::remove_flow`]; DF can be turned on
+//! with [`Nat64LanConfig::set_df`].
 //!
 //! # Placement
 //!
@@ -110,12 +107,12 @@ pub struct Nat64LanConfig {
     /// directions (e.g. the local link MTU minus 60). Default `None`.
     pub max_tcp_mss: Option<u16>,
     /// SNAT port candidates a new flow tries before it is dropped with
-    /// [`reasons::PORT_EXHAUSTED`]. Default 32, as ns.
+    /// [`reasons::PORT_EXHAUSTED`]. Default 32.
     pub port_tries: u8,
     /// The flow table: size and idle timeouts.
     pub conntrack: ConntrackConfig,
     /// Set DF on translated IPv4 packets above 1260 bytes (RFC 7915).
-    /// Default `false`, as ns.
+    /// Default `false`.
     ///
     /// With DF, LAN hosts and routers answer an oversized packet with ICMP
     /// Fragmentation Needed, which [`Nat64Lan::reverse`] turns into an
@@ -293,7 +290,7 @@ impl Nat64Lan {
 
     /// Removes the flow from `snat` to the LAN `target` (TCP or UDP; for ICMP
     /// the echo identifier is `snat`'s port and `target`'s port is ignored)
-    /// and releases its SNAT port, as ns `remove_translated_flow`. Returns
+    /// and releases its SNAT port. Returns
     /// whether a flow was removed.
     pub fn remove_flow(&self, protocol: u8, snat: SocketAddrV4, target: SocketAddrV4) -> bool {
         let target_port = match protocol {

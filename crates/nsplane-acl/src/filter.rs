@@ -11,72 +11,57 @@ use std::time::{Duration, Instant};
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
-use crate::engine::{
-    AclEngine, Evaluation, Membership, PinholeMatch, ReplyDependency, Snapshot, SourceAssertion,
-};
+use crate::engine::{AclEngine, Evaluation, Membership, PinholeMatch, ReplyDependency, Snapshot};
 use crate::lru::{FlowHash, LruMap};
-use crate::matcher::ADDRESS_LABEL;
 use crate::net::{IpNet, Protocol};
 use crate::pinhole::Direction;
 use crate::reasons;
-use crate::rules::{Flow, Label, LabelSet, PolicyState, Transport};
-
-/// The label set of a source assertion: its principal, plus the internal
-/// address label when the assertion carries an IP (the document's CIDR
-/// sources require it).
-pub(crate) fn assertion_labels(assertion: &SourceAssertion) -> LabelSet {
-    let principal = Label::from(assertion.source_anchor());
-    match assertion.ip() {
-        Some(_) => LabelSet::new([principal, Label::from(ADDRESS_LABEL)]),
-        None => LabelSet::new([principal]),
-    }
-}
+use crate::rules::{Flow, LabelSet, PolicyState, Transport};
 
 // ── Peer identity ─────────────────────────────────────────────────────────────
 
-/// Resolves the [`SourceAssertion`] (the ACL principal) of a peer.
+/// Resolves the [`LabelSet`] of a peer: the labels the rules, namespaces,
+/// grants and pinholes see for its packets.
 ///
-/// Implemented by closures `Fn(PeerId) -> Option<SourceAssertion>`, by
-/// [`PeerIdentityMap`] and by `Arc<T>` of any implementation, so a caller can
-/// keep a handle to update the identities while the filter uses them.
+/// Implemented by closures `Fn(PeerId) -> Option<LabelSet>`, by
+/// [`PeerLabelMap`] and by `Arc<T>` of any implementation, so a caller can
+/// keep a handle to update the labels while the filter uses them.
 pub trait PeerIdentity: Send + Sync + 'static {
-    /// The source assertion of `peer`, or `None` when the peer is unknown or
-    /// has no principal independent of the packet's address (see
-    /// [`by_source`](Self::by_source)).
-    fn assertion(&self, peer: PeerId) -> Option<SourceAssertion>;
+    /// The labels of `peer`; `None`: unknown peer (its inbound packets are
+    /// dropped with [`reasons::UNKNOWN_PEER`]).
+    fn labels(&self, peer: PeerId) -> Option<LabelSet>;
 
-    /// The source assertion of `peer` for a packet whose remote address is
-    /// `src`: the IP source of an inbound packet, the IP destination of an
-    /// outbound one. [`AclFilter`] resolves every principal through this
+    /// The labels of `peer` for a packet whose remote address is `remote`:
+    /// the IP source of an inbound packet, the IP destination of an
+    /// outbound one. [`AclFilter`] resolves every source through this
     /// method.
     ///
-    /// The default ignores `src` and returns [`assertion`](Self::assertion).
-    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
-        let _ = src;
-        self.assertion(peer)
+    /// The default ignores `remote` and returns [`labels`](Self::labels).
+    fn labels_for(&self, peer: PeerId, remote: IpAddr) -> Option<LabelSet> {
+        let _ = remote;
+        self.labels(peer)
     }
 
-    /// Whether the [`assertion_for`](Self::assertion_for) of `peer` depends
-    /// on the address. [`AclFilter`] asks once per peer and identity
-    /// generation, then caches the principal of such a peer per address, and
-    /// of any other peer per peer; so a versioned implementation must return
-    /// `true` for every peer whose assertion depends on the address. Default
-    /// `false`.
+    /// Whether [`labels_for`](Self::labels_for) of `peer` depends on the
+    /// address. [`AclFilter`] asks once per peer and identity generation,
+    /// then caches the labels of such a peer per address, and of any other
+    /// peer per peer; so a versioned implementation must return `true` for
+    /// every peer whose labels depend on the address. Default `false`.
     fn by_source(&self, peer: PeerId) -> bool {
         let _ = peer;
         false
     }
 
-    /// The identity generation: a non-zero value that changes whenever an
-    /// assertion may have changed (bumped once the change is visible to
-    /// [`assertion_for`](Self::assertion_for) and
-    /// [`by_source`](Self::by_source)). [`AclFilter`] caches the resolved
-    /// peers and the flow verdicts under it.
+    /// The identity generation: a non-zero value that changes whenever any
+    /// answer may have changed (bumped once the change is visible to
+    /// [`labels_for`](Self::labels_for) and [`by_source`](Self::by_source)).
+    /// [`AclFilter`] caches the resolved peers and the flow verdicts under
+    /// it.
     ///
     /// The default, 0, means "not versioned": the filter then resolves the
-    /// peer and evaluates the policy on every packet (no principal cache, no
+    /// peer and evaluates the policy on every packet (no label cache, no
     /// flow verdict cache, no bypass), so correctness never depends on it.
-    /// Closures keep the default; [`PeerIdentityMap`] is versioned.
+    /// Closures keep the default; [`PeerLabelMap`] is versioned.
     fn generation(&self) -> u64 {
         0
     }
@@ -84,20 +69,20 @@ pub trait PeerIdentity: Send + Sync + 'static {
 
 impl<F> PeerIdentity for F
 where
-    F: Fn(PeerId) -> Option<SourceAssertion> + Send + Sync + 'static,
+    F: Fn(PeerId) -> Option<LabelSet> + Send + Sync + 'static,
 {
-    fn assertion(&self, peer: PeerId) -> Option<SourceAssertion> {
+    fn labels(&self, peer: PeerId) -> Option<LabelSet> {
         self(peer)
     }
 }
 
 impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
-    fn assertion(&self, peer: PeerId) -> Option<SourceAssertion> {
-        (**self).assertion(peer)
+    fn labels(&self, peer: PeerId) -> Option<LabelSet> {
+        (**self).labels(peer)
     }
 
-    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
-        (**self).assertion_for(peer, src)
+    fn labels_for(&self, peer: PeerId, remote: IpAddr) -> Option<LabelSet> {
+        (**self).labels_for(peer, remote)
     }
 
     fn by_source(&self, peer: PeerId) -> bool {
@@ -109,28 +94,28 @@ impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
     }
 }
 
-/// A concurrent map from peers to their source assertions.
+/// A concurrent, versioned map from peers to their labels.
 ///
 /// Wrap it in an `Arc` and hand a clone to the filter to update it at runtime.
 /// Every [`insert`](Self::insert), [`insert_by_source`](Self::insert_by_source)
 /// and [`remove`](Self::remove) bumps its
-/// [generation](PeerIdentity::generation), so the filter's cached principals
-/// and verdicts never outlive an identity change.
+/// [generation](PeerIdentity::generation) under its write lock, so the
+/// filter's cached labels and verdicts never outlive a change.
 #[derive(Debug)]
-pub struct PeerIdentityMap {
-    map: RwLock<HashMap<PeerId, Identity>>,
+pub struct PeerLabelMap {
+    map: RwLock<HashMap<PeerId, Entry>>,
     generation: AtomicU64,
 }
 
-/// The identity of a peer in a [`PeerIdentityMap`].
+/// The labels of a peer in a [`PeerLabelMap`].
 #[derive(Debug)]
-enum Identity {
-    Assertion(SourceAssertion),
-    /// The principal of each packet is its remote address.
-    BySource,
+enum Entry {
+    Labels(LabelSet),
+    /// Labels per remote address, longest prefix first.
+    BySource(Vec<(IpNet, LabelSet)>),
 }
 
-impl Default for PeerIdentityMap {
+impl Default for PeerLabelMap {
     fn default() -> Self {
         Self {
             map: RwLock::default(),
@@ -139,43 +124,42 @@ impl Default for PeerIdentityMap {
     }
 }
 
-impl PeerIdentityMap {
+impl PeerLabelMap {
     /// An empty map.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the assertion of `peer`, replacing any previous one. A relayed
-    /// client is inserted with its [`SourceAssertion::WgPeerKey`].
-    pub fn insert(&self, peer: PeerId, assertion: SourceAssertion) {
-        self.set(peer, Identity::Assertion(assertion));
+    /// Set the labels of `peer`, replacing any previous entry.
+    pub fn insert(&self, peer: PeerId, labels: LabelSet) {
+        self.set(peer, Entry::Labels(labels));
     }
 
-    /// Make `peer` terminate by source address, replacing any previous
-    /// assertion: the principal of each of its packets is the packet's
-    /// remote address (see [`PeerIdentity::assertion_for`]), a
-    /// [`SourceAssertion::Terminate`] binding of that address (anchored by
-    /// the address text). For a gateway whose packets
-    /// carry several source addresses. [`assertion`](PeerIdentity::assertion)
-    /// of such a peer is `None`.
-    pub fn insert_by_source(&self, peer: PeerId) {
-        self.set(peer, Identity::BySource);
+    /// Set the labels of `peer` per remote address, replacing any previous
+    /// entry: the longest prefix of `by_address` containing the address wins
+    /// (the first one listed among equally long prefixes), and an address
+    /// outside every prefix makes the source unknown. For a peer whose
+    /// packets carry several source addresses.
+    /// [`labels`](PeerIdentity::labels) of such a peer is `None`.
+    pub fn insert_by_source(&self, peer: PeerId, mut by_address: Vec<(IpNet, LabelSet)>) {
+        // Stable: equally long prefixes keep their order.
+        by_address.sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
+        self.set(peer, Entry::BySource(by_address));
     }
 
-    fn set(&self, peer: PeerId, identity: Identity) {
+    fn set(&self, peer: PeerId, entry: Entry) {
         let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
-        map.insert(peer, identity);
+        map.insert(peer, entry);
         // Still under the write lock: a reader seeing the new generation
-        // also sees the new assertion.
+        // also sees the new labels.
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<PeerId, Identity>> {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<PeerId, Entry>> {
         self.map.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Remove the assertion (or the by-source mark) of `peer`; the peer
-    /// becomes unknown.
+    /// Remove the entry of `peer`; the peer becomes unknown.
     pub fn remove(&self, peer: PeerId) {
         let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
         map.remove(&peer);
@@ -183,23 +167,26 @@ impl PeerIdentityMap {
     }
 }
 
-impl PeerIdentity for PeerIdentityMap {
-    fn assertion(&self, peer: PeerId) -> Option<SourceAssertion> {
+impl PeerIdentity for PeerLabelMap {
+    fn labels(&self, peer: PeerId) -> Option<LabelSet> {
         match self.read().get(&peer)? {
-            Identity::Assertion(assertion) => Some(assertion.clone()),
-            Identity::BySource => None,
+            Entry::Labels(labels) => Some(labels.clone()),
+            Entry::BySource(_) => None,
         }
     }
 
-    fn assertion_for(&self, peer: PeerId, src: IpAddr) -> Option<SourceAssertion> {
+    fn labels_for(&self, peer: PeerId, remote: IpAddr) -> Option<LabelSet> {
         match self.read().get(&peer)? {
-            Identity::Assertion(assertion) => Some(assertion.clone()),
-            Identity::BySource => Some(SourceAssertion::from_ip(src)),
+            Entry::Labels(labels) => Some(labels.clone()),
+            Entry::BySource(by_address) => by_address
+                .iter()
+                .find(|(net, _)| net.contains(&remote))
+                .map(|(_, labels)| labels.clone()),
         }
     }
 
     fn by_source(&self, peer: PeerId) -> bool {
-        matches!(self.read().get(&peer), Some(Identity::BySource))
+        matches!(self.read().get(&peer), Some(Entry::BySource(_)))
     }
 
     fn generation(&self) -> u64 {
@@ -283,23 +270,16 @@ impl Default for AclFilterConfig {
 }
 
 impl AclFilterConfig {
-    /// The settings of the ACL step of an ns account: for inbound IPv4
-    /// packets the filter equals ns `is_local_node_packet(pkt, local) ||
-    /// is_icmp_echo_reply(pkt) || acl_check_packet(..)` (the first term only
-    /// when `local` is set), with the principals of a [`PeerIdentityMap`]
-    /// holding the relay clients under [`insert`](PeerIdentityMap::insert)
-    /// with their [`SourceAssertion::WgPeerKey`] and every other peer under
-    /// [`insert_by_source`](PeerIdentityMap::insert_by_source).
-    ///
-    /// That is: no reply allowances ([`stateful_replies`](Self::stateful_replies)
-    /// off), protocols other than TCP and UDP dropped, IPv4 fragments gated by
+    /// A stateless preset for inbound IPv4: no reply allowances
+    /// ([`stateful_replies`](Self::stateful_replies) off), protocols other
+    /// than TCP and UDP dropped, IPv4 fragments gated by
     /// [`FragmentMode::ALLOW_ONLY`], `local` in
     /// [`accept_to_local`](Self::accept_to_local) and
     /// [`accept_icmp_echo_reply`](Self::accept_icmp_echo_reply) on, and IPv6
-    /// packets accepted unevaluated ([`Ipv6Mode::Accept`], as ns: IPv6 is
-    /// authorized by the core's inbound destinations). Drop reasons follow
-    /// this filter (a packet ns drops is dropped here, possibly with another
-    /// reason), and outbound IPv4 packets keep this filter's handling.
+    /// packets accepted unevaluated ([`Ipv6Mode::Accept`]; an IPv6
+    /// destination is then checked by the core's inbound destinations).
+    /// Outbound IPv4 packets keep this filter's handling. The labels of the
+    /// filter's [`PeerLabelMap`] and the rules decide the rest.
     pub fn crates_acl(local: Option<Ipv4Addr>) -> Self {
         Self {
             allow_other_protocols: false,
@@ -756,7 +736,7 @@ fn is_icmp_echo_reply(bytes: &[u8]) -> bool {
 /// dropped silently.
 ///
 /// `peers` caches the resolved peers, bounded by `reply_capacity` too. A
-/// peer whose principal depends on the packet's address
+/// peer whose labels depend on the packet's address
 /// ([`PeerIdentity::by_source`]) is cached there as a marker, and resolved
 /// per remote address in `sources`, bounded by `reply_capacity` as well (when
 /// full, the least recently used entry is evicted in O(1); an evicted address
@@ -834,15 +814,13 @@ enum Hit {
 struct PeerInfo {
     generation: u64,
     identity: u64,
-    /// A marker: the peer's principal depends on the packet's address and is
+    /// A marker: the peer's labels depend on the packet's address and are
     /// resolved per address. Its other fields are those of an unknown peer.
     by_source: bool,
-    /// The labels of the peer's source assertion, `None` for an unknown peer.
+    /// The peer's labels, `None` for an unknown peer.
     labels: Option<LabelSet>,
-    /// The address of an IP-bearing assertion: the source address its rules
-    /// match.
-    address: Option<IpAddr>,
-    /// The peer's namespaces, `None` when it is in no namespace.
+    /// The peer's namespaces (the union over its labels, computed once
+    /// here), `None` when it is in no namespace.
     membership: Option<Arc<Membership>>,
     /// How the policy governs the peer.
     governed: Governed,
@@ -873,21 +851,15 @@ impl PeerInfo {
         src: IpAddr,
         generation: u64,
     ) -> Self {
-        Self::new(
-            identity.assertion_for(peer, src).as_ref(),
-            snapshot,
-            generation,
-            false,
-        )
+        Self::new(identity.labels_for(peer, src), snapshot, generation, false)
     }
 
     fn new(
-        source: Option<&SourceAssertion>,
+        labels: Option<LabelSet>,
         snapshot: &Snapshot,
         generation: u64,
         by_source: bool,
     ) -> Self {
-        let labels = source.map(assertion_labels);
         let membership = labels
             .as_ref()
             .and_then(|labels| snapshot.membership_of(labels));
@@ -904,18 +876,8 @@ impl PeerInfo {
                 .as_ref()
                 .is_some_and(|labels| snapshot.has_pinholes_of(labels)),
             bypass: labels.is_some() && snapshot.bypasses(membership.as_deref()),
-            address: source.and_then(SourceAssertion::ip),
             labels,
             membership,
-        }
-    }
-
-    /// `flow` as the peer's rules see it: from the address of an IP-bearing
-    /// assertion.
-    fn flow(&self, flow: Flow) -> Flow {
-        Flow {
-            src: self.address.unwrap_or(flow.src),
-            ..flow
         }
     }
 }
@@ -952,7 +914,7 @@ fn other_transport(packet: &IpPacket<'_>, protocol: u8) -> Option<Transport> {
 /// A [`PacketFilter`] enforcing an [`AclEngine`] policy on inbound packets.
 ///
 /// Inbound packets from a peer are evaluated as a new [`Flow`] from the
-/// peer's labels (its [`PeerIdentity`] assertion) unless a reply allowance or
+/// peer's labels (resolved by its [`PeerIdentity`]) unless a reply allowance or
 /// a cached verdict holds them, exactly as
 /// [`AclEngine::evaluate`] decides; anything the policy does not accept is
 /// dropped with a [`reasons`] constant. With nothing loaded every inbound
@@ -968,8 +930,8 @@ fn other_transport(packet: &IpPacket<'_>, protocol: u8) -> Option<Transport> {
 /// without traffic.
 ///
 /// **Per-flow hook**: with a versioned identity
-/// ([`PeerIdentity::generation`] non-zero, e.g. a [`PeerIdentityMap`]), the
-/// filter caches each peer's resolved principal and the verdict of each TCP or
+/// ([`PeerIdentity::generation`] non-zero, e.g. a [`PeerLabelMap`]), the
+/// filter caches each peer's resolved labels and the verdict of each TCP or
 /// UDP flow's first packet from a namespace member, tagged with the engine's
 /// [generation](AclEngine::generation) and the identity generation; later
 /// packets of the flow reuse it until either changes. Peers whose policy
@@ -1471,8 +1433,7 @@ impl Inner {
             return (FlowVerdict::new(Outcome::UnknownPeer), true);
         };
         let membership = info.membership.as_deref();
-        let evaluation =
-            snapshot.evaluate(labels, membership, &info.flow(flow), || self.engine.now());
+        let evaluation = snapshot.evaluate(labels, membership, &flow, || self.engine.now());
         let outcome = match evaluation {
             Evaluation::Rule { .. }
             | Evaluation::Grant(_)
@@ -1543,12 +1504,7 @@ impl Inner {
             let info = match src {
                 _ if self.identity.by_source(peer) => PeerInfo::new(None, snapshot, identity, true),
                 Some(src) => PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity),
-                None => PeerInfo::new(
-                    self.identity.assertion(peer).as_ref(),
-                    snapshot,
-                    identity,
-                    false,
-                ),
+                None => PeerInfo::new(self.identity.labels(peer), snapshot, identity, false),
             };
             Arc::new(info)
         };
@@ -1727,16 +1683,11 @@ impl Inner {
             };
             (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
         } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
-            let source = dst.map_or_else(
-                || self.identity.assertion(peer),
-                |dst| self.identity.assertion_for(peer, dst),
+            let labels = dst.map_or_else(
+                || self.identity.labels(peer),
+                |dst| self.identity.labels_for(peer, dst),
             );
-            Some(Arc::new(PeerInfo::new(
-                source.as_ref(),
-                &snapshot,
-                0,
-                false,
-            )))
+            Some(Arc::new(PeerInfo::new(labels, &snapshot, 0, false)))
         } else {
             None
         };
@@ -2099,19 +2050,34 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::engine::{TerminateBinding, wg_peer_anchor};
-    use crate::namespace::{Grant, GrantEnd, NamespaceMember, NamespacePolicy, OutboundRule};
+    use crate::namespace::{
+        Grant, GrantEnd, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule,
+    };
     use crate::policy::{AclAction, AclPolicy, AclRule};
-    use crate::rules::{NotInstalled, RuleSet};
+    use crate::rules::{Label, NotInstalled, PortSet, ProtocolMatch, Rule, RuleSet};
     use crate::test_packets::{Frag, icmp_echo, ip, ip_frag, tcp, tcp_packet, udp_packet};
 
     const PEER: PeerId = PeerId::new(1);
     const OTHER_PEER: PeerId = PeerId::new(2);
     const KEY_PEER: PeerId = PeerId::new(3);
-    const KEY: [u8; 32] = [7; 32];
+    /// The label of the peers judged by their source address.
+    const ADDR: &str = "addr";
 
     fn addr(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    /// The label of `KEY_PEER`.
+    fn key_label() -> Label {
+        Label::from("key:07")
+    }
+
+    fn label_set(labels: &[&str]) -> LabelSet {
+        labels.iter().map(|&label| Label::from(label)).collect()
     }
 
     fn rule(src: &str, dst: &str, proto: &str) -> AclRule {
@@ -2131,30 +2097,32 @@ mod tests {
         }
     }
 
-    /// Remote `10.0.0.1` (or `fd00::1`) may reach local TCP 80 (or 443); the key
-    /// principal may reach UDP 53.
-    fn test_policy() -> AclPolicy {
-        policy(vec![
-            rule("10.0.0.1/32", "10.0.0.2:80", "tcp"),
-            rule("fd00::1/128", "fd00::2:443", "tcp"),
-            rule(&wg_peer_anchor(&KEY), "*:53", "udp"),
+    /// An `ADDR`-labelled source at `10.0.0.1` (or `fd00::1`) may reach
+    /// `10.0.0.2` TCP 80 (or `fd00::2` TCP 443); a `key_label()` source may
+    /// reach UDP 53.
+    fn test_policy() -> RuleSet {
+        RuleSet::new([
+            Rule::new("0", vec![ProtocolMatch::Tcp(PortSet::single(80))])
+                .with_labels([ADDR.into()])
+                .with_sources([net("10.0.0.1/32")])
+                .with_destinations([net("10.0.0.2/32")]),
+            Rule::new("1", vec![ProtocolMatch::Tcp(PortSet::single(443))])
+                .with_labels([ADDR.into()])
+                .with_sources([net("fd00::1/128")])
+                .with_destinations([net("fd00::2/128")]),
+            Rule::new("2", vec![ProtocolMatch::Udp(PortSet::single(53))])
+                .with_labels([key_label()]),
         ])
+        .unwrap()
     }
 
-    fn identity() -> Arc<PeerIdentityMap> {
-        let map = Arc::new(PeerIdentityMap::new());
-        for (peer, ip) in [(PEER, "10.0.0.1"), (OTHER_PEER, "10.0.0.9")] {
-            map.insert(
-                peer,
-                SourceAssertion::Terminate {
-                    binding: TerminateBinding {
-                        ip: Some(addr(ip)),
-                        anchor: ip.to_owned(),
-                    },
-                },
-            );
-        }
-        map.insert(KEY_PEER, SourceAssertion::WgPeerKey { pubkey: KEY });
+    /// `PEER` and `OTHER_PEER` carry `ADDR` and a label of their own,
+    /// `KEY_PEER` the key label.
+    fn identity() -> Arc<PeerLabelMap> {
+        let map = Arc::new(PeerLabelMap::new());
+        map.insert(PEER, label_set(&[ADDR, "peer-1"]));
+        map.insert(OTHER_PEER, label_set(&[ADDR, "peer-2"]));
+        map.insert(KEY_PEER, LabelSet::new([key_label()]));
         map
     }
 
@@ -2164,8 +2132,14 @@ mod tests {
         engine
     }
 
+    fn rules_engine(rules: RuleSet) -> Arc<AclEngine> {
+        let engine = Arc::new(AclEngine::new());
+        engine.install(rules);
+        engine
+    }
+
     fn filter_with(config: AclFilterConfig) -> AclFilter {
-        AclFilter::with_config(loaded_engine(test_policy()), identity(), config)
+        AclFilter::with_config(rules_engine(test_policy()), identity(), config)
     }
 
     fn filter() -> AclFilter {
@@ -2211,16 +2185,8 @@ mod tests {
         let (r, l) = (addr("fd00::1"), addr("fd00::2"));
         let peer6 = PeerId::new(6);
         let map = identity();
-        map.insert(
-            peer6,
-            SourceAssertion::Terminate {
-                binding: TerminateBinding {
-                    ip: Some(r),
-                    anchor: "v6".to_owned(),
-                },
-            },
-        );
-        let f6 = AclFilter::new(loaded_engine(test_policy()), map);
+        map.insert(peer6, label_set(&[ADDR, "v6"]));
+        let f6 = AclFilter::new(rules_engine(test_policy()), map);
         assert_eq!(
             inbound(&f6, peer6, tcp_packet(r, 4000, l, 443)),
             Verdict::Accept
@@ -2233,18 +2199,23 @@ mod tests {
             inbound(&f6, peer6, udp_packet(r, 4000, l, 443)),
             drop(reasons::DENIED)
         );
-        // PEER's binding is the IPv4 address, so the IPv6 CIDR rule never matches it.
+        // The prefixes read the flow's source address: PEER sending from
+        // fd00::1 matches the IPv6 rule too.
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 443)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(addr("fd00::9"), 4000, l, 443)),
             drop(reasons::DENIED)
         );
     }
 
     #[test]
-    fn key_principal_and_cidr_principal() {
+    fn key_label_and_address_label() {
         let f = filter();
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
-        // The key principal matches by key regardless of the packet's source address.
+        // The key label matches regardless of the packet's source address.
         assert_eq!(
             inbound(&f, KEY_PEER, udp_packet(r, 5000, l, 53)),
             Verdict::Accept
@@ -2257,12 +2228,13 @@ mod tests {
             ),
             Verdict::Accept
         );
-        // A key assertion never matches a CIDR rule, even from an allowed address.
+        // Without the address label the prefix rule never matches, even from
+        // an allowed address.
         assert_eq!(
             inbound(&f, KEY_PEER, tcp_packet(r, 4000, l, 80)),
             drop(reasons::DENIED)
         );
-        // A terminate binding does not match the key rule.
+        // The address label does not match the key rule.
         assert_eq!(
             inbound(&f, PEER, udp_packet(r, 5000, l, 53)),
             drop(reasons::DENIED)
@@ -2292,9 +2264,8 @@ mod tests {
 
     #[test]
     fn closure_identity() {
-        let identity =
-            |peer: PeerId| (peer == PEER).then_some(SourceAssertion::WgPeerKey { pubkey: KEY });
-        let f = AclFilter::new(loaded_engine(test_policy()), identity);
+        let identity = |peer: PeerId| (peer == PEER).then(|| LabelSet::new([key_label()]));
+        let f = AclFilter::new(rules_engine(test_policy()), identity);
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
         assert_eq!(
             inbound(&f, PEER, udp_packet(r, 5000, l, 53)),
@@ -2309,7 +2280,7 @@ mod tests {
     #[test]
     fn identity_map_updates_through_shared_handle() {
         let map = identity();
-        let f = AclFilter::new(loaded_engine(test_policy()), Arc::clone(&map));
+        let f = AclFilter::new(rules_engine(test_policy()), Arc::clone(&map));
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
@@ -2331,7 +2302,7 @@ mod tests {
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             drop(reasons::NO_POLICY)
         );
-        engine.load(test_policy()).unwrap();
+        engine.install(test_policy());
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
             Verdict::Accept
@@ -2712,23 +2683,19 @@ mod tests {
     const E: PeerId = PeerId::new(15);
     const LOCAL: &str = "fd00::1";
 
-    fn peer_key(peer: PeerId) -> [u8; 32] {
-        [u8::try_from(peer.get()).unwrap(); 32]
-    }
-
     fn peer_addr(peer: PeerId) -> IpAddr {
         addr(&format!("fd00::{:x}", peer.get()))
     }
 
-    fn principal(peer: PeerId) -> String {
-        wg_peer_anchor(&peer_key(peer))
+    fn label(peer: PeerId) -> Label {
+        Label::from(format!("k{}", peer.get()))
     }
 
     fn members(peers: &[PeerId]) -> Vec<NamespaceMember> {
         peers
             .iter()
             .map(|&peer| NamespaceMember {
-                principal: principal(peer),
+                label: label(peer),
                 addresses: vec![peer_addr(peer).to_string().parse().unwrap()],
             })
             .collect()
@@ -2751,16 +2718,11 @@ mod tests {
         }
     }
 
-    /// Identities: the legacy peers plus `A..=E` by key.
-    fn ns_identity() -> Arc<PeerIdentityMap> {
+    /// Identities: the peers of `identity()` plus `A..=E` by their label.
+    fn ns_identity() -> Arc<PeerLabelMap> {
         let map = identity();
         for peer in [A, B, C, D, E] {
-            map.insert(
-                peer,
-                SourceAssertion::WgPeerKey {
-                    pubkey: peer_key(peer),
-                },
-            );
+            map.insert(peer, LabelSet::new([label(peer)]));
         }
         map
     }
@@ -2811,7 +2773,7 @@ mod tests {
                 "a-to-b",
                 Grant {
                     from: GrantEnd::Namespace("nsd:a".into()),
-                    to: GrantEnd::Peer(principal(B)),
+                    to: GrantEnd::Label(label(B)),
                     proto: Some("tcp".to_owned()),
                     ports: Some("443".to_owned()),
                 },
@@ -2854,7 +2816,7 @@ mod tests {
             .store_namespace("nsd:b", namespace(&[B], None))
             .unwrap();
         let grant = Grant {
-            from: GrantEnd::Peer(principal(A)),
+            from: GrantEnd::Label(label(A)),
             to: GrantEnd::Namespace("nsd:b".into()),
             proto: None,
             ports: Some("443".to_owned()),
@@ -3085,12 +3047,13 @@ mod tests {
     }
 
     #[test]
-    fn app_namespace_member_gets_nothing_inbound() {
+    fn pinhole_namespace_member_gets_nothing_inbound() {
         let engine = loaded_engine(policy(vec![rule("*", "*:*", "tcp")]));
         engine
             .store_namespace(
-                "app:s1",
+                "s1",
                 NamespacePolicy {
+                    kind: NamespaceKind::Pinholes,
                     members: members(&[E]),
                     outbound: Some(Vec::new()),
                     ..NamespacePolicy::default()
@@ -3115,7 +3078,7 @@ mod tests {
             inbound(&f, A, tcp_packet(a, 4000, e, 22)),
             drop(reasons::CROSS_NAMESPACE)
         );
-        // Its outbound is restricted by the app namespace.
+        // Its outbound is restricted by the pinhole namespace.
         assert_eq!(
             outbound(&f, E, tcp_packet(local, 22, e, 4000)),
             drop(reasons::OUTBOUND)
@@ -3123,8 +3086,8 @@ mod tests {
     }
 
     #[test]
-    fn principals_in_no_namespace_use_the_default_policy() {
-        let engine = loaded_engine(test_policy());
+    fn sources_in_no_namespace_use_the_default_policy() {
+        let engine = rules_engine(test_policy());
         engine
             .store_namespace("nsd:a", namespace(&[A], Some(Vec::new())))
             .unwrap();
@@ -3187,7 +3150,7 @@ mod tests {
             .store_grant(
                 "a-to-c",
                 Grant {
-                    from: GrantEnd::Peer(principal(A)),
+                    from: GrantEnd::Label(label(A)),
                     to: GrantEnd::Namespace("nsd:c".into()),
                     proto: Some("tcp".to_owned()),
                     ports: Some("443".to_owned()),
@@ -3219,8 +3182,9 @@ mod tests {
     use crate::pinhole::{Direction, PinholeGuard, PinholeSpec};
     use std::time::Instant;
 
-    /// Sessions and kinds: `app:s1` holds `E` (session-only) and `A`; `A` is
-    /// also in `quick`, which allows "transfer" pinholes.
+    /// Sessions and kinds: the pinhole namespace `s1` holds `E` (only there)
+    /// and `A`; `A` is also in the rule namespace `quick`, which permits
+    /// "transfer" pinholes.
     fn pinhole_engine(
         app_outbound: Option<Vec<OutboundRule>>,
     ) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
@@ -3228,12 +3192,13 @@ mod tests {
         let handle = Arc::clone(&clock);
         let engine = Arc::new(AclEngine::with_clock(move || *handle.lock().unwrap()));
         let mut quick = namespace(&[A], None);
-        quick.allow_app_pinholes.insert("transfer".to_owned());
+        quick.pinhole_kinds.insert("transfer".to_owned());
         engine.store_namespace("quick", quick).unwrap();
         engine
             .store_namespace(
-                "app:s1",
+                "s1",
                 NamespacePolicy {
+                    kind: NamespaceKind::Pinholes,
                     members: members(&[A, E]),
                     outbound: app_outbound,
                     ..NamespacePolicy::default()
@@ -3253,9 +3218,9 @@ mod tests {
         let expires_at = *clock.lock().unwrap() + Duration::from_secs(60);
         engine
             .open_pinhole(
-                "app:s1",
+                "s1",
                 PinholeSpec {
-                    peer: principal(peer),
+                    label: label(peer),
                     kind: "transfer".to_owned(),
                     protocol: Protocol::Tcp,
                     direction,
@@ -3503,7 +3468,7 @@ mod tests {
         let f = ns_filter(&engine, AclFilterConfig::default());
         let (a, local) = (peer_addr(A), addr(LOCAL));
         let guard = open(&engine, &clock, A, Direction::Inbound, 9000);
-        assert!(engine.remove_namespace("app:s1"));
+        assert!(engine.remove_namespace("s1"));
         assert!(!guard.is_open());
         assert_eq!(
             inbound(&f, A, tcp_packet(a, 4000, local, 9000)),
@@ -3520,7 +3485,7 @@ mod tests {
     #[test]
     fn clear_all_is_an_emergency_stop() {
         let (engine, clock) = pinhole_engine(Some(Vec::new()));
-        engine.load(test_policy()).unwrap();
+        engine.install(test_policy());
         engine
             .store_namespace("nsd:b", namespace(&[B], None))
             .unwrap();
@@ -3528,8 +3493,8 @@ mod tests {
             .store_grant(
                 "a-to-b",
                 Grant {
-                    from: GrantEnd::Peer(principal(A)),
-                    to: GrantEnd::Peer(principal(B)),
+                    from: GrantEnd::Label(label(A)),
+                    to: GrantEnd::Label(label(B)),
                     proto: Some("tcp".to_owned()),
                     ports: Some("443".to_owned()),
                 },
@@ -3597,26 +3562,49 @@ mod tests {
             inbound(&f, B, tcp_packet(b, 4000, local, 22)),
             Verdict::Accept
         );
-        engine.load(test_policy()).unwrap();
+        engine.install(test_policy());
         assert_eq!(
             inbound(&f, PEER, tcp_packet(remote, 4000, v4_local, 80)),
             Verdict::Accept
         );
     }
 
-    // ── Per-source principals ──
+    // ── Labels per source address ──
 
     const GATEWAY: PeerId = PeerId::new(20);
 
-    /// The ns identities plus [`GATEWAY`] terminating by source address.
-    fn by_source_identity() -> Arc<PeerIdentityMap> {
+    /// The host prefix of `ip`.
+    fn host(ip: IpAddr) -> IpNet {
+        ip.to_string().parse().unwrap()
+    }
+
+    /// The member label of the source address `ip`.
+    fn address_label(ip: IpAddr) -> Label {
+        Label::from(format!("addr:{ip}"))
+    }
+
+    /// The ns identities plus [`GATEWAY`] labelled per source address:
+    /// `peer_addr(A)` carries `ADDR` and its own member label, every other
+    /// address `ADDR`.
+    fn by_source_identity() -> Arc<PeerLabelMap> {
         let map = ns_identity();
-        map.insert_by_source(GATEWAY);
+        let member = peer_addr(A);
+        map.insert_by_source(
+            GATEWAY,
+            vec![
+                (net("0.0.0.0/0"), label_set(&[ADDR])),
+                (net("::/0"), label_set(&[ADDR])),
+                (
+                    host(member),
+                    LabelSet::new([ADDR.into(), address_label(member)]),
+                ),
+            ],
+        );
         map
     }
 
-    /// A namespace whose only member is the source address `member`, with
-    /// `acls` and the given outbound rules.
+    /// A namespace whose only member is the label of the source address
+    /// `member`, with `acls` and the given outbound rules.
     fn address_namespace(
         member: IpAddr,
         acls: Vec<AclRule>,
@@ -3624,8 +3612,8 @@ mod tests {
     ) -> NamespacePolicy {
         NamespacePolicy {
             members: vec![NamespaceMember {
-                principal: member.to_string(),
-                addresses: vec![member.to_string().parse().unwrap()],
+                label: address_label(member),
+                addresses: vec![host(member)],
             }],
             policy: policy(acls),
             outbound,
@@ -3634,19 +3622,62 @@ mod tests {
     }
 
     #[test]
+    fn insert_by_source_takes_the_longest_prefix() {
+        let map = PeerLabelMap::new();
+        let generation = map.generation();
+        map.insert_by_source(
+            GATEWAY,
+            vec![
+                (net("10.0.0.0/8"), label_set(&["wide"])),
+                (net("10.1.0.0/16"), label_set(&["narrow"])),
+                (net("10.1.2.3/32"), label_set(&["host", "narrow"])),
+                (net("10.1.0.0/16"), label_set(&["second"])),
+            ],
+        );
+        assert!(map.generation() > generation);
+        assert!(map.by_source(GATEWAY));
+        assert_eq!(map.labels(GATEWAY), None);
+        let labels = |ip| map.labels_for(GATEWAY, addr(ip));
+        assert_eq!(labels("10.1.2.3"), Some(label_set(&["host", "narrow"])));
+        // Equally long prefixes: the first listed wins.
+        assert_eq!(labels("10.1.2.4"), Some(label_set(&["narrow"])));
+        assert_eq!(labels("10.2.0.1"), Some(label_set(&["wide"])));
+        // Outside every prefix (another family included): unknown.
+        assert_eq!(labels("11.0.0.1"), None);
+        assert_eq!(labels("fd00::1"), None);
+        // An empty table makes every address unknown.
+        map.insert_by_source(GATEWAY, Vec::new());
+        assert_eq!(labels("10.1.2.3"), None);
+        // `insert` replaces the table.
+        map.insert(GATEWAY, label_set(&["fixed"]));
+        assert!(!map.by_source(GATEWAY));
+        assert_eq!(labels("11.0.0.1"), Some(label_set(&["fixed"])));
+    }
+
+    #[test]
+    fn by_source_peer_outside_its_prefixes_is_unknown() {
+        let map = Arc::new(PeerLabelMap::new());
+        map.insert_by_source(GATEWAY, vec![(net("10.0.0.0/30"), label_set(&[ADDR]))]);
+        let f = AclFilter::new(rules_engine(test_policy()), Arc::clone(&map));
+        let l = addr("10.0.0.2");
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(addr("10.0.0.1"), 4000, l, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, GATEWAY, tcp_packet(addr("10.0.0.5"), 4000, l, 80)),
+            drop(reasons::UNKNOWN_PEER)
+        );
+        assert_eq!(f.stats().unknown_peer, 1);
+    }
+
+    #[test]
     fn by_source_peer_is_judged_by_each_source() {
         let map = by_source_identity();
         let (r, other, l) = (addr("10.0.0.1"), addr("10.0.0.5"), addr("10.0.0.2"));
-        // The principal of a bare source IP, and no address-independent one.
-        assert!(map.assertion(GATEWAY).is_none());
-        let source = map.assertion_for(GATEWAY, r).unwrap();
-        let expected = SourceAssertion::from_ip(r);
-        assert_eq!(source.source_anchor(), expected.source_anchor());
-        assert_eq!(source.ip(), expected.ip());
-        assert_eq!(source.source_class(), "terminate-binding");
         assert!(map.by_source(GATEWAY) && !map.by_source(KEY_PEER));
 
-        let f = AclFilter::new(loaded_engine(test_policy()), Arc::clone(&map));
+        let f = AclFilter::new(rules_engine(test_policy()), Arc::clone(&map));
         assert_eq!(
             inbound(&f, GATEWAY, tcp_packet(r, 4000, l, 80)),
             Verdict::Accept
@@ -3655,7 +3686,7 @@ mod tests {
             inbound(&f, GATEWAY, tcp_packet(other, 4000, l, 80)),
             drop(reasons::DENIED)
         );
-        // Each source keeps its own principal on later packets.
+        // Each source keeps its own verdict on later packets.
         assert_eq!(
             inbound(&f, GATEWAY, tcp_packet(r, 4001, l, 80)),
             Verdict::Accept
@@ -3664,7 +3695,7 @@ mod tests {
             inbound(&f, GATEWAY, tcp_packet(other, 4001, l, 80)),
             drop(reasons::DENIED)
         );
-        // A relayed client in the same map keeps its key principal.
+        // A peer with a fixed label set in the same map keeps it.
         assert_eq!(
             inbound(&f, KEY_PEER, udp_packet(other, 5000, l, 53)),
             Verdict::Accept
@@ -3681,7 +3712,7 @@ mod tests {
             reply_capacity: 2,
             ..AclFilterConfig::default()
         };
-        let f = AclFilter::with_config(loaded_engine(test_policy()), by_source_identity(), config);
+        let f = AclFilter::with_config(rules_engine(test_policy()), by_source_identity(), config);
         let l = addr("10.0.0.2");
         for round in 0..3 {
             for last in [1, 5, 6, 7] {
@@ -3702,16 +3733,16 @@ mod tests {
     }
 
     #[test]
-    fn closure_identity_uses_the_default_assertion_for() {
-        let identity =
-            |peer: PeerId| (peer == PEER).then_some(SourceAssertion::WgPeerKey { pubkey: KEY });
+    fn closure_identity_uses_the_default_labels_for() {
+        let identity = |peer: PeerId| (peer == PEER).then(|| LabelSet::new([key_label()]));
         let any = addr("10.0.0.9");
         assert_eq!(
-            identity.assertion_for(PEER, any).map(|s| s.source_anchor()),
-            Some(wg_peer_anchor(&KEY))
+            identity.labels_for(PEER, any),
+            Some(LabelSet::new([key_label()]))
         );
         assert!(!identity.by_source(PEER));
-        let f = AclFilter::new(loaded_engine(test_policy()), identity);
+        assert_eq!(identity.generation(), 0);
+        let f = AclFilter::new(rules_engine(test_policy()), identity);
         assert_eq!(
             inbound(&f, PEER, udp_packet(any, 5000, addr("10.0.0.2"), 53)),
             Verdict::Accept
@@ -3742,15 +3773,11 @@ mod tests {
             drop(reasons::NO_POLICY)
         );
 
-        // By key: the key principal is in no namespace either.
-        map.insert(
-            GATEWAY,
-            SourceAssertion::WgPeerKey {
-                pubkey: peer_key(A),
-            },
-        );
+        // A fixed label set: `label(A)` is in no namespace either.
+        map.insert(GATEWAY, LabelSet::new([label(A)]));
         assert_eq!(inbound(&f, GATEWAY, packet()), drop(reasons::NO_POLICY));
-        map.insert_by_source(GATEWAY);
+        let table = vec![(host(member), LabelSet::new([address_label(member)]))];
+        map.insert_by_source(GATEWAY, table);
         assert_eq!(inbound(&f, GATEWAY, packet()), Verdict::Accept);
         map.remove(GATEWAY);
         assert_eq!(inbound(&f, GATEWAY, packet()), drop(reasons::UNKNOWN_PEER));
@@ -3787,9 +3814,12 @@ mod tests {
             Verdict::Accept
         );
         // A partial default policy bypasses nothing.
-        engine
-            .load(policy(vec![rule("fd00::d/128", "*:*", "udp")]))
-            .unwrap();
+        engine.install(
+            RuleSet::new([Rule::new("d", vec![ProtocolMatch::Udp(PortSet::Any)])
+                .with_labels([ADDR.into()])
+                .with_sources([net("fd00::d/128")])])
+            .unwrap(),
+        );
         assert_eq!(
             inbound(&f, GATEWAY, udp_packet(addr("fd00::d"), 4000, local, 9999)),
             Verdict::Accept
@@ -3852,12 +3882,12 @@ mod tests {
 
     // ── crates/acl mode: allow-only fragments, bypass flags ───────────────
 
-    /// An engine with `policy` loaded whose clock is moved by hand.
-    fn clocked_engine(policy: AclPolicy) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
+    /// An engine with `rules` installed whose clock is moved by hand.
+    fn clocked_engine(rules: RuleSet) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
         let clock = Arc::new(Mutex::new(Instant::now()));
         let handle = Arc::clone(&clock);
         let engine = AclEngine::with_clock(move || *handle.lock().unwrap());
-        engine.load(policy).unwrap();
+        engine.install(rules);
         (Arc::new(engine), clock)
     }
 
@@ -3999,7 +4029,7 @@ mod tests {
 
     #[test]
     fn allow_only_judges_continuations_before_the_policy_check() {
-        let engine = loaded_engine(test_policy());
+        let engine = rules_engine(test_policy());
         let f = AclFilter::with_config(Arc::clone(&engine), identity(), allow_only(4096));
         assert_eq!(inbound(&f, PEER, first_fragment(7, 80)), Verdict::Accept);
         engine.uninstall();
@@ -4130,7 +4160,7 @@ mod tests {
     #[test]
     fn stateless_replies_are_judged_by_the_policy_only() {
         let f = AclFilter::with_config(
-            loaded_engine(test_policy()),
+            rules_engine(test_policy()),
             identity(),
             AclFilterConfig {
                 stateful_replies: false,
@@ -4211,12 +4241,12 @@ mod tests {
         assert!(table.pending.is_empty());
     }
 
-    /// The identities of an ns account: gateways by source, relay clients
-    /// by key.
-    fn crates_acl_identity() -> Arc<PeerIdentityMap> {
-        let map = Arc::new(PeerIdentityMap::new());
-        map.insert_by_source(PEER);
-        map.insert(KEY_PEER, SourceAssertion::WgPeerKey { pubkey: KEY });
+    /// The identities of an ns account: the address label for the peers
+    /// judged by source address, the key label for relay clients.
+    fn crates_acl_identity() -> Arc<PeerLabelMap> {
+        let map = Arc::new(PeerLabelMap::new());
+        map.insert(PEER, label_set(&[ADDR]));
+        map.insert(KEY_PEER, LabelSet::new([key_label()]));
         map
     }
 
@@ -4259,7 +4289,7 @@ mod tests {
             inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(0, 1))),
             Verdict::Accept
         );
-        engine.load(test_policy()).unwrap();
+        engine.install(test_policy());
         // By source address.
         assert_eq!(
             inbound(&f, PEER, tcp_packet(r, 4000, l, 80)),
@@ -4347,7 +4377,7 @@ mod tests {
                 ),
                 drop(reasons::NO_POLICY)
             );
-            engine.load(test_policy()).unwrap();
+            engine.install(test_policy());
             // A denied port, a fragment, ICMPv6 and a truncated packet.
             assert_eq!(
                 inbound(&f, PEER, tcp_packet(r, 4000, l, 444)),
@@ -4434,7 +4464,7 @@ mod tests {
 
     /// `A` restricted to outbound TCP 80, in one namespace with `C`.
     fn scope_engine() -> Arc<AclEngine> {
-        let engine = loaded_engine(test_policy());
+        let engine = rules_engine(test_policy());
         engine
             .store_namespace(
                 "nsd:a",
@@ -4821,7 +4851,7 @@ mod tests {
 
         // An unversioned identity resolves the peer on each packet.
         let identities = ns_identity();
-        let identity = move |peer: PeerId| identities.assertion(peer);
+        let identity = move |peer: PeerId| identities.labels(peer);
         let rule = OtherProtocolRule::new(OtherProtocol::IcmpEcho, own_addresses());
         let f = AclFilter::with_scope(
             Arc::clone(&engine),
@@ -4871,7 +4901,7 @@ mod tests {
         // IPv6, to an unrestricted key peer.
         let map = ns_identity();
         let peer6 = PeerId::new(6);
-        map.insert(peer6, SourceAssertion::WgPeerKey { pubkey: [6; 32] });
+        map.insert(peer6, label_set(&["k6"]));
         let rule = OtherProtocolRule::new(OtherProtocol::IcmpEcho, own_addresses());
         let f6 = AclFilter::with_scope(
             Arc::clone(&engine),
@@ -5010,7 +5040,7 @@ mod tests {
                 "nsd:a",
                 NamespacePolicy {
                     members: vec![NamespaceMember {
-                        principal: "10.0.0.1".to_owned(),
+                        label: "peer-1".into(),
                         addresses: Vec::new(),
                     }],
                     ..NamespacePolicy::default()
@@ -5042,7 +5072,7 @@ mod tests {
                 vec![ProtocolMatch::Icmp(IcmpTypes::Only(vec![8, 128]))],
             )
             .with_destinations(["10.0.0.2/32".parse().unwrap(), "fd00::/64".parse().unwrap()]),
-            Rule::new("gre", vec![ProtocolMatch::Ip(47)]).with_labels(["10.0.0.1".into()]),
+            Rule::new("gre", vec![ProtocolMatch::Ip(47)]).with_labels(["peer-1".into()]),
         ]);
         let f = AclFilter::new(Arc::clone(&engine), identity());
         let (r, l, other) = (addr("10.0.0.1"), addr("10.0.0.2"), addr("10.0.0.3"));
@@ -5139,7 +5169,7 @@ mod tests {
     fn a_rule_with_labels_and_prefixes_needs_both() {
         use crate::{PortSet, ProtocolMatch, Rule};
         let engine = typed_rules([Rule::new("both", vec![ProtocolMatch::Tcp(PortSet::Any)])
-            .with_labels([wg_peer_anchor(&KEY).into()])
+            .with_labels([key_label()])
             .with_sources(["fd00::/64".parse().unwrap()])]);
         let f = AclFilter::new(engine, identity());
         let l = addr("fd00::2");
@@ -5153,10 +5183,7 @@ mod tests {
             drop(reasons::DENIED)
         );
         let map = identity();
-        map.insert(
-            PeerId::new(8),
-            SourceAssertion::External { idp: "x".into() },
-        );
+        map.insert(PeerId::new(8), label_set(&["other"]));
         let f = AclFilter::new(
             typed_rules([Rule::new("any", vec![ProtocolMatch::Any])
                 .with_sources(["fd00::/64".parse().unwrap()])]),

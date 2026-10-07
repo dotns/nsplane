@@ -766,10 +766,10 @@ scenario_acl_gateway() {
 
 # --- scenarios: NAT --------------------------------------------------------------------
 # translate_node t between an IPv4-only client c on t's LAN (an internal network) and a
-# kernel WireGuard peer k whose overlay is IPv6 only. t maps k's /127 group (node6
-# fd00:a::2:0, node4 fd00:a::2:1) to alias4 10.200.0.2, its own self4 10.200.0.1 to node4
-# fd00:a::1:1, and the LAN's IPv4 subnet to fd00:1::/96. c routes 10.200.0.2 through t;
-# k sees the requests from fd00:1::<c's IPv4> to node4 and answers over IPv6.
+# kernel WireGuard peer k whose overlay is IPv6 only. t maps k (peer6 fd00:a::2:0, eam6
+# fd00:a::2:1) to eam4 10.200.0.2, its own eam4 10.200.0.1 to eam6 fd00:a::1:1, and the
+# LAN's IPv4 subnet to fd00:1::/96. c routes 10.200.0.2 through t; k sees the requests from
+# fd00:1::<c's IPv4> to eam6 and answers over IPv6.
 scenario_translate_node() {
   local lan
   lan=$(case_net lan)
@@ -786,8 +786,8 @@ scenario_translate_node() {
   docker exec -d "$(ctr k)" bash -c "socat TCP6-LISTEN:7,fork,reuseaddr PIPE > /socat-7.log 2>&1 &
     socat UDP6-RECVFROM:7,fork PIPE >> /socat-7.log 2>&1 & wait"
   node t translate_node --self 10.200.0.1=fd00:a::1:1 --peer "$k_pub,endpoint=$k_ip:$PORT" \
-    --map "$k_pub,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2" --lan "$lan4=fd00:1::/96"
-  # node4 is k's preferred source, so its UDP replies come from the address c talks to.
+    --map "$k_pub,peer6=fd00:a::2:0,eam6=fd00:a::2:1,eam4=10.200.0.2" --lan "$lan4=fd00:1::/96"
+  # eam6 is k's preferred source, so its UDP replies come from the address c talks to.
   kernel_wg k fd00:a::2:1/128 "$t_pub" "$t_ip" fd00:1::/96,fd00:a::1:0/127 fd00:1::/96 fd00:a::1:0/127
   X k 'ip addr add fd00:a::2:0/128 dev wg0 preferred_lft 0'
   echo_check c tcp 10.200.0.2 7; echo_check c udp 10.200.0.2 7
@@ -804,7 +804,7 @@ scenario_translate_node() {
   local mtu=1420
   node t translate_node --no-offload --mtu "$mtu" --self 10.200.0.1=fd00:a::1:1 \
     --peer "$k_pub,endpoint=$k_ip:$PORT" \
-    --map "$k_pub,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2" --lan "$lan4=fd00:1::/96"
+    --map "$k_pub,peer6=fd00:a::2:0,eam6=fd00:a::2:1,eam4=10.200.0.2" --lan "$lan4=fd00:1::/96"
   wait_log t translate_node 'TUN device opened.* offload=off'
   # The replies are the translated size, 20 bytes over the MTU; k's IPv4 underlay has room.
   X k "ip link set wg0 mtu $(( mtu + 20 ))"
