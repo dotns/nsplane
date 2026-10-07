@@ -24,7 +24,8 @@ pub const UNMAPPED: &str = "translation unmapped";
 /// The mapping of an address belongs to another peer than the packet's peer.
 pub const PEER_MISMATCH: &str = "translation peer mismatch";
 /// A peer sent a packet whose source is one of this node's local-view
-/// addresses (an IPv4 alias, an IPv4 LAN address or an IPv6 alias).
+/// addresses (an IPv4 EAM address, an IPv4 LAN address or a local IPv6
+/// address).
 pub const SPOOFED_SOURCE: &str = "translation spoofed source";
 /// The transport protocol cannot be translated (only TCP, UDP and ICMP can).
 pub const UNSUPPORTED_PROTOCOL: &str = "translation unsupported protocol";

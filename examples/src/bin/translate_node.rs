@@ -7,22 +7,23 @@
 //!
 //! The address model ([`TranslationTable`]):
 //!
-//! - Every peer owns a /127 IPv6 group: `node6`, its native IPv6 address, and `node4`, the
-//!   address that stands for its IPv4 side. `--map <PUBKEY>,node6=..,node4=..` names them.
-//! - `alias4=<IPv4>` is the local IPv4 address of the peer: IPv4 to `alias4` leaves as IPv6
-//!   to `node4`, and IPv6 from `node4` arrives from `alias4`. `alias6=<IPv6>` is a local
-//!   IPv6 alias, rewritten to and from `node6`.
-//! - `--self <SELF4>=<NODE4>`: this node's own IPv4 address and the `node4` of its own
-//!   group; local packets from `self4` leave from `node4` and replies to `node4` arrive at
-//!   `self4`. `self4/32` is added to the interface unless an `--address` covers it.
+//! - Every peer has `peer6`, its own IPv6 address on the tunnel, and `eam6`, the IPv6 side
+//!   of its explicit address mapping (EAM). `--map <PUBKEY>,peer6=..,eam6=..` names them.
+//! - `eam4=<IPv4>` is the local IPv4 side of the peer's EAM: IPv4 to `eam4` leaves as IPv6
+//!   to `eam6`, and IPv6 from `eam6` arrives from `eam4`. `local6=<IPv6>` is a local
+//!   IPv6 address for the peer, rewritten to and from `peer6`.
+//! - `--self <EAM4>=<EAM6>`: this node's own EAM, its IPv4 address and the IPv6 address it
+//!   translates to and from; local packets from `eam4` leave from `eam6` and replies to
+//!   `eam6` arrive at `eam4`. `eam4/32` is added to the interface unless an `--address`
+//!   covers it.
 //! - `--lan <LAN4>=<LAN6>[@<PUBKEY>]` pairs an IPv4 prefix with an IPv6 /96: an IPv4
 //!   address inside `lan4` is the IPv6 address `lan6` with the IPv4 address in its low 32
-//!   bits. Without `@` the LAN is behind this node (hosts that route to the peers' aliases
+//!   bits. Without `@` the LAN is behind this node (hosts that route to the peers' local addresses
 //!   through it, with IP forwarding on); with `@` it is behind that peer.
 //!
 //! The core routes a local packet by its destination before the translator runs, and
 //! checks a peer's source address before the translator sees it. So each mapped peer's
-//! allowed IPs get its `alias4/32`, `alias6/128`, `node4/128` and `node6/128`, and those of
+//! allowed IPs get its `eam4/32`, `local6/128`, `eam6/128` and `peer6/128`, and those of
 //! a peer with LANs behind it the `lan4` and `lan6` prefixes, on top of its `allowed-ips`;
 //! the interface gets the routes to them as `tun_node` does. The translator's counters are
 //! in the status file's `extra.translate`.
@@ -33,7 +34,7 @@
 //!
 //! Usage: `sudo cargo run -p nsplane-examples --bin translate_node -- --private-key <KEY>
 //! --self 10.200.0.1=fd00:a::1:1 --peer <PUBKEY>,endpoint=192.0.2.2:51820
-//! --map <PUBKEY>,node6=fd00:a::2:0,node4=fd00:a::2:1,alias4=10.200.0.2
+//! --map <PUBKEY>,peer6=fd00:a::2:0,eam6=fd00:a::2:1,eam4=10.200.0.2
 //! --lan 192.168.50.0/24=fd00:1::/96`
 //!
 //! [`LanPrefix`]: nsplane_nat::LanPrefix
@@ -83,12 +84,12 @@ mod unix {
         #[command(flatten)]
         tun: TunArgs,
 
-        /// This node's IPv4 address and the `node4` of its own /127 group
-        #[arg(long = "self", value_name = "SELF4=NODE4")]
+        /// This node's IPv4 address and the IPv6 address it translates to and from
+        #[arg(long = "self", value_name = "EAM4=EAM6")]
         self_mapping: Option<SelfSpec>,
 
         /// The addresses of a `--peer`, repeatable:
-        /// `<base64 pubkey>,node6=<IPv6>,node4=<IPv6>[,alias4=<IPv4>][,alias6=<IPv6>]`
+        /// `<base64 pubkey>,peer6=<IPv6>,eam6=<IPv6>[,eam4=<IPv4>][,local6=<IPv6>]`
         #[arg(long, value_name = "SPEC")]
         map: Vec<MapSpec>,
 
@@ -106,16 +107,16 @@ mod unix {
         type Err = anyhow::Error;
 
         fn from_str(s: &str) -> anyhow::Result<Self> {
-            let (self4, node4) = s
+            let (eam4, eam6) = s
                 .split_once('=')
-                .ok_or_else(|| anyhow!("`{s}` is not `<self4>=<node4>`"))?;
+                .ok_or_else(|| anyhow!("`{s}` is not `<eam4>=<eam6>`"))?;
             Ok(Self(SelfMapping {
-                self4: self4
+                eam4: eam4
                     .parse()
-                    .with_context(|| format!("invalid IPv4 address `{self4}`"))?,
-                node4: node4
+                    .with_context(|| format!("invalid IPv4 address `{eam4}`"))?,
+                eam6: eam6
                     .parse()
-                    .with_context(|| format!("invalid IPv6 address `{node4}`"))?,
+                    .with_context(|| format!("invalid IPv6 address `{eam6}`"))?,
             }))
         }
     }
@@ -133,7 +134,7 @@ mod unix {
         fn from_str(spec: &str) -> anyhow::Result<Self> {
             let mut parts = spec.split(',');
             let public_key = PublicKey::from(decode_key(parts.next().unwrap_or_default())?);
-            let (mut node6, mut node4, mut alias6, mut alias4) = (None, None, None, None);
+            let (mut peer6, mut eam6, mut local6, mut eam4) = (None, None, None, None);
             for part in parts {
                 let (name, value) = part
                     .split_once('=')
@@ -144,11 +145,11 @@ mod unix {
                         .with_context(|| format!("invalid IPv6 address `{value}`"))
                 };
                 match name {
-                    "node6" => node6 = Some(v6()?),
-                    "node4" => node4 = Some(v6()?),
-                    "alias6" => alias6 = Some(v6()?),
-                    "alias4" => {
-                        alias4 = Some(
+                    "peer6" => peer6 = Some(v6()?),
+                    "eam6" => eam6 = Some(v6()?),
+                    "local6" => local6 = Some(v6()?),
+                    "eam4" => {
+                        eam4 = Some(
                             value
                                 .parse::<Ipv4Addr>()
                                 .with_context(|| format!("invalid IPv4 address `{value}`"))?,
@@ -158,10 +159,10 @@ mod unix {
                 }
             }
             let mapping = PeerMapping {
-                node6: node6.ok_or_else(|| anyhow!("`{spec}` has no node6"))?,
-                node4: node4.ok_or_else(|| anyhow!("`{spec}` has no node4"))?,
-                alias6,
-                alias4,
+                peer6: peer6.ok_or_else(|| anyhow!("`{spec}` has no peer6"))?,
+                eam6: eam6.ok_or_else(|| anyhow!("`{spec}` has no eam6"))?,
+                local6,
+                eam4,
             };
             Ok(Self {
                 public_key,
@@ -247,9 +248,9 @@ mod unix {
         for map in &args.map {
             let index = peer_of(&map.public_key, "--map")?;
             let m = map.mapping;
-            let mut ips = vec![(m.node6.into(), 128), (m.node4.into(), 128)];
-            ips.extend(m.alias6.map(|a| (a.into(), 128)));
-            ips.extend(m.alias4.map(|a| (a.into(), 32)));
+            let mut ips = vec![(m.peer6.into(), 128), (m.eam6.into(), 128)];
+            ips.extend(m.local6.map(|a| (a.into(), 128)));
+            ips.extend(m.eam4.map(|a| (a.into(), 32)));
             added.push((index, ips));
         }
         for lan in &args.lan {
@@ -274,16 +275,16 @@ mod unix {
         Ok(peers)
     }
 
-    /// The interface addresses: `--address`es, and `self4/32` unless one covers it.
+    /// The interface addresses: `--address`es, and the self `eam4/32` unless one covers it.
     fn addresses(args: &Args) -> Vec<AllowedIp> {
         let mut addresses = args.tun.address.clone();
         if let Some(SelfSpec(own)) = args.self_mapping
             && !addresses
                 .iter()
-                .any(|net| contains(net, IpAddr::V4(own.self4)))
+                .any(|net| contains(net, IpAddr::V4(own.eam4)))
         {
             addresses.push(AllowedIp {
-                addr: IpAddr::V4(own.self4),
+                addr: IpAddr::V4(own.eam4),
                 cidr: 32,
             });
         }
@@ -386,22 +387,22 @@ mod unix {
 
         #[test]
         fn map_spec() {
-            let map: MapSpec = format!("{KEY},node6=fd00::2:0,node4=fd00::2:1,alias4=10.1.0.2")
+            let map: MapSpec = format!("{KEY},peer6=fd00::2:0,eam6=fd00::2:1,eam4=10.1.0.2")
                 .parse()
                 .unwrap();
             assert_eq!(map.public_key.to_bytes(), [1; 32]);
-            assert_eq!(map.mapping.node6, v6("fd00::2:0"));
-            assert_eq!(map.mapping.node4, v6("fd00::2:1"));
-            assert_eq!(map.mapping.alias4, Some(Ipv4Addr::new(10, 1, 0, 2)));
-            assert_eq!(map.mapping.alias6, None);
-            assert!(format!("{KEY},node4=fd00::2:1").parse::<MapSpec>().is_err());
+            assert_eq!(map.mapping.peer6, v6("fd00::2:0"));
+            assert_eq!(map.mapping.eam6, v6("fd00::2:1"));
+            assert_eq!(map.mapping.eam4, Some(Ipv4Addr::new(10, 1, 0, 2)));
+            assert_eq!(map.mapping.local6, None);
+            assert!(format!("{KEY},eam6=fd00::2:1").parse::<MapSpec>().is_err());
             assert!(
-                format!("{KEY},node6=fd00::,node4=fd00::1,alias4=fd00::9")
+                format!("{KEY},peer6=fd00::,eam6=fd00::1,eam4=fd00::9")
                     .parse::<MapSpec>()
                     .is_err()
             );
             assert!(
-                format!("{KEY},node6=fd00::,node4=fd00::1,mtu=1")
+                format!("{KEY},peer6=fd00::,eam6=fd00::1,mtu=1")
                     .parse::<MapSpec>()
                     .is_err()
             );
@@ -420,7 +421,7 @@ mod unix {
         }
 
         #[test]
-        fn mapped_addresses_are_allowed_and_self4_is_an_address() {
+        fn mapped_addresses_are_allowed_and_the_self_eam4_is_an_address() {
             let args = Args::try_parse_from([
                 "translate_node",
                 "--private-key",
@@ -430,7 +431,7 @@ mod unix {
                 "--peer",
                 &format!("{KEY},allowed-ips=fd00::2:1/128"),
                 "--map",
-                &format!("{KEY},node6=fd00::2:0,node4=fd00::2:1,alias4=10.1.0.2"),
+                &format!("{KEY},peer6=fd00::2:0,eam6=fd00::2:1,eam4=10.1.0.2"),
                 "--lan",
                 "192.168.50.0/24=fd00:1::/96",
                 "--lan",
@@ -469,7 +470,7 @@ mod unix {
                 "--peer",
                 KEY,
                 "--map",
-                &format!("{other},node6=fd00::2:0,node4=fd00::2:1"),
+                &format!("{other},peer6=fd00::2:0,eam6=fd00::2:1"),
             ])
             .unwrap();
             assert!(peers_with_mappings(&args).is_err());

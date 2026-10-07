@@ -1,12 +1,12 @@
-//! Per-packet cost of the `Translator` on the `alias4` path.
+//! Per-packet cost of the `Translator` on the `eam4` path.
 //!
-//! - `alias4_out/{tcp,udp}/{64B,1400B|1420B}/{1,1000}`: `outbound` of an IPv4
-//!   packet from `self4` to a peer's `alias4`, translated to IPv6 from the
-//!   self `node4` to the peer's `node4`; the TCP payload is 1400 B and the
+//! - `eam4_out/{tcp,udp}/{64B,1400B|1420B}/{1,1000}`: `outbound` of an IPv4
+//!   packet from the self `eam4` to a peer's `eam4`, translated to IPv6 from the
+//!   self `eam6` to the peer's `eam6`; the TCP payload is 1400 B and the
 //!   UDP payload 1420 B, so both stay within a 1500 B MTU once translated.
 //!   The last segment is the number of peers in the table (lookup cost).
-//! - `alias4_in/...`: `inbound` of the IPv6 reply from the peer's `node4` to
-//!   the self `node4`, translated back to IPv4 from the `alias4` to `self4`.
+//! - `eam4_in/...`: `inbound` of the IPv6 reply from the peer's `eam6` to
+//!   the self `eam6`, translated back to IPv4 from the peer's `eam4` to the self `eam4`.
 //!
 //! Every packet is rebuilt per iteration (in a buffer with the engine's
 //! headroom and room for the 20 bytes the translation adds), so each
@@ -23,20 +23,20 @@ use nsplane_packet::checksum::{
 };
 use nsplane_packet::{PacketBuf, PeerId};
 
-const SELF4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
-const SELF_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xffff, 1);
+const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+const SELF_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xffff, 1);
 /// The peer the packets go to; the other peers only fill the table.
 const PEER: PeerId = PeerId::new(1);
 
-/// The mapping of peer `n` (1-based): `alias4` 100.65.x.y, `node4`
-/// `fd00::n:1`, `node6` `fd00::n:0`.
+/// The mapping of peer `n` (1-based): `eam4` 100.65.x.y, `eam6`
+/// `fd00::n:1`, `peer6` `fd00::n:0`.
 const fn mapping(n: u16) -> PeerMapping {
     let [hi, lo] = n.to_be_bytes();
     PeerMapping {
-        node6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 0),
-        node4: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 1),
-        alias6: None,
-        alias4: Some(Ipv4Addr::new(100, 65, hi, lo)),
+        peer6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 0),
+        eam6: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, n, 1),
+        local6: None,
+        eam4: Some(Ipv4Addr::new(100, 65, hi, lo)),
     }
 }
 
@@ -46,8 +46,8 @@ fn table(peers: u16) -> TranslationTable {
             builder.peer(PeerId::new(u32::from(n)), mapping(n))
         })
         .self_mapping(SelfMapping {
-            self4: SELF4,
-            node4: SELF_NODE4,
+            eam4: SELF_EAM4,
+            eam6: SELF_EAM6,
         })
         .build();
     assert!(table.is_ok(), "invalid table");
@@ -81,17 +81,17 @@ fn seal(protocol: u8, segment: &mut [u8], checksum: u16) {
     segment[at..at + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
-/// An IPv4 packet from `self4` to the peer's `alias4`.
+/// An IPv4 packet from the self `eam4` to the peer's `eam4`.
 fn ipv4(protocol: u8, payload: usize) -> Vec<u8> {
     let dst = Ipv4Addr::new(100, 65, 0, 1);
     let mut segment = segment(protocol, payload);
-    let checksum = transport_checksum_v4(SELF4, dst, protocol, &segment);
+    let checksum = transport_checksum_v4(SELF_EAM4, dst, protocol, &segment);
     seal(protocol, &mut segment, checksum);
     let total = u16::try_from(20 + segment.len()).unwrap_or(u16::MAX);
     let mut bytes = vec![0x45, 0];
     bytes.extend_from_slice(&total.to_be_bytes());
     bytes.extend_from_slice(&[0x12, 0x34, 0x40, 0, 64, protocol, 0, 0]);
-    bytes.extend_from_slice(&SELF4.octets());
+    bytes.extend_from_slice(&SELF_EAM4.octets());
     bytes.extend_from_slice(&dst.octets());
     let checksum = ipv4_header_checksum(&bytes);
     bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
@@ -99,18 +99,18 @@ fn ipv4(protocol: u8, payload: usize) -> Vec<u8> {
     bytes
 }
 
-/// The IPv6 reply from the peer's `node4` to the self `node4`.
+/// The IPv6 reply from the peer's `eam6` to the self `eam6`.
 fn ipv6(protocol: u8, payload: usize) -> Vec<u8> {
-    let src = mapping(1).node4;
+    let src = mapping(1).eam6;
     let mut segment = segment(protocol, payload);
-    let checksum = transport_checksum_v6(src, SELF_NODE4, protocol, &segment);
+    let checksum = transport_checksum_v6(src, SELF_EAM6, protocol, &segment);
     seal(protocol, &mut segment, checksum);
     let len = u16::try_from(segment.len()).unwrap_or(u16::MAX);
     let mut bytes = vec![0x60, 0, 0, 0];
     bytes.extend_from_slice(&len.to_be_bytes());
     bytes.extend_from_slice(&[protocol, 64]);
     bytes.extend_from_slice(&src.octets());
-    bytes.extend_from_slice(&SELF_NODE4.octets());
+    bytes.extend_from_slice(&SELF_EAM6.octets());
     bytes.extend_from_slice(&segment);
     bytes
 }
@@ -130,8 +130,8 @@ const CASES: [(u8, &str, usize); 4] = [
     (17, "udp", 1420),
 ];
 
-fn alias4(c: &mut Criterion) {
-    for (name, outbound) in [("alias4_out", true), ("alias4_in", false)] {
+fn eam4(c: &mut Criterion) {
+    for (name, outbound) in [("eam4_out", true), ("eam4_in", false)] {
         let mut group = c.benchmark_group(name);
         for peers in [1, 1000] {
             let translator = Translator::new(table(peers));
@@ -165,5 +165,5 @@ fn alias4(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, alias4);
+criterion_group!(benches, eam4);
 criterion_main!(benches);

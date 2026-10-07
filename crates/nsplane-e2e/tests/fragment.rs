@@ -21,13 +21,13 @@ use nsplane_nat::{PeerMapping, SelfMapping, TranslationTable, Translator};
 use nsplane_packet::checksum::{internet_checksum, ipv4_header_checksum, transport_checksum_v6};
 use nsplane_packet::{Ipv4Header, Ipv6Header, protocol};
 
-/// Node 1's own IPv4 address, translated to and from `SELF_NODE4`.
-const SELF4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
-const SELF_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
-/// Node 2's /127 group and node 1's IPv4 alias for it.
-const PEER_NODE6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
-const PEER_NODE4: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
-const PEER_ALIAS4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+/// Node 1's own IPv4 address, translated to and from `SELF_EAM6`.
+const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
+const SELF_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
+/// Node 2's `peer6`, `eam6` and node 1's `eam4` for it.
+const PEER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
+const PEER_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
+const PEER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 
 /// Next header value of the IPv6 Fragment header.
 const IPV6_FRAGMENT: u8 = 44;
@@ -48,17 +48,17 @@ impl PacketFilter for Shared {
 
 fn table(peer: Option<PeerId>) -> TestResult<TranslationTable> {
     let mut builder = TranslationTable::builder().self_mapping(SelfMapping {
-        self4: SELF4,
-        node4: SELF_NODE4,
+        eam4: SELF_EAM4,
+        eam6: SELF_EAM6,
     });
     if let Some(peer) = peer {
         builder = builder.peer(
             peer,
             PeerMapping {
-                node6: PEER_NODE6,
-                node4: PEER_NODE4,
-                alias6: None,
-                alias4: Some(PEER_ALIAS4),
+                peer6: PEER6,
+                eam6: PEER_EAM6,
+                local6: None,
+                eam4: Some(PEER_EAM4),
             },
         );
     }
@@ -74,7 +74,7 @@ fn allowed(addr: impl Into<IpAddr>, cidr: u8) -> AllowedIp {
 
 /// Two peers with a fragmenter on node 1 (the IPv4 side) and none on node 2 (the IPv6
 /// side), both with `workers` crypto workers; with `translate`, node 1 also translates node
-/// 2's IPv4 alias.
+/// 2's `eam4`.
 async fn pair(
     translate: bool,
     workers: usize,
@@ -103,12 +103,12 @@ async fn pair(
     })?;
     introduce(&a, &b, None).await?;
     if let Some(translator) = &translator {
-        // Node 1 routes the alias to node 2; node 2 accepts node 1's translated source.
+        // Node 1 routes the `eam4` to node 2; node 2 accepts node 1's translated source.
         let mut peer = b.as_peer(a.path.transport);
-        peer.allowed_ips = vec![allowed(PEER_ALIAS4, 32), allowed(PEER_NODE4, 128)];
+        peer.allowed_ips = vec![allowed(PEER_EAM4, 32), allowed(PEER_EAM6, 128)];
         a.handle.add_or_update_peer(peer).await?;
         let mut peer = a.as_peer(b.path.transport);
-        peer.allowed_ips = vec![allowed(SELF_NODE4, 128)];
+        peer.allowed_ips = vec![allowed(SELF_EAM6, 128)];
         b.handle.add_or_update_peer(peer).await?;
         translator.store(table(Some(a.peer_of(&b).await?))?);
     }
@@ -262,18 +262,18 @@ async fn native_ipv4_keeps_the_full_mtu_with(workers: usize) -> TestResult {
     a.send(&native).await?;
     assert_eq!(b.expect_delivery().await?.1, native);
 
-    // The same size to the translated alias is 20 bytes too large once it is IPv6.
-    let translated = udp4(SELF4, PEER_ALIAS4, &payload(usize::from(MTU) - 28));
+    // The same size to the translated `eam4` is 20 bytes too large once it is IPv6.
+    let translated = udp4(SELF_EAM4, PEER_EAM4, &payload(usize::from(MTU) - 28));
     a.send(&translated).await?;
     expect_fragmentation_needed(&mut a, from_b, &translated, MTU - 20).await?;
     b.expect_no_delivery().await?;
 
     // 20 bytes less fits as one IPv6 packet of exactly the MTU.
-    let fits = udp4(SELF4, PEER_ALIAS4, &payload(usize::from(MTU) - 48));
+    let fits = udp4(SELF_EAM4, PEER_EAM4, &payload(usize::from(MTU) - 48));
     send_with_room(&a, &fits).await?;
     let (_, delivered) = b.expect_delivery().await?;
     assert_eq!(delivered.len(), usize::from(MTU));
-    assert_eq!(Ipv6Header::parse(&delivered)?.0.dst(), PEER_NODE4);
+    assert_eq!(Ipv6Header::parse(&delivered)?.0.dst(), PEER_EAM6);
     Ok(())
 }
 
@@ -324,7 +324,7 @@ async fn translated_ipv4_arrives_as_ipv6_fragments_with(workers: usize) -> TestR
     let (a, mut b, translator) = pair(true, workers).await?;
     let translator = translator.ok_or("no translator")?;
     let data = payload(4000);
-    let original = udp4(SELF4, PEER_ALIAS4, &data);
+    let original = udp4(SELF_EAM4, PEER_EAM4, &data);
 
     for zero_checksum in [false, true] {
         let mut packet = without_df(original.clone());
@@ -335,14 +335,14 @@ async fn translated_ipv4_arrives_as_ipv6_fragments_with(workers: usize) -> TestR
 
         let reassembled = reassemble(&mut b).await?;
         let (ip, udp) = Ipv6Header::parse(&reassembled)?;
-        assert_eq!((ip.src(), ip.dst()), (SELF_NODE4, PEER_NODE4));
+        assert_eq!((ip.src(), ip.dst()), (SELF_EAM6, PEER_EAM6));
         assert_eq!(ip.next_header(), protocol::UDP);
         assert_eq!(ip.hop_limit(), 63);
         assert_eq!(udp[..6], original[20..26]);
         assert_eq!(udp[8..], data);
         // A valid checksum over the IPv6 pseudo-header, also when the IPv4 datagram had none.
         assert_eq!(
-            transport_checksum_v6(SELF_NODE4, PEER_NODE4, protocol::UDP, udp),
+            transport_checksum_v6(SELF_EAM6, PEER_EAM6, protocol::UDP, udp),
             0,
             "zero checksum: {zero_checksum}"
         );
@@ -373,7 +373,7 @@ async fn zero_checksum_fragments_out_of_order_arrive_as_one_ipv6_datagram() -> T
     let (a, mut b, translator) = pair(true, 0).await?;
     let translator = translator.ok_or("no translator")?;
     let data = payload(1000);
-    let mut original = udp4(SELF4, PEER_ALIAS4, &data);
+    let mut original = udp4(SELF_EAM4, PEER_EAM4, &data);
     original[26..28].fill(0);
     let len = original.len() - 20;
     let fragments = [
@@ -388,13 +388,13 @@ async fn zero_checksum_fragments_out_of_order_arrive_as_one_ipv6_datagram() -> T
 
     let (_, packet) = b.expect_delivery().await?;
     let (ip, udp) = Ipv6Header::parse(&packet)?;
-    assert_eq!((ip.src(), ip.dst()), (SELF_NODE4, PEER_NODE4));
+    assert_eq!((ip.src(), ip.dst()), (SELF_EAM6, PEER_EAM6));
     assert_eq!(ip.next_header(), protocol::UDP);
     assert_eq!(udp.len(), len);
     assert_eq!(udp[..6], original[20..26]);
     assert_eq!(udp[8..], data);
     assert_eq!(
-        transport_checksum_v6(SELF_NODE4, PEER_NODE4, protocol::UDP, udp),
+        transport_checksum_v6(SELF_EAM6, PEER_EAM6, protocol::UDP, udp),
         0
     );
     b.expect_no_delivery().await?;
