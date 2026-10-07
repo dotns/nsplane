@@ -1,16 +1,11 @@
-{
-  "hosts": {
-    "peer": "10.0.0.2/32",
-    "gateway": "10.0.0.1/32"
-  },
-  "acls": [
-    { "action": "accept", "src": ["peer"], "dst": ["gateway:7"], "proto": "tcp" },
-    { "action": "accept", "src": ["peer"], "dst": ["gateway:7"], "proto": "udp" }
-  ],
-  "tests": [
-    { "src": "10.0.0.2", "dst": "10.0.0.1:7", "proto": "tcp", "allow": true },
-    { "src": "10.0.0.2", "dst": "10.0.0.1:7", "proto": "udp", "allow": true },
-    { "src": "10.0.0.2", "dst": "10.0.0.1:8", "proto": "tcp", "allow": false },
-    { "src": "10.0.0.3", "dst": "10.0.0.1:7", "proto": "tcp", "allow": false }
-  ]
-}
+[
+  {
+    "id": "echo",
+    "sources": ["10.0.0.2/32"],
+    "destinations": ["10.0.0.1/32"],
+    "protocols": [
+      { "Tcp": { "Ranges": [{ "start": 7, "end": 7 }] } },
+      { "Udp": { "Ranges": [{ "start": 7, "end": 7 }] } }
+    ]
+  }
+]

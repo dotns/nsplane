@@ -1,6 +1,6 @@
 [package]
 name = "nsplane-acl"
-description = "Accept-only ACL policy engine and packet filters for nsplane"
+description = "Label-based flow ACL and stateful flow gate for nsplane"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -34,5 +34,5 @@ name = "namespaces"
 harness = false
 
 [[bench]]
-name = "node_l3"
+name = "gate"
 harness = false

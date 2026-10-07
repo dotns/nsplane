@@ -25,7 +25,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const WAIT: Duration = Duration::from_secs(1);
 
-/// A stack at `ip`/32 with the ns tunnel MTU.
+/// A stack at `ip`/32 with a typical tunnel MTU.
 fn config(ip: Ipv4Addr) -> NetStackConfig {
     NetStackConfig::new(vec![(IpAddr::V4(ip), 32)], 1360)
 }

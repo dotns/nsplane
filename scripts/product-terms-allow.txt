@@ -19,23 +19,20 @@ crates/nsplane-acl/src/lib.rs|ns|through a grant (peer to peer)|benchmark table 
 crates/nsplane-acl/src/lib.rs|ns|through an inbound pinhole|benchmark table cell in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|outbound-restricted peer (outbound rule)|benchmark table cell in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|Bypass (a namespace accepting everything)|benchmark table cell in nanoseconds
-crates/nsplane-acl/src/lib.rs|ns|Default policy, by-source peer (best of 3 runs)|benchmark table cell in nanoseconds
-crates/nsplane-acl/src/lib.rs|ns|IPv4 TCP (best of 3 runs)|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|Default policy, by-source peer|benchmark table cell in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|Stateless options (|benchmark table cell in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|non-first fragment after an accepted first fragment|benchmark table cell in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|71 ns (default policy)|benchmark timing in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|669 ns (namespaces)|benchmark timing in nanoseconds
 crates/nsplane-acl/src/lib.rs|ns|580/623 ns outbound|benchmark timing in nanoseconds
-crates/nsplane-acl/src/lib.rs|ns|(6-7.5 ns)|benchmark timing in nanoseconds
-crates/nsplane-acl/src/lib.rs|ns|(9-11.5 ns), 16-19 ns|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|parsing its five-tuple (|benchmark timing in nanoseconds
+crates/nsplane-acl/src/lib.rs|ns|engine snapshot (|benchmark timing in nanoseconds
 
 # Unix and Windows security groups.
 crates/nsplane-cli/src/main.rs|group|and group IDs|Unix user and group IDs of a process
 crates/nsplane-uapi/src/pipe.rs|group|Administrators group|the Windows built-in Administrators security group
 
 # A user-space stack terminates the connections addressed to it (TCP endpoint language).
-crates/nsplane-netstack/src/lib.rs|terminate|terminates the plaintext IP packets|the stack is the endpoint that terminates the decrypted traffic
-crates/nsplane-netstack/src/stack.rs|terminate|The stack terminates TCP and UDP|the stack is the endpoint that terminates TCP and UDP
-crates/nsplane-netstack/src/tcp.rs|terminate|A TCP connection terminated by the stack|TCP connection terminated at this endpoint
 crates/nsplane-netstack/src/tcp.rs|terminate|pub async fn terminated(&self)|TcpConnection::terminated(): standard TCP state language (connection terminated)
 crates/nsplane-netstack/src/tcp.rs|terminate|[`terminated`](Self::terminated)|rustdoc of TcpConnection::terminated(): TCP connection state
 
