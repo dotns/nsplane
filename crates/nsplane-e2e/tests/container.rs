@@ -28,8 +28,7 @@ use nsplane::{
     PeerStats, UdpTransport,
 };
 use nsplane_acl::{
-    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, PeerIdentityMap, SourceAssertion, reasons,
-    wg_peer_anchor,
+    AclAction, AclEngine, AclFilter, AclPolicy, AclRule, Label, LabelSet, PeerLabelMap, reasons,
 };
 use nsplane_e2e::{Family, Node, Options, TestResult, WAIT, payload, serve_udp_echo, udp};
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, TcpConnection};
@@ -1048,7 +1047,7 @@ async fn acl_udp(
 async fn kernel_peer_through_acl_filter() -> TestResult {
     let env = Interop::from_env()?;
     let acl = Arc::new(AclEngine::new());
-    let identities = Arc::new(PeerIdentityMap::new());
+    let identities = Arc::new(PeerLabelMap::new());
     let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&identities));
 
     let tun = Tun::create(ACL_IFACE)?;
@@ -1086,11 +1085,19 @@ async fn kernel_peer_through_acl_filter() -> TestResult {
     )
     .await?;
     let peer = the_peer(&handle).await?;
-    let key = peer.public_key.to_bytes();
-    identities.insert(peer.peer, SourceAssertion::WgPeerKey { pubkey: key });
+    // The label the policy's `key:<hex>` source compiles to.
+    let src = peer
+        .public_key
+        .to_bytes()
+        .iter()
+        .fold(String::from("key:"), |mut text, b| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{b:02x}");
+            text
+        });
+    identities.insert(peer.peer, LabelSet::new([Label::from(src.as_str())]));
     let local4: Ipv4Addr = env.addr_v4.split('/').next().unwrap_or_default().parse()?;
     let local6: Ipv6Addr = env.addr_v6.split('/').next().unwrap_or_default().parse()?;
-    let src = wg_peer_anchor(&key);
     acl.load(AclPolicy {
         acls: vec![
             accept(&src, format!("{local4}:{ALLOWED}")),
