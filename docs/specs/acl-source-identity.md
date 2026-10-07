@@ -3,8 +3,9 @@
 - **Status**: spec for workstream AC, item AG-2 (slice C3 of `acl-generic-api.md`)
 - **Audience**: products that feed `nsplane-acl`; ns is the reference product
 - **Normative API**: `docs/specs/acl-generic-api.md` sections 1.3-1.5, 2.1, 2.4, 3 and 4.2.
-  Rust snippets below are **illustrative**: they use the design note's names, and the final
-  names follow the merged code.
+  Rust snippets below are **illustrative** and use the names of the merged C3 code. Until
+  C4 a namespace's rules are still a policy document (`NamespacePolicy::policy`); C4
+  replaces it with typed `rules`.
 
 ## 1. Scope and status
 
@@ -172,8 +173,9 @@ identities.insert_by_source(gateway, vec![
 // Namespace member: NamespaceMember { label: "addr:fd00::a".into(), addresses: vec![..] }
 ```
 
-Longest prefix wins; an address outside every prefix is unknown (`UNKNOWN_PEER`). Without
-the catch-all entries a by-source peer can now be unknown, which the old model never was.
+Longest prefix wins (among equally long prefixes, the first listed); an address outside
+every prefix is unknown (`UNKNOWN_PEER`). Without the catch-all entries a by-source peer
+can now be unknown, which the old model never was.
 Use `Display` text of `IpAddr` for `addr:<ip>` so that the member label and the identity
 label are byte-equal.
 
@@ -200,7 +202,7 @@ The id stays the product's (`"app:<session>"` is fine) but no longer carries mea
 engine.store_namespace("app:s1", NamespacePolicy {
     kind: NamespaceKind::Pinholes,
     members: vec![NamespaceMember { label: key_label(&k), addresses }],
-    rules: vec![],                       // must be empty
+    policy: AclPolicy::default(),        // no rules (C4: `rules: vec![]`)
     pinhole_kinds: BTreeSet::new(),      // must be empty
     outbound: Some(vec![]),
 })?;
@@ -213,8 +215,10 @@ let guard = engine.open_pinhole("app:s1", PinholeSpec { label: key_label(&k), ki
 ```
 
 Rules or `pinhole_kinds` on a `Pinholes` namespace are rejected (`Error::InvalidNamespace`),
-as are grants naming one (`Error::InvalidGrant`). A pinhole on a `Rules` namespace fails
-with `PinholeError::NotPinholeNamespace`.
+as are grants naming a stored one (`Error::InvalidGrant`). A namespace grant end matches
+`Rules` namespaces only, so a grant stored before its namespace became `Pinholes` stops
+matching it. A pinhole on a `Rules` namespace fails with
+`PinholeError::NotPinholeNamespace`.
 
 ### 3.7 Decision logs
 
@@ -287,6 +291,19 @@ the default rule set is installed.
 Case 27 is the whole parity fixture; its compiler from the fixture's document lives with
 the AG-3 spec (`docs/specs/acl-policy-document.md`). Cases 15-18 use member labels
 `addr:<ip>` per 3.4.
+
+After C3 these nsplane tests carry the cases on labels: `engine.rs`
+`key_rules_match_the_label_and_cidr_rules_the_flow_source` (1-3; the document compiler's
+CIDR sources no longer carry `A`), `rules_of_all_namespaces_of_a_label_apply` (31),
+`pinhole_namespaces_never_widen_permissions` (32), `grants_cannot_name_pinhole_namespaces`
+(33); `filter.rs` `key_label_and_address_label` (6-8, typed rules with `A` on the prefix
+rules), `unknown_peer_is_dropped` (9), `closure_identity` (10),
+`identity_map_updates_through_shared_handle` (11), `by_source_peer_is_judged_by_each_source`
+(12-13), `by_source_cache_is_bounded` (14),
+`switching_between_by_source_and_by_key_applies_to_the_next_packet` (15-16),
+`bypass_is_never_shared_across_sources` (17-18), `pinhole_namespace_member_gets_nothing_inbound`
+(34), `session_only_peer_works_only_through_its_inbound_pinhole` (35); and
+`tests/crates_acl_parity.rs` with its test-local 4.2 compiler (23-27).
 
 ## 5. Edge cases
 

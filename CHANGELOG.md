@@ -131,6 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or reason at debug level.
 - `nsplane-acl`: `Error::InvalidRule`, `Error::InvalidNamespace` and `Error::InvalidGrant`
   (with the offending id and a reason).
+- `nsplane-acl`: `NamespaceKind::{Rules, Pinholes}` (`NamespacePolicy::kind`, default
+  `Rules`): a `Pinholes` namespace carries no rules or pinhole kinds, no grant may name it,
+  and its members get access only through pinholes.
+- `nsplane-acl`: `PeerLabelMap::insert_by_source(peer, Vec<(IpNet, LabelSet)>)`: labels per
+  remote address, the longest prefix containing it wins (the first listed among equal
+  prefixes) and an address outside every prefix is an unknown source (`UNKNOWN_PEER`).
 
 ### Changed
 - nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
@@ -185,16 +191,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `AclEngine::clear_all` leaves the default rules in `PolicyState::Failed`:
   every inbound packet is dropped with `reasons::POLICY_FAILED` (was `NO_POLICY`), also on an
   engine built with `NotInstalled::Accept`; `uninstall` returns to `NotInstalled`.
-- `nsplane-acl`: an invalid namespace (an app namespace with rules or app pinholes, an
+- `nsplane-acl`: an invalid namespace (a pinhole namespace with rules or pinhole kinds, an
   invalid outbound rule) is `Error::InvalidNamespace`, an invalid grant `Error::InvalidGrant`
   (both were `Error::InvalidPolicy`); `Error` is `#[non_exhaustive]`.
 - `nsplane-acl`: `AclEngine::evaluate` takes `(&LabelSet, &Flow)` and returns a `Decision`
   (was `&AccessRequest` to `AclDecision`).
 - `nsplane-acl`: `AclEngine::store_grant` takes `impl Into<RuleId>` and `AclEngine::grants`
   returns `Vec<(RuleId, Grant)>`.
-- `nsplane-acl`: the filter resolves each peer to a label set (its source anchor, plus an
-  internal address label for IP-bearing assertions, which the document's CIDR sources
-  require); a source is a member of the union of its labels' namespaces.
+- `nsplane-acl`: `PeerIdentity` yields labels: `labels(peer) -> Option<LabelSet>` and
+  `labels_for(peer, remote) -> Option<LabelSet>` (were `assertion` / `assertion_for`),
+  `by_source` and `generation` as before; `None` is an unknown peer (`UNKNOWN_PEER`).
+  Closures are `Fn(PeerId) -> Option<LabelSet>`. The filter caches each peer's label set
+  and the union of its labels' namespaces as before.
+- `nsplane-acl`: `PeerIdentityMap` is renamed `PeerLabelMap`; `insert(peer, LabelSet)` (was a
+  `SourceAssertion`), `insert_by_source` takes a prefix table (see Added; was "every remote
+  address is its own principal").
+- `nsplane-acl`: namespace membership, grants and pinholes are keyed by label:
+  `NamespaceMember::label: Label` (was `principal: String`), `GrantEnd::Label(Label)` (was
+  `GrantEnd::Peer(String)`), `PinholeSpec::label: Label` (was `peer: String`),
+  `AclEngine::memberships(&Label)` (was `&str`). A source is a member of the union of the
+  namespaces of all its labels; a destination address resolves to its owner label (longest
+  prefix, then the smallest label).
+- `nsplane-acl`: `NamespacePolicy::pinhole_kinds` replaces `allow_app_pinholes`, and
+  `PinholeError::NotPinholeNamespace` replaces `NotAppNamespace`. `AclEngine::store_grant`
+  rejects a grant naming a stored `Pinholes` namespace, and a namespace grant end matches
+  only `Rules` namespaces.
+- `nsplane-acl`: CIDR and host-alias sources of a policy document compile to `sources` only
+  and match the flow's source address, whatever the source's labels (they matched only the
+  IP of a terminate binding). A product that keeps CIDR rules from key-labelled sources adds
+  its own address label to the rule and to the address-bound sources
+  (`docs/specs/acl-source-identity.md`).
 
 ### Removed
 - `nsplane-acl`: `AccessRequest` (`from_ip`, `with_wg_peer_key`); use a `Flow` and the
@@ -210,6 +236,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-acl`: `AclEngine::store`, `clear`, `policy` and `is_allowed`; use `install`,
   `uninstall`, `rules` and `rules()` with `RuleSet::matching`.
 - `nsplane-acl`: the public `matcher` module (it exported nothing public).
+- `nsplane-acl`: `SourceAssertion` (`WgPeerKey`, `Terminate`, `External`, with
+  `source_class`, `source_anchor` and `ip`) and `TerminateBinding`; a `PeerIdentity` returns
+  the source's `LabelSet` instead, built by the caller.
+- `nsplane-acl`: `wg_peer_anchor`; the caller formats its own label text (a policy
+  document's `key:<hex>` source matches the label `key:<lowercase hex>`).
+- `nsplane-acl`: `NamespaceId::is_app` and the meaning of the `"app:"` id prefix; use
+  `NamespaceKind::Pinholes` (namespace ids are opaque).
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter
