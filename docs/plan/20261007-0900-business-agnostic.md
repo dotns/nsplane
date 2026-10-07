@@ -55,3 +55,5 @@ After the round: release 0.11.0 (owner's go). Its table is taken on an idle host
 nsplane-kernel for F1.
 
 ## Annotations
+- 2026-10-07: dispatched (campaign `nsplane-ba-202610070900`): AC `sot3v70g`, AN `b4d7qyct`, AW
+  `bckqkh2q`; watchdog every 30 min with stuck-process checks.
