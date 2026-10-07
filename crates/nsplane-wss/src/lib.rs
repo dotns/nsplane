@@ -2,15 +2,21 @@
 
 //! WebSocket-over-TLS (WSS) carriers for nsplane.
 //!
-//! The carriers share one connection setup ([`WssConfig`]):
+//! The dialing carriers share one connection setup ([`WssConfig`]):
 //!
 //! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport),
 //!   below.
-//! - [`WssStreamClient`], the stream carrier: TCP streams ([`WssTcpStream`]) and UDP flows
-//!   ([`WssUdpFlow`]) to targets behind a WSS terminate, multiplexed over sessions with the
-//!   `WsFrame` protocol of the [`frame`] module (the wire of ns and NSGW).
-//! - [`WssStreamServer`], the terminate leg of that protocol: it dials the relay too and
-//!   relays each opened stream to the backend a [`WssResolver`] picks.
+//! - [`WssStreamClient`], the stream carrier (deprecated): TCP streams ([`WssTcpStream`])
+//!   and UDP flows ([`WssUdpFlow`]) to targets behind a WSS server, multiplexed over
+//!   sessions with the `WsFrame` protocol of the [`frame`] module.
+//! - [`WssStreamServer`], the server side of that protocol (deprecated): it dials the relay
+//!   too and relays each opened stream to the backend a [`WssResolver`] picks.
+//!
+//! [`WssServerTransport`] is the server side of [`WssDialer`]'s links: a transport over
+//! the WebSocket sessions the embedder accepts (see [below](#server-transport)).
+//!
+//! The stream carrier has no remaining consumer and will be removed once its users have
+//! switched; a WireGuard peer over [`WssDialer`] replaces it.
 //!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each
@@ -70,9 +76,56 @@
 //! # }
 //! ```
 //!
+//! # Server transport
+//!
+//! [`WssServerTransport`] is a [`Transport`](nsplane::Transport) over WebSocket sessions
+//! the embedder accepts: it runs the listener, TLS, its own checks of the request (path,
+//! token) and the upgrade (with [`WssAcceptor::ws_config`]), then hands each session to a
+//! [`WssAcceptor`]. The wire is [`WssDialer`]'s: one datagram per binary message.
+//!
+//! - **Endpoints**: each session gets an address of its own, never reused: IPv6 in
+//!   `100::/64` (the RFC 6666 discard-only prefix) with the session count as interface id,
+//!   port 0. A WSS peer's endpoint (in the engine's status and in UAPI) shows such an
+//!   address; it identifies a session, not a host.
+//! - **Replies** follow the engine's path, which roams on authenticated messages, so they
+//!   go to the session the peer last authenticated on. A send to an address without a live
+//!   session fails at once with [`std::io::ErrorKind::NotConnected`]: between a session
+//!   closing and the peer's redial, datagrams to that peer are lost by design (counted as
+//!   send errors); WireGuard retransmits its handshakes and the peer's next authenticated
+//!   datagram on the new session moves its path.
+//! - **Limits**: a bounded queue per session (a full one fails the send at once), one
+//!   shared inbound queue that pushes back on the sessions' readers, keepalive pings, a read
+//!   idle, and at most [`WssServerConfig::max_sessions`] sessions.
+//!
+//! ```no_run
+//! use nsplane::TransportId;
+//! use nsplane_wss::{WssAcceptor, WssServerConfig, WssServerTransport};
+//! use tokio::net::TcpListener;
+//!
+//! # async fn run() -> std::io::Result<()> {
+//! let (transport, acceptor) = WssServerTransport::new(TransportId::new(3), WssServerConfig::default());
+//! let stats = transport.stats();
+//! // Hand `transport` to the engine, then accept sessions (behind TLS in practice).
+//! let listener = TcpListener::bind("0.0.0.0:8080").await?;
+//! loop {
+//!     let (tcp, _) = listener.accept().await?;
+//!     let acceptor = acceptor.clone();
+//!     tokio::spawn(async move {
+//!         let config = Some(WssAcceptor::ws_config());
+//!         if let Ok(ws) = tokio_tungstenite::accept_async_with_config(tcp, config).await {
+//!             if let Ok(session) = acceptor.accept(ws) {
+//!                 println!("session {}", session.addr());
+//!             }
+//!         }
+//!     });
+//! }
+//! # }
+//! ```
+//!
 //! The stream carrier on the same kind of configuration:
 //!
 //! ```no_run
+//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
 //! use nsplane_wss::{WssConfig, WssStreamClient, WssStreamLimits, WssTls};
 //! use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 //!
@@ -93,9 +146,10 @@
 //! # }
 //! ```
 //!
-//! The terminate leg, on its own configuration:
+//! The server side, on its own configuration:
 //!
 //! ```no_run
+//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
@@ -119,7 +173,7 @@
 //! }
 //!
 //! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
-//! let config = WssConfig::new("wss://relay.example/terminate", WssTls::Roots(roots));
+//! let config = WssConfig::new("wss://relay.example/server", WssTls::Roots(roots));
 //! let server = WssStreamServer::new(config, WssServerLimits::default(), Arc::new(Web))?;
 //! let stats = server.stats();
 //! let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -129,6 +183,7 @@
 //! # }
 //! ```
 
+mod accept;
 mod config;
 mod connect;
 mod dialer;
@@ -136,13 +191,19 @@ pub mod frame;
 mod server;
 mod stream;
 
+pub use accept::{
+    WssAcceptor, WssServerConfig, WssServerTransport, WssServerTransportStats, WssSession,
+    WssSessionStats,
+};
 pub use config::{BearerProvider, WssConfig, WssTls};
 pub use connect::{WssDialError, WssDialEvent};
 pub use dialer::{WssDialer, WssStats};
+#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
 pub use server::{
     Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,
     WssStreamEventKind, WssStreamServer,
 };
+#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
 pub use stream::{
     MAX_DATA_PAYLOAD, WssStreamClient, WssStreamLimits, WssStreamStats, WssTcpStream, WssUdpFlow,
 };

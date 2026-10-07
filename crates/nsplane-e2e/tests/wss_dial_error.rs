@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use nsplane::{LinkDialer as _, LinkState};
 use nsplane_e2e::{TestResult, WAIT};
-use nsplane_wss::{WssConfig, WssDialError, WssDialer, WssStreamClient, WssStreamLimits, WssTls};
+use nsplane_wss::{WssConfig, WssDialError, WssDialer, WssTls};
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
+use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -135,6 +137,7 @@ async fn unavailable_carries_the_detail() -> TestResult {
 /// Every open behind a refused session dial gets the detail, the waiters behind the dial
 /// included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
 async fn stream_opens_carry_the_detail() -> TestResult {
     let addr = refusing("401 Unauthorized").await?;
     let client = WssStreamClient::new(config(addr), WssStreamLimits::default())?;

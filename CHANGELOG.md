@@ -107,6 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other ICMP still counts as `unsupported` (a new field: breaking for code that builds
   `NetStackStats` with a struct literal). smoltcp fork `v0.14.0-nsplane.5`
   (`tcp::Socket::reduce_mss`).
+- `nsplane-wss`: `WssServerTransport`, the server side of `WssDialer` links (NG-7): a
+  `Transport` over WebSocket sessions the embedder accepts (TLS, request checks and the
+  upgrade stay the embedder's) and hands to a `WssAcceptor` (`accept`, `ws_config`).
+  Same wire as `WssDialer` (one binary message per datagram; text and longer than
+  `MAX_DATAGRAM` dropped and counted). Each session gets a never-reused address in
+  100::/64 (RFC 6666), port 0; replies follow the engine's roaming path, and a send to a
+  closed session fails with `NotConnected`. `WssServerConfig`: per-session queue (256,
+  full = `WouldBlock` at once), shared inbound queue (1024, backpressure onto the sessions),
+  ping interval (10 s), read idle (35 s), `max_sessions` (4096, refused before any task).
+  Counters in `WssServerTransportStats` and, per session, `WssSessionStats` (`WssSession`:
+  `addr`, `close`, `stats`; dropping it does not close the session).
 
 ### Changed
 - nsplane-netstack: `NetStackConfig::datagram_capacity` defaults to 256 instead of 128 (QN-4),
@@ -166,6 +177,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `peer6_eam4.rs` and `translate_peer6_eam4.rs`. The `translate_node` example's
   `--map` keys are `peer6=`, `eam6=`, `eam4=`, `local6=` (were `node6=`, `node4=`,
   `alias4=`, `alias6=`).
+- rustdoc in nsplane, nsplane-packet, nsplane-core, nsplane-tun, nsplane-netstack and
+  nsplane-wss no longer cites a product; provenance is in the task documents.
+
+### Deprecated
+- `nsplane-wss`: the WebSocket stream carrier, since 0.11.0: `WssStreamClient`,
+  `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
+  `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
+  `Denied`, `WssStreamEvent`, `WssStreamEventKind`, `WssCloseReason`, and every public item
+  of the `frame` module (the `WsFrame` codec). It has no remaining consumer and will be
+  removed once its users have switched; the replacement is a WireGuard peer over
+  `WssDialer` (and the upcoming WSS datagram server transport). Nothing else changes:
+  `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`, `WssDialError`, `WssDialEvent`,
+  `WssStats`, `MAX_DATAGRAM` and `MAX_MESSAGE` stay.
 
 ### Fixed
 - `nsplane-tun` (Windows): `Tun::create_with` no longer refuses an orphaned Wintun adapter

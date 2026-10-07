@@ -5,7 +5,7 @@
 //! request without touching it, so a caller can pick the pings it answers
 //! before handing them to [`echo_reply_in_place`]. It accepts the requests
 //! [`echo_reply_in_place`] rewrites, as well as a few it refuses (it only
-//! classifies, so it stays as permissive as ns `is_icmpv6_echo_request`):
+//! classifies, so it stays permissive):
 //!
 //! - **IPv4**: protocol 1, ICMP type 8, code 0, with the IPv4 header parsing
 //!   and the 8-byte ICMP header present within the total length. A non-first
@@ -15,15 +15,12 @@
 //! - **IPv6**: next header 58 (`ICMPv6`) in the fixed header, type 128,
 //!   code 0, with the 8-byte header present within the payload length; IPv6
 //!   extension headers are not walked, so a request behind one is `false`.
-//! - Bytes beyond the length the IP header declares are ignored (ns accepts
-//!   them); a buffer shorter than that length is `false`. Checksums are not
-//!   verified.
+//! - Bytes beyond the length the IP header declares are ignored; a buffer
+//!   shorter than that length is `false`. Checksums are not verified.
 //!
 //! [`echo_reply_in_place`] turns an ICMP Echo request into its Echo reply in
 //! the same buffer, so a caller that answers pings for an address it owns can
-//! send the request's bytes straight back. Ported from ns
-//! `tun_service/runtime/subnet.rs` (`subnet_icmp_echo_reply`,
-//! `recalc_icmpv4_checksum` and `is_icmpv6_echo_request`):
+//! send the request's bytes straight back:
 //!
 //! - **IPv4**: an ICMP Echo request (type 8, code 0) gets its source and
 //!   destination swapped and type 0 (Echo reply); the ICMP checksum is
@@ -32,21 +29,20 @@
 //! - **IPv6**: an `ICMPv6` Echo request (type 128, code 0) directly after the
 //!   fixed header gets its source and destination swapped and type 129 (Echo
 //!   reply); the `ICMPv6` checksum is recomputed with the IPv6 pseudo-header.
-//! - The TTL / hop limit is unchanged (as ns), and so are the identifier, the
+//! - The TTL / hop limit is unchanged, and so are the identifier, the
 //!   sequence number and the payload.
 //!
 //! Anything else returns `false` and leaves the buffer byte-for-byte
 //! untouched: other ICMP types and codes, other protocols, IPv6 extension
-//! headers (ns only looks at the next header of the fixed header), IPv4
-//! fragments other than a whole datagram (ns answers them; a fragment's
-//! checksum cannot be recomputed), malformed or truncated packets, and
-//! packets whose length differs from the one their IP header declares (ns
-//! answers a buffer with trailing bytes and sums them into the ICMP
-//! checksum). The packet is fully validated before anything is written. As
-//! in ns, incoming checksums are not verified.
+//! headers (only the next header of the fixed header is looked at), IPv4
+//! fragments other than a whole datagram (a fragment's checksum cannot be
+//! recomputed), malformed or truncated packets, and packets whose length
+//! differs from the one their IP header declares (trailing bytes would
+//! otherwise be summed into the ICMP checksum). The packet is fully validated
+//! before anything is written. Incoming checksums are not verified.
 //!
-//! Only the packet transform lives here: the host ICMP socket ns uses to
-//! probe the real destination before answering stays in ns.
+//! Only the packet transform lives here: probing the real destination (for
+//! instance with a host ICMP socket) before answering is up to the caller.
 
 use crate::checksum::{internet_checksum, ipv4_header_checksum, transport_checksum_v6};
 use crate::ip::{IcmpHeader, Ipv4Header, Ipv6Header};

@@ -205,11 +205,7 @@ impl WssConfig {
 
     /// The keepalive ping timer of [`ping_interval`](Self::ping_interval), started now.
     pub(crate) fn pings(&self) -> Pings {
-        let interval = self.ping_interval;
-        Pings(
-            (!interval.is_zero())
-                .then(|| tokio::time::interval_at(Instant::now() + interval, interval)),
-        )
+        Pings::new(self.ping_interval)
     }
 
     /// Sets [`connect_timeout`](Self::connect_timeout).
@@ -224,6 +220,14 @@ impl WssConfig {
 pub(crate) struct Pings(Option<Interval>);
 
 impl Pings {
+    /// A timer pinging every `interval`, started now; a zero `interval` never fires.
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self(
+            (!interval.is_zero())
+                .then(|| tokio::time::interval_at(Instant::now() + interval, interval)),
+        )
+    }
+
     /// Waits for the next ping: every interval, the first one interval after the start;
     /// forever with pings off.
     pub(crate) async fn tick(&mut self) {
