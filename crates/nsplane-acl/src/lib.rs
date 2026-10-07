@@ -32,10 +32,12 @@
 //!   fragments on their first fragment and accepts replies to flows the local
 //!   side opened (stateful replies, not a conntrack/NAT). Drop reasons are in
 //!   [`reasons`].
-//! - **Node L3 gate** ([`NodeL3Gate`]): target-bound Node / Service / Subnet
-//!   grants with source binding and bounded flow state for the Node-address
-//!   plane, configured by [`NodeL3Config`] snapshots and the WireGuard
-//!   projection [`NodeL3Transport`]; inert unless constructed.
+//! - **Flow gate** ([`gate`]): a stateful gate for IPv4 packets
+//!   ([`gate::FlowGate`]) judging them against one atomically replaced
+//!   [`gate::GatePolicy`] of scopes, bindings by peer and address, labelled
+//!   accept-only grants, holds and unbound rules, with bounded flow state;
+//!   run with an optional [`AclFilter`] as one filter by
+//!   [`gate::GateFilter`]; inert unless given a policy.
 //! - **Flow tracker** ([`FlowTracker`]): a pass-through
 //!   [`PacketFilter`](nsplane_core::PacketFilter) counting packets and bytes
 //!   per [`FlowKey`] in a bounded table.
@@ -327,10 +329,10 @@ mod differential;
 pub mod engine;
 mod filter;
 mod flow;
+pub mod gate;
 mod lru;
 pub mod namespace;
 pub mod net;
-mod node_l3;
 pub mod pinhole;
 pub mod reasons;
 pub mod rules;
@@ -347,14 +349,6 @@ pub use namespace::{
     Grant, GrantEnd, NamespaceId, NamespaceKind, NamespaceMember, NamespacePolicy, OutboundRule,
 };
 pub use net::{IpNet, ParseIpNetError, Protocol};
-pub use node_l3::{
-    GatewayConsumerAuthority, GatewayConsumerPacket, GatewayConsumerSink, NODE_L3_SCHEMA_VERSION,
-    NodeL3Applied, NodeL3Config, NodeL3ConfigError, NodeL3Counters, NodeL3Decision, NodeL3Filter,
-    NodeL3FilterStats, NodeL3Gate, NodeL3Grant, NodeL3Mode, NodeL3Node, NodeL3PeerBinding,
-    NodeL3PeerPolicyRequirement, NodeL3PeerReadiness, NodeL3PeerReadinessReason, NodeL3Reason,
-    NodeL3Resource, NodeL3ServiceEndpoint, NodeL3ServiceProtocol, NodeL3SubnetAuthorization,
-    NodeL3Transport, NodeL3TransportError, NodeL3TransportPeer, PeerKeyMap, PeerPublicKeys,
-};
 pub use pinhole::{Direction, PinholeError, PinholeGuard, PinholeId, PinholeSpec, PinholeStats};
 pub use rules::{
     Decision, Flow, IcmpTypes, Label, LabelSet, Matched, NotInstalled, PolicyState, PortSet,

@@ -1,4 +1,4 @@
-//! Bounded flow and fragment state, sharded by remote peer key.
+//! Bounded flow and fragment state, sharded by peer.
 //!
 //! Expiry is lazy: an expired entry is dropped when it is looked up, and a
 //! shard (or every shard) is swept only when a limit would be hit, so a
@@ -7,25 +7,24 @@
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use nsplane_packet::PeerId;
+
 use super::PacketDirection;
+use super::config::{GateConfig, GateTimeouts};
 use super::hash::FastMap;
-use super::policy::NetIdx;
-use super::{
-    FRAGMENT_TIMEOUT, ICMP_IDLE_TIMEOUT, OTHER_IDLE_TIMEOUT, TCP_HALF_CLOSE_TIMEOUT,
-    TCP_IDLE_TIMEOUT, TCP_TERMINAL_TIMEOUT, UDP_IDLE_TIMEOUT,
-};
+use super::policy::Slot;
+use crate::rules::{RuleId, Transport};
 
 /// Number of state shards.
 pub(super) const SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FlowKey {
-    pub(super) net: NetIdx,
-    pub(super) generation: u64,
-    pub(super) remote_peer: [u8; 32],
+    pub(super) slot: Slot,
+    pub(super) peer: PeerId,
     pub(super) remote_ip: Ipv4Addr,
     pub(super) local_ip: Ipv4Addr,
     pub(super) protocol: u8,
@@ -34,48 +33,28 @@ pub(super) struct FlowKey {
 }
 
 impl Hash for FlowKey {
-    /// Three words: the addresses folded with the first word of the peer key
-    /// (a random public key the peer authenticated with, not chosen per
-    /// packet), the Network and ports, and the generation and protocol.
-    /// Hashing a subset of the key's bits keeps equal keys equal.
+    /// Two words: the peer and the remote address; the local address, the
+    /// ports, the scope slot and the protocol folded together. Hashing a
+    /// subset of the key's bits keeps equal keys equal.
     fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64((u64::from(self.peer.get()) << 32) | u64::from(self.remote_ip.to_bits()));
         state.write_u64(
-            peer_word(&self.remote_peer)
-                ^ u64::from(self.remote_ip.to_bits())
-                ^ (u64::from(self.local_ip.to_bits()) << 32),
+            (u64::from(self.local_ip.to_bits()) << 32)
+                ^ (u64::from(self.remote_port) << 16)
+                ^ u64::from(self.local_port)
+                ^ (u64::from(self.slot) << 40)
+                ^ (u64::from(self.protocol) << 56),
         );
-        state.write_u64(
-            u64::from(self.net)
-                | (u64::from(self.remote_port) << 32)
-                | (u64::from(self.local_port) << 48),
-        );
-        state.write_u64(self.generation ^ (u64::from(self.protocol) << 56));
     }
-}
-
-/// The first word of a peer key.
-pub(super) fn peer_word(peer: &[u8; 32]) -> u64 {
-    let (words, _) = peer.as_chunks::<8>();
-    words.first().map_or(0, |word| u64::from_le_bytes(*word))
 }
 
 /// What a live flow lookup found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LiveFlow<T> {
+pub(super) enum Lookup<T> {
     /// No live flow; an expired one was dropped.
     Missing,
     /// The live flow, mapped.
     Found(T),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ServiceFlowAuthorization {
-    None,
-    /// Same-owner system access or a Node Grant covers every listener projected
-    /// on the exact target Node in this policy generation.
-    NodeWide,
-    /// A Service Grant covers only this stable resource id.
-    Exact(Arc<str>),
 }
 
 /// FIN/RST progress of a TCP flow.
@@ -99,7 +78,10 @@ impl TcpClose {
 #[derive(Debug, Clone)]
 pub(super) struct FlowState {
     pub(super) initiator: PacketDirection,
-    pub(super) service_authorization: ServiceFlowAuthorization,
+    /// The transport of the packet that opened the flow, to re-authorize it.
+    pub(super) opened: Transport,
+    /// The grant that admitted the flow.
+    pub(super) rule: RuleId,
     pub(super) enforced: bool,
     pub(super) close: TcpClose,
     pub(super) expires_at: Instant,
@@ -107,18 +89,18 @@ pub(super) struct FlowState {
 
 impl FlowState {
     /// Refresh the idle lifetime after a packet of an existing flow.
-    pub(super) fn touch(&mut self, protocol: u8, now: Instant) {
+    pub(super) fn touch(&mut self, protocol: u8, now: Instant, timeouts: &GateTimeouts) {
         if self.close.terminal() && protocol == 6 {
             // A final ACK may arrive after FIN/RST. It is valid tail traffic,
             // but must not turn a closed TCP entry back into the normal two-hour
             // lifetime and exhaust the per-peer state quota.
-            self.expires_at = self.expires_at.min(now + TCP_TERMINAL_TIMEOUT);
+            self.expires_at = self.expires_at.min(now + timeouts.tcp_closed);
         } else if self.close.closing() && protocol == 6 {
             // A half-closed flow may continue carrying data in the remaining
             // direction, but uses a bounded idle lifetime instead of two hours.
-            self.expires_at = now + TCP_HALF_CLOSE_TIMEOUT;
+            self.expires_at = now + timeouts.tcp_half_closed;
         } else {
-            self.expires_at = now + protocol_timeout(protocol);
+            self.expires_at = now + protocol_timeout(protocol, timeouts);
         }
     }
 
@@ -127,6 +109,7 @@ impl FlowState {
         direction: PacketDirection,
         tcp_flags: u8,
         now: Instant,
+        timeouts: &GateTimeouts,
     ) {
         if tcp_flags & 0x04 != 0 {
             self.close.reset = true;
@@ -139,19 +122,18 @@ impl FlowState {
             }
         }
         if self.close.terminal() {
-            self.expires_at = self.expires_at.min(now + TCP_TERMINAL_TIMEOUT);
+            self.expires_at = self.expires_at.min(now + timeouts.tcp_closed);
         } else if self.close.closing() {
-            self.expires_at = self.expires_at.min(now + TCP_HALF_CLOSE_TIMEOUT);
+            self.expires_at = self.expires_at.min(now + timeouts.tcp_half_closed);
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct FragmentKey {
-    pub(super) net: NetIdx,
-    pub(super) generation: u64,
+    pub(super) slot: Slot,
     pub(super) direction: PacketDirection,
-    pub(super) remote_peer: [u8; 32],
+    pub(super) peer: PeerId,
     pub(super) source: Ipv4Addr,
     pub(super) destination: Ipv4Addr,
     pub(super) protocol: u8,
@@ -160,8 +142,10 @@ pub(super) struct FragmentKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FragmentDisposition {
-    EnforceAllow,
-    LegacyL4,
+    /// The first fragment opened or matched a flow.
+    Allow,
+    /// The first fragment passed under an unbound rule.
+    Pass,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +164,7 @@ pub(super) enum Admission {
     SweepAll,
 }
 
-/// Global entry counts and the configured limits.
+/// Global entry counts, the configured limits and the timeouts.
 #[derive(Debug)]
 pub(super) struct Counts {
     pub(super) flows: AtomicUsize,
@@ -188,6 +172,7 @@ pub(super) struct Counts {
     pub(super) global_limit: usize,
     pub(super) peer_limit: usize,
     pub(super) fragment_limit: usize,
+    pub(super) timeouts: GateTimeouts,
 }
 
 impl Counts {
@@ -236,11 +221,11 @@ pub(super) struct Shard {
     pub(super) epoch: u64,
     pub(super) flows: FastMap<FlowKey, FlowState>,
     pub(super) fragments: FastMap<FragmentKey, FragmentState>,
-    pub(super) peer_flows: FastMap<[u8; 32], usize>,
+    pub(super) peer_flows: FastMap<PeerId, usize>,
 }
 
 impl Shard {
-    fn forget_peer_flow(&mut self, peer: [u8; 32]) {
+    fn forget_peer_flow(&mut self, peer: PeerId) {
         if let Some(count) = self.peer_flows.get_mut(&peer) {
             *count -= 1;
             if *count == 0 {
@@ -251,7 +236,7 @@ impl Shard {
 
     fn remove_flow(&mut self, key: &FlowKey, counts: &Counts) {
         if self.flows.remove(key).is_some() {
-            self.forget_peer_flow(key.remote_peer);
+            self.forget_peer_flow(key.peer);
             counts.release_flows(1);
         }
     }
@@ -270,21 +255,22 @@ impl Shard {
         now: Instant,
         counts: &Counts,
         with: impl FnOnce(&mut FlowState) -> T,
-    ) -> LiveFlow<T> {
+    ) -> Lookup<T> {
         let Some(state) = self.flows.get_mut(key) else {
-            return LiveFlow::Missing;
+            return Lookup::Missing;
         };
         if state.expires_at > now {
-            return LiveFlow::Found(with(state));
+            return Lookup::Found(with(state));
         }
         self.remove_flow(key, counts);
-        LiveFlow::Missing
+        Lookup::Missing
     }
 
     /// Whether `key` has a live flow; its idle lifetime is refreshed.
     pub(super) fn touch_flow(&mut self, key: &FlowKey, now: Instant, counts: &Counts) -> bool {
-        self.with_live_flow(key, now, counts, |state| state.touch(key.protocol, now))
-            != LiveFlow::Missing
+        self.with_live_flow(key, now, counts, |state| {
+            state.touch(key.protocol, now, &counts.timeouts);
+        }) != Lookup::Missing
     }
 
     pub(super) fn fragment_disposition(
@@ -316,10 +302,10 @@ impl Shard {
         let peer_flows = &mut self.peer_flows;
         self.flows.retain(|key, state| {
             let kept = keep(key, state);
-            if !kept && let Some(count) = peer_flows.get_mut(&key.remote_peer) {
+            if !kept && let Some(count) = peer_flows.get_mut(&key.peer) {
                 *count -= 1;
                 if *count == 0 {
-                    peer_flows.remove(&key.remote_peer);
+                    peer_flows.remove(&key.peer);
                 }
             }
             kept
@@ -337,28 +323,8 @@ impl Shard {
         counts.release_fragments(before - self.fragments.len());
     }
 
-    /// Replace the flows of this shard; `migrate` maps each entry to its
-    /// successor or drops it. Keys keep their remote peer, so they stay here.
-    pub(super) fn migrate_flows(
-        &mut self,
-        counts: &Counts,
-        mut migrate: impl FnMut(FlowKey, FlowState) -> Option<(FlowKey, FlowState)>,
-    ) {
-        let previous = std::mem::take(&mut self.flows);
-        let before = previous.len();
-        self.peer_flows.clear();
-        for (key, state) in previous {
-            if let Some((key, state)) = migrate(key, state)
-                && self.flows.insert(key, state).is_none()
-            {
-                *self.peer_flows.entry(key.remote_peer).or_default() += 1;
-            }
-        }
-        counts.release_flows(before - self.flows.len());
-    }
-
-    fn peer_flow_count(&self, peer: &[u8; 32]) -> usize {
-        self.peer_flows.get(peer).copied().unwrap_or(0)
+    fn peer_flow_count(&self, peer: PeerId) -> usize {
+        self.peer_flows.get(&peer).copied().unwrap_or(0)
     }
 
     /// Insert a new flow and, for a first fragment, its fragment authority,
@@ -391,9 +357,9 @@ impl Shard {
 
         let new_flow = !self.flows.contains_key(&key);
         if new_flow {
-            if self.peer_flow_count(&key.remote_peer) >= counts.peer_limit {
+            if self.peer_flow_count(key.peer) >= counts.peer_limit {
                 self.sweep(now, counts);
-                if self.peer_flow_count(&key.remote_peer) >= counts.peer_limit {
+                if self.peer_flow_count(key.peer) >= counts.peer_limit {
                     return Admission::Full;
                 }
             }
@@ -407,7 +373,7 @@ impl Shard {
         }
         if let Some(fragment) = &fragment {
             let admission = match self.fragments.get(fragment) {
-                Some(existing) if existing.disposition != FragmentDisposition::EnforceAllow => {
+                Some(existing) if existing.disposition != FragmentDisposition::Allow => {
                     Admission::Full
                 }
                 Some(_) => Admission::Admitted,
@@ -424,15 +390,15 @@ impl Shard {
         }
 
         if new_flow {
-            *self.peer_flows.entry(key.remote_peer).or_default() += 1;
+            *self.peer_flows.entry(key.peer).or_default() += 1;
         }
         self.flows.insert(key, state);
         if let Some(fragment) = fragment {
             self.fragments.insert(
                 fragment,
                 FragmentState {
-                    disposition: FragmentDisposition::EnforceAllow,
-                    expires_at: now + FRAGMENT_TIMEOUT,
+                    disposition: FragmentDisposition::Allow,
+                    expires_at: now + counts.timeouts.fragment,
                 },
             );
         }
@@ -464,7 +430,7 @@ impl Shard {
             key,
             FragmentState {
                 disposition,
-                expires_at: now + FRAGMENT_TIMEOUT,
+                expires_at: now + counts.timeouts.fragment,
             },
         );
         Admission::Admitted
@@ -479,21 +445,22 @@ pub(super) struct StateTable {
 }
 
 impl StateTable {
-    pub(super) fn new(global_limit: usize, peer_limit: usize, fragment_limit: usize) -> Self {
+    pub(super) fn new(config: &GateConfig) -> Self {
         Self {
             shards: (0..SHARD_COUNT).map(|_| Mutex::default()).collect(),
             counts: Counts {
                 flows: AtomicUsize::new(0),
                 fragments: AtomicUsize::new(0),
-                global_limit,
-                peer_limit,
-                fragment_limit,
+                global_limit: config.limits.flows,
+                peer_limit: config.limits.flows_per_peer,
+                fragment_limit: config.limits.fragments,
+                timeouts: config.timeouts,
             },
         }
     }
 
     /// Lock the shard holding `peer`'s state.
-    pub(super) fn lock(&self, peer: &[u8; 32]) -> MutexGuard<'_, Shard> {
+    pub(super) fn lock(&self, peer: PeerId) -> MutexGuard<'_, Shard> {
         self.shards[shard_index(peer)]
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -516,30 +483,17 @@ impl StateTable {
     }
 }
 
-/// Shard of a remote peer key: its four words multiplied by distinct odd
-/// constants (independently, unlike a byte-wise chain) and summed.
-pub(super) fn shard_index(peer: &[u8; 32]) -> usize {
-    const MULTIPLIERS: [u64; 4] = [
-        0x9E37_79B9_7F4A_7C15,
-        0xC2B2_AE3D_27D4_EB4F,
-        0x1656_67B1_9E37_79F9,
-        0x85EB_CA77_C2B2_AE63,
-    ];
-    let (words, _) = peer.as_chunks::<8>();
-    let hash = words
-        .iter()
-        .zip(MULTIPLIERS)
-        .fold(0_u64, |hash, (word, multiplier)| {
-            hash.wrapping_add(u64::from_le_bytes(*word).wrapping_mul(multiplier))
-        });
+/// Shard of a peer: its id multiplied by an odd constant, top bits.
+pub(super) fn shard_index(peer: PeerId) -> usize {
+    let hash = u64::from(peer.get()).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     usize::try_from(hash >> 58).unwrap_or(0)
 }
 
-pub(super) const fn protocol_timeout(protocol: u8) -> Duration {
+pub(super) const fn protocol_timeout(protocol: u8, timeouts: &GateTimeouts) -> Duration {
     match protocol {
-        6 => TCP_IDLE_TIMEOUT,
-        17 => UDP_IDLE_TIMEOUT,
-        1 => ICMP_IDLE_TIMEOUT,
-        _ => OTHER_IDLE_TIMEOUT,
+        6 => timeouts.tcp,
+        17 => timeouts.udp,
+        1 => timeouts.icmp,
+        _ => timeouts.other,
     }
 }
