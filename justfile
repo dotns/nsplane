@@ -3,7 +3,7 @@
 default: check
 
 # Run every gate.
-check: fmt clippy test doc-test deny shear typos msrv examples
+check: fmt clippy test doc-test deny shear typos msrv examples product-terms
 
 fmt:
     cargo fmt --all --check
@@ -32,6 +32,10 @@ msrv:
 # Build every example binary.
 examples:
     cargo build -p nsplane-examples --bins --locked
+
+# Product-term scan of the public API and rustdoc (ADR 2026-10-06 business-agnostic scope).
+product-terms:
+    scripts/check-product-terms.sh
 
 # Cross-target clippy: macOS through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
 cross:
