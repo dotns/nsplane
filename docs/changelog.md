@@ -161,3 +161,8 @@ Release 0.11.0 (tag `v0.11.0`). It is breaking: nsplane is business-agnostic (AD
 `2026-10-06-business-agnostic-scope`), and the products implement the removed concepts from
 `docs/specs/`. The release table is in README Performance. A F1 re-check against 0.10.1 shows
 nsplane -> kernel WireGuard at par.
+
+## 2026-10-08 07:00 [decision]
+
+Feature freeze at 0.11.x (ADR `2026-10-08-feature-freeze-0-11`, owner): only bug fixes until
+ns and nsgw are integrated.
