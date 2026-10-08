@@ -238,6 +238,9 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Release 0.9.0 | the remaining ns requests (tag `v0.9.0`) | 2026-10-04 |
 | Optimization | engine fast path and parallel per-peer crypto, UDP batching, TUN buffers; netstack smoltcp fork round; hygiene follow-ups | done (plan `20261004-1730-optimization`) |
 | Release 0.10.0 | the optimization round (tag `v0.10.0`) | 2026-10-05 |
+| ns requests 2 | graph primitives, recycling, Windows TUN, netstack PMTU and tail loss probe, deliver room without workers | done (plan `20261006-0900-ns-requests-2`) |
+| Business-agnostic | generic ACL core and flow gate, EAM names, WSS server transport, product-term scan; product concepts moved to `docs/specs/` | done (plan `20261007-0900-business-agnostic`) |
+| Release 0.11.0 | breaking: business-agnostic API (tag `v0.11.0`) | 2026-10-08 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

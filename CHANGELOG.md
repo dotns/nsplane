@@ -5,6 +5,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-08
+
+Two rounds since 0.10.0: the remaining ns requests with the optimization follow-ups (plan
+`20261006-0900-ns-requests-2`) and the business-agnostic cleanup (plan
+`20261007-0900-business-agnostic`, ADR `2026-10-06-business-agnostic-scope`). This release breaks
+the public API.
+
+- `nsplane-acl` is now a business-agnostic core: label sets, rule IDs, explicit policy states,
+  `Flow` evaluation and a generic stateful flow gate (`gate`). The product identity model, the
+  JSON policy document, the `crates_acl()` preset and the node L3 model are removed. They are
+  specified for products to implement in `docs/specs/`, together with their parity data.
+- `nsplane-nat` translator fields and lookups use generic explicit-address-mapping (EAM) names.
+- New features:
+  - local-side graph: `Splitter::new_map`, `MapSink::with_after`, `SwapSink` and `AbortSink`;
+  - buffer recycling: `SharedPacketPool`, `PacketSink::send_batch_spent`, and `recycle` in the
+    pipe, channel, merge and TUN sources;
+  - the WSS datagram server transport (`WssServerTransport`);
+  - `Event::Authenticated` once per source change, and caller-updated inbound destinations;
+  - Windows service TUN checks (Wintun pin, exclusive adapter, orphan replacement, MTU on both
+    families) and the created interface name.
+- Defaults: without crypto workers a full deliver sink now holds receive back instead of
+  dropping. The netstack `datagram_capacity` is 256. netstack TCP handles Packet Too Big for its
+  own connections and has a tail loss probe (smoltcp fork `v0.14.0-nsplane.6`).
+- The `WsFrame` stream carrier is deprecated.
+- Release table (2026-10-07, slot CPU sets, load 2-6, Gbit/s for 1 / 4 TCP streams): nsplane
+  11.1 / 11.8, with two crypto workers 14.5 / 15.2, kernel WireGuard -> nsplane 5.5,
+  wireguard-go 12.7 / 11.3, netstack 8.6 / 11.0. nsplane -> kernel WireGuard is at par with
+  0.10.1 (7.7 / 7.1 for both), so F1 costs nothing there.
+
 ### Added
 - `nsplane-core`: caller-updated inbound destinations: the `InboundDestinations` trait
   (implemented for closures), consulted once per decrypted data packet of a peer and never

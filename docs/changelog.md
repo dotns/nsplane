@@ -154,3 +154,10 @@ and why.
 Release 0.10.1 (tag `v0.10.1`, branch `release/0.10.x` from v0.10.0). It carries one fix: with
 `crypto_workers >= 2`, seals in flight count against the local room, so a full transmit queue
 holds back the source instead of dropping. Found by QE-6, campaign `nsplane-q2-202610060900`.
+
+## 2026-10-08 06:00 [release]
+
+Release 0.11.0 (tag `v0.11.0`). It is breaking: nsplane is business-agnostic (ADR
+`2026-10-06-business-agnostic-scope`), and the products implement the removed concepts from
+`docs/specs/`. The release table is in README Performance. A F1 re-check against 0.10.1 shows
+nsplane -> kernel WireGuard at par.

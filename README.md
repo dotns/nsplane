@@ -156,21 +156,24 @@ details.
 
 ## Performance
 
-Measured with `just bench-wg` (`scripts/bench/wg-compare.sh`): two containers per pair,
-pinned CPU sets, real TUN devices, MTU 1420, iperf3, 30 s x 3, medians, on a quiet 32-CPU
-host (2026-10-04, main `92652cb`):
+Measured with `just bench-wg` (`scripts/bench/wg-compare.sh` through `scripts/bench/slot.sh`):
+two containers per pair, pinned to one CCD's physical cores (slot 0: CPUs 1-3 / 4-7), real
+TUN devices, MTU 1420, iperf3, 30 s x 3, medians, 32-CPU host at load 2-6 (2026-10-07, main
+`45667ef`, 0.11.0):
 
 | Pair | TCP 1 stream | TCP 4 streams | UDP 3 Gbit/s loss |
 | --- | --- | --- | --- |
-| nsplane <-> nsplane | 8.1 Gbit/s | 8.9 Gbit/s | 0.4 % |
-| nsplane -> kernel WireGuard | 7.7 Gbit/s | 7.6 Gbit/s | 0.0 % |
-| kernel WireGuard -> nsplane | 7.0 Gbit/s | 6.9 Gbit/s | 0.0 % |
-| wireguard-go <-> wireguard-go | 10.0 Gbit/s | 10.1 Gbit/s | 0.4 % |
-| kernel WireGuard <-> kernel WireGuard | 4.0 Gbit/s | 4.1 Gbit/s | 0.0 % |
+| nsplane <-> nsplane | 11.1 Gbit/s | 11.8 Gbit/s | 0.03 % |
+| nsplane <-> nsplane, 2 crypto workers | 14.5 Gbit/s | 15.2 Gbit/s | 0.10 % |
+| nsplane -> kernel WireGuard | 7.7 Gbit/s | 7.1 Gbit/s | 0.05 % |
+| kernel WireGuard -> nsplane | 5.5 Gbit/s | 5.5 Gbit/s | 0.03 % |
+| wireguard-go <-> wireguard-go | 12.7 Gbit/s | 11.3 Gbit/s | 0.18 % |
+| netstack <-> netstack (user space, no TUN) | 8.6 Gbit/s | 11.0 Gbit/s | 0.00 % |
 
-Kernel WireGuard is held back by the CPU pinning (its crypto threads run outside the pinned
-sets). Offload carries nsplane: without it, 3.1 Gbit/s on one stream. Details, latency and CPU
-per GB are in [docs/architecture.md](docs/architecture.md#against-wireguard-implementations).
+Kernel WireGuard is held back by the CPU pinning, because its crypto threads run outside the
+pinned sets. With two or more crypto workers, one peer's crypto spreads over all workers.
+Details, latency and CPU per GB are in
+[docs/architecture.md](docs/architecture.md#against-wireguard-implementations).
 
 ## Tuning
 
