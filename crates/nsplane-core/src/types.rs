@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nsplane_noise::x25519;
-use nsplane_packet::{PacketBuf, Path, PeerId};
+use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 
 use crate::filter::PacketFilter;
 use crate::policy::{PathPolicy, StandardRoaming};
@@ -39,6 +39,44 @@ impl FromStr for AllowedIp {
     }
 }
 
+/// A local identity of the core: one of its own static keys.
+///
+/// Every peer belongs to one local identity, which answers and initiates its handshakes with
+/// its key. [`LocalIdentityId::DEFAULT`] always exists and holds the key set by
+/// [`CoreConfig::private_key`] and [`ConfigChange::SetPrivateKey`] (possibly none); the
+/// others are added with [`Core::add_local_identity`]. Ids are handed out in ascending order
+/// and never reused.
+///
+/// [`Core::add_local_identity`]: crate::Core::add_local_identity
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct LocalIdentityId(u32);
+
+impl LocalIdentityId {
+    /// The default identity, always present.
+    pub const DEFAULT: Self = Self(0);
+
+    /// The identity with this number.
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+/// A local identity as reported by [`Core::local_identities`].
+///
+/// [`Core::local_identities`]: crate::Core::local_identities
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub struct LocalIdentityInfo {
+    /// The identity.
+    pub id: LocalIdentityId,
+    /// Its public key; `None` for the default identity before a private key is set.
+    pub public_key: Option<x25519::PublicKey>,
+    /// Number of peers bound to it.
+    pub peers: usize,
+    /// The transports it answers handshakes on; `None` for any transport.
+    pub transports: Option<Vec<TransportId>>,
+}
+
 /// A peer to add, or the changes to apply to an existing peer.
 ///
 /// On update, `None` leaves the preshared key, keepalive, path and inbound destinations
@@ -67,6 +105,12 @@ pub struct PeerConfig {
     ///
     /// [`reasons::DESTINATION_NOT_ALLOWED`]: crate::reasons::DESTINATION_NOT_ALLOWED
     pub inbound_destinations: Option<Vec<AllowedIp>>,
+    /// The local identity the peer belongs to; `None` is [`LocalIdentityId::DEFAULT`].
+    ///
+    /// Fixed when the peer is added: the peer is keyed by its identity and public key, so a
+    /// config naming another identity addresses another peer (possibly with the same public
+    /// key). A peer of an unknown identity is not added.
+    pub local_identity: Option<LocalIdentityId>,
 }
 
 /// A caller-updated source of a peer's inbound destinations, consulted per packet.
@@ -102,6 +146,7 @@ impl PeerConfig {
             persistent_keepalive: None,
             path: None,
             inbound_destinations: None,
+            local_identity: None,
         }
     }
 }
@@ -116,11 +161,16 @@ impl fmt::Debug for PeerConfig {
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("path", &self.path)
             .field("inbound_destinations", &self.inbound_destinations)
+            .field("local_identity", &self.local_identity)
             .finish()
     }
 }
 
 /// A configuration change applied by the core.
+///
+/// Changes that name a peer by public key address the peer of the default identity
+/// ([`LocalIdentityId::DEFAULT`]); wrap them in [`ConfigChange::InLocalIdentity`] for a peer
+/// of another identity.
 pub enum ConfigChange {
     /// Replaces the private key; every peer is re-keyed and its sessions are cleared.
     SetPrivateKey(x25519::StaticSecret),
@@ -175,6 +225,22 @@ pub enum ConfigChange {
         /// The new source; `None` removes it, leaving the peer unchecked.
         source: Option<Arc<dyn InboundDestinations>>,
     },
+    /// Applies `change` to the peer of `identity` with the public key it names, instead of
+    /// the peer of the default identity.
+    ///
+    /// Only peer-keyed changes apply: [`ConfigChange::RemovePeer`],
+    /// [`ConfigChange::SetAllowedIps`], [`ConfigChange::SetPresharedKey`],
+    /// [`ConfigChange::SetKeepalive`], [`ConfigChange::SetPath`],
+    /// [`ConfigChange::SetInboundDestinations`] and
+    /// [`ConfigChange::SetInboundDestinationSource`]; any other change is ignored. Add or
+    /// update a peer of another identity with [`ConfigChange::AddOrUpdatePeer`] and
+    /// [`PeerConfig::local_identity`].
+    InLocalIdentity {
+        /// The identity of the peer.
+        identity: LocalIdentityId,
+        /// The change to apply to that identity's peer.
+        change: Box<Self>,
+    },
 }
 
 impl fmt::Debug for ConfigChange {
@@ -215,6 +281,11 @@ impl fmt::Debug for ConfigChange {
                 .debug_struct("SetInboundDestinationSource")
                 .field("peer", peer)
                 .field("source", &source.as_ref().map(|_| "<source>"))
+                .finish(),
+            Self::InLocalIdentity { identity, change } => f
+                .debug_struct("InLocalIdentity")
+                .field("identity", identity)
+                .field("change", change)
                 .finish(),
         }
     }
@@ -262,6 +333,11 @@ pub enum Output {
 }
 
 /// An event reported by the core.
+///
+/// Events name peers by [`PeerId`]; the peer's identity is resolvable from its `PeerId`
+/// ([`PeerStats::local_identity`], through [`Core::peer_stats`]).
+///
+/// [`Core::peer_stats`]: crate::Core::peer_stats
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A handshake with `peer` completed: a new session was established.
@@ -368,6 +444,8 @@ pub struct PeerStats {
     pub peer: PeerId,
     /// Public key of the peer.
     pub public_key: x25519::PublicKey,
+    /// The local identity the peer belongs to.
+    pub local_identity: LocalIdentityId,
     /// Current path of the peer.
     pub path: Option<Path>,
     /// Networks routed to the peer.
@@ -398,6 +476,7 @@ impl fmt::Debug for PeerStats {
         f.debug_struct("PeerStats")
             .field("peer", &self.peer)
             .field("public_key", &self.public_key)
+            .field("local_identity", &self.local_identity)
             .field("path", &self.path)
             .field("allowed_ips", &self.allowed_ips)
             .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
@@ -413,7 +492,8 @@ impl fmt::Debug for PeerStats {
 
 /// Configuration of the core.
 pub struct CoreConfig {
-    /// Own private key; peers can only be added once it is set.
+    /// Own private key, of the default identity ([`LocalIdentityId::DEFAULT`]); its peers can
+    /// only be added once it is set.
     pub private_key: Option<x25519::StaticSecret>,
     /// Path selection and roaming decisions.
     pub policy: Box<dyn PathPolicy>,
