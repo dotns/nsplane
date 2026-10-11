@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::PublicKey;
-use nsplane_packet::Path;
+use nsplane_packet::{Path, TransportId};
 
 use crate::core::same_route;
+use crate::types::LocalIdentityId;
 
 /// Where a peer keeps its tunnel, chosen once by the core.
 enum Tunnel {
@@ -63,6 +64,10 @@ pub(crate) struct Peer {
     /// The associated tunnel struct.
     tunnel: Tunnel,
     public_key: PublicKey,
+    /// The local identity the peer belongs to, fixed at creation.
+    local_identity: LocalIdentityId,
+    /// The transports its identity is restricted to; `None` for any transport.
+    transports: Option<Arc<[TransportId]>>,
     /// The index the tunnel uses
     index: u32,
     path: Option<Path>,
@@ -100,8 +105,9 @@ impl std::fmt::Debug for Peer {
 }
 
 impl Peer {
-    /// Creates a peer around `tunnel`; a `shared` tunnel goes behind a lock, for a core
-    /// that hands out [`CryptoJob`]s.
+    /// Creates a peer of the default identity around `tunnel`, accepting messages on any
+    /// transport; a `shared` tunnel goes behind a lock, for a core that hands out
+    /// [`CryptoJob`]s.
     ///
     /// [`CryptoJob`]: crate::CryptoJob
     pub(crate) fn new(
@@ -121,6 +127,8 @@ impl Peer {
         Self {
             tunnel,
             public_key,
+            local_identity: LocalIdentityId::DEFAULT,
+            transports: None,
             index,
             path,
             last_reported_from: None,
@@ -303,6 +311,31 @@ impl Peer {
     /// The public key of the peer.
     pub(crate) const fn public_key(&self) -> &PublicKey {
         &self.public_key
+    }
+
+    /// Binds a new peer to `local_identity`, accepting messages on `transports` only, or on
+    /// any transport with `None`.
+    pub(crate) fn with_identity(
+        mut self,
+        local_identity: LocalIdentityId,
+        transports: Option<Arc<[TransportId]>>,
+    ) -> Self {
+        self.local_identity = local_identity;
+        self.transports = transports;
+        self
+    }
+
+    /// The local identity the peer belongs to.
+    pub(crate) const fn local_identity(&self) -> LocalIdentityId {
+        self.local_identity
+    }
+
+    /// Whether the peer accepts messages arriving on `transport`: any transport unless its
+    /// identity is restricted to a set.
+    pub(crate) fn accepts(&self, transport: TransportId) -> bool {
+        self.transports
+            .as_deref()
+            .is_none_or(|set| set.contains(&transport))
     }
 
     /// The receiver index of the current session's transport data messages, if any.
