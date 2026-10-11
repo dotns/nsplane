@@ -667,6 +667,7 @@ mod tests {
         let peer = PeerStats {
             peer: nsplane::PeerId::new(1),
             public_key: PublicKey::from([1; 32]),
+            local_identity: nsplane::LocalIdentityId::DEFAULT,
             path: None,
             allowed_ips: Vec::new(),
             preshared_key: None,

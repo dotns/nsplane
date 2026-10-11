@@ -1894,3 +1894,258 @@ async fn duplicates_opened_on_different_workers_are_rejected_as_replays() {
     let replayed = b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await - replays;
     assert_eq!(replayed, u64::from(PACKETS));
 }
+
+#[tokio::test]
+async fn local_identities_are_added_listed_and_removed() {
+    let (a, _b) = peered().await;
+    let default = nsplane::LocalIdentityId::DEFAULT;
+
+    let first = a.handle.add_local_identity(secret(3)).await.unwrap();
+    let first = first.expect("new key");
+    assert_ne!(first, default);
+    // A key held by an identity, the default one included, is refused.
+    assert_eq!(a.handle.add_local_identity(secret(3)).await.unwrap(), None);
+    assert_eq!(a.handle.add_local_identity(secret(1)).await.unwrap(), None);
+
+    let identities = a.handle.local_identities().await.unwrap();
+    let listed: Vec<_> = identities
+        .iter()
+        .map(|i| (i.id, i.public_key, i.peers, i.transports.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (default, Some(a.public()), 1, None),
+            (first, Some(PublicKey::from(&secret(3))), 0, None),
+        ]
+    );
+
+    assert!(!a.handle.remove_local_identity(default).await.unwrap());
+    assert!(a.handle.remove_local_identity(first).await.unwrap());
+    assert!(!a.handle.remove_local_identity(first).await.unwrap());
+    assert_eq!(a.handle.local_identities().await.unwrap().len(), 1);
+
+    // Ids are not reused, even for the same key.
+    let second = a.handle.add_local_identity(secret(3)).await.unwrap();
+    let second = second.expect("key free again");
+    assert_ne!(second, first);
+    assert_ne!(second, default);
+}
+
+/// `node`'s peer description, bound to `identity` and routing `ip` to it.
+fn peer_in(
+    node: &Node,
+    identity: nsplane::LocalIdentityId,
+    ip: Ipv4Addr,
+    via: TransportId,
+) -> Peer {
+    Peer {
+        allowed_ips: vec![AllowedIp {
+            addr: IpAddr::V4(ip),
+            cidr: 32,
+        }],
+        local_identity: Some(identity),
+        ..node.as_peer(via)
+    }
+}
+
+#[tokio::test]
+async fn peers_with_one_key_in_two_identities_are_distinct() {
+    let (a, b) = peered().await;
+    let other = a
+        .handle
+        .add_local_identity(secret(3))
+        .await
+        .unwrap()
+        .unwrap();
+    let default = nsplane::LocalIdentityId::DEFAULT;
+    a.handle
+        .add_or_update_peer(peer_in(&b, other, Ipv4Addr::new(10, 0, 1, 2), a.transport))
+        .await
+        .unwrap();
+
+    let in_default = a.handle.peer_id_in(default, b.public()).await.unwrap();
+    let in_other = a.handle.peer_id_in(other, b.public()).await.unwrap();
+    assert_eq!(in_default, a.handle.peer_id(b.public()).await.unwrap());
+    assert!(in_default.is_some() && in_other.is_some());
+    assert_ne!(in_default, in_other);
+    let stats = a
+        .handle
+        .peer_stats(in_other.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats.local_identity, other);
+
+    // Removing one leaves the other.
+    a.handle.remove_peer_in(other, b.public()).await.unwrap();
+    assert_eq!(a.handle.peer_id_in(other, b.public()).await.unwrap(), None);
+    assert_eq!(a.handle.peer_id(b.public()).await.unwrap(), in_default);
+
+    // Removing an identity removes its peers.
+    a.handle
+        .add_or_update_peer(peer_in(&b, other, Ipv4Addr::new(10, 0, 1, 2), a.transport))
+        .await
+        .unwrap();
+    assert_eq!(a.handle.peers().await.unwrap().len(), 2);
+    assert!(a.handle.remove_local_identity(other).await.unwrap());
+    let peers = a.handle.peers().await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].local_identity, default);
+}
+
+#[tokio::test]
+async fn status_lists_local_identities() {
+    let (a, b) = peered().await;
+    let restricted = a
+        .handle
+        .add_local_identity_on(secret(3), [TransportId::new(1), TransportId::new(7)])
+        .await
+        .unwrap()
+        .unwrap();
+    let silent = a
+        .handle
+        .add_local_identity_on(secret(4), [])
+        .await
+        .unwrap()
+        .unwrap();
+    a.handle
+        .add_or_update_peer(peer_in(
+            &b,
+            restricted,
+            Ipv4Addr::new(10, 0, 1, 2),
+            a.transport,
+        ))
+        .await
+        .unwrap();
+
+    let status = a.handle.status().await.unwrap();
+    assert_eq!(status.public_key, Some(a.public()));
+    assert_eq!(status.peers.len(), 2);
+    let listed: Vec<_> = status
+        .local_identities
+        .iter()
+        .map(|i| (i.id, i.peers, i.transports.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (nsplane::LocalIdentityId::DEFAULT, 1, None),
+            (
+                restricted,
+                1,
+                Some(vec![TransportId::new(1), TransportId::new(7)])
+            ),
+            (silent, 0, Some(vec![])),
+        ]
+    );
+    assert_eq!(
+        status.local_identities,
+        a.handle.local_identities().await.unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_remote_key_in_two_identities_carries_traffic_with_crypto_workers() {
+    const IP_A2: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 1);
+    const IP_B2: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
+    let (ta, tb) = link(1024);
+    let (mut a, mut b) = nodes(ta, tb, &pooled(2));
+    // B answers as its default identity and as a second one; A peers with both keys.
+    let other = b
+        .handle
+        .add_local_identity(secret(3))
+        .await
+        .unwrap()
+        .unwrap();
+    b.handle
+        .add_or_update_peer(a.as_peer(b.transport))
+        .await
+        .unwrap();
+    b.handle
+        .add_or_update_peer(peer_in(&a, other, IP_A2, b.transport))
+        .await
+        .unwrap();
+    a.handle
+        .add_or_update_peer(b.as_peer(a.transport))
+        .await
+        .unwrap();
+    a.handle
+        .add_or_update_peer(Peer {
+            allowed_ips: vec![AllowedIp {
+                addr: IpAddr::V4(IP_B2),
+                cidr: 32,
+            }],
+            ..Peer::new(PublicKey::from(&secret(3)))
+        })
+        .await
+        .unwrap();
+    a.handle
+        .set_path(
+            PublicKey::from(&secret(3)),
+            Path {
+                transport: a.transport,
+                addr: b.addr,
+                ecn: Ecn::NotEct,
+            },
+        )
+        .await
+        .unwrap();
+    let in_default = b.handle.peer_id(a.public()).await.unwrap().unwrap();
+    let in_other = b
+        .handle
+        .peer_id_in(other, a.public())
+        .await
+        .unwrap()
+        .unwrap();
+    let to_other = a
+        .handle
+        .peer_id(PublicKey::from(&secret(3)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    for round in 0..3u8 {
+        a.local
+            .send(PacketBuf::from_packet(&ipv4(IP_A, IP_B, &[round])))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.expect_delivery().await,
+            (in_default, ipv4(IP_A, IP_B, &[round]))
+        );
+        a.local
+            .send(PacketBuf::from_packet(&ipv4(IP_A2, IP_B2, &[round])))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.expect_delivery().await,
+            (in_other, ipv4(IP_A2, IP_B2, &[round]))
+        );
+        b.local
+            .send(PacketBuf::from_packet(&ipv4(IP_B2, IP_A2, &[round])))
+            .await
+            .unwrap();
+        assert_eq!(
+            a.expect_delivery().await,
+            (to_other, ipv4(IP_B2, IP_A2, &[round]))
+        );
+    }
+    let stats = b.handle.peer_stats(in_other).await.unwrap().unwrap();
+    assert_eq!(stats.local_identity, other);
+    assert!(stats.data_rx > 0 && stats.data_tx > 0);
+}
+
+#[tokio::test]
+async fn default_key_held_by_another_identity_is_ignored() {
+    let (a, _b) = peered().await;
+    a.handle
+        .add_local_identity(secret(3))
+        .await
+        .unwrap()
+        .unwrap();
+    a.handle.set_private_key(secret(3)).await.unwrap();
+    assert_eq!(a.handle.public_key().await.unwrap(), Some(a.public()));
+    let kept = a.handle.private_key().await.unwrap().unwrap();
+    assert_eq!(PublicKey::from(&kept), a.public());
+}

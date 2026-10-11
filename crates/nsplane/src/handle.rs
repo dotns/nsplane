@@ -6,7 +6,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
-use nsplane_core::{AllowedIp, ConfigChange, Event, InboundDestinations, PeerConfig, PeerStats};
+use nsplane_core::{
+    AllowedIp, ConfigChange, Event, InboundDestinations, LocalIdentityId, LocalIdentityInfo,
+    PeerConfig, PeerStats,
+};
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -19,7 +22,18 @@ use crate::transport::{PathMtuReport, Transport};
 /// This is the core's [`PeerConfig`]: a public key, allowed IPs (added to the existing ones
 /// unless `replace_allowed_ips`), an optional preshared key, keepalive and initial path. On
 /// update, `None` fields leave the peer's settings unchanged.
+///
+/// With [`PeerConfig::local_identity`] set, the peer belongs to that local identity (see
+/// [`EngineHandle::add_local_identity`]); the identity is fixed at creation, and the pair
+/// (identity, public key) names the peer.
 pub type Peer = PeerConfig;
+
+/// A local identity of the engine; see [`EngineHandle::local_identities`].
+///
+/// This is the core's [`LocalIdentityInfo`]: its id, its public key (`None` for the default
+/// identity before a private key is set), its number of peers, and the transports it answers
+/// handshakes on (`None` for any transport, see [`EngineHandle::add_local_identity_on`]).
+pub type LocalIdentity = LocalIdentityInfo;
 
 /// The error every [`EngineHandle`] call returns once the engine has stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +225,7 @@ pub struct PathMtuStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EngineStatus {
-    /// The engine's public key, once a private key is set.
+    /// The public key of the default local identity, once a private key is set.
     pub public_key: Option<PublicKey>,
     /// The current MTU.
     pub mtu: u16,
@@ -231,6 +245,8 @@ pub struct EngineStatus {
     pub peer_mtus: PeerMtus,
     /// As [`EngineHandle::path_mtu_stats`].
     pub path_mtu: PathMtuStats,
+    /// Every local identity, as [`EngineHandle::local_identities`].
+    pub local_identities: Vec<LocalIdentity>,
 }
 
 /// A request to the owner task; each carries the channel for its reply.
@@ -273,6 +289,14 @@ pub(crate) enum Command {
     Shutdown(oneshot::Sender<()>),
     UnansweredHandshakes(PeerId, oneshot::Sender<Option<u64>>),
     TotalUnansweredHandshakes(oneshot::Sender<u64>),
+    AddLocalIdentity(
+        StaticSecret,
+        Option<Vec<TransportId>>,
+        oneshot::Sender<Option<LocalIdentityId>>,
+    ),
+    RemoveLocalIdentity(LocalIdentityId, oneshot::Sender<bool>),
+    LocalIdentities(oneshot::Sender<Vec<LocalIdentity>>),
+    PeerIdIn(LocalIdentityId, PublicKey, oneshot::Sender<Option<PeerId>>),
 }
 
 /// A cheap, cloneable handle to a running engine.
@@ -315,15 +339,26 @@ impl EngineHandle {
         self.call(|tx| Command::Config(change, tx)).await
     }
 
-    /// Replaces the private key; every peer is re-keyed and its sessions are cleared.
+    /// Replaces the private key of the default local identity; every peer of that identity
+    /// is re-keyed and its sessions are cleared. A key another local identity holds is
+    /// ignored.
     pub async fn set_private_key(&self, key: StaticSecret) -> Result<(), EngineError> {
         self.config(ConfigChange::SetPrivateKey(key)).await
     }
 
-    /// Adds a peer, or updates it in place if its public key is known.
+    /// Adds a peer, or updates it in place if its public key is known in its local identity.
     ///
     /// Peers cannot be added before a private key is set; the core then reports
     /// `Event::Dropped { reason: "no private key", .. }`.
+    ///
+    /// The methods below that name a peer by public key address the peer of the default
+    /// local identity. A peer of another identity (`local_identity` set) is removed and given
+    /// inbound destinations with the `_in` methods ([`EngineHandle::remove_peer_in`],
+    /// [`EngineHandle::set_inbound_destinations_in`],
+    /// [`EngineHandle::set_inbound_destination_source_in`]); every other setting of it goes
+    /// through this method with `local_identity` set: allowed IPs (with
+    /// `replace_allowed_ips` to replace them), the preshared key (all zeros removes it), the
+    /// keepalive (0 disables it) and the path.
     pub async fn add_or_update_peer(&self, peer: Peer) -> Result<(), EngineError> {
         self.config(ConfigChange::AddOrUpdatePeer(peer)).await
     }
@@ -399,7 +434,113 @@ impl EngineHandle {
         self.config(ConfigChange::SetPath { peer, path }).await
     }
 
-    /// The id of the peer with this public key.
+    /// Removes the peer of `identity` with this public key, as [`EngineHandle::remove_peer`]
+    /// does for the default identity. Ignored for an unknown identity or peer.
+    pub async fn remove_peer_in(
+        &self,
+        identity: LocalIdentityId,
+        key: PublicKey,
+    ) -> Result<(), EngineError> {
+        self.config_in(identity, ConfigChange::RemovePeer(key))
+            .await
+    }
+
+    /// Sets the inbound destinations of the peer of `identity` with public key `peer`, as
+    /// [`EngineHandle::set_inbound_destinations`] does for the default identity.
+    pub async fn set_inbound_destinations_in(
+        &self,
+        identity: LocalIdentityId,
+        peer: PublicKey,
+        destinations: Option<Vec<AllowedIp>>,
+    ) -> Result<(), EngineError> {
+        self.config_in(
+            identity,
+            ConfigChange::SetInboundDestinations { peer, destinations },
+        )
+        .await
+    }
+
+    /// Sets the inbound destination source of the peer of `identity` with public key `peer`,
+    /// as [`EngineHandle::set_inbound_destination_source`] does for the default identity.
+    pub async fn set_inbound_destination_source_in(
+        &self,
+        identity: LocalIdentityId,
+        peer: PublicKey,
+        source: Option<Arc<dyn InboundDestinations>>,
+    ) -> Result<(), EngineError> {
+        self.config_in(
+            identity,
+            ConfigChange::SetInboundDestinationSource { peer, source },
+        )
+        .await
+    }
+
+    async fn config_in(
+        &self,
+        identity: LocalIdentityId,
+        change: ConfigChange,
+    ) -> Result<(), EngineError> {
+        self.config(ConfigChange::InLocalIdentity {
+            identity,
+            change: Box::new(change),
+        })
+        .await
+    }
+
+    /// Adds a local identity with its own static key, which answers handshakes on every
+    /// transport; returns its id, or `None` if an identity of the engine (the default one
+    /// included) already holds the key.
+    ///
+    /// Peers are bound to an identity with [`PeerConfig::local_identity`]; the same remote
+    /// key may be a peer of several identities. Ids are never reused.
+    pub async fn add_local_identity(
+        &self,
+        key: StaticSecret,
+    ) -> Result<Option<LocalIdentityId>, EngineError> {
+        self.call(|tx| Command::AddLocalIdentity(key, None, tx))
+            .await
+    }
+
+    /// Like [`EngineHandle::add_local_identity`], but the identity answers handshakes only on
+    /// `transports` (on none for an empty set).
+    ///
+    /// On any other transport the identity behaves as if its key did not exist: an
+    /// initiation for it gets no response and no cookie reply. This keeps a remote party
+    /// from probing, through one transport, whether the engine also holds an identity used
+    /// on another. Its peers' handshake responses and cookie replies arriving on another
+    /// transport are dropped as for an unknown peer, and their data as for an unknown
+    /// session. Outbound traffic is not restricted: a peer's path may name any transport.
+    pub async fn add_local_identity_on(
+        &self,
+        key: StaticSecret,
+        transports: impl IntoIterator<Item = TransportId>,
+    ) -> Result<Option<LocalIdentityId>, EngineError> {
+        let transports = transports.into_iter().collect();
+        self.call(|tx| Command::AddLocalIdentity(key, Some(transports), tx))
+            .await
+    }
+
+    /// Removes a local identity and each of its peers as [`EngineHandle::remove_peer`] does;
+    /// `false` for [`LocalIdentityId::DEFAULT`] or an unknown identity.
+    pub async fn remove_local_identity(&self, id: LocalIdentityId) -> Result<bool, EngineError> {
+        self.call(|tx| Command::RemoveLocalIdentity(id, tx)).await
+    }
+
+    /// Every local identity, ascending by id; the default identity is first.
+    pub async fn local_identities(&self) -> Result<Vec<LocalIdentity>, EngineError> {
+        self.call(Command::LocalIdentities).await
+    }
+
+    /// The id of the peer of `identity` with this public key.
+    pub async fn peer_id_in(
+        &self,
+        identity: LocalIdentityId,
+        key: PublicKey,
+    ) -> Result<Option<PeerId>, EngineError> {
+        self.call(|tx| Command::PeerIdIn(identity, key, tx)).await
+    }
+
+    /// The id of the peer of the default local identity with this public key.
     pub async fn peer_id(&self, key: PublicKey) -> Result<Option<PeerId>, EngineError> {
         self.call(|tx| Command::PeerId(key, tx)).await
     }
@@ -414,13 +555,13 @@ impl EngineHandle {
         self.call(Command::Peers).await
     }
 
-    /// The own public key, once a private key is set.
+    /// The public key of the default local identity, once a private key is set.
     pub async fn public_key(&self) -> Result<Option<PublicKey>, EngineError> {
         self.call(Command::PublicKey).await
     }
 
-    /// The last private key given to the engine (by the builder or
-    /// [`EngineHandle::set_private_key`]).
+    /// The last private key of the default local identity given to the engine (by the
+    /// builder or [`EngineHandle::set_private_key`]).
     pub async fn private_key(&self) -> Result<Option<StaticSecret>, EngineError> {
         self.call(Command::PrivateKey).await
     }
@@ -691,7 +832,8 @@ impl EngineHandle {
     }
 
     /// The public key, MTU, suspension, peers, transport counters, drop counters, queue
-    /// statistics, fragmentation counters, peer MTUs and path MTU counters, taken together in one call to the owner task,
+    /// statistics, fragmentation counters, peer MTUs, path MTU counters and local
+    /// identities, taken together in one call to the owner task,
     /// so they describe the same moment (up to the transport counters, see
     /// [`EngineHandle::transport_stats`]).
     ///
