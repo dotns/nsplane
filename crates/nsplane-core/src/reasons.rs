@@ -19,6 +19,11 @@ pub const DESTINATION_NOT_ALLOWED: &str = "destination not allowed";
 pub const NO_PRIVATE_KEY: &str = "no private key";
 /// A handshake message failed the handshake gate's mac1 check.
 pub const INVALID_HANDSHAKE: &str = "invalid handshake";
+/// A handshake initiation is for no local identity, or a peer names an unknown one.
+///
+/// The initiation's mac1 matches the key of no local identity that serves the transport it
+/// arrived on: nothing is answered, and it counts against no handshake budget.
+pub const UNKNOWN_LOCAL_IDENTITY: &str = "unknown local identity";
 /// A verified handshake message names no configured peer.
 pub const UNKNOWN_PEER: &str = "unknown peer";
 /// A packet for an explicit path (`Core::inject_outbound_on`) found no current session.

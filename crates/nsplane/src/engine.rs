@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use nsplane_core::x25519::StaticSecret;
+use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{ConfigChange, Core, CoreConfig, CryptoJob, Event, Input, Output, PeerStats};
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
@@ -1752,14 +1752,7 @@ impl Owner {
         // Replies are best effort: the caller may have stopped waiting.
         match command {
             Command::Config(change, reply) => {
-                if let ConfigChange::SetPrivateKey(key) = &change {
-                    self.private_key = Some(key.clone());
-                }
-                self.core.handle_input(Input::Config(change), now());
-                self.drain(false);
-                if self.path_mtus.table.is_some() {
-                    self.recompute_peer_mtus();
-                }
+                self.config(change);
                 let _ = reply.send(());
             }
             Command::PeerId(key, reply) => {
@@ -1846,8 +1839,61 @@ impl Owner {
             Command::TotalUnansweredHandshakes(reply) => {
                 let _ = reply.send(self.core.total_unanswered_handshakes());
             }
+            command @ (Command::AddLocalIdentity(..)
+            | Command::RemoveLocalIdentity(..)
+            | Command::LocalIdentities(..)
+            | Command::PeerIdIn(..)) => self.identity_command(command),
         }
         ControlFlow::Continue(())
+    }
+
+    /// Applies a configuration change.
+    fn config(&mut self, change: ConfigChange) {
+        let key = match &change {
+            ConfigChange::SetPrivateKey(key) => Some(key.clone()),
+            _ => None,
+        };
+        self.core.handle_input(Input::Config(change), now());
+        // The core ignores a key another local identity holds.
+        if let Some(key) = key
+            && self.core.public_key() == Some(PublicKey::from(&key))
+        {
+            self.private_key = Some(key);
+        }
+        self.peers_changed();
+    }
+
+    /// Handles a command about the local identities.
+    fn identity_command(&mut self, command: Command) {
+        match command {
+            Command::AddLocalIdentity(key, transports, reply) => {
+                let id = match transports {
+                    Some(transports) => self.core.add_local_identity_on(key, transports),
+                    None => self.core.add_local_identity(key),
+                };
+                let _ = reply.send(id);
+            }
+            Command::RemoveLocalIdentity(id, reply) => {
+                let removed = self.core.remove_local_identity(id);
+                self.peers_changed();
+                let _ = reply.send(removed);
+            }
+            Command::LocalIdentities(reply) => {
+                let _ = reply.send(self.core.local_identities().collect());
+            }
+            Command::PeerIdIn(identity, key, reply) => {
+                let _ = reply.send(self.core.peer_id_in(identity, &key));
+            }
+            _ => {}
+        }
+    }
+
+    /// Sends what a change of the peers caused and updates the peer MTUs.
+    fn peers_changed(&mut self) {
+        self.drain(false);
+        if self.path_mtus.table.is_some() {
+            self.recompute_peer_mtus();
+        }
     }
 
     /// The high-water marks including the current occupancies; with `take`, the marks
@@ -1929,6 +1975,7 @@ impl Owner {
                 .as_ref()
                 .map(|table| table.stats())
                 .unwrap_or_default(),
+            local_identities: self.core.local_identities().collect(),
         }
     }
 
@@ -2456,6 +2503,8 @@ const fn settles(command: &Command) -> bool {
             | Command::Status(..)
             | Command::UnansweredHandshakes(..)
             | Command::TotalUnansweredHandshakes(..)
+            | Command::RemoveLocalIdentity(..)
+            | Command::LocalIdentities(..)
     )
 }
 

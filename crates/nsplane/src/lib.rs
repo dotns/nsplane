@@ -54,8 +54,8 @@ pub use events::{
 };
 pub use fragment::{FragmentConfig, FragmentStats};
 pub use handle::{
-    EngineError, EngineHandle, EngineStatus, PathMtuStats, Peer, PeerMtus, QueueDepth, QueueStats,
-    TransportError, TransportStats,
+    EngineError, EngineHandle, EngineStatus, LocalIdentity, PathMtuStats, Peer, PeerMtus,
+    QueueDepth, QueueStats, TransportError, TransportStats,
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
@@ -63,7 +63,8 @@ pub use map::{MapSink, MapSource, MapVerdict};
 pub use merge::MergeSource;
 pub use nsplane_core::reasons;
 pub use nsplane_core::{
-    AllowedIp, InboundDestinations, PacketFilter, PathPolicy, PeerStats, StandardRoaming, x25519,
+    AllowedIp, InboundDestinations, LocalIdentityId, PacketFilter, PathPolicy, PeerStats,
+    StandardRoaming, x25519,
 };
 pub use nsplane_packet::{
     Ecn, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, Path, PeerId, SharedPacketPool,
