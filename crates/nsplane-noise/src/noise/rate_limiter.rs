@@ -364,4 +364,129 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// Golden values computed on the 0.11 single-key limiter: the mac1 it accepts, the mac2 it
+    /// accepts under load and the cookie reply it sends, for fixed keys, a fixed initiation body
+    /// and a fixed source. The cookie secret and the nonce key are random in production; the test
+    /// pins them so the values are reproducible.
+    mod golden {
+        use super::*;
+
+        const SECRET_KEY: [u8; 16] = [9; 16];
+        const NONCE_KEY: [u8; 32] = [5; 32];
+        const SENDER_INDEX: u32 = 0x1122_3344;
+
+        const MAC1: [u8; 16] = [
+            63, 220, 229, 120, 62, 28, 59, 209, 110, 195, 144, 168, 166, 61, 170, 89,
+        ];
+        const MAC2: [u8; 16] = [
+            91, 99, 241, 93, 72, 229, 183, 206, 225, 148, 187, 234, 231, 205, 43, 16,
+        ];
+        const COOKIE_REPLY_BYTES: [u8; 64] = [
+            3, 0, 0, 0, 68, 51, 34, 17, 43, 111, 33, 127, 148, 23, 108, 21, 101, 196, 196, 179, 72,
+            55, 146, 129, 114, 156, 250, 130, 137, 68, 230, 41, 124, 113, 218, 76, 19, 238, 29,
+            233, 217, 237, 255, 124, 42, 231, 227, 90, 36, 85, 180, 97, 157, 183, 6, 150, 65, 83,
+            244, 76, 210, 92, 42, 2,
+        ];
+
+        fn responder_public() -> PublicKey {
+            PublicKey::from(&StaticSecret::from([7; 32]))
+        }
+
+        fn limiter(limit: u64) -> RateLimiter {
+            let mut limiter = RateLimiter::new(&responder_public(), limit);
+            limiter.secret_key = SECRET_KEY;
+            limiter.nonce_key = NONCE_KEY;
+            limiter
+        }
+
+        fn source() -> SocketAddr {
+            SocketAddr::from(([192, 0, 2, 1], 51820))
+        }
+
+        /// The first 116 bytes of a handshake initiation: type 1, a fixed sender index and a
+        /// fixed pattern for the ephemeral, the encrypted static and the encrypted timestamp.
+        fn body() -> [u8; 116] {
+            let mut body = [0u8; 116];
+            body[..4].copy_from_slice(&1u32.to_le_bytes());
+            body[4..8].copy_from_slice(&SENDER_INDEX.to_le_bytes());
+            for (i, b) in body[8..].iter_mut().enumerate() {
+                *b = u8::try_from(i).unwrap_or(0);
+            }
+            body
+        }
+
+        fn datagram(mac1: [u8; 16], mac2: [u8; 16]) -> [u8; 148] {
+            let mut datagram = [0u8; 148];
+            datagram[..116].copy_from_slice(&body());
+            datagram[116..132].copy_from_slice(&mac1);
+            datagram[132..].copy_from_slice(&mac2);
+            datagram
+        }
+
+        #[test]
+        fn mac1_is_the_0_11_value() {
+            let limiter = limiter(u64::MAX);
+            let mut dst = [0u8; 256];
+            assert!(
+                limiter
+                    .verify_packet(Some(source()), &datagram(MAC1, [0; 16]), &mut dst)
+                    .is_ok()
+            );
+            let mut wrong = MAC1;
+            wrong[0] ^= 1;
+            assert!(matches!(
+                limiter.verify_packet(Some(source()), &datagram(wrong, [0; 16]), &mut dst),
+                Err(TunnResult::Err(WireGuardError::InvalidMac))
+            ));
+        }
+
+        #[test]
+        fn mac2_under_load_is_the_0_11_value() {
+            let limiter = limiter(0);
+            let mut dst = [0u8; 256];
+            assert!(
+                limiter
+                    .verify_packet(Some(source()), &datagram(MAC1, MAC2), &mut dst)
+                    .is_ok()
+            );
+            assert!(is_cookie_reply(&limiter.verify_packet(
+                Some(source()),
+                &datagram(MAC1, [0; 16]),
+                &mut dst
+            )));
+        }
+
+        #[test]
+        fn cookie_reply_is_the_0_11_layout() {
+            let limiter = limiter(0);
+            let mut dst = [0u8; 256];
+            let Err(TunnResult::WriteToNetwork(reply)) =
+                limiter.verify_packet(Some(source()), &datagram(MAC1, [0; 16]), &mut dst)
+            else {
+                panic!("expected a cookie reply");
+            };
+            let reply = reply.to_vec();
+            assert_eq!(reply, COOKIE_REPLY_BYTES);
+
+            assert_eq!(reply.len(), 64);
+            assert_eq!(reply[..4], [3, 0, 0, 0]);
+            assert_eq!(reply[4..8], SENDER_INDEX.to_le_bytes());
+
+            // The initiator decrypts the cookie under HASH(LABEL_COOKIE || responder public)
+            // with its mac1 as associated data, and the cookie keys the expected mac2.
+            let key = b2s_hash(LABEL_COOKIE, responder_public().as_bytes());
+            let mut cookie = [0u8; 16];
+            cookie.copy_from_slice(&reply[32..48]);
+            XChaCha20Poly1305::new(&key.into())
+                .decrypt_in_place_detached(
+                    GenericArray::from_slice(&reply[8..32]),
+                    &MAC1,
+                    &mut cookie,
+                    GenericArray::from_slice(&reply[48..64]),
+                )
+                .expect("the cookie reply decrypts");
+            assert_eq!(b2s_keyed_mac_16_2(&cookie, &body(), &MAC1), MAC2);
+        }
+    }
 }
