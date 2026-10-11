@@ -61,3 +61,7 @@ peers' paths to it. That already works today.
 - N identities: the initiation cost is measured and documented for N = 1, 4, 16.
 - Full gate (check with the term scan, cross, test-windows, doc, e2e scripts).
 - Interop with kernel WireGuard per identity.
+
+## Annotations
+- 2026-10-11: dispatched (campaign `nsplane-li-202610110900`): LI `eos2286z`. Auto mode, watchdog every
+  30 min with stuck-process checks. The release (0.12.0) is asked of the owner at the end.
