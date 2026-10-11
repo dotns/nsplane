@@ -1,7 +1,8 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! The peers of the core, indexed by peer id, public key, session index and allowed IP.
+//! The local identities and the peers of the core, indexed by peer id, identity and public
+//! key, session index and allowed IP.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -9,15 +10,15 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nsplane_noise::noise::rate_limiter::RateLimiter;
+use nsplane_noise::noise::rate_limiter::{HandshakeBudget, RateLimiter};
 use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::{PublicKey, StaticSecret};
-use nsplane_packet::PeerId;
+use nsplane_packet::{PeerId, TransportId};
 use rand_core::{OsRng, RngCore};
 
 use crate::allowed_ips::AllowedIps;
 use crate::peer::Peer;
-use crate::types::{AllowedIp, InboundDestinations, PeerConfig};
+use crate::types::{AllowedIp, InboundDestinations, LocalIdentityId, PeerConfig};
 
 /// Why a [`PeerConfig`] could not be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,15 +29,38 @@ pub(crate) enum PeerTableError {
     IndicesExhausted,
     /// All peer ids have been handed out.
     IdsExhausted,
+    /// The config names a local identity the table does not hold.
+    UnknownIdentity,
 }
 
-/// The own key pair and the handshake gate derived from it.
-struct OwnKey {
-    private: StaticSecret,
-    public: PublicKey,
-    /// Verifies handshakes before they are demultiplexed to a peer. Every peer's `Tunn` shares
-    /// it, so the cookie it hands out also passes the tunnel's own verification.
-    gate: Arc<RateLimiter>,
+/// An own key pair and the handshake gate derived from it.
+pub(crate) struct OwnKey {
+    pub(crate) private: StaticSecret,
+    pub(crate) public: PublicKey,
+    /// Verifies handshakes before they are demultiplexed to a peer. Every peer's `Tunn` of
+    /// the identity shares it, so the cookie it hands out also passes the tunnel's own
+    /// verification. It counts against the table's one handshake budget.
+    pub(crate) gate: Arc<RateLimiter>,
+}
+
+/// A local identity: an optional key pair (only the default identity may lack one) and the
+/// transports it is restricted to.
+pub(crate) struct Identity {
+    pub(crate) id: LocalIdentityId,
+    pub(crate) key: Option<OwnKey>,
+    /// The transports the identity answers handshakes on; `None` for any transport.
+    pub(crate) transports: Option<Arc<[TransportId]>>,
+    /// Number of peers bound to the identity.
+    pub(crate) peers: usize,
+}
+
+impl Identity {
+    /// Whether the identity answers handshakes arriving on `transport`.
+    pub(crate) fn serves(&self, transport: TransportId) -> bool {
+        self.transports
+            .as_deref()
+            .is_none_or(|set| set.contains(&transport))
+    }
 }
 
 /// Hashes a session index with one multiplication. Session indices are random and chosen by the
@@ -60,10 +84,11 @@ impl Hasher for IndexHasher {
     }
 }
 
-/// The peers of the core.
+/// The local identities and the peers of the core.
 ///
-/// Peers are reachable by id, by public key, by the session index in received messages, and by
-/// allowed IP (cryptokey routing). Allowed IPs exist only in the routing table, so a range that
+/// Peers are reachable by id, by identity and public key, by the session index in received
+/// messages, and by allowed IP (cryptokey routing). Session indices, peer ids and allowed IPs
+/// are shared by all identities, so they are unique across them. Allowed IPs exist only in the routing table, so a range that
 /// a newer peer claims is moved away from its previous owner. Peer ids are never reused. A
 /// peer's inbound destinations are kept apart from the routing table, by slot.
 pub(crate) struct PeerTable {
@@ -74,15 +99,19 @@ pub(crate) struct PeerTable {
     /// The inbound destinations of the peers, at the position of their id in `ids`; `None`
     /// for an unchecked peer.
     destinations: Vec<Option<Destinations>>,
-    by_key: HashMap<PublicKey, PeerId>,
+    by_key: HashMap<(LocalIdentityId, PublicKey), PeerId>,
     by_index: HashMap<u32, PeerId, BuildHasherDefault<IndexHasher>>,
     by_ip: AllowedIps<PeerId>,
     next_index: IndexLfsr,
     next_id: u32,
-    handshake_rate_limit: u64,
+    /// The local identities, ascending by id; the default identity is first.
+    identities: Vec<Identity>,
+    /// The id of the next local identity.
+    next_identity: u32,
+    /// The handshake counters shared by the gates of all identities.
+    budget: Arc<HandshakeBudget>,
     /// Whether peers share their tunnels with crypto jobs.
     shared_tunnels: bool,
-    key: Option<OwnKey>,
 }
 
 impl std::fmt::Debug for PeerTable {
@@ -94,8 +123,9 @@ impl std::fmt::Debug for PeerTable {
 }
 
 impl PeerTable {
-    /// Creates an empty table without a private key. `handshake_rate_limit` is the number of
-    /// handshakes per second the gate tolerates before replying with cookies. With
+    /// Creates an empty table with only the default identity, without a private key.
+    /// `handshake_rate_limit` is the number of handshakes per second (per source address) the
+    /// gates of all identities together tolerate before replying with cookies. With
     /// `shared_tunnels` every peer keeps its tunnel behind a lock, to share it with crypto
     /// jobs; otherwise it owns the tunnel.
     pub(crate) fn new(handshake_rate_limit: u64, shared_tunnels: bool) -> Self {
@@ -108,37 +138,140 @@ impl PeerTable {
             by_ip: AllowedIps::new(),
             next_index: IndexLfsr::default(),
             next_id: 1,
-            handshake_rate_limit,
+            identities: vec![Identity {
+                id: LocalIdentityId::DEFAULT,
+                key: None,
+                transports: None,
+                peers: 0,
+            }],
+            next_identity: 1,
+            budget: Arc::new(HandshakeBudget::new(handshake_rate_limit)),
             shared_tunnels,
-            key: None,
         }
     }
 
-    /// Sets the own private key, re-keys every peer (clearing its sessions) and replaces the
-    /// handshake gate. Setting the current key again changes nothing.
+    /// The key pair of `private_key` with a gate on the shared budget.
+    fn own_key(&self, private_key: StaticSecret) -> OwnKey {
+        let public = PublicKey::from(&private_key);
+        OwnKey {
+            gate: Arc::new(RateLimiter::with_budget(&public, Arc::clone(&self.budget))),
+            private: private_key,
+            public,
+        }
+    }
+
+    /// Whether an identity holds `public_key`.
+    fn holds(&self, public_key: &PublicKey) -> bool {
+        self.identities
+            .iter()
+            .any(|i| i.key.as_ref().is_some_and(|k| k.public == *public_key))
+    }
+
+    /// Sets the private key of the default identity, re-keys its peers (clearing their
+    /// sessions) and replaces its handshake gate. Setting the current key again changes
+    /// nothing; a key another identity holds is ignored.
     pub(crate) fn set_private_key(&mut self, private_key: StaticSecret) {
         let public_key = PublicKey::from(&private_key);
 
         // x25519 (rightly) doesn't let us expose secret keys for comparison.
         // If the public keys are the same, then the private keys are the same.
-        if self.key.as_ref().is_some_and(|k| k.public == public_key) {
+        if self.holds(&public_key) {
+            if self
+                .key_pair()
+                .is_none_or(|(_, public)| *public != public_key)
+            {
+                tracing::debug!("Private key ignored: another local identity holds it");
+            }
             return;
         }
 
-        let gate = Arc::new(RateLimiter::new(&public_key, self.handshake_rate_limit));
+        let own = self.own_key(private_key);
         for peer in &mut self.peers {
-            peer.tunnel_mut().set_static_private(
-                private_key.clone(),
-                public_key,
-                Some(Arc::clone(&gate)),
-            );
+            if peer.local_identity() == LocalIdentityId::DEFAULT {
+                peer.tunnel_mut().set_static_private(
+                    own.private.clone(),
+                    own.public,
+                    Some(Arc::clone(&own.gate)),
+                );
+            }
         }
+        if let Some(default) = self.identities.first_mut() {
+            default.key = Some(own);
+        }
+    }
 
-        self.key = Some(OwnKey {
-            gate,
-            private: private_key,
-            public: public_key,
+    /// Adds a local identity with `private_key`, answering handshakes on `transports` only,
+    /// or on any transport with `None`. `None` if an identity already holds the key, or
+    /// if every identity id was handed out.
+    pub(crate) fn add_identity(
+        &mut self,
+        private_key: StaticSecret,
+        transports: Option<Arc<[TransportId]>>,
+    ) -> Option<LocalIdentityId> {
+        if self.holds(&PublicKey::from(&private_key)) {
+            return None;
+        }
+        let id = LocalIdentityId::new(self.next_identity);
+        self.next_identity = self.next_identity.checked_add(1)?;
+        let key = Some(self.own_key(private_key));
+        self.identities.push(Identity {
+            id,
+            key,
+            transports,
+            peers: 0,
         });
+        Some(id)
+    }
+
+    /// Removes a local identity without peers; `false` for the default identity, an unknown
+    /// one or one that still has peers.
+    pub(crate) fn remove_identity(&mut self, id: LocalIdentityId) -> bool {
+        if id == LocalIdentityId::DEFAULT {
+            return false;
+        }
+        let Ok(i) = self.identities.binary_search_by_key(&id, |i| i.id) else {
+            return false;
+        };
+        if self
+            .identities
+            .get(i)
+            .is_none_or(|identity| identity.peers > 0)
+        {
+            return false;
+        }
+        self.identities.remove(i);
+        true
+    }
+
+    /// The local identity `id`.
+    pub(crate) fn identity(&self, id: LocalIdentityId) -> Option<&Identity> {
+        let i = self.identities.binary_search_by_key(&id, |i| i.id).ok()?;
+        self.identities.get(i)
+    }
+
+    fn identity_mut(&mut self, id: LocalIdentityId) -> Option<&mut Identity> {
+        let i = self.identities.binary_search_by_key(&id, |i| i.id).ok()?;
+        self.identities.get_mut(i)
+    }
+
+    /// All local identities, ascending by id.
+    pub(crate) fn identities(&self) -> &[Identity] {
+        &self.identities
+    }
+
+    /// The local identities with a key, ascending by id, with their key.
+    pub(crate) fn keyed_identities(&self) -> impl Iterator<Item = (&Identity, &OwnKey)> {
+        self.identities
+            .iter()
+            .filter_map(|i| i.key.as_ref().map(|k| (i, k)))
+    }
+
+    /// Resets the handshake budget shared by all identities if a reset period passed at
+    /// `now`.
+    pub(crate) fn reset_handshake_budget(&self, now: Instant) {
+        if let Some((_, own)) = self.keyed_identities().next() {
+            own.gate.reset_count_at(now);
+        }
     }
 
     /// Whether peers share their tunnels with crypto jobs.
@@ -146,18 +279,20 @@ impl PeerTable {
         self.shared_tunnels
     }
 
-    /// The own key pair, if set.
+    /// The key pair of the default identity, if set.
     pub(crate) fn key_pair(&self) -> Option<(&StaticSecret, &PublicKey)> {
-        self.key.as_ref().map(|k| (&k.private, &k.public))
+        let own = self.identities.first()?.key.as_ref()?;
+        Some((&own.private, &own.public))
     }
 
-    /// The handshake gate for the own key, if set.
-    pub(crate) fn rate_limiter(&self) -> Option<&RateLimiter> {
-        self.key.as_ref().map(|k| &*k.gate)
+    /// The handshake gate of the default identity, if its key is set.
+    #[cfg(test)]
+    fn rate_limiter(&self) -> Option<&RateLimiter> {
+        Some(&*self.identities.first()?.key.as_ref()?.gate)
     }
 
-    /// Adds the peer, or updates it in place if its public key is known. A new peer's tunnel
-    /// runs its timers on the clock of `now`.
+    /// Adds the peer, or updates it in place if its identity and public key are known. A new
+    /// peer's tunnel runs its timers on the clock of `now`.
     pub(crate) fn apply(
         &mut self,
         config: &PeerConfig,
@@ -165,8 +300,9 @@ impl PeerTable {
     ) -> Result<PeerId, PeerTableError> {
         // An all-zero key means "no preshared key" in the UAPI.
         let preshared_key = config.preshared_key.map(|k| (k != [0; 32]).then_some(k));
+        let identity = config.local_identity.unwrap_or(LocalIdentityId::DEFAULT);
 
-        let id = if let Some(&id) = self.by_key.get(&config.public_key) {
+        let id = if let Some(&id) = self.by_key.get(&(identity, config.public_key)) {
             if let Some(p) = self.peer_mut(id) {
                 if let Some(path) = config.path {
                     p.set_path(path);
@@ -183,7 +319,13 @@ impl PeerTable {
             }
             id
         } else {
-            let own = self.key.as_ref().ok_or(PeerTableError::NoPrivateKey)?;
+            let owner = self
+                .identities
+                .iter()
+                .find(|i| i.id == identity)
+                .ok_or(PeerTableError::UnknownIdentity)?;
+            let own = owner.key.as_ref().ok_or(PeerTableError::NoPrivateKey)?;
+            let transports = owner.transports.clone();
             let id = PeerId::new(self.next_id);
             let next_id = self
                 .next_id
@@ -215,7 +357,8 @@ impl PeerTable {
                 index,
                 config.path,
                 preshared_key,
-            );
+            )
+            .with_identity(identity, transports);
             self.next_id = next_id;
             self.ids.push(id);
             self.peers.push(peer);
@@ -225,8 +368,11 @@ impl PeerTable {
                     .as_deref()
                     .map(|nets| Destinations::Owned(Box::new(destination_set(nets)))),
             );
-            self.by_key.insert(config.public_key, id);
+            self.by_key.insert((identity, config.public_key), id);
             self.by_index.insert(index, id);
+            if let Some(owner) = self.identity_mut(identity) {
+                owner.peers += 1;
+            }
             tracing::info!("Peer added");
             id
         };
@@ -240,9 +386,16 @@ impl PeerTable {
         Ok(id)
     }
 
-    /// Removes a peer and returns its id.
-    pub(crate) fn remove(&mut self, public_key: &PublicKey) -> Option<PeerId> {
-        let id = self.by_key.remove(public_key)?;
+    /// Removes the peer of `identity` with `public_key` and returns its id.
+    pub(crate) fn remove(
+        &mut self,
+        identity: LocalIdentityId,
+        public_key: &PublicKey,
+    ) -> Option<PeerId> {
+        let id = self.by_key.remove(&(identity, *public_key))?;
+        if let Some(owner) = self.identity_mut(identity) {
+            owner.peers = owner.peers.saturating_sub(1);
+        }
         // Found a peer to remove, now purge all references to it:
         if let Ok(i) = self.ids.binary_search(&id) {
             self.ids.remove(i);
@@ -256,8 +409,11 @@ impl PeerTable {
         Some(id)
     }
 
-    /// Removes all peers.
+    /// Removes all peers of every identity; the identities stay.
     pub(crate) fn clear(&mut self) {
+        for identity in &mut self.identities {
+            identity.peers = 0;
+        }
         self.ids.clear();
         self.peers.clear();
         self.destinations.clear();
@@ -266,9 +422,9 @@ impl PeerTable {
         self.by_ip.clear();
     }
 
-    /// The peer with this public key.
-    pub(crate) fn get(&self, public_key: &PublicKey) -> Option<PeerId> {
-        self.by_key.get(public_key).copied()
+    /// The peer of `identity` with this public key.
+    pub(crate) fn get(&self, identity: LocalIdentityId, public_key: &PublicKey) -> Option<PeerId> {
+        self.by_key.get(&(identity, *public_key)).copied()
     }
 
     /// The peer with this id.
@@ -478,7 +634,7 @@ mod tests {
         let a = key();
         let id = add(&mut table, a, &["10.0.0.0/16"]);
 
-        assert_eq!(table.get(&a), Some(id));
+        assert_eq!(table.get(LocalIdentityId::DEFAULT, &a), Some(id));
         let index = table.peer(id).unwrap().index();
         assert_eq!(table.by_index(index << 8), Some(id));
         assert_eq!(table.by_destination(ip("10.0.3.4")), Some(id));
@@ -575,14 +731,14 @@ mod tests {
         let id = add(&mut table, a, &["10.0.0.0/24"]);
         let index = table.peer(id).unwrap().index();
 
-        assert_eq!(table.remove(&a), Some(id));
+        assert_eq!(table.remove(LocalIdentityId::DEFAULT, &a), Some(id));
 
-        assert!(table.get(&a).is_none());
+        assert!(table.get(LocalIdentityId::DEFAULT, &a).is_none());
         assert!(table.peer(id).is_none());
         assert!(table.by_index(index << 8).is_none());
         assert!(table.by_destination(ip("10.0.0.1")).is_none());
         assert_eq!(table.len(), 0);
-        assert_eq!(table.remove(&a), None);
+        assert_eq!(table.remove(LocalIdentityId::DEFAULT, &a), None);
     }
 
     #[test]
@@ -591,7 +747,7 @@ mod tests {
         let a = key();
         let first = add(&mut table, a, &[]);
         assert_eq!(first, PeerId::new(1));
-        table.remove(&a);
+        table.remove(LocalIdentityId::DEFAULT, &a);
         let second = add(&mut table, a, &[]);
         assert_ne!(second, first);
         table.clear();
@@ -726,7 +882,7 @@ mod tests {
         // Removing a peer keeps the others' sets at their slots, and a peer added again
         // starts unchecked.
         table.set_inbound_destinations(peer_b, Some(&[net("10.2.0.0/16")]));
-        table.remove(&a);
+        table.remove(LocalIdentityId::DEFAULT, &a);
         assert_eq!(destinations(&table, peer_b), Some(vec![net("10.2.0.0/16")]));
         let peer_a = add(&mut table, a, &[]);
         assert_eq!(destinations(&table, peer_a), None);
@@ -762,6 +918,254 @@ mod tests {
         assert_eq!(destinations(&table, id), Some(vec![net("10.3.0.0/16")]));
         table.set_inbound_destination_source(id, None);
         assert_eq!(destinations(&table, id), None);
+    }
+
+    /// The static key the peer `id` initiates handshakes with, as the remote `responder`
+    /// decrypts it from an initiation.
+    fn initiator_key(table: &mut PeerTable, id: PeerId, responder: &StaticSecret) -> PublicKey {
+        use nsplane_noise::noise::Packet;
+        use nsplane_noise::noise::handshake::parse_handshake_anon;
+
+        let mut dst = [0u8; 256];
+        let peer = table.peer_mut(id).unwrap();
+        let mut tunnel = peer.tunnel_mut();
+        let TunnResult::WriteToNetwork(init) = tunnel.format_handshake_initiation(&mut dst, true)
+        else {
+            panic!("expected an initiation");
+        };
+        let Ok(Packet::HandshakeInit(init)) = Tunn::parse_incoming_packet(init) else {
+            panic!("expected an initiation");
+        };
+        let half = parse_handshake_anon(responder, &PublicKey::from(responder), &init).unwrap();
+        PublicKey::from(half.peer_static_public)
+    }
+
+    fn add_in(table: &mut PeerTable, identity: LocalIdentityId, peer: PublicKey) -> PeerId {
+        let mut config = PeerConfig::new(peer);
+        config.local_identity = Some(identity);
+        table.apply(&config, Instant::now()).unwrap()
+    }
+
+    #[test]
+    fn identities_are_added_refused_and_removed() {
+        let mut table = PeerTable::new(100, false);
+        let default = StaticSecret::random_from_rng(OsRng);
+        table.set_private_key(default.clone());
+        let own = StaticSecret::random_from_rng(OsRng);
+
+        let first = table.add_identity(own.clone(), None).unwrap();
+        assert_ne!(first, LocalIdentityId::DEFAULT);
+        // A key held by any identity, the default one included, is refused.
+        assert_eq!(table.add_identity(own, None), None);
+        assert_eq!(table.add_identity(default, None), None);
+
+        let transports: Arc<[TransportId]> = Arc::from([TransportId::new(3)]);
+        let second = table
+            .add_identity(
+                StaticSecret::random_from_rng(OsRng),
+                Some(Arc::clone(&transports)),
+            )
+            .unwrap();
+        assert!(second > first);
+        let identity = table.identity(second).unwrap();
+        assert!(identity.serves(TransportId::new(3)));
+        assert!(!identity.serves(TransportId::new(4)));
+        assert!(table.identity(first).unwrap().serves(TransportId::new(4)));
+        assert_eq!(
+            table.identities().iter().map(|i| i.id).collect::<Vec<_>>(),
+            [LocalIdentityId::DEFAULT, first, second]
+        );
+        assert_eq!(table.keyed_identities().count(), 3);
+
+        assert!(!table.remove_identity(LocalIdentityId::DEFAULT));
+        assert!(table.remove_identity(first));
+        assert!(!table.remove_identity(first), "already removed");
+        assert!(table.identity(first).is_none());
+
+        // Ids are never reused.
+        let third = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        assert!(third > second);
+    }
+
+    #[test]
+    fn the_default_identity_may_lack_a_key_but_its_peers_need_one() {
+        let mut table = PeerTable::new(100, false);
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        assert_eq!(table.keyed_identities().count(), 1);
+        assert_eq!(
+            table.apply(&PeerConfig::new(key()), Instant::now()),
+            Err(PeerTableError::NoPrivateKey)
+        );
+        add_in(&mut table, identity, key());
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn a_peer_of_an_unknown_identity_is_refused() {
+        let mut table = table();
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        assert!(table.remove_identity(identity));
+        let mut config = PeerConfig::new(key());
+        config.local_identity = Some(identity);
+        assert_eq!(
+            table.apply(&config, Instant::now()),
+            Err(PeerTableError::UnknownIdentity)
+        );
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn one_remote_key_under_two_identities_is_two_peers() {
+        let mut table = table();
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        let remote = key();
+        let default_peer = add(&mut table, remote, &["10.0.0.0/24"]);
+        let other_peer = add_in(&mut table, identity, remote);
+
+        assert_ne!(default_peer, other_peer);
+        assert_eq!(
+            table.get(LocalIdentityId::DEFAULT, &remote),
+            Some(default_peer)
+        );
+        assert_eq!(table.get(identity, &remote), Some(other_peer));
+        let (a, b) = (
+            table.peer(default_peer).unwrap(),
+            table.peer(other_peer).unwrap(),
+        );
+        assert_eq!(a.local_identity(), LocalIdentityId::DEFAULT);
+        assert_eq!(b.local_identity(), identity);
+        assert_ne!(a.index(), b.index());
+        assert_eq!(table.by_index(a.index() << 8), Some(default_peer));
+        assert_eq!(table.by_index(b.index() << 8), Some(other_peer));
+        assert_eq!(table.identity(identity).unwrap().peers, 1);
+        assert_eq!(table.identity(LocalIdentityId::DEFAULT).unwrap().peers, 1);
+
+        // An update naming the identity changes its peer only.
+        let mut config = PeerConfig::new(remote);
+        config.local_identity = Some(identity);
+        config.persistent_keepalive = Some(25);
+        assert_eq!(table.apply(&config, Instant::now()), Ok(other_peer));
+        assert_eq!(
+            table.peer(other_peer).unwrap().persistent_keepalive(),
+            Some(25)
+        );
+        assert_eq!(
+            table.peer(default_peer).unwrap().persistent_keepalive(),
+            None
+        );
+    }
+
+    #[test]
+    fn removal_drops_only_that_identitys_peer_and_index() {
+        let mut table = table();
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        let remote = key();
+        let default_peer = add(&mut table, remote, &["10.0.0.0/24"]);
+        let other_peer = add_in(&mut table, identity, remote);
+        let index = table.peer(other_peer).unwrap().index();
+
+        // An identity with peers is not removed by the table.
+        assert!(!table.remove_identity(identity));
+        assert_eq!(table.remove(identity, &remote), Some(other_peer));
+        assert!(table.by_index(index << 8).is_none());
+        assert_eq!(table.identity(identity).unwrap().peers, 0);
+        assert!(table.remove_identity(identity));
+
+        assert_eq!(
+            table.get(LocalIdentityId::DEFAULT, &remote),
+            Some(default_peer)
+        );
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(default_peer));
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn clear_keeps_the_identities() {
+        let mut table = table();
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        add_in(&mut table, identity, key());
+        add(&mut table, key(), &[]);
+        table.clear();
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.identities().len(), 2);
+        assert!(table.identities().iter().all(|i| i.peers == 0));
+        add_in(&mut table, identity, key());
+    }
+
+    #[test]
+    fn peers_initiate_with_their_identitys_key_and_set_private_key_rekeys_default_peers_only() {
+        let mut table = table();
+        let own = StaticSecret::random_from_rng(OsRng);
+        let identity = table.add_identity(own.clone(), None).unwrap();
+        let remote = StaticSecret::random_from_rng(OsRng);
+        let default_peer = add(&mut table, PublicKey::from(&remote), &[]);
+        let other_peer = add_in(&mut table, identity, PublicKey::from(&remote));
+
+        let old_default = *table.key_pair().unwrap().1;
+        assert_eq!(
+            initiator_key(&mut table, default_peer, &remote),
+            old_default
+        );
+        assert_eq!(
+            initiator_key(&mut table, other_peer, &remote),
+            PublicKey::from(&own)
+        );
+
+        let new_default = StaticSecret::random_from_rng(OsRng);
+        table.set_private_key(new_default.clone());
+        assert_eq!(
+            initiator_key(&mut table, default_peer, &remote),
+            PublicKey::from(&new_default)
+        );
+        assert_eq!(
+            initiator_key(&mut table, other_peer, &remote),
+            PublicKey::from(&own)
+        );
+
+        // A key another identity holds is ignored.
+        table.set_private_key(own);
+        assert_eq!(
+            table.key_pair().map(|(_, p)| *p),
+            Some(PublicKey::from(&new_default))
+        );
+        assert_eq!(
+            initiator_key(&mut table, default_peer, &remote),
+            PublicKey::from(&new_default)
+        );
+    }
+
+    #[test]
+    fn restricted_identities_restrict_their_peers() {
+        let mut table = table();
+        let transports: Arc<[TransportId]> = Arc::from([TransportId::new(1), TransportId::new(2)]);
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), Some(transports))
+            .unwrap();
+        let restricted = add_in(&mut table, identity, key());
+        let unrestricted = add(&mut table, key(), &[]);
+
+        let peer = table.peer(restricted).unwrap();
+        assert!(peer.accepts(TransportId::new(1)));
+        assert!(peer.accepts(TransportId::new(2)));
+        assert!(!peer.accepts(TransportId::new(3)));
+        assert!(
+            table
+                .peer(unrestricted)
+                .unwrap()
+                .accepts(TransportId::new(3))
+        );
     }
 
     #[test]

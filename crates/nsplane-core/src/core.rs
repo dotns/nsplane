@@ -13,16 +13,19 @@ use nsplane_noise::noise::errors::WireGuardError;
 use nsplane_noise::noise::handshake::parse_handshake_anon;
 use nsplane_noise::noise::{DATA_HEADER_SZ, Packet, Tunn, TunnResult};
 use nsplane_noise::x25519;
-use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId, TAILROOM};
+use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId, TAILROOM, TransportId};
 
 use crate::allowed_ips::AllowedIps;
 use crate::filter::{PacketFilter, Verdict};
 use crate::job::{self, CryptoJob, Direction, Outcome};
 use crate::peer::Peer;
-use crate::peer_table::{Destinations, PeerTable, PeerTableError};
+use crate::peer_table::{Destinations, OwnKey, PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
-use crate::types::{ConfigChange, CoreConfig, Event, Input, Output, PeerConfig, PeerStats};
+use crate::types::{
+    ConfigChange, CoreConfig, Event, Input, LocalIdentityId, LocalIdentityInfo, Output, PeerConfig,
+    PeerStats,
+};
 
 /// Interval of the peer timers, as in the device.
 const TICK: Duration = Duration::from_millis(250);
@@ -416,9 +419,7 @@ impl Core {
 
         let mut schedule = schedule;
         if now >= schedule.rate_limiter_reset {
-            if let Some(gate) = self.peers.rate_limiter() {
-                gate.reset_count_at(now);
-            }
+            self.peers.reset_handshake_budget(now);
             schedule.rate_limiter_reset = now + RATE_LIMITER_RESET;
         }
         if let (Some(due), Some(interval)) = (schedule.stats, self.stats_interval)
@@ -440,14 +441,80 @@ impl Core {
         self.schedule = Some(schedule);
     }
 
-    /// The own public key, once a private key is set.
+    /// The own public key of the default identity, once a private key is set.
     pub fn public_key(&self) -> Option<x25519::PublicKey> {
         self.peers.key_pair().map(|(_, public)| *public)
     }
 
-    /// The peer with this public key.
+    /// The peer of the default identity with this public key.
     pub fn peer_id(&self, key: &x25519::PublicKey) -> Option<PeerId> {
-        self.peers.get(key)
+        self.peers.get(LocalIdentityId::DEFAULT, key)
+    }
+
+    /// The peer of `identity` with this public key.
+    pub fn peer_id_in(&self, identity: LocalIdentityId, key: &x25519::PublicKey) -> Option<PeerId> {
+        self.peers.get(identity, key)
+    }
+
+    /// Adds a local identity with its own static key, answering handshakes on every
+    /// transport; see [`Core::add_local_identity_on`].
+    pub fn add_local_identity(&mut self, key: x25519::StaticSecret) -> Option<LocalIdentityId> {
+        self.peers.add_identity(key, None)
+    }
+
+    /// Adds a local identity with its own static key that answers handshakes only on
+    /// `transports` (none for an empty set); returns its id, or `None` if an identity
+    /// (the default one included) already holds the key.
+    ///
+    /// Bind peers to it with [`PeerConfig::local_identity`]. A handshake initiation is
+    /// dispatched to the identity whose key its mac1 is computed with: an identity is skipped
+    /// on a transport outside its set as if its key did not exist (no response, no cookie
+    /// reply), so it cannot be probed there. Its peers accept handshake responses, cookie
+    /// replies and transport data only on its transports; a message on another transport is
+    /// dropped like one for an unknown session index. What is sent is not restricted: a
+    /// peer's path may name any transport.
+    ///
+    /// Each identity has its own mac1 and cookie keys and cookie secret, while one handshake
+    /// budget ([`CoreConfig::handshake_rate_limit`]) holds across all of them. With several
+    /// identities, an initiation costs one keyed BLAKE2s per identity tried before it.
+    ///
+    /// [`CoreConfig::handshake_rate_limit`]: crate::CoreConfig::handshake_rate_limit
+    pub fn add_local_identity_on(
+        &mut self,
+        key: x25519::StaticSecret,
+        transports: impl IntoIterator<Item = TransportId>,
+    ) -> Option<LocalIdentityId> {
+        self.peers
+            .add_identity(key, Some(transports.into_iter().collect()))
+    }
+
+    /// Removes a local identity and its peers, each exactly as
+    /// [`ConfigChange::RemovePeer`] would; `false` for [`LocalIdentityId::DEFAULT`] or an
+    /// unknown identity. Its id is not reused.
+    pub fn remove_local_identity(&mut self, identity: LocalIdentityId) -> bool {
+        if identity == LocalIdentityId::DEFAULT || self.peers.identity(identity).is_none() {
+            return false;
+        }
+        let keys: Vec<x25519::PublicKey> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.local_identity() == identity)
+            .map(|(_, p)| *p.public_key())
+            .collect();
+        for key in &keys {
+            self.remove_peer(identity, key);
+        }
+        self.peers.remove_identity(identity)
+    }
+
+    /// The local identities, ascending by id; the default identity is first.
+    pub fn local_identities(&self) -> impl Iterator<Item = LocalIdentityInfo> + '_ {
+        self.peers.identities().iter().map(|i| LocalIdentityInfo {
+            id: i.id,
+            public_key: i.key.as_ref().map(|k| k.public),
+            peers: i.peers,
+            transports: i.transports.as_deref().map(<[TransportId]>::to_vec),
+        })
     }
 
     /// All peers, in id order.
@@ -463,6 +530,7 @@ impl Core {
         Some(PeerStats {
             peer,
             public_key: *p.public_key(),
+            local_identity: p.local_identity(),
             path: p.path(),
             allowed_ips: self.peers.allowed_ips(peer),
             preshared_key: p.preshared_key().copied(),
@@ -684,14 +752,46 @@ impl Core {
         })
     }
 
+    /// Removes the peer of `identity` with `key`, keeping its unanswered handshakes in the
+    /// total.
+    fn remove_peer(&mut self, identity: LocalIdentityId, key: &x25519::PublicKey) {
+        if let Some(p) = self
+            .peers
+            .get(identity, key)
+            .and_then(|id| self.peers.peer(id))
+        {
+            self.removed_unanswered_handshakes = self
+                .removed_unanswered_handshakes
+                .saturating_add(p.unanswered_handshakes());
+        }
+        self.peers.remove(identity, key);
+    }
+
     /// Applies a configuration change.
     ///
     /// Peers cannot be added without a private key; such a change is reported as
-    /// `Event::Dropped { peer: None, reason: reasons::NO_PRIVATE_KEY }`. Changes to unknown
+    /// `Event::Dropped { peer: None, reason: reasons::NO_PRIVATE_KEY }`, and a peer of an
+    /// unknown local identity as `reasons::UNKNOWN_LOCAL_IDENTITY`. Changes to unknown
     /// peers are ignored.
     // Rare: out of line, so the data path that shares `handle_input` keeps a small frame.
     #[inline(never)]
     fn configure(&mut self, change: ConfigChange, now: Instant) {
+        let (identity, change) = match change {
+            ConfigChange::InLocalIdentity { identity, change } => match *change {
+                change @ (ConfigChange::RemovePeer(_)
+                | ConfigChange::SetAllowedIps { .. }
+                | ConfigChange::SetPresharedKey { .. }
+                | ConfigChange::SetKeepalive { .. }
+                | ConfigChange::SetPath { .. }
+                | ConfigChange::SetInboundDestinations { .. }
+                | ConfigChange::SetInboundDestinationSource { .. }) => (identity, change),
+                ConfigChange::SetPrivateKey(_)
+                | ConfigChange::AddOrUpdatePeer(_)
+                | ConfigChange::RemoveAllPeers
+                | ConfigChange::InLocalIdentity { .. } => return,
+            },
+            change => (LocalIdentityId::DEFAULT, change),
+        };
         let config = match change {
             ConfigChange::SetPrivateKey(key) => {
                 self.peers.set_private_key(key);
@@ -705,19 +805,13 @@ impl Core {
             | ConfigChange::SetPath { peer, .. }
             | ConfigChange::SetInboundDestinations { peer, .. }
             | ConfigChange::SetInboundDestinationSource { peer, .. }
-                if self.peers.get(&peer).is_none() =>
+                if self.peers.get(identity, &peer).is_none() =>
             {
                 return;
             }
-            ConfigChange::RemovePeer(key) => {
-                if let Some(p) = self.peers.get(&key).and_then(|id| self.peers.peer(id)) {
-                    self.removed_unanswered_handshakes = self
-                        .removed_unanswered_handshakes
-                        .saturating_add(p.unanswered_handshakes());
-                }
-                self.peers.remove(&key);
-                return;
-            }
+            ConfigChange::RemovePeer(key) => return self.remove_peer(identity, &key),
+            // Unwrapped above.
+            ConfigChange::InLocalIdentity { .. } => return,
             ConfigChange::RemoveAllPeers => {
                 self.removed_unanswered_handshakes = self.total_unanswered_handshakes();
                 self.peers.clear();
@@ -726,31 +820,35 @@ impl Core {
             ConfigChange::SetAllowedIps { peer, allowed_ips } => PeerConfig {
                 allowed_ips,
                 replace_allowed_ips: true,
+                local_identity: Some(identity),
                 ..PeerConfig::new(peer)
             },
             ConfigChange::SetPresharedKey { peer, key } => PeerConfig {
                 // An all-zero key removes it.
                 preshared_key: Some(key.unwrap_or([0; 32])),
+                local_identity: Some(identity),
                 ..PeerConfig::new(peer)
             },
             ConfigChange::SetKeepalive { peer, interval } => PeerConfig {
                 persistent_keepalive: Some(interval.unwrap_or(0)),
+                local_identity: Some(identity),
                 ..PeerConfig::new(peer)
             },
             ConfigChange::SetPath { peer, path } => PeerConfig {
                 path: Some(path),
+                local_identity: Some(identity),
                 ..PeerConfig::new(peer)
             },
             ConfigChange::SetInboundDestinations { peer, destinations } => {
                 // A `None` in a PeerConfig leaves them unchanged: remove them directly.
-                if let Some(id) = self.peers.get(&peer) {
+                if let Some(id) = self.peers.get(identity, &peer) {
                     self.peers
                         .set_inbound_destinations(id, destinations.as_deref());
                 }
                 return;
             }
             ConfigChange::SetInboundDestinationSource { peer, source } => {
-                if let Some(id) = self.peers.get(&peer) {
+                if let Some(id) = self.peers.get(identity, &peer) {
                     self.peers.set_inbound_destination_source(id, source);
                 }
                 return;
@@ -761,6 +859,7 @@ impl Core {
                 PeerTableError::NoPrivateKey => reasons::NO_PRIVATE_KEY,
                 PeerTableError::IndicesExhausted => reasons::NO_FREE_SESSION_INDEX,
                 PeerTableError::IdsExhausted => reasons::NO_FREE_PEER_ID,
+                PeerTableError::UnknownIdentity => reasons::UNKNOWN_LOCAL_IDENTITY,
             };
             self.dropped(None, reason);
         }
@@ -808,6 +907,11 @@ impl Core {
         let Some(peer) = self.peers.at_mut(slot) else {
             return self.pool.put(data);
         };
+        // A restricted identity's peer knows no session on another transport.
+        if !peer.accepts(path.transport) {
+            self.pool.put(data);
+            return self.dropped(None, reasons::UNKNOWN_SESSION);
+        }
         let outcome = job::open(&mut peer.tunnel_mut(), path, &mut data);
         match self.opened(id, Some(slot), path, &data, outcome, lookups) {
             Some(plain_len) => self.deliver_opened(id, Some(slot), path, data, plain_len),
@@ -823,9 +927,11 @@ impl Core {
         receiver_idx: u32,
         lookups: &mut Lookups,
     ) -> Option<CryptoJob> {
+        // A restricted identity's peer knows no session on another transport.
         let peer = lookups
             .session(&self.peers, receiver_idx)
-            .and_then(|(id, slot)| Some((id, self.peers.at(slot)?)));
+            .and_then(|(id, slot)| Some((id, self.peers.at(slot)?)))
+            .filter(|(_, peer)| peer.accepts(path.transport));
         let Some((id, peer)) = peer else {
             self.pool.put(data);
             self.dropped(None, reasons::UNKNOWN_SESSION);
@@ -944,17 +1050,25 @@ impl Core {
         Some(plain_len)
     }
 
-    /// Verifies a handshake message with the handshake gate, finds its peer and lets the
-    /// peer's tunnel answer it. The gate counts each message once; the tunnel does not verify
-    /// or count it again.
+    /// Verifies a handshake message with the handshake gate of the local identity it is for,
+    /// finds its peer and lets the peer's tunnel answer it. The gate counts each message once;
+    /// the tunnel does not verify or count it again.
+    ///
+    /// With a single local identity that has a key and serves every transport, its gate
+    /// verifies every message. Otherwise an initiation goes to the first identity serving
+    /// the arrival transport whose mac1 key it matches, and a response or cookie reply to the
+    /// identity of the peer that owns its receiver index.
     // Rare: out of line, so the data path that shares `handle_input` keeps a small frame.
     #[inline(never)]
     fn receive_handshake(&mut self, path: Path, datagram: &[u8]) {
-        let (Some((private, public)), Some(gate)) =
-            (self.peers.key_pair(), self.peers.rate_limiter())
-        else {
+        let (first, second) = {
+            let mut keyed = self.peers.keyed_identities();
+            (keyed.next(), keyed.next())
+        };
+        let Some(first) = first else {
             return self.dropped(None, reasons::NO_PRIVATE_KEY);
         };
+        let sole = (second.is_none() && first.0.transports.is_none()).then_some(first);
 
         // Handshake messages are small: copy them out, so the reply can go to a pooled buffer.
         let mut message = [0u8; HANDSHAKE_INIT_SZ];
@@ -962,6 +1076,16 @@ impl Core {
             return self.dropped(None, reasons::INVALID_PACKET);
         };
         message.copy_from_slice(datagram);
+
+        let target = match sole {
+            Some((identity, own)) => Ok((identity.id, own, None)),
+            None => dispatch_handshake(&self.peers, path.transport, message),
+        };
+        let (identity, own, responder) = match target {
+            Ok(target) => target,
+            Err(reason) => return self.dropped(None, reason),
+        };
+        let (private, public, gate) = (&own.private, &own.public, &own.gate);
 
         let mut reply = self.pool.get_len(BUF_SIZE);
         let packet = match gate.verify_packet(
@@ -989,16 +1113,16 @@ impl Core {
                     .ok()
                     .and_then(|hh| {
                         self.peers
-                            .get(&x25519::PublicKey::from(hh.peer_static_public))
+                            .get(identity, &x25519::PublicKey::from(hh.peer_static_public))
                     }),
                 MessageKind::HandshakeInit,
             ),
             Packet::HandshakeResponse(p) => (
-                self.peers.by_index(p.receiver_idx),
+                responder.or_else(|| self.peers.by_index(p.receiver_idx)),
                 MessageKind::HandshakeResponse,
             ),
             Packet::PacketCookieReply(p) => (
-                self.peers.by_index(p.receiver_idx),
+                responder.or_else(|| self.peers.by_index(p.receiver_idx)),
                 MessageKind::CookieReply,
             ),
             Packet::PacketData(_) => (None, MessageKind::Data),
@@ -1233,6 +1357,46 @@ impl Core {
         self.outputs
             .push_back(Output::Event(Event::Dropped { peer, reason }));
     }
+}
+
+/// The local identity a handshake message arriving on `transport` is for, its key, and the
+/// peer that owns the receiver index of a response or cookie reply; with several local
+/// identities, or one restricted to some transports.
+///
+/// An initiation goes to the first identity serving `transport` whose mac1 key it matches,
+/// or is dropped as [`reasons::UNKNOWN_LOCAL_IDENTITY`] before any budget is counted. A
+/// response or cookie reply goes to its peer's identity, or is dropped as
+/// [`reasons::UNKNOWN_PEER`] for an unknown receiver index or a peer that does not accept
+/// `transport`.
+fn dispatch_handshake<'a>(
+    peers: &'a PeerTable,
+    transport: TransportId,
+    message: &[u8],
+) -> Result<(LocalIdentityId, &'a OwnKey, Option<PeerId>), &'static str> {
+    let receiver_idx = match Tunn::parse_incoming_packet(message) {
+        Ok(Packet::HandshakeInit(_)) => {
+            return peers
+                .keyed_identities()
+                .find(|(identity, own)| {
+                    identity.serves(transport) && own.gate.mac1_matches(message)
+                })
+                .map(|(identity, own)| (identity.id, own, None))
+                .ok_or(reasons::UNKNOWN_LOCAL_IDENTITY);
+        }
+        Ok(Packet::HandshakeResponse(p)) => p.receiver_idx,
+        Ok(Packet::PacketCookieReply(p)) => p.receiver_idx,
+        Ok(Packet::PacketData(_)) | Err(_) => return Err(reasons::INVALID_HANDSHAKE),
+    };
+    let id = peers.by_index(receiver_idx).ok_or(reasons::UNKNOWN_PEER)?;
+    let peer = peers
+        .peer(id)
+        .filter(|p| p.accepts(transport))
+        .ok_or(reasons::UNKNOWN_PEER)?;
+    let own = peers
+        .identity(peer.local_identity())
+        .and_then(|identity| identity.key.as_ref())
+        .ok_or(reasons::UNKNOWN_PEER)?;
+    Ok((peer.local_identity(), own, Some(id)))
 }
 
 /// A policy that sends everything on one path, for [`Core::inject_outbound_on`].

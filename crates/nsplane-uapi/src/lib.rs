@@ -16,6 +16,13 @@
 //! `listen_port=` or `fwmark=` equal to the reported value as a no-op, and fails any other
 //! value with `EADDRINUSE` (98), logging why. `get=1` still reports the listen port.
 //!
+//! The UAPI configures the default local identity
+//! ([`LocalIdentityId::DEFAULT`](nsplane::LocalIdentityId::DEFAULT)) and its peers only:
+//! `private_key` is that identity's key and every peer section addresses a peer of that
+//! identity. Other local identities
+//! ([`EngineHandle::add_local_identity`](nsplane::EngineHandle::add_local_identity)) and
+//! their peers are managed through the [`EngineHandle`](nsplane::EngineHandle) alone.
+//!
 //! [`Uapi::handle_request`] serves one request over any async reader and writer.
 //! [`UapiListener`] binds the endpoint that the `wg` tool talks to: on Unix the standard
 //! socket `/var/run/wireguard/<iface>.sock` (`socket_path`), on Windows the named pipe
