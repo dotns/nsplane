@@ -5,6 +5,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Local identities: one engine holds several static keys, and every peer is bound to one of
+  them (plan `20261011-0900-local-identities`). An engine with only the default identity
+  behaves and costs as before.
+  - `nsplane-core`: `LocalIdentityId` (`DEFAULT` is the existing key, ids are never reused),
+    `LocalIdentityInfo`, `Core::{add_local_identity, add_local_identity_on,
+    remove_local_identity, local_identities, peer_id_in}`, `PeerConfig::local_identity`,
+    `PeerStats::local_identity` and `ConfigChange::InLocalIdentity`. Peers are keyed by
+    (identity, remote key), so one remote key can be a peer under two identities; removing an
+    identity removes its peers.
+  - With two or more keyed identities (or a restricted one), a handshake initiation is
+    dispatched by its mac1 to the identity it is computed for; one that matches none is
+    dropped as the new reason `reasons::UNKNOWN_LOCAL_IDENTITY` without a reply.
+  - Cookies per identity (own mac1 and cookie keys, own cookie secret) under one handshake
+    budget for the whole engine (`nsplane-noise` `rate_limiter::HandshakeBudget`,
+    `RateLimiter::with_budget`, `RateLimiter::mac1_matches`).
+  - Transport restriction (`add_local_identity_on`): the identity answers initiations only on
+    its transports, and its peers accept handshake responses, cookie replies and data only
+    there. Outbound traffic is not restricted.
+  - `nsplane`: `EngineHandle::{add_local_identity, add_local_identity_on,
+    remove_local_identity, local_identities, peer_id_in, remove_peer_in,
+    set_inbound_destinations_in, set_inbound_destination_source_in}`, `LocalIdentity` and
+    `EngineStatus::local_identities`; `add_or_update_peer` binds a peer with
+    `Peer::local_identity`. The key-addressed methods keep meaning the default identity.
+  - The UAPI and the CLI stay on the default identity.
+  - `nsplane-core` bench `handshake`: one initiation with 1, 4 and 16 identities, and the drop
+    of an initiation matching none of 16.
+
 ## [0.11.0] - 2026-10-08
 
 Two rounds since 0.10.0: the remaining ns requests with the optimization follow-ups (plan
