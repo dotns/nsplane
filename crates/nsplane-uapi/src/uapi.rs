@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use nsplane::x25519::{PublicKey, StaticSecret};
-use nsplane::{AllowedIp, Ecn, EngineHandle, Path, Peer, PeerStats, TransportId, UdpTransport};
+use nsplane::{
+    AllowedIp, Ecn, EngineHandle, LocalIdentityId, Path, Peer, PeerStats, TransportId, UdpTransport,
+};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -54,6 +56,11 @@ struct NetState {
 /// with `EADDRINUSE` (98) and logs the reason.
 ///
 /// The transports it binds use segmentation offload unless [`Uapi::offload`] turns it off.
+///
+/// It configures and lists the default local identity ([`LocalIdentityId::DEFAULT`]) and
+/// its peers only: `get` lists that identity's peers, and `replace_peers=true` removes them
+/// alone. Other local identities and their peers are managed through the
+/// [`EngineHandle`]; the UAPI neither shows nor touches them.
 #[derive(Debug, Clone)]
 pub struct Uapi {
     handle: EngineHandle,
@@ -182,7 +189,8 @@ impl Uapi {
             (net.port, net.fwmark)
         };
         let private_key = self.handle.private_key().await.map_err(|_| EIO)?;
-        let peers = self.handle.peers().await.map_err(|_| EIO)?;
+        let mut peers = self.handle.peers().await.map_err(|_| EIO)?;
+        peers.retain(|peer| peer.local_identity == LocalIdentityId::DEFAULT);
         Ok(write_config(
             private_key.as_ref(),
             port,
@@ -262,12 +270,25 @@ impl Uapi {
                 })
             }
             "replace_peers" => match val.parse::<bool>() {
-                Ok(true) => self.handle.remove_all_peers().await.map_err(|_| EIO),
+                Ok(true) => self.remove_default_peers().await.map_err(|_| EIO),
                 Ok(false) => Ok(()),
                 Err(_) => Err(EINVAL),
             },
             _ => Err(EINVAL),
         }
+    }
+
+    /// Removes the peers of the default local identity, leaving other identities' peers.
+    async fn remove_default_peers(&self) -> Result<(), nsplane::EngineError> {
+        if self.handle.local_identities().await?.len() == 1 {
+            return self.handle.remove_all_peers().await;
+        }
+        for peer in self.handle.peers().await? {
+            if peer.local_identity == LocalIdentityId::DEFAULT {
+                self.handle.remove_peer(peer.public_key).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Applies one peer section.
@@ -647,6 +668,87 @@ mod tests {
 
         let config = request(&uapi, "get=1\n\n").await;
         assert_eq!(config, "listen_port=51820\nerrno=0\n\n");
+    }
+
+    /// The public keys of the peer sections `get` reports.
+    async fn listed_peers(uapi: &Uapi) -> Vec<String> {
+        request(uapi, "get=1\n\n")
+            .await
+            .lines()
+            .filter_map(|line| line.strip_prefix("public_key="))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A UAPI over an engine with a default private key and default peers `keys`.
+    async fn uapi_with_default_peers(keys: &[[u8; 32]]) -> (Uapi, impl Sized + use<>) {
+        let transport = udp_transport(0).unwrap();
+        let port = transport.local_addr().port();
+        let (engine, ends) = engine(transport);
+        let uapi = Uapi::with_listen_port(engine.handle(), port);
+        let mut set = format!("set=1\nprivate_key={}\n", hex::encode([1; 32]));
+        for key in keys {
+            let _ = writeln!(set, "public_key={}", hex::encode(key));
+        }
+        set.push('\n');
+        assert_eq!(request(&uapi, &set).await, "errno=0\n\n");
+        (uapi, (engine, ends))
+    }
+
+    #[tokio::test]
+    async fn other_identities_are_invisible_and_untouched() {
+        let shared = PublicKey::from(&StaticSecret::from([2; 32])).to_bytes();
+        let default_only = PublicKey::from(&StaticSecret::from([3; 32])).to_bytes();
+        let (uapi, _engine) = uapi_with_default_peers(&[shared, default_only]).await;
+        let handle = uapi.handle();
+        let second = handle
+            .add_local_identity(StaticSecret::from([4; 32]))
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .add_or_update_peer(Peer {
+                local_identity: Some(second),
+                ..Peer::new(PublicKey::from(shared))
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.peers().await.unwrap().len(), 3);
+
+        // `get` lists the shared key once, as the default identity's peer.
+        assert_eq!(
+            listed_peers(&uapi).await,
+            [hex::encode(shared), hex::encode(default_only)]
+        );
+
+        // replace_peers removes the default identity's peers alone.
+        assert_eq!(
+            request(&uapi, "set=1\nreplace_peers=true\n\n").await,
+            "errno=0\n\n"
+        );
+        assert_eq!(listed_peers(&uapi).await, Vec::<String>::new());
+        let shared = PublicKey::from(shared);
+        assert!(handle.peer_id(shared).await.unwrap().is_none());
+        assert!(handle.peer_id_in(second, shared).await.unwrap().is_some());
+        assert_eq!(handle.peers().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_peers_with_the_default_identity_alone() {
+        let keys =
+            [2, 3, 5].map(|seed| PublicKey::from(&StaticSecret::from([seed; 32])).to_bytes());
+        let (uapi, _engine) = uapi_with_default_peers(&keys).await;
+        assert_eq!(uapi.handle().local_identities().await.unwrap().len(), 1);
+        assert_eq!(listed_peers(&uapi).await, keys.map(hex::encode));
+
+        // The new peers of the same request survive the replacement.
+        let request_body = format!(
+            "set=1\nreplace_peers=true\npublic_key={}\n\n",
+            hex::encode(keys[2])
+        );
+        assert_eq!(request(&uapi, &request_body).await, "errno=0\n\n");
+        assert_eq!(listed_peers(&uapi).await, [hex::encode(keys[2])]);
+        assert_eq!(uapi.handle().peers().await.unwrap().len(), 1);
     }
 
     #[test]

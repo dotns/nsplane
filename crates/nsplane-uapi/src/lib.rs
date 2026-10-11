@@ -19,9 +19,11 @@
 //! The UAPI configures the default local identity
 //! ([`LocalIdentityId::DEFAULT`](nsplane::LocalIdentityId::DEFAULT)) and its peers only:
 //! `private_key` is that identity's key and every peer section addresses a peer of that
-//! identity. Other local identities
+//! identity. `get=1` lists that identity's peers only, and `replace_peers=true` removes
+//! them alone. Other local identities
 //! ([`EngineHandle::add_local_identity`](nsplane::EngineHandle::add_local_identity)) and
-//! their peers are managed through the [`EngineHandle`](nsplane::EngineHandle) alone.
+//! their peers are managed through the [`EngineHandle`](nsplane::EngineHandle) alone; the
+//! UAPI neither shows nor touches them.
 //!
 //! [`Uapi::handle_request`] serves one request over any async reader and writer.
 //! [`UapiListener`] binds the endpoint that the `wg` tool talks to: on Unix the standard
