@@ -1,6 +1,6 @@
 # 20261011-0101-local-identities Several local identities per engine
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P1
 - **owner**: L1 (7f5cstru), plan 20261011-0900-local-identities; the owner lifted the 0.11 freeze for
   this feature (2026-10-11)

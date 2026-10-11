@@ -1,6 +1,6 @@
 # 20261011-0900-local-identities Several local identities per engine
 
-- **status**: approved
+- **status**: completed
 - **approvedAt**: 2026-10-11 (user: "需要做这个需求"; the 0.11 freeze is lifted for this feature only; auto mode, no round cap, automatic merges, watchdog with stuck-process checks)
 - **createdAt**: 2026-10-11 09:00
 - **relatedTask**: 20261011-0101-local-identities
@@ -75,3 +75,10 @@ peers' paths to it. That already works today.
   - a golden mac1/mac2/cookie test.
   Added LI-6: an identity may be restricted to a set of transports, and initiations on other
   transports skip it, so a known key from another overlay cannot be probed via cookie replies.
+- 2026-10-12: completed (campaign `nsplane-li-202610110900`), merged into main. LI-A..F: noise shared
+  budget and `mac1_matches`, core identity table with (identity, key) peers and mac1 dispatch,
+  handle methods and status, e2e incl. kernel WireGuard per identity, benches and docs, UAPI on
+  the default identity only. Main: just check 1752 tests with a clean term scan, cargo doc green.
+  data_path +0.4 % / -0.1 % and single-identity initiation +0.1 % (noise). Initiation 129 / 130
+  / 132 us at N = 1 / 4 / 16, and a no-match drop 3.1 us at N = 16. Next: release 0.12.0 on the
+  owner's go; the freeze is back in force afterwards.
