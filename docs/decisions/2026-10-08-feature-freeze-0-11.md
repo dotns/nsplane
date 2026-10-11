@@ -26,3 +26,9 @@ slot A/B when it touches the data path.
   `EngineHandle::recycle`, netstack SACK) stay open, unscheduled.
 - The deprecated `WsFrame` stream carrier is removed only after the freeze is lifted. The
   removal is breaking.
+
+## Amendments
+
+- 2026-10-11: the owner lifted the freeze for one feature, local identities (task
+  `20261011-0101`, plan `20261011-0900-local-identities`). It is additive and ships as 0.12.0.
+  Everything else stays frozen. 0.11.x fixes continue on `release/0.11.x` if needed.

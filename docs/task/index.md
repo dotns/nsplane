@@ -46,3 +46,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261006-1500-business-agnostic-cleanup Remove product concepts from nsplane**](20261006-1500-business-agnostic-cleanup.md) `P1`
 - [ ] [**20261006-1700-windows-smoke-for-ns Windows TUN smoke scenario for ns (MT-3 addendum)**](20261006-1700-windows-smoke-for-ns.md) `P1`
 - [-] [**20261008-0800-consumer-integration ns and nsgw on nsplane 0.11**](20261008-0800-consumer-integration.md) `P1`
+- [-] [**20261011-0101-local-identities Several local identities per engine**](20261011-0101-local-identities.md) `P1`
