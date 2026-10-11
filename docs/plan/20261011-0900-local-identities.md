@@ -65,3 +65,13 @@ peers' paths to it. That already works today.
 ## Annotations
 - 2026-10-11: dispatched (campaign `nsplane-li-202610110900`): LI `eos2286z`. Auto mode, watchdog every
   30 min with stuck-process checks. The release (0.12.0) is asked of the owner at the end.
+- 2026-10-11: LI design note approved:
+  - `LocalIdentityId` with DEFAULT = 0, `PeerConfig::local_identity`, `ConfigChange::InLocalIdentity`
+    and `_in` handle methods;
+  - peers keyed by (identity, key) with one index allocator;
+  - mac1 dispatch only for N >= 2;
+  - a shared `HandshakeBudget` with per-identity cookie secrets;
+  - events unchanged, the identity resolvable from the PeerId (accepted reading of LI-5);
+  - a golden mac1/mac2/cookie test.
+  Added LI-6: an identity may be restricted to a set of transports, and initiations on other
+  transports skip it, so a known key from another overlay cannot be probed via cookie replies.
