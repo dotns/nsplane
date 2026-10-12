@@ -266,59 +266,6 @@ fn replace_rejects_invalid_policies_as_a_whole() {
 }
 
 #[test]
-fn replace_rejects_ipv6_entries() {
-    let gate = gate_with(policy(vec![open_scope(GateMode::Enforce)]));
-    let v6: IpAddr = "fd00::1".parse().unwrap();
-    let v6_net: IpNet = "fd00::/64".parse().unwrap();
-    let field = |policy: GatePolicy| match gate.replace(policy) {
-        Err(GatePolicyError::Ipv6 { field, .. }) => field,
-        other => panic!("{other:?}"),
-    };
-
-    let mut local = open_scope(GateMode::Off);
-    local.local.push(v6);
-    assert_eq!(field(policy(vec![local])), "local");
-    let mut bound = open_scope(GateMode::Enforce);
-    bound.bindings[0].addresses.push(v6);
-    assert_eq!(field(policy(vec![bound])), "bindings.addresses");
-    let mut granted = open_scope(GateMode::Enforce);
-    granted.grants[0].destinations.push(v6_net);
-    assert_eq!(field(policy(vec![granted])), "grants.destinations");
-    let held = |rule: HoldRule| GatePolicy {
-        scopes: Vec::new(),
-        holds: GateHolds {
-            outbound: vec![rule],
-            ..GateHolds::default()
-        },
-    };
-    assert_eq!(
-        field(held(HoldRule {
-            local: vec![v6_net],
-            ..HoldRule::default()
-        })),
-        "holds.local"
-    );
-    assert_eq!(
-        field(held(HoldRule {
-            remote: vec![v6_net],
-            ..HoldRule::default()
-        })),
-        "holds.remote"
-    );
-    assert_eq!(
-        field(GatePolicy {
-            scopes: Vec::new(),
-            holds: GateHolds {
-                release: vec![(PEER, v6)],
-                ..GateHolds::default()
-            },
-        }),
-        "holds.release"
-    );
-    assert_eq!(gate.generation(), 1);
-}
-
-#[test]
 fn defaults_are_the_documented_values() {
     assert_eq!(
         GateLimits::default(),

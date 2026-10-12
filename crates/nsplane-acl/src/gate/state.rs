@@ -5,7 +5,7 @@
 //! capacity verdict is reached only after expired entries were reclaimed.
 
 use std::hash::{Hash, Hasher};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use nsplane_packet::PeerId;
 
 use super::PacketDirection;
+use super::addr::GateAddr;
 use super::config::{GateConfig, GateTimeouts};
 use super::hash::FastMap;
 use super::policy::Slot;
@@ -22,24 +23,25 @@ use crate::rules::{RuleId, Transport};
 pub(super) const SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FlowKey {
+pub(super) struct FlowKey<A: GateAddr> {
     pub(super) slot: Slot,
     pub(super) peer: PeerId,
-    pub(super) remote_ip: Ipv4Addr,
-    pub(super) local_ip: Ipv4Addr,
+    pub(super) remote_ip: A,
+    pub(super) local_ip: A,
     pub(super) protocol: u8,
     pub(super) remote_port: u16,
     pub(super) local_port: u16,
 }
 
-impl Hash for FlowKey {
+impl<A: GateAddr> Hash for FlowKey<A> {
     /// Two words: the peer and the remote address; the local address, the
-    /// ports, the scope slot and the protocol folded together. Hashing a
-    /// subset of the key's bits keeps equal keys equal.
+    /// ports, the scope slot and the protocol folded together (an IPv6
+    /// address folded to 32 bits). Hashing a subset of the key's bits keeps
+    /// equal keys equal.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64((u64::from(self.peer.get()) << 32) | u64::from(self.remote_ip.to_bits()));
+        state.write_u64((u64::from(self.peer.get()) << 32) | u64::from(self.remote_ip.fold()));
         state.write_u64(
-            (u64::from(self.local_ip.to_bits()) << 32)
+            (u64::from(self.local_ip.fold()) << 32)
                 ^ (u64::from(self.remote_port) << 16)
                 ^ u64::from(self.local_port)
                 ^ (u64::from(self.slot) << 40)
@@ -88,8 +90,14 @@ pub(super) struct FlowState {
 }
 
 impl FlowState {
-    /// Refresh the idle lifetime after a packet of an existing flow.
-    pub(super) fn touch(&mut self, protocol: u8, now: Instant, timeouts: &GateTimeouts) {
+    /// Refresh the idle lifetime after a packet of an existing flow of the
+    /// family `A`.
+    pub(super) fn touch<A: GateAddr>(
+        &mut self,
+        protocol: u8,
+        now: Instant,
+        timeouts: &GateTimeouts,
+    ) {
         if self.close.terminal() && protocol == 6 {
             // A final ACK may arrive after FIN/RST. It is valid tail traffic,
             // but must not turn a closed TCP entry back into the normal two-hour
@@ -100,7 +108,7 @@ impl FlowState {
             // direction, but uses a bounded idle lifetime instead of two hours.
             self.expires_at = now + timeouts.tcp_half_closed;
         } else {
-            self.expires_at = now + protocol_timeout(protocol, timeouts);
+            self.expires_at = now + protocol_timeout::<A>(protocol, timeouts);
         }
     }
 
@@ -130,14 +138,15 @@ impl FlowState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct FragmentKey {
+pub(super) struct FragmentKey<A: GateAddr> {
     pub(super) slot: Slot,
     pub(super) direction: PacketDirection,
     pub(super) peer: PeerId,
-    pub(super) source: Ipv4Addr,
-    pub(super) destination: Ipv4Addr,
+    pub(super) source: A,
+    pub(super) destination: A,
+    /// The upper-layer protocol (for IPv6, the Fragment header's next header).
     pub(super) protocol: u8,
-    pub(super) identification: u16,
+    pub(super) identification: A::FragmentId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,152 +223,69 @@ impl Counts {
     }
 }
 
-/// One shard: the flows and fragments of the remote peers hashed to it.
+/// One shard: the flows and fragments of the remote peers hashed to it, one
+/// map of each per address family, and the flow count of each peer over
+/// both families.
 #[derive(Debug, Default)]
 pub(super) struct Shard {
     /// Epoch of the snapshot this shard's state was last migrated to.
     pub(super) epoch: u64,
-    pub(super) flows: FastMap<FlowKey, FlowState>,
-    pub(super) fragments: FastMap<FragmentKey, FragmentState>,
+    pub(super) flows: FastMap<FlowKey<Ipv4Addr>, FlowState>,
+    pub(super) fragments: FastMap<FragmentKey<Ipv4Addr>, FragmentState>,
+    pub(super) flows6: FastMap<FlowKey<Ipv6Addr>, FlowState>,
+    pub(super) fragments6: FastMap<FragmentKey<Ipv6Addr>, FragmentState>,
     pub(super) peer_flows: FastMap<PeerId, usize>,
 }
 
 impl Shard {
-    fn forget_peer_flow(&mut self, peer: PeerId) {
-        if let Some(count) = self.peer_flows.get_mut(&peer) {
-            *count -= 1;
-            if *count == 0 {
-                self.peer_flows.remove(&peer);
-            }
-        }
-    }
-
-    fn remove_flow(&mut self, key: &FlowKey, counts: &Counts) {
-        if self.flows.remove(key).is_some() {
-            self.forget_peer_flow(key.peer);
-            counts.release_flows(1);
-        }
-    }
-
-    fn remove_fragment(&mut self, key: &FragmentKey, counts: &Counts) {
-        if self.fragments.remove(key).is_some() {
-            counts.release_fragments(1);
-        }
-    }
-
-    /// `with` applied to the live flow for `key` (one lookup), dropping the
-    /// flow when expired.
-    pub(super) fn with_live_flow<T>(
-        &mut self,
-        key: &FlowKey,
-        now: Instant,
-        counts: &Counts,
-        with: impl FnOnce(&mut FlowState) -> T,
-    ) -> Lookup<T> {
-        let Some(state) = self.flows.get_mut(key) else {
-            return Lookup::Missing;
-        };
-        if state.expires_at > now {
-            return Lookup::Found(with(state));
-        }
-        self.remove_flow(key, counts);
-        Lookup::Missing
-    }
-
-    /// Whether `key` has a live flow; its idle lifetime is refreshed.
-    pub(super) fn touch_flow(&mut self, key: &FlowKey, now: Instant, counts: &Counts) -> bool {
-        self.with_live_flow(key, now, counts, |state| {
-            state.touch(key.protocol, now, &counts.timeouts);
-        }) != Lookup::Missing
-    }
-
-    pub(super) fn fragment_disposition(
-        &mut self,
-        key: &FragmentKey,
-        now: Instant,
-        counts: &Counts,
-    ) -> Option<FragmentDisposition> {
-        let state = *self.fragments.get(key)?;
-        if state.expires_at <= now {
-            self.remove_fragment(key, counts);
-            return None;
-        }
-        Some(state.disposition)
+    /// The state of the family `A`.
+    #[inline]
+    pub(super) fn family<A: GateAddr>(&mut self) -> FamilyShard<'_, A> {
+        A::shard(self)
     }
 
     /// Remove every expired entry of this shard.
     pub(super) fn sweep(&mut self, now: Instant, counts: &Counts) {
-        self.retain_flows(counts, |_, state| state.expires_at > now);
-        self.retain_fragments(counts, |_, state| state.expires_at > now);
-    }
-
-    pub(super) fn retain_flows(
-        &mut self,
-        counts: &Counts,
-        mut keep: impl FnMut(&FlowKey, &mut FlowState) -> bool,
-    ) {
-        let before = self.flows.len();
-        let peer_flows = &mut self.peer_flows;
-        self.flows.retain(|key, state| {
-            let kept = keep(key, state);
-            if !kept && let Some(count) = peer_flows.get_mut(&key.peer) {
-                *count -= 1;
-                if *count == 0 {
-                    peer_flows.remove(&key.peer);
-                }
-            }
-            kept
-        });
-        counts.release_flows(before - self.flows.len());
-    }
-
-    pub(super) fn retain_fragments(
-        &mut self,
-        counts: &Counts,
-        mut keep: impl FnMut(&FragmentKey, &FragmentState) -> bool,
-    ) {
-        let before = self.fragments.len();
-        self.fragments.retain(|key, state| keep(key, state));
-        counts.release_fragments(before - self.fragments.len());
-    }
-
-    fn peer_flow_count(&self, peer: PeerId) -> usize {
-        self.peer_flows.get(&peer).copied().unwrap_or(0)
+        self.family::<Ipv4Addr>().sweep(now, counts);
+        self.family::<Ipv6Addr>().sweep(now, counts);
     }
 
     /// Insert a new flow and, for a first fragment, its fragment authority,
     /// both or neither. `swept` is set once every shard has been swept for
-    /// this packet, so a global limit then fails closed.
-    pub(super) fn insert_flow_with_fragment(
+    /// this packet, so a global limit then fails closed. The per-peer limit
+    /// counts the peer's flows of both families.
+    pub(super) fn insert_flow_with_fragment<A: GateAddr>(
         &mut self,
-        key: FlowKey,
+        key: FlowKey<A>,
         state: FlowState,
-        fragment: Option<FragmentKey>,
+        fragment: Option<FragmentKey<A>>,
         now: Instant,
         counts: &Counts,
         swept: bool,
     ) -> Admission {
-        if self
+        let mut family = self.family::<A>();
+        if family
             .flows
             .get(&key)
             .is_some_and(|flow| flow.expires_at <= now)
         {
-            self.remove_flow(&key, counts);
+            family.remove_flow(&key, counts);
         }
         if let Some(fragment) = &fragment
-            && self
+            && family
                 .fragments
                 .get(fragment)
                 .is_some_and(|existing| existing.expires_at <= now)
         {
-            self.remove_fragment(fragment, counts);
+            family.remove_fragment(fragment, counts);
         }
 
-        let new_flow = !self.flows.contains_key(&key);
+        let new_flow = !family.flows.contains_key(&key);
         if new_flow {
-            if self.peer_flow_count(key.peer) >= counts.peer_limit {
+            if family.peer_flow_count(key.peer) >= counts.peer_limit {
                 self.sweep(now, counts);
-                if self.peer_flow_count(key.peer) >= counts.peer_limit {
+                family = self.family::<A>();
+                if family.peer_flow_count(key.peer) >= counts.peer_limit {
                     return Admission::Full;
                 }
             }
@@ -372,7 +298,7 @@ impl Shard {
             }
         }
         if let Some(fragment) = &fragment {
-            let admission = match self.fragments.get(fragment) {
+            let admission = match family.fragments.get(fragment) {
                 Some(existing) if existing.disposition != FragmentDisposition::Allow => {
                     Admission::Full
                 }
@@ -390,11 +316,11 @@ impl Shard {
         }
 
         if new_flow {
-            *self.peer_flows.entry(key.peer).or_default() += 1;
+            *family.peer_flows.entry(key.peer).or_default() += 1;
         }
-        self.flows.insert(key, state);
+        family.flows.insert(key, state);
         if let Some(fragment) = fragment {
-            self.fragments.insert(
+            family.fragments.insert(
                 fragment,
                 FragmentState {
                     disposition: FragmentDisposition::Allow,
@@ -406,27 +332,28 @@ impl Shard {
     }
 
     /// Remember a first fragment's disposition for its later fragments.
-    pub(super) fn remember_fragment(
+    pub(super) fn remember_fragment<A: GateAddr>(
         &mut self,
-        key: FragmentKey,
+        key: FragmentKey<A>,
         disposition: FragmentDisposition,
         now: Instant,
         counts: &Counts,
         swept: bool,
     ) -> Admission {
-        match self.fragments.get(&key) {
-            Some(existing) if existing.expires_at <= now => self.remove_fragment(&key, counts),
+        let mut family = self.family::<A>();
+        match family.fragments.get(&key) {
+            Some(existing) if existing.expires_at <= now => family.remove_fragment(&key, counts),
             Some(existing) if existing.disposition != disposition => return Admission::Full,
             _ => {}
         }
-        if !self.fragments.contains_key(&key) && !counts.reserve_fragment() {
+        if !family.fragments.contains_key(&key) && !counts.reserve_fragment() {
             return if swept {
                 Admission::Full
             } else {
                 Admission::SweepAll
             };
         }
-        self.fragments.insert(
+        family.fragments.insert(
             key,
             FragmentState {
                 disposition,
@@ -434,6 +361,119 @@ impl Shard {
             },
         );
         Admission::Admitted
+    }
+}
+
+/// The flows and fragments of one family in a shard, with the shard's
+/// per-peer flow counts.
+#[derive(Debug)]
+pub(super) struct FamilyShard<'a, A: GateAddr> {
+    pub(super) flows: &'a mut FastMap<FlowKey<A>, FlowState>,
+    pub(super) fragments: &'a mut FastMap<FragmentKey<A>, FragmentState>,
+    pub(super) peer_flows: &'a mut FastMap<PeerId, usize>,
+}
+
+impl<A: GateAddr> FamilyShard<'_, A> {
+    fn forget_peer_flow(&mut self, peer: PeerId) {
+        if let Some(count) = self.peer_flows.get_mut(&peer) {
+            *count -= 1;
+            if *count == 0 {
+                self.peer_flows.remove(&peer);
+            }
+        }
+    }
+
+    fn remove_flow(&mut self, key: &FlowKey<A>, counts: &Counts) {
+        if self.flows.remove(key).is_some() {
+            self.forget_peer_flow(key.peer);
+            counts.release_flows(1);
+        }
+    }
+
+    fn remove_fragment(&mut self, key: &FragmentKey<A>, counts: &Counts) {
+        if self.fragments.remove(key).is_some() {
+            counts.release_fragments(1);
+        }
+    }
+
+    /// `with` applied to the live flow for `key` (one lookup), dropping the
+    /// flow when expired.
+    pub(super) fn with_live_flow<T>(
+        &mut self,
+        key: &FlowKey<A>,
+        now: Instant,
+        counts: &Counts,
+        with: impl FnOnce(&mut FlowState) -> T,
+    ) -> Lookup<T> {
+        let Some(state) = self.flows.get_mut(key) else {
+            return Lookup::Missing;
+        };
+        if state.expires_at > now {
+            return Lookup::Found(with(state));
+        }
+        self.remove_flow(key, counts);
+        Lookup::Missing
+    }
+
+    /// Whether `key` has a live flow; its idle lifetime is refreshed.
+    pub(super) fn touch_flow(&mut self, key: &FlowKey<A>, now: Instant, counts: &Counts) -> bool {
+        self.with_live_flow(key, now, counts, |state| {
+            state.touch::<A>(key.protocol, now, &counts.timeouts);
+        }) != Lookup::Missing
+    }
+
+    pub(super) fn fragment_disposition(
+        &mut self,
+        key: &FragmentKey<A>,
+        now: Instant,
+        counts: &Counts,
+    ) -> Option<FragmentDisposition> {
+        let state = *self.fragments.get(key)?;
+        if state.expires_at <= now {
+            self.remove_fragment(key, counts);
+            return None;
+        }
+        Some(state.disposition)
+    }
+
+    /// Remove every expired entry of this family.
+    fn sweep(&mut self, now: Instant, counts: &Counts) {
+        self.retain_flows(counts, |_, state| state.expires_at > now);
+        self.retain_fragments(counts, |_, state| state.expires_at > now);
+    }
+
+    pub(super) fn retain_flows(
+        &mut self,
+        counts: &Counts,
+        mut keep: impl FnMut(&FlowKey<A>, &mut FlowState) -> bool,
+    ) {
+        let before = self.flows.len();
+        let peer_flows = &mut *self.peer_flows;
+        self.flows.retain(|key, state| {
+            let kept = keep(key, state);
+            if !kept && let Some(count) = peer_flows.get_mut(&key.peer) {
+                *count -= 1;
+                if *count == 0 {
+                    peer_flows.remove(&key.peer);
+                }
+            }
+            kept
+        });
+        counts.release_flows(before - self.flows.len());
+    }
+
+    pub(super) fn retain_fragments(
+        &mut self,
+        counts: &Counts,
+        mut keep: impl FnMut(&FragmentKey<A>, &FragmentState) -> bool,
+    ) {
+        let before = self.fragments.len();
+        self.fragments.retain(|key, state| keep(key, state));
+        counts.release_fragments(before - self.fragments.len());
+    }
+
+    fn peer_flow_count(&self, peer: PeerId) -> usize {
+        self.peer_flows.get(&peer).copied().unwrap_or(0)
     }
 }
 
@@ -489,11 +529,15 @@ pub(super) fn shard_index(peer: PeerId) -> usize {
     usize::try_from(hash >> 58).unwrap_or(0)
 }
 
-pub(super) const fn protocol_timeout(protocol: u8, timeouts: &GateTimeouts) -> Duration {
+/// The idle timeout of a flow of `protocol` in the family `A`.
+pub(super) const fn protocol_timeout<A: GateAddr>(
+    protocol: u8,
+    timeouts: &GateTimeouts,
+) -> Duration {
     match protocol {
         6 => timeouts.tcp,
         17 => timeouts.udp,
-        1 => timeouts.icmp,
+        _ if protocol == A::ICMP => timeouts.icmp,
         _ => timeouts.other,
     }
 }
