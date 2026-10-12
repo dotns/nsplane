@@ -46,3 +46,22 @@ reverses decision Q5 of plan `20261007-0900` (IPv4-only gate), which was a porti
 - Release 0.13.0 on the owner's go.
 
 ## Annotations
+- 2026-10-12: dispatched (campaign `nsplane-gf-202610121800`): GF `gsaqk7ds`. Auto mode, watchdog every
+  30 min with stuck-process checks. The release (0.13.0) is asked of the owner at the end.
+- 2026-10-12: GF design note approved. The design:
+  - monomorphized `GateAddr` (v4/v6 maps per shard; the IPv4 path and its hash are unchanged), with
+    dispatch on the version nibble;
+  - a bounded IPv6 extension walk (at most 8 headers; AH skipped; malformed handling mirrors IPv4);
+  - IPv6 fragments and the ICMPv6 errors 1-4 as for IPv4, echo 128/129, with NDP left to grants;
+  - an empty `GateBinding.addresses` is peer-keyed, as a most-specific-first fallback, with
+    `DuplicatePeerBinding` and a `by_peer` index;
+  - `GatePolicyError::Ipv6` removed;
+  - GF-4 `AclFilterScopes` + `replace_scopes` (an ArcSwap generation set, an unscoped fast path),
+    with the identity taken from `PeerIdentity::local_identity` (core untouched; the consumer
+    contract is documented).
+
+  Amendments:
+  - mixed scope/peer tests;
+  - malformed IPv6 edge cases;
+  - the bench threshold max(2 %, spread of A);
+  - fixed mixed-family model seeds.
