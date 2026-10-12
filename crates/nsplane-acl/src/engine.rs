@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use arc_swap::{ArcSwap, Guard};
+use nsplane_core::cell::{self, SnapshotCell};
 use tracing::{debug, warn};
 
 use crate::{
@@ -688,15 +688,15 @@ impl Snapshot {
 /// failed ([`fail`](Self::fail), fail closed). A namespace member is
 /// governed by its namespaces (plus grants and pinholes) in every state.
 /// The whole state is one immutable snapshot: writers serialize on a mutex
-/// and publish a new snapshot atomically, readers take one lock-free load, so
-/// the engine can be shared through an `Arc` and queried per packet while
-/// another thread updates it.
+/// and publish a new snapshot atomically, readers take one load that holds
+/// no lock, so the engine can be shared through an `Arc` and queried per
+/// packet while another thread updates it.
 ///
 /// [`evaluate`](Self::evaluate) decides a new inbound flow with namespaces,
 /// grants and pinholes, as [`AclFilter`](crate::AclFilter) does for inbound
 /// packets. See the crate docs for the namespace model and pinholes.
 pub struct AclEngine {
-    snapshot: ArcSwap<Snapshot>,
+    snapshot: SnapshotCell<Snapshot>,
     writer: Mutex<()>,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
     pinholes: PinholeCounters,
@@ -729,7 +729,7 @@ impl AclEngine {
     /// to follow paused tokio time in tests.
     pub fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
         Self {
-            snapshot: ArcSwap::default(),
+            snapshot: SnapshotCell::default(),
             writer: Mutex::default(),
             clock: Box::new(clock),
             pinholes: PinholeCounters::default(),
@@ -1091,8 +1091,8 @@ impl AclEngine {
         PinholeCounters::add(&self.pinholes.revoked, revoked);
     }
 
-    /// The current snapshot: one lock-free load.
-    pub(crate) fn snapshot(&self) -> Guard<Arc<Snapshot>> {
+    /// The current snapshot: one load that holds no lock.
+    pub(crate) fn snapshot(&self) -> cell::Snapshot<Snapshot> {
         self.snapshot.load()
     }
 
