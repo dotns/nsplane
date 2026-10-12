@@ -5,6 +5,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Peer-keyed, address-family-agnostic flow gate (plan `20261012-1800-peer-keyed-gate`, task
+`20261012-1700-peer-keyed-gate`, GF-1..GF-4). The gate decides by peer for IPv4 and IPv6, and an
+`AclFilter`'s address scopes are replaced at runtime, one per local identity. An IPv4-only policy
+behaves and costs as before. This is the second exception to the feature freeze (ADR
+`2026-10-08-feature-freeze-0-11`, amended 2026-10-12). It breaks `nsplane-acl`'s API in one place
+(`GatePolicyError::Ipv6`), so the next release is 0.13.0.
+
+### Added
+- `nsplane-acl` flow gate, IPv6 (GF-1, GF-3): `GatePolicy` scopes, bindings,
+  `unbound_addresses`, grants, holds and releases accept IPv6 addresses and prefixes. IPv6
+  packets take the IPv4 steps: a bounded extension-header walk (at most 8 headers; AH skipped by
+  its length), fragments keyed by the 32-bit identification without reassembly, `ICMPv6` errors
+  (types 1-4) refreshing the flow they quote, echo request 128 opening a flow and echo reply 129
+  reverse-only. Outbound IPv6 is governed by destination like IPv4. The flow and fragment limits
+  count both families together (one budget per peer).
+- `nsplane-acl` flow gate, peer-keyed bindings (GF-2): a `GateBinding` with empty `addresses`
+  binds every packet of its `PeerId`, of either family and any remote address. Exact
+  `(peer, address)` bindings take precedence. Outbound to a peer-keyed peer from a source the
+  scope does not govern is `Unbound` under the scope's mode. New
+  `GatePolicyError::DuplicatePeerBinding { scope, peer }`: a peer-keyed binding beside another
+  binding of the same peer in one scope. Before, an empty `addresses` list bound nothing.
+- `nsplane-acl` runtime per-identity scopes (GF-4): `AclFilterScopes` (a default
+  `AclFilterScope` plus one per `LocalIdentityId`), `AclFilter::replace_scopes` (atomic, returns
+  the new scope generation), `AclFilter::scope_generation`, `AclFilterScopeError::DuplicateIdentity`,
+  `PeerIdentity::local_identity` (default `LocalIdentityId::DEFAULT`, forwarded by `Arc<T>`) and
+  `PeerLabelMap::set_local_identity`. A packet is judged under its peer's identity's scope, or
+  the default one. `with_scope` sets the default (generation 0). An unscoped filter keeps its
+  cost (one flag load).
+- `nsplane-acl` `benches/gate.rs`: IPv6 cases `established/gate_v6`, `established/outbound_v6`,
+  `established/extension_chain_v6` (eight extension headers), `new_flow/any_grant_v6`,
+  `fragment/later_v6` and `icmp_error/v6`.
+- `nsplane-e2e`: `flow_gate_v6` (an IPv6 flow admitted and denied under a peer-keyed binding,
+  outbound IPv6 to an enforced peer denied while its inbound flows arrive, one binding governing
+  both families) and `acl_scope_runtime` (per-identity scopes on a second local identity, the
+  default fallback, replaces under traffic).
+
+### Changed
+- `nsplane-acl`: `FlowGate::find_flow` finds IPv6 flows; it returns `None` for a mixed-family
+  pair. Before, every IPv6 lookup returned `None`.
+- `nsplane-acl`: IPv6 packets are evaluated by the gate where a scope governs them. A policy
+  with IPv4 entries only governs no IPv6 address, so its IPv6 packets still pass.
+
+### Removed
+- `nsplane-acl`: `GatePolicyError::Ipv6` (breaking, 0.13.0). `replace` no longer rejects IPv6
+  entries, so nothing returned it. Migration: delete match arms on it; a policy that relied on
+  the rejection should leave its IPv6 entries out.
+
 ## [0.12.0] - 2026-10-12
 
 Local identities (plan `20261011-0900-local-identities`). One engine holds several static keys,

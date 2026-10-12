@@ -757,7 +757,7 @@ pub struct GateScope {
 }
 
 /// Packets of `peer` with a remote address in `addresses` are bound to the scope and
-/// carry `labels`.
+/// carry `labels`. Empty `addresses` (0.13.0, 5.5): every packet of `peer`, either family.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateBinding { pub peer: PeerId, pub addresses: Vec<IpAddr>, pub labels: LabelSet }
 
@@ -919,7 +919,9 @@ does one hash lookup of `(PeerId, address)` in the snapshot, which replaces toda
 `PeerKeyMap` load plus the `(key, address)` lookup. A product republishes the policy when
 its peers change (Q4).
 
-**Evaluation.** The gate handles IPv4 only. Every other packet is `Pass` (Q5).
+**Evaluation.** The gate handles IPv4 and IPv6 (since 0.13.0, 5.5; IPv4 only in C5, Q5).
+A non-IP packet is `Pass`. The steps below are the same for both families; a packet only
+matches policy entries of its own family.
 
 Inbound, with `local` = destination and `remote` = source:
 
@@ -931,7 +933,8 @@ Inbound, with `local` = destination and `remote` = source:
 3. **Holds**: `(peer, remote)` in `release` skips the inbound holds. Otherwise a matching
    `HoldRule` gives `Enforce { allow: false, Held }`.
 4. **Binding**: collect the scopes whose `local` contains `local` and that bind
-   `(peer, remote)`.
+   `(peer, remote)`; only when there is none, those with a peer-keyed binding of `peer`
+   (5.5).
    - More than one: `Ambiguous`. The mode is `Enforce` if any of them enforces, else
      `Observe`.
    - None: take the scopes whose `local` contains `local`.
@@ -944,8 +947,8 @@ Inbound, with `local` = destination and `remote` = source:
 5. **Bound** in scope `S` with labels `L`:
    - A non-first fragment follows its first fragment's state (`ValidState`) or is denied
      `OrphanFragment`.
-   - An ICMP error (types 3, 4, 11, 12) refreshes the quoted flow (`ValidState`), or is
-     denied `ReverseNewFlow`. An unparsable quote gives `Malformed`.
+   - An ICMP error (types 3, 4, 11, 12; `ICMPv6` 1, 2, 3, 4) refreshes the quoted flow
+     (`ValidState`), or is denied `ReverseNewFlow`. An unparsable quote gives `Malformed`.
    - An existing flow gives `ValidState`. These keep today's rules: a SYN against the
      initiator, and a terminal TCP tail.
    - A reverse-only packet (TCP without SYN or with ACK; ICMP echo reply or error) gives
@@ -1081,13 +1084,13 @@ The merged code (`crates/nsplane-acl/src/gate*`, public as the module `nsplane_a
 nothing is re-exported at the crate root) implements 5.1 with these differences and
 precisions:
 
-- **IPv6 entries** (Q5, open point O1 of `node-l3.md`): `replace` rejects them with a new
-  variant `GatePolicyError::Ipv6 { field: &'static str, value: String }`, fail closed; the
-  check covers `Off` scopes too.
+- **IPv6 entries** (Q5, open point O1 of `node-l3.md`): in C5 `replace` rejected them with
+  `GatePolicyError::Ipv6 { field, value }`. Since 0.13.0 they are accepted and that
+  variant is removed (5.5).
 - **Divert source check**: the filter offers a denial only when its source is no local *or*
   binding address of any scope (5.1 says binding address). This reproduces the old "no Node
   address of any Network" check.
-- **`GateScope::unbound_addresses: Vec<IpAddr>`** (new, default empty): remote addresses of a scope without a `PeerId` binding; outbound (and outbound malformed) packets to them are `Unbound` / `Malformed` under the scope's mode, no divert candidate comes from them, and `replace` rejects one listed twice or also bound in the scope (`GatePolicyError::ConflictingAddress`) or IPv6.
+- **`GateScope::unbound_addresses: Vec<IpAddr>`** (new, default empty): remote addresses of a scope without a `PeerId` binding; outbound (and outbound malformed) packets to them are `Unbound` / `Malformed` under the scope's mode, no divert candidate comes from them, and `replace` rejects one listed twice or also bound in the scope (`GatePolicyError::ConflictingAddress`).
 - **Outbound malformed packets** (step 2, open point O4): outbound, the mode is that of the
   scopes holding the destination as a binding address, as for an unbound outbound packet,
   not of the scopes whose `local` contains it.
@@ -1103,6 +1106,40 @@ precisions:
   `RuleId`. `FlowGate::new` and `with_clock` return `Arc<FlowGate>`.
 - **Subnet transport admission** (1.6, "compiled as ordinary `GateGrant`s"): see
   `node-l3.md` 3.5; those grants come first in the grant list.
+
+### 5.5 IPv6, peer-keyed bindings and runtime scopes (0.13.0)
+
+Plan `20261012-1800-peer-keyed-gate` (task `20261012-1700-peer-keyed-gate`, GF-1..GF-4)
+lifts the IPv4-only decision of Q5:
+
+- **IPv6** (GF-1, GF-3): every address and prefix of a `GatePolicy` may be IPv6, and IPv6
+  packets take the steps of 5.1. The extension-header walk is bounded (Hop-by-Hop, Routing,
+  Destination Options, Fragment; AH skipped by its length; at most 8 headers); a truncated or
+  longer chain, a second Fragment header or a first fragment without its whole upper-layer
+  header is `Malformed`, and a packet shorter than 40 bytes passes as unreadable. Fragments
+  use the 32-bit identification without reassembly. `ICMPv6` errors 1-4 refresh their
+  quoted flow, echo request 128 opens a flow, echo reply 129 and redirect 137 are
+  reverse-only; other types need a grant. Outbound grants, holds, `unbound_addresses` and
+  binding addresses govern outbound IPv6 by destination as for IPv4. The IPv4 path, key and
+  cost are unchanged.
+- **Peer-keyed bindings** (GF-2): a `GateBinding` with empty `addresses` binds every packet
+  of its `PeerId`, of either family and any remote address. The exact `(peer, remote)`
+  bindings decide first; the peer-keyed ones only when no scope governing `local` binds the
+  exact pair; more than one at the chosen level is `Ambiguous`. A scope may hold one
+  peer-keyed binding of a peer and then no address-listed one
+  (`GatePolicyError::DuplicatePeerBinding`). Outbound to a peer-keyed peer from a source the
+  scope does not govern is `Unbound` under its mode. Migration re-authorizes a flow with the
+  same two-level lookup.
+- **API**: `GatePolicyError::Ipv6` is removed (breaking, 0.13.0); `DuplicatePeerBinding` is
+  added; `FlowGate::find_flow` finds IPv6 flows and returns `None` for a mixed-family pair.
+- **Runtime per-identity scopes** (GF-4): `AclFilter::replace_scopes(AclFilterScopes)`
+  publishes a default `AclFilterScope` plus one per `LocalIdentityId` atomically and returns
+  the new scope generation (`AclFilter::scope_generation`; 0 is the scope given to
+  `with_scope`); a duplicate identity is `AclFilterScopeError::DuplicateIdentity`. A packet
+  is judged under one whole scope of one generation, chosen by its peer's identity from
+  `PeerIdentity::local_identity` (default `LocalIdentityId::DEFAULT`;
+  `PeerLabelMap::set_local_identity`), which must be the identity the peer was added under;
+  an identity without an entry uses the default scope.
 
 ## 6. Data path
 
@@ -1319,7 +1356,7 @@ Each question comes with a recommendation.
    every device change).
 5. **Q5: Gate address family.** *Recommendation*: IPv4 only, as today. The types use
    `IpAddr` and `IpNet`, so IPv6 can come later without an API break, as a generic
-   request.
+   request. *Outcome*: IPv6 landed in 0.13.0 (5.5).
 6. **Q6: Divert authority.** A queued candidate is current only while the gate generation
    is unchanged. Today it stays current while its Network policy and transport are
    unchanged. *Recommendation*: accept the stricter rule (fail-closed, it only affects

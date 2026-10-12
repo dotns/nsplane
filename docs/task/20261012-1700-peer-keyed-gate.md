@@ -59,3 +59,30 @@ What ns does once it lands:
   variant or removed in a minor release. Proposed release: 0.13.0.
 - One L2, with a design note first: the family-generic state key, the IPv6 extension-header walk
   (bounded), ICMPv6 error matching, the per-identity scope selection, the bench plan.
+
+## Consumer note
+
+How a consumer moves its gate from the local IPv4 view in front of a translator to the wire
+side, on 0.13.0:
+
+- **One peer-keyed binding per peer.** Give each governed peer one `GateBinding` with empty
+  `addresses` in its scope, with the peer's labels. It binds the peer's packets of both families
+  and any source, so the translator no longer has to sit in front of the gate. Do not also list
+  addresses of that peer in the same scope (`GatePolicyError::DuplicatePeerBinding`). An
+  address-listed binding of the same peer in another scope still takes precedence for its exact
+  addresses.
+- **Govern the IPv6 addresses.** Add the local IPv6 addresses to the scope's `local`, and give
+  grants IPv6 `destinations` where they name hosts. Outbound IPv6 to an enforced peer is then
+  denied without a matching outbound grant (`NoGrant`), or `Unbound` from a source the scope
+  does not govern, while the peer's inbound flows admitted by grants and their replies still
+  pass. Allowed IPs and the core's inbound source checks are not touched.
+- **Grant what IPv6 needs.** `ICMPv6` echo and errors follow the IPv4 rules; Neighbor Discovery
+  and other `ICMPv6` types are new flows that need a grant, as unlisted ICMP types do.
+- **Per-identity scopes at runtime.** Tell the filter each peer's local identity: implement
+  `PeerIdentity::local_identity`, or call `PeerLabelMap::set_local_identity(peer, id)` when the
+  peer is added. It must be the identity the peer was added under (`PeerConfig::local_identity`);
+  nothing checks it. Then publish `AclFilterScopes` (a default scope plus one per identity) with
+  `AclFilter::replace_scopes` on any clone of the filter whenever an identity's admitted sources
+  change; the returned generation identifies the published set.
+- **Migration.** Remove match arms on `GatePolicyError::Ipv6` (removed). `find_flow` now answers
+  IPv6 five-tuples.
