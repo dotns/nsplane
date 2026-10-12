@@ -1,14 +1,16 @@
 //! [`AclFilter`]: a sans-I/O [`PacketFilter`] enforcing the ACL policy on
 //! inbound packets and the outbound rules of restricted peers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use nsplane_core::{LocalIdentityId, PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
@@ -470,6 +472,13 @@ static UNSCOPED: AclFilterScope = AclFilterScope {
 /// [`identities`](Self::identities), or under [`default`](Self::default)
 /// when that identity has no entry. Built with [`new`](Self::new) and the
 /// `with_*` setters; the default scopes nothing.
+///
+/// A default scope alone costs what a scope given at build always did. Only
+/// with [`identities`](Self::identities) does a packet that needs a scope
+/// also resolve its peer's identity (from the peer cache, or the
+/// [`PeerIdentity::local_identity`] hook when the identity is not versioned)
+/// and look its scope up; the outbound source check then follows the peer
+/// lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AclFilterScopes {
@@ -552,6 +561,100 @@ impl ScopeSet {
     /// The scope of the local identity `id`.
     fn select(&self, id: LocalIdentityId) -> &AclFilterScope {
         self.by_identity.get(&id).unwrap_or(&self.default)
+    }
+}
+
+/// A [`ScopeSet`] loaded by one packet: a whole set of one generation.
+type ScopeRef = Rc<Arc<ScopeSet>>;
+
+/// The published [`ScopeSet`] of a filter. Every load and store of it goes
+/// through here.
+///
+/// Each thread caches the last set it loaded with its cell and generation, so
+/// a load is a plain atomic read of the generation and, while the set is
+/// unchanged, a non-atomic reference count increment: no read-modify-write.
+/// The cache holds one set per thread (a thread alternating between filters
+/// loads the set from the shared cell on every switch), so it keeps at most
+/// one set alive per thread.
+///
+/// Ordering: the generation is the publication point of a store. A store
+/// writes the set, then its generation (Release). A load reads the
+/// generation `g` (Acquire) and returns the set of exactly the generation it
+/// last read: the cached one when it is of this cell and `g`, else the shared
+/// set once a generation read after loading it equals the set's own (a newer
+/// set is not used before its generation is published). Sets are immutable
+/// values, so a packet sees one whole set; and since the generation only
+/// grows, a packet ordered after another load, or after a store returned,
+/// reads a generation at least as high, so it never sees an older set.
+struct ScopeCell {
+    set: ArcSwap<ScopeSet>,
+    /// The generation of the published set, stored after `set`.
+    generation: AtomicU64,
+    /// Tells the cells apart in the per-thread cache: from a global counter,
+    /// so never shared by two cells (an address could be reused).
+    id: u64,
+}
+
+/// The set a thread loaded last: its cell, its generation and the set.
+type CachedScopes = Option<(u64, u64, ScopeRef)>;
+
+thread_local! {
+    static SCOPE_CACHE: RefCell<CachedScopes> = const { RefCell::new(None) };
+}
+
+impl ScopeCell {
+    fn new(set: ScopeSet) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            generation: AtomicU64::new(set.generation),
+            set: ArcSwap::from_pointee(set),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The generation of the published set.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The published set, or a newer one.
+    fn load(&self) -> ScopeRef {
+        let generation = self.generation();
+        SCOPE_CACHE.with_borrow_mut(|cache| match cache {
+            Some((id, cached, set)) if *id == self.id && *cached == generation => Rc::clone(set),
+            _ => {
+                let set = Rc::new(self.load_published());
+                *cache = Some((self.id, set.generation, Rc::clone(&set)));
+                set
+            }
+        })
+    }
+
+    /// The shared set, once its generation is the published one.
+    fn load_published(&self) -> Arc<ScopeSet> {
+        loop {
+            let set = self.set.load_full();
+            if set.generation == self.generation() {
+                return set;
+            }
+            // A store is between its two writes (the set is not published
+            // yet), or a later store completed: read both again.
+            std::thread::yield_now();
+        }
+    }
+
+    /// Publish `set`, whose generation is above the published one; callers
+    /// serialize stores.
+    fn store(&self, set: ScopeSet) {
+        let generation = set.generation;
+        self.set.store(Arc::new(set));
+        self.generation.store(generation, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for ScopeCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self.set.load(), f)
     }
 }
 
@@ -1141,7 +1244,7 @@ struct Inner {
     identity: Box<dyn PeerIdentity>,
     config: AclFilterConfig,
     /// The published [`AclFilterScopes`].
-    scopes: ArcSwap<ScopeSet>,
+    scopes: ScopeCell,
     /// No published scope constrains anything, so packets skip the scopes.
     /// Read before them; it is true only while the latest published set is
     /// unscoped.
@@ -1160,7 +1263,7 @@ impl fmt::Debug for AclFilter {
         f.debug_struct("AclFilter")
             .field("engine", &self.inner.engine)
             .field("config", &self.inner.config)
-            .field("scopes", &self.inner.scopes.load())
+            .field("scopes", &self.inner.scopes)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -1227,7 +1330,7 @@ impl AclFilter {
                 identity,
                 config,
                 unscoped: AtomicBool::new(scopes.is_unscoped()),
-                scopes: ArcSwap::from_pointee(scopes),
+                scopes: ScopeCell::new(scopes),
                 scope_writer: Mutex::default(),
                 cache,
                 fragments: Mutex::default(),
@@ -1245,14 +1348,16 @@ impl AclFilter {
     /// see the previous scopes, those after see the new ones, and none mixes
     /// fields of both. Any clone of the filter can replace them. State
     /// recorded under the previous scopes (reply allowances, fragment
-    /// outcomes) is kept.
+    /// outcomes) is kept. Reading the published scopes costs a packet one
+    /// atomic load while they are unchanged; per-identity scopes add the
+    /// identity resolution described in [`AclFilterScopes`].
     pub fn replace_scopes(&self, scopes: AclFilterScopes) -> Result<u64, AclFilterScopeError> {
         let inner = &*self.inner;
         let _writer = inner
             .scope_writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let set = ScopeSet::new(inner.scopes.load().generation + 1, scopes)?;
+        let set = ScopeSet::new(inner.scopes.generation() + 1, scopes)?;
         let (generation, unscoped) = (set.generation, set.is_unscoped());
         // `unscoped` is cleared before a constrained set is stored and set
         // after an unscoped one is, so a packet reading it true is judged as
@@ -1260,7 +1365,7 @@ impl AclFilter {
         if !unscoped {
             inner.unscoped.store(false, Ordering::Release);
         }
-        inner.scopes.store(Arc::new(set));
+        inner.scopes.store(set);
         if unscoped {
             inner.unscoped.store(true, Ordering::Release);
         }
@@ -1271,7 +1376,7 @@ impl AclFilter {
     /// build, then increased by every [`replace_scopes`](Self::replace_scopes).
     #[must_use]
     pub fn scope_generation(&self) -> u64 {
-        self.inner.scopes.load().generation
+        self.inner.scopes.generation()
     }
 
     /// A snapshot of the counters.
@@ -1322,7 +1427,7 @@ impl Inner {
     }
 
     /// The published scopes, `None` when they constrain nothing.
-    fn scopes(&self) -> Option<Guard<Arc<ScopeSet>>> {
+    fn scopes(&self) -> Option<ScopeRef> {
         (!self.unscoped.load(Ordering::Acquire)).then(|| self.scopes.load())
     }
 
@@ -5823,11 +5928,19 @@ mod tests {
                 .with_identity(x, scope)
         };
         let done = std::sync::atomic::AtomicUsize::new(0);
+        /// Counts a reader as done even when it panics, so the writer stops.
+        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let remote = addr("10.0.0.1");
         std::thread::scope(|threads| {
             for reader in 0..READERS {
                 let (f, done) = (&f, &done);
                 threads.spawn(move || {
+                    let _done = Done(done);
                     for i in 0..PACKETS {
                         let id = reader * PACKETS + i;
                         // `scope_a` accepts the first source, `scope_b` the second.
@@ -5851,7 +5964,6 @@ mod tests {
                         let replied = inbound(f, OTHER_PEER, reply) == Verdict::Accept;
                         assert_eq!(replied, accepted && !a_accepts, "torn scope, id {id}");
                     }
-                    done.fetch_add(1, Ordering::Relaxed);
                 });
             }
             let mut generation = 0;
@@ -5862,5 +5974,47 @@ mod tests {
             }
             assert!(generation > 0);
         });
+    }
+
+    #[test]
+    fn filters_on_one_thread_never_share_cached_scopes() {
+        let [x, _] = local_identities();
+        let map = identity();
+        map.set_local_identity(OTHER_PEER, x);
+        let config = AclFilterConfig::default();
+        let a = AclFilter::with_scope(
+            rules_engine(test_policy()),
+            Arc::clone(&map),
+            config,
+            scope_a(),
+        );
+        let b = AclFilter::with_scope(
+            rules_engine(test_policy()),
+            Arc::clone(&map),
+            config,
+            scope_b(),
+        );
+        // Same generation, different cells: each packet uses its own filter's set.
+        for _ in 0..3 {
+            assert_eq!(judged_scope(&a, PEER), Some(true));
+            assert_eq!(judged_scope(&b, PEER), Some(false));
+        }
+        // A replace of one cell leaves the other one's set in place.
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_b())
+            .with_identity(x, scope_a());
+        assert_eq!(a.replace_scopes(scopes), Ok(1));
+        for _ in 0..3 {
+            assert_eq!(judged_scope(&a, PEER), Some(false));
+            assert_eq!(judged_scope(&a, OTHER_PEER), Some(true));
+            assert_eq!(judged_scope(&b, OTHER_PEER), Some(false));
+            assert_eq!(b.scope_generation(), 0);
+        }
+        // A filter built after another is dropped never reuses its cell.
+        let id = b.inner.scopes.id;
+        std::mem::drop(b);
+        let c = AclFilter::new(rules_engine(test_policy()), map);
+        assert_ne!(c.inner.scopes.id, id);
+        assert_eq!(judged_scope(&c, PEER), None);
     }
 }
