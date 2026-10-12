@@ -46,3 +46,5 @@ reverses decision Q5 of plan `20261007-0900` (IPv4-only gate), which was a porti
 - Release 0.13.0 on the owner's go.
 
 ## Annotations
+- 2026-10-12: dispatched (campaign `nsplane-gf-202610121800`): GF `gsaqk7ds`. Auto mode, watchdog every
+  30 min with stuck-process checks. The release (0.13.0) is asked of the owner at the end.
