@@ -73,8 +73,8 @@ async fn setup() -> TestResult<Setup> {
         TransportId::new(4),
         SocketAddr::from(([192, 0, 2, 3], 3000)),
     );
-    let (link_a, link_ba) = ChannelTransport::pair(CAPACITY, a_end, b_to_a);
-    let (link_bc, link_c) = ChannelTransport::pair(CAPACITY, b_to_c, c_end);
+    let (link_a, link_b_a) = ChannelTransport::pair(CAPACITY, a_end, b_to_a);
+    let (link_b_c, link_c) = ChannelTransport::pair(CAPACITY, b_to_c, c_end);
     let a = Node::with_builder(1, a_end.0, a_end.1, Options::default(), |builder| {
         builder.transport(link_a)
     })?;
@@ -84,8 +84,8 @@ async fn setup() -> TestResult<Setup> {
     let b_filter = filter.clone();
     let b = Node::with_builder(2, b_to_a.0, b_to_a.1, Options::default(), |builder| {
         builder
-            .transport(link_ba)
-            .transport(link_bc)
+            .transport(link_b_a)
+            .transport(link_b_c)
             .filter(Box::new(b_filter))
     })?;
     introduce(&a, &b, None).await?;
