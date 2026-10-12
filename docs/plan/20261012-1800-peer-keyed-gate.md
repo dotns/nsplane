@@ -65,3 +65,11 @@ reverses decision Q5 of plan `20261007-0900` (IPv4-only gate), which was a porti
   - malformed IPv6 edge cases;
   - the bench threshold max(2 %, spread of A);
   - fixed mixed-family model seeds.
+- 2026-10-12: GF-4 scoped-path performance:
+  - two reworks fixed `default/outbound_source_scope` (+1.8 %);
+  - `other/icmp_echo_scope` is +3.7 % in a clean round, but some processes run at 63-74 ns. Counters
+    show the per-thread scope cache hits (one miss per run), so the variance is attributed to the
+    hit path, a pointer chain whose placement is unverified;
+  - decision: accept it as a documented residual after a quiet icmp-repeat (by 21:30 UTC, else
+    measured at load < 8); no third round. AS (`nsplane-as-202610121830`) replaces the cell and
+    revisits this read path.
