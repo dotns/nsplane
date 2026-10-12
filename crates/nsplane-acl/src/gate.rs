@@ -150,7 +150,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use arc_swap::ArcSwap;
+use nsplane_core::cell::SnapshotCell;
 use nsplane_packet::PeerId;
 
 use crate::net::Protocol;
@@ -335,7 +335,7 @@ type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 /// The flow gate: an immutable policy snapshot swapped atomically plus
 /// bounded flow state sharded by peer.
 pub struct FlowGate {
-    snapshot: ArcSwap<Snapshot>,
+    snapshot: SnapshotCell<Snapshot>,
     /// The published snapshot is inert, so every packet passes. Read before
     /// the snapshot, without the clock.
     inert: AtomicBool,
@@ -372,7 +372,7 @@ impl FlowGate {
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
-            snapshot: ArcSwap::default(),
+            snapshot: SnapshotCell::default(),
             inert: AtomicBool::new(true),
             writer: Mutex::new(()),
             state: StateTable::new(&config),

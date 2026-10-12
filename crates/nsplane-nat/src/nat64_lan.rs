@@ -57,7 +57,7 @@
 //! `(snat_source, port)` for the flow's lifetime, so a caller can couple
 //! them to host sockets through [`SnatPorts`].
 //!
-//! Routes are replaced through the caller's [`ArcSwap`]; flows expire when
+//! Routes are replaced through the caller's [`LanRoutes`]; flows expire when
 //! idle, not only through [`Nat64Lan::remove_flow`]; DF can be turned on
 //! with [`Nat64LanConfig::set_df`].
 //!
@@ -88,7 +88,7 @@ use std::net::{IpAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
+use nsplane_core::cell::SnapshotCell;
 use nsplane_packet::{FiveTuple, PacketBuf, PeerId, protocol};
 
 pub use self::io::{Nat64LanSink, Nat64LanSource};
@@ -182,9 +182,39 @@ struct Counters {
     not_ours: AtomicU64,
 }
 
+/// The routes of a [`Nat64Lan`], shared with the caller: clones share the
+/// same routes, and [`replace`](Self::replace) through any of them is seen by
+/// the next packet.
+#[derive(Clone, Default)]
+pub struct LanRoutes(Arc<SnapshotCell<Vec<LanRoute>>>);
+
+impl LanRoutes {
+    /// A handle publishing `routes`.
+    pub fn new(routes: Vec<LanRoute>) -> Self {
+        Self(Arc::new(SnapshotCell::new(routes)))
+    }
+
+    /// Replaces the routes atomically; packets in flight see the old or the
+    /// new ones.
+    pub fn replace(&self, routes: Vec<LanRoute>) {
+        self.0.store(routes);
+    }
+
+    /// The current routes.
+    pub fn load(&self) -> Arc<Vec<LanRoute>> {
+        self.0.load_full()
+    }
+}
+
+impl fmt::Debug for LanRoutes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("LanRoutes").field(&self.load()).finish()
+    }
+}
+
 /// Stateful NAT64 to a LAN; see the [module docs](self).
 pub struct Nat64Lan {
-    routes: Arc<ArcSwap<Vec<LanRoute>>>,
+    routes: LanRoutes,
     config: Nat64LanConfig,
     ports: Arc<dyn SnatPorts>,
     conntrack: Conntrack,
@@ -205,14 +235,15 @@ impl fmt::Debug for Nat64Lan {
 
 impl Nat64Lan {
     /// A translator over `routes`, which the caller may replace atomically at
-    /// any time, with a [`DefaultSnatPorts`] allocator.
-    pub fn new(routes: Arc<ArcSwap<Vec<LanRoute>>>, config: Nat64LanConfig) -> Self {
+    /// any time through a clone of the handle, with a [`DefaultSnatPorts`]
+    /// allocator.
+    pub fn new(routes: LanRoutes, config: Nat64LanConfig) -> Self {
         Self::with_snat_ports(routes, config, Arc::new(DefaultSnatPorts::new()))
     }
 
     /// As [`new`](Self::new), reserving SNAT ports through `ports`.
     pub fn with_snat_ports(
-        routes: Arc<ArcSwap<Vec<LanRoute>>>,
+        routes: LanRoutes,
         config: Nat64LanConfig,
         ports: Arc<dyn SnatPorts>,
     ) -> Self {
@@ -221,7 +252,7 @@ impl Nat64Lan {
 
     /// Builds the translator around `conntrack` (tests inject a clock).
     fn with_conntrack(
-        routes: Arc<ArcSwap<Vec<LanRoute>>>,
+        routes: LanRoutes,
         config: Nat64LanConfig,
         ports: Arc<dyn SnatPorts>,
         conntrack: Conntrack,
@@ -334,7 +365,7 @@ impl Nat64Lan {
         let Some(request) = packet::request(bytes) else {
             return Ok(false);
         };
-        let routes = self.routes.load();
+        let routes = self.routes.0.load();
         let mut resolving = routes
             .iter()
             .filter_map(|route| Some((route, route.resolve(request.dst)?)));

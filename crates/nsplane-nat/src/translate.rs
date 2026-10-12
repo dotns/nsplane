@@ -122,7 +122,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use arc_swap::ArcSwap;
+use nsplane_core::cell::SnapshotCell;
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
 
@@ -236,7 +236,7 @@ pub struct TranslatorStats {
 /// packet is translated with either the old or the new table, never a mix.
 #[derive(Debug)]
 pub struct Translator {
-    table: Arc<ArcSwap<TranslationTable>>,
+    table: Arc<SnapshotCell<TranslationTable>>,
     reassembly: Mutex<Reassembly>,
     epoch: Instant,
     outbound: DirectionCounters,
@@ -250,7 +250,7 @@ impl Translator {
     /// A translator driven by `table`.
     pub fn new(table: TranslationTable) -> Self {
         Self {
-            table: Arc::new(ArcSwap::from_pointee(table)),
+            table: Arc::new(SnapshotCell::new(table)),
             reassembly: Mutex::new(Reassembly::new(REASSEMBLY_LIMITS)),
             epoch: Instant::now(),
             outbound: DirectionCounters::default(),
@@ -276,7 +276,7 @@ impl Translator {
 
     /// Replaces the table atomically; packets in flight see the old or the new one.
     pub fn store(&self, table: TranslationTable) {
-        self.table.store(Arc::new(table));
+        self.table.store(table);
     }
 
     /// The current table.
