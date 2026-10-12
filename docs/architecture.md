@@ -1865,8 +1865,8 @@ when they match an outbound rule, an open outbound pinhole or the reply allowanc
 inbound flow from that peer the filter accepted; anything else is dropped with
 `reasons::OUTBOUND`.
 
-**Outbound source scope.** `AclFilter::with_scope` takes an `AclFilterScope`, per-filter
-address scopes beside `AclFilterConfig`. With `outbound_sources: Some(prefixes)` every
+**Outbound source scope.** `AclFilter::with_scope` takes an `AclFilterScope`, address
+scopes beside `AclFilterConfig`, as the default scope (generation 0). With `outbound_sources: Some(prefixes)` every
 outbound packet (any peer, restricted or not, any protocol, every fragment) whose source
 address, read from the raw IPv4 or IPv6 header, is in none of the prefixes is dropped with
 `reasons::OUTBOUND_SOURCE` (`AclFilterStats::outbound_source`) before the outbound rules,
@@ -1892,6 +1892,19 @@ or a non-ICMP packet) records the outbound allowance its reply passes through
 (`outbound_replies`), and an outbound ICMP echo request records the inbound allowance of its
 reply as with `allow_other_protocols`. Rules match destinations only, never sources. The empty
 default costs nothing on the TCP/UDP path and one branch for other protocols.
+
+**Runtime scopes per local identity.** `AclFilter::replace_scopes(AclFilterScopes)` publishes
+a default scope plus one scope per `LocalIdentityId` atomically and returns the new scope
+generation (`scope_generation()`); a duplicate identity is
+`AclFilterScopeError::DuplicateIdentity` and publishes nothing. Any clone of the filter is the
+runtime handle. A packet loads the set once, so it is judged under one whole scope of one
+generation. The scope is chosen by the peer's local identity, which the filter learns from
+`PeerIdentity::local_identity` (`PeerLabelMap::set_local_identity`): it must be the identity
+the peer was added under (`PeerConfig::local_identity`), which the engine does not check. An
+identity without an entry uses the default scope. A versioned identity is asked once per
+peer and identity generation; while no scope constrains anything, one flag load keeps the
+unscoped cost. `nsplane-e2e` `acl_scope_runtime` covers per-identity selection, the default
+fallback and replaces under traffic.
 
 **Pinholes.** A session reaches a source only through pinholes in a `Pinholes` namespace:
 `open_pinhole` opens one label (`PinholeSpec::label`; every source carrying it uses the
@@ -1983,26 +1996,34 @@ with the caller, which stores namespaces, grants and pinholes through this API.
 
 `gate::FlowGate` (`crates/nsplane-acl/src/gate*`, slice C5 of plan
 `20261007-0900-business-agnostic`, design note `docs/specs/acl-generic-api.md` section 5) is a
-generic stateful gate for decrypted inbound and plaintext outbound IPv4 packets. It replaced
-the former node L3 gate.
+generic stateful gate for decrypted inbound and plaintext outbound IPv4 and IPv6 packets. It
+replaced the former node L3 gate; IPv6 and peer-keyed bindings came with plan
+`20261012-1800-peer-keyed-gate` (0.13.0).
 
 - **Policy.** `replace(GatePolicy)` validates and publishes one whole policy atomically and
   returns the new gate generation (`generation()`); a rejected policy
-  (`GatePolicyError`: duplicate scope, duplicate binding, invalid protocols, an unbound
-  address listed twice or also bound in its scope, any IPv6 entry) changes nothing. A
+  (`GatePolicyError`: duplicate scope, duplicate binding, a peer-keyed binding beside another
+  binding of the same peer in one scope (`DuplicatePeerBinding`), invalid protocols, an
+  unbound address listed twice or also bound in its scope) changes nothing. Every address and
+  prefix may be IPv4 or IPv6, and a packet only matches entries of its own family. A
   policy is a list of `GateScope`s plus `GateHolds`. A scope has an opaque `ScopeId`, a
   `GateMode` (`Off`, `Observe`, `Enforce`), the local addresses it governs, `GateBinding`s
-  (`PeerId` + remote addresses -> `LabelSet`), `unbound_addresses` (remote addresses of the
+  (`PeerId` + remote addresses -> `LabelSet`; no addresses: peer-keyed),
+  `unbound_addresses` (remote addresses of the
   scope without a `PeerId` binding; default empty), accept-only `GateGrant`s (direction,
   labels, destination prefixes, `ProtocolMatch`es, `suspended`) and `UnboundRule`s (`Pass`
   or `Divert` for designated peers).
-- **Binding.** A packet belongs to a scope only through the exact `(PeerId, remote address)`
-  pair of one of its bindings, the scope governing the packet's other address. Two scopes
-  binding it is `Ambiguous`; none is `Unbound` under the mode of the scopes governing the
+- **Binding.** A packet belongs to a scope only through one of its bindings, the scope
+  governing the packet's other address: first the exact `(PeerId, remote address)` pair;
+  only when no scope governing the local address binds it, a peer-keyed binding of the
+  `PeerId` (empty `addresses`: every remote address of either family). Two scopes at the
+  chosen level is `Ambiguous`; none is `Unbound` under the mode of the scopes governing the
   local address (inbound) or holding the remote address as a binding address or in
-  `unbound_addresses` (outbound), and `Pass` off the governed addresses. Outbound and
-  outbound malformed packets to an unbound address are therefore `Unbound` / `Malformed`
-  under the scope's mode, and such an address is never a divert candidate. With exactly one
+  `unbound_addresses` or binding the peer peer-keyed (outbound), and `Pass` off the governed
+  addresses. Outbound and outbound malformed packets to an unbound address, or to a
+  peer-keyed peer from a source the scope does not govern, are therefore `Unbound` /
+  `Malformed` under the scope's mode, and such an address is never a divert candidate. A
+  policy without any peer-keyed binding skips the fallback (one flag). With exactly one
   enforcing scope at the local
   address, an `UnboundAction::Pass` rule passes matching packets of its peers on (first
   fragments remember that disposition for their later fragments).
@@ -2026,8 +2047,19 @@ the former node L3 gate.
   denials (`GateCounters::observed_denied`) but keeps state; `Enforce` is authoritative.
   `GateReason` has stable names (`as_str`) and drop reasons (`drop_reason`, `flow gate:
   <reason>`).
-- **Queries.** `find_flow(remote, local, Protocol)` returns the live flow of a five-tuple
-  (`LiveFlow`: scope, grant id, enforced) and refreshes it.
+- **IPv6.** Hop-by-Hop, Routing, Destination Options and Fragment headers are walked (at
+  most 8, within the payload length; AH is skipped by its own length, ESP and No Next Header
+  carry no ports); a truncated or longer chain, a second Fragment header or a first fragment
+  without its whole upper-layer header is `Malformed` as for IPv4, and a packet shorter than
+  the 40-byte fixed header passes as unreadable. Fragments are keyed by the 32-bit
+  identification without reassembly; an atomic fragment is an unfragmented packet. `ICMPv6`
+  errors (types 1-4) refresh the flow they quote, echo request 128 opens a flow and echo reply
+  129 is reverse-only; Neighbor Discovery and other types need a grant like any new flow.
+  Each shard keeps one flow and fragment map per family under one budget, so the IPv4 key
+  and path are unchanged.
+- **Queries.** `find_flow(remote, local, Protocol)` returns the live flow of a five-tuple of
+  either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
+  mixed-family pair.
 
 **Migration and locking.** Packet paths take one lock-free load of an immutable snapshot
 (behind an `ArcSwap`) with the compiled scopes and their indexes (`(PeerId, address)` to
@@ -2063,14 +2095,18 @@ packet as current only while its `generation()` equals `FlowGate::generation()`.
 
 **Tests.** `src/gate/tests/` covers grants and flow state (`grants_flow`), suspended, port,
 ICMP and outbound grants (`grant_kinds`), ICMP errors, fragments and malformed packets
-(`packets_fragments`), holds and unbound rules (`holds_and_unbound`), the state limits,
+(`packets_fragments`), the IPv6 header walk, fragments and `ICMPv6` (`ipv6_packets`,
+`ipv6_flows`), peer-keyed bindings (`peer_keyed`), holds and unbound rules
+(`holds_and_unbound`), the state limits,
 validation and the epoch retry (`state_table`), a writer racing packet threads
 (`concurrency`), the filter (`filter`), and `model`, which compares the gate on seeded
 random sequences of packets, `replace` calls and clock steps against a reference model of
 the design note (one map, no shards, no lazy expiry) for equal decisions and counters.
 `nsplane-e2e` `flow_gate` runs the filter on one of two engines: grants, suspension,
 bindings, state, limits and expiry (injected clock), modes, holds, unbound pass, ICMP errors,
-divert with generation staleness, unbound addresses, and outbound.
+divert with generation staleness, unbound addresses, and outbound; `flow_gate_v6` runs it
+with a peer-keyed binding: an IPv6 flow admitted and denied, outbound IPv6 to the enforced
+peer denied while its inbound flows arrive, and one binding governing both families.
 
 **Measured.** `cargo bench -p nsplane-acl --bench gate` keeps the scenarios of the former
 `node_l3` bench like for like (mapping table in its module docs: `new_flow/node_grant` ->
@@ -2081,7 +2117,9 @@ established flow through the filter 52.6 ns (main 68.3), through the gate 49.9 n
 outbound 49.9 ns (49.4); new flows 91.5 ns under a grant of every protocol (89.4) and 92.0 ns
 under a port grant (99.0); the `AclFilter` alone 36.7 ns (35.9); an inert gate in front of
 it 41.3 ns (52.6) and alone 0.9 ns (2.1); writer contention every 1 / 10 ms 53.4 / 53.3 ns
-(68.4 / 68.2). See [Performance](#performance).
+(68.4 / 68.2). The IPv6 cases (`established/gate_v6`, `established/outbound_v6`,
+`established/extension_chain_v6`, `new_flow/any_grant_v6`, `fragment/later_v6`,
+`icmp_error/v6`) are measured, not compared. See [Performance](#performance).
 
 ## nsplane-nat
 
