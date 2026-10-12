@@ -283,7 +283,7 @@ async fn a_replace_under_traffic_switches_the_verdicts_at_its_generation() -> Te
     // Even generations give `a` the own addresses and `c` the alternate ones; odd ones swap
     // them.
     let set = |generation: u64| {
-        if generation % 2 == 0 {
+        if generation.is_multiple_of(2) {
             scopes(second, own(&b), ALT)
         } else {
             scopes(second, ALT, own(&b))
@@ -293,7 +293,7 @@ async fn a_replace_under_traffic_switches_the_verdicts_at_its_generation() -> Te
     assert_eq!(filter.replace_scopes(set(0)?)?, 1);
     for round in 1..=ROUNDS {
         // Both peers' traffic keeps flowing while the scopes alternate.
-        let (to_a, to_c) = if round % 2 == 0 {
+        let (to_a, to_c) = if round.is_multiple_of(2) {
             (ALT, own(&b))
         } else {
             (own(&b), ALT)
