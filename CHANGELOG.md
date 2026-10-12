@@ -5,12 +5,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Peer-keyed, address-family-agnostic flow gate (plan `20261012-1800-peer-keyed-gate`, task
-`20261012-1700-peer-keyed-gate`, GF-1..GF-4). The gate decides by peer for IPv4 and IPv6, and an
-`AclFilter`'s address scopes are replaced at runtime, one per local identity. An IPv4-only policy
-behaves and costs as before. This is the second exception to the feature freeze (ADR
-`2026-10-08-feature-freeze-0-11`, amended 2026-10-12). It breaks `nsplane-acl`'s API in one place
-(`GatePolicyError::Ipv6`), so the next release is 0.13.0.
+## [0.13.0] - 2026-10-12
+
+A peer-keyed, address-family-agnostic flow gate (plan `20261012-1800-peer-keyed-gate`, GF-1..GF-4),
+and the removal of `arc-swap` (plan `20261012-1830-no-arc-swap`, AS-1..AS-2).
+- The gate decides by peer for IPv4 and IPv6. A `GateBinding` without addresses binds every
+  packet of its peer.
+- An `AclFilter`'s scopes are replaced at runtime, one per local identity.
+- nsplane no longer depends on `arc-swap`, because of a soundness bug in its 1.9.x releases. A
+  std-only sharded snapshot cell replaces it.
+- An IPv4-only policy behaves as before.
+- Performance:
+  - measured so far:
+    - the first clean slot A/B round of the gate and unscoped filters is at par;
+    - a scoped `other_protocols` filter path is +3.7 %;
+    - a NAT64 translation of a 64 B packet costs +1..6 ns;
+  - still pending: the full quiet A/B pass, which is scheduled after the release.
+- Breaking:
+  - `GatePolicyError::Ipv6` is removed;
+  - `Nat64Lan::new` and `with_snat_ports` take a `LanRoutes` handle.
+
+Apart from these two items nsplane stays frozen (ADR `2026-10-08-feature-freeze-0-11`).
 
 ### Added
 - `nsplane-acl` flow gate, IPv6 (GF-1, GF-3): `GatePolicy` scopes, bindings,

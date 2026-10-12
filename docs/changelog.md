@@ -171,3 +171,12 @@ ns and nsgw are integrated.
 
 Release 0.12.0 (tag `v0.12.0`): local identities, the one feature the owner exempted from the
 0.11 freeze. The freeze applies again: bug fixes only.
+
+## 2026-10-12 [release]
+
+Release 0.13.0 (tag `v0.13.0`):
+- a peer-keyed, address-family-agnostic flow gate, the second feature the owner exempted from
+  the freeze;
+- the removal of `arc-swap`, a soundness fix.
+
+The quiet performance pass of both items is pending. The freeze applies again: bug fixes only.

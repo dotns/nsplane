@@ -243,6 +243,9 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Release 0.11.0 | breaking: business-agnostic API (tag `v0.11.0`) | 2026-10-08 |
 | Local identities | several static keys per engine, mac1 dispatch, transport-restricted identities | done (plan `20261011-0900-local-identities`) |
 | Release 0.12.0 | local identities (tag `v0.12.0`) | 2026-10-12 |
+| Peer-keyed gate | IPv6 flow gate, peer-keyed bindings, runtime per-identity ACL scopes | done (plan `20261012-1800-peer-keyed-gate`) |
+| No arc-swap | std-only snapshot cell, `LanRoutes` handle | done (plan `20261012-1830-no-arc-swap`) |
+| Release 0.13.0 | breaking: peer-keyed gate, arc-swap removal (tag `v0.13.0`) | 2026-10-12 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows
