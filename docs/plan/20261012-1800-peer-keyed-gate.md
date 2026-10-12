@@ -1,6 +1,6 @@
 # 20261012-1800-peer-keyed-gate Peer-keyed, address-family-agnostic flow gate
 
-- **status**: approved
+- **status**: completed (features; the performance pass is deferred)
 - **createdAt**: 2026-10-12 18:00
 - **approvedAt**: 2026-10-12 (user: "开始处理，这个是底层逻辑问题，需要处理"; the freeze is lifted for this
   feature only; auto mode, no round cap, automatic merges, watchdog with stuck-process checks)
@@ -73,3 +73,12 @@ reverses decision Q5 of plan `20261007-0900` (IPv4-only gate), which was a porti
   - decision: accept it as a documented residual after a quiet icmp-repeat (by 21:30 UTC, else
     measured at load < 8); no third round. AS (`nsplane-as-202610121830`) replaces the cell and
     revisits this read path.
+- 2026-10-12: owner directive: finish the features first, measure later. GF merged into main
+  (`daf76cf`, branch tip 3610e43). Main gate green: just check (1816 tests, term scan),
+  cargo doc, cross, test-windows. The e2e scripts were green on 3610e43.
+
+  Deferred to the performance pass:
+  - the quiet `other/icmp_echo_scope` repeat (+3.7 % in a clean round, some processes run at
+    63-74 ns);
+  - the full gate/namespaces A/B;
+  - `icmp_error/v6`.
