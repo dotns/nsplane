@@ -32,3 +32,6 @@ slot A/B when it touches the data path.
 - 2026-10-11: the owner lifted the freeze for one feature, local identities (task
   `20261011-0101`, plan `20261011-0900-local-identities`). It is additive and ships as 0.12.0.
   Everything else stays frozen. 0.11.x fixes continue on `release/0.11.x` if needed.
+- 2026-10-12: second exception (owner: "这个是底层逻辑问题，需要处理"): a peer-keyed,
+  address-family-agnostic flow gate and runtime per-identity `AclFilterScope` (task
+  `20261012-1700`, plan `20261012-1800-peer-keyed-gate`). It ships as 0.13.0.

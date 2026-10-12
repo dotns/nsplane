@@ -1,6 +1,6 @@
 # 20261012-1700-peer-keyed-gate Peer-keyed, address-family-agnostic flow gate
 
-- **status**: pending (a new feature; needs the owner to lift the freeze for it, ADR
+- **status**: in_progress (owner lifted the freeze for it, 2026-10-12; ADR
   `2026-10-08-feature-freeze-0-11`)
 - **priority**: P1
 - **owner**: L1 (7f5cstru)
