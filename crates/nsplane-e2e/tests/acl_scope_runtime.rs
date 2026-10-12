@@ -95,9 +95,7 @@ async fn setup() -> TestResult<Setup> {
         path: Some(path),
         ..b.as_peer(via)
     };
-    a.handle
-        .add_or_update_peer(b_peer(a_end.0, b.path))
-        .await?;
+    a.handle.add_or_update_peer(b_peer(a_end.0, b.path)).await?;
 
     let second = b
         .handle
@@ -191,7 +189,11 @@ const fn tunnel(node: &AclNode) -> [IpAddr; 2] {
 /// and checks that `to` delivers it unchanged.
 async fn delivered(b: &AclNode, from: [IpAddr; 2], to: &mut AclNode) -> TestResult {
     for (src, dst) in from.into_iter().zip(tunnel(to)) {
-        let packet = udp(SocketAddr::new(src, 5000), SocketAddr::new(dst, 6000), b"in");
+        let packet = udp(
+            SocketAddr::new(src, 5000),
+            SocketAddr::new(dst, 6000),
+            b"in",
+        );
         b.send(&packet).await?;
         let (_, got) = to.expect_delivery().await?;
         if got != packet {
@@ -210,7 +212,11 @@ async fn dropped(
     to: &mut AclNode,
 ) -> TestResult {
     for (src, dst) in from.into_iter().zip(tunnel(to)) {
-        let packet = udp(SocketAddr::new(src, 5000), SocketAddr::new(dst, 6000), b"in");
+        let packet = udp(
+            SocketAddr::new(src, 5000),
+            SocketAddr::new(dst, 6000),
+            b"in",
+        );
         b.send(&packet).await?;
         events
             .expect(|e| {

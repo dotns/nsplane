@@ -217,15 +217,18 @@ async fn an_ipv6_flow_is_admitted_and_denied_by_a_peer_keyed_binding() -> TestRe
     let stats = gated.filter.stats();
     assert_eq!((stats.gate_accepted, stats.gate_denied), (2, 2));
     let counters = gated.gate.counters();
-    assert_eq!((counters.enforced_allowed, counters.enforced_denied), (2, 2));
+    assert_eq!(
+        (counters.enforced_allowed, counters.enforced_denied),
+        (2, 2)
+    );
     assert_eq!(b.drops(no_grant).await?, 1);
     assert_eq!(b.drops(reverse).await?, 1);
     Ok(())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn outbound_ipv6_to_an_enforced_peer_is_denied_while_its_inbound_flows_arrive()
--> TestResult {
+async fn outbound_ipv6_to_an_enforced_peer_is_denied_while_its_inbound_flows_arrive() -> TestResult
+{
     let (mut a, mut b, gated) = gated_pair().await?;
     let mut events = b.subscribe().await?;
     // Only `a` may open flows to `b`.
@@ -249,9 +252,21 @@ async fn outbound_ipv6_to_an_enforced_peer_is_denied_while_its_inbound_flows_arr
     delivered(&a, &mut b, &tcp_flags(a_end, b_end, ACK)).await?;
     delivered(&a, &mut b, &udp(a_end, b_end, b"request")).await?;
     delivered(&b, &mut a, &udp(b_end, a_end, b"reply")).await?;
-    let ping = icmp(IpAddr::V6(a.ip6), IpAddr::V6(b.ip6), (128, 0), [0, 7, 0, 1], b"ping");
+    let ping = icmp(
+        IpAddr::V6(a.ip6),
+        IpAddr::V6(b.ip6),
+        (128, 0),
+        [0, 7, 0, 1],
+        b"ping",
+    );
     delivered(&a, &mut b, &ping).await?;
-    let pong = icmp(IpAddr::V6(b.ip6), IpAddr::V6(a.ip6), (129, 0), [0, 7, 0, 1], b"ping");
+    let pong = icmp(
+        IpAddr::V6(b.ip6),
+        IpAddr::V6(a.ip6),
+        (129, 0),
+        [0, 7, 0, 1],
+        b"ping",
+    );
     delivered(&b, &mut a, &pong).await?;
 
     let stats = gated.filter.stats();
@@ -293,14 +308,20 @@ async fn one_peer_keyed_binding_governs_both_families_of_a_peer() -> TestResult 
             .gate
             .find_flow(remote, local, Protocol::Tcp)
             .ok_or("no flow")?;
-        assert_eq!((flow.scope.as_str(), flow.rule.as_str()), ("scope-1", "web"));
+        assert_eq!(
+            (flow.scope.as_str(), flow.rule.as_str()),
+            ("scope-1", "web")
+        );
     }
     assert!(gated.gate.find_flow(a4, b6, Protocol::Tcp).is_none());
 
     let stats = gated.filter.stats();
     assert_eq!((stats.gate_accepted, stats.gate_denied), (2, 2));
     let counters = gated.gate.counters();
-    assert_eq!((counters.enforced_allowed, counters.enforced_denied), (2, 2));
+    assert_eq!(
+        (counters.enforced_allowed, counters.enforced_denied),
+        (2, 2)
+    );
     assert_eq!(b.drops(no_grant).await?, 2);
     Ok(())
 }
