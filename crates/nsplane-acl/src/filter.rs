@@ -5909,6 +5909,13 @@ mod tests {
 
     #[test]
     fn replace_scopes_under_concurrency_never_tears_a_scope() {
+        /// Counts a reader as done even when it panics, so the writer stops.
+        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         const READERS: u16 = 4;
         const PACKETS: u16 = 500;
         let [x, _] = local_identities();
@@ -5928,13 +5935,6 @@ mod tests {
                 .with_identity(x, scope)
         };
         let done = std::sync::atomic::AtomicUsize::new(0);
-        /// Counts a reader as done even when it panics, so the writer stops.
-        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
-        impl Drop for Done<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let remote = addr("10.0.0.1");
         std::thread::scope(|threads| {
             for reader in 0..READERS {
