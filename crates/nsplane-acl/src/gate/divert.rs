@@ -4,10 +4,12 @@
 //! queue of its own and check [`DivertedPacket::generation`] against
 //! [`FlowGate::generation`] before it acts on the packet.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use nsplane_packet::PeerId;
 
+use super::addr::GateAddr;
 use super::config::{ScopeId, UnboundAction};
-use super::packet::PacketMeta;
 use super::{FlowGate, PacketDirection};
 use crate::rules::RuleId;
 
@@ -70,7 +72,17 @@ impl FlowGate {
     /// local, binding or unbound address of any scope and that no hold
     /// matches.
     pub(super) fn divert_candidate(&self, peer: PeerId, packet: &[u8]) -> Option<DivertedPacket> {
-        let meta = PacketMeta::parse(packet)?;
+        match packet.first()? >> 4 {
+            4 => self.divert_family::<Ipv4Addr>(peer, packet),
+            6 => self.divert_family::<Ipv6Addr>(peer, packet),
+            _ => None,
+        }
+    }
+
+    /// [`divert_candidate`](Self::divert_candidate) of a packet of the
+    /// family `A`.
+    fn divert_family<A: GateAddr>(&self, peer: PeerId, packet: &[u8]) -> Option<DivertedPacket> {
+        let meta = A::parse(packet)?;
         if !matches!(meta.protocol, 6 | 17) {
             return None;
         }

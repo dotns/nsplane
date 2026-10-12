@@ -1,8 +1,10 @@
 //! State migration across [`FlowGate::replace`](super::FlowGate::replace).
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::MutexGuard;
 
 use super::PacketDirection;
+use super::addr::GateAddr;
 use super::hash::FastMap;
 use super::policy::{Authorization, BindingKey, CompiledScope, Slot};
 use super::snapshot::Snapshot;
@@ -48,24 +50,39 @@ pub(super) fn migrate(
         return;
     }
     for shard in shards.iter_mut() {
-        shard.retain_flows(counts, |key, state| match plans.get(&key.slot) {
-            Some(Plan::Keep) => true,
-            Some(Plan::Revalidate(scope)) => reauthorize(scope, key, state),
-            None => false,
-        });
-        shard.retain_fragments(counts, |key, _| {
-            matches!(plans.get(&key.slot), Some(Plan::Keep))
-        });
+        migrate_family::<Ipv4Addr>(shard, &plans, counts);
+        migrate_family::<Ipv6Addr>(shard, &plans, counts);
     }
+}
+
+/// Migrate the state of the family `A` of one shard by `plans`.
+fn migrate_family<A: GateAddr>(
+    shard: &mut Shard,
+    plans: &FastMap<Slot, Plan<'_>>,
+    counts: &Counts,
+) {
+    let mut family = shard.family::<A>();
+    family.retain_flows(counts, |key, state| match plans.get(&key.slot) {
+        Some(Plan::Keep) => true,
+        Some(Plan::Revalidate(scope)) => reauthorize(scope, key, state),
+        None => false,
+    });
+    family.retain_fragments(counts, |key, _| {
+        matches!(plans.get(&key.slot), Some(Plan::Keep))
+    });
 }
 
 /// Re-authorize a flow of a changed scope as a new flow by its initiator,
 /// updating its grant and mode; `false` drops it.
-fn reauthorize(scope: &CompiledScope, key: &FlowKey, state: &mut FlowState) -> bool {
+fn reauthorize<A: GateAddr>(
+    scope: &CompiledScope,
+    key: &FlowKey<A>,
+    state: &mut FlowState,
+) -> bool {
     if !scope.governs(key.local_ip) {
         return false;
     }
-    let Some(labels) = scope.bindings.get(&BindingKey {
+    let Some(labels) = scope.labels(&BindingKey {
         peer: key.peer,
         ip: key.remote_ip,
     }) else {

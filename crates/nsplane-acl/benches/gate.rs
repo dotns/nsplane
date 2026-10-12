@@ -27,6 +27,19 @@
 //!   or 10 ms, toggling a grant for an unrelated source in the same scope (a changed scope,
 //!   whose flows are re-authorized).
 //!
+//! IPv6, with the same scope also governing an IPv6 local address and binding the remote and
+//! the unrelated source at IPv6 addresses (the grants to the local address name both):
+//!
+//! - `established/gate_v6`, `established/outbound_v6`: `established/gate` and
+//!   `established/outbound` over IPv6.
+//! - `established/extension_chain_v6`: the same ACK behind eight Destination Options headers,
+//!   the most the gate walks.
+//! - `new_flow/any_grant_v6`: `new_flow/any_grant` over IPv6.
+//! - `fragment/later_v6`: a later fragment of an admitted first UDP fragment.
+//! - `icmp_error/v6`: an `ICMPv6` destination-unreachable error quoting an outbound UDP flow.
+//!
+//! The fragment and error benches run on a frozen clock, so their state never expires.
+//!
 //! The scenarios of the former `benches/node_l3.rs`, like for like:
 //!
 //! | Former scenario | Here |
@@ -38,7 +51,7 @@
 //! | `baseline/legacy_filter`, `baseline/legacy_gate` | `baseline/pass_filter`, `baseline/pass_gate` |
 //! | `contention/1ms`, `contention/10ms` | same names |
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -59,6 +72,9 @@ use nsplane_packet::{PacketBuf, PeerId};
 const LOCAL: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 const REMOTE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 const UNRELATED: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 3);
+const LOCAL6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+const REMOTE6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+const UNRELATED6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 3);
 const REMOTE_PEER: PeerId = PeerId::new(1);
 const UNRELATED_PEER: PeerId = PeerId::new(2);
 const PORT: u16 = 443;
@@ -78,6 +94,64 @@ fn tcp(src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, flags: u8) ->
     bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
     bytes.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
     PacketBuf::from_packet(&bytes)
+}
+
+/// An IPv6 packet whose `extensions` Destination Options headers (8 bytes each) precede the
+/// upper layer `protocol` carrying `payload`.
+fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, extensions: usize, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(extensions * 8 + payload.len()).unwrap_or(u16::MAX);
+    let first = if extensions == 0 { protocol } else { 60 };
+    let mut bytes = vec![0x60, 0, 0, 0];
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(&[first, 64]);
+    bytes.extend_from_slice(&src.octets());
+    bytes.extend_from_slice(&dst.octets());
+    for index in 0..extensions {
+        let next = if index + 1 == extensions {
+            protocol
+        } else {
+            60
+        };
+        bytes.extend_from_slice(&[next, 0, 1, 4, 0, 0, 0, 0]);
+    }
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// A TCP header without options of an IPv6 packet behind `extensions` extension headers.
+fn tcp6(
+    src: Ipv6Addr,
+    src_port: u16,
+    dst: Ipv6Addr,
+    dst_port: u16,
+    flags: u8,
+    extensions: usize,
+) -> PacketBuf {
+    let mut header = Vec::new();
+    header.extend_from_slice(&src_port.to_be_bytes());
+    header.extend_from_slice(&dst_port.to_be_bytes());
+    header.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+    header.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    PacketBuf::from_packet(&ipv6(src, dst, extensions, 6, &header))
+}
+
+/// A UDP header and 8 bytes of payload.
+fn udp_payload(src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&src_port.to_be_bytes());
+    bytes.extend_from_slice(&dst_port.to_be_bytes());
+    bytes.extend_from_slice(&[0, 16, 0, 0]);
+    bytes.extend_from_slice(&[0; 8]);
+    bytes
+}
+
+/// A UDP fragment behind a Fragment header (`offset` in 8-byte units; more fragments follow).
+fn udp6_fragment(src: Ipv6Addr, dst: Ipv6Addr, offset: u16, payload: &[u8]) -> PacketBuf {
+    let mut bytes = vec![17, 0];
+    bytes.extend_from_slice(&((offset << 3) | 1).to_be_bytes());
+    bytes.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+    bytes.extend_from_slice(payload);
+    PacketBuf::from_packet(&ipv6(src, dst, 0, 44, &bytes))
 }
 
 fn host(ip: Ipv4Addr) -> IpNet {
@@ -171,6 +245,34 @@ fn policy(same_owner: bool, grants: Vec<GateGrant>) -> GatePolicy {
     }
 }
 
+/// `policy` with its scope also governing [`LOCAL6`], binding the remote and the unrelated
+/// source at [`REMOTE6`] and [`UNRELATED6`], and its grants to [`LOCAL`] also naming
+/// [`LOCAL6`].
+fn dual_stack(mut policy: GatePolicy) -> GatePolicy {
+    let local6 = format!("{LOCAL6}/128")
+        .parse::<IpNet>()
+        .unwrap_or_else(|_| unreachable!());
+    for scope in &mut policy.scopes {
+        scope.local.push(IpAddr::V6(LOCAL6));
+        scope.bindings[0].addresses.push(IpAddr::V6(REMOTE6));
+        scope.bindings[1].addresses.push(IpAddr::V6(UNRELATED6));
+        for grant in &mut scope.grants {
+            if grant.destinations == [host(LOCAL)] {
+                grant.destinations.push(local6);
+            }
+        }
+    }
+    policy
+}
+
+/// A gate with `policy` published, on a clock frozen at its creation.
+fn frozen_gate(policy: GatePolicy) -> Arc<FlowGate> {
+    let start = Instant::now();
+    let gate = FlowGate::with_clock(GateConfig::default(), move || start);
+    assert!(gate.replace(policy).is_ok());
+    gate
+}
+
 /// A gate with `policy` published.
 fn gate(policy: GatePolicy) -> Arc<FlowGate> {
     let gate = FlowGate::new(GateConfig::default());
@@ -248,6 +350,116 @@ fn bench_new_flows(
             elapsed
         });
     });
+}
+
+/// [`bench_new_flows`] over IPv6.
+fn bench_new_flows_v6(c: &mut Criterion, name: &str, make_gate: impl Fn() -> Arc<FlowGate>) {
+    let packet = tcp6(REMOTE6, 1024, LOCAL6, 22, SYN, 0);
+    c.bench_function(name, |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            let mut done = 0;
+            while done < iters {
+                let gate = make_gate();
+                let chunk = NEW_FLOW_CHUNK.min(iters - done);
+                let mut buf = packet.clone();
+                let start = Instant::now();
+                for port in 0..chunk {
+                    let port = u16::try_from(port + 1024).unwrap_or(u16::MAX);
+                    // The TCP source port, after the 40-byte IPv6 header.
+                    buf.as_packet_mut()[40..42].copy_from_slice(&port.to_be_bytes());
+                    std::hint::black_box(
+                        gate.evaluate_inbound(REMOTE_PEER, std::hint::black_box(buf.as_packet())),
+                    );
+                }
+                elapsed += start.elapsed();
+                done += chunk;
+            }
+            elapsed
+        });
+    });
+}
+
+/// Bench `name`: `packet` repeated through `gate` in `direction`, which must allow it.
+fn bench_allowed(
+    c: &mut Criterion,
+    name: &str,
+    gate: &FlowGate,
+    inbound: bool,
+    packet: &PacketBuf,
+) {
+    let evaluate = |packet: &[u8]| {
+        if inbound {
+            gate.evaluate_inbound(REMOTE_PEER, packet)
+        } else {
+            gate.evaluate_outbound(REMOTE_PEER, packet)
+        }
+    };
+    assert!(
+        matches!(
+            evaluate(packet.as_packet()),
+            GateDecision::Enforce { allow: true, .. }
+        ),
+        "{name}"
+    );
+    c.bench_function(name, |b| {
+        b.iter(|| evaluate(std::hint::black_box(packet.as_packet())));
+    });
+}
+
+/// The IPv6 benches.
+fn bench_ipv6(c: &mut Criterion) {
+    let established = gate(dual_stack(policy(true, grants(&[]))));
+    let syn = tcp6(REMOTE6, 40000, LOCAL6, 22, SYN, 0);
+    assert!(matches!(
+        established.evaluate_inbound(REMOTE_PEER, syn.as_packet()),
+        GateDecision::Enforce { allow: true, .. }
+    ));
+    let ack = tcp6(REMOTE6, 40000, LOCAL6, 22, ACK, 0);
+    bench_allowed(c, "established/gate_v6", &established, true, &ack);
+    let reply = tcp6(LOCAL6, 22, REMOTE6, 40000, ACK, 0);
+    bench_allowed(c, "established/outbound_v6", &established, false, &reply);
+    let chained = tcp6(REMOTE6, 40000, LOCAL6, 22, ACK, 8);
+    bench_allowed(
+        c,
+        "established/extension_chain_v6",
+        &established,
+        true,
+        &chained,
+    );
+
+    let any_grant = || {
+        gate(dual_stack(policy(
+            false,
+            grants(&[("any", "source:remote", vec![ProtocolMatch::Any])]),
+        )))
+    };
+    let probe = tcp6(REMOTE6, 1, LOCAL6, 22, SYN, 0);
+    assert!(matches!(
+        any_grant().evaluate_inbound(REMOTE_PEER, probe.as_packet()),
+        GateDecision::Enforce { allow: true, .. }
+    ));
+    bench_new_flows_v6(c, "new_flow/any_grant_v6", any_grant);
+
+    let fragments = frozen_gate(dual_stack(policy(true, grants(&[]))));
+    let first = udp6_fragment(REMOTE6, LOCAL6, 0, &udp_payload(40000, 53));
+    assert!(matches!(
+        fragments.evaluate_inbound(REMOTE_PEER, first.as_packet()),
+        GateDecision::Enforce { allow: true, .. }
+    ));
+    let later = udp6_fragment(REMOTE6, LOCAL6, 2, &[0; 16]);
+    bench_allowed(c, "fragment/later_v6", &fragments, true, &later);
+
+    let errors = frozen_gate(dual_stack(policy(true, grants(&[]))));
+    let original = ipv6(LOCAL6, REMOTE6, 0, 17, &udp_payload(50000, 53));
+    assert!(matches!(
+        errors.evaluate_outbound(REMOTE_PEER, &original),
+        GateDecision::Enforce { allow: true, .. }
+    ));
+    let mut unreachable = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    unreachable.extend_from_slice(&original);
+    let error = PacketBuf::from_packet(&ipv6(REMOTE6, LOCAL6, 0, 58, &unreachable));
+    bench_allowed(c, "icmp_error/v6", &errors, true, &error);
 }
 
 /// Without the gate: the ACL filter alone, and a gate without a policy in front of it and
@@ -382,5 +594,5 @@ fn bench_gate(c: &mut Criterion) {
     bench_contention(c, "contention/10ms", Duration::from_millis(10));
 }
 
-criterion_group!(gate_benches, bench_gate);
+criterion_group!(gate_benches, bench_gate, bench_ipv6);
 criterion_main!(gate_benches);

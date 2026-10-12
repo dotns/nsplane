@@ -2,11 +2,12 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nsplane_packet::PeerId;
 
 use super::PacketDirection;
+use super::addr::GateAddr;
 use super::config::{
     GateBinding, GateGrant, GateHolds, GateMode, GatePolicy, GatePolicyError, GateScope, HoldRule,
     ScopeId, UnboundAction, UnboundRule,
@@ -21,15 +22,15 @@ pub(super) type Slot = u32;
 
 /// A `(peer, remote address)` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BindingKey {
+pub(super) struct BindingKey<A: GateAddr> {
     pub(super) peer: PeerId,
-    pub(super) ip: Ipv4Addr,
+    pub(super) ip: A,
 }
 
-impl Hash for BindingKey {
-    /// One word: the peer and the address.
+impl<A: GateAddr> Hash for BindingKey<A> {
+    /// One word: the peer and the address (an IPv6 address folded).
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64((u64::from(self.peer.get()) << 32) | u64::from(self.ip.to_bits()));
+        state.write_u64((u64::from(self.peer.get()) << 32) | u64::from(self.ip.fold()));
     }
 }
 
@@ -47,11 +48,11 @@ pub(super) struct CompiledGrant {
 impl CompiledGrant {
     /// Whether a new flow initiated in `direction` from a source with
     /// `labels` to `destination` matches (`suspended` is not checked).
-    pub(super) fn matches(
+    pub(super) fn matches<A: GateAddr>(
         &self,
         direction: PacketDirection,
         labels: &LabelSet,
-        destination: Ipv4Addr,
+        destination: A,
         transport: Transport,
     ) -> bool {
         self.direction == direction
@@ -60,7 +61,7 @@ impl CompiledGrant {
                 || self
                     .destinations
                     .iter()
-                    .any(|net| net.contains(&IpAddr::V4(destination))))
+                    .any(|net| net.contains(&destination.ip())))
             && self.protocols.matches(transport)
     }
 }
@@ -104,6 +105,67 @@ pub(super) enum Authorization<'a> {
     NoGrant,
 }
 
+/// The addresses of one family of a scope.
+#[derive(Debug)]
+pub(super) struct ScopeAddrs<A: GateAddr> {
+    pub(super) local: Box<[A]>,
+    pub(super) bindings: FastMap<BindingKey<A>, LabelSet>,
+    /// Remote addresses of the scope without a binding.
+    pub(super) unbound_addresses: Box<[A]>,
+}
+
+impl<A: GateAddr> ScopeAddrs<A> {
+    /// The addresses of the family `A` of `scope`, validated.
+    fn compile(scope: &GateScope) -> Result<Self, GatePolicyError> {
+        let local = scope.local.iter().filter_map(|ip| A::of(*ip)).collect();
+        let mut bindings = FastMap::default();
+        for GateBinding {
+            peer,
+            addresses,
+            labels,
+        } in &scope.bindings
+        {
+            for address in addresses {
+                let Some(ip) = A::of(*address) else {
+                    continue;
+                };
+                if bindings
+                    .insert(BindingKey { peer: *peer, ip }, labels.clone())
+                    .is_some()
+                {
+                    return Err(GatePolicyError::DuplicateBinding {
+                        scope: scope.id.clone(),
+                        peer: *peer,
+                        address: *address,
+                    });
+                }
+            }
+        }
+        let mut unbound_addresses: Vec<A> = Vec::new();
+        for address in &scope.unbound_addresses {
+            let Some(ip) = A::of(*address) else {
+                continue;
+            };
+            if unbound_addresses.contains(&ip)
+                || bindings
+                    .keys()
+                    .any(|binding: &BindingKey<A>| binding.ip == ip)
+            {
+                return Err(GatePolicyError::ConflictingAddress {
+                    scope: scope.id.clone(),
+                    address: *address,
+                });
+            }
+            unbound_addresses.push(ip);
+        }
+        Ok(Self {
+            local,
+            bindings,
+            unbound_addresses: unbound_addresses.into(),
+        })
+    }
+}
+
 /// A scope with a mode other than [`GateMode::Off`], in its matching form.
 #[derive(Debug)]
 pub(super) struct CompiledScope {
@@ -111,10 +173,8 @@ pub(super) struct CompiledScope {
     pub(super) id: ScopeId,
     /// [`GateMode::Enforce`]; otherwise [`GateMode::Observe`].
     pub(super) enforce: bool,
-    pub(super) local: Box<[Ipv4Addr]>,
-    pub(super) bindings: FastMap<BindingKey, LabelSet>,
-    /// Remote addresses of the scope without a binding.
-    pub(super) unbound_addresses: Box<[Ipv4Addr]>,
+    pub(super) v4: ScopeAddrs<Ipv4Addr>,
+    pub(super) v6: ScopeAddrs<Ipv6Addr>,
     pub(super) grants: Box<[CompiledGrant]>,
     pub(super) unbound: Box<[CompiledUnbound]>,
     /// The scope as given, to detect a changed scope on the next replace.
@@ -122,17 +182,22 @@ pub(super) struct CompiledScope {
 }
 
 impl CompiledScope {
-    pub(super) fn governs(&self, local: Ipv4Addr) -> bool {
-        self.local.contains(&local)
+    pub(super) fn governs<A: GateAddr>(&self, local: A) -> bool {
+        A::scope(self).local.contains(&local)
+    }
+
+    /// The labels of `binding` in this scope.
+    pub(super) fn labels<A: GateAddr>(&self, binding: &BindingKey<A>) -> Option<&LabelSet> {
+        A::scope(self).bindings.get(binding)
     }
 
     /// The grant search for a new flow initiated in `direction` from a
     /// source with `labels` to `destination`.
-    pub(super) fn authorize(
+    pub(super) fn authorize<A: GateAddr>(
         &self,
         direction: PacketDirection,
         labels: &LabelSet,
-        destination: Ipv4Addr,
+        destination: A,
         transport: Transport,
     ) -> Authorization<'_> {
         let mut suspended = None;
@@ -148,48 +213,48 @@ impl CompiledScope {
     }
 }
 
-/// A set of IPv4 addresses: empty (any address), hosts and prefixes.
-#[derive(Debug, Default)]
-struct AddressSet {
+/// The addresses of one family in a list of prefixes: an empty list is any
+/// address, else its hosts and prefixes of the family.
+#[derive(Debug)]
+pub(super) struct AddressSet<A: GateAddr> {
     any: bool,
-    hosts: FastSet<Ipv4Addr>,
+    hosts: FastSet<A>,
     prefixes: Box<[IpNet]>,
 }
 
-impl AddressSet {
+impl<A: GateAddr> AddressSet<A> {
     fn compile(nets: &[IpNet]) -> Self {
-        let mut set = Self {
-            any: nets.is_empty(),
-            ..Self::default()
-        };
+        let mut hosts = FastSet::default();
         let mut prefixes = Vec::new();
         for net in nets {
-            match net.network() {
-                IpAddr::V4(host) if net.prefix_len() == 32 => {
-                    set.hosts.insert(host);
-                }
-                _ => prefixes.push(*net),
+            let Some(network) = A::of(net.network()) else {
+                continue;
+            };
+            if net.prefix_len() == A::BITS {
+                hosts.insert(network);
+            } else {
+                prefixes.push(*net);
             }
         }
-        set.prefixes = prefixes.into();
-        set
+        Self {
+            any: nets.is_empty(),
+            hosts,
+            prefixes: prefixes.into(),
+        }
     }
 
-    fn contains(&self, ip: Ipv4Addr) -> bool {
+    fn contains(&self, ip: A) -> bool {
         self.any
             || self.hosts.contains(&ip)
-            || self
-                .prefixes
-                .iter()
-                .any(|net| net.contains(&IpAddr::V4(ip)))
+            || self.prefixes.iter().any(|net| net.contains(&ip.ip()))
     }
 }
 
 #[derive(Debug)]
-struct CompiledHoldRule {
+pub(super) struct CompiledHoldRule {
     peers: Option<FastSet<PeerId>>,
-    local: AddressSet,
-    remote: AddressSet,
+    pub(super) local: (AddressSet<Ipv4Addr>, AddressSet<Ipv6Addr>),
+    pub(super) remote: (AddressSet<Ipv4Addr>, AddressSet<Ipv6Addr>),
 }
 
 impl CompiledHoldRule {
@@ -199,17 +264,24 @@ impl CompiledHoldRule {
                 .peers
                 .as_ref()
                 .map(|peers| peers.iter().copied().collect()),
-            local: AddressSet::compile(&rule.local),
-            remote: AddressSet::compile(&rule.remote),
+            local: (
+                AddressSet::compile(&rule.local),
+                AddressSet::compile(&rule.local),
+            ),
+            remote: (
+                AddressSet::compile(&rule.remote),
+                AddressSet::compile(&rule.remote),
+            ),
         }
     }
 
-    fn matches(&self, peer: PeerId, local: Ipv4Addr, remote: Ipv4Addr) -> bool {
+    fn matches<A: GateAddr>(&self, peer: PeerId, local: A, remote: A) -> bool {
+        let (local_set, remote_set) = A::hold(self);
         self.peers
             .as_ref()
             .is_none_or(|peers| peers.contains(&peer))
-            && self.local.contains(local)
-            && self.remote.contains(remote)
+            && local_set.contains(local)
+            && remote_set.contains(remote)
     }
 }
 
@@ -218,7 +290,7 @@ impl CompiledHoldRule {
 pub(super) struct CompiledHolds {
     inbound: Box<[CompiledHoldRule]>,
     outbound: Box<[CompiledHoldRule]>,
-    release: FastSet<BindingKey>,
+    pub(super) release: (FastSet<BindingKey<Ipv4Addr>>, FastSet<BindingKey<Ipv6Addr>>),
 }
 
 impl CompiledHolds {
@@ -234,17 +306,7 @@ impl CompiledHolds {
                 .iter()
                 .map(CompiledHoldRule::compile)
                 .collect(),
-            release: holds
-                .release
-                .iter()
-                .filter_map(|(peer, ip)| match ip {
-                    IpAddr::V4(ip) => Some(BindingKey {
-                        peer: *peer,
-                        ip: *ip,
-                    }),
-                    IpAddr::V6(_) => None,
-                })
-                .collect(),
+            release: (release(&holds.release), release(&holds.release)),
         }
     }
 
@@ -253,17 +315,17 @@ impl CompiledHolds {
     }
 
     /// Whether a packet of `peer` between `local` and `remote` is held.
-    pub(super) fn held(
+    pub(super) fn held<A: GateAddr>(
         &self,
         direction: PacketDirection,
         peer: PeerId,
-        local: Ipv4Addr,
-        remote: Ipv4Addr,
+        local: A,
+        remote: A,
     ) -> bool {
         let rules = match direction {
             PacketDirection::Inbound => {
                 if self.inbound.is_empty()
-                    || self.release.contains(&BindingKey { peer, ip: remote })
+                    || A::release(self).contains(&BindingKey { peer, ip: remote })
                 {
                     return false;
                 }
@@ -273,6 +335,14 @@ impl CompiledHolds {
         };
         rules.iter().any(|rule| rule.matches(peer, local, remote))
     }
+}
+
+/// The released pairs of the family `A`.
+fn release<A: GateAddr>(pairs: &[(PeerId, IpAddr)]) -> FastSet<BindingKey<A>> {
+    pairs
+        .iter()
+        .filter_map(|(peer, ip)| A::of(*ip).map(|ip| BindingKey { peer: *peer, ip }))
+        .collect()
 }
 
 /// A validated policy: the compiled scopes (without the `Off` ones, in
@@ -295,7 +365,6 @@ pub(super) fn compile(
             return Err(GatePolicyError::DuplicateScope(scope.id.clone()));
         }
     }
-    validate_holds(&policy.holds)?;
     let mut used: HashSet<Slot> = published.values().copied().collect();
     let mut next = 0;
     let holds = CompiledHolds::compile(&policy.holds);
@@ -318,43 +387,8 @@ pub(super) fn compile(
 }
 
 fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
-    let local = scope
-        .local
-        .iter()
-        .map(|ip| ipv4(*ip, "local"))
-        .collect::<Result<_, _>>()?;
-    let mut bindings = FastMap::default();
-    for GateBinding {
-        peer,
-        addresses,
-        labels,
-    } in &scope.bindings
-    {
-        for address in addresses {
-            let ip = ipv4(*address, "bindings.addresses")?;
-            if bindings
-                .insert(BindingKey { peer: *peer, ip }, labels.clone())
-                .is_some()
-            {
-                return Err(GatePolicyError::DuplicateBinding {
-                    scope: scope.id.clone(),
-                    peer: *peer,
-                    address: *address,
-                });
-            }
-        }
-    }
-    let mut unbound_addresses: Vec<Ipv4Addr> = Vec::new();
-    for address in &scope.unbound_addresses {
-        let ip = ipv4(*address, "unbound_addresses")?;
-        if unbound_addresses.contains(&ip) || bindings.keys().any(|binding| binding.ip == ip) {
-            return Err(GatePolicyError::ConflictingAddress {
-                scope: scope.id.clone(),
-                address: *address,
-            });
-        }
-        unbound_addresses.push(ip);
-    }
+    let v4 = ScopeAddrs::compile(&scope)?;
+    let v6 = ScopeAddrs::compile(&scope)?;
     let grants = scope
         .grants
         .iter()
@@ -369,9 +403,8 @@ fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
         slot: 0,
         id: scope.id.clone(),
         enforce: scope.mode == GateMode::Enforce,
-        local,
-        bindings,
-        unbound_addresses: unbound_addresses.into(),
+        v4,
+        v6,
         grants,
         unbound,
         source: scope,
@@ -379,9 +412,6 @@ fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
 }
 
 fn compile_grant(grant: &GateGrant) -> Result<CompiledGrant, GatePolicyError> {
-    for net in &grant.destinations {
-        ipv4_net(net, "grants.destinations")?;
-    }
     Ok(CompiledGrant {
         id: grant.id.clone(),
         direction: match grant.direction {
@@ -412,40 +442,4 @@ fn protocols(
         id: id.clone(),
         reason,
     })
-}
-
-fn validate_holds(holds: &GateHolds) -> Result<(), GatePolicyError> {
-    for rule in holds.inbound.iter().chain(&holds.outbound) {
-        for net in &rule.local {
-            ipv4_net(net, "holds.local")?;
-        }
-        for net in &rule.remote {
-            ipv4_net(net, "holds.remote")?;
-        }
-    }
-    for (_, ip) in &holds.release {
-        ipv4(*ip, "holds.release")?;
-    }
-    Ok(())
-}
-
-fn ipv4(ip: IpAddr, field: &'static str) -> Result<Ipv4Addr, GatePolicyError> {
-    match ip {
-        IpAddr::V4(ip) => Ok(ip),
-        IpAddr::V6(_) => Err(GatePolicyError::Ipv6 {
-            field,
-            value: ip.to_string(),
-        }),
-    }
-}
-
-fn ipv4_net(net: &IpNet, field: &'static str) -> Result<(), GatePolicyError> {
-    if net.network().is_ipv4() {
-        Ok(())
-    } else {
-        Err(GatePolicyError::Ipv6 {
-            field,
-            value: net.to_string(),
-        })
-    }
 }
