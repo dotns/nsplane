@@ -77,7 +77,7 @@ pub use masquerade::{
     Masquerade, MasqueradeConfig, MasqueradeDecision, MasqueradeStats, MasqueradeVerdict,
 };
 pub use nat64_lan::{
-    DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanSink,
+    DefaultSnatPorts, LanRoute, LanRoutes, Nat64Lan, Nat64LanConfig, Nat64LanError, Nat64LanSink,
     Nat64LanSource, Nat64LanStats, Nat64Verdict, SnatPorts,
 };
 pub use port_map::{PortMap, PortMapError, PortMapProtocol, PortMapRule};

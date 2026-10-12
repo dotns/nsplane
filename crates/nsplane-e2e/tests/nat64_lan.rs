@@ -13,7 +13,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, ChannelTransport, Ecn, Engine, EngineBuilder, PacketBuf,
@@ -24,7 +23,8 @@ use nsplane_e2e::{
     serve_udp_echo, udp, verify_checksums,
 };
 use nsplane_nat::{
-    DefaultSnatPorts, LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource, SnatPorts,
+    DefaultSnatPorts, LanRoute, LanRoutes, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource,
+    SnatPorts,
 };
 use nsplane_netstack::{NetStack, NetStackConfig, NetStackHandle};
 use nsplane_packet::{Ipv4Header, Ipv6Header, protocol};
@@ -92,7 +92,7 @@ impl SnatPorts for Ports {
 fn nat(ports: Arc<Ports>) -> TestResult<Arc<Nat64Lan>> {
     let route = LanRoute::new((MAPPED, 96), (REAL, 24), SNAT)?;
     Ok(Arc::new(Nat64Lan::with_snat_ports(
-        Arc::new(ArcSwap::from_pointee(vec![route])),
+        LanRoutes::new(vec![route]),
         Nat64LanConfig::default(),
         ports,
     )))

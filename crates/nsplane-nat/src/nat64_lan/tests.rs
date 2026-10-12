@@ -8,7 +8,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use nsplane::{PacketSink, PacketSource};
 use nsplane_packet::{PacketBatch, PacketBuf, PeerId, protocol};
 use tokio::sync::watch;
@@ -45,8 +44,8 @@ fn route() -> LanRoute {
     .unwrap()
 }
 
-fn routes(routes: Vec<LanRoute>) -> Arc<ArcSwap<Vec<LanRoute>>> {
-    Arc::new(ArcSwap::from_pointee(routes))
+fn routes(routes: Vec<LanRoute>) -> LanRoutes {
+    LanRoutes::new(routes)
 }
 
 fn lan() -> Nat64Lan {
@@ -625,12 +624,12 @@ fn replies_of_unknown_flows_and_other_packets_are_not_ours() {
     assert_not_ours(&mut PacketBuf::from_packet(&fragment), |p| lan.reverse(p));
 }
 
-// -- Routes replaced through the ArcSwap. --
+// -- Routes replaced through a LanRoutes clone. --
 
 #[test]
 fn routes_are_replaced_atomically() {
     let shared = routes(Vec::new());
-    let lan = Nat64Lan::new(Arc::clone(&shared), Nat64LanConfig::default());
+    let lan = Nat64Lan::new(shared.clone(), Nat64LanConfig::default());
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
     assert_not_ours(&mut packet, |p| lan.forward(p));
 
@@ -641,12 +640,12 @@ fn routes_are_replaced_atomically() {
         Ipv4Addr::new(10, 9, 9, 9),
     )
     .unwrap();
-    shared.store(Arc::new(vec![elsewhere, route()]));
+    shared.replace(vec![elsewhere, route()]);
     assert_eq!(lan.forward(&mut packet), Nat64Verdict::Translated);
     assert_eq!(&packet.as_packet()[12..16], &SNAT.octets());
     assert_eq!(lan.stats().ambiguous_route, 0);
 
-    shared.store(Arc::new(Vec::new()));
+    shared.replace(Vec::new());
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
     assert_not_ours(&mut packet, |p| lan.forward(p));
 }
@@ -656,7 +655,7 @@ fn a_destination_several_routes_resolve_is_dropped_and_counted() {
     let mut second = route();
     second.snat_source = Ipv4Addr::new(10, 9, 9, 9);
     let shared = routes(vec![route(), second]);
-    let lan = Nat64Lan::new(Arc::clone(&shared), Nat64LanConfig::default());
+    let lan = Nat64Lan::new(shared.clone(), Nat64LanConfig::default());
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b""));
     let before = packet.as_packet().to_vec();
     assert_eq!(
@@ -670,9 +669,9 @@ fn a_destination_several_routes_resolve_is_dropped_and_counted() {
     assert_eq!(stats.conntrack.entries, 0);
 
     // A tracked flow is gated too once its destination becomes ambiguous.
-    shared.store(Arc::new(vec![route()]));
+    shared.replace(vec![route()]);
     forward_udp(&lan);
-    shared.store(Arc::new(vec![route(), second]));
+    shared.replace(vec![route(), second]);
     let mut packet = ipv6(protocol::UDP, udp(4321, 53, b"query"));
     assert_eq!(
         lan.forward(&mut packet),

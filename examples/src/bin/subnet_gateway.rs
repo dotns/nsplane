@@ -16,15 +16,16 @@
 //! the MSS of TCP SYNs both ways. The translator's counters are in the status file's
 //! `extra.nat64_lan`.
 //!
-//! APIs shown: [`LanRoute::new`], [`Nat64Lan::new`] with a [`Nat64LanConfig`],
-//! [`Nat64LanSink`] and [`Nat64LanSource`] around the TUN device's sink and source,
-//! [`Nat64Lan::stats`], and the shared TUN node assembly.
+//! APIs shown: [`LanRoute::new`], [`Nat64Lan::new`] over [`LanRoutes::new`] with a
+//! [`Nat64LanConfig`], [`Nat64LanSink`] and [`Nat64LanSource`] around the TUN device's sink
+//! and source, [`Nat64Lan::stats`], and the shared TUN node assembly.
 //!
 //! Usage: `sudo cargo run -p nsplane-examples --bin subnet_gateway -- --private-key <KEY>
 //! --address fd00:c::1/64 --peer <PUBKEY>,endpoint=192.0.2.2:51820,allowed-ips=fd00:c::2/128
 //! --route fd00:64::/96=192.168.50.0/24,snat=10.201.0.1`
 //!
 //! [`LanRoute::new`]: nsplane_nat::LanRoute::new
+//! [`LanRoutes::new`]: nsplane_nat::LanRoutes::new
 //! [`Nat64Lan`]: nsplane_nat::Nat64Lan
 //! [`Nat64Lan::new`]: nsplane_nat::Nat64Lan::new
 //! [`Nat64Lan::stats`]: nsplane_nat::Nat64Lan::stats
@@ -40,7 +41,6 @@ mod unix {
     use std::sync::Arc;
 
     use anyhow::{Context as _, anyhow, bail};
-    use arc_swap::ArcSwap;
     use clap::Parser;
     use nsplane::AllowedIp;
     use nsplane_examples::echo::{Backend, EchoArgs};
@@ -50,7 +50,9 @@ mod unix {
     };
     use nsplane_examples::out;
     use nsplane_examples::status::Status;
-    use nsplane_nat::{LanRoute, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource};
+    use nsplane_nat::{
+        LanRoute, LanRoutes, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource,
+    };
     use serde_json::{Value, json};
 
     /// A TUN node translating its peers' IPv6 to an IPv4 LAN (needs root).
@@ -164,10 +166,7 @@ mod unix {
 
         let mut config = Nat64LanConfig::default();
         config.max_tcp_mss = args.max_tcp_mss;
-        let nat = Arc::new(Nat64Lan::new(
-            Arc::new(ArcSwap::from_pointee(routes)),
-            config,
-        ));
+        let nat = Arc::new(Nat64Lan::new(LanRoutes::new(routes), config));
         let node = build_engine(
             Nat64LanSource::new(source, Arc::clone(&nat)),
             Nat64LanSink::new(sink, Arc::clone(&nat)),
