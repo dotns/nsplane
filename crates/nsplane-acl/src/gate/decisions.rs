@@ -1,15 +1,16 @@
 //! Packet evaluation and decision recording.
 
 use std::cell::OnceCell;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use nsplane_packet::PeerId;
 
+use super::addr::GateAddr;
 use super::config::UnboundAction;
-use super::packet::{PacketMeta, flow_key, packet_ipv4_endpoints, related_flow_key};
+use super::packet::{PacketMeta, flow_key, related_flow_key};
 use super::policy::{Authorization, BindingKey, CompiledScope};
 use super::snapshot::Snapshot;
 use super::state::{
@@ -78,14 +79,15 @@ pub(super) enum Step<T> {
     SweepAll,
 }
 
-/// One packet being evaluated, with what persists across attempts.
+/// One packet of the family `A` being evaluated, with what persists across
+/// attempts.
 #[derive(Debug, Clone)]
-pub(super) struct PacketInput<'a> {
+pub(super) struct PacketInput<'a, A: GateAddr> {
     pub(super) direction: PacketDirection,
     pub(super) peer: PeerId,
     pub(super) packet: &'a [u8],
     /// `None` when the packet cannot be parsed.
-    pub(super) meta: Option<PacketMeta>,
+    pub(super) meta: Option<PacketMeta<A>>,
     /// Read from the clock once the packet reaches the state.
     pub(super) now: OnceCell<Instant>,
     /// Every shard was swept for this packet; a global limit now fails closed.
@@ -130,8 +132,24 @@ impl FlowGate {
     }
 
     /// Evaluate one packet without recording counters; `now` is read from
-    /// the clock on first use unless already set.
+    /// the clock on first use unless already set. The version nibble picks
+    /// the family once; a packet of another version passes.
     pub(super) fn evaluate_with(
+        &self,
+        direction: PacketDirection,
+        peer: PeerId,
+        packet: &[u8],
+        now: OnceCell<Instant>,
+    ) -> GateDecision {
+        match packet.first().map(|byte| byte >> 4) {
+            Some(4) => self.evaluate_family::<Ipv4Addr>(direction, peer, packet, now),
+            Some(6) => self.evaluate_family::<Ipv6Addr>(direction, peer, packet, now),
+            _ => GateDecision::Pass,
+        }
+    }
+
+    /// [`evaluate_with`](Self::evaluate_with) of a packet of the family `A`.
+    fn evaluate_family<A: GateAddr>(
         &self,
         direction: PacketDirection,
         peer: PeerId,
@@ -142,7 +160,7 @@ impl FlowGate {
             direction,
             peer,
             packet,
-            meta: PacketMeta::parse(packet),
+            meta: A::parse(packet),
             now,
             swept: false,
         };
@@ -161,7 +179,7 @@ impl FlowGate {
     }
 
     /// The evaluation time of `input`, read from the clock once.
-    fn now(&self, input: &PacketInput<'_>) -> Instant {
+    fn now<A: GateAddr>(&self, input: &PacketInput<'_, A>) -> Instant {
         *input.now.get_or_init(|| (self.clock)())
     }
 
@@ -176,17 +194,22 @@ impl FlowGate {
     }
 
     /// Evaluate `input` against `snapshot`.
-    pub(super) fn evaluate_once(
+    pub(super) fn evaluate_once<A: GateAddr>(
         &self,
         snapshot: &Snapshot,
-        input: &PacketInput<'_>,
+        input: &PacketInput<'_, A>,
     ) -> Step<GateDecision> {
-        if snapshot.inert || input.packet.first().is_none_or(|byte| byte >> 4 != 4) {
+        if snapshot.inert {
             return Step::Done(GateDecision::Pass);
         }
         let (direction, peer) = (input.direction, input.peer);
         let Some(meta) = &input.meta else {
-            return Step::Done(malformed_decision(snapshot, direction, peer, input.packet));
+            return Step::Done(malformed_decision::<A>(
+                snapshot,
+                direction,
+                peer,
+                input.packet,
+            ));
         };
         let (remote, local) = meta.endpoints(direction);
         if snapshot.held(direction, peer, local, remote) {
@@ -229,7 +252,7 @@ impl FlowGate {
             PacketDirection::Inbound => local,
             PacketDirection::Outbound => remote,
         };
-        let labels = &scope.bindings[&binding];
+        let labels = &A::scope(scope).bindings[&binding];
         let rule = match scope.authorize(direction, labels, destination, transport) {
             Authorization::Granted(rule) => rule,
             Authorization::Suspended(rule) => {
@@ -251,7 +274,7 @@ impl FlowGate {
                 rule: rule.clone(),
                 enforced: scope.enforce,
                 close: TcpClose::default(),
-                expires_at: now + protocol_timeout(meta.protocol, &counts.timeouts),
+                expires_at: now + protocol_timeout::<A>(meta.protocol, &counts.timeouts),
             },
             meta.more_fragments
                 .then(|| meta.fragment_key(scope.slot, direction, peer)),
@@ -270,12 +293,12 @@ impl FlowGate {
 
     /// The verdict for a later fragment or an ICMP error of a bound packet,
     /// which only ever match existing state.
-    fn fragment_or_icmp_error(
+    fn fragment_or_icmp_error<A: GateAddr>(
         &self,
         snapshot: &Snapshot,
         scope: &CompiledScope,
-        input: &PacketInput<'_>,
-        meta: &PacketMeta,
+        input: &PacketInput<'_, A>,
+        meta: &PacketMeta<A>,
     ) -> Option<Step<GateDecision>> {
         let (direction, peer) = (input.direction, input.peer);
         let counts = &self.state.counts;
@@ -285,7 +308,10 @@ impl FlowGate {
                 return Some(Step::Retry);
             };
             return Some(Step::Done(
-                match shard.fragment_disposition(&fragment_key, self.now(input), counts) {
+                match shard
+                    .family()
+                    .fragment_disposition(&fragment_key, self.now(input), counts)
+                {
                     Some(FragmentDisposition::Allow) => valid_state(scope),
                     // A pass disposition belongs to an unbound packet; a
                     // bound later fragment colliding with it fails closed.
@@ -297,7 +323,8 @@ impl FlowGate {
         }
 
         if meta.is_icmp_error() {
-            let Some(related_key) = related_flow_key(scope.slot, direction, peer, input.packet)
+            let Some(related_key) =
+                related_flow_key::<A>(scope.slot, direction, peer, input.packet)
             else {
                 return Some(Step::Done(deny(scope, GateReason::Malformed)));
             };
@@ -305,7 +332,10 @@ impl FlowGate {
                 return Some(Step::Retry);
             };
             return Some(Step::Done(
-                if shard.touch_flow(&related_key, self.now(input), counts) {
+                if shard
+                    .family()
+                    .touch_flow(&related_key, self.now(input), counts)
+                {
                     valid_state(scope)
                 } else {
                     deny(scope, GateReason::ReverseNewFlow)
@@ -316,30 +346,32 @@ impl FlowGate {
     }
 
     /// The verdict for a packet of an existing live flow, if there is one.
-    fn established(
+    fn established<A: GateAddr>(
         &self,
         shard: &mut Shard,
         scope: &CompiledScope,
-        flow_key: &FlowKey,
-        input: &PacketInput<'_>,
-        meta: &PacketMeta,
+        flow_key: &FlowKey<A>,
+        input: &PacketInput<'_, A>,
+        meta: &PacketMeta<A>,
     ) -> Option<Step<GateDecision>> {
         let counts = &self.state.counts;
         let now = self.now(input);
-        let touched = shard.with_live_flow(flow_key, now, counts, |existing| {
-            // Flow keys are direction-independent so return traffic finds
-            // the initiator's state. A bare SYN in the opposite direction is
-            // nevertheless a new connection, not a return packet. Terminal
-            // state also cannot be recycled into another connection until
-            // its short FIN/RST tail expires.
-            if meta.tcp_initial_syn()
-                && (existing.close.closing() || input.direction != existing.initiator)
-            {
-                return false;
-            }
-            existing.touch(flow_key.protocol, now, &counts.timeouts);
-            true
-        });
+        let touched = shard
+            .family()
+            .with_live_flow(flow_key, now, counts, |existing| {
+                // Flow keys are direction-independent so return traffic finds
+                // the initiator's state. A bare SYN in the opposite direction is
+                // nevertheless a new connection, not a return packet. Terminal
+                // state also cannot be recycled into another connection until
+                // its short FIN/RST tail expires.
+                if meta.tcp_initial_syn()
+                    && (existing.close.closing() || input.direction != existing.initiator)
+                {
+                    return false;
+                }
+                existing.touch::<A>(flow_key.protocol, now, &counts.timeouts);
+                true
+            });
         match touched {
             Lookup::Missing => return None,
             Lookup::Found(false) => {
@@ -364,7 +396,7 @@ impl FlowGate {
             }
         }
         if meta.tcp_terminal()
-            && let Some(flow) = shard.flows.get_mut(flow_key)
+            && let Some(flow) = shard.family().flows.get_mut(flow_key)
         {
             // Keep the short terminal tail so FIN/ACK or RST acknowledgement
             // packets remain valid, then reclaim deterministically.
@@ -373,13 +405,13 @@ impl FlowGate {
         Some(Step::Done(valid_state(scope)))
     }
 
-    fn unbound_decision(
+    fn unbound_decision<A: GateAddr>(
         &self,
         snapshot: &Snapshot,
-        input: &PacketInput<'_>,
-        meta: &PacketMeta,
-        local: Ipv4Addr,
-        remote: Ipv4Addr,
+        input: &PacketInput<'_, A>,
+        meta: &PacketMeta<A>,
+        local: A,
+        remote: A,
     ) -> Step<GateDecision> {
         let applicable = match input.direction {
             PacketDirection::Inbound => Applicable::of(snapshot.with_local(local)),
@@ -399,12 +431,12 @@ impl FlowGate {
 
     /// The unbound rules of `scope`, the one enforcing scope governing an
     /// unbound inbound packet's local address.
-    fn unbound_rules(
+    fn unbound_rules<A: GateAddr>(
         &self,
         snapshot: &Snapshot,
         scope: &CompiledScope,
-        input: &PacketInput<'_>,
-        meta: &PacketMeta,
+        input: &PacketInput<'_, A>,
+        meta: &PacketMeta<A>,
     ) -> Option<Step<GateDecision>> {
         let peer = input.peer;
         let counts = &self.state.counts;
@@ -419,7 +451,10 @@ impl FlowGate {
                 return Some(Step::Retry);
             };
             return Some(Step::Done(
-                match shard.fragment_disposition(&fragment, self.now(input), counts) {
+                match shard
+                    .family()
+                    .fragment_disposition(&fragment, self.now(input), counts)
+                {
                     Some(FragmentDisposition::Pass) => GateDecision::Pass,
                     Some(FragmentDisposition::Allow) | None => {
                         deny(scope, GateReason::OrphanFragment)
@@ -455,13 +490,13 @@ impl FlowGate {
     }
 }
 
-fn malformed_decision(
+fn malformed_decision<A: GateAddr>(
     snapshot: &Snapshot,
     direction: PacketDirection,
     peer: PeerId,
     packet: &[u8],
 ) -> GateDecision {
-    let Some((source, destination)) = packet_ipv4_endpoints(packet) else {
+    let Some((source, destination)) = A::endpoints(packet) else {
         return GateDecision::Pass;
     };
     let (remote, local) = match direction {
