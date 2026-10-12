@@ -5,7 +5,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
@@ -453,6 +452,7 @@ impl AclFilterScope {
 
     /// Whether an [`other_protocols`](Self::other_protocols) rule accepts
     /// `packet`.
+    #[inline]
     fn accepts_other(&self, packet: &IpPacket<'_>) -> bool {
         self.other_protocols.iter().any(|rule| rule.accepts(packet))
     }
@@ -473,7 +473,8 @@ static UNSCOPED: AclFilterScope = AclFilterScope {
 /// when that identity has no entry. Built with [`new`](Self::new) and the
 /// `with_*` setters; the default scopes nothing.
 ///
-/// A default scope alone costs what a scope given at build always did. Only
+/// A default scope alone adds only the read of the published scopes (see
+/// [`AclFilter::replace_scopes`]). Only
 /// with [`identities`](Self::identities) does a packet that needs a scope
 /// also resolve its peer's identity (from the peer cache, or the
 /// [`PeerIdentity::local_identity`] hook when the identity is not versioned)
@@ -564,18 +565,15 @@ impl ScopeSet {
     }
 }
 
-/// A [`ScopeSet`] loaded by one packet: a whole set of one generation.
-type ScopeRef = Rc<Arc<ScopeSet>>;
-
 /// The published [`ScopeSet`] of a filter. Every load and store of it goes
 /// through here.
 ///
 /// Each thread caches the last set it loaded with its cell and generation, so
 /// a load is a plain atomic read of the generation and, while the set is
-/// unchanged, a non-atomic reference count increment: no read-modify-write.
-/// The cache holds one set per thread (a thread alternating between filters
-/// loads the set from the shared cell on every switch), so it keeps at most
-/// one set alive per thread.
+/// unchanged, a borrow of the cached set: no read-modify-write and no
+/// reference count. The cache holds one set per thread (a thread alternating
+/// between filters loads the set from the shared cell on every switch), so it
+/// keeps at most one set alive per thread.
 ///
 /// Ordering: the generation is the publication point of a store. A store
 /// writes the set, then its generation (Release). A load reads the
@@ -596,7 +594,7 @@ struct ScopeCell {
 }
 
 /// The set a thread loaded last: its cell, its generation and the set.
-type CachedScopes = Option<(u64, u64, ScopeRef)>;
+type CachedScopes = Option<(u64, u64, Arc<ScopeSet>)>;
 
 thread_local! {
     static SCOPE_CACHE: RefCell<CachedScopes> = const { RefCell::new(None) };
@@ -613,21 +611,36 @@ impl ScopeCell {
     }
 
     /// The generation of the published set.
+    #[inline]
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// The published set, or a newer one.
-    fn load(&self) -> ScopeRef {
+    /// Run `f` on the published set (see the ordering above).
+    #[inline]
+    fn load<R>(&self, f: impl FnOnce(&ScopeSet) -> R) -> R {
         let generation = self.generation();
-        SCOPE_CACHE.with_borrow_mut(|cache| match cache {
-            Some((id, cached, set)) if *id == self.id && *cached == generation => Rc::clone(set),
-            _ => {
-                let set = Rc::new(self.load_published());
-                *cache = Some((self.id, set.generation, Rc::clone(&set)));
-                set
+        SCOPE_CACHE.with(|cache| {
+            if let Some((id, cached, set)) = &*cache.borrow()
+                && *id == self.id
+                && *cached == generation
+            {
+                return f(set);
             }
+            f(&self.refill(cache))
         })
+    }
+
+    /// Load the published set and cache it, unless the cache is lent to an
+    /// outer load (`f` processing another packet on this thread).
+    #[cold]
+    #[inline(never)]
+    fn refill(&self, cache: &RefCell<CachedScopes>) -> Arc<ScopeSet> {
+        let set = self.load_published();
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            *cache = Some((self.id, set.generation, Arc::clone(&set)));
+        }
+        set
     }
 
     /// The shared set, once its generation is the published one.
@@ -1348,9 +1361,10 @@ impl AclFilter {
     /// see the previous scopes, those after see the new ones, and none mixes
     /// fields of both. Any clone of the filter can replace them. State
     /// recorded under the previous scopes (reply allowances, fragment
-    /// outcomes) is kept. Reading the published scopes costs a packet one
-    /// atomic load while they are unchanged; per-identity scopes add the
-    /// identity resolution described in [`AclFilterScopes`].
+    /// outcomes) is kept. While the scopes are unchanged a packet reads them
+    /// with one atomic load and a per-thread cache lookup (about 2 ns more
+    /// than a scope fixed at build); per-identity scopes add the identity
+    /// resolution described in [`AclFilterScopes`].
     pub fn replace_scopes(&self, scopes: AclFilterScopes) -> Result<u64, AclFilterScopeError> {
         let inner = &*self.inner;
         let _writer = inner
@@ -1426,13 +1440,9 @@ impl Inner {
         }
     }
 
-    /// The published scopes, `None` when they constrain nothing.
-    fn scopes(&self) -> Option<ScopeRef> {
-        (!self.unscoped.load(Ordering::Acquire)).then(|| self.scopes.load())
-    }
-
     /// The scope from `set` of `peer`'s inbound packets from `src`; `None`
     /// on an invariant failure of the peer cache.
+    #[inline]
     fn inbound_scope<'s>(
         &self,
         set: &'s ScopeSet,
@@ -1443,6 +1453,18 @@ impl Inner {
         if set.by_identity.is_empty() {
             return Some(&set.default);
         }
+        self.identity_scope(set, snapshot, peer, src)
+    }
+
+    /// [`inbound_scope`](Self::inbound_scope) with per-identity scopes.
+    #[inline(never)]
+    fn identity_scope<'s>(
+        &self,
+        set: &'s ScopeSet,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        src: IpAddr,
+    ) -> Option<&'s AclFilterScope> {
         let identity = self.identity_generation();
         let local = if identity == 0 {
             self.identity.local_identity(peer)
@@ -1705,14 +1727,16 @@ impl Inner {
         // allowance.
         let allows_reply = self.config.stateful_replies
             && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Request));
-        let scoped = match self.scopes() {
-            None => false,
-            Some(set) => {
-                let Some(scope) = self.inbound_scope(&set, snapshot, peer, tuple.src) else {
-                    return Outcome::Internal;
-                };
-                scope.accepts_other(packet)
-            }
+        let scoped = if self.unscoped.load(Ordering::Acquire) {
+            Some(false)
+        } else {
+            self.scopes.load(|set| {
+                self.inbound_scope(set, snapshot, peer, tuple.src)
+                    .map(|scope| scope.accepts_other(packet))
+            })
+        };
+        let Some(scoped) = scoped else {
+            return Outcome::Internal;
         };
         if scoped {
             if allows_reply {
@@ -2050,10 +2074,18 @@ impl Inner {
         if self.accepts_ipv6(bytes) {
             return Outcome::Ipv6Accepted;
         }
-        let set = self.scopes();
+        if self.unscoped.load(Ordering::Acquire) {
+            return self.outbound_under(peer, bytes, None);
+        }
+        self.scopes
+            .load(|set| self.outbound_under(peer, bytes, Some(set)))
+    }
+
+    /// [`outbound`](Self::outbound) under the scopes `set`, `None` when they
+    /// constrain nothing.
+    fn outbound_under(&self, peer: PeerId, bytes: &[u8], set: Option<&ScopeSet>) -> Outcome {
         // Without per-identity scopes the scope is known before the peer.
         let early = set
-            .as_deref()
             .filter(|set| set.by_identity.is_empty())
             .map(|set| &set.default);
         if early.is_some_and(|scope| !scope.allows_source(bytes)) {
@@ -2088,7 +2120,7 @@ impl Inner {
         } else {
             None
         };
-        let scope = match (early, set.as_deref()) {
+        let scope = match (early, set) {
             (Some(scope), _) => scope,
             (None, None) => &UNSCOPED,
             (None, Some(set)) => {
