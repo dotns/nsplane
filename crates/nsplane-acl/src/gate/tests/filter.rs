@@ -540,3 +540,58 @@ fn clones_share_state() {
     assert!(Arc::ptr_eq(f.gate(), clone.gate()));
     assert!(format!("{f:?}").contains("GateFilter"));
 }
+
+#[test]
+fn ipv6_is_gated_like_ipv4() {
+    use crate::test_packets::{ip, tcp as tcp_header, udp_packet};
+
+    let local: IpAddr = "fd00::1".parse().unwrap();
+    let remote: IpAddr = "fd00::2".parse().unwrap();
+    let unbound: IpAddr = "fd7f::1".parse().unwrap();
+    let mut web = web_grant();
+    web.destinations.push("fd00::1/128".parse().unwrap());
+    let mut scope = scope(GateMode::Enforce, vec![web, out_grant()]);
+    scope.local.push(local);
+    scope.bindings[0].addresses.push(remote);
+    let gate = FlowGate::new(GateConfig::default());
+    gate.replace(GatePolicy {
+        scopes: vec![scope],
+        holds: GateHolds::default(),
+    })
+    .unwrap();
+    let queue = Queue::new(8);
+    let f = GateFilter::new(gate)
+        .with_acl(deny_acl())
+        .with_divert(queue.clone());
+
+    let syn = |dst_port| {
+        ip(remote, local, 6, &tcp_header(40_000, dst_port, b""))
+            .as_packet()
+            .to_vec()
+    };
+    assert_eq!(inbound(&f, PEER, &syn(443)), Verdict::Accept);
+    let mut syn_ack = ip(local, remote, 6, &tcp_header(443, 40_000, b""))
+        .as_packet()
+        .to_vec();
+    // The TCP flags, after the 40-byte IPv6 header.
+    syn_ack[53] = 0x12;
+    assert_eq!(
+        outbound(&f, PEER, &syn_ack),
+        Verdict::Accept,
+        "the reply of the admitted flow"
+    );
+    assert_eq!(inbound(&f, PEER, &syn(22)), dropped("flow gate: no grant"));
+    let reply = udp_packet(unbound, 19_999, local, 49_152);
+    assert_eq!(inbound(&f, CARRIER, reply.as_packet()), Verdict::Handled);
+    assert_eq!(queue.taken()[0].1.packet(), reply.as_packet());
+    let stats = f.stats();
+    assert_eq!(
+        (
+            stats.gate_accepted,
+            stats.gate_denied,
+            stats.diverted,
+            stats.passed_to_acl
+        ),
+        (2, 1, 1, 0)
+    );
+}

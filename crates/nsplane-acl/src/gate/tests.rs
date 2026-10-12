@@ -3,7 +3,7 @@
 //! model test against a reference implementation.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::time::Duration;
 
 use super::*;
@@ -249,10 +249,228 @@ fn audit(gate: &FlowGate) -> (usize, usize) {
     (flows, fragments)
 }
 
+// ── IPv6 ──────────────────────────────────────────────────────────────────────
+
+const LOCAL6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+const REMOTE6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+
+fn host6(ip: Ipv6Addr) -> IpNet {
+    format!("{ip}/128").parse().unwrap()
+}
+
+fn binding6(peer: PeerId, ip: Ipv6Addr, with: &[&str]) -> GateBinding {
+    GateBinding {
+        peer,
+        addresses: vec![IpAddr::V6(ip)],
+        labels: labels(with),
+    }
+}
+
+/// [`scope`] over IPv6: governing [`LOCAL6`], binding [`PEER`] at
+/// [`REMOTE6`] with the label `remote`.
+fn scope6(id: &str, mode: GateMode, grants: Vec<GateGrant>) -> GateScope {
+    GateScope {
+        local: vec![IpAddr::V6(LOCAL6)],
+        bindings: vec![binding6(PEER, REMOTE6, &["remote"])],
+        ..scope(id, mode, grants)
+    }
+}
+
+/// [`open_scope`] over IPv6: `remote` may open every protocol to
+/// [`LOCAL6`] inbound and to [`REMOTE6`] outbound.
+fn open_scope6(mode: GateMode) -> GateScope {
+    scope6(
+        "scope-1",
+        mode,
+        vec![
+            grant(
+                "in",
+                Direction::Inbound,
+                &["remote"],
+                vec![host6(LOCAL6)],
+                vec![ProtocolMatch::Any],
+            ),
+            grant(
+                "out",
+                Direction::Outbound,
+                &["remote"],
+                vec![host6(REMOTE6)],
+                vec![ProtocolMatch::Any],
+            ),
+        ],
+    )
+}
+
+/// An IPv6 extension header of `kind` and its bytes; the first byte (the
+/// next header) is filled in by [`ipv6_with`].
+type Extension = (u8, Vec<u8>);
+
+/// A Hop-by-Hop (0), Routing (43) or Destination Options (60) header of
+/// `units` 8-byte units.
+fn options(kind: u8, units: u8) -> Extension {
+    let mut header = vec![0_u8; usize::from(units) * 8];
+    header[1] = units - 1;
+    (kind, header)
+}
+
+/// An Authentication Header of 16 bytes (its length counts 4-byte units).
+fn ah() -> Extension {
+    let mut header = vec![0_u8; 16];
+    header[1] = 2;
+    (51, header)
+}
+
+/// A Fragment header: identification, offset in 8-byte units and the
+/// more-fragments flag.
+fn fragment6(id: u32, offset: u16, more: bool) -> Extension {
+    let mut header = vec![0_u8; 8];
+    header[2..4].copy_from_slice(&((offset << 3) | u16::from(more)).to_be_bytes());
+    header[4..8].copy_from_slice(&id.to_be_bytes());
+    (44, header)
+}
+
+/// An IPv6 packet whose `extensions` precede the upper layer `protocol`
+/// carrying `payload`.
+fn ipv6_with(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    extensions: &[Extension],
+    protocol: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let kinds: Vec<u8> = extensions
+        .iter()
+        .map(|(kind, _)| *kind)
+        .chain([protocol])
+        .collect();
+    let mut packet = vec![0_u8; 40];
+    packet[0] = 0x60;
+    packet[6] = kinds[0];
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+    for (index, (_, header)) in extensions.iter().enumerate() {
+        let start = packet.len();
+        packet.extend_from_slice(header);
+        packet[start] = kinds[index + 1];
+    }
+    packet.extend_from_slice(payload);
+    let length = u16::try_from(packet.len() - 40).unwrap();
+    packet[4..6].copy_from_slice(&length.to_be_bytes());
+    packet
+}
+
+fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    ipv6_with(src, dst, &[], protocol, payload)
+}
+
+fn tcp_header(src_port: u16, dst_port: u16, flags: u8) -> [u8; 20] {
+    let mut header = [0_u8; 20];
+    header[0..2].copy_from_slice(&src_port.to_be_bytes());
+    header[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    header[12] = 0x50;
+    header[13] = flags;
+    header
+}
+
+fn udp_header(src_port: u16, dst_port: u16) -> [u8; 8] {
+    let mut header = [0_u8; 8];
+    header[0..2].copy_from_slice(&src_port.to_be_bytes());
+    header[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    header[4..6].copy_from_slice(&8_u16.to_be_bytes());
+    header
+}
+
+fn icmp_header(icmp_type: u8, identifier: u16) -> [u8; 8] {
+    let mut header = [0_u8; 8];
+    header[0] = icmp_type;
+    header[4..6].copy_from_slice(&identifier.to_be_bytes());
+    header
+}
+
+fn tcp6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16, flags: u8) -> Vec<u8> {
+    ipv6(src, dst, 6, &tcp_header(src_port, dst_port, flags))
+}
+
+fn udp6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    ipv6(src, dst, 17, &udp_header(src_port, dst_port))
+}
+
+fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, icmp_type: u8, identifier: u16) -> Vec<u8> {
+    ipv6(src, dst, 58, &icmp_header(icmp_type, identifier))
+}
+
+/// An `ICMPv6` error of `icmp_type` from `src` to `dst` quoting `quoted`.
+fn icmp6_error(src: Ipv6Addr, dst: Ipv6Addr, icmp_type: u8, quoted: &[u8]) -> Vec<u8> {
+    let mut payload = vec![icmp_type, 0, 0, 0, 0, 0, 0, 0];
+    payload.extend_from_slice(quoted);
+    ipv6(src, dst, 58, &payload)
+}
+
+/// A first UDP fragment (offset 0, more fragments) with the id `id`.
+fn first_fragment6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16, id: u32) -> Vec<u8> {
+    ipv6_with(
+        src,
+        dst,
+        &[fragment6(id, 0, true)],
+        17,
+        &udp_header(src_port, dst_port),
+    )
+}
+
+fn later_fragment6(src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, id: u32) -> Vec<u8> {
+    ipv6_with(src, dst, &[fragment6(id, 1, false)], protocol, &[0; 8])
+}
+
+/// [`audit`] over both address families: every shard's per-peer counts
+/// cover the flows of both; returns the flow and fragment entry counts of
+/// both.
+fn audit_families(gate: &FlowGate) -> (usize, usize) {
+    let shards = gate.state.lock_all();
+    let counts = &gate.state.counts;
+    let (mut flows, mut fragments) = (0, 0);
+    for (index, shard) in shards.iter().enumerate() {
+        let mut per_peer = HashMap::<PeerId, usize>::new();
+        let peers = shard
+            .flows
+            .keys()
+            .map(|key| key.peer)
+            .chain(shard.flows6.keys().map(|key| key.peer));
+        for peer in peers {
+            assert_eq!(state::shard_index(peer), index);
+            *per_peer.entry(peer).or_default() += 1;
+        }
+        let fragment_peers = shard
+            .fragments
+            .keys()
+            .map(|key| key.peer)
+            .chain(shard.fragments6.keys().map(|key| key.peer));
+        for peer in fragment_peers {
+            assert_eq!(state::shard_index(peer), index);
+        }
+        assert_eq!(
+            per_peer,
+            shard.peer_flows.clone().into_iter().collect(),
+            "per-peer counts of shard {index}"
+        );
+        assert!(per_peer.values().all(|count| *count <= counts.peer_limit));
+        flows += shard.flows.len() + shard.flows6.len();
+        fragments += shard.fragments.len() + shard.fragments6.len();
+    }
+    assert_eq!(flows, counts.flows.load(Ordering::SeqCst));
+    assert_eq!(fragments, counts.fragments.load(Ordering::SeqCst));
+    assert!(flows <= counts.global_limit);
+    assert!(fragments <= counts.fragment_limit);
+    (flows, fragments)
+}
+
 mod concurrency;
 mod grant_kinds;
 mod grants_flow;
 mod holds_and_unbound;
+mod ipv6_flows;
+mod ipv6_packets;
 mod model;
 mod packets_fragments;
+mod peer_keyed;
 mod state_table;

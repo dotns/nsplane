@@ -1,8 +1,10 @@
 //! State migration across [`FlowGate::replace`](super::FlowGate::replace).
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::MutexGuard;
 
 use super::PacketDirection;
+use super::addr::GateAddr;
 use super::hash::FastMap;
 use super::policy::{Authorization, BindingKey, CompiledScope, Slot};
 use super::snapshot::Snapshot;
@@ -19,7 +21,8 @@ enum Plan<'a> {
 
 /// Migrate every shard from `previous` to `next`. The caller holds every
 /// shard; slots of scopes absent from `next` (removed or `Off`) lose all
-/// their state.
+/// their state. When `next` has a peer-keyed binding, a flow is also kept
+/// only while its scope is the one [`Snapshot::select`] picks for it.
 pub(super) fn migrate(
     shards: &mut [MutexGuard<'_, Shard>],
     previous: &Snapshot,
@@ -44,28 +47,60 @@ pub(super) fn migrate(
             plans.insert(scope.slot, Plan::Revalidate(successor));
         }
     }
-    if all_kept {
+    // With every scope kept and none added, every lookup selects as before.
+    let select = next.has_peer_keyed().then_some(next);
+    if all_kept && (select.is_none() || next.scopes.len() == previous.scopes.len()) {
         return;
     }
     for shard in shards.iter_mut() {
-        shard.retain_flows(counts, |key, state| match plans.get(&key.slot) {
-            Some(Plan::Keep) => true,
-            Some(Plan::Revalidate(scope)) => reauthorize(scope, key, state),
-            None => false,
-        });
-        shard.retain_fragments(counts, |key, _| {
-            matches!(plans.get(&key.slot), Some(Plan::Keep))
-        });
+        migrate_family::<Ipv4Addr>(shard, &plans, select, counts);
+        migrate_family::<Ipv6Addr>(shard, &plans, select, counts);
     }
+}
+
+/// Migrate the state of the family `A` of one shard by `plans`; with
+/// `select`, a flow whose scope that snapshot no longer selects is dropped.
+fn migrate_family<A: GateAddr>(
+    shard: &mut Shard,
+    plans: &FastMap<Slot, Plan<'_>>,
+    select: Option<&Snapshot>,
+    counts: &Counts,
+) {
+    let selected = |key: &FlowKey<A>| {
+        select.is_none_or(|snapshot| {
+            snapshot
+                .select(
+                    &BindingKey {
+                        peer: key.peer,
+                        ip: key.remote_ip,
+                    },
+                    key.local_ip,
+                )
+                .is_some_and(|scope| scope.slot == key.slot)
+        })
+    };
+    let mut family = shard.family::<A>();
+    family.retain_flows(counts, |key, state| match plans.get(&key.slot) {
+        Some(Plan::Keep) => selected(key),
+        Some(Plan::Revalidate(scope)) => selected(key) && reauthorize(scope, key, state),
+        None => false,
+    });
+    family.retain_fragments(counts, |key, _| {
+        matches!(plans.get(&key.slot), Some(Plan::Keep))
+    });
 }
 
 /// Re-authorize a flow of a changed scope as a new flow by its initiator,
 /// updating its grant and mode; `false` drops it.
-fn reauthorize(scope: &CompiledScope, key: &FlowKey, state: &mut FlowState) -> bool {
+fn reauthorize<A: GateAddr>(
+    scope: &CompiledScope,
+    key: &FlowKey<A>,
+    state: &mut FlowState,
+) -> bool {
     if !scope.governs(key.local_ip) {
         return false;
     }
-    let Some(labels) = scope.bindings.get(&BindingKey {
+    let Some(labels) = scope.labels(&BindingKey {
         peer: key.peer,
         ip: key.remote_ip,
     }) else {
