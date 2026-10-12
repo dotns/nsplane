@@ -166,3 +166,8 @@ nsplane -> kernel WireGuard at par.
 
 Feature freeze at 0.11.x (ADR `2026-10-08-feature-freeze-0-11`, owner): only bug fixes until
 ns and nsgw are integrated.
+
+## 2026-10-12 [release]
+
+Release 0.12.0 (tag `v0.12.0`): local identities, the one feature the owner exempted from the
+0.11 freeze. The freeze applies again: bug fixes only.

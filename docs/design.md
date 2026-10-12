@@ -241,6 +241,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | ns requests 2 | graph primitives, recycling, Windows TUN, netstack PMTU and tail loss probe, deliver room without workers | done (plan `20261006-0900-ns-requests-2`) |
 | Business-agnostic | generic ACL core and flow gate, EAM names, WSS server transport, product-term scan; product concepts moved to `docs/specs/` | done (plan `20261007-0900-business-agnostic`) |
 | Release 0.11.0 | breaking: business-agnostic API (tag `v0.11.0`) | 2026-10-08 |
+| Local identities | several static keys per engine, mac1 dispatch, transport-restricted identities | done (plan `20261011-0900-local-identities`) |
+| Release 0.12.0 | local identities (tag `v0.12.0`) | 2026-10-12 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

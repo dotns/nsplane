@@ -5,6 +5,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-12
+
+Local identities (plan `20261011-0900-local-identities`). One engine holds several static keys,
+and every peer is bound to one of them; one remote key may be a peer under two identities.
+- Initiations are dispatched by `mac1`, and identities share one engine-wide handshake budget,
+  while each identity keeps its own cookie secret.
+- An identity can be restricted to a set of transports. Handshakes and data for it on any other
+  transport are then dropped silently, which defeats a cross-overlay probe.
+- The default identity is today's key: existing callers, UAPI and the CLI are unchanged.
+- With one identity the wire is byte-identical to 0.11, and data_path and handshake cost are
+  within noise. Initiation costs 129 / 130 / 132 us with 1 / 4 / 16 identities.
+- `PeerConfig`, `PeerStats` and `ConfigChange` gain a field or variant each. Full struct literals
+  and exhaustive matches need updating.
+
+Apart from this feature nsplane stays frozen (ADR `2026-10-08-feature-freeze-0-11`).
+
 ### Added
 - Local identities: one engine holds several static keys, and every peer is bound to one of
   them (plan `20261011-0900-local-identities`). An engine with only the default identity
