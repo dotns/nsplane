@@ -40,17 +40,30 @@ behaves and costs as before. This is the second exception to the feature freeze 
   outbound IPv6 to an enforced peer denied while its inbound flows arrive, one binding governing
   both families) and `acl_scope_runtime` (per-identity scopes on a second local identity, the
   default fallback, replaces under traffic).
+- `nsplane-core`: `cell::SnapshotCell` (`new`, `load`, `load_full`, `store`) and its `Snapshot`
+  guard, a std-only sharded cell readers load and a writer replaces; `benches/cell.rs`.
+- `nsplane-nat`: `LanRoutes` (`new`, `replace`, `load`), the shared handle of a `Nat64Lan`'s
+  routes.
 
 ### Changed
 - `nsplane-acl`: `FlowGate::find_flow` finds IPv6 flows; it returns `None` for a mixed-family
   pair. Before, every IPv6 lookup returned `None`.
 - `nsplane-acl`: IPv6 packets are evaluated by the gate where a scope governs them. A policy
   with IPv4 entries only governs no IPv6 address, so its IPv6 packets still pass.
+- `nsplane-nat`: `Nat64Lan::new` and `Nat64Lan::with_snat_ports` take a `LanRoutes` handle
+  instead of `Arc<ArcSwap<Vec<LanRoute>>>` (breaking, 0.13.0). Migration: build the routes with
+  `LanRoutes::new(routes)`, keep a clone, and replace them with `LanRoutes::replace`.
 
 ### Removed
 - `nsplane-acl`: `GatePolicyError::Ipv6` (breaking, 0.13.0). `replace` no longer rejects IPv6
   entries, so nothing returned it. Migration: delete match arms on it; a policy that relied on
   the rejection should leave its IPv6 entries out.
+
+### Fixed
+- nsplane no longer depends on `arc-swap`, whose 1.9.x hybrid strategy can return another
+  instance's value under load (wrong-instance reads, lost updates, an invalid free). The ACL
+  engine, the filter scopes, the gate, the translator and the NAT64 LAN routes use a std-only
+  sharded snapshot cell (`nsplane_core::cell::SnapshotCell`) instead.
 
 ## [0.12.0] - 2026-10-12
 

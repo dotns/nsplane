@@ -52,7 +52,7 @@ where it is described below.
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 | `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow` (either family), `counters`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters`, `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`; `Ipv6` removed in 0.13.0) |
-| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_peer6_eam4`) / `TranslationTable` (`peer6_eam4`, `by_peer6_eam4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
+| `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_peer6_eam4`) / `TranslationTable` (`peer6_eam4`, `by_peer6_eam4`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `LanRoutes`, `Nat64LanConfig`, `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `with_endpoint_tries`, `endpoint_in_use`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
 | `nsplane-nat` (local side) | `Masquerade` (`new`, `with_clock`, `forward`, `reverse`, `len`, `is_empty`, `stats`, `config`) | `MasqueradeDecision`, `MasqueradeConfig` (`recheck_route_on_forward`), `MasqueradeVerdict`, `MasqueradeStats`, `masquerade::reasons` |
 | `nsplane-uapi` | `Uapi` (`new`, `with_external_transport`, `with_listen_port`, `handle_request`, `serve_stream`), `UapiListener` (Unix socket; named pipe on Windows) | `udp_transport`, `TRANSPORT_ID`, `socket_path` / `pipe_path` |
@@ -1783,9 +1783,12 @@ Product mappings onto this API are in `docs/specs/acl-source-identity.md`,
 `docs/specs/acl-policy-document.md` and `docs/specs/node-l3.md`.
 
 `AclEngine` holds its whole state (the default `RuleSet` and its policy state, the rule
-namespaces, the directed grants and the open pinholes) as one immutable snapshot behind an
-`ArcSwap`: writers serialize on a mutex and publish a new snapshot, and evaluation takes one
-lock-free load per packet. `install` swaps a `RuleSet` that `RuleSet::new` validated in
+namespaces, the directed grants and the open pinholes) as one immutable snapshot in a
+`nsplane_core::cell::SnapshotCell`: writers serialize on a mutex and publish a new snapshot, and
+evaluation takes one load per packet. The cell, std-only, also holds the filter scopes, the gate
+policy, the translation table and the NAT64 LAN routes: 16 cache-line-padded `RwLock` shards,
+each with its own `Arc`, where a load read-locks its thread's shard only to clone that `Arc` (no
+lock is held after it returns) and a writer locks every shard to replace them. `install` swaps a `RuleSet` that `RuleSet::new` validated in
 atomically, and a rejected update (`RuleSet::new`, `store_namespace` or `store_grant`
 returning an error) leaves the previous state in effect. With nothing loaded every flow is
 denied; `clear_all` removes everything in one swap. nsplane takes typed rules only: parsing
@@ -2061,8 +2064,8 @@ replaced the former node L3 gate; IPv6 and peer-keyed bindings came with plan
   either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
   mixed-family pair.
 
-**Migration and locking.** Packet paths take one lock-free load of an immutable snapshot
-(behind an `ArcSwap`) with the compiled scopes and their indexes (`(PeerId, address)` to
+**Migration and locking.** Packet paths take one load of an immutable snapshot
+(in a `SnapshotCell`) with the compiled scopes and their indexes (`(PeerId, address)` to
 scopes, local and binding addresses to scopes) and the holds, and then lock only the state
 shard of their peer: 64 shards by `PeerId`, each tagged with the generation it was migrated
 to. Flow keys carry a scope slot that stays stable while the scope id stays in the policy.
@@ -2195,8 +2198,10 @@ range drops the packet rather than aliasing a flow. Replies and Fragmentation Ne
 Packet Too Big) are translated back; TCP MSS can be clamped. Translated packets
 leave DF clear by default (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
 fragmentation for a PMTU black hole when the LAN filters ICMP), and a destination that more
-than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`). The routes gate
-every forward packet; a flow keeps its SNAT address across a route replacement, and the
+than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`). The routes are a
+`LanRoutes` handle passed to `Nat64Lan::new` / `with_snat_ports`: its clones share one
+`SnapshotCell`, and `LanRoutes::replace` on the caller's clone applies to the next packet. The
+routes gate every forward packet; a flow keeps its SNAT address across a route replacement, and the
 caller revokes the flows of a removed route with `remove_flow`. Unlike the filters above it sits
 on the **local side**: the LAN's replies are addressed to `snat_source`, which no peer's
 allowed IPs contain, so the core could not route them to a peer before a filter ran.
