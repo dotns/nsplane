@@ -87,7 +87,7 @@ pub struct GateScope {
     pub id: ScopeId,
     /// How its decisions take effect.
     pub mode: GateMode,
-    /// The local addresses this scope governs.
+    /// The local addresses this scope governs, IPv4 or IPv6.
     pub local: Vec<IpAddr>,
     /// The remote sources bound to the scope.
     pub bindings: Vec<GateBinding>,
@@ -109,6 +109,8 @@ pub struct GateScope {
 /// Packets of `peer` with a remote address in `addresses` are bound to the
 /// scope and carry `labels`. The remote address is the IP source of an
 /// inbound packet and the IP destination of an outbound one.
+///
+/// Addresses may be IPv4 or IPv6; each binds packets of its own family.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateBinding {
     /// The peer the packets travel over.
@@ -230,7 +232,7 @@ pub struct GateTimeouts {
     pub tcp_closed: Duration,
     /// A UDP flow.
     pub udp: Duration,
-    /// An ICMP flow.
+    /// An ICMP or `ICMPv6` flow.
     pub icmp: Duration,
     /// A flow of another protocol.
     pub other: Duration,
@@ -264,7 +266,7 @@ pub struct GateConfig {
 }
 
 /// Why [`FlowGate::replace`](super::FlowGate::replace) rejected a policy.
-/// Nothing is published.
+/// Nothing is published. IPv4 and IPv6 entries are both accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum GatePolicyError {
@@ -299,15 +301,5 @@ pub enum GatePolicyError {
         scope: ScopeId,
         /// The address.
         address: IpAddr,
-    },
-    /// An IPv6 address or prefix: the gate handles IPv4 only.
-    #[error("IPv6 entry {value} in {field}: the flow gate handles IPv4 only")]
-    Ipv6 {
-        /// The policy field (`local`, `bindings.addresses`,
-        /// `unbound_addresses`, `grants.destinations`, `holds.local`,
-        /// `holds.remote` or `holds.release`).
-        field: &'static str,
-        /// The entry.
-        value: String,
     },
 }
