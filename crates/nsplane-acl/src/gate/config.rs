@@ -87,9 +87,10 @@ pub struct GateScope {
     pub id: ScopeId,
     /// How its decisions take effect.
     pub mode: GateMode,
-    /// The local addresses this scope governs.
+    /// The local addresses this scope governs, IPv4 or IPv6.
     pub local: Vec<IpAddr>,
-    /// The remote sources bound to the scope.
+    /// The remote sources bound to the scope, by `(peer, address)` pair or,
+    /// with no address, by peer.
     pub bindings: Vec<GateBinding>,
     /// Remote addresses that belong to the scope without a peer binding:
     /// outbound packets to them (malformed ones included) are
@@ -109,11 +110,19 @@ pub struct GateScope {
 /// Packets of `peer` with a remote address in `addresses` are bound to the
 /// scope and carry `labels`. The remote address is the IP source of an
 /// inbound packet and the IP destination of an outbound one.
+///
+/// Addresses may be IPv4 or IPv6; each binds packets of its own family.
+/// Empty `addresses` make a peer-keyed binding: it binds every packet of
+/// `peer`, of either family and with any remote address. A binding of the
+/// exact `(peer, remote address)` pair takes precedence: the peer-keyed
+/// bindings are consulted only when no scope governing the local address
+/// binds the exact pair. A scope holds at most one peer-keyed binding of a
+/// peer, and then no address-listed binding of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateBinding {
     /// The peer the packets travel over.
     pub peer: PeerId,
-    /// The remote addresses bound for that peer.
+    /// The remote addresses bound for that peer; empty: every address.
     pub addresses: Vec<IpAddr>,
     /// The labels the bound source carries.
     pub labels: LabelSet,
@@ -230,7 +239,7 @@ pub struct GateTimeouts {
     pub tcp_closed: Duration,
     /// A UDP flow.
     pub udp: Duration,
-    /// An ICMP flow.
+    /// An ICMP or `ICMPv6` flow.
     pub icmp: Duration,
     /// A flow of another protocol.
     pub other: Duration,
@@ -264,7 +273,7 @@ pub struct GateConfig {
 }
 
 /// Why [`FlowGate::replace`](super::FlowGate::replace) rejected a policy.
-/// Nothing is published.
+/// Nothing is published. IPv4 and IPv6 entries are both accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum GatePolicyError {
@@ -280,6 +289,15 @@ pub enum GatePolicyError {
         peer: PeerId,
         /// The address.
         address: IpAddr,
+    },
+    /// One scope holds a peer-keyed binding of a peer together with another
+    /// binding of the same peer, peer-keyed or address-listed.
+    #[error("gate scope '{scope}' binds peer {peer:?} by peer alongside another binding of it")]
+    DuplicatePeerBinding {
+        /// The scope.
+        scope: ScopeId,
+        /// The peer.
+        peer: PeerId,
     },
     /// A grant or unbound rule is invalid (its protocols, validated as
     /// [`RuleSet::new`](crate::RuleSet::new) does).
@@ -299,15 +317,5 @@ pub enum GatePolicyError {
         scope: ScopeId,
         /// The address.
         address: IpAddr,
-    },
-    /// An IPv6 address or prefix: the gate handles IPv4 only.
-    #[error("IPv6 entry {value} in {field}: the flow gate handles IPv4 only")]
-    Ipv6 {
-        /// The policy field (`local`, `bindings.addresses`,
-        /// `unbound_addresses`, `grants.destinations`, `holds.local`,
-        /// `holds.remote` or `holds.release`).
-        field: &'static str,
-        /// The entry.
-        value: String,
     },
 }

@@ -579,8 +579,9 @@ let ok = gate.find_flow(remote, local, protocol.into()).is_some_and(|f| {  // ns
 `find_flow` refreshes the flow, ignores expired ones and prefers an enforced flow when
 several peers share the five-tuple. The projection check makes the
 `service:` prefix match unambiguous (one listener has one service id). Subnet flows
-(`subnet:*`) never authorize a Provider socket, as before. Non-IPv4 addresses give
-`false`.
+(`subnet:*`) never authorize a Provider socket, as before. The compile above binds IPv4
+Node addresses, so an IPv6 five-tuple finds no flow of it and gives `false`; since 0.13.0
+`find_flow` itself looks up flows of either family (`None` for a mixed-family pair).
 
 ### 3.11 Reasons, decisions and counters
 
@@ -657,13 +658,19 @@ plane, is no longer dropped by the gate filter; that is ns's routing concern.
 
 ### 4.3 Address family (Q5)
 
-The gate handles IPv4 only; every other packet (IPv6, non-IP) is `GateDecision::Pass`,
-which equals the old behaviour (`legacy`, and the filter skipped IPv6 inbound). The
-policy types use `IpAddr` and `IpNet`. **Decision (O1, C5)**: `replace` rejects a policy
-with any IPv6 entry, fail closed, with `GatePolicyError::Ipv6 { field, value }` (`field` is
-`local`, `bindings.addresses`, `grants.destinations`, `holds.local`, `holds.remote` or
-`holds.release`); nothing is published. The check covers `Off` scopes too. ns emits IPv4
-only, so this is not visible to it; a compiler bug fails closed instead of being ignored.
+Since 0.13.0 (plan `20261012-1800-peer-keyed-gate`) the gate handles IPv4 and IPv6; a
+non-IP packet is `GateDecision::Pass`. Every address and prefix of a `GatePolicy` (scope
+`local`, binding addresses, `unbound_addresses`, grant destinations, holds and releases) may
+be of either family, and a packet only matches entries of its own family. IPv6 flows,
+fragments (Fragment header) and `ICMPv6` errors follow the IPv4 rules (design note in the
+plan). A `GateBinding` with no addresses is peer-keyed: it binds every packet of its
+`PeerId`, of both families, after the exact `(PeerId, address)` bindings. The compile of
+section 3 emits IPv4 entries and address-listed bindings only; with it no scope governs an
+IPv6 address, so IPv6 packets still pass. Governing a peer's IPv6 traffic takes IPv6 local
+addresses and a peer-keyed binding (or IPv6 binding addresses) in the compiled scopes.
+
+Before 0.13.0 (decision O1, C5) the gate was IPv4 only: IPv6 packets passed and `replace`
+rejected any IPv6 entry with `GatePolicyError::Ipv6`. That variant is removed.
 
 ### 4.4 Further differences
 
@@ -709,7 +716,7 @@ by the compile procedure or stated as a difference:
 
 All closed by C5:
 
-- **O1** (IPv6 in a `GatePolicy`): rejected by `replace` (4.3).
+- **O1** (IPv6 in a `GatePolicy`): rejected by `replace` in C5; accepted since 0.13.0 (4.3).
 - **O2** (the differences of 4.4): each reproduced or stated in 4.4.
 - **O3** (the `l/<network>/<node>` live label): supported as specified (3.5).
 - **O4** (outbound malformed packets): keyed on the remote binding address, as before (4.4).

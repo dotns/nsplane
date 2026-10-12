@@ -1,15 +1,17 @@
-//! A generic stateful flow gate for IPv4 packets.
+//! A generic stateful flow gate for IPv4 and IPv6 packets.
 //!
-//! A [`FlowGate`] judges decrypted inbound and plaintext outbound IPv4
-//! packets against one [`GatePolicy`] snapshot, replaced atomically as a
+//! A [`FlowGate`] judges decrypted inbound and plaintext outbound IPv4 and
+//! IPv6 packets against one [`GatePolicy`] snapshot, replaced atomically as a
 //! whole with [`FlowGate::replace`]:
 //!
 //! - **Scopes** ([`GateScope`]): each governs a set of local addresses in a
-//!   [`GateMode`]. A packet belongs to a scope only through the exact pair
-//!   `(PeerId, remote address)` of one of its [`GateBinding`]s, where the
-//!   remote address is the IP source inbound and the IP destination
-//!   outbound, and the scope governs the packet's other address. The binding
-//!   gives the source its [`LabelSet`](crate::LabelSet).
+//!   [`GateMode`]. A packet belongs to a scope only through one of its
+//!   [`GateBinding`]s, either the exact pair `(PeerId, remote address)`,
+//!   where the remote address is the IP source inbound and the IP
+//!   destination outbound, or a peer-keyed binding of the `PeerId` (no
+//!   addresses: every remote address of either family), and the scope
+//!   governs the packet's other address. The binding gives the source its
+//!   [`LabelSet`](crate::LabelSet).
 //! - **Grants** ([`GateGrant`]): accept-only, directional, by remote label,
 //!   destination prefix and [`ProtocolMatch`](crate::ProtocolMatch). The
 //!   first matching grant that is not suspended admits a new flow and its
@@ -17,7 +19,8 @@
 //! - **State**: admitted flows create bounded state ([`GateLimits`]) with
 //!   per-protocol idle timeouts ([`GateTimeouts`]). Replies, later fragments
 //!   and ICMP errors are admitted only through that state; a full table
-//!   fails closed and never evicts a live entry.
+//!   fails closed and never evicts a live entry. The limits count the flows
+//!   and fragments of both families together (one budget per peer).
 //! - **Holds** ([`GateHolds`]): packets held fail closed in every mode before
 //!   any scope is consulted.
 //! - **Unbound rules** ([`UnboundRule`]): what happens to inbound packets of
@@ -26,10 +29,10 @@
 //!
 //! # Evaluation
 //!
-//! The gate handles IPv4 only: every other packet is [`GateDecision::Pass`],
-//! and [`FlowGate::replace`] rejects IPv6 entries in a policy
-//! ([`GatePolicyError::Ipv6`]). Inbound, with `local` the destination and
-//! `remote` the source:
+//! The gate handles IPv4 and IPv6; a packet of another version is
+//! [`GateDecision::Pass`]. Every address and prefix of a policy may be of
+//! either family, and a packet only ever matches entries of its own family.
+//! Inbound, with `local` the destination and `remote` the source:
 //!
 //! 1. **Inert**: no scope with a mode other than [`GateMode::Off`] and no
 //!    hold rule: [`GateDecision::Pass`], without parsing the packet or
@@ -41,9 +44,10 @@
 //! 3. **Holds**: `(peer, remote)` in [`GateHolds::release`] skips the
 //!    inbound holds; otherwise a matching [`HoldRule`] gives
 //!    [`GateReason::Held`] (always enforced).
-//! 4. **Binding**: the scopes governing `local` that bind `(peer, remote)`.
-//!    More than one: [`GateReason::Ambiguous`], enforced when any of them
-//!    enforces. None: when exactly one scope governs `local` and it
+//! 4. **Binding**: the scopes governing `local` that bind the exact pair
+//!    `(peer, remote)`; only when there is none, the scopes governing `local`
+//!    with a peer-keyed binding of `peer`. More than one at that level:
+//!    [`GateReason::Ambiguous`], enforced when any of them enforces. None: when exactly one scope governs `local` and it
 //!    enforces, a matching [`UnboundAction::Pass`] rule of that scope passes
 //!    the packet (a first fragment remembers that disposition; a later
 //!    fragment of a peer named by an unbound rule follows it or is denied
@@ -52,12 +56,14 @@
 //!    is none.
 //! 5. **Bound** in one scope: a later fragment follows its first fragment's
 //!    state ([`GateReason::ValidState`]) or is denied
-//!    [`GateReason::OrphanFragment`]. An ICMP error (types 3, 4, 11, 12)
+//!    [`GateReason::OrphanFragment`]. An ICMP error (types 3, 4, 11, 12;
+//!    `ICMPv6` types 1, 2, 3, 4)
 //!    refreshes the quoted flow or is denied [`GateReason::ReverseNewFlow`]
 //!    (an unreadable quote is [`GateReason::Malformed`]). A packet of a live
 //!    flow is [`GateReason::ValidState`], except a TCP SYN without ACK from
 //!    the responder or on a closing flow. A reverse-only packet (TCP without
-//!    SYN or with ACK; ICMP types 0, 3, 4, 5, 11, 12) without state is
+//!    SYN or with ACK; ICMP types 0, 3, 4, 5, 11, 12; `ICMPv6` types 1, 2,
+//!    3, 4, 129, 137) without state is
 //!    [`GateReason::ReverseNewFlow`]. TCP or UDP with a port 0 is
 //!    [`GateReason::Malformed`].
 //! 6. **New flow**: the first matching grant that is not suspended admits it
@@ -72,12 +78,42 @@
 //! [`GateHolds::release`]; grants of [`Direction::Outbound`](crate::Direction)
 //! check `destinations` against `remote`; there are no unbound rules; and an
 //! unbound or malformed packet takes the mode of the scopes holding `remote`
-//! as a binding address or in [`GateScope::unbound_addresses`] (a packet to
-//! another destination passes).
+//! as a binding address or in [`GateScope::unbound_addresses`] and of the
+//! scopes with a peer-keyed binding of `peer` (a packet to another
+//! destination over another peer passes).
 //!
 //! Decisions take each scope's mode: [`GateMode::Observe`] gives
 //! [`GateDecision::Observe`] and [`GateMode::Enforce`] gives
 //! [`GateDecision::Enforce`]; holds always give [`GateDecision::Enforce`].
+//!
+//! # IPv6
+//!
+//! IPv6 packets take the same steps, with these rules:
+//!
+//! - **Extension headers**: Hop-by-Hop (0), Routing (43), Destination
+//!   Options (60) and Fragment (44) headers are walked, an Authentication
+//!   Header (51) is skipped by its own length so the ports behind it stay
+//!   visible, and ESP (50) and No Next Header (59) are upper layers without
+//!   ports. At most 8 extension headers, all within the payload length; a
+//!   longer or truncated chain, a second Fragment header, a payload length
+//!   beyond the packet, or a first fragment that does not hold the whole
+//!   TCP (20 bytes), UDP or `ICMPv6` (8 bytes) header is malformed. The
+//!   addresses are those of the fixed header, with or without a Routing
+//!   header; a packet shorter than the fixed header (40 bytes, or 20 for
+//!   IPv4) is unreadable and passes.
+//! - **Fragments**: no reassembly, as for IPv4. A fragment is keyed by the
+//!   Fragment header's 32-bit identification and next header; a first
+//!   fragment (offset 0, more fragments) carries the ports, a later one
+//!   follows it; an atomic fragment (offset 0 without more fragments) is an
+//!   unfragmented packet.
+//! - **`ICMPv6`**: errors of types 1 to 4 refresh the flow they quote (the
+//!   quoted fixed header, its extension headers and 8 bytes of its upper
+//!   layer, with addresses mirroring the error's, as for IPv4); echo request
+//!   128 opens a flow keyed by its identifier and echo reply 129 is
+//!   reverse-only. Every other type, Neighbor Discovery and Multicast
+//!   Listener messages included, is an ordinary new flow that needs a grant
+//!   ([`ProtocolMatch::Icmp`](crate::ProtocolMatch::Icmp) matches `ICMPv6`
+//!   types).
 //!
 //! # Replace and state migration
 //!
@@ -93,7 +129,12 @@
 //!   governed, a grant that is not suspended still matching the packet that
 //!   opened it); it keeps its five-tuple and its idle deadline and takes the
 //!   grant's id and the scope's mode, or is dropped;
-//! - the fragments of a changed scope are dropped.
+//! - the fragments of a changed scope are dropped;
+//! - when the new policy has a peer-keyed binding, a flow is also dropped
+//!   when its scope is no longer the one step 4 selects for its peer,
+//!   remote and local address (another scope's exact binding now takes
+//!   precedence, or the lookup became ambiguous); its next packet is then
+//!   evaluated under the selected scope.
 //!
 //! A packet never sees a policy together with the state of another policy.
 //! A holds-only change revalidates nothing.
@@ -104,7 +145,7 @@
 
 use std::cell::OnceCell;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -115,6 +156,7 @@ use nsplane_packet::PeerId;
 use crate::net::Protocol;
 use crate::rules::RuleId;
 
+mod addr;
 mod clock;
 mod config;
 mod decisions;
@@ -136,6 +178,7 @@ pub use config::{
 pub use divert::DivertedPacket;
 pub use filter::{GateDivert, GateFilter, GateFilterStats};
 
+use addr::GateAddr;
 use snapshot::Snapshot;
 use state::StateTable;
 
@@ -404,7 +447,8 @@ impl FlowGate {
     }
 
     /// The live flow between `remote` and `local` of `protocol`, refreshed,
-    /// preferring an enforced one; `None` for IPv6 addresses.
+    /// preferring an enforced one; `None` when `remote` and `local` are of
+    /// different address families.
     #[must_use]
     pub fn find_flow(
         &self,
@@ -412,13 +456,32 @@ impl FlowGate {
         local: SocketAddr,
         protocol: Protocol,
     ) -> Option<LiveFlow> {
-        let (SocketAddr::V4(remote), SocketAddr::V4(local)) = (remote, local) else {
-            return None;
-        };
         let protocol = match protocol {
             Protocol::Tcp => 6,
             Protocol::Udp => 17,
         };
+        match (remote, local) {
+            (SocketAddr::V4(remote), SocketAddr::V4(local)) => self.find_family::<Ipv4Addr>(
+                (*remote.ip(), remote.port()),
+                (*local.ip(), local.port()),
+                protocol,
+            ),
+            (SocketAddr::V6(remote), SocketAddr::V6(local)) => self.find_family::<Ipv6Addr>(
+                (*remote.ip(), remote.port()),
+                (*local.ip(), local.port()),
+                protocol,
+            ),
+            _ => None,
+        }
+    }
+
+    /// [`find_flow`](Self::find_flow) of the family `A`.
+    fn find_family<A: GateAddr>(
+        &self,
+        (remote_ip, remote_port): (A, u16),
+        (local_ip, local_port): (A, u16),
+        protocol: u8,
+    ) -> Option<LiveFlow> {
         let now = (self.clock)();
         // With every shard held no writer can publish, so the snapshot and
         // the state are consistent.
@@ -427,11 +490,11 @@ impl FlowGate {
         let counts = &self.state.counts;
         let mut found: Option<LiveFlow> = None;
         for shard in &mut shards {
-            shard.retain_flows(counts, |key, flow| {
-                if key.remote_ip != *remote.ip()
-                    || key.local_ip != *local.ip()
-                    || key.remote_port != remote.port()
-                    || key.local_port != local.port()
+            shard.family::<A>().retain_flows(counts, |key, flow| {
+                if key.remote_ip != remote_ip
+                    || key.local_ip != local_ip
+                    || key.remote_port != remote_port
+                    || key.local_port != local_port
                     || key.protocol != protocol
                 {
                     return true;
@@ -439,7 +502,7 @@ impl FlowGate {
                 if flow.expires_at <= now {
                     return false;
                 }
-                flow.touch(key.protocol, now, &counts.timeouts);
+                flow.touch::<A>(key.protocol, now, &counts.timeouts);
                 if found.as_ref().is_none_or(|live| !live.enforced)
                     && let Some(scope) = snapshot.scope_of_slot(key.slot)
                 {
