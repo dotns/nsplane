@@ -175,6 +175,8 @@ pub(super) struct CompiledScope {
     pub(super) enforce: bool,
     pub(super) v4: ScopeAddrs<Ipv4Addr>,
     pub(super) v6: ScopeAddrs<Ipv6Addr>,
+    /// The labels of the peer-keyed bindings, by peer.
+    pub(super) peer_bindings: FastMap<PeerId, LabelSet>,
     pub(super) grants: Box<[CompiledGrant]>,
     pub(super) unbound: Box<[CompiledUnbound]>,
     /// The scope as given, to detect a changed scope on the next replace.
@@ -186,9 +188,13 @@ impl CompiledScope {
         A::scope(self).local.contains(&local)
     }
 
-    /// The labels of `binding` in this scope.
+    /// The labels of `binding` in this scope: of its exact pair, else of a
+    /// peer-keyed binding of its peer.
     pub(super) fn labels<A: GateAddr>(&self, binding: &BindingKey<A>) -> Option<&LabelSet> {
-        A::scope(self).bindings.get(binding)
+        A::scope(self)
+            .bindings
+            .get(binding)
+            .or_else(|| self.peer_bindings.get(&binding.peer))
     }
 
     /// The grant search for a new flow initiated in `direction` from a
@@ -387,6 +393,7 @@ pub(super) fn compile(
 }
 
 fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
+    let peer_bindings = peer_bindings(&scope)?;
     let v4 = ScopeAddrs::compile(&scope)?;
     let v6 = ScopeAddrs::compile(&scope)?;
     let grants = scope
@@ -405,10 +412,40 @@ fn compile_scope(scope: GateScope) -> Result<CompiledScope, GatePolicyError> {
         enforce: scope.mode == GateMode::Enforce,
         v4,
         v6,
+        peer_bindings,
         grants,
         unbound,
         source: scope,
     })
+}
+
+/// The peer-keyed bindings of `scope`, validated: a peer with one has no
+/// other binding in the scope.
+fn peer_bindings(scope: &GateScope) -> Result<FastMap<PeerId, LabelSet>, GatePolicyError> {
+    let mut peer_bindings = FastMap::default();
+    for binding in &scope.bindings {
+        if binding.addresses.is_empty()
+            && peer_bindings
+                .insert(binding.peer, binding.labels.clone())
+                .is_some()
+        {
+            return Err(GatePolicyError::DuplicatePeerBinding {
+                scope: scope.id.clone(),
+                peer: binding.peer,
+            });
+        }
+    }
+    if let Some(binding) = scope
+        .bindings
+        .iter()
+        .find(|binding| !binding.addresses.is_empty() && peer_bindings.contains_key(&binding.peer))
+    {
+        return Err(GatePolicyError::DuplicatePeerBinding {
+            scope: scope.id.clone(),
+            peer: binding.peer,
+        });
+    }
+    Ok(peer_bindings)
 }
 
 fn compile_grant(grant: &GateGrant) -> Result<CompiledGrant, GatePolicyError> {

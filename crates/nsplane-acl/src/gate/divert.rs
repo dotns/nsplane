@@ -68,9 +68,9 @@ impl DivertedPacket {
 impl FlowGate {
     /// The divert candidate of an enforced inbound denial: a TCP or UDP
     /// packet matching an [`UnboundAction::Divert`] rule for `peer` of the
-    /// one enforcing scope governing its destination, whose source is no
-    /// local, binding or unbound address of any scope and that no hold
-    /// matches.
+    /// one enforcing scope governing its destination, which has no
+    /// peer-keyed binding of `peer`, whose source is no local, binding or
+    /// unbound address of any scope and that no hold matches.
     pub(super) fn divert_candidate(&self, peer: PeerId, packet: &[u8]) -> Option<DivertedPacket> {
         match packet.first()? >> 4 {
             4 => self.divert_family::<Ipv4Addr>(peer, packet),
@@ -91,6 +91,7 @@ impl FlowGate {
         let scope = scopes.next()?;
         if scopes.next().is_some()
             || !scope.enforce
+            || scope.peer_bindings.contains_key(&peer)
             || snapshot.is_scope_address(meta.source)
             || snapshot.held(
                 PacketDirection::Inbound,
