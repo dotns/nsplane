@@ -343,8 +343,9 @@ mod test_packets;
 
 pub use engine::AclEngine;
 pub use filter::{
-    AclFilter, AclFilterConfig, AclFilterScope, AclFilterStats, FragmentMode, Ipv6Mode,
-    OtherProtocol, OtherProtocolRule, PeerIdentity, PeerLabelMap,
+    AclFilter, AclFilterConfig, AclFilterScope, AclFilterScopeError, AclFilterScopes,
+    AclFilterStats, FragmentMode, Ipv6Mode, OtherProtocol, OtherProtocolRule, PeerIdentity,
+    PeerLabelMap,
 };
 pub use flow::{FlowKey, FlowStats, FlowTracker};
 pub use namespace::{

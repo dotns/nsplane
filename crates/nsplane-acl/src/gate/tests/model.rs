@@ -2,7 +2,9 @@
 //! flow map, no shards, no slots, no lazy expiry, matching straight on the
 //! [`GatePolicy`]. Seeded random sequences of packets, `replace` calls and
 //! clock steps must give equal decisions and counters, so the sharded state,
-//! its migration and lazy expiry never change a verdict.
+//! its migration and lazy expiry never change a verdict. The sequences run
+//! over IPv4, over IPv6, over both families at once, and over both families
+//! with peer-keyed bindings.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -24,8 +26,66 @@ const REMOTES: [Ipv4Addr; 3] = [
     Ipv4Addr::new(100, 64, 0, 3),
     Ipv4Addr::new(100, 127, 0, 1),
 ];
+const LOCALS6: [Ipv6Addr; 2] = [LOCAL6, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x10)];
+const REMOTES6: [Ipv6Addr; 3] = [
+    REMOTE6,
+    Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 3),
+    Ipv6Addr::new(0xfd7f, 0, 0, 0, 0, 0, 0, 1),
+];
 const PEERS: [PeerId; 3] = [PEER, OTHER_PEER, CARRIER];
 const LABELS: [&str; 2] = ["a", "b"];
+
+/// The address families of a sequence. An IPv4 sequence draws exactly the
+/// random numbers it drew before IPv6 was added, so its seeds are the same
+/// sequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+    /// Policies list every address in both families; each packet picks one.
+    Both,
+    /// [`Family::Both`], and scopes also bind peers by peer.
+    PeerKeyed,
+}
+
+impl Family {
+    /// The policy entries for address `index` of `v4` and `v6`.
+    fn addresses(self, index: usize, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Vec<IpAddr> {
+        match self {
+            Self::V4 => vec![IpAddr::V4(v4[index])],
+            Self::V6 => vec![IpAddr::V6(v6[index])],
+            Self::Both | Self::PeerKeyed => vec![IpAddr::V4(v4[index]), IpAddr::V6(v6[index])],
+        }
+    }
+
+    fn hosts(self, index: usize, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Vec<IpNet> {
+        self.addresses(index, v4, v6)
+            .into_iter()
+            .map(|ip| match ip {
+                IpAddr::V4(ip) => host(ip),
+                IpAddr::V6(ip) => host6(ip),
+            })
+            .collect()
+    }
+
+    /// Whether the next packet is IPv6.
+    fn packet_v6(self, rng: &mut Rng) -> bool {
+        match self {
+            Self::V4 => false,
+            Self::V6 => true,
+            Self::Both | Self::PeerKeyed => rng.chance(50),
+        }
+    }
+}
+
+/// Address `index` of `v4` or `v6`.
+fn address(v6: bool, index: usize, v4_table: &[Ipv4Addr], v6_table: &[Ipv6Addr]) -> IpAddr {
+    if v6 {
+        IpAddr::V6(v6_table[index])
+    } else {
+        IpAddr::V4(v4_table[index])
+    }
+}
 
 /// `SplitMix64`.
 struct Rng(u64);
@@ -54,12 +114,16 @@ impl Rng {
 
 // ── Policies ──────────────────────────────────────────────────────────────────
 
-fn random_protocols(rng: &mut Rng) -> Vec<ProtocolMatch> {
+fn random_protocols(rng: &mut Rng, family: Family) -> Vec<ProtocolMatch> {
+    let echo = match family {
+        Family::V4 => vec![8],
+        Family::V6 | Family::Both | Family::PeerKeyed => vec![8, 128],
+    };
     let choices = [
         ProtocolMatch::Any,
         tcp_port(22),
         ProtocolMatch::Udp(PortSet::single(53)),
-        ProtocolMatch::Icmp(IcmpTypes::Only(vec![8])),
+        ProtocolMatch::Icmp(IcmpTypes::Only(echo)),
     ];
     let mut protocols = vec![choices[rng.below(choices.len())].clone()];
     if rng.chance(30) {
@@ -68,25 +132,43 @@ fn random_protocols(rng: &mut Rng) -> Vec<ProtocolMatch> {
     protocols
 }
 
-fn random_scope(rng: &mut Rng, index: usize) -> GateScope {
+fn random_scope(rng: &mut Rng, index: usize, family: Family) -> GateScope {
     let mode = rng.pick(&[
         GateMode::Off,
         GateMode::Observe,
         GateMode::Enforce,
         GateMode::Enforce,
     ]);
-    let mut local = vec![IpAddr::V4(LOCALS[index % 2])];
+    let mut local = family.addresses(index % 2, &LOCALS, &LOCALS6);
     if rng.chance(25) {
-        local.push(IpAddr::V4(LOCALS[(index + 1) % 2]));
+        local.extend(family.addresses((index + 1) % 2, &LOCALS, &LOCALS6));
     }
     let mut bindings = Vec::new();
+    // Peers bound by peer, which then have no address-listed binding here.
+    let keyed: Vec<PeerId> = if family == Family::PeerKeyed {
+        PEERS.iter().copied().filter(|_| rng.chance(30)).collect()
+    } else {
+        Vec::new()
+    };
+    for peer in &keyed {
+        let with: Vec<&str> = LABELS.iter().copied().filter(|_| rng.chance(60)).collect();
+        bindings.push(GateBinding {
+            peer: *peer,
+            addresses: Vec::new(),
+            labels: labels(&with),
+        });
+    }
     let mut seen = Vec::new();
     for _ in 0..rng.below(4) {
-        let pair = (rng.pick(&PEERS), rng.pick(&REMOTES[..2]));
-        if !seen.contains(&pair) {
+        let pair = (rng.pick(&PEERS), rng.below(2));
+        if !seen.contains(&pair) && !keyed.contains(&pair.0) {
             seen.push(pair);
             let with: Vec<&str> = LABELS.iter().copied().filter(|_| rng.chance(60)).collect();
-            bindings.push(binding(pair.0, pair.1, &with));
+            bindings.push(GateBinding {
+                peer: pair.0,
+                addresses: family.addresses(pair.1, &REMOTES, &REMOTES6),
+                labels: labels(&with),
+            });
         }
     }
     let grants = (0..rng.below(4))
@@ -99,13 +181,13 @@ fn random_scope(rng: &mut Rng, index: usize) -> GateScope {
                 .map(|label| Label::from(*label))
                 .collect(),
             destinations: if rng.chance(40) {
-                vec![host(
-                    rng.pick(&[LOCALS[0], LOCALS[1], REMOTES[0], REMOTES[1]]),
-                )]
+                let all4 = [LOCALS[0], LOCALS[1], REMOTES[0], REMOTES[1]];
+                let all6 = [LOCALS6[0], LOCALS6[1], REMOTES6[0], REMOTES6[1]];
+                family.hosts(rng.below(all4.len()), &all4, &all6)
             } else {
                 Vec::new()
             },
-            protocols: random_protocols(rng),
+            protocols: random_protocols(rng, family),
             suspended: rng.chance(20),
         })
         .collect();
@@ -114,15 +196,14 @@ fn random_scope(rng: &mut Rng, index: usize) -> GateScope {
             id: format!("u{index}-{n}").into(),
             peers: PEERS.iter().copied().filter(|_| rng.chance(50)).collect(),
             action: rng.pick(&[UnboundAction::Pass, UnboundAction::Divert]),
-            protocols: random_protocols(rng),
+            protocols: random_protocols(rng, family),
         })
         .collect();
     // Remote addresses of the scope without a binding: any remote address
     // this scope does not bind (another scope may bind it).
-    let unbound_addresses = REMOTES
-        .iter()
-        .filter(|ip| !seen.iter().any(|(_, bound)| bound == *ip) && rng.chance(25))
-        .map(|ip| IpAddr::V4(*ip))
+    let unbound_addresses = (0..REMOTES.len())
+        .filter(|index| !seen.iter().any(|(_, bound)| bound == index) && rng.chance(25))
+        .flat_map(|index| family.addresses(index, &REMOTES, &REMOTES6))
         .collect();
     GateScope {
         id: format!("s{index}").into(),
@@ -135,7 +216,7 @@ fn random_scope(rng: &mut Rng, index: usize) -> GateScope {
     }
 }
 
-fn random_holds(rng: &mut Rng) -> GateHolds {
+fn random_holds(rng: &mut Rng, family: Family) -> GateHolds {
     let mut holds = GateHolds::default();
     if rng.chance(70) {
         return holds;
@@ -143,11 +224,11 @@ fn random_holds(rng: &mut Rng) -> GateHolds {
     let rule = |rng: &mut Rng| HoldRule {
         peers: rng.chance(30).then(|| vec![rng.pick(&PEERS)]),
         local: if rng.chance(50) {
-            vec![host(rng.pick(&LOCALS))]
+            family.hosts(rng.below(LOCALS.len()), &LOCALS, &LOCALS6)
         } else {
             Vec::new()
         },
-        remote: vec![host(rng.pick(&REMOTES))],
+        remote: family.hosts(rng.below(REMOTES.len()), &REMOTES, &REMOTES6),
     };
     if rng.chance(60) {
         holds.inbound.push(rule(rng));
@@ -156,28 +237,29 @@ fn random_holds(rng: &mut Rng) -> GateHolds {
         holds.outbound.push(rule(rng));
     }
     if rng.chance(50) {
-        holds
-            .release
-            .push((rng.pick(&PEERS), IpAddr::V4(rng.pick(&REMOTES))));
+        let peer = rng.pick(&PEERS);
+        for ip in family.addresses(rng.below(REMOTES.len()), &REMOTES, &REMOTES6) {
+            holds.release.push((peer, ip));
+        }
     }
     holds
 }
 
 /// A new policy, or (mostly) the current one with one scope changed, so
 /// that unchanged scopes keep their state.
-fn next_policy(rng: &mut Rng, current: &GatePolicy) -> GatePolicy {
+fn next_policy(rng: &mut Rng, current: &GatePolicy, family: Family) -> GatePolicy {
     if current.scopes.is_empty() || rng.chance(25) {
         let scopes = (0..=rng.below(2))
-            .map(|index| random_scope(rng, index))
+            .map(|index| random_scope(rng, index, family))
             .collect();
         return GatePolicy {
             scopes,
-            holds: random_holds(rng),
+            holds: random_holds(rng, family),
         };
     }
     let mut next = current.clone();
     match rng.below(5) {
-        0 => next.holds = random_holds(rng),
+        0 => next.holds = random_holds(rng, family),
         1 => {
             let index = rng.below(next.scopes.len());
             next.scopes[index].mode =
@@ -196,7 +278,7 @@ fn next_policy(rng: &mut Rng, current: &GatePolicy) -> GatePolicy {
             let id = next.scopes[index].id.clone();
             next.scopes[index] = GateScope {
                 id,
-                ..random_scope(rng, index)
+                ..random_scope(rng, index, family)
             };
         }
         _ => {}
@@ -217,18 +299,29 @@ enum Fragment {
 enum Kind {
     Tcp(u8),
     Udp,
-    /// Echo request (8) or reply (0) with an identifier.
+    /// Echo request (8, or 128 in IPv6) or reply (0, or 129) with an
+    /// identifier.
     Echo(u8, u16),
     /// A destination-unreachable error quoting a UDP packet
     /// `(src, dst, src_port, dst_port)`.
-    Error(Ipv4Addr, Ipv4Addr, u16, u16),
+    Error(IpAddr, IpAddr, u16, u16),
     Malformed,
+}
+
+/// The echo type of the family: a request (8 or 128) or a reply (0 or 129).
+const fn echo(v6: bool, request: bool) -> u8 {
+    match (v6, request) {
+        (false, true) => 8,
+        (false, false) => 0,
+        (true, true) => 128,
+        (true, false) => 129,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Packet {
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     kind: Kind,
     src_port: u16,
     dst_port: u16,
@@ -236,13 +329,48 @@ struct Packet {
 }
 
 impl Packet {
+    const fn v6(&self) -> bool {
+        self.src.is_ipv6()
+    }
+
     fn bytes(&self) -> Vec<u8> {
-        let (src, dst) = (self.src, self.dst);
+        match (self.src, self.dst) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => self.bytes_v4(src, dst),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => self.bytes_v6(src, dst),
+            _ => unreachable!("one family per packet"),
+        }
+    }
+
+    fn bytes_v6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let (src_port, dst_port) = (self.src_port, self.dst_port);
+        match (self.fragment, self.kind) {
+            (_, Kind::Malformed) => {
+                let mut packet = tcp6(src, dst, src_port, dst_port, 0x02);
+                packet.truncate(50);
+                packet[4..6].copy_from_slice(&10_u16.to_be_bytes());
+                packet
+            }
+            (Fragment::First(id), _) => first_fragment6(src, dst, src_port, dst_port, id.into()),
+            (Fragment::Later(id), _) => later_fragment6(src, dst, 17, id.into()),
+            (_, Kind::Tcp(flags)) => tcp6(src, dst, src_port, dst_port, flags),
+            (_, Kind::Udp) => udp6(src, dst, src_port, dst_port),
+            (_, Kind::Echo(icmp_type, identifier)) => icmp6(src, dst, icmp_type, identifier),
+            (_, Kind::Error(IpAddr::V6(qs), IpAddr::V6(qd), qsp, qdp)) => {
+                icmp6_error(src, dst, 1, &udp6(qs, qd, qsp, qdp))
+            }
+            (_, Kind::Error(..)) => unreachable!("one family per packet"),
+        }
+    }
+
+    fn bytes_v4(&self, src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         let packet = match self.kind {
             Kind::Tcp(flags) => tcp(src, dst, self.src_port, self.dst_port, flags),
             Kind::Udp => udp(src, dst, self.src_port, self.dst_port),
             Kind::Echo(icmp_type, identifier) => icmp(src, dst, icmp_type, identifier),
-            Kind::Error(qs, qd, qsp, qdp) => icmp_error(src, dst, &udp(qs, qd, qsp, qdp)),
+            Kind::Error(IpAddr::V4(qs), IpAddr::V4(qd), qsp, qdp) => {
+                icmp_error(src, dst, &udp(qs, qd, qsp, qdp))
+            }
+            Kind::Error(..) => unreachable!("one family per packet"),
             Kind::Malformed => {
                 let mut packet = tcp(src, dst, self.src_port, self.dst_port, 0x02);
                 packet.truncate(30);
@@ -265,7 +393,9 @@ impl Packet {
             (_, Kind::Tcp(_)) => Some(Transport::Tcp { src_port, dst_port }),
             (_, Kind::Udp) => Some(Transport::Udp { src_port, dst_port }),
             (_, Kind::Echo(icmp_type, _)) => Some(Transport::Icmp { icmp_type }),
-            (_, Kind::Error(..)) => Some(Transport::Icmp { icmp_type: 3 }),
+            (_, Kind::Error(..)) => Some(Transport::Icmp {
+                icmp_type: if self.v6() { 1 } else { 3 },
+            }),
         }
     }
 
@@ -290,14 +420,16 @@ impl Packet {
         match self.kind {
             Kind::Tcp(_) | Kind::Malformed => 6,
             Kind::Udp => 17,
+            Kind::Echo(..) | Kind::Error(..) if self.v6() => 58,
             Kind::Echo(..) | Kind::Error(..) => 1,
         }
     }
 }
 
-fn random_packet(rng: &mut Rng, direction: PacketDirection) -> Packet {
-    let local = rng.pick(&LOCALS);
-    let remote = rng.pick(&REMOTES);
+fn random_packet(rng: &mut Rng, direction: PacketDirection, family: Family) -> Packet {
+    let v6 = family.packet_v6(rng);
+    let local = address(v6, rng.below(LOCALS.len()), &LOCALS, &LOCALS6);
+    let remote = address(v6, rng.below(REMOTES.len()), &REMOTES, &REMOTES6);
     let (src, dst) = match direction {
         PacketDirection::Inbound => (remote, local),
         PacketDirection::Outbound => (local, remote),
@@ -307,13 +439,16 @@ fn random_packet(rng: &mut Rng, direction: PacketDirection) -> Packet {
     let kind = match rng.below(10) {
         0..=3 => Kind::Tcp(rng.pick(&[0x02, 0x02, 0x10, 0x12, 0x11, 0x04])),
         4..=6 => Kind::Udp,
-        7 => Kind::Echo(rng.pick(&[0, 8]), rng.pick(&[1, 2])),
+        7 => Kind::Echo(echo(v6, rng.pick(&[false, true])), rng.pick(&[1, 2])),
         8 => {
             // Quote a packet the other way, mostly a plausible one.
             let (qs, qd) = if rng.chance(80) {
                 (dst, src)
             } else {
-                (dst, rng.pick(&REMOTES))
+                (
+                    dst,
+                    address(v6, rng.below(REMOTES.len()), &REMOTES, &REMOTES6),
+                )
             };
             Kind::Error(qs, qd, rng.pick(&ports[1..]), rng.pick(&ports[1..]))
         }
@@ -334,9 +469,13 @@ fn random_packet(rng: &mut Rng, direction: PacketDirection) -> Packet {
     }
 }
 
-fn fresh(rng: &mut Rng) -> (PacketDirection, PeerId, Packet) {
+fn fresh(rng: &mut Rng, family: Family) -> (PacketDirection, PeerId, Packet) {
     let direction = rng.pick(&[PacketDirection::Inbound, PacketDirection::Outbound]);
-    (direction, rng.pick(&PEERS), random_packet(rng, direction))
+    (
+        direction,
+        rng.pick(&PEERS),
+        random_packet(rng, direction, family),
+    )
 }
 
 /// A packet related to an allowed one: a reply, a repeat, a later
@@ -356,7 +495,7 @@ fn follow_up(
         dst_port: packet.src_port,
         kind: match packet.kind {
             Kind::Tcp(_) => Kind::Tcp(rng.pick(&[0x10, 0x12, 0x11, 0x04, 0x02])),
-            Kind::Echo(_, identifier) => Kind::Echo(0, identifier),
+            Kind::Echo(_, identifier) => Kind::Echo(echo(packet.v6(), false), identifier),
             kind => kind,
         },
         fragment: Fragment::Whole,
@@ -421,8 +560,8 @@ fn follow_up(
 struct ModelFlowKey {
     scope: ScopeId,
     peer: PeerId,
-    remote: Ipv4Addr,
-    local: Ipv4Addr,
+    remote: IpAddr,
+    local: IpAddr,
     protocol: u8,
     remote_port: u16,
     local_port: u16,
@@ -461,8 +600,8 @@ struct ModelFragmentKey {
     scope: ScopeId,
     direction: PacketDirection,
     peer: PeerId,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     id: u16,
 }
 
@@ -495,20 +634,66 @@ fn protocol_matches(protocol: &ProtocolMatch, transport: Transport) -> bool {
     }
 }
 
-fn net_matches(nets: &[IpNet], ip: Ipv4Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(&IpAddr::V4(ip)))
+fn net_matches(nets: &[IpNet], ip: IpAddr) -> bool {
+    nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
 }
 
-fn binding_labels(scope: &GateScope, peer: PeerId, remote: Ipv4Addr) -> Option<&LabelSet> {
+/// The labels of the binding of `peer` at `remote` in `scope`: exact or
+/// peer-keyed (a scope never has both for one peer).
+fn binding_labels(scope: &GateScope, peer: PeerId, remote: IpAddr) -> Option<&LabelSet> {
     scope
         .bindings
         .iter()
-        .find(|binding| binding.peer == peer && binding.addresses.contains(&IpAddr::V4(remote)))
+        .find(|binding| {
+            binding.peer == peer
+                && (binding.addresses.contains(&remote) || binding.addresses.is_empty())
+        })
         .map(|binding| &binding.labels)
 }
 
-fn governs(scope: &GateScope, local: Ipv4Addr) -> bool {
-    scope.local.contains(&IpAddr::V4(local))
+fn binds_exactly(scope: &GateScope, peer: PeerId, remote: IpAddr) -> bool {
+    scope
+        .bindings
+        .iter()
+        .any(|binding| binding.peer == peer && binding.addresses.contains(&remote))
+}
+
+fn binds_by_peer(scope: &GateScope, peer: PeerId) -> bool {
+    scope
+        .bindings
+        .iter()
+        .any(|binding| binding.peer == peer && binding.addresses.is_empty())
+}
+
+fn active_scopes(policy: &GatePolicy) -> impl Iterator<Item = &GateScope> {
+    policy
+        .scopes
+        .iter()
+        .filter(|scope| scope.mode != GateMode::Off)
+}
+
+/// The scopes binding a packet of `peer` between `local` and `remote`: those
+/// governing `local` that bind the exact pair, else those governing `local`
+/// that bind the peer by peer.
+fn binding_level(
+    policy: &GatePolicy,
+    peer: PeerId,
+    remote: IpAddr,
+    local: IpAddr,
+) -> Vec<&GateScope> {
+    let exact: Vec<&GateScope> = active_scopes(policy)
+        .filter(|scope| governs(scope, local) && binds_exactly(scope, peer, remote))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    active_scopes(policy)
+        .filter(|scope| governs(scope, local) && binds_by_peer(scope, peer))
+        .collect()
+}
+
+fn governs(scope: &GateScope, local: IpAddr) -> bool {
+    scope.local.contains(&local)
 }
 
 fn decision(enforce: bool, allow: bool, reason: GateReason, rule: Option<RuleId>) -> GateDecision {
@@ -520,7 +705,7 @@ fn authorize(
     scope: &GateScope,
     direction: PacketDirection,
     labels: &LabelSet,
-    destination: Ipv4Addr,
+    destination: IpAddr,
     transport: Transport,
 ) -> Result<RuleId, Option<RuleId>> {
     let mut suspended = None;
@@ -548,23 +733,20 @@ fn authorize(
 
 impl Model {
     fn active(&self) -> impl Iterator<Item = &GateScope> {
-        self.policy
-            .scopes
-            .iter()
-            .filter(|scope| scope.mode != GateMode::Off)
+        active_scopes(&self.policy)
     }
 
     fn held(
         &self,
         direction: PacketDirection,
         peer: PeerId,
-        local: Ipv4Addr,
-        remote: Ipv4Addr,
+        local: IpAddr,
+        remote: IpAddr,
     ) -> bool {
         let holds = &self.policy.holds;
         let rules = match direction {
             PacketDirection::Inbound => {
-                if holds.release.contains(&(peer, IpAddr::V4(remote))) {
+                if holds.release.contains(&(peer, remote)) {
                     return false;
                 }
                 &holds.inbound
@@ -635,7 +817,7 @@ impl Model {
             now + match protocol {
                 6 => t.tcp,
                 17 => t.udp,
-                1 => t.icmp,
+                1 | 58 => t.icmp,
                 _ => t.other,
             }
         };
@@ -689,11 +871,9 @@ impl Model {
             model
                 .active()
                 .filter(|scope| {
-                    scope.unbound_addresses.contains(&IpAddr::V4(remote))
-                        || scope
-                            .bindings
-                            .iter()
-                            .any(|b| b.addresses.contains(&IpAddr::V4(remote)))
+                    scope.unbound_addresses.contains(&remote)
+                        || scope.bindings.iter().any(|b| b.addresses.contains(&remote))
+                        || binds_by_peer(scope, peer)
                 })
                 .cloned()
                 .collect()
@@ -721,9 +901,8 @@ impl Model {
             return decision(true, false, GateReason::Held, None);
         }
         // 4. Binding.
-        let bound: Vec<GateScope> = self
-            .active()
-            .filter(|scope| governs(scope, local) && binding_labels(scope, peer, remote).is_some())
+        let bound: Vec<GateScope> = binding_level(&self.policy, peer, remote, local)
+            .into_iter()
             .cloned()
             .collect();
         let transport = packet.transport();
@@ -845,7 +1024,7 @@ impl Model {
             (_, PacketDirection::Outbound) => (packet.dst_port, packet.src_port),
         };
         let protocol = packet.protocol();
-        if protocol != 1 && (remote_port == 0 || local_port == 0) {
+        if !matches!(protocol, 1 | 58) && (remote_port == 0 || local_port == 0) {
             return decision(enforce, false, GateReason::Malformed, None);
         }
         let flow_key = key(remote_port, local_port, protocol);
@@ -854,7 +1033,7 @@ impl Model {
         }
         let reverse_only = match packet.kind {
             Kind::Tcp(flags) => flags & 0x02 == 0 || flags & 0x10 != 0,
-            Kind::Echo(icmp_type, _) => icmp_type == 0,
+            Kind::Echo(icmp_type, _) => matches!(icmp_type, 0 | 129),
             _ => false,
         };
         if reverse_only {
@@ -996,10 +1175,22 @@ impl Model {
                 .cloned()
         };
         let (previous, next) = (std::mem::replace(&mut self.policy, policy), &self.policy);
+        let peer_keyed =
+            active_scopes(next).any(|scope| scope.bindings.iter().any(|b| b.addresses.is_empty()));
         self.flows.retain(|key, flow| {
             let Some(after) = active(next, &key.scope) else {
                 return false;
             };
+            // With a peer-keyed binding, a flow stays only in the scope
+            // step 4 selects for it.
+            if peer_keyed
+                && !matches!(
+                    binding_level(next, key.peer, key.remote, key.local).as_slice(),
+                    [scope] if scope.id == key.scope
+                )
+            {
+                return false;
+            }
             if active(&previous, &key.scope).as_ref() == Some(&after) {
                 return true;
             }
@@ -1033,7 +1224,12 @@ impl Model {
 
 /// Run one seeded sequence; every decision seen is added to `seen`. Without
 /// `unbound_addresses` every generated scope has that list emptied.
-fn run(seed: u64, seen: &mut std::collections::HashSet<String>, unbound_addresses: bool) {
+fn run(
+    seed: u64,
+    seen: &mut std::collections::HashSet<String>,
+    unbound_addresses: bool,
+    family: Family,
+) {
     let mut rng = Rng(seed);
     let start = Instant::now();
     let clock = Arc::new(Mutex::new(start));
@@ -1050,7 +1246,7 @@ fn run(seed: u64, seen: &mut std::collections::HashSet<String>, unbound_addresse
     for step in 0..STEPS {
         match rng.below(20) {
             0 => {
-                let mut policy = next_policy(&mut rng, &model.policy);
+                let mut policy = next_policy(&mut rng, &model.policy, family);
                 if !unbound_addresses {
                     for scope in &mut policy.scopes {
                         scope.unbound_addresses.clear();
@@ -1066,12 +1262,12 @@ fn run(seed: u64, seen: &mut std::collections::HashSet<String>, unbound_addresse
             }
             _ => {
                 let (direction, peer, packet) = match history.len() {
-                    0 => fresh(&mut rng),
+                    0 => fresh(&mut rng, family),
                     n if rng.chance(50) => {
                         let earlier = history[rng.below(n)];
                         follow_up(&mut rng, earlier)
                     }
-                    _ => fresh(&mut rng),
+                    _ => fresh(&mut rng, family),
                 };
                 let now = *clock.lock().unwrap();
                 let expected = model.evaluate(direction, peer, &packet, now);
@@ -1097,36 +1293,38 @@ fn run(seed: u64, seen: &mut std::collections::HashSet<String>, unbound_addresse
                 });
                 assert_eq!(
                     actual, expected,
-                    "seed {seed} step {step}: {direction:?} {peer:?} {packet:?}\npolicy {:#?}",
+                    "{family:?} seed {seed} step {step}: {direction:?} {peer:?} {packet:?}\npolicy {:#?}",
                     model.policy
                 );
             }
         }
-        assert_eq!(gate.counters(), model.counters, "seed {seed} step {step}");
+        assert_eq!(
+            gate.counters(),
+            model.counters,
+            "{family:?} seed {seed} step {step}"
+        );
     }
-    let _ = audit(&gate);
+    let _ = audit_families(&gate);
 }
 
-#[test]
-fn the_gate_matches_the_reference_model() {
-    let mut seen = std::collections::HashSet::new();
-    for seed in 0..SEEDS {
-        run(seed, &mut seen, true);
-    }
-    let reasons = [
-        GateReason::ValidState,
-        GateReason::Granted,
-        GateReason::Unbound,
-        GateReason::ReverseNewFlow,
-        GateReason::NoGrant,
-        GateReason::Suspended,
-        GateReason::Held,
-        GateReason::OrphanFragment,
-        GateReason::StateCapacity,
-        GateReason::Ambiguous,
-        GateReason::Malformed,
-    ];
-    for reason in reasons {
+/// Every reason, enforced.
+const REASONS: [GateReason; 11] = [
+    GateReason::ValidState,
+    GateReason::Granted,
+    GateReason::Unbound,
+    GateReason::ReverseNewFlow,
+    GateReason::NoGrant,
+    GateReason::Suspended,
+    GateReason::Held,
+    GateReason::OrphanFragment,
+    GateReason::StateCapacity,
+    GateReason::Ambiguous,
+    GateReason::Malformed,
+];
+
+/// Every reason was enforced, packets passed and grants observed.
+fn assert_coverage(seen: &std::collections::HashSet<String>) {
+    for reason in REASONS {
         assert!(
             seen.contains(reason.as_str()),
             "{reason:?} never enforced: {seen:?}"
@@ -1138,12 +1336,53 @@ fn the_gate_matches_the_reference_model() {
     );
 }
 
+#[test]
+fn the_gate_matches_the_reference_model() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, true, Family::V4);
+    }
+    assert_coverage(&seen);
+}
+
 /// Policies that never list unbound addresses behave as before the field
 /// existed.
 #[test]
 fn the_gate_matches_the_reference_model_without_unbound_addresses() {
     let mut seen = std::collections::HashSet::new();
     for seed in 0..SEEDS {
-        run(seed, &mut seen, false);
+        run(seed, &mut seen, false, Family::V4);
     }
+}
+
+#[test]
+fn the_gate_matches_the_reference_model_over_ipv6() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, true, Family::V6);
+    }
+    assert_coverage(&seen);
+}
+
+/// Both families in every policy and in one state table: the per-peer,
+/// global and fragment limits count them together.
+#[test]
+fn the_gate_matches_the_reference_model_over_both_families() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, true, Family::Both);
+    }
+    assert_coverage(&seen);
+}
+
+/// Both families with peer-keyed bindings: one binding covers every address
+/// of its peer in both families, the exact bindings of other scopes take
+/// precedence, and migration keeps a flow only in the scope selected for it.
+#[test]
+fn the_gate_matches_the_reference_model_with_peer_keyed_bindings() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, true, Family::PeerKeyed);
+    }
+    assert_coverage(&seen);
 }

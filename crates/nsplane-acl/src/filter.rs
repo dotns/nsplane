@@ -1,14 +1,16 @@
 //! [`AclFilter`]: a sans-I/O [`PacketFilter`] enforcing the ACL policy on
 //! inbound packets and the outbound rules of restricted peers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use nsplane_core::{PacketFilter, Verdict};
+use arc_swap::ArcSwap;
+use nsplane_core::{LocalIdentityId, PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
 use crate::engine::{AclEngine, Evaluation, Membership, PinholeMatch, ReplyDependency, Snapshot};
@@ -17,6 +19,7 @@ use crate::net::{IpNet, Protocol};
 use crate::pinhole::Direction;
 use crate::reasons;
 use crate::rules::{Flow, LabelSet, PolicyState, Transport};
+use thiserror::Error;
 
 // ── Peer identity ─────────────────────────────────────────────────────────────
 
@@ -65,6 +68,25 @@ pub trait PeerIdentity: Send + Sync + 'static {
     fn generation(&self) -> u64 {
         0
     }
+
+    /// The local identity `peer` was added under (`nsplane-core`
+    /// `PeerConfig::local_identity`): it selects the peer's
+    /// [`AclFilterScope`] among the [`AclFilterScopes`] of the filter.
+    ///
+    /// It must return the identity the peer was added under; the engine does
+    /// not check it, and a mismatch selects the wrong scope. Since a peer's
+    /// identity is fixed when it is added, the answer is static per peer.
+    /// A versioned implementation must bump its
+    /// [`generation`](Self::generation) when it changes. [`AclFilter`] asks
+    /// a versioned identity once per peer and identity generation, and one
+    /// that is not versioned on every packet that needs a scope, only while
+    /// some identity has a scope of its own.
+    ///
+    /// The default is [`LocalIdentityId::DEFAULT`].
+    fn local_identity(&self, peer: PeerId) -> LocalIdentityId {
+        let _ = peer;
+        LocalIdentityId::DEFAULT
+    }
 }
 
 impl<F> PeerIdentity for F
@@ -92,18 +114,26 @@ impl<T: PeerIdentity + ?Sized> PeerIdentity for Arc<T> {
     fn generation(&self) -> u64 {
         (**self).generation()
     }
+
+    fn local_identity(&self, peer: PeerId) -> LocalIdentityId {
+        (**self).local_identity(peer)
+    }
 }
 
-/// A concurrent, versioned map from peers to their labels.
+/// A concurrent, versioned map from peers to their labels and local
+/// identities.
 ///
 /// Wrap it in an `Arc` and hand a clone to the filter to update it at runtime.
-/// Every [`insert`](Self::insert), [`insert_by_source`](Self::insert_by_source)
-/// and [`remove`](Self::remove) bumps its
-/// [generation](PeerIdentity::generation) under its write lock, so the
-/// filter's cached labels and verdicts never outlive a change.
+/// Every [`insert`](Self::insert), [`insert_by_source`](Self::insert_by_source),
+/// [`set_local_identity`](Self::set_local_identity) and
+/// [`remove`](Self::remove) bumps its [generation](PeerIdentity::generation)
+/// under its write lock, so the filter's cached labels, identities and
+/// verdicts never outlive a change.
 #[derive(Debug)]
 pub struct PeerLabelMap {
     map: RwLock<HashMap<PeerId, Entry>>,
+    /// The local identities other than [`LocalIdentityId::DEFAULT`].
+    identities: RwLock<HashMap<PeerId, LocalIdentityId>>,
     generation: AtomicU64,
 }
 
@@ -119,6 +149,7 @@ impl Default for PeerLabelMap {
     fn default() -> Self {
         Self {
             map: RwLock::default(),
+            identities: RwLock::default(),
             generation: AtomicU64::new(1),
         }
     }
@@ -159,10 +190,29 @@ impl PeerLabelMap {
         self.map.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Remove the entry of `peer`; the peer becomes unknown.
+    /// Set the local identity of `peer` ([`PeerIdentity::local_identity`]):
+    /// the identity it was added under. Without one a peer is of
+    /// [`LocalIdentityId::DEFAULT`]. Independent of its labels: inserting
+    /// labels keeps it, [`remove`](Self::remove) clears it.
+    pub fn set_local_identity(&self, peer: PeerId, id: LocalIdentityId) {
+        let mut identities = self
+            .identities
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        identities.insert(peer, id);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Remove the entry and the local identity of `peer`; the peer becomes
+    /// unknown.
     pub fn remove(&self, peer: PeerId) {
         let mut map = self.map.write().unwrap_or_else(PoisonError::into_inner);
+        let mut identities = self
+            .identities
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         map.remove(&peer);
+        identities.remove(&peer);
         self.generation.fetch_add(1, Ordering::Release);
     }
 }
@@ -191,6 +241,17 @@ impl PeerIdentity for PeerLabelMap {
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    fn local_identity(&self, peer: PeerId) -> LocalIdentityId {
+        let identities = self
+            .identities
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        identities
+            .get(&peer)
+            .copied()
+            .unwrap_or(LocalIdentityId::DEFAULT)
     }
 }
 
@@ -267,10 +328,17 @@ impl Default for AclFilterConfig {
     }
 }
 
-/// Per-filter address scopes of an [`AclFilter`] (beyond [`AclFilterConfig`]).
+/// Address scopes of an [`AclFilter`] (beyond [`AclFilterConfig`]).
 ///
 /// Built with [`new`](Self::new) and the `with_*` setters; the default scopes
 /// nothing and costs nothing on the packet path.
+///
+/// A filter holds one scope per local identity, plus a default one, in an
+/// [`AclFilterScopes`]: given at build ([`AclFilter::with_scope`] sets the
+/// default) and replaced at runtime by [`AclFilter::replace_scopes`]. Each
+/// packet is judged under the scope of its peer's
+/// [local identity](PeerIdentity::local_identity), or the default one when
+/// that identity has none.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AclFilterScope {
@@ -367,6 +435,239 @@ impl AclFilterScope {
     pub fn with_other_protocol(mut self, rule: OtherProtocolRule) -> Self {
         self.other_protocols.push(rule);
         self
+    }
+
+    /// Whether the scope constrains nothing.
+    const fn is_unconstrained(&self) -> bool {
+        self.outbound_sources.is_none() && self.other_protocols.is_empty()
+    }
+
+    /// Whether [`outbound_sources`](Self::outbound_sources) lets an outbound
+    /// packet through.
+    fn allows_source(&self, bytes: &[u8]) -> bool {
+        self.outbound_sources
+            .as_deref()
+            .is_none_or(|prefixes| source_in(bytes, prefixes))
+    }
+
+    /// Whether an [`other_protocols`](Self::other_protocols) rule accepts
+    /// `packet`.
+    #[inline]
+    fn accepts_other(&self, packet: &IpPacket<'_>) -> bool {
+        self.other_protocols.iter().any(|rule| rule.accepts(packet))
+    }
+}
+
+/// The scope of a filter that constrains nothing.
+static UNSCOPED: AclFilterScope = AclFilterScope {
+    outbound_sources: None,
+    other_protocols: Vec::new(),
+};
+
+/// The [`AclFilterScope`]s of an [`AclFilter`], published together by
+/// [`AclFilter::replace_scopes`].
+///
+/// A packet is judged under the scope of its peer's
+/// [local identity](PeerIdentity::local_identity) in
+/// [`identities`](Self::identities), or under [`default`](Self::default)
+/// when that identity has no entry. Built with [`new`](Self::new) and the
+/// `with_*` setters; the default scopes nothing.
+///
+/// A default scope alone adds only the read of the published scopes (see
+/// [`AclFilter::replace_scopes`]). Only
+/// with [`identities`](Self::identities) does a packet that needs a scope
+/// also resolve its peer's identity (from the peer cache, or the
+/// [`PeerIdentity::local_identity`] hook when the identity is not versioned)
+/// and look its scope up; the outbound source check then follows the peer
+/// lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AclFilterScopes {
+    /// The scope of the peers whose identity has no entry.
+    pub default: AclFilterScope,
+    /// The scope of each local identity; an identity may be listed once.
+    /// [`LocalIdentityId::DEFAULT`] may be listed too, and then replaces
+    /// [`default`](Self::default) for its peers.
+    pub identities: Vec<(LocalIdentityId, AclFilterScope)>,
+}
+
+impl AclFilterScopes {
+    /// No scope: no constraint.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`default`](Self::default) to `scope`.
+    #[must_use]
+    pub fn with_default(mut self, scope: AclFilterScope) -> Self {
+        self.default = scope;
+        self
+    }
+
+    /// Appends the scope of the local identity `id` to
+    /// [`identities`](Self::identities).
+    #[must_use]
+    pub fn with_identity(mut self, id: LocalIdentityId, scope: AclFilterScope) -> Self {
+        self.identities.push((id, scope));
+        self
+    }
+}
+
+/// Why [`AclFilter::replace_scopes`] rejected an [`AclFilterScopes`].
+/// Nothing is published.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum AclFilterScopeError {
+    /// A local identity is listed twice.
+    #[error("local identity {0:?} has two scopes")]
+    DuplicateIdentity(LocalIdentityId),
+}
+
+/// The published [`AclFilterScopes`]: one value, so a packet loading it sees
+/// every field of one generation.
+#[derive(Debug)]
+struct ScopeSet {
+    /// 0 for the scope given at build, then increased by every replace.
+    generation: u64,
+    default: AclFilterScope,
+    by_identity: HashMap<LocalIdentityId, AclFilterScope, FlowHash>,
+}
+
+impl ScopeSet {
+    fn new(generation: u64, scopes: AclFilterScopes) -> Result<Self, AclFilterScopeError> {
+        let mut by_identity =
+            HashMap::with_capacity_and_hasher(scopes.identities.len(), FlowHash::default());
+        for (id, scope) in scopes.identities {
+            if by_identity.insert(id, scope).is_some() {
+                return Err(AclFilterScopeError::DuplicateIdentity(id));
+            }
+        }
+        Ok(Self {
+            generation,
+            default: scopes.default,
+            by_identity,
+        })
+    }
+
+    /// Whether no scope constrains anything.
+    fn is_unscoped(&self) -> bool {
+        self.default.is_unconstrained()
+            && self
+                .by_identity
+                .values()
+                .all(AclFilterScope::is_unconstrained)
+    }
+
+    /// The scope of the local identity `id`.
+    fn select(&self, id: LocalIdentityId) -> &AclFilterScope {
+        self.by_identity.get(&id).unwrap_or(&self.default)
+    }
+}
+
+/// The published [`ScopeSet`] of a filter. Every load and store of it goes
+/// through here.
+///
+/// Each thread caches the last set it loaded with its cell and generation, so
+/// a load is a plain atomic read of the generation and, while the set is
+/// unchanged, a borrow of the cached set: no read-modify-write and no
+/// reference count. The cache holds one set per thread (a thread alternating
+/// between filters loads the set from the shared cell on every switch), so it
+/// keeps at most one set alive per thread.
+///
+/// Ordering: the generation is the publication point of a store. A store
+/// writes the set, then its generation (Release). A load reads the
+/// generation `g` (Acquire) and returns the set of exactly the generation it
+/// last read: the cached one when it is of this cell and `g`, else the shared
+/// set once a generation read after loading it equals the set's own (a newer
+/// set is not used before its generation is published). Sets are immutable
+/// values, so a packet sees one whole set; and since the generation only
+/// grows, a packet ordered after another load, or after a store returned,
+/// reads a generation at least as high, so it never sees an older set.
+struct ScopeCell {
+    set: ArcSwap<ScopeSet>,
+    /// The generation of the published set, stored after `set`.
+    generation: AtomicU64,
+    /// Tells the cells apart in the per-thread cache: from a global counter,
+    /// so never shared by two cells (an address could be reused).
+    id: u64,
+}
+
+/// The set a thread loaded last: its cell, its generation and the set.
+type CachedScopes = Option<(u64, u64, Arc<ScopeSet>)>;
+
+thread_local! {
+    static SCOPE_CACHE: RefCell<CachedScopes> = const { RefCell::new(None) };
+}
+
+impl ScopeCell {
+    fn new(set: ScopeSet) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            generation: AtomicU64::new(set.generation),
+            set: ArcSwap::from_pointee(set),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The generation of the published set.
+    #[inline]
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Run `f` on the published set (see the ordering above).
+    #[inline]
+    fn load<R>(&self, f: impl FnOnce(&ScopeSet) -> R) -> R {
+        let generation = self.generation();
+        SCOPE_CACHE.with(|cache| {
+            if let Some((id, cached, set)) = &*cache.borrow()
+                && *id == self.id
+                && *cached == generation
+            {
+                return f(set);
+            }
+            f(&self.refill(cache))
+        })
+    }
+
+    /// Load the published set and cache it, unless the cache is lent to an
+    /// outer load (`f` processing another packet on this thread).
+    #[cold]
+    #[inline(never)]
+    fn refill(&self, cache: &RefCell<CachedScopes>) -> Arc<ScopeSet> {
+        let set = self.load_published();
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            *cache = Some((self.id, set.generation, Arc::clone(&set)));
+        }
+        set
+    }
+
+    /// The shared set, once its generation is the published one.
+    fn load_published(&self) -> Arc<ScopeSet> {
+        loop {
+            let set = self.set.load_full();
+            if set.generation == self.generation() {
+                return set;
+            }
+            // A store is between its two writes (the set is not published
+            // yet), or a later store completed: read both again.
+            std::thread::yield_now();
+        }
+    }
+
+    /// Publish `set`, whose generation is above the published one; callers
+    /// serialize stores.
+    fn store(&self, set: ScopeSet) {
+        let generation = set.generation;
+        self.set.store(Arc::new(set));
+        self.generation.store(generation, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for ScopeCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self.set.load(), f)
     }
 }
 
@@ -782,6 +1083,10 @@ struct PeerInfo {
     /// A marker: the peer's labels depend on the packet's address and are
     /// resolved per address. Its other fields are those of an unknown peer.
     by_source: bool,
+    /// The peer's local identity ([`PeerIdentity::local_identity`]), when
+    /// cached (`identity` non-zero); else [`LocalIdentityId::DEFAULT`], never
+    /// read.
+    local_identity: LocalIdentityId,
     /// The peer's labels, `None` for an unknown peer.
     labels: Option<LabelSet>,
     /// The peer's namespaces (the union over its labels, computed once
@@ -816,7 +1121,18 @@ impl PeerInfo {
         src: IpAddr,
         generation: u64,
     ) -> Self {
-        Self::new(identity.labels_for(peer, src), snapshot, generation, false)
+        let local_identity = if generation == 0 {
+            LocalIdentityId::DEFAULT
+        } else {
+            identity.local_identity(peer)
+        };
+        Self::new(
+            identity.labels_for(peer, src),
+            snapshot,
+            generation,
+            false,
+            local_identity,
+        )
     }
 
     fn new(
@@ -824,6 +1140,7 @@ impl PeerInfo {
         snapshot: &Snapshot,
         generation: u64,
         by_source: bool,
+        local_identity: LocalIdentityId,
     ) -> Self {
         let membership = labels
             .as_ref()
@@ -832,6 +1149,7 @@ impl PeerInfo {
             generation: snapshot.generation(),
             identity: generation,
             by_source,
+            local_identity,
             governed: match &membership {
                 None => Governed::Default,
                 Some(membership) if membership.outbound_restricted() => Governed::Restricted,
@@ -845,6 +1163,13 @@ impl PeerInfo {
             membership,
         }
     }
+}
+
+/// An outbound-restricted peer and the scope its packet is judged under.
+#[derive(Clone, Copy)]
+struct Restricted<'a> {
+    info: &'a PeerInfo,
+    scope: &'a AclFilterScope,
 }
 
 /// The flow of a TCP or UDP five-tuple.
@@ -903,6 +1228,18 @@ fn other_transport(packet: &IpPacket<'_>, protocol: u8) -> Option<Transport> {
 /// accepts everything skip the evaluation altogether (see the crate docs on
 /// the ACL hook). Verdicts and counters are the same as without the cache.
 ///
+/// **Scopes**: each packet is judged under one [`AclFilterScope`], that of
+/// its peer's [local identity](PeerIdentity::local_identity) in the
+/// published [`AclFilterScopes`], or their default one when that identity has
+/// none. [`with_scope`](Self::with_scope) gives the default scope at build
+/// (scope generation 0); [`replace_scopes`](Self::replace_scopes) replaces
+/// every scope at runtime in one atomic store and bumps the
+/// [scope generation](Self::scope_generation). A packet loads the scopes
+/// once, so it never mixes fields of two generations. A versioned identity's
+/// answer is cached with the peer's labels; one that is not versioned is
+/// asked per packet, only while some identity has a scope of its own. While
+/// no scope constrains anything, a packet reads one flag and skips them.
+///
 /// IPv4 fragments: a first fragment is evaluated and its outcome recorded;
 /// later fragments of the same packet follow it, and a later fragment with no
 /// recorded first fragment is dropped. [`AclFilterConfig::fragments`] selects
@@ -919,10 +1256,14 @@ struct Inner {
     engine: Arc<AclEngine>,
     identity: Box<dyn PeerIdentity>,
     config: AclFilterConfig,
-    /// [`AclFilterScope::outbound_sources`].
-    outbound_sources: Option<Box<[IpNet]>>,
-    /// [`AclFilterScope::other_protocols`].
-    other_protocols: Box<[OtherProtocolRule]>,
+    /// The published [`AclFilterScopes`].
+    scopes: ScopeCell,
+    /// No published scope constrains anything, so packets skip the scopes.
+    /// Read before them; it is true only while the latest published set is
+    /// unscoped.
+    unscoped: AtomicBool,
+    /// Serializes [`AclFilter::replace_scopes`].
+    scope_writer: Mutex<()>,
     /// Cache peers and verdicts (always, except in the differential tests).
     cache: bool,
     fragments: Mutex<FragmentTable>,
@@ -935,8 +1276,7 @@ impl fmt::Debug for AclFilter {
         f.debug_struct("AclFilter")
             .field("engine", &self.inner.engine)
             .field("config", &self.inner.config)
-            .field("outbound_sources", &self.inner.outbound_sources)
-            .field("other_protocols", &self.inner.other_protocols)
+            .field("scopes", &self.inner.scopes)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -957,7 +1297,8 @@ impl AclFilter {
         Self::with_scope(engine, identity, config, AclFilterScope::default())
     }
 
-    /// A filter with the given settings and address scopes.
+    /// A filter with the given settings and default address scope (scope
+    /// generation 0; see [`replace_scopes`](Self::replace_scopes)).
     pub fn with_scope(
         engine: Arc<AclEngine>,
         identity: impl PeerIdentity,
@@ -991,19 +1332,65 @@ impl AclFilter {
         scope: AclFilterScope,
         cache: bool,
     ) -> Self {
+        let scopes = ScopeSet {
+            generation: 0,
+            default: scope,
+            by_identity: HashMap::default(),
+        };
         Self {
             inner: Arc::new(Inner {
                 engine,
                 identity,
                 config,
-                outbound_sources: scope.outbound_sources.map(Vec::into_boxed_slice),
-                other_protocols: scope.other_protocols.into_boxed_slice(),
+                unscoped: AtomicBool::new(scopes.is_unscoped()),
+                scopes: ScopeCell::new(scopes),
+                scope_writer: Mutex::default(),
                 cache,
                 fragments: Mutex::default(),
                 flows: Mutex::default(),
                 counters: Counters::default(),
             }),
         }
+    }
+
+    /// Validate `scopes` and publish them atomically; returns the new scope
+    /// generation. A rejected set changes nothing.
+    ///
+    /// Each packet loads the published set once and is judged under one
+    /// whole scope of one generation: packets that load it before the store
+    /// see the previous scopes, those after see the new ones, and none mixes
+    /// fields of both. Any clone of the filter can replace them. State
+    /// recorded under the previous scopes (reply allowances, fragment
+    /// outcomes) is kept. While the scopes are unchanged a packet reads them
+    /// with one atomic load and a per-thread cache lookup, a few dependent
+    /// loads more than a scope fixed at build; per-identity scopes add the
+    /// identity resolution described in [`AclFilterScopes`].
+    pub fn replace_scopes(&self, scopes: AclFilterScopes) -> Result<u64, AclFilterScopeError> {
+        let inner = &*self.inner;
+        let _writer = inner
+            .scope_writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let set = ScopeSet::new(inner.scopes.generation() + 1, scopes)?;
+        let (generation, unscoped) = (set.generation, set.is_unscoped());
+        // `unscoped` is cleared before a constrained set is stored and set
+        // after an unscoped one is, so a packet reading it true is judged as
+        // under the latest published set.
+        if !unscoped {
+            inner.unscoped.store(false, Ordering::Release);
+        }
+        inner.scopes.store(set);
+        if unscoped {
+            inner.unscoped.store(true, Ordering::Release);
+        }
+        Ok(generation)
+    }
+
+    /// The generation of the published scopes: 0 for the scope given at
+    /// build, then increased by every [`replace_scopes`](Self::replace_scopes).
+    #[must_use]
+    pub fn scope_generation(&self) -> u64 {
+        self.inner.scopes.generation()
     }
 
     /// A snapshot of the counters.
@@ -1051,6 +1438,42 @@ impl Inner {
         } else {
             0
         }
+    }
+
+    /// The scope from `set` of `peer`'s inbound packets from `src`; `None`
+    /// on an invariant failure of the peer cache.
+    #[inline]
+    fn inbound_scope<'s>(
+        &self,
+        set: &'s ScopeSet,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        src: IpAddr,
+    ) -> Option<&'s AclFilterScope> {
+        if set.by_identity.is_empty() {
+            return Some(&set.default);
+        }
+        self.identity_scope(set, snapshot, peer, src)
+    }
+
+    /// [`inbound_scope`](Self::inbound_scope) with per-identity scopes.
+    #[inline(never)]
+    fn identity_scope<'s>(
+        &self,
+        set: &'s ScopeSet,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        src: IpAddr,
+    ) -> Option<&'s AclFilterScope> {
+        let identity = self.identity_generation();
+        let local = if identity == 0 {
+            self.identity.local_identity(peer)
+        } else {
+            let mut table = self.table();
+            self.cached_peer(&mut table, snapshot, peer, Some(src), identity)?
+                .local_identity
+        };
+        Some(set.select(local))
     }
 
     /// Sweep the expired pinholes when a lookup saw one.
@@ -1304,7 +1727,18 @@ impl Inner {
         // allowance.
         let allows_reply = self.config.stateful_replies
             && (!is_icmp(tuple.protocol) || echo_type(packet) == Some(EchoType::Request));
-        if self.other_protocols.iter().any(|rule| rule.accepts(packet)) {
+        let scoped = if self.unscoped.load(Ordering::Acquire) {
+            Some(false)
+        } else {
+            self.scopes.load(|set| {
+                self.inbound_scope(set, snapshot, peer, tuple.src)
+                    .map(|scope| scope.accepts_other(packet))
+            })
+        };
+        let Some(scoped) = scoped else {
+            return Outcome::Internal;
+        };
+        if scoped {
             if allows_reply {
                 self.allow_restricted_reply(snapshot, peer, tuple);
             }
@@ -1467,10 +1901,19 @@ impl Inner {
             }
         }
         let resolve = || {
+            let local = || self.identity.local_identity(peer);
             let info = match src {
-                _ if self.identity.by_source(peer) => PeerInfo::new(None, snapshot, identity, true),
+                _ if self.identity.by_source(peer) => {
+                    PeerInfo::new(None, snapshot, identity, true, local())
+                }
                 Some(src) => PeerInfo::resolve(&*self.identity, snapshot, peer, src, identity),
-                None => PeerInfo::new(self.identity.labels(peer), snapshot, identity, false),
+                None => PeerInfo::new(
+                    self.identity.labels(peer),
+                    snapshot,
+                    identity,
+                    false,
+                    local(),
+                ),
             };
             Arc::new(info)
         };
@@ -1631,9 +2074,21 @@ impl Inner {
         if self.accepts_ipv6(bytes) {
             return Outcome::Ipv6Accepted;
         }
-        if let Some(prefixes) = &self.outbound_sources
-            && !source_in(bytes, prefixes)
-        {
+        if self.unscoped.load(Ordering::Acquire) {
+            return self.outbound_under(peer, bytes, None);
+        }
+        self.scopes
+            .load(|set| self.outbound_under(peer, bytes, Some(set)))
+    }
+
+    /// [`outbound`](Self::outbound) under the scopes `set`, `None` when they
+    /// constrain nothing.
+    fn outbound_under(&self, peer: PeerId, bytes: &[u8], set: Option<&ScopeSet>) -> Outcome {
+        // Without per-identity scopes the scope is known before the peer.
+        let early = set
+            .filter(|set| set.by_identity.is_empty())
+            .map(|set| &set.default);
+        if early.is_some_and(|scope| !scope.allows_source(bytes)) {
             return Outcome::OutboundSource;
         }
         let snapshot = self.engine.snapshot();
@@ -1642,20 +2097,42 @@ impl Inner {
         // The remote address; a by-source peer is unknown without it.
         let dst = parsed.as_ref().ok().map(IpPacket::dst);
         let mut table = self.table();
+        let mut local = LocalIdentityId::DEFAULT;
         // `None`: an unrestricted peer without pinholes.
         let info = if identity != 0 {
             let Some(info) = self.cached_peer(&mut table, &snapshot, peer, dst, identity) else {
                 return Outcome::Internal;
             };
+            local = info.local_identity;
             (info.governed == Governed::Restricted || info.pinholes).then(|| Arc::clone(info))
         } else if snapshot.has_outbound_restrictions() || snapshot.has_pinholes() {
             let labels = dst.map_or_else(
                 || self.identity.labels(peer),
                 |dst| self.identity.labels_for(peer, dst),
             );
-            Some(Arc::new(PeerInfo::new(labels, &snapshot, 0, false)))
+            Some(Arc::new(PeerInfo::new(
+                labels,
+                &snapshot,
+                0,
+                false,
+                LocalIdentityId::DEFAULT,
+            )))
         } else {
             None
+        };
+        let scope = match (early, set) {
+            (Some(scope), _) => scope,
+            (None, None) => &UNSCOPED,
+            (None, Some(set)) => {
+                if identity == 0 {
+                    local = self.identity.local_identity(peer);
+                }
+                let scope = set.select(local);
+                if !scope.allows_source(bytes) {
+                    return Outcome::OutboundSource;
+                }
+                scope
+            }
         };
         let restricted = info
             .as_ref()
@@ -1670,16 +2147,18 @@ impl Inner {
         let info = match info {
             Some(info) if restricted => info,
             info => {
-                self.outbound_unrestricted(&snapshot, peer, info.as_deref(), &packet, table);
+                let info = info.as_deref();
+                self.outbound_unrestricted(&snapshot, peer, info, scope, &packet, table);
                 return Outcome::OutboundAccepted;
             }
         };
+        let restricted = Restricted { info: &info, scope };
         if packet.fragment().is_none() {
-            return self.evaluate_outbound(&snapshot, peer, &info, identity, &packet, table);
+            return self.evaluate_outbound(&snapshot, peer, restricted, identity, &packet, table);
         }
         drop(table);
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(&snapshot, peer, &info, identity, packet, self.table())
+            self.evaluate_outbound(&snapshot, peer, restricted, identity, packet, self.table())
         })
     }
 
@@ -1690,6 +2169,7 @@ impl Inner {
         snapshot: &Snapshot,
         peer: PeerId,
         info: Option<&PeerInfo>,
+        scope: &AclFilterScope,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
     ) {
@@ -1700,7 +2180,7 @@ impl Inner {
         let dependency = info
             .and_then(|info| info.labels.as_ref())
             .and_then(|labels| self.outbound_pinhole(snapshot, labels, &tuple, &mut sweep));
-        self.track_outbound(&mut table, peer, tuple, packet, dependency);
+        self.track_outbound(&mut table, peer, tuple, scope, packet, dependency);
         drop(table);
         self.sweep_if(sweep);
     }
@@ -1737,7 +2217,7 @@ impl Inner {
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
-        info: &PeerInfo,
+        Restricted { info, scope }: Restricted<'_>,
         identity: u64,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
@@ -1747,10 +2227,11 @@ impl Inner {
         };
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
             if self.config.allow_other_protocols {
-                self.track_outbound(&mut table, peer, tuple, packet, None);
+                self.track_outbound(&mut table, peer, tuple, scope, packet, None);
                 return Outcome::OutboundAccepted;
             }
-            return self.outbound_other(snapshot, peer, info, tuple, packet, table);
+            let restricted = Restricted { info, scope };
+            return self.outbound_other(snapshot, peer, restricted, tuple, packet, table);
         };
         let key = EntryKey {
             peer,
@@ -1780,7 +2261,7 @@ impl Inner {
             }
         };
         if verdict.outcome != Outcome::OutboundDenied {
-            self.track_outbound(&mut table, peer, tuple, packet, verdict.dependency);
+            self.track_outbound(&mut table, peer, tuple, scope, packet, verdict.dependency);
         }
         drop(table);
         self.sweep_if(sweep);
@@ -1794,7 +2275,7 @@ impl Inner {
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
-        info: &PeerInfo,
+        Restricted { info, scope }: Restricted<'_>,
         tuple: FiveTuple,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
@@ -1827,7 +2308,7 @@ impl Inner {
         if !rule {
             return Outcome::OutboundDenied;
         }
-        self.track_outbound(&mut table, peer, tuple, packet, None);
+        self.track_outbound(&mut table, peer, tuple, scope, packet, None);
         Outcome::OutboundAccepted
     }
 
@@ -1870,12 +2351,14 @@ impl Inner {
         (verdict, !expired)
     }
 
-    /// Record the inbound reply allowance of an accepted outbound packet.
+    /// Record the inbound reply allowance of an accepted outbound packet
+    /// judged under `scope`.
     fn track_outbound(
         &self,
         table: &mut FlowTable,
         peer: PeerId,
         tuple: FiveTuple,
+        scope: &AclFilterScope,
         packet: &IpPacket<'_>,
         dependency: Option<ReplyDependency>,
     ) {
@@ -1885,7 +2368,7 @@ impl Inner {
         let tracked = match tuple.protocol {
             protocol::TCP | protocol::UDP => true,
             p if is_icmp(p) => {
-                (self.config.allow_other_protocols || !self.other_protocols.is_empty())
+                (self.config.allow_other_protocols || !scope.other_protocols.is_empty())
                     && echo_type(packet) == Some(EchoType::Request)
             }
             _ => false,
@@ -5241,5 +5724,329 @@ mod tests {
             inbound(&f, PeerId::new(8), tcp_packet(addr("fd00::7"), 4000, l, 80)),
             Verdict::Accept
         );
+    }
+
+    // ── Per-identity scopes ──────────────────────────────────────────────────
+
+    /// Two local identities other than the default one.
+    fn local_identities() -> [LocalIdentityId; 2] {
+        let mut core = nsplane_core::Core::new(nsplane_core::CoreConfig::default());
+        [1, 2].map(|seed| {
+            core.add_local_identity(nsplane_core::x25519::StaticSecret::from([seed; 32]))
+                .unwrap()
+        })
+    }
+
+    /// Outbound sources in `10.0.0.0/24`, no other-protocol rule.
+    fn scope_a() -> AclFilterScope {
+        AclFilterScope::new().with_outbound_sources([net("10.0.0.0/24")])
+    }
+
+    /// Outbound sources in `10.1.0.0/24`, GRE to `10.0.0.2` accepted.
+    fn scope_b() -> AclFilterScope {
+        AclFilterScope::new()
+            .with_outbound_sources([net("10.1.0.0/24")])
+            .with_other_protocol(OtherProtocolRule::new(
+                OtherProtocol::Ip(47),
+                [net("10.0.0.2/32")],
+            ))
+    }
+
+    /// Which scope `peer`'s packets are judged under: `Some(true)` for
+    /// [`scope_a`], `Some(false)` for [`scope_b`], `None` for no constraint.
+    fn judged_scope(f: &AclFilter, peer: PeerId) -> Option<bool> {
+        let remote = addr("10.0.0.1");
+        let from = |src: &str| outbound(f, peer, tcp_packet(addr(src), 5000, remote, 80));
+        let gre = inbound(f, peer, ip(remote, addr("10.0.0.2"), 47, &[0; 4]));
+        match (from("10.0.0.2"), from("10.1.0.2"), gre) {
+            (Verdict::Accept, Verdict::Accept, Verdict::Drop { .. }) => None,
+            (Verdict::Accept, Verdict::Drop { .. }, Verdict::Drop { .. }) => Some(true),
+            (Verdict::Drop { .. }, Verdict::Accept, Verdict::Accept) => Some(false),
+            verdicts => panic!("no single scope gives {verdicts:?}"),
+        }
+    }
+
+    #[test]
+    fn scopes_are_selected_by_local_identity() {
+        let [x, y] = local_identities();
+        let map = identity();
+        map.set_local_identity(OTHER_PEER, x);
+        // An identity without a scope of its own.
+        map.set_local_identity(KEY_PEER, y);
+        map.insert(KEY_PEER, label_set(&[ADDR]));
+        let f = AclFilter::new(rules_engine(test_policy()), Arc::clone(&map));
+        assert_eq!(AclFilterScopes::new(), AclFilterScopes::default());
+        for peer in [PEER, OTHER_PEER, KEY_PEER] {
+            assert_eq!(judged_scope(&f, peer), None);
+        }
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_a())
+            .with_identity(x, scope_b());
+        assert_eq!(f.replace_scopes(scopes), Ok(1));
+        assert_eq!(judged_scope(&f, PEER), Some(true));
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+        // No entry for its identity: the default scope.
+        assert_eq!(judged_scope(&f, KEY_PEER), Some(true));
+        let stats = f.stats();
+        assert_eq!((stats.outbound_source, stats.protocol), (3, 5));
+        assert_eq!(stats.accepted, 1);
+
+        // A scope for the default identity replaces the default scope for its peers only.
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_b())
+            .with_identity(LocalIdentityId::DEFAULT, scope_a());
+        assert_eq!(f.replace_scopes(scopes), Ok(2));
+        assert_eq!(judged_scope(&f, PEER), Some(true));
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+        assert_eq!(judged_scope(&f, KEY_PEER), Some(false));
+    }
+
+    #[test]
+    fn replace_scopes_bumps_the_generation_and_rejects_duplicates() {
+        let [x, _] = local_identities();
+        let map = identity();
+        map.set_local_identity(OTHER_PEER, x);
+        let config = AclFilterConfig::default();
+        let f = AclFilter::with_scope(rules_engine(test_policy()), map, config, scope_a());
+        // The build scope is the default one, generation 0.
+        assert_eq!(f.scope_generation(), 0);
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(true));
+
+        // Any clone replaces the scopes of all of them.
+        let handle = f.clone();
+        let scopes = AclFilterScopes::new().with_default(scope_b());
+        assert_eq!(handle.replace_scopes(scopes), Ok(1));
+        assert_eq!(f.scope_generation(), 1);
+        assert_eq!(judged_scope(&f, PEER), Some(false));
+
+        // A duplicate identity publishes nothing.
+        let duplicate = AclFilterScopes::new()
+            .with_identity(x, scope_a())
+            .with_identity(x, scope_a());
+        assert_eq!(
+            f.replace_scopes(duplicate),
+            Err(AclFilterScopeError::DuplicateIdentity(x))
+        );
+        assert_eq!(f.scope_generation(), 1);
+        assert_eq!(judged_scope(&f, PEER), Some(false));
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+
+        // Back to no constraint: the fast path again.
+        assert!(!f.inner.unscoped.load(Ordering::Relaxed));
+        assert_eq!(f.replace_scopes(AclFilterScopes::new()), Ok(2));
+        assert!(f.inner.unscoped.load(Ordering::Relaxed));
+        assert_eq!(judged_scope(&f, OTHER_PEER), None);
+        // Entries that constrain nothing keep the fast path.
+        let empty = AclFilterScopes::new().with_identity(x, AclFilterScope::new());
+        assert_eq!(f.replace_scopes(empty), Ok(3));
+        assert!(f.inner.unscoped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn set_local_identity_changes_the_scope() {
+        let [x, _] = local_identities();
+        let map = identity();
+        let f = AclFilter::new(rules_engine(test_policy()), Arc::clone(&map));
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_a())
+            .with_identity(x, scope_b());
+        f.replace_scopes(scopes).unwrap();
+        // The peer's identity is cached with its labels.
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(true));
+        map.set_local_identity(OTHER_PEER, x);
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+        // Inserting labels keeps the identity; removing the peer clears it.
+        map.insert(OTHER_PEER, label_set(&[ADDR, "peer-2"]));
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+        map.remove(OTHER_PEER);
+        map.insert(OTHER_PEER, label_set(&[ADDR, "peer-2"]));
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(true));
+    }
+
+    /// The labels of a [`PeerLabelMap`], versioned or not, counting the
+    /// local identity lookups.
+    struct CountingIdentity {
+        map: PeerLabelMap,
+        versioned: bool,
+        lookups: AtomicU64,
+    }
+
+    impl PeerIdentity for CountingIdentity {
+        fn labels(&self, peer: PeerId) -> Option<LabelSet> {
+            self.map.labels(peer)
+        }
+
+        fn generation(&self) -> u64 {
+            if self.versioned {
+                self.map.generation()
+            } else {
+                0
+            }
+        }
+
+        fn local_identity(&self, peer: PeerId) -> LocalIdentityId {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            self.map.local_identity(peer)
+        }
+    }
+
+    #[test]
+    fn local_identity_is_cached_when_versioned_and_asked_only_when_needed() {
+        let [x, _] = local_identities();
+        for versioned in [true, false] {
+            let map = PeerLabelMap::new();
+            map.insert(PEER, label_set(&[ADDR]));
+            map.insert(OTHER_PEER, label_set(&[ADDR]));
+            map.set_local_identity(OTHER_PEER, x);
+            let identity = Arc::new(CountingIdentity {
+                map,
+                versioned,
+                lookups: AtomicU64::new(0),
+            });
+            let config = AclFilterConfig::default();
+            let engine = rules_engine(test_policy());
+            let f = AclFilter::with_scope(engine, Arc::clone(&identity), config, scope_a());
+            let lookups = || identity.lookups.load(Ordering::Relaxed);
+            // Without per-identity scopes an unversioned identity is never asked.
+            assert_eq!(judged_scope(&f, OTHER_PEER), Some(true));
+            let before = lookups();
+            assert_eq!(before, u64::from(versioned));
+
+            let scopes = AclFilterScopes::new()
+                .with_default(scope_a())
+                .with_identity(x, scope_b());
+            f.replace_scopes(scopes).unwrap();
+            for _ in 0..3 {
+                assert_eq!(judged_scope(&f, PEER), Some(true));
+                assert_eq!(judged_scope(&f, OTHER_PEER), Some(false));
+            }
+            if versioned {
+                // Cached per peer under the identity generation: `PEER` once.
+                assert_eq!(lookups(), before + 1);
+            } else {
+                // Asked by every packet that needs a scope: two outbound, one GRE.
+                assert_eq!(lookups(), before + 18);
+            }
+        }
+
+        // A closure is of the default identity: the default scope.
+        let closure = |_: PeerId| Some(label_set(&[ADDR]));
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_a())
+            .with_identity(x, scope_b());
+        let f = AclFilter::new(rules_engine(test_policy()), closure);
+        f.replace_scopes(scopes).unwrap();
+        assert_eq!(judged_scope(&f, OTHER_PEER), Some(true));
+    }
+
+    #[test]
+    fn replace_scopes_under_concurrency_never_tears_a_scope() {
+        /// Counts a reader as done even when it panics, so the writer stops.
+        struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        const READERS: u16 = 4;
+        const PACKETS: u16 = 500;
+        let [x, _] = local_identities();
+        let map = identity();
+        map.set_local_identity(OTHER_PEER, x);
+        let config = AclFilterConfig::default();
+        let f = AclFilter::with_scope(rules_engine(test_policy()), map, config, scope_a());
+        // `OTHER_PEER` is under `scope_b` in odd generations, `scope_a` in even ones.
+        let set = |generation: u64| {
+            let scope = if generation % 2 == 1 {
+                scope_b()
+            } else {
+                scope_a()
+            };
+            AclFilterScopes::new()
+                .with_default(scope_a())
+                .with_identity(x, scope)
+        };
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let remote = addr("10.0.0.1");
+        std::thread::scope(|threads| {
+            for reader in 0..READERS {
+                let (f, done) = (&f, &done);
+                threads.spawn(move || {
+                    let _done = Done(done);
+                    for i in 0..PACKETS {
+                        let id = reader * PACKETS + i;
+                        // `scope_a` accepts the first source, `scope_b` the second.
+                        let (src, a_accepts) = if i % 2 == 0 {
+                            (addr("10.0.0.2"), true)
+                        } else {
+                            (addr("10.1.0.2"), false)
+                        };
+                        let before = f.scope_generation();
+                        let request = ip(src, remote, protocol::ICMP, &icmp_echo(8, id));
+                        let verdict = outbound(f, OTHER_PEER, request);
+                        let after = f.scope_generation();
+                        let accepted = verdict == Verdict::Accept;
+                        if before == after {
+                            let under_a = before % 2 == 0;
+                            assert_eq!(accepted, a_accepts == under_a, "generation {before}");
+                        }
+                        // Only `scope_b` records the echo reply's allowance, and it
+                        // accepts the second source only: both fields of one scope.
+                        let reply = ip(remote, src, protocol::ICMP, &icmp_echo(0, id));
+                        let replied = inbound(f, OTHER_PEER, reply) == Verdict::Accept;
+                        assert_eq!(replied, accepted && !a_accepts, "torn scope, id {id}");
+                    }
+                });
+            }
+            let mut generation = 0;
+            while done.load(Ordering::Relaxed) < usize::from(READERS) {
+                generation += 1;
+                assert_eq!(f.replace_scopes(set(generation)), Ok(generation));
+                std::thread::yield_now();
+            }
+            assert!(generation > 0);
+        });
+    }
+
+    #[test]
+    fn filters_on_one_thread_never_share_cached_scopes() {
+        let [x, _] = local_identities();
+        let map = identity();
+        map.set_local_identity(OTHER_PEER, x);
+        let config = AclFilterConfig::default();
+        let a = AclFilter::with_scope(
+            rules_engine(test_policy()),
+            Arc::clone(&map),
+            config,
+            scope_a(),
+        );
+        let b = AclFilter::with_scope(
+            rules_engine(test_policy()),
+            Arc::clone(&map),
+            config,
+            scope_b(),
+        );
+        // Same generation, different cells: each packet uses its own filter's set.
+        for _ in 0..3 {
+            assert_eq!(judged_scope(&a, PEER), Some(true));
+            assert_eq!(judged_scope(&b, PEER), Some(false));
+        }
+        // A replace of one cell leaves the other one's set in place.
+        let scopes = AclFilterScopes::new()
+            .with_default(scope_b())
+            .with_identity(x, scope_a());
+        assert_eq!(a.replace_scopes(scopes), Ok(1));
+        for _ in 0..3 {
+            assert_eq!(judged_scope(&a, PEER), Some(false));
+            assert_eq!(judged_scope(&a, OTHER_PEER), Some(true));
+            assert_eq!(judged_scope(&b, OTHER_PEER), Some(false));
+            assert_eq!(b.scope_generation(), 0);
+        }
+        // A filter built after another is dropped never reuses its cell.
+        let id = b.inner.scopes.id;
+        std::mem::drop(b);
+        let c = AclFilter::new(rules_engine(test_policy()), map);
+        assert_ne!(c.inner.scopes.id, id);
+        assert_eq!(judged_scope(&c, PEER), None);
     }
 }

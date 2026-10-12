@@ -446,15 +446,6 @@ fn unbound_addresses_are_validated() {
             })
         );
     }
-    let mut v6 = open_scope(GateMode::Enforce);
-    v6.unbound_addresses = vec!["fd00::1".parse().unwrap()];
-    assert!(matches!(
-        gate.replace(policy(vec![v6])),
-        Err(GatePolicyError::Ipv6 {
-            field: "unbound_addresses",
-            ..
-        })
-    ));
     assert_eq!(gate.generation(), 1, "nothing published");
 
     // Another scope may bind the address.
