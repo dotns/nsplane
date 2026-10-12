@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use nsplane_core::cell::SnapshotCell;
 use nsplane_core::{LocalIdentityId, PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
@@ -585,7 +585,7 @@ impl ScopeSet {
 /// grows, a packet ordered after another load, or after a store returned,
 /// reads a generation at least as high, so it never sees an older set.
 struct ScopeCell {
-    set: ArcSwap<ScopeSet>,
+    set: SnapshotCell<ScopeSet>,
     /// The generation of the published set, stored after `set`.
     generation: AtomicU64,
     /// Tells the cells apart in the per-thread cache: from a global counter,
@@ -605,7 +605,7 @@ impl ScopeCell {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             generation: AtomicU64::new(set.generation),
-            set: ArcSwap::from_pointee(set),
+            set: SnapshotCell::new(set),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -667,7 +667,7 @@ impl ScopeCell {
 
 impl fmt::Debug for ScopeCell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self.set.load(), f)
+        fmt::Debug::fmt(&*self.set.load(), f)
     }
 }
 
