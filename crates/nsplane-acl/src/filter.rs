@@ -1362,9 +1362,9 @@ impl AclFilter {
     /// fields of both. Any clone of the filter can replace them. State
     /// recorded under the previous scopes (reply allowances, fragment
     /// outcomes) is kept. While the scopes are unchanged a packet reads them
-    /// with one atomic load and a per-thread cache lookup (about 2 ns more
-    /// than a scope fixed at build); per-identity scopes add the identity
-    /// resolution described in [`AclFilterScopes`].
+    /// with one atomic load and a per-thread cache lookup, a few dependent
+    /// loads more than a scope fixed at build; per-identity scopes add the
+    /// identity resolution described in [`AclFilterScopes`].
     pub fn replace_scopes(&self, scopes: AclFilterScopes) -> Result<u64, AclFilterScopeError> {
         let inner = &*self.inner;
         let _writer = inner
