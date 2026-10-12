@@ -461,7 +461,7 @@ fn replace_moves_flows_between_exact_and_peer_keyed_scopes() {
         "c",
     );
     c.local = vec![IpAddr::V6(LOCAL6)];
-    gate.replace(policy(vec![a.clone(), b.clone(), c])).unwrap();
+    gate.replace(policy(vec![a, b, c])).unwrap();
     assert_eq!(other6(&gate), None);
     assert_eq!(exact(&gate), Some("a".into()));
     assert_eq!(audit_families(&gate), (1, 0));
