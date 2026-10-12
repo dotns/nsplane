@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 mod allowed_ips;
+pub mod cell;
 mod core;
 mod filter;
 mod job;
