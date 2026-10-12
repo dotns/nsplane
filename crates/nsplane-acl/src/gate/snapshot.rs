@@ -59,6 +59,8 @@ pub(super) struct Snapshot {
     pub(super) holds: CompiledHolds,
     pub(super) v4: AddrIndex<Ipv4Addr>,
     pub(super) v6: AddrIndex<Ipv6Addr>,
+    /// Scope indexes with a peer-keyed binding of a peer.
+    by_peer: FastMap<PeerId, Vec<usize>>,
     /// The slot of every scope id.
     pub(super) slots: FastMap<ScopeId, Slot>,
 }
@@ -79,6 +81,12 @@ impl Snapshot {
     pub(super) fn build(generation: u64, policy: CompiledPolicy) -> Self {
         let v4 = AddrIndex::build(&policy.scopes);
         let v6 = AddrIndex::build(&policy.scopes);
+        let mut by_peer = FastMap::<_, Vec<_>>::default();
+        for (index, scope) in policy.scopes.iter().enumerate() {
+            for peer in scope.peer_bindings.keys() {
+                by_peer.entry(*peer).or_default().push(index);
+            }
+        }
         let slots = policy
             .scopes
             .iter()
@@ -91,6 +99,7 @@ impl Snapshot {
             holds: policy.holds,
             v4,
             v6,
+            by_peer,
             slots,
         }
     }
@@ -111,6 +120,40 @@ impl Snapshot {
         binding: &BindingKey<A>,
     ) -> impl Iterator<Item = &CompiledScope> {
         self.resolve(A::index(self).bindings.get(binding))
+    }
+
+    /// Whether any scope has a peer-keyed binding.
+    pub(super) fn has_peer_keyed(&self) -> bool {
+        !self.by_peer.is_empty()
+    }
+
+    /// Scopes with a peer-keyed binding of `peer`.
+    pub(super) fn peer_keyed(&self, peer: PeerId) -> impl Iterator<Item = &CompiledScope> {
+        self.resolve(if self.has_peer_keyed() {
+            self.by_peer.get(&peer)
+        } else {
+            None
+        })
+    }
+
+    /// The scope a packet of `binding` to or from `local` belongs to: the
+    /// one governing `local` that binds the exact pair, else the one
+    /// governing `local` with a peer-keyed binding of the peer. `None` when
+    /// there is none or more than one at the chosen level.
+    pub(super) fn select<A: GateAddr>(
+        &self,
+        binding: &BindingKey<A>,
+        local: A,
+    ) -> Option<&CompiledScope> {
+        let mut exact = self.bound(binding).filter(|scope| scope.governs(local));
+        let mut scopes = match exact.next() {
+            Some(scope) => return exact.next().is_none().then_some(scope),
+            None => self
+                .peer_keyed(binding.peer)
+                .filter(|scope| scope.governs(local)),
+        };
+        let scope = scopes.next()?;
+        scopes.next().is_none().then_some(scope)
     }
 
     /// Scopes governing the local address `ip`.

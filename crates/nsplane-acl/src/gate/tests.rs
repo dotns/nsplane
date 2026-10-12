@@ -472,4 +472,5 @@ mod ipv6_flows;
 mod ipv6_packets;
 mod model;
 mod packets_fragments;
+mod peer_keyed;
 mod state_table;

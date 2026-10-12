@@ -216,11 +216,21 @@ impl FlowGate {
             return Step::Done(held());
         }
         let binding = BindingKey { peer, ip: remote };
-        let matches = Applicable::of(
+        let mut matches = Applicable::of(
             snapshot
                 .bound(&binding)
                 .filter(|scope| scope.governs(local)),
         );
+        // Most specific first: the peer-keyed bindings only when no scope
+        // binds the exact pair.
+        let peer_keyed = !matches.any && snapshot.has_peer_keyed();
+        if peer_keyed {
+            matches = Applicable::of(
+                snapshot
+                    .peer_keyed(peer)
+                    .filter(|scope| scope.governs(local)),
+            );
+        }
         if !matches.any {
             return self.unbound_decision(snapshot, input, meta, local, remote);
         }
@@ -252,7 +262,11 @@ impl FlowGate {
             PacketDirection::Inbound => local,
             PacketDirection::Outbound => remote,
         };
-        let labels = &A::scope(scope).bindings[&binding];
+        let labels = if peer_keyed {
+            &scope.peer_bindings[&peer]
+        } else {
+            &A::scope(scope).bindings[&binding]
+        };
         let rule = match scope.authorize(direction, labels, destination, transport) {
             Authorization::Granted(rule) => rule,
             Authorization::Suspended(rule) => {
@@ -415,9 +429,14 @@ impl FlowGate {
     ) -> Step<GateDecision> {
         let applicable = match input.direction {
             PacketDirection::Inbound => Applicable::of(snapshot.with_local(local)),
-            // Every route to a bound remote address is governed, even when
-            // the selected peer or the local source is not the bound one.
-            PacketDirection::Outbound => Applicable::of(snapshot.with_remote(remote)),
+            // Every route to a bound remote address or over a peer-keyed
+            // peer is governed, even when the selected peer or the local
+            // source is not the bound one.
+            PacketDirection::Outbound => Applicable::of(
+                snapshot
+                    .with_remote(remote)
+                    .chain(snapshot.peer_keyed(input.peer)),
+            ),
         };
         if input.direction == PacketDirection::Inbound
             && let Some(scope) = applicable.single
@@ -508,7 +527,11 @@ fn malformed_decision<A: GateAddr>(
     }
     let applicable = match direction {
         PacketDirection::Inbound => Applicable::of(snapshot.with_local(local)),
-        PacketDirection::Outbound => Applicable::of(snapshot.with_remote(remote)),
+        PacketDirection::Outbound => Applicable::of(
+            snapshot
+                .with_remote(remote)
+                .chain(snapshot.peer_keyed(peer)),
+        ),
     };
     applicable.deny(GateReason::Malformed)
 }

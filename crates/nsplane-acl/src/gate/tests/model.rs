@@ -3,7 +3,8 @@
 //! [`GatePolicy`]. Seeded random sequences of packets, `replace` calls and
 //! clock steps must give equal decisions and counters, so the sharded state,
 //! its migration and lazy expiry never change a verdict. The sequences run
-//! over IPv4, over IPv6 and over both families at once.
+//! over IPv4, over IPv6, over both families at once, and over both families
+//! with peer-keyed bindings.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -43,6 +44,8 @@ enum Family {
     V6,
     /// Policies list every address in both families; each packet picks one.
     Both,
+    /// [`Family::Both`], and scopes also bind peers by peer.
+    PeerKeyed,
 }
 
 impl Family {
@@ -51,7 +54,7 @@ impl Family {
         match self {
             Self::V4 => vec![IpAddr::V4(v4[index])],
             Self::V6 => vec![IpAddr::V6(v6[index])],
-            Self::Both => vec![IpAddr::V4(v4[index]), IpAddr::V6(v6[index])],
+            Self::Both | Self::PeerKeyed => vec![IpAddr::V4(v4[index]), IpAddr::V6(v6[index])],
         }
     }
 
@@ -70,7 +73,7 @@ impl Family {
         match self {
             Self::V4 => false,
             Self::V6 => true,
-            Self::Both => rng.chance(50),
+            Self::Both | Self::PeerKeyed => rng.chance(50),
         }
     }
 }
@@ -114,7 +117,7 @@ impl Rng {
 fn random_protocols(rng: &mut Rng, family: Family) -> Vec<ProtocolMatch> {
     let echo = match family {
         Family::V4 => vec![8],
-        Family::V6 | Family::Both => vec![8, 128],
+        Family::V6 | Family::Both | Family::PeerKeyed => vec![8, 128],
     };
     let choices = [
         ProtocolMatch::Any,
@@ -141,10 +144,24 @@ fn random_scope(rng: &mut Rng, index: usize, family: Family) -> GateScope {
         local.extend(family.addresses((index + 1) % 2, &LOCALS, &LOCALS6));
     }
     let mut bindings = Vec::new();
+    // Peers bound by peer, which then have no address-listed binding here.
+    let keyed: Vec<PeerId> = if family == Family::PeerKeyed {
+        PEERS.iter().copied().filter(|_| rng.chance(30)).collect()
+    } else {
+        Vec::new()
+    };
+    for peer in &keyed {
+        let with: Vec<&str> = LABELS.iter().copied().filter(|_| rng.chance(60)).collect();
+        bindings.push(GateBinding {
+            peer: *peer,
+            addresses: Vec::new(),
+            labels: labels(&with),
+        });
+    }
     let mut seen = Vec::new();
     for _ in 0..rng.below(4) {
         let pair = (rng.pick(&PEERS), rng.below(2));
-        if !seen.contains(&pair) {
+        if !seen.contains(&pair) && !keyed.contains(&pair.0) {
             seen.push(pair);
             let with: Vec<&str> = LABELS.iter().copied().filter(|_| rng.chance(60)).collect();
             bindings.push(GateBinding {
@@ -621,12 +638,58 @@ fn net_matches(nets: &[IpNet], ip: IpAddr) -> bool {
     nets.is_empty() || nets.iter().any(|net| net.contains(&ip))
 }
 
+/// The labels of the binding of `peer` at `remote` in `scope`: exact or
+/// peer-keyed (a scope never has both for one peer).
 fn binding_labels(scope: &GateScope, peer: PeerId, remote: IpAddr) -> Option<&LabelSet> {
     scope
         .bindings
         .iter()
-        .find(|binding| binding.peer == peer && binding.addresses.contains(&remote))
+        .find(|binding| {
+            binding.peer == peer
+                && (binding.addresses.contains(&remote) || binding.addresses.is_empty())
+        })
         .map(|binding| &binding.labels)
+}
+
+fn binds_exactly(scope: &GateScope, peer: PeerId, remote: IpAddr) -> bool {
+    scope
+        .bindings
+        .iter()
+        .any(|binding| binding.peer == peer && binding.addresses.contains(&remote))
+}
+
+fn binds_by_peer(scope: &GateScope, peer: PeerId) -> bool {
+    scope
+        .bindings
+        .iter()
+        .any(|binding| binding.peer == peer && binding.addresses.is_empty())
+}
+
+fn active_scopes(policy: &GatePolicy) -> impl Iterator<Item = &GateScope> {
+    policy
+        .scopes
+        .iter()
+        .filter(|scope| scope.mode != GateMode::Off)
+}
+
+/// The scopes binding a packet of `peer` between `local` and `remote`: those
+/// governing `local` that bind the exact pair, else those governing `local`
+/// that bind the peer by peer.
+fn binding_level(
+    policy: &GatePolicy,
+    peer: PeerId,
+    remote: IpAddr,
+    local: IpAddr,
+) -> Vec<&GateScope> {
+    let exact: Vec<&GateScope> = active_scopes(policy)
+        .filter(|scope| governs(scope, local) && binds_exactly(scope, peer, remote))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    active_scopes(policy)
+        .filter(|scope| governs(scope, local) && binds_by_peer(scope, peer))
+        .collect()
 }
 
 fn governs(scope: &GateScope, local: IpAddr) -> bool {
@@ -670,10 +733,7 @@ fn authorize(
 
 impl Model {
     fn active(&self) -> impl Iterator<Item = &GateScope> {
-        self.policy
-            .scopes
-            .iter()
-            .filter(|scope| scope.mode != GateMode::Off)
+        active_scopes(&self.policy)
     }
 
     fn held(
@@ -813,6 +873,7 @@ impl Model {
                 .filter(|scope| {
                     scope.unbound_addresses.contains(&remote)
                         || scope.bindings.iter().any(|b| b.addresses.contains(&remote))
+                        || binds_by_peer(scope, peer)
                 })
                 .cloned()
                 .collect()
@@ -840,9 +901,8 @@ impl Model {
             return decision(true, false, GateReason::Held, None);
         }
         // 4. Binding.
-        let bound: Vec<GateScope> = self
-            .active()
-            .filter(|scope| governs(scope, local) && binding_labels(scope, peer, remote).is_some())
+        let bound: Vec<GateScope> = binding_level(&self.policy, peer, remote, local)
+            .into_iter()
             .cloned()
             .collect();
         let transport = packet.transport();
@@ -1115,10 +1175,22 @@ impl Model {
                 .cloned()
         };
         let (previous, next) = (std::mem::replace(&mut self.policy, policy), &self.policy);
+        let peer_keyed =
+            active_scopes(next).any(|scope| scope.bindings.iter().any(|b| b.addresses.is_empty()));
         self.flows.retain(|key, flow| {
             let Some(after) = active(next, &key.scope) else {
                 return false;
             };
+            // With a peer-keyed binding, a flow stays only in the scope
+            // step 4 selects for it.
+            if peer_keyed
+                && !matches!(
+                    binding_level(next, key.peer, key.remote, key.local).as_slice(),
+                    [scope] if scope.id == key.scope
+                )
+            {
+                return false;
+            }
             if active(&previous, &key.scope).as_ref() == Some(&after) {
                 return true;
             }
@@ -1299,6 +1371,18 @@ fn the_gate_matches_the_reference_model_over_both_families() {
     let mut seen = std::collections::HashSet::new();
     for seed in 0..SEEDS {
         run(seed, &mut seen, true, Family::Both);
+    }
+    assert_coverage(&seen);
+}
+
+/// Both families with peer-keyed bindings: one binding covers every address
+/// of its peer in both families, the exact bindings of other scopes take
+/// precedence, and migration keeps a flow only in the scope selected for it.
+#[test]
+fn the_gate_matches_the_reference_model_with_peer_keyed_bindings() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..SEEDS {
+        run(seed, &mut seen, true, Family::PeerKeyed);
     }
     assert_coverage(&seen);
 }

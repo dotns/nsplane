@@ -5,11 +5,13 @@
 //! whole with [`FlowGate::replace`]:
 //!
 //! - **Scopes** ([`GateScope`]): each governs a set of local addresses in a
-//!   [`GateMode`]. A packet belongs to a scope only through the exact pair
-//!   `(PeerId, remote address)` of one of its [`GateBinding`]s, where the
-//!   remote address is the IP source inbound and the IP destination
-//!   outbound, and the scope governs the packet's other address. The binding
-//!   gives the source its [`LabelSet`](crate::LabelSet).
+//!   [`GateMode`]. A packet belongs to a scope only through one of its
+//!   [`GateBinding`]s, either the exact pair `(PeerId, remote address)`,
+//!   where the remote address is the IP source inbound and the IP
+//!   destination outbound, or a peer-keyed binding of the `PeerId` (no
+//!   addresses: every remote address of either family), and the scope
+//!   governs the packet's other address. The binding gives the source its
+//!   [`LabelSet`](crate::LabelSet).
 //! - **Grants** ([`GateGrant`]): accept-only, directional, by remote label,
 //!   destination prefix and [`ProtocolMatch`](crate::ProtocolMatch). The
 //!   first matching grant that is not suspended admits a new flow and its
@@ -42,9 +44,10 @@
 //! 3. **Holds**: `(peer, remote)` in [`GateHolds::release`] skips the
 //!    inbound holds; otherwise a matching [`HoldRule`] gives
 //!    [`GateReason::Held`] (always enforced).
-//! 4. **Binding**: the scopes governing `local` that bind `(peer, remote)`.
-//!    More than one: [`GateReason::Ambiguous`], enforced when any of them
-//!    enforces. None: when exactly one scope governs `local` and it
+//! 4. **Binding**: the scopes governing `local` that bind the exact pair
+//!    `(peer, remote)`; only when there is none, the scopes governing `local`
+//!    with a peer-keyed binding of `peer`. More than one at that level:
+//!    [`GateReason::Ambiguous`], enforced when any of them enforces. None: when exactly one scope governs `local` and it
 //!    enforces, a matching [`UnboundAction::Pass`] rule of that scope passes
 //!    the packet (a first fragment remembers that disposition; a later
 //!    fragment of a peer named by an unbound rule follows it or is denied
@@ -75,8 +78,9 @@
 //! [`GateHolds::release`]; grants of [`Direction::Outbound`](crate::Direction)
 //! check `destinations` against `remote`; there are no unbound rules; and an
 //! unbound or malformed packet takes the mode of the scopes holding `remote`
-//! as a binding address or in [`GateScope::unbound_addresses`] (a packet to
-//! another destination passes).
+//! as a binding address or in [`GateScope::unbound_addresses`] and of the
+//! scopes with a peer-keyed binding of `peer` (a packet to another
+//! destination over another peer passes).
 //!
 //! Decisions take each scope's mode: [`GateMode::Observe`] gives
 //! [`GateDecision::Observe`] and [`GateMode::Enforce`] gives
@@ -125,7 +129,12 @@
 //!   governed, a grant that is not suspended still matching the packet that
 //!   opened it); it keeps its five-tuple and its idle deadline and takes the
 //!   grant's id and the scope's mode, or is dropped;
-//! - the fragments of a changed scope are dropped.
+//! - the fragments of a changed scope are dropped;
+//! - when the new policy has a peer-keyed binding, a flow is also dropped
+//!   when its scope is no longer the one step 4 selects for its peer,
+//!   remote and local address (another scope's exact binding now takes
+//!   precedence, or the lookup became ambiguous); its next packet is then
+//!   evaluated under the selected scope.
 //!
 //! A packet never sees a policy together with the state of another policy.
 //! A holds-only change revalidates nothing.
