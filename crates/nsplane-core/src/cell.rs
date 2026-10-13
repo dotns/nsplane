@@ -19,15 +19,17 @@
 //!
 //! [`SnapshotCell::read`] lends the value to a closure without a lock or a reference count
 //! while it is unchanged. Each store gives the value the next generation of its cell and
-//! publishes that generation (Release) after the shards hold the value. Each thread caches
-//! the last value it read of up to 8 cells, keyed by a cell id from a global counter (never
-//! reused, unlike an address) and the generation. A read loads the generation (Acquire) and
-//! uses the cached value when it is of this cell and generation; otherwise it loads the shard
-//! and caches its value. A load waits while the shard's generation is above a generation read
-//! after it, so neither a load nor a read uses a value before its generation is published, and
-//! a value it uses was the published one at some point of the call. So loads and reads never
-//! return an older value than a store that returned or an earlier load or read on the same
-//! thread saw, and one closure sees one whole value. A read inside the closure of another uses
+//! publishes that generation (Release) while it still holds every shard's write lock, so a
+//! value is in no unlocked shard before its generation is published. Each thread caches the
+//! last value it read of up to 8 cells, keyed by a cell id from a global counter (never
+//! reused, unlike an address) and the value's generation. A read loads the generation
+//! (Acquire) and uses the cached value when it is of this cell and generation; otherwise it
+//! loads the shard once and caches its value under the value's own generation. No reader waits
+//! for a writer beyond the shard lock, and a load costs what it did before reads existed. A
+//! load that sees a value took the shard lock after the publication of its generation, and a
+//! read that sees a generation takes any later shard lock after that store's swap, so loads and
+//! reads never return an older value than a store that returned or an earlier load or read on
+//! the same thread saw, and one closure sees one whole value. A read inside the closure of another uses
 //! the cache but cannot fill it, and a read while the thread exits loads the shard.
 //!
 //! Retention: the cache holds at most 8 values per thread across all cells, so at most one
@@ -124,7 +126,7 @@ impl Cache {
 /// concurrently.
 pub struct SnapshotCell<T> {
     shards: [Shard<T>; SHARDS],
-    /// The generation of the published value, stored after the shards.
+    /// The generation of the published value, stored under the shards' write locks.
     generation: AtomicU64,
     /// Tells the cells apart in the per-thread cache.
     id: u64,
@@ -152,20 +154,11 @@ impl<T> SnapshotCell<T> {
     /// The current value. It holds no lock: dropping it is a reference count decrement.
     pub fn load(&self) -> Snapshot<T> {
         let slot = SLOT.with(|slot| *slot);
-        loop {
-            let published = Arc::clone(
-                &self.shards[slot]
-                    .0
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
-            if published.generation <= self.generation.load(Ordering::Acquire) {
-                return Snapshot(published);
-            }
-            // A store swapped its value in but has not published its generation yet, so a
-            // later read could still return the older value: wait for the publication.
-            std::thread::yield_now();
-        }
+        let shard = self.shards[slot]
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        Snapshot(Arc::clone(&shard))
     }
 
     /// The current value as its `Arc`.
@@ -194,8 +187,9 @@ impl<T> SnapshotCell<T> {
         for (shard, value) in shards.iter_mut().zip(&mut values) {
             std::mem::swap(&mut **shard, value);
         }
-        drop(shards);
+        // Publish before unlocking, so a load that sees the value is ordered after it.
         self.generation.store(generation, Ordering::Release);
+        drop(shards);
         // Unlock before the old values drop.
         drop(writer);
     }
