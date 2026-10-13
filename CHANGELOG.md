@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `nsplane-nat`: LAN prefixes map by prefix (RFC 7757 style). A `LanPrefix`'s `lan6` is either
+  the /96 that embeds the whole IPv4 address (unchanged), or a /(96 + `lan4` length) whose low
+  bits carry an embedded IPv4 network other than `lan4`, so a remote LAN is reached through a
+  local IPv4 range of its own: with `lan4` 10.9.1.0/24 and `lan6` `fd64:c::c0a8:100/120`,
+  10.9.1.5 maps to `fd64:c::c0a8:105` and back, and addresses outside the embedded network are
+  unmapped. ICMP and `ICMPv6` inner packets map the same way. `LanRoute` is unchanged: it
+  resolves the embedded address. Pinned by `nsplane-e2e`'s `translate_lan_prefix` tests (two
+  peers with the same remote LAN range answering at once, ICMP errors from the remapped LAN,
+  sources outside the embedded network, a `Nat64Lan` gateway in front of the remapped LAN).
 - Per-identity routing (LR, task `20261013-1301-per-identity-routing`): allowed IPs are scoped
   to the peer's local identity, so the same remote key with the same allowed IPs can be a peer
   of several identities, each carrying its own traffic.
