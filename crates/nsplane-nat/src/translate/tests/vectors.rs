@@ -623,3 +623,142 @@ fn malformed_matrix_never_panics_and_keeps_lengths_consistent() {
         }
     }
 }
+
+// --- LAN prefix mappings ---
+
+/// A host of `PEER`'s remapped LAN: 10.9.1.5 locally, 192.168.1.5 on the
+/// remote LAN, embedded in `fd64:c::/96`.
+const REMAPPED4: Ipv4Addr = Ipv4Addr::new(10, 9, 1, 5);
+
+fn remapped6() -> Ipv6Addr {
+    ip6("fd64:c::c0a8:105")
+}
+
+/// The peers and self mapping of [`table`], with `PEER`'s LAN
+/// `10.9.1.0/24 <-> fd64:c::c0a8:100/120` and `OTHER`'s LAN
+/// `10.9.2.0/24 <-> fd64:d::c0a8:100/120`: both embed 192.168.1.0/24.
+fn remapped_translator() -> Translator {
+    let remapped = |lan4, lan6, peer| LanPrefix {
+        lan6: (ip6(lan6), 120),
+        ..lan(lan4, 24, "::", Some(peer))
+    };
+    let table = TranslationTable::builder()
+        .peer(PEER, peer_mapping())
+        .peer(OTHER, other_mapping())
+        .self_mapping(SelfMapping {
+            eam4: SELF_EAM4,
+            eam6: self_eam6(),
+        })
+        .lan(remapped("10.9.1.0", "fd64:c::c0a8:100", PEER))
+        .lan(remapped("10.9.2.0", "fd64:d::c0a8:100", OTHER))
+        .build()
+        .unwrap();
+    Translator::new(table)
+}
+
+#[test]
+fn remapped_lan_traffic_translates_through_the_embedded_network() {
+    let translator = remapped_translator();
+    let cases = [
+        (PEER, REMAPPED4, remapped6()),
+        (OTHER, ip4("10.9.2.5"), ip6("fd64:d::c0a8:105")),
+    ];
+    for (peer, host4, host6) in cases {
+        let udp = udp4(SELF_EAM4, host4, b"remap", false);
+        let (verdict, v6) = outbound(
+            &translator,
+            peer,
+            &ipv4_simple(SELF_EAM4, host4, protocol::UDP, &udp),
+        );
+        assert_eq!(verdict, Verdict::Accept);
+        check_v6(&v6);
+        assert_eq!((src6(&v6), dst6(&v6)), (self_eam6(), host6));
+
+        let udp = udp6(host6, self_eam6(), b"reply");
+        let (verdict, v4) = inbound(
+            &translator,
+            peer,
+            &ipv6_simple(host6, self_eam6(), protocol::UDP, &udp),
+        );
+        assert_eq!(verdict, Verdict::Accept);
+        check_v4(&v4);
+        assert_eq!((src4(&v4), dst4(&v4)), (host4, SELF_EAM4));
+    }
+    // Each LAN is reached only through its own peer.
+    let udp = udp4(SELF_EAM4, REMAPPED4, b"x", false);
+    let (verdict, _) = outbound(
+        &translator,
+        OTHER,
+        &ipv4_simple(SELF_EAM4, REMAPPED4, protocol::UDP, &udp),
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Drop {
+            reason: reasons::PEER_MISMATCH
+        }
+    );
+}
+
+#[test]
+fn icmpv6_errors_from_a_remapped_lan_quote_the_local_range() {
+    let translator = remapped_translator();
+    let router6 = ip6("fd64:c::c0a8:1fe");
+    let udp = udp6(self_eam6(), remapped6(), b"quote");
+    let quoted = ipv6(self_eam6(), remapped6(), protocol::UDP, 37, 0, &[], &udp);
+    // Destination unreachable (port) and packet too big.
+    for (kind, code, rest, kind4, code4) in
+        [(1, 4, [0; 4], 3, 3), (2, 0, 1300_u32.to_be_bytes(), 3, 4)]
+    {
+        let error = icmp6_error(router6, self_eam6(), kind, code, rest, &quoted);
+        let packet = ipv6_simple(router6, self_eam6(), protocol::ICMPV6, &error);
+        let (verdict, v4) = inbound(&translator, PEER, &packet);
+        assert_eq!(verdict, Verdict::Accept);
+        check_v4(&v4);
+        assert_eq!((v4[9], v4[20], v4[21]), (protocol::ICMP, kind4, code4));
+        assert_eq!((src4(&v4), dst4(&v4)), (ip4("10.9.1.254"), SELF_EAM4));
+        let quote = &v4[28..];
+        assert_eq!((src4(quote), dst4(quote)), (SELF_EAM4, REMAPPED4));
+        assert_eq!(internet_checksum(&quote[..20]), 0);
+        assert_eq!(
+            transport_checksum_v4(SELF_EAM4, REMAPPED4, protocol::UDP, &quote[20..]),
+            0
+        );
+    }
+}
+
+#[test]
+fn remapped_lan_addresses_outside_the_embedded_network_are_unmapped() {
+    let translator = remapped_translator();
+    // The local range embedded in the base, and another remote network.
+    for src in [ip6("fd64:c::a09:105"), ip6("fd64:c::c0a8:205")] {
+        let udp = udp6(src, self_eam6(), b"x");
+        let (verdict, _) = inbound(
+            &translator,
+            PEER,
+            &ipv6_simple(src, self_eam6(), protocol::UDP, &udp),
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Drop {
+                reason: reasons::UNMAPPED
+            },
+            "{src}"
+        );
+    }
+    // A quote addressed outside the embedded network.
+    let (router6, outside) = (ip6("fd64:c::c0a8:1fe"), ip6("fd64:c::a09:105"));
+    let udp = udp6(self_eam6(), outside, b"quote");
+    let quoted = ipv6_simple(self_eam6(), outside, protocol::UDP, &udp);
+    let error = icmp6_error(router6, self_eam6(), 1, 4, [0; 4], &quoted);
+    let (verdict, _) = inbound(
+        &translator,
+        PEER,
+        &ipv6_simple(router6, self_eam6(), protocol::ICMPV6, &error),
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Drop {
+            reason: reasons::UNMAPPED
+        }
+    );
+}

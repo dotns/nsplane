@@ -10,6 +10,8 @@
 //! - `lan_out/...`, `lan_in/...`: the same from the self `eam4` to a host of
 //!   the /96 LAN prefix behind the peer and back; the table has one LAN
 //!   prefix per peer.
+//! - `lan_remap_out/...`, `lan_remap_in/...`: the same with /120 LAN
+//!   prefixes that embed 192.168.1.0/24 instead of the `lan4` network.
 //!
 //! Every packet is rebuilt per iteration (in a buffer with the engine's
 //! headroom and room for the 20 bytes the translation adds), so each
@@ -54,9 +56,20 @@ fn lan(n: u16) -> LanPrefix {
     }
 }
 
+/// [`lan`] with the /120 `lan6` `fd64::n:c0a8:100`, which embeds
+/// 192.168.1.0/24.
+fn lan_remap(n: u16) -> LanPrefix {
+    LanPrefix {
+        lan6: (Ipv6Addr::new(0xfd64, 0, 0, 0, 0, n, 0xc0a8, 0x0100), 120),
+        ..lan(n)
+    }
+}
+
 /// A host of the LAN behind `PEER`, and its IPv6 address through [`lan`].
 const LAN_HOST4: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 5);
 const LAN_HOST6: Ipv6Addr = Ipv6Addr::new(0xfd64, 0, 0, 0, 0, 1, 0x0a00, 0x0105);
+/// The IPv6 address of [`LAN_HOST4`] through [`lan_remap`].
+const LAN_REMAP_HOST6: Ipv6Addr = Ipv6Addr::new(0xfd64, 0, 0, 0, 0, 1, 0xc0a8, 0x0105);
 
 /// A table of `peers` peers, each with the LAN prefix `lan` gives it, if any.
 fn table(peers: u16, lan: impl Fn(u16) -> Option<LanPrefix>) -> TranslationTable {
@@ -205,5 +218,15 @@ fn lan96(c: &mut Criterion) {
     translate(c, "lan", |n| Some(lan(n)), LAN_HOST4, LAN_HOST6);
 }
 
-criterion_group!(benches, eam4, lan96);
+fn lan_remapped(c: &mut Criterion) {
+    translate(
+        c,
+        "lan_remap",
+        |n| Some(lan_remap(n)),
+        LAN_HOST4,
+        LAN_REMAP_HOST6,
+    );
+}
+
+criterion_group!(benches, eam4, lan96, lan_remapped);
 criterion_main!(benches);

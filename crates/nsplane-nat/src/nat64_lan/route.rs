@@ -64,6 +64,12 @@ impl LanRoute {
     /// (not unspecified, loopback, link-local, multicast, the limited
     /// broadcast, nor the broadcast address of `real` when it is a /30 or
     /// shorter).
+    ///
+    /// A peer that maps the LAN to a local IPv4 range of its own with a
+    /// [`LanPrefix`](crate::LanPrefix) whose `lan6` embeds a network other
+    /// than its `lan4` sends the embedded address: with `mapped`
+    /// `fd64:c::/96` and `real` 192.168.1.0/24, `fd64:c::c0a8:105` resolves
+    /// to 192.168.1.5, and the peer's local range never reaches the route.
     pub fn resolve(&self, dst: Ipv6Addr) -> Option<Ipv4Addr> {
         if !self.maps(dst) {
             return None;
@@ -107,4 +113,25 @@ fn safe_lan_target(address: Ipv4Addr, (real, len): (Ipv4Addr, u8)) -> bool {
         && !address.is_multicast()
         && address != Ipv4Addr::BROADCAST
         && (len > 30 || address != broadcast)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_the_embedded_address_not_a_remapped_local_range() {
+        let route = LanRoute::new(
+            ("fd64:c::".parse().unwrap(), 96),
+            (Ipv4Addr::new(192, 168, 1, 0), 24),
+            Ipv4Addr::new(192, 168, 1, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            route.resolve("fd64:c::c0a8:105".parse().unwrap()),
+            Some(Ipv4Addr::new(192, 168, 1, 5))
+        );
+        // The consumer's local range (10.9.1.0/24) is not inside `real`.
+        assert_eq!(route.resolve("fd64:c::a09:105".parse().unwrap()), None);
+    }
 }
