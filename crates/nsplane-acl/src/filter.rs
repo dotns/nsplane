@@ -1403,7 +1403,10 @@ impl Inner {
         if let Some(((key, true, _), ttl, _)) = allow_only {
             return self.follow_allowed(key, ttl);
         }
-        self.engine.read_snapshot(|snapshot| {
+        // `move`: borrowing `allow_only` would spill it to the stack before
+        // the branch above, and the later fragment then reloads its key with a
+        // load that store forwarding cannot serve.
+        self.engine.read_snapshot(move |snapshot| {
             if !snapshot.is_loaded() {
                 return match snapshot.policy_state() {
                     PolicyState::Failed => Outcome::PolicyFailed,
