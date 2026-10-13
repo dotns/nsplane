@@ -40,6 +40,24 @@ impl<D> AllowedIps<D> {
         self.ips.insert(network, data)
     }
 
+    /// Returns the value stored for exactly the network `key/cidr`; `None` for a `cidr`
+    /// longer than the address.
+    pub(crate) fn get(&self, key: IpAddr, cidr: u8) -> Option<&D> {
+        let network = IpNetwork::new_truncate(key, cidr).ok()?;
+        self.ips.exact_match(network)
+    }
+
+    /// Removes the entry for exactly the network `key/cidr` and returns its value.
+    pub(crate) fn remove_network(&mut self, key: IpAddr, cidr: u8) -> Option<D> {
+        let network = IpNetwork::new_truncate(key, cidr).ok()?;
+        self.ips.remove(network)
+    }
+
+    /// Whether the table holds no entry.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ips.is_empty()
+    }
+
     /// Returns the value of the longest prefix that contains `key`.
     pub(crate) fn find(&self, key: IpAddr) -> Option<&D> {
         self.ips.longest_match(key).map(|(_net, data)| data)
@@ -147,6 +165,23 @@ mod tests {
             Some((&'4', IpAddr::from([255, 1, 15, 0]), 24))
         );
         assert_eq!(map_iter.next(), None);
+    }
+
+    #[test]
+    fn exact_prefixes_are_found_and_removed() {
+        let mut map = build_allowed_ips();
+        assert_eq!(map.get(IpAddr::from([127, 0, 9, 9]), 16), Some(&'2'));
+        assert_eq!(map.get(IpAddr::from([127, 0, 0, 0]), 24), None);
+        assert_eq!(map.get(IpAddr::from([127, 0, 0, 0]), 33), None);
+        assert_eq!(
+            map.remove_network(IpAddr::from([127, 0, 0, 0]), 16),
+            Some('2')
+        );
+        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), None);
+        assert_eq!(map.find(IpAddr::from([127, 0, 0, 1])), Some(&'1'));
+        assert!(!map.is_empty());
+        map.clear();
+        assert!(map.is_empty());
     }
 
     #[test]

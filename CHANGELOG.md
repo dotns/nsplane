@@ -5,6 +5,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-nat`: LAN prefixes map by prefix (RFC 7757 style). A `LanPrefix`'s `lan6` is either
+  the /96 that embeds the whole IPv4 address (unchanged), or a /(96 + `lan4` length) whose low
+  bits carry an embedded IPv4 network other than `lan4`, so a remote LAN is reached through a
+  local IPv4 range of its own: with `lan4` 10.9.1.0/24 and `lan6` `fd64:c::c0a8:100/120`,
+  10.9.1.5 maps to `fd64:c::c0a8:105` and back, and addresses outside the embedded network are
+  unmapped. ICMP and `ICMPv6` inner packets map the same way. `LanRoute` is unchanged: it
+  resolves the embedded address. Pinned by `nsplane-e2e`'s `translate_lan_prefix` tests (two
+  peers with the same remote LAN range answering at once, ICMP errors from the remapped LAN,
+  sources outside the embedded network, a `Nat64Lan` gateway in front of the remapped LAN).
+- Per-identity routing (LR, task `20261013-1301-per-identity-routing`): allowed IPs are scoped
+  to the peer's local identity, so the same remote key with the same allowed IPs can be a peer
+  of several identities, each carrying its own traffic.
+  - `nsplane-core` `Core::set_local_sources(identity, sources)`: a source set per identity. A
+    local packet whose source lies in a set is routed among that identity's peers only (the
+    most specific network of all sets wins; no route there drops it as `reasons::NO_ROUTE`).
+    Refused for an unknown identity or a network another identity's set holds; removing the
+    identity drops its set, `ConfigChange::RemoveAllPeers` keeps it.
+  - `nsplane-core` `Core::route_from(src, dst)`: the send path's routing decision.
+  - `nsplane-core` `LocalIdentityInfo::sources` (and so `nsplane` `LocalIdentity::sources` in
+    `EngineStatus::local_identities`).
+  - `nsplane` `EngineHandle::set_local_sources`.
+
+### Changed
+- Per-identity routing (LR): the inbound source check uses the allowed IPs of the receiving
+  peer's identity only. A local packet whose source lies in no source set is routed as before
+  in the engine-wide fallback, now `Core::route`: the default identity's trie, or, while a
+  non-default identity's peers hold allowed IPs, a merged trie in which the last insert across
+  identities owns a prefix; when that owner loses the prefix, it is re-filled from the lowest-id
+  identity still holding it. The fragmentation stage looks up the peer by the packet's source
+  and destination, so path-MTU state and ICMP too-big errors follow the selected identity's
+  peer. With one identity, or without source sets, routing and its cost are unchanged.
+
 ### Fixed
 - The 0.13.0 per-packet read regression of the snapshot cell: the ACL engine, the flow gate,
   the `AclFilter` scopes, the `Translator` table and the NAT64 LAN routes now read their

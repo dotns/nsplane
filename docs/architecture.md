@@ -45,8 +45,8 @@ where it is described below.
 |---|---|---|
 | `nsplane-noise` | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`), `noise::rate_limiter::RateLimiter` (`with_budget`, `mac1_matches`), `x25519` keys | `noise::rate_limiter::HandshakeBudget`, `TunnResult`, `noise::errors::WireGuardError` |
 | `nsplane-packet` | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
-| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
-| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `remove_peer_in`, `set_inbound_destinations_in` / `set_inbound_destination_source_in`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `LocalIdentity`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
+| `nsplane-core` | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| `nsplane` | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `subscribe`, `peers` / `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `remove_peer_in`, `set_inbound_destinations_in` / `set_inbound_destination_source_in`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `LocalIdentity`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-wss` (server transport) | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
@@ -73,6 +73,9 @@ Local identities add: `nsplane-noise` `rate_limiter::HandshakeBudget`,
 `PeerStats::local_identity`, `ConfigChange::InLocalIdentity` and
 `reasons::UNKNOWN_LOCAL_IDENTITY`; `nsplane` `LocalIdentity`, `EngineStatus::local_identities`
 and the `EngineHandle` identity methods above (see nsplane-core).
+Per-identity routing adds: `nsplane-core` `Core::set_local_sources`, `Core::route_from` and
+`LocalIdentityInfo::sources` (so also `LocalIdentity::sources` in `nsplane`); `nsplane`
+`EngineHandle::set_local_sources`.
 
 `nsplane-packet::build` writes whole IPv4 or IPv6 UDP datagrams for packets an application
 injects into the tunnel: `write_udp(buf, src, dst, payload)` into an existing `PacketBuf`
@@ -144,11 +147,12 @@ to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and int
 
 The filter chain is an onion: filters are installed from the wire side to the local side,
 decrypted packets run through them in install order and local packets in reverse. A local
-packet is routed by its destination (longest allowed-IP match) before the filters run, and a
+packet is routed by its destination (longest allowed-IP match; with source sets, within the
+identity its source selects, see Local identities) before the filters run, and a
 decrypted packet's source is checked against the peer's allowed IPs before them, so filters
-that rewrite addresses need those addresses in the peers' allowed IPs. `Core::route` exposes
-the routing decision, e.g. to pick the peer `Core::inject_inbound` delivers a locally
-generated reply as.
+that rewrite addresses need those addresses in the peers' allowed IPs. `Core::route_from`
+exposes the routing decision and `Core::route` the decision for a source in no source set,
+e.g. to pick the peer `Core::inject_inbound` delivers a locally generated reply as.
 
 Hooks for a path ladder (ns account mode, quick-v2 §9), each unused by default:
 
@@ -240,6 +244,26 @@ changes to another identity's peer; `peer_id(key)` means the default identity an
 handshakes, rekeys, cookies and keepalives use its identity's key; `PeerStats::local_identity`
 reports it, and events are unchanged (the identity follows from the `PeerId`).
 
+Routing: allowed IPs are scoped to the peer's identity, each identity having its own trie,
+so the same remote key with the same allowed IPs can be a peer of two identities. A
+decrypted packet's source is checked in the trie of the receiving peer's identity only.
+Outbound, `Core::set_local_sources(identity, sources)` gives an identity a source set (the
+default identity too; empty clears it). A local packet whose source lies in a set is routed
+in the trie of that set's identity only, the most specific network of all sets winning;
+without a match there it is dropped as `reasons::NO_ROUTE`, whatever other identities' peers
+allow. A set is refused (`false`) for an unknown identity or when another identity's set
+holds an identical network. A packet whose source lies in no set is routed in the
+engine-wide fallback (`Core::route`): the default identity's trie while it is the only one
+with allowed IPs, otherwise a merged trie of all identities, which exists only while a
+non-default identity's peers hold allowed IPs. In the merged trie the last insert across
+identities owns a prefix; when its owner loses it (peer or identity removed, allowed IPs
+replaced), the prefix is re-filled from the lowest-id identity still holding that exact
+prefix. `Core::route_from(src, dst)` is the send path's decision. Fast path: while no
+identity has a source set, the source is not looked at and a local packet takes one trie
+lookup as before; with one identity there is one trie and no selection step.
+`remove_local_identity` drops the identity's trie and source set and re-fills what it owned
+in the merged trie; `ConfigChange::RemoveAllPeers` keeps the sets.
+
 Dispatch: with the default identity alone, an initiation takes the single
 mac1 check as before. With two or more keyed identities, or a restricted one, an initiation
 goes to the first identity, in id order, that serves the arrival transport and whose mac1 key
@@ -326,12 +350,16 @@ leaves behind, and the engine's later `send_batch` would map them a second time.
   blocks, and a lagging subscriber loses the oldest events.
 - Drops are counted per reason (`EngineHandle::drop_counters`) and published as events.
 - Local identities are handle commands to the owner (`add_local_identity`,
-  `add_local_identity_on`, `remove_local_identity`, `local_identities`, `peer_id_in`, and the
+  `add_local_identity_on`, `remove_local_identity`, `local_identities`, `peer_id_in`,
+  `set_local_sources`, and the
   `_in` forms `remove_peer_in`, `set_inbound_destinations_in`,
   `set_inbound_destination_source_in`); `add_or_update_peer` binds a peer with
   `Peer::local_identity`, and the key-addressed methods mean the default identity.
   `EngineStatus::local_identities` lists every identity (id, public key, peer count,
-  transports). Transports, filters, path policy, fragmenter, crypto workers and the local side
+  transports, source set). `set_local_sources` gives an identity its source set (see
+  nsplane-core, Routing); the fragmentation stage looks up a local packet's peer by its
+  source and destination too (`Core::route_from`), so path-MTU state and the ICMP errors
+  about a too-big packet follow the identity the source selects. Transports, filters, path policy, fragmenter, crypto workers and the local side
   are shared by all identities; the UAPI and the CLI use the default identity only.
 - Unanswered handshake initiations are counted per peer and in total
   (`EngineHandle::unanswered_handshakes` / `total_unanswered_handshakes`, see nsplane-core).
@@ -2147,6 +2175,16 @@ a local IPv6 rewrite `local6 <-> peer6` (rewritten, not translated). The node's 
 IPv4 address in the low 32 bits (`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
 by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
 atomically while traffic flows.
+
+**LAN prefixes.** A `LanPrefix` has one of two forms. With a /96 `lan6`, the IPv4 address
+itself fills the low 32 bits: `lan4` 192.168.1.0/24 and `fd64:b::/96` map 192.168.1.5 to
+`fd64:b::c0a8:105`. With a /(96 + `lan4` length) `lan6` (RFC 7757 style), the low bits carry
+an embedded IPv4 network other than `lan4` and only the host part is copied: `lan4`
+10.9.1.0/24 and `fd64:c::c0a8:100/120` map 10.9.1.5 to `fd64:c::c0a8:105`, so two remote LANs
+with the same range are told apart by giving one of them a local range. IPv6 addresses under
+the /96 base but outside the embedded network are unmapped; ICMP inner packets map the same
+way. One LAN prefix per /96 base, and the `lan4` ranges must not overlap. A `LanRoute` on the
+gateway resolves the embedded address and needs no change.
 
 **Translator.** A stateless RFC 7915 translator: local IPv4 to an `eam4` or a peer's LAN
 leaves as IPv6 to `eam6` / `lan6`, IPv6 to `local6` is rewritten to `peer6`, and the

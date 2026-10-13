@@ -59,3 +59,13 @@ on these rows. The IPv6 gate numbers (B only) are 53.6-109.0 ns.
   - `ScopeCell` folds in.
   - The hot call sites in acl and nat move to `read`.
   - An e2e test checks replaces under traffic.
+- 2026-10-13: OP A/B, invocations 1-4. B = f33360d.
+  - Improvements:
+    - `floor/snapshot` 8.8 -> 2.9 ns (0.12.0) and 15.8 -> 2.9 ns (main);
+    - `icmp_echo_scope` -6.4 % against 0.12.0;
+    - most filter and namespaces rows 5-15 % faster than 0.12.0.
+  - Residuals:
+    - `stateless/inbound_fragment` +2.7 ns against main. OP-4 fixes it (filter.rs, fragment early
+      return).
+    - Gate `established/*` +3.4..6.7 % against 0.12.0, but 4-10 % better than main. Accepted and
+      attributed to the 0.13.0 peer-keyed gate (probable, not isolated).

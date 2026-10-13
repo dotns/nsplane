@@ -171,14 +171,15 @@ impl Fragmenter {
     }
 
     /// Decides about `packet`. No packet's MTU is below `floor`; above it, `lookup` names the
-    /// peer a destination is routed to and the MTU of packets to it (the source MTU, or the
-    /// lower inner MTU of that peer), so packets within the floor never pay for it.
+    /// peer a packet from a source to a destination is routed to and the MTU of packets to
+    /// it (the source MTU, or the lower inner MTU of that peer), so packets within the floor
+    /// never pay for it.
     pub(crate) fn process(
         &mut self,
         packet: PacketBuf,
         floor: u16,
         now: Instant,
-        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
+        lookup: impl FnOnce(IpAddr, IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
         let floor = usize::from(floor);
         // Within every ceiling: the common case.
@@ -198,7 +199,7 @@ impl Fragmenter {
         packet: PacketBuf,
         floor: usize,
         now: Instant,
-        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
+        lookup: impl FnOnce(IpAddr, IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
         let bytes = packet.as_packet();
         if bytes.len() <= floor {
@@ -208,7 +209,7 @@ impl Fragmenter {
             return Action::Send(packet);
         };
         let (src, dst) = (header.src(), header.dst());
-        let (peer, mtu) = lookup(IpAddr::V6(dst));
+        let (peer, mtu) = lookup(IpAddr::V6(src), IpAddr::V6(dst));
         let mtu = usize::from(mtu);
         if bytes.len() <= mtu {
             return Action::Send(packet);
@@ -230,7 +231,7 @@ impl Fragmenter {
         packet: PacketBuf,
         floor: usize,
         now: Instant,
-        lookup: impl FnOnce(IpAddr) -> (Option<PeerId>, u16),
+        lookup: impl FnOnce(IpAddr, IpAddr) -> (Option<PeerId>, u16),
     ) -> Action {
         let bytes = packet.as_packet();
         let Ok((header, payload)) = Ipv4Header::parse(bytes) else {
@@ -247,7 +248,7 @@ impl Fragmenter {
         if bytes.len() <= ceiling(floor) {
             return Action::Send(packet);
         }
-        let (peer, mtu) = lookup(IpAddr::V4(dst));
+        let (peer, mtu) = lookup(IpAddr::V4(src), IpAddr::V4(dst));
         let mtu = usize::from(mtu);
         let ceiling = ceiling(mtu);
         if bytes.len() <= ceiling {
@@ -575,7 +576,7 @@ mod tests {
     }
 
     fn run(f: &mut Fragmenter, packet: &[u8], mtu: u16, now: Instant) -> Action {
-        f.process(PacketBuf::from_packet(packet), mtu, now, |_| {
+        f.process(PacketBuf::from_packet(packet), mtu, now, |_, _| {
             (Some(PEER), mtu)
         })
     }
@@ -945,7 +946,7 @@ mod tests {
             PacketBuf::from_packet(&packet),
             1420,
             Instant::now(),
-            |_| (None, 1420),
+            |_, _| (None, 1420),
         );
         assert!(matches!(action, Action::Drop(FRAGMENT_NO_ROUTE)));
         assert_eq!(f.stats().no_route, 1);
@@ -992,7 +993,7 @@ mod tests {
             PacketBuf::from_packet(packet),
             mtu.min(1420),
             Instant::now(),
-            |dst| {
+            |_, dst| {
                 lookups.set(lookups.get() + 1);
                 if dst == IpAddr::V4(DST4) || dst == IpAddr::V6(DST6) {
                     (Some(PEER), mtu)

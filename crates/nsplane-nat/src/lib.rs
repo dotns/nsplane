@@ -7,8 +7,10 @@
 //! `peer6`, the model holds an EAM `eam4 <-> eam6`, an optional second EAM
 //! `peer6_eam4 <-> peer6` and an optional local IPv6 rewrite
 //! `local6 <-> peer6`. This node's own EAM is `eam4 <-> eam6`, and IPv4 LAN
-//! prefixes map to IPv6 /96 prefixes by placing the IPv4 address in the low
-//! 32 bits (`lan4 <-> lan6`).
+//! prefixes map to IPv6 prefixes by placing an IPv4 address with the same
+//! host part in the low 32 bits (`lan4 <-> lan6`): the address itself for a
+//! /96 `lan6`, or one of another network that a /(96 + `lan4` length)
+//! `lan6` embeds.
 //!
 //! - **Translation table** ([`TranslationTable`]): the immutable, validated
 //!   address model above, with O(1) / O(log n) lookups. Built with

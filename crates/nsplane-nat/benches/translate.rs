@@ -1,4 +1,4 @@
-//! Per-packet cost of the `Translator` on the `eam4` path.
+//! Per-packet cost of the `Translator` on the `eam4` and LAN prefix paths.
 //!
 //! - `eam4_out/{tcp,udp}/{64B,1400B|1420B}/{1,1000}`: `outbound` of an IPv4
 //!   packet from the self `eam4` to a peer's `eam4`, translated to IPv6 from the
@@ -7,6 +7,11 @@
 //!   The last segment is the number of peers in the table (lookup cost).
 //! - `eam4_in/...`: `inbound` of the IPv6 reply from the peer's `eam6` to
 //!   the self `eam6`, translated back to IPv4 from the peer's `eam4` to the self `eam4`.
+//! - `lan_out/...`, `lan_in/...`: the same from the self `eam4` to a host of
+//!   the /96 LAN prefix behind the peer and back; the table has one LAN
+//!   prefix per peer.
+//! - `lan_remap_out/...`, `lan_remap_in/...`: the same with /120 LAN
+//!   prefixes that embed 192.168.1.0/24 instead of the `lan4` network.
 //!
 //! Every packet is rebuilt per iteration (in a buffer with the engine's
 //! headroom and room for the 20 bytes the translation adds), so each
@@ -17,7 +22,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use nsplane_core::{PacketFilter, Verdict};
-use nsplane_nat::{PeerMapping, SelfMapping, TranslationTable, Translator};
+use nsplane_nat::{LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator};
 use nsplane_packet::checksum::{
     ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -40,10 +45,41 @@ const fn mapping(n: u16) -> PeerMapping {
     }
 }
 
-fn table(peers: u16) -> TranslationTable {
+/// The /96 LAN prefix behind peer `n` (1-based): `lan4` 10.x.y.0/24 and
+/// `lan6` `fd64::n:0:0`.
+fn lan(n: u16) -> LanPrefix {
+    let [hi, lo] = n.to_be_bytes();
+    LanPrefix {
+        lan4: (Ipv4Addr::new(10, hi, lo, 0), 24),
+        lan6: (Ipv6Addr::new(0xfd64, 0, 0, 0, 0, n, 0, 0), 96),
+        peer: Some(PeerId::new(u32::from(n))),
+    }
+}
+
+/// [`lan`] with the /120 `lan6` `fd64::n:c0a8:100`, which embeds
+/// 192.168.1.0/24.
+fn lan_remap(n: u16) -> LanPrefix {
+    LanPrefix {
+        lan6: (Ipv6Addr::new(0xfd64, 0, 0, 0, 0, n, 0xc0a8, 0x0100), 120),
+        ..lan(n)
+    }
+}
+
+/// A host of the LAN behind `PEER`, and its IPv6 address through [`lan`].
+const LAN_HOST4: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 5);
+const LAN_HOST6: Ipv6Addr = Ipv6Addr::new(0xfd64, 0, 0, 0, 0, 1, 0x0a00, 0x0105);
+/// The IPv6 address of [`LAN_HOST4`] through [`lan_remap`].
+const LAN_REMAP_HOST6: Ipv6Addr = Ipv6Addr::new(0xfd64, 0, 0, 0, 0, 1, 0xc0a8, 0x0105);
+
+/// A table of `peers` peers, each with the LAN prefix `lan` gives it, if any.
+fn table(peers: u16, lan: impl Fn(u16) -> Option<LanPrefix>) -> TranslationTable {
     let table = (1..=peers)
         .fold(TranslationTable::builder(), |builder, n| {
-            builder.peer(PeerId::new(u32::from(n)), mapping(n))
+            let builder = builder.peer(PeerId::new(u32::from(n)), mapping(n));
+            match lan(n) {
+                Some(prefix) => builder.lan(prefix),
+                None => builder,
+            }
         })
         .self_mapping(SelfMapping {
             eam4: SELF_EAM4,
@@ -81,9 +117,8 @@ fn seal(protocol: u8, segment: &mut [u8], checksum: u16) {
     segment[at..at + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
-/// An IPv4 packet from the self `eam4` to the peer's `eam4`.
-fn ipv4(protocol: u8, payload: usize) -> Vec<u8> {
-    let dst = Ipv4Addr::new(100, 65, 0, 1);
+/// An IPv4 packet from the self `eam4` to `dst`.
+fn ipv4(dst: Ipv4Addr, protocol: u8, payload: usize) -> Vec<u8> {
     let mut segment = segment(protocol, payload);
     let checksum = transport_checksum_v4(SELF_EAM4, dst, protocol, &segment);
     seal(protocol, &mut segment, checksum);
@@ -99,9 +134,8 @@ fn ipv4(protocol: u8, payload: usize) -> Vec<u8> {
     bytes
 }
 
-/// The IPv6 reply from the peer's `eam6` to the self `eam6`.
-fn ipv6(protocol: u8, payload: usize) -> Vec<u8> {
-    let src = mapping(1).eam6;
+/// The IPv6 reply from `src` to the self `eam6`.
+fn ipv6(src: Ipv6Addr, protocol: u8, payload: usize) -> Vec<u8> {
     let mut segment = segment(protocol, payload);
     let checksum = transport_checksum_v6(src, SELF_EAM6, protocol, &segment);
     seal(protocol, &mut segment, checksum);
@@ -130,16 +164,25 @@ const CASES: [(u8, &str, usize); 4] = [
     (17, "udp", 1420),
 ];
 
-fn eam4(c: &mut Criterion) {
-    for (name, outbound) in [("eam4_out", true), ("eam4_in", false)] {
-        let mut group = c.benchmark_group(name);
+/// The `{prefix}_out` and `{prefix}_in` groups: `outbound` of IPv4 packets
+/// from the self `eam4` to `dst4`, and `inbound` of the IPv6 replies from
+/// `src6`, with the LAN prefixes `lan` gives each peer.
+fn translate(
+    c: &mut Criterion,
+    prefix: &str,
+    lan: impl Fn(u16) -> Option<LanPrefix> + Copy,
+    dst4: Ipv4Addr,
+    src6: Ipv6Addr,
+) {
+    for (direction, outbound) in [("out", true), ("in", false)] {
+        let mut group = c.benchmark_group(format!("{prefix}_{direction}"));
         for peers in [1, 1000] {
-            let translator = Translator::new(table(peers));
+            let translator = Translator::new(table(peers, lan));
             for (protocol, proto_name, payload) in CASES {
                 let bytes = if outbound {
-                    ipv4(protocol, payload)
+                    ipv4(dst4, protocol, payload)
                 } else {
-                    ipv6(protocol, payload)
+                    ipv6(src6, protocol, payload)
                 };
                 let filter = |packet: &mut PacketBuf| {
                     if outbound {
@@ -165,5 +208,25 @@ fn eam4(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, eam4);
+fn eam4(c: &mut Criterion) {
+    let peer = mapping(1);
+    let dst4 = peer.eam4.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    translate(c, "eam4", |_| None, dst4, peer.eam6);
+}
+
+fn lan96(c: &mut Criterion) {
+    translate(c, "lan", |n| Some(lan(n)), LAN_HOST4, LAN_HOST6);
+}
+
+fn lan_remapped(c: &mut Criterion) {
+    translate(
+        c,
+        "lan_remap",
+        |n| Some(lan_remap(n)),
+        LAN_HOST4,
+        LAN_REMAP_HOST6,
+    );
+}
+
+criterion_group!(benches, eam4, lan96, lan_remapped);
 criterion_main!(benches);
