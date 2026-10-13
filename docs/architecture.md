@@ -1790,12 +1790,13 @@ the gate policy, the translation table and the NAT64 LAN routes: 16 cache-line-p
 shards, each with its own `Arc`, where a load read-locks its thread's shard only to clone that
 `Arc` (no lock is held after it returns) and a writer locks every shard to replace them. `store`
 is safe to call concurrently (stores serialize on a writer mutex inside the cell); each store
-gives the value the next generation of its cell and publishes it after the shards. The packet
-paths use `read(|value| ..)`: each thread caches up to 8 values keyed by a never-reused cell id
-and the generation, so a read of an unchanged value takes no lock and no reference count. `load`
-keeps its semantics and now also waits until a store's generation is published, so neither a
-load nor a read returns a value older than one a returned store or an earlier load or read on
-its thread saw. Retention: at most 8 cached values per thread across all cells, so at most one
+gives the value the next generation of its cell and publishes that generation while it still
+holds every shard write lock. The packet paths use `read(|value| ..)`: each thread caches up to 8
+values keyed by a never-reused cell id and the generation, so a read of an unchanged value takes
+no lock and no reference count, and a miss is one shard load plus a cache insert. `load` keeps
+its semantics and cost, no reader waits beyond its shard lock, and the guarantee stays: neither
+a load nor a read returns a value older than one a returned store, or an earlier load or read on
+its thread, saw. Retention: at most 8 cached values per thread across all cells, so at most one
 replaced value per cell per thread; a thread that stops reading keeps up to 8 old values until
 it exits. `install` swaps a `RuleSet` that `RuleSet::new` validated in
 atomically, and a rejected update (`RuleSet::new`, `store_namespace` or `store_grant`
