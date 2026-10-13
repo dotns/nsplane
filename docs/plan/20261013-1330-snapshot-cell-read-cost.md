@@ -49,3 +49,4 @@ on these rows. The IPv6 gate numbers (B only) are 53.6-109.0 ns.
    max(2 %, spread).
 
 ## Annotations
+- 2026-10-13: dispatched OP `gcxn1i1c` (campaign `nsplane-op-202610131330`).

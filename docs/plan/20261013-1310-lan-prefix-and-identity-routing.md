@@ -42,3 +42,4 @@ owner's go.
   CLI + linux.sh, lib.sh, examples.sh).
 
 ## Annotations
+- 2026-10-13: dispatched, LP `affo3r15` (campaign `nsplane-lp-202610131330`) and LR `j3miawgn` (campaign `nsplane-lr-202610131330`), in parallel with OP (plan 20261013-1330). Auto mode, watchdog every 30 min.
