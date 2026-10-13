@@ -1,6 +1,6 @@
 # 20261013-1310-lan-prefix-and-identity-routing LAN prefix mappings and per-identity routing
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-13 13:10
 - **approvedAt**: 2026-10-13 (owner: "开始处理"; freeze lifted for these two items; auto mode, no round
   cap, automatic merges, watchdog with stuck-process checks)
@@ -72,3 +72,12 @@ owner's go.
     (noise).
   - Two identities with source sets (B only): 64 B 604.9 ns, 1420 B 1.467 us. That is about
     +60 ns over one identity, a known cost of the selection step, paid only when sets exist.
+- 2026-10-13: LP merged into main (branch tip ad4d996).
+  - Branch gate green: just check (1855 tests), cross, test-windows, cargo doc, release CLI +
+    linux.sh, lib.sh, examples.sh.
+  - Main gate green: just check, cargo doc.
+  - Slot A/B, all within max(2 %, spread):
+    - translate `eam4_*`: 16/16, -1.5..+0.4 %;
+    - translate `lan_*` /96: 16/16, -1.3..+0.8 %.
+  - `lan_remap_*` costs the same as /96.
+  - Both items are complete; release 0.14.0 waits for OP and the owner's go.
