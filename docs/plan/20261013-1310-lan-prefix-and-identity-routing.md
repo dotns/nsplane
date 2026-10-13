@@ -42,3 +42,25 @@ owner's go.
   CLI + linux.sh, lib.sh, examples.sh).
 
 ## Annotations
+- 2026-10-13: dispatched, LP `affo3r15` (campaign `nsplane-lp-202610131330`) and LR `j3miawgn` (campaign `nsplane-lr-202610131330`), in parallel with OP (plan 20261013-1330). Auto mode, watchdog every 30 min.
+- 2026-10-13: LR design note approved.
+  - Allowed IPs: one allowed-IP trie per identity, plus an engine-wide merged trie as the fallback.
+    The merged trie is built only while a non-default identity holds allowed IPs, and is re-filled
+    from the other identities on removal.
+  - LR-1 checks the receiving peer's identity trie.
+  - LR-2 selects the identity by the packet's source, through `set_local_sources`
+    (most-specific-wins; an identical prefix is rejected). A source that matches no identity routes
+    through the merged trie. This deviates from L1's default-identity fallback: it is accepted
+    because adding a set changes routing only for the sources it claims.
+  - New `Core::route_from(src, dst)`, used by the fragmenter.
+  - The fast path is unchanged with one identity or without source sets.
+  - No new events. `LocalIdentityInfo::sources` is added.
+- 2026-10-13: LP design note approved.
+  - Accepted `lan6` forms: /96 as today, or /(96 + len4) carrying an embedded IPv4 network E.
+  - The mapping XORs `delta = lan4 ^ E`, so a /96 costs one XOR and gives bit-identical
+    results.
+  - At most one LAN prefix per /96 base.
+  - No new public items: `InvalidLan6` is widened.
+  - No changes needed in translate.rs or `LanRoute::resolve`, which already checks E against the
+    real CIDR.
+  - New lan_* translate bench cases land first, for an A/B.
