@@ -71,6 +71,8 @@ Everything here is additive: there is no breaking change.
   published value through a cached closure read, with no lock or reference count while it is
   unchanged. `SnapshotCell::read` is added, and `SnapshotCell::store` is now safe to call
   concurrently.
+- `AclFilter`: the later-fragment early return on the inbound path is back to its 0.13.0 cost
+  (it regressed by about 2.7 ns per packet with the snapshot cell's closure read).
 
 ## [0.13.0] - 2026-10-12
 
