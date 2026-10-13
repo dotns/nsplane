@@ -1617,10 +1617,10 @@ impl Owner {
                 Some(fragmenter) => {
                     let core = &self.core;
                     let table = &mut self.path_mtus.table;
-                    // Above the floor: the destination's peer and its MTU, following the
+                    // Above the floor: the packet's peer and its MTU, following the
                     // path its data leaves on now (a policy may have moved it).
-                    let lookup = |dst| {
-                        let peer = core.route(dst);
+                    let lookup = |src, dst| {
+                        let peer = core.route_from(src, dst);
                         let mtu = match (peer, table.as_deref_mut()) {
                             (Some(peer), Some(table)) => {
                                 table.peer(peer, core.data_path(peer), source)
@@ -1841,6 +1841,7 @@ impl Owner {
             }
             command @ (Command::AddLocalIdentity(..)
             | Command::RemoveLocalIdentity(..)
+            | Command::SetLocalSources(..)
             | Command::LocalIdentities(..)
             | Command::PeerIdIn(..)) => self.identity_command(command),
         }
@@ -1877,6 +1878,9 @@ impl Owner {
                 let removed = self.core.remove_local_identity(id);
                 self.peers_changed();
                 let _ = reply.send(removed);
+            }
+            Command::SetLocalSources(id, sources, reply) => {
+                let _ = reply.send(self.core.set_local_sources(id, &sources));
             }
             Command::LocalIdentities(reply) => {
                 let _ = reply.send(self.core.local_identities().collect());

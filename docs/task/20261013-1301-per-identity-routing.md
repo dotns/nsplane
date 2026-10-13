@@ -47,3 +47,19 @@ Conventions:
   - With one identity the cost must stay identical: one trie and no selection step.
 - Data-path change, so a data_path A/B is required. Disjoint from LP (`nsplane-nat`), so the two
   can run in parallel.
+
+## Consumer note
+
+This replaces the 0.12 advice to keep the identities' address spaces disjoint (task
+`20261011-0101-local-identities`, "Not requested").
+
+- Allowed IPs are scoped per local identity: peers of different identities may allow the
+  same addresses, and the inbound source check uses the receiving peer's identity only.
+- Give each identity that owns local addresses a source set
+  (`EngineHandle::set_local_sources`): local packets from those addresses are routed among
+  that identity's peers only.
+- Strict separation needs a source set for every identity that owns local addresses, the
+  default identity included. A packet whose source lies in no set uses the engine-wide
+  fallback routing, where the last insert across identities owns a prefix.
+- Remove an identity's local addresses together with the identity: once it is removed, its
+  set is gone and packets from those addresses use the fallback routing.
