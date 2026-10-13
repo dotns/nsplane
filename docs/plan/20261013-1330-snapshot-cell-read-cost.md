@@ -1,6 +1,6 @@
 # 20261013-1330-snapshot-cell-read-cost Restore 0.12 read cost after the arc-swap removal
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-10-13 13:30
 - **approvedAt**: 2026-10-13 (owner: optimize now that the host is quiet; a fix of a 0.13.0 regression, so
   allowed under the freeze)
@@ -155,3 +155,10 @@ Residuals (L1 decisions):
       return).
     - Gate `established/*` +3.4..6.7 % against 0.12.0, but 4-10 % better than main. Accepted and
       attributed to the 0.13.0 peer-keyed gate (probable, not isolated).
+- 2026-10-13: completed.
+  - OP-1 and OP-2 shipped in 0.14.0 (`26f9c77`, release `b28d649`).
+  - OP-3 added the results in this file. OP-4 fixed `stateless/inbound_fragment` after the
+    release: a closure borrow made LLVM spill the key with narrow stores and reload it with a
+    wider load, a store-forwarding stall. It is now 26.5 ns against 26.9 on main. The entry is
+    in [Unreleased] for 0.14.1.
+  - Other residuals: task `20261013-1600-perf-residuals`.
