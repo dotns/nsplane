@@ -5,6 +5,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-identity routing (LR, task `20261013-1301-per-identity-routing`): allowed IPs are scoped
+  to the peer's local identity, so the same remote key with the same allowed IPs can be a peer
+  of several identities, each carrying its own traffic.
+  - `nsplane-core` `Core::set_local_sources(identity, sources)`: a source set per identity. A
+    local packet whose source lies in a set is routed among that identity's peers only (the
+    most specific network of all sets wins; no route there drops it as `reasons::NO_ROUTE`).
+    Refused for an unknown identity or a network another identity's set holds; removing the
+    identity drops its set, `ConfigChange::RemoveAllPeers` keeps it.
+  - `nsplane-core` `Core::route_from(src, dst)`: the send path's routing decision.
+  - `nsplane-core` `LocalIdentityInfo::sources` (and so `nsplane` `LocalIdentity::sources` in
+    `EngineStatus::local_identities`).
+  - `nsplane` `EngineHandle::set_local_sources`.
+
+### Changed
+- Per-identity routing (LR): the inbound source check uses the allowed IPs of the receiving
+  peer's identity only. A local packet whose source lies in no source set is routed as before
+  in the engine-wide fallback, now `Core::route`: the default identity's trie, or, while a
+  non-default identity's peers hold allowed IPs, a merged trie in which the last insert across
+  identities owns a prefix; when that owner loses the prefix, it is re-filled from the lowest-id
+  identity still holding it. The fragmentation stage looks up the peer by the packet's source
+  and destination, so path-MTU state and ICMP too-big errors follow the selected identity's
+  peer. With one identity, or without source sets, routing and its cost are unchanged.
+
 ## [0.13.0] - 2026-10-12
 
 A peer-keyed, address-family-agnostic flow gate (plan `20261012-1800-peer-keyed-gate`, GF-1..GF-4),
