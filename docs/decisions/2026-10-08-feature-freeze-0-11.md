@@ -35,3 +35,6 @@ slot A/B when it touches the data path.
 - 2026-10-12: second exception (owner: "这个是底层逻辑问题，需要处理"): a peer-keyed,
   address-family-agnostic flow gate and runtime per-identity `AclFilterScope` (task
   `20261012-1700`, plan `20261012-1800-peer-keyed-gate`). It ships as 0.13.0.
+- 2026-10-13: third exception (owner: "开始处理"): prefix address mappings for LAN prefixes (task
+  `20261013-1300`) and cryptokey routing per local identity (task `20261013-1301`), both from ns.
+  They ship as 0.14.0.
