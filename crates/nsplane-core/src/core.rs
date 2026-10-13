@@ -23,8 +23,8 @@ use crate::peer_table::{Destinations, OwnKey, PeerTable, PeerTableError};
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
 use crate::types::{
-    ConfigChange, CoreConfig, Event, Input, LocalIdentityId, LocalIdentityInfo, Output, PeerConfig,
-    PeerStats,
+    AllowedIp, ConfigChange, CoreConfig, Event, Input, LocalIdentityId, LocalIdentityInfo, Output,
+    PeerConfig, PeerStats,
 };
 
 /// Interval of the peer timers, as in the device.
@@ -57,6 +57,9 @@ struct Lookups {
     session: Option<(u32, PeerId, usize)>,
     /// The last destination, with the peer and slot it is routed to.
     route: Option<(IpAddr, PeerId, usize)>,
+    /// With source sets: the last identity selected (`None` for the fallback trie) and
+    /// destination, with the peer and slot they are routed to.
+    selected_route: Option<(Option<LocalIdentityId>, IpAddr, PeerId, usize)>,
     /// The last source accepted from a peer.
     source: Option<(IpAddr, PeerId)>,
     /// The last destination accepted from a peer with inbound destinations.
@@ -87,6 +90,27 @@ impl Lookups {
         let id = peers.by_destination(dst)?;
         let slot = peers.slot(id)?;
         self.route = Some((dst, id, slot));
+        Some((id, slot))
+    }
+
+    /// The peer and slot a packet from `src` to `dst` is routed to, with source sets: in the
+    /// trie of the identity whose set matches `src`, otherwise in the fallback trie.
+    fn route_from(
+        &mut self,
+        peers: &PeerTable,
+        src: Option<IpAddr>,
+        dst: IpAddr,
+    ) -> Option<(PeerId, usize)> {
+        let identity = src.and_then(|src| peers.source_identity(src));
+        if let Some((last_identity, last, id, slot)) = self.selected_route
+            && last_identity == identity
+            && last == dst
+        {
+            return Some((id, slot));
+        }
+        let id = peers.route_in(identity, dst)?;
+        let slot = peers.slot(id)?;
+        self.selected_route = Some((identity, dst, id, slot));
         Some((id, slot))
     }
 
@@ -489,8 +513,8 @@ impl Core {
     }
 
     /// Removes a local identity and its peers, each exactly as
-    /// [`ConfigChange::RemovePeer`] would; `false` for [`LocalIdentityId::DEFAULT`] or an
-    /// unknown identity. Its id is not reused.
+    /// [`ConfigChange::RemovePeer`] would, and its source set; `false` for
+    /// [`LocalIdentityId::DEFAULT`] or an unknown identity. Its id is not reused.
     pub fn remove_local_identity(&mut self, identity: LocalIdentityId) -> bool {
         if identity == LocalIdentityId::DEFAULT || self.peers.identity(identity).is_none() {
             return false;
@@ -514,7 +538,24 @@ impl Core {
             public_key: i.key.as_ref().map(|k| k.public),
             peers: i.peers,
             transports: i.transports.as_deref().map(<[TransportId]>::to_vec),
+            sources: self.peers.sources(i.id),
         })
+    }
+
+    /// Replaces the source set of `identity` with `sources`; an empty list clears it. Returns
+    /// `false` and changes nothing for an unknown identity, or if another identity's set
+    /// holds one of the networks (compared after truncation to the prefix length).
+    ///
+    /// A local packet whose source lies in a set is routed among the allowed IPs of that
+    /// set's identity only (the most specific network of all sets wins): without a route
+    /// there it is dropped as [`reasons::NO_ROUTE`], whatever other identities' peers allow.
+    /// A packet whose source lies in no set is routed as without sets, see [`Core::route`].
+    /// While no identity has a set, local packets are routed without looking at their source.
+    /// The default identity may have a set too.
+    ///
+    /// Removing an identity drops its set; [`ConfigChange::RemoveAllPeers`] keeps the sets.
+    pub fn set_local_sources(&mut self, identity: LocalIdentityId, sources: &[AllowedIp]) -> bool {
+        self.peers.set_sources(identity, sources)
     }
 
     /// All peers, in id order.
@@ -570,11 +611,21 @@ impl Core {
             })
     }
 
-    /// The peer a packet to `dst` is routed to: the longest allowed-IP match, as on the send
-    /// path. Use it to pick the `peer` of [`Core::inject_inbound`] for a locally generated
-    /// reply about a packet to `dst`.
+    /// The peer a packet to `dst` is routed to when its source lies in no source set (see
+    /// [`Core::set_local_sources`]): the longest allowed-IP match among the peers of the
+    /// default identity or, while another identity's peers hold allowed IPs, among the peers
+    /// of all identities, the range going to the peer that claimed it last. Use it to pick
+    /// the `peer` of [`Core::inject_inbound`] for a locally generated reply about a packet to
+    /// `dst`; [`Core::route_from`] is the send path's decision for a known source.
     pub fn route(&self, dst: IpAddr) -> Option<PeerId> {
         self.peers.by_destination(dst)
+    }
+
+    /// The peer a local packet from `src` to `dst` is routed to, as on the send path: the
+    /// longest allowed-IP match among the peers of the identity whose source set holds `src`
+    /// (see [`Core::set_local_sources`]), otherwise [`Core::route`].
+    pub fn route_from(&self, src: IpAddr, dst: IpAddr) -> Option<PeerId> {
+        self.peers.route_from(src, dst)
     }
 
     /// The path `peer`'s next transport data message would leave on: the one the policy
@@ -1206,9 +1257,14 @@ impl Core {
         filter: bool,
         lookups: &mut Lookups,
     ) -> Option<(PeerId, usize, PacketBuf, usize)> {
-        let Some((id, slot)) =
-            Tunn::dst_address(packet.as_packet()).and_then(|dst| lookups.route(&self.peers, dst))
-        else {
+        let route = match Tunn::dst_address(packet.as_packet()) {
+            Some(dst) if self.peers.has_sources() => {
+                lookups.route_from(&self.peers, src_address(packet.as_packet()), dst)
+            }
+            Some(dst) => lookups.route(&self.peers, dst),
+            None => None,
+        };
+        let Some((id, slot)) = route else {
             self.pool.put(packet);
             self.dropped(None, reasons::NO_ROUTE);
             return None;
@@ -1468,6 +1524,21 @@ fn transmit(
             peer: Some(id),
             reason: reasons::NO_PATH,
         }));
+    }
+}
+
+/// The source address of an IP packet.
+fn src_address(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 20 => {
+            let src: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+            Some(IpAddr::from(src))
+        }
+        6 if packet.len() >= 40 => {
+            let src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+            Some(IpAddr::from(src))
+        }
+        _ => None,
     }
 }
 
@@ -2003,6 +2074,290 @@ mod tests {
                 assert_eq!(pump(&mut cores)[1], [sent], "{limit:?} {len}");
             }
         }
+    }
+
+    /// An IPv4 packet of 100 bytes from `src` to `dst`.
+    fn packet_between(src: [u8; 4], dst: [u8; 4]) -> PacketBuf {
+        let mut buf = local_packet(100);
+        let p = buf.as_packet_mut();
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        buf
+    }
+
+    /// Feeds `input` to `core`, through a crypto job with `crypto_jobs`.
+    fn feed(core: &mut Core, input: Input, crypto_jobs: bool) {
+        if crypto_jobs {
+            if let Some(mut job) = core.handle_input_deferred(input, Instant::now()) {
+                job.run();
+                core.complete_job(job);
+            }
+        } else {
+            core.handle_input(input, Instant::now());
+        }
+    }
+
+    /// Moves datagrams between the cores until both are quiet, a datagram from core `i`
+    /// arriving on `path(i)`; returns what each delivered, with the peer it came from.
+    fn pump_from(cores: &mut [Core; 2], crypto_jobs: bool) -> [Vec<(PeerId, Vec<u8>)>; 2] {
+        let mut delivered = [Vec::new(), Vec::new()];
+        loop {
+            let mut quiet = true;
+            for i in 0..2 {
+                while let Some(output) = cores[i].poll_output() {
+                    match output {
+                        Output::Transmit { data, .. } => {
+                            quiet = false;
+                            let path = path(u16::try_from(i).unwrap());
+                            feed(
+                                &mut cores[1 - i],
+                                Input::Datagram { path, data },
+                                crypto_jobs,
+                            );
+                        }
+                        Output::Deliver { from, packet } => {
+                            delivered[i].push((from, packet.as_packet().to_vec()));
+                        }
+                        Output::Event(_) => {}
+                    }
+                }
+            }
+            if quiet {
+                return delivered;
+            }
+        }
+    }
+
+    /// Core `0` with the default identity and a second one, each with a peer of core `1`'s
+    /// key allowing `10.0.0.2/32`, and with the sources `10.0.0.1/32` and `10.0.1.1/32`;
+    /// core `1`, at `10.0.0.2`, with a peer for each, allowing one of the sources. Returns
+    /// the second identity and the peers of core `0` and of core `1`, default identity first.
+    fn identity_pair(crypto_jobs: bool) -> ([Core; 2], LocalIdentityId, [PeerId; 2], [PeerId; 2]) {
+        let secrets = [[1; 32], [2; 32], [3; 32]].map(x25519::StaticSecret::from);
+        let [own, remote, second] = secrets.each_ref().map(x25519::PublicKey::from);
+        let new = |key: &x25519::StaticSecret| {
+            Core::new(CoreConfig {
+                private_key: Some(key.clone()),
+                crypto_jobs,
+                ..CoreConfig::default()
+            })
+        };
+        let add = |core: &mut Core, identity, key, allowed: &str, at: u16| {
+            let mut config = PeerConfig::new(key);
+            config.local_identity = Some(identity);
+            config.allowed_ips = vec![allowed.parse().unwrap()];
+            config.path = Some(path(at));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core.peer_id_in(identity, &key).unwrap()
+        };
+
+        let mut a = new(&secrets[0]);
+        let identity = a.add_local_identity(secrets[2].clone()).unwrap();
+        let a_peers = [LocalIdentityId::DEFAULT, identity]
+            .map(|id| add(&mut a, id, remote, "10.0.0.2/32", 1));
+        assert!(a.set_local_sources(LocalIdentityId::DEFAULT, &["10.0.0.1/32".parse().unwrap()]));
+        assert!(a.set_local_sources(identity, &["10.0.1.1/32".parse().unwrap()]));
+
+        let mut b = new(&secrets[1]);
+        let b_peers = [(own, "10.0.0.1/32"), (second, "10.0.1.1/32")]
+            .map(|(key, allowed)| add(&mut b, LocalIdentityId::DEFAULT, key, allowed, 0));
+        ([a, b], identity, a_peers, b_peers)
+    }
+
+    #[test]
+    fn two_identities_with_the_same_remote_key_and_ranges_exchange_traffic() {
+        for crypto_jobs in [false, true] {
+            let (mut cores, identity, a_peers, b_peers) = identity_pair(crypto_jobs);
+            for _ in 0..2 {
+                // Out by source, to the identity's own peer.
+                for src in [[10, 0, 0, 1], [10, 0, 1, 1]] {
+                    let packet = packet_between(src, [10, 0, 0, 2]);
+                    feed(&mut cores[0], Input::Local { packet }, crypto_jobs);
+                }
+                let delivered = pump_from(&mut cores, crypto_jobs);
+                let from: Vec<PeerId> = delivered[1].iter().map(|(from, _)| *from).collect();
+                assert_eq!(from, b_peers, "{crypto_jobs}");
+
+                // In, each checked against its own identity's allowed IPs.
+                for dst in [[10, 0, 0, 1], [10, 0, 1, 1]] {
+                    let packet = packet_between([10, 0, 0, 2], dst);
+                    feed(&mut cores[1], Input::Local { packet }, crypto_jobs);
+                }
+                let delivered = pump_from(&mut cores, crypto_jobs);
+                let from: Vec<PeerId> = delivered[0].iter().map(|(from, _)| *from).collect();
+                assert_eq!(from, a_peers, "{crypto_jobs}");
+            }
+
+            // The second identity goes; the default one keeps working both ways.
+            assert!(cores[0].remove_local_identity(identity));
+            let packet = packet_between([10, 0, 0, 1], [10, 0, 0, 2]);
+            feed(&mut cores[0], Input::Local { packet }, crypto_jobs);
+            assert_eq!(pump_from(&mut cores, crypto_jobs)[1].len(), 1);
+            let packet = packet_between([10, 0, 0, 2], [10, 0, 0, 1]);
+            feed(&mut cores[1], Input::Local { packet }, crypto_jobs);
+            let delivered = pump_from(&mut cores, crypto_jobs);
+            assert_eq!(
+                delivered[0]
+                    .iter()
+                    .map(|(from, _)| *from)
+                    .collect::<Vec<_>>(),
+                [a_peers[0]]
+            );
+        }
+    }
+
+    /// The drops `core` reported, its other outputs discarded.
+    fn drops(core: &mut Core) -> Vec<&'static str> {
+        drain(core)
+            .1
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Dropped { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A core with the default identity and a second one, each with a peer allowing `ranges`.
+    fn two_identity_core(ranges: &[&str]) -> (Core, LocalIdentityId, [PeerId; 2]) {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let identity = core
+            .add_local_identity(x25519::StaticSecret::from([3; 32]))
+            .unwrap();
+        let peers = [LocalIdentityId::DEFAULT, identity].map(|id| {
+            let key = x25519::PublicKey::from([7; 32]);
+            let mut config = PeerConfig::new(key);
+            config.local_identity = Some(id);
+            config.allowed_ips = ranges.iter().map(|r| r.parse().unwrap()).collect();
+            config.path = Some(path(2));
+            core.handle_input(
+                Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+                Instant::now(),
+            );
+            core.peer_id_in(id, &key).unwrap()
+        });
+        (core, identity, peers)
+    }
+
+    #[test]
+    fn a_selected_identity_without_a_route_drops_and_no_set_falls_back() {
+        let (mut core, identity, peers) = two_identity_core(&["10.0.0.0/24"]);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(core.set_local_sources(identity, &["100.64.0.0/16".parse().unwrap()]));
+        // Unmatched source: the fallback trie, where the last insert owns the range.
+        assert_eq!(
+            core.route_from(ip("192.0.2.1"), ip("10.0.0.1")),
+            Some(peers[1])
+        );
+        assert_eq!(core.route(ip("10.0.0.1")), Some(peers[1]));
+        assert_eq!(
+            core.route_from(ip("100.64.0.1"), ip("10.0.0.1")),
+            Some(peers[1])
+        );
+
+        // The default identity's peer is reached through its own set only.
+        assert!(core.set_local_sources(
+            LocalIdentityId::DEFAULT,
+            &["100.64.1.0/24".parse().unwrap()]
+        ));
+        assert_eq!(
+            core.route_from(ip("100.64.1.1"), ip("10.0.0.1")),
+            Some(peers[0])
+        );
+
+        // A matched identity without a route: dropped, though the fallback has one.
+        assert_eq!(core.route_from(ip("100.64.0.1"), ip("10.0.1.1")), None);
+        let packet = packet_between([100, 64, 0, 1], [10, 0, 1, 1]);
+        core.handle_input(Input::Local { packet }, Instant::now());
+        assert_eq!(drops(&mut core), [reasons::NO_ROUTE]);
+        // A routed packet starts a handshake with its peer.
+        let packet = packet_between([100, 64, 1, 1], [10, 0, 0, 1]);
+        core.handle_locals([packet], Instant::now());
+        assert_eq!(drops(&mut core), Vec::<&str>::new());
+        assert_eq!(
+            core.peer_stats(peers[0]).unwrap().tx,
+            HANDSHAKE_INIT_SZ as u64
+        );
+        assert_eq!(core.peer_stats(peers[1]).unwrap().tx, 0);
+    }
+
+    #[test]
+    fn a_shared_range_stays_routed_after_either_holder_goes() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let key = x25519::PublicKey::from([7; 32]);
+        for removed in [0, 1] {
+            let (mut core, identity, peers) = two_identity_core(&["10.0.0.0/24"]);
+            let ids = [LocalIdentityId::DEFAULT, identity];
+            core.handle_input(
+                Input::Config(ConfigChange::InLocalIdentity {
+                    identity: ids[removed],
+                    change: Box::new(ConfigChange::RemovePeer(key)),
+                }),
+                Instant::now(),
+            );
+            assert_eq!(core.route(ip("10.0.0.1")), Some(peers[1 - removed]));
+            let stats = core.peer_stats(peers[1 - removed]).unwrap();
+            assert_eq!(stats.allowed_ips, vec!["10.0.0.0/24".parse().unwrap()]);
+        }
+
+        let (mut core, identity, peers) = two_identity_core(&["10.0.0.0/24"]);
+        assert!(core.remove_local_identity(identity));
+        assert_eq!(core.route(ip("10.0.0.1")), Some(peers[0]));
+        assert_eq!(
+            core.route_from(ip("192.0.2.1"), ip("10.0.0.1")),
+            Some(peers[0])
+        );
+    }
+
+    #[test]
+    fn one_identity_routes_from_any_source_as_without_sets() {
+        let (mut core, peer) = core_with_peer(1, 2, path(2), Instant::now());
+        let mut config = PeerConfig::new(x25519::PublicKey::from(&x25519::StaticSecret::from(
+            [2; 32],
+        )));
+        config.allowed_ips = vec!["10.0.0.0/24".parse().unwrap()];
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+        assert!(!core.peers.merged());
+        for dst in ["10.0.0.1", "10.0.1.1"] {
+            let dst = dst.parse().unwrap();
+            assert_eq!(
+                core.route_from("192.0.2.1".parse().unwrap(), dst),
+                core.route(dst)
+            );
+        }
+        assert_eq!(core.route("10.0.0.1".parse().unwrap()), Some(peer));
+    }
+
+    #[test]
+    fn local_identities_report_their_sources_and_remove_all_peers_keeps_them() {
+        let (mut core, identity, _) = two_identity_core(&["10.0.0.0/24"]);
+        let set: Vec<AllowedIp> = vec!["100.64.0.0/16".parse().unwrap()];
+        assert!(core.set_local_sources(identity, &set));
+        let sources = |core: &Core| {
+            core.local_identities()
+                .map(|i| i.sources)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sources(&core), [Vec::new(), set.clone()]);
+        // An identical network of another identity, or an unknown identity: refused.
+        assert!(!core.set_local_sources(LocalIdentityId::DEFAULT, &set));
+        assert!(!core.set_local_sources(LocalIdentityId::new(99), &[]));
+        assert_eq!(sources(&core), [Vec::new(), set.clone()]);
+
+        core.handle_input(Input::Config(ConfigChange::RemoveAllPeers), Instant::now());
+        assert_eq!(sources(&core), [Vec::new(), set]);
+        assert!(core.remove_local_identity(identity));
+        assert_eq!(sources(&core), [Vec::<AllowedIp>::new()]);
+        assert!(!core.peers.has_sources());
     }
 
     /// Keeps the current path unless told to adopt; counts what it is told about.

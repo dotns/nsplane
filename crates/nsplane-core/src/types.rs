@@ -75,6 +75,10 @@ pub struct LocalIdentityInfo {
     pub peers: usize,
     /// The transports it answers handshakes on; `None` for any transport.
     pub transports: Option<Vec<TransportId>>,
+    /// Its source set, see [`Core::set_local_sources`]; empty without one.
+    ///
+    /// [`Core::set_local_sources`]: crate::Core::set_local_sources
+    pub sources: Vec<AllowedIp>,
 }
 
 /// A peer to add, or the changes to apply to an existing peer.

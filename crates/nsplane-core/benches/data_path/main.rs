@@ -7,6 +7,11 @@
 //! trip plus the cryptokey routing a device does per packet (allowed-IP lookup of the
 //! destination on send, source check on receive) on the table the core's allowed IPs live in.
 //!
+//! `core_round_trip_two_identities` is `core_round_trip` between two cores with two local
+//! identities each: under both identities a peer of the same remote key with the same allowed
+//! IPs, and a source set on both, so every packet takes the source selection on send and its
+//! identity's allowed IPs on receive.
+//!
 //! The `*_batch32` cases feed the core [`BATCH`] packets per call through
 //! `Core::handle_locals` and `Core::handle_datagrams`; they report the time of a whole batch,
 //! with a throughput of [`BATCH`] elements: divide the time by [`BATCH`] for one packet.
@@ -21,8 +26,8 @@ use ip_network_table::IpNetworkTable;
 use nsplane_core::noise::{DATA_HEADER_SZ, Tunn, TunnResult};
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{
-    AllowedIp, ConfigChange, Core, CoreConfig, Ecn, Input, Output, PacketBuf, Path, PeerConfig,
-    TransportId,
+    AllowedIp, ConfigChange, Core, CoreConfig, Ecn, Input, LocalIdentityId, Output, PacketBuf,
+    Path, PeerConfig, TransportId,
 };
 use rand_core::OsRng;
 
@@ -105,6 +110,84 @@ fn connected_pair() -> (Core, Core) {
     cores[0].force_handshake(peer, None, now);
     pump(&mut cores, now);
     // A packet from each side proves the session is up both ways.
+    for i in 0..2u8 {
+        let packet = ipv4_packet(ip4(i), ip4(1 - i), 64);
+        cores[usize::from(i)].handle_input(
+            Input::Local {
+                packet: PacketBuf::from_packet(&packet),
+            },
+            now,
+        );
+        assert_eq!(pump(&mut cores, now), 1, "session not established");
+    }
+    cores.into()
+}
+
+/// The second address of core `i` (0 or 1), the source of its second identity.
+const fn second_ip4(i: u8) -> Ipv4Addr {
+    Ipv4Addr::new(10, 0, 1, i + 1)
+}
+
+/// `ip/32`.
+fn host(ip: Ipv4Addr) -> AllowedIp {
+    AllowedIp {
+        addr: ip.into(),
+        cidr: 32,
+    }
+}
+
+/// Core `i` with the default identity `keys[0]` and a second identity `keys[1]`, each with
+/// the source `ip4(i)` or `second_ip4(i)` and a peer `peer` owning `ip4(j)`; the default
+/// identity also has a peer `extra` owning `second_ip4(j)`, as `peer`'s second identity.
+fn identity_core(
+    i: u8,
+    keys: [StaticSecret; 2],
+    peer: PublicKey,
+    extra: PublicKey,
+    now: Instant,
+) -> Core {
+    let j = 1 - i;
+    let [default_key, second_key] = keys;
+    let mut core = Core::new(CoreConfig {
+        private_key: Some(default_key),
+        ..CoreConfig::default()
+    });
+    let second = core.add_local_identity(second_key).unwrap();
+    for (identity, key, ip) in [
+        (LocalIdentityId::DEFAULT, peer, ip4(j)),
+        (second, peer, ip4(j)),
+        (LocalIdentityId::DEFAULT, extra, second_ip4(j)),
+    ] {
+        let mut config = PeerConfig::new(key);
+        config.local_identity = Some(identity);
+        config.allowed_ips = vec![host(ip)];
+        config.path = Some(path(j));
+        core.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(config)), now);
+    }
+    assert!(core.set_local_sources(LocalIdentityId::DEFAULT, &[host(ip4(i))]));
+    assert!(core.set_local_sources(second, &[host(second_ip4(i))]));
+    core
+}
+
+/// A pair of two-identity cores with an established session between their default
+/// identities, on the real clock.
+fn connected_identity_pair() -> (Core, Core) {
+    let now = Instant::now();
+    let keys = [0, 1].map(|_| {
+        [
+            StaticSecret::random_from_rng(OsRng),
+            StaticSecret::random_from_rng(OsRng),
+        ]
+    });
+    let public = keys.each_ref().map(|k| k.each_ref().map(PublicKey::from));
+    let [a_keys, b_keys] = keys;
+    let mut cores = [
+        identity_core(0, a_keys, public[1][0], public[1][1], now),
+        identity_core(1, b_keys, public[0][0], public[0][1], now),
+    ];
+    let peer = cores[0].peer_id(&public[1][0]).unwrap();
+    cores[0].force_handshake(peer, None, now);
+    pump(&mut cores, now);
     for i in 0..2u8 {
         let packet = ipv4_packet(ip4(i), ip4(1 - i), 64);
         cores[usize::from(i)].handle_input(
@@ -313,6 +396,26 @@ fn bench_batches(group: &mut BenchmarkGroup<'_, WallTime>, len: usize, packet: &
     );
 }
 
+/// The two-identity round trip at packet length `len`.
+fn bench_two_identities(group: &mut BenchmarkGroup<'_, WallTime>, len: usize, packet: &[u8]) {
+    group.bench_with_input(
+        BenchmarkId::new("core_round_trip_two_identities", len),
+        packet,
+        |b, p| {
+            let (mut tx, mut rx) = connected_identity_pair();
+            let now = Instant::now();
+            let mut slot = Some(PacketBuf::with_capacity(BUF_CAPACITY));
+            b.iter(|| {
+                let mut buf = slot.take().unwrap();
+                fill(&mut buf, p);
+                let data = encapsulate(&mut tx, buf, now);
+                // The delivered packet's buffer carries the next packet.
+                slot = Some(decapsulate(&mut rx, data, now));
+            });
+        },
+    );
+}
+
 fn bench_data_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_path");
     for len in [64, 1420] {
@@ -414,6 +517,7 @@ fn bench_data_path(c: &mut Criterion) {
             },
         );
 
+        bench_two_identities(&mut group, len, &packet);
         bench_batches(&mut group, len, &packet);
     }
     group.finish();
