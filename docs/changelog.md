@@ -180,3 +180,13 @@ Release 0.13.0 (tag `v0.13.0`):
 - the removal of `arc-swap`, a soundness fix.
 
 The quiet performance pass of both items is pending. The freeze applies again: bug fixes only.
+
+## 2026-10-13 [release]
+
+Release 0.14.0 (tag `v0.14.0`):
+- LAN prefix mappings and cryptokey routing per local identity, the third exemption from the
+  freeze;
+- the fix of the 0.13.0 snapshot-cell read cost.
+
+The remaining performance residuals are tracked in task `20261013-1600-perf-residuals`, to be
+fixed as bugs. The freeze applies again: bug fixes only.

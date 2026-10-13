@@ -246,6 +246,9 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Peer-keyed gate | IPv6 flow gate, peer-keyed bindings, runtime per-identity ACL scopes | done (plan `20261012-1800-peer-keyed-gate`) |
 | No arc-swap | std-only snapshot cell, `LanRoutes` handle | done (plan `20261012-1830-no-arc-swap`) |
 | Release 0.13.0 | breaking: peer-keyed gate, arc-swap removal (tag `v0.13.0`) | 2026-10-12 |
+| LAN prefixes, identity routing | RFC 7757-style LAN prefix mappings; allowed IPs and source sets per local identity | done (plan `20261013-1310-lan-prefix-and-identity-routing`) |
+| Snapshot cell read cost | cached closure reads, 0.13.0 regression fixed | done (plan `20261013-1330-snapshot-cell-read-cost`) |
+| Release 0.14.0 | LAN prefix mappings, per-identity routing, read-cost fix (tag `v0.14.0`) | 2026-10-13 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

@@ -5,6 +5,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-13
+
+Two consumer requests from ns, and a fix of the 0.13.0 read-cost regression.
+
+LAN prefix mappings (LP, plan `20261013-1310-lan-prefix-and-identity-routing`):
+- LAN prefixes map RFC 7757 style, so one remote LAN range can be reached through a local IPv4
+  range of its own.
+- /96 prefixes are unchanged, bit-identical and at the same cost.
+
+Cryptokey routing per local identity (LR, same plan):
+- Allowed IPs are scoped to a peer's identity, and per-identity source sets select the
+  identity of an outbound packet.
+- The same remote key and addresses can now serve several identities at once.
+- An engine with one identity, or without source sets, is unchanged: data_path is within noise.
+
+Snapshot cell read cost (OP, plan `20261013-1330-snapshot-cell-read-cost`):
+- `SnapshotCell::read` is a cached closure read: one engine snapshot read drops from 15.8 ns
+  (0.13.0) to 2.9 ns (0.12.0: 8.8 ns), and most ACL paths are faster than in 0.12.0.
+- Known residuals, tracked in task `20261013-1600-perf-residuals` and to be fixed in a later
+  patch:
+  - outbound translation is +6..7 % against 0.12.0 (not the cell);
+  - the flow gate's established path is +3..7 % against 0.12.0 (probably the 0.13.0 gate);
+  - `stateless/inbound_fragment` is +2.7 ns against 0.13.0 (fix in progress);
+  - routing with source sets costs about +60 ns per round trip when they are used.
+
+Everything here is additive: there is no breaking change.
+
 ### Added
 - `nsplane-nat`: LAN prefixes map by prefix (RFC 7757 style). A `LanPrefix`'s `lan6` is either
   the /96 that embeds the whole IPv4 address (unchanged), or a /(96 + `lan4` length) whose low
