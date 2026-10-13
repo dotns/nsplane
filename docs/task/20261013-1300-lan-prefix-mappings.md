@@ -8,7 +8,7 @@
 ## Description
 
 Requested by ns (ns plan `20261010-1542-concurrent-nsd-connections`, section "nsplane request:
-prefix address mappings for LAN prefixes", ns commit `ba62735f`).
+prefix address mappings for LAN prefixes").
 
 Today (`nsplane-nat` 0.13), a `LanPrefix {lan4, lan6, peer}`:
 - requires `lan6` to be a /96 that embeds the whole IPv4 address (`lan6 | a`);
