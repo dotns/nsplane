@@ -1,6 +1,6 @@
 # 20261013-1300-lan-prefix-mappings Prefix address mappings for LAN prefixes
 
-- **status**: in_progress (owner lifted the freeze, 2026-10-13; plan 20261013-1310)
+- **status**: completed (released in 0.14.0)
 - **priority**: P1
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-13 13:00
