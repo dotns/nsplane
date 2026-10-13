@@ -295,6 +295,7 @@ pub(crate) enum Command {
         oneshot::Sender<Option<LocalIdentityId>>,
     ),
     RemoveLocalIdentity(LocalIdentityId, oneshot::Sender<bool>),
+    SetLocalSources(LocalIdentityId, Vec<AllowedIp>, oneshot::Sender<bool>),
     LocalIdentities(oneshot::Sender<Vec<LocalIdentity>>),
     PeerIdIn(LocalIdentityId, PublicKey, oneshot::Sender<Option<PeerId>>),
 }
@@ -524,6 +525,31 @@ impl EngineHandle {
     /// `false` for [`LocalIdentityId::DEFAULT`] or an unknown identity.
     pub async fn remove_local_identity(&self, id: LocalIdentityId) -> Result<bool, EngineError> {
         self.call(|tx| Command::RemoveLocalIdentity(id, tx)).await
+    }
+
+    /// Replaces the source set of the local identity `identity` with `sources` (an empty set
+    /// clears it); `false`, changing nothing, for an unknown identity or when another
+    /// identity's set holds one of the networks (compared after truncation to the prefix
+    /// length).
+    ///
+    /// A local packet whose source address lies in a set is routed among the allowed IPs of
+    /// the peers of that set's identity only, the most specific network of all sets
+    /// winning; without a route there it is dropped. A packet whose source lies in no set is
+    /// routed as without sets: by the longest allowed-IP match among the peers of every
+    /// identity, a range going to the peer that claimed it last. Path-MTU state and ICMP
+    /// errors about a too-big packet follow the same choice. The default identity may have a
+    /// set too.
+    ///
+    /// Removing the identity drops its set; [`EngineHandle::remove_all_peers`] keeps the
+    /// sets. The sets are reported in [`LocalIdentityInfo::sources`].
+    pub async fn set_local_sources(
+        &self,
+        identity: LocalIdentityId,
+        sources: impl IntoIterator<Item = AllowedIp>,
+    ) -> Result<bool, EngineError> {
+        let sources = sources.into_iter().collect();
+        self.call(|tx| Command::SetLocalSources(identity, sources, tx))
+            .await
     }
 
     /// Every local identity, ascending by id; the default identity is first.
