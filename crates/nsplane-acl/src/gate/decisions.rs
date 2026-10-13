@@ -165,12 +165,13 @@ impl FlowGate {
             swept: false,
         };
         loop {
-            let snapshot = self.snapshot.load();
-            match self.evaluate_once(&snapshot, &input) {
+            match self
+                .snapshot
+                .read(|snapshot| self.evaluate_once(snapshot, &input))
+            {
                 Step::Done(decision) => return decision,
                 Step::Retry => {}
                 Step::SweepAll => {
-                    drop(snapshot);
                     self.state.sweep_all(self.now(&input));
                     input.swept = true;
                 }
