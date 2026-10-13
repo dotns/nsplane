@@ -55,3 +55,12 @@ owner's go.
   - New `Core::route_from(src, dst)`, used by the fragmenter.
   - The fast path is unchanged with one identity or without source sets.
   - No new events. `LocalIdentityInfo::sources` is added.
+- 2026-10-13: LP design note approved.
+  - Accepted `lan6` forms: /96 as today, or /(96 + len4) carrying an embedded IPv4 network E.
+  - The mapping XORs `delta = lan4 ^ E`, so a /96 costs one XOR and gives bit-identical
+    results.
+  - At most one LAN prefix per /96 base.
+  - No new public items: `InvalidLan6` is widened.
+  - No changes needed in translate.rs or `LanRoute::resolve`, which already checks E against the
+    real CIDR.
+  - New lan_* translate bench cases land first, for an A/B.
