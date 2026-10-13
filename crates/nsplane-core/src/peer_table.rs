@@ -52,6 +52,8 @@ pub(crate) struct Identity {
     pub(crate) transports: Option<Arc<[TransportId]>>,
     /// Number of peers bound to the identity.
     pub(crate) peers: usize,
+    /// The allowed IPs of the identity's peers.
+    ips: AllowedIps<PeerId>,
 }
 
 impl Identity {
@@ -87,10 +89,16 @@ impl Hasher for IndexHasher {
 /// The local identities and the peers of the core.
 ///
 /// Peers are reachable by id, by identity and public key, by the session index in received
-/// messages, and by allowed IP (cryptokey routing). Session indices, peer ids and allowed IPs
-/// are shared by all identities, so they are unique across them. Allowed IPs exist only in the routing table, so a range that
-/// a newer peer claims is moved away from its previous owner. Peer ids are never reused. A
-/// peer's inbound destinations are kept apart from the routing table, by slot.
+/// messages, and by allowed IP (cryptokey routing). Session indices and peer ids are shared by
+/// all identities, so they are unique across them. Peer ids are never reused.
+///
+/// Each identity routes its peers' allowed IPs in its own trie: within an identity a range
+/// that a newer peer claims is moved away from its previous owner. Unrouted local packets
+/// take the fallback trie: the default identity's, or the merged trie of all identities while
+/// a non-default identity holds allowed IPs. In the merged trie the last insert owns a range;
+/// a range its owner loses goes to the lowest identity that still holds exactly that range.
+/// Source sets pick the identity whose trie routes a local packet, by its source. A peer's
+/// inbound destinations are kept apart from the routing tables, by slot.
 pub(crate) struct PeerTable {
     /// Ids of the peers, ascending: ids are handed out in order, so a new peer goes last.
     ids: Vec<PeerId>,
@@ -101,7 +109,10 @@ pub(crate) struct PeerTable {
     destinations: Vec<Option<Destinations>>,
     by_key: HashMap<(LocalIdentityId, PublicKey), PeerId>,
     by_index: HashMap<u32, PeerId, BuildHasherDefault<IndexHasher>>,
-    by_ip: AllowedIps<PeerId>,
+    /// The allowed IPs of all identities, while a non-default identity holds some.
+    merged: Option<AllowedIps<PeerId>>,
+    /// The source sets of the identities, while one has a set.
+    sources: Option<AllowedIps<LocalIdentityId>>,
     next_index: IndexLfsr,
     next_id: u32,
     /// The local identities, ascending by id; the default identity is first.
@@ -135,7 +146,8 @@ impl PeerTable {
             destinations: Vec::new(),
             by_key: HashMap::new(),
             by_index: HashMap::default(),
-            by_ip: AllowedIps::new(),
+            merged: None,
+            sources: None,
             next_index: IndexLfsr::default(),
             next_id: 1,
             identities: vec![Identity {
@@ -143,6 +155,7 @@ impl PeerTable {
                 key: None,
                 transports: None,
                 peers: 0,
+                ips: AllowedIps::new(),
             }],
             next_identity: 1,
             budget: Arc::new(HandshakeBudget::new(handshake_rate_limit)),
@@ -219,12 +232,13 @@ impl PeerTable {
             key,
             transports,
             peers: 0,
+            ips: AllowedIps::new(),
         });
         Some(id)
     }
 
-    /// Removes a local identity without peers; `false` for the default identity, an unknown
-    /// one or one that still has peers.
+    /// Removes a local identity without peers, with its source set; `false` for the default
+    /// identity, an unknown one or one that still has peers.
     pub(crate) fn remove_identity(&mut self, id: LocalIdentityId) -> bool {
         if id == LocalIdentityId::DEFAULT {
             return false;
@@ -240,6 +254,12 @@ impl PeerTable {
             return false;
         }
         self.identities.remove(i);
+        if let Some(sources) = &mut self.sources {
+            sources.remove(&|owner: &LocalIdentityId| *owner == id);
+            if sources.is_empty() {
+                self.sources = None;
+            }
+        }
         true
     }
 
@@ -378,12 +398,72 @@ impl PeerTable {
         };
 
         if config.replace_allowed_ips {
-            self.by_ip.remove(&|p: &PeerId| *p == id);
+            self.remove_allowed_ips(identity, id);
         }
-        for &AllowedIp { addr, cidr } in &config.allowed_ips {
-            self.by_ip.insert(addr, cidr, id);
+        for &ip in &config.allowed_ips {
+            self.insert_allowed_ip(identity, ip, id);
         }
+        self.drop_unused_merged();
         Ok(id)
+    }
+
+    /// Routes `ip` to `peer` of `identity`, in the identity's trie and in the merged trie,
+    /// which the first allowed IP of a non-default identity builds from the default one's.
+    fn insert_allowed_ip(&mut self, identity: LocalIdentityId, ip: AllowedIp, peer: PeerId) {
+        if identity != LocalIdentityId::DEFAULT && self.merged.is_none() {
+            let mut merged = AllowedIps::new();
+            if let Some(default) = self.identities.first() {
+                for (&owner, addr, cidr) in default.ips.iter() {
+                    merged.insert(addr, cidr, owner);
+                }
+            }
+            self.merged = Some(merged);
+        }
+        if let Some(owner) = self.identity_mut(identity) {
+            owner.ips.insert(ip.addr, ip.cidr, peer);
+        }
+        if let Some(merged) = &mut self.merged {
+            merged.insert(ip.addr, ip.cidr, peer);
+        }
+    }
+
+    /// Removes the allowed IPs of `peer` of `identity`. A range the peer owned in the merged
+    /// trie goes to the lowest identity that still holds exactly that range.
+    fn remove_allowed_ips(&mut self, identity: LocalIdentityId, peer: PeerId) {
+        let Ok(i) = self.identities.binary_search_by_key(&identity, |i| i.id) else {
+            return;
+        };
+        let owned: Vec<(IpAddr, u8)> = match (&self.merged, self.identities.get(i)) {
+            (Some(_), Some(owner)) => owner
+                .ips
+                .iter()
+                .filter(|(p, _, _)| **p == peer)
+                .map(|(_, addr, cidr)| (addr, cidr))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(owner) = self.identities.get_mut(i) {
+            owner.ips.remove(&|p: &PeerId| *p == peer);
+        }
+        let Some(merged) = &mut self.merged else {
+            return;
+        };
+        for (addr, cidr) in owned {
+            if merged.get(addr, cidr) != Some(&peer) {
+                continue;
+            }
+            match self.identities.iter().find_map(|i| i.ips.get(addr, cidr)) {
+                Some(&next) => merged.insert(addr, cidr, next),
+                None => merged.remove_network(addr, cidr),
+            };
+        }
+    }
+
+    /// Drops the merged trie once no non-default identity holds allowed IPs.
+    fn drop_unused_merged(&mut self) {
+        if self.merged.is_some() && self.identities.iter().skip(1).all(|i| i.ips.is_empty()) {
+            self.merged = None;
+        }
     }
 
     /// Removes the peer of `identity` with `public_key` and returns its id.
@@ -403,23 +483,25 @@ impl PeerTable {
             self.destinations.remove(i);
             self.by_index.remove(&peer.index());
         }
-        self.by_ip.remove(&|p: &PeerId| *p == id);
+        self.remove_allowed_ips(identity, id);
+        self.drop_unused_merged();
 
         tracing::info!("Peer removed");
         Some(id)
     }
 
-    /// Removes all peers of every identity; the identities stay.
+    /// Removes all peers of every identity; the identities and their source sets stay.
     pub(crate) fn clear(&mut self) {
         for identity in &mut self.identities {
             identity.peers = 0;
+            identity.ips.clear();
         }
         self.ids.clear();
         self.peers.clear();
         self.destinations.clear();
         self.by_key.clear();
         self.by_index.clear();
-        self.by_ip.clear();
+        self.merged = None;
     }
 
     /// The peer of `identity` with this public key.
@@ -460,24 +542,120 @@ impl PeerTable {
         self.by_index.get(&(receiver_idx >> 8)).copied()
     }
 
-    /// The peer to send a packet for `dst` to (cryptokey routing).
+    /// The fallback trie: the merged one while it exists, otherwise the default identity's.
+    fn fallback(&self) -> Option<&AllowedIps<PeerId>> {
+        self.merged
+            .as_ref()
+            .or_else(|| self.identities.first().map(|i| &i.ips))
+    }
+
+    /// The peer to send a packet for `dst` to in the fallback trie (cryptokey routing).
     pub(crate) fn by_destination(&self, dst: IpAddr) -> Option<PeerId> {
-        self.by_ip.find(dst).copied()
+        self.fallback()?.find(dst).copied()
+    }
+
+    /// Whether an identity has a source set.
+    pub(crate) const fn has_sources(&self) -> bool {
+        self.sources.is_some()
+    }
+
+    /// The identity whose source set holds the longest match of `src`.
+    pub(crate) fn source_identity(&self, src: IpAddr) -> Option<LocalIdentityId> {
+        self.sources.as_ref()?.find(src).copied()
+    }
+
+    /// The peer to send a packet for `dst` to in the trie of `identity` alone, or in the
+    /// fallback trie for `None`.
+    pub(crate) fn route_in(
+        &self,
+        identity: Option<LocalIdentityId>,
+        dst: IpAddr,
+    ) -> Option<PeerId> {
+        match identity {
+            Some(id) => self.identity(id)?.ips.find(dst).copied(),
+            None => self.by_destination(dst),
+        }
+    }
+
+    /// The peer to send a packet from `src` to `dst` to: in the trie of the identity whose
+    /// source set matches `src`, otherwise in the fallback trie.
+    pub(crate) fn route_from(&self, src: IpAddr, dst: IpAddr) -> Option<PeerId> {
+        if !self.has_sources() {
+            return self.by_destination(dst);
+        }
+        self.route_in(self.source_identity(src), dst)
     }
 
     /// Whether `peer` may send packets from `src`: the longest allowed-IP match of `src`
-    /// across all peers must be `peer` itself.
+    /// among the peers of `peer`'s identity must be `peer` itself.
     pub(crate) fn routes_to(&self, src: IpAddr, peer: PeerId) -> bool {
-        self.by_ip.find(src) == Some(&peer)
+        let ips = match self.merged {
+            // Only the default identity holds allowed IPs: either they are the peer's
+            // identity's or the peer has none.
+            None => self.identities.first().map(|i| &i.ips),
+            Some(_) => self
+                .peer(peer)
+                .and_then(|p| self.identity(p.local_identity()))
+                .map(|i| &i.ips),
+        };
+        ips.and_then(|ips| ips.find(src)) == Some(&peer)
     }
 
     /// The allowed IPs of `peer`.
     pub(crate) fn allowed_ips(&self, peer: PeerId) -> Vec<AllowedIp> {
-        self.by_ip
+        let Some(owner) = self
+            .peer(peer)
+            .and_then(|p| self.identity(p.local_identity()))
+        else {
+            return Vec::new();
+        };
+        owner
+            .ips
             .iter()
             .filter(|(p, _, _)| **p == peer)
             .map(|(_, addr, cidr)| AllowedIp { addr, cidr })
             .collect()
+    }
+
+    /// Replaces the source set of `identity` with `sources`; an empty list clears it. `false`,
+    /// changing nothing, for an unknown identity or a network another identity's set holds.
+    pub(crate) fn set_sources(&mut self, identity: LocalIdentityId, sources: &[AllowedIp]) -> bool {
+        if self.identity(identity).is_none() {
+            return false;
+        }
+        if let Some(set) = &self.sources
+            && sources.iter().any(|ip| {
+                set.get(ip.addr, ip.cidr)
+                    .is_some_and(|owner| *owner != identity)
+            })
+        {
+            return false;
+        }
+        let set = self.sources.get_or_insert_with(AllowedIps::new);
+        set.remove(&|owner: &LocalIdentityId| *owner == identity);
+        for ip in sources {
+            set.insert(ip.addr, ip.cidr, identity);
+        }
+        if set.is_empty() {
+            self.sources = None;
+        }
+        true
+    }
+
+    /// The source set of `identity`.
+    pub(crate) fn sources(&self, identity: LocalIdentityId) -> Vec<AllowedIp> {
+        self.sources.as_ref().map_or_else(Vec::new, |set| {
+            set.iter()
+                .filter(|(owner, _, _)| **owner == identity)
+                .map(|(_, addr, cidr)| AllowedIp { addr, cidr })
+                .collect()
+        })
+    }
+
+    /// Whether the merged trie exists.
+    #[cfg(test)]
+    pub(crate) const fn merged(&self) -> bool {
+        self.merged.is_some()
     }
 
     /// Sets the inbound destinations of `peer`, or with `None` removes them.
@@ -1166,6 +1344,176 @@ mod tests {
                 .unwrap()
                 .accepts(TransportId::new(3))
         );
+    }
+
+    fn add_ips_in(
+        table: &mut PeerTable,
+        identity: LocalIdentityId,
+        peer: PublicKey,
+        ips: &[&str],
+    ) -> PeerId {
+        let mut config = PeerConfig::new(peer);
+        config.local_identity = Some(identity);
+        config.allowed_ips = ips.iter().copied().map(net).collect();
+        table.apply(&config, Instant::now()).unwrap()
+    }
+
+    fn identity(table: &mut PeerTable) -> LocalIdentityId {
+        table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn one_identity_builds_no_merged_trie() {
+        let mut table = table();
+        let a = key();
+        let peer_a = add(&mut table, a, &["10.0.0.0/16"]);
+        let peer_b = add(&mut table, key(), &["10.0.1.0/24"]);
+        // A non-default identity without allowed IPs needs none either.
+        let other = identity(&mut table);
+        let other_peer = add_in(&mut table, other, key());
+        let mut config = PeerConfig::new(a);
+        config.replace_allowed_ips = true;
+        config.allowed_ips = vec![net("10.0.0.0/16"), net("fd00::/64")];
+        table.apply(&config, Instant::now()).unwrap();
+        assert!(!table.merged());
+
+        for (src, dst, peer) in [
+            ("10.9.0.1", "10.0.1.5", Some(peer_b)),
+            ("10.9.0.1", "10.0.2.5", Some(peer_a)),
+            ("10.9.0.1", "fd00::1", Some(peer_a)),
+            ("10.9.0.1", "192.0.2.1", None),
+        ] {
+            assert_eq!(table.by_destination(ip(dst)), peer);
+            assert_eq!(table.route_from(ip(src), ip(dst)), peer);
+        }
+        assert!(table.routes_to(ip("10.0.2.5"), peer_a));
+        assert!(!table.routes_to(ip("10.0.1.5"), peer_a));
+        assert!(!table.routes_to(ip("10.0.2.5"), other_peer));
+    }
+
+    #[test]
+    fn the_same_ranges_under_two_identities_are_checked_per_identity() {
+        let mut table = table();
+        let other = identity(&mut table);
+        let remote = key();
+        let default_peer = add(&mut table, remote, &["10.0.0.0/24"]);
+        assert!(!table.merged());
+        let other_peer = add_ips_in(&mut table, other, remote, &["10.0.0.0/24"]);
+        assert!(table.merged());
+
+        assert!(table.routes_to(ip("10.0.0.1"), default_peer));
+        assert!(table.routes_to(ip("10.0.0.1"), other_peer));
+        assert!(!table.routes_to(ip("10.0.1.1"), other_peer));
+        assert_eq!(table.allowed_ips(default_peer), vec![net("10.0.0.0/24")]);
+        assert_eq!(table.allowed_ips(other_peer), vec![net("10.0.0.0/24")]);
+        // The fallback trie: the last insert owns the range.
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(other_peer));
+
+        // Within an identity the last insert still moves a range.
+        let third = add_ips_in(&mut table, other, key(), &["10.0.0.0/24"]);
+        assert_eq!(table.allowed_ips(other_peer), Vec::new());
+        assert!(!table.routes_to(ip("10.0.0.1"), other_peer));
+        assert!(table.routes_to(ip("10.0.0.1"), third));
+        assert!(table.routes_to(ip("10.0.0.1"), default_peer));
+    }
+
+    #[test]
+    fn a_lost_range_goes_to_the_lowest_identity_that_holds_it() {
+        let mut table = table();
+        let (first, second) = (identity(&mut table), identity(&mut table));
+        let (a, b, c) = (key(), key(), key());
+        let default_peer = add(&mut table, a, &["10.0.0.0/24"]);
+        let second_peer = add_ips_in(&mut table, second, b, &["10.0.0.0/24", "10.0.1.0/24"]);
+        let first_peer = add_ips_in(&mut table, first, c, &["10.0.0.0/24", "10.0.1.0/24"]);
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(first_peer));
+
+        // Replaced away: the default identity holds the range, and comes first.
+        let mut config = PeerConfig::new(c);
+        config.local_identity = Some(first);
+        config.replace_allowed_ips = true;
+        config.allowed_ips = vec![net("10.0.2.0/24")];
+        table.apply(&config, Instant::now()).unwrap();
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(default_peer));
+        assert_eq!(table.by_destination(ip("10.0.1.1")), Some(second_peer));
+        assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
+
+        // A range owned by another peer is left alone.
+        assert_eq!(
+            table.remove(LocalIdentityId::DEFAULT, &a),
+            Some(default_peer)
+        );
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(second_peer));
+        assert_eq!(table.remove(second, &b), Some(second_peer));
+        assert_eq!(table.by_destination(ip("10.0.0.1")), None);
+        assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
+        assert!(table.merged());
+
+        // No non-default identity holds allowed IPs: the merged trie goes.
+        assert_eq!(table.remove(first, &c), Some(first_peer));
+        assert!(!table.merged());
+        let default_peer = add(&mut table, a, &["10.0.0.0/24"]);
+        assert_eq!(table.by_destination(ip("10.0.0.1")), Some(default_peer));
+        assert!(!table.merged());
+
+        add_ips_in(&mut table, second, b, &["10.0.3.0/24"]);
+        table.clear();
+        assert!(!table.merged());
+        assert_eq!(table.by_destination(ip("10.0.0.1")), None);
+    }
+
+    #[test]
+    fn source_sets_select_an_identity() {
+        let mut table = table();
+        let (first, second) = (identity(&mut table), identity(&mut table));
+        let remote = key();
+        let default_peer = add(&mut table, remote, &["10.0.0.0/24"]);
+        let first_peer = add_ips_in(&mut table, first, remote, &["10.0.0.0/24"]);
+        add_in(&mut table, second, remote);
+        assert!(!table.has_sources());
+
+        assert!(table.set_sources(first, &[net("100.64.0.0/16")]));
+        assert!(table.set_sources(LocalIdentityId::DEFAULT, &[net("100.64.1.0/24")]));
+        assert!(table.set_sources(second, &[net("100.65.0.0/16")]));
+        assert!(table.has_sources());
+        // The most specific set wins.
+        assert_eq!(
+            table.route_from(ip("100.64.1.1"), ip("10.0.0.1")),
+            Some(default_peer)
+        );
+        assert_eq!(
+            table.route_from(ip("100.64.2.1"), ip("10.0.0.1")),
+            Some(first_peer)
+        );
+        // A selected identity without a route has none, whatever the others route.
+        assert_eq!(table.route_from(ip("100.65.0.1"), ip("10.0.0.1")), None);
+        // No set: the fallback trie.
+        assert_eq!(
+            table.route_from(ip("192.0.2.1"), ip("10.0.0.1")),
+            table.by_destination(ip("10.0.0.1"))
+        );
+
+        // The same network after truncation, held by another identity: refused, unchanged.
+        assert!(!table.set_sources(second, &[net("100.66.0.0/16"), net("100.64.9.9/16")]));
+        assert_eq!(table.sources(second), vec![net("100.65.0.0/16")]);
+        // An unknown identity is refused.
+        assert!(!table.set_sources(LocalIdentityId::new(99), &[net("100.67.0.0/16")]));
+        // A set is replaced as a whole, and an identity may restate its own networks.
+        assert!(table.set_sources(first, &[net("100.64.0.0/16"), net("100.68.0.0/16")]));
+        assert_eq!(
+            table.sources(first),
+            vec![net("100.64.0.0/16"), net("100.68.0.0/16")]
+        );
+
+        // Clearing keeps the sets; removing an identity drops its set.
+        table.clear();
+        assert_eq!(table.sources(second), vec![net("100.65.0.0/16")]);
+        assert!(table.remove_identity(second));
+        assert_eq!(table.sources(second), Vec::new());
+        assert!(table.set_sources(first, &[]));
+        assert!(table.set_sources(LocalIdentityId::DEFAULT, &[]));
+        assert!(!table.has_sources());
     }
 
     #[test]
