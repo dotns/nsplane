@@ -2138,6 +2138,16 @@ IPv4 address in the low 32 bits (`lan4 <-> lan6`), behind this node or behind a 
 by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
 atomically while traffic flows.
 
+**LAN prefixes.** A `LanPrefix` has one of two forms. With a /96 `lan6`, the IPv4 address
+itself fills the low 32 bits: `lan4` 192.168.1.0/24 and `fd64:b::/96` map 192.168.1.5 to
+`fd64:b::c0a8:105`. With a /(96 + `lan4` length) `lan6` (RFC 7757 style), the low bits carry
+an embedded IPv4 network other than `lan4` and only the host part is copied: `lan4`
+10.9.1.0/24 and `fd64:c::c0a8:100/120` map 10.9.1.5 to `fd64:c::c0a8:105`, so two remote LANs
+with the same range are told apart by giving one of them a local range. IPv6 addresses under
+the /96 base but outside the embedded network are unmapped; ICMP inner packets map the same
+way. One LAN prefix per /96 base, and the `lan4` ranges must not overlap. A `LanRoute` on the
+gateway resolves the embedded address and needs no change.
+
 **Translator.** A stateless RFC 7915 translator: local IPv4 to an `eam4` or a peer's LAN
 leaves as IPv6 to `eam6` / `lan6`, IPv6 to `local6` is rewritten to `peer6`, and the
 replies are mapped back; local IPv4 to a peer's `peer6_eam4`
