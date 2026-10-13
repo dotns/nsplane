@@ -40,3 +40,31 @@ Conventions:
   change is expected. A patch-compatible minor (0.14.0) or 0.13.x if the owner accepts it as an
   extension.
 - Disjoint from LR (`nsplane-core`), so the two can run in parallel.
+
+## Consumer note
+
+A consumer that reaches two remote LANs with the same IPv4 range through different peers keeps
+one of them at its real range and gives the other a local IPv4 range of its own:
+
+- LAN via peer `b`: `lan4` 192.168.1.0/24, `lan6` `<b-base>::/96` (the /96 form, unchanged);
+- LAN via peer `c`: `lan4` 10.9.1.0/24 (a local range), `lan6` `<c-base>::c0a8:100/120` (the
+  remote network 192.168.1.0/24 embedded under the /96 base).
+
+Local applications address 10.9.1.5 for the host 192.168.1.5 behind `c`; it leaves as
+`<c-base>::c0a8:105`, replies and ICMP errors (with their quoted packets) come back as
+10.9.1.x. The consumer routes `<b-base>::/96` to `b` and `<c-base>::/96` to `c`, plus each
+`lan4` range to its peer.
+
+Validation (`TranslationTableBuilder::build`):
+- `lan6` length is 96, or 96 + the `lan4` length;
+- neither prefix has host bits set (a /96 has zero low 32 bits);
+- at most one LAN prefix per /96 base (`Lan6Overlap`); different bases may embed the same
+  IPv4 network;
+- `lan4` ranges must not overlap each other or an IPv4 EAM/self address (`Lan4Overlap`).
+
+IPv6 sources under a base but outside its embedded network (`<c-base>::c0a8:205`) are dropped
+as unmapped, not read as 10.9.2.5.
+
+The gateway side needs no change: its `LanRoute` maps `<c-base>::/96` to the real
+192.168.1.0/24 and resolves the embedded address; it never sees the consumer's local range.
+Pinned by `nsplane-e2e`'s `translate_lan_prefix` tests.
