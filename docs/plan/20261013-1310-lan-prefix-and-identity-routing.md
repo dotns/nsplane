@@ -43,3 +43,15 @@ owner's go.
 
 ## Annotations
 - 2026-10-13: dispatched, LP `affo3r15` (campaign `nsplane-lp-202610131330`) and LR `j3miawgn` (campaign `nsplane-lr-202610131330`), in parallel with OP (plan 20261013-1330). Auto mode, watchdog every 30 min.
+- 2026-10-13: LR design note approved.
+  - Allowed IPs: one allowed-IP trie per identity, plus an engine-wide merged trie as the fallback.
+    The merged trie is built only while a non-default identity holds allowed IPs, and is re-filled
+    from the other identities on removal.
+  - LR-1 checks the receiving peer's identity trie.
+  - LR-2 selects the identity by the packet's source, through `set_local_sources`
+    (most-specific-wins; an identical prefix is rejected). A source that matches no identity routes
+    through the merged trie. This deviates from L1's default-identity fallback: it is accepted
+    because adding a set changes routing only for the sources it claims.
+  - New `Core::route_from(src, dst)`, used by the fragmenter.
+  - The fast path is unchanged with one identity or without source sets.
+  - No new events. `LocalIdentityInfo::sources` is added.
