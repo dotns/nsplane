@@ -64,7 +64,7 @@ fn cell(c: &mut Criterion) {
     group.bench_function("read_4_cells_interleaved", |b| {
         b.iter_custom(|iters| {
             let begin = Instant::now();
-            for cell in cells.iter().cycle().take(iters as usize) {
+            for (cell, _) in cells.iter().cycle().zip(0..iters) {
                 read(cell);
             }
             begin.elapsed()

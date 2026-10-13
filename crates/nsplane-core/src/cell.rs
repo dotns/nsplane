@@ -217,8 +217,10 @@ impl<T: Send + Sync + 'static> SnapshotCell<T> {
             return result;
         }
         // The cache is gone: this thread is exiting.
-        let f = f.expect("the cache is gone, so the closure did not run");
-        f(&self.load())
+        f.map_or_else(
+            || unreachable!("try_with takes `f` exactly when it returns Ok"),
+            |f| f(&self.load()),
+        )
     }
 
     /// Runs `f` on the cached value of `generation`, else on the published one.
