@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use nsplane_core::cell::{self, SnapshotCell};
+use nsplane_core::cell::SnapshotCell;
 use tracing::{debug, warn};
 
 use crate::{
@@ -840,23 +840,24 @@ impl AclEngine {
         if flow.is_mixed() {
             return Decision::Deny(reasons::MALFORMED);
         }
-        let snapshot = self.snapshot.load();
-        let membership = snapshot.membership_of(labels);
-        let evaluation = snapshot.evaluate(labels, membership.as_deref(), flow, || self.now());
-        match evaluation {
-            Evaluation::Rule { namespace, id } => Decision::Accept(Matched::Rule {
-                namespace: namespace.cloned(),
-                id: id.clone(),
-            }),
-            Evaluation::Grant(id) => Decision::Accept(Matched::Grant(id.clone())),
-            Evaluation::Pinhole(id) => Decision::Accept(Matched::Pinhole(id)),
-            Evaluation::NotInstalled => Decision::Accept(Matched::NotInstalled),
-            Evaluation::PinholeExpired => {
-                self.expire_pinholes();
-                Decision::Deny(reasons::DENIED)
+        self.snapshot.read(|snapshot| {
+            let membership = snapshot.membership_of(labels);
+            let evaluation = snapshot.evaluate(labels, membership.as_deref(), flow, || self.now());
+            match evaluation {
+                Evaluation::Rule { namespace, id } => Decision::Accept(Matched::Rule {
+                    namespace: namespace.cloned(),
+                    id: id.clone(),
+                }),
+                Evaluation::Grant(id) => Decision::Accept(Matched::Grant(id.clone())),
+                Evaluation::Pinhole(id) => Decision::Accept(Matched::Pinhole(id)),
+                Evaluation::NotInstalled => Decision::Accept(Matched::NotInstalled),
+                Evaluation::PinholeExpired => {
+                    self.expire_pinholes();
+                    Decision::Deny(reasons::DENIED)
+                }
+                Evaluation::Deny(reason) => Decision::Deny(reason),
             }
-            Evaluation::Deny(reason) => Decision::Deny(reason),
-        }
+        })
     }
 
     /// Validate `policy` and store it as namespace `id`, replacing only that
@@ -1055,7 +1056,7 @@ impl AclEngine {
     /// expired but is not swept yet is caught by the filter's expiry check
     /// instead.
     pub fn generation(&self) -> u64 {
-        self.snapshot.load().generation
+        self.snapshot.read(|snapshot| snapshot.generation)
     }
 
     /// The pinhole counters.
@@ -1070,8 +1071,7 @@ impl AclEngine {
 
     pub(crate) fn is_pinhole_open(&self, id: PinholeId) -> bool {
         self.snapshot
-            .load()
-            .is_live(&ReplyDependency::Pinhole(id), || self.now())
+            .read(|snapshot| snapshot.is_live(&ReplyDependency::Pinhole(id), || self.now()))
     }
 
     pub(crate) fn close_pinhole(&self, id: PinholeId) {
@@ -1092,8 +1092,15 @@ impl AclEngine {
     }
 
     /// The current snapshot: one load that holds no lock.
-    pub(crate) fn snapshot(&self) -> cell::Snapshot<Snapshot> {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> nsplane_core::cell::Snapshot<Snapshot> {
         self.snapshot.load()
+    }
+
+    /// Run `f` on the current snapshot through the cached closure read: no
+    /// lock or reference count while it is unchanged.
+    pub(crate) fn read_snapshot<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> R {
+        self.snapshot.read(f)
     }
 
     /// Apply `update` to a copy of the current snapshot and publish it.

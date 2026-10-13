@@ -404,7 +404,7 @@ impl FlowGate {
     /// [`replace`](Self::replace), then increased by every one.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.snapshot.load().generation
+        self.snapshot.read(|snapshot| snapshot.generation)
     }
 
     /// Evaluate a packet received from `peer`.
@@ -486,36 +486,37 @@ impl FlowGate {
         // With every shard held no writer can publish, so the snapshot and
         // the state are consistent.
         let mut shards = self.state.lock_all();
-        let snapshot = self.snapshot.load();
-        let counts = &self.state.counts;
-        let mut found: Option<LiveFlow> = None;
-        for shard in &mut shards {
-            shard.family::<A>().retain_flows(counts, |key, flow| {
-                if key.remote_ip != remote_ip
-                    || key.local_ip != local_ip
-                    || key.remote_port != remote_port
-                    || key.local_port != local_port
-                    || key.protocol != protocol
-                {
-                    return true;
-                }
-                if flow.expires_at <= now {
-                    return false;
-                }
-                flow.touch::<A>(key.protocol, now, &counts.timeouts);
-                if found.as_ref().is_none_or(|live| !live.enforced)
-                    && let Some(scope) = snapshot.scope_of_slot(key.slot)
-                {
-                    found = Some(LiveFlow {
-                        scope: scope.id.clone(),
-                        rule: flow.rule.clone(),
-                        enforced: flow.enforced,
-                    });
-                }
-                true
-            });
-        }
-        found
+        self.snapshot.read(|snapshot| {
+            let counts = &self.state.counts;
+            let mut found: Option<LiveFlow> = None;
+            for shard in &mut shards {
+                shard.family::<A>().retain_flows(counts, |key, flow| {
+                    if key.remote_ip != remote_ip
+                        || key.local_ip != local_ip
+                        || key.remote_port != remote_port
+                        || key.local_port != local_port
+                        || key.protocol != protocol
+                    {
+                        return true;
+                    }
+                    if flow.expires_at <= now {
+                        return false;
+                    }
+                    flow.touch::<A>(key.protocol, now, &counts.timeouts);
+                    if found.as_ref().is_none_or(|live| !live.enforced)
+                        && let Some(scope) = snapshot.scope_of_slot(key.slot)
+                    {
+                        found = Some(LiveFlow {
+                            scope: scope.id.clone(),
+                            rule: flow.rule.clone(),
+                            enforced: flow.enforced,
+                        });
+                    }
+                    true
+                });
+            }
+            found
+        })
     }
 
     /// The decision counters.
