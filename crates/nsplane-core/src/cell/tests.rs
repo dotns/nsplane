@@ -138,3 +138,288 @@ fn cells_replaced_under_load_never_mix_or_go_back() {
         assert!(sequence > 0);
     }
 }
+
+#[test]
+fn read_sees_each_store() {
+    let cell = SnapshotCell::new(1);
+    assert_eq!(cell.read(|value| *value), 1);
+    assert_eq!(cell.read(|value| *value), 1);
+    cell.store(2);
+    assert_eq!(cell.read(|value| *value), 2);
+    assert_eq!((*cell.load(), cell.read(|value| *value)), (2, 2));
+}
+
+/// More cells than cache entries, read in turn on one thread and replaced between rounds:
+/// every read gets its own cell's current value.
+#[test]
+fn cells_read_in_turn_beyond_the_cache_never_mix() {
+    let cells: Vec<_> = (0..=2 * CACHE_ENTRIES)
+        .map(|id| SnapshotCell::new((id, 0)))
+        .collect();
+    for round in 0..4 {
+        for _ in 0..2 {
+            for (id, cell) in cells.iter().enumerate() {
+                assert_eq!(cell.read(|value| *value), (id, round));
+            }
+        }
+        for (id, cell) in cells.iter().enumerate().step_by(2) {
+            cell.store((id, round + 1));
+        }
+        for (id, cell) in cells.iter().enumerate().skip(1).step_by(2) {
+            cell.store((id, round + 1));
+        }
+    }
+}
+
+#[test]
+fn nested_reads_of_the_same_and_other_cells() {
+    let (outer, other) = (SnapshotCell::new(1), SnapshotCell::new(10));
+    outer.read(|_| ());
+    // A hit outside, a hit and a miss inside.
+    let read = outer.read(|first| {
+        let again = outer.read(|again| *again);
+        let missed = other.read(|other| *other);
+        let nested = other.read(|other| outer.read(|again| other + again));
+        (*first, again, missed, nested)
+    });
+    assert_eq!(read, (1, 1, 10, 11));
+    // A store inside: the outer closure keeps its value, an inner read misses and sees the
+    // new one without caching it.
+    let read = outer.read(|first| {
+        outer.store(2);
+        (
+            *first,
+            outer.read(|again| *again),
+            outer.read(|again| *again),
+        )
+    });
+    assert_eq!(read, (1, 2, 2));
+    assert_eq!(
+        (outer.read(|value| *value), other.read(|value| *value)),
+        (2, 10)
+    );
+}
+
+#[test]
+fn store_inside_a_read() {
+    let cell = SnapshotCell::new(1);
+    for expected in 1..4 {
+        cell.read(|value| {
+            assert_eq!(*value, expected);
+            cell.store(value + 1);
+            assert_eq!(*value, expected);
+        });
+    }
+    assert_eq!(cell.read(|value| *value), 4);
+}
+
+#[test]
+fn reads_on_more_threads_than_shards_see_a_store() {
+    let readers = 2 * SHARDS + 1;
+    let cell = Arc::new(SnapshotCell::new(0));
+    let (read, stored) = (
+        Arc::new(Barrier::new(readers + 1)),
+        Arc::new(Barrier::new(readers + 1)),
+    );
+    let threads: Vec<_> = (0..readers)
+        .map(|_| {
+            let (cell, read, stored) = (Arc::clone(&cell), Arc::clone(&read), Arc::clone(&stored));
+            thread::spawn(move || {
+                let before = cell.read(|value| *value);
+                read.wait();
+                stored.wait();
+                (before, cell.read(|value| *value))
+            })
+        })
+        .collect();
+    read.wait();
+    cell.store(1);
+    stored.wait();
+    for thread in threads {
+        assert_eq!(thread.join().unwrap(), (0, 1));
+    }
+}
+
+/// Like `cells_replaced_under_load_never_mix_or_go_back`, with readers on more threads than
+/// shards that read every cell in turn, mixing `read` and `load`.
+#[test]
+fn cells_replaced_under_read_never_mix_or_go_back() {
+    const CELLS: usize = 4;
+    const READERS: usize = SHARDS;
+    const MAX_STORES: u64 = 2_000_000;
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    let cells: Arc<Vec<_>> = Arc::new(
+        (0..CELLS)
+            .map(|id| SnapshotCell::new((id, 0_u64)))
+            .collect(),
+    );
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let (cells, done) = (Arc::clone(&cells), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut last = [0_u64; CELLS];
+                let mut count = 0_u64;
+                while !done.load(Ordering::Relaxed) {
+                    for (id, cell) in cells.iter().enumerate() {
+                        let (owner, sequence) = if count.is_multiple_of(3) {
+                            *cell.load()
+                        } else {
+                            cell.read(|value| *value)
+                        };
+                        assert_eq!(owner, id, "a value of another cell");
+                        assert!(
+                            sequence >= last[id],
+                            "{sequence} went back from {}",
+                            last[id]
+                        );
+                        last[id] = sequence;
+                        count += 1;
+                    }
+                }
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..CELLS)
+        .map(|id| {
+            let cells = Arc::clone(&cells);
+            thread::spawn(move || {
+                let mut sequence = 0;
+                while sequence < MAX_STORES && Instant::now() < deadline {
+                    sequence += 1;
+                    cells[id].store((id, sequence));
+                }
+            })
+        })
+        .collect();
+    assert!(readers.len() + writers.len() > SHARDS);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    for (id, cell) in cells.iter().enumerate() {
+        let (owner, sequence) = cell.read(|value| *value);
+        assert_eq!((owner, *cell.load()), (id, (id, sequence)));
+        assert!(sequence > 0);
+    }
+}
+
+/// Several threads store into one cell while others read it: no read waits forever, a reader
+/// never sees a writer's values go back, and the final value is the last of some writer.
+#[test]
+fn concurrent_stores_with_readers() {
+    const WRITERS: usize = 4;
+    const READERS: usize = 4;
+    const MAX_STORES: u64 = 500_000;
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    let cell = Arc::new(SnapshotCell::new((0_usize, 0_u64)));
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let (cell, done) = (Arc::clone(&cell), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut last = [0_u64; WRITERS];
+                let mut count = 0_u64;
+                while !done.load(Ordering::Relaxed) {
+                    let (writer, sequence) = if count.is_multiple_of(4) {
+                        *cell.load()
+                    } else {
+                        cell.read(|value| *value)
+                    };
+                    assert!(sequence >= last[writer], "{sequence} went back");
+                    last[writer] = sequence;
+                    count += 1;
+                }
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let cell = Arc::clone(&cell);
+            thread::spawn(move || {
+                let mut sequence = 0;
+                while sequence < MAX_STORES && Instant::now() < deadline {
+                    sequence += 1;
+                    cell.store((writer, sequence));
+                }
+                sequence
+            })
+        })
+        .collect();
+    let mut last = Vec::new();
+    for writer in writers {
+        last.push(writer.join().unwrap());
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    let (writer, sequence) = cell.read(|value| *value);
+    assert_eq!(sequence, last[writer]);
+    assert_eq!(*cell.load(), (writer, sequence));
+}
+
+/// A replaced value stays in the cache of a thread that read it until the thread reads the
+/// cell again or evicts it.
+#[test]
+fn the_cache_retains_a_replaced_value_until_evicted() {
+    thread::spawn(|| {
+        let value = Arc::new(1);
+        let (old, cell) = (Arc::downgrade(&value), SnapshotCell::new(value));
+        cell.read(|_| ());
+        cell.store(2);
+        assert!(old.upgrade().is_some(), "cached");
+        assert_eq!(cell.read(|value| *value), 2);
+        assert!(old.upgrade().is_none(), "the read replaced it");
+
+        let value = Arc::new(3);
+        let old = Arc::downgrade(&value);
+        cell.store(value);
+        cell.read(|_| ());
+        cell.store(4);
+        let others: Vec<_> = (0..CACHE_ENTRIES).map(SnapshotCell::<usize>::new).collect();
+        for (other, expected) in others.iter().zip(0..) {
+            assert!(old.upgrade().is_some(), "cached");
+            assert_eq!(other.read(|value| *value), expected);
+        }
+        assert!(old.upgrade().is_none(), "evicted");
+    })
+    .join()
+    .unwrap();
+}
+
+/// A thread-local whose drop reads a cell, initialized before the cache so that it drops
+/// after it on Linux: the read loads the shard.
+#[test]
+fn a_read_while_the_thread_exits() {
+    struct ReadOnDrop(Arc<SnapshotCell<u32>>, Arc<Mutex<Option<u32>>>);
+
+    impl Drop for ReadOnDrop {
+        fn drop(&mut self) {
+            *self.1.lock().unwrap() = Some(self.0.read(|value| *value));
+        }
+    }
+
+    thread_local! {
+        static PROBE: RefCell<Option<ReadOnDrop>> = const { RefCell::new(None) };
+    }
+
+    let cell = Arc::new(SnapshotCell::new(1));
+    let read = Arc::new(Mutex::new(None));
+    {
+        let (cell, read) = (Arc::clone(&cell), Arc::clone(&read));
+        thread::spawn(move || {
+            PROBE.with(|probe| *probe.borrow_mut() = Some(ReadOnDrop(Arc::clone(&cell), read)));
+            assert_eq!(cell.read(|value| *value), 1);
+            cell.store(2);
+        })
+        .join()
+        .unwrap();
+    }
+    assert_eq!(*read.lock().unwrap(), Some(2));
+}
