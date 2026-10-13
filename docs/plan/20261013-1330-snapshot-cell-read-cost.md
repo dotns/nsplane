@@ -50,3 +50,12 @@ on these rows. The IPv6 gate numbers (B only) are 53.6-109.0 ns.
 
 ## Annotations
 - 2026-10-13: dispatched OP `gcxn1i1c` (campaign `nsplane-op-202610131330`).
+- 2026-10-13: OP design note approved.
+  - `SnapshotCell::read(|&T| ..)`: a published generation (Acquire), and a per-thread cache of
+    4-8 entries keyed by a never-reused cell id that holds an `Arc<dyn Any>`. A hit costs no
+    refcount and no lock; a miss loads the shard until the generation matches.
+  - A writer mutex inside the cell makes concurrent stores safe.
+  - Retention is bounded (at most 8 values per thread).
+  - `ScopeCell` folds in.
+  - The hot call sites in acl and nat move to `read`.
+  - An e2e test checks replaces under traffic.
