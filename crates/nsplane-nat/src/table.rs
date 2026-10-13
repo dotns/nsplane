@@ -11,6 +11,13 @@
 //! address: unlike `local6`, which keeps the packet IPv6 and only rewrites the
 //! address, it is translated between IPv4 and IPv6.
 //!
+//! A LAN prefix pair maps an IPv4 LAN prefix to an IPv6 prefix by copying
+//! the host part of the address ([`LanPrefix`]). The IPv6 side is either a /96
+//! that embeds the whole IPv4 address in its low 32 bits, or a longer prefix
+//! whose low bits carry an IPv4 network other than the `lan4` one (RFC 7757
+//! prefix mappings): with `lan4` 10.9.1.0/24 and `lan6`
+//! `fd64:c::c0a8:100/120`, 10.9.1.5 maps to `fd64:c::c0a8:105` and back.
+//!
 //! A [`TranslationTable`] holds data and lookups only; it never rewrites
 //! packets. It is immutable once built and validated by
 //! [`TranslationTableBuilder::build`].
@@ -22,7 +29,8 @@ use nsplane_packet::PeerId;
 use nsplane_packet::hash::KeyedState;
 use thiserror::Error;
 
-/// Prefix length of every LAN IPv6 prefix: the IPv4 address fills the low 32 bits.
+/// Prefix length of the /96 base of every LAN IPv6 prefix: the embedded IPv4
+/// address fills the low 32 bits.
 pub const LAN6_PREFIX_LEN: u8 = 96;
 
 /// Mask of the low 32 bits of a LAN IPv6 address (the embedded IPv4 address).
@@ -53,14 +61,28 @@ pub struct SelfMapping {
     pub eam6: Ipv6Addr,
 }
 
-/// An IPv4 LAN prefix and the IPv6 /96 prefix it is translated to.
+/// An IPv4 LAN prefix and the IPv6 prefix it is translated to.
 ///
-/// An IPv4 address `a` inside `lan4` maps to `lan6` with `a` in the low 32 bits.
+/// The IPv6 address of an IPv4 address `a` inside `lan4` is `lan6` with an
+/// embedded IPv4 address in its low 32 bits, which keeps the host part of
+/// `a`. `lan6` takes one of two forms:
+///
+/// - a /96 with zero low 32 bits: the embedded address is `a` itself
+///   (`lan4` 10.9.1.0/24 and `lan6` `fd64:b::/96` map 10.9.1.5 to
+///   `fd64:b::a09:105`);
+/// - a /(96 + `lan4` length) without host bits: its low bits carry an
+///   embedded IPv4 network, which may differ from the `lan4` network
+///   (`lan4` 10.9.1.0/24 and `lan6` `fd64:c::c0a8:100/120` map 10.9.1.5 to
+///   `fd64:c::c0a8:105`). With the `lan4` network embedded it is the same
+///   as the /96 form.
+///
+/// The /96 that holds `lan6` (its first [`LAN6_PREFIX_LEN`] bits) is its base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanPrefix {
     /// IPv4 prefix and its length.
     pub lan4: (Ipv4Addr, u8),
-    /// IPv6 prefix and its length, which must be [`LAN6_PREFIX_LEN`].
+    /// IPv6 prefix and its length: a /96 with zero low 32 bits, or a
+    /// /(96 + `lan4` length) without host bits.
     pub lan6: (Ipv6Addr, u8),
     /// `None` for the LAN behind this node, `Some(peer)` for a LAN behind that peer.
     pub peer: Option<PeerId>,
@@ -81,13 +103,18 @@ pub enum TableError {
     /// A LAN IPv4 prefix is longer than 32 bits or has host bits set.
     #[error("invalid LAN IPv4 prefix {0}/{1}")]
     InvalidLan4(Ipv4Addr, u8),
-    /// A LAN IPv6 prefix is not a /96 or has low 32 bits set.
-    #[error("invalid LAN IPv6 prefix {0}/{1}: must be a /96 with zero low 32 bits")]
+    /// A LAN IPv6 prefix is neither a /96 with zero low 32 bits nor a
+    /// /(96 + IPv4 prefix length) without host bits.
+    #[error(
+        "invalid LAN IPv6 prefix {0}/{1}: must be a /96 with zero low 32 bits \
+         or a /(96 + IPv4 prefix length) without host bits"
+    )]
     InvalidLan6(Ipv6Addr, u8),
     /// A LAN IPv4 prefix overlaps another one or an IPv4 EAM/self address.
     #[error("LAN IPv4 prefix {0}/{1} overlaps another prefix or address")]
     Lan4Overlap(Ipv4Addr, u8),
-    /// A LAN IPv6 prefix overlaps another one or a peer, EAM or local address.
+    /// The /96 base of a LAN IPv6 prefix is the base of another one or
+    /// holds a peer, EAM or local address.
     #[error("LAN IPv6 prefix {0}/96 overlaps another prefix or address")]
     Lan6Overlap(Ipv6Addr),
 }
@@ -101,8 +128,11 @@ struct Lan {
     end4: u32,
     /// IPv4 prefix length, for error reports.
     len4: u8,
-    /// The /96 prefix with zero low 32 bits.
+    /// The /96 base with zero low 32 bits.
     prefix6: u128,
+    /// The `lan4` network XOR the embedded IPv4 network (zero for the /96
+    /// form): an address XOR `delta` is its embedded address and back.
+    delta: u32,
     peer: Option<PeerId>,
 }
 
@@ -200,24 +230,34 @@ impl TranslationTable {
 
     /// Maps an IPv4 address inside a LAN prefix to its IPv6 address and the
     /// peer the LAN is behind (`None` for the local LAN).
+    ///
+    /// The IPv6 address is `lan6` with the host part of `addr`: `addr` itself
+    /// in the low 32 bits for a /96 `lan6`; for `lan4` 10.9.1.0/24 and `lan6`
+    /// `fd64:c::c0a8:100/120`, 10.9.1.5 maps to `fd64:c::c0a8:105`.
     pub fn lan4_to_lan6(&self, addr: Ipv4Addr) -> Option<(Ipv6Addr, Option<PeerId>)> {
         let bits = addr.to_bits();
         let lan = self.lan4(bits)?;
         Some((
-            Ipv6Addr::from_bits(lan.prefix6 | u128::from(bits)),
+            Ipv6Addr::from_bits(lan.prefix6 | u128::from(bits ^ lan.delta)),
             lan.peer,
         ))
     }
 
-    /// Maps an IPv6 address inside a LAN /96 prefix to its IPv4 address and the
-    /// peer the LAN is behind, if the embedded IPv4 address is inside the
-    /// paired IPv4 prefix.
+    /// Maps an IPv6 address inside a LAN prefix to its IPv4 address and the
+    /// peer the LAN is behind, if the IPv4 address in its low 32 bits is
+    /// inside the network `lan6` embeds (the `lan4` network for a /96).
+    ///
+    /// The IPv4 address is the `lan4` network with the host part of `addr`;
+    /// for `lan4` 10.9.1.0/24 and `lan6` `fd64:c::c0a8:100/120`,
+    /// `fd64:c::c0a8:105` maps to 10.9.1.5 and `fd64:c::a09:105` to nothing.
     pub fn lan6_to_lan4(&self, addr: Ipv6Addr) -> Option<(Ipv4Addr, Option<PeerId>)> {
         let bits = addr.to_bits();
         let lan = self
             .lans
             .get(*self.by_lan6.get(&(bits & !LAN6_HOST_MASK))?)?;
-        let addr4 = u32::try_from(bits & LAN6_HOST_MASK).ok()?;
+        // XOR `delta` maps the embedded network onto `lan4` and every other
+        // address outside it.
+        let addr4 = u32::try_from(bits & LAN6_HOST_MASK).ok()? ^ lan.delta;
         lan.contains4(addr4)
             .then_some((Ipv4Addr::from_bits(addr4), lan.peer))
     }
@@ -278,6 +318,12 @@ impl TranslationTableBuilder {
     }
 
     /// Adds a LAN prefix pair.
+    ///
+    /// `lan6` is a /96 with zero low 32 bits, or a /(96 + `lan4` length)
+    /// whose low bits carry an embedded IPv4 network; see [`LanPrefix`]. At
+    /// most one LAN prefix may use a given /96 base, even with different
+    /// embedded networks (a limit that may be relaxed later); prefixes under
+    /// different bases may embed the same IPv4 network.
     #[must_use]
     pub fn lan(mut self, lan: LanPrefix) -> Self {
         self.lans.push(lan);
@@ -392,14 +438,22 @@ fn validate_lan(lan: &LanPrefix) -> Result<Lan, TableError> {
     if len4 > 32 || addr4.to_bits() & host4 != 0 {
         return Err(TableError::InvalidLan4(addr4, len4));
     }
-    if len6 != LAN6_PREFIX_LEN || addr6.to_bits() & LAN6_HOST_MASK != 0 {
+    // The low 32 bits of `lan6`: zero for a /96, else the embedded network.
+    let [.., a, b, c, d] = addr6.octets();
+    let embedded = u32::from_be_bytes([a, b, c, d]);
+    let delta = if len6 == LAN6_PREFIX_LEN && embedded == 0 {
+        0
+    } else if len6 == LAN6_PREFIX_LEN + len4 && embedded & host4 == 0 {
+        addr4.to_bits() ^ embedded
+    } else {
         return Err(TableError::InvalidLan6(addr6, len6));
-    }
+    };
     Ok(Lan {
         start4: addr4.to_bits(),
         end4: addr4.to_bits() | host4,
         len4,
-        prefix6: addr6.to_bits(),
+        prefix6: addr6.to_bits() & !LAN6_HOST_MASK,
+        delta,
         peer: lan.peer,
     })
 }
@@ -569,6 +623,231 @@ mod tests {
 
     fn err(builder: TranslationTableBuilder) -> TableError {
         builder.build().unwrap_err()
+    }
+
+    /// A LAN prefix pair with an explicit `lan6` length.
+    fn lan_len6(lan4: &str, len4: u8, lan6: &str, len6: u8, peer: Option<u32>) -> LanPrefix {
+        LanPrefix {
+            lan6: (v6(lan6), len6),
+            ..lan(lan4, len4, "::", peer)
+        }
+    }
+
+    #[test]
+    fn prefix_mapping_vectors() {
+        let table = TranslationTable::builder()
+            .peer(PeerId::new(1), mapping(1))
+            .lan(lan_len6("10.9.1.0", 24, "fd64:c::c0a8:100", 120, Some(1)))
+            .lan(lan_len6("172.16.0.0", 16, "fd64:d::a0a:0", 112, None))
+            .lan(lan_len6(
+                "203.0.113.9",
+                32,
+                "fd64:e::c000:201",
+                128,
+                Some(1),
+            ))
+            .lan(lan_len6("10.10.0.0", 15, "fd64:f::", 111, None))
+            .build()
+            .unwrap();
+        let one = Some(PeerId::new(1));
+        let vectors = [
+            ("10.9.1.5", "fd64:c::c0a8:105", one),
+            ("10.9.1.0", "fd64:c::c0a8:100", one),
+            ("10.9.1.255", "fd64:c::c0a8:1ff", one),
+            ("172.16.3.4", "fd64:d::a0a:304", None),
+            ("172.16.255.255", "fd64:d::a0a:ffff", None),
+            ("203.0.113.9", "fd64:e::c000:201", one),
+            ("10.10.0.1", "fd64:f::1", None),
+            ("10.11.255.255", "fd64:f::1:ffff", None),
+        ];
+        for (addr4, addr6, peer) in vectors {
+            assert_eq!(
+                table.lan4_to_lan6(v4(addr4)),
+                Some((v6(addr6), peer)),
+                "{addr4}"
+            );
+            assert_eq!(
+                table.lan6_to_lan4(v6(addr6)),
+                Some((v4(addr4), peer)),
+                "{addr6}"
+            );
+        }
+        // Right /96 base, outside the embedded network: the `lan4` range
+        // itself included.
+        for addr6 in [
+            "fd64:c::a09:105",
+            "fd64:c::c0a8:205",
+            "fd64:c::c0a9:105",
+            "fd64:d::ac10:304",
+            "fd64:d::a0b:0",
+            "fd64:e::c000:202",
+            "fd64:f::2:0",
+        ] {
+            assert!(table.lan6_to_lan4(v6(addr6)).is_none(), "{addr6}");
+        }
+        // The embedded network is not a `lan4` range.
+        assert!(table.lan4_to_lan6(v4("192.168.1.5")).is_none());
+    }
+
+    #[test]
+    fn prefix_mapping_round_trips_for_every_lan4_length() {
+        for len4 in 8..=32_u8 {
+            let host4 = u32::MAX.checked_shr(u32::from(len4)).unwrap_or(0);
+            let start4 = 0x0a12_3456 & !host4;
+            let embedded = 0xc0a8_0000_u32.rotate_right(u32::from(len4)) & !host4;
+            let lan6 = Ipv6Addr::from_bits((0xfd64_000c_u128 << 96) | u128::from(embedded));
+            let table = TranslationTable::builder()
+                .lan(LanPrefix {
+                    lan4: (Ipv4Addr::from_bits(start4), len4),
+                    lan6: (lan6, LAN6_PREFIX_LEN + len4),
+                    peer: Some(PeerId::new(1)),
+                })
+                .build()
+                .unwrap();
+            for host in [0, host4 / 2, host4] {
+                let addr4 = Ipv4Addr::from_bits(start4 | host);
+                let (addr6, peer) = table.lan4_to_lan6(addr4).unwrap();
+                assert_eq!(
+                    addr6.to_bits(),
+                    lan6.to_bits() | u128::from(host),
+                    "/{len4}"
+                );
+                assert_eq!(peer, Some(PeerId::new(1)));
+                assert_eq!(table.lan6_to_lan4(addr6), Some((addr4, peer)), "/{len4}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_96_and_the_equivalent_prefix_mapping_behave_identically() {
+        let build = |lan6, len6| {
+            TranslationTable::builder()
+                .lan(lan_len6("10.9.1.0", 24, lan6, len6, Some(1)))
+                .build()
+                .unwrap()
+        };
+        let (a, b) = (build("fd64:b::", 96), build("fd64:b::a09:100", 120));
+        assert_eq!(a.lans, b.lans);
+        for addr4 in ["10.9.1.0", "10.9.1.5", "10.9.1.255", "10.9.2.0"] {
+            assert_eq!(a.lan4_to_lan6(v4(addr4)), b.lan4_to_lan6(v4(addr4)));
+        }
+        for addr6 in ["fd64:b::a09:105", "fd64:b::a09:205", "fd64:b::c0a8:105"] {
+            assert_eq!(a.lan6_to_lan4(v6(addr6)), b.lan6_to_lan4(v6(addr6)));
+        }
+    }
+
+    #[test]
+    fn prefix_mappings_may_embed_the_same_network_under_different_bases() {
+        let table = TranslationTable::builder()
+            .lan(lan_len6("10.9.1.0", 24, "fd64:c::c0a8:100", 120, Some(1)))
+            .lan(lan("192.168.1.0", 24, "fd64:d::", Some(2)))
+            .build()
+            .unwrap();
+        assert_eq!(
+            table.lan6_to_lan4(v6("fd64:c::c0a8:105")),
+            Some((v4("10.9.1.5"), Some(PeerId::new(1))))
+        );
+        assert_eq!(
+            table.lan6_to_lan4(v6("fd64:d::c0a8:105")),
+            Some((v4("192.168.1.5"), Some(PeerId::new(2))))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_prefix_mappings() {
+        let cases = [
+            // Lengths other than 96 and 96 + 24.
+            ("fd64:c::c0a8:100", 112),
+            ("fd64:c::c0a8:100", 121),
+            ("fd64:c::c0a8:100", 128),
+            ("fd64:c::", 64),
+            // Host bits past the length.
+            ("fd64:c::c0a8:101", 120),
+            ("fd64:c::c0a8:180", 120),
+            // A /96 with low bits set.
+            ("fd64:c::c0a8:100", 96),
+        ];
+        for (lan6, len6) in cases {
+            let builder =
+                TranslationTable::builder().lan(lan_len6("10.9.1.0", 24, lan6, len6, None));
+            assert_eq!(
+                err(builder),
+                TableError::InvalidLan6(v6(lan6), len6),
+                "{lan6}/{len6}"
+            );
+        }
+        // A whole-space `lan4` only has the /96 form.
+        let builder =
+            TranslationTable::builder().lan(lan_len6("0.0.0.0", 0, "fd64:c::c0a8:100", 96, None));
+        assert_eq!(
+            err(builder),
+            TableError::InvalidLan6(v6("fd64:c::c0a8:100"), 96)
+        );
+    }
+
+    #[test]
+    fn rejects_two_prefix_mappings_in_one_base() {
+        let base = v6("fd64:c::");
+        // A /96 and a prefix mapping, two prefix mappings (even with the same
+        // embedded network).
+        let cases = [
+            (
+                lan("10.0.0.0", 24, "fd64:c::", None),
+                lan_len6("10.1.0.0", 24, "fd64:c::c0a8:100", 120, Some(1)),
+            ),
+            (
+                lan_len6("10.0.0.0", 24, "fd64:c::c0a8:200", 120, None),
+                lan_len6("10.1.0.0", 24, "fd64:c::c0a8:100", 120, Some(1)),
+            ),
+            (
+                lan_len6("10.0.0.0", 24, "fd64:c::c0a8:100", 120, None),
+                lan_len6("10.1.0.0", 24, "fd64:c::c0a8:100", 120, Some(1)),
+            ),
+        ];
+        for (first, second) in cases {
+            let builder = TranslationTable::builder().lan(first).lan(second);
+            assert_eq!(err(builder), TableError::Lan6Overlap(base), "{second:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_prefix_mapping_base_holding_a_peer_eam_or_local_address() {
+        let one = mapping(1);
+        for addr in [one.peer6, one.eam6, one.local6.unwrap(), own().eam6] {
+            let base = Ipv6Addr::from_bits(addr.to_bits() & !LAN6_HOST_MASK);
+            // The embedded network does not contain the address.
+            let lan6 = Ipv6Addr::from_bits(base.to_bits() | 0xc0a8_0100);
+            let builder = TranslationTable::builder()
+                .self_mapping(own())
+                .peer(PeerId::new(1), one)
+                .lan(LanPrefix {
+                    lan6: (lan6, 120),
+                    ..lan("10.9.1.0", 24, "::", None)
+                });
+            assert_eq!(err(builder), TableError::Lan6Overlap(base), "{addr}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_prefix_mapping_lan4_covering_an_eam4() {
+        // The `lan4` range counts, not the embedded network.
+        let builder = TranslationTable::builder()
+            .self_mapping(own())
+            .peer_with_peer6_eam4(PeerId::new(1), mapping(1), v4("10.9.1.50"))
+            .lan(lan_len6("10.9.1.0", 24, "fd64:c::6440:0", 120, None));
+        assert_eq!(err(builder), TableError::Lan4Overlap(v4("10.9.1.0"), 24));
+        let builder = TranslationTable::builder()
+            .self_mapping(own())
+            .peer(PeerId::new(1), mapping(1))
+            .lan(lan_len6("100.64.0.0", 24, "fd64:c::c0a8:100", 120, None));
+        assert_eq!(err(builder), TableError::Lan4Overlap(v4("100.64.0.0"), 24));
+        // An embedded network holding the EAM addresses is fine.
+        let table = TranslationTable::builder()
+            .self_mapping(own())
+            .peer(PeerId::new(1), mapping(1))
+            .lan(lan_len6("10.9.1.0", 24, "fd64:c::6440:0", 120, None))
+            .build();
+        assert!(table.is_ok());
     }
 
     #[test]
@@ -822,6 +1101,11 @@ mod tests {
         assert_eq!(
             TableError::InvalidLan4(v4("10.0.0.1"), 8).to_string(),
             "invalid LAN IPv4 prefix 10.0.0.1/8"
+        );
+        assert_eq!(
+            TableError::InvalidLan6(v6("fd64:c::c0a8:101"), 120).to_string(),
+            "invalid LAN IPv6 prefix fd64:c::c0a8:101/120: must be a /96 with zero low 32 \
+             bits or a /(96 + IPv4 prefix length) without host bits"
         );
     }
 
