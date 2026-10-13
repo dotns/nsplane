@@ -365,23 +365,28 @@ impl Nat64Lan {
         let Some(request) = packet::request(bytes) else {
             return Ok(false);
         };
-        let routes = self.routes.0.load();
-        let mut resolving = routes
-            .iter()
-            .filter_map(|route| Some((route, route.resolve(request.dst)?)));
-        let Some((route, target)) = resolving.next() else {
-            if routes.iter().any(|route| route.maps(request.dst)) {
-                return Err(reasons::UNSAFE_TARGET);
+        let Some((snat_source, target)) = self.routes.0.read(|routes| {
+            let mut resolving = routes
+                .iter()
+                .filter_map(|route| Some((route, route.resolve(request.dst)?)));
+            let Some((route, target)) = resolving.next() else {
+                if routes.iter().any(|route| route.maps(request.dst)) {
+                    return Err(reasons::UNSAFE_TARGET);
+                }
+                return Ok(None);
+            };
+            if resolving.next().is_some() {
+                return Err(reasons::AMBIGUOUS_ROUTE);
             }
+            Ok(Some((route.snat_source, target)))
+        })?
+        else {
             return Ok(false);
         };
-        if resolving.next().is_some() {
-            return Err(reasons::AMBIGUOUS_ROUTE);
-        }
         let (original, flags) = packet::request_tuple(bytes, request).ok_or(reasons::MALFORMED)?;
         let translated = match self.conntrack.lookup(&original, Some(flags)) {
             Some(found) if found.direction == FlowDirection::Original => found.flow.translated,
-            _ => self.new_flow(&original, route.snat_source, target, flags)?,
+            _ => self.new_flow(&original, snat_source, target, flags)?,
         };
         packet::to_ipv4(
             packet,

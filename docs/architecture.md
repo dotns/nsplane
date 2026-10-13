@@ -1785,10 +1785,20 @@ Product mappings onto this API are in `docs/specs/acl-source-identity.md`,
 `AclEngine` holds its whole state (the default `RuleSet` and its policy state, the rule
 namespaces, the directed grants and the open pinholes) as one immutable snapshot in a
 `nsplane_core::cell::SnapshotCell`: writers serialize on a mutex and publish a new snapshot, and
-evaluation takes one load per packet. The cell, std-only, also holds the filter scopes, the gate
-policy, the translation table and the NAT64 LAN routes: 16 cache-line-padded `RwLock` shards,
-each with its own `Arc`, where a load read-locks its thread's shard only to clone that `Arc` (no
-lock is held after it returns) and a writer locks every shard to replace them. `install` swaps a `RuleSet` that `RuleSet::new` validated in
+evaluation takes one closure read per packet. The cell, std-only, also holds the filter scopes,
+the gate policy, the translation table and the NAT64 LAN routes: 16 cache-line-padded `RwLock`
+shards, each with its own `Arc`, where a load read-locks its thread's shard only to clone that
+`Arc` (no lock is held after it returns) and a writer locks every shard to replace them. `store`
+is safe to call concurrently (stores serialize on a writer mutex inside the cell); each store
+gives the value the next generation of its cell and publishes that generation while it still
+holds every shard write lock. The packet paths use `read(|value| ..)`: each thread caches up to 8
+values keyed by a never-reused cell id and the generation, so a read of an unchanged value takes
+no lock and no reference count, and a miss is one shard load plus a cache insert. `load` keeps
+its semantics and cost, no reader waits beyond its shard lock, and the guarantee stays: neither
+a load nor a read returns a value older than one a returned store, or an earlier load or read on
+its thread, saw. Retention: at most 8 cached values per thread across all cells, so at most one
+replaced value per cell per thread; a thread that stops reading keeps up to 8 old values until
+it exits. `install` swaps a `RuleSet` that `RuleSet::new` validated in
 atomically, and a rejected update (`RuleSet::new`, `store_namespace` or `store_grant`
 returning an error) leaves the previous state in effect. With nothing loaded every flow is
 denied; `clear_all` removes everything in one swap. nsplane takes typed rules only: parsing
@@ -2064,7 +2074,7 @@ replaced the former node L3 gate; IPv6 and peer-keyed bindings came with plan
   either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
   mixed-family pair.
 
-**Migration and locking.** Packet paths take one load of an immutable snapshot
+**Migration and locking.** Packet paths take one read of an immutable snapshot
 (in a `SnapshotCell`) with the compiled scopes and their indexes (`(PeerId, address)` to
 scopes, local and binding addresses to scopes) and the holds, and then lock only the state
 shard of their peer: 64 shards by `PeerId`, each tagged with the generation it was migrated

@@ -290,7 +290,7 @@ impl Translator {
     /// current table: it follows later [`store`](Self::store) calls.
     pub fn ipv4_translated_predicate(&self) -> Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync> {
         let table = Arc::clone(&self.table);
-        Arc::new(move |dst| translated_ipv4(&table.load(), dst))
+        Arc::new(move |dst| table.read(|table| translated_ipv4(table, dst)))
     }
 
     /// A snapshot of the counters.
@@ -364,25 +364,29 @@ impl Translator {
 
 impl PacketFilter for Translator {
     fn inbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
-        let table = self.table.load();
         let start = allocation(packet);
-        let result = match packet.as_packet().first().map(|byte| byte >> 4) {
-            Some(4) => inbound_v4(&table, packet),
-            Some(6) => inbound_v6(&table, peer, packet),
-            _ => Ok(Action::Pass),
-        };
+        let result =
+            self.table.read(
+                |table| match packet.as_packet().first().map(|byte| byte >> 4) {
+                    Some(4) => inbound_v4(table, packet),
+                    Some(6) => inbound_v6(table, peer, packet),
+                    _ => Ok(Action::Pass),
+                },
+            );
         self.count_grown(start, packet);
         self.inbound.count(result)
     }
 
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict {
-        let table = self.table.load();
         let start = allocation(packet);
-        let result = match packet.as_packet().first().map(|byte| byte >> 4) {
-            Some(4) => self.outbound_v4(&table, peer, packet),
-            Some(6) => outbound_v6(&table, peer, packet),
-            _ => Ok(Action::Pass),
-        };
+        let result =
+            self.table.read(
+                |table| match packet.as_packet().first().map(|byte| byte >> 4) {
+                    Some(4) => self.outbound_v4(table, peer, packet),
+                    Some(6) => outbound_v6(table, peer, packet),
+                    _ => Ok(Action::Pass),
+                },
+            );
         self.count_grown(start, packet);
         self.outbound.count(result)
     }
