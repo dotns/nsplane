@@ -86,32 +86,33 @@ impl FlowGate {
         if !matches!(meta.protocol, 6 | 17) {
             return None;
         }
-        let snapshot = self.snapshot.load();
-        let mut scopes = snapshot.with_local(meta.destination);
-        let scope = scopes.next()?;
-        if scopes.next().is_some()
-            || !scope.enforce
-            || scope.peer_bindings.contains_key(&peer)
-            || snapshot.is_scope_address(meta.source)
-            || snapshot.held(
-                PacketDirection::Inbound,
+        self.snapshot.read(|snapshot| {
+            let mut scopes = snapshot.with_local(meta.destination);
+            let scope = scopes.next()?;
+            if scopes.next().is_some()
+                || !scope.enforce
+                || scope.peer_bindings.contains_key(&peer)
+                || snapshot.is_scope_address(meta.source)
+                || snapshot.held(
+                    PacketDirection::Inbound,
+                    peer,
+                    meta.destination,
+                    meta.source,
+                )
+            {
+                return None;
+            }
+            let rule = scope.unbound.iter().find(|rule| {
+                rule.action == UnboundAction::Divert
+                    && rule.matches(peer, meta.protocol, meta.transport())
+            })?;
+            Some(DivertedPacket {
+                generation: snapshot.generation,
                 peer,
-                meta.destination,
-                meta.source,
-            )
-        {
-            return None;
-        }
-        let rule = scope.unbound.iter().find(|rule| {
-            rule.action == UnboundAction::Divert
-                && rule.matches(peer, meta.protocol, meta.transport())
-        })?;
-        Some(DivertedPacket {
-            generation: snapshot.generation,
-            peer,
-            scope: scope.id.clone(),
-            rule: rule.id.clone(),
-            packet: packet.into(),
+                scope: scope.id.clone(),
+                rule: rule.id.clone(),
+                packet: packet.into(),
+            })
         })
     }
 }

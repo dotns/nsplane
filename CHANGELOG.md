@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and destination, so path-MTU state and ICMP too-big errors follow the selected identity's
   peer. With one identity, or without source sets, routing and its cost are unchanged.
 
+### Fixed
+- The 0.13.0 per-packet read regression of the snapshot cell: the ACL engine, the flow gate,
+  the `AclFilter` scopes, the `Translator` table and the NAT64 LAN routes now read their
+  published value through a cached closure read, with no lock or reference count while it is
+  unchanged. `SnapshotCell::read` is added, and `SnapshotCell::store` is now safe to call
+  concurrently.
+
 ## [0.13.0] - 2026-10-12
 
 A peer-keyed, address-family-agnostic flow gate (plan `20261012-1800-peer-keyed-gate`, GF-1..GF-4),

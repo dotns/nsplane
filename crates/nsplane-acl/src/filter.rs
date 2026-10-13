@@ -1,7 +1,6 @@
 //! [`AclFilter`]: a sans-I/O [`PacketFilter`] enforcing the ACL policy on
 //! inbound packets and the outbound rules of restricted peers.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
@@ -562,112 +561,6 @@ impl ScopeSet {
     /// The scope of the local identity `id`.
     fn select(&self, id: LocalIdentityId) -> &AclFilterScope {
         self.by_identity.get(&id).unwrap_or(&self.default)
-    }
-}
-
-/// The published [`ScopeSet`] of a filter. Every load and store of it goes
-/// through here.
-///
-/// Each thread caches the last set it loaded with its cell and generation, so
-/// a load is a plain atomic read of the generation and, while the set is
-/// unchanged, a borrow of the cached set: no read-modify-write and no
-/// reference count. The cache holds one set per thread (a thread alternating
-/// between filters loads the set from the shared cell on every switch), so it
-/// keeps at most one set alive per thread.
-///
-/// Ordering: the generation is the publication point of a store. A store
-/// writes the set, then its generation (Release). A load reads the
-/// generation `g` (Acquire) and returns the set of exactly the generation it
-/// last read: the cached one when it is of this cell and `g`, else the shared
-/// set once a generation read after loading it equals the set's own (a newer
-/// set is not used before its generation is published). Sets are immutable
-/// values, so a packet sees one whole set; and since the generation only
-/// grows, a packet ordered after another load, or after a store returned,
-/// reads a generation at least as high, so it never sees an older set.
-struct ScopeCell {
-    set: SnapshotCell<ScopeSet>,
-    /// The generation of the published set, stored after `set`.
-    generation: AtomicU64,
-    /// Tells the cells apart in the per-thread cache: from a global counter,
-    /// so never shared by two cells (an address could be reused).
-    id: u64,
-}
-
-/// The set a thread loaded last: its cell, its generation and the set.
-type CachedScopes = Option<(u64, u64, Arc<ScopeSet>)>;
-
-thread_local! {
-    static SCOPE_CACHE: RefCell<CachedScopes> = const { RefCell::new(None) };
-}
-
-impl ScopeCell {
-    fn new(set: ScopeSet) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Self {
-            generation: AtomicU64::new(set.generation),
-            set: SnapshotCell::new(set),
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        }
-    }
-
-    /// The generation of the published set.
-    #[inline]
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    /// Run `f` on the published set (see the ordering above).
-    #[inline]
-    fn load<R>(&self, f: impl FnOnce(&ScopeSet) -> R) -> R {
-        let generation = self.generation();
-        SCOPE_CACHE.with(|cache| {
-            if let Some((id, cached, set)) = &*cache.borrow()
-                && *id == self.id
-                && *cached == generation
-            {
-                return f(set);
-            }
-            f(&self.refill(cache))
-        })
-    }
-
-    /// Load the published set and cache it, unless the cache is lent to an
-    /// outer load (`f` processing another packet on this thread).
-    #[cold]
-    #[inline(never)]
-    fn refill(&self, cache: &RefCell<CachedScopes>) -> Arc<ScopeSet> {
-        let set = self.load_published();
-        if let Ok(mut cache) = cache.try_borrow_mut() {
-            *cache = Some((self.id, set.generation, Arc::clone(&set)));
-        }
-        set
-    }
-
-    /// The shared set, once its generation is the published one.
-    fn load_published(&self) -> Arc<ScopeSet> {
-        loop {
-            let set = self.set.load_full();
-            if set.generation == self.generation() {
-                return set;
-            }
-            // A store is between its two writes (the set is not published
-            // yet), or a later store completed: read both again.
-            std::thread::yield_now();
-        }
-    }
-
-    /// Publish `set`, whose generation is above the published one; callers
-    /// serialize stores.
-    fn store(&self, set: ScopeSet) {
-        let generation = set.generation;
-        self.set.store(Arc::new(set));
-        self.generation.store(generation, Ordering::Release);
-    }
-}
-
-impl fmt::Debug for ScopeCell {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.set.load(), f)
     }
 }
 
@@ -1257,7 +1150,7 @@ struct Inner {
     identity: Box<dyn PeerIdentity>,
     config: AclFilterConfig,
     /// The published [`AclFilterScopes`].
-    scopes: ScopeCell,
+    scopes: SnapshotCell<ScopeSet>,
     /// No published scope constrains anything, so packets skip the scopes.
     /// Read before them; it is true only while the latest published set is
     /// unscoped.
@@ -1276,7 +1169,7 @@ impl fmt::Debug for AclFilter {
         f.debug_struct("AclFilter")
             .field("engine", &self.inner.engine)
             .field("config", &self.inner.config)
-            .field("scopes", &self.inner.scopes)
+            .field("scopes", &*self.inner.scopes.load())
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -1343,7 +1236,7 @@ impl AclFilter {
                 identity,
                 config,
                 unscoped: AtomicBool::new(scopes.is_unscoped()),
-                scopes: ScopeCell::new(scopes),
+                scopes: SnapshotCell::new(scopes),
                 scope_writer: Mutex::default(),
                 cache,
                 fragments: Mutex::default(),
@@ -1371,7 +1264,7 @@ impl AclFilter {
             .scope_writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let set = ScopeSet::new(inner.scopes.generation() + 1, scopes)?;
+        let set = ScopeSet::new(inner.scopes.read(|set| set.generation) + 1, scopes)?;
         let (generation, unscoped) = (set.generation, set.is_unscoped());
         // `unscoped` is cleared before a constrained set is stored and set
         // after an unscoped one is, so a packet reading it true is judged as
@@ -1390,7 +1283,7 @@ impl AclFilter {
     /// build, then increased by every [`replace_scopes`](Self::replace_scopes).
     #[must_use]
     pub fn scope_generation(&self) -> u64 {
-        self.inner.scopes.generation()
+        self.inner.scopes.read(|set| set.generation)
     }
 
     /// A snapshot of the counters.
@@ -1510,26 +1403,27 @@ impl Inner {
         if let Some(((key, true, _), ttl, _)) = allow_only {
             return self.follow_allowed(key, ttl);
         }
-        let snapshot = self.engine.snapshot();
-        if !snapshot.is_loaded() {
-            return match snapshot.policy_state() {
-                PolicyState::Failed => Outcome::PolicyFailed,
-                PolicyState::NotInstalled | PolicyState::Installed { .. } => Outcome::NoPolicy,
+        self.engine.read_snapshot(|snapshot| {
+            if !snapshot.is_loaded() {
+                return match snapshot.policy_state() {
+                    PolicyState::Failed => Outcome::PolicyFailed,
+                    PolicyState::NotInstalled | PolicyState::Installed { .. } => Outcome::NoPolicy,
+                };
+            }
+            let Ok(packet) = IpPacket::parse(bytes) else {
+                return Outcome::Malformed;
             };
-        }
-        let Ok(packet) = IpPacket::parse(bytes) else {
-            return Outcome::Malformed;
-        };
-        let Some(((key, _, first_of_many), ttl, capacity)) = allow_only else {
-            return self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
-                self.evaluate(&snapshot, peer, packet)
-            });
-        };
-        let outcome = self.evaluate(&snapshot, peer, &packet);
-        if first_of_many && matches!(outcome, Outcome::Accepted | Outcome::Reply) {
-            self.remember_allowed(key, ttl, capacity);
-        }
-        outcome
+            let Some(((key, _, first_of_many), ttl, capacity)) = allow_only else {
+                return self.with_fragments(peer, false, &packet, Outcome::Fragment, |packet| {
+                    self.evaluate(snapshot, peer, packet)
+                });
+            };
+            let outcome = self.evaluate(snapshot, peer, &packet);
+            if first_of_many && matches!(outcome, Outcome::Accepted | Outcome::Reply) {
+                self.remember_allowed(key, ttl, capacity);
+            }
+            outcome
+        })
     }
 
     /// [`FragmentMode::AllowOnly`]: whether the first fragment of `key` was
@@ -1730,7 +1624,7 @@ impl Inner {
         let scoped = if self.unscoped.load(Ordering::Acquire) {
             Some(false)
         } else {
-            self.scopes.load(|set| {
+            self.scopes.read(|set| {
                 self.inbound_scope(set, snapshot, peer, tuple.src)
                     .map(|scope| scope.accepts_other(packet))
             })
@@ -2074,16 +1968,26 @@ impl Inner {
         if self.accepts_ipv6(bytes) {
             return Outcome::Ipv6Accepted;
         }
-        if self.unscoped.load(Ordering::Acquire) {
-            return self.outbound_under(peer, bytes, None);
-        }
-        self.scopes
-            .load(|set| self.outbound_under(peer, bytes, Some(set)))
+        // The engine snapshot is read first, as on the inbound path: a read
+        // nested in another one cannot fill the thread's cache.
+        self.engine.read_snapshot(|snapshot| {
+            if self.unscoped.load(Ordering::Acquire) {
+                return self.outbound_under(snapshot, peer, bytes, None);
+            }
+            self.scopes
+                .read(|set| self.outbound_under(snapshot, peer, bytes, Some(set)))
+        })
     }
 
-    /// [`outbound`](Self::outbound) under the scopes `set`, `None` when they
-    /// constrain nothing.
-    fn outbound_under(&self, peer: PeerId, bytes: &[u8], set: Option<&ScopeSet>) -> Outcome {
+    /// [`outbound`](Self::outbound) under the engine `snapshot` and the scopes
+    /// `set`, `None` when they constrain nothing.
+    fn outbound_under(
+        &self,
+        snapshot: &Snapshot,
+        peer: PeerId,
+        bytes: &[u8],
+        set: Option<&ScopeSet>,
+    ) -> Outcome {
         // Without per-identity scopes the scope is known before the peer.
         let early = set
             .filter(|set| set.by_identity.is_empty())
@@ -2091,7 +1995,6 @@ impl Inner {
         if early.is_some_and(|scope| !scope.allows_source(bytes)) {
             return Outcome::OutboundSource;
         }
-        let snapshot = self.engine.snapshot();
         let identity = self.identity_generation();
         let parsed = IpPacket::parse(bytes);
         // The remote address; a by-source peer is unknown without it.
@@ -2100,7 +2003,7 @@ impl Inner {
         let mut local = LocalIdentityId::DEFAULT;
         // `None`: an unrestricted peer without pinholes.
         let info = if identity != 0 {
-            let Some(info) = self.cached_peer(&mut table, &snapshot, peer, dst, identity) else {
+            let Some(info) = self.cached_peer(&mut table, snapshot, peer, dst, identity) else {
                 return Outcome::Internal;
             };
             local = info.local_identity;
@@ -2112,7 +2015,7 @@ impl Inner {
             );
             Some(Arc::new(PeerInfo::new(
                 labels,
-                &snapshot,
+                snapshot,
                 0,
                 false,
                 LocalIdentityId::DEFAULT,
@@ -2148,17 +2051,17 @@ impl Inner {
             Some(info) if restricted => info,
             info => {
                 let info = info.as_deref();
-                self.outbound_unrestricted(&snapshot, peer, info, scope, &packet, table);
+                self.outbound_unrestricted(snapshot, peer, info, scope, &packet, table);
                 return Outcome::OutboundAccepted;
             }
         };
         let restricted = Restricted { info: &info, scope };
         if packet.fragment().is_none() {
-            return self.evaluate_outbound(&snapshot, peer, restricted, identity, &packet, table);
+            return self.evaluate_outbound(snapshot, peer, restricted, identity, &packet, table);
         }
         drop(table);
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(&snapshot, peer, restricted, identity, packet, self.table())
+            self.evaluate_outbound(snapshot, peer, restricted, identity, packet, self.table())
         })
     }
 
@@ -6042,11 +5945,9 @@ mod tests {
             assert_eq!(judged_scope(&b, OTHER_PEER), Some(false));
             assert_eq!(b.scope_generation(), 0);
         }
-        // A filter built after another is dropped never reuses its cell.
-        let id = b.inner.scopes.id;
+        // A filter built after another is dropped never uses its set.
         std::mem::drop(b);
         let c = AclFilter::new(rules_engine(test_policy()), map);
-        assert_ne!(c.inner.scopes.id, id);
         assert_eq!(judged_scope(&c, PEER), None);
     }
 }
