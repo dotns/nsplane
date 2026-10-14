@@ -183,8 +183,8 @@ fn nested_reads_of_the_same_and_other_cells() {
         (*first, again, missed, nested)
     });
     assert_eq!(read, (1, 1, 10, 11));
-    // A store inside: the outer closure keeps its value, an inner read misses and sees the
-    // new one without caching it.
+    // A store inside: the outer closure keeps its value, an inner read misses, sees the new
+    // one and caches it, so the next inner read hits.
     let read = outer.read(|first| {
         outer.store(2);
         (
@@ -198,6 +198,99 @@ fn nested_reads_of_the_same_and_other_cells() {
         (outer.read(|value| *value), other.read(|value| *value)),
         (2, 10)
     );
+}
+
+fn refills() -> usize {
+    REFILLS.with(std::cell::Cell::get)
+}
+
+/// A read inside the closure of another fills the cache: after a store, the first inner read
+/// loads the shard and the next ones hit.
+#[test]
+fn a_nested_read_fills_the_cache() {
+    thread::spawn(|| {
+        let (outer, other) = (SnapshotCell::new(1), SnapshotCell::new(10));
+        outer.read(|_| ());
+        let before = refills();
+        let read = outer.read(|first| {
+            outer.store(2);
+            let missed = outer.read(|again| *again);
+            let filled = refills();
+            let hit = outer.read(|again| *again);
+            (*first, missed, hit, filled, refills())
+        });
+        assert_eq!(read, (1, 2, 2, before + 1, before + 1));
+        // Another cell's value, cached by a nested read.
+        outer.read(|_| other.read(|_| ()));
+        let before = refills();
+        assert_eq!(outer.read(|_| other.read(|value| *value)), 10);
+        assert_eq!(refills(), before, "both reads hit");
+    })
+    .join()
+    .unwrap();
+}
+
+/// Sets its flag when it drops.
+struct DropMarker(Arc<AtomicBool>);
+
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reads of more cells than the cache holds inside a closure evict the outer read's entry;
+/// the outer closure's value stays whole and drops only once that closure returns.
+#[test]
+fn inner_reads_evict_the_entry_of_an_outer_read() {
+    thread::spawn(|| {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cell = SnapshotCell::new(DropMarker(Arc::clone(&dropped)));
+        let others: Vec<_> = (0..=CACHE_ENTRIES).map(SnapshotCell::<usize>::new).collect();
+        cell.read(|_| ());
+        cell.read(|value| {
+            cell.store(DropMarker(Arc::new(AtomicBool::new(false))));
+            for (other, expected) in others.iter().zip(0..) {
+                assert_eq!(other.read(|value| *value), expected);
+            }
+            assert!(Arc::ptr_eq(&value.0, &dropped), "the outer value is unchanged");
+            assert!(!dropped.load(Ordering::Relaxed), "the outer value is alive");
+        });
+        assert!(dropped.load(Ordering::Relaxed), "dropped once the outer read returned");
+    })
+    .join()
+    .unwrap();
+}
+
+/// A value whose drop reads a cell, released by the read that lent it when its closure returns.
+#[test]
+fn a_value_whose_drop_reads_a_cell_drops_after_a_read() {
+    struct ReadOnDrop(Arc<SnapshotCell<u32>>, Arc<Mutex<Option<u32>>>);
+
+    impl Drop for ReadOnDrop {
+        fn drop(&mut self) {
+            *self.1.lock().unwrap() = Some(self.0.read(|value| *value));
+        }
+    }
+
+    thread::spawn(|| {
+        let (other, read) = (Arc::new(SnapshotCell::new(7)), Arc::new(Mutex::new(None)));
+        let cell = SnapshotCell::new(ReadOnDrop(Arc::clone(&other), Arc::clone(&read)));
+        let (spare_other, spare_read) = (Arc::clone(&other), Arc::new(Mutex::new(None)));
+        cell.read(|_| ());
+        cell.read(|_| {
+            cell.store(ReadOnDrop(spare_other, spare_read));
+            // Replaces the cache entry: only this closure's read still holds the old value.
+            cell.read(|_| ());
+            let dropped = *read.lock().unwrap();
+            assert_eq!(dropped, None);
+        });
+        let dropped = *read.lock().unwrap();
+        assert_eq!(dropped, Some(7));
+        assert_eq!(other.read(|value| *value), 7);
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
