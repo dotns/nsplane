@@ -1,6 +1,6 @@
 # 20261013-1600-perf-residuals Performance residuals left after 0.13/0.14
 
-- **status**: pending (measured residuals to investigate; not scheduled)
+- **status**: in_progress (PR-1, PR-2: L2 OQ `ybrk0a5w`, campaign `nsplane-oq-202610142230`, 2026-10-14; target 0.14.1)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-13 16:00
