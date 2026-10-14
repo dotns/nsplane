@@ -246,17 +246,25 @@ fn inner_reads_evict_the_entry_of_an_outer_read() {
     thread::spawn(|| {
         let dropped = Arc::new(AtomicBool::new(false));
         let cell = SnapshotCell::new(DropMarker(Arc::clone(&dropped)));
-        let others: Vec<_> = (0..=CACHE_ENTRIES).map(SnapshotCell::<usize>::new).collect();
+        let others: Vec<_> = (0..=CACHE_ENTRIES)
+            .map(SnapshotCell::<usize>::new)
+            .collect();
         cell.read(|_| ());
         cell.read(|value| {
             cell.store(DropMarker(Arc::new(AtomicBool::new(false))));
             for (other, expected) in others.iter().zip(0..) {
                 assert_eq!(other.read(|value| *value), expected);
             }
-            assert!(Arc::ptr_eq(&value.0, &dropped), "the outer value is unchanged");
+            assert!(
+                Arc::ptr_eq(&value.0, &dropped),
+                "the outer value is unchanged"
+            );
             assert!(!dropped.load(Ordering::Relaxed), "the outer value is alive");
         });
-        assert!(dropped.load(Ordering::Relaxed), "dropped once the outer read returned");
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "dropped once the outer read returned"
+        );
     })
     .join()
     .unwrap();
