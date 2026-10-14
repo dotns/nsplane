@@ -49,3 +49,15 @@ Conclusions:
 - Next step for PR-1/PR-2: profile the per-packet `read`s on the gate and translator paths
   (count of reads per packet, the cost of a TLS-cache hit against the arc-swap guard), and
   consider one read per packet or a lighter hit path.
+
+## Annotations
+
+- 2026-10-14, OQ design note (OQ-1 ou76wjbz): option B approved. Single call site for `f` with a
+  per-thread `Rc<Lent<T>>` on a hit. Conditions: (1) wording "no lock and no atomic reference
+  count (one thread-local, non-atomic count)" in cell.rs docs and architecture.md, with the
+  retention "at most 8 cached values per thread, plus one per read in progress on the stack";
+  (2) TDD tests for nested-read cache fill, eviction under 9+ inner reads with the outer &T
+  valid, and a Drop that reads a cell; (3) OQ-3 adds a `cell read hit` micro row for v0.12.0,
+  main and the branch, and the Rc version must not lose on the hit; (4) codegen check that the
+  gate and translator bodies are inlined again; (5) scope cell.rs, its tests, the docs and
+  CHANGELOG only.

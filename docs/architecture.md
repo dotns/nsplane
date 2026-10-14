@@ -1821,12 +1821,14 @@ is safe to call concurrently (stores serialize on a writer mutex inside the cell
 gives the value the next generation of its cell and publishes that generation while it still
 holds every shard write lock. The packet paths use `read(|value| ..)`: each thread caches up to 8
 values keyed by a never-reused cell id and the generation, so a read of an unchanged value takes
-no lock and no reference count, and a miss is one shard load plus a cache insert. `load` keeps
-its semantics and cost, no reader waits beyond its shard lock, and the guarantee stays: neither
-a load nor a read returns a value older than one a returned store, or an earlier load or read on
-its thread, saw. Retention: at most 8 cached values per thread across all cells, so at most one
-replaced value per cell per thread; a thread that stops reading keeps up to 8 old values until
-it exits. `install` swaps a `RuleSet` that `RuleSet::new` validated in
+no lock and no atomic reference count (one thread-local, non-atomic count), and a miss is one
+shard load plus a cache insert. The closure is called from one site, after the hit and miss
+paths join, and the cache is not borrowed while it runs, so a nested read uses and fills the
+cache. `load` keeps its semantics and cost, no reader waits beyond its shard lock, and the
+guarantee stays: neither a load nor a read returns a value older than one a returned store, or
+an earlier load or read on its thread, saw. Retention: at most 8 cached values per thread, plus
+one per read in progress on the stack, so at most one replaced value per cell per thread between
+reads; a thread that stops reading keeps up to 8 old values until it exits. `install` swaps a `RuleSet` that `RuleSet::new` validated in
 atomically, and a rejected update (`RuleSet::new`, `store_namespace` or `store_grant`
 returning an error) leaves the previous state in effect. With nothing loaded every flow is
 denied; `clear_all` removes everything in one swap. nsplane takes typed rules only: parsing
