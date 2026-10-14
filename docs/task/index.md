@@ -51,4 +51,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [-] [**20261012-1830-no-arc-swap No arc-swap in the data path or the public API**](20261012-1830-no-arc-swap.md) `P1`
 - [x] [**20261013-1300-lan-prefix-mappings Prefix address mappings for LAN prefixes**](20261013-1300-lan-prefix-mappings.md) `P1`
 - [x] [**20261013-1301-per-identity-routing Cryptokey routing per local identity**](20261013-1301-per-identity-routing.md) `P1`
-- [ ] [**20261013-1600-perf-residuals Performance residuals left after 0.13/0.14**](20261013-1600-perf-residuals.md) `P2`
+- [-] [**20261013-1600-perf-residuals Performance residuals left after 0.13/0.14**](20261013-1600-perf-residuals.md) `P2`
