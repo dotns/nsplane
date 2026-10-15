@@ -1,6 +1,6 @@
 # 20261013-1600-perf-residuals Performance residuals left after 0.13/0.14
 
-- **status**: in_progress (PR-1, PR-2: L2 OQ `ybrk0a5w`, campaign `nsplane-oq-202610142230`, 2026-10-14; target 0.14.1)
+- **status**: completed (PR-1, PR-2 by OQ, campaign nsplane-oq-202610142230, 2026-10-15; pending release 0.14.1); PR-3 open
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-13 16:00
@@ -111,11 +111,14 @@ Namespaces (invocation 5):
 
 | Row | V12 | M | B | B vs V12 | B vs M | Target |
 |---|---|---|---|---|---|---|
-| `floor/snapshot` | 8.79 | 2.95 | 3.10 | -64.8 % | +5.0 % | not met (+0.15 ns against M, every B round 3.08-3.12, M 2.94-2.97) |
+| `floor/snapshot` | 8.79 | 2.95 | 3.10 | -64.8 % | +5.0 % | not met (+0.15 ns against M, every B round 3.08-3.12, M 2.94-2.97); accepted by L1 (2026-10-15) |
 | `default/inbound` | 50.56 | 44.06 | 44.22 | -12.5 % | +0.4 % | met |
 | `default/outbound` | 81.83 | 75.86 | 74.84 | -8.5 % | -1.3 % | - |
 | `other/icmp_echo_scope` | 38.70 | 36.44 | 37.16 | -4.0 % | +2.0 % | - |
 | `stateless/inbound_fragment` | 26.15 | 26.72 | 27.07 | +3.5 % | +1.3 % | - |
+
+`floor/snapshot` is the one row that misses its target (+0.15 ns against M, still -64.8 % against
+V12); L1 accepted it as an explained residual on 2026-10-15 (see Annotations).
 
 Conclusions:
 - PR-1: every translate row is at or below V12 (-0.3 to -8.6 %) and below M except
@@ -123,7 +126,23 @@ Conclusions:
 - PR-2: `established/gate`, `outbound` and `filter` are 13.5-19.8 % below V12. Target met.
 - Cell hit: B 2.97 ns against M 3.14 ns (-5.4 %) and V12's arc-swap guard 9.23 ns.
 - OP wins against M: `baseline/acl_established` -2.7 % and `default/inbound` +0.4 % hold;
-  `floor/snapshot` is +5.0 % (3.10 against 2.95 ns), outside M's 1.2 % spread.
+  `floor/snapshot` is +5.0 % (3.10 against 2.95 ns), outside M's 1.2 % spread; accepted by L1
+  (2026-10-15).
+
+Data path (L2, after OQ-3). A = main 660db1a; B = `bkd/ybrk0a5w` a6bac13 (code identical to
+0f96d37). One slot invocation, the two points interleaved (A, B x 3 rounds), criterion medians.
+Reference: the 0.10.0 numbers (530 ns for 64 B, 1.334 us for 1420 B).
+
+| # | Bench | Points | Slot | CPUs | Load start | Load end | Rounds | Spread (A) |
+|---|---|---|---|---|---|---|---|---|
+| 6 | core data_path | A, B | 0 | 1-7 | 2.44 | 1.61 | 3 | 0.4-0.6 % |
+
+| Row | A rounds | A | B rounds | B | B vs A | B vs 0.10.0 |
+|---|---|---|---|---|---|---|
+| `data_path/core_round_trip/64` (ns) | 533.33 / 535.39 / 535.39 | 535.39 | 535.12 / 531.80 / 536.43 | 535.12 | -0.05 % (par) | +1.0 % |
+| `data_path/core_round_trip/1420` (us) | 1.3444 / 1.3358 / 1.3379 | 1.3379 | 1.3324 / 1.3354 / 1.3404 | 1.3354 | -0.2 % (par) | +0.1 % |
+
+Conclusion: the core data path (no cell on the path) is at par; no regression beyond noise.
 
 ## Annotations
 
@@ -136,3 +155,7 @@ Conclusions:
   main and the branch, and the Rc version must not lose on the hit; (4) codegen check that the
   gate and translator bodies are inlined again; (5) scope cell.rs, its tests, the docs and
   CHANGELOG only.
+- 2026-10-15, L1 decision: option A. `floor/snapshot` +0.15 ns (+5 % against main, -65 % against
+  v0.12.0) is an explained residual: the cost of the thread-local, non-atomic `Rc` increment and
+  decrement around the single call site, on a closure that only reads one value. Every per-packet
+  path is at or below v0.12.0, and the cell hit row is faster than main. No further work.
