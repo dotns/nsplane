@@ -17,10 +17,11 @@
 //! holder drops it. The locks only guard a pointer swap, so a panic while one is held cannot
 //! leave a torn value and poisoning is ignored.
 //!
-//! [`SnapshotCell::read`] lends the value to a closure without a lock or a reference count
-//! while it is unchanged. Each store gives the value the next generation of its cell and
-//! publishes that generation (Release) while it still holds every shard's write lock, so a
-//! value is in no unlocked shard before its generation is published. Each thread caches the
+//! [`SnapshotCell::read`] lends the value to a closure with no lock and no atomic reference
+//! count (one thread-local, non-atomic count) while it is unchanged. Each store gives the value
+//! the next generation of its cell and publishes that generation (Release) while it still holds
+//! every shard's write lock, so a value is in no unlocked shard before its generation is
+//! published. Each thread caches the
 //! last value it read of up to 8 cells, keyed by a cell id from a global counter (never
 //! reused, unlike an address) and the value's generation. A read loads the generation
 //! (Acquire) and uses the cached value when it is of this cell and generation; otherwise it
@@ -29,19 +30,22 @@
 //! load that sees a value took the shard lock after the publication of its generation, and a
 //! read that sees a generation takes any later shard lock after that store's swap, so loads and
 //! reads never return an older value than a store that returned or an earlier load or read on
-//! the same thread saw, and one closure sees one whole value. A read inside the closure of another uses
-//! the cache but cannot fill it, and a read while the thread exits loads the shard.
+//! the same thread saw, and one closure sees one whole value. The cache is not borrowed while
+//! the closure runs, so a read inside the closure of another uses and fills it, and a read while
+//! the thread exits loads the shard.
 //!
 //! Retention: the cache holds at most 8 values per thread across all cells, so at most one
 //! replaced value per cell per thread, plus values of dropped cells until they are evicted.
 //! Such a value lives until the thread reads that cell again, evicts the entry or exits, and
-//! it may drop on that reader thread. A thread that stops reading keeps up to 8 old values
-//! until it exits.
+//! it may drop on that reader thread. A read also keeps its value until its closure returns,
+//! so a thread holds at most 8 cached values plus one per read in progress on its stack. A
+//! thread that stops reading keeps up to 8 old values until it exits.
 
 use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -68,6 +72,12 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The shard loads of this thread's reads.
+    static REFILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[repr(align(128))]
 struct Shard<T>(RwLock<Arc<Published<T>>>);
 
@@ -77,12 +87,15 @@ struct Published<T> {
     value: Arc<T>,
 }
 
-/// A value a thread read: its cell, its generation and the value.
+/// A value a thread read: its cell, its generation and the value (an `Rc<Lent<T>>`).
 struct Entry {
     id: u64,
     generation: u64,
-    value: Arc<dyn Any + Send + Sync>,
+    value: Rc<dyn Any>,
 }
+
+/// The cached `Arc` of a value; a newtype so the cache can lend it by `Rc`.
+struct Lent<T>(Arc<T>);
 
 /// A thread's read values, at most one per cell.
 struct Cache {
@@ -94,12 +107,12 @@ struct Cache {
 impl Cache {
     /// The cached value of cell `id` at `generation`.
     #[inline]
-    fn get<T: 'static>(&self, id: u64, generation: u64) -> Option<&T> {
+    fn get<T: 'static>(&self, id: u64, generation: u64) -> Option<Rc<Lent<T>>> {
         self.entries
             .iter()
             .flatten()
             .find(|entry| entry.id == id && entry.generation == generation)
-            .and_then(|entry| entry.value.downcast_ref())
+            .and_then(|entry| Rc::clone(&entry.value).downcast().ok())
     }
 
     /// Caches `entry` in place of its cell's entry, else of the next one in turn; returns the
@@ -197,56 +210,43 @@ impl<T> SnapshotCell<T> {
 
 impl<T: Send + Sync + 'static> SnapshotCell<T> {
     /// Runs `f` on the current value. While the value is unchanged since this thread last
-    /// read it, this takes no lock and no reference count.
+    /// read it, this takes no lock and no atomic reference count (one thread-local, non-atomic
+    /// count).
     ///
     /// The thread's cache keeps the value alive until the thread reads this cell again,
-    /// evicts it or exits (see the [module docs](self)). `f` may read cells and store.
+    /// evicts it or exits, and the read keeps it until `f` returns (see the
+    /// [module docs](self)). `f` may read cells and store.
     #[inline]
     pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let generation = self.generation.load(Ordering::Acquire);
-        let mut f = Some(f);
-        if let Ok(Some(result)) =
-            CACHE.try_with(|cache| f.take().map(|f| self.read_cached(cache, generation, f)))
-        {
-            return result;
-        }
-        // The cache is gone: this thread is exiting.
-        f.map_or_else(
-            || unreachable!("try_with takes `f` exactly when it returns Ok"),
-            |f| f(&self.load()),
-        )
+        let cached = CACHE
+            .try_with(|cache| cache.try_borrow().ok()?.get(self.id, generation))
+            .ok()
+            .flatten();
+        // One call of `f`, so it inlines into the caller.
+        let value = cached.unwrap_or_else(|| self.refill());
+        f(&value.0)
     }
 
-    /// Runs `f` on the cached value of `generation`, else on the published one.
-    #[inline]
-    fn read_cached<R>(
-        &self,
-        cache: &RefCell<Cache>,
-        generation: u64,
-        f: impl FnOnce(&T) -> R,
-    ) -> R {
-        if let Ok(entries) = cache.try_borrow()
-            && let Some(value) = entries.get(self.id, generation)
-        {
-            return f(value);
-        }
-        f(&self.refill(cache))
-    }
-
-    /// Loads the published value and caches it, unless the cache is lent to an outer read
-    /// (`f` of a read on this thread).
+    /// Loads the published value and caches it, unless this thread is exiting.
     #[cold]
     #[inline(never)]
-    fn refill(&self, cache: &RefCell<Cache>) -> Arc<T> {
+    fn refill(&self) -> Rc<Lent<T>> {
+        #[cfg(test)]
+        REFILLS.with(|refills| refills.set(refills.get() + 1));
         let published = self.load().0;
-        let (generation, value) = (published.generation, Arc::clone(&published.value));
+        let value = Rc::new(Lent(Arc::clone(&published.value)));
+        let entry = Entry {
+            id: self.id,
+            generation: published.generation,
+            value: Rc::clone(&value) as Rc<dyn Any>,
+        };
         // The replaced entry drops after the borrow ends: its value's drop may read a cell.
-        let _replaced = cache.try_borrow_mut().map(|mut entries| {
-            entries.insert(Entry {
-                id: self.id,
-                generation,
-                value: Arc::clone(&value) as Arc<dyn Any + Send + Sync>,
-            })
+        let _replaced = CACHE.try_with(|cache| {
+            cache
+                .try_borrow_mut()
+                .ok()
+                .map(|mut entries| entries.insert(entry))
         });
         value
     }
