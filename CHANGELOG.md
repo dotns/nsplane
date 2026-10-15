@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `SnapshotCell::read`: the gate and translator read cost is back to 0.12.0 par; the closure is
+  called from one site again, so the per-packet body inlines into its caller.
 - `AclFilter`: the later-fragment early return on the inbound path is back to its 0.13.0 cost
   (it regressed by about 2.7 ns per packet with the snapshot cell's closure read).
 
