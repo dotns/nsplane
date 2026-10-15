@@ -21,9 +21,8 @@
 //! count (one thread-local, non-atomic count) while it is unchanged. Each store gives the value
 //! the next generation of its cell and publishes that generation (Release) while it still holds
 //! every shard's write lock, so a value is in no unlocked shard before its generation is
-//! published. Each thread caches the
-//! last value it read of up to 8 cells, keyed by a cell id from a global counter (never
-//! reused, unlike an address) and the value's generation. A read loads the generation
+//! published. Each thread caches the last value it read of up to 8 cells, keyed by a cell id
+//! from a global counter (never reused, unlike an address) and the value's generation. A read loads the generation
 //! (Acquire) and uses the cached value when it is of this cell and generation; otherwise it
 //! loads the shard once and caches its value under the value's own generation. No reader waits
 //! for a writer beyond the shard lock, and a load costs what it did before reads existed. A
