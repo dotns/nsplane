@@ -5,11 +5,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-15
+
+Bug fixes: the last performance residuals of the snapshot cell, and a dependency advisory.
+
 ### Fixed
 - `SnapshotCell::read`: the gate and translator read cost is back to 0.12.0 par; the closure is
   called from one site again, so the per-packet body inlines into its caller.
 - `AclFilter`: the later-fragment early return on the inbound path is back to its 0.13.0 cost
   (it regressed by about 2.7 ns per packet with the snapshot cell's closure read).
+
+### Security
+- `Cargo.lock`: rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349), via `nsplane-wss`.
 
 ## [0.14.0] - 2026-10-13
 

@@ -249,6 +249,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | LAN prefixes, identity routing | RFC 7757-style LAN prefix mappings; allowed IPs and source sets per local identity | done (plan `20261013-1310-lan-prefix-and-identity-routing`) |
 | Snapshot cell read cost | cached closure reads, 0.13.0 regression fixed | done (plan `20261013-1330-snapshot-cell-read-cost`) |
 | Release 0.14.0 | LAN prefix mappings, per-identity routing, read-cost fix (tag `v0.14.0`) | 2026-10-13 |
+| Performance residuals | snapshot cell read closure from one call site, later-fragment early return | done (task `20261013-1600-perf-residuals`) |
+| Release 0.14.1 | performance residual fixes, rustls advisory (tag `v0.14.1`) | 2026-10-15 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows

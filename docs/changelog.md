@@ -190,3 +190,15 @@ Release 0.14.0 (tag `v0.14.0`):
 
 The remaining performance residuals are tracked in task `20261013-1600-perf-residuals`, to be
 fixed as bugs. The freeze applies again: bug fixes only.
+
+## 2026-10-15 [release]
+
+Release 0.14.1 (tag `v0.14.1`), bug fixes only:
+- the snapshot cell calls the read closure from one site, so the gate and translator bodies
+  inline into their callers again: gate `established/*` 13-20 % and translate 0-9 % below
+  0.12.0;
+- the later-fragment early return of the inbound ACL path is back to its 0.13.0 cost;
+- rustls 0.23.46 in `Cargo.lock` for RUSTSEC-2026-0346 to -0349.
+
+Task `20261013-1600-perf-residuals` keeps PR-3 (two-identity routing cost) open. The freeze
+applies: bug fixes only.
