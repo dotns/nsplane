@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "handshake"
 harness = false
+
+[[bench]]
+name = "allowed_ips"
+harness = false
