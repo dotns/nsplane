@@ -123,6 +123,9 @@ pub(crate) struct PeerTable {
     budget: Arc<HandshakeBudget>,
     /// Whether peers share their tunnels with crypto jobs.
     shared_tunnels: bool,
+    /// Moves on every change of the routing state: the peers' slots, the identities, their
+    /// allowed IPs, the merged trie and the source sets.
+    generation: u64,
 }
 
 impl std::fmt::Debug for PeerTable {
@@ -160,7 +163,19 @@ impl PeerTable {
             next_identity: 1,
             budget: Arc::new(HandshakeBudget::new(handshake_rate_limit)),
             shared_tunnels,
+            generation: 0,
         }
+    }
+
+    /// The generation of the routing state: lookups of the peers' slots, routes and source
+    /// checks stay valid while it stays the same.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Records a change of the routing state.
+    const fn changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// The key pair of `private_key` with a gate on the shared budget.
@@ -224,6 +239,7 @@ impl PeerTable {
         if self.holds(&PublicKey::from(&private_key)) {
             return None;
         }
+        self.changed();
         let id = LocalIdentityId::new(self.next_identity);
         self.next_identity = self.next_identity.checked_add(1)?;
         let key = Some(self.own_key(private_key));
@@ -253,6 +269,7 @@ impl PeerTable {
         {
             return false;
         }
+        self.changed();
         self.identities.remove(i);
         if let Some(sources) = &mut self.sources {
             sources.remove(&|owner: &LocalIdentityId| *owner == id);
@@ -320,6 +337,7 @@ impl PeerTable {
         now: Instant,
     ) -> Result<PeerId, PeerTableError> {
         // An all-zero key means "no preshared key" in the UAPI.
+        self.changed();
         let preshared_key = config.preshared_key.map(|k| (k != [0; 32]).then_some(k));
         let identity = config.local_identity.unwrap_or(LocalIdentityId::DEFAULT);
 
@@ -489,6 +507,7 @@ impl PeerTable {
         public_key: &PublicKey,
     ) -> Option<PeerId> {
         let id = self.by_key.remove(&(identity, *public_key))?;
+        self.changed();
         if let Some(owner) = self.identity_mut(identity) {
             owner.peers = owner.peers.saturating_sub(1);
         }
@@ -509,6 +528,7 @@ impl PeerTable {
 
     /// Removes all peers of every identity; the identities and their source sets stay.
     pub(crate) fn clear(&mut self) {
+        self.changed();
         for identity in &mut self.identities {
             identity.peers = 0;
             identity.ips.clear();
@@ -649,6 +669,7 @@ impl PeerTable {
         {
             return false;
         }
+        self.changed();
         let set = self.sources.get_or_insert_with(AllowedIps::new);
         set.remove(&|owner: &LocalIdentityId| *owner == identity);
         for ip in sources {
