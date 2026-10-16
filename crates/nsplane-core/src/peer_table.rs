@@ -260,6 +260,7 @@ impl PeerTable {
                 self.sources = None;
             }
         }
+        self.commit();
         true
     }
 
@@ -404,6 +405,7 @@ impl PeerTable {
             self.insert_allowed_ip(identity, ip, id);
         }
         self.drop_unused_merged();
+        self.commit();
         Ok(id)
     }
 
@@ -466,6 +468,20 @@ impl PeerTable {
         }
     }
 
+    /// Rebuilds what the configuration change written so far left dirty in the tries, once
+    /// per family; every entry point that writes one ends with it.
+    fn commit(&mut self) {
+        for identity in &mut self.identities {
+            identity.ips.commit();
+        }
+        if let Some(merged) = &mut self.merged {
+            merged.commit();
+        }
+        if let Some(sources) = &mut self.sources {
+            sources.commit();
+        }
+    }
+
     /// Removes the peer of `identity` with `public_key` and returns its id.
     pub(crate) fn remove(
         &mut self,
@@ -485,6 +501,7 @@ impl PeerTable {
         }
         self.remove_allowed_ips(identity, id);
         self.drop_unused_merged();
+        self.commit();
 
         tracing::info!("Peer removed");
         Some(id)
@@ -502,6 +519,7 @@ impl PeerTable {
         self.by_key.clear();
         self.by_index.clear();
         self.merged = None;
+        self.commit();
     }
 
     /// The peer of `identity` with this public key.
@@ -639,6 +657,7 @@ impl PeerTable {
         if set.is_empty() {
             self.sources = None;
         }
+        self.commit();
         true
     }
 
@@ -720,6 +739,7 @@ fn destination_set(destinations: &[AllowedIp]) -> AllowedIps<()> {
     for &AllowedIp { addr, cidr } in destinations {
         set.insert(addr, cidr, ());
     }
+    set.commit();
     set
 }
 
@@ -1543,5 +1563,107 @@ mod tests {
         assert_eq!(peer.public_key(), &a);
         assert_eq!(peer.path(), Some(path));
         assert_eq!(peer.data_rx(), 120);
+    }
+
+    #[test]
+    fn a_configuration_change_rebuilds_each_family_once() {
+        let mut table = table();
+        let rebuilds = |table: &PeerTable| table.identities[0].ips.rebuilds;
+        // Networks of both families in one change.
+        let nets: Vec<String> = (0..64)
+            .flat_map(|i| [format!("10.{i}.0.0/16"), format!("fd00:{i:x}::/32")])
+            .collect();
+        let nets: Vec<&str> = nets.iter().map(String::as_str).collect();
+        let a = key();
+        let peer_a = add(&mut table, a, &nets);
+        assert_eq!(rebuilds(&table), 2);
+        assert_eq!(table.by_destination(ip("10.63.1.1")), Some(peer_a));
+        // Replacing them removes and inserts in one change.
+        let mut config = PeerConfig::new(a);
+        config.replace_allowed_ips = true;
+        config.allowed_ips = vec![net("10.0.0.0/8"), net("fd00::/16")];
+        table.apply(&config, Instant::now()).unwrap();
+        assert_eq!(rebuilds(&table), 4);
+        // An update without allowed IPs rebuilds nothing.
+        add(&mut table, a, &[]);
+        assert_eq!(rebuilds(&table), 4);
+        // The worst load order, in one change: 10 k /128 networks, then one network of each
+        // other length.
+        let mut config = PeerConfig::new(key());
+        config.allowed_ips = (0..10_000_u128)
+            .map(|i| AllowedIp {
+                addr: IpAddr::from(((0xfd01_u128 << 112) | i).to_be_bytes()),
+                cidr: 128,
+            })
+            .chain((0..128).map(|cidr| AllowedIp {
+                addr: ip("fd01::"),
+                cidr,
+            }))
+            .collect();
+        let peer_b = table.apply(&config, Instant::now()).unwrap();
+        assert_eq!(rebuilds(&table), 5);
+        assert_eq!(table.by_destination(ip("fd01::5")), Some(peer_b));
+        assert_eq!(table.by_destination(ip("fd00::1")), Some(peer_a));
+        // A removed peer's networks go in one change.
+        assert_eq!(table.remove(LocalIdentityId::DEFAULT, &a), Some(peer_a));
+        assert_eq!(rebuilds(&table), 7);
+        assert_eq!(table.by_destination(ip("fd00::1")), Some(peer_b));
+        assert_eq!(table.by_destination(ip("10.0.0.1")), None);
+        // Removing all peers leaves nothing to rebuild.
+        table.clear();
+        assert_eq!(rebuilds(&table), 7);
+        assert_eq!(table.by_destination(ip("fd01::5")), None);
+    }
+
+    #[test]
+    fn every_trie_is_rebuilt_once_per_change() {
+        let mut table = table();
+        let (first, second) = (identity(&mut table), identity(&mut table));
+        let rebuilds = |table: &PeerTable, i: usize| table.identities[i].ips.rebuilds;
+        let merged = |table: &PeerTable| table.merged.as_ref().map(|set| set.rebuilds);
+        let sources = |table: &PeerTable| table.sources.as_ref().map(|set| set.rebuilds);
+        let default_peer = add(&mut table, key(), &["10.0.0.0/24", "fd00::/64"]);
+        assert_eq!(rebuilds(&table, 0), 2);
+        assert_eq!(merged(&table), None);
+
+        // The first allowed IPs of another identity build the merged trie from the default
+        // one's, in the same change.
+        let first_peer = add_ips_in(&mut table, first, key(), &["10.0.1.0/24", "10.0.2.0/24"]);
+        assert_eq!(rebuilds(&table, 1), 1);
+        assert_eq!(merged(&table), Some(2));
+        assert_eq!(table.by_destination(ip("fd00::1")), Some(default_peer));
+        assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
+        let c = key();
+        let second_peer = add_ips_in(&mut table, second, c, &["10.0.1.0/24", "10.0.3.0/24"]);
+        assert_eq!(merged(&table), Some(3));
+        assert_eq!(table.by_destination(ip("10.0.1.1")), Some(second_peer));
+        // A removal re-fills the merged trie in the same change.
+        assert_eq!(table.remove(second, &c), Some(second_peer));
+        assert_eq!(rebuilds(&table, 2), 2);
+        assert_eq!(merged(&table), Some(4));
+        assert_eq!(table.by_destination(ip("10.0.1.1")), Some(first_peer));
+        assert_eq!(table.by_destination(ip("10.0.3.1")), None);
+
+        // Source sets.
+        assert!(table.set_sources(first, &[net("100.64.0.0/16"), net("fd64::/16")]));
+        assert_eq!(sources(&table), Some(2));
+        assert!(table.set_sources(second, &[net("100.65.0.0/16")]));
+        assert_eq!(sources(&table), Some(3));
+        assert_eq!(table.source_identity(ip("100.65.0.1")), Some(second));
+        assert!(!table.set_sources(second, &[net("100.64.0.0/16")]));
+        assert_eq!(sources(&table), Some(3));
+        // A removed identity's source set goes in one change.
+        assert!(table.remove_identity(second));
+        assert_eq!(sources(&table), Some(4));
+        assert_eq!(table.source_identity(ip("100.65.0.1")), None);
+        assert_eq!(table.source_identity(ip("fd64::1")), Some(first));
+
+        // Inbound destination sets are built in one change.
+        let nets = ["192.0.2.0/24", "2001:db8::/32", "198.51.100.0/24"];
+        let d = add_with_destinations(&mut table, key(), &nets);
+        assert_eq!(owned(&table, d).map(|set| set.rebuilds), Some(2));
+        table.set_inbound_destinations(d, Some(&[net("203.0.113.0/24")]));
+        assert_eq!(owned(&table, d).map(|set| set.rebuilds), Some(1));
+        assert_eq!(owned(&table, d).unwrap().find(ip("203.0.113.9")), Some(&()));
     }
 }
