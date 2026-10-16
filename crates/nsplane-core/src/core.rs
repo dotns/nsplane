@@ -1990,8 +1990,8 @@ mod tests {
         check(core);
         let generation = core.peers.generation();
         change(core);
-        assert_ne!(core.peers.generation(), generation);
         check(core);
+        assert_ne!(core.peers.generation(), generation);
     }
 
     /// Adds (or updates) the peer `[key; 32]` of `identity` with `allowed` IPs.
