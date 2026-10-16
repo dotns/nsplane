@@ -107,9 +107,10 @@ impl<'a, D> Iterator for Iter<'a, D> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[test]
+    fn test_allowed_ips_insert_find() {
+        use super::*;
 
-    fn build_allowed_ips() -> AllowedIps<char> {
         let mut map: AllowedIps<char> = AllowedIps::default();
         map.insert(IpAddr::from([127, 0, 0, 1]), 32, '1');
         map.insert(IpAddr::from([45, 25, 15, 1]), 30, '6');
@@ -118,12 +119,6 @@ mod tests {
         map.insert(IpAddr::from([255, 1, 15, 1]), 24, '4');
         map.insert(IpAddr::from([60, 25, 15, 1]), 32, '5');
         map.insert(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128, '7');
-        map
-    }
-
-    #[test]
-    fn test_allowed_ips_insert_find() {
-        let map = build_allowed_ips();
         assert_eq!(map.find(IpAddr::from([127, 0, 0, 1])), Some(&'1'));
         assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&'2'));
         assert_eq!(map.find(IpAddr::from([127, 1, 255, 255])), None);
@@ -144,7 +139,16 @@ mod tests {
 
     #[test]
     fn test_allowed_ips_remove() {
-        let mut map = build_allowed_ips();
+        use super::*;
+
+        let mut map: AllowedIps<char> = AllowedIps::default();
+        map.insert(IpAddr::from([127, 0, 0, 1]), 32, '1');
+        map.insert(IpAddr::from([45, 25, 15, 1]), 30, '6');
+        map.insert(IpAddr::from([127, 0, 15, 1]), 16, '2');
+        map.insert(IpAddr::from([127, 1, 15, 1]), 24, '3');
+        map.insert(IpAddr::from([255, 1, 15, 1]), 24, '4');
+        map.insert(IpAddr::from([60, 25, 15, 1]), 32, '5');
+        map.insert(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128, '7');
         map.remove(&|c| *c == '5' || *c == '1' || *c == '7');
 
         let mut map_iter = map.iter();
@@ -169,7 +173,16 @@ mod tests {
 
     #[test]
     fn exact_prefixes_are_found_and_removed() {
-        let mut map = build_allowed_ips();
+        use super::*;
+
+        let mut map: AllowedIps<char> = AllowedIps::default();
+        map.insert(IpAddr::from([127, 0, 0, 1]), 32, '1');
+        map.insert(IpAddr::from([45, 25, 15, 1]), 30, '6');
+        map.insert(IpAddr::from([127, 0, 15, 1]), 16, '2');
+        map.insert(IpAddr::from([127, 1, 15, 1]), 24, '3');
+        map.insert(IpAddr::from([255, 1, 15, 1]), 24, '4');
+        map.insert(IpAddr::from([60, 25, 15, 1]), 32, '5');
+        map.insert(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128, '7');
         assert_eq!(map.get(IpAddr::from([127, 0, 9, 9]), 16), Some(&'2'));
         assert_eq!(map.get(IpAddr::from([127, 0, 0, 0]), 24), None);
         assert_eq!(map.get(IpAddr::from([127, 0, 0, 0]), 33), None);
@@ -186,7 +199,16 @@ mod tests {
 
     #[test]
     fn test_allowed_ips_iter() {
-        let map = build_allowed_ips();
+        use super::*;
+
+        let mut map: AllowedIps<char> = AllowedIps::default();
+        map.insert(IpAddr::from([127, 0, 0, 1]), 32, '1');
+        map.insert(IpAddr::from([45, 25, 15, 1]), 30, '6');
+        map.insert(IpAddr::from([127, 0, 15, 1]), 16, '2');
+        map.insert(IpAddr::from([127, 1, 15, 1]), 24, '3');
+        map.insert(IpAddr::from([255, 1, 15, 1]), 24, '4');
+        map.insert(IpAddr::from([60, 25, 15, 1]), 32, '5');
+        map.insert(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128, '7');
         let mut map_iter = map.iter();
         assert_eq!(
             map_iter.next(),
@@ -221,6 +243,8 @@ mod tests {
 
     #[test]
     fn test_allowed_ips_v4_kernel_compatibility() {
+        use super::*;
+
         // Test case from wireguard-go
         let mut map: AllowedIps<char> = AllowedIps::default();
 
@@ -281,6 +305,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "verbatim wireguard-go test vector")]
     fn test_allowed_ips_v6_kernel_compatibility() {
+        use super::*;
+
         // Test case from wireguard-go
         let mut map: AllowedIps<char> = AllowedIps::default();
 
@@ -414,6 +440,8 @@ mod tests {
 
     #[test]
     fn test_allowed_ips_iter_zero_leaf_bits() {
+        use super::*;
+
         let mut map: AllowedIps<char> = AllowedIps::default();
         map.insert(IpAddr::from([10, 111, 0, 1]), 32, '1');
         map.insert(IpAddr::from([10, 111, 0, 2]), 32, '2');
