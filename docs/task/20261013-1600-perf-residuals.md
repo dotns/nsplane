@@ -1,6 +1,6 @@
 # 20261013-1600-perf-residuals Performance residuals left after 0.13/0.14
 
-- **status**: completed (PR-1, PR-2 by OQ, campaign nsplane-oq-202610142230, 2026-10-15; pending release 0.14.1); PR-3 open
+- **status**: in_progress (PR-1, PR-2 fixed by OQ, released in 0.14.1; PR-3 profiled 2026-10-16, open)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-13 16:00
@@ -143,6 +143,33 @@ Reference: the 0.10.0 numbers (530 ns for 64 B, 1.334 us for 1420 B).
 | `data_path/core_round_trip/1420` (us) | 1.3444 / 1.3358 / 1.3379 | 1.3379 | 1.3324 / 1.3354 / 1.3404 | 1.3354 | -0.2 % (par) | +0.1 % |
 
 Conclusion: the core data path (no cell on the path) is at par; no regression beyond noise.
+
+## PR-3 profile, 2026-10-16
+
+0.14.1 (de521e5), slot 0 (CPUs 1-7), load 2.2 at start; criterion medians of one invocation and a
+`perf record -g` of each case (`ai-agent/nstun-perf`, 10 s profile time):
+
+| Case, 64 B | Time | Trie lookups per packet |
+|---|---|---|
+| `tunn_round_trip` | 373.4 ns | 0 |
+| `device_equivalent_round_trip` | 471.6 ns | 2 |
+| `core_round_trip` | 527.9 ns | 2 (destination on send, source on receive) |
+| `core_round_trip_two_identities` | 593.5 ns | 3 (plus the source set on send) |
+
+- One allowed-IP lookup (`ip_network_table` tree bitmap `longest_match`) costs about 49 ns:
+  the two lookups of `device_equivalent_round_trip` add 98 ns to the bare round trip.
+- perf: `longest_match` is 23.6 % of `core_round_trip` (~125 ns, two lookups) and 28.8 % of the
+  two-identity case (~171 ns, three lookups). Seal and open are 56 % and 50 %.
+- So PR-3's +66 ns is the extra source-set lookup on send (~49 ns) plus ~15 ns of the
+  identity selection and the owner lookup of `PeerTable::routes_to` on receive (peer binary
+  search, identity, then its trie). It is the cost of the feature, not a defect.
+- `Lookups` caches a route only within one batch, and `route_from` looks the source set up
+  before its cache check, so a batch of one flow still pays the source lookup per packet.
+  Keying `selected_route` on (source, destination) would skip it within a batch; it does not
+  help single-packet calls.
+- The larger cost is the lookup itself in every case: ~49 ns per lookup, two per round trip,
+  about 9 % of the per-packet budget at 64 B. A faster longest-prefix match or a per-flow
+  cache would help all configurations, not only source sets.
 
 ## Annotations
 
