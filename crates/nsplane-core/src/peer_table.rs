@@ -1288,6 +1288,34 @@ mod tests {
     }
 
     #[test]
+    fn every_routing_change_moves_the_generation() {
+        let mut table = table();
+        let mut last = table.generation();
+        let mut moved = |table: &PeerTable| {
+            let moved = table.generation() != last;
+            last = table.generation();
+            moved
+        };
+        let identity = table
+            .add_identity(StaticSecret::random_from_rng(OsRng), None)
+            .unwrap();
+        assert!(moved(&table));
+        let peer = key();
+        add(&mut table, peer, &["10.0.0.0/8"]);
+        assert!(moved(&table));
+        assert!(table.set_sources(identity, &[net("192.0.2.0/24")]));
+        assert!(moved(&table));
+        table.remove(LocalIdentityId::DEFAULT, &peer).unwrap();
+        assert!(moved(&table));
+        add(&mut table, key(), &["10.0.0.0/8"]);
+        assert!(moved(&table));
+        table.clear();
+        assert!(moved(&table));
+        assert!(table.remove_identity(identity));
+        assert!(moved(&table));
+    }
+
+    #[test]
     fn clear_keeps_the_identities() {
         let mut table = table();
         let identity = table

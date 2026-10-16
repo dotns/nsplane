@@ -1779,6 +1779,246 @@ mod tests {
         assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
     }
 
+    #[test]
+    fn the_route_cache_answers_like_the_peer_table() {
+        // splitmix64
+        let mut state = 0x6e73_706c_616e_6533_u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let nets: Vec<AllowedIp> = [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            "10.1.2.3/32",
+            "10.1.2.4/32",
+            "192.0.2.0/24",
+            "::/0",
+            "fd00::/8",
+            "fd00::1/128",
+            "fd00::2/128",
+        ]
+        .iter()
+        .map(|n| n.parse().unwrap())
+        .collect();
+        let addrs: Vec<IpAddr> = [
+            "10.1.2.3",
+            "10.1.2.4",
+            "10.1.2.5",
+            "10.1.3.1",
+            "10.2.0.1",
+            "192.0.2.9",
+            "198.51.100.1",
+            "fd00::1",
+            "fd00::2",
+            "fd00::3",
+            "2001:db8::1",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        let now = Instant::now();
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let mut identities = vec![LocalIdentityId::DEFAULT];
+        let keys: Vec<x25519::PublicKey> = (2..8u8)
+            .map(|k| x25519::PublicKey::from(&x25519::StaticSecret::from([k; 32])))
+            .collect();
+        let mut pick = |n: usize| usize::try_from(next()).unwrap() % n;
+        for step in 0..3000u32 {
+            let identity = identities[pick(identities.len())];
+            let key = keys[pick(keys.len())];
+            let change = match pick(10) {
+                0..=4 => {
+                    let mut config = PeerConfig::new(key);
+                    config.local_identity = Some(identity);
+                    config.replace_allowed_ips = pick(2) == 0;
+                    config.allowed_ips = (0..pick(3)).map(|_| nets[pick(nets.len())]).collect();
+                    Some(ConfigChange::AddOrUpdatePeer(config))
+                }
+                5 => Some(ConfigChange::InLocalIdentity {
+                    identity,
+                    change: Box::new(ConfigChange::RemovePeer(key)),
+                }),
+                6 if pick(8) == 0 => Some(ConfigChange::RemoveAllPeers),
+                7 => {
+                    let sources: Vec<AllowedIp> =
+                        (0..pick(3)).map(|_| nets[pick(nets.len())]).collect();
+                    core.set_local_sources(identity, &sources);
+                    None
+                }
+                8 if identities.len() < 4 => {
+                    let secret =
+                        x25519::StaticSecret::from([u8::try_from(100 + step % 100).unwrap(); 32]);
+                    identities.extend(core.add_local_identity(secret));
+                    None
+                }
+                9 if identity != LocalIdentityId::DEFAULT => {
+                    if core.remove_local_identity(identity) {
+                        identities.retain(|&i| i != identity);
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(change) = change {
+                core.handle_input(Input::Config(change), now);
+            }
+            // Twice: the second round answers from the cache.
+            for _ in 0..2 {
+                for &dst in &addrs {
+                    for &src in &addrs {
+                        assert_routes_like_the_peer_table(&mut core, src, dst);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Asserts that the route cache of `core` answers the route of `dst`, the route from
+    /// `src` to `dst` and whether each peer may send from `src` like the peer table.
+    fn assert_routes_like_the_peer_table(core: &mut Core, src: IpAddr, dst: IpAddr) {
+        let slot = |id: PeerId| Some((id, core.peers.slot(id)?));
+        let route = core.peers.by_destination(dst).and_then(slot);
+        let route_from = core.peers.route_from(src, dst).and_then(slot);
+        assert_eq!(core.routes.route(&core.peers, dst), route, "{dst}");
+        let selected = if core.peers.has_sources() {
+            core.routes.route_from(&core.peers, Some(src), dst)
+        } else {
+            core.routes.route(&core.peers, dst)
+        };
+        assert_eq!(selected, route_from, "{src} -> {dst}");
+        let peers: Vec<PeerId> = core.peers().collect();
+        for id in peers {
+            assert_eq!(
+                core.routes.source_allowed(&core.peers, src, id),
+                core.peers.routes_to(src, id),
+                "{src} from {id:?}"
+            );
+        }
+    }
+
+    /// Fills the route cache with the routes between `addrs`, runs `change` and asserts that
+    /// the next answers are the peer table's and that the generation moved.
+    fn assert_change_drops_the_route_cache(
+        core: &mut Core,
+        addrs: &[&str],
+        change: impl FnOnce(&mut Core),
+    ) {
+        let addrs: Vec<IpAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
+        let check = |core: &mut Core| {
+            for &src in &addrs {
+                for &dst in &addrs {
+                    assert_routes_like_the_peer_table(core, src, dst);
+                }
+            }
+        };
+        check(core);
+        let generation = core.peers.generation();
+        change(core);
+        assert_ne!(core.peers.generation(), generation);
+        check(core);
+    }
+
+    /// Adds (or updates) the peer `[key; 32]` of `identity` with `allowed` IPs.
+    fn add_peer_in(core: &mut Core, identity: LocalIdentityId, key: u8, allowed: &[&str]) {
+        let mut config = PeerConfig::new(x25519::PublicKey::from([key; 32]));
+        config.local_identity = Some(identity);
+        config.allowed_ips = allowed.iter().map(|a| a.parse().unwrap()).collect();
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+    }
+
+    /// A core with the peer `[7; 32]` routing 10.0.0.0/8.
+    fn core_routing_ten() -> Core {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 7, &["10.0.0.0/8"]);
+        core
+    }
+
+    #[test]
+    fn adding_a_peer_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            add_peer_in(core, LocalIdentityId::DEFAULT, 8, &["10.1.0.0/16"]);
+        });
+        let narrow = core.peer_id(&x25519::PublicKey::from([8; 32]));
+        assert_eq!(
+            core.routes
+                .route(&core.peers, "10.1.2.3".parse().unwrap())
+                .map(|r| r.0),
+            narrow
+        );
+    }
+
+    #[test]
+    fn removing_a_peer_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 8, &["10.1.0.0/16"]);
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            core.handle_input(
+                Input::Config(ConfigChange::RemovePeer(x25519::PublicKey::from([8; 32]))),
+                Instant::now(),
+            );
+        });
+    }
+
+    #[test]
+    fn removing_all_peers_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            core.handle_input(Input::Config(ConfigChange::RemoveAllPeers), Instant::now());
+        });
+        assert_eq!(
+            core.routes.route(&core.peers, "10.1.2.3".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn setting_source_sets_drops_the_cached_routes() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let other = core
+            .add_local_identity(x25519::StaticSecret::from([2; 32]))
+            .unwrap();
+        // The other identity routes 10.0.0.0/8 to its peer, the fallback to the default's.
+        add_peer_in(&mut core, other, 8, &["10.0.0.0/8"]);
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 7, &["10.0.0.0/8"]);
+        assert!(core.set_local_sources(other, &["192.0.2.0/24".parse().unwrap()]));
+        assert_change_drops_the_route_cache(&mut core, &["192.0.2.1", "10.1.2.3"], |core| {
+            assert!(core.set_local_sources(other, &["198.51.100.0/24".parse().unwrap()]));
+        });
+    }
+
+    #[test]
+    fn adding_and_removing_an_identity_moves_the_generation() {
+        let mut core = core_routing_ten();
+        let mut added = None;
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            added = core.add_local_identity(x25519::StaticSecret::from([2; 32]));
+        });
+        let added = added.unwrap();
+        assert!(core.set_local_sources(added, &["192.0.2.0/24".parse().unwrap()]));
+        assert_change_drops_the_route_cache(&mut core, &["192.0.2.1", "10.1.2.3"], |core| {
+            assert!(core.remove_local_identity(added));
+        });
+    }
+
     /// A core with private key `own` and peer `peer` at `path`.
     fn core_with_peer(own: u8, peer: u8, path: Path, now: Instant) -> (Core, PeerId) {
         let mut core = Core::new(CoreConfig {
