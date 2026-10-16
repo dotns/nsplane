@@ -1,9 +1,13 @@
 //! `AllowedIps::find` on IPv4 and IPv6 tables of 1, 16, 1 k and 10 k entries, for addresses
-//! inside an inserted prefix (`hit`) and outside every prefix (`miss`); each case cycles over
+//! inside an inserted prefix (`hit`), outside every prefix (`miss`) and next to an inserted prefix
+//! but outside every prefix (`near`: the prefix with its last network bit flipped, so a lookup
+//! descends as far as the prefix before it fails); each case cycles over
 //! `LOOKUPS` addresses and reports the time of one `find`. The write cases report building a
-//! 10 k table with `insert` (`build`), one `insert` and `remove_network` of a new prefix on a
-//! 10 k table (`insert_remove`), and removing one value's entries from a 10 k table with
-//! `remove` (`remove_value`).
+//! 10 k table with `insert` in one configuration change (`build`) and in one change per network
+//! (`build_per_change`), one `insert` and `remove_network` of a new prefix on a 10 k table, each
+//! its own change (`insert_remove`; `insert_remove_new_len` with a /1, a prefix length the table
+//! does not use yet), and removing one value's entries from a 10 k table with `remove`
+//! (`remove_value`). A change ends with `commit`, see [`Commit`].
 //!
 //! Tables come from a fixed-seed generator: prefixes of mixed length (IPv4 /8../32, IPv6
 //! /32../128, a quarter of them host routes), all with the top address bit clear, so an
@@ -18,7 +22,7 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use allowed_ips::AllowedIps;
-use criterion::{BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, SamplingMode};
 
 /// Addresses each lookup case cycles over.
 const LOOKUPS: usize = 1024;
@@ -30,6 +34,20 @@ const SIZES: [(usize, &str); 4] = [(1, "1"), (16, "16"), (1000, "1k"), (10_000, 
 const WRITE_SIZE: usize = 10_000;
 /// The top address bit: clear in every inserted prefix, set in every miss address.
 const TOP_BIT: u128 = 1 << 127;
+
+/// The end of a configuration change, on both sides of an A/B against v0.14.1.
+///
+/// Where the table defers its rebuilds, the inherent `AllowedIps::commit` shadows this method;
+/// v0.14.1 has no commit (its writes take effect at once), so there this default runs. It
+/// returns the family rebuilds the table has run, none for v0.14.1. `pub` because only one side
+/// calls it.
+pub trait Commit {
+    fn commit(&mut self) -> usize {
+        0
+    }
+}
+
+impl<D> Commit for AllowedIps<D> {}
 
 /// An address family; addresses are held left-aligned in a `u128`.
 #[derive(Clone, Copy)]
@@ -111,10 +129,22 @@ fn value(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX) % VALUES
 }
 
+/// A table of `prefixes` built in one configuration change: one rebuild at most.
 fn build(family: Family, prefixes: &[(u128, u8)]) -> AllowedIps<u32> {
     let mut table = AllowedIps::new();
     for (i, &(net, len)) in prefixes.iter().enumerate() {
         table.insert(family.addr(net), len, value(i));
+    }
+    assert!(table.commit() <= 1);
+    table
+}
+
+/// A table of `prefixes` built in one configuration change per network.
+fn build_per_change(family: Family, prefixes: &[(u128, u8)]) -> AllowedIps<u32> {
+    let mut table = AllowedIps::new();
+    for (i, &(net, len)) in prefixes.iter().enumerate() {
+        table.insert(family.addr(net), len, value(i));
+        table.commit();
     }
     table
 }
@@ -135,6 +165,25 @@ fn check(family: Family, table: &AllowedIps<u32>, prefixes: &[(u128, u8)]) {
             .all(|(_, net, len)| networks.contains(&(net, len)))
     );
     assert_eq!(table.iter().count(), networks.len());
+}
+
+/// Up to `LOOKUPS` addresses next to the prefixes (last network bit flipped, host bits random)
+/// that `table` does not match.
+fn near(
+    family: Family,
+    table: &AllowedIps<u32>,
+    prefixes: &[(u128, u8)],
+    rng: &mut Rng,
+) -> Vec<IpAddr> {
+    (0..LOOKUPS * 64)
+        .filter_map(|_| {
+            let (net, len) = prefixes[rng.below(prefixes.len())];
+            let flipped = net ^ (1 << (128 - u32::from(len)));
+            let addr = family.addr(flipped | (rng.bits() & !mask(len)));
+            table.find(addr).is_none().then_some(addr)
+        })
+        .take(LOOKUPS)
+        .collect()
 }
 
 /// `LOOKUPS` addresses inside the prefixes (host bits random) and `LOOKUPS` outside them.
@@ -162,7 +211,9 @@ fn find(c: &mut Criterion) {
             let (hits, misses) = addresses(family, &prefixes, &mut rng);
             assert!(hits.iter().all(|&a| table.find(a).is_some()));
             assert!(misses.iter().all(|&a| table.find(a).is_none()));
-            for (kind, addrs) in [("hit", &hits), ("miss", &misses)] {
+            let near = near(family, &table, &prefixes, &mut rng);
+            let cases = [("hit", &hits), ("miss", &misses), ("near", &near)];
+            for (kind, addrs) in cases.into_iter().filter(|(_, addrs)| !addrs.is_empty()) {
                 let id = format!("find/{}/{kind}/{size_id}", family.id());
                 group.bench_function(id, |b| {
                     b.iter_custom(|iters| {
@@ -182,6 +233,13 @@ fn find(c: &mut Criterion) {
         group.bench_function(format!("build/{}/10k", family.id()), |b| {
             b.iter_with_large_drop(|| build(family, black_box(&prefixes)));
         });
+        // Up to a rebuild per network: seconds per build, so ten single builds.
+        group.sample_size(10).sampling_mode(SamplingMode::Flat);
+        group.bench_function(format!("build_per_change/{}/10k", family.id()), |b| {
+            b.iter_with_large_drop(|| build_per_change(family, black_box(&prefixes)));
+        });
+        group.sample_size(100).sampling_mode(SamplingMode::Auto);
+        check(family, &build_per_change(family, &prefixes), &prefixes);
 
         let (_, max) = family.lengths();
         let new = family.addr(rng.bits() | TOP_BIT);
@@ -189,7 +247,17 @@ fn find(c: &mut Criterion) {
         group.bench_function(format!("insert_remove/{}/10k", family.id()), |b| {
             b.iter(|| {
                 black_box(table.insert(black_box(new), max, VALUES));
+                black_box(table.commit());
                 black_box(table.remove_network(black_box(new), max));
+                black_box(table.commit());
+            });
+        });
+        group.bench_function(format!("insert_remove_new_len/{}/10k", family.id()), |b| {
+            b.iter(|| {
+                black_box(table.insert(black_box(new), 1, VALUES));
+                black_box(table.commit());
+                black_box(table.remove_network(black_box(new), 1));
+                black_box(table.commit());
             });
         });
         check(family, &table, &prefixes);
@@ -201,6 +269,7 @@ fn find(c: &mut Criterion) {
                 || build(family, &prefixes),
                 |mut table| {
                     table.remove(&|&v| v == black_box(0));
+                    table.commit();
                     table
                 },
                 BatchSize::LargeInput,
