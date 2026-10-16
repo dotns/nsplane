@@ -46,22 +46,15 @@ struct Schedule {
     stats: Option<Instant>,
 }
 
-/// Lookups that consecutive data packets of a batch share: a peer's slot in the peer table, the
-/// peer a destination is routed to, a source a peer may send from and a destination a peer may
-/// send to. Only configuration changes the peer table, and a batch holds none, so they stay
-/// valid for the whole batch; a batch of datagrams still starts over after every handshake
-/// message, the only other message it holds.
+/// Lookups that consecutive data packets of a batch share: the peer and slot of a session and
+/// a destination a peer may send to. Only configuration changes the peer table, and a batch
+/// holds none, so they stay valid for the whole batch; a batch of datagrams still starts over
+/// after every handshake message, the only other message it holds. Routes and source checks
+/// are kept across calls in the [`RouteCache`].
 #[derive(Debug, Default)]
 struct Lookups {
     /// The last receiver index, with its peer and slot.
     session: Option<(u32, PeerId, usize)>,
-    /// The last destination, with the peer and slot it is routed to.
-    route: Option<(IpAddr, PeerId, usize)>,
-    /// With source sets: the last identity selected (`None` for the fallback trie) and
-    /// destination, with the peer and slot they are routed to.
-    selected_route: Option<(Option<LocalIdentityId>, IpAddr, PeerId, usize)>,
-    /// The last source accepted from a peer.
-    source: Option<(IpAddr, PeerId)>,
     /// The last destination accepted from a peer with inbound destinations.
     destination: Option<(IpAddr, PeerId)>,
 }
@@ -80,16 +73,94 @@ impl Lookups {
         Some((id, slot))
     }
 
+    /// Whether peer `id`, whose inbound destinations are `set`, may send packets to `dst`.
+    fn destination_allowed(&mut self, set: &AllowedIps<()>, dst: IpAddr, id: PeerId) -> bool {
+        if self.destination == Some((dst, id)) {
+            return true;
+        }
+        let allowed = set.find(dst).is_some();
+        if allowed {
+            self.destination = Some((dst, id));
+        }
+        allowed
+    }
+}
+
+/// Entries of each table of the [`RouteCache`]; a power of two.
+const ROUTE_CACHE_ENTRIES: usize = 64;
+
+/// The place of `addr` in a table of the [`RouteCache`].
+fn cache_index(addr: IpAddr) -> usize {
+    let word = match addr {
+        IpAddr::V4(a) => u64::from(u32::from(a)),
+        IpAddr::V6(a) => {
+            let bits = u128::from(a);
+            u64::try_from((bits ^ (bits >> 64)) & u128::from(u64::MAX)).unwrap_or(0)
+        }
+    };
+    let hash =
+        word.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - ROUTE_CACHE_ENTRIES.trailing_zeros());
+    usize::try_from(hash).unwrap_or(0)
+}
+
+/// A source (`None` if unreadable) and a destination, with the peer and slot they are routed
+/// to with source sets.
+type SelectedRoute = (Option<IpAddr>, IpAddr, PeerId, usize);
+
+/// The allowed-IP lookups of the data path, kept across calls: the peer and slot a destination
+/// is routed to, with source sets the same for a source and a destination (so a known flow
+/// skips the source-set lookup), and the sources a peer may send from. Only positive answers
+/// are kept. Each table is direct mapped on a hash of the address; a new entry replaces the
+/// one in its place. Every entry is dropped once the peer table changes (its generation
+/// moves), so an entry always holds what the peer table answers.
+struct RouteCache {
+    /// The peer table generation the entries were looked up in.
+    generation: u64,
+    /// Destinations, with the peer and slot they are routed to.
+    route: [Option<(IpAddr, PeerId, usize)>; ROUTE_CACHE_ENTRIES],
+    /// With source sets: sources and destinations, with their route.
+    selected_route: [Option<SelectedRoute>; ROUTE_CACHE_ENTRIES],
+    /// Sources accepted from a peer.
+    source: [Option<(IpAddr, PeerId)>; ROUTE_CACHE_ENTRIES],
+}
+
+impl fmt::Debug for RouteCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteCache")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RouteCache {
+    const fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            route: [None; ROUTE_CACHE_ENTRIES],
+            selected_route: [None; ROUTE_CACHE_ENTRIES],
+            source: [None; ROUTE_CACHE_ENTRIES],
+        }
+    }
+
+    /// Drops every entry if the peer table changed since they were looked up.
+    const fn sync(&mut self, peers: &PeerTable) {
+        if self.generation != peers.generation() {
+            *self = Self::new(peers.generation());
+        }
+    }
+
     /// The peer and slot a packet to `dst` is routed to.
     fn route(&mut self, peers: &PeerTable, dst: IpAddr) -> Option<(PeerId, usize)> {
-        if let Some((last, id, slot)) = self.route
+        self.sync(peers);
+        let entry = self.route.get_mut(cache_index(dst))?;
+        if let Some((last, id, slot)) = *entry
             && last == dst
         {
             return Some((id, slot));
         }
         let id = peers.by_destination(dst)?;
         let slot = peers.slot(id)?;
-        self.route = Some((dst, id, slot));
+        *entry = Some((dst, id, slot));
         Some((id, slot))
     }
 
@@ -101,39 +172,34 @@ impl Lookups {
         src: Option<IpAddr>,
         dst: IpAddr,
     ) -> Option<(PeerId, usize)> {
-        let identity = src.and_then(|src| peers.source_identity(src));
-        if let Some((last_identity, last, id, slot)) = self.selected_route
-            && last_identity == identity
+        self.sync(peers);
+        let index = cache_index(dst) ^ src.map_or(0, cache_index);
+        let entry = self.selected_route.get_mut(index)?;
+        if let Some((last_src, last, id, slot)) = *entry
+            && last_src == src
             && last == dst
         {
             return Some((id, slot));
         }
+        let identity = src.and_then(|src| peers.source_identity(src));
         let id = peers.route_in(identity, dst)?;
         let slot = peers.slot(id)?;
-        self.selected_route = Some((identity, dst, id, slot));
+        *entry = Some((src, dst, id, slot));
         Some((id, slot))
     }
 
     /// Whether peer `id` may send packets from `src`.
     fn source_allowed(&mut self, peers: &PeerTable, src: IpAddr, id: PeerId) -> bool {
-        if self.source == Some((src, id)) {
+        self.sync(peers);
+        let Some(entry) = self.source.get_mut(cache_index(src)) else {
+            return false;
+        };
+        if *entry == Some((src, id)) {
             return true;
         }
         let allowed = peers.routes_to(src, id);
         if allowed {
-            self.source = Some((src, id));
-        }
-        allowed
-    }
-
-    /// Whether peer `id`, whose inbound destinations are `set`, may send packets to `dst`.
-    fn destination_allowed(&mut self, set: &AllowedIps<()>, dst: IpAddr, id: PeerId) -> bool {
-        if self.destination == Some((dst, id)) {
-            return true;
-        }
-        let allowed = set.find(dst).is_some();
-        if allowed {
-            self.destination = Some((dst, id));
+            *entry = Some((src, id));
         }
         allowed
     }
@@ -148,6 +214,8 @@ impl Lookups {
 /// reported by [`Core::poll_timeout`].
 pub struct Core {
     peers: PeerTable,
+    /// The allowed-IP lookups of the data path, valid for the current peer table.
+    routes: Box<RouteCache>,
     policy: Box<dyn PathPolicy>,
     /// [`PathPolicy::observe_every_message`], read once.
     observe_every_message: bool,
@@ -181,6 +249,7 @@ impl Core {
             peers.set_private_key(private_key);
         }
         Self {
+            routes: Box::new(RouteCache::new(peers.generation())),
             peers,
             observe_every_message: config.policy.observe_every_message(),
             policy: config.policy,
@@ -202,7 +271,7 @@ impl Core {
         self.start_schedule(now);
         match input {
             Input::Datagram { path, data } => self.receive(path, data),
-            Input::Local { packet } => self.send(packet, true, &mut Lookups::default()),
+            Input::Local { packet } => self.send(packet, true),
             Input::Config(change) => self.configure(change, now),
         }
     }
@@ -246,9 +315,8 @@ impl Core {
         }
         self.start_schedule(now);
         self.outputs.reserve(batch.size_hint().0);
-        let mut lookups = Lookups::default();
         for packet in batch {
-            self.send(packet, true, &mut lookups);
+            self.send(packet, true);
         }
     }
 
@@ -297,9 +365,8 @@ impl Core {
         }
         self.start_schedule(now);
         jobs.reserve(batch.size_hint().0);
-        let mut lookups = Lookups::default();
         for packet in batch {
-            jobs.extend(self.seal_job(packet, &mut lookups));
+            jobs.extend(self.seal_job(packet));
         }
     }
 
@@ -322,7 +389,7 @@ impl Core {
                 let (data, index) = self.classify(path, data)?;
                 self.open_job(path, data, index, &mut Lookups::default())
             }
-            Input::Local { packet } => self.seal_job(packet, &mut Lookups::default()),
+            Input::Local { packet } => self.seal_job(packet),
             Input::Config(change) => {
                 self.configure(change, now);
                 None
@@ -675,7 +742,7 @@ impl Core {
     /// translating filter does not translate it.
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
-        self.send(packet, false, &mut Lookups::default());
+        self.send(packet, false);
     }
 
     /// Encrypts `packet` for `peer` in its current session and transmits it on `path`
@@ -1079,7 +1146,7 @@ impl Core {
         }
 
         let src = src?;
-        if !lookups.source_allowed(&self.peers, src, id) {
+        if !self.routes.source_allowed(&self.peers, src, id) {
             self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
             return None;
         }
@@ -1220,8 +1287,8 @@ impl Core {
     }
 
     /// Encrypts a local packet in place and transmits it to the peer it is routed to.
-    fn send(&mut self, packet: PacketBuf, filter: bool, lookups: &mut Lookups) {
-        let Some((id, slot, mut packet, len)) = self.prepare_send(packet, filter, lookups) else {
+    fn send(&mut self, packet: PacketBuf, filter: bool) {
+        let Some((id, slot, mut packet, len)) = self.prepare_send(packet, filter) else {
             return;
         };
         let Some(peer) = self.peers.at_mut(slot) else {
@@ -1240,8 +1307,8 @@ impl Core {
     }
 
     /// Hands out the encryption of a local packet as a job.
-    fn seal_job(&mut self, packet: PacketBuf, lookups: &mut Lookups) -> Option<CryptoJob> {
-        let (id, slot, packet, len) = self.prepare_send(packet, true, lookups)?;
+    fn seal_job(&mut self, packet: PacketBuf) -> Option<CryptoJob> {
+        let (id, slot, packet, len) = self.prepare_send(packet, true)?;
         let Some(peer) = self.peers.at_mut(slot) else {
             self.pool.put(packet);
             return None;
@@ -1255,13 +1322,13 @@ impl Core {
         &mut self,
         mut packet: PacketBuf,
         filter: bool,
-        lookups: &mut Lookups,
     ) -> Option<(PeerId, usize, PacketBuf, usize)> {
         let route = match Tunn::dst_address(packet.as_packet()) {
             Some(dst) if self.peers.has_sources() => {
-                lookups.route_from(&self.peers, src_address(packet.as_packet()), dst)
+                self.routes
+                    .route_from(&self.peers, src_address(packet.as_packet()), dst)
             }
-            Some(dst) => lookups.route(&self.peers, dst),
+            Some(dst) => self.routes.route(&self.peers, dst),
             None => None,
         };
         let Some((id, slot)) = route else {
@@ -1777,6 +1844,246 @@ mod tests {
         assert_eq!(core.route("10.1.0.1".parse().unwrap()), Some(narrow));
         assert_eq!(core.route("fd00::1".parse().unwrap()), Some(wide));
         assert_eq!(core.route("192.0.2.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn the_route_cache_answers_like_the_peer_table() {
+        // splitmix64
+        let mut state = 0x6e73_706c_616e_6533_u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let nets: Vec<AllowedIp> = [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            "10.1.2.3/32",
+            "10.1.2.4/32",
+            "192.0.2.0/24",
+            "::/0",
+            "fd00::/8",
+            "fd00::1/128",
+            "fd00::2/128",
+        ]
+        .iter()
+        .map(|n| n.parse().unwrap())
+        .collect();
+        let addrs: Vec<IpAddr> = [
+            "10.1.2.3",
+            "10.1.2.4",
+            "10.1.2.5",
+            "10.1.3.1",
+            "10.2.0.1",
+            "192.0.2.9",
+            "198.51.100.1",
+            "fd00::1",
+            "fd00::2",
+            "fd00::3",
+            "2001:db8::1",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        let now = Instant::now();
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let mut identities = vec![LocalIdentityId::DEFAULT];
+        let keys: Vec<x25519::PublicKey> = (2..8u8)
+            .map(|k| x25519::PublicKey::from(&x25519::StaticSecret::from([k; 32])))
+            .collect();
+        let mut pick = |n: usize| usize::try_from(next()).unwrap() % n;
+        for step in 0..3000u32 {
+            let identity = identities[pick(identities.len())];
+            let key = keys[pick(keys.len())];
+            let change = match pick(10) {
+                0..=4 => {
+                    let mut config = PeerConfig::new(key);
+                    config.local_identity = Some(identity);
+                    config.replace_allowed_ips = pick(2) == 0;
+                    config.allowed_ips = (0..pick(3)).map(|_| nets[pick(nets.len())]).collect();
+                    Some(ConfigChange::AddOrUpdatePeer(config))
+                }
+                5 => Some(ConfigChange::InLocalIdentity {
+                    identity,
+                    change: Box::new(ConfigChange::RemovePeer(key)),
+                }),
+                6 if pick(8) == 0 => Some(ConfigChange::RemoveAllPeers),
+                7 => {
+                    let sources: Vec<AllowedIp> =
+                        (0..pick(3)).map(|_| nets[pick(nets.len())]).collect();
+                    core.set_local_sources(identity, &sources);
+                    None
+                }
+                8 if identities.len() < 4 => {
+                    let secret =
+                        x25519::StaticSecret::from([u8::try_from(100 + step % 100).unwrap(); 32]);
+                    identities.extend(core.add_local_identity(secret));
+                    None
+                }
+                9 if identity != LocalIdentityId::DEFAULT => {
+                    if core.remove_local_identity(identity) {
+                        identities.retain(|&i| i != identity);
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(change) = change {
+                core.handle_input(Input::Config(change), now);
+            }
+            // Twice: the second round answers from the cache.
+            for _ in 0..2 {
+                for &dst in &addrs {
+                    for &src in &addrs {
+                        assert_routes_like_the_peer_table(&mut core, src, dst);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Asserts that the route cache of `core` answers the route of `dst`, the route from
+    /// `src` to `dst` and whether each peer may send from `src` like the peer table.
+    fn assert_routes_like_the_peer_table(core: &mut Core, src: IpAddr, dst: IpAddr) {
+        let slot = |id: PeerId| Some((id, core.peers.slot(id)?));
+        let route = core.peers.by_destination(dst).and_then(slot);
+        let route_from = core.peers.route_from(src, dst).and_then(slot);
+        assert_eq!(core.routes.route(&core.peers, dst), route, "{dst}");
+        let selected = if core.peers.has_sources() {
+            core.routes.route_from(&core.peers, Some(src), dst)
+        } else {
+            core.routes.route(&core.peers, dst)
+        };
+        assert_eq!(selected, route_from, "{src} -> {dst}");
+        let peers: Vec<PeerId> = core.peers().collect();
+        for id in peers {
+            assert_eq!(
+                core.routes.source_allowed(&core.peers, src, id),
+                core.peers.routes_to(src, id),
+                "{src} from {id:?}"
+            );
+        }
+    }
+
+    /// Fills the route cache with the routes between `addrs`, runs `change` and asserts that
+    /// the next answers are the peer table's and that the generation moved.
+    fn assert_change_drops_the_route_cache(
+        core: &mut Core,
+        addrs: &[&str],
+        change: impl FnOnce(&mut Core),
+    ) {
+        let addrs: Vec<IpAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
+        let check = |core: &mut Core| {
+            for &src in &addrs {
+                for &dst in &addrs {
+                    assert_routes_like_the_peer_table(core, src, dst);
+                }
+            }
+        };
+        check(core);
+        let generation = core.peers.generation();
+        change(core);
+        check(core);
+        assert_ne!(core.peers.generation(), generation);
+    }
+
+    /// Adds (or updates) the peer `[key; 32]` of `identity` with `allowed` IPs.
+    fn add_peer_in(core: &mut Core, identity: LocalIdentityId, key: u8, allowed: &[&str]) {
+        let mut config = PeerConfig::new(x25519::PublicKey::from([key; 32]));
+        config.local_identity = Some(identity);
+        config.allowed_ips = allowed.iter().map(|a| a.parse().unwrap()).collect();
+        core.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+    }
+
+    /// A core with the peer `[7; 32]` routing 10.0.0.0/8.
+    fn core_routing_ten() -> Core {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 7, &["10.0.0.0/8"]);
+        core
+    }
+
+    #[test]
+    fn adding_a_peer_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            add_peer_in(core, LocalIdentityId::DEFAULT, 8, &["10.1.0.0/16"]);
+        });
+        let narrow = core.peer_id(&x25519::PublicKey::from([8; 32]));
+        assert_eq!(
+            core.routes
+                .route(&core.peers, "10.1.2.3".parse().unwrap())
+                .map(|r| r.0),
+            narrow
+        );
+    }
+
+    #[test]
+    fn removing_a_peer_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 8, &["10.1.0.0/16"]);
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            core.handle_input(
+                Input::Config(ConfigChange::RemovePeer(x25519::PublicKey::from([8; 32]))),
+                Instant::now(),
+            );
+        });
+    }
+
+    #[test]
+    fn removing_all_peers_drops_the_cached_routes() {
+        let mut core = core_routing_ten();
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            core.handle_input(Input::Config(ConfigChange::RemoveAllPeers), Instant::now());
+        });
+        assert_eq!(
+            core.routes.route(&core.peers, "10.1.2.3".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn setting_source_sets_drops_the_cached_routes() {
+        let mut core = Core::new(CoreConfig {
+            private_key: Some(x25519::StaticSecret::from([1; 32])),
+            ..CoreConfig::default()
+        });
+        let other = core
+            .add_local_identity(x25519::StaticSecret::from([2; 32]))
+            .unwrap();
+        // The other identity routes 10.0.0.0/8 to its peer, the fallback to the default's.
+        add_peer_in(&mut core, other, 8, &["10.0.0.0/8"]);
+        add_peer_in(&mut core, LocalIdentityId::DEFAULT, 7, &["10.0.0.0/8"]);
+        assert!(core.set_local_sources(other, &["192.0.2.0/24".parse().unwrap()]));
+        assert_change_drops_the_route_cache(&mut core, &["192.0.2.1", "10.1.2.3"], |core| {
+            assert!(core.set_local_sources(other, &["198.51.100.0/24".parse().unwrap()]));
+        });
+    }
+
+    #[test]
+    fn adding_and_removing_an_identity_moves_the_generation() {
+        let mut core = core_routing_ten();
+        let mut added = None;
+        assert_change_drops_the_route_cache(&mut core, &["10.1.2.3"], |core| {
+            added = core.add_local_identity(x25519::StaticSecret::from([2; 32]));
+        });
+        let added = added.unwrap();
+        assert!(core.set_local_sources(added, &["192.0.2.0/24".parse().unwrap()]));
+        assert_change_drops_the_route_cache(&mut core, &["192.0.2.1", "10.1.2.3"], |core| {
+            assert!(core.remove_local_identity(added));
+        });
     }
 
     /// A core with private key `own` and peer `peer` at `path`.

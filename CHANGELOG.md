@@ -5,6 +5,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Faster allowed-IP lookups. Every routing table (an identity's, the merged one, the source sets,
+  a peer's allowed IPs) runs a binary search on the prefix lengths in use, per address
+  family: at most 6 (IPv4) / 8 (IPv6) hash probes whatever the number of networks. One lookup on
+  a 10 k table drops from 48 to 16 ns (IPv4) and from 175 to 26 ns (IPv6).
+- Each core keeps a route cache of 64 entries for destinations, (source, destination) pairs with
+  source sets, and accepted sources, so lookups are shared across calls, not only within a batch;
+  every routing change invalidates it. `data_path` against 0.14.1: `core_round_trip` 531 -> 417 ns
+  (64 B) and 1342 -> 1224 ns (1420 B), `core_round_trip_two_identities` 594 -> 421 ns (64 B), and
+  with more flows than the cache holds 500 -> 431 ns (64 B); the batch and `tunn` cases are within
+  noise. wg-compare `nsplane-nsplane` is at par or up to 1.7 % faster.
+- Write cost: a configuration change at prefix lengths already in use updates the tables in
+  place (an insert and a remove on 10 k networks: 0.25 / 0.30 µs); a change that adds or empties
+  a prefix length rebuilds that family once, about 1 / 1.5 ms for 10 k networks, paid by the
+  core thread.
+- The public API is unchanged.
+
 ## [0.14.1] - 2026-10-15
 
 Bug fixes: the last performance residuals of the snapshot cell, and a dependency advisory.
