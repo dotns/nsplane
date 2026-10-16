@@ -17,13 +17,13 @@ workspace = true
 [dependencies]
 nsplane-noise = { version = "0.14.1", path = "../nsplane-noise" }
 nsplane-packet = { version = "0.14.1", path = "../nsplane-packet" }
-ip_network = "0.4.1"
-ip_network_table = "0.2.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 tracing = "0.1.40"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
+ip_network = "0.4.1"
+ip_network_table = "0.2.0"
 
 [[bench]]
 name = "cell"

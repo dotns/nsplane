@@ -1,15 +1,297 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use ip_network::IpNetwork;
-use ip_network_table::IpNetworkTable;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use std::collections::VecDeque;
-use std::net::IpAddr;
+use nsplane_packet::hash::KeyedState;
 
-/// A trie of IP/cidr addresses
+/// A longest-prefix-match table of IP/cidr networks.
+///
+/// Each address family runs a binary search on the prefix lengths in use (Waldvogel et al.):
+/// one hash table per length holds the networks of that length and markers, the network bits
+/// at that length of the longer networks whose search passes it. Every entry holds its best
+/// matching network, so a lookup takes at most `ceil(log2(lengths in use + 1))` hash probes
+/// (6 for IPv4, 8 for IPv6). The hash tables are [`KeyedState`] maps, keyed with fresh random
+/// words each time a family is built, so keys differ per table and per rebuild.
+///
+/// Writes are deferred: `insert`, `remove_network` and `remove` change the networks and mark
+/// their family dirty, and [`AllowedIps::commit`] rebuilds each dirty family once. A
+/// configuration change that ends in one commit costs at most one rebuild per family. Lookups
+/// stay exact on a dirty family, probing every prefix length of the networks, longest first.
 pub(crate) struct AllowedIps<D> {
-    ips: IpNetworkTable<D>,
+    v4: Table<D>,
+    v6: Table<D>,
+    /// The family rebuilds the table has run.
+    pub(crate) rebuilds: usize,
+}
+
+/// The networks and markers of one prefix length.
+struct Level {
+    len: u8,
+    /// The network bits of `len`, left-aligned.
+    mask: u128,
+    /// Networks and markers by their left-aligned bits, each with the slot of its best
+    /// match: the longest network of this length or shorter that contains the bits.
+    entries: HashMap<u128, Option<u32>, KeyedState>,
+}
+
+/// The networks of one address family.
+struct Table<D> {
+    /// The lengths in use at the last rebuild, ascending: the binary search runs over this
+    /// list.
+    levels: Vec<Level>,
+    /// The networks, `(bits, len)` to their slot.
+    networks: BTreeMap<(u128, u8), u32>,
+    /// The values, by slot.
+    values: Vec<Option<D>>,
+    /// Free slots in `values`.
+    free: Vec<u32>,
+    /// Whether `networks` changed since the last rebuild, so `levels` are out of date.
+    dirty: bool,
+}
+
+/// The left-aligned network bits of a prefix of `len` bits.
+fn mask(len: u8) -> u128 {
+    u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0)
+}
+
+/// The family of `addr` (`true` for IPv6) and its bits, left-aligned.
+fn bits(addr: IpAddr) -> (bool, u128) {
+    match addr {
+        IpAddr::V4(a) => (false, u128::from(u32::from(a)) << 96),
+        IpAddr::V6(a) => (true, u128::from(a)),
+    }
+}
+
+/// The address of left-aligned `bits` of a family.
+fn addr(v6: bool, bits: u128) -> IpAddr {
+    if v6 {
+        Ipv6Addr::from(bits).into()
+    } else {
+        Ipv4Addr::from(u32::try_from(bits >> 96).unwrap_or(0)).into()
+    }
+}
+
+/// The levels before level `target` where the binary search over `count` levels for
+/// `target` goes on to longer lengths: those where the target places a marker.
+fn path(count: usize, target: usize) -> impl Iterator<Item = usize> {
+    let (mut lo, mut hi) = (0, count);
+    std::iter::from_fn(move || {
+        if lo >= hi {
+            return None;
+        }
+        let mid = lo + (hi - lo) / 2;
+        if mid == target {
+            lo = hi;
+            return None;
+        }
+        if mid < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+        Some(mid)
+    })
+    .filter(move |&mid| mid < target)
+}
+
+impl<D> Table<D> {
+    const fn new() -> Self {
+        Self {
+            levels: Vec::new(),
+            networks: BTreeMap::new(),
+            values: Vec::new(),
+            free: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    /// The position of the level of `len`.
+    fn level(&self, len: u8) -> Option<usize> {
+        self.levels
+            .binary_search_by_key(&len, |level| level.len)
+            .ok()
+    }
+
+    /// The slot of the longest network that contains `bits`, among the levels below `limit`:
+    /// the search runs over all levels and takes those from `limit` on as empty, so it meets
+    /// the markers where they are placed.
+    fn search(&self, bits: u128, limit: usize) -> Option<u32> {
+        let (mut lo, mut hi) = (0, self.levels.len());
+        let mut best = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self
+                .levels
+                .get(mid)
+                .filter(|_| mid < limit)
+                .and_then(|level| level.entries.get(&(bits & level.mask)));
+            match entry {
+                Some(entry) => {
+                    best = entry.or(best);
+                    lo = mid + 1;
+                }
+                None => hi = mid,
+            }
+        }
+        best
+    }
+
+    /// The value of the longest network that contains `bits`; `max` is the address length.
+    fn find(&self, bits: u128, max: u8) -> Option<&D> {
+        let slot = if self.dirty {
+            (0..=max)
+                .rev()
+                .find_map(|len| self.networks.get(&(bits & mask(len), len)).copied())?
+        } else {
+            self.search(bits, usize::MAX)?
+        };
+        self.values.get(usize::try_from(slot).ok()?)?.as_ref()
+    }
+
+    fn get(&self, bits: u128, len: u8) -> Option<&D> {
+        let slot = *self.networks.get(&(bits & mask(len), len))?;
+        self.values.get(usize::try_from(slot).ok()?)?.as_ref()
+    }
+
+    fn value_mut(&mut self, slot: u32) -> Option<&mut Option<D>> {
+        self.values.get_mut(usize::try_from(slot).ok()?)
+    }
+
+    fn insert(&mut self, bits: u128, len: u8, data: D) -> Option<D> {
+        let net = bits & mask(len);
+        if let Some(&slot) = self.networks.get(&(net, len)) {
+            // A new value for a known network: the levels stay valid.
+            return self.value_mut(slot)?.replace(data);
+        }
+        let slot = if let Some(slot) = self.free.pop() {
+            *self.value_mut(slot)? = Some(data);
+            slot
+        } else {
+            let slot = u32::try_from(self.values.len()).ok()?;
+            self.values.push(Some(data));
+            slot
+        };
+        self.networks.insert((net, len), slot);
+        self.dirty = true;
+        None
+    }
+
+    fn remove_network(&mut self, bits: u128, len: u8) -> Option<D> {
+        let slot = self.networks.remove(&(bits & mask(len), len))?;
+        self.free.push(slot);
+        self.dirty = true;
+        self.value_mut(slot)?.take()
+    }
+
+    fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
+        let values = &mut self.values;
+        let free = &mut self.free;
+        let mut removed = false;
+        self.networks.retain(|_, slot| {
+            let Some(value) = usize::try_from(*slot).ok().and_then(|i| values.get_mut(i)) else {
+                return false;
+            };
+            if value.as_ref().is_some_and(predicate) {
+                *value = None;
+                free.push(*slot);
+                removed = true;
+                return false;
+            }
+            true
+        });
+        self.dirty |= removed;
+    }
+
+    /// Rebuilds the levels from the networks.
+    fn rebuild(&mut self) {
+        let mut lens: Vec<u8> = self.networks.keys().map(|&(_, len)| len).collect();
+        lens.sort_unstable();
+        lens.dedup();
+        self.levels = lens
+            .into_iter()
+            .map(|len| Level {
+                len,
+                mask: mask(len),
+                entries: HashMap::default(),
+            })
+            .collect();
+        let count = self.levels.len();
+        // Networks with their own slot and markers without a best match yet, then the best
+        // match of the markers, shortest level first so each search below finds complete
+        // levels.
+        for (&(net, len), &slot) in &self.networks {
+            let Some(t) = self.level(len) else {
+                continue;
+            };
+            for mid in path(count, t) {
+                if let Some(level) = self.levels.get_mut(mid) {
+                    level.entries.entry(net & level.mask).or_insert(None);
+                }
+            }
+            if let Some(level) = self.levels.get_mut(t) {
+                level.entries.insert(net, Some(slot));
+            }
+        }
+        for mid in 0..count {
+            let markers: Vec<u128> = self
+                .levels
+                .get(mid)
+                .map(|level| {
+                    level
+                        .entries
+                        .iter()
+                        .filter(|(_, best)| best.is_none())
+                        .map(|(&key, _)| key)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for key in markers {
+                let best = self.search(key, mid);
+                if let Some(entry) = self
+                    .levels
+                    .get_mut(mid)
+                    .and_then(|level| level.entries.get_mut(&key))
+                {
+                    *entry = best;
+                }
+            }
+        }
+        self.dirty = false;
+    }
+
+    /// Appends `(value, network address, prefix length)` of every network, in the order of
+    /// the stride-4 tree bitmap the table replaced (`ip_network_table`): a node's prefixes
+    /// (shorter first, then by address) before its children, children by address.
+    fn collect<'a>(&'a self, v6: bool, out: &mut Vec<(&'a D, IpAddr, u8)>) {
+        let mut entries: Vec<(u128, u8, &D)> = self
+            .networks
+            .iter()
+            .filter_map(|(&(net, len), &slot)| {
+                let value = self.values.get(usize::try_from(slot).ok()?)?.as_ref()?;
+                Some((net, len, value))
+            })
+            .collect();
+        entries.sort_unstable_by(|&(a, a_len, _), &(b, b_len, _)| tree_order(a, a_len, b, b_len));
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(net, len, data)| (data, addr(v6, net), len)),
+        );
+    }
+}
+
+/// The order of networks `a/a_len` and `b/b_len` in a pre-order walk of a stride-4 trie.
+fn tree_order(a: u128, a_len: u8, b: u128, b_len: u8) -> std::cmp::Ordering {
+    // The depth of the node a network sits in.
+    let (a_node, b_node) = (a_len / 4 * 4, b_len / 4 * 4);
+    let common = mask(a_node.min(b_node));
+    (a & common)
+        .cmp(&(b & common))
+        .then(a_node.cmp(&b_node))
+        .then(a_len.cmp(&b_len))
+        .then(a.cmp(&b))
 }
 
 impl<D> Default for AllowedIps<D> {
@@ -20,62 +302,97 @@ impl<D> Default for AllowedIps<D> {
 
 impl<D> AllowedIps<D> {
     /// Creates an empty table.
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            ips: IpNetworkTable::new(),
+            v4: Table::new(),
+            v6: Table::new(),
+            rebuilds: 0,
         }
     }
 
-    /// Removes all entries.
+    /// The table of `key`'s family, with `key`'s bits, if `cidr` fits the family.
+    fn split(&self, key: IpAddr, cidr: u8) -> Option<(&Table<D>, u128)> {
+        match bits(key) {
+            (false, bits) if cidr <= 32 => Some((&self.v4, bits)),
+            (true, bits) if cidr <= 128 => Some((&self.v6, bits)),
+            _ => None,
+        }
+    }
+
+    fn split_mut(&mut self, key: IpAddr, cidr: u8) -> Option<(&mut Table<D>, u128)> {
+        match bits(key) {
+            (false, bits) if cidr <= 32 => Some((&mut self.v4, bits)),
+            (true, bits) if cidr <= 128 => Some((&mut self.v6, bits)),
+            _ => None,
+        }
+    }
+
+    /// Removes all entries; nothing is left to rebuild.
     pub(crate) fn clear(&mut self) {
-        self.ips = IpNetworkTable::new();
+        self.v4 = Table::new();
+        self.v6 = Table::new();
     }
 
     /// Inserts `data` for `key/cidr` and returns the value previously stored for that network.
     /// A `cidr` longer than the address is ignored and yields `None`.
     pub(crate) fn insert(&mut self, key: IpAddr, cidr: u8, data: D) -> Option<D> {
-        // These are networks, it doesn't make sense for host bits to be set, so
-        // use new_truncate().
-        let network = IpNetwork::new_truncate(key, cidr).ok()?;
-        self.ips.insert(network, data)
+        // These are networks, it doesn't make sense for host bits to be set, so the table
+        // truncates them.
+        let (table, bits) = self.split_mut(key, cidr)?;
+        table.insert(bits, cidr, data)
     }
 
     /// Returns the value stored for exactly the network `key/cidr`; `None` for a `cidr`
     /// longer than the address.
     pub(crate) fn get(&self, key: IpAddr, cidr: u8) -> Option<&D> {
-        let network = IpNetwork::new_truncate(key, cidr).ok()?;
-        self.ips.exact_match(network)
+        let (table, bits) = self.split(key, cidr)?;
+        table.get(bits, cidr)
     }
 
     /// Removes the entry for exactly the network `key/cidr` and returns its value.
     pub(crate) fn remove_network(&mut self, key: IpAddr, cidr: u8) -> Option<D> {
-        let network = IpNetwork::new_truncate(key, cidr).ok()?;
-        self.ips.remove(network)
+        let (table, bits) = self.split_mut(key, cidr)?;
+        table.remove_network(bits, cidr)
     }
 
     /// Whether the table holds no entry.
     pub(crate) fn is_empty(&self) -> bool {
-        self.ips.is_empty()
+        self.v4.networks.is_empty() && self.v6.networks.is_empty()
     }
 
     /// Returns the value of the longest prefix that contains `key`.
     pub(crate) fn find(&self, key: IpAddr) -> Option<&D> {
-        self.ips.longest_match(key).map(|(_net, data)| data)
+        match bits(key) {
+            (false, bits) => self.v4.find(bits, 32),
+            (true, bits) => self.v6.find(bits, 128),
+        }
     }
 
     /// Removes every entry whose value matches `predicate`.
     pub(crate) fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
-        self.ips.retain(|_, v| !predicate(v));
+        self.v4.remove(predicate);
+        self.v6.remove(predicate);
     }
 
-    /// Iterates over `(value, network address, prefix length)`.
+    /// Rebuilds each family written since the last commit, once, and returns
+    /// [`rebuilds`](Self::rebuilds). The end of every configuration change calls it.
+    pub(crate) fn commit(&mut self) -> usize {
+        for table in [&mut self.v4, &mut self.v6] {
+            if table.dirty {
+                table.rebuild();
+                self.rebuilds += 1;
+            }
+        }
+        self.rebuilds
+    }
+
+    /// Iterates over `(value, network address, prefix length)`: IPv4 first, each family in
+    /// the pre-order of the stride-4 trie the table replaced.
     pub(crate) fn iter(&self) -> Iter<'_, D> {
-        Iter(
-            self.ips
-                .iter()
-                .map(|(ipa, d)| (d, ipa.network_address(), ipa.netmask()))
-                .collect(),
-        )
+        let mut entries = Vec::new();
+        self.v4.collect(false, &mut entries);
+        self.v6.collect(true, &mut entries);
+        Iter(entries.into())
     }
 }
 

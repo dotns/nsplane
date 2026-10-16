@@ -260,6 +260,7 @@ impl PeerTable {
                 self.sources = None;
             }
         }
+        self.commit();
         true
     }
 
@@ -404,6 +405,7 @@ impl PeerTable {
             self.insert_allowed_ip(identity, ip, id);
         }
         self.drop_unused_merged();
+        self.commit();
         Ok(id)
     }
 
@@ -466,6 +468,20 @@ impl PeerTable {
         }
     }
 
+    /// Rebuilds what the configuration change written so far left dirty in the tries, once
+    /// per family; every entry point that writes one ends with it.
+    fn commit(&mut self) {
+        for identity in &mut self.identities {
+            identity.ips.commit();
+        }
+        if let Some(merged) = &mut self.merged {
+            merged.commit();
+        }
+        if let Some(sources) = &mut self.sources {
+            sources.commit();
+        }
+    }
+
     /// Removes the peer of `identity` with `public_key` and returns its id.
     pub(crate) fn remove(
         &mut self,
@@ -485,6 +501,7 @@ impl PeerTable {
         }
         self.remove_allowed_ips(identity, id);
         self.drop_unused_merged();
+        self.commit();
 
         tracing::info!("Peer removed");
         Some(id)
@@ -502,6 +519,7 @@ impl PeerTable {
         self.by_key.clear();
         self.by_index.clear();
         self.merged = None;
+        self.commit();
     }
 
     /// The peer of `identity` with this public key.
@@ -639,6 +657,7 @@ impl PeerTable {
         if set.is_empty() {
             self.sources = None;
         }
+        self.commit();
         true
     }
 
@@ -720,6 +739,7 @@ fn destination_set(destinations: &[AllowedIp]) -> AllowedIps<()> {
     for &AllowedIp { addr, cidr } in destinations {
         set.insert(addr, cidr, ());
     }
+    set.commit();
     set
 }
 
