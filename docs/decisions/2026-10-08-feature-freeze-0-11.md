@@ -38,3 +38,6 @@ slot A/B when it touches the data path.
 - 2026-10-13: third exception (owner: "开始处理"): prefix address mappings for LAN prefixes (task
   `20261013-1300`) and cryptokey routing per local identity (task `20261013-1301`), both from ns.
   They ship as 0.14.0.
+- 2026-10-16: fourth exception (owner: "用大改的方式，保持api不变即可"): faster allowed-IP
+  lookups on the data path with the public API unchanged (plan `20261016-1800-route-lookup`,
+  task `20261013-1600` PR-3). It ships as a 0.14.x patch release.
