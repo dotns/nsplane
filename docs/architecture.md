@@ -140,7 +140,8 @@ sealed in its own buffer and leaves as the transmit, a datagram is opened in its
 leaves as the delivery; buffers come back through `recycle`. `handle_datagrams` and
 `handle_locals` take a batch of received datagrams or local packets and behave exactly like
 feeding each to `handle_input` in order, but share one schedule update, the output queue's
-room and the session, route and peer lookups of consecutive packets. Peers are looked up by key,
+room and the session, route and peer lookups of consecutive packets; the route and source
+lookups also hold across calls, in the core's route cache (see Lookup structure). Peers are looked up by key,
 session index and allowed IP (cryptokey routing). Path selection and roaming are delegated
 to a `PathPolicy` (`StandardRoaming` by default), local packet rewriting and interception to
 `PacketFilter`s.
@@ -207,7 +208,7 @@ after decryption, right after the source check and before the inbound filters, o
 path (per packet, batched, deferred); a packet to another destination, or whose destination
 cannot be read, is dropped as `reasons::DESTINATION_NOT_ALLOWED`. The networks sit in their
 own per-peer table, apart from routing (they add no routes), and the last accepted
-destination of the batch is remembered like the other lookups.
+destination of the batch is remembered like the session lookup.
 `ConfigChange::SetInboundDestinations` (`EngineHandle::set_inbound_destinations`) sets or removes them at runtime, and
 `add_or_update_peer` with `Some` replaces them (`None` keeps them). An unchecked peer pays one
 `Option` check per packet; no peer pays an allocation or a lock.
@@ -289,6 +290,13 @@ thread pays the writes: a change at lengths in use pauses that core's data path 
 microseconds, one that adds or empties a length on a 10 k-network table for about 1 / 1.5 ms
 per family rebuilt. Every configuration entry point commits before it returns, so the data
 path never meets a pending rebuild; a lookup during one would stay exact, probing every length.
+On top of the tries, each core keeps a route cache of 64 direct-mapped entries for each of
+the routes of destinations, the routes of (source, destination) pairs with source sets (so a
+known flow skips the source-set lookup) and the sources accepted from peers: about 6.7 KB,
+boxed and fixed; a new entry replaces the one in its place, nothing grows and no packet
+allocates. It keeps positive answers only, and every routing change (peers, allowed IPs,
+identities, source sets) moves the peer table's generation, which drops all entries at the
+next lookup, so the cache always answers like the tries.
 
 Dispatch: with the default identity alone, an initiation takes the single
 mac1 check as before. With two or more keyed identities, or a restricted one, an initiation

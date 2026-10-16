@@ -12,6 +12,10 @@
 //! IPs, and a source set on both, so every packet takes the source selection on send and its
 //! identity's allowed IPs on receive.
 //!
+//! `core_round_trip_flows256` is `core_round_trip` with the destinations cycling over 256
+//! addresses of a /8 the sender's peer holds: more flows than the core's route cache holds, so
+//! most sends look their route up in the allowed IPs.
+//!
 //! The `*_batch32` cases feed the core [`BATCH`] packets per call through
 //! `Core::handle_locals` and `Core::handle_datagrams`; they report the time of a whole batch,
 //! with a throughput of [`BATCH`] elements: divide the time by [`BATCH`] for one packet.
@@ -416,6 +420,44 @@ fn bench_two_identities(group: &mut BenchmarkGroup<'_, WallTime>, len: usize, pa
     );
 }
 
+/// Destinations of `core_round_trip_flows256`, more than the core's route cache holds.
+const FLOWS: u16 = 256;
+
+/// `core_round_trip` with the sender's peer also routing 10.0.0.0/8 and the destinations
+/// cycling over [`FLOWS`] addresses in it, so most sends miss the route cache.
+fn bench_flows(group: &mut BenchmarkGroup<'_, WallTime>, len: usize) {
+    let packets: Vec<Vec<u8>> = (0..FLOWS)
+        .map(|i| {
+            let [hi, lo] = i.to_be_bytes();
+            ipv4_packet(ip4(0), Ipv4Addr::new(10, 1, hi, lo), len)
+        })
+        .collect();
+    group.bench_with_input(
+        BenchmarkId::new("core_round_trip_flows256", len),
+        &packets,
+        |b, packets| {
+            let (mut tx, mut rx) = connected_pair();
+            let now = Instant::now();
+            let peer = tx.peers().next().unwrap();
+            let mut config = PeerConfig::new(tx.peer_stats(peer).unwrap().public_key);
+            config.allowed_ips = vec![AllowedIp {
+                addr: Ipv4Addr::new(10, 0, 0, 0).into(),
+                cidr: 8,
+            }];
+            tx.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(config)), now);
+            let mut flows = packets.iter().cycle();
+            let mut slot = Some(PacketBuf::with_capacity(BUF_CAPACITY));
+            b.iter(|| {
+                let mut buf = slot.take().unwrap();
+                fill(&mut buf, flows.next().unwrap());
+                let data = encapsulate(&mut tx, buf, now);
+                // The delivered packet's buffer carries the next packet.
+                slot = Some(decapsulate(&mut rx, data, now));
+            });
+        },
+    );
+}
+
 fn bench_data_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_path");
     for len in [64, 1420] {
@@ -518,6 +560,7 @@ fn bench_data_path(c: &mut Criterion) {
         );
 
         bench_two_identities(&mut group, len, &packet);
+        bench_flows(&mut group, len);
         bench_batches(&mut group, len, &packet);
     }
     group.finish();
