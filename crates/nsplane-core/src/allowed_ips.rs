@@ -785,6 +785,7 @@ mod tests {
         use super::*;
         use ip_network::IpNetwork;
         use ip_network_table::IpNetworkTable;
+        use std::collections::BTreeSet;
 
         // splitmix64 with a fixed seed: every run checks the same tables.
         let mut state = 0x6e73_706c_616e_6532_u64;
@@ -802,6 +803,14 @@ mod tests {
                 IpAddr::from(u32::try_from(bits >> 96).unwrap().to_be_bytes())
             }
         };
+        // The prefix lengths in use, per family.
+        let lengths = |trie: &IpNetworkTable<u8>| -> [BTreeSet<u8>; 2] {
+            let mut lengths = [BTreeSet::new(), BTreeSet::new()];
+            for (net, _) in trie.iter() {
+                lengths[usize::from(net.network_address().is_ipv6())].insert(net.netmask());
+            }
+            lengths
+        };
         for round in 0..300 {
             let mut ours: AllowedIps<u8> = AllowedIps::new();
             let mut trie: IpNetworkTable<u8> = IpNetworkTable::new();
@@ -809,29 +818,36 @@ mod tests {
             let bases: Vec<u128> = (0..4)
                 .map(|_| (u128::from(next()) << 64) | u128::from(next()))
                 .collect();
-            let steps = if round % 10 == 0 { 2000 } else { 200 };
+            // Most networks take one of a few lengths, so most writes hit a length in use
+            // and update the levels in place.
+            let palette: Vec<u64> = (0..4).map(|_| next()).collect();
+            // A third of the rounds end a configuration change after every step, so every
+            // write starts on a table without pending rebuilds.
+            let every_step = round % 3 == 0;
+            let steps = if round % 10 == 1 { 1000 } else { 200 };
             for _ in 0..steps {
                 let v6 = next() % 2 == 1;
                 let max: u8 = if v6 { 128 } else { 32 };
-                let len = match next() % 8 {
+                let len = match next() % 16 {
                     0 => 0,
-                    1 | 2 => max,
-                    _ => u8::try_from(next() % (u64::from(max) + 1)).unwrap(),
+                    1 => max,
+                    2 => u8::try_from(next() % (u64::from(max) + 1)).unwrap(),
+                    _ => {
+                        let pick = palette[usize::try_from(next() % 4).unwrap()];
+                        u8::try_from(pick % (u64::from(max) + 1)).unwrap()
+                    }
                 };
                 let noise =
                     ((u128::from(next()) << 64) | u128::from(next())) >> (next() % 129).min(127);
                 let base = bases[usize::try_from(next() % 4).unwrap()];
                 let addr = to_addr(v6, base ^ noise);
                 let value = u8::try_from(next() % 8).unwrap();
+                let net = IpNetwork::new_truncate(addr, len).unwrap();
+                let before = lengths(&trie);
+                let mut cleared = false;
                 match next() % 16 {
-                    0..=8 => {
-                        let net = IpNetwork::new_truncate(addr, len).unwrap();
-                        assert_eq!(ours.insert(addr, len, value), trie.insert(net, value));
-                    }
-                    9..=12 => {
-                        let net = IpNetwork::new_truncate(addr, len).unwrap();
-                        assert_eq!(ours.remove_network(addr, len), trie.remove(net));
-                    }
+                    0..=8 => assert_eq!(ours.insert(addr, len, value), trie.insert(net, value)),
+                    9..=12 => assert_eq!(ours.remove_network(addr, len), trie.remove(net)),
                     13 => {
                         ours.remove(&|v| *v == value);
                         trie.retain(|_, v| *v != value);
@@ -839,6 +855,7 @@ mod tests {
                     14 if next() % 32 == 0 => {
                         ours.clear();
                         trie = IpNetworkTable::new();
+                        cleared = true;
                     }
                     _ => {
                         assert_eq!(ours.insert(addr, max + 1, value), None);
@@ -847,10 +864,16 @@ mod tests {
                 }
                 // A configuration change ends at random points, so lookups run on tables
                 // with and without pending rebuilds.
-                if next() % 2 == 0 {
+                if every_step || next() % 2 == 0 {
+                    let rebuilds = ours.rebuilds;
                     ours.commit();
+                    if every_step && !cleared {
+                        // Only a family whose set of lengths changed rebuilds, once.
+                        let after = lengths(&trie);
+                        let changed = (0..2).filter(|&f| before[f] != after[f]).count();
+                        assert_eq!(ours.rebuilds - rebuilds, changed);
+                    }
                 }
-                let net = IpNetwork::new_truncate(addr, len).unwrap();
                 assert_eq!(ours.get(addr, len), trie.exact_match(net));
                 assert_eq!(ours.is_empty(), trie.is_empty());
                 for probe in [addr, to_addr(v6, base), to_addr(!v6, base ^ noise)] {
@@ -860,19 +883,17 @@ mod tests {
                         "{probe}"
                     );
                 }
+                let expected: Vec<_> = trie
+                    .iter()
+                    .map(|(net, v)| (v, net.network_address(), net.netmask()))
+                    .collect();
+                assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
             }
-            let expected: Vec<_> = trie
-                .iter()
-                .map(|(net, v)| (v, net.network_address(), net.netmask()))
-                .collect();
-            assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
-            ours.commit();
-            assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
         }
     }
 
     #[test]
-    fn a_change_rebuilds_each_family_once() {
+    fn a_change_rebuilds_each_family_at_most_once() {
         use super::*;
 
         let v4 = |i: u32, len: u8| (IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes()), len);
@@ -910,33 +931,179 @@ mod tests {
             map.find(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])),
             Some(&2000)
         );
+        // The same load on a family that already uses every length: all in place.
+        for i in 10_000..20_000 {
+            let (addr, len) = v6(i, 128);
+            map.insert(addr, len, 1001);
+        }
+        for len in 0..128 {
+            let (addr, _) = v6(1 << 64, len);
+            map.insert(addr, len, u32::from(len) + 3000);
+        }
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(v6(19_999, 128).0), Some(&1001));
+        assert_eq!(map.find(v6(20_000, 128).0), Some(&2113));
+        assert_eq!(map.find(v6((1 << 64) | 1, 128).0), Some(&3127));
+        assert_eq!(map.find(v6(3 << 64, 128).0), Some(&3));
+        assert_eq!(map.find(v6(1 << 62, 128).0), Some(&2065));
 
         // A new value for a network changes no lookup level.
         map.insert(v4(5, 24).0, 24, 105);
         assert_eq!(map.commit(), 3);
         assert_eq!(map.find(v4(5, 32).0), Some(&105));
 
-        // Removing by value rebuilds the families that lost a network, once each.
+        // Removing by value leaves every length in use: in place.
         map.remove(&|v| *v == 6);
-        assert_eq!(map.commit(), 5);
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(v4(6, 32).0), None);
+        assert_eq!(map.find(v6((6 << 64) | 1, 128).0), Some(&3061));
+        // Removing the values of all /128 but one empties no length either.
         map.remove(&|v| *v == 1000);
-        assert_eq!(map.commit(), 6);
+        assert_eq!(map.commit(), 3);
         assert_eq!(map.find(v6(9999, 128).0), Some(&2114));
-        map.remove(&|v| *v == 1000);
-        assert_eq!(map.commit(), 6);
+        // The last /128 networks: one rebuild of their family.
+        map.remove(&|v| *v == 1001);
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(v6(19_999, 128).0), Some(&2113));
+        map.remove(&|v| *v == 1001);
+        assert_eq!(map.commit(), 4);
 
-        // Exact removes and inserts in one change, and a remove of no network.
+        // Exact removes at a length in use and an insert of a new length in one change.
         assert_eq!(map.remove_network(v4(7, 24).0, 24), Some(7));
         assert_eq!(map.remove_network(v4(7, 24).0, 24), None);
         map.insert(v4(7, 32).0, 32, 207);
-        assert_eq!(map.commit(), 7);
+        assert_eq!(map.commit(), 5);
         assert_eq!(map.find(v4(7, 32).0), Some(&207));
         assert_eq!(map.find(IpAddr::from([10, 0, 7, 1])), None);
 
         // Clearing leaves nothing to rebuild.
         map.clear();
         assert!(map.is_empty());
-        assert_eq!(map.commit(), 7);
+        assert_eq!(map.commit(), 5);
         assert_eq!(map.find(v4(5, 32).0), None);
+    }
+
+    #[test]
+    fn writes_at_lengths_in_use_rebuild_nothing() {
+        use super::*;
+
+        let v4 = |i: u32| IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes());
+        let v6 = |i: u128| IpAddr::from(((0xfd00_u128 << 112) | (i << 64)).to_be_bytes());
+        let mut map: AllowedIps<u32> = AllowedIps::new();
+        for i in 0..64 {
+            map.insert(v4(i), 24, i);
+            map.insert(v6(i.into()), 64, i);
+        }
+        // Shorter networks above them, so in-place writes change their best matches.
+        map.insert(IpAddr::from([10, 0, 0, 0]), 16, 100);
+        map.insert(IpAddr::from([10, 255, 0, 0]), 16, 101);
+        map.insert(v6(0), 16, 100);
+        assert_eq!(map.commit(), 2);
+
+        // An insert and a remove at a length in use, each its own change.
+        assert_eq!(map.insert(v4(100), 24, 200), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 100, 1])), Some(&200));
+        assert_eq!(map.insert(v6(100), 64, 200), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(v6(100)), Some(&200));
+        assert_eq!(map.remove_network(v4(100), 24), Some(200));
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 100, 1])), Some(&100));
+        assert_eq!(map.remove_network(v6(100), 64), Some(200));
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(v6(100)), Some(&100));
+
+        // The network above the others, out and back in place.
+        assert_eq!(
+            map.remove_network(IpAddr::from([10, 0, 0, 0]), 16),
+            Some(100)
+        );
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 200, 1])), None);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&5));
+        assert_eq!(map.insert(IpAddr::from([10, 0, 0, 0]), 16, 102), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 200, 1])), Some(&102));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&5));
+
+        // A new length: one rebuild of its family.
+        map.insert(IpAddr::from([10, 0, 5, 7]), 32, 300);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&300));
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&300));
+        // An emptied length: one rebuild.
+        assert_eq!(
+            map.remove_network(IpAddr::from([10, 0, 5, 7]), 32),
+            Some(300)
+        );
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&5));
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&5));
+
+        // Writes on a family with a pending rebuild only change its networks: one rebuild.
+        map.insert(IpAddr::from([10, 0, 5, 7]), 32, 301);
+        map.insert(v4(101), 24, 201);
+        assert_eq!(map.remove_network(v4(5), 24), Some(5));
+        assert_eq!(map.find(IpAddr::from([10, 0, 101, 1])), Some(&201));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&102));
+        assert_eq!(map.commit(), 5);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&301));
+        assert_eq!(map.find(IpAddr::from([10, 0, 101, 1])), Some(&201));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&102));
+    }
+
+    #[test]
+    fn remove_by_value_rebuilds_only_for_an_emptied_length() {
+        use super::*;
+
+        let v4 = |i: u32| IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes());
+        let v6 = |i: u128| IpAddr::from(((0xfd00_u128 << 112) | (i << 64)).to_be_bytes());
+        let mut map: AllowedIps<u32> = AllowedIps::new();
+        for i in 0..64 {
+            map.insert(v4(i), 24, i % 4);
+            map.insert(v6(i.into()), 64, i % 4);
+        }
+        map.insert(IpAddr::from([10, 0, 0, 0]), 16, 10);
+        map.insert(IpAddr::from([10, 0, 0, 1]), 32, 11);
+        map.insert(v6(0), 16, 10);
+        map.insert(IpAddr::from([0xfd01, 0, 0, 0, 0, 0, 0, 0]), 16, 12);
+        assert_eq!(map.commit(), 2);
+
+        // One value's networks leave every length in use: in place in both families.
+        map.remove(&|v| *v == 1);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 1, 1])), Some(&10));
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&2));
+        assert_eq!(map.find(v6(1)), Some(&10));
+        assert_eq!(map.find(v6(2)), Some(&2));
+        // A value without networks.
+        map.remove(&|v| *v == 99);
+        assert_eq!(map.commit(), 2);
+        // The last network of a length: one rebuild of its family.
+        map.remove(&|v| *v == 11);
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(IpAddr::from([10, 0, 0, 1])), Some(&0));
+        // A length emptied in one family, kept in the other: one rebuild.
+        map.remove(&|v| *v == 10);
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(IpAddr::from([10, 0, 1, 1])), None);
+        assert_eq!(map.find(v6(1)), None);
+        assert_eq!(
+            map.find(IpAddr::from([0xfd01, 0, 0, 0, 0, 0, 0, 1])),
+            Some(&12)
+        );
+        // On a family with a pending rebuild: that one rebuild.
+        map.insert(IpAddr::from([10, 0, 0, 0]), 8, 13);
+        map.remove(&|v| *v == 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&13));
+        assert_eq!(map.commit(), 5);
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&13));
+        assert_eq!(map.find(IpAddr::from([10, 0, 3, 1])), Some(&3));
+        // Lengths emptied in both families: one rebuild each.
+        map.remove(&|v| *v != 13);
+        assert_eq!(map.commit(), 7);
+        assert_eq!(map.find(IpAddr::from([10, 0, 3, 1])), Some(&13));
+        assert_eq!(map.find(v6(3)), None);
     }
 }

@@ -1604,14 +1604,15 @@ mod tests {
         assert_eq!(rebuilds(&table), 5);
         assert_eq!(table.by_destination(ip("fd01::5")), Some(peer_b));
         assert_eq!(table.by_destination(ip("fd00::1")), Some(peer_a));
-        // A removed peer's networks go in one change.
+        // A removed peer's networks go in one change: IPv4 loses its last /8 and rebuilds,
+        // IPv6 keeps a /16 and removes in place.
         assert_eq!(table.remove(LocalIdentityId::DEFAULT, &a), Some(peer_a));
-        assert_eq!(rebuilds(&table), 7);
+        assert_eq!(rebuilds(&table), 6);
         assert_eq!(table.by_destination(ip("fd00::1")), Some(peer_b));
         assert_eq!(table.by_destination(ip("10.0.0.1")), None);
         // Removing all peers leaves nothing to rebuild.
         table.clear();
-        assert_eq!(rebuilds(&table), 7);
+        assert_eq!(rebuilds(&table), 6);
         assert_eq!(table.by_destination(ip("fd01::5")), None);
     }
 
@@ -1634,13 +1635,14 @@ mod tests {
         assert_eq!(table.by_destination(ip("fd00::1")), Some(default_peer));
         assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
         let c = key();
+        // Networks of a length the merged trie uses go in place.
         let second_peer = add_ips_in(&mut table, second, c, &["10.0.1.0/24", "10.0.3.0/24"]);
-        assert_eq!(merged(&table), Some(3));
+        assert_eq!(merged(&table), Some(2));
         assert_eq!(table.by_destination(ip("10.0.1.1")), Some(second_peer));
-        // A removal re-fills the merged trie in the same change.
+        // A removal re-fills the merged trie in the same change, in place.
         assert_eq!(table.remove(second, &c), Some(second_peer));
         assert_eq!(rebuilds(&table, 2), 2);
-        assert_eq!(merged(&table), Some(4));
+        assert_eq!(merged(&table), Some(2));
         assert_eq!(table.by_destination(ip("10.0.1.1")), Some(first_peer));
         assert_eq!(table.by_destination(ip("10.0.3.1")), None);
 
@@ -1648,13 +1650,13 @@ mod tests {
         assert!(table.set_sources(first, &[net("100.64.0.0/16"), net("fd64::/16")]));
         assert_eq!(sources(&table), Some(2));
         assert!(table.set_sources(second, &[net("100.65.0.0/16")]));
-        assert_eq!(sources(&table), Some(3));
+        assert_eq!(sources(&table), Some(2));
         assert_eq!(table.source_identity(ip("100.65.0.1")), Some(second));
         assert!(!table.set_sources(second, &[net("100.64.0.0/16")]));
-        assert_eq!(sources(&table), Some(3));
-        // A removed identity's source set goes in one change.
+        assert_eq!(sources(&table), Some(2));
+        // A removed identity's source set goes in one change, in place.
         assert!(table.remove_identity(second));
-        assert_eq!(sources(&table), Some(4));
+        assert_eq!(sources(&table), Some(2));
         assert_eq!(table.source_identity(ip("100.65.0.1")), None);
         assert_eq!(table.source_identity(ip("fd64::1")), Some(first));
 
