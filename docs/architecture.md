@@ -264,6 +264,24 @@ lookup as before; with one identity there is one trie and no selection step.
 `remove_local_identity` drops the identity's trie and source set and re-fills what it owned
 in the merged trie; `ConfigChange::RemoveAllPeers` keeps the sets.
 
+Lookup structure: every trie (an identity's, the merged one, the source sets, a peer's inbound
+destinations) runs, per address family, a binary search on the prefix lengths in use
+(Waldvogel et al.): one hash table per length holds that length's networks and markers for the
+longer networks whose search passes it, each entry with its best match. A lookup takes at most
+`ceil(log2(L + 1))` hash probes for L lengths in use, so 6 for IPv4 and 8 for IPv6 whatever the
+number of networks. The hash tables use nsplane-packet's `KeyedState`: their keys are random,
+per table, and drawn anew at each rebuild. Memory per network is bounded by an ordered-map
+entry (<= 100 B), a value slot (<= 24 B) and up to 6 (IPv4) / 8 (IPv6) hash entries, the
+network and its markers, of <= 76 B each at the lowest load: <= 0.6 KB per IPv4 and <= 0.75 KB
+per IPv6 network, <= 5.8 / 7.3 MB for 10 k; networks with common leading bits share markers.
+Writes are deferred: a configuration change records its inserts and removals, and its end
+rebuilds each family it touched once (O(n log L)): 0.9 ms (IPv4) / 1.5 ms (IPv6) for a 10 k
+family, 1.9 / 2.5 ms to load 10 k networks in one change. The core thread pays the rebuild, so
+a change to a 10 k-network table pauses that core's data path for a few ms, and loading N
+networks as N separate changes pays N rebuilds (4.3 / 7.7 s for 10 k). Every configuration
+entry point rebuilds before it returns, so the data path never meets pending writes; a lookup
+during them would stay exact, probing every length.
+
 Dispatch: with the default identity alone, an initiation takes the single
 mac1 check as before. With two or more keyed identities, or a restricted one, an initiation
 goes to the first identity, in id order, that serves the arrival transport and whose mac1 key
