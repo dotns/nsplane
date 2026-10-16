@@ -15,10 +15,13 @@ use nsplane_packet::hash::KeyedState;
 /// (6 for IPv4, 8 for IPv6). The hash tables are [`KeyedState`] maps, keyed with fresh random
 /// words each time a family is built, so keys differ per table and per rebuild.
 ///
-/// Writes are deferred: `insert`, `remove_network` and `remove` change the networks and mark
-/// their family dirty, and [`AllowedIps::commit`] rebuilds each dirty family once. A
-/// configuration change that ends in one commit costs at most one rebuild per family. Lookups
-/// stay exact on a dirty family, probing every prefix length of the networks, longest first.
+/// A write at a prefix length in use updates the levels in place: the network, its markers
+/// and the best matches of the markers below it. One that adds the first or removes the last
+/// network of a length changes the search itself, so it marks the family dirty, and
+/// [`AllowedIps::commit`] rebuilds each dirty family once; until then writes to a dirty family
+/// only change its networks. A configuration change that ends in one commit costs at most one
+/// rebuild per family. Lookups stay exact on a dirty family, probing every prefix length of
+/// the networks, longest first.
 pub(crate) struct AllowedIps<D> {
     v4: Table<D>,
     v6: Table<D>,
@@ -26,20 +29,38 @@ pub(crate) struct AllowedIps<D> {
     pub(crate) rebuilds: usize,
 }
 
+/// A network or a marker in the level of one prefix length.
+struct Entry {
+    /// The slot and length of its best match: the longest network of this length or shorter
+    /// that contains the bits. A network's own entry is the one whose best match has the
+    /// length of the level.
+    best: Option<(u32, u8)>,
+    /// How many longer networks place a marker here.
+    markers: u32,
+}
+
+impl Entry {
+    const EMPTY: Self = Self {
+        best: None,
+        markers: 0,
+    };
+}
+
 /// The networks and markers of one prefix length.
 struct Level {
     len: u8,
     /// The network bits of `len`, left-aligned.
     mask: u128,
-    /// Networks and markers by their left-aligned bits, each with the slot of its best
-    /// match: the longest network of this length or shorter that contains the bits.
-    entries: HashMap<u128, Option<u32>, KeyedState>,
+    /// The networks of exactly this length.
+    networks: usize,
+    /// Networks and markers by their left-aligned bits.
+    entries: HashMap<u128, Entry, KeyedState>,
 }
 
 /// The networks of one address family.
 struct Table<D> {
-    /// The lengths in use at the last rebuild, ascending: the binary search runs over this
-    /// list.
+    /// The lengths in use, ascending: the binary search runs over this list. Up to date
+    /// unless `dirty`.
     levels: Vec<Level>,
     /// The networks, `(bits, len)` to their slot.
     networks: BTreeMap<(u128, u8), u32>,
@@ -47,7 +68,7 @@ struct Table<D> {
     values: Vec<Option<D>>,
     /// Free slots in `values`.
     free: Vec<u32>,
-    /// Whether `networks` changed since the last rebuild, so `levels` are out of date.
+    /// Whether the lengths in use changed since the last rebuild, so `levels` are out of date.
     dirty: bool,
 }
 
@@ -114,10 +135,10 @@ impl<D> Table<D> {
             .ok()
     }
 
-    /// The slot of the longest network that contains `bits`, among the levels below `limit`:
-    /// the search runs over all levels and takes those from `limit` on as empty, so it meets
-    /// the markers where they are placed.
-    fn search(&self, bits: u128, limit: usize) -> Option<u32> {
+    /// The slot and length of the longest network that contains `bits`, among the levels
+    /// below `limit`: the search runs over all levels and takes those from `limit` on as
+    /// empty, so it meets the markers where they are placed.
+    fn search(&self, bits: u128, limit: usize) -> Option<(u32, u8)> {
         let (mut lo, mut hi) = (0, self.levels.len());
         let mut best = None;
         while lo < hi {
@@ -129,7 +150,7 @@ impl<D> Table<D> {
                 .and_then(|level| level.entries.get(&(bits & level.mask)));
             match entry {
                 Some(entry) => {
-                    best = entry.or(best);
+                    best = entry.best.or(best);
                     lo = mid + 1;
                 }
                 None => hi = mid,
@@ -145,7 +166,7 @@ impl<D> Table<D> {
                 .rev()
                 .find_map(|len| self.networks.get(&(bits & mask(len), len)).copied())?
         } else {
-            self.search(bits, usize::MAX)?
+            self.search(bits, usize::MAX)?.0
         };
         self.values.get(usize::try_from(slot).ok()?)?.as_ref()
     }
@@ -174,34 +195,159 @@ impl<D> Table<D> {
             slot
         };
         self.networks.insert((net, len), slot);
-        self.dirty = true;
+        if !self.dirty {
+            match self.level(len) {
+                Some(t) => self.place(net, t, slot),
+                None => self.dirty = true,
+            }
+        }
         None
     }
 
+    /// Adds network `net` of level `t`, stored in `slot`, to the levels.
+    fn place(&mut self, net: u128, t: usize, slot: u32) {
+        for mid in path(self.levels.len(), t) {
+            let Some(key) = self.levels.get(mid).map(|level| net & level.mask) else {
+                continue;
+            };
+            if let Some(entry) = self
+                .levels
+                .get_mut(mid)
+                .and_then(|level| level.entries.get_mut(&key))
+            {
+                entry.markers += 1;
+                continue;
+            }
+            let best = self.search(key, mid);
+            if let Some(level) = self.levels.get_mut(mid) {
+                level.entries.insert(key, Entry { best, markers: 1 });
+            }
+        }
+        let Some(level) = self.levels.get_mut(t) else {
+            return;
+        };
+        let len = level.len;
+        let best = Some((slot, len));
+        level.networks += 1;
+        level.entries.entry(net).or_insert(Entry::EMPTY).best = best;
+        // The markers below the network that matched a shorter one now match it.
+        self.rematch(net, t, best, |old| old.is_none_or(|(_, old)| old < len));
+    }
+
     fn remove_network(&mut self, bits: u128, len: u8) -> Option<D> {
-        let slot = self.networks.remove(&(bits & mask(len), len))?;
+        let net = bits & mask(len);
+        let slot = self.networks.remove(&(net, len))?;
         self.free.push(slot);
-        self.dirty = true;
+        if !self.dirty {
+            self.unplace(net, len, slot);
+        }
         self.value_mut(slot)?.take()
     }
 
-    fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
-        let values = &mut self.values;
-        let free = &mut self.free;
-        let mut removed = false;
-        self.networks.retain(|_, slot| {
-            let Some(value) = usize::try_from(*slot).ok().and_then(|i| values.get_mut(i)) else {
-                return false;
-            };
-            if value.as_ref().is_some_and(predicate) {
-                *value = None;
-                free.push(*slot);
-                removed = true;
-                return false;
+    /// Takes network `net/len`, stored in `slot` and already out of the networks, out of the
+    /// levels; the last network of a length marks the family dirty instead.
+    fn unplace(&mut self, net: u128, len: u8, slot: u32) {
+        let Some(t) = self
+            .level(len)
+            .filter(|&t| self.levels.get(t).is_some_and(|level| level.networks > 1))
+        else {
+            self.dirty = true;
+            return;
+        };
+        let next = self.search(net, t);
+        if let Some(level) = self.levels.get_mut(t) {
+            level.networks -= 1;
+            if let Some(entry) = level.entries.get_mut(&net) {
+                entry.best = next;
+                if entry.markers == 0 {
+                    level.entries.remove(&net);
+                }
             }
-            true
-        });
-        self.dirty |= removed;
+        }
+        for mid in path(self.levels.len(), t) {
+            let Some(level) = self.levels.get_mut(mid) else {
+                continue;
+            };
+            let key = net & level.mask;
+            if let Some(entry) = level.entries.get_mut(&key) {
+                entry.markers -= 1;
+                if entry.markers == 0 && entry.best.is_none_or(|(_, best)| best != level.len) {
+                    level.entries.remove(&key);
+                }
+            }
+        }
+        // The markers below the network that matched it now match the next shorter one.
+        let removed = Some((slot, len));
+        self.rematch(net, t, next, |old| old == removed);
+    }
+
+    /// Sets the best match of the markers above level `t` inside `net` to `best` where
+    /// `stale` holds for it. Those markers are on the paths of the longer networks inside
+    /// `net`.
+    fn rematch(
+        &mut self,
+        net: u128,
+        t: usize,
+        best: Option<(u32, u8)>,
+        stale: impl Fn(Option<(u32, u8)>) -> bool,
+    ) {
+        let Some(len) = self.levels.get(t).map(|level| level.len) else {
+            return;
+        };
+        let count = self.levels.len();
+        let Self {
+            levels, networks, ..
+        } = self;
+        // Every network in this range is longer than `len`.
+        for &(sub, sub_len) in networks
+            .range((net, len + 1)..=(net | !mask(len), u8::MAX))
+            .map(|(key, _)| key)
+        {
+            let Ok(sub_t) = levels.binary_search_by_key(&sub_len, |level| level.len) else {
+                continue;
+            };
+            for mid in path(count, sub_t).filter(|&mid| mid > t) {
+                let Some(level) = levels.get_mut(mid) else {
+                    continue;
+                };
+                if let Some(entry) = level.entries.get_mut(&(sub & level.mask))
+                    && stale(entry.best)
+                {
+                    entry.best = best;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
+        let removed: Vec<(u128, u8)> = self
+            .networks
+            .iter()
+            .filter(|&(_, &slot)| {
+                usize::try_from(slot)
+                    .ok()
+                    .and_then(|i| self.values.get(i)?.as_ref())
+                    .is_some_and(predicate)
+            })
+            .map(|(&key, _)| key)
+            .collect();
+        if !self.dirty {
+            // In place, unless the networks are the last of a length.
+            let mut counts = [0_usize; 129];
+            for &(_, len) in &removed {
+                if let Some(count) = counts.get_mut(usize::from(len)) {
+                    *count += 1;
+                }
+            }
+            self.dirty = self.levels.iter().any(|level| {
+                counts
+                    .get(usize::from(level.len))
+                    .is_some_and(|&count| count >= level.networks)
+            });
+        }
+        for (net, len) in removed {
+            self.remove_network(net, len);
+        }
     }
 
     /// Rebuilds the levels from the networks.
@@ -214,6 +360,7 @@ impl<D> Table<D> {
             .map(|len| Level {
                 len,
                 mask: mask(len),
+                networks: 0,
                 entries: HashMap::default(),
             })
             .collect();
@@ -227,11 +374,16 @@ impl<D> Table<D> {
             };
             for mid in path(count, t) {
                 if let Some(level) = self.levels.get_mut(mid) {
-                    level.entries.entry(net & level.mask).or_insert(None);
+                    level
+                        .entries
+                        .entry(net & level.mask)
+                        .or_insert(Entry::EMPTY)
+                        .markers += 1;
                 }
             }
             if let Some(level) = self.levels.get_mut(t) {
-                level.entries.insert(net, Some(slot));
+                level.networks += 1;
+                level.entries.entry(net).or_insert(Entry::EMPTY).best = Some((slot, len));
             }
         }
         for mid in 0..count {
@@ -242,7 +394,7 @@ impl<D> Table<D> {
                     level
                         .entries
                         .iter()
-                        .filter(|(_, best)| best.is_none())
+                        .filter(|(_, entry)| entry.best.is_none())
                         .map(|(&key, _)| key)
                         .collect()
                 })
@@ -254,7 +406,7 @@ impl<D> Table<D> {
                     .get_mut(mid)
                     .and_then(|level| level.entries.get_mut(&key))
                 {
-                    *entry = best;
+                    entry.best = best;
                 }
             }
         }
@@ -374,8 +526,8 @@ impl<D> AllowedIps<D> {
         self.v6.remove(predicate);
     }
 
-    /// Rebuilds each family written since the last commit, once, and returns
-    /// [`rebuilds`](Self::rebuilds). The end of every configuration change calls it.
+    /// Rebuilds each dirty family, once, and returns [`rebuilds`](Self::rebuilds). The end of
+    /// every configuration change calls it.
     pub(crate) fn commit(&mut self) -> usize {
         for table in [&mut self.v4, &mut self.v6] {
             if table.dirty {
@@ -785,6 +937,7 @@ mod tests {
         use super::*;
         use ip_network::IpNetwork;
         use ip_network_table::IpNetworkTable;
+        use std::collections::BTreeSet;
 
         // splitmix64 with a fixed seed: every run checks the same tables.
         let mut state = 0x6e73_706c_616e_6532_u64;
@@ -802,6 +955,14 @@ mod tests {
                 IpAddr::from(u32::try_from(bits >> 96).unwrap().to_be_bytes())
             }
         };
+        // The prefix lengths in use, per family.
+        let lengths = |trie: &IpNetworkTable<u8>| -> [BTreeSet<u8>; 2] {
+            let mut lengths = [BTreeSet::new(), BTreeSet::new()];
+            for (net, _) in trie.iter() {
+                lengths[usize::from(net.network_address().is_ipv6())].insert(net.netmask());
+            }
+            lengths
+        };
         for round in 0..300 {
             let mut ours: AllowedIps<u8> = AllowedIps::new();
             let mut trie: IpNetworkTable<u8> = IpNetworkTable::new();
@@ -809,29 +970,36 @@ mod tests {
             let bases: Vec<u128> = (0..4)
                 .map(|_| (u128::from(next()) << 64) | u128::from(next()))
                 .collect();
-            let steps = if round % 10 == 0 { 2000 } else { 200 };
+            // Most networks take one of a few lengths, so most writes hit a length in use
+            // and update the levels in place.
+            let palette: Vec<u64> = (0..4).map(|_| next()).collect();
+            // A third of the rounds end a configuration change after every step, so every
+            // write starts on a table without pending rebuilds.
+            let every_step = round % 3 == 0;
+            let steps = if round % 10 == 1 { 1000 } else { 200 };
             for _ in 0..steps {
                 let v6 = next() % 2 == 1;
                 let max: u8 = if v6 { 128 } else { 32 };
-                let len = match next() % 8 {
+                let len = match next() % 16 {
                     0 => 0,
-                    1 | 2 => max,
-                    _ => u8::try_from(next() % (u64::from(max) + 1)).unwrap(),
+                    1 => max,
+                    2 => u8::try_from(next() % (u64::from(max) + 1)).unwrap(),
+                    _ => {
+                        let pick = palette[usize::try_from(next() % 4).unwrap()];
+                        u8::try_from(pick % (u64::from(max) + 1)).unwrap()
+                    }
                 };
                 let noise =
                     ((u128::from(next()) << 64) | u128::from(next())) >> (next() % 129).min(127);
                 let base = bases[usize::try_from(next() % 4).unwrap()];
                 let addr = to_addr(v6, base ^ noise);
                 let value = u8::try_from(next() % 8).unwrap();
+                let net = IpNetwork::new_truncate(addr, len).unwrap();
+                let before = lengths(&trie);
+                let mut cleared = false;
                 match next() % 16 {
-                    0..=8 => {
-                        let net = IpNetwork::new_truncate(addr, len).unwrap();
-                        assert_eq!(ours.insert(addr, len, value), trie.insert(net, value));
-                    }
-                    9..=12 => {
-                        let net = IpNetwork::new_truncate(addr, len).unwrap();
-                        assert_eq!(ours.remove_network(addr, len), trie.remove(net));
-                    }
+                    0..=8 => assert_eq!(ours.insert(addr, len, value), trie.insert(net, value)),
+                    9..=12 => assert_eq!(ours.remove_network(addr, len), trie.remove(net)),
                     13 => {
                         ours.remove(&|v| *v == value);
                         trie.retain(|_, v| *v != value);
@@ -839,6 +1007,7 @@ mod tests {
                     14 if next() % 32 == 0 => {
                         ours.clear();
                         trie = IpNetworkTable::new();
+                        cleared = true;
                     }
                     _ => {
                         assert_eq!(ours.insert(addr, max + 1, value), None);
@@ -847,10 +1016,16 @@ mod tests {
                 }
                 // A configuration change ends at random points, so lookups run on tables
                 // with and without pending rebuilds.
-                if next() % 2 == 0 {
+                if every_step || next() % 2 == 0 {
+                    let rebuilds = ours.rebuilds;
                     ours.commit();
+                    if every_step && !cleared {
+                        // Only a family whose set of lengths changed rebuilds, once.
+                        let after = lengths(&trie);
+                        let changed = (0..2).filter(|&f| before[f] != after[f]).count();
+                        assert_eq!(ours.rebuilds - rebuilds, changed);
+                    }
                 }
-                let net = IpNetwork::new_truncate(addr, len).unwrap();
                 assert_eq!(ours.get(addr, len), trie.exact_match(net));
                 assert_eq!(ours.is_empty(), trie.is_empty());
                 for probe in [addr, to_addr(v6, base), to_addr(!v6, base ^ noise)] {
@@ -860,19 +1035,17 @@ mod tests {
                         "{probe}"
                     );
                 }
+                let expected: Vec<_> = trie
+                    .iter()
+                    .map(|(net, v)| (v, net.network_address(), net.netmask()))
+                    .collect();
+                assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
             }
-            let expected: Vec<_> = trie
-                .iter()
-                .map(|(net, v)| (v, net.network_address(), net.netmask()))
-                .collect();
-            assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
-            ours.commit();
-            assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
         }
     }
 
     #[test]
-    fn a_change_rebuilds_each_family_once() {
+    fn a_change_rebuilds_each_family_at_most_once() {
         use super::*;
 
         let v4 = |i: u32, len: u8| (IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes()), len);
@@ -910,33 +1083,179 @@ mod tests {
             map.find(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])),
             Some(&2000)
         );
+        // The same load on a family that already uses every length: all in place.
+        for i in 10_000..20_000 {
+            let (addr, len) = v6(i, 128);
+            map.insert(addr, len, 1001);
+        }
+        for len in 0..128 {
+            let (addr, _) = v6(1 << 64, len);
+            map.insert(addr, len, u32::from(len) + 3000);
+        }
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(v6(19_999, 128).0), Some(&1001));
+        assert_eq!(map.find(v6(20_000, 128).0), Some(&2113));
+        assert_eq!(map.find(v6((1 << 64) | 1, 128).0), Some(&3127));
+        assert_eq!(map.find(v6(3 << 64, 128).0), Some(&3));
+        assert_eq!(map.find(v6(1 << 62, 128).0), Some(&2065));
 
         // A new value for a network changes no lookup level.
         map.insert(v4(5, 24).0, 24, 105);
         assert_eq!(map.commit(), 3);
         assert_eq!(map.find(v4(5, 32).0), Some(&105));
 
-        // Removing by value rebuilds the families that lost a network, once each.
+        // Removing by value leaves every length in use: in place.
         map.remove(&|v| *v == 6);
-        assert_eq!(map.commit(), 5);
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(v4(6, 32).0), None);
+        assert_eq!(map.find(v6((6 << 64) | 1, 128).0), Some(&3061));
+        // Removing the values of all /128 but one empties no length either.
         map.remove(&|v| *v == 1000);
-        assert_eq!(map.commit(), 6);
+        assert_eq!(map.commit(), 3);
         assert_eq!(map.find(v6(9999, 128).0), Some(&2114));
-        map.remove(&|v| *v == 1000);
-        assert_eq!(map.commit(), 6);
+        // The last /128 networks: one rebuild of their family.
+        map.remove(&|v| *v == 1001);
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(v6(19_999, 128).0), Some(&2113));
+        map.remove(&|v| *v == 1001);
+        assert_eq!(map.commit(), 4);
 
-        // Exact removes and inserts in one change, and a remove of no network.
+        // Exact removes at a length in use and an insert of a new length in one change.
         assert_eq!(map.remove_network(v4(7, 24).0, 24), Some(7));
         assert_eq!(map.remove_network(v4(7, 24).0, 24), None);
         map.insert(v4(7, 32).0, 32, 207);
-        assert_eq!(map.commit(), 7);
+        assert_eq!(map.commit(), 5);
         assert_eq!(map.find(v4(7, 32).0), Some(&207));
         assert_eq!(map.find(IpAddr::from([10, 0, 7, 1])), None);
 
         // Clearing leaves nothing to rebuild.
         map.clear();
         assert!(map.is_empty());
-        assert_eq!(map.commit(), 7);
+        assert_eq!(map.commit(), 5);
         assert_eq!(map.find(v4(5, 32).0), None);
+    }
+
+    #[test]
+    fn writes_at_lengths_in_use_rebuild_nothing() {
+        use super::*;
+
+        let v4 = |i: u32| IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes());
+        let v6 = |i: u128| IpAddr::from(((0xfd00_u128 << 112) | (i << 64)).to_be_bytes());
+        let mut map: AllowedIps<u32> = AllowedIps::new();
+        for i in 0..64 {
+            map.insert(v4(i), 24, i);
+            map.insert(v6(i.into()), 64, i);
+        }
+        // Shorter networks above them, so in-place writes change their best matches.
+        map.insert(IpAddr::from([10, 0, 0, 0]), 16, 100);
+        map.insert(IpAddr::from([10, 255, 0, 0]), 16, 101);
+        map.insert(v6(0), 16, 100);
+        assert_eq!(map.commit(), 2);
+
+        // An insert and a remove at a length in use, each its own change.
+        assert_eq!(map.insert(v4(100), 24, 200), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 100, 1])), Some(&200));
+        assert_eq!(map.insert(v6(100), 64, 200), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(v6(100)), Some(&200));
+        assert_eq!(map.remove_network(v4(100), 24), Some(200));
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 100, 1])), Some(&100));
+        assert_eq!(map.remove_network(v6(100), 64), Some(200));
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(v6(100)), Some(&100));
+
+        // The network above the others, out and back in place.
+        assert_eq!(
+            map.remove_network(IpAddr::from([10, 0, 0, 0]), 16),
+            Some(100)
+        );
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 200, 1])), None);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&5));
+        assert_eq!(map.insert(IpAddr::from([10, 0, 0, 0]), 16, 102), None);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 200, 1])), Some(&102));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&5));
+
+        // A new length: one rebuild of its family.
+        map.insert(IpAddr::from([10, 0, 5, 7]), 32, 300);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&300));
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&300));
+        // An emptied length: one rebuild.
+        assert_eq!(
+            map.remove_network(IpAddr::from([10, 0, 5, 7]), 32),
+            Some(300)
+        );
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&5));
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&5));
+
+        // Writes on a family with a pending rebuild only change its networks: one rebuild.
+        map.insert(IpAddr::from([10, 0, 5, 7]), 32, 301);
+        map.insert(v4(101), 24, 201);
+        assert_eq!(map.remove_network(v4(5), 24), Some(5));
+        assert_eq!(map.find(IpAddr::from([10, 0, 101, 1])), Some(&201));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&102));
+        assert_eq!(map.commit(), 5);
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 7])), Some(&301));
+        assert_eq!(map.find(IpAddr::from([10, 0, 101, 1])), Some(&201));
+        assert_eq!(map.find(IpAddr::from([10, 0, 5, 1])), Some(&102));
+    }
+
+    #[test]
+    fn remove_by_value_rebuilds_only_for_an_emptied_length() {
+        use super::*;
+
+        let v4 = |i: u32| IpAddr::from((0x0a00_0000 | (i << 8)).to_be_bytes());
+        let v6 = |i: u128| IpAddr::from(((0xfd00_u128 << 112) | (i << 64)).to_be_bytes());
+        let mut map: AllowedIps<u32> = AllowedIps::new();
+        for i in 0..64 {
+            map.insert(v4(i), 24, i % 4);
+            map.insert(v6(i.into()), 64, i % 4);
+        }
+        map.insert(IpAddr::from([10, 0, 0, 0]), 16, 10);
+        map.insert(IpAddr::from([10, 0, 0, 1]), 32, 11);
+        map.insert(v6(0), 16, 10);
+        map.insert(IpAddr::from([0xfd01, 0, 0, 0, 0, 0, 0, 0]), 16, 12);
+        assert_eq!(map.commit(), 2);
+
+        // One value's networks leave every length in use: in place in both families.
+        map.remove(&|v| *v == 1);
+        assert_eq!(map.commit(), 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 1, 1])), Some(&10));
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&2));
+        assert_eq!(map.find(v6(1)), Some(&10));
+        assert_eq!(map.find(v6(2)), Some(&2));
+        // A value without networks.
+        map.remove(&|v| *v == 99);
+        assert_eq!(map.commit(), 2);
+        // The last network of a length: one rebuild of its family.
+        map.remove(&|v| *v == 11);
+        assert_eq!(map.commit(), 3);
+        assert_eq!(map.find(IpAddr::from([10, 0, 0, 1])), Some(&0));
+        // A length emptied in one family, kept in the other: one rebuild.
+        map.remove(&|v| *v == 10);
+        assert_eq!(map.commit(), 4);
+        assert_eq!(map.find(IpAddr::from([10, 0, 1, 1])), None);
+        assert_eq!(map.find(v6(1)), None);
+        assert_eq!(
+            map.find(IpAddr::from([0xfd01, 0, 0, 0, 0, 0, 0, 1])),
+            Some(&12)
+        );
+        // On a family with a pending rebuild: that one rebuild.
+        map.insert(IpAddr::from([10, 0, 0, 0]), 8, 13);
+        map.remove(&|v| *v == 2);
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&13));
+        assert_eq!(map.commit(), 5);
+        assert_eq!(map.find(IpAddr::from([10, 0, 2, 1])), Some(&13));
+        assert_eq!(map.find(IpAddr::from([10, 0, 3, 1])), Some(&3));
+        // Lengths emptied in both families: one rebuild each.
+        map.remove(&|v| *v != 13);
+        assert_eq!(map.commit(), 7);
+        assert_eq!(map.find(IpAddr::from([10, 0, 3, 1])), Some(&13));
+        assert_eq!(map.find(v6(3)), None);
     }
 }

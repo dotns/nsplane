@@ -275,13 +275,21 @@ per table, and drawn anew at each rebuild. Memory per network is bounded by an o
 entry (<= 100 B), a value slot (<= 24 B) and up to 6 (IPv4) / 8 (IPv6) hash entries, the
 network and its markers, of <= 76 B each at the lowest load: <= 0.6 KB per IPv4 and <= 0.75 KB
 per IPv6 network, <= 5.8 / 7.3 MB for 10 k; networks with common leading bits share markers.
-Writes are deferred: a configuration change records its inserts and removals, and its end
-rebuilds each family it touched once (O(n log L)): 0.9 ms (IPv4) / 1.5 ms (IPv6) for a 10 k
-family, 1.9 / 2.5 ms to load 10 k networks in one change. The core thread pays the rebuild, so
-a change to a 10 k-network table pauses that core's data path for a few ms, and loading N
-networks as N separate changes pays N rebuilds (4.3 / 7.7 s for 10 k). Every configuration
-entry point rebuilds before it returns, so the data path never meets pending writes; a lookup
-during them would stay exact, probing every length.
+A write at a prefix length already in use updates the structure in place: the network, its
+reference-counted markers and the best match of the markers below it. An insert and a remove
+on a 10 k table, each its own change, take 0.25 µs (IPv4) / 0.31 µs (IPv6) together. Removing
+one value's networks (a removed peer, or the old list a SetAllowedIps replacement drops) is in
+place too while every length stays in use: 52 µs per change at 10 k, mostly the scan for the
+value; draining a 10 k table of 1 k peers one peer per change averages 8 / 10 µs per change.
+Only the first network of a new length or the last one of a length, also through a remove by
+value, changes the search: it marks the family for one rebuild (O(n log L)) at the end of the
+change, 0.9 ms (IPv4) / 1.5 ms (IPv6) for a 10 k family; loading 10 k networks in one change
+takes 1.9 / 2.5 ms. A change thus rebuilds each family at most once, and loading 10 k networks
+as 10 k separate changes takes 3.0 / 5.5 ms, rebuilding only as lengths first appear. The core
+thread pays the writes: a change at lengths in use pauses that core's data path for
+microseconds, one that adds or empties a length on a 10 k-network table for about 1 / 1.5 ms
+per family rebuilt. Every configuration entry point commits before it returns, so the data
+path never meets a pending rebuild; a lookup during one would stay exact, probing every length.
 On top of the tries, each core keeps a route cache of 64 direct-mapped entries for each of
 the routes of destinations, the routes of (source, destination) pairs with source sets (so a
 known flow skips the source-set lookup) and the sources accepted from peers: about 6.7 KB,

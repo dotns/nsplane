@@ -3,11 +3,13 @@
 //! but outside every prefix (`near`: the prefix with its last network bit flipped, so a lookup
 //! descends as far as the prefix before it fails); each case cycles over
 //! `LOOKUPS` addresses and reports the time of one `find`. The write cases report building a
-//! 10 k table with `insert` in one configuration change (`build`) and in one change per network
-//! (`build_per_change`), one `insert` and `remove_network` of a new prefix on a 10 k table, each
-//! its own change (`insert_remove`; `insert_remove_new_len` with a /1, a prefix length the table
-//! does not use yet), and removing one value's entries from a 10 k table with `remove`
-//! (`remove_value`). A change ends with `commit`, see [`Commit`].
+//! 10 k table with `insert` in one configuration change (`build`) and 1 k and 10 k tables in one
+//! change per network (`build_per_change`), one `insert` and `remove_network` of a new prefix on
+//! a 10 k table, each its own change (`insert_remove`; `insert_remove_new_len` with a /1, a
+//! prefix length the table does not use yet), removing one value's entries from a 10 k table
+//! with `remove` (`remove_value`), and emptying a 10 k table of 1 k values (10 networks each)
+//! one value per change (`remove_peer_per_change`). A change ends with `commit`, see
+//! [`Commit`].
 //!
 //! Tables come from a fixed-seed generator: prefixes of mixed length (IPv4 /8../32, IPv6
 //! /32../128, a quarter of them host routes), all with the top address bit clear, so an
@@ -32,6 +34,8 @@ const VALUES: u32 = 100;
 const SIZES: [(usize, &str); 4] = [(1, "1"), (16, "16"), (1000, "1k"), (10_000, "10k")];
 /// Table size of the write cases.
 const WRITE_SIZE: usize = 10_000;
+/// Networks per value in `remove_peer_per_change`.
+const PEER_NETWORKS: usize = 10;
 /// The top address bit: clear in every inserted prefix, set in every miss address.
 const TOP_BIT: u128 = 1 << 127;
 
@@ -233,13 +237,41 @@ fn find(c: &mut Criterion) {
         group.bench_function(format!("build/{}/10k", family.id()), |b| {
             b.iter_with_large_drop(|| build(family, black_box(&prefixes)));
         });
-        // Up to a rebuild per network: seconds per build, so ten single builds.
+        // Up to a rebuild per network where every write rebuilds: seconds per build, so ten
+        // single builds.
         group.sample_size(10).sampling_mode(SamplingMode::Flat);
-        group.bench_function(format!("build_per_change/{}/10k", family.id()), |b| {
-            b.iter_with_large_drop(|| build_per_change(family, black_box(&prefixes)));
+        for (n, id) in [(1000, "1k"), (WRITE_SIZE, "10k")] {
+            let prefixes = &prefixes[..n];
+            group.bench_function(format!("build_per_change/{}/{id}", family.id()), |b| {
+                b.iter_with_large_drop(|| build_per_change(family, black_box(prefixes)));
+            });
+            check(family, &build_per_change(family, prefixes), prefixes);
+        }
+        // Up to a rebuild per value where every remove by value rebuilds.
+        group.bench_function(format!("remove_peer_per_change/{}/10k", family.id()), |b| {
+            b.iter_batched(
+                || {
+                    let mut table = AllowedIps::new();
+                    for (i, &(net, len)) in prefixes.iter().enumerate() {
+                        let peer = u32::try_from(i / PEER_NETWORKS).unwrap_or(u32::MAX);
+                        table.insert(family.addr(net), len, peer);
+                    }
+                    table.commit();
+                    table
+                },
+                |mut table| {
+                    for peer in 0..WRITE_SIZE / PEER_NETWORKS {
+                        let peer = u32::try_from(peer).unwrap_or(u32::MAX);
+                        table.remove(&|&v| v == black_box(peer));
+                        table.commit();
+                    }
+                    assert!(table.is_empty());
+                    table
+                },
+                BatchSize::LargeInput,
+            );
         });
         group.sample_size(100).sampling_mode(SamplingMode::Auto);
-        check(family, &build_per_change(family, &prefixes), &prefixes);
 
         let (_, max) = family.lengths();
         let new = family.addr(rng.bits() | TOP_BIT);
