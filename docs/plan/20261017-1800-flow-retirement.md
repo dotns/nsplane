@@ -306,3 +306,23 @@ FL-B lands first; FL-C rebases on it (it only adds to `flow.rs` and the reassemb
   application only wanted the egress channel scrubbed; scrubbing it from `NetStackSource`
   after the driver is gone would need the fence logic without the driver.
 - No new dependency, no `unsafe`, no `#[allow]` / `#[expect]`.
+
+### L1 decision on the FL-A note (2026-10-17)
+
+Approved as written, amended as follows (binding for FL-B..FL-D):
+
+- **Q1**: the stack allocates the instance, the caller gives the domain (FL-C).
+- **Q2**: TCP output is identified by tuple + `[start, end)` window (accepted).
+- **Q3**: no RST on revoke; `abort()` keeps its RST. `revoke`'s rustdoc says the peer is not
+  told and times out on its own (or learns from the stateless RST on its next segment).
+- **Q4**: strictly additive: no new field in `NetStackStats`. Retirement drops are counted
+  by `NetStackHandle::retired_drops(&self) -> u64` (everything the stack discarded because
+  its flow was revoked).
+- **Q5**: FL-D adds a UDP netstack bench case.
+- **Q6**: `Unknown` after the driver stopped, never a false success.
+- **Condition 1**: the rustdoc of `FlowControl` and `RetirementReceipt` states the proof
+  boundary: the stack only; packets already taken from `NetStackSource` are not covered (R3).
+- **Condition 2**: `bind_context` binds once and late binding labels the existing
+  `FlowState` (FL-C implements it and its test); FL-B keeps queue tags referencing the
+  `FlowState`, not a copy of the context.
+- **Condition 3**: this subsection records the decision.
