@@ -1028,3 +1028,159 @@ fn source_recycle_reaches_inner() {
     let pooled: Vec<_> = pool.iter().map(PacketBuf::as_packet).collect();
     assert_eq!(pooled, [&[1][..], &[2]]);
 }
+
+// -- Nested routes (`Nat64LanConfig::nested_routes`). --
+
+const WIDE_SNAT: Ipv4Addr = Ipv4Addr::new(10, 9, 9, 9);
+/// A LAN host outside `route()`'s /24, reached through `wide()`.
+const FAR: Ipv4Addr = Ipv4Addr::new(10, 1, 2, 3);
+
+/// A /0 route in `route()`'s mapped /96.
+fn wide() -> LanRoute {
+    LanRoute::new(
+        (Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 7, 0, 0), 96),
+        (Ipv4Addr::UNSPECIFIED, 0),
+        WIDE_SNAT,
+    )
+    .unwrap()
+}
+
+fn nested(shared: LanRoutes) -> Nat64Lan {
+    let config = Nat64LanConfig {
+        nested_routes: true,
+        ..Nat64LanConfig::default()
+    };
+    Nat64Lan::new(shared, config)
+}
+
+/// A UDP request from `CLIENT:4321` to port 53 of the mapped `host`.
+fn udp_to(host: Ipv4Addr) -> PacketBuf {
+    PacketBuf::from_packet(&ipv6_bytes(
+        protocol::UDP,
+        CLIENT,
+        mapped(host),
+        udp(4321, 53, b"query"),
+    ))
+}
+
+/// Forwards a UDP request to `host`; returns the SNAT source and port.
+fn forward_to(lan: &Nat64Lan, host: Ipv4Addr) -> SocketAddrV4 {
+    let mut packet = udp_to(host);
+    assert_eq!(lan.forward(&mut packet), Nat64Verdict::Translated);
+    let bytes = packet.as_packet();
+    assert_eq!(&bytes[16..20], &host.octets());
+    let snat = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
+    SocketAddrV4::new(snat, be16(bytes, 20))
+}
+
+#[test]
+fn nested_routes_the_longest_real_prefix_wins() {
+    let lan = nested(routes(vec![wide(), route()]));
+    assert_eq!(*forward_to(&lan, HOST).ip(), SNAT);
+    // Outside the /24, the /0 route decides.
+    assert_eq!(*forward_to(&lan, FAR).ip(), WIDE_SNAT);
+    let stats = lan.stats();
+    assert_eq!((stats.forwarded, stats.ambiguous_route), (2, 0));
+}
+
+#[test]
+fn nested_routes_of_equal_length_are_ambiguous_and_counted() {
+    let mut second = route();
+    second.snat_source = Ipv4Addr::new(192, 168, 7, 250);
+    let lan = nested(routes(vec![wide(), route(), second]));
+    let mut packet = udp_to(HOST);
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::AMBIGUOUS_ROUTE)
+    );
+    let stats = lan.stats();
+    assert_eq!((stats.ambiguous_route, stats.forwarded), (1, 0));
+    // The /0 route alone still decides outside the /24.
+    assert_eq!(*forward_to(&lan, FAR).ip(), WIDE_SNAT);
+}
+
+#[test]
+fn nested_routes_drop_an_unsafe_target_of_the_specific_route() {
+    let lan = nested(routes(vec![wide(), route()]));
+    let mut packet = udp_to(Ipv4Addr::new(192, 168, 7, 255));
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::UNSAFE_TARGET)
+    );
+    let stats = lan.stats();
+    assert_eq!((stats.unsafe_target, stats.forwarded), (1, 0));
+    assert_eq!(stats.conntrack.entries, 0);
+}
+
+#[test]
+fn nested_routes_regate_tracked_flows_after_a_replacement() {
+    let shared = routes(vec![wide(), route()]);
+    let lan = nested(shared.clone());
+    let tracked = forward_to(&lan, HOST);
+    assert_eq!(*tracked.ip(), SNAT);
+
+    // The /24 route goes: the /0 route resolves HOST, so the tracked flow
+    // keeps going and keeps its SNAT address.
+    shared.replace(vec![wide()]);
+    assert_eq!(forward_to(&lan, HOST), tracked);
+
+    // Two /24 routes again: the tracked flow is gated as ambiguous.
+    let mut second = route();
+    second.snat_source = Ipv4Addr::new(192, 168, 7, 250);
+    shared.replace(vec![wide(), route(), second]);
+    let mut packet = udp_to(HOST);
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::AMBIGUOUS_ROUTE)
+    );
+
+    // The broadcast of the /24 inside the /0: the tracked flow is not passed
+    // to the /0 route.
+    let broadcast = Ipv4Addr::new(192, 168, 7, 255);
+    shared.replace(vec![wide()]);
+    let flow = forward_to(&lan, broadcast);
+    assert_eq!(*flow.ip(), WIDE_SNAT);
+    shared.replace(vec![wide(), route()]);
+    let mut packet = udp_to(broadcast);
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::UNSAFE_TARGET)
+    );
+
+    // No route maps the destination any more.
+    shared.replace(Vec::new());
+    let mut packet = udp_to(HOST);
+    assert_not_ours(&mut packet, |p| lan.forward(p));
+}
+
+#[test]
+fn nested_routes_reverse_replies_of_both_routes() {
+    let lan = nested(routes(vec![wide(), route()]));
+    for host in [HOST, FAR] {
+        let snat = forward_to(&lan, host);
+        let mut packet = PacketBuf::from_packet(&ipv4_bytes(
+            protocol::UDP,
+            host,
+            *snat.ip(),
+            udp(53, snat.port(), b"answer"),
+        ));
+        assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+        let restored = packet.as_packet();
+        assert_eq!(&restored[8..24], &mapped(host).octets());
+        assert_eq!(&restored[24..40], &CLIENT.octets());
+        assert_eq!(be16(restored, 42), 4321);
+        assert_valid6(restored);
+    }
+    assert_eq!(lan.stats().reversed, 2);
+}
+
+#[test]
+fn nested_routes_stay_ambiguous_by_default() {
+    let lan = Nat64Lan::new(routes(vec![wide(), route()]), Nat64LanConfig::default());
+    let mut packet = udp_to(HOST);
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::AMBIGUOUS_ROUTE)
+    );
+    assert_eq!(lan.stats().ambiguous_route, 1);
+}

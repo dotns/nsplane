@@ -9,7 +9,9 @@
 //!   `ICMPv6` echo request to an address of a route's `mapped` prefix becomes
 //!   an IPv4 packet to the embedded LAN host, from the route's `snat_source`
 //!   with a source port (or ICMP echo identifier) reserved for the flow.
-//!   Exactly one route must resolve the destination: a destination that several routes resolve
+//!   Exactly one route must resolve the destination (unless
+//!   [`Nat64LanConfig::nested_routes`] is on; see [Routes](#routes)): a
+//!   destination that several routes resolve
 //!   is dropped ([`reasons::AMBIGUOUS_ROUTE`]), and a destination inside a
 //!   `mapped` prefix that no route resolves to a safe address of its `real`
 //!   prefix (see [`LanRoute::resolve`]) is dropped
@@ -42,6 +44,12 @@
 //! destination still resolves after a route replacement keeps the SNAT
 //! address it was created with; to revoke the flows of a removed route, call
 //! [`Nat64Lan::remove_flow`] for them.
+//!
+//! Routes of one `mapped` prefix may nest their `real` prefixes (say a /0
+//! and a /24 inside it) with [`Nat64LanConfig::nested_routes`]: the route
+//! with the longest `real` prefix containing the embedded IPv4 address
+//! decides, instead of every resolving route counting as ambiguous. The
+//! gate applies the same rule.
 //!
 //! # Flows and limits
 //!
@@ -84,7 +92,7 @@ mod route;
 mod tests;
 
 use std::fmt;
-use std::net::{IpAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -120,6 +128,23 @@ pub struct Nat64LanConfig {
     /// filters ICMP then black-holes those packets. Without DF there is no
     /// such black hole, but oversized packets are fragmented on the LAN.
     pub set_df: bool,
+    /// Let routes of one `mapped` prefix nest their `real` prefixes. Default
+    /// `false`.
+    ///
+    /// When on, the routes whose `mapped` prefix holds the destination and
+    /// whose `real` prefix contains the embedded IPv4 address are
+    /// candidates, and the one with the longest `real` prefix wins. Two
+    /// candidates of that same length are ambiguous
+    /// ([`reasons::AMBIGUOUS_ROUTE`]). An unsafe target of the winning route
+    /// (see [`LanRoute::resolve`]), such as the broadcast address of a /24
+    /// nested in a /0, is dropped ([`reasons::UNSAFE_TARGET`]), not passed to
+    /// a shorter route. Without a candidate the destination is dropped as
+    /// unsafe if a route maps it, and not ours otherwise.
+    ///
+    /// When off, exactly one route must resolve the destination, as in
+    /// 0.14.2: several resolving routes are ambiguous, whatever their
+    /// lengths.
+    pub nested_routes: bool,
 }
 
 impl Default for Nat64LanConfig {
@@ -129,6 +154,7 @@ impl Default for Nat64LanConfig {
             port_tries: 32,
             conntrack: ConntrackConfig::default(),
             set_df: false,
+            nested_routes: false,
         }
     }
 }
@@ -366,6 +392,9 @@ impl Nat64Lan {
             return Ok(false);
         };
         let Some((snat_source, target)) = self.routes.0.read(|routes| {
+            if self.config.nested_routes {
+                return nested_route(routes, request.dst);
+            }
             let mut resolving = routes
                 .iter()
                 .filter_map(|route| Some((route, route.resolve(request.dst)?)));
@@ -452,6 +481,49 @@ impl Nat64Lan {
         let found = self.conntrack.lookup(reply, flags)?;
         (found.direction == FlowDirection::Reply).then_some(found.flow.original)
     }
+}
+
+/// The SNAT source and LAN target of `dst` under
+/// [`Nat64LanConfig::nested_routes`]: the route with the longest `real`
+/// prefix containing the embedded address decides.
+fn nested_route(
+    routes: &[LanRoute],
+    dst: Ipv6Addr,
+) -> Result<Option<(Ipv4Addr, Ipv4Addr)>, &'static str> {
+    let [.., a, b, c, d] = dst.octets();
+    let embedded = u32::from_be_bytes([a, b, c, d]);
+    let contains = |(real, len): (Ipv4Addr, u8)| {
+        (embedded ^ u32::from(real))
+            .checked_shr(32_u32.saturating_sub(u32::from(len)))
+            .unwrap_or(0)
+            == 0
+    };
+    let mut best: Option<&LanRoute> = None;
+    let mut tied = false;
+    for route in routes
+        .iter()
+        .filter(|route| route.maps(dst) && contains(route.real))
+    {
+        match best {
+            Some(current) if current.real.1 > route.real.1 => {}
+            Some(current) if current.real.1 == route.real.1 => tied = true,
+            _ => {
+                best = Some(route);
+                tied = false;
+            }
+        }
+    }
+    let Some(route) = best else {
+        if routes.iter().any(|route| route.maps(dst)) {
+            return Err(reasons::UNSAFE_TARGET);
+        }
+        return Ok(None);
+    };
+    if tied {
+        return Err(reasons::AMBIGUOUS_ROUTE);
+    }
+    let target = route.resolve(dst).ok_or(reasons::UNSAFE_TARGET)?;
+    Ok(Some((route.snat_source, target)))
 }
 
 /// The SNAT address and port of a translated tuple.

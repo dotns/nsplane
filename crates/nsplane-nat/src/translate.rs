@@ -31,6 +31,17 @@
 //!   `local6`) is a spoof and is dropped.
 //! - Everything else passes unchanged.
 //!
+//! # Nested LAN prefixes
+//!
+//! With [`TranslationTableBuilder::nested_lans`], LAN IPv4 prefixes may nest
+//! (a 0.0.0.0/0 behind one peer around more specific LANs). Every lookup
+//! above then takes the longest prefix that contains the address, and the
+//! self `eam4`, the `eam4`s and the `peer6_eam4`s are never LAN addresses, so
+//! they keep their own mappings. An IPv6 address inside a `lan6` prefix maps
+//! back only when its IPv4 address resolves to that same prefix: a source
+//! claiming an address of a more specific LAN, or an exact address, under a
+//! shorter prefix's /96 is dropped with [`reasons::UNMAPPED`].
+//!
 //! # Translation
 //!
 //! Headers are translated as RFC 7915 describes: the TTL / hop limit is
