@@ -146,6 +146,11 @@ struct Lan {
     /// Position of the prefix among the table's prefixes sorted by
     /// `start4` (then `len4`): its identity as the owner of segments.
     index: usize,
+    /// Whether the prefix owns one segment, its whole range: always with
+    /// disjoint prefixes; with nested ones, when no other prefix and no
+    /// exact address lies inside it. Every address of a simple prefix
+    /// resolves back to it.
+    simple: bool,
 }
 
 impl Lan {
@@ -308,8 +313,11 @@ impl TranslationTable {
         // XOR `delta` maps the embedded network onto `lan4` and every other
         // address outside it.
         let addr4 = u32::try_from(bits & LAN6_HOST_MASK).ok()? ^ lan.delta;
+        // A simple prefix owns all of its range, so only the others need the
+        // owner lookup.
         let owned = lan.contains4(addr4)
             && (!self.nested_lans
+                || lan.simple
                 || self
                     .lan4(addr4)
                     .is_some_and(|segment| segment.lan.index == lan.index));
@@ -600,6 +608,7 @@ fn validate_lan(lan: &LanPrefix) -> Result<Lan, TableError> {
         delta,
         peer: lan.peer,
         index: 0,
+        simple: true,
     })
 }
 
@@ -662,6 +671,18 @@ fn flatten(lans: &mut [Lan], holes: &[u32]) -> Result<Vec<Segment>, TableError> 
     while let Some(outer) = open.pop() {
         push_segments(&mut segments, &outer, next, outer.end4, holes);
         next = u64::from(outer.end4) + 1;
+    }
+    let mut simple = vec![false; lans.len()];
+    for segment in &segments {
+        if (segment.start4, segment.end4) == (segment.lan.start4, segment.lan.end4) {
+            simple[segment.lan.index] = true;
+        }
+    }
+    for lan in lans.iter_mut() {
+        lan.simple = simple[lan.index];
+    }
+    for segment in &mut segments {
+        segment.lan.simple = simple[segment.lan.index];
     }
     Ok(segments)
 }

@@ -288,6 +288,75 @@ fn lan6_rules_are_unchanged() {
     assert_eq!(err(builder), TableError::InvalidLan4(v4("10.0.0.1"), 24));
 }
 
+/// Whether the prefix under the /96 base `base` is simple.
+fn simple(table: &TranslationTable, base: &str) -> bool {
+    table.by_lan6[&v6(base).to_bits()].simple
+}
+
+#[test]
+fn a_simple_prefix_next_to_a_whole_space_maps_back() {
+    let table = nested()
+        .lan(lan("0.0.0.0", 0, "fd64:1::", Some(1)))
+        .lan(lan("10.1.0.0", 16, "fd64:2::", Some(2)))
+        .build()
+        .unwrap();
+    assert!(simple(&table, "fd64:2::"));
+    assert!(!simple(&table, "fd64:1::"));
+    let cases = [
+        ("fd64:2::a01:5", Some(("10.1.0.5", 2))),
+        ("fd64:2::a01:ffff", Some(("10.1.255.255", 2))),
+        ("fd64:2::a02:5", None),
+        ("fd64:2::a00:ffff", None),
+        ("fd64:1::a01:5", None),
+        ("fd64:1::a02:5", Some(("10.2.0.5", 1))),
+        ("fd64:1::a00:ffff", Some(("10.0.255.255", 1))),
+    ];
+    for (addr6, expected) in cases {
+        let expected = expected.map(|(addr4, n)| (v4(addr4), Some(peer(n))));
+        assert_eq!(table.lan6_to_lan4(v6(addr6)), expected, "{addr6}");
+    }
+}
+
+#[test]
+fn a_prefix_with_a_hole_or_an_inner_prefix_is_not_simple() {
+    let table = nested()
+        .peer(PeerId::new(1), mapping(1, Some(v4("10.0.0.7"))))
+        .lan(lan("10.0.0.0", 24, "fd64:1::", None))
+        .lan(lan("10.0.0.6", 31, "fd64:2::", None))
+        .lan(lan("172.16.0.0", 16, "fd64:3::", None))
+        .lan(lan("172.16.1.0", 24, "fd64:4::", Some(1)))
+        .lan(lan("172.16.0.0", 24, "fd64:5::", Some(1)))
+        .lan(lan("192.168.0.0", 24, "fd64:6::", None))
+        .build()
+        .unwrap();
+    // A hole, an inner prefix, a prefix with a hole, inner ones, none.
+    for (base, expected) in [
+        ("fd64:1::", false),
+        ("fd64:2::", false),
+        ("fd64:3::", false),
+        ("fd64:4::", true),
+        ("fd64:5::", true),
+        ("fd64:6::", true),
+    ] {
+        assert_eq!(simple(&table, base), expected, "{base}");
+    }
+    // Shadowed entirely.
+    let table = nested()
+        .lan(lan("10.0.0.0", 23, "fd64:1::", None))
+        .lan(lan("10.0.0.0", 24, "fd64:2::", None))
+        .lan(lan("10.0.1.0", 24, "fd64:3::", None))
+        .build()
+        .unwrap();
+    assert!(!simple(&table, "fd64:1::"));
+    assert!(simple(&table, "fd64:2::") && simple(&table, "fd64:3::"));
+    // Strict prefixes are all simple.
+    let table = TranslationTable::builder()
+        .lan(lan("10.0.0.0", 24, "fd64:1::", None))
+        .build()
+        .unwrap();
+    assert!(simple(&table, "fd64:1::"));
+}
+
 /// The bench's `table_build/nested_10k` model: a /0, 9 /8s, 90 /16s and
 /// 9900 /24s, with 10 000 peer `eam4`s inside them.
 #[test]
