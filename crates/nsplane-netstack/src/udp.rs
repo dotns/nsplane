@@ -16,7 +16,7 @@ use nsplane_packet::checksum::{
 };
 use nsplane_packet::{IpPacket, PacketBuf, UdpHeader, protocol};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::device::TAILROOM;
 use crate::flow::{FlowControl, FlowState};
@@ -192,14 +192,12 @@ async fn receive<T>(rx: &mut mpsc::Receiver<T>, flow: &FlowState) -> Option<T> {
     if flow.is_revoked() {
         return None;
     }
-    let item = match rx.try_recv() {
-        Ok(item) => Some(item),
-        Err(TryRecvError::Disconnected) => None,
-        Err(TryRecvError::Empty) => tokio::select! {
-            biased;
-            () = flow.revoked() => None,
-            item = rx.recv() => item,
-        },
+    // The queue first, so a ready item never waits on the revoke's notifier; not
+    // `try_recv`, which parks the worker thread while a send to the queue is in progress.
+    let item = tokio::select! {
+        biased;
+        item = rx.recv() => item,
+        () = flow.revoked() => None,
     };
     item.filter(|_| !flow.is_revoked())
 }
