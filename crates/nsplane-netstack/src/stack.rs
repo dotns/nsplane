@@ -885,11 +885,16 @@ struct Driver {
     /// backlog leave an empty placeholder the source discards.
     sent: u64,
     /// The egress position and flow of every UDP datagram in the backlog or possibly still
-    /// in the egress queue, ascending.
+    /// in the egress queue, ascending. Bounded by those two queues: a mark is added only
+    /// with its datagram's backlog slot and pruned at the start of each turn once the
+    /// source took its position: it holds at most `EGRESS_BACKLOG + egress_capacity`
+    /// entries, plus what one turn moves before the next prune. It has no full state, so
+    /// no revoke fails on it.
     marks: VecDeque<(u64, Arc<FlowState>)>,
     fences: Arc<Fences>,
     /// Revoked flows whose fragments the reassembler may still hold; at most
-    /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout.
+    /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout. A revoke that
+    /// needs one more fails (`RetirementOutcome::Failed`).
     barriers: Vec<Barrier>,
     #[cfg(test)]
     turns: u64,

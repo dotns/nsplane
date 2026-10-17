@@ -5,6 +5,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-flow revoke in nsplane-netstack: `TcpConnection::control`, `UdpFlow::control`,
+  `UdpReply::control` and `UdpSocket::control` return a `FlowControl` for one connection, flow or
+  socket of a shared stack. `FlowControl::revoke` (idempotent, never waits, sends no FIN or RST)
+  fails the flow's handles with `ConnectionAborted`, and the next driver turn removes its state
+  and drops its output still queued in the stack, without waiting for the peer; `is_revoked`
+  tells whether it happened.
+- `RetirementReceipt` (`outcome`, a cancellation-safe and repeatable `wait`) with the
+  `#[non_exhaustive]` `RetirementOutcome`: `Retired`, `Failed` (a bound on the held-back output
+  or the reassembly barriers was full) or `Unknown` (the stack stopped first). The proof boundary
+  is the stack: packets already taken from `NetStackSource` are not covered.
+- `FlowControl::bind_context(domain)` and `FlowControl::context`: an opaque `FlowContext`
+  (`domain`, `instance`) with a process-wide instance that is never handed out twice; the stack
+  never reads it.
+- `NetStackHandle::retired_drops`: packets and datagrams discarded because their flow was
+  revoked.
+- A UDP case in the `send_stream` bench: `netstack_udp_send` and `netstack_udp_send_1cpu`.
+
 ## [0.15.0] - 2026-10-17
 
 Opt-in nested LAN prefixes with longest-prefix match in nsplane-nat; the API is additive.
