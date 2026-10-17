@@ -54,7 +54,10 @@ fn owners(table: &TranslationTable) -> Vec<(Ipv4Addr, u8)> {
     table
         .lans
         .iter()
-        .map(|segment| (Ipv4Addr::from_bits(segment.lan.start4), segment.lan.len4))
+        .map(|segment| {
+            let lan = &table.prefixes[segment.owner];
+            (Ipv4Addr::from_bits(lan.start4), lan.len4)
+        })
         .collect()
 }
 
@@ -290,7 +293,7 @@ fn lan6_rules_are_unchanged() {
 
 /// Whether the prefix under the /96 base `base` is simple.
 fn simple(table: &TranslationTable, base: &str) -> bool {
-    table.by_lan6[&v6(base).to_bits()].simple
+    table.prefixes[table.by_lan6[&v6(base).to_bits()]].simple
 }
 
 #[test]
