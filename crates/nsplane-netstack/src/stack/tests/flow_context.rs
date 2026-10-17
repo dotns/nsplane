@@ -135,7 +135,10 @@ fn kind<T>(result: io::Result<T>) -> Option<io::ErrorKind> {
 }
 
 /// Waits until `ready` holds for `handle`, for at most five seconds.
-async fn until(handle: &NetStackHandle, ready: impl Fn(&NetStackHandle) -> bool) -> TestResult {
+async fn until(
+    handle: &NetStackHandle,
+    ready: impl Fn(&NetStackHandle) -> bool + Send + Sync,
+) -> TestResult {
     timeout(Duration::from_secs(5), async {
         while !ready(handle) {
             sleep(Duration::from_millis(5)).await;
@@ -305,10 +308,9 @@ async fn observe(domain: Option<u64>) -> Result<Observed, Box<dyn Error>> {
         flow.send(b"queued").await?;
     }
     sleep(Duration::from_millis(20)).await;
-    let outcomes = vec![
-        retire(&conn.control()).await?,
-        retire(&flow.control()).await?,
-    ];
+    let tcp_outcome = retire(&conn.control()).await?;
+    let udp_outcome = retire(&flow.control()).await?;
+    let outcomes = vec![tcp_outcome, udp_outcome];
     let seen = pump(&mut peer, 10).await;
     udp_payloads.extend(seen.iter().filter_map(udp_payload));
     let tuple = segment_tuple(client, server);
