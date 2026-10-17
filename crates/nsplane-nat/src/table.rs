@@ -146,6 +146,11 @@ struct Lan {
     /// Position of the prefix among the table's prefixes sorted by
     /// `start4` (then `len4`): its identity as the owner of segments.
     index: usize,
+    /// Whether the prefix owns one segment, its whole range: always with
+    /// disjoint prefixes; with nested ones, when no other prefix and no
+    /// exact address lies inside it. Every address of a simple prefix
+    /// resolves back to it.
+    simple: bool,
 }
 
 impl Lan {
@@ -158,20 +163,37 @@ impl Lan {
     }
 }
 
-/// A run of IPv4 addresses owned by one LAN prefix, with the owner's data:
-/// the whole prefix when prefixes are disjoint; with nested prefixes, the
-/// part of the prefix that no more specific prefix or exact address covers.
+/// A run of IPv4 addresses owned by one LAN prefix, with the owner's data
+/// that [`TranslationTable::lan4_to_lan6`] reads: the whole prefix when
+/// prefixes are disjoint; with nested prefixes, the part of the prefix that
+/// no more specific prefix or exact address covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Segment {
     /// First IPv4 address of the segment.
     start4: u32,
     /// Last IPv4 address of the segment.
     end4: u32,
-    /// The prefix that owns the segment.
-    lan: Lan,
+    /// The owner's `prefix6`, `delta` and peer.
+    prefix6: u128,
+    delta: u32,
+    peer: Option<PeerId>,
+    /// The owner's index in the table's prefixes.
+    owner: usize,
 }
 
 impl Segment {
+    /// The segment of `lan` from `start4` to `end4`.
+    const fn new(start4: u32, end4: u32, lan: &Lan) -> Self {
+        Self {
+            start4,
+            end4,
+            prefix6: lan.prefix6,
+            delta: lan.delta,
+            peer: lan.peer,
+            owner: lan.index,
+        }
+    }
+
     const fn contains4(&self, addr: u32) -> bool {
         self.start4 <= addr && addr <= self.end4
     }
@@ -198,8 +220,10 @@ pub struct TranslationTable {
     /// LAN segments sorted by `start4`, non-overlapping: one per prefix
     /// unless the prefixes nest.
     lans: Vec<Segment>,
-    /// `lan6` /96 base to its prefix.
-    by_lan6: Ipv6Map<Lan>,
+    /// LAN prefixes sorted by `start4` (then `len4`).
+    prefixes: Vec<Lan>,
+    /// `lan6` /96 base to index into `prefixes`.
+    by_lan6: Ipv6Map<usize>,
     nested_lans: bool,
 }
 
@@ -281,7 +305,7 @@ impl TranslationTable {
     /// returns `None` for it, even inside a prefix.
     pub fn lan4_to_lan6(&self, addr: Ipv4Addr) -> Option<(Ipv6Addr, Option<PeerId>)> {
         let bits = addr.to_bits();
-        let lan = &self.lan4(bits)?.lan;
+        let lan = self.lan4(bits)?;
         Some((
             Ipv6Addr::from_bits(lan.prefix6 | u128::from(bits ^ lan.delta)),
             lan.peer,
@@ -304,15 +328,19 @@ impl TranslationTable {
     /// `lan4_to_lan6` in both modes.
     pub fn lan6_to_lan4(&self, addr: Ipv6Addr) -> Option<(Ipv4Addr, Option<PeerId>)> {
         let bits = addr.to_bits();
-        let lan = self.by_lan6.get(&(bits & !LAN6_HOST_MASK))?;
+        let index = *self.by_lan6.get(&(bits & !LAN6_HOST_MASK))?;
+        let lan = self.prefixes.get(index)?;
         // XOR `delta` maps the embedded network onto `lan4` and every other
         // address outside it.
         let addr4 = u32::try_from(bits & LAN6_HOST_MASK).ok()? ^ lan.delta;
+        // A simple prefix owns all of its range, so only the others need the
+        // owner lookup.
         let owned = lan.contains4(addr4)
             && (!self.nested_lans
+                || lan.simple
                 || self
                     .lan4(addr4)
-                    .is_some_and(|segment| segment.lan.index == lan.index));
+                    .is_some_and(|segment| segment.owner == index));
         owned.then_some((Ipv4Addr::from_bits(addr4), lan.peer))
     }
 
@@ -532,30 +560,33 @@ impl TranslationTableBuilder {
             holes.sort_unstable();
             table.lans = flatten(&mut lans, &holes)?;
         } else {
-            table.lans = lans.iter().map(Segment::whole).collect();
-            table.lans.sort_unstable_by_key(|segment| segment.start4);
-            for pair in table.lans.windows(2) {
+            lans.sort_unstable_by_key(|lan| lan.start4);
+            for pair in lans.windows(2) {
                 if let [prev, next] = pair
                     && prev.end4 >= next.start4
                 {
-                    return Err(next.lan.overlap4());
+                    return Err(next.overlap4());
                 }
             }
+            for (index, lan) in lans.iter_mut().enumerate() {
+                lan.index = index;
+            }
+            table.lans = lans
+                .iter()
+                .map(|lan| Segment::new(lan.start4, lan.end4, lan))
+                .collect();
             for addr in addrs4 {
                 if let Some(segment) = table.lan4(addr.to_bits()) {
-                    return Err(segment.lan.overlap4());
+                    return Err(lans[segment.owner].overlap4());
                 }
             }
-            for (index, segment) in table.lans.iter_mut().enumerate() {
-                segment.lan.index = index;
-            }
-            lans = table.lans.iter().map(|segment| segment.lan).collect();
         }
-        for lan in lans {
-            if table.by_lan6.insert(lan.prefix6, lan).is_some() {
+        for lan in &lans {
+            if table.by_lan6.insert(lan.prefix6, lan.index).is_some() {
                 return Err(TableError::Lan6Overlap(Ipv6Addr::from_bits(lan.prefix6)));
             }
         }
+        table.prefixes = lans;
         for addr in &v6 {
             let prefix = addr.to_bits() & !LAN6_HOST_MASK;
             if table.by_lan6.contains_key(&prefix) {
@@ -600,18 +631,8 @@ fn validate_lan(lan: &LanPrefix) -> Result<Lan, TableError> {
         delta,
         peer: lan.peer,
         index: 0,
+        simple: true,
     })
-}
-
-impl Segment {
-    /// The segment that covers all of `lan`.
-    const fn whole(lan: &Lan) -> Self {
-        Self {
-            start4: lan.start4,
-            end4: lan.end4,
-            lan: *lan,
-        }
-    }
 }
 
 /// Sorts nested LAN prefixes by (`start4`, `len4`), numbers them and splits
@@ -663,6 +684,16 @@ fn flatten(lans: &mut [Lan], holes: &[u32]) -> Result<Vec<Segment>, TableError> 
         push_segments(&mut segments, &outer, next, outer.end4, holes);
         next = u64::from(outer.end4) + 1;
     }
+    let mut simple = vec![false; lans.len()];
+    for segment in &segments {
+        let lan = &lans[segment.owner];
+        if (segment.start4, segment.end4) == (lan.start4, lan.end4) {
+            simple[segment.owner] = true;
+        }
+    }
+    for lan in lans.iter_mut() {
+        lan.simple = simple[lan.index];
+    }
     Ok(segments)
 }
 
@@ -674,11 +705,7 @@ fn push_segments(segments: &mut Vec<Segment>, lan: &Lan, start: u64, end: u32, h
     let first = holes.partition_point(|&hole| hole < start);
     for &hole in holes[first..].iter().take_while(|&&hole| hole <= end) {
         if start < hole {
-            segments.push(Segment {
-                start4: start,
-                end4: hole - 1,
-                lan: *lan,
-            });
+            segments.push(Segment::new(start, hole - 1, lan));
         }
         let Some(after) = hole.checked_add(1) else {
             return;
@@ -686,11 +713,7 @@ fn push_segments(segments: &mut Vec<Segment>, lan: &Lan, start: u64, end: u32, h
         start = after;
     }
     if start <= end {
-        segments.push(Segment {
-            start4: start,
-            end4: end,
-            lan: *lan,
-        });
+        segments.push(Segment::new(start, end, lan));
     }
 }
 
