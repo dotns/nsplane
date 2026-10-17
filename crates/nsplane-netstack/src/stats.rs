@@ -75,6 +75,9 @@ pub(crate) struct Counters {
     pub(crate) reassembly_timeout: AtomicU64,
     pub(crate) reassembly_overflow: AtomicU64,
     pub(crate) icmp_ignored: AtomicU64,
+    /// Behind [`NetStackHandle::retired_drops`](crate::NetStackHandle::retired_drops), not
+    /// part of [`NetStackStats`].
+    pub(crate) retired: AtomicU64,
 }
 
 /// Adds `n` to `counter`.
