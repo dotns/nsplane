@@ -41,3 +41,7 @@ slot A/B when it touches the data path.
 - 2026-10-16: fourth exception (owner: "用大改的方式，保持api不变即可"): faster allowed-IP
   lookups on the data path with the public API unchanged (plan `20261016-1800-route-lookup`,
   task `20261013-1600` PR-3). It ships as a 0.14.x patch release.
+- 2026-10-17: fifth exception (owner: "2，需要，开始修改然后发布0.15.0"): nested LAN prefixes
+  with longest-prefix match in nsplane-nat, opt-in and additive (plan
+  `20261017-1300-nested-lan-prefixes`, from the ns plan `20261017-0422-gateway-as-node`). It
+  ships as 0.15.0.
