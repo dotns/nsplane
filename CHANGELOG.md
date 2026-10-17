@@ -5,6 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-17
+
+Per-flow revoke with a scoped retirement receipt and an opaque flow context in nsplane-netstack;
+the API is additive.
+
 ### Added
 - Per-flow revoke in nsplane-netstack: `TcpConnection::control`, `UdpFlow::control`,
   `UdpReply::control` and `UdpSocket::control` return a `FlowControl` for one connection, flow or

@@ -1,6 +1,6 @@
 # 20261017-1700-flow-lifecycle-request Per-flow retirement, flow context and delivery gates (request, draft)
 
-- **status**: in_progress (R1, R2 merged 2026-10-17, plan `20261017-1800-flow-retirement`, pending release 0.16.0; R3 deferred by the owner)
+- **status**: in_progress (R1, R2 merged 2026-10-17, plan `20261017-1800-flow-retirement`, released 0.16.0 (tag `v0.16.0`); R3 deferred by the owner)
 - **priority**: P3
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-17 17:00

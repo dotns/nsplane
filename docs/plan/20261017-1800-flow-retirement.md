@@ -1,6 +1,6 @@
 # 20261017-1800-flow-retirement Per-flow control, retirement receipts and flow context in the netstack
 
-- **status**: completed (merged 2026-10-17; pending release 0.16.0)
+- **status**: completed (merged 2026-10-17; released 0.16.0 (tag `v0.16.0`))
 - **createdAt**: 2026-10-17 18:00
 - **approvedAt**: 2026-10-17 (owner: "可以先做r1和r2，先不做r3", the sixth exception to the freeze)
 - **relatedTask**: 20261017-1700-flow-lifecycle-request (R1, R2; R3 deferred)

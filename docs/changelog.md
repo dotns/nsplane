@@ -228,3 +228,19 @@ Release 0.15.0 (tag `v0.15.0`), the fifth exception to the freeze (plan
 - `Nat64LanConfig::nested_routes` does the same for `Nat64Lan` routes.
 
 Strict mode stays the default and unchanged. The freeze applies again: bug fixes only.
+
+## 2026-10-17 [release] 0.16.0
+
+Release 0.16.0 (tag `v0.16.0`), the sixth exception to the freeze (plan
+`20261017-1800-flow-retirement`, R1 and R2 of task `20261017-1700-flow-lifecycle-request`),
+additive:
+- `control()` on `TcpConnection`, `UdpFlow`, `UdpReply` and `UdpSocket` returns a `FlowControl`;
+  `revoke` is idempotent, sends no FIN or RST, fails the flow's handles and removes only that
+  flow's state and queued output from a shared stack;
+- `RetirementReceipt` reports `Retired`, `Failed` or `Unknown`, with a cancellation-safe,
+  repeatable `wait`; the proof boundary is the stack;
+- `bind_context(domain)` attaches an opaque `FlowContext` whose instance is never handed out twice;
+- `NetStackHandle::retired_drops` counts output discarded for revoked flows.
+
+Accepted residual: multi-flow UDP send +4.1 % in the netstack micro bench, every other path at
+par. R3 (delivery gates) is deferred. The freeze applies again: bug fixes only.
