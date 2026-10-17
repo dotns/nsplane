@@ -127,7 +127,7 @@ strict `lan_*` rows of the same invocation:
 
 | Row | Strict `lan_*` ns | Nested ns | r1 | r2 | r3 | Median | Spread | Within |
 |---|---|---|---|---|---|---|---|---|
-| `lan96_nested_out/tcp/64B/1` | 40.6 | 42.9 | +6.27 % | +5.62 % | +4.19 % | +5.62 % | 2.40 % | **no** |
+| `lan96_nested_out/tcp/64B/1` | 40.6 | 42.9 | +6.27 % | +5.62 % | +4.19 % | +5.62 % | 2.40 % | **no** (accepted by L1 2026-10-17, see Annotations) |
 | `lan96_nested_out/tcp/1400B/1` | 80.4 | 81.0 | +0.48 % | +1.50 % | +0.42 % | +0.48 % | 2.47 % | yes |
 | `lan96_nested_out/tcp/64B/1000` | 56.2 | 56.3 | +0.37 % | -0.19 % | -0.20 % | -0.19 % | 1.22 % | yes |
 | `lan96_nested_out/tcp/1400B/1000` | 88.9 | 88.7 | -0.83 % | +0.12 % | -0.69 % | -0.69 % | 0.87 % | yes |
@@ -168,3 +168,8 @@ New public API: `TranslationTableBuilder::nested_lans`, `TranslationTable::neste
   [Unreleased] Added, released by L1 after the owner confirms.
 - 2026-10-17 (NL-B1 perf rework): simple prefixes (no nested prefix or exact address inside)
   skip the owner search, and the segment element is compacted to 48 B.
+- 2026-10-17 (L1): `lan96_nested_out/tcp/64B/1` at +5.62 % (about 2.3 ns) is accepted (option
+  A). It is the cost of the larger table, not of the mode: the 0.0.0.0/0 splits into about 6
+  segments (around the /24 and the /32 holes of the self and peer `eam4`), so the outbound
+  binary search takes about 3 probes instead of 1. Strict mode is at par with 0.14.2 on all 24
+  rows, the 1000-peer nested row is at par (-0.19 %), and nesting is opt-in.
