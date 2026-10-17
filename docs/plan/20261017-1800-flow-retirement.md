@@ -62,6 +62,60 @@ is R3 and out of scope. The receipt states that boundary.
 R1-1..5 and R2-1..4 met with tests, full gate green, netstack benches at par, released as 0.16.0
 after the owner confirms.
 
+## Results
+
+### FL-D benches: v0.15.0 (A) against the branch (B)
+
+2026-10-17, `scripts/bench/slot.sh`, every invocation in slot 0 (criterion container
+`--cpuset-cpus 1-7`), one A/B per invocation (A then B), 120 s between invocations, three
+rounds each for the netstack benches and `data_path`, interleaved netstack, `data_path`,
+netstack, ... A is `git archive v0.15.0` with the branch's `benches/send_stream.rs` copied in
+(the UDP case uses only 0.15.0 API). Criterion medians per round, then the median of the three
+rounds; lower is better. Branch at `6f940e2`.
+
+`send_stream` (TCP: 8 MiB per iteration; UDP: 1024 x 1200 B datagrams per iteration):
+
+| Case | A rounds | B rounds | A median | B median | B vs A |
+| --- | --- | --- | --- | --- | --- |
+| `netstack_send/streams_1` | 3.137 / 3.145 / 3.099 ms | 3.089 / 3.139 / 3.151 ms | 3.137 ms | 3.139 ms | +0.1 % |
+| `netstack_send/streams_4` | 2.020 / 2.028 / 2.006 ms | 2.006 / 1.999 / 1.994 ms | 2.020 ms | 1.999 ms | -1.0 % |
+| `netstack_send_1cpu/streams_1` | 3.352 / 3.360 / 3.348 ms | 3.313 / 3.308 / 3.357 ms | 3.352 ms | 3.313 ms | -1.2 % |
+| `netstack_send_1cpu/streams_4` | 4.055 / 4.122 / 4.064 ms | 4.079 / 4.067 / 4.100 ms | 4.064 ms | 4.079 ms | +0.4 % |
+| `netstack_udp_send/flows_1` | 575.1 / 574.8 / 577.9 us | 566.6 / 580.0 / 582.3 us | 575.1 us | 580.0 us | +0.8 % |
+| `netstack_udp_send/flows_4` | 461.9 / 456.8 / 468.5 us | 480.7 / 478.7 / 481.7 us | 461.9 us | 480.7 us | **+4.1 %** |
+| `netstack_udp_send_1cpu/flows_1` | 425.9 / 425.8 / 423.2 us | 420.2 / 419.9 / 417.7 us | 425.8 us | 419.9 us | -1.4 % |
+| `netstack_udp_send_1cpu/flows_4` | 420.8 / 421.1 / 425.0 us | 425.6 / 421.5 / 422.4 us | 421.1 us | 422.4 us | +0.3 % |
+
+`nsplane-core` `data_path` (no code difference between A and B in `nsplane-core`, so this row
+is the A/B noise floor):
+
+| Case | A rounds | B rounds | A median | B median | B vs A |
+| --- | --- | --- | --- | --- | --- |
+| `core_round_trip/64` | 416.3 / 415.9 / 418.1 ns | 417.4 / 415.5 / 421.3 ns | 416.3 ns | 417.4 ns | +0.3 % |
+| `core_round_trip/1420` | 1.224 / 1.221 / 1.221 us | 1.240 / 1.222 / 1.233 us | 1.221 us | 1.233 us | +1.0 % |
+
+Load (`/proc/loadavg`, 1-minute, 32 CPUs) before / after each run:
+
+| Invocation | A | B |
+| --- | --- | --- |
+| netstack round 1 | 2.22 / 1.72 | 1.72 / 1.53 |
+| `data_path` round 1 | 0.76 / 0.97 | 0.97 / 0.98 |
+| netstack round 2 | 0.81 / 1.44 | 1.44 / 1.84 |
+| `data_path` round 2 | 0.75 / 0.98 | 0.98 / 1.07 |
+| netstack round 3 | 0.66 / 1.32 | 1.32 / 1.72 |
+| `data_path` round 3 | 0.69 / 0.98 | 0.98 / 1.21 |
+
+- TCP `send_stream` and `data_path`: at par (within -1.2..+1.0 %, the spread of the identical
+  `data_path` code).
+- UDP on one thread and with one flow on four workers: at par.
+- **UDP, four flows on four workers: +4.1 % per iteration, beyond noise.** All three B rounds
+  (478.7-481.7 us) are slower than every A round (456.8-468.5 us) on a quiet host, while the same
+  case on one thread is at par. The per-datagram cost added in FL-B is one `Arc<FlowState>`
+  clone in `UdpSocket::send`, one atomic load in the driver, and a push and a prune of the
+  driver's mark list; with four sender tasks on other workers the clone and the later drop of
+  that `Arc` in the driver touch a reference count shared across threads, the likely cause (not
+  profiled). Not fixed in FL-D (outside its scope); reported to L2.
+
 ## Annotations
 
 ### FL-A design note (2026-10-17)

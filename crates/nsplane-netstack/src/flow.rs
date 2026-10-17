@@ -15,7 +15,8 @@ use tokio::sync::Notify;
 
 use crate::tcp::{self, Shared};
 
-/// Most fences the egress holds at once; a revoke that needs one more fails.
+/// Most fences the egress holds at once, TCP and UDP together; a revoke that needs one
+/// more fails. A fence is dropped once the source took every position it holds back.
 pub(crate) const MAX_FENCES: usize = 1024;
 
 const PENDING: u8 = 0;
@@ -295,14 +296,17 @@ impl Revocations {
 /// [`NetStackSource`]: crate::NetStackSource
 #[derive(Debug)]
 pub(crate) enum Fence {
-    /// TCP packets from `local` to `peer` at egress positions in `[start, end)`.
+    /// TCP packets from `local` to `peer` at egress positions in `[start, end)`, clipped
+    /// to the positions possibly in the egress queue: one per revoked connection, of fixed
+    /// size.
     Tcp {
         local: SocketAddr,
         peer: SocketAddr,
         start: u64,
         end: u64,
     },
-    /// The UDP datagrams at these egress positions, ascending.
+    /// The UDP datagrams at these egress positions, ascending: positions in the egress
+    /// queue only, so at most `egress_capacity` of them. One per revoked flow.
     Udp(VecDeque<u64>),
 }
 
@@ -520,6 +524,21 @@ impl fmt::Debug for FlowControl {
 ///   its [`NetStackSink`](crate::NetStackSink) or [`NetStackSource`](crate::NetStackSource)
 ///   was dropped, or the runtime shut down). A stopped stack never reports a retirement it
 ///   did not complete.
+///
+/// # Bounds
+///
+/// The state the stack keeps to hold back a revoked flow's output is bounded, and a
+/// revoke that would need more fails instead of growing it:
+///
+/// - output already in the egress queue is held back by a fence, at most 1024 at once for
+///   the whole stack; a UDP fence lists at most
+///   [`egress_capacity`](crate::NetStackConfig::egress_capacity) positions;
+/// - with [`reassembly`](crate::NetStackConfig::reassembly), fragments the reassembler may
+///   hold are barred for one reassembly timeout, at most
+///   [`max_datagrams`](crate::ReassemblyConfig::max_datagrams) bars at once.
+///
+/// The stack also tracks which flow each queued UDP datagram belongs to; that list is
+/// bounded by the backlog and the egress queue themselves and never fails a revoke.
 ///
 /// # Proof boundary
 ///

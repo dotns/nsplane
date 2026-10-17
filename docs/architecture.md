@@ -1491,6 +1491,58 @@ smoltcp on its own dispatch path.
   release (11.0-21.0 s), as they did on smoltcp 0.14 with the Phase 5 workarounds (8.3-17.3 s
   and 9.0-23.1 s).
 
+### Per-flow control and retirement
+
+Every `TcpConnection`, `UdpFlow` (shared with its `UdpReply` clones) and `UdpSocket` gets
+one `FlowState` when the driver creates it, and `control()` hands out a `FlowControl` on
+it: valid after the data handles moved, were aborted, dropped or released.
+
+- `FlowControl::revoke` flips the flow's revoked bit, clears its TCP stream buffers, wakes
+  its blocked reads, writes and sends, and queues the flow for the driver; it never waits
+  and sends nothing (no FIN, no RST: the peer times out or gets the stateless RST on its
+  next segment). From then on every data handle fails with `ConnectionAborted`
+  (`UdpFlow::recv` returns `None`). Repeated calls share the first call's outcome.
+- The driver takes the revocations at the start of its next turn and in that turn removes
+  the flow's socket (without an RST, also from the aborting list) or its queue entry,
+  replaces the flow's packets in the egress backlog by empty placeholders, fences those
+  possibly in the egress queue, and bars the flow's tuple in the reassembler if it holds
+  fragments. Nothing in it waits for the peer, TIME-WAIT, an RST or egress room.
+- Egress positions identify output without a per-packet tag for TCP: the driver counts
+  packets it moves into the egress queue, `NetStackSource` counts packets it takes, and a
+  TCP flow owns the tuple's packets in `[start, end)`. UDP datagrams are marked with their
+  flow. The source drops placeholders (they keep later positions intact), packets of a
+  fenced TCP window and fenced UDP positions; none of them reaches the engine, none counts
+  in `NetStackStats`. Everything dropped for a revoked flow counts in
+  `NetStackHandle::retired_drops`.
+- `RetirementReceipt` reports `Retired` (state removed, queued output dropped), `Failed`
+  (state removed, but a bound below was full, so output in the egress queue or a held
+  fragment may still leave) or `Unknown` (the driver stopped first, or had stopped: a stopped
+  stack never claims a retirement). `wait` is cancellation-safe and repeatable.
+- Proof boundary: the stack only. A packet `NetStackSource::recv` already returned belongs
+  to the engine and is not covered.
+- `FlowControl::bind_context(domain)` labels the flow once with an opaque `FlowContext`:
+  the caller's domain and an instance from a process-wide counter that never repeats (and
+  refuses with `QuotaExceeded` when used up). The stack never reads it; a same-tuple
+  re-open is a new flow with a new state, new queues and a new instance.
+
+Bounds of the retirement state; a full table fails the revoke (`Failed`) after the flow's
+own state is removed, it never grows past its bound:
+
+| State | Bound | When full |
+| --- | --- | --- |
+| UDP marks (flow of each queued datagram) | the backlog (256) plus `egress_capacity`, pruned every turn | cannot fill: a mark exists only with its datagram's queue slot |
+| UDP fence positions | `egress_capacity` per fence (positions in the egress queue only) | n/a |
+| Fences (TCP windows and UDP position lists) | 1024 per stack, dropped once the source passed them | `Failed` |
+| Reassembly barriers | `ReassemblyConfig::max_datagrams`, each for one reassembly timeout | `Failed` |
+
+Without a revoke the per-packet cost is one relaxed load per driver turn, a position
+counter on each side of the egress queue, one atomic load per packet in the source while
+no fence exists, and an `Arc` clone per UDP datagram sent; see the `send_stream` and
+`netstack_udp_send` rows in the plan `docs/plan/20261017-1800-flow-retirement.md`.
+The unit tests `src/stack/tests/flow_control.rs`, `flow_context.rs` and `flow_bounds.rs`
+and `nsplane-e2e`'s `tests/netstack_flow_retirement.rs` cover the outcomes, the bounds and
+same-tuple re-opens.
+
 ### Netstack throughput
 
 Release, two netstacks over two engines on an in-process `ChannelTransport` pair (no
@@ -1636,6 +1688,10 @@ summed cost):
 ```text
 cargo bench -p nsplane-netstack --bench send_stream
 ```
+
+The same file's `netstack_udp_send` and `netstack_udp_send_1cpu` send 1200-byte datagrams
+over one or four connected UDP sockets (flows without a context) to bound sockets of the
+other stack, 1024 per iteration in batches of 128 so that no receiver queue overflows.
 
 `.3` against `.4` (MF-5), 15 alternating pairs pinned to CPUs 2-5, 2026-10-06, 1-minute load
 1.6-9.4 (32 cores); medians in MB/s [IQR], and `.4` against `.3` per pair:
