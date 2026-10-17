@@ -25,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::config::{NetStackConfig, Settings};
 use crate::device::VirtualDevice;
+use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
 use crate::ownership::{Owners, Ownership, Registration};
 use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self, Counters, NetStackStats};
@@ -96,6 +97,8 @@ impl NetStack {
             settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
+        let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
+        let fences = Arc::new(Fences::default());
 
         let mut device = VirtualDevice::new(settings.mtu, EGRESS_BACKLOG, Arc::clone(&stats));
         let iface = interface(&settings, &mut device);
@@ -137,11 +140,25 @@ impl NetStack {
             owners: Arc::clone(&owners),
             reassembler,
             reassembly_counted: ReassemblyStats::default(),
+            revocations,
+            retiring: Vec::new(),
+            sent: 0,
+            marks: VecDeque::new(),
+            fences: Arc::clone(&fences),
+            barriers: Vec::new(),
+            #[cfg(test)]
+            turns: 0,
         };
         tokio::spawn(driver.run());
 
         let stack = Self {
-            source: NetStackSource { rx: egress_rx, mtu },
+            source: NetStackSource {
+                rx: egress_rx,
+                mtu,
+                received: 0,
+                fences,
+                stats: Arc::clone(&stats),
+            },
             sink: NetStackSink { tx: ingress_tx },
         };
         let handle = NetStackHandle {
@@ -166,16 +183,58 @@ impl NetStack {
 /// configured MTU, except IPv4 UDP datagrams with DF clear under
 /// [`NetStackConfig::udp_allow_fragmentation`]. [`recv`](PacketSource::recv) returns [`io::ErrorKind::BrokenPipe`] once
 /// the driver stopped and the queue is drained, on every later call. [`mtu`](PacketSource::mtu)
-/// holds the (normalised) configured MTU, which never changes.
+/// holds the (normalised) configured MTU, which never changes. Output of a revoked flow
+/// (see [`FlowControl::revoke`](crate::FlowControl::revoke)) still queued here is dropped,
+/// never returned.
 #[derive(Debug)]
 pub struct NetStackSource {
     rx: mpsc::Receiver<PacketBuf>,
     mtu: watch::Receiver<u16>,
+    /// Packets taken from `rx`: the egress position of the next one.
+    received: u64,
+    fences: Arc<Fences>,
+    stats: Arc<Counters>,
+}
+
+impl NetStackSource {
+    /// Whether `packet`, the next one out of the egress queue, may leave the stack: not a
+    /// placeholder of output dropped in the backlog, nor held back by a fence.
+    fn admit(&mut self, packet: &PacketBuf) -> bool {
+        let position = self.received;
+        self.received += 1;
+        if packet.is_empty() {
+            return false;
+        }
+        if self
+            .fences
+            .holds(position, || tcp_tuple(packet.as_packet()))
+        {
+            stats::add(&self.stats.retired, 1);
+            return false;
+        }
+        true
+    }
+
+    /// The next packet [`recv`](PacketSource::recv) would return, if one is queued now.
+    #[cfg(test)]
+    pub(crate) fn try_admit(&mut self) -> Option<PacketBuf> {
+        loop {
+            let packet = self.rx.try_recv().ok()?;
+            if self.admit(&packet) {
+                return Some(packet);
+            }
+        }
+    }
 }
 
 impl PacketSource for NetStackSource {
     async fn recv(&mut self) -> io::Result<PacketBuf> {
-        self.rx.recv().await.ok_or_else(stack_gone)
+        loop {
+            let packet = self.rx.recv().await.ok_or_else(stack_gone)?;
+            if self.admit(&packet) {
+                return Ok(packet);
+            }
+        }
     }
 
     fn mtu(&self) -> watch::Receiver<u16> {
@@ -368,6 +427,17 @@ impl NetStackHandle {
         self.stats.snapshot()
     }
 
+    /// Packets and datagrams the stack discarded because their flow was revoked with
+    /// [`FlowControl::revoke`](crate::FlowControl::revoke): queued output removed from the
+    /// egress backlog, held back at the [`NetStackSource`], or still waiting in the UDP
+    /// send queue. Counted here and not in [`stats`](Self::stats); bytes and datagrams a
+    /// revoked flow had buffered for the application are not counted. Only grows.
+    pub fn retired_drops(&self) -> u64 {
+        self.stats
+            .retired
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Discards the fragmented datagram `(src, dst, protocol, id)` sent towards the stack,
     /// so that none of its fragments joins a later flow on the same tuple.
     ///
@@ -535,6 +605,7 @@ struct Conn {
     /// `close()` was called on the socket.
     local_closed: bool,
     last_activity_at: SmolInstant,
+    flow: Arc<FlowState>,
 }
 
 /// What one bridge pass did.
@@ -700,6 +771,8 @@ struct Connecting {
     _registration: Registration,
     reply: oneshot::Sender<io::Result<TcpConnection>>,
     started: SmolInstant,
+    /// The egress position when the socket was created.
+    start: u64,
 }
 
 /// Socket pool limits: sockets per port and in total, and each socket's buffer sizes.
@@ -710,14 +783,54 @@ struct Pool {
     tx_buffer: usize,
 }
 
+/// The queue of a UDP flow or socket, with the flow it belongs to.
+type Inbox<T> = (mpsc::Sender<T>, Arc<FlowState>);
+
+/// A revoked flow whose fragments the reassembler may still hold. Later fragments carry
+/// no ports, so a held datagram cannot be told apart from one of a new flow on the same
+/// tuple: every datagram completed for the flow's tuple before `until` is dropped.
+#[derive(Debug)]
+struct Barrier {
+    protocol: u8,
+    local: SocketAddr,
+    /// `None` for a bound socket: every remote.
+    remote: Option<SocketAddr>,
+    until: std::time::Instant,
+}
+
+impl Barrier {
+    /// Whether a datagram from `src` to `dst` completed at `now` is held back; `ports`
+    /// gives its protocol and `(src, dst)` ports if it is TCP or UDP. One whose ports
+    /// cannot be read is held back by its addresses alone.
+    fn holds(
+        &self,
+        src: IpAddr,
+        dst: IpAddr,
+        ports: Option<(u8, u16, u16)>,
+        now: std::time::Instant,
+    ) -> bool {
+        let local_ip = self.local.ip();
+        let addresses = (local_ip == dst
+            || (local_ip.is_unspecified() && local_ip.is_ipv4() == dst.is_ipv4()))
+            && self.remote.is_none_or(|remote| remote.ip() == src);
+        let ports = ports.is_none_or(|(protocol, src_port, dst_port)| {
+            protocol == self.protocol
+                && dst_port == self.local.port()
+                && self.remote.is_none_or(|remote| remote.port() == src_port)
+        });
+        now < self.until && addresses && ports
+    }
+}
+
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
     settings: Settings,
     iface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
-    /// Listener sockets mid handshake, with the tuple they registered for `owns`.
-    inbound: HashMap<SocketHandle, Registration>,
+    /// Listener sockets mid handshake, with the tuple they registered for `owns` and the
+    /// egress position when they took the SYN.
+    inbound: HashMap<SocketHandle, (Registration, u64)>,
     /// port -> the sockets this port has open for inbound connections: those in `Listen`
     /// (free to accept a SYN) plus those in `SynReceived` (claimed by a SYN, mid
     /// handshake). A socket leaves the pool when it is established (promoted to a
@@ -733,18 +846,18 @@ struct Driver {
     /// released.
     deferred: Vec<Command>,
     connecting: Vec<Connecting>,
-    flows: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Bytes>>,
-    bound: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Bytes)>>,
+    flows: HashMap<(SocketAddr, SocketAddr), Inbox<Bytes>>,
+    bound: HashMap<SocketAddr, Inbox<(SocketAddr, Bytes)>>,
     /// Connected UDP sockets by `(remote, local)`; checked before `bound` only while not
     /// empty.
-    connected: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<(SocketAddr, Bytes)>>,
+    connected: HashMap<(SocketAddr, SocketAddr), Inbox<(SocketAddr, Bytes)>>,
     ingress: mpsc::Receiver<PacketBuf>,
     /// Ingress packets taken in one batch; empty between batches.
     batch: Vec<PacketBuf>,
     egress: mpsc::Sender<PacketBuf>,
     /// `None` once every handle is gone.
     commands: Option<mpsc::Receiver<Command>>,
-    udp_rx: mpsc::Receiver<PacketBuf>,
+    udp_rx: mpsc::Receiver<(PacketBuf, Arc<FlowState>)>,
     out: UdpOut,
     accept_tcp: mpsc::Sender<TcpConnection>,
     accept_udp: mpsc::Sender<UdpFlow>,
@@ -764,10 +877,32 @@ struct Driver {
     reassembler: Option<Reassembler>,
     /// The reassembler's counts already added to `stats`.
     reassembly_counted: ReassemblyStats,
+    revocations: Arc<Revocations>,
+    /// Revoked flows taken in this turn and not retired yet; empty between turns.
+    retiring: Vec<Arc<FlowState>>,
+    /// Packets moved from the backlog into the egress queue. The packet at `tx_queue[i]`
+    /// has egress position `sent + i`; positions never change, as packets dropped from the
+    /// backlog leave an empty placeholder the source discards.
+    sent: u64,
+    /// The egress position and flow of every UDP datagram in the backlog or possibly still
+    /// in the egress queue, ascending. Bounded by those two queues: a mark is added only
+    /// with its datagram's backlog slot and pruned at the start of each turn once the
+    /// source took its position: it holds at most `EGRESS_BACKLOG + egress_capacity`
+    /// entries, plus what one turn moves before the next prune. It has no full state, so
+    /// no revoke fails on it.
+    marks: VecDeque<(u64, Arc<FlowState>)>,
+    fences: Arc<Fences>,
+    /// Revoked flows whose fragments the reassembler may still hold; at most
+    /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout. A revoke that
+    /// needs one more fails (`RetirementOutcome::Failed`).
+    barriers: Vec<Barrier>,
+    #[cfg(test)]
+    turns: u64,
 }
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        self.revocations.close(&mut self.retiring);
         for conn in self.conns.values() {
             conn.release();
         }
@@ -789,6 +924,12 @@ impl Driver {
 
     /// One driver iteration; `false` once the stack must stop.
     async fn turn(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.turns += 1;
+        }
+        // 0. Retire revoked flows before anything of theirs can move.
+        self.retire_revoked();
         // 1. Take a bounded batch of ingress packets and pending requests.
         self.expire_fragments();
         let Some(demand) = self.ingest_batch() else {
@@ -804,6 +945,7 @@ impl Driver {
         let now = self.now();
         // Before the pool reclaims sockets that left the handshake.
         self.release_inbound();
+        let mark = self.position();
         let pool = Pool {
             limit: self.settings.listener_pool,
             rx_buffer: self.settings.tcp_rx_buffer(),
@@ -822,7 +964,7 @@ impl Driver {
         self.preserve_all(now);
         self.device
             .poll_interface(&mut self.iface, now, &mut self.sockets);
-        self.track_inbound(&demand);
+        self.track_inbound(&demand, mark);
 
         // 3. Hand established connections to the application.
         self.promote(now);
@@ -966,6 +1108,10 @@ impl Driver {
         }
         let routed = match reassembler.push(packet.as_packet(), now) {
             Outcome::Pass => return Some(packet),
+            Outcome::Complete(datagram) if self.barred(&datagram, now) => {
+                stats::add(&self.stats.retired, 1);
+                None
+            }
             Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
             Outcome::Held | Outcome::Dropped => None,
         };
@@ -984,6 +1130,62 @@ impl Driver {
             self.count_reassembly();
         }
         self.owners.expire_discarded(now);
+        self.barriers.retain(|barrier| now < barrier.until);
+    }
+
+    /// Whether a reassembled `datagram` may hold fragments of a revoked flow; free while
+    /// there is no barrier.
+    fn barred(&self, datagram: &[u8], now: std::time::Instant) -> bool {
+        if self.barriers.is_empty() {
+            return false;
+        }
+        let Ok(ip) = IpPacket::parse(datagram) else {
+            return false;
+        };
+        let protocol = ip.protocol();
+        let ports = ip
+            .payload()
+            .first_chunk::<4>()
+            .filter(|_| protocol == protocol::TCP || protocol == protocol::UDP)
+            .map(|&[a, b, c, d]| {
+                (
+                    protocol,
+                    u16::from_be_bytes([a, b]),
+                    u16::from_be_bytes([c, d]),
+                )
+            });
+        self.barriers
+            .iter()
+            .any(|barrier| barrier.holds(ip.src(), ip.dst(), ports, now))
+    }
+
+    /// Bars the datagrams of a revoked flow the reassembler may still complete, see
+    /// [`Barrier`]; `false` if the table is full. Nothing while no datagram is held.
+    fn bar(&mut self, target: &Target) -> bool {
+        let Some(reassembler) = self.reassembler.as_ref() else {
+            return true;
+        };
+        if reassembler.pending() == 0 {
+            return true;
+        }
+        if self.barriers.len() >= reassembler.config().max_datagrams {
+            return false;
+        }
+        let (protocol, local, remote) = match *target {
+            Target::Tcp { local, peer, .. } => (protocol::TCP, local, Some(peer)),
+            Target::UdpFlow((remote, local)) | Target::UdpConnected((remote, local)) => {
+                (protocol::UDP, local, Some(remote))
+            }
+            Target::UdpBound(local) => (protocol::UDP, local, None),
+        };
+        let until = Instant::now().into_std() + reassembler.config().timeout;
+        self.barriers.push(Barrier {
+            protocol,
+            local,
+            remote,
+            until,
+        });
+        true
     }
 
     /// Adds what the reassembler counted since the last call to the stack's counters.
@@ -1014,7 +1216,7 @@ impl Driver {
             mut payload,
         } = datagram;
         if !self.connected.is_empty()
-            && let Some(socket) = self.connected.get(&(src, dst))
+            && let Some((socket, _)) = self.connected.get(&(src, dst))
         {
             match socket.try_send((src, payload)) {
                 Ok(()) => return,
@@ -1033,7 +1235,7 @@ impl Driver {
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
         for key in [dst, SocketAddr::new(unspecified, dst.port())] {
-            let Some(socket) = self.bound.get(&key) else {
+            let Some((socket, _)) = self.bound.get(&key) else {
                 continue;
             };
             match socket.try_send((src, payload)) {
@@ -1058,7 +1260,7 @@ impl Driver {
         // closed one means the application dropped the flow, so it is replaced by a new
         // flow carrying this datagram.
         let payload = match self.flows.get(&key) {
-            Some(flow) => match flow.try_send(payload) {
+            Some((flow, _)) => match flow.try_send(payload) {
                 Ok(()) => return,
                 Err(TrySendError::Full(_)) => {
                     tracing::trace!(%remote, %local, "UDP flow queue full; dropping");
@@ -1075,7 +1277,7 @@ impl Driver {
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.
         if self.flows.len() >= self.settings.max_udp_flows {
-            self.flows.retain(|_, flow| !flow.is_closed());
+            self.flows.retain(|_, (flow, _)| !flow.is_closed());
             if self.flows.len() >= self.settings.max_udp_flows {
                 tracing::warn!(%remote, %local, "UDP flow table at capacity; dropping new flow");
                 stats::add(&self.stats.udp_flow_limit, 1);
@@ -1087,13 +1289,14 @@ impl Driver {
         let _ = tx.try_send(payload);
         // Registered before the application can see (and drop) the flow.
         let registration = self.owners.udp_flow(local, remote);
+        let state = FlowState::new(Target::UdpFlow(key), &self.revocations);
         let flow = UdpFlow::new(
             registration,
             rx,
-            UdpReply::new(local, remote, self.out.clone()),
+            UdpReply::new(local, remote, self.out.clone(), Arc::clone(&state)),
         );
         if self.accept_udp.try_send(flow).is_ok() {
-            self.flows.insert(key, tx);
+            self.flows.insert(key, (tx, state));
         } else {
             tracing::debug!(%remote, %local, "incoming_udp full or gone; dropping UDP flow");
             stats::add(&self.stats.udp_not_accepted, 1);
@@ -1140,6 +1343,7 @@ impl Driver {
                     _registration: registration,
                     reply,
                     started: self.now(),
+                    start: self.position(),
                 }),
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -1158,14 +1362,173 @@ impl Driver {
         }
     }
 
-    /// Moves queued UDP sends into the egress backlog while it has room.
+    /// Moves queued UDP sends into the egress backlog while it has room, and forgets the
+    /// marks of datagrams the source took.
     fn take_udp_sends(&mut self) {
+        let oldest = self.oldest_queued();
+        while self
+            .marks
+            .front()
+            .is_some_and(|(position, _)| *position < oldest)
+        {
+            self.marks.pop_front();
+        }
         while !self.device.tx_full() {
             match self.udp_rx.try_recv() {
-                Ok(packet) => self.device.tx_queue.push_back(packet),
+                Ok((packet, flow)) => self.push_udp(packet, flow),
                 Err(_) => break,
             }
         }
+    }
+
+    /// Appends a UDP datagram of `flow` to the egress backlog, or drops it if the flow was
+    /// revoked.
+    fn push_udp(&mut self, packet: PacketBuf, flow: Arc<FlowState>) {
+        if flow.is_revoked() {
+            return stats::add(&self.stats.retired, 1);
+        }
+        self.marks.push_back((self.position(), flow));
+        self.device.tx_queue.push_back(packet);
+    }
+
+    /// The egress position of the next packet appended to the backlog.
+    fn position(&self) -> u64 {
+        self.sent + self.device.tx_queue.len() as u64
+    }
+
+    /// The egress position of the oldest packet possibly still in the egress queue.
+    fn oldest_queued(&self) -> u64 {
+        let queued = self.egress.max_capacity() - self.egress.capacity();
+        self.sent.saturating_sub(queued as u64)
+    }
+
+    /// Retires the flows revoked since the last turn, see [`retire`](Self::retire).
+    fn retire_revoked(&mut self) {
+        self.revocations.take(&mut self.retiring);
+        // Each flow stays in `retiring` until its outcome is written, so a panic leaves the
+        // rest to `Drop`, which reports them unknown.
+        while let Some(flow) = self.retiring.last().cloned() {
+            #[cfg(test)]
+            flow.observed_in(self.turns);
+            let outcome = self.retire(&flow);
+            #[cfg(test)]
+            flow.completed_in(self.turns);
+            flow.finish(outcome);
+            self.retiring.pop();
+        }
+    }
+
+    /// Removes a revoked flow's state and its output from the stack: the socket (without
+    /// an RST) or the queue entry, its packets in the backlog, a fence for those already
+    /// in the egress queue, and a barrier for its fragments the reassembler may hold.
+    /// `Failed` if the fence or the barrier table is full.
+    fn retire(&mut self, flow: &Arc<FlowState>) -> RetirementOutcome {
+        let fenced = match flow.target() {
+            &Target::Tcp {
+                handle,
+                local,
+                peer,
+                start,
+                ..
+            } => {
+                if self
+                    .conns
+                    .get(&handle)
+                    .is_some_and(|conn| Arc::ptr_eq(&conn.flow, flow))
+                {
+                    self.aborting.retain(|&aborting| aborting != handle);
+                    self.release_conn(handle);
+                }
+                self.purge_tcp(local, peer, start, flow.end())
+            }
+            Target::UdpFlow(key) => {
+                if self
+                    .flows
+                    .get(key)
+                    .is_some_and(|(_, owner)| Arc::ptr_eq(owner, flow))
+                {
+                    self.flows.remove(key);
+                }
+                self.purge_udp(flow)
+            }
+            Target::UdpBound(local) => {
+                if self
+                    .bound
+                    .get(local)
+                    .is_some_and(|(_, owner)| Arc::ptr_eq(owner, flow))
+                {
+                    self.bound.remove(local);
+                }
+                self.purge_udp(flow)
+            }
+            Target::UdpConnected(key) => {
+                if self
+                    .connected
+                    .get(key)
+                    .is_some_and(|(_, owner)| Arc::ptr_eq(owner, flow))
+                {
+                    self.connected.remove(key);
+                }
+                self.purge_udp(flow)
+            }
+        };
+        let barred = self.bar(flow.target());
+        if fenced && barred {
+            RetirementOutcome::Retired
+        } else {
+            RetirementOutcome::Failed
+        }
+    }
+
+    /// Drops the TCP packets from `local` to `peer` at egress positions in `[start, end)`
+    /// from the backlog and fences those possibly in the egress queue; `false` if the
+    /// fence table is full.
+    fn purge_tcp(&mut self, local: SocketAddr, peer: SocketAddr, start: u64, end: u64) -> bool {
+        let sent = self.sent;
+        let mut dropped = 0;
+        for (position, packet) in (sent..).zip(self.device.tx_queue.iter_mut()) {
+            if (start..end).contains(&position)
+                && tcp_tuple(packet.as_packet()) == Some((local, peer))
+            {
+                *packet = placeholder();
+                dropped += 1;
+            }
+        }
+        stats::add(&self.stats.retired, dropped);
+        let (start, end) = (start.max(self.oldest_queued()), end.min(sent));
+        start >= end
+            || self.fences.insert(Fence::Tcp {
+                local,
+                peer,
+                start,
+                end,
+            })
+    }
+
+    /// Drops the UDP datagrams of `flow` from the backlog and fences those possibly in the
+    /// egress queue; `false` if the fence table is full.
+    fn purge_udp(&mut self, flow: &Arc<FlowState>) -> bool {
+        let (sent, oldest) = (self.sent, self.oldest_queued());
+        let tx_queue = &mut self.device.tx_queue;
+        let mut dropped = 0;
+        let mut queued = VecDeque::new();
+        self.marks.retain(|(position, owner)| {
+            if !Arc::ptr_eq(owner, flow) {
+                return true;
+            }
+            if *position >= sent {
+                let index = usize::try_from(position - sent).unwrap_or(usize::MAX);
+                if let Some(packet) = tx_queue.get_mut(index) {
+                    *packet = placeholder();
+                    dropped += 1;
+                }
+            } else if *position >= oldest {
+                queued.push_back(*position);
+            }
+            false
+        });
+        stats::add(&self.stats.retired, dropped);
+        queued.is_empty() || self.fences.insert(Fence::Udp(queued))
     }
 
     /// Starts a handshake to `remote` from `local_port`, or an ephemeral port, keeping
@@ -1258,14 +1621,15 @@ impl Driver {
             local.port()
         };
         let addr = SocketAddr::new(local.ip(), port);
-        if self.bound.get(&addr).is_some_and(|tx| !tx.is_closed()) {
+        if self.bound.get(&addr).is_some_and(|(tx, _)| !tx.is_closed()) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "address already bound",
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        self.bound.insert(addr, tx);
+        let flow = FlowState::new(Target::UdpBound(addr), &self.revocations);
+        self.bound.insert(addr, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_bound(addr);
         Ok(UdpSocket::new(
             registration,
@@ -1274,6 +1638,7 @@ impl Driver {
             None,
             rx,
             self.out.clone(),
+            flow,
         ))
     }
 
@@ -1304,7 +1669,7 @@ impl Driver {
             ));
         }
         // Dropped sockets leave the table here too, so it empties when none is live.
-        self.connected.retain(|_, tx| !tx.is_closed());
+        self.connected.retain(|_, (tx, _)| !tx.is_closed());
         let port = if local.port() == 0 {
             let (bound, connected) = (&self.bound, &self.connected);
             let any = unspecified(source);
@@ -1321,7 +1686,7 @@ impl Driver {
         let local = SocketAddr::new(source, port);
         let key = (remote, local);
         if self.connected.contains_key(&key)
-            || self.flows.get(&key).is_some_and(|tx| !tx.is_closed())
+            || self.flows.get(&key).is_some_and(|(tx, _)| !tx.is_closed())
         {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -1329,7 +1694,8 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        self.connected.insert(key, tx);
+        let flow = FlowState::new(Target::UdpConnected(key), &self.revocations);
+        self.connected.insert(key, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_flow(local, remote);
         Ok(UdpSocket::new(
             registration,
@@ -1338,6 +1704,7 @@ impl Driver {
             Some(remote),
             rx,
             self.out.clone(),
+            flow,
         ))
     }
 
@@ -1364,7 +1731,9 @@ impl Driver {
         self.listeners.retain(|_, handles| !handles.is_empty());
 
         for (handle, port) in accepted {
-            let connection = self.adopt(handle, now);
+            // A socket the batch tracking missed counts from the start, which covers it.
+            let start = self.inbound.get(&handle).map_or(0, |&(_, start)| start);
+            let connection = self.adopt(handle, now, start);
             self.inbound.remove(&handle);
             tracing::debug!(
                 target: "netstack",
@@ -1424,13 +1793,14 @@ impl Driver {
                 _registration: registration,
                 reply,
                 started,
+                start,
             } = connecting;
             let socket = self.sockets.get_mut::<tcp::Socket<'_>>(handle);
             match socket.state() {
                 tcp::State::Established | tcp::State::CloseWait => {
                     socket.set_timeout(None);
                     // A caller that gave up drops the connection, which closes it.
-                    let _ = reply.send(Ok(self.adopt(handle, now)));
+                    let _ = reply.send(Ok(self.adopt(handle, now, start)));
                 }
                 tcp::State::Closed => {
                     self.sockets.remove(handle);
@@ -1450,14 +1820,16 @@ impl Driver {
                         _registration: registration,
                         reply,
                         started,
+                        start,
                     });
                 }
             }
         }
     }
 
-    /// Registers an established socket as a connection and returns the application side.
-    fn adopt(&mut self, handle: SocketHandle, now: SmolInstant) -> TcpConnection {
+    /// Registers an established socket as a connection and returns the application side;
+    /// `start` is the egress position when the socket took or sent the SYN.
+    fn adopt(&mut self, handle: SocketHandle, now: SmolInstant, start: u64) -> TcpConnection {
         let socket = self.sockets.get::<tcp::Socket<'_>>(handle);
         let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let local = socket
@@ -1471,6 +1843,16 @@ impl Driver {
         let progress = Arc::new(Progress::new(self.epoch.into_std()));
         // Taken before the caller drops the connect's or the handshake's registration.
         let registration = self.owners.tcp(local, peer);
+        let flow = FlowState::new(
+            Target::Tcp {
+                handle,
+                shared: Arc::clone(&shared),
+                local,
+                peer,
+                start,
+            },
+            &self.revocations,
+        );
         self.conns.insert(
             handle,
             Conn {
@@ -1481,6 +1863,7 @@ impl Driver {
                 terminal,
                 local_closed: false,
                 last_activity_at: now,
+                flow: Arc::clone(&flow),
             },
         );
         TcpConnection::new(
@@ -1490,6 +1873,7 @@ impl Driver {
             local,
             peer,
             terminal_rx,
+            flow,
         )
     }
 
@@ -1566,7 +1950,9 @@ impl Driver {
 
     /// Releases a connection's tuple and socket and tells the application.
     fn release_conn(&mut self, handle: SocketHandle) {
+        let end = self.position();
         if let Some(conn) = self.conns.remove(&handle) {
+            conn.flow.set_end(end);
             conn.release();
         }
         self.sockets.remove(handle);
@@ -1585,8 +1971,9 @@ impl Driver {
     }
 
     /// Registers the tuples of listener sockets a SYN of this batch moved into
-    /// `SynReceived`, before their SYN-ACK leaves.
-    fn track_inbound(&mut self, demand: &HashMap<u16, usize>) {
+    /// `SynReceived`, before their SYN-ACK leaves, with `mark`, the egress position before
+    /// the batch.
+    fn track_inbound(&mut self, demand: &HashMap<u16, usize>, mark: u64) {
         for port in demand.keys() {
             let Some(handles) = self.listeners.get(port) else {
                 continue;
@@ -1608,9 +1995,10 @@ impl Driver {
                 if self
                     .inbound
                     .get(&handle)
-                    .is_none_or(|registration| !registration.is(local, remote))
+                    .is_none_or(|(registration, _)| !registration.is(local, remote))
                 {
-                    self.inbound.insert(handle, self.owners.tcp(local, remote));
+                    self.inbound
+                        .insert(handle, (self.owners.tcp(local, remote), mark));
                 }
             }
         }
@@ -1620,7 +2008,7 @@ impl Driver {
     fn flush_egress(&mut self) -> bool {
         while let Some(packet) = self.device.tx_queue.pop_front() {
             match self.egress.try_send(packet) {
-                Ok(()) => {}
+                Ok(()) => self.sent += 1,
                 Err(TrySendError::Full(packet)) => {
                     self.device.tx_queue.push_front(packet);
                     break;
@@ -1663,8 +2051,15 @@ impl Driver {
                 None => return false,
             },
             command = next_command(self.commands.as_mut()), if has_commands => command,
-            Some(packet) = self.udp_rx.recv(), if !tx_full => {
-                self.device.tx_queue.push_back(packet);
+            Some((packet, flow)) = self.udp_rx.recv(), if !tx_full => {
+                // `push_udp`, on the fields the other branches do not borrow.
+                if flow.is_revoked() {
+                    stats::add(&self.stats.retired, 1);
+                } else {
+                    let position = self.sent + self.device.tx_queue.len() as u64;
+                    self.marks.push_back((position, flow));
+                    self.device.tx_queue.push_back(packet);
+                }
                 return true;
             }
             () = self.notify.notified() => return true,
@@ -1682,6 +2077,7 @@ impl Driver {
                 Ok(permit) => {
                     if let Some(packet) = self.device.tx_queue.pop_front() {
                         permit.send(packet);
+                        self.sent += 1;
                     }
                     return true;
                 }
@@ -1757,6 +2153,26 @@ pub(crate) fn tcp_segment(pkt: &[u8]) -> Option<&[u8]> {
         return None;
     }
     pkt.get(ihl..)
+}
+
+/// The `(src, dst)` of a TCP packet.
+pub(crate) fn tcp_tuple(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    let segment = tcp_segment(pkt)?;
+    let (src_port, dst_port) = (
+        u16::from_be_bytes([*segment.first()?, *segment.get(1)?]),
+        u16::from_be_bytes([*segment.get(2)?, *segment.get(3)?]),
+    );
+    let ip = IpPacket::parse(pkt).ok()?;
+    Some((
+        SocketAddr::new(ip.src(), src_port),
+        SocketAddr::new(ip.dst(), dst_port),
+    ))
+}
+
+/// What a packet dropped from the backlog leaves behind: an empty packet, which keeps the
+/// later packets' egress positions and which the source discards.
+fn placeholder() -> PacketBuf {
+    PacketBuf::with_capacity(0)
 }
 
 fn tcp_dst_port(pkt: &[u8]) -> Option<u16> {

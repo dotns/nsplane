@@ -50,7 +50,7 @@ where it is described below.
 | `nsplane-wss` | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`), `WssStreamClient` (`new`, `connect`, `open_tcp`, `open_udp`, `state`, `stats`, `events`), `WssStreamServer` (`new`, `with_events`, `run`, `state`, `stats`); traits `BearerProvider`, `WssResolver` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`, `WssStreamLimits` (`open_timeout`), `WssStreamStats`, `WssTcpStream`, `WssUdpFlow`, `WssServerLimits`, `WssServerStats`, `WssOpen`, `Denied`, `WssStreamEvent` / `WssStreamEventKind`, `WssCloseReason`; `frame` (`WsFrame`, `FrameCommand`, `Protocol`, `FrameError`, the command and protocol bytes); `MAX_DATAGRAM`, `MAX_MESSAGE`, `MAX_DATA_PAYLOAD` |
 | `nsplane-wss` (server transport) | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
 | `nsplane-tun` | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
-| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| `nsplane-netstack` | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | `nsplane-acl` | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow` (either family), `counters`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters`, `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`; `Ipv6` removed in 0.13.0) |
 | `nsplane-nat` | `Translator` (`new`, `store`, `set_mtu`, `ipv4_translated_predicate`, `stats`), `TranslationTableBuilder` (`peer_with_peer6_eam4`, `nested_lans`) / `TranslationTable` (`peer6_eam4`, `by_peer6_eam4`, `nested_lans`), `PortMap` (`new`, `with_conntrack`, `set_rules`), `Conntrack` (`peek`, `remove`, `with_removal_hook`), `Nat64Lan` (`new`, `with_snat_ports`, `forward`, `reverse`, `remove_flow`, `stats`), `Nat64LanSink` / `Nat64LanSource`; trait `SnatPorts` | `PeerMapping`, `SelfMapping`, `LanPrefix`, `TableError`, `TranslatorStats`, `PortMapRule`, `PortMapProtocol`, `PortMapError`, `ConntrackConfig`, `ConntrackStats`, `ConntrackError`, `Flow`, `FlowMatch`, `FlowDirection`, `TcpState`, `LanRoute`, `LanRoutes`, `Nat64LanConfig` (`nested_routes`), `Nat64LanStats`, `Nat64LanError`, `Nat64Verdict`, `DefaultSnatPorts`, `nat64_lan::reasons`, `checksum` |
 | `nsplane-nat` (local side) | `Redirect` (`new`, `with_conntrack`, `forward`, `reverse`, `original_destination`, `with_endpoint_tries`, `endpoint_in_use`, `remove_flow`, `retain`, `stats`) | `RedirectDecision`, `RedirectVerdict`, `RedirectStats`, `redirect::reasons` |
@@ -1491,6 +1491,58 @@ smoltcp on its own dispatch path.
   release (11.0-21.0 s), as they did on smoltcp 0.14 with the Phase 5 workarounds (8.3-17.3 s
   and 9.0-23.1 s).
 
+### Per-flow control and retirement
+
+Every `TcpConnection`, `UdpFlow` (shared with its `UdpReply` clones) and `UdpSocket` gets
+one `FlowState` when the driver creates it, and `control()` hands out a `FlowControl` on
+it: valid after the data handles moved, were aborted, dropped or released.
+
+- `FlowControl::revoke` flips the flow's revoked bit, clears its TCP stream buffers, wakes
+  its blocked reads, writes and sends, and queues the flow for the driver; it never waits
+  and sends nothing (no FIN, no RST: the peer times out or gets the stateless RST on its
+  next segment). From then on every data handle fails with `ConnectionAborted`
+  (`UdpFlow::recv` returns `None`). Repeated calls share the first call's outcome.
+- The driver takes the revocations at the start of its next turn and in that turn removes
+  the flow's socket (without an RST, also from the aborting list) or its queue entry,
+  replaces the flow's packets in the egress backlog by empty placeholders, fences those
+  possibly in the egress queue, and bars the flow's tuple in the reassembler if it holds
+  fragments. Nothing in it waits for the peer, TIME-WAIT, an RST or egress room.
+- Egress positions identify output without a per-packet tag for TCP: the driver counts
+  packets it moves into the egress queue, `NetStackSource` counts packets it takes, and a
+  TCP flow owns the tuple's packets in `[start, end)`. UDP datagrams are marked with their
+  flow. The source drops placeholders (they keep later positions intact), packets of a
+  fenced TCP window and fenced UDP positions; none of them reaches the engine, none counts
+  in `NetStackStats`. Everything dropped for a revoked flow counts in
+  `NetStackHandle::retired_drops`.
+- `RetirementReceipt` reports `Retired` (state removed, queued output dropped), `Failed`
+  (state removed, but a bound below was full, so output in the egress queue or a held
+  fragment may still leave) or `Unknown` (the driver stopped first, or had stopped: a stopped
+  stack never claims a retirement). `wait` is cancellation-safe and repeatable.
+- Proof boundary: the stack only. A packet `NetStackSource::recv` already returned belongs
+  to the engine and is not covered.
+- `FlowControl::bind_context(domain)` labels the flow once with an opaque `FlowContext`:
+  the caller's domain and an instance from a process-wide counter that never repeats (and
+  refuses with `QuotaExceeded` when used up). The stack never reads it; a same-tuple
+  re-open is a new flow with a new state, new queues and a new instance.
+
+Bounds of the retirement state; a full table fails the revoke (`Failed`) after the flow's
+own state is removed, it never grows past its bound:
+
+| State | Bound | When full |
+| --- | --- | --- |
+| UDP marks (flow of each queued datagram) | the backlog (256) plus `egress_capacity`, pruned every turn | cannot fill: a mark exists only with its datagram's queue slot |
+| UDP fence positions | `egress_capacity` per fence (positions in the egress queue only) | n/a |
+| Fences (TCP windows and UDP position lists) | 1024 per stack, dropped once the source passed them | `Failed` |
+| Reassembly barriers | `ReassemblyConfig::max_datagrams`, each for one reassembly timeout | `Failed` |
+
+Without a revoke the per-packet cost is one relaxed load per driver turn, a position
+counter on each side of the egress queue, one atomic load per packet in the source while
+no fence exists, and an `Arc` clone per UDP datagram sent; see the `send_stream` and
+`netstack_udp_send` rows in the plan `docs/plan/20261017-1800-flow-retirement.md`.
+The unit tests `src/stack/tests/flow_control.rs`, `flow_context.rs` and `flow_bounds.rs`
+and `nsplane-e2e`'s `tests/netstack_flow_retirement.rs` cover the outcomes, the bounds and
+same-tuple re-opens.
+
 ### Netstack throughput
 
 Release, two netstacks over two engines on an in-process `ChannelTransport` pair (no
@@ -1636,6 +1688,10 @@ summed cost):
 ```text
 cargo bench -p nsplane-netstack --bench send_stream
 ```
+
+The same file's `netstack_udp_send` and `netstack_udp_send_1cpu` send 1200-byte datagrams
+over one or four connected UDP sockets (flows without a context) to bound sockets of the
+other stack, 1024 per iteration in batches of 128 so that no receiver queue overflows.
 
 `.3` against `.4` (MF-5), 15 alternating pairs pinned to CPUs 2-5, 2026-10-06, 1-minute load
 1.6-9.4 (32 cores); medians in MB/s [IQR], and `.4` against `.3` per pair:

@@ -8,7 +8,13 @@
 //! all of it. `netstack_send` runs on four runtime workers (the stacks and the application
 //! tasks in parallel, as in a node), `netstack_send_1cpu` on one thread (the summed cost of
 //! both ends, with less scheduling noise). Built against a smoltcp fork tag this compares the tags' sender; see
-//! "Netstack throughput" in `docs/architecture.md`:
+//! "Netstack throughput" in `docs/architecture.md`.
+//!
+//! `netstack_udp_send` and `netstack_udp_send_1cpu` send UDP the same way: one and four
+//! connected sockets of stack `a`, flows without a context, each to a bound socket of `b`.
+//! An iteration sends `DATAGRAMS` datagrams of `DATAGRAM` bytes in batches of `BATCH` and
+//! ends when the receivers took all of them; a batch fits the receivers' queues, so none
+//! is lost:
 //!
 //! ```text
 //! cargo bench -p nsplane-netstack --bench send_stream
@@ -22,7 +28,9 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput};
 use futures_core::Stream;
 use nsplane::{PacketSink, PacketSource, PeerId};
-use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackSink, NetStackSource};
+use nsplane_netstack::{
+    DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, NetStackSink, NetStackSource,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -33,6 +41,15 @@ const CHUNK_BYTES: usize = 8 << 20;
 const IO: usize = 64 << 10;
 /// TCP port of the receiving stack.
 const PORT: u16 = 9000;
+/// Datagrams per UDP iteration.
+const DATAGRAMS: usize = 1024;
+/// Datagrams in flight at once, split between the flows: fewer than a bound socket queues
+/// (256 by default).
+const BATCH: usize = 128;
+/// UDP payload bytes.
+const DATAGRAM: usize = 1200;
+/// First UDP port of the receiving stack, one per flow.
+const UDP_PORT: u16 = 5000;
 
 /// Forwards every packet from `from` to `to`.
 async fn wire(mut from: NetStackSource, to: NetStackSink) {
@@ -41,6 +58,19 @@ async fn wire(mut from: NetStackSource, to: NetStackSink) {
             break;
         }
     }
+}
+
+/// Two stacks, `10.0.0.1` and `10.0.0.2`, wired back to back.
+fn pair() -> (NetStackHandle, NetStackHandle) {
+    let config =
+        |last: u8| NetStackConfig::new(vec![(IpAddr::from([10, 0, 0, last]), 24)], DEFAULT_MTU);
+    let (a_stack, a) = NetStack::new(config(1));
+    let (b_stack, b) = NetStack::new(config(2));
+    let (a_source, a_sink) = a_stack.split();
+    let (b_source, b_sink) = b_stack.split();
+    tokio::spawn(wire(a_source, b_sink));
+    tokio::spawn(wire(b_source, a_sink));
+    (a, b)
 }
 
 /// `streams` connections from stack `10.0.0.1` to stack `10.0.0.2`: a sender per
@@ -52,15 +82,7 @@ async fn streams(
     Vec<mpsc::UnboundedSender<usize>>,
     mpsc::UnboundedReceiver<usize>,
 ) {
-    let config =
-        |last: u8| NetStackConfig::new(vec![(IpAddr::from([10, 0, 0, last]), 24)], DEFAULT_MTU);
-    let (a_stack, a) = NetStack::new(config(1));
-    let (b_stack, b) = NetStack::new(config(2));
-    let (a_source, a_sink) = a_stack.split();
-    let (b_source, b_sink) = b_stack.split();
-    tokio::spawn(wire(a_source, b_sink));
-    tokio::spawn(wire(b_source, a_sink));
-
+    let (a, b) = pair();
     let mut incoming = b.incoming_tcp();
     let (read_tx, read_rx) = mpsc::unbounded_channel();
     let mut senders = Vec::with_capacity(streams);
@@ -94,6 +116,44 @@ async fn streams(
         senders.push(tx);
     }
     (senders, read_rx)
+}
+
+/// `flows` UDP flows from stack `10.0.0.1` to stack `10.0.0.2`: a sender per flow that
+/// sends the datagram counts it is given, and a receiver per flow that reports every
+/// datagram on the returned channel.
+async fn udp_flows(
+    flows: usize,
+) -> (
+    Vec<mpsc::UnboundedSender<usize>>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (a, b) = pair();
+    let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+    let mut senders = Vec::with_capacity(flows);
+    for port in (UDP_PORT..).take(flows) {
+        let target = SocketAddr::from(([10, 0, 0, 2], port));
+        let mut server = b.bind_udp(target).await.unwrap();
+        let received = recv_tx.clone();
+        tokio::spawn(async move {
+            while server.recv_from().await.is_ok() {
+                if received.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let socket = a.connect_udp(target).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<usize>();
+        tokio::spawn(async move {
+            let data = vec![0x5a; DATAGRAM];
+            while let Some(count) = rx.recv().await {
+                for _ in 0..count {
+                    socket.send(&data).await.unwrap();
+                }
+            }
+        });
+        senders.push(tx);
+    }
+    (senders, recv_rx)
 }
 
 fn bench_send(c: &mut Criterion) {
@@ -133,5 +193,46 @@ fn bench_send(c: &mut Criterion) {
     }
 }
 
-criterion::criterion_group!(benches, bench_send);
+fn bench_udp_send(c: &mut Criterion) {
+    let runtimes = [
+        (
+            "netstack_udp_send",
+            tokio::runtime::Builder::new_multi_thread(),
+        ),
+        (
+            "netstack_udp_send_1cpu",
+            tokio::runtime::Builder::new_current_thread(),
+        ),
+    ];
+    for (name, mut builder) in runtimes {
+        let runtime = builder.worker_threads(4).enable_time().build().unwrap();
+        let mut group = c.benchmark_group(name);
+        group.throughput(Throughput::Elements(DATAGRAMS as u64));
+        group.sample_size(20);
+        group.measurement_time(Duration::from_secs(10));
+        for count in [1, 4] {
+            let (senders, mut received) = runtime.block_on(udp_flows(count));
+            group.bench_function(format!("flows_{count}"), |bench| {
+                bench.iter_custom(|iters| {
+                    runtime.block_on(async {
+                        let batches = DATAGRAMS / BATCH * usize::try_from(iters).unwrap();
+                        let started = Instant::now();
+                        for _ in 0..batches {
+                            for sender in &senders {
+                                sender.send(BATCH / count).unwrap();
+                            }
+                            for _ in 0..BATCH {
+                                received.recv().await.unwrap();
+                            }
+                        }
+                        started.elapsed()
+                    })
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+criterion::criterion_group!(benches, bench_send, bench_udp_send);
 criterion::criterion_main!(benches);

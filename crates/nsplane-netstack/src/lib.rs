@@ -13,6 +13,13 @@
 //! [`UdpFlow`] per `(remote, local)` tuple, and [`connect_tcp`](NetStackHandle::connect_tcp),
 //! [`bind_udp`](NetStackHandle::bind_udp) and [`connect_udp`](NetStackHandle::connect_udp)
 //! open the reverse direction.
+//! Every connection, flow and socket has a [`FlowControl`] that revokes it alone, without
+//! stopping the stack; its [`RetirementReceipt`] tells when nothing of the flow can leave
+//! the stack any more. [`FlowControl::bind_context`] labels a flow with an opaque
+//! [`FlowContext`] (the caller's isolation domain and an instance the stack never hands
+//! out twice); the stack never reads it, and a new flow on the same tuple never takes
+//! over a revoked flow's queues, replies or held fragments. Both cover the stack only:
+//! packets already taken from [`NetStackSource`] are outside.
 //! [`owns`](NetStackHandle::owns) tells whether an ingress packet is the stack's
 //! ([`Ownership`]), for a local side that shares one decrypted stream with other consumers.
 //!
@@ -40,6 +47,7 @@
 
 mod config;
 mod device;
+mod flow;
 mod ownership;
 mod pmtu;
 mod stack;
@@ -48,6 +56,7 @@ mod tcp;
 mod udp;
 
 pub use config::{DEFAULT_MTU, MIN_MTU, NetStackConfig};
+pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
 pub use stack::{NetStack, NetStackHandle, NetStackSink, NetStackSource};
