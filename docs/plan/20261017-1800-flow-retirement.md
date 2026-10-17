@@ -116,6 +116,143 @@ Load (`/proc/loadavg`, 1-minute, 32 CPUs) before / after each run:
   that `Arc` in the driver touch a reference count shared across threads, the likely cause (not
   profiled). Not fixed in FL-D (outside its scope); reported to L2.
 
+### FL-G: profile of `netstack_udp_send/flows_4`, one fix attempt, A/B
+
+FL-E (`bkd/un2bfqis`, not merged) replaced the per-datagram `Arc<FlowState>` clone with a slot
+and generation tag and moved `flows_4` by only -0.1 / -1.6 %, so the clone is not the cause.
+
+**Profile.** 2026-10-17, one `scripts/bench/slot.sh` invocation, slot 0 (`--cpuset-cpus 1-7`),
+load 2.13 / 2.54 (A) and 2.54 / 2.90 (B) before / after. Bench profile with
+`CARGO_PROFILE_BENCH_DEBUG=true` in separate target dirs, A = `git archive v0.15.0` with the
+branch's `benches/send_stream.rs`, B = the branch at `69e42df` (= `bkd/azzieiyq` `3aa8050`);
+`perf record -F 4999 -g -- send_stream --bench --profile-time 20 'netstack_udp_send/flows_4$'`
+(perf 6.12, `ai-agent/nstun-perf`), then `perf report --no-children --sort symbol`. Top 30 by
+self time (percent of the period; raw sample counts beside it; kernel symbols are unresolved,
+`kptr_restrict`):
+
+A (v0.15.0), 349 220 samples:
+
+```text
+ self %  samples  symbol
+ 10.09%    31306  <tokio::mpsc::bounded::Sender<PacketBuf>>::send::{closure#0}
+  6.87%    21390  send_stream::udp_flows::{closure#0}::{closure#1}
+  6.42%    19902  send_stream::udp_flows::{closure#0}::{closure#0}
+  4.66%    14451  <Driver>::run::{closure#0}
+  3.89%    12011  <Driver>::ingest
+  3.84%    11891  _int_malloc
+  2.95%     9124  0x0000000000000db8 (vdso)
+  2.76%     8550  _int_free_chunk
+  2.37%     9358  0xffffffff9ea00080 (kernel, unresolved)
+  2.15%     6666  <tokio::mpsc::list::Tx<PacketBuf>>::find_block
+  1.97%     6070  send_stream::wire::{closure#0}
+  1.82%     5637  __memmove_avx512_unaligned_erms
+  1.77%     5485  tokio::runtime::task::raw::poll::<BlockingTask<multi_thread worker launch>>
+  1.63%     5066  <tokio::batch_semaphore::Semaphore>::add_permits_locked
+  1.58%    10535  <tokio::task::atomic_waker::AtomicWaker>::register_by_ref
+  1.38%     4259  <RandomState as BuildHasher>::hash_one::<&SocketAddr>
+  1.33%     5310  syscall
+  1.32%     4122  cfree@GLIBC_2.2.5
+  1.32%     4083  <tokio::batch_semaphore::Acquire as Future>::poll
+  1.26%     3926  malloc
+  1.15%     3709  0xffffffff9fb5b9a2 (kernel, unresolved)
+  1.14%     3537  <tokio::mpsc::list::Rx<PacketBuf>>::pop
+  0.89%     2752  <tokio::mpsc::list::Rx<(SocketAddr, Bytes)>>::pop
+  0.87%     6465  send_stream::bench_udp_send::{closure#0}::{closure#0}::{closure#0}
+  0.79%     5836  <tokio::mpsc::list::Rx<()>>::pop
+  0.78%     3404  0xffffffff9ed37f17 (kernel, unresolved)
+  0.72%     2211  <PacketBuf>::freeze
+  0.70%     2159  <tokio::mpsc::bounded::Sender<(SocketAddr, Bytes)>>::try_send
+  0.70%     2151  <tokio::mpsc::list::Tx<()>>::find_block
+  0.62%     1905  unlink_chunk.isra.0
+```
+
+B (branch at 69e42df, before the fix), 430 438 samples:
+
+```text
+ self %  samples  symbol
+ 12.36%    46751  send_stream::udp_flows::{closure#0}::{closure#1}
+  6.24%    23618  send_stream::udp_flows::{closure#0}::{closure#0}
+  5.60%    21006  <Driver>::run::{closure#0}
+  5.38%    20154  send_stream::wire::{closure#0}
+  3.96%    14796  <Driver>::ingest
+  3.85%    14514  _int_malloc
+  3.00%    11346  0x0000000000000db8 (vdso)
+  2.79%    10618  _int_free_chunk
+  2.33%    11646  0xffffffff9ea00080 (kernel, unresolved)
+  1.74%     6618  tokio::runtime::task::raw::poll::<BlockingTask<multi_thread worker launch>>
+  1.67%     6309  __memmove_avx512_unaligned_erms
+  1.64%     6192  <tokio::mpsc::list::Tx<(PacketBuf, Arc<FlowState>)>>::find_block
+  1.43%    12382  <tokio::task::atomic_waker::AtomicWaker>::register_by_ref
+  1.41%     5315  <tokio::batch_semaphore::Semaphore>::add_permits_locked
+  1.35%     6710  syscall
+  1.31%     4942  malloc
+  1.24%     4661  <RandomState as BuildHasher>::hash_one::<&SocketAddr>
+  1.20%     4548  cfree@GLIBC_2.2.5
+  1.19%     4748  0xffffffff9fb5b9a2 (kernel, unresolved)
+  1.06%     3965  <tokio::mpsc::list::Tx<PacketBuf>>::find_block
+  0.98%     3656  <tokio::mpsc::bounded::Sender<(SocketAddr, Bytes)>>::try_send
+  0.86%     3230  <tokio::batch_semaphore::Acquire as Future>::poll
+  0.86%     8287  send_stream::bench_udp_send::{closure#0}::{closure#0}::{closure#0}
+  0.84%     3191  <tokio::notify::NotifiedProject>::poll_notified
+  0.84%     3172  <tokio::mpsc::list::Rx<(PacketBuf, Arc<FlowState>)>>::pop
+  0.81%     3042  unlink_chunk.isra.0
+  0.76%     7358  <tokio::mpsc::list::Rx<()>>::pop
+  0.76%     4319  0xffffffff9ed37f17 (kernel, unresolved)
+  0.72%     2691  <PacketBuf>::freeze
+  0.58%     2215  <tokio::mpsc::list::Rx<(SocketAddr, Bytes)>>::pop
+```
+
+Reading the diff:
+
+- B spent 23 % more CPU in the same 20 s (430 438 against 349 220 samples) for about 4 % fewer
+  iterations, and the extra time is spread over the whole path, not in one new symbol. Per
+  source file (`--sort srcline`, B scaled by 462/481 for its fewer iterations, B - A in
+  samples): unresolved kernel and libc +20 337, `malloc.c` +6 358, `atomic.rs` +4 722, tokio
+  `list.rs` +3 657, `stack.rs` +3 239, `atomic_waker.rs` +2 317, `chan.rs` +2 261, `notify.rs`
+  +2 236 (275 -> 2 614), `send_stream.rs` +2 046, vdso clock +1 774, `syscall.S` +1 135, tokio
+  `park.rs` +1 093. Only `bounded.rs` fell (-4 597), because `UdpOut` now sends a
+  `(PacketBuf, Arc<FlowState>)` and `Sender<PacketBuf>::send` (A's top symbol) is inlined into
+  the `wire` task in B: the `wire` and sender-closure rows move by inlining, not by cost.
+- New in B: `Notify::poll_notified` (the revoke notifier in `receive` and in `UdpOut::send`) and
+  the extra `chan.rs:433`, the `try_pop` of `Receiver::try_recv` (1 021 -> 2 321 samples). In
+  tokio 1.53 `try_recv` parks the worker thread when it finds a send to the queue in progress
+  (`Busy`), after waking the task's own receive waker. FL-B's `receive` calls it before every
+  receive of a `UdpFlow` or `UdpSocket`; on four workers the receivers drain while the driver
+  pushes, which matches the extra park, futex and wake time. On one thread there is no
+  concurrent send, which matches the at-par `_1cpu` cases.
+
+**Fix attempt** (`ac68346`): `receive` without the `try_recv` fast path, a `biased` select that
+polls the queue before the revoke notifier, so a ready datagram still skips the notifier;
+same results (a revoked flow still yields `None`, queued datagrams are discarded). Gate passed
+on it (`just check` with 1946 tests, `cargo doc -D warnings`), every existing test untouched.
+
+**A/B** of v0.15.0 (A) against the fixed branch (B, `ac68346`), normal bench profile, 2026-10-17,
+three invocations of `scripts/bench/slot.sh`, all in slot 0 (`--cpuset-cpus 1-7`), A then B in
+each, 120 s between invocations; criterion medians per round, then the median of the rounds:
+
+| Case | A rounds | B rounds | A median | B median | B vs A |
+| --- | --- | --- | --- | --- | --- |
+| `netstack_send/streams_1` | 3.162 / 3.185 / 3.143 ms | 3.158 / 3.098 / 3.156 ms | 3.162 ms | 3.156 ms | -0.2 % |
+| `netstack_send/streams_4` | 2.042 / 2.006 / 2.012 ms | 2.030 / 2.033 / 2.025 ms | 2.012 ms | 2.030 ms | +0.9 % |
+| `netstack_udp_send/flows_1` | 554.46 / 570.06 / 572.12 us | 581.85 / 577.77 / 572.80 us | 570.06 us | 577.77 us | +1.4 % |
+| `netstack_udp_send/flows_4` | 463.78 / 462.06 / 458.35 us | 476.33 / 472.01 / 471.54 us | 462.06 us | 472.01 us | **+2.2 %** |
+| `netstack_udp_send_1cpu/flows_1` | 424.53 / 427.39 / 426.92 us | 417.05 / 417.89 / 416.26 us | 426.92 us | 417.05 us | -2.3 % |
+| `netstack_udp_send_1cpu/flows_4` | 422.37 / 423.22 / 422.79 us | 422.86 / 425.24 / 424.79 us | 422.79 us | 424.79 us | +0.5 % |
+
+Load (`/proc/loadavg`, 1-minute) before / after: round 1 A 8.07 / 3.28 (just after the bench
+builds), B 3.28 / 2.17; round 2 A 0.70 / 1.60, B 1.60 / 1.73; round 3 A 0.68 / 1.74, B 1.74 /
+1.79.
+
+**Conclusion.** The fix halves the gap (FL-D +4.1 % -> +2.2 %), but `flows_4` stays outside
+max(2 %, round spread): every B round (471.5-476.3 us) is slower than every A round
+(458.4-463.8 us), a spread of about 1.2 %; `flows_1` (+1.4 %) and `streams_4` (+0.9 %) are also
+above their FL-D values. By the L1 rule the fix is reverted (`e49a6cf`; the source equals
+`bkd/azzieiyq`) and the residual is recorded: multi-flow UDP send +4.1 % in the netstack micro
+bench (the FL-D value; the unfixed branch was not timed again), every other path at par. The
+rest of the gap has no single hot symbol in the profile; the remaining per-datagram changes
+are the revoke checks and the notifier select in `UdpOut::send`, the mark push and prune in
+the driver and the larger `udp_rx` element.
+
 ## Annotations
 
 ### FL-A design note (2026-10-17)
