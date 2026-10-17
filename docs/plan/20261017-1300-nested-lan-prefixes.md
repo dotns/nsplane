@@ -1,6 +1,6 @@
 # 20261017-1300-nested-lan-prefixes Nested LAN prefixes with longest-prefix match
 
-- **status**: in_progress
+- **status**: completed (merged 2026-10-17; pending release 0.15.0)
 - **createdAt**: 2026-10-17 13:00
 - **approvedAt**: 2026-10-17 (owner: "2，需要，开始修改然后发布0.15.0", the fifth exception to the
   freeze, released as 0.15.0)
