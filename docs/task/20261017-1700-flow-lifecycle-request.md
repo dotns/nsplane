@@ -1,6 +1,6 @@
 # 20261017-1700-flow-lifecycle-request Per-flow retirement, flow context and delivery gates (request, draft)
 
-- **status**: waiting (draft request from ns, not approved; the freeze applies)
+- **status**: in_progress (R1, R2: plan `20261017-1800-flow-retirement`; R3 deferred by the owner)
 - **priority**: P3
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-17 17:00

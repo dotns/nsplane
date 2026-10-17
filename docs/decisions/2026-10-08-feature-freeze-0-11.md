@@ -45,3 +45,7 @@ slot A/B when it touches the data path.
   with longest-prefix match in nsplane-nat, opt-in and additive (plan
   `20261017-1300-nested-lan-prefixes`, from the ns plan `20261017-0422-gateway-as-node`). It
   ships as 0.15.0.
+- 2026-10-17: sixth exception (owner: "可以先做r1和r2，先不做r3"): per-flow control,
+  retirement receipts and a flow context inside `nsplane-netstack` (plan
+  `20261017-1800-flow-retirement`, task `20261017-1700-flow-lifecycle-request` R1 and R2). R3,
+  delivery gates in the engine and transports, stays deferred. It ships as 0.16.0.
