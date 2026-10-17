@@ -75,7 +75,10 @@ async fn pump(peer: &mut RawPeer, ticks: usize) -> Vec<PacketBuf> {
 }
 
 /// Pumps until `ready` holds, for at most five seconds.
-async fn pump_until(peer: &mut RawPeer, ready: impl Fn(&RawPeer) -> bool) -> TestResult {
+async fn pump_until(
+    peer: &mut RawPeer,
+    ready: impl Fn(&RawPeer) -> bool + Send + Sync,
+) -> TestResult {
     timeout(Duration::from_secs(5), async {
         while !ready(peer) {
             pump(peer, 1).await;
@@ -216,7 +219,10 @@ async fn control_survives_moved_and_cloned_handles() -> TestResult {
         received
     });
     pump(&mut peer, 2).await;
-    assert_eq!(retire(&reply_clone.control()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        retire(&reply_clone.control()).await?,
+        RetirementOutcome::Retired
+    );
     assert!(flow_control.is_revoked());
     assert!(reply.control().is_revoked());
     assert_eq!(timeout(WAIT, receiver).await??, 1);
@@ -280,7 +286,10 @@ async fn revoke_is_idempotent_and_wakes_blocked_read_write_send() -> TestResult 
         timeout(WAIT, sender).await??,
         io::ErrorKind::ConnectionAborted
     );
-    assert_eq!(timeout(WAIT, first.wait()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        timeout(WAIT, first.wait()).await?,
+        RetirementOutcome::Retired
+    );
     assert_eq!(
         timeout(WAIT, udp_first.wait()).await?,
         RetirementOutcome::Retired
@@ -329,14 +338,24 @@ async fn revoked_handles_fail_with_connection_aborted() -> TestResult {
 
     let mut connected = handle.connect_udp(remote).await?;
     let mut bound = handle.bind_udp("10.9.42.1:5000".parse()?).await?;
-    assert_eq!(retire(&connected.control()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        retire(&connected.control()).await?,
+        RetirementOutcome::Retired
+    );
     assert_eq!(retire(&bound.control()).await?, RetirementOutcome::Retired);
     assert_eq!(connected.send(b"x").await.err().map(|e| e.kind()), aborted);
     assert_eq!(
-        connected.send_to(b"x", remote).await.err().map(|e| e.kind()),
+        connected
+            .send_to(b"x", remote)
+            .await
+            .err()
+            .map(|e| e.kind()),
         aborted
     );
-    assert_eq!(bound.send_to(b"x", remote).await.err().map(|e| e.kind()), aborted);
+    assert_eq!(
+        bound.send_to(b"x", remote).await.err().map(|e| e.kind()),
+        aborted
+    );
     let received = timeout(WAIT, connected.recv_from()).await?;
     assert_eq!(received.err().map(|e| e.kind()), aborted);
     let received = timeout(WAIT, bound.recv_from()).await?;
@@ -350,20 +369,31 @@ async fn revoke_sends_no_fin_and_no_rst() -> TestResult {
     let client: SocketAddrV4 = "10.9.43.2:49200".parse()?;
     let (handle, mut conn, mut peer, socket) =
         establish(config(*server.ip()), server, client).await?;
+    // The client acknowledges at once, so nothing of it is left to answer after the revoke.
+    peer.socket(socket).set_ack_delay(None);
     conn.write_all(b"before").await?;
     pump_until(&mut peer, |peer| {
-        peer.sockets.get::<client_tcp::Socket<'_>>(socket).recv_queue() == 6
+        peer.sockets
+            .get::<client_tcp::Socket<'_>>(socket)
+            .recv_queue()
+            == 6
     })
     .await?;
+    pump(&mut peer, 4).await;
 
     assert_eq!(retire(&conn.control()).await?, RetirementOutcome::Retired);
     assert_eq!(handle.owns(&segment(client, server, ACK)), Ownership::None);
     let seen = pump(&mut peer, 20).await;
     assert!(
-        seen.iter().all(|packet| tcp_flags(packet) & (FIN | RST) == 0),
+        seen.iter()
+            .all(|packet| tcp_flags(packet) & (FIN | RST) == 0),
         "revoke sends neither FIN nor RST"
     );
-    assert_eq!(peer.state(socket), tcp::State::Established, "the peer is not told");
+    assert_eq!(
+        peer.state(socket),
+        tcp::State::Established,
+        "the peer is not told"
+    );
 
     // The peer learns from the stateless RST to its next segment.
     peer.socket(socket).send_slice(b"after")?;
@@ -389,14 +419,26 @@ async fn revoke_cleans_only_its_flow_two_tcp_two_udp() -> TestResult {
     let mut flow_1 = timeout(WAIT, next(&mut flows)).await?.ok_or("no flow")?;
     datagram_in(&peer.sink, remote_2, local, b"2").await?;
     let mut flow_2 = timeout(WAIT, next(&mut flows)).await?.ok_or("no flow")?;
-    assert_eq!(timeout(WAIT, flow_1.recv()).await?.as_deref(), Some(&b"1"[..]));
-    assert_eq!(timeout(WAIT, flow_2.recv()).await?.as_deref(), Some(&b"2"[..]));
+    assert_eq!(
+        timeout(WAIT, flow_1.recv()).await?.as_deref(),
+        Some(&b"1"[..])
+    );
+    assert_eq!(
+        timeout(WAIT, flow_2.recv()).await?.as_deref(),
+        Some(&b"2"[..])
+    );
 
     assert_eq!(retire(&conn_a.control()).await?, RetirementOutcome::Retired);
     assert_eq!(retire(&flow_1.control()).await?, RetirementOutcome::Retired);
     assert!(!conn_b.control().is_revoked() && !flow_2.control().is_revoked());
-    assert_eq!(handle.owns(&segment(client_a, server, ACK)), Ownership::None);
-    assert_eq!(handle.owns(&segment(client_b, server, ACK)), Ownership::Flow);
+    assert_eq!(
+        handle.owns(&segment(client_a, server, ACK)),
+        Ownership::None
+    );
+    assert_eq!(
+        handle.owns(&segment(client_b, server, ACK)),
+        Ownership::Flow
+    );
 
     // The other connection keeps working both ways.
     conn_b.write_all(b"to b").await?;
@@ -413,7 +455,10 @@ async fn revoke_cleans_only_its_flow_two_tcp_two_udp() -> TestResult {
 
     // The other flow keeps working both ways.
     datagram_in(&peer.sink, remote_2, local, b"2b").await?;
-    assert_eq!(timeout(WAIT, flow_2.recv()).await?.as_deref(), Some(&b"2b"[..]));
+    assert_eq!(
+        timeout(WAIT, flow_2.recv()).await?.as_deref(),
+        Some(&b"2b"[..])
+    );
     flow_2.send(b"pong").await?;
     let packet = timeout(WAIT, peer.source.recv()).await??;
     assert_eq!(tuple_of(&packet), Some((local, remote_2)));
@@ -422,7 +467,10 @@ async fn revoke_cleans_only_its_flow_two_tcp_two_udp() -> TestResult {
     datagram_in(&peer.sink, remote_1, local, b"1b").await?;
     let mut reopened = timeout(WAIT, next(&mut flows)).await?.ok_or("no flow")?;
     assert_eq!(reopened.peer_addr(), remote_1);
-    assert_eq!(timeout(WAIT, reopened.recv()).await?.as_deref(), Some(&b"1b"[..]));
+    assert_eq!(
+        timeout(WAIT, reopened.recv()).await?.as_deref(),
+        Some(&b"1b"[..])
+    );
     assert!(timeout(WAIT, flow_1.recv()).await?.is_none());
     assert!(!reopened.control().is_revoked());
     Ok(())
@@ -495,9 +543,16 @@ async fn receipt_wait_is_cancellation_safe_and_repeatable() -> TestResult {
     drop(cancelled);
 
     let clone = receipt.clone();
-    let (first, second) = timeout(WAIT, async { tokio::join!(receipt.wait(), clone.wait()) }).await?;
-    assert_eq!((first, second), (RetirementOutcome::Retired, RetirementOutcome::Retired));
-    assert_eq!(timeout(WAIT, receipt.wait()).await?, RetirementOutcome::Retired);
+    let (first, second) =
+        timeout(WAIT, async { tokio::join!(receipt.wait(), clone.wait()) }).await?;
+    assert_eq!(
+        (first, second),
+        (RetirementOutcome::Retired, RetirementOutcome::Retired)
+    );
+    assert_eq!(
+        timeout(WAIT, receipt.wait()).await?,
+        RetirementOutcome::Retired
+    );
     assert_eq!(receipt.outcome(), Some(RetirementOutcome::Retired));
     assert_eq!(control.revoke().outcome(), Some(RetirementOutcome::Retired));
     Ok(())
@@ -535,8 +590,9 @@ async fn revoke_after_stop_is_unknown() -> TestResult {
     let (source, sink) = stack.split();
     let socket = handle.bind_udp("10.9.48.1:5000".parse()?).await?;
     drop(sink);
+    let any_port: SocketAddr = "10.9.48.1:0".parse()?;
     timeout(WAIT, async {
-        while handle.bind_udp("10.9.48.1:0".parse()?).await.is_ok() {
+        while handle.bind_udp(any_port).await.is_ok() {
             sleep(Duration::from_millis(5)).await;
         }
         Ok::<_, io::Error>(())
@@ -544,9 +600,15 @@ async fn revoke_after_stop_is_unknown() -> TestResult {
     .await??;
     let receipt = socket.control().revoke();
     assert_eq!(receipt.outcome(), Some(RetirementOutcome::Unknown));
-    assert_eq!(timeout(WAIT, receipt.wait()).await?, RetirementOutcome::Unknown);
+    assert_eq!(
+        timeout(WAIT, receipt.wait()).await?,
+        RetirementOutcome::Unknown
+    );
     let error = socket.send_to(b"x", "10.9.48.2:53".parse()?).await.err();
-    assert_eq!(error.map(|e| e.kind()), Some(io::ErrorKind::ConnectionAborted));
+    assert_eq!(
+        error.map(|e| e.kind()),
+        Some(io::ErrorKind::ConnectionAborted)
+    );
     drop(source);
     Ok(())
 }
@@ -574,7 +636,10 @@ async fn receipt_fails_when_fence_table_is_full() -> TestResult {
     assert_eq!(retire(&sending.control()).await?, RetirementOutcome::Failed);
     // The flow is still revoked; one with nothing queued still retires.
     let error = sending.send_to(b"x", remote).await.err();
-    assert_eq!(error.map(|e| e.kind()), Some(io::ErrorKind::ConnectionAborted));
+    assert_eq!(
+        error.map(|e| e.kind()),
+        Some(io::ErrorKind::ConnectionAborted)
+    );
     assert_eq!(retire(&quiet.control()).await?, RetirementOutcome::Retired);
     Ok(())
 }
@@ -596,12 +661,22 @@ async fn retires_in_one_turn_with_silent_peer_full_egress_time_wait() -> TestRes
     let mut shutdown = Box::pin(closing_conn.shutdown());
     pump_while(&mut peer, &mut shutdown).await??;
     drop(shutdown);
-    pump_until(&mut peer, |peer| peer.state(closing_socket) == tcp::State::CloseWait).await?;
+    pump_until(&mut peer, |peer| {
+        peer.state(closing_socket) == tcp::State::CloseWait
+    })
+    .await?;
     let socket = peer.socket(closing_socket);
     socket.send_slice(b"unread")?;
     socket.close();
-    pump_until(&mut peer, |peer| peer.state(closing_socket) == tcp::State::Closed).await?;
-    assert!(timeout(Duration::from_millis(50), closing_conn.terminated()).await.is_err());
+    pump_until(&mut peer, |peer| {
+        peer.state(closing_socket) == tcp::State::Closed
+    })
+    .await?;
+    assert!(
+        timeout(Duration::from_millis(50), closing_conn.terminated())
+            .await
+            .is_err()
+    );
 
     // The peer goes silent with bytes in flight, and nobody drains the egress any more:
     // a flood fills the egress queue and the backlog.
@@ -612,7 +687,11 @@ async fn retires_in_one_turn_with_silent_peer_full_egress_time_wait() -> TestRes
     }
     sleep(Duration::from_millis(50)).await;
 
-    for control in [silent_conn.control(), closing_conn.control(), flood.control()] {
+    for control in [
+        silent_conn.control(),
+        closing_conn.control(),
+        flood.control(),
+    ] {
         assert_eq!(retire(&control).await?, RetirementOutcome::Retired);
         assert_one_turn(&control);
     }
@@ -637,7 +716,10 @@ async fn revoke_after_abort_or_release_retires() -> TestResult {
     let released_control = released_conn.control();
     let mut terminal = released_conn.terminal();
     drop(released_conn);
-    pump_until(&mut peer, |peer| peer.state(released_socket) == tcp::State::CloseWait).await?;
+    pump_until(&mut peer, |peer| {
+        peer.state(released_socket) == tcp::State::CloseWait
+    })
+    .await?;
     peer.socket(released_socket).close();
     let mut released_wait = Box::pin(terminal.wait_for(|terminal| *terminal));
     pump_while(&mut peer, &mut released_wait).await??;
@@ -690,7 +772,10 @@ async fn retired_drops_counts_everything_discarded_for_revoked_flows() -> TestRe
         revoked.send_to(b"r", remote).await?;
     }
     let receipt = revoked.control().revoke();
-    assert_eq!(timeout(WAIT, receipt.wait()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        timeout(WAIT, receipt.wait()).await?,
+        RetirementOutcome::Retired
+    );
 
     let packets = drain(&mut source).await;
     assert_eq!(packets.len(), 1, "only the kept flow's datagram leaves");
