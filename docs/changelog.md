@@ -216,3 +216,15 @@ Release 0.14.2 (tag `v0.14.2`), the fourth exception to the freeze (plan
 `core_round_trip` 64 B drops from 531 to 417 ns, and the two-identity case from 594 to 421 ns,
 which closes PR-3 of task `20261013-1600-perf-residuals`. The freeze applies again: bug fixes
 only.
+
+## 2026-10-17 [release] 0.15.0
+
+Release 0.15.0 (tag `v0.15.0`), the fifth exception to the freeze (plan
+`20261017-1300-nested-lan-prefixes`, from the ns gateway-as-node plan), additive:
+- `TranslationTableBuilder::nested_lans` lets LAN prefixes nest, so a default `0.0.0.0/0`
+  behind one peer coexists with more specific prefixes; the longest prefix wins and exact
+  addresses (self `eam4`, `eam4`, `peer6_eam4`) win over every prefix;
+- a reply under a shorter prefix's /96 that claims a more specific or exact address is dropped;
+- `Nat64LanConfig::nested_routes` does the same for `Nat64Lan` routes.
+
+Strict mode stays the default and unchanged. The freeze applies again: bug fixes only.

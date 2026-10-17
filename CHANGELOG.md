@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-17
+
+Opt-in nested LAN prefixes with longest-prefix match in nsplane-nat; the API is additive.
+
 ### Added
 - Opt-in nested LAN prefixes with longest-prefix match: `TranslationTableBuilder::nested_lans`,
   reported by `TranslationTable::nested_lans`. A default 0.0.0.0/0 prefix behind one peer and a
