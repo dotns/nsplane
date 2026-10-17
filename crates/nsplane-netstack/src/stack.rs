@@ -145,6 +145,7 @@ impl NetStack {
             sent: 0,
             marks: VecDeque::new(),
             fences: Arc::clone(&fences),
+            barriers: Vec::new(),
             #[cfg(test)]
             turns: 0,
         };
@@ -785,6 +786,42 @@ struct Pool {
 /// The queue of a UDP flow or socket, with the flow it belongs to.
 type Inbox<T> = (mpsc::Sender<T>, Arc<FlowState>);
 
+/// A revoked flow whose fragments the reassembler may still hold. Later fragments carry
+/// no ports, so a held datagram cannot be told apart from one of a new flow on the same
+/// tuple: every datagram completed for the flow's tuple before `until` is dropped.
+#[derive(Debug)]
+struct Barrier {
+    protocol: u8,
+    local: SocketAddr,
+    /// `None` for a bound socket: every remote.
+    remote: Option<SocketAddr>,
+    until: std::time::Instant,
+}
+
+impl Barrier {
+    /// Whether a datagram from `src` to `dst` completed at `now` is held back; `ports`
+    /// gives its protocol and `(src, dst)` ports if it is TCP or UDP. One whose ports
+    /// cannot be read is held back by its addresses alone.
+    fn holds(
+        &self,
+        src: IpAddr,
+        dst: IpAddr,
+        ports: Option<(u8, u16, u16)>,
+        now: std::time::Instant,
+    ) -> bool {
+        let local_ip = self.local.ip();
+        let addresses = (local_ip == dst
+            || (local_ip.is_unspecified() && local_ip.is_ipv4() == dst.is_ipv4()))
+            && self.remote.is_none_or(|remote| remote.ip() == src);
+        let ports = ports.is_none_or(|(protocol, src_port, dst_port)| {
+            protocol == self.protocol
+                && dst_port == self.local.port()
+                && self.remote.is_none_or(|remote| remote.port() == src_port)
+        });
+        now < self.until && addresses && ports
+    }
+}
+
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
     settings: Settings,
@@ -851,6 +888,9 @@ struct Driver {
     /// in the egress queue, ascending.
     marks: VecDeque<(u64, Arc<FlowState>)>,
     fences: Arc<Fences>,
+    /// Revoked flows whose fragments the reassembler may still hold; at most
+    /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout.
+    barriers: Vec<Barrier>,
     #[cfg(test)]
     turns: u64,
 }
@@ -1063,6 +1103,10 @@ impl Driver {
         }
         let routed = match reassembler.push(packet.as_packet(), now) {
             Outcome::Pass => return Some(packet),
+            Outcome::Complete(datagram) if self.barred(&datagram, now) => {
+                stats::add(&self.stats.retired, 1);
+                None
+            }
             Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
             Outcome::Held | Outcome::Dropped => None,
         };
@@ -1081,6 +1125,62 @@ impl Driver {
             self.count_reassembly();
         }
         self.owners.expire_discarded(now);
+        self.barriers.retain(|barrier| now < barrier.until);
+    }
+
+    /// Whether a reassembled `datagram` may hold fragments of a revoked flow; free while
+    /// there is no barrier.
+    fn barred(&self, datagram: &[u8], now: std::time::Instant) -> bool {
+        if self.barriers.is_empty() {
+            return false;
+        }
+        let Ok(ip) = IpPacket::parse(datagram) else {
+            return false;
+        };
+        let protocol = ip.protocol();
+        let ports = ip
+            .payload()
+            .first_chunk::<4>()
+            .filter(|_| protocol == protocol::TCP || protocol == protocol::UDP)
+            .map(|&[a, b, c, d]| {
+                (
+                    protocol,
+                    u16::from_be_bytes([a, b]),
+                    u16::from_be_bytes([c, d]),
+                )
+            });
+        self.barriers
+            .iter()
+            .any(|barrier| barrier.holds(ip.src(), ip.dst(), ports, now))
+    }
+
+    /// Bars the datagrams of a revoked flow the reassembler may still complete, see
+    /// [`Barrier`]; `false` if the table is full. Nothing while no datagram is held.
+    fn bar(&mut self, target: &Target) -> bool {
+        let Some(reassembler) = self.reassembler.as_ref() else {
+            return true;
+        };
+        if reassembler.pending() == 0 {
+            return true;
+        }
+        if self.barriers.len() >= reassembler.config().max_datagrams {
+            return false;
+        }
+        let (protocol, local, remote) = match *target {
+            Target::Tcp { local, peer, .. } => (protocol::TCP, local, Some(peer)),
+            Target::UdpFlow((remote, local)) | Target::UdpConnected((remote, local)) => {
+                (protocol::UDP, local, Some(remote))
+            }
+            Target::UdpBound(local) => (protocol::UDP, local, None),
+        };
+        let until = Instant::now().into_std() + reassembler.config().timeout;
+        self.barriers.push(Barrier {
+            protocol,
+            local,
+            remote,
+            until,
+        });
+        true
     }
 
     /// Adds what the reassembler counted since the last call to the stack's counters.
@@ -1314,8 +1414,9 @@ impl Driver {
     }
 
     /// Removes a revoked flow's state and its output from the stack: the socket (without
-    /// an RST) or the queue entry, its packets in the backlog, and a fence for those
-    /// already in the egress queue. `Failed` if the fence table is full.
+    /// an RST) or the queue entry, its packets in the backlog, a fence for those already
+    /// in the egress queue, and a barrier for its fragments the reassembler may hold.
+    /// `Failed` if the fence or the barrier table is full.
     fn retire(&mut self, flow: &Arc<FlowState>) -> RetirementOutcome {
         let fenced = match flow.target() {
             &Target::Tcp {
@@ -1366,7 +1467,8 @@ impl Driver {
                 self.purge_udp(flow)
             }
         };
-        if fenced {
+        let barred = self.bar(flow.target());
+        if fenced && barred {
             RetirementOutcome::Retired
         } else {
             RetirementOutcome::Failed

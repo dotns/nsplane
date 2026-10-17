@@ -1,12 +1,14 @@
-//! Per-flow control: revoking one connection or flow of a shared stack, and the receipt
-//! that tells when the stack holds nothing of it any more.
+//! Per-flow control: revoking one connection or flow of a shared stack, the receipt that
+//! tells when the stack holds nothing of it any more, and the caller's label on the flow.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use smoltcp::iface::SocketHandle;
 use tokio::sync::Notify;
@@ -20,6 +22,48 @@ const PENDING: u8 = 0;
 const RETIRED: u8 = 1;
 const FAILED: u8 = 2;
 const UNKNOWN: u8 = 3;
+
+/// The next instance [`FlowControl::bind_context`] hands out, shared by every stack of the
+/// process.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// Takes the next instance from `counter`; `None` once it is used up. It never wraps, so
+/// no instance is handed out twice.
+fn allocate(counter: &AtomicU64) -> Option<NonZeroU64> {
+    let mut next = counter.load(Ordering::SeqCst);
+    loop {
+        let after = next.checked_add(1)?;
+        match counter.compare_exchange_weak(next, after, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return NonZeroU64::new(next),
+            Err(current) => next = current,
+        }
+    }
+}
+
+/// The caller's opaque label on one flow: an isolation domain the caller chooses and an
+/// instance the stack allocates.
+///
+/// [`FlowControl::bind_context`] binds it. The instance is unique within the process: it
+/// is never handed out again, to a flow of any stack, also not once the flow is revoked,
+/// so a later flow on the same tuple, in the same domain or not, always has another one.
+/// The stack never reads the context; it is the caller's way to tell flows apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FlowContext {
+    domain: u64,
+    instance: NonZeroU64,
+}
+
+impl FlowContext {
+    /// The isolation domain the caller bound.
+    pub const fn domain(&self) -> u64 {
+        self.domain
+    }
+
+    /// The instance the stack allocated for the flow.
+    pub const fn instance(&self) -> NonZeroU64 {
+        self.instance
+    }
+}
 
 /// How a revoke ended, see [`RetirementReceipt`].
 #[non_exhaustive]
@@ -68,6 +112,8 @@ pub(crate) struct FlowState {
     /// the socket; `u64::MAX` before.
     end: AtomicU64,
     revocations: Arc<Revocations>,
+    /// The caller's label; never read by the stack.
+    context: OnceLock<FlowContext>,
     #[cfg(test)]
     observed_turn: AtomicU64,
     #[cfg(test)]
@@ -84,6 +130,7 @@ impl FlowState {
             wake: Notify::new(),
             end: AtomicU64::new(u64::MAX),
             revocations: Arc::clone(revocations),
+            context: OnceLock::new(),
             #[cfg(test)]
             observed_turn: AtomicU64::new(0),
             #[cfg(test)]
@@ -391,12 +438,71 @@ impl FlowControl {
     pub fn is_revoked(&self) -> bool {
         self.state.is_revoked()
     }
+
+    /// Labels the flow with `domain` and a new instance, and returns that
+    /// [`FlowContext`].
+    ///
+    /// Binds once per flow. Fails with
+    /// [`io::ErrorKind::ConnectionAborted`](std::io::ErrorKind::ConnectionAborted) once the
+    /// flow is revoked, [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) if it has a
+    /// context, and [`QuotaExceeded`](std::io::ErrorKind::QuotaExceeded) once the
+    /// process's instances are used up; a failed call leaves the flow as it was.
+    ///
+    /// Bind right after the flow is handed out ([`incoming_tcp`], [`incoming_udp`],
+    /// [`connect_tcp`], [`connect_udp`], [`bind_udp`]). A later bind loses nothing: the
+    /// stack tracks a flow's queued output by the flow itself from its creation, so the
+    /// context labels output queued before the bind too, and a revoke drops it either way.
+    /// The stack never reads the context and treats flows with and without one alike.
+    ///
+    /// The context lives on the stack's state of the flow only. The proof boundary of
+    /// [`revoke`](Self::revoke) applies: packets already taken from [`NetStackSource`] do
+    /// not carry it.
+    ///
+    /// [`incoming_tcp`]: crate::NetStackHandle::incoming_tcp
+    /// [`incoming_udp`]: crate::NetStackHandle::incoming_udp
+    /// [`connect_tcp`]: crate::NetStackHandle::connect_tcp
+    /// [`connect_udp`]: crate::NetStackHandle::connect_udp
+    /// [`bind_udp`]: crate::NetStackHandle::bind_udp
+    /// [`NetStackSource`]: crate::NetStackSource
+    pub fn bind_context(&self, domain: u64) -> io::Result<FlowContext> {
+        self.bind_context_from(domain, &NEXT_INSTANCE)
+    }
+
+    /// [`bind_context`](Self::bind_context) with the instance taken from `counter`.
+    pub(crate) fn bind_context_from(
+        &self,
+        domain: u64,
+        counter: &AtomicU64,
+    ) -> io::Result<FlowContext> {
+        if self.is_revoked() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "flow revoked",
+            ));
+        }
+        let bound = || io::Error::new(io::ErrorKind::AlreadyExists, "flow context already bound");
+        if self.state.context.get().is_some() {
+            return Err(bound());
+        }
+        let instance = allocate(counter).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::QuotaExceeded, "flow instances used up")
+        })?;
+        let context = FlowContext { domain, instance };
+        self.state.context.set(context).map_err(|_| bound())?;
+        Ok(context)
+    }
+
+    /// The flow's context, if one was bound; it stays after a revoke.
+    pub fn context(&self) -> Option<FlowContext> {
+        self.state.context.get().copied()
+    }
 }
 
 impl fmt::Debug for FlowControl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlowControl")
             .field("revoked", &self.is_revoked())
+            .field("context", &self.context())
             .finish_non_exhaustive()
     }
 }
