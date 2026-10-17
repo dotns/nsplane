@@ -5,6 +5,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Opt-in nested LAN prefixes with longest-prefix match: `TranslationTableBuilder::nested_lans`,
+  reported by `TranslationTable::nested_lans`. A default 0.0.0.0/0 prefix behind one peer and a
+  more specific prefix behind another may coexist; the longest prefix containing an address owns
+  it.
+- With nested prefixes the exact addresses (the self `eam4`, every `eam4` and `peer6_eam4`) take
+  precedence over every prefix, even inside one.
+- A reply under a shorter prefix's /96 base that claims an address of a more specific LAN or an
+  exact address is dropped (`reasons::UNMAPPED`), not translated.
+- `Nat64LanConfig::nested_routes`: routes of one `mapped` prefix may nest their `real` prefixes;
+  the longest `real` prefix containing the destination decides.
+- Strict mode stays the default and is unchanged; the API is additive.
+
 ## [0.14.2] - 2026-10-17
 
 Faster allowed-IP lookups on the data path; the public API is unchanged.
