@@ -12,6 +12,12 @@
 //!   prefix per peer.
 //! - `lan_remap_out/...`, `lan_remap_in/...`: the same with /120 LAN
 //!   prefixes that embed 192.168.1.0/24 instead of the `lan4` network.
+//! - `lan96_nested_out/...`, `lan96_nested_in/...`: the `lan` rows with
+//!   nested LAN prefixes and a 0.0.0.0/0 LAN behind another peer.
+//! - `table_build/strict_10k`: building a table of 10 000 peers with an
+//!   `eam4` and 10 000 disjoint /24 LAN prefixes; `table_build/nested_10k`:
+//!   a nested table of a /0, 9 /8s, 90 /16s and 9900 /24s with 10 000 peer
+//!   `eam4`s inside them.
 //!
 //! Every packet is rebuilt per iteration (in a buffer with the engine's
 //! headroom and room for the 20 bytes the translation adds), so each
@@ -22,7 +28,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use nsplane_core::{PacketFilter, Verdict};
-use nsplane_nat::{LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator};
+use nsplane_nat::{
+    LanPrefix, PeerMapping, SelfMapping, TranslationTable, TranslationTableBuilder, Translator,
+};
 use nsplane_packet::checksum::{
     ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6,
 };
@@ -73,7 +81,12 @@ const LAN_REMAP_HOST6: Ipv6Addr = Ipv6Addr::new(0xfd64, 0, 0, 0, 0, 1, 0xc0a8, 0
 
 /// A table of `peers` peers, each with the LAN prefix `lan` gives it, if any.
 fn table(peers: u16, lan: impl Fn(u16) -> Option<LanPrefix>) -> TranslationTable {
-    let table = (1..=peers)
+    build(builder(peers, lan))
+}
+
+/// The builder of [`table`].
+fn builder(peers: u16, lan: impl Fn(u16) -> Option<LanPrefix>) -> TranslationTableBuilder {
+    (1..=peers)
         .fold(TranslationTable::builder(), |builder, n| {
             let builder = builder.peer(PeerId::new(u32::from(n)), mapping(n));
             match lan(n) {
@@ -85,10 +98,21 @@ fn table(peers: u16, lan: impl Fn(u16) -> Option<LanPrefix>) -> TranslationTable
             eam4: SELF_EAM4,
             eam6: SELF_EAM6,
         })
-        .build();
+}
+
+fn build(builder: TranslationTableBuilder) -> TranslationTable {
+    let table = builder.build();
     assert!(table.is_ok(), "invalid table");
     table.unwrap_or_default()
 }
+
+/// The 0.0.0.0/0 LAN prefix behind a peer outside the table, `lan6`
+/// `fd65::/96`.
+const WHOLE_SPACE: LanPrefix = LanPrefix {
+    lan4: (Ipv4Addr::UNSPECIFIED, 0),
+    lan6: (Ipv6Addr::new(0xfd65, 0, 0, 0, 0, 0, 0, 0), 96),
+    peer: Some(PeerId::new(u32::MAX)),
+};
 
 /// A TCP (20-byte header) or UDP segment with `payload` bytes; the checksum
 /// field is left zero.
@@ -166,18 +190,18 @@ const CASES: [(u8, &str, usize); 4] = [
 
 /// The `{prefix}_out` and `{prefix}_in` groups: `outbound` of IPv4 packets
 /// from the self `eam4` to `dst4`, and `inbound` of the IPv6 replies from
-/// `src6`, with the LAN prefixes `lan` gives each peer.
+/// `src6`, with the table `table` gives for a number of peers.
 fn translate(
     c: &mut Criterion,
     prefix: &str,
-    lan: impl Fn(u16) -> Option<LanPrefix> + Copy,
+    table: impl Fn(u16) -> TranslationTable,
     dst4: Ipv4Addr,
     src6: Ipv6Addr,
 ) {
     for (direction, outbound) in [("out", true), ("in", false)] {
         let mut group = c.benchmark_group(format!("{prefix}_{direction}"));
         for peers in [1, 1000] {
-            let translator = Translator::new(table(peers, lan));
+            let translator = Translator::new(table(peers));
             for (protocol, proto_name, payload) in CASES {
                 let bytes = if outbound {
                     ipv4(dst4, protocol, payload)
@@ -211,22 +235,92 @@ fn translate(
 fn eam4(c: &mut Criterion) {
     let peer = mapping(1);
     let dst4 = peer.eam4.unwrap_or(Ipv4Addr::UNSPECIFIED);
-    translate(c, "eam4", |_| None, dst4, peer.eam6);
+    translate(c, "eam4", |peers| table(peers, |_| None), dst4, peer.eam6);
 }
 
 fn lan96(c: &mut Criterion) {
-    translate(c, "lan", |n| Some(lan(n)), LAN_HOST4, LAN_HOST6);
+    translate(
+        c,
+        "lan",
+        |peers| table(peers, |n| Some(lan(n))),
+        LAN_HOST4,
+        LAN_HOST6,
+    );
 }
 
 fn lan_remapped(c: &mut Criterion) {
     translate(
         c,
         "lan_remap",
-        |n| Some(lan_remap(n)),
+        |peers| table(peers, |n| Some(lan_remap(n))),
         LAN_HOST4,
         LAN_REMAP_HOST6,
     );
 }
 
-criterion_group!(benches, eam4, lan96, lan_remapped);
+fn lan96_nested(c: &mut Criterion) {
+    let table = |peers| {
+        let builder = builder(peers, |n| Some(lan(n)));
+        build(builder.nested_lans().lan(WHOLE_SPACE))
+    };
+    translate(c, "lan96_nested", table, LAN_HOST4, LAN_HOST6);
+}
+
+/// The `table_build/nested_10k` builder: a /0, 9 /8s, 90 /16s and 9900
+/// /24s, numbered from 1 for their `lan6` `fd64::n:0:0`, and 10 000 peers
+/// whose `eam4`s fall inside them.
+fn nested_10k() -> TranslationTableBuilder {
+    let mut builder = TranslationTable::builder().nested_lans().lan(WHOLE_SPACE);
+    let mut n = 0_u16;
+    let mut prefixes = Vec::new();
+    for a in 1..=9_u8 {
+        prefixes.push((Ipv4Addr::new(a, 0, 0, 0), 8));
+        prefixes.extend((0..10).map(|b| (Ipv4Addr::new(a, b, 0, 0), 16)));
+        for b in 0..=10 {
+            prefixes.extend((0..100).map(|c| (Ipv4Addr::new(a, b, c, 0), 24)));
+        }
+    }
+    for lan4 in prefixes {
+        n += 1;
+        builder = builder.lan(LanPrefix {
+            lan4,
+            lan6: (Ipv6Addr::new(0xfd64, 0, 0, 0, 0, n, 0, 0), 96),
+            peer: Some(PeerId::new(u32::from(n % 100 + 1))),
+        });
+    }
+    for n in 1..=10_000_u16 {
+        let [a, b, c] = [n % 9 + 1, n / 9 % 11, n / 99].map(|x| u8::try_from(x).unwrap_or(0));
+        let eam4 = Some(Ipv4Addr::new(a, b, c, 200));
+        let mapping = PeerMapping { eam4, ..mapping(n) };
+        builder = builder.peer(PeerId::new(u32::from(n)), mapping);
+    }
+    builder
+}
+
+fn table_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("table_build");
+    for (name, builder) in [
+        ("strict_10k", builder(10_000, |n| Some(lan(n)))),
+        ("nested_10k", nested_10k()),
+    ] {
+        assert!(builder.clone().build().is_ok(), "{name}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || builder.clone(),
+                TranslationTableBuilder::build,
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    eam4,
+    lan96,
+    lan_remapped,
+    lan96_nested,
+    table_build
+);
 criterion_main!(benches);
