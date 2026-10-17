@@ -24,6 +24,10 @@ pub enum Nat64LanError {
 /// [`LanPrefix`](crate::LanPrefix). Build routes with [`LanRoute::new`]; a
 /// route built from the public fields directly is only as valid as those
 /// fields, and [`resolve`](Self::resolve) never reaches outside them.
+///
+/// Routes sharing a `mapped` prefix may nest their `real` prefixes only with
+/// [`Nat64LanConfig::nested_routes`](crate::Nat64LanConfig::nested_routes);
+/// otherwise a destination two of them resolve is ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LanRoute {
     /// The IPv6 /96 prefix peers address the LAN through.
