@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-17
+
+Faster allowed-IP lookups on the data path; the public API is unchanged.
+
 ### Changed
 - Faster allowed-IP lookups. Every routing table (an identity's, the merged one, the source sets,
   a peer's allowed IPs) runs a binary search on the prefix lengths in use, per address

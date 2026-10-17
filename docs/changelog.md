@@ -202,3 +202,17 @@ Release 0.14.1 (tag `v0.14.1`), bug fixes only:
 
 Task `20261013-1600-perf-residuals` keeps PR-3 (two-identity routing cost) open. The freeze
 applies: bug fixes only.
+
+## 2026-10-17 [release]
+
+Release 0.14.2 (tag `v0.14.2`), the fourth exception to the freeze (plan
+`20261016-1800-route-lookup`), with the public API unchanged:
+- allowed-IP tables run a binary search on the prefix lengths in use: one lookup on 10 k
+  networks drops from 48 to 16 ns (IPv4) and from 175 to 26 ns (IPv6);
+- a per-core route cache of 64 entries, invalidated by every routing change;
+- writes at prefix lengths in use update in place; a new or emptied length rebuilds its family
+  once per change.
+
+`core_round_trip` 64 B drops from 531 to 417 ns, and the two-identity case from 594 to 421 ns,
+which closes PR-3 of task `20261013-1600-perf-residuals`. The freeze applies again: bug fixes
+only.

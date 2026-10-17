@@ -251,6 +251,8 @@ unanswered packet; jittered handshake retries. Debug output redacts key material
 | Release 0.14.0 | LAN prefix mappings, per-identity routing, read-cost fix (tag `v0.14.0`) | 2026-10-13 |
 | Performance residuals | snapshot cell read closure from one call site, later-fragment early return | done (task `20261013-1600-perf-residuals`) |
 | Release 0.14.1 | performance residual fixes, rustls advisory (tag `v0.14.1`) | 2026-10-15 |
+| Allowed-IP lookups | prefix-length binary search, per-core route cache, in-place writes | done (plan `20261016-1800-route-lookup`) |
+| Release 0.14.2 | faster allowed-IP lookups, API unchanged (tag `v0.14.2`) | 2026-10-17 |
 | 6 | ns migration: both `tunnel-wg` and `quick-runtime` data planes move onto the engine (in ns, per the NS next-architecture plan) | in ns: account mode on the engine (M4) in progress, Quick (M5) later |
 
 Open items in this repository (`docs/task/20261002-1509-phase1-followups.md`): #5 Windows
