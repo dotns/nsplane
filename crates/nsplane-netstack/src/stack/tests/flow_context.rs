@@ -177,7 +177,9 @@ fn fragmented(
     local: SocketAddr,
     id: u16,
 ) -> Result<(Vec<PacketBuf>, Vec<u8>), Box<dyn Error>> {
-    let payload: Vec<u8> = (0..3000_usize).map(|i| (i % 251).to_le_bytes()[0]).collect();
+    let payload: Vec<u8> = (0..3000_usize)
+        .map(|i| (i % 251).to_le_bytes()[0])
+        .collect();
     let packet = build_udp(remote, local, &payload).ok_or("build")?;
     Ok((fragments_v4(packet.as_packet(), 1336, id), payload))
 }
@@ -204,7 +206,11 @@ async fn bind_context_once_and_not_after_revoke() -> TestResult {
         let context = control.bind_context(7)?;
         assert_eq!(context.domain(), 7);
         assert_eq!(control.context(), Some(context));
-        assert_eq!(control.clone().context(), Some(context), "every control sees it");
+        assert_eq!(
+            control.clone().context(),
+            Some(context),
+            "every control sees it"
+        );
         // Binds once: neither the same nor another domain rebinds.
         for domain in [7, 8] {
             let again = control.bind_context(domain);
@@ -299,7 +305,10 @@ async fn observe(domain: Option<u64>) -> Result<Observed, Box<dyn Error>> {
         flow.send(b"queued").await?;
     }
     sleep(Duration::from_millis(20)).await;
-    let outcomes = vec![retire(&conn.control()).await?, retire(&flow.control()).await?];
+    let outcomes = vec![
+        retire(&conn.control()).await?,
+        retire(&flow.control()).await?,
+    ];
     let seen = pump(&mut peer, 10).await;
     udp_payloads.extend(seen.iter().filter_map(udp_payload));
     let tuple = segment_tuple(client, server);
@@ -431,7 +440,11 @@ async fn same_tuple_reopen_gets_new_queues_and_replies() -> TestResult {
         .filter(|packet| tuple_of(packet) == Some((local, remote)))
         .filter_map(udp_payload)
         .collect();
-    assert_eq!(payloads, [b"new".to_vec()], "only the new flow's reply leaves");
+    assert_eq!(
+        payloads,
+        [b"new".to_vec()],
+        "only the new flow's reply leaves"
+    );
     Ok(())
 }
 
@@ -477,7 +490,11 @@ async fn old_reply_clone_never_sends_after_revoke() -> TestResult {
     let new = timeout(WAIT, next(&mut flows)).await?.ok_or("no flow")?;
     new.reply_handle().send(b"new").await?;
     assert_eq!(kind(kept.send(b"old").await), aborted);
-    let payloads: Vec<Vec<u8>> = drain(&mut source).await.iter().filter_map(udp_payload).collect();
+    let payloads: Vec<Vec<u8>> = drain(&mut source)
+        .await
+        .iter()
+        .filter_map(udp_payload)
+        .collect();
     assert_eq!(payloads, [b"new".to_vec()]);
     Ok(())
 }
@@ -570,7 +587,11 @@ async fn two_domains_same_tuple_never_mix() -> TestResult {
         Some(&b"for 2"[..])
     );
     assert!(timeout(WAIT, first.recv()).await?.is_none());
-    let payloads: Vec<Vec<u8>> = drain(&mut source).await.iter().filter_map(udp_payload).collect();
+    let payloads: Vec<Vec<u8>> = drain(&mut source)
+        .await
+        .iter()
+        .filter_map(udp_payload)
+        .collect();
     assert_eq!(payloads, [b"from 2".to_vec()]);
     // Retiring the second holder leaves the first one's record as it was.
     assert_eq!(retire(&second.control()).await?, RetirementOutcome::Retired);
@@ -596,9 +617,16 @@ async fn two_domains_same_tuple_never_mix() -> TestResult {
         }
     }
     sleep(Duration::from_millis(20)).await;
-    assert_eq!(retire(&stacks[0].3.control()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        retire(&stacks[0].3.control()).await?,
+        RetirementOutcome::Retired
+    );
     assert!(drain(&mut stacks[0].1).await.is_empty());
-    let payloads: Vec<Vec<u8>> = drain(&mut stacks[1].1).await.iter().filter_map(udp_payload).collect();
+    let payloads: Vec<Vec<u8>> = drain(&mut stacks[1].1)
+        .await
+        .iter()
+        .filter_map(udp_payload)
+        .collect();
     assert_eq!(payloads, vec![2u64.to_be_bytes().to_vec(); 10]);
     assert_eq!(stacks[1].0.retired_drops(), 0);
     Ok(())
