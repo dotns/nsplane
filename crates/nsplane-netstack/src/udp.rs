@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use nsplane_packet::checksum::{
@@ -15,9 +16,12 @@ use nsplane_packet::checksum::{
 };
 use nsplane_packet::{IpPacket, PacketBuf, UdpHeader, protocol};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
 use crate::device::TAILROOM;
+use crate::flow::{FlowControl, FlowState};
 use crate::ownership::Registration;
+use crate::tcp::revoked;
 
 /// UDP header length.
 const UDP_HEADER: usize = 8;
@@ -133,18 +137,28 @@ fn stack_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "network stack stopped")
 }
 
-/// The path from UDP handles to the driver's egress.
+/// The path from UDP handles to the driver's egress; each datagram carries its flow.
 #[derive(Debug, Clone)]
 pub(crate) struct UdpOut {
-    pub(crate) tx: mpsc::Sender<PacketBuf>,
+    pub(crate) tx: mpsc::Sender<(PacketBuf, Arc<FlowState>)>,
     pub(crate) mtu: usize,
     /// IPv4 datagrams above the MTU leave with DF clear instead of failing.
     pub(crate) allow_fragmentation: bool,
 }
 
 impl UdpOut {
-    /// Wraps `payload` from `src` to `dst` and queues it, waiting while the queue is full.
-    async fn send(&self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
+    /// Wraps `payload` from `src` to `dst` and queues it for `flow`, waiting while the
+    /// queue is full.
+    async fn send(
+        &self,
+        flow: &Arc<FlowState>,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        if flow.is_revoked() {
+            return Err(revoked());
+        }
         if src.is_ipv4() != dst.is_ipv4() {
             return Err(invalid("address families differ"));
         }
@@ -156,8 +170,38 @@ impl UdpOut {
             }
             clear_dont_fragment(&mut packet);
         }
-        self.tx.send(packet).await.map_err(|_| stack_gone())
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Closed(())) => return Err(stack_gone()),
+            Err(TrySendError::Full(())) => tokio::select! {
+                biased;
+                () = flow.revoked() => return Err(revoked()),
+                permit = self.tx.reserve() => permit.map_err(|_| stack_gone())?,
+            },
+        };
+        if flow.is_revoked() {
+            return Err(revoked());
+        }
+        permit.send((packet, Arc::clone(flow)));
+        Ok(())
     }
+}
+
+/// The next item of `rx`, or `None` once it is closed and empty or `flow` is revoked.
+async fn receive<T>(rx: &mut mpsc::Receiver<T>, flow: &FlowState) -> Option<T> {
+    if flow.is_revoked() {
+        return None;
+    }
+    let item = match rx.try_recv() {
+        Ok(item) => Some(item),
+        Err(TryRecvError::Disconnected) => None,
+        Err(TryRecvError::Empty) => tokio::select! {
+            biased;
+            () = flow.revoked() => None,
+            item = rx.recv() => item,
+        },
+    };
+    item.filter(|_| !flow.is_revoked())
 }
 
 /// A UDP flow: the datagrams one remote sends to one local address.
@@ -199,9 +243,10 @@ impl UdpFlow {
         self.reply.peer
     }
 
-    /// The next datagram's payload, or `None` once the stack stopped and the queue is empty.
+    /// The next datagram's payload, or `None` once the stack stopped and the queue is empty,
+    /// or once the flow was revoked (queued datagrams are discarded then).
     pub async fn recv(&mut self) -> Option<Bytes> {
-        self.rx.recv().await
+        receive(&mut self.rx, &self.reply.flow).await
     }
 
     /// Sends `payload` back from the local address to the remote; see [`UdpReply::send`].
@@ -213,6 +258,12 @@ impl UdpFlow {
     pub fn reply_handle(&self) -> UdpReply {
         self.reply.clone()
     }
+
+    /// The flow's control, which can revoke it from any task; see [`FlowControl`]. The
+    /// flow and every [`UdpReply`] of it share one control.
+    pub fn control(&self) -> FlowControl {
+        self.reply.control()
+    }
 }
 
 /// Sends datagrams from a flow's local address to its remote.
@@ -221,25 +272,44 @@ pub struct UdpReply {
     local: SocketAddr,
     peer: SocketAddr,
     out: UdpOut,
+    flow: Arc<FlowState>,
 }
 
 impl UdpReply {
-    pub(crate) const fn new(local: SocketAddr, peer: SocketAddr, out: UdpOut) -> Self {
-        Self { local, peer, out }
+    pub(crate) const fn new(
+        local: SocketAddr,
+        peer: SocketAddr,
+        out: UdpOut,
+        flow: Arc<FlowState>,
+    ) -> Self {
+        Self {
+            local,
+            peer,
+            out,
+            flow,
+        }
+    }
+
+    /// The control of the flow this handle replies on; see [`FlowControl`].
+    pub fn control(&self) -> FlowControl {
+        FlowControl::new(Arc::clone(&self.flow))
     }
 
     /// Sends `payload` from the flow's local address to its remote.
     ///
     /// Waits while the stack's send queue is full. Fails with
     /// [`io::ErrorKind::InvalidInput`] if the IP packet would exceed the MTU (the stack
-    /// does not fragment) and with [`io::ErrorKind::BrokenPipe`] once the stack stopped.
+    /// does not fragment), with [`io::ErrorKind::BrokenPipe`] once the stack stopped and
+    /// with [`io::ErrorKind::ConnectionAborted`] once the flow was revoked.
     ///
     /// With [`NetStackConfig::udp_allow_fragmentation`](crate::NetStackConfig::udp_allow_fragmentation),
     /// an IPv4 packet above the MTU leaves as one datagram with DF clear (for the engine's
     /// fragmenter to split) and only a packet above the IPv4 total length limit of 65 535
     /// bytes fails; IPv6 above the MTU still fails.
     pub async fn send(&self, payload: &[u8]) -> io::Result<()> {
-        self.out.send(self.local, self.peer, payload).await
+        self.out
+            .send(&self.flow, self.local, self.peer, payload)
+            .await
     }
 }
 
@@ -251,7 +321,9 @@ impl UdpReply {
 /// to the unspecified address of a family receives that family's datagrams to its port
 /// unless another socket is bound to the exact address. A connected socket receives only
 /// the datagrams from its remote to its local address, ahead of any socket bound to that
-/// address. Dropping the socket unbinds it.
+/// address. Dropping the socket unbinds it. After a revoke through its
+/// [`control`](Self::control) every operation fails with
+/// [`io::ErrorKind::ConnectionAborted`].
 #[derive(Debug)]
 pub struct UdpSocket {
     /// Declared before `rx`: the address leaves the ownership table before the driver can
@@ -263,6 +335,7 @@ pub struct UdpSocket {
     peer: Option<SocketAddr>,
     rx: mpsc::Receiver<(SocketAddr, Bytes)>,
     out: UdpOut,
+    flow: Arc<FlowState>,
 }
 
 impl UdpSocket {
@@ -273,6 +346,7 @@ impl UdpSocket {
         peer: Option<SocketAddr>,
         rx: mpsc::Receiver<(SocketAddr, Bytes)>,
         out: UdpOut,
+        flow: Arc<FlowState>,
     ) -> Self {
         Self {
             _registration: registration,
@@ -281,7 +355,14 @@ impl UdpSocket {
             peer,
             rx,
             out,
+            flow,
         }
+    }
+
+    /// The socket's control, which can revoke it from any task; see [`FlowControl`]. A
+    /// bound socket is one flow with all its remotes.
+    pub fn control(&self) -> FlowControl {
+        FlowControl::new(Arc::clone(&self.flow))
     }
 
     /// The bound address, with the port the stack picked if `0` was requested. A connected
@@ -316,16 +397,23 @@ impl UdpSocket {
     /// Oversize IPv4 packets are handled as described on [`UdpReply::send`].
     pub async fn send_to(&self, payload: &[u8], remote: SocketAddr) -> io::Result<()> {
         let src = SocketAddr::new(self.source, self.local.port());
-        self.out.send(src, remote, payload).await
+        self.out.send(&self.flow, src, remote, payload).await
     }
 
     /// The next datagram's payload and sender; on a connected socket the sender is always
     /// its remote.
     ///
     /// Fails with [`io::ErrorKind::BrokenPipe`] once the stack stopped and the queue is
-    /// empty.
+    /// empty, and with [`io::ErrorKind::ConnectionAborted`] once the socket was revoked
+    /// (queued datagrams are discarded then).
     pub async fn recv_from(&mut self) -> io::Result<(Bytes, SocketAddr)> {
-        let (from, payload) = self.rx.recv().await.ok_or_else(stack_gone)?;
+        let Some((from, payload)) = receive(&mut self.rx, &self.flow).await else {
+            return Err(if self.flow.is_revoked() {
+                revoked()
+            } else {
+                stack_gone()
+            });
+        };
         Ok((payload, from))
     }
 }
