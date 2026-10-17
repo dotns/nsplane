@@ -57,7 +57,10 @@ async fn placeholders_never_leave_the_source() -> TestResult {
         send(&other, &[seq], remote).await?;
     }
     sleep(Duration::from_millis(20)).await;
-    assert_eq!(retire(&revoked.control()).await?, RetirementOutcome::Retired);
+    assert_eq!(
+        retire(&revoked.control()).await?,
+        RetirementOutcome::Retired
+    );
     // Twenty placeholders in the backlog, each counted once, when it was purged.
     assert_eq!(handle.retired_drops(), 20);
 
@@ -120,7 +123,10 @@ async fn saturated_marks_and_positions_still_drop_every_retired_datagram() -> Te
         }
         sleep(Duration::from_millis(20)).await;
         let before = handle.retired_drops();
-        assert_eq!(retire(&revoked.control()).await?, RetirementOutcome::Retired);
+        assert_eq!(
+            retire(&revoked.control()).await?,
+            RetirementOutcome::Retired
+        );
 
         let packets = drain(&mut source).await;
         let revoked_tuple = revoked.local_addr();

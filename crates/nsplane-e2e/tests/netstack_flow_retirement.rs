@@ -20,6 +20,7 @@ use nsplane_e2e::{
 };
 use nsplane_netstack::{
     FlowControl, NetStack, NetStackConfig, NetStackSource, RetirementOutcome, RetirementReceipt,
+    TcpConnection, UdpSocket,
 };
 use nsplane_packet::{Ecn, IpPacket, PacketBuf, Path, TransportId, protocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -96,7 +97,10 @@ impl Side {
 
     /// How many packets the gate let out so far.
     fn sent(&self) -> usize {
-        self.log.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// The packets the gate let out after the first `from`.
@@ -237,8 +241,8 @@ async fn revoke_under_full_queues_leaves_the_other_flows_intact() -> TestResult 
         udp_tuples.push((socket.local_addr(), remote));
         udp.push(socket);
     }
-    let tcp_controls: Vec<_> = tcp.iter().map(|conn| conn.control()).collect();
-    let udp_controls: Vec<_> = udp.iter().map(|socket| socket.control()).collect();
+    let tcp_controls: Vec<_> = tcp.iter().map(TcpConnection::control).collect();
+    let udp_controls: Vec<_> = udp.iter().map(UdpSocket::control).collect();
     let tcp_tuples: Vec<_> = tcp
         .iter()
         .map(|conn| (conn.local_addr(), conn.peer_addr()))
@@ -336,8 +340,16 @@ async fn revoke_does_not_wait_for_an_unresponsive_peer() -> TestResult {
     let target = b.node.socket_addr(Family::V4, 80);
     let mut client = timeout(TRANSFER, a.node.stack.connect_tcp(target)).await??;
     let _server = next_within(&mut incoming, WAIT).await?;
-    let _quiet = b.node.stack.bind_udp(b.node.socket_addr(Family::V4, 53)).await?;
-    let socket = a.node.stack.connect_udp(b.node.socket_addr(Family::V4, 53)).await?;
+    let _quiet = b
+        .node
+        .stack
+        .bind_udp(b.node.socket_addr(Family::V4, 53))
+        .await?;
+    let socket = a
+        .node
+        .stack
+        .connect_udp(b.node.socket_addr(Family::V4, 53))
+        .await?;
 
     // The peer stops: it never reads and sends nothing, not even an ACK.
     b.close();
@@ -413,7 +425,10 @@ async fn reopened_udp_tuple_never_carries_old_queued_output() -> TestResult {
         .await?;
     socket.send_to(b"hi", target).await?;
     let mut flow = next_within(&mut incoming, WAIT).await?;
-    assert_eq!(timeout(WAIT, flow.recv()).await?.as_deref(), Some(&b"hi"[..]));
+    assert_eq!(
+        timeout(WAIT, flow.recv()).await?.as_deref(),
+        Some(&b"hi"[..])
+    );
     let tuple = (flow.peer_addr(), flow.local_addr());
 
     // Output queued in the stack for the old flow at the revoke.
@@ -475,7 +490,11 @@ async fn revoke_after_the_stack_stopped_is_unknown() -> TestResult {
     let target = b.node.socket_addr(Family::V4, 80);
     let client = timeout(TRANSFER, a.node.stack.connect_tcp(target)).await??;
     let _server = next_within(&mut incoming, WAIT).await?;
-    let socket = a.node.stack.connect_udp(b.node.socket_addr(Family::V4, 53)).await?;
+    let socket = a
+        .node
+        .stack
+        .connect_udp(b.node.socket_addr(Family::V4, 53))
+        .await?;
     let stack = a.node.stack.clone();
     let any_port = a.node.socket_addr(Family::V4, 0);
 
@@ -505,7 +524,11 @@ fn receipts_are_unknown_when_the_stack_stops_during_retirement() -> TestResult {
         let target = b.node.socket_addr(Family::V4, 80);
         let client = timeout(TRANSFER, a.node.stack.connect_tcp(target)).await??;
         next_within(&mut incoming, WAIT).await?;
-        let socket = a.node.stack.connect_udp(b.node.socket_addr(Family::V4, 53)).await?;
+        let socket = a
+            .node
+            .stack
+            .connect_udp(b.node.socket_addr(Family::V4, 53))
+            .await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((a, b, client, socket))
     })?;
 
