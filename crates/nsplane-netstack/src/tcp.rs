@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
 
+use crate::flow::{FlowControl, FlowState};
+
 /// Progress of the application's write half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteHalf {
@@ -119,6 +121,10 @@ fn broken_pipe() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
 }
 
+pub(crate) fn revoked() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "flow revoked")
+}
+
 /// A TCP connection whose local endpoint is the stack.
 ///
 /// Reads return the bytes the peer sent and then `Ok(0)` once the peer's FIN arrived
@@ -134,6 +140,8 @@ fn broken_pipe() -> io::Error {
 /// until the close completes. [`abort`](Self::abort) resets the connection instead and
 /// releases it at once. A connection without traffic in either
 /// direction for 5 minutes is reset the same way: the peer gets an RST.
+/// [`control`](Self::control) revokes it without sending anything; every operation then
+/// fails with [`io::ErrorKind::ConnectionAborted`].
 pub struct TcpConnection {
     shared: Arc<Mutex<Shared>>,
     progress: Arc<Progress>,
@@ -141,6 +149,7 @@ pub struct TcpConnection {
     local: SocketAddr,
     peer: SocketAddr,
     terminal: watch::Receiver<bool>,
+    flow: Arc<FlowState>,
 }
 
 impl TcpConnection {
@@ -151,6 +160,7 @@ impl TcpConnection {
         local: SocketAddr,
         peer: SocketAddr,
         terminal: watch::Receiver<bool>,
+        flow: Arc<FlowState>,
     ) -> Self {
         Self {
             shared,
@@ -159,7 +169,13 @@ impl TcpConnection {
             local,
             peer,
             terminal,
+            flow,
         }
+    }
+
+    /// The connection's control, which can revoke it from any task; see [`FlowControl`].
+    pub fn control(&self) -> FlowControl {
+        FlowControl::new(Arc::clone(&self.flow))
     }
 
     /// The stack's end of the connection.
@@ -252,6 +268,10 @@ impl AsyncRead for TcpConnection {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut shared = lock(&self.shared);
+        // Under the lock: a revoke sets the flag before it locks to wake the waiters.
+        if self.flow.is_revoked() {
+            return Poll::Ready(Err(revoked()));
+        }
         if shared.rx.is_empty() {
             if shared.rx_eof || shared.released {
                 return Poll::Ready(Ok(()));
@@ -284,6 +304,10 @@ impl AsyncWrite for TcpConnection {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut shared = lock(&self.shared);
+        // Under the lock: a revoke sets the flag before it locks to wake the waiters.
+        if self.flow.is_revoked() {
+            return Poll::Ready(Err(revoked()));
+        }
         if shared.released || shared.write_half != WriteHalf::Open {
             return Poll::Ready(Err(broken_pipe()));
         }
@@ -302,6 +326,10 @@ impl AsyncWrite for TcpConnection {
     /// Waits until every written byte is handed to the stack's socket.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut shared = lock(&self.shared);
+        // Under the lock: a revoke sets the flag before it locks to wake the waiters.
+        if self.flow.is_revoked() {
+            return Poll::Ready(Err(revoked()));
+        }
         if shared.tx.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -315,6 +343,10 @@ impl AsyncWrite for TcpConnection {
     /// Shuts the write half down and waits until the FIN is queued behind the written bytes.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut shared = lock(&self.shared);
+        // Under the lock: a revoke sets the flag before it locks to wake the waiters.
+        if self.flow.is_revoked() {
+            return Poll::Ready(Err(revoked()));
+        }
         if shared.write_half == WriteHalf::FinSent || shared.released {
             return Poll::Ready(Ok(()));
         }
