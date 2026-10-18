@@ -6,7 +6,8 @@ This guide shows how to embed nsplane in an application: which crates to pick, h
 is assembled, and complete code for the common deployments. It describes nsplane 0.16.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
-- Design, internals and measurements: [architecture.md](architecture.md).
+- Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
+  measurements: [performance.md](performance.md).
 - Runnable programs: [examples/README.md](../examples/README.md).
 
 ## Contents
@@ -454,7 +455,7 @@ sends an RST and releases the socket at once, and `terminated()` waits for that 
 `UdpFlow::reply_handle()` gives cloneable `UdpReply` senders; `NetStackHandle::stats()`
 returns drop counters; `NetStackConfig::reassembly` enables IP fragment reassembly.
 
-### Revoking one flow (0.16.0)
+### Revoking one flow
 
 On a stack shared by many flows, `FlowControl` ends one flow at once and reports whether its
 resources were released. It is independent of the data handles, so it still works after the
@@ -576,7 +577,7 @@ acl.install(rules()?); // call again to reload
   (`open_pinhole`, closed when the `PinholeGuard` drops) for app sessions — see the
   `app_session` example and [specs/acl-generic-api.md](specs/acl-generic-api.md).
 - `gate::GateFilter` is a stateful flow gate keyed by peer (admission, holds, timeouts,
-  diverting packets to the application); see [architecture.md](architecture.md#nsplane-acl).
+  diverting packets to the application); see [the nsplane-acl reference](reference/nsplane-acl.md).
 
 ## 11. Address translation and NAT: nsplane-nat
 
@@ -798,7 +799,7 @@ the local side did; injected packets bypass the filters),
 
 Reference numbers (x86-64, 0.11.0, real TUN, iperf3): about 11 Gbit/s for one TCP stream
 between two nsplane nodes, 14.5 Gbit/s with two crypto workers, 8.6 Gbit/s between two
-netstack nodes. See [architecture.md](architecture.md#performance).
+netstack nodes. See [performance.md](performance.md).
 
 ## 15. Platforms and building
 

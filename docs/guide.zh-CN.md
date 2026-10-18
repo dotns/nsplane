@@ -6,7 +6,8 @@
 内容对应 nsplane 0.16.0。
 
 - 函数签名与契约：rustdoc（`cargo doc --workspace --no-deps --open`）。
-- 设计、内部实现与性能数据：[architecture.md](architecture.md)。
+- 设计：[architecture.md](architecture.md)；各 crate 的行为：[reference](reference/)；
+  性能数据：[performance.md](performance.md)。
 - 可运行的程序：[examples/README.md](../examples/README.md)。
 
 ## 目录
@@ -439,7 +440,7 @@ async fn clients(stack: &NetStackHandle) -> anyhow::Result<()> {
 释放 socket，`terminated()` 等待该释放完成；`UdpFlow::reply_handle()` 返回可克隆的 `UdpReply` 发送端；
 `NetStackHandle::stats()` 返回丢包计数；`NetStackConfig::reassembly` 开启 IP 分片重组。
 
-### 撤销单个 flow（0.16.0）
+### 撤销单个 flow
 
 在多个 flow 共享的栈上，`FlowControl` 可以立即结束某一个 flow，并报告其资源是否已释放。它独立于数据
 句柄，即使连接已移交给其他任务也照样可用。
@@ -553,7 +554,7 @@ acl.install(rules()?); // 再次调用即重新加载
   `PinholeGuard` 被 drop 时关闭）——见 `app_session` 示例和
   [specs/acl-generic-api.md](specs/acl-generic-api.md)。
 - `gate::GateFilter` 是按 peer 区分的有状态流闸门（准入、保持、超时、把包转交应用）；见
-  [architecture.md](architecture.md#nsplane-acl)。
+  [nsplane-acl 参考文档](reference/nsplane-acl.md)。
 
 ## 11. 地址转换与 NAT：nsplane-nat
 
@@ -767,7 +768,7 @@ let status = handle.status().await?;
 
 参考数据（x86-64，0.11.0，真实 TUN，iperf3）：两个 nsplane 节点之间单条 TCP 流约 11 Gbit/s，
 2 个加密 worker 时 14.5 Gbit/s，两个 netstack 节点之间 8.6 Gbit/s。详见
-[architecture.md](architecture.md#performance)。
+[performance.md](performance.md)。
 
 ## 15. 平台与构建
 

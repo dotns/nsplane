@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Examples end-to-end test: the nsplane-examples binaries run as the design's
-# "Presentation x transport" scenarios (docs/design.md §5), against each other and against
+# "Local side x transport" scenarios (docs/architecture.md, Data flow), against each other and against
 # kernel WireGuard, each node in its own sibling container.
 #
 # Matrix cells (`cell <row> <transport> <case>...`) and scenarios (`scenario <name>`) record
