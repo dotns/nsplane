@@ -244,7 +244,7 @@ Dependencies: `nsplane`, `nsplane-netstack`, `tokio` (`macros`, `rt-multi-thread
 A classic VPN client: a TUN device as the local side, one UDP transport, one server peer,
 and optionally the UAPI so `wg` can inspect and change it. Needs root or `CAP_NET_ADMIN`.
 
-```rust
+```rust ignore
 use std::net::SocketAddr;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
@@ -304,7 +304,7 @@ Notes:
 `VpnService.Builder.establish()` returns a new fd on every reconfiguration. `TunSlot` keeps
 the engine running and swaps the fd under it:
 
-```rust
+```rust ignore
 use std::os::fd::OwnedFd;
 
 use nsplane::EngineBuilder;
@@ -337,7 +337,7 @@ slot.
 
 `NEPacketTunnelFlow` exposes packets through callbacks rather than an fd:
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::EngineBuilder;
@@ -368,7 +368,7 @@ changes the MTU.
 
 When the host pumps packets itself (any platform, or tests), use channels:
 
-```rust
+```rust ignore
 use nsplane::{ChannelSink, ChannelSource, EngineBuilder};
 
 let (source, to_engine, mtu) = ChannelSource::new(1024, 1420);
@@ -388,7 +388,7 @@ fencing a sink at shutdown; see rustdoc.
 an API for the application: it owns addresses inside the tunnel and serves TCP and UDP
 endpoints on them, IPv4 and IPv6. No TUN device, no root, no host routing.
 
-```rust
+```rust ignore
 let (stack, handle) = NetStack::new(NetStackConfig::new(
     vec![("10.0.0.1".parse()?, 24), ("fd00::1".parse()?, 64)],
     DEFAULT_MTU,
@@ -400,7 +400,7 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 
 ### TCP and UDP
 
-```rust
+```rust ignore
 use futures_util::StreamExt as _;
 use nsplane_netstack::NetStackHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -461,7 +461,7 @@ On a stack shared by many flows, `FlowControl` ends one flow at once and reports
 resources were released. It is independent of the data handles, so it still works after the
 connection was moved into another task.
 
-```rust
+```rust ignore
 use nsplane_netstack::RetirementOutcome;
 
 let conn = stack.connect_tcp("10.0.0.2:80".parse()?).await?;
@@ -495,7 +495,7 @@ match receipt.wait().await {
 `MergeSource` merges several sources into one. Here, packets for 10.0.0.0/16 go to the TUN
 device and everything else to the netstack:
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::{EngineBuilder, MergeSource, PacketBuf, PacketSink, PeerId, Splitter};
@@ -532,7 +532,7 @@ peer's **labels** (opaque strings you assign), source and destination prefixes, 
 protocol/ports. Policies are installed atomically and can be reloaded at any time; until the
 first install everything is dropped (fail closed).
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::{EngineBuilder, PeerId};
@@ -589,7 +589,7 @@ All NAT types are packet filters (`EngineBuilder::filter`) or wrap the local sid
 address mappings (EAM) per peer and LAN prefixes behind peers. The table is built once the
 peers have ids, and can be swapped live with `Translator::store`:
 
-```rust
+```rust ignore
 use nsplane_nat::{LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator};
 
 fn table(gw: PeerId, other: PeerId) -> anyhow::Result<TranslationTable> {
@@ -616,7 +616,7 @@ address belongs to the longest prefix that contains it, and the exact addresses 
 To keep a handle for `store` while the engine owns the filter, share it through an `Arc` and a
 forwarding filter (`Verdict` is from `nsplane-core`):
 
-```rust
+```rust ignore
 use nsplane_core::{PacketFilter, Verdict};
 
 struct Shared(Arc<Translator>);
@@ -640,7 +640,7 @@ translator.store(table(gw, other)?);
 
 DNAT/SNAT from a tunnel-facing address to a local service, optionally limited to some peers:
 
-```rust
+```rust ignore
 use nsplane_nat::{Conntrack, ConntrackConfig, PortMap, PortMapProtocol, PortMapRule};
 
 let map = PortMap::with_conntrack(Vec::new(), Conntrack::new(ConntrackConfig::default()))?;
@@ -656,7 +656,7 @@ map.set_rules(vec![PortMapRule {
 
 A gateway wraps its local side so that IPv6 peers reach an IPv4 LAN through stateful NAT64:
 
-```rust
+```rust ignore
 use nsplane_nat::{LanRoute, LanRoutes, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource};
 
 let route = LanRoute::new(
@@ -697,7 +697,7 @@ ingress. See rustdoc.
 Client side: `WssDialer` is a `LinkDialer`, so a WSS connection becomes a transport. TLS
 trust is the caller's (no built-in roots):
 
-```rust
+```rust ignore
 use nsplane::{LinkConfig, TransportId};
 use nsplane_wss::{WssConfig, WssDialer, WssTls};
 
@@ -715,7 +715,7 @@ per dial), keepalive, backoff and `allow_plaintext` for `ws://` in tests.
 Server side: the embedder runs its own HTTP server, authenticates, upgrades, and hands each
 WebSocket to the `WssAcceptor` of a `WssServerTransport`:
 
-```rust
+```rust ignore
 use nsplane_wss::{WssAcceptor, WssServerConfig, WssServerTransport};
 
 let (transport, acceptor) = WssServerTransport::new(TransportId::new(1), WssServerConfig::default());
@@ -738,7 +738,7 @@ WireGuard peer over `WssDialer` instead.
 
 One engine can answer as several WireGuard identities (private keys) on the same transports:
 
-```rust
+```rust ignore
 let id = handle.add_local_identity(second_key).await?.expect("a new key");
 let mut peer = nsplane::Peer::new(peer_key);
 peer.local_identity = Some(id); // this peer talks to `second_key`
@@ -753,7 +753,7 @@ outbound packets by source address to an identity's peers (per-identity routing)
 
 ### Events and statistics
 
-```rust
+```rust ignore
 use nsplane::Event;
 
 let mut events = handle.subscribe().await?;

@@ -244,3 +244,20 @@ additive:
 
 Accepted residual: multi-flow UDP send +4.1 % in the netstack micro bench, every other path at
 par. R3 (delivery gates) is deferred. The freeze applies again: bug fixes only.
+
+## 2026-10-18 [docs] Documentation standard
+
+Plan `20261018-1000-doc-system` (owner: "可以一起做，完成到D5，不需要L2，你直接做就可以了"),
+executed by L1 directly on branch `doc-system`:
+- `docs/README.md`: index, document classes, writing rules, templates, delivery table;
+- `scripts/check-docs.sh` in `just check` (`just docs`): wording, links, reference coverage;
+- usage guide in English and Chinese; its complete program runs as a doctest of
+  `nsplane-examples`, fragments are `rust ignore`;
+- `docs/reference/<crate>.md` for the eleven published crates, `docs/performance.md` with the
+  current numbers, `docs/architecture.md` reduced to the cross-crate design;
+  `docs/design.md` removed;
+- specs in present tense with the spec header; the generic ACL API design note moved to
+  `docs/plan/20261007-0900-business-agnostic-acl-api.md`; eleven ADRs on one header format;
+- code comments without plan ids, versions or intentions.
+
+The removed measurement history stays in git and in the plans that produced it.

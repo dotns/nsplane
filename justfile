@@ -3,7 +3,7 @@
 default: check
 
 # Run every gate.
-check: fmt clippy test doc-test deny shear typos msrv examples product-terms
+check: fmt clippy test doc-test deny shear typos msrv examples product-terms docs
 
 fmt:
     cargo fmt --all --check
@@ -36,6 +36,10 @@ examples:
 # Product-term scan of the public API and rustdoc (ADR 2026-10-06 business-agnostic scope).
 product-terms:
     scripts/check-product-terms.sh
+
+# Documentation standard: wording, links and reference coverage (docs/README.md).
+docs:
+    scripts/check-docs.sh
 
 # Cross-target clippy: macOS through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
 cross:

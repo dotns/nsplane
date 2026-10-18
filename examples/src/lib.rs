@@ -12,3 +12,13 @@ pub mod node;
 pub mod out;
 pub mod relay;
 pub mod status;
+
+/// The usage guide; its complete programs run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/guide.md")]
+mod guide {}
+
+/// The Chinese usage guide; its complete programs run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/guide.zh-CN.md")]
+mod guide_zh_cn {}

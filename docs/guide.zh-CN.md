@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
 典型 VPN 客户端：TUN 设备作本地侧，一个 UDP 传输，一个服务端 peer，可选地开启 UAPI 以便用 `wg`
 查看和修改。需要 root 或 `CAP_NET_ADMIN`。
 
-```rust
+```rust ignore
 use std::net::SocketAddr;
 
 use nsplane::x25519::{PublicKey, StaticSecret};
@@ -292,7 +292,7 @@ async fn client(key: StaticSecret, server_key: PublicKey, server: SocketAddr) ->
 `VpnService.Builder.establish()` 每次重新配置都会返回新的 fd。`TunSlot` 让引擎持续运行，并在其下
 替换 fd：
 
-```rust
+```rust ignore
 use std::os::fd::OwnedFd;
 
 use nsplane::EngineBuilder;
@@ -324,7 +324,7 @@ fn reconfigure(slot: &TunSlot, new_fd: OwnedFd) -> std::io::Result<()> {
 
 `NEPacketTunnelFlow` 通过回调而非 fd 交付数据包：
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::EngineBuilder;
@@ -354,7 +354,7 @@ fn start(
 
 宿主自己搬运数据包时（任意平台，或测试中），使用 channel：
 
-```rust
+```rust ignore
 use nsplane::{ChannelSink, ChannelSource, EngineBuilder};
 
 let (source, to_engine, mtu) = ChannelSource::new(1024, 1420);
@@ -374,7 +374,7 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 它拥有隧道内的地址，在这些地址上提供 TCP 和 UDP 端点，支持 IPv4 与 IPv6。无需 TUN 设备、root 或
 宿主路由。
 
-```rust
+```rust ignore
 let (stack, handle) = NetStack::new(NetStackConfig::new(
     vec![("10.0.0.1".parse()?, 24), ("fd00::1".parse()?, 64)],
     DEFAULT_MTU,
@@ -386,7 +386,7 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 
 ### TCP 与 UDP
 
-```rust
+```rust ignore
 use futures_util::StreamExt as _;
 use nsplane_netstack::NetStackHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -445,7 +445,7 @@ async fn clients(stack: &NetStackHandle) -> anyhow::Result<()> {
 在多个 flow 共享的栈上，`FlowControl` 可以立即结束某一个 flow，并报告其资源是否已释放。它独立于数据
 句柄，即使连接已移交给其他任务也照样可用。
 
-```rust
+```rust ignore
 use nsplane_netstack::RetirementOutcome;
 
 let conn = stack.connect_tcp("10.0.0.2:80".parse()?).await?;
@@ -476,7 +476,7 @@ match receipt.wait().await {
 `Splitter` 用闭包把每个解密后的包分发给多个 sink 之一；`MergeSource` 把多个 source 合并为一个。
 下例中，发往 10.0.0.0/16 的包交给 TUN 设备，其余交给 netstack：
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::{EngineBuilder, MergeSource, PacketBuf, PacketSink, PeerId, Splitter};
@@ -510,7 +510,7 @@ let engine = EngineBuilder::new(merge, splitter).private_key(key).transport(udp)
 ACL 只有放行规则：只有规则允许的包才能通过。规则匹配发送方 peer 的**标签**（由你分配的不透明字符串）、
 源和目的前缀以及协议/端口。策略原子安装，可随时重新加载；首次安装之前所有包都被丢弃（默认拒绝）。
 
-```rust
+```rust ignore
 use std::sync::Arc;
 
 use nsplane::{EngineBuilder, PeerId};
@@ -565,7 +565,7 @@ acl.install(rules()?); // 再次调用即重新加载
 `Translator`（RFC 7915）让本地 IPv4 流量到达以 IPv6 寻址的 peer，依据每个 peer 的显式地址映射（EAM）
 以及 peer 背后的 LAN 前缀。映射表在 peer 拿到 id 后构建，并可通过 `Translator::store` 在线替换：
 
-```rust
+```rust ignore
 use nsplane_nat::{LanPrefix, PeerMapping, SelfMapping, TranslationTable, Translator};
 
 fn table(gw: PeerId, other: PeerId) -> anyhow::Result<TranslationTable> {
@@ -591,7 +591,7 @@ fn table(gw: PeerId, other: PeerId) -> anyhow::Result<TranslationTable> {
 若要在引擎持有过滤器的同时保留一个用于 `store` 的句柄，用 `Arc` 加一个转发过滤器共享它
 （`Verdict` 来自 `nsplane-core`）：
 
-```rust
+```rust ignore
 use nsplane_core::{PacketFilter, Verdict};
 
 struct Shared(Arc<Translator>);
@@ -615,7 +615,7 @@ translator.store(table(gw, other)?);
 
 从面向隧道的地址 DNAT/SNAT 到本地服务，可限定只对部分 peer 开放：
 
-```rust
+```rust ignore
 use nsplane_nat::{Conntrack, ConntrackConfig, PortMap, PortMapProtocol, PortMapRule};
 
 let map = PortMap::with_conntrack(Vec::new(), Conntrack::new(ConntrackConfig::default()))?;
@@ -631,7 +631,7 @@ map.set_rules(vec![PortMapRule {
 
 网关包装其本地侧，让 IPv6 peer 通过有状态 NAT64 访问 IPv4 局域网：
 
-```rust
+```rust ignore
 use nsplane_nat::{LanRoute, LanRoutes, Nat64Lan, Nat64LanConfig, Nat64LanSink, Nat64LanSource};
 
 let route = LanRoute::new(
@@ -669,7 +669,7 @@ SNAT）；`Masquerade` 是针对路由进来的 LAN 流量的有状态 IPv6 源 
 客户端：`WssDialer` 是一个 `LinkDialer`，因此一个 WSS 连接即成为一个传输。TLS 信任由调用方提供
 （没有内置根证书）：
 
-```rust
+```rust ignore
 use nsplane::{LinkConfig, TransportId};
 use nsplane_wss::{WssConfig, WssDialer, WssTls};
 
@@ -687,7 +687,7 @@ keepalive、退避，以及测试用的 `allow_plaintext`（允许 `ws://`）。
 服务端：由嵌入方运行自己的 HTTP 服务器、完成认证和升级，再把每个 WebSocket 交给
 `WssServerTransport` 的 `WssAcceptor`：
 
-```rust
+```rust ignore
 use nsplane_wss::{WssAcceptor, WssServerConfig, WssServerTransport};
 
 let (transport, acceptor) = WssServerTransport::new(TransportId::new(1), WssServerConfig::default());
@@ -710,7 +710,7 @@ WireGuard peer。
 
 一个引擎可以在同一组传输上以多个 WireGuard 身份（私钥）应答：
 
-```rust
+```rust ignore
 let id = handle.add_local_identity(second_key).await?.expect("a new key");
 let mut peer = nsplane::Peer::new(peer_key);
 peer.local_identity = Some(id); // 这个 peer 与 `second_key` 通信
@@ -724,7 +724,7 @@ peer（按身份路由）；`peer_id_in` / `remove_peer_in` 在某个身份内�
 
 ### 事件与统计
 
-```rust
+```rust ignore
 use nsplane::Event;
 
 let mut events = handle.subscribe().await?;
