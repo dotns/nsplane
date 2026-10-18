@@ -1,7 +1,6 @@
 //! The `WsFrame` codec of the stream carrier.
 //!
-//! Deprecated with the stream carrier: it has no remaining consumer and will be removed
-//! once its users have switched.
+//! Deprecated with the stream carrier; a WireGuard peer over `WssDialer` replaces it.
 //!
 //! Every binary WebSocket message is one frame (big-endian):
 //!

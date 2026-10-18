@@ -1,7 +1,8 @@
 # ADR: nsplane stays business-agnostic; policy semantics are compiled above it
 
-Status   : Accepted
-Date     : 2026-10-06
+- **Status**: Accepted
+- **Date**: 2026-10-06
+- **Review**: none
 
 ## Context
 

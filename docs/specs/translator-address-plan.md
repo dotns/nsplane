@@ -1,23 +1,17 @@
-# Spec: the Quick v2 address plan on the generic translator model
+# The Quick v2 address plan on the generic translator model
 
-Status   : Current
-Since    : nsplane 0.11.0
-Source   : ADR `docs/decisions/2026-10-06-business-agnostic-scope.md`, task
-           `docs/task/20261006-1500-business-agnostic-cleanup.md` item AG-5
+- **Status**: Current
+- **Applies to**: `nsplane-nat` (`TranslationTable`, `Translator`)
 
-## 1. Purpose and status
+How the Quick v2 address plan of ns maps onto the generic translator model, and which of
+the plan's rules the product keeps itself.
+
+## 1. Purpose
 
 `nsplane-nat` exposes per-peer explicit address mappings (EAM, RFC 7757) to its stateless
-IPv4 <-> IPv6 translator (RFC 7915). It does not know any product's address plan. A
-product builds its plan on top of the generic model.
-
-Before 0.11.0 the model used the names of the Quick v2 address plan of ns (`node6`,
-`node4`, `alias4`, `alias6`, `self4`, native alias). 0.11.0 renames them to generic EAM
-names. The change is breaking and has no compatibility layer. Behaviour, validation order,
-errors, reason strings and memory layout are unchanged.
-
-This document maps the Quick v2 plan onto the generic model. A product that used the former
-names reads it to port its code and to keep the plan's rules that nsplane no longer encodes.
+IPv4 <-> IPv6 translator (RFC 7915). It does not know any product's address plan
+(ADR `docs/decisions/2026-10-06-business-agnostic-scope.md`); a product builds its plan on
+top of the generic model.
 
 ## 2. The generic model
 
@@ -119,45 +113,31 @@ Rules that apply to these rows:
 
 ### Addresses
 
-| Quick v2 name | Former nsplane name | Generic name |
-| --- | --- | --- |
-| `node6`, `N6` (native IPv6 of a peer) | `PeerMapping::node6` | `PeerMapping::peer6` |
-| `node4`, `N4` (IPv4 service address of a peer) | `PeerMapping::node4` | `PeerMapping::eam6` |
-| `alias4` (local IPv4 alias of `N4`) | `PeerMapping::alias4` | `PeerMapping::eam4` |
-| IPv6 alias of `N6` | `PeerMapping::alias6` | `PeerMapping::local6` |
-| `alias6(b)`, native alias (local IPv4 alias of `N6`) | `native_alias4` argument | `peer6_eam4` argument of `peer_with_peer6_eam4` |
-| `self4` | `SelfMapping::self4` | `SelfMapping::eam4` |
-| `N4(self)`, the node's own `node4` | `SelfMapping::node4` | `SelfMapping::eam6` |
-| `lan4` / `lan6` | `LanPrefix::lan4` / `lan6` | unchanged |
-
-Two things were called `alias6`. The former `PeerMapping::alias6` was an IPv6 alias,
-rewritten to and from `N6`; it is now `local6`. The `alias6` of the Quick CLI and DNS is an
-IPv4 alias translated to `N6(b)`; it is now `peer6_eam4`. Port each by its meaning, not by
-its name.
-
-### Methods and errors
-
-| Former | Generic |
+| Quick v2 name | Generic name |
 | --- | --- |
-| `TranslationTableBuilder::peer_with_native_alias4` | `TranslationTableBuilder::peer_with_peer6_eam4` |
-| `TranslationTable::native_alias4` | `TranslationTable::peer6_eam4` |
-| `TranslationTable::by_native_alias4` | `TranslationTable::by_peer6_eam4` |
-| `TranslationTable::by_alias4` | `TranslationTable::by_eam4` |
-| `TranslationTable::by_alias6` | `TranslationTable::by_local6` |
-| `TranslationTable::by_node4` | `TranslationTable::by_eam6` |
-| `TranslationTable::by_node6` | `TranslationTable::by_peer6` |
-| `TableError::Alias4IsSelf4` | `TableError::Eam4IsSelf` (message "IPv4 EAM address {0} equals the self address") |
+| `node6`, `N6` (native IPv6 of a peer) | `PeerMapping::peer6` |
+| `node4`, `N4` (IPv4 service address of a peer) | `PeerMapping::eam6` |
+| `alias4` (local IPv4 alias of `N4`) | `PeerMapping::eam4` |
+| IPv6 alias of `N6` | `PeerMapping::local6` |
+| `alias6(b)`, native alias (local IPv4 alias of `N6`) | `peer6_eam4` argument of `peer_with_peer6_eam4` |
+| `self4` | `SelfMapping::eam4` |
+| `N4(self)`, the node's own `node4` | `SelfMapping::eam6` |
+| `lan4` / `lan6` | `LanPrefix::lan4` / `lan6` |
+
+Quick v2 uses `alias6` for two things. The IPv6 alias, rewritten to and from `N6`, is
+`local6`. The `alias6` of the Quick CLI and DNS is an IPv4 alias translated to `N6(b)`; it is
+`peer6_eam4`. Map each by its meaning, not by its name.
 
 The `translate_node` example's `--map` keys are `peer6=`, `eam6=`, `eam4=`, `local6=`, and
 `--self` takes `<EAM4>=<EAM6>`.
 
 ## 4. The Quick v2 address plan as product semantics
 
-nsplane no longer encodes any of this. The product derives and checks it.
+nsplane does not encode any of this. The product derives and checks it.
 
 ### The /127 group
 
-The Quick v2 protocol decision (2026-10-02) defines it as:
+The Quick v2 protocol decision defines it as:
 
 > Keep two addresses per node: a /127 group from a 119-bit hash of `I`, mode bit 0 =
 > native IPv6 (`N6`), 1 = IPv4 service (`N4`).
@@ -279,7 +259,7 @@ local IPv4 EAM addresses, and stateful replies of translated flows match.
 
 ## 6. Parity cases
 
-These tests pin the behaviour. They stay in nsplane as generic tests; a product can replay
+These tests pin the behaviour. They are generic nsplane tests; a product can replay
 the same cases against its own plan.
 
 | File | Tests | Covers |

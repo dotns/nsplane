@@ -5041,7 +5041,7 @@ mod tests {
             outbound(&f, PEER, PacketBuf::from_packet(&[])),
             drop(reasons::OUTBOUND_SOURCE)
         );
-        // Long enough for the source, but not a valid packet: judged as before.
+        // Long enough for the source, but not a valid packet: judged like the empty one.
         v4.push(0x45);
         v4[12..16].copy_from_slice(&[10, 0, 0, 2]);
         assert_eq!(
@@ -5431,7 +5431,7 @@ mod tests {
         assert_eq!(inbound(&f, PEER, ping), drop(reasons::POLICY_FAILED));
         assert_eq!(f.stats().policy_state, PolicyState::Failed);
 
-        // Not installed, deny: as before any policy was loaded.
+        // Not installed, deny: the state of an engine that never had a policy.
         engine.uninstall();
         assert_eq!(inbound(&f, PEER, reply()), drop(reasons::NO_POLICY));
         let stats = f.stats();

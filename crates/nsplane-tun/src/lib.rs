@@ -7,7 +7,7 @@
 //! Supported targets: Linux and Android (`/dev/net/tun`, raw IP packets), macOS and iOS
 //! (utun control socket, packets framed by a 4-byte address-family header), and Windows
 //! (a Wintun adapter; a reader thread feeds the source, so there is no fd). On every
-//! other target the crate is empty for now.
+//! other target the crate is empty.
 //!
 //! Offloads (Linux/Android): [`Tun::create`] opens the device with a virtio-net header
 //! (`IFF_VNET_HDR`) and TCP segmentation offload, plus UDP segmentation offload where the

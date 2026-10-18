@@ -1345,8 +1345,7 @@ fn the_gate_matches_the_reference_model() {
     assert_coverage(&seen);
 }
 
-/// Policies that never list unbound addresses behave as before the field
-/// existed.
+/// Policies that never list unbound addresses behave as if the field did not exist.
 #[test]
 fn the_gate_matches_the_reference_model_without_unbound_addresses() {
     let mut seen = std::collections::HashSet::new();

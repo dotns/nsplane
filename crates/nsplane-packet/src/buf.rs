@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(bytes[..8], [7; 8]);
         assert_eq!(bytes[8..], [0; 4]);
 
-        // A fresh buffer zero-fills as before.
+        // A fresh buffer still zero-fills.
         let mut fresh = PacketBuf::with_capacity(4);
         fresh.set_len(4);
         assert_eq!(fresh.as_packet(), [0; 4]);

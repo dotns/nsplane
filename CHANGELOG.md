@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documentation: a usage guide (English and Chinese), one reference document per crate under
+  `docs/reference/`, `docs/performance.md` with the current measurements, and a shorter
+  `docs/architecture.md`; `docs/design.md` is removed. `docs/README.md` states the documentation
+  standard, and `just check` enforces it with `scripts/check-docs.sh`.
+
 ## [0.16.0] - 2026-10-17
 
 Per-flow revoke with a scoped retirement receipt and an opaque flow context in nsplane-netstack;

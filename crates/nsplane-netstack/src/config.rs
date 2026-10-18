@@ -46,7 +46,7 @@ pub struct NetStackConfig {
     /// [`NetStackStats::syn_deferred`](crate::NetStackStats::syn_deferred), the peer
     /// retransmits them) while the queue is full, and connections that completed their
     /// handshake meanwhile wait in the stack until the application accepts them. UDP flows
-    /// are dropped as before. Default `false`.
+    /// are dropped when their queue is full, as without the option. Default `false`.
     pub accept_backpressure: bool,
     /// Datagrams queued per UDP flow or bound socket before new ones are dropped, and UDP
     /// payloads queued for sending before `send` waits. Default 256.
@@ -54,8 +54,7 @@ pub struct NetStackConfig {
     /// The driver routes up to 256 ingress packets in one step before the application
     /// can take any, so a burst to one flow or socket beyond this capacity loses the
     /// excess even when the application keeps up on average; the default takes one whole
-    /// step. Between two `netstack_bench` nodes, 1380-byte datagrams lost 1.24 % at
-    /// 1 Gbit/s and 5.21 % at 3 Gbit/s with a queue of 128, 0.00 % and 2.62 % with 256.
+    /// step (the loss measured at both sizes is in `docs/performance.md`).
     ///
     /// The queue grows on demand in blocks of 32 entries, so an idle flow or socket costs
     /// the same at any capacity (one block, about 1 KiB per flow and 2 KiB per bound

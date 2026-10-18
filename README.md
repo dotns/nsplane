@@ -14,7 +14,8 @@ implementation of the WireGuard protocol written in Rust. It:
   devices (including Windows through Wintun) in `nsplane-tun` and a user-space TCP/IP
   stack in `nsplane-netstack`.
 
-See [CHANGELOG.md](CHANGELOG.md) for details.
+See [CHANGELOG.md](CHANGELOG.md) for details, and the usage guide
+([English](docs/guide.md), [中文](docs/guide.zh-CN.md)) for how to embed it.
 
 ## Repository layout
 
@@ -151,57 +152,35 @@ async fn client(
 }
 ```
 
-See [docs/architecture.md](docs/architecture.md#optional-features-and-defaults) for the
-details.
+Every feature is optional and costs nothing when it is not installed; each crate's
+[reference](docs/reference/) lists its features, defaults and costs.
 
 ## Performance
 
-Measured with `just bench-wg` (`scripts/bench/wg-compare.sh` through `scripts/bench/slot.sh`):
-two containers per pair, pinned to one CCD's physical cores (slot 0: CPUs 1-3 / 4-7), real
-TUN devices, MTU 1420, iperf3, 30 s x 3, medians, 32-CPU host at load 2-6 (2026-10-07, main
-`45667ef`, 0.11.0):
-
-| Pair | TCP 1 stream | TCP 4 streams | UDP 3 Gbit/s loss |
-| --- | --- | --- | --- |
-| nsplane <-> nsplane | 11.1 Gbit/s | 11.8 Gbit/s | 0.03 % |
-| nsplane <-> nsplane, 2 crypto workers | 14.5 Gbit/s | 15.2 Gbit/s | 0.10 % |
-| nsplane -> kernel WireGuard | 7.7 Gbit/s | 7.1 Gbit/s | 0.05 % |
-| kernel WireGuard -> nsplane | 5.5 Gbit/s | 5.5 Gbit/s | 0.03 % |
-| wireguard-go <-> wireguard-go | 12.7 Gbit/s | 11.3 Gbit/s | 0.18 % |
-| netstack <-> netstack (user space, no TUN) | 8.6 Gbit/s | 11.0 Gbit/s | 0.00 % |
-
-Kernel WireGuard is held back by the CPU pinning, because its crypto threads run outside the
-pinned sets. With two or more crypto workers, one peer's crypto spreads over all workers.
-Details, latency and CPU per GB are in
-[docs/architecture.md](docs/architecture.md#against-wireguard-implementations).
+nsplane is measured against kernel WireGuard and wireguard-go with `just bench-wg`
+(`scripts/bench/wg-compare.sh` through `scripts/bench/slot.sh`: two containers per pair,
+pinned CPU sets, real TUN devices, iperf3), and per component with criterion benches. The
+method and the current numbers are in [docs/performance.md](docs/performance.md).
 
 ## Tuning
 
 The engine's packet queues hold 1024 packets each by default
-(`EngineBuilder::queue_capacity`), measured to leave 1.5x headroom over a single bulk TCP
-flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
+(`EngineBuilder::queue_capacity`), enough for a single bulk TCP flow. `EngineHandle::queue_stats` reports each queue's high-water mark, and
 `take_queue_stats` restarts the marks: a mark at its capacity together with
 `DROP_SINK_FULL` or `DROP_TRANSMIT_FULL` in `EngineHandle::drop_counters` means the queue is
 too small for the load (raise `queue_capacity`, e.g. to 2048 for many parallel bulk flows
 through a userspace netstack); marks far below the capacity mean it can shrink. With crypto
 workers, `QueueStats::crypto` and `crypto_done` cover the jobs with the workers, and
 `EngineHandle::fragment_stats` reports the fragmentation stage's counters. See
-[docs/architecture.md](docs/architecture.md#queue-depths) for the measurements.
+[queue depths](docs/reference/nsplane.md#queue-depths) and the
+[measurements](docs/performance.md#queue-depths).
 
 By default one owner task encrypts and decrypts every packet. A hub with several busy peers
 can spread that work over a pool of worker tasks with `EngineBuilder::crypto_workers(n)`
-(`n` of 2 or more; 0 or 1 is the default single task). The pool is sharded by peer, so
-each peer's packets keep their order, and it only helps on a multi-threaded tokio runtime
-with traffic from several peers: one peer's packets always go to one worker. See
-[docs/architecture.md](docs/architecture.md#crypto-worker-pool) for the design and the
-throughput note.
-
-Performance: on an x86-64 dev host a core round trip (seal and open) takes about 532 ns at
-64 B and 1.35 us at 1420 B one packet at a time, and 412 ns and 1.23 us per packet in
-batches of 32 (`Core::handle_datagrams` / `handle_locals`), an ACL-filtered established flow about 51-55 ns per packet, and
-a hub with 8 peers moves about 0.9 Mpps of 1420 B packets on one owner task and 0.9-1.3 Mpps
-with 2 or 4 crypto workers. The bench commands and the full table are in
-[docs/architecture.md](docs/architecture.md#performance).
+(`n` of 2 or more; 0 or 1 is the default single task). Every peer's
+packets keep their arrival order, one peer's cryptography spreads over every worker, and the
+pool needs a multi-threaded tokio runtime. See the
+[crypto worker pool](docs/reference/nsplane.md#crypto-worker-pool) for the design.
 
 ## Building
 
@@ -274,7 +253,8 @@ supported.
   the executable, which runs elevated.
 - `nsplane-uapi` listens on the named pipe
   `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` with the default security
-  descriptor; the path and descriptor are not yet verified on a real Windows host.
+  descriptor; the path and descriptor have no automated test, which needs a real Windows
+  host.
 
 ### Platform local sides
 

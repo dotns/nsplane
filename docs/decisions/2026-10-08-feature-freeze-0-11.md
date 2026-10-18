@@ -1,7 +1,8 @@
 # ADR: feature freeze at 0.11.x
 
-Status   : Accepted
-Date     : 2026-10-08
+- **Status**: Accepted
+- **Date**: 2026-10-08
+- **Review**: none
 
 ## Context
 

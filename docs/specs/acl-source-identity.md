@@ -1,20 +1,20 @@
-# ACL source identity: rebuilding the removed model on labels (AG-2)
+# ACL source identity on labels
 
-- **Status**: spec for workstream AC, item AG-2 (slice C3 of `acl-generic-api.md`)
-- **Audience**: products that feed `nsplane-acl`; ns is the reference product
-- **Normative API**: `docs/specs/acl-generic-api.md` sections 1.3-1.5, 2.1, 2.4, 3 and 4.2.
-  Rust snippets below are **illustrative** and use the names of the merged C3 code. Until
-  C4 a namespace's rules are still a policy document (`NamespacePolicy::policy`); C4
-  replaces it with typed `rules`.
+- **Status**: Current
+- **Applies to**: `nsplane-acl`
 
-## 1. Scope and status
+How a product maps its source identities (WireGuard keys, terminate bindings,
+identity-provider assertions, by-source peers) onto opaque labels and keeps the verdicts of
+the reference source model below, the model of the ns account filter. The generic API is in
+the [nsplane-acl reference](../reference/nsplane-acl.md); Rust snippets are illustrative.
+
+## 1. Scope
 
 ADR `docs/decisions/2026-10-06-business-agnostic-scope.md` makes nsplane business-agnostic:
 a source carries a set of opaque labels, and nsplane compares them for equality without
-interpreting them. The identity model that nsplane-acl took over from ns is therefore
-removed in slice C3:
+interpreting them. Each element of the reference model maps onto the generic API:
 
-| Removed item | Replacement in nsplane | Owner of the old semantics |
+| Reference model item | Generic API | Owner of the semantics |
 | --- | --- | --- |
 | `SourceAssertion::WgPeerKey { pubkey }` | a label chosen by the product (3.1) | product |
 | `SourceAssertion::Terminate { binding }`, `TerminateBinding { ip, anchor }` | labels plus the address label `A` (3.2) | product |
@@ -30,14 +30,14 @@ removed in slice C3:
 | `PinholeError::NotAppNamespace` | `PinholeError::NotPinholeNamespace` | - |
 
 The product owns the mapping from its identities to labels. Nothing in this document is
-implemented by nsplane; it states what a product must build to keep the old verdicts.
+implemented by nsplane; it states what a product builds to keep the reference verdicts.
 
-## 2. Semantics of the removed model
+## 2. The reference model
 
 ### 2.1 Principal and anchor per assertion kind
 
-A source was a `SourceAssertion`. Its **principal** was `source_anchor()`, a string used
-for namespace membership, grant ends and pinholes. Its IP (`ip()`) was used by CIDR rules.
+A source is a `SourceAssertion`. Its **principal** is `source_anchor()`, a string used
+for namespace membership, grant ends and pinholes. Its IP (`ip()`) is used by CIDR rules.
 
 | Kind | `source_class()` | Principal (`source_anchor()`) | `ip()` | Matches rule `src` |
 | --- | --- | --- | --- | --- |
@@ -47,49 +47,49 @@ for namespace membership, grant ends and pinholes. Its IP (`ip()`) was used by C
 
 Notes that a product compiler must reproduce:
 
-- A rule `src` of `key:<hex>` was parsed into 32 bytes (`parse_hex32`, upper or lower case
+- A rule `src` of `key:<hex>` is parsed into 32 bytes (`parse_hex32`, upper or lower case
   accepted) and compared to the key bytes. Labels compare text, so the product must
   canonicalize both sides (lowercase hex).
-- A CIDR source compared against `binding.ip`, **not** the packet's source address
-  (`AccessRequest::src_ip` was kept only for logs). For a by-source peer both are equal
+- A CIDR source compares against `binding.ip`, **not** the packet's source address
+  (`AccessRequest::src_ip` is kept only for logs). For a by-source peer both are equal
   (2.2); for a terminate binding inserted with `insert`, a packet from another address still
-  matched as `binding.ip`.
-- A key or IdP source never matched a CIDR rule, even when its packet's source address lay
+  matches as `binding.ip`.
+- A key or IdP source never matches a CIDR rule, even when its packet's source address lies
   inside the prefix (`SrcMatcher::Cidr` reads `ip()`, which is `None` for them).
-- The principal namespace was one flat string space: a terminate anchor equal to a
-  `key:<hex>` string or to `idp:<x>` collided with the other kinds.
+- The principal namespace is one flat string space: a terminate anchor equal to a
+  `key:<hex>` string or to `idp:<x>` collides with the other kinds.
 
 ### 2.2 The by-source principal
 
-`PeerIdentityMap::insert_by_source(peer)` marked a peer (for ns: every peer that is not a
+`PeerIdentityMap::insert_by_source(peer)` marks a peer (for ns: every peer that is not a
 relay client, typically a gateway or node carrying several source addresses). For each
-packet the filter called `assertion_for(peer, remote)`, which returned
+packet the filter calls `assertion_for(peer, remote)`, which returns
 `SourceAssertion::from_ip(remote)`: `Terminate { ip: Some(remote), anchor:
 remote.to_string() }`. So:
 
 - one principal per remote address, the address's `Display` text (`10.0.0.1`, `fd00::1`);
-- every address had a principal: a by-source peer was never unknown;
-- a namespace member whose `principal` was an address string (`"fd00::a"`) captured
+- every address has a principal: a by-source peer is never unknown;
+- a namespace member whose `principal` is an address string (`"fd00::a"`) captures
   exactly the packets from that address (nsplane test helper `address_namespace`);
-- `assertion(peer)` returned `None`; `by_source(peer)` returned `true`;
-- the filter cached the resolved principal per `(peer, address)` in an LRU bounded by
-  `reply_capacity`, and computed the bypass per address.
+- `assertion(peer)` returns `None`; `by_source(peer)` returns `true`;
+- the filter caches the resolved principal per `(peer, address)` in an LRU bounded by
+  `reply_capacity`, and computes the bypass per address.
 
 ### 2.3 Namespaces, grants and pinholes
 
-- `NamespaceMember::principal` placed a principal in a namespace. ns (`crates/overlay`)
-  used `wg_peer_anchor(wg_key)` for every member.
-- `GrantEnd::Peer(principal)` named one principal. ns built grant ends with
+- `NamespaceMember::principal` places a principal in a namespace. ns (`crates/overlay`)
+  uses `wg_peer_anchor(wg_key)` for every member.
+- `GrantEnd::Peer(principal)` names one principal. ns builds grant ends with
   `wg_peer_anchor`.
-- `PinholeSpec::peer` named the principal the pinhole serves.
-- A namespace id starting with `"app:"` was an app namespace: no accept rules, no
+- `PinholeSpec::peer` names the principal the pinhole serves.
+- A namespace id starting with `"app:"` is an app namespace: no accept rules, no
   `allow_app_pinholes`, no grant may name it, members get access only through pinholes.
-  `allow_app_pinholes` of a member's non-app namespaces gated the pinhole kind.
+  `allow_app_pinholes` of a member's non-app namespaces gates the pinhole kind.
 
 ### 2.4 Decision logs
 
-nsplane-acl itself logged `src`, `dst`, `port`, `proto` and the rule index; the source
-class and anchor strings were read by the product (`source_class()`, `source_anchor()`)
+The reference filter logs `src`, `dst`, `port`, `proto` and the rule index; the source
+class and anchor strings are read by the product (`source_class()`, `source_anchor()`)
 for its own decision logs (`source_class=client-wg-key`, `source_wg_peer`).
 
 ## 3. Mapping onto the generic API
@@ -100,12 +100,12 @@ recommendations, not API. Recommended scheme (used in the rest of this spec):
 | Label | Text | Given to |
 | --- | --- | --- |
 | key label | `key:<64 lowercase hex>` | a peer judged by its WireGuard key |
-| address label `A` | `addr` | every address-bound source (old IP-bearing terminate bindings, by-source peers) |
+| address label `A` | `addr` | every address-bound source (IP-bearing terminate bindings, by-source peers) |
 | address principal | `addr:<ip Display>` | by-source address that is a namespace member by address (3.4) |
 | anchor label | `anchor:<anchor>` | a terminate binding's stable anchor |
 | IdP label | `idp:<idp>` | an external identity-provider assertion |
 
-Distinct prefixes remove the old collision between anchors and key or IdP strings. Any
+Distinct prefixes remove the reference model's collision between anchors and key or IdP strings. Any
 scheme works as long as the rule compiler and the identity side produce the same text.
 
 ### 3.1 WireGuard key
@@ -130,38 +130,39 @@ packet's source address.
 
 - `binding.ip = Some(ip)`: labels `{A, anchor:<anchor>}`.
 - `binding.ip = None`: labels `{anchor:<anchor>}` (no `A`: CIDR rules never match).
-- A rule `src` CIDR or alias becomes `sources: [cidr]` **and** `labels: [A]` (2.2 of the
-  design note: conjunction), so only address-bound sources match it.
+- A rule `src` CIDR or alias becomes `sources: [cidr]` **and** `labels: [A]` (a rule's conditions
+  all have to hold), so only address-bound sources match it.
 
-The new `sources` condition reads `Flow::src` (the packet), not the binding's IP. A product
-keeps the old verdicts with one of:
+The `sources` condition reads `Flow::src` (the packet), not the binding's IP. A product
+keeps the reference verdicts with one of:
 
 1. **Source equals binding IP** (recommended when the transport already enforces it, as
    WireGuard allowed IPs do): `insert(peer, {A, anchor})`.
 2. **Bind the label to the IP**: `insert_by_source(peer, vec![(ip/32 or /128, {A,
    anchor})])`. A packet from another address resolves to `None` and is dropped
    `UNKNOWN_PEER` instead of being judged as `binding.ip`. The verdict for such a packet
-   can differ from the old model (old: judged as `ip`); the product decides whether that
+   can differ from the reference model (which judges it as `ip`); the product decides whether that
    matters (it is stricter).
 
 ### 3.3 IdP assertion
 
 `External { idp }` becomes `{idp:<idp>}`. No `A`, so only `*` rules and rules naming that
-label match, as before.
+label match.
 
 ### 3.4 By-source peers
 
 Two cases:
 
-- **Default policy only** (ns `crates/acl` preset, design note 4.2): `insert(peer, {A})`.
+- **Default policy only** (ns `crates/acl` preset,
+  [acl-policy-document.md](acl-policy-document.md) section 6): `insert(peer, {A})`.
   CIDR rules read the flow's source address directly, so no per-address principal is
   needed.
-- **Namespace members by address** (members whose old principal was an address string):
-  `insert_by_source` with a prefix table. Each address that was a member gets its own
-  entry; catch-all prefixes keep every other address known, as the old model did.
+- **Namespace members by address** (members whose reference principal is an address string):
+  `insert_by_source` with a prefix table. Each address that is a member gets its own
+  entry; catch-all prefixes keep every other address known, as in the reference model.
 
 ```rust
-// Illustrative: the old "every remote address is its own principal" for a peer whose
+// Illustrative: the reference "every remote address is its own principal" for a peer whose
 // addresses fd00::a and 10.0.0.1 are namespace members.
 let a = Label::from("addr");
 identities.insert_by_source(gateway, vec![
@@ -175,7 +176,7 @@ identities.insert_by_source(gateway, vec![
 
 Longest prefix wins (among equally long prefixes, the first listed); an address outside
 every prefix is unknown (`UNKNOWN_PEER`). Without the catch-all entries a by-source peer
-can now be unknown, which the old model never was.
+can be unknown, which the reference model never is.
 Use `Display` text of `IpAddr` for `addr:<ip>` so that the member label and the identity
 label are byte-equal.
 
@@ -239,15 +240,16 @@ tracing::info!(source_class = class_of(&labels), rule = ?decision.rule_id(),
                reason = ?decision.reason(), "acl decision");
 ```
 
-Rule ids are opaque; ns uses `"<source>#<index>"` (design note 4.2), so the old rule index
-is still recoverable from the id.
+Rule ids are opaque; ns uses `"<source>#<index>"`, so the document's rule index
+is recoverable from the id.
 
 ## 4. Parity cases
 
-A product compiler (rules per design note 4.2, identities per section 3) must reproduce
-these verdicts. Keys are written `kNN` = 32 bytes of `0xNN`; `key(kNN)` is its key label.
-"nsplane" paths are relative to this repository before C3; "ns" paths are on branch
-`refactor/nsplane` of `/srv/dotns/ns`. Unless stated, the source is in no namespace and
+A product compiler (rules per [acl-policy-document.md](acl-policy-document.md) section 3,
+identities per section 3 here) reproduces these verdicts. Keys are written `kNN` = 32 bytes of `0xNN`; `key(kNN)` is its key label.
+"nsplane" sources are the `crates/nsplane-acl` tests the cases were recorded from (their
+label-based counterparts are listed below the table); "ns" paths are on branch
+`refactor/nsplane` of ns. Unless stated, the source is in no namespace and
 the default rule set is installed.
 
 | # | Rule set / setup | Source labels | Flow | Expected | Source |
@@ -289,12 +291,11 @@ the default rule set is installed.
 | 35 | inbound pinhole for E's label, TCP 9000 | E | TCP E -> local:9000 before / during / after the guard | `DENIED` / Accept (UDP and :9001 `DENIED`) / `DENIED`, allowances revoked | `filter.rs` `session_only_peer_works_only_through_its_inbound_pinhole` |
 
 Case 27 is the whole parity fixture; its compiler from the fixture's document lives with
-the AG-3 spec (`docs/specs/acl-policy-document.md`). Cases 15-18 use member labels
+[acl-policy-document.md](acl-policy-document.md). Cases 15-18 use member labels
 `addr:<ip>` per 3.4.
 
-After C3 these nsplane tests carry the cases on labels: `engine.rs`
-`label_rules_match_the_label_and_prefix_rules_the_flow_source` (1-3; the document compiler's
-CIDR sources no longer carry `A`), `rules_of_all_namespaces_of_a_label_apply` (31),
+These nsplane tests carry the cases on labels: `engine.rs`
+`label_rules_match_the_label_and_prefix_rules_the_flow_source` (1-3), `rules_of_all_namespaces_of_a_label_apply` (31),
 `pinhole_namespaces_never_widen_permissions` (32), `grants_cannot_name_pinhole_namespaces`
 (33); `filter.rs` `key_label_and_address_label` (6-8, typed rules with `A` on the prefix
 rules), `unknown_peer_and_empty_labels` (9), `closure_identity` (10),
@@ -303,9 +304,8 @@ rules), `unknown_peer_and_empty_labels` (9), `closure_identity` (10),
 `switching_between_by_source_and_by_key_applies_to_the_next_packet` (15-16),
 `bypass_is_never_shared_across_sources` (17-18), `pinhole_namespace_member_gets_nothing_inbound`
 (34), `session_only_peer_works_only_through_its_inbound_pinhole` (35). Cases 23-27 are the
-parity fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed by the product with a
-4.2 compiler (`docs/specs/acl-policy-document.md` section 7); the crate's
-`tests/crates_acl_parity.rs` was removed in C4.
+parity fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed by the product with its
+document compiler ([acl-policy-document.md](acl-policy-document.md) section 7).
 
 ## 5. Edge cases
 
@@ -316,7 +316,7 @@ parity fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed by the pro
   reply to a flow the local side opened still passes after the peer became unknown, until
   the allowance idles out.
 - **Peer with no labels / empty label set.** `Some(LabelSet::empty())` is a known source:
-  it matches only rules with empty `labels` (old `*` rules; a CIDR rule compiled per 3.2
+  it matches only rules with empty `labels` (the document's `*` rules; a CIDR rule compiled per 3.2
   carries `A` and never matches it), is in no namespace, and is governed by the default
   rule set (`NO_POLICY` while nothing is installed). Use it for a known peer without any product identity; it never
   matches a key, CIDR (`A`) or IdP rule.
@@ -325,8 +325,8 @@ parity fixture `docs/specs/data/acl-crates-acl-parity.json`, replayed by the pro
   every namespace of every label sets `outbound`. Pinhole permission is checked against
   all its `Rules` namespaces. A destination address owned by several labels resolves to
   the longest prefix, then the smallest label. A product that gives one peer both a key
-  label and `A` makes it match key rules **and** CIDR rules, which the old model never did
-  (one assertion per peer): do not add `A` to key-judged peers when parity matters.
+  label and `A` makes it match key rules **and** CIDR rules, which the reference model never
+  does (one assertion per peer): do not add `A` to key-judged peers when parity matters.
 - **Label text.** Equality is byte-wise: no case folding, no hex or IP normalization. The
   product canonicalizes (lowercase hex, `IpAddr` `Display`).
 - **Identity generation bumps.** `PeerLabelMap` bumps its generation under its write lock

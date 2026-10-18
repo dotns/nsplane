@@ -1,0 +1,241 @@
+# Performance
+
+How nsplane's performance is measured and the current numbers. Each table states its method
+and the run it comes from; a new measurement replaces the row it supersedes. What a component
+does is in the [reference](reference/); this page holds only measured results.
+
+## Method
+
+- Host: x86-64, 32 CPUs (two CCDs), the `ai-agent/nstun-dev` image, release or bench
+  profile. The host is shared, so every comparison is an interleaved A/B (A, B, A, B) inside
+  one `scripts/bench/slot.sh` invocation, and the 1-minute load is recorded with each run.
+- `scripts/bench/slot.sh <command>` runs a command on one CCD's physical cores (slot 0: CPUs
+  1-7, slot 1: CPUs 8-15) and exports `BENCH_CPUS_A`, `BENCH_CPUS_B` and `BENCH_CPUS`; one A/B
+  per invocation, 120 s between invocations.
+- Criterion benches report means; the tables give the mean of the rounds, or the range when
+  the rounds spread.
+- `scripts/bench/wg-compare.sh` runs two tunnel endpoints in containers pinned to
+  `BENCH_CPUS_A` / `BENCH_CPUS_B` and measures iperf3 TCP and UDP, ping, and CPU per GB
+  (`scripts/bench/README.md`).
+
+```text
+scripts/bench/slot.sh scripts/bench/wg-compare.sh
+cargo bench -p nsplane-core --bench data_path
+cargo bench -p nsplane --bench worker_pool
+cargo bench -p nsplane --bench local_graph
+cargo bench -p nsplane-acl --bench namespaces
+cargo bench -p nsplane-acl --bench gate
+cargo bench -p nsplane-nat --bench translate
+cargo bench -p nsplane-netstack --bench send_stream
+cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test netstack_buffers -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
+```
+
+## WireGuard implementations
+
+`wg-compare.sh` at de521e5 (0.14.1), 2026-10-16, CPU sets 1-3 / 4-7, 30 s x 3 repetitions,
+medians, MTU 1420, load 1.6-3.7. Throughput is the receiver-side sum; loaded ping runs next
+to one saturating TCP stream; CPU s/GB includes iperf3's own CPU.
+
+| Pair (a -> b) | TCP P1 Gbit/s | TCP P4 Gbit/s | UDP loss 1G / 3G % | ping p50 / p99 idle ms | ping p50 / p99 loaded ms | CPU s/GB a / b |
+| --- | --- | --- | --- | --- | --- | --- |
+| kernel-kernel | 4.73 | 4.65 | 0.00 / 0.02 | 0.591 / 1.310 | 1.340 / 1.630 | 0.08 † / 0.74 † |
+| nsplane-nsplane | 11.00 | 11.81 | 0.00 / 0.00 | 0.192 / 0.280 | 2.370 / 4.710 | 0.91 / 0.94 |
+| nsplane-nsplane (2 crypto workers) | 14.05 | 14.75 | 0.00 / 0.01 | 0.223 / 0.338 | 2.040 / 4.240 | 1.02 / 1.13 |
+| nsplane-nsplane (no offload) | 3.76 | 3.70 | 0.00 / 0.00 | 0.189 / 0.281 | 1.080 / 1.950 | 2.90 / 3.11 |
+| nsplane-nsplane (no offload, 2 workers) | 5.41 | 5.52 | 0.00 / 0.02 | 0.210 / 0.342 | 0.891 / 1.840 | 2.52 / 3.26 |
+| nsplane-kernel | 7.59 | 7.14 | 0.00 / 0.01 | 0.517 / 1.380 | 3.260 / 5.390 | 1.91 / 0.31 † |
+| kernel-nsplane | 7.17 | 7.17 | 0.00 / 0.02 | 0.484 / 1.020 | 2.050 / 5.590 | 0.12 † / 1.63 |
+| wireguard-go | 11.08 | 11.06 | 0.01 / 0.11 | 0.227 / 0.342 | 2.190 / 5.710 | 1.38 / 1.55 |
+| netstack (user-space) | 8.25 | 10.59 | 0.00 / 0.00 | 0.028 / 0.066 | 0.130 / 0.893 | 1.60 / 1.40 |
+
+† Kernel WireGuard encrypts in kernel threads that are not charged to the container cgroup,
+so its side is an undercount. The netstack pair runs the engine and an in-process load
+generator (`netstack_bench`) in one process per side, without TUN; its ping columns are 1-byte
+TCP request/response round trips.
+
+## Core data path
+
+`cargo bench -p nsplane-core --bench data_path` (0.14.2): one encrypt plus decrypt round trip
+through `Core`, criterion means.
+
+| Case | 64 B | 1420 B |
+| --- | --- | --- |
+| `core_round_trip`, one packet per call | 417.1 ns | 1.22 µs |
+| `core_round_trip_batch32`, per batch of 32 | 13.1 µs | 39.2 µs |
+| `flows256`, 256 destinations | 430.5 ns | 1.25 µs |
+| `two_identities`, two local identities | 421.2 ns | 1.23 µs |
+
+## Handshake dispatch
+
+`data_path`'s handshake group with several local identities (0.14.0): a handshake initiation
+is tried against each identity's static key until one matches.
+
+| Case | Time |
+| --- | --- |
+| initiation, 1 identity | 129.11 µs |
+| initiation, 4 identities | 130.14 µs |
+| initiation, 16 identities | 132.25 µs |
+| no match, 16 identities | 3.10 µs (about 0.2 µs per identity tried) |
+
+## Allowed-IP writes
+
+Writes to a 10,000-entry allowed-IP table (0.14.2), IPv4 / IPv6:
+
+| Operation | IPv4 | IPv6 |
+| --- | --- | --- |
+| insert plus remove, each its own change | 0.25 µs | 0.31 µs |
+| remove by value, per change (either family) | 52 µs | 52 µs |
+| drain a peer's networks (10k / 1k peers), per change | 8 µs | 10 µs |
+| rebuild of one family | 0.9 ms | 1.5 ms |
+| load 10k networks in one change | 1.9 ms | 2.5 ms |
+| 10k separate changes | 3.0 ms | 5.5 ms |
+| memory per network | ≤ 0.6 KB | ≤ 0.75 KB |
+
+## Crypto worker pool
+
+`cargo bench -p nsplane --bench worker_pool`, 2026-10-03, bench profile with LTO,
+multi-threaded runtime, two runs. Hub case: a hub engine with 8 peers on in-memory links
+sends 120 packets to every peer while every peer sends 120 to it (1920 packets per
+iteration). One-peer case (`worker_pool_one_peer`, 2026-10-05, load below 4.2): the hub
+linked to one spoke with as many workers, the same packets per iteration.
+
+| Case | Pool off (0 or 1) | 2 workers | 4 workers |
+| --- | --- | --- | --- |
+| hub, 64 B | 1.49-1.55 Mpps | 1.64-1.68 Mpps | 1.61-1.64 Mpps |
+| hub, 1420 B | 869-906 kpps (9.9-10.3 Gbit/s) | 0.94-1.20 Mpps (10.6-13.6 Gbit/s) | 1.17-1.26 Mpps (13.3-14.3 Gbit/s) |
+| one peer, 1420 B | 792 kpps | 1.30 Mpps | 1.41 Mpps |
+
+## Engine latency
+
+`cargo test --release -p nsplane-e2e --test latency`, 2026-10-03: two engines over UDP
+loopback with builder defaults, 2000 pings, two runs.
+
+| Case | p50 | p99 | lost pings |
+| --- | --- | --- | --- |
+| idle | 11.2-11.3 µs | 36.0-40.3 µs | 0 |
+| next to a saturating bulk flow | 2.13-2.15 ms | 4.69-5.16 ms | 13-18 |
+
+## Queue depths
+
+High-water marks (`EngineHandle::queue_stats`) with the default capacity of 1024, two
+engines linked in process, release, 4-thread runtime, the highest mark of either engine over
+three runs (2026-10-02). These runs predate the owner's inline output; without crypto
+workers, `transmit`, `deliver` and `recycle` now stay lower while the tasks keep up.
+
+| Load | local | datagrams | deliver | recycle | transmit | backlog | Drops |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Ping-pong, 1300 B, one packet in flight | 1 | 1 | 1 | 1 | 1 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, channel link | 64 | 41 | 53 | 64 | 64 | 0 | none |
+| UDP paced, 64 x 1300 B per ms, loopback `UdpTransport` | 103 | 43 | 64 | 107 | 107 | 0 | none |
+| UDP flood, 100k x 1300 B, channel link | 1024 | 341 | 866 | 1023 | 1024 | 449 | none |
+| UDP flood, 100k x 1300 B, loopback `UdpTransport` | 1024 | 120 | 239 | 1013 | 1024 | 280 | none (the kernel drops ~25 %) |
+| Netstack TCP, 1 connection, 32 MiB echoed | 668 | 642 | 212 | 247 | 665 | 0 | none |
+| Netstack TCP, 4 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 469 | 1024 | 1024 | `DROP_SINK_FULL` in 3 of 6 runs |
+| Netstack TCP, 8-16 connections, 32 MiB echoed | 1024 | 1024 | 1024 | 896 | 1024 | 1024 | `DROP_SINK_FULL` in every run |
+
+The command and event queues never passed 1 and 0. With capacity 2048, 8 and 16 netstack
+connections ran without a drop; with 512 and 256, 4 connections dropped at the deliver queue.
+
+## Local-side graph
+
+`cargo bench -p nsplane --bench local_graph`, per packet, 1024 packets per iteration,
+2026-10-03 (load 10-30).
+
+| Case | 64 B | 1420 B |
+| --- | --- | --- |
+| `pipe`: send plus `recv_batch`, current-thread runtime | ~68 ns | ~68 ns |
+| `pipe` with `PipeSink::alloc` and `recycle` | about +14 ns over plain `pipe` | about +14 ns |
+| `pump` pipe to pipe, two spawned tasks | ~146 ns | ~170 ns |
+
+`pump` into a device-like sink, per 1024 packets (slot 0, load 9.3): a sink that returns its
+buffers (`send_batch_spent`) 99.40 / 98.37 µs at 64 / 1420 B, against 106.86 / 129.53 µs for
+one that drops them.
+
+## ACL
+
+`cargo bench -p nsplane-acl --bench namespaces`, IPv6 TCP ("new flow": the source port
+changes with every packet; "established": one five-tuple repeated), 2026-10-07, slot 0,
+load 1.0-2.2, mean of three interleaved rounds.
+
+| Scenario | New flow | Established | Outbound |
+| --- | --- | --- | --- |
+| No namespaces (default policy, 3 rules, not cached) | 50 ns | 50 ns | 82 ns |
+| 8 namespaces x 64 members, 4 grants, 16 pinholes: local rule | 172 ns | 51 ns | 100 ns |
+| same, through a grant (peer to peer) | 353 ns | 244 ns | |
+| same, through an inbound pinhole | 213 ns | | |
+| same, outbound-restricted peer (outbound rule) | | | 135 ns |
+| Bypass (a namespace accepting everything) | 39 ns | 39 ns | 82 ns |
+| Default policy, by-source peer | 74 ns | 73 ns | |
+| Stateless options, by-source peer, IPv4 TCP | 53 ns | 52 ns | |
+| same, non-first fragment after an accepted first fragment | | 26 ns | |
+
+Re-measured on 0.14.1 (2026-10-15, interleaved A/B, slot.sh): `floor/snapshot` (the engine
+snapshot read every packet pays) 3.10 ns, `default/inbound` 44.22 ns, `default/outbound`
+74.84 ns, `stateless/inbound_fragment` 27.07 ns.
+
+## Flow gate
+
+`cargo bench -p nsplane-acl --bench gate` on 0.14.1, 2026-10-15, interleaved A/B, slot.sh.
+
+| Case | Time |
+| --- | --- |
+| `established/gate` | 40.34 ns |
+| `established/outbound` | 40.57 ns |
+| `established/filter` (`GateFilter` with an `AclFilter`) | 45.73 ns |
+| `baseline/acl_established` (`AclFilter` alone) | 30.19 ns |
+| `baseline/pass_filter` (inert gate in front of the ACL) | 35.46 ns |
+| `baseline/pass_gate` (inert gate alone) | 0.80 ns |
+
+## Translator
+
+`cargo bench -p nsplane-nat --bench translate` on 0.14.1, 2026-10-15, interleaved A/B,
+slot.sh: `Translator::outbound` of IPv4 to a peer's `eam4` (`eam4_out`) and `inbound` of the
+IPv6 reply (`eam4_in`), one peer in the table (1000 peers cost the same), in a buffer with
+the TUN reader's room.
+
+| Case | 64 B | 1400 B (TCP) / 1420 B (UDP) |
+| --- | --- | --- |
+| `eam4_out`, TCP | 39.15 ns | 81.05 ns |
+| `eam4_out`, UDP | 39.39 ns | 81.75 ns |
+| `eam4_in`, TCP | 53.00 ns | 76.07 ns |
+| `eam4_in`, UDP | 52.19 ns | 74.90 ns |
+
+## Netstack
+
+`tests/netstack_lossy.rs` `throughput`, smoltcp `v0.14.0-nsplane.6`, 2026-10-06: two
+netstacks over two engines on an in-process `ChannelTransport` pair, one TCP connection, MTU
+1420; `LossyTransport` drops a deterministic fraction of the data messages, `Bottleneck` is
+25 MB/s behind a 64-datagram drop-tail buffer. Median [range] of 10 interleaved runs, slot 1,
+load 11-27.
+
+| Case | Time |
+| --- | --- |
+| TCP, 64 MiB, no loss | 0.209 s [0.180-0.242] |
+| TCP, 16 MiB, 1 % loss | 0.10 s [0.09-1.17] |
+| TCP, 16 MiB, 3 % loss | 1.01 s [0.30-3.39] |
+| TCP, 16 MiB, bottleneck | 0.86 s [0.83-0.87] |
+
+`tests/netstack_multistream.rs` (1 GiB per run split between the streams, default
+configuration, release, 12 pairs, load 3.2-5.5, 2026-10-05): one stream 669-782 MB/s, four
+streams 689-841 MB/s (1.00-1.11x the one stream), with 251-577 `DROP_SINK_FULL` per
+four-stream run.
+
+UDP queue: between two `netstack_bench` nodes (the harness pair, 2026-10-06), 1380-byte
+datagrams lost 1.24 % at 1 Gbit/s and 5.21 % at 3 Gbit/s with a `datagram_capacity` of 128,
+and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's full sink.
+
+### Socket buffers
+
+`tests/netstack_buffers.rs` `throughput`, 64 MiB, three runs, release, load 17-31
+(2026-10-03, smoltcp `.3`):
+
+| Buffers on both stacks | MB/s, median [range] | `DROP_SINK_FULL` per run |
+| --- | --- | --- |
+| Default, 512 segments (about 690 KiB) | 287 [200-336] | 0 |
+| 1 MiB | 315 [298-334] | 0 |
+| 4 MiB, about 3000 segments | 52 [37-53] | 101-312 |
+
+A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
+tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.

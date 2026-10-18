@@ -263,7 +263,7 @@ async fn oversize_reply_fails_by_default() -> TestResult {
     let error = flow.send(&data(3000)).await.err().ok_or("must fail")?;
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
-    // A reply that fits arrives whole, DF set as before.
+    // A reply that fits arrives whole, with DF set.
     let payload = data(usize::from(MTU) - 28);
     flow.send(&payload).await?;
     let (_, packet) = raw.expect_delivery().await?;

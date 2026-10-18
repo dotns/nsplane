@@ -1,9 +1,8 @@
 # ADR: Single-port relay wire format
 
-Status   : Proposed (the wire contract is shared with ns and nsgw and is not decided by this
-           repository)
-Date     : 2026-10-02
-Sunset   : when ns and nsgw adopt or reject the framing below
+- **Status**: Proposed
+- **Date**: 2026-10-02
+- **Review**: when ns and nsgw adopt or reject the framing below
 
 ## Context
 
@@ -201,3 +200,7 @@ listener of the relay (`relay_server --wss-listen`; `relay::wss`).
   WireGuard by design; a relay never holds keys of the peers it relays.
 - Every WireGuard key the relay serves (its own and each target's) must be unique among
   them; collisions are ambiguous and dropped.
+
+## Status history
+
+- 2026-10-02: proposed; the wire contract is shared with ns and nsgw and is not decided by this repository.

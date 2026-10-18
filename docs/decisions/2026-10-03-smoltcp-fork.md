@@ -1,8 +1,8 @@
 # ADR: nsplane-netstack depends on the dotns/smoltcp fork
 
-Status   : Accepted
-Date     : 2026-10-03
-Sunset   : when an upstream smoltcp release ships the fixes below
+- **Status**: Accepted
+- **Date**: 2026-10-03
+- **Review**: when an upstream smoltcp release ships the fixes below
 
 ## Context
 
