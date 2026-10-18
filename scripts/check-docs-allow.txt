@@ -6,3 +6,6 @@
 #
 # Rules: id, ref, date, version, history, intent. Text inherited from upstream code is
 # listed here instead of being rewritten; nsplane's own text is reworded, not listed.
+
+crates/nsplane-noise/src/noise/handshake.rs|intent|// TODO: make TimeStamper a singleton|upstream boringtun comment
+crates/nsplane-noise/src/noise/handshake.rs|intent|// TODO: pre-compute|upstream boringtun comment

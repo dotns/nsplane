@@ -263,7 +263,7 @@ async fn dialer_sends_one_event_per_occurrence() -> TestResult {
     // The dialer redials on its own.
     phases(&relay, &seen, || std::future::ready(())).await?;
     check_sequence(&seen, &relay)?;
-    // The counters keep counting as before.
+    // The counters keep counting across the redial.
     assert_eq!(stats.connects(), 2);
     assert!(stats.rejected_unauthorized() >= 2 && stats.rejected_forbidden() >= 2);
     drop(transport);

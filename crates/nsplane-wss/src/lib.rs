@@ -15,8 +15,7 @@
 //! [`WssServerTransport`] is the server side of [`WssDialer`]'s links: a transport over
 //! the WebSocket sessions the embedder accepts (see [below](#server-transport)).
 //!
-//! The stream carrier has no remaining consumer and will be removed once its users have
-//! switched; a WireGuard peer over [`WssDialer`] replaces it.
+//! The stream carrier is deprecated; a WireGuard peer over [`WssDialer`] replaces it.
 //!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each

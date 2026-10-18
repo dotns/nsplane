@@ -406,7 +406,7 @@ impl TranslationTableBuilder {
     /// `lan6` is a /96 with zero low 32 bits, or a /(96 + `lan4` length)
     /// whose low bits carry an embedded IPv4 network; see [`LanPrefix`]. At
     /// most one LAN prefix may use a given /96 base, even with different
-    /// embedded networks (a limit that may be relaxed later); prefixes under
+    /// embedded networks; prefixes under
     /// different bases may embed the same IPv4 network.
     #[must_use]
     pub fn lan(mut self, lan: LanPrefix) -> Self {

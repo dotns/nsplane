@@ -161,7 +161,7 @@ async fn reassembled_datagrams_reach_a_socket_and_a_flow() -> TestResult {
     let got = timeout(WAIT, flow.recv()).await?.ok_or("flow closed")?;
     assert_eq!(got.as_ref(), &payload6[..]);
 
-    // Unfragmented packets pass as before.
+    // Unfragmented packets still pass.
     let (whole, small) = datagram(remote, local, 10)?;
     send_all(&sink, [whole]).await?;
     let (got, _) = timeout(WAIT, socket.recv_from()).await??;

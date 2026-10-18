@@ -867,7 +867,7 @@ fn hex(bytes: &[u8]) -> String {
 /// How far one end of a transfer got, for the message of a transfer that times out.
 #[derive(Debug)]
 struct Progress {
-    /// What the end waits for now.
+    /// What the end is waiting for.
     stage: Mutex<&'static str>,
     /// Payload bytes moved so far.
     bytes: AtomicUsize,

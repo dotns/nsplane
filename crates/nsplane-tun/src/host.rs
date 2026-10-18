@@ -20,8 +20,6 @@ pub const HOST_TUN_DEFAULT_CAPACITY: usize = 4096;
 /// Creates the local side of a host that hands packets over through callbacks rather than
 /// a file descriptor: the iOS `NEPacketTunnelFlow` local side, usable on every target.
 ///
-/// This is the MT-2 local side; the contract's `HostTun::new` ships as `host_tun`.
-///
 /// The side starts with MTU `mtu` ([`HostTunSource::set_mtu`] changes it), queues up to
 /// `capacity` packets from the host ([`HOST_TUN_DEFAULT_CAPACITY`] is recommended), and
 /// writes the engine's packets with `write`, an `Arc<dyn Fn(&[u8]) -> bool + Send + Sync>`.

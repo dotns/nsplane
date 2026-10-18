@@ -47,7 +47,8 @@ pub(super) fn migrate(
             plans.insert(scope.slot, Plan::Revalidate(successor));
         }
     }
-    // With every scope kept and none added, every lookup selects as before.
+    // With every scope kept and none added, every lookup selects the same scope as under
+    // the previous policy.
     let select = next.has_peer_keyed().then_some(next);
     if all_kept && (select.is_none() || next.scopes.len() == previous.scopes.len()) {
         return;
