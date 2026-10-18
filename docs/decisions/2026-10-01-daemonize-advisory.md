@@ -1,8 +1,8 @@
 # ADR: Accept the unmaintained `daemonize` crate in the CLI
 
-Status   : Superseded 2026-10-02 (the CLI no longer daemonizes; `daemonize` was removed)
-Date     : 2026-10-01
-Sunset   : 2027-03-31
+- **Status**: Superseded
+- **Date**: 2026-10-01
+- **Review**: 2027-03-31
 
 ## Context
 
@@ -19,3 +19,7 @@ thread is spawned (the log writer thread is now started after the fork).
 
 Revisit by the sunset date: either a maintained safe crate exists, or the CLI drops
 self-daemonization in favour of the service manager (systemd, launchd).
+
+## Status history
+
+- 2026-10-02: superseded; the CLI no longer daemonizes and `daemonize` was removed.

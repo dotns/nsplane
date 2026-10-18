@@ -1,7 +1,8 @@
 # ADR: every data-channel protocol is implemented in nsplane
 
-Status   : Accepted
-Date     : 2026-10-03
+- **Status**: Accepted
+- **Date**: 2026-10-03
+- **Review**: none
 
 ## Context
 

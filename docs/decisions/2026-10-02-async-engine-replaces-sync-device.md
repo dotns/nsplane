@@ -1,8 +1,8 @@
 # ADR: An async engine replaces the synchronous `boringtun::device`
 
-Status   : Accepted
-Date     : 2026-10-02
-Sunset   : none (structural)
+- **Status**: Accepted
+- **Date**: 2026-10-02
+- **Review**: none (structural)
 
 ## Context
 

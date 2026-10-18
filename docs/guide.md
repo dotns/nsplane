@@ -575,7 +575,7 @@ acl.install(rules()?); // call again to reload
 - Beyond static rules: per-source **namespaces** (`store_namespace`), directed **grants**
   between namespaces (`store_grant`), outbound rules, and short-lived **pinholes**
   (`open_pinhole`, closed when the `PinholeGuard` drops) for app sessions — see the
-  `app_session` example and [specs/acl-generic-api.md](specs/acl-generic-api.md).
+  `app_session` example and the [nsplane-acl reference](reference/nsplane-acl.md#namespaces).
 - `gate::GateFilter` is a stateful flow gate keyed by peer (admission, holds, timeouts,
   diverting packets to the application); see [the nsplane-acl reference](reference/nsplane-acl.md).
 

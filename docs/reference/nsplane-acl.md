@@ -252,7 +252,7 @@ with the caller, which stores namespaces, grants and pinholes through this API.
 ### Flow gate
 
 `gate::FlowGate` is a generic stateful gate for decrypted inbound and plaintext outbound IPv4
-and IPv6 packets. Its model is in the [generic ACL API spec](../specs/acl-generic-api.md).
+and IPv6 packets.
 
 - **Policy.** `replace(GatePolicy)` validates and publishes one whole policy atomically and
   returns the new gate generation (`generation()`); a rejected policy
@@ -362,7 +362,7 @@ ICMP and outbound grants (`grant_kinds`), ICMP errors, fragments and malformed p
 validation and the epoch retry (`state_table`), a writer racing packet threads
 (`concurrency`), the filter (`filter`), and `model`, which compares the gate on seeded
 random sequences of packets, `replace` calls and clock steps against a reference model of
-the design note (one map, no shards, no lazy expiry) for equal decisions and counters.
+the gate (one map, no shards, no lazy expiry) for equal decisions and counters.
 `nsplane-e2e` `flow_gate` runs the filter on one of two engines: grants, suspension,
 bindings, state, limits and expiry (injected clock), modes, holds, unbound pass, ICMP errors,
 divert with generation staleness, unbound addresses, and outbound; `flow_gate_v6` runs it
@@ -407,7 +407,6 @@ reject invalid input and leave the previous state in effect; `open_pinhole` retu
 ## See also
 
 - [Usage guide: access control](../guide.md#10-access-control-nsplane-acl)
-- Specs: [generic ACL API](../specs/acl-generic-api.md),
-  [source identity](../specs/acl-source-identity.md),
+- Specs: [source identity](../specs/acl-source-identity.md),
   [policy document](../specs/acl-policy-document.md), [node L3](../specs/node-l3.md)
 - [Performance: ACL](../performance.md#acl) and [flow gate](../performance.md#flow-gate)

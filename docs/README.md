@@ -104,7 +104,7 @@ Sections without content are left out; the order stays.
 ```markdown
 # ADR: <title>
 
-- **Status**: Proposed | Accepted | Superseded by <ADR>
+- **Status**: Proposed | Accepted | Superseded [by <ADR>]
 - **Date**: YYYY-MM-DD
 - **Review**: <date or condition> | none
 

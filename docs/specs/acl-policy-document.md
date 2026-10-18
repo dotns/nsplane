@@ -1,37 +1,35 @@
-# ACL policy document and the `crates_acl` preset (AG-3) — product specification
+# ACL policy document and the `crates_acl` preset
 
-- **Status**: specification of items removed from `nsplane-acl` in slice C4 of plan
-  `20261007-0900-business-agnostic` (removed; `CHANGELOG.md` `[Unreleased]` lists each item
-  with its replacement).
-- **Audience**: a product (ns first) that keeps the JSON policy document, its self-tests,
-  layered merge, deny scope and the ns `crates/acl` filter mode on top of the generic API.
-- **Generic API**: [`acl-generic-api.md`](acl-generic-api.md) (typed `Rule` / `RuleSet`,
-  `PolicyState`, `PeerLabelMap`, `AclEngine::evaluate`). Snippets are illustrative (the
-  product's own parsers and error types are elided); the nsplane names are those of the
-  merged code.
+- **Status**: Current
+- **Applies to**: `nsplane-acl`
 - **Parity data**: [`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json),
   see [`data/README.md`](data/README.md).
 
-## 1. Scope and status
+How a product (ns first) keeps a JSON policy document, its self-tests, layered merge, deny
+scope and the ns `crates/acl` filter mode on top of the generic API: typed `Rule` /
+`RuleSet`, `PolicyState`, `PeerLabelMap`, `AclEngine::evaluate`
+([nsplane-acl reference](../reference/nsplane-acl.md)). Snippets are illustrative; the
+product's own parsers and error types are elided.
 
-`nsplane-acl` before C4 parsed and compiled a JSON policy document, ran its self-tests,
-merged policy layers, applied a deny scope, and offered a filter preset reproducing the ns
-`crates/acl` step. Under ADR
+## 1. Scope
+
+Under ADR
 [`2026-10-06-business-agnostic-scope`](../decisions/2026-10-06-business-agnostic-scope.md)
 nsplane enforces business-agnostic typed rules only; a policy language, its layering and
-product presets belong to the product that compiles them. C4 removes:
+product presets belong to the product that compiles them.
 
-| Removed item | Product replacement (this spec) |
+| Product element | Generic API |
 | --- | --- |
-| `AclPolicy` (`hosts`, `acls`, `tests`), `AclRule`, `AclAction`, `AclTest` (`src/policy.rs`, hosts deserializer) | The product's document types (section 2) |
-| String parsers `parse_src`, `parse_dst`, `parse_ports`, `parse_protocol`, `parse_hex32` (`src/matcher.rs`) | The product's compiler to `Rule` (section 3) |
-| `CompiledPolicy::compile`, `CompiledPolicy::validate_tests`, `parse_test_dst`, `AclTestFailure`, `RuleSet::from_document` | Compile, then `RuleSet::new` (section 3); self-tests with `RuleSet::matching` (section 4) |
-| `AclEngine::load` | `RuleSet::new` + `AclEngine::install`; `AclEngine::fail` on a product-side failure |
-| `merge_layered`, `PolicyLayers`, `RemotePolicy`, `MergedPolicy`, `MergeStats`, `RuleProvenance`, `acl_rule_key`, `acl_test_key` (`src/merge.rs`) | Product merge before compilation (section 5.1) |
-| `apply_deny_scope`, `DenyScope`, `DenyScopeOutcome`, `DroppedRule`, `DropReason` (`src/deny_scope.rs`) | Product deny scope before compilation (section 5.2) |
-| `AclFilterConfig::crates_acl`, `FragmentMode::ALLOW_ONLY` | Explicit `AclFilterConfig` values (section 6) |
-| `Error::{InvalidCidr, InvalidDst, UnknownAlias, TestsFailed, InvalidPolicy}` | Product errors (sections 2.4, 4); nsplane keeps `Error::InvalidRule { id, reason }` |
-| `tests/crates_acl_parity.rs` and `tests/fixtures/crates_acl_parity.json` | Parity data under `docs/specs/data/` and the replay procedure (section 7) |
+| Document types (`hosts`, `acls`, `tests`) | none; the product's own types (section 2) |
+| Source, destination, port and protocol parsing | the product's compiler to `Rule` (section 3) |
+| Compiling and validating a document | compile, then `RuleSet::new` (section 3) |
+| Self-tests | `RuleSet::matching` (section 4) |
+| Loading a policy | `RuleSet::new` + `AclEngine::install`; `AclEngine::fail` on a product-side failure |
+| Layered merge and provenance | product merge before compilation (section 5.1) |
+| Deny scope | product deny scope before compilation (section 5.2) |
+| The `crates_acl` filter mode | explicit `AclFilterConfig` values (section 6) |
+| Document errors | product errors (sections 2.4, 4); nsplane reports `Error::InvalidRule { id, reason }` |
+| Parity with the ns `crates/acl` step | the parity data under `docs/specs/data/` and its replay procedure (section 7) |
 
 The product owns: the document format and its versioning, alias expansion, rule IDs,
 self-tests and their failure policy, layer sources and caches, the deny scope, the filter
@@ -217,7 +215,7 @@ and the test's destination. Key (`key:`) rules never match a self-test, since th
 source carries only label `A`. `AclEngine::evaluate(&addr, &flow)` gives the same answer
 once the set is installed and the source is in no namespace; `matching` is the form to use
 before installation. The product decides whether merged documents (section 5) are tested
-after the merge (as before: tests are merged and run on the merged rules) or per layer.
+after the merge (tests are merged and run on the merged rules) or per layer.
 
 ## 5. Layered merge and deny scope
 
@@ -370,9 +368,8 @@ the `AclEngine` API.
 
 ## 7. Parity data
 
-[`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json) is byte-identical to
-`crates/nsplane-acl/tests/fixtures/crates_acl_parity.json` (deleted in C4) as last changed in
-commit
+[`data/acl-crates-acl-parity.json`](data/acl-crates-acl-parity.json) is the parity fixture
+`crates/nsplane-acl/tests/fixtures/crates_acl_parity.json` of nsplane commit
 `b548bebc297c4cf14e7b6e9eae878ae5b8e7b26d` (sha256 in [`data/README.md`](data/README.md)).
 It records the verdicts ns gave to IPv4 packet sequences in the ns `crates/acl` step.
 
@@ -424,14 +421,12 @@ Generated by a throwaway crate (never committed) built against ns `refactor/nspl
 acl_check_packet` with the fragment gate on the `t_ms` clock; sequences shorter than 15 s
 were cross-checked against the real `tunnel_wg::acl_check_packet`. The generator, the
 packet pools and the regeneration procedure are documented in the module docs of
-`crates/nsplane-acl/tests/crates_acl_parity.rs` (removed by C4; see its history at the
-commit above).
+`crates/nsplane-acl/tests/crates_acl_parity.rs` at the commit above.
 
 ### 7.3 Replay procedure
 
-A product proves its compiler plus nsplane reproduces the old mode by replaying every
-sequence (nsplane ran this as a test with a test-local compiler from slice C3 until C4
-removed it; the generic tests of section 6.1 and design note 4.3 replace it):
+A product proves that its compiler plus nsplane reproduces the ns `crates/acl` mode by
+replaying every sequence:
 
 1. Parse the fixture; for each sequence create an `AclEngine::with_clock` on a manual
    clock set to `start`.

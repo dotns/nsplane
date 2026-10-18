@@ -1,8 +1,8 @@
 # ADR: Rename the project from nstun to nsplane
 
-Status   : Accepted (execution deferred)
-Date     : 2026-10-02
-Sunset   : none
+- **Status**: Accepted
+- **Date**: 2026-10-02
+- **Review**: none
 
 ## Context
 
@@ -49,3 +49,7 @@ Candidates were checked against GitHub repository names and crates.io on 2026-10
 - ns pins the engine by git URL; its Phase 0 pin (`noise` only) must point at the new
   repository name and crate name once the rename lands, so Phase 0 is scheduled after it.
 - BKD project directory and any later campaign contracts use the new names.
+
+## Status history
+
+- 2026-10-02: accepted with the execution deferred; the rename was carried out afterwards (commit `5578a90`).

@@ -552,7 +552,7 @@ acl.install(rules()?); // 再次调用即重新加载
 - 静态规则之外：按来源划分的**命名空间**（`store_namespace`）、命名空间之间的定向**授权**
   （`store_grant`）、出站规则，以及用于应用会话的短期**临时放行（pinhole）**（`open_pinhole`，
   `PinholeGuard` 被 drop 时关闭）——见 `app_session` 示例和
-  [specs/acl-generic-api.md](specs/acl-generic-api.md)。
+  [nsplane-acl 参考文档](reference/nsplane-acl.md#namespaces)。
 - `gate::GateFilter` 是按 peer 区分的有状态流闸门（准入、保持、超时、把包转交应用）；见
   [nsplane-acl 参考文档](reference/nsplane-acl.md)。
 

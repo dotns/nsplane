@@ -1,8 +1,8 @@
 # ADR: `unsafe` code in the `boringtun` library crate
 
-Status   : Accepted
-Date     : 2026-10-01 (updated 2026-10-02: the device layer moved to `nstun-tun`)
-Sunset   : none (structural; reassess if the platform layers move to safe wrappers)
+- **Status**: Accepted
+- **Date**: 2026-10-01
+- **Review**: none (structural; reassess if the platform layers move to safe wrappers)
 
 ## Context
 
@@ -33,3 +33,7 @@ Until 2026-10-02 the TUN devices and the epoll/kqueue event loops lived in
 
 The `unsafe` surface is confined to the FFI and TUN platform modules and is greppable via
 `allow(unsafe_code`.
+
+## Status history
+
+- 2026-10-02: updated; the device layer moved to `nstun-tun`.
