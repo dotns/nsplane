@@ -261,3 +261,9 @@ executed by L1 directly on branch `doc-system`:
 - code comments without plan ids, versions or intentions.
 
 The removed measurement history stays in git and in the plans that produced it.
+
+## 2026-10-18 [release] 0.16.1
+
+Release 0.16.1 (tag `v0.16.1`) on the owner's "合并推送发新版本": the documentation standard of
+plan `20261018-1000-doc-system` (merge 24be670). Docs and comments only; no API or behavior
+change, so the freeze is not affected.

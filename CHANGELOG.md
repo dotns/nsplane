@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-10-18
+
+Documentation release; no API or behavior change.
+
 ### Changed
 - Documentation: a usage guide (English and Chinese), one reference document per crate under
   `docs/reference/`, `docs/performance.md` with the current measurements, and a shorter
