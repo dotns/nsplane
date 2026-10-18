@@ -14,7 +14,8 @@ implementation of the WireGuard protocol written in Rust. It:
   devices (including Windows through Wintun) in `nsplane-tun` and a user-space TCP/IP
   stack in `nsplane-netstack`.
 
-See [CHANGELOG.md](CHANGELOG.md) for details.
+See [CHANGELOG.md](CHANGELOG.md) for details, and the usage guide
+([English](docs/guide.md), [中文](docs/guide.zh-CN.md)) for how to embed it.
 
 ## Repository layout
 

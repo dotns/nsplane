@@ -1,0 +1,8 @@
+# Allowlist of scripts/check-docs.sh.
+#
+# Format, one entry per line:
+#
+#   <path>|<rule>|<fixed substring of the offending line, or *>|<reason>
+#
+# Rules: id, ref, date, version, history, intent. Text inherited from upstream code is
+# listed here instead of being rewritten; nsplane's own text is reworded, not listed.
