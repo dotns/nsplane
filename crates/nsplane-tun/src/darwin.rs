@@ -6,12 +6,12 @@
 
 use std::io;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use libc::{
     AF_SYS_CONTROL, AF_SYSTEM, IF_NAMESIZE, PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL,
-    UTUN_OPT_IFNAME, c_int, c_ulong, connect, getsockopt, ioctl, iovec, readv, sockaddr_ctl,
-    socket, socklen_t, writev,
+    UTUN_OPT_IFNAME, c_int, c_ulong, connect, getpeername, getsockopt, ioctl, iovec, readv,
+    sockaddr_ctl, socket, socklen_t, writev,
 };
 
 use crate::unix::{cvt, cvt_len, ioctl_socket};
@@ -54,19 +54,11 @@ pub(crate) fn create(name: &str) -> io::Result<OwnedFd> {
     // SAFETY: `socket` returned a new fd that nothing else owns.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
-    let mut info = CtlInfo {
-        ctl_id: 0,
-        ctl_name: [0; 96],
-    };
-    info.ctl_name[..CTRL_NAME.len()].copy_from_slice(CTRL_NAME);
-    // SAFETY: CTLIOCGINFO reads and writes the `ctl_info` that lives for the call.
-    cvt(unsafe { ioctl(fd.as_raw_fd(), CTLIOCGINFO, &raw mut info) })?;
-
     let addr = sockaddr_ctl {
         sc_len: u8::try_from(size_of::<sockaddr_ctl>()).unwrap_or(u8::MAX),
         sc_family: u8::try_from(AF_SYSTEM).unwrap_or(u8::MAX),
         ss_sysaddr: u16::try_from(AF_SYS_CONTROL).unwrap_or(u16::MAX),
-        sc_id: info.ctl_id,
+        sc_id: control_id(fd.as_fd())?,
         sc_unit: unit,
         sc_reserved: Default::default(),
     };
@@ -76,9 +68,47 @@ pub(crate) fn create(name: &str) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Looks up the registered utun controller ID.
+fn control_id(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut info = CtlInfo {
+        ctl_id: 0,
+        ctl_name: [0; 96],
+    };
+    info.ctl_name[..CTRL_NAME.len()].copy_from_slice(CTRL_NAME);
+    // SAFETY: CTLIOCGINFO reads and writes the `ctl_info` that lives for the call.
+    cvt(unsafe { ioctl(fd.as_raw_fd(), CTLIOCGINFO, &raw mut info) })?;
+
+    Ok(info.ctl_id)
+}
+
+/// Rejects descriptors that are not connected to the utun controller.
+fn check_utun(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut addr = sockaddr_ctl {
+        sc_len: 0,
+        sc_family: 0,
+        ss_sysaddr: 0,
+        sc_id: 0,
+        sc_unit: 0,
+        sc_reserved: Default::default(),
+    };
+    let size = socklen_t::try_from(size_of::<sockaddr_ctl>()).unwrap_or(socklen_t::MAX);
+    let mut len = size;
+    // SAFETY: `addr` is initialized and writable for `len` bytes; both outlive the call.
+    cvt(unsafe { getpeername(fd.as_raw_fd(), (&raw mut addr).cast(), &raw mut len) })?;
+    if len != size
+        || c_int::from(addr.sc_family) != AF_SYSTEM
+        || c_int::from(addr.ss_sysaddr) != AF_SYS_CONTROL
+        || addr.sc_id != control_id(fd)?
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
+}
+
 /// The utun interface name of `fd` (`UTUN_OPT_IFNAME`); fails with the OS error for a
 /// socket that is not a utun control socket.
 pub(crate) fn name(fd: BorrowedFd<'_>) -> io::Result<String> {
+    check_utun(fd)?;
     let mut name = [0u8; IF_NAMESIZE];
     let mut len = socklen_t::try_from(name.len()).unwrap_or(0);
     // SAFETY: `name` is valid for writes of `len` bytes and `len` outlives the call.

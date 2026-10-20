@@ -58,3 +58,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261020-0854-udp-icmp-isolation Isolate asynchronous errors on shared UDP sockets**](20261020-0854-udp-icmp-isolation.md) `P1`
 - [x] [**20261020-1000-macos-quality-gates Make native macOS quality gates executable**](20261020-1000-macos-quality-gates.md) `P2`
 - [x] [**20261020-1026-synchronize-regression-fixtures Synchronize concurrent regression fixtures**](20261020-1026-synchronize-regression-fixtures.md) `P1`
+
+- [x] [**20261020-1224-darwin-utun-name Validate Darwin utun descriptors before name queries**](20261020-1224-darwin-utun-name.md) `P1`

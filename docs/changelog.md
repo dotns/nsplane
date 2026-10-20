@@ -282,3 +282,16 @@ Validation: native macOS `just check` exited 0 (1909 tests passed, 8 configured 
 the focused CLI/TUN suites passed 85 tests. Documentation self-tests passed with system
 Bash 3.2/native awk, the installed Bash, and Linux Bash/awk. The task and plan are
 completed; runtime and dependency files are unchanged.
+
+## 2026-10-20 12:24 [progress]
+
+The owner approved task `20261020-1224-darwin-utun-name` for the v0.16.2 release.
+The Darwin backend checks the peer address family and registered utun controller
+before reading UTUN_OPT_IFNAME. Unix datagram and stream regressions failed on the
+old code and pass after the fix; connected UDP is also rejected. Adopted descriptors
+retain packet transport and their supplied MTU when interface lookup is unavailable.
+A privileged smoke test covers real utun creation, adoption and split.
+
+Validation completed: native macOS just check passed with 1912 tests and 9 configured
+skips. The new privileged real-utun smoke passed separately with system authentication.
+The task and plan are complete; the reviewed patch has no additional findings.

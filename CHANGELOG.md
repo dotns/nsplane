@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Darwin TUN name queries reject non-utun descriptors before reading socket options,
+  so Unix socket peer process IDs cannot be mistaken for interface names.
 - Native macOS quality gates: CLI fixtures use a valid interface name, the TUN slot
   fixture exercises oversized reads within the host datagram limit, and documentation
   checks support the system Bash and awk.
