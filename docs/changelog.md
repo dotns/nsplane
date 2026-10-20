@@ -267,3 +267,18 @@ The removed measurement history stays in git and in the plans that produced it.
 Release 0.16.1 (tag `v0.16.1`) on the owner's "合并推送发新版本": the documentation standard of
 plan `20261018-1000-doc-system` (merge 24be670). Docs and comments only; no API or behavior
 change, so the freeze is not affected.
+
+## 2026-10-20 11:54 [progress]
+
+The owner approved task `20261020-1000-macos-quality-gates` after the UDP repair review.
+Plan `20261020-1154-macos-quality-gates` repairs the native macOS gate fixtures and
+documentation checker on `fix/udp-icmp-isolation`, without merging or releasing.
+The CLI tests use a valid platform interface name and require descriptor validation;
+the slot fixture still checks MTU + 1 and truncated oversized reads, exact drop counts,
+and subsequent valid packets. The checker supports system Bash 3.2 and native awk,
+including empty source and decision-document arrays.
+
+Validation: native macOS `just check` exited 0 (1909 tests passed, 8 configured skips);
+the focused CLI/TUN suites passed 85 tests. Documentation self-tests passed with system
+Bash 3.2/native awk, the installed Bash, and Linux Bash/awk. The task and plan are
+completed; runtime and dependency files are unchanged.

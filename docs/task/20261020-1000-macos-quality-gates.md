@@ -1,13 +1,13 @@
 # 20261020-1000-macos-quality-gates Make native macOS quality gates executable
 
-- **status**: pending
+- **status**: completed
 - **priority**: P2
-- **owner**: (unassigned)
+- **owner**: a/macos-gates-20261020
 - **createdAt**: 2026-10-20 10:00 UTC
 
 ## Description
 
-The native macOS quality gate has platform-specific failures reproduced while validating the UDP error recovery repair. These are outside that repair's implementation scope. No product or fixture changes are included for this follow-up.
+The native macOS quality gate has platform-specific failures reproduced while validating the UDP error recovery repair. The user approved this follow-up after reviewing the UDP repair. See [the implementation plan](../plan/20261020-1154-macos-quality-gates.md).
 
 ## Evidence
 
@@ -18,10 +18,22 @@ The native macOS quality gate has platform-specific failures reproduced while va
 
 ## Acceptance
 
-- [ ] Native macOS fixtures reach and verify their intended behavior without relaxing product validation.
-- [ ] The documentation check runs with the supported native macOS tools or documents an explicit portable tool prerequisite.
-- [ ] Native `just check` passes, with unrelated transient failures retained as evidence.
+- [x] Native macOS fixtures reach and verify their intended behavior without relaxing product validation.
+- [x] The documentation check runs with the supported native macOS tools or documents an explicit portable tool prerequisite.
+- [x] Native `just check` passes, with unrelated transient failures retained as evidence.
 
 ## ActiveForm
 
-Awaiting scope approval for native macOS gate portability.
+Completed: native macOS quality gates pass; runtime behavior and existing assertions are preserved.
+
+- complete: Native macOS just check passed: 1909 tests passed, 8 configured skips; focused CLI/TUN suites passed 85 tests; documentation self-tests passed on macOS and Linux.
+
+## Validation
+
+- Native aarch64 macOS, pinned Rust 1.99.0: `just check` exited 0.
+- Workspace tests: 1909 passed, 8 configured skips; no additional tests skipped.
+- All feature-combination Clippy checks, doctests, dependency checks, spelling, Rust 1.95 MSRV, examples, product terms and documentation gates passed.
+- CLI and TUN focused suites: 85 passed.
+- Documentation self-tests: macOS system Bash 3.2/native awk, installed Bash, and Linux Bash/awk passed, including empty source and decision-document lists.
+- Documentation gate and report mode also passed with system Bash.
+- Local review found no additional defects; no runtime or dependency files changed.

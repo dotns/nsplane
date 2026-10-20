@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-10-02
+> Updated: 2026-10-20
 
 ## Usage
 
@@ -56,5 +56,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [-] [**20261017-1700-flow-lifecycle-request Per-flow retirement, flow context and delivery gates (request, draft)**](20261017-1700-flow-lifecycle-request.md) `P3`
 - [x] [**20261018-1000-doc-system One documentation standard: behavior-only product docs and comments**](20261018-1000-doc-system.md) `P2`
 - [x] [**20261020-0854-udp-icmp-isolation Isolate asynchronous errors on shared UDP sockets**](20261020-0854-udp-icmp-isolation.md) `P1`
-- [ ] [**20261020-1000-macos-quality-gates Make native macOS quality gates executable**](20261020-1000-macos-quality-gates.md) `P2`
+- [x] [**20261020-1000-macos-quality-gates Make native macOS quality gates executable**](20261020-1000-macos-quality-gates.md) `P2`
 - [x] [**20261020-1026-synchronize-regression-fixtures Synchronize concurrent regression fixtures**](20261020-1026-synchronize-regression-fixtures.md) `P1`

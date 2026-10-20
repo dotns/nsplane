@@ -5,11 +5,17 @@
 
 use std::process::Command;
 
+const INTERFACE_NAME: &str = if cfg!(target_os = "macos") {
+    "utun"
+} else {
+    "nsplane-clitest"
+};
+
 /// Runs the daemon with `env` set; starting is expected to fail, but argument parsing
 /// must succeed.
 fn run_with_env(env: &[(&str, &str)]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_nsplane-cli"))
-        .args(["nsplane-clitest"])
+        .arg(INTERFACE_NAME)
         .envs(env.iter().copied())
         .output()
         .expect("run nsplane-cli")
@@ -27,10 +33,14 @@ fn boolean_environment_variables_accept_1() {
                 !stderr.contains("invalid value"),
                 "{name}={value} was rejected: {stderr}"
             );
-            assert_ne!(
+            assert_eq!(
                 output.status.code(),
-                Some(2),
-                "clap usage error for {name}={value}"
+                Some(1),
+                "startup must reject the closed fd for {name}={value}: {stderr}"
+            );
+            assert!(
+                stderr.contains("Invalid --tun-fd 987654"),
+                "{name}={value} did not reach fd validation: {stderr}"
             );
         }
     }
@@ -74,7 +84,7 @@ fn a_closed_fd_fails_startup() {
     let closed = i32::MAX.to_string();
     for (flag, env) in [("--tun-fd", "WG_TUN_FD"), ("--uapi-fd", "WG_UAPI_FD")] {
         let by_flag = Command::new(env!("CARGO_BIN_EXE_nsplane-cli"))
-            .args([flag, &closed, "nsplane-clitest"])
+            .args([flag, &closed, INTERFACE_NAME])
             .output()
             .expect("run nsplane-cli");
         let by_env = run_with_env(&[(env, &closed)]);
