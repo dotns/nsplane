@@ -3,7 +3,7 @@
 [English](guide.md)
 
 本指南说明如何把 nsplane 嵌入应用：选哪些 crate、引擎如何组装，以及常见部署形态的完整代码。
-内容对应 nsplane 0.16.1。
+内容对应 nsplane 0.16.2。
 
 - 函数签名与契约：rustdoc（`cargo doc --workspace --no-deps --open`）。
 - 设计：[architecture.md](architecture.md)；各 crate 的行为：[reference](reference/)；
@@ -90,8 +90,8 @@ nsplane 通过 git 引用。固定 tag 或 commit 以保证构建可复现：
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.16.1" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.16.1" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
 # 按需添加：
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

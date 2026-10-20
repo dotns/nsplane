@@ -5,7 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-10-20
+
+Patch release; no public API change.
+
 ### Fixed
+- Replay and stalled WSS session regression fixtures synchronize concurrent work.
 - Darwin TUN name queries reject non-utun descriptors before reading socket options,
   so Unix socket peer process IDs cannot be mistaken for interface names.
 - Native macOS quality gates: CLI fixtures use a valid interface name, the TUN slot

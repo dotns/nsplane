@@ -295,3 +295,14 @@ A privileged smoke test covers real utun creation, adoption and split.
 Validation completed: native macOS just check passed with 1912 tests and 9 configured
 skips. The new privileged real-utun smoke passed separately with system authentication.
 The task and plan are complete; the reviewed patch has no additional findings.
+
+## 2026-10-20 [release]
+
+Prepare 0.16.2 (tag `v0.16.2`) after the owner merged the UDP repair branch and
+approved release. This patch includes UDP asynchronous error isolation, Darwin
+utun descriptor validation, synchronized replay/WSS fixtures, and native macOS
+quality-gate portability fixes. Workspace versions, internal requirements and
+guide examples are updated together; there is no public API change.
+The owner explicitly approved the historical `release: 0.16.2` commit title as a
+one-time exception to the local cog type allowlist; hooks and permanent rules
+remain unchanged.
