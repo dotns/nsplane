@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- UDP sends with path MTU discovery enabled recover queued asynchronous ICMP errors before
+  retrying an unaccepted send, so an earlier unreachable destination does not discard the
+  next reachable datagram. Transport and side-channel sends share PMTU reports and bounded
+  recovery; successful batch prefixes are not repeated and persistent errors still fail.
+
 ## [0.16.1] - 2026-10-18
 
 Documentation release; no API or behavior change.
