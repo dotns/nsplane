@@ -1856,8 +1856,8 @@ async fn removing_a_peer_with_jobs_in_flight_counts_every_packet() {
     assert!(b.handle.drop_counters().await.unwrap().is_empty());
 }
 
-/// A transport that sends every datagram twice.
-struct Doubling(ChannelTransport);
+/// A transport that duplicates sends after the measured phase begins.
+struct Doubling(ChannelTransport, Arc<AtomicBool>);
 
 impl Transport for Doubling {
     fn id(&self) -> TransportId {
@@ -1869,8 +1869,12 @@ impl Transport for Doubling {
     }
 
     async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        let duplicate = self.1.load(Ordering::Relaxed);
         self.0.send(datagram, to).await?;
-        self.0.send(datagram, to).await
+        if duplicate {
+            self.0.send(datagram, to).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1878,10 +1882,16 @@ impl Transport for Doubling {
 async fn duplicates_opened_on_different_workers_are_rejected_as_replays() {
     const PACKETS: u32 = 2000;
     let (ta, tb) = link(1024);
-    let (mut a, mut b) = nodes(Doubling(ta), Doubling(tb), &pooled(4));
+    let duplicate = Arc::new(AtomicBool::new(false));
+    let (mut a, mut b) = nodes(
+        Doubling(ta, Arc::clone(&duplicate)),
+        Doubling(tb, Arc::clone(&duplicate)),
+        &pooled(4),
+    );
     introduce(&a, &b).await;
     exchange(&mut a, &mut b).await;
     let replays = b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await;
+    duplicate.store(true, Ordering::Relaxed);
 
     let at_b = receive(&mut b);
     timeout(WAIT, flood(&a.local, IP_A, IP_B, PACKETS))
@@ -1891,6 +1901,10 @@ async fn duplicates_opened_on_different_workers_are_rejected_as_replays() {
     let at_b = received(&mut b, at_b).await;
     assert_eq!(at_b[&IP_A], (0..PACKETS).collect::<Vec<_>>());
     // Each packet's copy, opened next to it on another worker, is rejected when completed.
+    eventually(|| async {
+        b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await >= replays + u64::from(PACKETS)
+    })
+    .await;
     let replayed = b.drops(nsplane_core::reasons::DECAPSULATE_ERROR).await - replays;
     assert_eq!(replayed, u64::from(PACKETS));
 }

@@ -2,12 +2,15 @@
 //! WebSocket listener on the loopback interface: several nodes on one transport, each on a
 //! session address of its own; a session closed by the server, the node redialing and its
 //! endpoint moving to the new session; the transport next to a `UdpTransport` in one engine;
-//! sessions that cannot take over another node's endpoint; and a session that stops reading
+//! sessions that cannot take over another node's endpoint; and a session with a stalled writer
 //! without holding up the others.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::SinkExt as _;
@@ -21,9 +24,8 @@ use nsplane_wss::{
     WssServerTransportStats, WssSession, WssSessionStats, WssStats, WssTls,
 };
 use rustls::RootCertStore;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::watch;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -73,12 +75,16 @@ async fn until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult {
 }
 
 /// A plain WebSocket listener handing every upgraded connection to a
-/// [`WssServerTransport`], keeping the sessions in the order they were accepted. Its
-/// connections have a small send buffer, so a session that is not read stops writing soon.
+/// [`WssServerTransport`], keeping the sessions in the order they were accepted.
 struct Server {
     addr: SocketAddr,
-    sessions: Arc<Mutex<Vec<WssSession>>>,
+    sessions: Arc<Mutex<Vec<Session>>>,
     stats: Arc<WssServerTransportStats>,
+}
+
+struct Session {
+    session: WssSession,
+    writes: Arc<WriteGate>,
 }
 
 impl Server {
@@ -99,13 +105,18 @@ impl Server {
             while let Ok((tcp, _)) = listener.accept().await {
                 let (acceptor, sessions) = (acceptor.clone(), Arc::clone(&sessions));
                 tokio::spawn(async move {
+                    let writes = Arc::new(WriteGate::default());
+                    let tcp = GatedStream {
+                        tcp,
+                        writes: Arc::clone(&writes),
+                    };
                     let config = Some(WssAcceptor::ws_config());
                     let Ok(ws) = tokio_tungstenite::accept_async_with_config(tcp, config).await
                     else {
                         return;
                     };
                     if let Ok(session) = acceptor.accept(ws) {
-                        lock(&sessions).push(session);
+                        lock(&sessions).push(Session { session, writes });
                     }
                 });
             }
@@ -115,7 +126,10 @@ impl Server {
 
     /// The addresses of the sessions accepted so far, in order.
     fn addrs(&self) -> Vec<SocketAddr> {
-        lock(&self.sessions).iter().map(WssSession::addr).collect()
+        lock(&self.sessions)
+            .iter()
+            .map(|s| s.session.addr())
+            .collect()
     }
 
     /// The counters of the session at `addr`.
@@ -123,9 +137,20 @@ impl Server {
         let sessions = lock(&self.sessions);
         let session = sessions
             .iter()
-            .find(|s| s.addr() == addr)
+            .find(|s| s.session.addr() == addr)
             .ok_or_else(|| format!("no session at {addr}"))?;
-        Ok(session.stats())
+        Ok(session.session.stats())
+    }
+
+    /// Permanently blocks writes on one connection, leaving its reads live.
+    fn stall(&self, addr: SocketAddr) -> TestResult<Arc<WriteGate>> {
+        let sessions = lock(&self.sessions);
+        let session = sessions
+            .iter()
+            .find(|s| s.session.addr() == addr)
+            .ok_or_else(|| format!("no session at {addr}"))?;
+        session.writes.stalled.store(true, Ordering::Relaxed);
+        Ok(Arc::clone(&session.writes))
     }
 
     /// Closes the session at `addr`.
@@ -133,9 +158,9 @@ impl Server {
         let sessions = lock(&self.sessions);
         let session = sessions
             .iter()
-            .find(|s| s.addr() == addr)
+            .find(|s| s.session.addr() == addr)
             .ok_or_else(|| format!("no session at {addr}"))?;
-        session.close();
+        session.session.close();
         Ok(())
     }
 }
@@ -410,59 +435,56 @@ async fn other_sessions_do_not_take_over_an_endpoint() -> TestResult {
     Ok(())
 }
 
-/// A TCP proxy to `upstream` whose connections stop reading from `upstream` while stalled.
-struct Proxy {
-    addr: SocketAddr,
-    stall: watch::Sender<bool>,
+/// An observable, permanent write stall; no timer or kernel buffer can release it.
+#[derive(Default)]
+struct WriteGate {
+    stalled: AtomicBool,
+    blocked: AtomicBool,
 }
 
-impl Proxy {
-    async fn start(upstream: SocketAddr) -> TestResult<Self> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let proxy = Self {
-            addr: listener.local_addr()?,
-            stall: watch::Sender::new(false),
-        };
-        let stall = proxy.stall.clone();
-        tokio::spawn(async move {
-            while let Ok((client, _)) = listener.accept().await {
-                tokio::spawn(pipe(client, upstream, stall.subscribe()));
-            }
-        });
-        Ok(proxy)
+impl WriteGate {
+    fn blocks(&self) -> bool {
+        let stalled = self.stalled.load(Ordering::Relaxed);
+        if stalled {
+            self.blocked.store(true, Ordering::Relaxed);
+        }
+        stalled
     }
 }
 
-/// Copies between `client` and a new connection to `upstream`; reads nothing from
-/// `upstream` while `stall` is set. The upstream connection has a small receive buffer, so
-/// the sender's buffers fill soon.
-async fn pipe(
-    client: TcpStream,
-    upstream: SocketAddr,
-    mut stall: watch::Receiver<bool>,
-) -> io::Result<()> {
-    let socket = TcpSocket::new_v4()?;
-    socket.set_recv_buffer_size(4096)?;
-    let up = socket.connect(upstream).await?;
-    let (mut client_rx, mut client_tx) = client.into_split();
-    let (mut up_rx, mut up_tx) = up.into_split();
-    let forward = tokio::io::copy(&mut client_rx, &mut up_tx);
-    let backward = async {
-        let mut buf = vec![0; 16 * 1024];
-        loop {
-            if stall.wait_for(|stalled| !*stalled).await.is_err() {
-                return Ok(());
-            }
-            let n = up_rx.read(&mut buf).await?;
-            if n == 0 {
-                return Ok(());
-            }
-            client_tx.write_all(&buf[..n]).await?;
+struct GatedStream {
+    tcp: TcpStream,
+    writes: Arc<WriteGate>,
+}
+
+impl AsyncRead for GatedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GatedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.writes.blocks() {
+            return Poll::Pending;
         }
-    };
-    tokio::select! {
-        result = forward => result.map(drop),
-        result = backward => result,
+        Pin::new(&mut self.tcp).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_shutdown(cx)
     }
 }
 
@@ -473,7 +495,7 @@ const ROUNDS: usize = 200;
 /// Packets the hub sends to the stalled node per round.
 const TO_STALLED: usize = 4;
 
-/// One node's session stops reading while the hub keeps sending to it; the other sessions of
+/// One node's session stops writing while the hub keeps sending to it; the other sessions of
 /// the same transport keep flowing.
 ///
 /// The criterion is a bounded, lossless stream rather than a throughput ratio: in each of
@@ -487,28 +509,32 @@ const TO_STALLED: usize = 4;
 async fn stalled_session_does_not_block_the_others() -> TestResult {
     let (server, wss) = Server::start(WssServerConfig::new().queue(STALL_QUEUE))?;
     let mut hub = hub(wss, None)?;
-    let proxy = Proxy::start(server.addr).await?;
     let mut healthy = Vec::new();
     for seed in 2..=4 {
         let (node, _) = wss_node(seed, server.addr)?;
         join(&hub, &node, None, at(WSS, hub_link())).await?;
         healthy.push(node);
     }
-    let (mut stalled, _) = wss_node(5, proxy.addr)?;
+    let (mut stalled, _) = wss_node(5, server.addr)?;
     join(&hub, &stalled, None, at(WSS, hub_link())).await?;
     for node in healthy.iter_mut().chain([&mut stalled]) {
         exchange(node, &mut hub).await?;
     }
     assert_eq!(server.stats.active(), 4);
 
-    // Stall the session, and send to it until its writer is stuck: its queue overflows and
-    // nothing more is written for 20 bursts in a row.
-    let session = server.session_stats(session_of(&hub, &stalled, &server).await?)?;
-    proxy.stall.send_replace(true);
+    // Observe a blocked write and a full queue before measuring further sends.
+    let addr = session_of(&hub, &stalled, &server).await?;
+    let session = server.session_stats(addr)?;
+    let writes = server.stall(addr)?;
     let to_stalled = hub.packet_to(&stalled, Family::V4, &payload(1300));
+    hub.send(&to_stalled).await?;
+    until("blocked session write", || {
+        writes.blocked.load(Ordering::Relaxed)
+    })
+    .await?;
+    let initial_overflow = session.dropped_queue_full();
     let deadline = Instant::now() + WAIT;
-    let (mut written, mut still) = (session.tx(), 0);
-    while session.dropped_queue_full() == 0 || still < 20 {
+    while session.dropped_queue_full() == initial_overflow {
         if Instant::now() > deadline {
             return Err(format!("session writer not stuck within {WAIT:?}: {session:?}").into());
         }
@@ -516,13 +542,8 @@ async fn stalled_session_does_not_block_the_others() -> TestResult {
             hub.send(&to_stalled).await?;
         }
         sleep(Duration::from_millis(2)).await;
-        still = if session.tx() == written {
-            still + 1
-        } else {
-            0
-        };
-        written = session.tx();
     }
+    let written = session.tx();
     let overflowed = server.stats.dropped_queue_full();
     let send_errors = hub.drops(DROP_TRANSPORT_SEND_ERROR).await?;
 
