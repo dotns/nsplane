@@ -151,7 +151,7 @@ wording() {
           printf "%s:%d: stale allowlist entry (suppresses nothing): %s\n", allow, aline[k], atext[k]
           stale++
         }
-      printf "wording: %d finding(s), %d stale allowlist entr%s\n", total, stale, stale == 1 ? "y" : "ies"
+      printf "wording: %d finding(s), %d stale allowlist entr%s\n", total, stale, (stale == 1 ? "y" : "ies")
       exit (total > 0 || stale > 0) ? 1 : 0
     }
   ' "$@"
@@ -239,14 +239,14 @@ coverage() {
 
 # Runs every check in the current directory. Argument: allowlist. Exits 0, 1 or 2.
 check_tree() {
-  local allow=$1 rc=0 md rs
-  mapfile -t md < <(product_docs)
-  mapfile -t rs < <(rust_sources)
-  wording "$allow" "${md[@]}" -- "${rs[@]}" || rc=$?
+  local allow=$1 rc=0 file
+  local md=() rs=() adr=()
+  while IFS= read -r file; do md+=("$file"); done < <(product_docs)
+  while IFS= read -r file; do rs+=("$file"); done < <(rust_sources)
+  wording "$allow" ${md[@]+"${md[@]}"} -- ${rs[@]+"${rs[@]}"} || rc=$?
   [ "$rc" -eq 2 ] && return 2
-  local adr=()
-  mapfile -t adr < <(find docs/decisions -type f -name '*.md' 2>/dev/null | sort)
-  links "${md[@]}" "${adr[@]}" || rc=1
+  while IFS= read -r file; do adr+=("$file"); done < <(find docs/decisions -type f -name '*.md' 2>/dev/null | sort)
+  links ${md[@]+"${md[@]}"} ${adr[@]+"${adr[@]}"} || rc=1
   coverage || rc=1
   return "$rc"
 }
@@ -323,6 +323,17 @@ README.md: broken link: docs/guide.md#nope (no such heading)" "$(grep 'broken li
   rc=0
   out=$(cd "$tmp" && wording "$tmp/bad.txt" README.md -- 2>&1) || rc=$?
   check 2 "$rc" "entry without a reason exits 2"
+
+  mkdir -p "$tmp/empty/docs/reference" "$tmp/empty/docs/specs" "$tmp/empty/docs/decisions" "$tmp/empty/crates/a" "$tmp/empty/examples"
+  printf '# Empty project\n' >"$tmp/empty/README.md"
+  printf '[package]\nname = "a"\npublish = false\n' >"$tmp/empty/crates/a/Cargo.toml"
+  : >"$tmp/empty/allow.txt"
+  rc=0
+  out=$(cd "$tmp/empty" && check_tree "$tmp/empty/allow.txt" 2>&1) || rc=$?
+  check 0 "$rc" "empty source and decision lists exit 0"
+  check "wording: 0 finding(s), 0 stale allowlist entries
+links: 0 broken
+coverage: 0 missing" "$out" "empty source and decision lists run every check"
 
   if [ "$failures" -eq 0 ]; then echo "self-test passed"; else echo "self-test: $failures failure(s)"; return 1; fi
 }

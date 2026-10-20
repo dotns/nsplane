@@ -26,6 +26,60 @@ const MAX_SEND: usize = 65_507;
 /// The socket buffer size [`UdpTransport::bind`] requests for both directions.
 const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 
+/// The error queue belongs to the socket, including its side-channel sends.
+#[derive(Debug)]
+struct SocketErrors {
+    id: TransportId,
+    discovery: AtomicBool,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pmtu: linux::Pmtu,
+    dropped: AtomicU64,
+}
+
+impl SocketErrors {
+    const fn new(id: TransportId) -> Self {
+        Self {
+            id,
+            discovery: AtomicBool::new(false),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            pmtu: linux::Pmtu::new(),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Retries only an unsuccessful syscall, never an accepted batch prefix. A concurrent
+    /// receiver may already have drained its ICMP error, so one retry needs no queued
+    /// evidence; further retries require an asynchronous error from the queue.
+    fn write<R>(
+        &self,
+        socket: &UdpSocket,
+        mut write: impl FnMut() -> io::Result<R>,
+    ) -> io::Result<R> {
+        let mut retries = 0;
+        loop {
+            match write() {
+                Err(error)
+                    if self.discovery.load(Ordering::Relaxed)
+                        && error.kind() != io::ErrorKind::WouldBlock =>
+                {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let asynchronous = self.drain_errors(socket);
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let asynchronous = {
+                        let _ = socket;
+                        false
+                    };
+                    if retries == 7 || (retries > 0 && !asynchronous) {
+                        return Err(error);
+                    }
+                    retries += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 /// A [`Transport`] over one UDP socket.
 ///
 /// Bound to `[::]:port` the socket is dual-stack: IPv4 peers are reported in
@@ -133,7 +187,6 @@ const DEFAULT_SOCKET_BUFFER: usize = 4 << 20;
 /// The transport never closes: it lives as long as its socket.
 #[derive(Debug)]
 pub struct UdpTransport {
-    id: TransportId,
     local: SocketAddr,
     /// Shared with the [`SideSender`]s.
     socket: Arc<UdpSocket>,
@@ -146,13 +199,8 @@ pub struct UdpTransport {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rx: std::sync::Mutex<linux::Rx>,
     side: Option<Side>,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pmtu: linux::Pmtu,
-    /// Path MTU discovery is on; shared with the [`SideSender`]s, whose sends then back off
-    /// (see [`write_io`]).
-    discovery: Arc<AtomicBool>,
-    /// Path MTU reports dropped while their receiver was full or closed.
-    pmtu_dropped: AtomicU64,
+    /// Error queue and PMTU reports shared with the side senders.
+    errors: Arc<SocketErrors>,
     /// The buffer a run is copied into where it is not sent from the datagrams' own
     /// buffers (see [`UdpTransport::send_run_now`]).
     train: std::sync::Mutex<Vec<u8>>,
@@ -228,7 +276,6 @@ impl UdpTransport {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let state = offload.then(|| set_up(&socket)).flatten();
         Ok(Self {
-            id,
             local,
             socket: Arc::new(socket),
             state,
@@ -237,10 +284,7 @@ impl UdpTransport {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rx: std::sync::Mutex::default(),
             side: None,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            pmtu: linux::Pmtu::default(),
-            discovery: Arc::default(),
-            pmtu_dropped: AtomicU64::new(0),
+            errors: Arc::new(SocketErrors::new(id)),
             train: std::sync::Mutex::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             no_mmsg: AtomicBool::new(false),
@@ -272,7 +316,7 @@ impl UdpTransport {
             socket: Arc::clone(&self.socket),
             local: self.local,
             counters: Arc::clone(&counters),
-            discovery: Arc::clone(&self.discovery),
+            errors: Arc::clone(&self.errors),
         };
         self.side = Some(Side {
             classify: Box::new(classify),
@@ -372,8 +416,9 @@ impl UdpTransport {
     /// code 0) about one of the transport's datagrams becomes a
     /// [`PathMtuReport`](crate::PathMtuReport) for the
     /// datagram's destination (reported as [`Path::addr`] would report it) with the MTU the
-    /// error carries, quoting the datagram's leading bytes. Other errors (port unreachable,
-    /// for example) are read and skipped. No error fails a receive.
+    /// error carries, quoting the datagram's leading bytes. Failed sends also read this
+    /// queue. Other errors (port unreachable, for example) are read and skipped. No ICMP
+    /// error fails a receive.
     ///
     /// The reports go to the receiver [`Transport::path_mtu_reports`] hands out, once,
     /// after this was first turned on; so turn it on before handing the transport to the
@@ -383,9 +428,16 @@ impl UdpTransport {
     ///
     /// The kernel learns of a too small path only for datagrams sent with the DF bit: with
     /// offload ([`bind`](Self::bind)) all of them, without it those below the path MTU the
-    /// kernel knows (it fragments larger ones itself). While on, an ICMP error can fail
-    /// one send before receiving reads it: the engine drops and counts that datagram,
-    /// [`SideSender`] returns the error. And once the socket has reported an error, tokio
+    /// kernel knows (it fragments larger ones itself). An ICMP error reported by a send
+    /// belongs to an earlier datagram, possibly to another destination. A failed send
+    /// reads up to 64 queued errors and retries the unaccepted operation once, even if a
+    /// concurrent receiver has already read the error. Further retries require a queued
+    /// ICMP error; at most seven retries are made. Successful batch prefixes are never
+    /// retried. Persistent errors still fail: the engine drops and counts the failed
+    /// datagram, and [`SideSender`] returns the error. Packet Too Big reports read by a
+    /// sender use the same report queue and accounting as those read by a receiver.
+    ///
+    /// Once the socket has reported an error, tokio
     /// reports it writable for good, so sends that find the
     /// send buffer full ([`send`](Transport::send), [`send_batch`](Transport::send_batch),
     /// [`SideSender::send_to_async`]) no longer wait for room: they try again after a
@@ -419,7 +471,7 @@ impl UdpTransport {
     /// [`set_path_mtu_discovery`](Self::set_path_mtu_discovery)); always 0 where path MTU
     /// discovery is not supported.
     pub fn path_mtu_reports_dropped(&self) -> u64 {
-        self.pmtu_dropped.load(Ordering::Relaxed)
+        self.errors.dropped.load(Ordering::Relaxed)
     }
 
     /// Maps `addr` to the socket's address family.
@@ -437,7 +489,7 @@ impl UdpTransport {
     /// The path of a datagram received from `addr` with mark `ecn`.
     fn path(&self, addr: SocketAddr, ecn: Ecn) -> Path {
         Path {
-            transport: self.id,
+            transport: self.errors.id,
             addr: unmap(addr),
             ecn,
         }
@@ -471,7 +523,7 @@ impl UdpTransport {
             segment_size,
             src_ip: None,
         };
-        write_io(&self.socket, &self.discovery, || {
+        write_io(&self.socket, &self.errors, || {
             state.try_send(UdpSockRef::from(&*self.socket), &transmit)
         })
         .await
@@ -497,7 +549,9 @@ impl UdpTransport {
             src_ip: None,
         };
         self.socket.try_io(Interest::WRITABLE, || {
-            state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+            self.errors.write(&self.socket, || {
+                state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+            })
         })
     }
 
@@ -510,7 +564,7 @@ impl UdpTransport {
         to: &Path,
     ) -> io::Result<()> {
         let destination = self.target(to.addr)?;
-        write_io(&self.socket, &self.discovery, || {
+        write_io(&self.socket, &self.errors, || {
             self.send_run_now(state, run, destination, to.ecn)
         })
         .await
@@ -526,7 +580,9 @@ impl UdpTransport {
     ) -> io::Result<()> {
         let destination = self.target(to.addr)?;
         self.socket.try_io(Interest::WRITABLE, || {
-            self.send_run_now(state, run, destination, to.ecn)
+            self.errors.write(&self.socket, || {
+                self.send_run_now(state, run, destination, to.ecn)
+            })
         })
     }
 
@@ -571,7 +627,7 @@ impl UdpTransport {
 
 impl Transport for UdpTransport {
     fn id(&self) -> TransportId {
-        self.id
+        self.errors.id
     }
 
     async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
@@ -603,7 +659,7 @@ impl Transport for UdpTransport {
                 let run = &datagrams[*sent..*sent + linux::mmsg_len(&datagrams[*sent..])];
                 let result = match self.target(to.addr) {
                     Ok(destination) => {
-                        write_io(&self.socket, &self.discovery, || {
+                        write_io(&self.socket, &self.errors, || {
                             self.send_mmsg_or_one(run, destination, to.ecn)
                         })
                         .await
@@ -630,8 +686,8 @@ impl Transport for UdpTransport {
         Ok(())
     }
 
-    /// [`send_batch`](Transport::send_batch) without waiting: the same runs, each tried
-    /// once; a run the socket cannot take now ends the call with
+    /// [`send_batch`](Transport::send_batch) without waiting: the same runs and bounded
+    /// ICMP recovery; a run the socket cannot take now ends the call with
     /// [`io::ErrorKind::WouldBlock`] and stays unsent.
     fn try_send_batch(
         &self,
@@ -645,7 +701,9 @@ impl Transport for UdpTransport {
                 let run = &datagrams[*sent..*sent + linux::mmsg_len(&datagrams[*sent..])];
                 let result = self.target(to.addr).and_then(|destination| {
                     self.socket.try_io(Interest::WRITABLE, || {
-                        self.send_mmsg_or_one(run, destination, to.ecn)
+                        self.errors.write(&self.socket, || {
+                            self.send_mmsg_or_one(run, destination, to.ecn)
+                        })
                     })
                 });
                 if let Err(e) = &result
@@ -679,7 +737,7 @@ impl Transport for UdpTransport {
     /// first turned on.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn path_mtu_reports(&self) -> Option<mpsc::Receiver<crate::PathMtuReport>> {
-        self.pmtu.take()
+        self.errors.pmtu.take()
     }
 }
 
@@ -717,8 +775,8 @@ pub struct SideSender {
     socket: Arc<UdpSocket>,
     local: SocketAddr,
     counters: Arc<SideCounters>,
-    /// The transport's path MTU discovery is on.
-    discovery: Arc<AtomicBool>,
+    /// The transport's error queue and PMTU reports.
+    errors: Arc<SocketErrors>,
 }
 
 impl SideSender {
@@ -731,8 +789,11 @@ impl SideSender {
     pub fn send_to(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
         // Straight to the non-blocking socket: tokio's `try_send_to` also fails while it
         // has not seen the socket writable yet.
-        socket2::SockRef::from(&*self.socket)
-            .send_to(datagram, &target(self.local, to)?.into())
+        let to = target(self.local, to)?.into();
+        self.errors
+            .write(&self.socket, || {
+                socket2::SockRef::from(&*self.socket).send_to(datagram, &to)
+            })
             .map(drop)
     }
 
@@ -749,7 +810,7 @@ impl SideSender {
     /// whatever order they reach the socket, and the ones that do not fit wait again.
     pub async fn send_to_async(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
         let to = target(self.local, to)?.into();
-        write_io(&self.socket, &self.discovery, || {
+        write_io(&self.socket, &self.errors, || {
             socket2::SockRef::from(&*self.socket).send_to(datagram, &to)
         })
         .await
@@ -877,16 +938,16 @@ const LONGEST_PAUSE: Duration = Duration::from_millis(8);
 /// spinning.
 async fn write_io<R>(
     socket: &UdpSocket,
-    discovery: &AtomicBool,
+    errors: &SocketErrors,
     mut io: impl FnMut() -> io::Result<R>,
 ) -> io::Result<R> {
-    if !discovery.load(Ordering::Relaxed) {
+    if !errors.discovery.load(Ordering::Relaxed) {
         return socket.async_io(Interest::WRITABLE, io).await;
     }
     let mut pause = Duration::ZERO;
     loop {
         let ready = socket.ready(Interest::WRITABLE).await?;
-        match socket.try_io(Interest::WRITABLE, &mut io) {
+        match socket.try_io(Interest::WRITABLE, || errors.write(socket, &mut io)) {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if ready.is_write_closed() {
                     pause = (pause * 2).clamp(FIRST_PAUSE, LONGEST_PAUSE);
@@ -1134,6 +1195,13 @@ mod linux {
     }
 
     impl Pmtu {
+        pub(super) const fn new() -> Self {
+            Self {
+                tx: OnceLock::new(),
+                rx: Mutex::new(None),
+            }
+        }
+
         /// Creates the report queue if it does not exist yet.
         fn open(&self) {
             self.tx.get_or_init(|| {
@@ -1174,54 +1242,13 @@ mod linux {
         too_big.then(|| PathMtuReport::with_quote(path, mtu, quote))
     }
 
-    impl UdpTransport {
-        /// [`UdpTransport::set_path_mtu_discovery`].
-        pub(super) fn set_recv_err(&self, on: bool) -> io::Result<()> {
-            if self.local.is_ipv4() || !getsockopt(&self.socket, sockopt::Ipv6V6Only)? {
-                setsockopt(&self.socket, sockopt::Ipv4RecvErr, &on)?;
-            }
-            if self.local.is_ipv6() {
-                setsockopt(&self.socket, sockopt::Ipv6RecvErr, &on)?;
-            }
-            if on {
-                self.pmtu.open();
-            }
-            self.discovery.store(on, Ordering::Relaxed);
-            Ok(())
-        }
-
-        /// What a read waits for: the socket to be readable, and with path MTU discovery
-        /// on also an error.
-        fn readiness(&self) -> Interest {
-            if self.discovery.load(Ordering::Relaxed) {
-                Interest::READABLE | Interest::ERROR
-            } else {
-                Interest::READABLE
-            }
-        }
-
-        /// Runs the non-blocking read `read`. With path MTU discovery on, it reads the
-        /// error queue empty first, and retries a failed read: a queued ICMP error also
-        /// fails the next read once with its error code, which is not the engine's.
-        fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-            if !self.discovery.load(Ordering::Relaxed) {
-                return read();
-            }
-            loop {
-                self.drain_errors();
-                match read() {
-                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
-                        tracing::trace!(message = "Read failed on an ICMP error", error = %e);
-                    }
-                    result => return result,
-                }
-            }
-        }
-
-        /// Reads the error queue empty, queuing a report for each Packet Too Big.
-        fn drain_errors(&self) {
-            let fd = self.socket.as_raw_fd();
-            loop {
+    impl super::SocketErrors {
+        /// Reads at most 64 queued errors, reporting Packet Too Big. Returns whether an
+        /// asynchronous ICMP error was read; locally generated errors do not count.
+        pub(super) fn drain_errors(&self, socket: &UdpSocket) -> bool {
+            let fd = socket.as_raw_fd();
+            let mut asynchronous = false;
+            for _ in 0..64 {
                 let mut quote = [0; QUOTE];
                 let mut cmsg = ErrCmsgBuf([0; 256]);
                 let mut iov = [IoSliceMut::new(&mut quote)];
@@ -1245,27 +1272,85 @@ mod linux {
                                 _ => None,
                             }),
                     ),
-                    Err(Errno::EAGAIN) => return,
+                    Err(Errno::EAGAIN) => return asynchronous,
                     Err(e) => {
                         tracing::debug!(message = "Error queue not read", error = %e);
-                        return;
+                        return asynchronous;
                     }
                 };
-                if let (Some(to), Some(err)) = (to, err)
-                    && let Some(report) =
-                        path_mtu_report(self.path(to, Ecn::NotEct), &err, &quote[..len])
-                {
-                    self.push_report(report);
+                if let Some(err) = err {
+                    asynchronous |= matches!(err.ee_origin, SO_EE_ORIGIN_ICMP | SO_EE_ORIGIN_ICMP6);
+                    if let Some(to) = to {
+                        let path = Path {
+                            transport: self.id,
+                            addr: super::unmap(to),
+                            ecn: Ecn::NotEct,
+                        };
+                        if let Some(report) = path_mtu_report(path, &err, &quote[..len]) {
+                            self.push_report(report);
+                        }
+                    }
                 }
             }
+            asynchronous
         }
 
         /// Queues `report` for the engine; drops and counts it when the queue is full or
         /// closed.
         pub(super) fn push_report(&self, report: PathMtuReport) {
             if !self.pmtu.push(report) {
-                self.pmtu_dropped.fetch_add(1, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    impl UdpTransport {
+        /// [`UdpTransport::set_path_mtu_discovery`].
+        pub(super) fn set_recv_err(&self, on: bool) -> io::Result<()> {
+            if self.local.is_ipv4() || !getsockopt(&self.socket, sockopt::Ipv6V6Only)? {
+                setsockopt(&self.socket, sockopt::Ipv4RecvErr, &on)?;
+            }
+            if self.local.is_ipv6() {
+                setsockopt(&self.socket, sockopt::Ipv6RecvErr, &on)?;
+            }
+            if on {
+                self.errors.pmtu.open();
+            }
+            self.errors.discovery.store(on, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// What a read waits for: the socket to be readable, and with path MTU discovery
+        /// on also an error.
+        fn readiness(&self) -> Interest {
+            if self.errors.discovery.load(Ordering::Relaxed) {
+                Interest::READABLE | Interest::ERROR
+            } else {
+                Interest::READABLE
+            }
+        }
+
+        /// Runs the non-blocking read `read`. With path MTU discovery on, it reads the
+        /// error queue empty first, and retries a failed read: a queued ICMP error also
+        /// fails the next read once with its error code, which is not the engine's.
+        fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+            if !self.errors.discovery.load(Ordering::Relaxed) {
+                return read();
+            }
+            loop {
+                self.errors.drain_errors(&self.socket);
+                match read() {
+                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                        tracing::trace!(message = "Read failed on an ICMP error", error = %e);
+                    }
+                    result => return result,
+                }
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn push_report(&self, report: PathMtuReport) {
+            self.errors.push_report(report);
         }
 
         fn rx(&self) -> MutexGuard<'_, Rx> {
@@ -1580,7 +1665,7 @@ mod linux {
             to: SocketAddr,
             ecn: Ecn,
         ) -> io::Result<()> {
-            super::write_io(&self.socket, &self.discovery, || {
+            super::write_io(&self.socket, &self.errors, || {
                 self.send_msg(datagram, to, ecn)
             })
             .await
@@ -1593,8 +1678,10 @@ mod linux {
             to: SocketAddr,
             ecn: Ecn,
         ) -> io::Result<()> {
-            self.socket
-                .try_io(Interest::WRITABLE, || self.send_msg(datagram, to, ecn))
+            self.socket.try_io(Interest::WRITABLE, || {
+                self.errors
+                    .write(&self.socket, || self.send_msg(datagram, to, ecn))
+            })
         }
 
         /// One non-blocking `sendmsg` of `datagram` to `to`, marked with `ecn`.
@@ -2217,13 +2304,13 @@ mod tests {
 
                 a.set_path_mtu_discovery(true).unwrap();
                 assert_eq!(recv_err(&a), on, "{addr}");
-                assert!(a.discovery.load(Ordering::Relaxed));
+                assert!(a.errors.discovery.load(Ordering::Relaxed));
                 assert!(Transport::path_mtu_reports(&a).is_some());
                 assert!(Transport::path_mtu_reports(&a).is_none());
 
                 a.set_path_mtu_discovery(false).unwrap();
                 assert_eq!(recv_err(&a), off, "{addr}");
-                assert!(!a.discovery.load(Ordering::Relaxed));
+                assert!(!a.errors.discovery.load(Ordering::Relaxed));
                 a.set_path_mtu_discovery(true).unwrap();
                 assert_eq!(recv_err(&a), on, "{addr}");
                 assert!(Transport::path_mtu_reports(&a).is_none());
@@ -2376,10 +2463,258 @@ mod tests {
         }
     }
 
-    /// Makes `a` (path MTU discovery on) take an ICMP port unreachable from loopback `ip`,
-    /// and waits until tokio reports the socket in error, which it takes for a closed write
-    /// side: from then on it reports the socket writable for good. The error fails the
-    /// next send, once.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn sends_survive_another_destinations_icmp_error() {
+        for (addr, ip) in [
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("[::1]:0", "::1"),
+            ("[::]:0", "127.0.0.1"),
+            ("[::]:0", "::1"),
+        ] {
+            for offload in OFFLOAD {
+                for mode in 0..5 {
+                    let (a, side, _) = bind_with(1, addr, offload).with_side_channel(|_| false, 1);
+                    let b = bind(2, &SocketAddr::new(ip.parse().unwrap(), 0).to_string());
+                    a.set_path_mtu_discovery(true).unwrap();
+                    let closed =
+                        bind(3, &SocketAddr::new(ip.parse().unwrap(), 0).to_string()).local_addr();
+                    a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
+                        .await
+                        .unwrap();
+                    timeout(Duration::from_secs(5), a.socket.ready(Interest::ERROR))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let to = path_to(b.local_addr(), Ecn::NotEct);
+                    let batch: Vec<_> = (0..4)
+                        .map(|i| (to, PacketBuf::from_packet(&[i; 32])))
+                        .collect();
+                    let mut sent = 0;
+                    let mut failed = 0;
+                    let result = match mode {
+                        0 => a.send(batch[0].1.as_packet(), &to).await,
+                        1 => a.send_batch(&batch, &mut sent, &mut failed).await,
+                        2 => a.try_send_batch(&batch, &mut sent, &mut failed),
+                        3 => side.send_to_async(batch[0].1.as_packet(), to.addr).await,
+                        _ => side.send_to(batch[0].1.as_packet(), to.addr),
+                    };
+                    assert!(result.is_ok(), "{addr} {ip} {offload} {mode}: {result:?}");
+                    let count = if matches!(mode, 1 | 2) {
+                        assert_eq!((sent, failed), (batch.len(), 0));
+                        batch.len()
+                    } else {
+                        1
+                    };
+                    for (_, packet) in &batch[..count] {
+                        assert_eq!(recv(&b, 1500).await.0.as_packet(), packet.as_packet());
+                    }
+                    let mut packet = PacketBuf::with_capacity(1500);
+                    assert!(
+                        timeout(Duration::from_millis(10), b.recv(&mut packet))
+                            .await
+                            .is_err(),
+                        "duplicate datagram"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn icmp_recovery_preserves_partial_batches_and_real_errors() {
+        for offload in OFFLOAD {
+            for nonblocking in [false, true] {
+                let a = bind_with(1, "127.0.0.1:0", offload);
+                let b = bind(2, "127.0.0.1:0");
+                a.set_path_mtu_discovery(true).unwrap();
+                let closed = bind(3, "127.0.0.1:0").local_addr();
+                a.send(DATAGRAM, &path_to(closed, Ecn::NotEct))
+                    .await
+                    .unwrap();
+                timeout(Duration::from_secs(5), a.socket.ready(Interest::ERROR))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let to = path_to(b.local_addr(), Ecn::NotEct);
+                let batch = [
+                    (to, PacketBuf::from_packet(b"first")),
+                    (to, PacketBuf::from_packet(&vec![0; MAX_SEND + 1])),
+                    (to, PacketBuf::from_packet(b"last")),
+                ];
+                let mut sent = 0;
+                let mut failed = 0;
+                let result = if nonblocking {
+                    a.try_send_batch(&batch, &mut sent, &mut failed)
+                } else {
+                    a.send_batch(&batch, &mut sent, &mut failed).await
+                };
+                assert_eq!(
+                    result.unwrap_err().raw_os_error(),
+                    Some(nix::libc::EMSGSIZE)
+                );
+                assert_eq!((sent, failed), (2, 1));
+                assert_eq!(recv(&b, 1500).await.0.as_packet(), b"first");
+                if nonblocking {
+                    a.try_send_batch(&batch, &mut sent, &mut failed).unwrap();
+                } else {
+                    a.send_batch(&batch, &mut sent, &mut failed).await.unwrap();
+                }
+                assert_eq!((sent, failed), (3, 1));
+                assert_eq!(recv(&b, 1500).await.0.as_packet(), b"last");
+                let mut packet = PacketBuf::with_capacity(1500);
+                assert!(
+                    timeout(Duration::from_millis(10), b.recv(&mut packet))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn send_recovery_does_not_spin_on_local_errors_or_backpressure() {
+        let a = bind(1, "127.0.0.1:0");
+        for discovery in [false, true] {
+            a.set_path_mtu_discovery(discovery).unwrap();
+            for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::WouldBlock] {
+                let mut attempts = 0;
+                let result: io::Result<()> = a.errors.write(&a.socket, || {
+                    attempts += 1;
+                    Err(kind.into())
+                });
+                assert_eq!(result.unwrap_err().kind(), kind);
+                let expected = if discovery && kind != io::ErrorKind::WouldBlock {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(attempts, expected);
+            }
+        }
+    }
+
+    /// Builds an ICMP Packet Too Big quoting a UDP datagram. The raw IPv6 socket supplies
+    /// the `ICMPv6` checksum; IPv4 carries its own checksum.
+    #[cfg(target_os = "linux")]
+    fn too_big_quote(from: SocketAddr, to: SocketAddr) -> (Socket, Vec<u8>) {
+        use nsplane_packet::checksum::{
+            internet_checksum, ipv4_header_checksum, transport_checksum_v6,
+        };
+        let mut udp = vec![0_u8; 16];
+        udp[..2].copy_from_slice(&from.port().to_be_bytes());
+        udp[2..4].copy_from_slice(&to.port().to_be_bytes());
+        udp[4..6].copy_from_slice(&16_u16.to_be_bytes());
+        udp[8..].copy_from_slice(b"pmtu1234");
+        let mut icmp = vec![0_u8; 8];
+        let (socket, header) = match (from.ip(), to.ip()) {
+            (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+                let mut header = vec![0_u8; 20];
+                header[0] = 0x45;
+                header[2..4].copy_from_slice(&36_u16.to_be_bytes());
+                header[6] = 0x40;
+                header[8] = 64;
+                header[9] = 17;
+                header[12..16].copy_from_slice(&src.octets());
+                header[16..20].copy_from_slice(&dst.octets());
+                let checksum = ipv4_header_checksum(&header);
+                header[10..12].copy_from_slice(&checksum.to_be_bytes());
+                icmp[0] = 3;
+                icmp[1] = 4;
+                icmp[6..8].copy_from_slice(&1400_u16.to_be_bytes());
+                (
+                    Socket::new(Domain::IPV4, Type::RAW, Some(socket2::Protocol::ICMPV4)).unwrap(),
+                    header,
+                )
+            }
+            (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
+                let checksum = transport_checksum_v6(src, dst, 17, &udp);
+                udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+                let mut header = vec![0_u8; 40];
+                header[0] = 0x60;
+                header[4..6].copy_from_slice(&16_u16.to_be_bytes());
+                header[6] = 17;
+                header[7] = 64;
+                header[8..24].copy_from_slice(&src.octets());
+                header[24..40].copy_from_slice(&dst.octets());
+                icmp[0] = 2;
+                icmp[4..8].copy_from_slice(&1400_u32.to_be_bytes());
+                (
+                    Socket::new(Domain::IPV6, Type::RAW, Some(socket2::Protocol::ICMPV6)).unwrap(),
+                    header,
+                )
+            }
+            _ => unreachable!(),
+        };
+        icmp.extend(header);
+        icmp.extend(udp);
+        if from.is_ipv4() {
+            let checksum = internet_checksum(&icmp);
+            icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+        }
+        socket.set_nonblocking(true).unwrap();
+        (socket, icmp)
+    }
+
+    /// Needs `CAP_NET_RAW` and a disposable network namespace: injected Packet Too Big
+    /// messages can change the namespace's loopback path-MTU cache.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires CAP_NET_RAW in a disposable network namespace"]
+    async fn send_recovery_preserves_real_path_mtu_reports() {
+        for (addr, ip) in [
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("[::1]:0", "::1"),
+            ("[::]:0", "127.0.0.1"),
+            ("[::]:0", "::1"),
+        ] {
+            for offload in OFFLOAD {
+                for mode in 0..5 {
+                    let (a, side, _) = bind_with(1, addr, offload).with_side_channel(|_| false, 1);
+                    let b = bind(2, &SocketAddr::new(ip.parse().unwrap(), 0).to_string());
+                    let c = bind(3, &SocketAddr::new(ip.parse().unwrap(), 0).to_string());
+                    a.set_path_mtu_discovery(true).unwrap();
+                    let mut reports = a.path_mtu_reports().unwrap();
+                    a.send(b"pmtu1234", &path_to(b.local_addr(), Ecn::NotEct))
+                        .await
+                        .unwrap();
+                    assert_eq!(recv(&b, 1500).await.0.as_packet(), b"pmtu1234");
+                    let (raw, quote) = too_big_quote(seen_as(&a, ip), b.local_addr());
+                    raw.send_to(&quote, &SocketAddr::new(ip.parse().unwrap(), 0).into())
+                        .unwrap();
+                    timeout(Duration::from_secs(5), a.socket.ready(Interest::ERROR))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let to = path_to(c.local_addr(), Ecn::NotEct);
+                    let batch = [(to, PacketBuf::from_packet(DATAGRAM))];
+                    let mut sent = 0;
+                    let mut failed = 0;
+                    let result = match mode {
+                        0 => a.send(DATAGRAM, &to).await,
+                        1 => a.send_batch(&batch, &mut sent, &mut failed).await,
+                        2 => a.try_send_batch(&batch, &mut sent, &mut failed),
+                        3 => side.send_to_async(DATAGRAM, to.addr).await,
+                        _ => side.send_to(DATAGRAM, to.addr),
+                    };
+                    assert!(result.is_ok(), "{addr} {ip} {offload} {mode}: {result:?}");
+                    assert_eq!(recv(&c, 1500).await.0.as_packet(), DATAGRAM);
+                    let report = reports.try_recv().unwrap();
+                    assert_eq!(report.path.addr, b.local_addr());
+                    assert_eq!(report.path.transport, a.id());
+                    assert_eq!(report.mtu, 1400);
+                    assert_eq!(report.quote(), b"pmtu1234");
+                    assert!(reports.try_recv().is_err());
+                    assert_eq!(a.path_mtu_reports_dropped(), 0);
+                }
+            }
+        }
+    }
+
+    /// Makes `a` take an ICMP error and waits until tokio reports a closed write side:
+    /// from then on it reports the socket writable for good. Sending recovers the error.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn icmp_error(a: &UdpTransport, ip: &str) {
         let closed = bind(3, &format!("{ip}:0")).local_addr();
@@ -2393,12 +2728,8 @@ mod tests {
         let ready = a.socket.ready(Interest::WRITABLE).await.unwrap();
         assert!(ready.is_write_closed());
         let open = SocketAddr::new(ip.parse().unwrap(), a.local_addr().port());
-        for refused in [true, false] {
-            let sent = a.send(DATAGRAM, &path_to(open, Ecn::NotEct)).await;
-            match sent {
-                Err(e) if refused => assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused),
-                sent => assert_eq!(sent.ok(), (!refused).then_some(())),
-            }
+        for _ in 0..2 {
+            a.send(DATAGRAM, &path_to(open, Ecn::NotEct)).await.unwrap();
         }
     }
 
@@ -2407,7 +2738,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn tries_within(
         a: &UdpTransport,
-        discovery: &AtomicBool,
+        errors: &SocketErrors,
         period: Duration,
         mut send: impl FnMut() -> io::Result<()> + Send,
     ) -> u64 {
@@ -2416,7 +2747,7 @@ mod tests {
             tries.fetch_add(1, Ordering::Relaxed);
             send()
         };
-        let result = timeout(period, write_io(&a.socket, discovery, io)).await;
+        let result = timeout(period, write_io(&a.socket, errors, io)).await;
         assert!(result.is_err(), "the send went through");
         tries.load(Ordering::Relaxed)
     }
@@ -2437,7 +2768,7 @@ mod tests {
             icmp_error(&a, "127.0.0.1").await;
 
             let full = || Err(io::ErrorKind::WouldBlock.into());
-            let tries = tries_within(&a, &a.discovery, PERIOD, full).await;
+            let tries = tries_within(&a, &a.errors, PERIOD, full).await;
             // Pauses of 1, 2, 4 and then 8 ms: about 15 tries.
             assert!((3..=30).contains(&tries), "{tries} tries in {PERIOD:?}");
             // Without the pauses (`async_io`) this never yields: tokio's readiness returns
@@ -3491,7 +3822,7 @@ mod tests {
         }
 
         let to = b.local_addr().into();
-        let tries = tries_within(&a, &a.discovery, PERIOD, || {
+        let tries = tries_within(&a, &a.errors, PERIOD, || {
             socket2::SockRef::from(&*a.socket)
                 .send_to(DATAGRAM, &to)
                 .map(drop)
@@ -3504,25 +3835,15 @@ mod tests {
         .unwrap();
         assert!((3..=50).contains(&tries), "{tries} tries in {PERIOD:?}");
 
-        // Once resolution gives up, the host unreachable it reports for the queued
-        // datagrams may fail the next send, once.
-        let failed_once = |first: io::Result<()>| {
-            first
-                .inspect_err(|e| assert_eq!(e.kind(), io::ErrorKind::HostUnreachable))
-                .is_err()
-        };
+        // Host unreachable errors from queued datagrams must not fail healthy sends.
         let control = side(b"control");
         let to_b = path_to(b.local_addr(), Ecn::NotEct);
         timeout(Duration::from_secs(10), async {
-            if failed_once(a.send(DATAGRAM, &to_b).await) {
-                a.send(DATAGRAM, &to_b).await.unwrap();
-            }
-            if failed_once(sender.send_to_async(&control, b.local_addr()).await) {
-                sender
-                    .send_to_async(&control, b.local_addr())
-                    .await
-                    .unwrap();
-            }
+            a.send(DATAGRAM, &to_b).await.unwrap();
+            sender
+                .send_to_async(&control, b.local_addr())
+                .await
+                .unwrap();
         })
         .await
         .unwrap();

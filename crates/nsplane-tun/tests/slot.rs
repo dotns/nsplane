@@ -81,7 +81,8 @@ async fn oversize_reads_are_dropped_and_counted() {
     let mtu = usize::from(MTU);
 
     host.send(&vec![1; mtu + 1]).await.unwrap();
-    host.send(&vec![2; 5000]).await.unwrap();
+    // Exceed the MTU + 1 read buffer without exceeding the host's datagram limit.
+    host.send(&vec![2; mtu * 2]).await.unwrap();
     host.send(&vec![3; mtu]).await.unwrap();
     host.send(&[4]).await.unwrap();
     assert_eq!(recv(&mut source).await.unwrap(), vec![3; mtu]);

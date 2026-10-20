@@ -1,6 +1,6 @@
 # nstun - Plan Index
 
-> Updated: 2026-10-02
+> Updated: 2026-10-20
 
 ## Usage
 
@@ -43,3 +43,6 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261003-2330-local-side Local-side graph primitives, masquerade, Echo reply, host TUNs**](20261003-2330-local-side.md) `2026-10-03`
 - [-] [**20261004-1100-ns-requests The remaining ns requests: WSS legs, netstack, ACL, MTU, nat**](20261004-1100-ns-requests.md) `2026-10-04`
 - [x] [**20261018-1000-doc-system One documentation standard: behavior-only product docs and comments**](20261018-1000-doc-system.md) `2026-10-18`
+- [x] [**20261020-0854-udp-icmp-isolation Isolate asynchronous errors on shared UDP sockets**](20261020-0854-udp-icmp-isolation.md) `2026-10-20`
+- [x] [**20261020-1026-synchronize-regression-fixtures Synchronize concurrent regression fixtures**](20261020-1026-synchronize-regression-fixtures.md) `2026-10-20`
+- [x] [**20261020-1154-macos-quality-gates Restore native macOS quality gates**](20261020-1154-macos-quality-gates.md) `2026-10-20`

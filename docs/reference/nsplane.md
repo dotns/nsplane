@@ -300,9 +300,17 @@ through `Transport::path_mtu_reports`, handed out once after the first switch-on
 turned on before the transport is given to the engine; at most 64 wait, further ones are
 dropped and counted (`UdpTransport::path_mtu_reports_dropped`). The kernel learns of a too
 small path only for datagrams sent with DF: with offload all of them, without it only those
-below the path MTU it knows. Two caveats while it is on: an ICMP error can fail one send
-before a receive reads it (the engine drops and counts that datagram, `SideSender` returns
-the error), and once the socket has reported an error tokio keeps its write readiness (after
+below the path MTU it knows.
+
+A failed send reads up to 64 queued errors, preserving Packet Too Big reports in the same
+report queue, then retries only the unaccepted operation. The first retry also covers a
+concurrent receiver having already read the error; further retries require a queued
+asynchronous ICMP error. There are at most seven retries. Successful batch prefixes are
+not repeated, and genuine persistent errors still fail and are counted. This applies to
+single, batched and nonblocking batched transport sends, and synchronous/asynchronous side
+sends.
+
+Once the socket has reported an error tokio keeps its write readiness (after
 `EPOLLERR`), so a send that finds the send buffer full (`send`, `send_batch`,
 `SideSender::send_to_async`) retries after pauses of 1 ms doubling up to 8 ms and may go out
 up to 8 ms after room appeared; sends that find room are not delayed, and with discovery off
