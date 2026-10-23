@@ -140,7 +140,7 @@ impl NetStack {
             owners: Arc::clone(&owners),
             reassembler,
             reassembly_counted: ReassemblyStats::default(),
-            revocations,
+            revocations: Arc::clone(&revocations),
             retiring: Vec::new(),
             sent: 0,
             marks: VecDeque::new(),
@@ -156,6 +156,7 @@ impl NetStack {
                 rx: egress_rx,
                 mtu,
                 received: 0,
+                revocations,
                 fences,
                 stats: Arc::clone(&stats),
             },
@@ -192,11 +193,28 @@ pub struct NetStackSource {
     mtu: watch::Receiver<u16>,
     /// Packets taken from `rx`: the egress position of the next one.
     received: u64,
+    revocations: Arc<Revocations>,
     fences: Arc<Fences>,
     stats: Arc<Counters>,
 }
 
 impl NetStackSource {
+    /// Whether every queued output position through a released TCP connection's last
+    /// packet has been taken by this source. This remains false before socket release,
+    /// including while a final ACK is still in the driver's backlog or egress queue.
+    ///
+    /// Keep receiving and forwarding packets until this returns true before revoking a
+    /// gracefully closed flow. Packets already returned by `recv` remain the caller's
+    /// responsibility: finish forwarding them before retirement. This does not prove
+    /// delivery or application completion at the peer.
+    ///
+    /// Returns an error for another stack's control, a non-TCP flow, or a revoked flow.
+    pub fn tcp_egress_drained(&self, control: &crate::FlowControl) -> io::Result<bool> {
+        Ok(control
+            .tcp_egress_end(&self.revocations)?
+            .is_some_and(|end| self.received >= end))
+    }
+
     /// Whether `packet`, the next one out of the egress queue, may leave the stack: not a
     /// placeholder of output dropped in the backlog, nor held back by a fence.
     fn admit(&mut self, packet: &PacketBuf) -> bool {

@@ -9,7 +9,7 @@ reassembly, and an ownership query for local sides that share one decrypted stre
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource`, `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 
 ## Behavior
 
@@ -305,6 +305,16 @@ and `netstack_udp_send` benches, see [Performance](../performance.md#netstack)).
 The unit tests `src/stack/tests/flow_control.rs`, `flow_context.rs` and `flow_bounds.rs`
 and `nsplane-e2e`'s `tests/netstack_flow_retirement.rs` cover the outcomes, the bounds and
 same-tuple re-opens.
+
+### Graceful TCP egress drain
+
+`TcpConnection::terminated` reports socket release. The final TCP ACK can still be
+queued in the driver or `NetStackSource` at that point. Before revoking a gracefully
+closed flow, keep receiving and forwarding packets until
+`NetStackSource::tcp_egress_drained(&control)` returns true. Finish each external send
+before checking the barrier; it does not cover a packet already returned by `recv`.
+The query rejects another stack's control, non-TCP flows and revoked flows. It does
+not establish peer application completion or remote cleanup.
 
 ### Tests
 
