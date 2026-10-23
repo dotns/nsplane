@@ -143,6 +143,13 @@ impl Peer {
         }
     }
 
+    pub(crate) fn has_session(&self) -> bool {
+        match &self.tunnel {
+            Tunnel::Owned(tunnel) => tunnel.has_session(),
+            Tunnel::Shared(tunnel) => lock(tunnel).has_session(),
+        }
+    }
+
     /// The tunnel; a shared one is locked (uncontended).
     pub(crate) fn tunnel_mut(&mut self) -> TunnelMut<'_> {
         match &mut self.tunnel {
