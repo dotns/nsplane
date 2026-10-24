@@ -16,6 +16,7 @@ members = [
     "crates/nsplane-ether",
     "crates/nsplane-dns",
     "examples",
+    "third_party/simple-dns",
 ]
 
 [workspace.package]

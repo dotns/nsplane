@@ -1,6 +1,6 @@
 # ADR: nsplane-dns depends on the dotns/simple-dns fork
 
-- **Status**: Accepted
+- **Status**: Superseded by [2026-10-24-simple-dns-in-tree](2026-10-24-simple-dns-in-tree.md)
 - **Date**: 2026-10-24
 - **Review**: when the fork carries no change that upstream lacks
 
@@ -52,3 +52,5 @@ Changes are made on `main`, tagged `v<upstream version>-nsplane.N` and recorded 
 
 - 2026-10-24: Accepted as a GitHub fork; the same day the owner made it an independent
   repository maintained by dotns, without the parts outside the protocol.
+- 2026-10-24: Superseded the same day: the crate moved into this repository
+  (`third_party/simple-dns`) and the standalone repository is archived.

@@ -15,3 +15,7 @@ passt = "passt"
 [default.extend-identifiers]
 # libc `msghdr` field
 msg_controllen = "msg_controllen"
+
+[files]
+# Third-party code keeps its upstream spelling (third_party/simple-dns/UPSTREAM.md)
+extend-exclude = ["third_party/"]

@@ -6,8 +6,8 @@ answers clients with what the embedder decides; resolution policy (which names a
 which are faked, where the rest goes) stays with the embedder, which can express it as a rule
 table for `PolicyResolver`. It is not a full DNS implementation: no zones, no DNSSEC, no
 recursion, no cache, no zone transfers or updates.
-The codec builds on the `simple-dns` fork (ADR
-[2026-10-24-simple-dns-fork](../decisions/2026-10-24-simple-dns-fork.md)), which stays an
+The codec builds on `simple-dns`, kept in this repository under `third_party/simple-dns` (ADR
+[2026-10-24-simple-dns-in-tree](../decisions/2026-10-24-simple-dns-in-tree.md)), which stays an
 implementation detail: no `simple-dns` type appears in the public API. The optional `netstack`
 feature builds on `nsplane-netstack`.
 
@@ -276,6 +276,6 @@ address and port to these functions.
 
 - [nsplane-netstack](nsplane-netstack.md): the user-space stack served by the `netstack`
   feature.
-- [ADR: simple-dns fork](../decisions/2026-10-24-simple-dns-fork.md)
+- [ADR: simple-dns in this repository](../decisions/2026-10-24-simple-dns-in-tree.md)
 - [`dns_netstack`](../../examples/README.md#dns_netstack): a server on an address a transparent
   netstack terminates without owning it, with static, fake and forwarded answers.

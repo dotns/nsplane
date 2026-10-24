@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Query::decode` decodes only the header, the question and the OPT record: records of
     unknown types or with RDATA the codec cannot parse elsewhere in a query no longer give
     `FORMERR`, and the forwarder no longer ignores upstream responses carrying them
-    (simple-dns fork tag `v0.12.0-nsplane.4`).
+    (`PacketView` in the in-tree `simple-dns`).
 - nsplane-dns policy routing: `PolicyResolver` routes each query by a `PolicyTable` of
   `Rule`s to one of several resolvers registered under ids in a `ResolverSet`, or to a local
   answer.
@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
 
 ### Changed
+- nsplane-dns builds its codec from `third_party/simple-dns`, the `simple-dns` protocol crate
+  kept in this repository; the git dependency on `github.com/dotns/simple-dns` is gone.
 - nsplane-tun depends on nsplane-packet and splits offload reads with
   `nsplane_packet::vnet::segment`; behavior unchanged.
 

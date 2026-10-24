@@ -9,7 +9,9 @@ fmt:
     cargo fmt --all --check
 
 clippy:
-    cargo hack clippy --workspace --each-feature --all-targets --locked
+    cargo hack clippy --workspace --exclude simple-dns --each-feature --all-targets --locked
+    # Third-party code: checked as nsplane-dns uses it (its tests need std).
+    cargo clippy -p simple-dns --all-targets --locked
 
 test:
     cargo nextest run --workspace --all-features --locked
