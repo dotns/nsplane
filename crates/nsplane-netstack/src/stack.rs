@@ -94,12 +94,7 @@ impl NetStack {
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
-        let (events, flow_events) = settings
-            .transparent
-            .as_ref()
-            .and_then(|transparent| transparent.events)
-            .map(|config| EventSink::new(config, Instant::now()))
-            .unzip();
+        let (events, flow_events) = event_sink(&settings).unzip();
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -596,6 +591,13 @@ fn pending_table(
         }
         Admission::Immediate => None,
     }
+}
+
+/// The admission event sink and the receiving end of its events, with
+/// `TransparentConfig::events` only.
+fn event_sink(settings: &Settings) -> Option<(EventSink, mpsc::Receiver<FlowEvent>)> {
+    let config = settings.transparent.as_ref()?.events?;
+    Some(EventSink::new(config, Instant::now()))
 }
 
 /// Creates the smoltcp interface with the stack's addresses; in transparent mode it takes

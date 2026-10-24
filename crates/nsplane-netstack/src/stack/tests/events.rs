@@ -49,11 +49,13 @@ async fn send(sink: &NetStackSink, packet: &[u8]) -> TestResult {
 }
 
 async fn send_syn(sink: &NetStackSink, src: &str, dst: &str) -> TestResult {
-    send(sink, &tcp_packet(addr(src)?, addr(dst)?, SYN)).await
+    let packet = tcp_packet(addr(src)?, addr(dst)?, SYN);
+    send(sink, &packet).await
 }
 
 async fn send_udp(sink: &NetStackSink, src: &str, dst: &str) -> TestResult {
-    send(sink, &udp_packet(addr(src)?, addr(dst)?)).await
+    let packet = udp_packet(addr(src)?, addr(dst)?);
+    send(sink, &packet).await
 }
 
 async fn next_event(
