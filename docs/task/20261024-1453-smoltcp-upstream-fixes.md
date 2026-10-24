@@ -1,6 +1,6 @@
 # 20261024-1453-smoltcp-upstream-fixes smoltcp fork: rebase onto upstream main and reapply the fork patches
 
-- **status**: in progress (owner approved 2026-10-24: "修复smoltcp的fork然后测试一下当前的性能影响"; scope widened: "需要同步到完整上游再更新我们的补丁，包括每个 socket 单独调重传超时")
+- **status**: in progress (merged into main 51eccd7; fork tag `v0.14.0-nsplane.7`; ships with the next release)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 14:53
@@ -20,3 +20,8 @@ impact.
 
 - **blocked by**: (none)
 - **blocks**: (none)
+
+## Notes
+
+- TCP send microbenchmarks are about 1-2 % slower on `.7` (reproducible; not caused by the
+  Cubic change; end-to-end throughput unchanged). Accepted by L1.
