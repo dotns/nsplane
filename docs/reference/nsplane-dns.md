@@ -63,8 +63,6 @@ over the name's records.
 
 - One question per message; opcodes other than `QUERY` (notify, update) are answered with
   `NOTIMP`.
-- A question whose type the codec does not know (for example TLSA, type 52) does not parse
-  and is answered with `FORMERR`.
 - Response codes are limited to `ResponseCode` (no extended codes).
 - `RecordData` covers A, AAAA, CNAME, PTR and TXT.
 
