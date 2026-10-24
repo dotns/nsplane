@@ -7,6 +7,10 @@ const POOL: Pool = Pool {
     limit: MAX_LISTENERS_TOTAL,
     rx_buffer: 4096,
     tx_buffer: 4096,
+    rto: TcpRto {
+        min: SmolDuration::from_secs(1),
+        initial: SmolDuration::from_secs(1),
+    },
 };
 
 type Listeners = HashMap<u16, Vec<SocketHandle>>;
@@ -487,7 +491,7 @@ fn tcp_sockets_run_cubic_congestion_control() {
         tcp::CongestionControl::Cubic
     );
     assert_eq!(
-        new_tcp_socket(4096, 4096).congestion_control(),
+        new_tcp_socket(4096, 4096, POOL.rto).congestion_control(),
         tcp::CongestionControl::Cubic
     );
 }

@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use nsplane_packet::reassembly::ReassemblyConfig;
+use smoltcp::time::Duration as SmolDuration;
 
 use crate::events::FlowEventsConfig;
 
@@ -116,6 +117,25 @@ pub struct NetStackConfig {
     /// than the budget, parallel connections no longer add throughput.
     /// Default `None`: no budget, each connection up to its own send buffer.
     pub tcp_send_budget: Option<usize>,
+    /// Lower bound of each TCP socket's retransmission timeout (RTO).
+    ///
+    /// smoltcp computes the RTO from the measured round-trip time (RFC 6298) and raises it
+    /// to this bound; RTTs are sampled in whole milliseconds. On a path whose round trip is
+    /// far below the bound, the bound alone sets the RTO, so a loss that fast retransmit
+    /// and the tail loss probe do not recover costs at least this long. A bound below the
+    /// peer's delayed-ACK time turns delayed ACKs into spurious retransmissions. A lowered
+    /// bound applies from a connection's first RTT measurement.
+    ///
+    /// Taken in whole milliseconds and clamped to 1 ms..=60 s, smoltcp's range; the
+    /// largest RTO, after exponential back-off, stays smoltcp's 60 s. Default 1 s
+    /// (RFC 6298 2.4, smoltcp's default).
+    pub tcp_min_rto: Duration,
+    /// Retransmission timeout of each TCP socket before its first RTT measurement: the
+    /// timeout of the SYN or SYN-ACK and of data sent before a round trip was measured.
+    ///
+    /// Taken in whole milliseconds and clamped to 1 ms..=60 s like
+    /// [`tcp_min_rto`](Self::tcp_min_rto). Default 1 s (RFC 6298 2.1, smoltcp's default).
+    pub tcp_initial_rto: Duration,
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
@@ -304,6 +324,8 @@ impl Default for NetStackConfig {
             tcp_rx_buffer: None,
             tcp_tx_buffer: None,
             tcp_send_budget: None,
+            tcp_min_rto: DEFAULT_RTO,
+            tcp_initial_rto: DEFAULT_RTO,
             max_udp_flows: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
@@ -328,11 +350,35 @@ pub(crate) struct Settings {
     tcp_rx_buffer: usize,
     tcp_tx_buffer: usize,
     pub(crate) tcp_send_budget: Option<usize>,
+    pub(crate) tcp_rto: TcpRto,
     pub(crate) max_udp_flows: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
     /// Boxed, so that it does not grow the driver.
     pub(crate) transparent: Option<Box<Transparent>>,
+}
+
+/// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
+/// [`NetStackConfig::tcp_initial_rto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpRto {
+    pub(crate) min: SmolDuration,
+    pub(crate) initial: SmolDuration,
+}
+
+impl TcpRto {
+    /// Normalises `min` and `initial` as documented on [`NetStackConfig::tcp_min_rto`].
+    fn new(min: Duration, initial: Duration) -> Self {
+        let millis = |rto: Duration| {
+            SmolDuration::from_millis(
+                u64::try_from(rto.as_millis()).map_or(MAX_RTO_MS, |ms| ms.clamp(1, MAX_RTO_MS)),
+            )
+        };
+        Self {
+            min: millis(min),
+            initial: millis(initial),
+        }
+    }
 }
 
 /// A [`TransparentConfig`] with its prefixes normalised.
@@ -404,6 +450,10 @@ impl Prefixes {
 /// buffer, and without loss a smaller window gains nothing. Congestion control keeps the
 /// large window from collapsing on a congested hop; the window stays large for long paths.
 const WINDOW_SEGMENTS: usize = 512;
+/// smoltcp's default minimum and initial RTO.
+const DEFAULT_RTO: Duration = Duration::from_secs(1);
+/// smoltcp's largest RTO in milliseconds, also the upper clamp of the configurable bounds.
+const MAX_RTO_MS: u64 = 60_000;
 /// Longest [`Admission::Decide`] timeout.
 const MAX_PENDING_TIMEOUT: Duration = Duration::from_hours(24);
 
@@ -443,6 +493,7 @@ impl Settings {
             tcp_rx_buffer: tcp_buffer(config.tcp_rx_buffer),
             tcp_tx_buffer: tcp_buffer(config.tcp_tx_buffer),
             tcp_send_budget: config.tcp_send_budget,
+            tcp_rto: TcpRto::new(config.tcp_min_rto, config.tcp_initial_rto),
             max_udp_flows: config.max_udp_flows.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
@@ -576,5 +627,29 @@ mod tests {
             buffers(usize::MAX, (65_535 << 14) + 1),
             (65_535 << 14, 65_535 << 14)
         );
+    }
+
+    #[test]
+    fn tcp_rto_defaults_to_smoltcp_and_clamps() {
+        let rto = |min, initial| {
+            Settings::new(NetStackConfig {
+                tcp_min_rto: min,
+                tcp_initial_rto: initial,
+                ..NetStackConfig::default()
+            })
+            .tcp_rto
+        };
+        let defaults = Settings::new(NetStackConfig::default()).tcp_rto;
+        assert_eq!(defaults.min, SmolDuration::from_secs(1));
+        assert_eq!(defaults.initial, SmolDuration::from_secs(1));
+        let set = rto(Duration::from_millis(20), Duration::from_micros(50_900));
+        assert_eq!(set.min, SmolDuration::from_millis(20));
+        assert_eq!(set.initial, SmolDuration::from_millis(50));
+        let low = rto(Duration::ZERO, Duration::from_micros(999));
+        assert_eq!(low.min, SmolDuration::from_millis(1));
+        assert_eq!(low.initial, SmolDuration::from_millis(1));
+        let high = rto(Duration::from_secs(61), Duration::MAX);
+        assert_eq!(high.min, SmolDuration::from_secs(60));
+        assert_eq!(high.initial, SmolDuration::from_secs(60));
     }
 }
