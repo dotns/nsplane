@@ -6,8 +6,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bytes::Bytes;
 use nsplane_dns::{
-    Answer, DecodeError, EncodeOptions, Query, Record, RecordType, ResponseCode, encode_error,
-    encode_response, max_udp_response_size,
+    Answer, DecodeError, EncodeOptions, Query, Record, RecordType, ResponseCode, StaticRecords,
+    encode_error, encode_response, max_udp_response_size,
 };
 use simple_dns::rdata::{OPT, RData};
 use simple_dns::{CLASS, Name, OPCODE, Packet, PacketFlag, QTYPE, Question, RCODE, TYPE};
@@ -70,6 +70,32 @@ fn decode_reads_the_any_type() {
     ));
     let query = Query::decode(&packet.build_bytes_vec().unwrap()).unwrap();
     assert_eq!(query.record_type(), RecordType::ANY);
+}
+
+#[test]
+fn unknown_type_is_answered() {
+    // TLSA (52) has no RDATA support in the codec; the query is still valid (RFC 3597).
+    let query = decode(52, "_443._tcp.Host.Example", TYPE::Unknown(52), Some(1232));
+    assert_eq!(query.record_type(), RecordType(52));
+    assert_eq!(query.record_type().to_string(), "TYPE52");
+    assert_eq!(query.name(), "_443._tcp.host.example");
+
+    let mut table = StaticRecords::new();
+    table.insert(Record::a("_443._tcp.host.example", 60, Ipv4Addr::LOCALHOST));
+    let answer = table.lookup(&query);
+    assert_eq!(answer, Answer::Records(Vec::new()));
+
+    let bytes = encode_response(&query, &answer, 512, options());
+    let packet = Packet::parse(&bytes).unwrap();
+    assert_eq!(packet.id(), 52);
+    assert_eq!(packet.rcode(), RCODE::NoError);
+    assert_eq!(packet.answers.len(), 0);
+    assert_eq!(packet.questions.len(), 1);
+    assert_eq!(u16::from(packet.questions[0].qtype), 52);
+    assert_eq!(
+        packet.questions[0].qname.to_string(),
+        "_443._tcp.Host.Example"
+    );
 }
 
 #[test]
