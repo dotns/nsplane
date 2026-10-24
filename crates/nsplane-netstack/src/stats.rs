@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// counters also count datagrams completed. The admission counters from
 /// [`pending`](Self::pending) on belong to
 /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) and are always 0
-/// without it. Counters only grow, except the gauge [`pending`](Self::pending).
+/// without it. [`events_emitted`](Self::events_emitted) and
+/// [`events_dropped`](Self::events_dropped) count admission events, not packets. Counters
+/// only grow, except the gauge [`pending`](Self::pending).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetStackStats {
     /// Ingress packets that are not a parseable IPv4/IPv6 packet, or whose TCP/UDP header
@@ -91,6 +93,13 @@ pub struct NetStackStats {
     /// of the stack's addresses; each is also counted in
     /// [`no_address`](Self::no_address).
     pub rejected_prefix: u64,
+    /// Admission events delivered to the channel of
+    /// [`TransparentConfig::events`](crate::TransparentConfig::events).
+    pub events_emitted: u64,
+    /// Admission events dropped: beyond the token bucket of
+    /// [`TransparentConfig::events`](crate::TransparentConfig::events), or finding its
+    /// channel full or its receiver gone.
+    pub events_dropped: u64,
 }
 
 /// The live counters behind [`NetStackStats`].
@@ -117,6 +126,8 @@ pub(crate) struct Counters {
     pub(crate) rejected_table_full: AtomicU64,
     pub(crate) rejected_connection_limit: AtomicU64,
     pub(crate) rejected_prefix: AtomicU64,
+    pub(crate) events_emitted: AtomicU64,
+    pub(crate) events_dropped: AtomicU64,
     /// Behind [`NetStackHandle::retired_drops`](crate::NetStackHandle::retired_drops), not
     /// part of [`NetStackStats`].
     pub(crate) retired: AtomicU64,
@@ -153,6 +164,8 @@ impl Counters {
             rejected_table_full: get(&self.rejected_table_full),
             rejected_connection_limit: get(&self.rejected_connection_limit),
             rejected_prefix: get(&self.rejected_prefix),
+            events_emitted: get(&self.events_emitted),
+            events_dropped: get(&self.events_dropped),
         }
     }
 }
