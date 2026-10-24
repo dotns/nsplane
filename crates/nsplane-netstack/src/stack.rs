@@ -2608,7 +2608,7 @@ pub(crate) fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
             head[16..20].copy_from_slice(&dst.octets());
             let header_checksum = checksum::ipv4_header_checksum(head);
             head[10..12].copy_from_slice(&header_checksum.to_be_bytes());
-            checksum::transport_checksum_v4(src, dst, protocol::TCP, tcp)
+            pending::pseudo_header_checksum(src.into(), dst.into(), protocol::TCP, tcp)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
             head[0] = 0x60;
@@ -2617,7 +2617,7 @@ pub(crate) fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
             head[7] = 64;
             head[8..24].copy_from_slice(&src.octets());
             head[24..40].copy_from_slice(&dst.octets());
-            checksum::transport_checksum_v6(src, dst, protocol::TCP, tcp)
+            pending::pseudo_header_checksum(src.into(), dst.into(), protocol::TCP, tcp)
         }
         _ => return None,
     };
