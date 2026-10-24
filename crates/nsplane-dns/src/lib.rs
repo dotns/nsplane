@@ -20,6 +20,9 @@
 //!   over UDP (TCP for truncated responses), without caching or policy.
 //! - **Fake addresses** ([`fake`]): [`FakePool`], which answers A / AAAA with addresses
 //!   allocated per name from configured prefixes and maps them back to names.
+//! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
+//!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
+//!   transport-neutral core.
 //!
 //! ```
 //! use std::net::{Ipv4Addr, SocketAddr};
@@ -54,6 +57,7 @@ pub mod forward;
 pub mod message;
 pub mod records;
 pub mod resolver;
+pub mod server;
 
 pub use fake::{
     DEFAULT_FAKE_CAPACITY, DEFAULT_FAKE_TTL, FakePool, FakePoolConfig, FakePoolConfigError,
@@ -67,3 +71,4 @@ pub use message::{
 };
 pub use records::StaticRecords;
 pub use resolver::{Fallback, Resolver};
+pub use server::{Server, ServerConfig, ServerStats, Transport};

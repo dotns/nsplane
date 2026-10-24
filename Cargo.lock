@@ -1102,6 +1102,7 @@ dependencies = [
  "simple-dns",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
