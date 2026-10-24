@@ -22,6 +22,11 @@ Tag `v0.12.0-nsplane.1` (`f92badd1a2472bb50348f46f0923ca7a37c9adae`) carries one
 top of it: the `bind9` submodule and the `bind9-tests` crate are removed, because Cargo
 clones the submodules of a git dependency.
 
+Tag `v0.12.0-nsplane.2` (`58b0bd8a11b861c1ffb86d9594f3676b473d7ae4`) adds one commit: a
+question whose QTYPE has no RDATA support (TLSA, SSHFP, URI and other codes) parses as
+`QTYPE::TYPE(TYPE::Unknown(n))` instead of failing (RFC 3597), so such queries get an answer
+instead of FORMERR.
+
 Fork changes are made on the fork branch, tagged `v0.12.0-nsplane.N` and recorded here.
 
 ## Consequences
