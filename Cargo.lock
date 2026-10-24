@@ -1095,6 +1095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-dns"
+version = "0.16.2"
+dependencies = [
+ "bytes",
+ "simple-dns",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "nsplane-e2e"
 version = "0.16.2"
 dependencies = [
@@ -1772,6 +1782,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "simple-dns"
+version = "0.12.0"
+source = "git+https://github.com/dotns/simple-dns?tag=v0.12.0-nsplane.1#f92badd1a2472bb50348f46f0923ca7a37c9adae"
+dependencies = [
+ "bitflags 2.11.1",
 ]
 
 [[package]]
