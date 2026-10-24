@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The standard WireGuard peer of vm-wireguard.sh, run in its own container (NET_ADMIN and
-# /dev/net/tun): wireguard-go on wg0 with 10.66.0.1/24, an address behind it (10.66.1.1/24)
-# and fd66::1/64, MTU 1420, and one-line TCP responders on ports 7 and 8 that answer
+# /dev/net/tun): wireguard-go on wg0 with 10.66.0.1/24, an address behind it (10.66.1.1/24),
+# fd66::1/64 and second addresses in the guest's prefixes (10.66.0.3, fd66::3), MTU 1420, and one-line TCP responders on ports 7 and 8 that answer
 # `peer <port> <line>`.
 #
 #   vm-wireguard-peer.sh up <work dir>      keys in the work dir, wg0 up, then sleeps
@@ -29,6 +29,8 @@ up() {
   ip addr add 10.66.0.1/24 dev wg0
   ip addr add 10.66.1.1/24 dev wg0
   ip addr add fd66::1/64 dev wg0
+  ip addr add 10.66.0.3/32 dev wg0
+  ip addr add fd66::3/128 dev wg0
   ip link set wg0 mtu 1420 up
 
   for port in 7 8; do
