@@ -1,6 +1,7 @@
 //! Stack configuration and its normalised form.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use nsplane_packet::reassembly::ReassemblyConfig;
 
@@ -139,6 +140,104 @@ pub struct NetStackConfig {
     /// Default `None`: fragments are dropped (counted as
     /// [`unsupported`](crate::NetStackStats::unsupported)) and no reassembly state exists.
     pub reassembly: Option<ReassemblyConfig>,
+    /// Transparent mode: the stack is the endpoint for TCP and UDP addressed to any
+    /// destination inside [`TransparentConfig::prefixes`], not only to its own addresses.
+    ///
+    /// The stack answers for every in-prefix address the engine delivers to it: a bare SYN
+    /// or a UDP datagram to such an address opens a connection or flow, and replies and
+    /// RSTs are sourced from the original destination. Which destinations reach the stack
+    /// is decided in front of it: the peers' allowed IPs,
+    /// `PeerConfig::inbound_destinations`, the ACL or a `Splitter`. On an accepted
+    /// [`TcpConnection`](crate::TcpConnection) or [`UdpFlow`](crate::UdpFlow),
+    /// `local_addr()` is the original destination and `peer_addr()` the source.
+    ///
+    /// Every bound of the stack (the listener pool, the UDP flow limit, every queue)
+    /// applies to all addresses together. Fragments to in-prefix destinations are
+    /// reassembled within the same [`reassembly`](Self::reassembly) bounds, and
+    /// [`NetStackHandle::owns`](crate::NetStackHandle::owns) treats in-prefix destinations
+    /// as the stack's. [`connect_tcp`](crate::NetStackHandle::connect_tcp),
+    /// [`connect_udp`](crate::NetStackHandle::connect_udp) and
+    /// [`bind_udp`](crate::NetStackHandle::bind_udp) still require one of the
+    /// [`addresses`](Self::addresses).
+    ///
+    /// ```
+    /// use nsplane_netstack::{NetStackConfig, TransparentConfig};
+    ///
+    /// let config = NetStackConfig {
+    ///     transparent: Some(TransparentConfig {
+    ///         prefixes: vec![],
+    ///         ..Default::default()
+    ///     }),
+    ///     ..Default::default()
+    /// };
+    /// assert!(config.transparent.is_some());
+    /// ```
+    ///
+    /// Default `None`: the stack is the endpoint for its own addresses only, and the transparent
+    /// checks cost nothing per packet.
+    pub transparent: Option<TransparentConfig>,
+}
+
+/// Configuration of transparent mode, see [`NetStackConfig::transparent`].
+///
+/// Build it with `..Default::default()` so that fields added later keep the literal
+/// compiling:
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr};
+///
+/// use nsplane_netstack::TransparentConfig;
+///
+/// let config = TransparentConfig {
+///     prefixes: vec![(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)],
+///     max_connections: Some(1024),
+///     ..Default::default()
+/// };
+/// assert_eq!(config.admission, nsplane_netstack::Admission::Immediate);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransparentConfig {
+    /// Destination prefixes the stack accepts, each an address with its prefix length;
+    /// empty means every address of both families.
+    ///
+    /// A prefix length longer than the family allows is clamped to 32 (IPv4) or 128
+    /// (IPv6), and host bits are ignored. A packet to a destination outside every prefix
+    /// that is not one of the stack's addresses is dropped and counted in
+    /// [`NetStackStats::no_address`](crate::NetStackStats::no_address), as without
+    /// transparent mode, and also in
+    /// [`rejected_prefix`](crate::NetStackStats::rejected_prefix).
+    pub prefixes: Vec<(IpAddr, u8)>,
+    /// How a new connection or flow is admitted. Default [`Admission::Immediate`].
+    pub admission: Admission,
+    /// Most TCP connections the stack holds at once: accepted, mid handshake or opened
+    /// with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until they are released.
+    ///
+    /// At the limit, a bare SYN of a new connection is answered with a RST sourced from
+    /// its original destination and counted in
+    /// [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit). A
+    /// retransmitted SYN of a handshake in progress is not a new connection. Default
+    /// `None`: no limit beyond the [`listener_pool`](NetStackConfig::listener_pool) and
+    /// the accept queue.
+    pub max_connections: Option<usize>,
+}
+
+/// How a transparent stack admits a new TCP connection or UDP flow, see
+/// [`TransparentConfig::admission`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Admission {
+    /// Accept on arrival: a bare SYN is answered with SYN-ACK and a UDP flow's first
+    /// datagram opens the flow, as for the stack's own addresses.
+    #[default]
+    Immediate,
+    /// Hold a bare SYN, or a UDP flow's first datagram, until the application decides,
+    /// for at most `timeout`, with at most `max_pending` connections and flows held.
+    Decide {
+        /// Longest a connection or flow waits for the decision.
+        timeout: Duration,
+        /// Most connections and flows held at once.
+        max_pending: usize,
+    },
 }
 
 impl NetStackConfig {
@@ -171,6 +270,7 @@ impl Default for NetStackConfig {
             max_udp_flows: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
+            transparent: None,
         }
     }
 }
@@ -194,6 +294,61 @@ pub(crate) struct Settings {
     pub(crate) max_udp_flows: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
+    pub(crate) transparent: Option<Transparent>,
+}
+
+/// A [`TransparentConfig`] with its prefixes normalised.
+#[derive(Debug, Clone)]
+pub(crate) struct Transparent {
+    pub(crate) prefixes: Prefixes,
+    pub(crate) admission: Admission,
+    pub(crate) max_connections: Option<usize>,
+}
+
+/// One destination prefix: the network and its mask.
+#[derive(Debug, Clone, Copy)]
+enum Prefix {
+    V4(u32, u32),
+    V6(u128, u128),
+}
+
+/// The destination prefixes of a transparent stack; empty means every address.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Prefixes(Vec<Prefix>);
+
+impl Prefixes {
+    /// Normalises `prefixes` as documented on [`TransparentConfig::prefixes`].
+    fn new(prefixes: Vec<(IpAddr, u8)>) -> Self {
+        Self(
+            prefixes
+                .into_iter()
+                .map(|(addr, len)| match addr {
+                    IpAddr::V4(addr) => {
+                        let mask = u32::MAX
+                            .checked_shl(32 - u32::from(len.min(32)))
+                            .unwrap_or(0);
+                        Prefix::V4(u32::from(addr) & mask, mask)
+                    }
+                    IpAddr::V6(addr) => {
+                        let mask = u128::MAX
+                            .checked_shl(128 - u32::from(len.min(128)))
+                            .unwrap_or(0);
+                        Prefix::V6(u128::from(addr) & mask, mask)
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether `addr` lies inside one of the prefixes, or there are none.
+    pub(crate) fn contains(&self, addr: IpAddr) -> bool {
+        self.0.is_empty()
+            || self.0.iter().any(|prefix| match (*prefix, addr) {
+                (Prefix::V4(net, mask), IpAddr::V4(addr)) => u32::from(addr) & mask == net,
+                (Prefix::V6(net, mask), IpAddr::V6(addr)) => u128::from(addr) & mask == net,
+                _ => false,
+            })
+    }
 }
 
 /// Sockets get send and receive buffers of this many IPv4-sized segments unless
@@ -250,6 +405,11 @@ impl Settings {
             max_udp_flows: config.max_udp_flows.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
+            transparent: config.transparent.map(|transparent| Transparent {
+                prefixes: Prefixes::new(transparent.prefixes),
+                admission: transparent.admission,
+                max_connections: transparent.max_connections,
+            }),
         }
     }
 
@@ -264,6 +424,16 @@ impl Settings {
     /// Whether `addr` is one of the stack's addresses.
     pub(crate) fn is_local(&self, addr: IpAddr) -> bool {
         self.local_for(addr) == Some(addr)
+    }
+
+    /// Whether the stack accepts packets to `addr`: one of its addresses, or in
+    /// transparent mode an in-prefix address.
+    pub(crate) fn accepts(&self, addr: IpAddr) -> bool {
+        self.is_local(addr)
+            || self
+                .transparent
+                .as_ref()
+                .is_some_and(|transparent| transparent.prefixes.contains(addr))
     }
 
     /// Receive buffer size of every TCP socket, see [`NetStackConfig::tcp_rx_buffer`].

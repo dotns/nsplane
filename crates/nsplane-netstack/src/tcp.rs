@@ -178,12 +178,17 @@ impl TcpConnection {
         FlowControl::new(Arc::clone(&self.flow))
     }
 
-    /// The stack's end of the connection.
+    /// The stack's end of the connection: the destination of the peer's SYN for an
+    /// accepted connection. With
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) that is the
+    /// original destination, which need not be one of the stack's addresses.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
     }
 
-    /// The peer's end of the connection.
+    /// The peer's end of the connection: the source of its SYN for an accepted
+    /// connection, also with
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent).
     pub const fn peer_addr(&self) -> SocketAddr {
         self.peer
     }

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use nsplane::{PacketSink, PacketSource};
 use nsplane_packet::reassembly::{Outcome, Reassembler, ReassemblyStats};
-use nsplane_packet::{IpPacket, PacketBuf, PeerId, protocol};
+use nsplane_packet::{IpPacket, PacketBuf, PeerId, checksum, protocol};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
@@ -23,8 +23,8 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::config::{NetStackConfig, Settings};
-use crate::device::VirtualDevice;
+use crate::config::{Admission, NetStackConfig, Settings};
+use crate::device::{TAILROOM, VirtualDevice};
 use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
 use crate::ownership::{Owners, Ownership, Registration};
 use crate::pmtu::{self, Message, TooBig};
@@ -62,8 +62,8 @@ fn stack_gone() -> io::Error {
 /// returned [`NetStackHandle`] accepts and opens TCP connections and UDP flows.
 ///
 /// The stack is the endpoint for TCP and UDP addressed to its own addresses (any port), for IPv4
-/// and IPv6. Everything else it receives is dropped and counted in
-/// [`NetStackHandle::stats`].
+/// and IPv6, and with [`NetStackConfig::transparent`] to any in-prefix destination.
+/// Everything else it receives is dropped and counted in [`NetStackHandle::stats`].
 #[derive(Debug)]
 pub struct NetStack {
     source: NetStackSource,
@@ -94,6 +94,10 @@ impl NetStack {
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
             settings.v6.map(|(addr, _)| addr),
+            settings
+                .transparent
+                .as_ref()
+                .map(|transparent| transparent.prefixes.clone()),
             settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
@@ -480,14 +484,15 @@ impl NetStackHandle {
     ///   remote); or an IPv4 or IPv6 ICMP error (destination unreachable, packet too big,
     ///   time exceeded, parameter problem) quoting a packet the stack sent on such a tuple.
     /// - [`Ownership::Listener`]: a bare TCP SYN or a UDP datagram to one of the stack's
-    ///   addresses that would open a new connection or flow.
+    ///   addresses (with [`NetStackConfig::transparent`], to an in-prefix address) that
+    ///   would open a new connection or flow.
     /// - [`Ownership::None`]: anything else, including malformed packets, IPv4 fragments
     ///   and IPv6 packets with a Fragment header without
     ///   [`NetStackConfig::reassembly`] (the stack drops them), and every packet once the
     ///   stack stopped.
     ///
     /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
-    /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
+    /// addresses (or in-prefix addresses) is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
     /// one of the above and [`Ownership::Listener`] otherwise. A later fragment carries no
     /// ports: it is [`Ownership::Flow`] when this call classified the first fragment of
     /// its datagram (same addresses, protocol and identification) as
@@ -532,11 +537,15 @@ impl<T> Stream for Incoming<T> {
     }
 }
 
-/// Creates the smoltcp interface with the stack's addresses.
+/// Creates the smoltcp interface with the stack's addresses; in transparent mode it takes
+/// packets to any address (`classify` has checked the prefixes before).
 fn interface(settings: &Settings, device: &mut VirtualDevice) -> Interface {
     let mut config = Config::new(HardwareAddress::Ip);
     config.random_seed = RandomState::new().build_hasher().finish();
     let mut iface = Interface::new(config, device, SmolInstant::ZERO);
+    if settings.transparent.is_some() {
+        iface.set_any_ip(true);
+    }
     iface.update_ip_addrs(|addrs| {
         // At most one address per family; the default capacity of two always fits.
         if let Some((addr, prefix)) = settings.v4 {
@@ -566,6 +575,8 @@ enum Class {
 enum Reject {
     Malformed,
     NoAddress,
+    /// In transparent mode: neither one of the stack's addresses nor in a prefix.
+    Prefix,
     Unsupported,
 }
 
@@ -573,7 +584,13 @@ enum Reject {
 fn classify(bytes: &[u8], settings: &Settings) -> Result<Class, Reject> {
     let ip = IpPacket::parse(bytes).map_err(|_| Reject::Malformed)?;
     if !settings.is_local(ip.dst()) {
-        return Err(Reject::NoAddress);
+        match &settings.transparent {
+            None => return Err(Reject::NoAddress),
+            Some(transparent) if !transparent.prefixes.contains(ip.dst()) => {
+                return Err(Reject::Prefix);
+            }
+            Some(_) => {}
+        }
     }
     if ip.fragment().is_some() {
         return Err(Reject::Unsupported);
@@ -1031,6 +1048,11 @@ impl Driver {
                         // Unanswered, the peer retransmits it once the queue may have room.
                         return stats::add(&self.stats.syn_deferred, 1);
                     }
+                    if self.settings.transparent.is_some()
+                        && !self.admit_syn(packet.as_packet(), demand)
+                    {
+                        return;
+                    }
                     *demand.entry(dst_port).or_insert(0) += 1;
                 }
                 self.device.inject(packet);
@@ -1042,8 +1064,61 @@ impl Driver {
             Ok(Class::Icmp) => self.icmp(packet.as_packet()),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
+            Err(Reject::Prefix) => {
+                stats::add(&self.stats.no_address, 1);
+                stats::add(&self.stats.rejected_prefix, 1);
+            }
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Admits a bare SYN in transparent mode; whether it goes on into smoltcp. A
+    /// retransmitted SYN of a handshake in progress passes uncounted; a new connection
+    /// beyond `max_connections` (counting the connections held, the handshakes in
+    /// progress and the SYNs of this batch in `demand`) is answered with RST.
+    fn admit_syn(&mut self, packet: &[u8], demand: &HashMap<u16, usize>) -> bool {
+        let Some((limit, admission)) = self
+            .settings
+            .transparent
+            .as_ref()
+            .map(|transparent| (transparent.max_connections, transparent.admission))
+        else {
+            return true;
+        };
+        let Some((remote, local)) = tcp_tuple(packet) else {
+            return true;
+        };
+        if self.owners.has_tcp(local, remote) {
+            return true;
+        }
+        if let Some(limit) = limit {
+            let held = self.conns.len()
+                + self.connecting.len()
+                + self.inbound.len()
+                + demand.values().sum::<usize>();
+            if held >= limit {
+                stats::add(&self.stats.rejected_connection_limit, 1);
+                if let Some(reset) = tcp_reset(packet) {
+                    self.push_reply(reset);
+                }
+                return false;
+            }
+        }
+        match admission {
+            Admission::Immediate | Admission::Decide { .. } => {
+                stats::add(&self.stats.accepted, 1);
+                true
+            }
+        }
+    }
+
+    /// Appends a packet the driver answers an ingress packet with to the egress backlog,
+    /// or drops and counts it while the backlog is full, as smoltcp's replies.
+    fn push_reply(&mut self, packet: PacketBuf) {
+        if self.device.tx_full() {
+            return stats::add(&self.stats.egress_full, 1);
+        }
+        self.device.tx_queue.push_back(packet);
     }
 
     /// Applies an ICMP Fragmentation Needed or `ICMPv6` Packet Too Big to the connection
@@ -1064,9 +1139,10 @@ impl Driver {
     /// Lowers the MSS of the live connection `too_big` quotes; whether it did. smoltcp
     /// checks that the quoted sequence number lies within SND.UNA..SND.NXT and that the
     /// MSS goes down, and resends the data in flight at once in segments of the new size.
+    /// In transparent mode the quoted tuple alone finds the connection.
     fn reduce_mss(&mut self, too_big: &TooBig) -> bool {
         if too_big.mtu >= u32::from(self.settings.mtu)
-            || !self.settings.is_local(too_big.local.ip())
+            || (self.settings.transparent.is_none() && !self.settings.is_local(too_big.local.ip()))
         {
             return false;
         }
@@ -1087,7 +1163,7 @@ impl Driver {
             })
     }
 
-    /// Feeds a packet to the stack's address through the reassembler, if there is one:
+    /// Feeds a packet to an address the stack accepts through the reassembler, if there is one:
     /// the packet to route (the packet itself or a completed datagram), or `None` while
     /// its datagram is incomplete or once the fragment is dropped.
     fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
@@ -1099,7 +1175,7 @@ impl Driver {
             // `classify` counts it.
             return Some(packet);
         };
-        if !self.settings.is_local(ip.dst()) {
+        if !self.settings.accepts(ip.dst()) {
             return Some(packet);
         }
         if self.owners.is_discarded(&ip, now) {
@@ -1274,6 +1350,13 @@ impl Driver {
             },
             None => payload,
         };
+        if let Some(transparent) = &self.settings.transparent {
+            match transparent.admission {
+                Admission::Immediate | Admission::Decide { .. } => {
+                    stats::add(&self.stats.accepted, 1);
+                }
+            }
+        }
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.
         if self.flows.len() >= self.settings.max_udp_flows {
@@ -2173,6 +2256,64 @@ pub(crate) fn tcp_tuple(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
 /// later packets' egress positions and which the source discards.
 fn placeholder() -> PacketBuf {
     PacketBuf::with_capacity(0)
+}
+
+/// The RST answering the bare SYN `syn`, from its destination (RFC 9293 section 3.10.7.1:
+/// sequence number 0, acknowledging the SYN and its data).
+fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
+    const RST_ACK: u8 = 0x14;
+    const FIN: u8 = 0x01;
+    let segment = tcp_segment(syn)?;
+    let (&[src_hi, src_lo, dst_hi, dst_lo, s0, s1, s2, s3], rest) =
+        segment.split_first_chunk::<8>()?;
+    let offset = usize::from(rest.get(4)? >> 4) * 4;
+    let flags = *rest.get(5)?;
+    let data = segment.len().checked_sub(offset)?;
+    let length = u32::try_from(data).ok()? + 1 + u32::from(flags & FIN);
+    let ack = u32::from_be_bytes([s0, s1, s2, s3]).wrapping_add(length);
+    let mut reply = [0u8; 20];
+    reply[0..2].copy_from_slice(&[dst_hi, dst_lo]);
+    reply[2..4].copy_from_slice(&[src_hi, src_lo]);
+    reply[8..12].copy_from_slice(&ack.to_be_bytes());
+    reply[12] = 5 << 4;
+    reply[13] = RST_ACK;
+    let ip = IpPacket::parse(syn).ok()?;
+    let (src, dst) = (ip.dst(), ip.src());
+    let (header, total) = match src {
+        IpAddr::V4(_) => (20, 40),
+        IpAddr::V6(_) => (40, 60),
+    };
+    let mut packet = PacketBuf::with_capacity(total + TAILROOM);
+    packet.set_len(total);
+    let bytes = packet.as_packet_mut();
+    let (head, tcp) = bytes.split_at_mut(header);
+    tcp.copy_from_slice(&reply);
+    let sum = match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            head[0] = 0x45;
+            head[2..4].copy_from_slice(&40u16.to_be_bytes());
+            head[6] = 0x40;
+            head[8] = 64;
+            head[9] = protocol::TCP;
+            head[12..16].copy_from_slice(&src.octets());
+            head[16..20].copy_from_slice(&dst.octets());
+            let header_checksum = checksum::ipv4_header_checksum(head);
+            head[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+            checksum::transport_checksum_v4(src, dst, protocol::TCP, tcp)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            head[0] = 0x60;
+            head[4..6].copy_from_slice(&20u16.to_be_bytes());
+            head[6] = protocol::TCP;
+            head[7] = 64;
+            head[8..24].copy_from_slice(&src.octets());
+            head[24..40].copy_from_slice(&dst.octets());
+            checksum::transport_checksum_v6(src, dst, protocol::TCP, tcp)
+        }
+        _ => return None,
+    };
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    Some(packet)
 }
 
 fn tcp_dst_port(pkt: &[u8]) -> Option<u16> {

@@ -233,12 +233,15 @@ impl UdpFlow {
         }
     }
 
-    /// The stack's address the datagrams were sent to.
+    /// The address the datagrams were sent to; replies are sourced from it. With
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) that is the
+    /// original destination, which need not be one of the stack's addresses.
     pub const fn local_addr(&self) -> SocketAddr {
         self.reply.local
     }
 
-    /// The remote address the datagrams came from.
+    /// The remote address the datagrams came from (their source), also with
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent).
     pub const fn peer_addr(&self) -> SocketAddr {
         self.reply.peer
     }
