@@ -306,3 +306,33 @@ guide examples are updated together; there is no public API change.
 The owner explicitly approved the historical `release: 0.16.2` commit title as a
 one-time exception to the local cog type allowlist; hooks and permanent rules
 remain unchanged.
+
+## 2026-10-24 [release]
+
+Prepare 0.17.0 (tag `v0.17.0`), the seventh freeze exception (plan
+`20261024-1600-egress-0-17`, task `20261024-1500-gino-egress-requests`). Three workstreams ran
+as an auto-mode BKD campaign (`l1-7f5cstru-20261024-egress017`) and were merged by L1 after
+review and a green full gate each:
+
+- W1: transparent termination in nsplane-netstack (prefixes, immediate or decided
+  admission with a bounded pending table, RST / ICMP rejects from the dialed address,
+  connection limit, counters) and opt-in rate-limited flow decision events from the stack
+  and from `FlowGate`. Two A/B rounds found and fixed off-path regressions (FlowGate event
+  emission inlined into the hot path; LTO outlining checksum and payload helpers once the
+  transparent paths added callers). The remaining multi-threaded four-stream TCP send delta
+  (about 4.5 %, fewer instructions at equal IPC, single-CPU at par) was accepted as
+  scheduling and layout noise.
+- W2: nsplane-ether, an ethernet adapter for one guest with ARP, IPv6 ND / RA and a
+  single-lease DHCPv4 server over a length-prefixed stream or a Linux TAP device, verified
+  with a real QEMU/KVM guest.
+- W3: nsplane-dns, generic DNS serving (codec, `Resolver` trait, static records, fake-address
+  pool with reverse lookup, forwarder, UDP/TCP server on sockets or netstack flows). The codec
+  is `simple-dns` from `github.com/dotns/simple-dns`, an independent copy maintained by
+  dotns with only the protocol crate (tag `v0.12.0-nsplane.3`; ADR
+  `2026-10-24-simple-dns-fork`). This partly reverses the 2026-10-15 decision: resolution
+  policy stays with the consumer.
+
+Baseline fixes on the way: `rustls-webpki` and `tokio` updated for RUSTSEC-2026-0382 and
+RUSTSEC-2026-0386, and nsplane-tun moved to `AsyncFd::register` for tokio 1.54. R5 and R6 of
+the request are not done. Known flaky timing tests (`netstack_flow_retirement`,
+`netstack_lossy`) failed once each under host load during subtask gates and passed on re-run.

@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-24
+
+Feature release (additive API).
+
 ### Added
 - nsplane-ether, an ethernet adapter for one guest: ethernet frames to IP packets and back,
   with the IP side as a `PacketSource` / `PacketSink` pair (`spawn_port`) for a `NetStack`
@@ -44,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns `GateEvents` with a `GateEvent` per new-flow decision, `FlowGate::disable_events`
   turns them off. Drops are counted in `NetStackStats::events_dropped` and
   `GateCounters::events_dropped`, deliveries in `events_emitted`.
+
+### Changed
+- nsplane-tun registers its descriptors with `AsyncFd::register`; `AsyncFd::new` is
+  deprecated in tokio 1.54.
+- With `transparent: None` the netstack hot paths, and `FlowGate` with events off, measure
+  at par with 0.16.2, except the multi-threaded four-stream TCP send benchmark: about 4.5 %
+  slower with fewer instructions retired at equal IPC (scheduling and code layout; the
+  single-CPU variant is at par).
+
+### Security
+- `rustls-webpki` 0.103.16 and `tokio` 1.54.1 in `Cargo.lock` (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0386).
 
 ## [0.16.2] - 2026-10-20
 

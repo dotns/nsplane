@@ -1,6 +1,6 @@
 # 20261024-1500-gino-egress-requests Sandboxed agent egress requests from gino-agent
 
-- **status**: pending (owner decision 2026-10-24: R1, R3, R4 and a generic DNS crate ship in 0.17.0; R5 and R6 not done)
+- **status**: completed (R1, R3, R4 and the generic DNS crate shipped in 0.17.0; R5 and R6 not done, owner decision 2026-10-24)
 - **plan**: 20261024-1600-egress-0-17
 - **priority**: P2
 - **owner**: L1 (7f5cstru)

@@ -1,6 +1,6 @@
 # 20261024-1430-netstack-any-destination Netstack mode that accepts any destination address
 
-- **status**: pending (proposal sent to the owner, waiting for approval)
+- **status**: completed (transparent mode in 0.17.0, plan 20261024-1600-egress-0-17)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 14:30

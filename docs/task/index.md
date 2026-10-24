@@ -60,5 +60,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261020-1026-synchronize-regression-fixtures Synchronize concurrent regression fixtures**](20261020-1026-synchronize-regression-fixtures.md) `P1`
 
 - [x] [**20261020-1224-darwin-utun-name Validate Darwin utun descriptors before name queries**](20261020-1224-darwin-utun-name.md) `P1`
-- [ ] [**20261024-1430-netstack-any-destination Netstack mode that accepts any destination address**](20261024-1430-netstack-any-destination.md) `P2`
-- [ ] [**20261024-1500-gino-egress-requests Sandboxed agent egress requests from gino-agent**](20261024-1500-gino-egress-requests.md) `P2`
+- [x] [**20261024-1430-netstack-any-destination Netstack mode that accepts any destination address**](20261024-1430-netstack-any-destination.md) `P2`
+- [x] [**20261024-1500-gino-egress-requests Sandboxed agent egress requests from gino-agent**](20261024-1500-gino-egress-requests.md) `P2`

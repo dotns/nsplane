@@ -1,6 +1,6 @@
 # 20261024-1430-netstack-any-destination Netstack mode that accepts any destination address
 
-- **status**: proposed (folded into 20261024-1600-egress-0-17, workstream W1)
+- **status**: completed (folded into 20261024-1600-egress-0-17, workstream W1; released as 0.17.0)
 - **createdAt**: 2026-10-24 14:30
 - **relatedTask**: 20261024-1430-netstack-any-destination
 
