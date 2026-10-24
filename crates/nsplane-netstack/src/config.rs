@@ -140,8 +140,8 @@ pub struct NetStackConfig {
     /// Default `None`: fragments are dropped (counted as
     /// [`unsupported`](crate::NetStackStats::unsupported)) and no reassembly state exists.
     pub reassembly: Option<ReassemblyConfig>,
-    /// Transparent mode: the stack terminates TCP and UDP addressed to any destination
-    /// inside [`TransparentConfig::prefixes`], not only to its own addresses.
+    /// Transparent mode: the stack is the endpoint for TCP and UDP addressed to any
+    /// destination inside [`TransparentConfig::prefixes`], not only to its own addresses.
     ///
     /// The stack answers for every in-prefix address the engine delivers to it: a bare SYN
     /// or a UDP datagram to such an address opens a connection or flow, and replies and
@@ -173,7 +173,7 @@ pub struct NetStackConfig {
     /// assert!(config.transparent.is_some());
     /// ```
     ///
-    /// Default `None`: only the stack's own addresses are terminated, and the transparent
+    /// Default `None`: the stack is the endpoint for its own addresses only, and the transparent
     /// checks cost nothing per packet.
     pub transparent: Option<TransparentConfig>,
 }
@@ -197,7 +197,7 @@ pub struct NetStackConfig {
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransparentConfig {
-    /// Destination prefixes the stack terminates, each an address with its prefix length;
+    /// Destination prefixes the stack accepts, each an address with its prefix length;
     /// empty means every address of both families.
     ///
     /// A prefix length longer than the family allows is clamped to 32 (IPv4) or 128
@@ -426,7 +426,7 @@ impl Settings {
         self.local_for(addr) == Some(addr)
     }
 
-    /// Whether the stack terminates packets to `addr`: one of its addresses, or in
+    /// Whether the stack accepts packets to `addr`: one of its addresses, or in
     /// transparent mode an in-prefix address.
     pub(crate) fn accepts(&self, addr: IpAddr) -> bool {
         self.is_local(addr)

@@ -15,7 +15,7 @@ const ACK: u8 = 0x10;
 const LOCAL: Ipv4Addr = Ipv4Addr::new(10, 6, 0, 1);
 const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 6, 0, 2);
 
-/// A stack at [`LOCAL`] terminating `prefixes` (no transparent mode with `None`).
+/// A stack at [`LOCAL`] accepting `prefixes` (no transparent mode with `None`).
 fn transparent(prefixes: Option<Vec<(IpAddr, u8)>>) -> NetStackConfig {
     NetStackConfig {
         transparent: prefixes.map(|prefixes| TransparentConfig {
@@ -148,7 +148,7 @@ async fn owns_foreign_destinations_only_in_transparent_mode() -> TestResult {
 }
 
 #[tokio::test]
-async fn tcp_and_udp_to_foreign_destinations_are_terminated() -> TestResult {
+async fn tcp_and_udp_to_foreign_destinations_are_accepted() -> TestResult {
     let config = transparent(Some(documentation_prefixes()));
     let (handle, mut peer) = RawPeer::start(config, CLIENT, 21);
     let mut incoming_tcp = handle.incoming_tcp();
@@ -209,7 +209,7 @@ async fn tcp_and_udp_to_foreign_destinations_are_terminated() -> TestResult {
 }
 
 #[tokio::test]
-async fn ipv6_tcp_to_a_foreign_destination_is_terminated() -> TestResult {
+async fn ipv6_tcp_to_a_foreign_destination_is_accepted() -> TestResult {
     let client: IpAddr = "fd00::2".parse()?;
     let config = NetStackConfig {
         transparent: Some(TransparentConfig::default()),

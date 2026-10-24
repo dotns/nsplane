@@ -1163,7 +1163,7 @@ impl Driver {
             })
     }
 
-    /// Feeds a packet to an address the stack terminates through the reassembler, if there is one:
+    /// Feeds a packet to an address the stack accepts through the reassembler, if there is one:
     /// the packet to route (the packet itself or a completed datagram), or `None` while
     /// its datagram is incomplete or once the fragment is dropped.
     fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {

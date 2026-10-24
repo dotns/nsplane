@@ -122,7 +122,7 @@ fn now() -> Instant {
 pub(crate) struct Owners {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
-    /// The destination prefixes the stack terminates besides its addresses; only in
+    /// The destination prefixes the stack accepts besides its addresses; only in
     /// transparent mode.
     transparent: Option<Prefixes>,
     /// Only when the stack reassembles fragments, so they are its packets too.
@@ -228,7 +228,7 @@ impl Owners {
         }
     }
 
-    /// Whether the stack terminates packets to `addr`: one of its addresses, or in
+    /// Whether the stack accepts packets to `addr`: one of its addresses, or in
     /// transparent mode an in-prefix address.
     fn accepts(&self, addr: IpAddr) -> bool {
         self.local_for(addr) == Some(addr)
