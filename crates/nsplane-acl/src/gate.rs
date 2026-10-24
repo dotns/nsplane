@@ -139,6 +139,12 @@
 //! A packet never sees a policy together with the state of another policy.
 //! A holds-only change revalidates nothing.
 //!
+//! # Decision events
+//!
+//! [`FlowGate::enable_events`] opts in to a bounded, rate-limited, lossy
+//! channel of [`GateEvent`]s, one per new-flow decision (a grant or a
+//! denial). Events are off by default and cost one relaxed flag read then.
+//!
 //! The gate is inert unless constructed with a policy. Packet paths read one
 //! immutable snapshot and lock only the state shard of their peer; writers
 //! serialize on one mutex. Established flows allocate nothing.
@@ -161,6 +167,7 @@ mod clock;
 mod config;
 mod decisions;
 mod divert;
+mod events;
 mod filter;
 mod hash;
 mod migrate;
@@ -176,9 +183,11 @@ pub use config::{
     GatePolicyError, GateScope, GateTimeouts, HoldRule, ScopeId, UnboundAction, UnboundRule,
 };
 pub use divert::DivertedPacket;
+pub use events::{GateEvent, GateEvents, GateEventsConfig};
 pub use filter::{GateDivert, GateFilter, GateFilterStats};
 
 use addr::GateAddr;
+use events::{EventCounters, EventSink};
 use snapshot::Snapshot;
 use state::StateTable;
 
@@ -302,6 +311,12 @@ pub struct GateCounters {
     pub unbound_denied: u64,
     /// Enforced [`GateReason::StateCapacity`] denials.
     pub state_capacity_denied: u64,
+    /// Decision events delivered to the channel of
+    /// [`FlowGate::enable_events`].
+    pub events_emitted: u64,
+    /// Decision events dropped by the rate limit, a full channel or a gone
+    /// receiver.
+    pub events_dropped: u64,
 }
 
 /// A live flow found by [`FlowGate::find_flow`].
@@ -343,6 +358,11 @@ pub struct FlowGate {
     state: StateTable,
     counters: RuntimeCounters,
     clock: Clock,
+    /// Decision events are enabled. Read before [`events`](Self::events),
+    /// so a gate without events reads neither the sink nor the clock.
+    events_on: AtomicBool,
+    events: SnapshotCell<Option<EventSink>>,
+    event_counters: EventCounters,
 }
 
 impl fmt::Debug for FlowGate {
@@ -378,6 +398,9 @@ impl FlowGate {
             state: StateTable::new(&config),
             counters: RuntimeCounters::default(),
             clock: Box::new(clock),
+            events_on: AtomicBool::new(false),
+            events: SnapshotCell::default(),
+            event_counters: EventCounters::default(),
         })
     }
 
@@ -443,7 +466,48 @@ impl FlowGate {
     ) -> GateDecision {
         let decision = self.evaluate_with(direction, peer, packet, OnceCell::new());
         self.record_decision(&decision);
+        if self.events_on.load(Ordering::Relaxed) {
+            self.emit_event(peer, packet, &decision);
+        }
         decision
+    }
+
+    /// Enable decision events and return their receiver, replacing (and
+    /// disconnecting) the receiver of an earlier call.
+    ///
+    /// New-flow decisions emit: a [`GateReason::Granted`] allow and every
+    /// enforced or observed denial, whatever its reason. Packets of existing
+    /// flows ([`GateReason::ValidState`]) and [`GateDecision::Pass`] do not,
+    /// nor does an inert gate.
+    ///
+    /// The channel is bounded and lossy: emission is limited by a token
+    /// bucket of [`GateEventsConfig::burst`] tokens refilled at
+    /// [`GateEventsConfig::rate`] per second of the gate clock (starting
+    /// full), and an event finding [`GateEventsConfig::capacity`] events
+    /// buffered or the receiver gone is dropped. The packet path never
+    /// blocks on the channel; emitted and dropped events are counted in
+    /// [`GateCounters::events_emitted`] and [`GateCounters::events_dropped`].
+    ///
+    /// Costs: without events the packet path reads one relaxed flag. With
+    /// events, each emitting decision also reads the clock, takes a short
+    /// lock on the token bucket and reparses the packet's header for the
+    /// event.
+    pub fn enable_events(&self, config: GateEventsConfig) -> GateEvents {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let (sink, events) = EventSink::new(config, (self.clock)());
+        self.events.store(Some(sink));
+        self.events_on.store(true, Ordering::Relaxed);
+        events
+    }
+
+    /// Disable decision events: the receiver of
+    /// [`enable_events`](Self::enable_events) is disconnected after the
+    /// events already buffered, and the packet path is back to reading one
+    /// relaxed flag.
+    pub fn disable_events(&self) {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.events_on.store(false, Ordering::Relaxed);
+        self.events.store(None);
     }
 
     /// The live flow between `remote` and `local` of `protocol`, refreshed,
@@ -529,6 +593,8 @@ impl FlowGate {
             observed_denied: load(&self.counters.observed_denied),
             unbound_denied: load(&self.counters.unbound_denied),
             state_capacity_denied: load(&self.counters.state_capacity_denied),
+            events_emitted: load(&self.event_counters.emitted),
+            events_dropped: load(&self.event_counters.dropped),
         }
     }
 }
