@@ -22,7 +22,8 @@
 //!   allocated per name from configured prefixes and maps them back to names.
 //! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
 //!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
-//!   transport-neutral core.
+//!   transport-neutral core. With the `netstack` feature it also serves the UDP flows and
+//!   TCP connections of an `nsplane-netstack` user-space stack ([`netstack`]).
 //!
 //! ```
 //! use std::net::{Ipv4Addr, SocketAddr};
@@ -55,6 +56,8 @@
 pub mod fake;
 pub mod forward;
 pub mod message;
+#[cfg(feature = "netstack")]
+pub mod netstack;
 pub mod records;
 pub mod resolver;
 pub mod server;

@@ -1099,6 +1099,9 @@ name = "nsplane-dns"
 version = "0.16.2"
 dependencies = [
  "bytes",
+ "futures-core",
+ "nsplane",
+ "nsplane-netstack",
  "simple-dns",
  "thiserror",
  "tokio",
