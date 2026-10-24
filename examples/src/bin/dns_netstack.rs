@@ -19,6 +19,8 @@
 //! [`Server::serve_udp_flow`], [`Server::serve_tcp_connection`],
 //! [`StaticRecords::with_fallback`], [`FakePool::with_fallback`], [`FakePool::lookup`].
 //!
+//! [`PendingFlow`]: nsplane_netstack::PendingFlow
+//!
 //! Usage: `cargo run -p nsplane-examples --bin dns_netstack -- [--upstream <IP:PORT>]`
 
 use std::future::poll_fn;
