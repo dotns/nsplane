@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- nsplane-ether, an ethernet adapter for one guest: ethernet frames to IP packets and back,
+  with the IP side as a `PacketSource` / `PacketSink` pair (`spawn_port`) for a `NetStack`
+  or an engine.
+  - ARP replies for the gateway address, IPv6 neighbor advertisements for the gateway
+    addresses, router advertisements with MTU, prefix and RDNSS options (solicited, and
+    once when the guest MAC is first learned), and an optional single-lease `DHCPv4` server.
+  - Guest MAC learning from the source address of the guest's frames; per-reason drop
+    counters in `EtherStats`.
+  - Frame transports: a length-prefixed byte stream (4-byte big-endian length, the framing
+    of passt and QEMU's stream netdev) over any Tokio stream or a Unix socket, and a TAP
+    device on Linux.
+  - Sans-I/O protocol layer: `Frame`, `ArpPacket`, `Ndp`, `DhcpMessage` / `DhcpServer`,
+    `MacAddr`.
 - Transparent termination in nsplane-netstack: `NetStackConfig::transparent` with
   `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`) makes the stack
   the endpoint for TCP and UDP to any destination in the prefixes; accepted connections and

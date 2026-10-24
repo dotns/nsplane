@@ -1,0 +1,18 @@
+#!/bin/sh
+# udhcpc hook in the guest: applies the lease to the interface and records the address.
+# udhcpc sets interface, ip, mask, router, dns and lease in the environment.
+# shellcheck disable=SC2154
+case "$1" in
+  deconfig)
+    ip -4 addr flush dev "$interface"
+    ;;
+  bound | renew)
+    ip -4 addr flush dev "$interface"
+    ip addr add "$ip/$mask" dev "$interface"
+    if [ -n "${router:-}" ]; then
+      ip route add default via "$router" dev "$interface"
+    fi
+    echo "DHCP lease $ip/$mask router ${router:-none} dns ${dns:-none} lease ${lease:-0}s"
+    echo "$ip" >/tmp/lease
+    ;;
+esac

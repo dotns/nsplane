@@ -58,6 +58,11 @@ pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
 }
 
 /// The source, destination and payload range of an unfragmented UDP datagram.
+#[allow(
+    clippy::inline_always,
+    reason = "the ingress path keeps it inlined in `parse_udp`"
+)]
+#[inline(always)]
 fn udp_payload(packet: &PacketBuf) -> Option<(SocketAddr, SocketAddr, std::ops::Range<usize>)> {
     let bytes = packet.as_packet();
     let ip = IpPacket::parse(bytes).ok()?;

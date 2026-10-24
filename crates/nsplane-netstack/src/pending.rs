@@ -286,6 +286,23 @@ impl Pending {
     }
 }
 
+/// The checksum of `segment` over the pseudo-header of `src`, `dst` and `protocol`, as
+/// `checksum::transport_checksum_v4` and `_v6` compute it. The rejection replies use this
+/// instead, so that the UDP egress path stays their only caller and inlines them.
+pub(crate) fn pseudo_header_checksum(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    segment: &[u8],
+) -> u16 {
+    let add = |acc, addr| match addr {
+        IpAddr::V4(addr) => checksum::sum_words(acc, &addr.octets()),
+        IpAddr::V6(addr) => checksum::sum_words(acc, &addr.octets()),
+    };
+    let acc = add(add(0, src), dst) + u64::from(protocol) + segment.len() as u64;
+    !checksum::fold(checksum::sum_words(acc, segment))
+}
+
 /// The ICMP (IPv4) or `ICMPv6` (IPv6) port unreachable answering `packet`, from its
 /// destination to its source, quoting as much of it as fits in 576 (IPv4) or 1280 (IPv6)
 /// bytes and in `mtu`.
@@ -328,7 +345,7 @@ pub(crate) fn port_unreachable(packet: &[u8], mtu: u16) -> Option<PacketBuf> {
             head[7] = 64;
             head[8..24].copy_from_slice(&src.octets());
             head[24..40].copy_from_slice(&dst.octets());
-            checksum::transport_checksum_v6(src, dst, protocol::ICMPV6, message)
+            pseudo_header_checksum(src.into(), dst.into(), protocol::ICMPV6, message)
         }
         _ => return None,
     };
