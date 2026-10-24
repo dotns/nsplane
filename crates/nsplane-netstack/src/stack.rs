@@ -94,7 +94,9 @@ impl NetStack {
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
+        let pending = pending.map(Box::new);
         let (events, flow_events) = event_sink(&settings).unzip();
+        let events = events.map(Box::new);
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -978,9 +980,9 @@ struct Driver {
     barriers: Vec<Barrier>,
     /// Connections and flows held for the application's decision; only with
     /// `Admission::Decide`.
-    pending: Option<Pending>,
+    pending: Option<Box<Pending>>,
     /// Only with `TransparentConfig::events`.
-    events: Option<EventSink>,
+    events: Option<Box<EventSink>>,
     #[cfg(test)]
     turns: u64,
 }
@@ -1017,7 +1019,9 @@ impl Driver {
         self.retire_revoked();
         // 1. Take a bounded batch of ingress packets and pending requests.
         self.expire_fragments();
-        self.expire_pending();
+        if self.pending.is_some() {
+            self.expire_pending();
+        }
         let Some(demand) = self.ingest_batch() else {
             tracing::debug!(target: "netstack", "sink dropped; stopping");
             return false;
@@ -1095,7 +1099,9 @@ impl Driver {
         self.batch = batch;
         // After the batch, so that a SYN retransmitted in it is absorbed by its entry
         // rather than held anew once the entry is accepted.
-        self.take_decisions(&mut demand);
+        if self.pending.is_some() {
+            self.take_decisions(&mut demand);
+        }
         // Zero packets taken means the queue is closed and drained.
         (taken != Poll::Ready(0)).then_some(demand)
     }
@@ -1133,18 +1139,11 @@ impl Driver {
                 }
                 self.device.inject(packet);
             }
-            Ok(Class::Udp) => {
-                // The whole packet is kept only for a flow that may be held.
-                let parsed = if self.pending.is_some() {
-                    udp::parse_udp_whole(packet).map(|(datagram, whole)| (datagram, Some(whole)))
-                } else {
-                    udp::parse_udp(packet).map(|datagram| (datagram, None))
-                };
-                match parsed {
-                    Some((datagram, whole)) => self.dispatch_udp(datagram, whole),
-                    None => stats::add(&self.stats.malformed, 1),
-                }
-            }
+            Ok(Class::Udp) if self.pending.is_some() => self.ingest_held_udp(packet),
+            Ok(Class::Udp) => match udp::parse_udp(packet) {
+                Some(datagram) => self.dispatch_udp(datagram, None),
+                None => stats::add(&self.stats.malformed, 1),
+            },
             Ok(Class::Icmp) => self.icmp(packet.as_packet()),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
@@ -1155,6 +1154,24 @@ impl Driver {
             }
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Routes an ingress UDP packet with `Admission::Decide`, keeping the whole packet for
+    /// a flow that may be held.
+    #[cold]
+    #[inline(never)]
+    fn ingest_held_udp(&mut self, packet: PacketBuf) {
+        match udp::parse_udp_whole(packet) {
+            Some((datagram, whole)) => self.dispatch_held_udp(datagram, Some(whole)),
+            None => stats::add(&self.stats.malformed, 1),
+        }
+    }
+
+    /// [`dispatch_udp`](Self::dispatch_udp) out of line, for the `Admission::Decide` paths.
+    #[cold]
+    #[inline(never)]
+    fn dispatch_held_udp(&mut self, datagram: Datagram, whole: Option<Bytes>) {
+        self.dispatch_udp(datagram, whole);
     }
 
     /// Admits a bare SYN in transparent mode; the SYN if it goes on into smoltcp now. A
@@ -1251,11 +1268,13 @@ impl Driver {
 
     /// Applies the application's decisions on held connections and flows: an accepted SYN
     /// goes into smoltcp with this batch (counted in `demand`), an accepted datagram
-    /// opens its flow.
+    /// opens its flow. Only with `Admission::Decide`.
+    #[cold]
+    #[inline(never)]
     fn take_decisions(&mut self, demand: &mut HashMap<u16, usize>) {
         let mut changed = false;
         while let Some((decision, key, held)) =
-            self.pending.as_mut().and_then(Pending::next_decision)
+            self.pending.as_deref_mut().and_then(Pending::next_decision)
         {
             changed = true;
             if !decision.accept {
@@ -1279,7 +1298,7 @@ impl Driver {
                         dst: key.local,
                         payload,
                     };
-                    self.dispatch_udp(datagram, None);
+                    self.dispatch_held_udp(datagram, None);
                 }
             }
         }
@@ -1288,12 +1307,47 @@ impl Driver {
         }
     }
 
-    /// Rejects the held connections and flows past their deadline. Without
-    /// [`Admission::Decide`] it does not read the clock.
-    fn expire_pending(&mut self) {
-        if self.pending.is_none() {
+    /// Holds the new flow from `remote` to `local` with its first datagram, or drops the
+    /// datagram of a flow already held.
+    #[cold]
+    #[inline(never)]
+    fn hold_udp(&mut self, remote: SocketAddr, local: SocketAddr, payload: Bytes, packet: Bytes) {
+        let key = pending::Key {
+            protocol: PendingProtocol::Udp,
+            remote,
+            local,
+        };
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|table| table.contains(&key))
+        {
+            // A held flow queues its first datagram only.
+            stats::add(&self.stats.udp_queue_full, 1);
             return;
         }
+        self.hold(key, pending::Held::Udp { payload, packet });
+    }
+
+    /// Counts and reports the new flow from `remote` to `local` admitted in transparent
+    /// mode.
+    #[cold]
+    #[inline(never)]
+    fn admit_udp(&mut self, remote: SocketAddr, local: SocketAddr) {
+        stats::add(&self.stats.accepted, 1);
+        let key = pending::Key {
+            protocol: PendingProtocol::Udp,
+            remote,
+            local,
+        };
+        self.emit(&key, FlowEventReason::Admitted);
+    }
+
+    /// Rejects the held connections and flows past their deadline. Only with
+    /// [`Admission::Decide`], so that without it the driver does not read the clock.
+    #[cold]
+    #[inline(never)]
+    fn expire_pending(&mut self) {
         let now = Instant::now();
         let mut changed = false;
         while let Some((key, held)) = self
@@ -1526,6 +1580,11 @@ impl Driver {
     /// Delivers a datagram to its connected socket, its bound socket, or to its flow;
     /// `whole` is the packet of an ingress datagram whose new flow may be held, `None`
     /// without `Admission::Decide` or for an accepted held datagram.
+    #[allow(
+        clippy::inline_always,
+        reason = "the ingress path keeps its own copy, with `whole` a constant `None`"
+    )]
+    #[inline(always)]
     fn dispatch_udp(&mut self, datagram: Datagram, whole: Option<Bytes>) {
         let Datagram {
             src,
@@ -1599,30 +1658,10 @@ impl Driver {
             None => payload,
         };
         if let Some(packet) = whole {
-            let key = pending::Key {
-                protocol: PendingProtocol::Udp,
-                remote,
-                local,
-            };
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|table| table.contains(&key))
-            {
-                // A held flow queues its first datagram only.
-                stats::add(&self.stats.udp_queue_full, 1);
-                return;
-            }
-            return self.hold(key, pending::Held::Udp { payload, packet });
+            return self.hold_udp(remote, local, payload, packet);
         }
         if self.settings.transparent.is_some() {
-            stats::add(&self.stats.accepted, 1);
-            let key = pending::Key {
-                protocol: PendingProtocol::Udp,
-                remote,
-                local,
-            };
-            self.emit(&key, FlowEventReason::Admitted);
+            self.admit_udp(remote, local);
         }
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.
@@ -2385,7 +2424,7 @@ impl Driver {
                     Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
                 })
         };
-        if let Some(deadline) = self.pending.as_mut().and_then(Pending::next_deadline) {
+        if let Some(deadline) = self.pending.as_deref_mut().and_then(Pending::next_deadline) {
             delay = delay.min(deadline.saturating_duration_since(Instant::now()));
         }
         if delay.is_zero() {

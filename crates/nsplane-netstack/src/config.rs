@@ -331,7 +331,8 @@ pub(crate) struct Settings {
     pub(crate) max_udp_flows: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
-    pub(crate) transparent: Option<Transparent>,
+    /// Boxed, so that it does not grow the driver.
+    pub(crate) transparent: Option<Box<Transparent>>,
 }
 
 /// A [`TransparentConfig`] with its prefixes normalised.
@@ -445,21 +446,23 @@ impl Settings {
             max_udp_flows: config.max_udp_flows.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
-            transparent: config.transparent.map(|transparent| Transparent {
-                prefixes: Prefixes::new(transparent.prefixes),
-                admission: match transparent.admission {
-                    Admission::Decide {
-                        timeout,
-                        max_pending,
-                    } => Admission::Decide {
-                        timeout: timeout.min(MAX_PENDING_TIMEOUT),
-                        // Within the bound of the channel that offers the items.
-                        max_pending: max_pending.clamp(1, usize::MAX >> 3),
+            transparent: config.transparent.map(|transparent| {
+                Box::new(Transparent {
+                    prefixes: Prefixes::new(transparent.prefixes),
+                    admission: match transparent.admission {
+                        Admission::Decide {
+                            timeout,
+                            max_pending,
+                        } => Admission::Decide {
+                            timeout: timeout.min(MAX_PENDING_TIMEOUT),
+                            // Within the bound of the channel that offers the items.
+                            max_pending: max_pending.clamp(1, usize::MAX >> 3),
+                        },
+                        admission => admission,
                     },
-                    admission => admission,
-                },
-                max_connections: transparent.max_connections,
-                events: transparent.events,
+                    max_connections: transparent.max_connections,
+                    events: transparent.events,
+                })
             }),
         }
     }
