@@ -55,7 +55,7 @@ mod stats;
 mod tcp;
 mod udp;
 
-pub use config::{DEFAULT_MTU, MIN_MTU, NetStackConfig};
+pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentConfig};
 pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;

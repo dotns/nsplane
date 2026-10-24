@@ -23,6 +23,7 @@ mod ownership;
 mod pmtu;
 mod progress;
 mod reassembly;
+mod transparent;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
