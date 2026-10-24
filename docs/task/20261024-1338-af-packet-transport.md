@@ -1,6 +1,6 @@
 # 20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface
 
-- **status**: proposed (owner chose this option 2026-10-24: "用C方式最合理、不引入额外管理")
+- **status**: in progress (owner approved 2026-10-24: "用C方式最合理、不引入额外管理"; "可以")
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:38

@@ -61,4 +61,6 @@ slot A/B when it touches the data path.
   (owner: "可以，cname也可以一起放进去") by DNS policy routing with CNAME rewriting (plan
   `20261024-1313-dns-policy`), and an example of a virtual machine reaching a remote
   WireGuard peer (owner: "可以把vm路径的examples也放进0.18"; plan
-  `20261024-1329-vm-wireguard-example`). All ship as 0.18.0.
+  `20261024-1329-vm-wireguard-example`), and an `AF_PACKET` frame transport for guests whose
+  TAP another process holds, such as Firecracker (owner: "用C方式最合理、不引入额外管理"; plan
+  `20261024-1338-af-packet-transport`). All ship as 0.18.0.
