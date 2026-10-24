@@ -18,7 +18,6 @@ members = [
     "examples",
     "third_party/simple-dns",
 ]
-exclude = [".tmp/smoltcp"]
 
 [workspace.package]
 version = "0.18.0"
@@ -78,6 +77,3 @@ codegen-units = 1 # Use only 1 codegen-unit to enable full optimizations.
 [profile.bench]
 lto = true        # Enable full link-time optimization.
 codegen-units = 1 # Use only 1 codegen-unit to enable full optimizations.
-
-[patch."https://github.com/dotns/smoltcp"]
-smoltcp = { path = ".tmp/smoltcp" }
