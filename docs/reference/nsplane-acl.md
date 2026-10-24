@@ -9,7 +9,7 @@ a stateful flow gate for bound peers (`gate::FlowGate`, `GateFilter`). Builds on
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow` (either family), `counters`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters`, `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`) |
+| main | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow` (either family), `counters`, `enable_events` / `disable_events`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters` (`events_emitted`, `events_dropped`), decision events `GateEventsConfig` (`capacity`, `rate`, `burst`), `GateEvent` (`at`, `peer`, `protocol`, `src`, `dst`, `allow`, `enforced`, `reason`, `rule`), `GateEvents` (`try_recv`, `recv`, `recv_timeout`, `drain`), `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`) |
 
 ## Behavior
 
@@ -314,6 +314,37 @@ and IPv6 packets.
   either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
   mixed-family pair.
 
+#### Decision events
+
+`FlowGate::enable_events(GateEventsConfig)` opts in to a channel of `GateEvent`s and returns
+its receiver, `GateEvents`; a second call replaces (and disconnects) the earlier receiver,
+and `disable_events` turns them off again.
+
+- **What emits.** New-flow decisions: a `GateReason::Granted` allow and every denial,
+  enforced or observed, whatever its reason. Packets of existing flows
+  (`GateReason::ValidState`), `GateDecision::Pass` and an inert gate emit nothing. An event
+  carries `at` (the gate clock), the `peer`, the IP `protocol` (for IPv6 behind the
+  extension headers), `src` and `dst` with ports (0 when the packet has none or they cannot
+  be parsed), `allow`, `enforced` (`Enforce` rather than `Observe`), the `reason` and the
+  `rule`: the admitting grant, or the first matching suspended grant for `Suspended`.
+- **Bounded.** `capacity` events are buffered (default 1024). With 0 an event is delivered
+  only to a receiver blocked in `recv` or `recv_timeout` at that moment.
+- **Rate limited.** A token bucket of `burst` tokens (default 1000) refilled at `rate` per
+  second of the gate clock (default 1000) limits emission; the bucket starts full, `rate` 0
+  never refills it and `burst` 0 emits nothing.
+- **Lossy.** The packet path never blocks on the channel: an event beyond the bucket,
+  finding the buffer full or the receiver gone is dropped and counted in
+  `GateCounters::events_dropped`; delivered events are counted in `events_emitted`. Dropping
+  the `GateEvents` does not stop emission: events are counted as dropped until
+  `disable_events`.
+- **Receiver.** `try_recv` and `drain` never wait, `recv` and `recv_timeout` block the
+  calling thread (use them off the async runtime). The receiver is disconnected once the
+  gate is dropped or its events are disabled or replaced; buffered events are still
+  received.
+- **Cost.** Without events the packet path reads one relaxed flag. With events, each
+  emitting decision also reads the clock, takes a short lock on the token bucket and
+  reparses the packet's header for the event; established flows pay nothing more.
+
 #### Migration and locking
 
 Packet paths take one read of an immutable snapshot
@@ -360,7 +391,7 @@ ICMP and outbound grants (`grant_kinds`), ICMP errors, fragments and malformed p
 `ipv6_flows`), peer-keyed bindings (`peer_keyed`), holds and unbound rules
 (`holds_and_unbound`), the state limits,
 validation and the epoch retry (`state_table`), a writer racing packet threads
-(`concurrency`), the filter (`filter`), and `model`, which compares the gate on seeded
+(`concurrency`), the filter (`filter`), decision events (`events`), and `model`, which compares the gate on seeded
 random sequences of packets, `replace` calls and clock steps against a reference model of
 the gate (one map, no shards, no lazy expiry) for equal decisions and counters.
 `nsplane-e2e` `flow_gate` runs the filter on one of two engines: grants, suspension,
@@ -381,6 +412,7 @@ peer denied while its inbound flows arrive, and one binding governing both famil
 | ACL IPv6 mode | `AclFilterConfig::ipv6 = Ipv6Mode::Accept` | `Ipv6Mode::Evaluate` | one branch per packet |
 | Flow accounting | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | not installed | none |
 | Flow gate | `EngineBuilder::filter(Box::new(GateFilter::new(gate).with_acl(acl)))` with `FlowGate::new(GateConfig::default())` and `FlowGate::replace(policy)` | not installed; constructed without a policy, inert | none; an inert gate passes every packet after one flag load |
+| Flow gate decision events | `FlowGate::enable_events(GateEventsConfig::default())` (1024 buffered, 1000/s, burst 1000); `disable_events` | off | one relaxed flag read per decision |
 
 ## Errors and drop reasons
 
@@ -403,6 +435,9 @@ reject invalid input and leave the previous state in effect; `open_pinhole` retu
 - Flow gate: `GateLimits` (defaults 16,384 flows, 2,048 per peer, 4,096 fragments); a full
   table fails closed with `GateReason::StateCapacity` and never evicts a live entry.
 - IPv6 header walk in the gate: at most 8 extension headers.
+- Gate decision events: `GateEventsConfig::capacity` buffered events and a token bucket of
+  `burst` tokens refilled at `rate` per second; events beyond them are dropped and counted
+  in `GateCounters::events_dropped`.
 
 ## See also
 
