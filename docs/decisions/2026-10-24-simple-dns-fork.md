@@ -17,7 +17,9 @@ not wait for upstream releases, the same situation as smoltcp.
 `nsplane-dns` depends on `github.com/dotns/simple-dns`, pinned to a tag. `deny.toml` allows
 that git source; `unknown-git` stays `deny`.
 
-The fork is branch `nsplane/v0.12`, cut from upstream tag `simple-dns/0.12.0` (`5c7ec98`).
+`github.com/dotns/simple-dns` is an independent repository, not a GitHub fork: dotns
+maintains it, upstream changes are applied by hand after review, and only the DNS protocol
+crate is kept. Its branch `main` starts at upstream tag `simple-dns/0.12.0` (`5c7ec98`).
 Tag `v0.12.0-nsplane.1` (`f92badd1a2472bb50348f46f0923ca7a37c9adae`) carries one commit on
 top of it: the `bind9` submodule and the `bind9-tests` crate are removed, because Cargo
 clones the submodules of a git dependency.
@@ -27,15 +29,20 @@ question whose QTYPE has no RDATA support (TLSA, SSHFP, URI and other codes) par
 `QTYPE::TYPE(TYPE::Unknown(n))` instead of failing (RFC 3597), so such queries get an answer
 instead of FORMERR.
 
-Fork changes are made on the fork branch, tagged `v0.12.0-nsplane.N` and recorded here.
+Tag `v0.12.0-nsplane.3` (`e17b0c7bfec7e6378bcaefda7ee782bdd1117993`) removes everything
+outside the protocol crate: the mDNS crate, the benchmarks, the Docker files and the upstream
+CI and release tooling. The crate and its fuzz targets remain.
+
+Changes are made on `main`, tagged `v<upstream version>-nsplane.N` and recorded here.
 
 ## Consequences
 
-- The fork is rebased onto a new upstream release when one is needed; the commits above are
-  re-applied and a new tag is cut.
+- Upstream fixes are ported by hand when they touch the protocol crate; there is no
+  automatic sync, and upstream releases are not followed by default.
 - A crates.io release of `nsplane-dns` would need the fork published or its changes
   upstreamed.
 
 ## Status history
 
-- 2026-10-24: Accepted.
+- 2026-10-24: Accepted as a GitHub fork; the same day the owner made it an independent
+  repository maintained by dotns, without the parts outside the protocol.
