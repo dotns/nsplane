@@ -24,7 +24,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, watch};
 
-use crate::unix::set_nonblocking;
+use crate::unix::{register, set_nonblocking};
 
 /// Idle buffers kept by a [`SlotSource`]'s pool.
 const POOL_FREE: usize = 64;
@@ -179,7 +179,7 @@ impl TunSlot {
             return Err(io::Error::other("TunSlot::replace needs a tokio runtime"));
         }
         set_nonblocking(&fd)?;
-        let fd = Arc::new(AsyncFd::new(File::from(fd))?);
+        let fd = Arc::new(register::<File>(fd)?);
         let shared = self.shared();
         let previous = {
             let mut state = shared.write();
