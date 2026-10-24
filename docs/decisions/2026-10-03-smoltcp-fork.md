@@ -103,12 +103,12 @@ probe timer), the per-socket RTO bounds (`c7595c5`, `7d961a1`, `51c662c`:
 `no_std` fix `5fe57a1` and the MLD gating `f878f18`. The crate version stays `0.14.0`. The
 patches of `.1` to `.6`, reapplied in order:
 
-- Kept: `35ec5eb` (as `f62700c`), `045279d` (`90a7487`), `4566ba6` (`1f9054b`, upstream lacks
-  it), `5d87540` (`3e051ed`), `a56c712` (`419f085`; independent of `336a1dd`, which only
+- Kept: `35ec5eb` (as `f62700c`), `045279d` (`90a7487`), the FIN fix tagged as `.3`
+  (`1f9054b`, upstream lacks it), `5d87540` (`3e051ed`), `a56c712` (`419f085`; independent of `336a1dd`, which only
   saturates one computation, while `a56c712` keeps the advertised edge and clamps the
   accepted data), `2e165a7` (`0b35d84`), `01267ee` (`4d2a376`), `b4a44da` (`762a065`),
   `cf04a5b` (`95ceea4`). Each keeps its regression test; those of `35ec5eb`, `045279d` and
-  `4566ba6` were checked to fail without the fix on the new base.
+  the FIN fix were checked to fail without the fix on the new base.
 - Dropped `998d9f9`: `bfe5f95` fixes both of its defects and its tests cover them. Upstream
   probes one backed-off RTO after a timeout on a closed window where `998d9f9` probed at
   once; that is the only difference, and the old test fails only on that timing.
