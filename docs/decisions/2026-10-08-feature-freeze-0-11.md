@@ -56,3 +56,5 @@ slot A/B when it touches the data path.
   `20261024-1500-gino-egress-requests`). The DNS crate carries protocol, serving and a
   fake-address pool only; resolution policy stays with the consumer. R5 and R6 are not done.
   It ships as 0.17.0.
+- 2026-10-24: eighth exception (owner: "可以 开始处理"): transparent forwarding in nsplane-dns for
+  messages it does not handle (plan `20261024-1304-dns-passthrough`). It ships as 0.18.0.
