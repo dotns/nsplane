@@ -8,7 +8,7 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
 
 ## Behavior
 
@@ -60,6 +60,14 @@ Hooks for a caller-driven path ladder, each unused by default:
   of the call. `Event::Authenticated` stays limited to off-path sources, once per change of
   source: a peer kept on its path by the policy reports a source again only after its path is
   set (configuration, `force_handshake`, adoption) or a handshake completes.
+
+### Current sending session
+
+`Core::peer_has_session(peer)` returns the actual current sending-session state
+(`None` for an unknown peer). It handles both tunnel storage modes and returns
+false after local private-key replacement or timer-driven session expiry. It does
+not infer a session from historical handshake counters, initiate a handshake, or
+establish path reachability.
 
 ### Unanswered handshakes
 
@@ -258,4 +266,3 @@ The engine reports the counts with `EngineHandle::drop_counters`.
 
 - [nsplane](nsplane.md): the tokio driver around `Core`.
 - [Performance](../performance.md): `data_path`, handshake dispatch and allowed-IP writes.
-

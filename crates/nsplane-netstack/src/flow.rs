@@ -414,6 +414,25 @@ impl FlowControl {
         Self { state }
     }
 
+    pub(crate) fn tcp_egress_end(&self, owner: &Arc<Revocations>) -> io::Result<Option<u64>> {
+        if !Arc::ptr_eq(owner, &self.state.revocations)
+            || !matches!(self.state.target, Target::Tcp { .. })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flow is not a TCP connection of this stack",
+            ));
+        }
+        if self.is_revoked() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "flow revoked",
+            ));
+        }
+        let end = self.state.end();
+        Ok((end != u64::MAX).then_some(end))
+    }
+
     /// Revokes the flow and returns the receipt of its retirement.
     ///
     /// Idempotent and irreversible: later calls return a receipt of the same outcome. The

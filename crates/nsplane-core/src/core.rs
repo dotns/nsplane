@@ -630,6 +630,15 @@ impl Core {
         self.peers.iter().map(|(id, _)| id)
     }
 
+    /// Whether `peer` currently has a sending session with an unexhausted key.
+    /// Returns `None` for an unknown peer. This reads the actual tunnel state,
+    /// not the age of its last handshake, and does not start a handshake.
+    /// Session expiry follows the core's normal timer processing.
+    /// A session alone does not prove that a transport path is reachable.
+    pub fn peer_has_session(&self, peer: PeerId) -> Option<bool> {
+        self.peers.peer(peer).map(Peer::has_session)
+    }
+
     /// Configuration and counters of `peer`; the time since its last handshake is measured
     /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {

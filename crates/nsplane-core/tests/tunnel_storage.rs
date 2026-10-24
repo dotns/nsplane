@@ -99,3 +99,30 @@ fn owned_and_shared_tunnels_behave_the_same() {
     assert!(owned.stats.iter().all(|s| s.data_rx > 0 && s.data_tx > 0));
     assert_eq!(owned, scenario(true));
 }
+
+#[test]
+fn current_session_query_tracks_reset_expiry_and_removal_in_both_storages() {
+    for crypto_jobs in [false, true] {
+        let mut net = Net::with_configs(2, |_| CoreConfig {
+            crypto_jobs,
+            ..CoreConfig::default()
+        });
+        let peer = net.peer_id(0, 1);
+        assert_eq!(net.cores[0].peer_has_session(peer), Some(false));
+        assert_eq!(net.cores[0].peer_has_session(PeerId::new(999)), None);
+        net.ping4(0, 1, b"establish");
+        assert_eq!(net.cores[0].peer_has_session(peer), Some(true));
+        net.run_for(Duration::from_secs(600));
+        assert_eq!(net.cores[0].peer_has_session(peer), Some(false));
+        net.ping4(0, 1, b"fresh session");
+        assert_eq!(net.cores[0].peer_has_session(peer), Some(true));
+        net.configure(
+            0,
+            ConfigChange::SetPrivateKey(nsplane_core::x25519::StaticSecret::from([77; 32])),
+        );
+        assert_eq!(net.cores[0].peer_has_session(peer), Some(false));
+        // A retained handshake observation does not imply a current session.
+        net.configure(0, ConfigChange::RemovePeer(net.public_key(1)));
+        assert_eq!(net.cores[0].peer_has_session(peer), None);
+    }
+}

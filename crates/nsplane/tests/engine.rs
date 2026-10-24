@@ -393,11 +393,17 @@ async fn keepalives_are_sent() {
 async fn peer_stats_count_traffic() {
     let (mut a, mut b) = peered().await;
     let to_b = a.peer_of(&b).await;
+    assert_eq!(a.handle.peer_has_session(to_b).await.unwrap(), Some(false));
+    assert_eq!(
+        a.handle.peer_has_session(PeerId::new(999)).await.unwrap(),
+        None
+    );
     let before = a.handle.peer_stats(to_b).await.unwrap().unwrap();
     assert_eq!((before.rx, before.tx, before.data_rx), (0, 0, 0));
     assert_eq!(before.last_handshake, None);
 
     exchange(&mut a, &mut b).await;
+    assert_eq!(a.handle.peer_has_session(to_b).await.unwrap(), Some(true));
     let after = a.handle.peer_stats(to_b).await.unwrap().unwrap();
     assert!(after.rx > 0 && after.tx > 0);
     assert_eq!(

@@ -1758,6 +1758,9 @@ impl Owner {
             Command::PeerId(key, reply) => {
                 let _ = reply.send(self.core.peer_id(&key));
             }
+            Command::PeerHasSession(peer, reply) => {
+                let _ = reply.send(self.core.peer_has_session(peer));
+            }
             Command::PeerStats(peer, reply) => {
                 let _ = reply.send(self.core.peer_stats(peer));
             }
@@ -2501,6 +2504,7 @@ const fn settles(command: &Command) -> bool {
         command,
         Command::Config(..)
             | Command::PeerStats(..)
+            | Command::PeerHasSession(..)
             | Command::Peers(..)
             | Command::Inject(..)
             | Command::DropCounters(..)
