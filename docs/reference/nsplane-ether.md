@@ -185,6 +185,16 @@ two `NetStack`s through the adapter, and the shutdown of both sides when the tra
 closes. The TAP unit tests run the transport over a datagram socket pair; opening a real
 TAP device needs `CAP_NET_ADMIN`, so that test is ignored by default.
 
+[`scripts/vm-guest.sh`](../../crates/nsplane-ether/scripts/vm-guest.sh) checks the adapter
+against a real Linux guest. It builds the
+[`unix_gateway`](../../crates/nsplane-ether/examples/unix_gateway.rs) example (the adapter
+on a Unix socket, its IP side on a `NetStack` that answers TCP with one echoed line) and a
+labelled runner image with QEMU and a Debian kernel, then boots a minimal busybox guest
+with `-enable-kvm` and `-netdev stream` on that socket. The guest takes a DHCP lease and
+an IPv6 address from the router advertisement and exchanges TCP over IPv4 and IPv6; the
+script exits 0 only when the guest prints its success marker. It needs docker and
+`/dev/kvm`; the normal test run needs neither.
+
 ## Configuration and defaults
 
 | Setting | Field | Default |
