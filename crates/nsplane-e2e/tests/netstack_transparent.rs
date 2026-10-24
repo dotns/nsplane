@@ -59,7 +59,10 @@ fn prefixes() -> Vec<(IpAddr, u8)> {
     vec![
         (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24),
         (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24),
-        (IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)), 32),
+        (
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+            32,
+        ),
     ]
 }
 
