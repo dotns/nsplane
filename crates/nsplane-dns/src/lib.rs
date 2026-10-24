@@ -23,7 +23,7 @@
 //! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
 //!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
 //!   transport-neutral core. With the `netstack` feature it also serves the UDP flows and
-//!   TCP connections of an `nsplane-netstack` user-space stack ([`netstack`]).
+//!   TCP connections of an `nsplane-netstack` user-space stack (module `netstack`).
 //!
 //! ```
 //! use std::net::{Ipv4Addr, SocketAddr};
