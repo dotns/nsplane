@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use nsplane_packet::reassembly::ReassemblyConfig;
 
+use crate::events::FlowEventsConfig;
+
 /// Default MTU: the WireGuard default for an IPv4 or IPv6 outer path.
 pub const DEFAULT_MTU: u16 = 1420;
 
@@ -219,6 +221,17 @@ pub struct TransparentConfig {
     /// `None`: no limit beyond the [`listener_pool`](NetStackConfig::listener_pool) and
     /// the accept queue.
     pub max_connections: Option<usize>,
+    /// Admission events: a [`FlowEvent`](crate::FlowEvent) for each connection or flow
+    /// admitted or rejected and each packet rejected for its prefix, on
+    /// [`flow_events`](crate::NetStackHandle::flow_events), within the bounds of the
+    /// [`FlowEventsConfig`].
+    ///
+    /// Events beyond the token bucket, or finding the channel full or its receiver gone,
+    /// are dropped and counted in
+    /// [`events_dropped`](crate::NetStackStats::events_dropped); delivered ones in
+    /// [`events_emitted`](crate::NetStackStats::events_emitted). Default `None`: no
+    /// events and no channel.
+    pub events: Option<FlowEventsConfig>,
 }
 
 /// How a transparent stack admits a new TCP connection or UDP flow, see
@@ -327,6 +340,7 @@ pub(crate) struct Transparent {
     pub(crate) prefixes: Prefixes,
     pub(crate) admission: Admission,
     pub(crate) max_connections: Option<usize>,
+    pub(crate) events: Option<FlowEventsConfig>,
 }
 
 /// One destination prefix: the network and its mask.
@@ -445,6 +459,7 @@ impl Settings {
                     admission => admission,
                 },
                 max_connections: transparent.max_connections,
+                events: transparent.events,
             }),
         }
     }

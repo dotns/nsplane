@@ -6,7 +6,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -26,6 +26,7 @@ use tokio::time::Instant;
 
 use crate::config::{Admission, NetStackConfig, Settings};
 use crate::device::{TAILROOM, VirtualDevice};
+use crate::events::{EventSink, FlowEvent, FlowEventReason};
 use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
 use crate::ownership::{Owners, Ownership, Registration};
 use crate::pending::{self, Hold, Pending, PendingFlow, PendingProtocol};
@@ -93,6 +94,7 @@ impl NetStack {
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
+        let (events, flow_events) = event_sink(&settings).unzip();
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -154,6 +156,7 @@ impl NetStack {
             fences: Arc::clone(&fences),
             barriers: Vec::new(),
             pending,
+            events,
             #[cfg(test)]
             turns: 0,
         };
@@ -174,6 +177,7 @@ impl NetStack {
             incoming_tcp: Arc::new(Mutex::new(Some(incoming_tcp))),
             incoming_udp: Arc::new(Mutex::new(Some(incoming_udp))),
             incoming_pending: Arc::new(Mutex::new(incoming_pending)),
+            flow_events: Arc::new(Mutex::new(flow_events)),
             stats,
             owners,
         };
@@ -299,6 +303,7 @@ pub struct NetStackHandle {
     incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
     incoming_pending: Arc<Mutex<Option<mpsc::Receiver<PendingFlow>>>>,
+    flow_events: Arc<Mutex<Option<mpsc::Receiver<FlowEvent>>>>,
     stats: Arc<Counters>,
     owners: Arc<Owners>,
 }
@@ -342,6 +347,19 @@ impl NetStackHandle {
     /// that ends immediately. The stream ends when the stack stops.
     pub fn incoming_pending(&self) -> impl Stream<Item = PendingFlow> + Send + Unpin + use<> {
         Incoming(take(&self.incoming_pending))
+    }
+
+    /// Admission events of a transparent stack, with
+    /// [`TransparentConfig::events`](crate::TransparentConfig::events) configured.
+    ///
+    /// Only the first call (on any clone of the handle) gets the events; every later
+    /// call, and every call without events configured, returns a stream that ends
+    /// immediately. The stream ends when the stack stops. Events not taken are buffered up
+    /// to the configured capacity, then dropped and counted in
+    /// [`events_dropped`](NetStackStats::events_dropped), as are all events once the
+    /// stream is dropped.
+    pub fn flow_events(&self) -> impl Stream<Item = FlowEvent> + Send + Unpin + use<> {
+        Incoming(take(&self.flow_events))
     }
 
     /// Opens a TCP connection from the stack to `remote`.
@@ -573,6 +591,13 @@ fn pending_table(
         }
         Admission::Immediate => None,
     }
+}
+
+/// The admission event sink and the receiving end of its events, with
+/// `TransparentConfig::events` only.
+fn event_sink(settings: &Settings) -> Option<(EventSink, mpsc::Receiver<FlowEvent>)> {
+    let config = settings.transparent.as_ref()?.events?;
+    Some(EventSink::new(config, Instant::now()))
 }
 
 /// Creates the smoltcp interface with the stack's addresses; in transparent mode it takes
@@ -954,6 +979,8 @@ struct Driver {
     /// Connections and flows held for the application's decision; only with
     /// `Admission::Decide`.
     pending: Option<Pending>,
+    /// Only with `TransparentConfig::events`.
+    events: Option<EventSink>,
     #[cfg(test)]
     turns: u64,
 }
@@ -1124,6 +1151,7 @@ impl Driver {
             Err(Reject::Prefix) => {
                 stats::add(&self.stats.no_address, 1);
                 stats::add(&self.stats.rejected_prefix, 1);
+                self.emit_prefix(packet.as_packet());
             }
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
@@ -1154,7 +1182,7 @@ impl Driver {
             return None;
         }
         if self.at_connection_limit(demand) {
-            self.reject_connection_limit(packet.as_packet());
+            self.reject_connection_limit(&key, packet.as_packet());
             return None;
         }
         if self.pending.is_some() {
@@ -1162,6 +1190,7 @@ impl Driver {
             return None;
         }
         stats::add(&self.stats.accepted, 1);
+        self.emit(&key, FlowEventReason::Admitted);
         Some(packet)
     }
 
@@ -1183,9 +1212,10 @@ impl Driver {
         held >= limit
     }
 
-    /// Answers the bare SYN `packet` with RST for `max_connections`.
-    fn reject_connection_limit(&mut self, packet: &[u8]) {
+    /// Answers the bare SYN `packet` of `key` with RST for `max_connections`.
+    fn reject_connection_limit(&mut self, key: &pending::Key, packet: &[u8]) {
         stats::add(&self.stats.rejected_connection_limit, 1);
+        self.emit(key, FlowEventReason::ConnectionLimit);
         if let Some(reset) = tcp_reset(packet) {
             self.push_reply(reset);
         }
@@ -1199,15 +1229,21 @@ impl Driver {
         };
         match table.hold(key, held, Instant::now()) {
             Hold::Held => self.count_pending(),
-            Hold::Full(held) => self.reject(&held, |stats| &stats.rejected_table_full),
-            Hold::Gone(held) => self.reject(&held, |stats| &stats.rejected_hook),
+            Hold::Full(held) => self.reject(&key, &held, FlowEventReason::TableFull),
+            Hold::Gone(held) => self.reject(&key, &held, FlowEventReason::Hook),
         }
     }
 
-    /// Answers a held SYN with RST or a held datagram with port unreachable, counting it
-    /// in `counter`.
-    fn reject(&mut self, held: &pending::Held, counter: fn(&Counters) -> &AtomicU64) {
-        stats::add(counter(&self.stats), 1);
+    /// Answers a held SYN or datagram of `key` with RST or port unreachable, counting it
+    /// in the `rejected_` counter of `reason` (`Hook`, `Timeout` or `TableFull`).
+    fn reject(&mut self, key: &pending::Key, held: &pending::Held, reason: FlowEventReason) {
+        let counter = match reason {
+            FlowEventReason::Timeout => &self.stats.rejected_timeout,
+            FlowEventReason::TableFull => &self.stats.rejected_table_full,
+            _ => &self.stats.rejected_hook,
+        };
+        stats::add(counter, 1);
+        self.emit(key, reason);
         if let Some(reply) = held.rejection(self.settings.mtu) {
             self.push_reply(reply);
         }
@@ -1223,16 +1259,17 @@ impl Driver {
         {
             changed = true;
             if !decision.accept {
-                self.reject(&held, |stats| &stats.rejected_hook);
+                self.reject(&key, &held, FlowEventReason::Hook);
                 continue;
             }
             match held {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
-                        self.reject_connection_limit(syn.as_packet());
+                        self.reject_connection_limit(&key, syn.as_packet());
                         continue;
                     }
                     stats::add(&self.stats.accepted, 1);
+                    self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
                     self.device.inject(syn);
                 }
@@ -1255,17 +1292,50 @@ impl Driver {
     fn expire_pending(&mut self) {
         let now = Instant::now();
         let mut changed = false;
-        while let Some((_, held)) = self
+        while let Some((key, held)) = self
             .pending
             .as_mut()
             .and_then(|table| table.next_expired(now))
         {
             changed = true;
-            self.reject(&held, |stats| &stats.rejected_timeout);
+            self.reject(&key, &held, FlowEventReason::Timeout);
         }
         if changed {
             self.count_pending();
         }
+    }
+
+    /// Emits the admission event of `key` for `reason`, with `TransparentConfig::events`.
+    fn emit(&mut self, key: &pending::Key, reason: FlowEventReason) {
+        let Some(events) = self.events.as_mut() else {
+            return;
+        };
+        let protocol = match key.protocol {
+            PendingProtocol::Tcp => protocol::TCP,
+            PendingProtocol::Udp => protocol::UDP,
+        };
+        events.emit(&self.stats, protocol, key.remote, key.local, reason);
+    }
+
+    /// Emits the admission event of `packet`, rejected for its destination prefix.
+    fn emit_prefix(&mut self, packet: &[u8]) {
+        let Some(events) = self.events.as_mut() else {
+            return;
+        };
+        // `classify` parsed the packet before rejecting it.
+        let Ok(ip) = IpPacket::parse(packet) else {
+            return;
+        };
+        let (src_port, dst_port) = ip
+            .five_tuple()
+            .map_or((0, 0), |tuple| (tuple.src_port, tuple.dst_port));
+        events.emit(
+            &self.stats,
+            ip.protocol(),
+            SocketAddr::new(ip.src(), src_port),
+            SocketAddr::new(ip.dst(), dst_port),
+            FlowEventReason::Prefix,
+        );
     }
 
     /// Publishes the number of held connections and flows.
@@ -1543,6 +1613,12 @@ impl Driver {
         }
         if self.settings.transparent.is_some() {
             stats::add(&self.stats.accepted, 1);
+            let key = pending::Key {
+                protocol: PendingProtocol::Udp,
+                remote,
+                local,
+            };
+            self.emit(&key, FlowEventReason::Admitted);
         }
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.

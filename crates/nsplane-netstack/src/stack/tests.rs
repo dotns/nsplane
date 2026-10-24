@@ -13,6 +13,7 @@ mod abort;
 mod basic_udp;
 mod buffers;
 mod connected_udp;
+mod events;
 mod flow_bounds;
 mod flow_context;
 mod flow_control;
