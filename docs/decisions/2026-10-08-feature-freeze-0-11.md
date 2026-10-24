@@ -50,3 +50,9 @@ slot A/B when it touches the data path.
   retirement receipts and a flow context inside `nsplane-netstack` (plan
   `20261017-1800-flow-retirement`, task `20261017-1700-flow-lifecycle-request` R1 and R2). R3,
   delivery gates in the engine and transports, stays deferred. It ships as 0.16.0.
+- 2026-10-24: seventh exception (owner: "1，发0.17 2，合并到一起0.17 ... 4，做"; "可以做dns，同步放在0.17"):
+  the gino-agent egress requests R1 (transparent netstack), R3 (ethernet adapter) and R4 (flow
+  decision events), plus a generic DNS crate (plan `20261024-1600-egress-0-17`, task
+  `20261024-1500-gino-egress-requests`). The DNS crate carries protocol, serving and a
+  fake-address pool only; resolution policy stays with the consumer. R5 and R6 are not done.
+  It ships as 0.17.0.
