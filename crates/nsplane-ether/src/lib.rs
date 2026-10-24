@@ -2,9 +2,20 @@
 //! discovery and router advertisements, and a single-lease `DHCPv4` server.
 //!
 //! The adapter stands in for the gateway on a point-to-point link to one guest (a virtual
-//! machine or container speaking ethernet). This crate holds its protocol layer, which is
-//! sans-I/O: pure parsers, frame builders and small state machines that take and return
-//! bytes, with no sockets and no tasks.
+//! machine or container speaking ethernet). [`spawn_port`] runs it over a frame transport
+//! and exposes the IP side as an [`nsplane::PacketSource`] and [`nsplane::PacketSink`], so a
+//! user-space stack or an engine plugs in unchanged:
+//!
+//! - [`adapter`]: the sans-I/O core ([`EtherAdapter`], [`EtherConfig`], [`EtherStats`]):
+//!   learns the guest MAC, answers ARP, neighbor discovery and DHCP, and converts between
+//!   frames and IP packets.
+//! - [`port`]: the async ports ([`EtherSource`], [`EtherSink`], [`EtherHandle`]).
+//! - [`transport`]: the frame transport traits ([`FrameRead`], [`FrameWrite`]);
+//!   [`stream`] implements them over a length-prefixed byte stream (a Unix socket to passt,
+//!   QEMU or libkrun) and `tap` over a Linux TAP device.
+//!
+//! The protocol layer below the adapter is sans-I/O too: pure parsers, frame builders and
+//! small state machines that take and return bytes.
 //!
 //! - [`frame`]: Ethernet II headers ([`Frame`], [`EtherType`]); 802.1Q tagged frames are
 //!   reported as unsupported.
@@ -19,15 +30,27 @@
 //! Every parser is bounds-checked and returns an error on truncated or malformed input;
 //! none panics.
 
+pub mod adapter;
 pub mod arp;
 pub mod dhcp;
 pub mod frame;
 pub mod mac;
 pub mod ndp;
+pub mod port;
 mod read;
+pub mod stream;
+#[cfg(target_os = "linux")]
+pub mod tap;
+pub mod transport;
+
+pub use adapter::{DEFAULT_MTU, EtherAdapter, EtherConfig, EtherStats};
 
 pub use arp::{ArpError, ArpOp, ArpPacket};
 pub use dhcp::{DhcpConfig, DhcpError, DhcpMessage, DhcpServer, MessageType};
 pub use frame::{EtherType, Frame, FrameError};
 pub use mac::MacAddr;
 pub use ndp::{Ndp, NdpError, NdpMessage, RaConfig};
+pub use port::{EtherHandle, EtherSink, EtherSource, spawn_port};
+#[cfg(target_os = "linux")]
+pub use tap::{TapDevice, TapReader, TapWriter};
+pub use transport::{FrameRead, FrameWrite, MAX_FRAME_LEN};
