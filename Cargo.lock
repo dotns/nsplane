@@ -1787,7 +1787,7 @@ dependencies = [
 [[package]]
 name = "simple-dns"
 version = "0.12.0"
-source = "git+https://github.com/dotns/simple-dns?tag=v0.12.0-nsplane.2#58b0bd8a11b861c1ffb86d9594f3676b473d7ae4"
+source = "git+https://github.com/dotns/simple-dns?tag=v0.12.0-nsplane.3#e17b0c7bfec7e6378bcaefda7ee782bdd1117993"
 dependencies = [
  "bitflags 2.11.1",
 ]
