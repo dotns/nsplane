@@ -18,6 +18,7 @@ workspace = true
 bytes = { workspace = true }
 simple-dns = { version = "0.12.0", git = "https://github.com/dotns/simple-dns", tag = "v0.12.0-nsplane.1", default-features = false, features = ["std"] }
 thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["io-util", "net", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
