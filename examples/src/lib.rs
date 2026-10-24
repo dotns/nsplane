@@ -12,6 +12,7 @@ pub mod node;
 pub mod out;
 pub mod relay;
 pub mod status;
+pub mod vm;
 
 /// The usage guide; its complete programs run as doctests.
 #[cfg(doctest)]

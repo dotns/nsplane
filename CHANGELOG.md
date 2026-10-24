@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unknown types or with RDATA the codec cannot parse elsewhere in a query no longer give
     `FORMERR`, and the forwarder no longer ignores upstream responses carrying them
     (simple-dns fork tag `v0.12.0-nsplane.4`).
+- Example `vm_wireguard`: a virtual machine's link (QEMU `-netdev stream`, passt, libkrun on a
+  Unix socket) as the local side of an engine through `nsplane-ether`, with the tunnel
+  address and MTU in the DHCP lease, an optional IPv6 router advertisement and masquerade,
+  and a reloadable ACL deciding which flows the guest and the peers may open. Tested in
+  process against a second engine and with a Linux guest under QEMU against wireguard-go
+  (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
 
 ## [0.17.0] - 2026-10-24
 
