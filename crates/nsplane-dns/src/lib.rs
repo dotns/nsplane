@@ -16,6 +16,8 @@
 //!   decoded query and the client's address, and [`Fallback`], which asks a second resolver
 //!   when the first answers `NXDOMAIN`.
 //! - **Static records** ([`records`]): [`StaticRecords`], a fixed name -> records table.
+//! - **Fake addresses** ([`fake`]): [`FakePool`], which answers A / AAAA with addresses
+//!   allocated per name from configured prefixes and maps them back to names.
 //!
 //! ```
 //! use std::net::{Ipv4Addr, SocketAddr};
@@ -45,10 +47,15 @@
 //! # }
 //! ```
 
+pub mod fake;
 pub mod message;
 pub mod records;
 pub mod resolver;
 
+pub use fake::{
+    DEFAULT_FAKE_CAPACITY, DEFAULT_FAKE_TTL, FakePool, FakePoolConfig, FakePoolConfigError,
+    FakePoolStats, NoData,
+};
 pub use message::{
     Answer, CLASS_IN, DEFAULT_UDP_PAYLOAD_SIZE, DecodeError, EncodeOptions, MIN_UDP_RESPONSE_SIZE,
     Query, Record, RecordData, RecordType, ResponseCode, encode_error, encode_response,
