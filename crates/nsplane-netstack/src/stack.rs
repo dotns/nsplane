@@ -6,6 +6,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -27,6 +28,7 @@ use crate::config::{Admission, NetStackConfig, Settings};
 use crate::device::{TAILROOM, VirtualDevice};
 use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
 use crate::ownership::{Owners, Ownership, Registration};
+use crate::pending::{self, Hold, Pending, PendingFlow, PendingProtocol};
 use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self, Counters, NetStackStats};
 use crate::tcp::{Progress, Shared, TcpConnection, WriteHalf, lock};
@@ -90,6 +92,7 @@ impl NetStack {
         let (udp_tx, udp_rx) = mpsc::channel(settings.datagram_capacity);
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
+        let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -150,6 +153,7 @@ impl NetStack {
             marks: VecDeque::new(),
             fences: Arc::clone(&fences),
             barriers: Vec::new(),
+            pending,
             #[cfg(test)]
             turns: 0,
         };
@@ -169,6 +173,7 @@ impl NetStack {
             commands: commands_tx,
             incoming_tcp: Arc::new(Mutex::new(Some(incoming_tcp))),
             incoming_udp: Arc::new(Mutex::new(Some(incoming_udp))),
+            incoming_pending: Arc::new(Mutex::new(incoming_pending)),
             stats,
             owners,
         };
@@ -293,6 +298,7 @@ pub struct NetStackHandle {
     commands: mpsc::Sender<Command>,
     incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
+    incoming_pending: Arc<Mutex<Option<mpsc::Receiver<PendingFlow>>>>,
     stats: Arc<Counters>,
     owners: Arc<Owners>,
 }
@@ -322,6 +328,20 @@ impl NetStackHandle {
     /// [`NetStackConfig::accept_capacity`], then dropped and counted.
     pub fn incoming_udp(&self) -> impl Stream<Item = UdpFlow> + Send + Unpin + use<> {
         Incoming(take(&self.incoming_udp))
+    }
+
+    /// New TCP connections and UDP flows held for the application's decision, with
+    /// [`Admission::Decide`] configured in [`NetStackConfig::transparent`].
+    ///
+    /// Each [`PendingFlow`] is accepted, rejected or dropped (which rejects); an accepted
+    /// connection or flow then arrives on [`incoming_tcp`](Self::incoming_tcp) or
+    /// [`incoming_udp`](Self::incoming_udp). Items not taken are queued up to the
+    /// `max_pending` of [`Admission::Decide`]; beyond that a new connection or flow is
+    /// rejected at once. Only the first call (on any clone of the handle) gets the items;
+    /// every later call, and every call without [`Admission::Decide`], returns a stream
+    /// that ends immediately. The stream ends when the stack stops.
+    pub fn incoming_pending(&self) -> impl Stream<Item = PendingFlow> + Send + Unpin + use<> {
+        Incoming(take(&self.incoming_pending))
     }
 
     /// Opens a TCP connection from the stack to `remote`.
@@ -534,6 +554,24 @@ impl<T> Stream for Incoming<T> {
         self.0
             .as_mut()
             .map_or(Poll::Ready(None), |rx| rx.poll_recv(cx))
+    }
+}
+
+/// The pending table and the receiving end of its items, with `Admission::Decide` only.
+fn pending_table(
+    settings: &Settings,
+    notify: &Arc<Notify>,
+) -> Option<(Pending, mpsc::Receiver<PendingFlow>)> {
+    match settings.transparent.as_ref()?.admission {
+        Admission::Decide {
+            timeout,
+            max_pending,
+        } => {
+            let (offer, incoming) = mpsc::channel(max_pending);
+            let table = Pending::new(timeout, max_pending, offer, Arc::clone(notify));
+            Some((table, incoming))
+        }
+        Admission::Immediate => None,
     }
 }
 
@@ -913,6 +951,9 @@ struct Driver {
     /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout. A revoke that
     /// needs one more fails (`RetirementOutcome::Failed`).
     barriers: Vec<Barrier>,
+    /// Connections and flows held for the application's decision; only with
+    /// `Admission::Decide`.
+    pending: Option<Pending>,
     #[cfg(test)]
     turns: u64,
 }
@@ -949,6 +990,7 @@ impl Driver {
         self.retire_revoked();
         // 1. Take a bounded batch of ingress packets and pending requests.
         self.expire_fragments();
+        self.expire_pending();
         let Some(demand) = self.ingest_batch() else {
             tracing::debug!(target: "netstack", "sink dropped; stopping");
             return false;
@@ -1024,6 +1066,9 @@ impl Driver {
         );
         self.ingest_all(&mut batch, &mut demand);
         self.batch = batch;
+        // After the batch, so that a SYN retransmitted in it is absorbed by its entry
+        // rather than held anew once the entry is accepted.
+        self.take_decisions(&mut demand);
         // Zero packets taken means the queue is closed and drained.
         (taken != Poll::Ready(0)).then_some(demand)
     }
@@ -1048,19 +1093,31 @@ impl Driver {
                         // Unanswered, the peer retransmits it once the queue may have room.
                         return stats::add(&self.stats.syn_deferred, 1);
                     }
-                    if self.settings.transparent.is_some()
-                        && !self.admit_syn(packet.as_packet(), demand)
-                    {
-                        return;
-                    }
+                    let packet = if self.settings.transparent.is_some() {
+                        match self.admit_syn(packet, demand) {
+                            Some(packet) => packet,
+                            None => return,
+                        }
+                    } else {
+                        packet
+                    };
                     *demand.entry(dst_port).or_insert(0) += 1;
+                    return self.device.inject(packet);
                 }
                 self.device.inject(packet);
             }
-            Ok(Class::Udp) => match udp::parse_udp(packet) {
-                Some(datagram) => self.dispatch_udp(datagram),
-                None => stats::add(&self.stats.malformed, 1),
-            },
+            Ok(Class::Udp) => {
+                // The whole packet is kept only for a flow that may be held.
+                let parsed = if self.pending.is_some() {
+                    udp::parse_udp_whole(packet).map(|(datagram, whole)| (datagram, Some(whole)))
+                } else {
+                    udp::parse_udp(packet).map(|datagram| (datagram, None))
+                };
+                match parsed {
+                    Some((datagram, whole)) => self.dispatch_udp(datagram, whole),
+                    None => stats::add(&self.stats.malformed, 1),
+                }
+            }
             Ok(Class::Icmp) => self.icmp(packet.as_packet()),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
@@ -1072,43 +1129,151 @@ impl Driver {
         }
     }
 
-    /// Admits a bare SYN in transparent mode; whether it goes on into smoltcp. A
-    /// retransmitted SYN of a handshake in progress passes uncounted; a new connection
-    /// beyond `max_connections` (counting the connections held, the handshakes in
-    /// progress and the SYNs of this batch in `demand`) is answered with RST.
-    fn admit_syn(&mut self, packet: &[u8], demand: &HashMap<u16, usize>) -> bool {
-        let Some((limit, admission)) = self
+    /// Admits a bare SYN in transparent mode; the SYN if it goes on into smoltcp now. A
+    /// retransmitted SYN of a handshake in progress passes uncounted, and one of a held
+    /// connection is absorbed; a new connection beyond `max_connections` is answered with
+    /// RST. Under `Admission::Decide` a new connection is held (or, with the table full,
+    /// answered with RST).
+    fn admit_syn(&mut self, packet: PacketBuf, demand: &HashMap<u16, usize>) -> Option<PacketBuf> {
+        let Some((remote, local)) = tcp_tuple(packet.as_packet()) else {
+            return Some(packet);
+        };
+        if self.owners.has_tcp(local, remote) {
+            return Some(packet);
+        }
+        let key = pending::Key {
+            protocol: PendingProtocol::Tcp,
+            remote,
+            local,
+        };
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|table| table.contains(&key))
+        {
+            return None;
+        }
+        if self.at_connection_limit(demand) {
+            self.reject_connection_limit(packet.as_packet());
+            return None;
+        }
+        if self.pending.is_some() {
+            self.hold(key, pending::Held::Tcp(packet));
+            return None;
+        }
+        stats::add(&self.stats.accepted, 1);
+        Some(packet)
+    }
+
+    /// Whether the stack holds `max_connections` TCP connections, counting the connections
+    /// held, the handshakes in progress and the SYNs of this batch in `demand`.
+    fn at_connection_limit(&self, demand: &HashMap<u16, usize>) -> bool {
+        let Some(limit) = self
             .settings
             .transparent
             .as_ref()
-            .map(|transparent| (transparent.max_connections, transparent.admission))
+            .and_then(|transparent| transparent.max_connections)
         else {
-            return true;
+            return false;
         };
-        let Some((remote, local)) = tcp_tuple(packet) else {
-            return true;
-        };
-        if self.owners.has_tcp(local, remote) {
-            return true;
+        let held = self.conns.len()
+            + self.connecting.len()
+            + self.inbound.len()
+            + demand.values().sum::<usize>();
+        held >= limit
+    }
+
+    /// Answers the bare SYN `packet` with RST for `max_connections`.
+    fn reject_connection_limit(&mut self, packet: &[u8]) {
+        stats::add(&self.stats.rejected_connection_limit, 1);
+        if let Some(reset) = tcp_reset(packet) {
+            self.push_reply(reset);
         }
-        if let Some(limit) = limit {
-            let held = self.conns.len()
-                + self.connecting.len()
-                + self.inbound.len()
-                + demand.values().sum::<usize>();
-            if held >= limit {
-                stats::add(&self.stats.rejected_connection_limit, 1);
-                if let Some(reset) = tcp_reset(packet) {
-                    self.push_reply(reset);
+    }
+
+    /// Holds a new connection or flow for the application's decision, rejecting it at
+    /// once when the table is full or the application's stream is gone.
+    fn hold(&mut self, key: pending::Key, held: pending::Held) {
+        let Some(table) = self.pending.as_mut() else {
+            return;
+        };
+        match table.hold(key, held, Instant::now()) {
+            Hold::Held => self.count_pending(),
+            Hold::Full(held) => self.reject(&held, |stats| &stats.rejected_table_full),
+            Hold::Gone(held) => self.reject(&held, |stats| &stats.rejected_hook),
+        }
+    }
+
+    /// Answers a held SYN with RST or a held datagram with port unreachable, counting it
+    /// in `counter`.
+    fn reject(&mut self, held: &pending::Held, counter: fn(&Counters) -> &AtomicU64) {
+        stats::add(counter(&self.stats), 1);
+        if let Some(reply) = held.rejection(self.settings.mtu) {
+            self.push_reply(reply);
+        }
+    }
+
+    /// Applies the application's decisions on held connections and flows: an accepted SYN
+    /// goes into smoltcp with this batch (counted in `demand`), an accepted datagram
+    /// opens its flow.
+    fn take_decisions(&mut self, demand: &mut HashMap<u16, usize>) {
+        let mut changed = false;
+        while let Some((decision, key, held)) =
+            self.pending.as_mut().and_then(Pending::next_decision)
+        {
+            changed = true;
+            if !decision.accept {
+                self.reject(&held, |stats| &stats.rejected_hook);
+                continue;
+            }
+            match held {
+                pending::Held::Tcp(syn) => {
+                    if self.at_connection_limit(demand) {
+                        self.reject_connection_limit(syn.as_packet());
+                        continue;
+                    }
+                    stats::add(&self.stats.accepted, 1);
+                    *demand.entry(key.local.port()).or_insert(0) += 1;
+                    self.device.inject(syn);
                 }
-                return false;
+                pending::Held::Udp { payload, .. } => {
+                    let datagram = Datagram {
+                        src: key.remote,
+                        dst: key.local,
+                        payload,
+                    };
+                    self.dispatch_udp(datagram, None);
+                }
             }
         }
-        match admission {
-            Admission::Immediate | Admission::Decide { .. } => {
-                stats::add(&self.stats.accepted, 1);
-                true
-            }
+        if changed {
+            self.count_pending();
+        }
+    }
+
+    /// Rejects the held connections and flows past their deadline.
+    fn expire_pending(&mut self) {
+        let now = Instant::now();
+        let mut changed = false;
+        while let Some((_, held)) = self
+            .pending
+            .as_mut()
+            .and_then(|table| table.next_expired(now))
+        {
+            changed = true;
+            self.reject(&held, |stats| &stats.rejected_timeout);
+        }
+        if changed {
+            self.count_pending();
+        }
+    }
+
+    /// Publishes the number of held connections and flows.
+    fn count_pending(&self) {
+        if let Some(table) = &self.pending {
+            self.stats
+                .pending
+                .store(table.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -1284,8 +1449,10 @@ impl Driver {
         stats::add(&self.stats.malformed, rejected);
     }
 
-    /// Delivers a datagram to its connected socket, its bound socket, or to its flow.
-    fn dispatch_udp(&mut self, datagram: Datagram) {
+    /// Delivers a datagram to its connected socket, its bound socket, or to its flow;
+    /// `whole` is the packet of an ingress datagram whose new flow may be held, `None`
+    /// without `Admission::Decide` or for an accepted held datagram.
+    fn dispatch_udp(&mut self, datagram: Datagram, whole: Option<Bytes>) {
         let Datagram {
             src,
             dst,
@@ -1326,11 +1493,18 @@ impl Driver {
                 }
             }
         }
-        self.dispatch_flow(src, dst, payload);
+        self.dispatch_flow(src, dst, payload, whole);
     }
 
-    /// Routes a datagram into the flow table, opening a flow for a new tuple.
-    fn dispatch_flow(&mut self, remote: SocketAddr, local: SocketAddr, payload: Bytes) {
+    /// Routes a datagram into the flow table, opening a flow for a new tuple, or holding it
+    /// for the application's decision (see [`dispatch_udp`](Self::dispatch_udp)).
+    fn dispatch_flow(
+        &mut self,
+        remote: SocketAddr,
+        local: SocketAddr,
+        payload: Bytes,
+        whole: Option<Bytes>,
+    ) {
         let key = (remote, local);
         // Existing flow: a full queue drops the datagram (normal UDP backpressure); a
         // closed one means the application dropped the flow, so it is replaced by a new
@@ -1350,12 +1524,25 @@ impl Driver {
             },
             None => payload,
         };
-        if let Some(transparent) = &self.settings.transparent {
-            match transparent.admission {
-                Admission::Immediate | Admission::Decide { .. } => {
-                    stats::add(&self.stats.accepted, 1);
-                }
+        if let Some(packet) = whole {
+            let key = pending::Key {
+                protocol: PendingProtocol::Udp,
+                remote,
+                local,
+            };
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|table| table.contains(&key))
+            {
+                // A held flow queues its first datagram only.
+                stats::add(&self.stats.udp_queue_full, 1);
+                return;
             }
+            return self.hold(key, pending::Held::Udp { payload, packet });
+        }
+        if self.settings.transparent.is_some() {
+            stats::add(&self.stats.accepted, 1);
         }
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.
@@ -2109,7 +2296,7 @@ impl Driver {
     /// `false` once the stack must stop.
     async fn wait(&mut self, now: SmolInstant) -> bool {
         let tx_full = self.device.tx_full();
-        let delay = if tx_full {
+        let mut delay = if tx_full {
             MAX_POLL_DELAY
         } else {
             self.iface
@@ -2118,6 +2305,9 @@ impl Driver {
                     Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
                 })
         };
+        if let Some(deadline) = self.pending.as_mut().and_then(Pending::next_deadline) {
+            delay = delay.min(deadline.saturating_duration_since(Instant::now()));
+        }
         if delay.is_zero() {
             tokio::task::yield_now().await;
             return true;
@@ -2260,7 +2450,7 @@ fn placeholder() -> PacketBuf {
 
 /// The RST answering the bare SYN `syn`, from its destination (RFC 9293 section 3.10.7.1:
 /// sequence number 0, acknowledging the SYN and its data).
-fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
+pub(crate) fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
     const RST_ACK: u8 = 0x14;
     const FIN: u8 = 0x01;
     let segment = tcp_segment(syn)?;

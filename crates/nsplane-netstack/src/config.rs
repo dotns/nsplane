@@ -232,6 +232,30 @@ pub enum Admission {
     Immediate,
     /// Hold a bare SYN, or a UDP flow's first datagram, until the application decides,
     /// for at most `timeout`, with at most `max_pending` connections and flows held.
+    ///
+    /// Each held connection or flow is offered as a [`PendingFlow`](crate::PendingFlow) on
+    /// [`incoming_pending`](crate::NetStackHandle::incoming_pending); the stack answers
+    /// the SYN with SYN-ACK, or opens the flow, only once it is accepted. A rejected
+    /// connection is answered with a RST and a rejected flow with an ICMP or `ICMPv6`
+    /// port unreachable, both sourced from the original destination. This applies to
+    /// every new connection and flow of a transparent stack, to its own addresses too.
+    ///
+    /// - A connection or flow with no decision within `timeout` is rejected the same way
+    ///   and counted in [`rejected_timeout`](crate::NetStackStats::rejected_timeout); a
+    ///   later decision does nothing.
+    /// - With `max_pending` held, or with `max_pending` items not taken from
+    ///   `incoming_pending`, a new one is rejected at once and counted in
+    ///   [`rejected_table_full`](crate::NetStackStats::rejected_table_full).
+    /// - While a connection is held, its retransmitted SYNs are absorbed; while a flow is
+    ///   held, its further datagrams are dropped and counted in
+    ///   [`udp_queue_full`](crate::NetStackStats::udp_queue_full): a held flow queues its
+    ///   first datagram only.
+    /// - [`TransparentConfig::max_connections`] is checked when the SYN arrives and again
+    ///   when the connection is accepted.
+    ///
+    /// An entry costs the held packet and a few words; expiry rides on the driver's
+    /// timer, with no task per entry. A `max_pending` of 0 is taken as 1, and a `timeout`
+    /// above one day as one day.
     Decide {
         /// Longest a connection or flow waits for the decision.
         timeout: Duration,
@@ -365,6 +389,8 @@ impl Prefixes {
 /// buffer, and without loss a smaller window gains nothing. Congestion control keeps the
 /// large window from collapsing on a congested hop; the window stays large for long paths.
 const WINDOW_SEGMENTS: usize = 512;
+/// Longest [`Admission::Decide`] timeout.
+const MAX_PENDING_TIMEOUT: Duration = Duration::from_hours(24);
 
 impl Settings {
     /// Normalises `config` as documented on [`NetStackConfig`].
@@ -407,7 +433,17 @@ impl Settings {
             reassembly: config.reassembly,
             transparent: config.transparent.map(|transparent| Transparent {
                 prefixes: Prefixes::new(transparent.prefixes),
-                admission: transparent.admission,
+                admission: match transparent.admission {
+                    Admission::Decide {
+                        timeout,
+                        max_pending,
+                    } => Admission::Decide {
+                        timeout: timeout.min(MAX_PENDING_TIMEOUT),
+                        // Within the bound of the channel that offers the items.
+                        max_pending: max_pending.clamp(1, usize::MAX >> 3),
+                    },
+                    admission => admission,
+                },
                 max_connections: transparent.max_connections,
             }),
         }

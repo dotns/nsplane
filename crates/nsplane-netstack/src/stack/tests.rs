@@ -20,6 +20,7 @@ mod half_close;
 mod listener_integration;
 mod listener_pool;
 mod ownership;
+mod pending;
 mod pmtu;
 mod progress;
 mod reassembly;

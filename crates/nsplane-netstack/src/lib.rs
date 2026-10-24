@@ -49,6 +49,7 @@ mod config;
 mod device;
 mod flow;
 mod ownership;
+mod pending;
 mod pmtu;
 mod stack;
 mod stats;
@@ -59,6 +60,7 @@ pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentCon
 pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
+pub use pending::{PendingFlow, PendingProtocol};
 pub use stack::{NetStack, NetStackHandle, NetStackSink, NetStackSource};
 pub use stats::NetStackStats;
 pub use tcp::TcpConnection;
