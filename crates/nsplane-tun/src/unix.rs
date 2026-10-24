@@ -1,5 +1,5 @@
 //! Fd helpers shared by the Unix TUN backends.
-#![allow(unsafe_code, reason = "fcntl and socket syscalls on raw fds")]
+#![allow(unsafe_code, reason = "raw fd syscalls and reactor registration")]
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use libc::{
     AF_INET, F_GETFD, F_GETFL, F_SETFL, O_NONBLOCK, SOCK_DGRAM, c_int, fcntl, socket, ssize_t,
 };
+use tokio::io::unix::AsyncFd;
 
 /// Maps a `-1` syscall return to the current OS error.
 pub(crate) fn cvt(ret: c_int) -> io::Result<c_int> {
@@ -29,6 +30,13 @@ pub(crate) fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     // SAFETY: F_SETFL on an fd we own; no pointer arguments.
     cvt(unsafe { fcntl(fd.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) })?;
     Ok(())
+}
+
+/// Registers `fd` with the tokio reactor as a `T` that owns it.
+pub(crate) fn register<T: AsRawFd + From<OwnedFd>>(fd: OwnedFd) -> io::Result<AsyncFd<T>> {
+    // SAFETY: `T` takes ownership of the open fd, so it stays open and refers to the same
+    // file description until the `AsyncFd` drops `T`; `as_raw_fd` keeps returning it.
+    Ok(unsafe { AsyncFd::register(T::from(fd)) }?)
 }
 
 /// Opens an `AF_INET` datagram socket to issue interface ioctls on.
