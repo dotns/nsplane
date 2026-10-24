@@ -28,6 +28,7 @@ The package `nsplane-examples` is not published.
 | [`relay_transport`](#relay_transport) | Relay discovery and the direct/relay path ladder, in-process | no |
 | [`app_session`](#app_session) | App sessions on ACL namespaces: a file transfer through source-gated pinholes | no (`--tun`: yes) |
 | [`dns_netstack`](#dns_netstack) | A DNS server on an unowned address of a transparent netstack: static, fake and forwarded answers | no |
+| [`dns_policy`](#dns_policy) | DNS policy routing: per-name rules to local records, a fake pool, an upstream, sinkhole, block and CNAME | no |
 
 ## Examples
 
@@ -399,6 +400,26 @@ Flags: `--upstream <IP:PORT>`, `--forward-name <NAME>` (default `example.com`),
 
 ```sh
 cargo run -p nsplane-examples --bin dns_netstack -- [--upstream 192.0.2.53:53]
+```
+
+### dns_policy
+
+A `PolicyResolver` from `nsplane-dns`, queried directly in one process (no root, no
+network unless `--upstream` is given). Hosts-format text (`Hosts::parse`) gives the local
+records `printer.lan` and `nas.lan` and a wildcard rule `*.dev.example`; the other rules send
+`*.lan` to the local records, names below `fake.example` to a `FakePool` on
+`198.18.0.0/15`, sinkhole `ads.example`, block `blocked.example` with `NXDOMAIN`, alias
+`www.example` to `printer.lan` with a CNAME and send every other name to a `Forwarder` for
+`--upstream` (`REFUSED` without one). Prints a `CHECK` line per name (the wildcard's apex
+`dev.example` falls to the default rule), a `RULE` line from `PolicyResolver::matching`,
+then replaces the table at runtime (`replace_table`) to answer `blocked.example` locally and
+checks it again, then `STATS` (policy counters) and `CHECKS PASS` (exit 0) or `CHECKS FAIL`
+(exit 1).
+
+Flags: `--upstream <IP:PORT>`, `--log <FILTER>` (default `warn`).
+
+```sh
+cargo run -p nsplane-examples --bin dns_policy -- [--upstream 192.0.2.53:53]
 ```
 
 ## Shared flags
