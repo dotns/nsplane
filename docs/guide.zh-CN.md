@@ -3,7 +3,7 @@
 [English](guide.md)
 
 本指南说明如何把 nsplane 嵌入应用：选哪些 crate、引擎如何组装，以及常见部署形态的完整代码。
-内容对应 nsplane 0.16.2。
+内容对应 nsplane 0.18.0。
 
 - 函数签名与契约：rustdoc（`cargo doc --workspace --no-deps --open`）。
 - 设计：[architecture.md](architecture.md)；各 crate 的行为：[reference](reference/)；
@@ -83,6 +83,7 @@ nsplane ─► nsplane-nat, nsplane-wss
 | 带访问控制的网关 | `nsplane`、`nsplane-tun`、`nsplane-acl` |
 | 子网路由 / 纯 IPv6 网络 | `nsplane`、`nsplane-tun`、`nsplane-nat` |
 | 位于封锁 UDP 的防火墙之后 | 再加 `nsplane-wss` |
+| 虚拟机不经 TUN 设备访问 peer | `nsplane`、`nsplane-ether` |
 
 ## 3. 添加依赖
 
@@ -90,10 +91,11 @@ nsplane 通过 git 引用。固定 tag 或 commit 以保证构建可复现：
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
 # 按需添加：
-# nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core
+# nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
+# nsplane-ether, nsplane-dns
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -368,6 +370,99 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 `pipe`、`pump`、`SwapSink` 和 `AbortSink` 分别用于进程内连接、运行中替换 sink、关闭时隔离 sink；
 详见 rustdoc。
 
+### 虚拟机的网络链路：nsplane-ether
+
+通过 Unix socket 承载虚拟机以太网帧的 guest 运行时（QEMU `-netdev stream`、passt、libkrun）可以直接
+作为引擎的本地侧：`spawn_port` 在该 socket 上运行一个 `nsplane-ether` 适配器，应答 guest 的 DHCP、
+ARP 和邻居发现，并把它的 IP 数据包作为 packet source 和 sink 提供出来：
+
+```rust ignore
+use nsplane::{EngineBuilder, FragmentConfig};
+use nsplane_ether::{DhcpConfig, EtherConfig, MacAddr, spawn_port, stream};
+
+// guest 运行时连接到 `listener`（一个 tokio UnixListener）。
+let (conn, _) = listener.accept().await?;
+let (reader, writer) = stream::unix(conn);
+let gateway: std::net::Ipv4Addr = "10.66.0.1".parse()?; // peer 的隧道地址
+let config = EtherConfig {
+    gateway_ipv4: Some(gateway),
+    dhcp: Some(DhcpConfig {
+        router: Some(gateway),
+        dns: vec![gateway],
+        mtu: Some(1420),
+        ..DhcpConfig::new(gateway, "10.66.0.2".parse()?, 24) // guest 的隧道地址
+    }),
+    mtu: 1420, // 隧道 MTU
+    ..EtherConfig::new(MacAddr([0x02, 0, 0, 0, 0, 1]))
+};
+let (source, sink, ether) = spawn_port(reader, writer, config);
+let engine = EngineBuilder::new(source, sink)
+    .private_key(key)
+    .transport(udp)
+    .fragmenter(FragmentConfig::default())
+    .build()?;
+// ether.stats()：适配器计数器；ether.guest_mac()：学习到的 guest MAC。
+```
+
+- **地址规划。** guest 通过 DHCP 租到自己的隧道地址和网关，网关通常就是 peer 自己的隧道地址。
+  适配器只为网关地址应答 ARP；guest 发出的每个 IP 包都进入引擎，并发往 allowed IPs 包含其目的
+  地址的 peer，因此 peer 的 allowed IPs 决定了 guest 能到达哪些网络。租约前缀内的其他地址对
+  guest 而言是同链路地址且得不到 ARP 应答，因此隧道网络中网关以外的主机 guest 无法到达。IPv6
+  可选：`EtherConfig::ipv6_prefix` 作为 /64 通告，guest 在其中自行选取地址。
+- **MTU。** 链路 MTU 即隧道 MTU（1500 字节路径上 WireGuard 的 1420），写入租约、路由通告以及
+  引擎读取的 source，guest 因而不会发送更大的包。仍然发出的大包由分片阶段处理：DF 置位的 IPv4
+  回 ICMP Fragmentation Needed，未置 DF 的拆成分片，IPv6 回 `ICMPv6` Packet Too Big。
+- **Masquerade。** 隧道只分配一个 IPv6 地址而不是 /64 时，在 source（`forward`）和 sink
+  （`reverse`，例如放在 `MapSink` 中）外包一层 `nsplane_nat::Masquerade`，把 guest 来自通告前缀的
+  flow 改写为该地址。IPv4 不需要，因为租约本身就是隧道地址。
+- **访问控制。** peer 属于一个带出站规则的命名空间时，`AclFilter` 对两个方向都做判定：`rules`
+  是 peer 可以向 guest 发起的 flow，`outbound` 是 guest 可以发起的 flow；已接受 flow 的回包放行。
+  用 `store_namespace` 替换命名空间后，从下一个包起生效。
+
+```rust ignore
+use nsplane_acl::{AclEngine, AclFilter, Label, LabelSet, NamespaceMember, NamespacePolicy, PeerLabelMap};
+
+let acl = Arc::new(AclEngine::new());
+acl.store_namespace("vm", NamespacePolicy {
+    members: vec![NamespaceMember { label: Label::from("remote"), addresses: vec![] }],
+    rules: to_guest,           // Vec<Rule>：peer 可以向 guest 发起的 flow
+    outbound: Some(from_guest), // Vec<OutboundRule>：guest 可以发起的 flow
+    ..NamespacePolicy::default()
+})?;
+let labels = Arc::new(PeerLabelMap::new());
+let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
+// EngineBuilder::filter(Box::new(filter))；添加 peer 之后：
+labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
+```
+
+#### Firecracker：由监控程序持有的 TAP
+
+Firecracker 只把 guest 接到宿主机的 TAP 设备上，并且自己持有该 TAP 的文件描述符。在 Linux 上，
+适配器于是通过 `AF_PACKET` socket（`PacketSocket`，需要 `CAP_NET_RAW`）在 TAP 的宿主机一侧读写
+guest 的帧，不需要网桥，也不需要第二个 TAP。`ensure_tap` 在监控程序启动前创建该 TAP（需要
+`CAP_NET_ADMIN`）：持久化，指定的用户和组可以接入，关闭 IPv6、地址自动配置和 ARP，使宿主机内核
+不介入 guest 的链路；返回的 `TapInterface` 被 drop 时删除它。已存在的接口按原样使用，并保留不动。
+
+```rust ignore
+use nsplane_ether::{PacketSocket, TapConfig, ensure_tap, spawn_port};
+
+// 在 Firecracker 启动之前；它的配置里写明该 TAP：
+// "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "fctap0" }]
+let tap = ensure_tap(&TapConfig::new("fctap0").owner(firecracker_uid))?;
+let (reader, writer) = PacketSocket::bind(tap.name())?.split();
+let (source, sink, ether) = spawn_port(reader, writer, config); // `config` 同上
+// ... 引擎同上；在引擎停止之前保留 `tap`。
+```
+
+- **Offload。** Firecracker 与 guest 协商校验和与分段 offload，因此一个帧可能带部分校验和，或者是
+  一个大的 GSO 帧。reader 在适配器看到之前补全校验和，并把 GSO 帧拆成 guest 分段大小的帧；发往
+  guest 的帧带完整的校验和。
+- **生命周期。** packet socket 没有流结束：guest 关机或监控程序重启时传输保持打开，重启后的监控
+  程序接入同一个持久化 TAP。停止 port 的方式是 drop 引擎；删除接口会让 reader 以 `ENETDOWN` 结束。
+- **MTU。** 大于 TAP MTU（默认 1500）的发往 guest 的帧会被丢弃；租约中的隧道 MTU 应不大于它。
+
+`vm_wireguard` 示例把这些组合在一起，策略放在可热加载的文件中。
+
 ## 8. 用户态节点：nsplane-netstack
 
 `nsplane-netstack` 是一个 TCP/IP 协议栈（smoltcp 分支），既是引擎的本地侧，也是给应用使用的 API：
@@ -470,6 +565,139 @@ match receipt.wait().await {
 - `FlowContext`（`domain()`、`instance()`）是不透明标签，`instance` 来自进程级计数器，绝不重复分配；
   nsplane 从不解读它。同一五元组上的新连接是新的 flow，拥有新的 instance。
 - `NetStackHandle::retired_drops()` 统计因 flow 被撤销而丢弃的包数。
+
+### 透明终结
+
+设置 `NetStackConfig::transparent` 后，协议栈成为发往其前缀内任意目的地址的 TCP 和 UDP 的端点，而不只是
+自身地址的端点。被接受的连接或 flow 以被拨打的地址作为 `local_addr()`，并从该地址应答。哪些目的地址能
+到达协议栈由它前面的组件决定（peer 的 allowed IPs、ACL、`Splitter`）；本例中客户端把所有流量都路由到
+服务端。
+
+在 `Admission::Decide` 下，每个新连接或 flow 都在 `incoming_pending` 上等待应用接受或拒绝；被拒绝的
+连接收到 RST，被拒绝的 UDP flow 收到 ICMP 端口不可达，两者都来自被拨打的地址。`flow_events` 报告每个
+决定。
+
+```rust
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use futures_util::StreamExt as _;
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{AllowedIp, Ecn, Engine, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_netstack::{
+    Admission, DEFAULT_MTU, FlowEventReason, FlowEventsConfig, NetStack, NetStackConfig,
+    NetStackHandle, TransparentConfig,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+const UDP: TransportId = TransportId::new(0);
+const WAIT: Duration = Duration::from_secs(10);
+/// 服务端唯一接受的目的地址。
+const ALLOWED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+/// 位于服务端前缀内，但会被拒绝。
+const REJECTED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 443);
+
+/// 一个节点：按 `config` 构建的协议栈，加上回环地址上的 UDP 传输。
+fn node(key: StaticSecret, config: NetStackConfig) -> anyhow::Result<(Engine, NetStackHandle, SocketAddr)> {
+    let (stack, handle) = NetStack::new(config);
+    let (source, sink) = stack.split();
+    let udp = UdpTransport::bind(UDP, "127.0.0.1:0".parse()?)?;
+    let outer = udp.local_addr();
+    let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).build()?;
+    Ok((engine, handle, outer))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let key_c = StaticSecret::random_from_rng(rand_core::OsRng);
+    let key_s = StaticSecret::random_from_rng(rand_core::OsRng);
+    let (pub_c, pub_s) = (PublicKey::from(&key_c), PublicKey::from(&key_s));
+
+    // 客户端：位于 10.0.0.1 的普通协议栈。
+    let client = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], DEFAULT_MTU);
+    let (c, stack_c, _) = node(key_c, client)?;
+    // 服务端：拥有 10.0.0.2，并终结 192.0.2.0/24 内的所有地址，每个新连接或 flow
+    // 都交由应用决定。
+    let server = NetStackConfig {
+        transparent: Some(TransparentConfig {
+            prefixes: vec![("192.0.2.0".parse()?, 24)],
+            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
+            max_connections: Some(4096),
+            events: Some(FlowEventsConfig::default()),
+            ..Default::default()
+        }),
+        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
+    };
+    let (s, stack_s, outer_s) = node(key_s, server)?;
+
+    // 客户端把所有 IPv4 目的地址路由到服务端。
+    let mut peer_s = Peer::new(pub_s);
+    peer_s.allowed_ips = vec![AllowedIp { addr: Ipv4Addr::UNSPECIFIED.into(), cidr: 0 }];
+    peer_s.path = Some(Path { transport: UDP, addr: outer_s, ecn: Ecn::NotEct });
+    c.handle().add_or_update_peer(peer_s).await?;
+    let mut peer_c = Peer::new(pub_c);
+    peer_c.allowed_ips = vec![AllowedIp { addr: "10.0.0.1".parse()?, cidr: 32 }];
+    s.handle().add_or_update_peer(peer_c).await?;
+
+    // 服务端：按被拨打的地址做决定。
+    let mut pending = stack_s.incoming_pending();
+    tokio::spawn(async move {
+        while let Some(flow) = pending.next().await {
+            if flow.local_addr() == ALLOWED {
+                flow.accept();
+            } else {
+                flow.reject(); // 直接丢弃 `flow` 同样是拒绝
+            }
+        }
+    });
+    // 服务端：被接受的连接从这里到达；告诉客户端它拨打的是哪个地址。
+    let mut incoming = stack_s.incoming_tcp();
+    tokio::spawn(async move {
+        while let Some(mut conn) = incoming.next().await {
+            let dialed = conn.local_addr().to_string();
+            tokio::spawn(async move { conn.write_all(dialed.as_bytes()).await });
+        }
+    });
+
+    // 接受：连接终结在服务端，服务端以 192.0.2.10 的身份应答。
+    let mut conn = timeout(WAIT, stack_c.connect_tcp(ALLOWED)).await??;
+    let mut dialed = String::new();
+    conn.read_to_string(&mut dialed).await?;
+    assert_eq!(dialed, ALLOWED.to_string());
+
+    // 拒绝：SYN 收到来自 192.0.2.11 的 RST。
+    let refused = timeout(WAIT, stack_c.connect_tcp(REJECTED)).await?;
+    assert_eq!(refused.err().map(|e| e.kind()), Some(io::ErrorKind::ConnectionRefused));
+
+    // 每个决定一个事件，按顺序到达。
+    let mut events = stack_s.flow_events();
+    for (dst, reason) in [(ALLOWED, FlowEventReason::Admitted), (REJECTED, FlowEventReason::Hook)] {
+        let event = timeout(WAIT, events.next()).await?.expect("stack running");
+        assert_eq!((event.dst, event.reason), (dst, reason));
+    }
+    let stats = stack_s.stats();
+    assert_eq!((stats.accepted, stats.rejected_hook, stats.pending), (1, 1, 0));
+
+    for engine in [c, s] {
+        engine.handle().shutdown().await?;
+        engine.wait().await?;
+    }
+    Ok(())
+}
+```
+
+依赖：同[快速上手](#5-快速上手一个进程内的两个节点)。
+
+- `Admission::Immediate`（默认）在到达时即接受；此时 `incoming_pending` 立即结束。使用 `Decide` 时，
+  在 `timeout` 内没有得到决定的连接或 flow 会被拒绝（`rejected_timeout`），已持有 `max_pending` 个时
+  新来的会立即被拒绝（`rejected_table_full`）。
+- `max_connections` 限制协议栈的 TCP 连接数；超出后的 SYN 收到 RST（`rejected_connection_limit`）。
+- 发往前缀之外目的地址的包被丢弃（计入 `rejected_prefix`，同时计入 `no_address`）。
+- flow 事件有界、限速且可丢失：超出 `FlowEventsConfig` 的事件计入 `events_dropped`。不设置 `events`
+  时不存在 channel。
+- `connect_tcp`、`connect_udp` 和 `bind_udp` 仍然使用协议栈自身的地址。
 
 ## 9. 一个引擎同时接 TUN 和 netstack
 
@@ -816,5 +1044,6 @@ wg setconf wg0 /path/to/wg0.conf
 | `relay_server` | 同时也是 WireGuard 节点的单端口 relay | 否 |
 | `relay_transport` | relay 发现与直连/relay 路径逐级切换 | 否 |
 | `app_session` | 基于 ACL 命名空间和临时放行的应用会话 | 否 |
+| `vm_wireguard` | 以虚拟机链路为本地侧，带 ACL 和 masquerade | 否 |
 
 `relay_server` / `relay_transport` 中的 relay 是示例代码，不是对外发布的 API。

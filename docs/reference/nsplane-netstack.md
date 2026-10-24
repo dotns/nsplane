@@ -1,15 +1,17 @@
 # nsplane-netstack
 
 A user-space TCP/IP stack on smoltcp that an engine uses in place of a TUN device: TCP
-connections and UDP flows and sockets for the application, per-flow revocation, optional
-reassembly, and an ownership query for local sides that share one decrypted stream. Builds on
+connections and UDP flows and sockets for the application, transparent termination of
+traffic to any destination in configured prefixes with optional per-flow admission and
+admission events, per-flow revocation, optional reassembly, and an ownership query for local sides that share one decrypted stream. Builds on
 `nsplane`, `nsplane-core` and `nsplane-packet`.
 
 ## Public API
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::incoming_pending`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`), `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
 ## Behavior
 
@@ -254,6 +256,115 @@ The engine's `DROP_SINK_FULL` is ordinary loss to TCP: a decrypted segment the e
 at the full sink is never acknowledged, the retransmission timer stays armed and smoltcp
 resends it.
 
+### Transparent mode
+
+With `NetStackConfig::transparent: Some(TransparentConfig)` the stack is the endpoint for TCP
+and UDP addressed to any destination inside `TransparentConfig::prefixes`, not only to its
+own `addresses`.
+
+- **Destinations.** `prefixes` lists addresses with prefix lengths of either family; an
+  empty list means every address of both families. A prefix length longer than the family
+  allows is clamped to 32 or 128 and host bits are ignored. A packet to a destination that
+  is neither one of the stack's addresses nor inside a prefix is dropped and counted in
+  `no_address`, as without transparent mode, and also in `rejected_prefix`. Which
+  destinations reach the stack at all is decided in front of it: the peers' allowed IPs,
+  `PeerConfig::inbound_destinations`, the ACL or a `Splitter`. The stack only terminates
+  what the engine delivers.
+- **Addresses of a connection.** On an accepted `TcpConnection` or `UdpFlow`,
+  `local_addr()` is the original destination (the address the peer dialed) and
+  `peer_addr()` the source. The stack sources SYN-ACKs, data, RSTs and UDP replies from the
+  original destination, so the peer sees answers from the address it dialed.
+- **Shared bounds.** Every bound of the stack applies to all addresses together: the
+  listener pool (per destination port and in total), `max_udp_flows`, the accept queue and
+  every other queue. Fragments to in-prefix destinations are reassembled within the same
+  `reassembly` bounds, ICMP Fragmentation Needed / Packet Too Big is matched by the quoted
+  tuple alone, and `owns` treats in-prefix destinations as the stack's (`Listener` for a bare
+  SYN or datagram). `connect_tcp`, `connect_udp` and `bind_udp` still require one of the
+  stack's own `addresses`.
+
+#### Admission
+
+`TransparentConfig::admission` decides how a new TCP connection (a bare SYN) or UDP flow (its
+first datagram) is admitted. It applies to every new connection and flow of a transparent
+stack, to its own addresses too.
+
+- `Admission::Immediate` (default): accepted on arrival, as for the stack's own addresses,
+  and counted in `accepted`.
+- `Admission::Decide { timeout, max_pending }`: the SYN or first datagram is held in a
+  pending table and offered on `NetStackHandle::incoming_pending` as a `PendingFlow` with
+  its `protocol()`, `peer_addr()` (the source) and `local_addr()` (the original
+  destination). `accept()` admits it: the stack answers the held SYN with SYN-ACK (the
+  connection arrives on `incoming_tcp` once established) or opens the flow with the held
+  datagram on `incoming_udp`, and counts it in `accepted`. `reject()`, or dropping the item,
+  rejects it (`rejected_hook`). Decisions take effect on the next driver turn and never
+  wait; a decision after the timeout or after the stack stopped does nothing.
+  - No decision within `timeout`: rejected, counted in `rejected_timeout`.
+  - `max_pending` entries held, or `max_pending` items not taken from `incoming_pending`:
+    a new connection or flow is rejected at once, counted in `rejected_table_full`.
+  - While a connection is held, its retransmitted SYNs are absorbed. While a flow is held,
+    its further datagrams are dropped and counted in `udp_queue_full`: a held flow queues
+    its first datagram only.
+  - `incoming_pending` hands its items to the first call only (on any clone of the handle);
+    later calls, and every call without `Decide`, return a stream that ends at once. The
+    stream ends when the stack stops.
+
+A rejected TCP connection is answered with a RST and a rejected UDP flow with an ICMP port
+unreachable (type 3 code 3) or `ICMPv6` port unreachable (type 1 code 4) quoting the
+datagram, both sourced from the original destination, so the peer sees a refused
+connection or an unreachable port at the address it dialed.
+
+`TransparentConfig::max_connections` bounds the TCP connections the stack holds at once
+(accepted, mid handshake, or opened with `connect_tcp`, until released). At the limit, the
+bare SYN of a new connection is answered with a RST from its original destination and
+counted in `rejected_connection_limit`; a retransmitted SYN of a handshake in progress is not
+a new connection. Under `Decide` the limit is checked when the SYN arrives and again when the
+connection is accepted. Default `None`: no limit beyond the listener pool and the accept
+queue.
+
+#### Counters
+
+`NetStackStats` carries the admission outcome: `pending` (a gauge: connections and flows
+held now), `accepted`, `rejected_hook`, `rejected_timeout`, `rejected_table_full`,
+`rejected_connection_limit` and `rejected_prefix` (per packet, also in `no_address`). Each
+held connection or flow leaves `pending` accepted or counted in exactly one `rejected_`
+field. An accepted SYN may still be refused by the listener pool (`syn_refused`), and an
+accepted datagram by the flow limit or the accept queue.
+
+#### Flow events
+
+`TransparentConfig::events: Some(FlowEventsConfig)` opts in to admission events: one
+`FlowEvent` per increment of `accepted` or of a `rejected_` counter, on
+`NetStackHandle::flow_events`. An event carries `at` (read from the tokio clock), the IP
+`protocol`, `src` (the peer), `dst` (the original destination; ports are 0 for a packet
+without readable ports), `allow` and a `FlowEventReason` (`Admitted`, `Hook`, `Timeout`,
+`TableFull`, `ConnectionLimit`, `Prefix`). Prefix rejections emit per packet.
+
+- **Bounded.** `capacity` events are buffered for the receiver (default 1024; 0 is taken
+  as 1).
+- **Rate limited.** A token bucket of `burst` tokens (default 1000) refilled at `rate`
+  events per second (default 1000) limits emission; the bucket starts full, `rate` 0 never
+  refills it and `burst` 0 emits nothing.
+- **Lossy.** The driver never waits on the channel: an event beyond the bucket, finding the
+  buffer full or the receiver gone is dropped and counted in `events_dropped`; delivered
+  events are counted in `events_emitted`.
+- `flow_events` hands its events to the first call only; later calls, and every call
+  without events configured, return a stream that ends at once. The stream ends when the
+  stack stops; once it is dropped every event is counted as dropped.
+
+Off (`events: None`, the default) there is no channel and the cost is one `Option` check on
+the admission and rejection paths; established traffic pays nothing.
+
+#### Cost
+
+Without transparent mode (the default) a bare SYN, a new UDP flow and a packet to a foreign
+address each take one `Option` check; established connections and flows pay nothing. In
+transparent mode, the prefix check is a scan of the configured prefixes for packets not
+addressed to the stack's own addresses. A pending entry costs the held packet and a few
+words; expiry rides on the driver's timer, with no task per entry. `nsplane-e2e`
+`netstack_transparent` covers Immediate admission for both families, Decide accept and
+reject (RST and ICMP / `ICMPv6` port unreachable observed at the client) and the
+`no_address` drops without transparent mode.
+
 ### Per-flow control and retirement
 
 Every `TcpConnection`, `UdpFlow` (shared with its `UdpReply` clones) and `UdpSocket` gets
@@ -342,6 +453,10 @@ not establish peer application completion or remote cleanup.
 | TCP abort | `TcpConnection::abort` instead of dropping the connection | drop closes with a FIN | one state compare under the connection's lock and two empty-`Vec` takes per driver turn |
 | Fragment discard | `NetStackHandle::discard_fragments(src, dst, protocol, id)` when a flow's admission is revoked; needs `NetStackConfig::reassembly` | not called | none without reassembly; with it one atomic load per ingress packet while nothing is discarded, no lock |
 | Later-fragment ownership | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
+| Transparent termination | `NetStackConfig::transparent = Some(TransparentConfig { prefixes, ..Default::default() })` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
+| Per-flow admission | `TransparentConfig::admission = Admission::Decide { timeout, max_pending }`, decisions on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none |
+| TCP connection limit | `TransparentConfig::max_connections = Some(n)` | `None`: listener pool and accept queue only | one `Option` check per bare SYN in transparent mode |
+| Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |
 | Connected UDP sockets | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
 
 ## Errors and drop reasons
@@ -349,8 +464,13 @@ not establish peer application completion or remote cleanup.
 Everything the stack discards is counted per reason in `NetStackStats` (malformed, foreign
 and unsupported packets, refused and deferred SYNs, connections and flows not accepted, full
 UDP queues, the flow limit, egress over the backlog, ignored ICMP, reassembly timeouts and
-overflows); packets dropped for a revoked flow are counted in
-`NetStackHandle::retired_drops`. Handle calls fail with `std::io::Error` kinds:
+overflows, and in transparent mode the admission outcome: `accepted` and `rejected_hook`,
+`rejected_timeout`, `rejected_table_full`, `rejected_connection_limit`, `rejected_prefix`);
+packets dropped for a revoked flow are counted in `NetStackHandle::retired_drops`. A
+connection rejected in transparent mode reaches the peer as a RST (`connect_tcp` on a peer
+stack fails with `ConnectionRefused`), a rejected UDP flow as an ICMP or `ICMPv6` port
+unreachable from the original destination. Flow events lost to the token bucket, a full
+buffer or a dropped receiver are counted in `events_dropped`. Handle calls fail with `std::io::Error` kinds:
 `InvalidInput`, `AddrNotAvailable`, `AddrInUse`, `NotConnected`, `ConnectionAborted` (a
 revoked flow) and `BrokenPipe` (the stack stopped).
 
@@ -363,10 +483,17 @@ revoked flow) and `BrokenPipe` (the stack stopped).
 - Idle TCP connections are reset after 5 minutes.
 - Reassembly and the fragment memories: `ReassemblyConfig` (64 datagrams, 30 s, 65 535 bytes
   by default).
+- Pending table of `Admission::Decide`: `max_pending` entries (0 is taken as 1), each held
+  for at most `timeout` (at most one day); a held flow queues one datagram.
+- TCP connections in transparent mode: `TransparentConfig::max_connections`, otherwise the
+  listener pool and the accept queue.
+- Flow events: `FlowEventsConfig::capacity` buffered events (0 is taken as 1) and a token
+  bucket of `burst` tokens refilled at `rate` per second.
 - Retirement state: the table under [Per-flow control and retirement](#per-flow-control-and-retirement).
 
 ## See also
 
-- [Usage guide: a userspace node](../guide.md#8-a-userspace-node-nsplane-netstack)
+- [Usage guide: a userspace node](../guide.md#8-a-userspace-node-nsplane-netstack) and
+  [transparent termination](../guide.md#transparent-termination)
 - [nsplane](nsplane.md): the engine and its local-side graph.
 - [Performance: netstack](../performance.md#netstack)

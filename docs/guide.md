@@ -3,7 +3,7 @@
 [中文版](guide.zh-CN.md)
 
 This guide shows how to embed nsplane in an application: which crates to pick, how an engine
-is assembled, and complete code for the common deployments. It describes nsplane 0.16.2.
+is assembled, and complete code for the common deployments. It describes nsplane 0.18.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
 - Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
@@ -86,6 +86,7 @@ Typical combinations:
 | Gateway with access control | `nsplane`, `nsplane-tun`, `nsplane-acl` |
 | Subnet router / IPv6-only fabric | `nsplane`, `nsplane-tun`, `nsplane-nat` |
 | Behind firewalls that block UDP | add `nsplane-wss` |
+| Virtual machines reaching peers without a TUN device | `nsplane`, `nsplane-ether` |
 
 ## 3. Adding the dependency
 
@@ -93,10 +94,11 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.16.2" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
 # as needed:
-# nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core
+# nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
+# nsplane-ether, nsplane-dns
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -382,6 +384,113 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 `pipe`, `pump`, `SwapSink` and `AbortSink` cover in-process wiring, live sink replacement and
 fencing a sink at shutdown; see rustdoc.
 
+### A virtual machine's link: nsplane-ether
+
+A guest runtime that carries a virtual machine's ethernet frames over a Unix socket (QEMU
+`-netdev stream`, passt, libkrun) can be the engine's local side directly: `spawn_port` puts
+an `nsplane-ether` adapter on the socket, answers the guest's DHCP, ARP and neighbor
+discovery, and exposes its IP packets as a packet source and sink:
+
+```rust ignore
+use nsplane::{EngineBuilder, FragmentConfig};
+use nsplane_ether::{DhcpConfig, EtherConfig, MacAddr, spawn_port, stream};
+
+// The guest runtime connects to `listener` (a tokio UnixListener).
+let (conn, _) = listener.accept().await?;
+let (reader, writer) = stream::unix(conn);
+let gateway: std::net::Ipv4Addr = "10.66.0.1".parse()?; // the peer's tunnel address
+let config = EtherConfig {
+    gateway_ipv4: Some(gateway),
+    dhcp: Some(DhcpConfig {
+        router: Some(gateway),
+        dns: vec![gateway],
+        mtu: Some(1420),
+        ..DhcpConfig::new(gateway, "10.66.0.2".parse()?, 24) // the guest's tunnel address
+    }),
+    mtu: 1420, // the tunnel MTU
+    ..EtherConfig::new(MacAddr([0x02, 0, 0, 0, 0, 1]))
+};
+let (source, sink, ether) = spawn_port(reader, writer, config);
+let engine = EngineBuilder::new(source, sink)
+    .private_key(key)
+    .transport(udp)
+    .fragmenter(FragmentConfig::default())
+    .build()?;
+// ether.stats(): adapter counters; ether.guest_mac(): the learned guest MAC.
+```
+
+- **Address plan.** The guest leases its tunnel address with the gateway, typically the
+  peer's own tunnel address. The adapter answers ARP for the gateway only; every IP packet
+  the guest sends enters the engine and goes to the peer whose allowed IPs contain its
+  destination, so the peer's allowed IPs name the networks the guest reaches. Other
+  addresses of the leased prefix are on-link for the guest and get no ARP answer, so hosts
+  of the tunnel network other than the gateway are out of its reach. IPv6 is optional:
+  `EtherConfig::ipv6_prefix` is advertised as a /64 and the guest picks its address in it.
+- **MTU.** The link MTU is the tunnel MTU (WireGuard's 1420 over a 1500-byte path), in the
+  lease, the router advertisement and the source the engine reads, so the guest does not
+  send larger packets. The fragmentation stage handles the ones it sends anyway: ICMP
+  Fragmentation Needed for IPv4 with DF set, fragments without DF, `ICMPv6` Packet Too Big
+  for IPv6.
+- **Masquerade.** When the tunnel gives one IPv6 address rather than a /64, a
+  `nsplane_nat::Masquerade` around the source (`forward`) and the sink (`reverse`,
+  for example in a `MapSink`) rewrites the guest's flows from the advertised prefix to that
+  address. IPv4 needs none, since the lease is the tunnel address.
+- **Access control.** An `AclFilter` decides both directions when the peers are members of a
+  namespace with outbound rules: `rules` are the flows the peers may open to the guest,
+  `outbound` the flows the guest may open; replies of accepted flows pass. Replacing the
+  namespace with `store_namespace` takes effect on the next packet.
+
+```rust ignore
+use nsplane_acl::{AclEngine, AclFilter, Label, LabelSet, NamespaceMember, NamespacePolicy, PeerLabelMap};
+
+let acl = Arc::new(AclEngine::new());
+acl.store_namespace("vm", NamespacePolicy {
+    members: vec![NamespaceMember { label: Label::from("remote"), addresses: vec![] }],
+    rules: to_guest,           // Vec<Rule>: what the peers may open to the guest
+    outbound: Some(from_guest), // Vec<OutboundRule>: what the guest may open
+    ..NamespacePolicy::default()
+})?;
+let labels = Arc::new(PeerLabelMap::new());
+let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
+// EngineBuilder::filter(Box::new(filter)); once the peer is added:
+labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
+```
+
+#### Firecracker: a TAP that the monitor holds
+
+Firecracker attaches a guest only to a host TAP device and keeps that TAP's file descriptor
+itself. On Linux the adapter then reads and writes the guest's frames on the TAP's host side
+through an `AF_PACKET` socket (`PacketSocket`, needs `CAP_NET_RAW`), with no bridge and no
+second TAP. `ensure_tap` creates the TAP before the monitor starts (needs `CAP_NET_ADMIN`):
+persistent, attachable by the given user and group, with IPv6, address autoconfiguration and
+ARP off so the host kernel stays out of the guest's link, and deleted when the returned
+`TapInterface` is dropped. An interface that already exists is used as it is and left in
+place.
+
+```rust ignore
+use nsplane_ether::{PacketSocket, TapConfig, ensure_tap, spawn_port};
+
+// Before Firecracker starts; its config names the TAP:
+// "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "fctap0" }]
+let tap = ensure_tap(&TapConfig::new("fctap0").owner(firecracker_uid))?;
+let (reader, writer) = PacketSocket::bind(tap.name())?.split();
+let (source, sink, ether) = spawn_port(reader, writer, config); // `config` as above
+// ... the engine as above; keep `tap` until the engine stops.
+```
+
+- **Offloads.** Firecracker negotiates checksum and segmentation offload with the guest, so
+  a frame can come with a partial checksum or as one large GSO frame. The reader completes
+  the checksum and splits GSO frames into frames of the guest's segment size before the
+  adapter sees them; frames to the guest go out with complete checksums.
+- **Lifetime.** A packet socket has no end of stream: a guest that shuts down or a monitor
+  that restarts leaves the transport open, and a restarted monitor attaches to the same
+  persistent TAP. Stop the port by dropping the engine; deleting the interface ends the
+  reader with `ENETDOWN`.
+- **MTU.** Frames to the guest larger than the TAP's MTU (1500 by default) are dropped; keep
+  the tunnel MTU in the lease at or below it.
+
+The `vm_wireguard` example puts these together, with the policy in a reloadable file.
+
 ## 8. A userspace node: nsplane-netstack
 
 `nsplane-netstack` is a TCP/IP stack (smoltcp fork) that is both the engine's local side and
@@ -488,6 +597,143 @@ match receipt.wait().await {
   number that is never handed out twice; nsplane never interprets it. A new connection on
   the same 5-tuple is a new flow with a new instance.
 - `NetStackHandle::retired_drops()` counts packets dropped for revoked flows.
+
+### Transparent termination
+
+With `NetStackConfig::transparent` the stack is the endpoint for TCP and UDP to any
+destination inside its prefixes, not only to its own addresses. An accepted connection or
+flow keeps the dialed address as `local_addr()` and answers from it. Which destinations
+reach the stack is decided in front of it (the peers' allowed IPs, the ACL, a `Splitter`);
+here the client routes everything to the server.
+
+Under `Admission::Decide` each new connection or flow waits on `incoming_pending` until the
+application accepts or rejects it; a rejected connection gets a RST and a rejected UDP flow
+an ICMP port unreachable, both from the dialed address. `flow_events` reports each decision.
+
+```rust
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use futures_util::StreamExt as _;
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{AllowedIp, Ecn, Engine, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_netstack::{
+    Admission, DEFAULT_MTU, FlowEventReason, FlowEventsConfig, NetStack, NetStackConfig,
+    NetStackHandle, TransparentConfig,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+const UDP: TransportId = TransportId::new(0);
+const WAIT: Duration = Duration::from_secs(10);
+/// The only destination the server accepts.
+const ALLOWED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+/// Inside the server's prefix, but rejected.
+const REJECTED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 443);
+
+/// One node: a stack built from `config`, a UDP transport on loopback.
+fn node(key: StaticSecret, config: NetStackConfig) -> anyhow::Result<(Engine, NetStackHandle, SocketAddr)> {
+    let (stack, handle) = NetStack::new(config);
+    let (source, sink) = stack.split();
+    let udp = UdpTransport::bind(UDP, "127.0.0.1:0".parse()?)?;
+    let outer = udp.local_addr();
+    let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).build()?;
+    Ok((engine, handle, outer))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let key_c = StaticSecret::random_from_rng(rand_core::OsRng);
+    let key_s = StaticSecret::random_from_rng(rand_core::OsRng);
+    let (pub_c, pub_s) = (PublicKey::from(&key_c), PublicKey::from(&key_s));
+
+    // Client: a plain stack on 10.0.0.1.
+    let client = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], DEFAULT_MTU);
+    let (c, stack_c, _) = node(key_c, client)?;
+    // Server: owns 10.0.0.2 and terminates every address of 192.0.2.0/24, asking the
+    // application about each new connection or flow.
+    let server = NetStackConfig {
+        transparent: Some(TransparentConfig {
+            prefixes: vec![("192.0.2.0".parse()?, 24)],
+            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
+            max_connections: Some(4096),
+            events: Some(FlowEventsConfig::default()),
+            ..Default::default()
+        }),
+        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
+    };
+    let (s, stack_s, outer_s) = node(key_s, server)?;
+
+    // The client routes every IPv4 destination to the server.
+    let mut peer_s = Peer::new(pub_s);
+    peer_s.allowed_ips = vec![AllowedIp { addr: Ipv4Addr::UNSPECIFIED.into(), cidr: 0 }];
+    peer_s.path = Some(Path { transport: UDP, addr: outer_s, ecn: Ecn::NotEct });
+    c.handle().add_or_update_peer(peer_s).await?;
+    let mut peer_c = Peer::new(pub_c);
+    peer_c.allowed_ips = vec![AllowedIp { addr: "10.0.0.1".parse()?, cidr: 32 }];
+    s.handle().add_or_update_peer(peer_c).await?;
+
+    // Server: decide by the dialed address.
+    let mut pending = stack_s.incoming_pending();
+    tokio::spawn(async move {
+        while let Some(flow) = pending.next().await {
+            if flow.local_addr() == ALLOWED {
+                flow.accept();
+            } else {
+                flow.reject(); // dropping `flow` rejects as well
+            }
+        }
+    });
+    // Server: accepted connections arrive here; tell the client which address it dialed.
+    let mut incoming = stack_s.incoming_tcp();
+    tokio::spawn(async move {
+        while let Some(mut conn) = incoming.next().await {
+            let dialed = conn.local_addr().to_string();
+            tokio::spawn(async move { conn.write_all(dialed.as_bytes()).await });
+        }
+    });
+
+    // Accepted: the connection terminates at the server, which answers as 192.0.2.10.
+    let mut conn = timeout(WAIT, stack_c.connect_tcp(ALLOWED)).await??;
+    let mut dialed = String::new();
+    conn.read_to_string(&mut dialed).await?;
+    assert_eq!(dialed, ALLOWED.to_string());
+
+    // Rejected: the SYN is answered with a RST from 192.0.2.11.
+    let refused = timeout(WAIT, stack_c.connect_tcp(REJECTED)).await?;
+    assert_eq!(refused.err().map(|e| e.kind()), Some(io::ErrorKind::ConnectionRefused));
+
+    // One event per decision, in order.
+    let mut events = stack_s.flow_events();
+    for (dst, reason) in [(ALLOWED, FlowEventReason::Admitted), (REJECTED, FlowEventReason::Hook)] {
+        let event = timeout(WAIT, events.next()).await?.expect("stack running");
+        assert_eq!((event.dst, event.reason), (dst, reason));
+    }
+    let stats = stack_s.stats();
+    assert_eq!((stats.accepted, stats.rejected_hook, stats.pending), (1, 1, 0));
+
+    for engine in [c, s] {
+        engine.handle().shutdown().await?;
+        engine.wait().await?;
+    }
+    Ok(())
+}
+```
+
+Dependencies: as in [the quick start](#5-quick-start-two-nodes-in-one-process).
+
+- `Admission::Immediate` (the default) accepts on arrival; `incoming_pending` then ends at
+  once. With `Decide`, a connection or flow without a decision within `timeout` is rejected
+  (`rejected_timeout`), and one beyond `max_pending` held is rejected at once
+  (`rejected_table_full`).
+- `max_connections` caps the TCP connections of the stack; a SYN beyond it gets a RST
+  (`rejected_connection_limit`).
+- A packet to a destination outside the prefixes is dropped (`rejected_prefix`, also
+  `no_address`).
+- Flow events are bounded, rate-limited and lossy: events beyond `FlowEventsConfig` count in
+  `events_dropped`. Without `events` there is no channel.
+- `connect_tcp`, `connect_udp` and `bind_udp` still use the stack's own addresses.
 
 ## 9. TUN and netstack behind one engine
 
@@ -847,5 +1093,6 @@ All in `examples/` (`cargo run -p nsplane-examples --bin <name> -- --help`):
 | `relay_server` | a single-port relay that is also a WireGuard node | no |
 | `relay_transport` | relay discovery and the direct/relay path ladder | no |
 | `app_session` | app sessions on ACL namespaces and pinholes | no |
+| `vm_wireguard` | a virtual machine's link as the local side, with ACL and masquerade | no |
 
 The relay in `relay_server` / `relay_transport` is example code, not a published API.

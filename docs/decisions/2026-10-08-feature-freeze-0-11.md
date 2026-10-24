@@ -50,3 +50,17 @@ slot A/B when it touches the data path.
   retirement receipts and a flow context inside `nsplane-netstack` (plan
   `20261017-1800-flow-retirement`, task `20261017-1700-flow-lifecycle-request` R1 and R2). R3,
   delivery gates in the engine and transports, stays deferred. It ships as 0.16.0.
+- 2026-10-24: seventh exception (owner: "1，发0.17 2，合并到一起0.17 ... 4，做"; "可以做dns，同步放在0.17"):
+  the gino-agent egress requests R1 (transparent netstack), R3 (ethernet adapter) and R4 (flow
+  decision events), plus a generic DNS crate (plan `20261024-1600-egress-0-17`, task
+  `20261024-1500-gino-egress-requests`). The DNS crate carries protocol, serving and a
+  fake-address pool only; resolution policy stays with the consumer. R5 and R6 are not done.
+  It ships as 0.17.0.
+- 2026-10-24: eighth exception (owner: "可以 开始处理"): transparent forwarding in nsplane-dns for
+  messages it does not handle (plan `20261024-1304-dns-passthrough`), extended the same day
+  (owner: "可以，cname也可以一起放进去") by DNS policy routing with CNAME rewriting (plan
+  `20261024-1313-dns-policy`), and an example of a virtual machine reaching a remote
+  WireGuard peer (owner: "可以把vm路径的examples也放进0.18"; plan
+  `20261024-1329-vm-wireguard-example`), and an `AF_PACKET` frame transport for guests whose
+  TAP another process holds, such as Firecracker (owner: "用C方式最合理、不引入额外管理"; plan
+  `20261024-1338-af-packet-transport`). All ship as 0.18.0.

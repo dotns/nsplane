@@ -306,3 +306,65 @@ guide examples are updated together; there is no public API change.
 The owner explicitly approved the historical `release: 0.16.2` commit title as a
 one-time exception to the local cog type allowlist; hooks and permanent rules
 remain unchanged.
+
+## 2026-10-24 [release]
+
+Prepare 0.17.0 (tag `v0.17.0`), the seventh freeze exception (plan
+`20261024-1600-egress-0-17`, task `20261024-1500-gino-egress-requests`). Three workstreams ran
+as an auto-mode BKD campaign (`l1-7f5cstru-20261024-egress017`) and were merged by L1 after
+review and a green full gate each:
+
+- W1: transparent termination in nsplane-netstack (prefixes, immediate or decided
+  admission with a bounded pending table, RST / ICMP rejects from the dialed address,
+  connection limit, counters) and opt-in rate-limited flow decision events from the stack
+  and from `FlowGate`. Two A/B rounds found and fixed off-path regressions (FlowGate event
+  emission inlined into the hot path; LTO outlining checksum and payload helpers once the
+  transparent paths added callers). The remaining multi-threaded four-stream TCP send delta
+  (about 4.5 %, fewer instructions at equal IPC, single-CPU at par) was accepted as
+  scheduling and layout noise.
+- W2: nsplane-ether, an ethernet adapter for one guest with ARP, IPv6 ND / RA and a
+  single-lease DHCPv4 server over a length-prefixed stream or a Linux TAP device, verified
+  with a real QEMU/KVM guest.
+- W3: nsplane-dns, generic DNS serving (codec, `Resolver` trait, static records, fake-address
+  pool with reverse lookup, forwarder, UDP/TCP server on sockets or netstack flows). The codec
+  is `simple-dns` from `github.com/dotns/simple-dns`, an independent copy maintained by
+  dotns with only the protocol crate (tag `v0.12.0-nsplane.3`; ADR
+  `2026-10-24-simple-dns-fork`). This partly reverses the 2026-10-15 decision: resolution
+  policy stays with the consumer.
+
+Baseline fixes on the way: `rustls-webpki` and `tokio` updated for RUSTSEC-2026-0382 and
+RUSTSEC-2026-0386, and nsplane-tun moved to `AsyncFd::register` for tokio 1.54. R5 and R6 of
+the request are not done. Known flaky timing tests (`netstack_flow_retirement`,
+`netstack_lossy`) failed once each under host load during subtask gates and passed on re-run.
+
+## 2026-10-24 [release]
+
+Prepare 0.18.0 (tag `v0.18.0`), the eighth freeze exception. Four single-issue BKD
+workstreams reported to L1, which reviewed each branch and merged it after a green full gate:
+
+- DNS transparent forwarding (plan `20261024-1304-dns-passthrough`): messages nsplane-dns does
+  not answer itself (other opcodes, other question counts, records it cannot parse) go to a
+  `Forwarder` byte for byte under a `PassthroughPolicy`; the codec parses leniently
+  (`simple-dns` tag `v0.12.0-nsplane.4`). The upstream OPT TTL layout is a recorded
+  follow-up.
+- DNS policy routing (plan `20261024-1313-dns-policy`): `PolicyResolver` with exact, suffix,
+  wildcard and default rules, local actions, bounded CNAME chains, `NXDOMAIN` fallback,
+  hosts-format text and atomic replacement.
+- VM to WireGuard example (plan `20261024-1329-vm-wireguard-example`): `vm_wireguard`,
+  verified in process and with a QEMU/KVM guest against wireguard-go, including the ACL. The
+  real-guest run found that an accepted outbound echo request did not allow its reply
+  unless other-protocol settings were present; fixed in nsplane-acl.
+- AF_PACKET frame transport (plan `20261024-1338-af-packet-transport`): `PacketSocket` and
+  `ensure_tap` in nsplane-ether for guests whose TAP another process holds, verified with a
+  Firecracker/KVM guest against wireguard-go; the virtio-net segmentation moved to
+  `nsplane_packet::vnet`. An interleaved A/B on the bench slots measured the TUN offload
+  segment and coalesce paths about 28 % faster.
+
+The `simple-dns` protocol crate moved into this repository (`third_party/simple-dns`, plan
+`20261024-1437-simple-dns-in-tree`, ADR `2026-10-24-simple-dns-in-tree`) before the release;
+`github.com/dotns/simple-dns` is archived.
+
+One run of the release gate failed in
+`udp::tests::icmp_recovery_preserves_partial_batches_and_real_errors` (loopback ICMP error
+timing under full parallel load); it passed 50 of 50 stress runs alone and the re-run of the
+full gate was green.

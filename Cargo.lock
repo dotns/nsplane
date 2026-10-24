@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-acl"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "criterion",
  "nix",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-cli"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-core"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "criterion",
  "ip_network",
@@ -1095,8 +1095,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-dns"
+version = "0.18.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "nsplane",
+ "nsplane-netstack",
+ "simple-dns",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nsplane-e2e"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1119,8 +1133,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-ether"
+version = "0.18.0"
+dependencies = [
+ "futures-core",
+ "libc",
+ "nsplane",
+ "nsplane-netstack",
+ "nsplane-packet",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nsplane-examples"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1134,6 +1161,8 @@ dependencies = [
  "nsplane",
  "nsplane-acl",
  "nsplane-core",
+ "nsplane-dns",
+ "nsplane-ether",
  "nsplane-nat",
  "nsplane-netstack",
  "nsplane-noise",
@@ -1156,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-nat"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "criterion",
  "nsplane",
@@ -1168,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-netstack"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1182,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-noise"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "aead",
  "aws-lc-rs",
@@ -1203,16 +1232,17 @@ dependencies = [
 
 [[package]]
 name = "nsplane-packet"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "bytes",
+ "criterion",
  "smallvec",
  "zerocopy",
 ]
 
 [[package]]
 name = "nsplane-tun"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "criterion",
  "futures-core",
@@ -1229,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-uapi"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1240,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-wss"
-version = "0.16.2"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1775,6 +1805,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple-dns"
+version = "0.12.0"
+dependencies = [
+ "bitflags 2.11.1",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1941,9 +1978,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",

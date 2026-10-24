@@ -1,0 +1,98 @@
+#!/bin/busybox sh
+# Guest /init of vm-wireguard.sh: brings eth0 up by DHCP (with the tunnel MTU) and router
+# advertisement, then checks the path to the WireGuard peer through the ACL: ping and TCP
+# to the peer (10.66.0.1, fd66::1) and to an address behind it (10.66.1.1) pass, a 100 kB
+# line over TCP comes back whole, TCP to port 8 is blocked. Then it serves TCP 2222 (allowed to the peer) and 2223 (blocked) and
+# prints `GUEST-READY` until the peer sends `finish` to 2222. The success line is
+# `NSPLANE-VM-WG-OK <lease address> <IPv6 address>`.
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /tmp
+
+fail() {
+  echo "NSPLANE-VM-WG-FAIL $*"
+  poweroff -f
+}
+
+for module in /modules/*.ko; do
+  [ -e "$module" ] && insmod "$module"
+done
+echo "guest kernel $(uname -r)"
+ip link set lo up
+ip link set eth0 up || fail "no eth0"
+
+udhcpc -i eth0 -n -q -t 5 -T 2 -O mtu -s /udhcpc.script || fail "no DHCP lease"
+lease=$(cat /tmp/lease)
+mtu=$(cat /sys/class/net/eth0/mtu)
+echo "eth0 MTU $mtu"
+[ "$mtu" = 1420 ] || fail "MTU $mtu, not the tunnel MTU 1420"
+
+ipv6=
+for _ in $(seq 1 30); do
+  ipv6=$(ip -6 addr show dev eth0 scope global | grep -v tentative | awk '/inet6/ { sub("/.*", "", $2); print $2; exit }')
+  [ -n "$ipv6" ] && break
+  sleep 1
+done
+[ -n "$ipv6" ] || fail "no IPv6 address from router advertisement"
+echo "IPv6 address from RA: $ipv6"
+ip addr show dev eth0
+ip route show
+ip -6 route show
+
+# ping TARGET: the first replies may wait for the WireGuard handshake.
+ping_ok() {
+  ping -c 5 -W 2 "$1" >/tmp/ping 2>&1 || ping -c 3 -W 2 "$1" >>/tmp/ping 2>&1
+  status=$?
+  cat /tmp/ping
+  return $status
+}
+ping_ok 10.66.0.1 || fail "ping 10.66.0.1"
+ping_ok 10.66.1.1 || fail "ping 10.66.1.1 (behind the peer)"
+ping_ok fd66::1 || fail "ping fd66::1"
+
+# tcp HOST PORT: one line to the peer's responder, which answers `peer <port> <line>`.
+tcp() {
+  echo "hello from the guest" | nc -w 5 "$1" "$2"
+}
+for target in "10.66.0.1 7" "10.66.1.1 7" "fd66::1 7"; do
+  set -- $target
+  reply=$(tcp "$1" "$2")
+  echo "TCP $1 port $2 reply: $reply"
+  [ "$reply" = "peer $2 hello from the guest" ] || fail "TCP to $1 port $2"
+done
+reply=$(tcp 10.66.0.1 8)
+echo "TCP 10.66.0.1 port 8 reply: '$reply'"
+[ -z "$reply" ] || fail "TCP to 10.66.0.1 port 8 passed the ACL"
+echo "TCP 10.66.0.1 port 8 blocked"
+
+# One 100 kB line: with segmentation offload (Firecracker) the guest sends it as GSO frames.
+big=$(head -c 100000 /dev/zero | tr '\0' a)
+reply=$(echo "$big" | nc -w 10 10.66.0.1 7)
+[ "$reply" = "peer 7 $big" ] || fail "100 kB line over TCP to 10.66.0.1 port 7 (${#reply} bytes back)"
+echo "TCP 10.66.0.1 port 7: 100 kB line echoed"
+
+for port in 2222 2223; do
+  cat >/answer-$port <<EOF
+#!/bin/sh
+read -r line
+echo "guest $port \$line"
+echo "\$line" >>/tmp/got-$port
+EOF
+  chmod 755 /answer-$port
+  nc -ll -p $port -e /answer-$port &
+done
+echo "GUEST-READY"
+for _ in $(seq 1 120); do
+  grep -qx finish /tmp/got-2222 2>/dev/null && break
+  sleep 1
+done
+grep -qx finish /tmp/got-2222 2>/dev/null || fail "the peer never sent finish"
+echo "TCP 2222 from the peer: $(tr '\n' ' ' </tmp/got-2222)"
+[ ! -e /tmp/got-2223 ] || fail "TCP 2223 from the peer passed the ACL: $(cat /tmp/got-2223)"
+echo "TCP 2223 from the peer blocked"
+
+echo "NSPLANE-VM-WG-OK $lease $ipv6"
+poweroff -f

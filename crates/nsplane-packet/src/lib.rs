@@ -14,6 +14,7 @@ mod ip;
 mod pool;
 pub mod reassembly;
 mod types;
+pub mod vnet;
 
 pub use buf::{BoundsError, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, TAILROOM};
 pub use build::{UdpBuildError, udp_packet, write_udp};

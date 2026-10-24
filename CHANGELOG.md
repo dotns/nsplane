@@ -5,6 +5,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Core::peer_has_session` and `EngineHandle::peer_has_session` query whether a peer has
+  a current sending session with an unexhausted key. The engine query settles preceding
+  crypto work; a session does not establish transport reachability.
+- `NetStackSource::tcp_egress_drained` reports whether the source has taken every queued
+  packet through a released TCP connection's final output. It rejects another stack's
+  control, non-TCP flows and revoked flows; forwarding returned packets remains the caller's
+  responsibility and the query does not establish remote delivery.
+
+## [0.18.0] - 2026-10-24
+
+Feature release (additive API) with one behavior fix in nsplane-acl.
+
+### Added
+- DNS transparent forwarding in nsplane-dns: `Server::with_passthrough` sends messages the
+  codec does not answer (opcodes other than `QUERY`, question counts other than one, a
+  malformed question) to a `Forwarder` byte for byte and returns its response under the
+  client's ID, with UDP truncation and TCP; `Server::with_passthrough_policy` decides per
+  message (`PassthroughPolicy`, `PassthroughRequest`, `PassthroughDecision`), and
+  `ServerStats` counts `passed`, `pass_refused` and `pass_failed`.
+  - `Forwarder::forward` passes a raw message to the upstreams.
+  - `Query::decode` decodes only the header, the question and the OPT record: records of
+    unknown types or with RDATA the codec cannot parse elsewhere in a query no longer give
+    `FORMERR`, and the forwarder no longer ignores upstream responses carrying them
+    (`PacketView` in the in-tree `simple-dns`).
+- nsplane-dns policy routing: `PolicyResolver` routes each query by a `PolicyTable` of
+  `Rule`s to one of several resolvers registered under ids in a `ResolverSet`, or to a local
+  answer.
+  - Name matches exact, suffix, hosts-style wildcard (`*.name`, not the name itself) and
+    default, with precedence by match kind and length; optional query type and client
+    prefix conditions; lookup cost per label of the query name.
+  - Actions `Resolve`, `Records`, `Block`, `Sinkhole`, `NoData` and `Cname` (the target
+    resolved through the same rules, chain bounded by `MAX_CNAME_CHAIN`, loops cut);
+    per-rule `NXDOMAIN` fallback to the default rule or another resolver.
+  - Validated tables, atomic replacement of the table and the resolver set at runtime,
+    `matching` for diagnostics, counters in `PolicyStats`.
+  - `Hosts`: hosts-format text to `StaticRecords` and rules, with per-line errors.
+  - Example `dns_policy`.
+- nsplane-ether packet socket transport (Linux): `PacketSocket::bind(ifname)` serves a guest
+  whose host-side TAP another process holds (a virtual machine monitor such as Firecracker)
+  through an `AF_PACKET` socket bound to that interface; `split` gives a `PacketReader` and a
+  `PacketWriter` for `spawn_port`. The socket carries a virtio-net header: partial checksums
+  are completed and GSO frames (TCP over IPv4 and IPv6, UDP) split before the adapter sees
+  them; its own frames are not read back. Needs `CAP_NET_RAW`.
+- nsplane-ether `ensure_tap(&TapConfig)` (Linux): creates a persistent TAP interface with an
+  owner and group for the monitor to attach to, IPv6, address autoconfiguration and ARP off,
+  up, and deleted when the returned `TapInterface` is dropped; an existing interface is used
+  as it is and left in place.
+- nsplane-packet `vnet` module: `VirtioNetHdr`, `segment` and `OffloadError`, the virtio-net
+  header codec and GSO segmentation that nsplane-tun uses for its offload reads.
+- Example `vm_wireguard`: a virtual machine's link (QEMU `-netdev stream`, passt, libkrun on a
+  Unix socket) as the local side of an engine through `nsplane-ether`, with the tunnel
+  address and MTU in the DHCP lease, an optional IPv6 router advertisement and masquerade,
+  and a reloadable ACL deciding which flows the guest and the peers may open. Tested in
+  process against a second engine and with a Linux guest under QEMU against wireguard-go
+  (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
+
+### Changed
+- nsplane-dns builds its codec from `third_party/simple-dns`, the `simple-dns` protocol crate
+  kept in this repository; the git dependency on `github.com/dotns/simple-dns` is gone.
+- nsplane-tun depends on nsplane-packet and splits offload reads with
+  `nsplane_packet::vnet::segment`; behavior unchanged.
+- The TUN offload paths sum checksums with `nsplane_packet::checksum::sum_words`: segmenting
+  a 64 KiB TCP frame and coalescing 48 segments measure about 28 % faster than in 0.17.0.
+
+### Fixed
+- nsplane-acl: an accepted outbound ICMP or `ICMPv6` echo request records the reply allowance
+  of its echo reply whatever the other-protocol settings, as TCP and UDP replies do. A ping
+  an outbound rule accepts towards an outbound-restricted peer (or any ping to an
+  unrestricted peer) now gets its reply instead of a `reasons::PROTOCOL` drop; only the echo
+  reply with the request's identifier passes.
+
+## [0.17.0] - 2026-10-24
+
+Feature release (additive API).
+
+### Added
+- nsplane-ether, an ethernet adapter for one guest: ethernet frames to IP packets and back,
+  with the IP side as a `PacketSource` / `PacketSink` pair (`spawn_port`) for a `NetStack`
+  or an engine.
+  - ARP replies for the gateway address, IPv6 neighbor advertisements for the gateway
+    addresses, router advertisements with MTU, prefix and RDNSS options (solicited, and
+    once when the guest MAC is first learned), and an optional single-lease `DHCPv4` server.
+  - Guest MAC learning from the source address of the guest's frames; per-reason drop
+    counters in `EtherStats`.
+  - Frame transports: a length-prefixed byte stream (4-byte big-endian length, the framing
+    of passt and QEMU's stream netdev) over any Tokio stream or a Unix socket, and a TAP
+    device on Linux.
+  - Sans-I/O protocol layer: `Frame`, `ArpPacket`, `Ndp`, `DhcpMessage` / `DhcpServer`,
+    `MacAddr`.
+- nsplane-dns, generic DNS serving: owned message types and a wire codec (one question,
+  EDNS OPT echo, truncation for the UDP size with TCP fallback), and the async `Resolver`
+  trait with `Fallback` composition; resolution policy stays with the embedder.
+  - Resolvers: `StaticRecords` (local records), `FakePool` (A / AAAA addresses handed out
+    per name from configured prefixes, TTL/LRU reuse, reverse lookup) and `Forwarder`
+    (upstream servers over UDP, TCP retry for truncated responses, no cache).
+  - `Server` over tokio UDP and TCP sockets or any byte stream, with a bound on queries in
+    flight, resolve and TCP idle timeouts and counters in `ServerStats`; feature `netstack`
+    serves the UDP flows and TCP connections of an `nsplane-netstack` stack.
+- Transparent termination in nsplane-netstack: `NetStackConfig::transparent` with
+  `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`) makes the stack
+  the endpoint for TCP and UDP to any destination in the prefixes; accepted connections and
+  flows report the dialed address as `local_addr()` and answer from it.
+- Per-flow admission: `Admission::Decide { timeout, max_pending }` holds each new
+  connection or flow as a `PendingFlow` on `NetStackHandle::incoming_pending` until it is
+  accepted or rejected; a rejection answers with a RST or an ICMP / `ICMPv6` port
+  unreachable from the dialed address. `NetStackStats` counts `pending`, `accepted` and
+  `rejected_hook`, `rejected_timeout`, `rejected_table_full`, `rejected_connection_limit`,
+  `rejected_prefix`.
+- Flow events: bounded, rate-limited, lossy decision events, off by default.
+  `TransparentConfig::events` (`FlowEventsConfig`) and `NetStackHandle::flow_events` yield
+  `FlowEvent`s with a `FlowEventReason`; `FlowGate::enable_events` (`GateEventsConfig`)
+  returns `GateEvents` with a `GateEvent` per new-flow decision, `FlowGate::disable_events`
+  turns them off. Drops are counted in `NetStackStats::events_dropped` and
+  `GateCounters::events_dropped`, deliveries in `events_emitted`.
+
+### Changed
+- nsplane-tun registers its descriptors with `AsyncFd::register`; `AsyncFd::new` is
+  deprecated in tokio 1.54.
+- With `transparent: None` the netstack hot paths, and `FlowGate` with events off, measure
+  at par with 0.16.2, except the multi-threaded four-stream TCP send benchmark: about 4.5 %
+  slower with fewer instructions retired at equal IPC (scheduling and code layout; the
+  single-CPU variant is at par).
+
+### Security
+- `rustls-webpki` 0.103.16 and `tokio` 1.54.1 in `Cargo.lock` (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0386).
+
 ## [0.16.2] - 2026-10-20
 
 Patch release; no public API change.

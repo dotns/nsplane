@@ -13,11 +13,14 @@ members = [
     "crates/nsplane-acl",
     "crates/nsplane-nat",
     "crates/nsplane-wss",
+    "crates/nsplane-ether",
+    "crates/nsplane-dns",
     "examples",
+    "third_party/simple-dns",
 ]
 
 [workspace.package]
-version = "0.16.2"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["dotns"]

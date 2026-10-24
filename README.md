@@ -30,6 +30,8 @@ See [CHANGELOG.md](CHANGELOG.md) for details, and the usage guide
 | `crates/nsplane-wss/`    | `nsplane-wss`    | WebSocket-over-TLS carriers: `WssDialer` (datagrams for `LinkTransport`), `WssServerTransport` (its server side: a transport over the WebSocket sessions the embedder accepts and hands to a `WssAcceptor`), and the deprecated stream carrier (`WssStreamClient` and `WssStreamServer`, TCP streams and UDP flows multiplexed per session), removed once its users have switched; the replacement is a WireGuard peer over `WssDialer` |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp ([dotns/smoltcp](https://github.com/dotns/smoltcp) fork; TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
+| `crates/nsplane-ether/` | `nsplane-ether` | Ethernet adapter for one guest: ethernet frames to IP packets as a packet source and sink, with ARP, IPv6 neighbor discovery and router advertisements, and a single-lease DHCPv4 server; length-prefixed stream and Linux TAP transports |
+| `crates/nsplane-dns/` | `nsplane-dns` | DNS serving: wire codec (`simple-dns`, kept in [`third_party/simple-dns`](third_party/simple-dns/UPSTREAM.md)), async `Resolver` trait, static records, a fake-address pool with reverse lookup, an upstream forwarder, and a UDP/TCP `Server` on sockets or `nsplane-netstack` flows (feature `netstack`) |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
@@ -90,8 +92,8 @@ nsplane-uapi = { path = "../nsplane/crates/nsplane-uapi" }
 
 A basic client (an `EngineBuilder` on a TUN device and a `UdpTransport`, with peers and no
 filters) needs only `nsplane` and `nsplane-tun`, which pull in `nsplane-core`,
-`nsplane-packet` and `nsplane-noise`; `nsplane-acl`, `nsplane-nat`, `nsplane-netstack` and
-`nsplane-wss` are not dependencies of either and are not built. A feature that is not
+`nsplane-packet` and `nsplane-noise`; `nsplane-acl`, `nsplane-nat`, `nsplane-netstack`,
+`nsplane-ether`, `nsplane-dns` and `nsplane-wss` are not dependencies of either and are not built. A feature that is not
 installed is not on the data path, so such a client pays no extra latency for it:
 
 | Feature | How to enable | Default | Cost when not enabled |
