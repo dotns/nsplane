@@ -471,6 +471,139 @@ match receipt.wait().await {
   nsplane 从不解读它。同一五元组上的新连接是新的 flow，拥有新的 instance。
 - `NetStackHandle::retired_drops()` 统计因 flow 被撤销而丢弃的包数。
 
+### 透明终结
+
+设置 `NetStackConfig::transparent` 后，协议栈成为发往其前缀内任意目的地址的 TCP 和 UDP 的端点，而不只是
+自身地址的端点。被接受的连接或 flow 以被拨打的地址作为 `local_addr()`，并从该地址应答。哪些目的地址能
+到达协议栈由它前面的组件决定（peer 的 allowed IPs、ACL、`Splitter`）；本例中客户端把所有流量都路由到
+服务端。
+
+在 `Admission::Decide` 下，每个新连接或 flow 都在 `incoming_pending` 上等待应用接受或拒绝；被拒绝的
+连接收到 RST，被拒绝的 UDP flow 收到 ICMP 端口不可达，两者都来自被拨打的地址。`flow_events` 报告每个
+决定。
+
+```rust
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use futures_util::StreamExt as _;
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{AllowedIp, Ecn, Engine, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_netstack::{
+    Admission, DEFAULT_MTU, FlowEventReason, FlowEventsConfig, NetStack, NetStackConfig,
+    NetStackHandle, TransparentConfig,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+const UDP: TransportId = TransportId::new(0);
+const WAIT: Duration = Duration::from_secs(10);
+/// 服务端唯一接受的目的地址。
+const ALLOWED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+/// 位于服务端前缀内，但会被拒绝。
+const REJECTED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 443);
+
+/// 一个节点：按 `config` 构建的协议栈，加上回环地址上的 UDP 传输。
+fn node(key: StaticSecret, config: NetStackConfig) -> anyhow::Result<(Engine, NetStackHandle, SocketAddr)> {
+    let (stack, handle) = NetStack::new(config);
+    let (source, sink) = stack.split();
+    let udp = UdpTransport::bind(UDP, "127.0.0.1:0".parse()?)?;
+    let outer = udp.local_addr();
+    let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).build()?;
+    Ok((engine, handle, outer))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let key_c = StaticSecret::random_from_rng(rand_core::OsRng);
+    let key_s = StaticSecret::random_from_rng(rand_core::OsRng);
+    let (pub_c, pub_s) = (PublicKey::from(&key_c), PublicKey::from(&key_s));
+
+    // 客户端：位于 10.0.0.1 的普通协议栈。
+    let client = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], DEFAULT_MTU);
+    let (c, stack_c, _) = node(key_c, client)?;
+    // 服务端：拥有 10.0.0.2，并终结 192.0.2.0/24 内的所有地址，每个新连接或 flow
+    // 都交由应用决定。
+    let server = NetStackConfig {
+        transparent: Some(TransparentConfig {
+            prefixes: vec![("192.0.2.0".parse()?, 24)],
+            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
+            max_connections: Some(4096),
+            events: Some(FlowEventsConfig::default()),
+            ..Default::default()
+        }),
+        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
+    };
+    let (s, stack_s, outer_s) = node(key_s, server)?;
+
+    // 客户端把所有 IPv4 目的地址路由到服务端。
+    let mut peer_s = Peer::new(pub_s);
+    peer_s.allowed_ips = vec![AllowedIp { addr: Ipv4Addr::UNSPECIFIED.into(), cidr: 0 }];
+    peer_s.path = Some(Path { transport: UDP, addr: outer_s, ecn: Ecn::NotEct });
+    c.handle().add_or_update_peer(peer_s).await?;
+    let mut peer_c = Peer::new(pub_c);
+    peer_c.allowed_ips = vec![AllowedIp { addr: "10.0.0.1".parse()?, cidr: 32 }];
+    s.handle().add_or_update_peer(peer_c).await?;
+
+    // 服务端：按被拨打的地址做决定。
+    let mut pending = stack_s.incoming_pending();
+    tokio::spawn(async move {
+        while let Some(flow) = pending.next().await {
+            if flow.local_addr() == ALLOWED {
+                flow.accept();
+            } else {
+                flow.reject(); // 直接丢弃 `flow` 同样是拒绝
+            }
+        }
+    });
+    // 服务端：被接受的连接从这里到达；告诉客户端它拨打的是哪个地址。
+    let mut incoming = stack_s.incoming_tcp();
+    tokio::spawn(async move {
+        while let Some(mut conn) = incoming.next().await {
+            let dialed = conn.local_addr().to_string();
+            tokio::spawn(async move { conn.write_all(dialed.as_bytes()).await });
+        }
+    });
+
+    // 接受：连接终结在服务端，服务端以 192.0.2.10 的身份应答。
+    let mut conn = timeout(WAIT, stack_c.connect_tcp(ALLOWED)).await??;
+    let mut dialed = String::new();
+    conn.read_to_string(&mut dialed).await?;
+    assert_eq!(dialed, ALLOWED.to_string());
+
+    // 拒绝：SYN 收到来自 192.0.2.11 的 RST。
+    let refused = timeout(WAIT, stack_c.connect_tcp(REJECTED)).await?;
+    assert_eq!(refused.err().map(|e| e.kind()), Some(io::ErrorKind::ConnectionRefused));
+
+    // 每个决定一个事件，按顺序到达。
+    let mut events = stack_s.flow_events();
+    for (dst, reason) in [(ALLOWED, FlowEventReason::Admitted), (REJECTED, FlowEventReason::Hook)] {
+        let event = timeout(WAIT, events.next()).await?.expect("stack running");
+        assert_eq!((event.dst, event.reason), (dst, reason));
+    }
+    let stats = stack_s.stats();
+    assert_eq!((stats.accepted, stats.rejected_hook, stats.pending), (1, 1, 0));
+
+    for engine in [c, s] {
+        engine.handle().shutdown().await?;
+        engine.wait().await?;
+    }
+    Ok(())
+}
+```
+
+依赖：同[快速上手](#5-快速上手一个进程内的两个节点)。
+
+- `Admission::Immediate`（默认）在到达时即接受；此时 `incoming_pending` 立即结束。使用 `Decide` 时，
+  在 `timeout` 内没有得到决定的连接或 flow 会被拒绝（`rejected_timeout`），已持有 `max_pending` 个时
+  新来的会立即被拒绝（`rejected_table_full`）。
+- `max_connections` 限制协议栈的 TCP 连接数；超出后的 SYN 收到 RST（`rejected_connection_limit`）。
+- 发往前缀之外目的地址的包被丢弃（计入 `rejected_prefix`，同时计入 `no_address`）。
+- flow 事件有界、限速且可丢失：超出 `FlowEventsConfig` 的事件计入 `events_dropped`。不设置 `events`
+  时不存在 channel。
+- `connect_tcp`、`connect_udp` 和 `bind_udp` 仍然使用协议栈自身的地址。
+
 ## 9. 一个引擎同时接 TUN 和 netstack
 
 `Splitter` 用闭包把每个解密后的包分发给多个 sink 之一；`MergeSource` 把多个 source 合并为一个。

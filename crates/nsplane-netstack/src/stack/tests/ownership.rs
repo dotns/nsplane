@@ -40,7 +40,7 @@ pub(super) fn ip(src: IpAddr, dst: IpAddr, proto: u8, payload: &[u8]) -> Vec<u8>
 }
 
 /// A TCP segment with `flags` and no payload (checksums are not checked by `owns`).
-fn tcp_packet(src: SocketAddr, dst: SocketAddr, flags: u8) -> Vec<u8> {
+pub(super) fn tcp_packet(src: SocketAddr, dst: SocketAddr, flags: u8) -> Vec<u8> {
     let mut segment = vec![0u8; 20];
     segment[0..2].copy_from_slice(&src.port().to_be_bytes());
     segment[2..4].copy_from_slice(&dst.port().to_be_bytes());
@@ -49,7 +49,7 @@ fn tcp_packet(src: SocketAddr, dst: SocketAddr, flags: u8) -> Vec<u8> {
     ip(src.ip(), dst.ip(), protocol::TCP, &segment)
 }
 
-fn udp_packet(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+pub(super) fn udp_packet(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     build_udp(src, dst, b"x").map_or_else(Vec::new, |packet| packet.as_packet().to_vec())
 }
 
