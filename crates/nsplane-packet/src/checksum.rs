@@ -18,6 +18,7 @@ const IPV4_CHECKSUM: std::ops::Range<usize> = 10..12;
 ///
 /// The bulk is summed as 32-bit words in native byte order, folded, and swapped to network
 /// order, which the one's complement sum allows (RFC 1071 section 2).
+#[inline]
 pub fn sum_words(acc: u64, data: &[u8]) -> u64 {
     let (words, tail) = data.as_chunks::<4>();
     let words = words.iter().fold(0_u64, |acc, word| {
@@ -36,6 +37,7 @@ pub fn sum_words(acc: u64, data: &[u8]) -> u64 {
 /// Folds the carries of `acc` into 16 bits: the one's complement sum, not complemented.
 ///
 /// Zero only if `acc` is.
+#[inline]
 pub const fn fold(mut acc: u64) -> u16 {
     while acc > 0xFFFF {
         acc = (acc & 0xFFFF) + (acc >> 16);

@@ -15,6 +15,8 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nsplane::{MAX_BATCH, PacketBatch};
 use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use nsplane_packet::vnet::{self, VirtioNetHdr};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
@@ -24,7 +26,7 @@ use crate::darwin as sys;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::linux as sys;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::offload::{self, Coalescer, VirtioNetHdr};
+use crate::offload::Coalescer;
 use crate::unix::{adopt_fd, register, set_nonblocking};
 
 /// Idle buffers kept by a [`TunSource`]'s pool.
@@ -718,7 +720,7 @@ impl VnetReader {
         batch: &mut PacketBatch,
     ) {
         let packet = &self.scratch[VirtioNetHdr::LEN..len];
-        match offload::segment(&hdr, packet, first, capacity, pool, batch) {
+        match vnet::segment(&hdr, packet, first, capacity, pool, batch) {
             Ok(next) => self.pending = next.map(|next| Pending { hdr, len, next }),
             Err(e) => tracing::debug!(?e, ?hdr, "dropping a malformed TUN read"),
         }

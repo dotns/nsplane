@@ -13,7 +13,8 @@ on `nsplane` and `nsplane-packet`.
 |---|---|---|
 | adapter | `EtherAdapter` (`new`, `from_guest`, `to_guest`, `guest_mac`, `stats`, `count_backlog_drop`), `EtherConfig` (`new`) | `EtherStats`, `DEFAULT_MTU` |
 | ports | `spawn_port` | `EtherSource` (`PacketSource`), `EtherSink` (`PacketSink`), `EtherHandle` (`stats`, `guest_mac`) |
-| transports | `FrameRead`, `FrameWrite`; `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux) | `TapReader`, `TapWriter` (Linux), `MAX_FRAME_LEN` |
+| transports | `FrameRead`, `FrameWrite`; `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux); `PacketSocket` (`bind`, `index`, `split`; Linux) | `TapReader`, `TapWriter`, `PacketReader`, `PacketWriter` (Linux), `MAX_FRAME_LEN` |
+| interfaces | `ensure_tap` (Linux) | `TapConfig` (`new`, `owner`, `group`, `name`), `TapInterface` (`name`, `index`, `created`) |
 | protocols | `Frame` (`parse`), `frame::write_header`; `ArpPacket` (`parse`, `write`, `is_gratuitous`), `arp::reply`; `Ndp` (`parse`), `ndp::answer_neighbor_solicitation`, `ndp::answer_router_solicitation`, `ndp::router_advertisement`; `DhcpMessage` (`parse`, `option`, `requested_ip`, `server_id`, `broadcast`), `DhcpServer` (`new`, `handle`, `reply_frame`, `bound`, `config`) | `EtherType`, `FrameError`, `frame::HEADER_LEN`; `ArpOp`, `ArpError`; `NdpMessage`, `NdpError`, `RaConfig`, `ndp::ALL_NODES`; `DhcpConfig` (`new`, `netmask`), `MessageType`, `DhcpError`, `dhcp::option`, `dhcp::SERVER_PORT`, `dhcp::CLIENT_PORT`; `MacAddr` (`link_local`, `ipv6_multicast`, `is_unicast`, `is_multicast`, `is_broadcast`) |
 
 ## Behavior
@@ -157,7 +158,7 @@ forward between `EtherSource` / `EtherSink` and `NetStack::split`'s sink and sou
 ### Transports
 
 `FrameRead` and `FrameWrite` move whole ethernet frames; an error ends the transport and
-neither future is cancellation safe. Two implementations:
+neither future is cancellation safe. Three implementations:
 
 - Framed byte stream (`stream`): every frame is a 4-byte big-endian length followed by the
   frame bytes, the convention of passt and of QEMU's `-netdev stream`, also used by libkrun
@@ -176,6 +177,55 @@ neither future is cancellation safe. Two implementations:
   `read(2)` and `write(2)` is one frame; a read of zero bytes ends the transport. While the
   interface is down the kernel refuses writes with `EIO`; that frame is dropped and the
   transport stays open. Interface addresses and link state are left to the caller.
+- Packet socket (`PacketSocket`, Linux): for a guest whose host-side TAP another process
+  holds, as a virtual machine monitor such as Firecracker does. `bind(ifname)` opens an
+  `AF_PACKET` / `SOCK_RAW` socket for every protocol (`ETH_P_ALL`) with a virtio-net header
+  (`PACKET_VNET_HDR`), bound to the index of the existing interface `ifname`, non-blocking;
+  it needs `CAP_NET_RAW`. A missing interface is `ENODEV`, an invalid name `InvalidInput`.
+  The interface itself is not changed: every frame a TAP receives reaches the socket
+  whatever its destination MAC, so no promiscuous mode is needed. The socket does not read
+  back what is sent out of the interface, its own frames included (`PACKET_IGNORE_OUTGOING`;
+  on kernels without it the reader skips frames of type `PACKET_OUTGOING`).
+  - The reader returns one received frame per call and never `None`. A frame with a partial
+    checksum (`VIRTIO_NET_HDR_F_NEEDS_CSUM`, as a guest with checksum offload sends it) is
+    completed in place, a UDP checksum of 0 written as `0xFFFF`. A GSO frame (TCP over IPv4
+    or IPv6, UDP) is split by `nsplane_packet::vnet::segment` into frames of `gso_size`
+    payload bytes with their own lengths, identification, sequence numbers and checksums,
+    each behind the original ethernet header, and returned one per call. A frame the
+    kernel truncated, or one whose virtio-net header or headers do not match, is dropped and
+    logged at debug level. While the interface is down the reader waits for it to come
+    back; once it is deleted, the read fails with `ENETDOWN`.
+  - The writer sends each frame behind an empty virtio-net header, so frames for the guest
+    carry complete checksums. `ENETDOWN`, `ENXIO`, `ENOBUFS` and `EMSGSIZE` (the interface
+    is down or gone, no buffer space, the frame exceeds the interface MTU) drop that frame
+    and keep the transport open; while no process holds the TAP the kernel drops the frames
+    without an error.
+
+### TAP interfaces
+
+`ensure_tap(&TapConfig)` (Linux) gives a packet socket its interface, so an embedder starts
+nsplane before the virtual machine monitor and needs no other network setup.
+
+- An interface named `TapConfig::name` that already exists is used as it is: nothing about
+  it changes, and dropping the returned `TapInterface` leaves it in place
+  (`created() == false`).
+- A missing one is created as a persistent TAP: `TUNSETIFF` with `IFF_TAP | IFF_NO_PI |
+  IFF_VNET_HDR` (and `IFF_TUN_EXCL`, so an interface created concurrently by someone else
+  is not taken over), `TUNSETOWNER` / `TUNSETGROUP` from `TapConfig::owner` / `group`
+  (without them only `CAP_NET_ADMIN` attaches), `TUNSETPERSIST`; the file descriptor is
+  closed again so the monitor can attach. Then `net.ipv6.conf.<name>.autoconf` is set to 0
+  and `disable_ipv6` to 1, and the interface is brought up with `IFF_NOARP`: the host
+  kernel neither answers the guest's ARP and neighbor discovery nor sends frames of its own
+  to the guest. A write to `/proc/sys` that fails (read-only in a container) is accepted
+  when the setting already has the wanted value, for example inherited from
+  `net.ipv6.conf.default`; a kernel without IPv6 skips both settings. Creating needs
+  `CAP_NET_ADMIN`; using an existing interface needs nothing.
+- Dropping a `TapInterface` with `created() == true` deletes the interface over rtnetlink
+  (`RTM_DELLINK` by index), which works while the monitor still holds it; a failure is
+  logged.
+- A name that is empty, longer than 15 bytes, `.` or `..`, or contains NUL, `/`, `%`, `:`
+  or whitespace is `InvalidInput`. A step that fails after the interface was created deletes
+  it again and returns the error.
 
 ### Tests
 
@@ -183,7 +233,13 @@ neither future is cancellation safe. Two implementations:
 through the public API: ARP, neighbor and router solicitations, a DHCP lease, TCP between
 two `NetStack`s through the adapter, and the shutdown of both sides when the transport
 closes. The TAP unit tests run the transport over a datagram socket pair; opening a real
-TAP device needs `CAP_NET_ADMIN`, so that test is ignored by default.
+TAP device needs `CAP_NET_ADMIN`, so that test is ignored by default. The offload handling
+of the packet socket is tested on crafted frames (partial checksums, GSO frames beyond one
+batch, malformed headers). The tests of `ensure_tap` and `PacketSocket` on real interfaces
+(creation, owner, flags and IPv6 settings, deletion while attached, an existing interface
+left in place, frames in both directions, GSO and partial-checksum frames through the
+kernel) need `CAP_NET_ADMIN`, `CAP_NET_RAW` and `/dev/net/tun` and return early without
+them.
 
 [`scripts/vm-guest.sh`](../../crates/nsplane-ether/scripts/vm-guest.sh) checks the adapter
 against a real Linux guest. It builds the
@@ -237,15 +293,24 @@ once the transport is gone.
 - Frames up to `MAX_FRAME_LEN` (65 549 bytes: a 64 KiB IP packet behind the ethernet
   header); the reader task holds one buffer of that size.
 - No VLAN tags (802.1Q / 802.1ad frames are dropped), no 802.3 length framing.
+- Packet socket: one guest per interface; GSO types TCP over IPv4 and IPv6 and UDP, no
+  IPv6 extension headers in GSO frames; frames for the guest no larger than the interface
+  MTU plus the ethernet header. The reader holds a copy of the GSO frame being split and
+  up to `MAX_BATCH` segment buffers.
 - Source queue: 256 packets; buffer pool: 256 idle buffers.
 - At most 63 IPv4 DNS servers in DHCP, 127 IPv6 DNS servers in router advertisements.
 
 ## Platform notes
 
 - The framed stream transport builds on every platform; `stream::unix` is Unix only.
-- `TapDevice`, `TapReader` and `TapWriter` are Linux only, and the `libc` dependency is
-  Linux only. `unsafe` code lives only in the TAP module (`ioctl`, `fcntl`, `read`, `write`
-  and the reactor registration), each with a SAFETY comment.
+- `TapDevice`, `TapReader`, `TapWriter`, `PacketSocket`, `PacketReader`, `PacketWriter`,
+  `ensure_tap`, `TapConfig` and `TapInterface` are Linux only, and the `libc` dependency is
+  Linux only. `unsafe` code lives only in the TAP and packet socket modules (`ioctl`,
+  `fcntl`, `socket`, `setsockopt`, `bind`, `send`, `recv`, `recvmsg`, `writev`, `read`,
+  `write`, interface name and index lookups, and the reactor registration), each with a
+  SAFETY comment.
+- Capabilities: `PacketSocket::bind` needs `CAP_NET_RAW`; `ensure_tap` needs
+  `CAP_NET_ADMIN` when it creates the interface; `TapDevice::open` needs `CAP_NET_ADMIN`.
 
 ## See also
 
