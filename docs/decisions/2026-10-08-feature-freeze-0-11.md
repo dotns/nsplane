@@ -64,3 +64,5 @@ slot A/B when it touches the data path.
   `20261024-1329-vm-wireguard-example`), and an `AF_PACKET` frame transport for guests whose
   TAP another process holds, such as Firecracker (owner: "用C方式最合理、不引入额外管理"; plan
   `20261024-1338-af-packet-transport`). All ship as 0.18.0.
+- 2026-10-24: ninth exception (owner: "网关做arp代理"): `nsplane-ether` answers ARP and NDP
+  for every address of the guest's link but its own (plan `20261024-1454-ether-proxy-arp`).
