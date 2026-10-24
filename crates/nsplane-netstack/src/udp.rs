@@ -44,6 +44,26 @@ pub(crate) struct Datagram {
 /// Returns `None` if the packet is not an unfragmented UDP datagram or is malformed.
 /// IPv6 extension headers are not walked.
 pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
+    let (src, dst, payload) = udp_payload(&packet)?;
+    let payload = packet.freeze().slice(payload);
+    Some(Datagram { src, dst, payload })
+}
+
+/// [`parse_udp`], also returning the whole packet the datagram's payload is a view into.
+pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
+    let (src, dst, payload) = udp_payload(&packet)?;
+    let whole = packet.freeze();
+    let payload = whole.slice(payload);
+    Some((Datagram { src, dst, payload }, whole))
+}
+
+/// The source, destination and payload range of an unfragmented UDP datagram.
+#[allow(
+    clippy::inline_always,
+    reason = "the ingress path keeps it inlined in `parse_udp`"
+)]
+#[inline(always)]
+fn udp_payload(packet: &PacketBuf) -> Option<(SocketAddr, SocketAddr, std::ops::Range<usize>)> {
     let bytes = packet.as_packet();
     let ip = IpPacket::parse(bytes).ok()?;
     if ip.protocol() != protocol::UDP || ip.fragment().is_some() {
@@ -62,8 +82,7 @@ pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
     let dst = SocketAddr::new(ip.dst(), udp.dst_port());
     let start = header_len + UDP_HEADER;
     let end = header_len + udp_len;
-    let payload = packet.freeze().slice(start..end);
-    Some(Datagram { src, dst, payload })
+    Some((src, dst, start..end))
 }
 
 /// Builds an IP/UDP packet from `src` to `dst` carrying `payload`.
@@ -233,12 +252,15 @@ impl UdpFlow {
         }
     }
 
-    /// The stack's address the datagrams were sent to.
+    /// The address the datagrams were sent to; replies are sourced from it. With
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) that is the
+    /// original destination, which need not be one of the stack's addresses.
     pub const fn local_addr(&self) -> SocketAddr {
         self.reply.local
     }
 
-    /// The remote address the datagrams came from.
+    /// The remote address the datagrams came from (their source), also with
+    /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent).
     pub const fn peer_addr(&self) -> SocketAddr {
         self.reply.peer
     }
