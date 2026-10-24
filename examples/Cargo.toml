@@ -27,6 +27,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 nsplane = { path = "../crates/nsplane", version = "0.16.2" }
 nsplane-acl = { path = "../crates/nsplane-acl", version = "0.16.2" }
 nsplane-core = { path = "../crates/nsplane-core", version = "0.16.2" }
+nsplane-dns = { path = "../crates/nsplane-dns", version = "0.16.2", features = ["netstack"] }
 nsplane-nat = { path = "../crates/nsplane-nat", version = "0.16.2" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.16.2" }
 nsplane-packet = { path = "../crates/nsplane-packet", version = "0.16.2" }

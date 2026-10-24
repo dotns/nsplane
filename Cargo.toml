@@ -14,6 +14,7 @@ members = [
     "crates/nsplane-nat",
     "crates/nsplane-wss",
     "crates/nsplane-ether",
+    "crates/nsplane-dns",
     "examples",
 ]
 

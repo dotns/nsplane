@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     device on Linux.
   - Sans-I/O protocol layer: `Frame`, `ArpPacket`, `Ndp`, `DhcpMessage` / `DhcpServer`,
     `MacAddr`.
+- nsplane-dns, generic DNS serving: owned message types and a wire codec (one question,
+  EDNS OPT echo, truncation for the UDP size with TCP fallback), and the async `Resolver`
+  trait with `Fallback` composition; resolution policy stays with the embedder.
+  - Resolvers: `StaticRecords` (local records), `FakePool` (A / AAAA addresses handed out
+    per name from configured prefixes, TTL/LRU reuse, reverse lookup) and `Forwarder`
+    (upstream servers over UDP, TCP retry for truncated responses, no cache).
+  - `Server` over tokio UDP and TCP sockets or any byte stream, with a bound on queries in
+    flight, resolve and TCP idle timeouts and counters in `ServerStats`; feature `netstack`
+    serves the UDP flows and TCP connections of an `nsplane-netstack` stack.
 - Transparent termination in nsplane-netstack: `NetStackConfig::transparent` with
   `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`) makes the stack
   the endpoint for TCP and UDP to any destination in the prefixes; accepted connections and
