@@ -10,7 +10,6 @@ repository.workspace = true
 readme = "../../README.md"
 keywords.workspace = true
 categories.workspace = true
-publish = false
 
 [lints]
 workspace = true
