@@ -4,8 +4,8 @@ Generic DNS serving: owned message types, a wire codec, the async `Resolver` tra
 to compose (local records, fake addresses, forwarding) and a server over UDP and TCP. It
 answers clients with what the embedder decides; resolution policy (which names are local,
 which are faked, where the rest goes) stays with the embedder, which can express it as a rule
-table for `PolicyResolver`. It is not a full DNS
-implementation: no zones, no DNSSEC, no recursion, no cache, no zone transfers or updates.
+table for `PolicyResolver`. It is not a full DNS implementation: no zones, no DNSSEC, no
+recursion, no cache, no zone transfers or updates.
 The codec builds on the `simple-dns` fork (ADR
 [2026-10-24-simple-dns-fork](../decisions/2026-10-24-simple-dns-fork.md)), which stays an
 implementation detail: no `simple-dns` type appears in the public API. The optional `netstack`
@@ -19,10 +19,10 @@ feature builds on `nsplane-netstack`.
 | resolvers: composition (`resolver`) | trait `Resolver` (also for `Arc<R>` and `&R`), `Fallback` (`new`) | |
 | resolvers: static records (`records`) | `StaticRecords` (`new`, `insert`, `FromIterator<Record>`, `lookup`, `with_fallback`, `len`, `is_empty`) | |
 | resolvers: fake addresses (`fake`) | `FakePool` (`new`, `with_fallback`, `lookup`, `lookup_name`, `capacity`, `len`, `is_empty`, `stats`) | `FakePoolConfig`, `FakePoolConfigError`, `FakePoolStats`, `NoData`, `DEFAULT_FAKE_CAPACITY`, `DEFAULT_FAKE_TTL` |
-| resolvers: forwarding (`forward`) | `Forwarder` (`new`, `config`, `stats`) | `ForwarderConfig` (`new`), `ForwarderError`, `ForwarderStats` |
+| resolvers: forwarding (`forward`) | `Forwarder` (`new`, `forward`, `config`, `stats`) | `ForwarderConfig` (`new`), `ForwarderError`, `ForwarderStats` |
 | resolvers: policy routing (`policy`) | `PolicyResolver` (`new`, `replace`, `replace_table`, `table`, `matching`, `stats`) | `PolicyTable` (`new`, `with_ttl`, `rules`, `ttl`, `matching`), `Rule` (`new`, `with_types`, `with_clients`, `with_on_nxdomain`), `NameMatch`, `Action`, `NxDomainFallback`, `ResolverSet` (`new`, `with`, `insert`, `contains`, `len`, `is_empty`), `PolicyStats`, `PolicyError`, `DEFAULT_POLICY_TTL`, `MAX_CNAME_CHAIN` |
 | hosts text (`hosts`) | `Hosts` (`parse`, `static_records`, `wildcard_rules`, `rules`, `errors`, `is_empty`) | `HostsError`, `HostsErrorKind` |
-| server (`server`) | `Server` (`new`, `handle`, `serve_udp`, `serve_tcp`, `serve_stream`, `config`, `resolver`, `stats`) | `ServerConfig` (`with_max_in_flight`, `with_udp_payload_size`, `with_resolve_timeout`, `with_tcp_idle_timeout`), `ServerStats`, `Transport` |
+| server (`server`) | `Server` (`new`, `with_passthrough`, `with_passthrough_policy`, `handle`, `serve_udp`, `serve_tcp`, `serve_stream`, `config`, `resolver`, `stats`) | `ServerConfig` (`with_max_in_flight`, `with_udp_payload_size`, `with_resolve_timeout`, `with_tcp_idle_timeout`), `ServerStats`, `Transport`, trait `PassthroughPolicy` (also for closures), `PassthroughRequest`, `PassthroughDecision` |
 | feature `netstack` (`netstack`) | `Server::serve_udp_flow`, `Server::serve_tcp_connection` | |
 
 ## Behavior
@@ -31,10 +31,12 @@ feature builds on `nsplane-netstack`.
 
 `Query::decode` accepts a query (`QR` = 0) with opcode `QUERY` and exactly one question. The
 question name is normalized (ASCII-lowercase, no trailing dot) for matching; `raw` keeps the
-received bytes for forwarding. Records in the other sections are ignored except the EDNS OPT
-record, whose UDP payload size `udp_payload_size` reports. A message that does not decode
-yields a `DecodeError`: `response_code` is `FORMERR` for a malformed message or zero or
-several questions, `NOTIMP` for another opcode, and `None` (drop silently) for input shorter
+received bytes for forwarding. Only the header, the question and the EDNS OPT record (whose
+UDP payload size `udp_payload_size` reports) are decoded: records in the answer, authority
+and additional sections are skipped by their length, so records of unknown types or classes
+and RDATA the codec does not parse do not fail the query. A message that does not decode
+yields a `DecodeError`: `response_code` is `FORMERR` for a malformed message (header,
+question or OPT record that does not parse, a record cut off) or zero or several questions, `NOTIMP` for another opcode, and `None` (drop silently) for input shorter
 than the header or a response. `encode_error(id, code)` answers the former without a
 question.
 
@@ -99,7 +101,15 @@ compared case-insensitively, type and class) is accepted; other datagrams are ig
 the attempt times out. A truncated response (`TC` = 1) is retried over TCP to the same
 upstream. Attempts rotate through `ForwarderConfig::upstreams` in order, starting with the
 first for every query; when all attempts fail (timeout, ICMP refusal, I/O error) the answer is
-`SERVFAIL`. Any accepted response is final, whatever its response code.
+`SERVFAIL`. Any accepted response is final, whatever its response code. Responses are read
+with the same lenient view as queries, so records the codec does not parse do not make a
+response unacceptable.
+
+`Forwarder::forward(message)` passes any DNS message byte for byte the same way (attempts,
+fresh transaction ID, TCP retry, counters) and returns the response with the message's ID.
+The message is not decoded: a response is accepted on its transaction ID, `QR` = 1 and the
+message's opcode, without a question comparison. It returns `None` for a message shorter than
+the header or when every attempt fails (`ForwarderStats::failures`).
 
 The transaction ID mixes a counter with the socket's port and is not cryptographically random;
 resistance against spoofed responses comes mostly from the random source port of every
@@ -181,6 +191,23 @@ is `SERVFAIL` (`ServerStats::timeouts`). The response is encoded with the limit 
 `Transport`: `max_udp_response_size` over UDP, 65535 over TCP. `handle` does not bound
 concurrency itself.
 
+Passthrough is off by default. `Server::with_passthrough(forwarder)` takes an
+`Arc<Forwarder>` (which may also serve as a resolver) and sends it the messages that do not
+decode but have a readable header: opcodes other than `QUERY` (`IQUERY`, `NOTIFY`, `UPDATE`
+and others), question counts other than one, and queries whose question or OPT record does
+not parse. Responses (`QR` = 1) and input shorter than the header are still dropped. Before a
+message is passed, the `PassthroughPolicy` set with `with_passthrough_policy` gets a
+`PassthroughRequest` (client address, opcode, question count) and returns
+`PassthroughDecision::Pass` or `Local`; `Local` answers with the decode error as without
+passthrough (`ServerStats::pass_refused`). Without a policy every such message is passed. The
+policy runs inline in `handle` and must not block. The forwarder's response is returned under
+the client's ID (`ServerStats::passed`); when `resolve_timeout` expires or every forwarder
+attempt fails the answer is `SERVFAIL` without a question (`ServerStats::pass_failed`). Over
+UDP a response above the client's limit (its OPT payload size when the message has a readable
+OPT record, else 512 bytes, clamped like `max_udp_response_size`) is replaced by the
+response's header with `TC` = 1 and all section counts zero; the client retries over TCP,
+where the limit is 65535.
+
 The serve functions bound the queries resolved at once, over all transports of a server and
 its clones, to `ServerConfig::max_in_flight`:
 
@@ -229,14 +256,15 @@ address and port to these functions.
 - `HostsError` (with the line number): `HostsErrorKind::InvalidAddress`, `NoName`,
   `InvalidName`.
 - Server: every message that does not decode counts in `ServerStats::decode_errors`; it is
-  answered `FORMERR` or `NOTIMP`, or dropped when it is shorter than the header or a
-  response. UDP datagrams over the in-flight bound are dropped
+  answered `FORMERR` or `NOTIMP` (or passed through, see Server), or dropped when it is
+  shorter than the header or a response. Passed messages count in `ServerStats::passed`,
+  `pass_refused` (kept local by the policy) or `pass_failed` (answered `SERVFAIL`). UDP datagrams over the in-flight bound are dropped
   (`ServerStats::dropped_overload`).
 
 ## Limits and bounds
 
 - One question per message; opcodes other than `QUERY` (notify, update) are answered with
-  `NOTIMP`.
+  `NOTIMP` unless passthrough sends them to a forwarder.
 - Response codes are limited to `ResponseCode` (no extended codes).
 - `RecordData` covers A, AAAA, CNAME, PTR and TXT.
 - At most `max_in_flight` queries resolve at once per server; a `FakePool` holds at most

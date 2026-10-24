@@ -64,3 +64,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-1500-gino-egress-requests Sandboxed agent egress requests from gino-agent**](20261024-1500-gino-egress-requests.md) `P2`
 - [-] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `P2`
 - [-] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `P2`
+- [-] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `P2`

@@ -52,3 +52,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-1600-egress-0-17 Release 0.17.0: transparent netstack, flow events, ethernet adapter, DNS crate**](20261024-1600-egress-0-17.md) `2026-10-24`
 - [-] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `2026-10-24`
 - [-] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `2026-10-24`
+- [-] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `2026-10-24`

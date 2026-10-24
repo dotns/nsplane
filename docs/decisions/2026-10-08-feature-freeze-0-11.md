@@ -59,4 +59,6 @@ slot A/B when it touches the data path.
 - 2026-10-24: eighth exception (owner: "可以 开始处理"): transparent forwarding in nsplane-dns for
   messages it does not handle (plan `20261024-1304-dns-passthrough`), extended the same day
   (owner: "可以，cname也可以一起放进去") by DNS policy routing with CNAME rewriting (plan
-  `20261024-1313-dns-policy`). Both ship as 0.18.0.
+  `20261024-1313-dns-policy`), and an example of a virtual machine reaching a remote
+  WireGuard peer (owner: "可以把vm路径的examples也放进0.18"; plan
+  `20261024-1329-vm-wireguard-example`). All ship as 0.18.0.

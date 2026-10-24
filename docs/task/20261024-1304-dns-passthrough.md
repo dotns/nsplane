@@ -1,6 +1,6 @@
 # 20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle
 
-- **status**: in progress (owner approved 2026-10-24: "可以 开始处理")
+- **status**: in progress (merged into main 652752d; ships with 0.18.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:04
@@ -18,3 +18,10 @@ transparent forwarding of what the crate does not support.
 
 - **blocked by**: (none)
 - **blocks**: (none)
+
+## Follow-up
+
+- Upstream simple-dns `Header` / `OPT` encode and decode the OPT TTL with a non-RFC 6891
+  layout (extended RCODE and version swapped). `PacketView` decodes it correctly; responses
+  built from `Packet` still use the upstream encoding, harmless while nsplane-dns writes
+  version 0 and RCODEs below 16. Fix in the simple-dns repository later.

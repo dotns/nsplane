@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- DNS transparent forwarding in nsplane-dns: `Server::with_passthrough` sends messages the
+  codec does not answer (opcodes other than `QUERY`, question counts other than one, a
+  malformed question) to a `Forwarder` byte for byte and returns its response under the
+  client's ID, with UDP truncation and TCP; `Server::with_passthrough_policy` decides per
+  message (`PassthroughPolicy`, `PassthroughRequest`, `PassthroughDecision`), and
+  `ServerStats` counts `passed`, `pass_refused` and `pass_failed`.
+  - `Forwarder::forward` passes a raw message to the upstreams.
+  - `Query::decode` decodes only the header, the question and the OPT record: records of
+    unknown types or with RDATA the codec cannot parse elsewhere in a query no longer give
+    `FORMERR`, and the forwarder no longer ignores upstream responses carrying them
+    (simple-dns fork tag `v0.12.0-nsplane.4`).
 - nsplane-dns policy routing: `PolicyResolver` routes each query by a `PolicyTable` of
   `Rule`s to one of several resolvers registered under ids in a `ResolverSet`, or to a local
   answer.

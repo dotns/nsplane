@@ -4,7 +4,13 @@
 //! serve functions run it over tokio sockets ([`serve_udp`](Server::serve_udp),
 //! [`serve_tcp`](Server::serve_tcp)) or any byte stream ([`serve_stream`](Server::serve_stream));
 //! they spawn tasks with `tokio::spawn` and need a tokio runtime.
+//!
+//! With [`with_passthrough`](Server::with_passthrough), messages that do not decode as a
+//! [`Query`] but have a readable header (other opcodes, other question counts, a malformed
+//! question) are passed to a [`Forwarder`] byte for byte instead of being answered with an
+//! error, as a [`PassthroughPolicy`] decides.
 
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,13 +18,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use simple_dns::PacketView;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::forward::Forwarder;
 use crate::message::{
-    Answer, DEFAULT_UDP_PAYLOAD_SIZE, EncodeOptions, Query, ResponseCode, encode_error,
-    encode_response, max_udp_response_size,
+    Answer, DEFAULT_UDP_PAYLOAD_SIZE, DecodeError, EncodeOptions, Query, ResponseCode,
+    encode_error, encode_response, max_udp_response_size, udp_response_limit,
 };
 use crate::resolver::Resolver;
 
@@ -27,6 +35,9 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 
 /// The `TC` bit in the third header byte.
 const TC_BIT: u8 = 0x02;
+
+/// Length of the fixed DNS header.
+const HEADER_LEN: usize = 12;
 
 /// The transport a message arrived on; it decides the response size limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,6 +121,14 @@ pub struct ServerStats {
     pub decode_errors: u64,
     /// Queries answered `SERVFAIL` after [`ServerConfig::resolve_timeout`].
     pub timeouts: u64,
+    /// Messages passed through ([`Server::with_passthrough`]) and answered with the
+    /// upstream response.
+    pub passed: u64,
+    /// Messages the [`PassthroughPolicy`] kept local, answered with the decode error.
+    pub pass_refused: u64,
+    /// Passed messages answered `SERVFAIL`: every forwarder attempt failed or
+    /// [`ServerConfig::resolve_timeout`] expired.
+    pub pass_failed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -120,10 +139,60 @@ struct Counters {
     dropped_overload: AtomicU64,
     decode_errors: AtomicU64,
     timeouts: AtomicU64,
+    passed: AtomicU64,
+    pass_refused: AtomicU64,
+    pass_failed: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A message that did not decode as a [`Query`], offered to a [`PassthroughPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PassthroughRequest {
+    /// The transport peer the message came from.
+    pub client: SocketAddr,
+    /// The header's opcode (0 `QUERY`, 1 `IQUERY`, 2 `STATUS`, 4 `NOTIFY`, 5 `UPDATE`).
+    pub opcode: u8,
+    /// The header's question count (`ZOCOUNT` for `UPDATE`).
+    pub question_count: u16,
+}
+
+/// What [`Server`] does with a message offered for passthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PassthroughDecision {
+    /// Pass it to the forwarder and return its response.
+    Pass,
+    /// Answer locally with the decode error (`FORMERR`, `NOTIMP`).
+    Local,
+}
+
+/// Decides per message whether [`Server`] passes it through; called inline, so it must not
+/// block. Any `Fn(&PassthroughRequest) -> PassthroughDecision + Send + Sync` is a policy.
+pub trait PassthroughPolicy: Send + Sync {
+    /// The decision for `request`.
+    fn decide(&self, request: &PassthroughRequest) -> PassthroughDecision;
+}
+
+impl<F> PassthroughPolicy for F
+where
+    F: Fn(&PassthroughRequest) -> PassthroughDecision + Send + Sync,
+{
+    fn decide(&self, request: &PassthroughRequest) -> PassthroughDecision {
+        self(request)
+    }
+}
+
+/// A shared [`PassthroughPolicy`].
+#[derive(Clone)]
+struct Policy(Arc<dyn PassthroughPolicy>);
+
+impl fmt::Debug for Policy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PassthroughPolicy")
+    }
 }
 
 /// A DNS server answering with a [`Resolver`].
@@ -139,6 +208,8 @@ pub struct Server<R> {
     config: ServerConfig,
     permits: Arc<Semaphore>,
     counters: Arc<Counters>,
+    passthrough: Option<Arc<Forwarder>>,
+    policy: Option<Policy>,
 }
 
 impl<R> Clone for Server<R> {
@@ -148,6 +219,8 @@ impl<R> Clone for Server<R> {
             config: self.config,
             permits: Arc::clone(&self.permits),
             counters: Arc::clone(&self.counters),
+            passthrough: self.passthrough.clone(),
+            policy: self.policy.clone(),
         }
     }
 }
@@ -160,7 +233,33 @@ impl<R: Resolver> Server<R> {
             config,
             permits: Arc::new(Semaphore::new(config.max_in_flight)),
             counters: Arc::default(),
+            passthrough: None,
+            policy: None,
         }
+    }
+
+    /// Passes messages that do not decode as a [`Query`] but have a readable header to
+    /// `forwarder` ([`Forwarder::forward`]) and answers with its response, under the client's
+    /// ID: opcodes other than `QUERY`, question counts other than one, and messages whose
+    /// question or OPT record does not parse. Responses (`QR` = 1) and messages shorter than
+    /// the header are still dropped. Every such message is passed unless a policy is set with
+    /// [`with_passthrough_policy`](Self::with_passthrough_policy).
+    ///
+    /// The forwarder may be shared, for example with a resolver that also uses it.
+    #[must_use]
+    pub fn with_passthrough(mut self, forwarder: Arc<Forwarder>) -> Self {
+        self.passthrough = Some(forwarder);
+        self
+    }
+
+    /// Sets the policy that decides, per message, whether
+    /// [`with_passthrough`](Self::with_passthrough) passes it or the server answers it with
+    /// the decode error ([`ServerStats::pass_refused`]). Without a passthrough target the
+    /// policy is not called.
+    #[must_use]
+    pub fn with_passthrough_policy(mut self, policy: impl PassthroughPolicy + 'static) -> Self {
+        self.policy = Some(Policy(Arc::new(policy)));
+        self
     }
 
     /// The settings.
@@ -183,6 +282,9 @@ impl<R: Resolver> Server<R> {
             dropped_overload: c.dropped_overload.load(Ordering::Relaxed),
             decode_errors: c.decode_errors.load(Ordering::Relaxed),
             timeouts: c.timeouts.load(Ordering::Relaxed),
+            passed: c.passed.load(Ordering::Relaxed),
+            pass_refused: c.pass_refused.load(Ordering::Relaxed),
+            pass_failed: c.pass_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -190,10 +292,18 @@ impl<R: Resolver> Server<R> {
     /// functions; transport adapters call it with each received message.
     ///
     /// A message that does not decode is answered by [`encode_error`] (`FORMERR`, `NOTIMP`)
-    /// when its header is readable, else `None`. A query is resolved under
+    /// when its header is readable, else `None`; with
+    /// [`with_passthrough`](Self::with_passthrough) a message with a readable header goes to
+    /// the forwarder instead, as the policy decides. A query is resolved under
     /// [`ServerConfig::resolve_timeout`] (`SERVFAIL` when it expires) and encoded with the
     /// size limit of `transport`: [`max_udp_response_size`] over UDP, so larger answers
     /// come back truncated for the client to retry over TCP, and 65535 over TCP.
+    ///
+    /// A passed message is forwarded under [`ServerConfig::resolve_timeout`] (`SERVFAIL` when
+    /// it expires or every forwarder attempt fails). Over UDP, a response above the client's
+    /// limit (its OPT payload size when the message has a readable OPT record, else 512
+    /// bytes, clamped like [`max_udp_response_size`]) is replaced by its header with `TC` = 1
+    /// and all section counts zero.
     ///
     /// It does not take an in-flight permit; callers bound concurrency themselves.
     pub async fn handle(
@@ -208,7 +318,11 @@ impl<R: Resolver> Server<R> {
             Err(err) => {
                 bump(&self.counters.decode_errors);
                 tracing::debug!(%client, %err, "undecodable DNS message");
-                encode_error(err.id()?, err.response_code()?)
+                let code = err.response_code()?;
+                match self.passthrough_target(message, client, &err) {
+                    Some(forwarder) => self.pass(forwarder, message, client, transport).await?,
+                    None => encode_error(err.id()?, code),
+                }
             }
         };
         if response.get(2).is_some_and(|flags| flags & TC_BIT != 0) {
@@ -216,6 +330,81 @@ impl<R: Resolver> Server<R> {
         }
         bump(&self.counters.responses);
         Some(response)
+    }
+
+    /// The forwarder `message` goes to, `None` when it is answered locally.
+    fn passthrough_target(
+        &self,
+        message: &[u8],
+        client: SocketAddr,
+        err: &DecodeError,
+    ) -> Option<&Forwarder> {
+        let forwarder = self.passthrough.as_deref()?;
+        let (Some(&flags), Ok(question_count)) = (
+            message.get(2),
+            simple_dns::header_buffer::questions(message),
+        ) else {
+            return None;
+        };
+        let request = PassthroughRequest {
+            client,
+            opcode: (flags >> 3) & 0x0f,
+            question_count,
+        };
+        let decision = self
+            .policy
+            .as_ref()
+            .map_or(PassthroughDecision::Pass, |policy| {
+                policy.0.decide(&request)
+            });
+        if decision == PassthroughDecision::Local {
+            bump(&self.counters.pass_refused);
+            tracing::debug!(%client, %err, "DNS passthrough refused by policy");
+            return None;
+        }
+        Some(forwarder)
+    }
+
+    /// Forwards `message` and returns the response sized for `transport`; `None` when
+    /// `message` has no ID to answer with.
+    async fn pass(
+        &self,
+        forwarder: &Forwarder,
+        message: &[u8],
+        client: SocketAddr,
+        transport: Transport,
+    ) -> Option<Bytes> {
+        let id = simple_dns::header_buffer::id(message).ok()?;
+        let forward = forwarder.forward(message);
+        let Ok(Some(response)) = tokio::time::timeout(self.config.resolve_timeout, forward).await
+        else {
+            bump(&self.counters.pass_failed);
+            tracing::debug!(%client, "DNS passthrough failed");
+            return Some(encode_error(id, ResponseCode::ServFail));
+        };
+        bump(&self.counters.passed);
+        let max_size = match transport {
+            Transport::Udp => {
+                let client_size = PacketView::parse(message)
+                    .ok()
+                    .and_then(|view| view.opt().map(|opt| opt.udp_packet_size));
+                udp_response_limit(client_size, self.options())
+            }
+            Transport::Tcp => MAX_MESSAGE_SIZE,
+        };
+        if response.len() <= max_size {
+            return Some(response);
+        }
+        let mut header = response.slice(..HEADER_LEN).to_vec();
+        header[2] |= TC_BIT;
+        header[4..].fill(0);
+        Some(Bytes::from(header))
+    }
+
+    const fn options(&self) -> EncodeOptions {
+        EncodeOptions {
+            udp_payload_size: self.config.udp_payload_size,
+        }
     }
 
     async fn answer(&self, query: &Query, client: SocketAddr, transport: Transport) -> Bytes {
@@ -227,9 +416,7 @@ impl<R: Resolver> Server<R> {
                 tracing::debug!(%client, name = query.name(), "DNS resolve timed out");
                 Answer::Code(ResponseCode::ServFail)
             });
-        let options = EncodeOptions {
-            udp_payload_size: self.config.udp_payload_size,
-        };
+        let options = self.options();
         let max_size = match transport {
             Transport::Udp => max_udp_response_size(query, options),
             Transport::Tcp => MAX_MESSAGE_SIZE,
