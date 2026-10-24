@@ -1,0 +1,24 @@
+[package]
+name = "nsplane-dns"
+description = "DNS serving for nsplane: wire codec, async Resolver trait and resolver building blocks"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+simple-dns = { version = "0.12.0", git = "https://github.com/dotns/simple-dns", tag = "v0.12.0-nsplane.2", default-features = false, features = ["std"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt", "test-util"] }
