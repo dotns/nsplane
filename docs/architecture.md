@@ -71,6 +71,7 @@ handle and the filter APIs.
 | `nsplane-wss` | `crates/nsplane-wss/` | WebSocket-over-TLS carriers: `WssDialer` for `LinkTransport`, the server transport, the `WsFrame` stream client and terminate leg | [nsplane-wss](reference/nsplane-wss.md) |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices and host-managed devices as `PacketSource` / `PacketSink` | [nsplane-tun](reference/nsplane-tun.md) |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource` / `PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 | [nsplane-netstack](reference/nsplane-netstack.md) |
+| `nsplane-ether` | `crates/nsplane-ether/` | Ethernet adapter for one guest as `PacketSource` / `PacketSink`: ARP, IPv6 neighbor discovery and router advertisements, single-lease DHCPv4; stream and TAP frame transports | [nsplane-ether](reference/nsplane-ether.md) |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener | [nsplane-uapi](reference/nsplane-uapi.md) |
 | `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI | [nsplane-cli](reference/nsplane-cli.md) |
 | `nsplane-e2e` | `crates/nsplane-e2e/` | Not published: library-level end-to-end tests | |
@@ -79,7 +80,7 @@ handle and the filter APIs.
 ```text
 nsplane-noise (noise) ─► nsplane-core ─► nsplane ─► nsplane-tun, nsplane-uapi ─► nsplane-cli
 nsplane-packet ────────► nsplane-core, nsplane
-nsplane, nsplane-packet ─► nsplane-netstack
+nsplane, nsplane-packet ─► nsplane-netstack, nsplane-ether
 nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
 nsplane ─► nsplane-nat
 nsplane ─► nsplane-wss
