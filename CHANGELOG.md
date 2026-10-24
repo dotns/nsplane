@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `arp_replies` and `nd_replies`).
   - The `vm_wireguard` example reaches the other hosts of the tunnel prefix; its status
     reports the two counters.
+- TCP retransmission timeout bounds in nsplane-netstack: `NetStackConfig::tcp_min_rto` and
+  `tcp_initial_rto` set smoltcp's per-socket minimum and initial RTO on every TCP socket,
+  in whole milliseconds clamped to 1 ms..=60 s. The defaults are smoltcp's 1 s, so behavior
+  is unchanged unless set; a 20 ms minimum cut the in-process 1 % loss transfer from 1.10 s
+  to 0.11 s (`docs/performance.md`).
+
+### Changed
+- nsplane-netstack depends on smoltcp fork tag `v0.14.0-nsplane.7`, rebased onto upstream
+  smoltcp `main` (`24bda3b`). The fork's zero-window and pending fast retransmission fixes
+  are replaced by upstream's equivalents, and the tail loss probe yields to a retransmission
+  timeout that expires first (ADR `2026-10-03-smoltcp-fork`). A retransmission timeout
+  that finds the peer's window closed now arms the zero-window probe one backed-off timeout
+  later instead of probing at once. The in-process netstack throughput rows are unchanged;
+  the `send_stream` TCP microbenchmarks are 1-2 % slower, not caused by upstream's Cubic
+  `no_std` change (reverting it is slower still).
+
+### Fixed
+- nsplane-netstack, through upstream smoltcp: the last advertised window saturates at zero
+  after a FIN at a zero-window edge instead of underflowing (smoltcp's window-update path
+  does not reach that state; the computation is total now).
 
 ## [0.18.0] - 2026-10-24
 

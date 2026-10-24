@@ -24,7 +24,7 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::config::{Admission, NetStackConfig, Settings};
+use crate::config::{Admission, NetStackConfig, Settings, TcpRto};
 use crate::device::{TAILROOM, VirtualDevice};
 use crate::events::{EventSink, FlowEvent, FlowEventReason};
 use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
@@ -857,12 +857,14 @@ struct Connecting {
     start: u64,
 }
 
-/// Socket pool limits: sockets per port and in total, and each socket's buffer sizes.
+/// Socket pool limits: sockets per port and in total, and each socket's buffer sizes and
+/// RTO bounds.
 #[derive(Debug, Clone, Copy)]
 struct Pool {
     limit: usize,
     rx_buffer: usize,
     tx_buffer: usize,
+    rto: TcpRto,
 }
 
 /// The queue of a UDP flow or socket, with the flow it belongs to.
@@ -1040,6 +1042,7 @@ impl Driver {
             limit: self.settings.listener_pool,
             rx_buffer: self.settings.tcp_rx_buffer(),
             tx_buffer: self.settings.tcp_tx_buffer(),
+            rto: self.settings.tcp_rto,
         };
         let refused = prepare_tcp_listeners(
             &demand,
@@ -1952,8 +1955,11 @@ impl Driver {
                 io::Error::new(io::ErrorKind::AddrInUse, "no free ephemeral port")
             })?,
         };
-        let mut socket =
-            new_tcp_socket(self.settings.tcp_rx_buffer(), self.settings.tcp_tx_buffer());
+        let mut socket = new_tcp_socket(
+            self.settings.tcp_rx_buffer(),
+            self.settings.tcp_tx_buffer(),
+            self.settings.tcp_rto,
+        );
         socket.set_timeout(Some(CONNECT_TIMEOUT));
         socket
             .connect(
@@ -2717,10 +2723,11 @@ fn preserve_terminal_receive(
     shared.wake_reader();
 }
 
-/// A TCP socket tuned for relaying, with buffers of `rx_buffer` and `tx_buffer` bytes.
+/// A TCP socket tuned for relaying, with buffers of `rx_buffer` and `tx_buffer` bytes and
+/// the RTO bounds `rto`.
 ///
 /// smoltcp derives the window-scale shift from the receive buffer's capacity here.
-fn new_tcp_socket(rx_buffer: usize, tx_buffer: usize) -> tcp::Socket<'static> {
+fn new_tcp_socket(rx_buffer: usize, tx_buffer: usize, rto: TcpRto) -> tcp::Socket<'static> {
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buffer]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buffer]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -2735,6 +2742,8 @@ fn new_tcp_socket(rx_buffer: usize, tx_buffer: usize) -> tcp::Socket<'static> {
     // buffer) loses the retransmission too and the timeouts double past 30 s. CUBIC
     // restarts from one segment after a timeout and backs off on loss.
     socket.set_congestion_control(tcp::CongestionControl::Cubic);
+    socket.set_min_rto(rto.min);
+    socket.set_initial_rto(rto.initial);
     socket
 }
 
@@ -2904,7 +2913,7 @@ fn ensure_tcp_listeners(
 
     let handles = listeners.entry(port).or_default();
     for _ in 0..add {
-        let mut socket = new_tcp_socket(pool.rx_buffer, pool.tx_buffer);
+        let mut socket = new_tcp_socket(pool.rx_buffer, pool.tx_buffer, pool.rto);
         let _ = socket.listen(port);
         handles.push(sockets.add(socket));
     }
