@@ -3,7 +3,8 @@
 //! An ICMP Destination Unreachable / Fragmentation Needed (type 3, code 4) or an `ICMPv6`
 //! Packet Too Big (type 2) that quotes a TCP segment the stack sent lowers that
 //! connection's MSS. This module only reads the message; the driver checks it against
-//! the stack's addresses, MTU and live connections.
+//! the stack's addresses (not in transparent mode, where the quoted tuple alone finds the
+//! connection), MTU and live connections.
 
 use std::net::SocketAddr;
 

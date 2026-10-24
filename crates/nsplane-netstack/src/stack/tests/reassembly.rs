@@ -22,7 +22,7 @@ fn config(reassembly: Option<ReassemblyConfig>) -> NetStackConfig {
 
 /// `packet` (IPv4, 20-byte header) split into fragments of `chunk` payload bytes (a
 /// multiple of 8), with identification `id`.
-fn fragments_v4(packet: &[u8], chunk: usize, id: u16) -> Vec<Vec<u8>> {
+pub(super) fn fragments_v4(packet: &[u8], chunk: usize, id: u16) -> Vec<Vec<u8>> {
     let (header, payload) = packet.split_at(20);
     let count = payload.len().div_ceil(chunk);
     payload
