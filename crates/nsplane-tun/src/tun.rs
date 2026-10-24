@@ -25,7 +25,7 @@ use crate::darwin as sys;
 use crate::linux as sys;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::offload::{self, Coalescer, VirtioNetHdr};
-use crate::unix::{adopt_fd, set_nonblocking};
+use crate::unix::{adopt_fd, register, set_nonblocking};
 
 /// Idle buffers kept by a [`TunSource`]'s pool.
 const POOL_FREE: usize = 64;
@@ -181,7 +181,7 @@ impl Tun {
         let watched = sys::name(self.fd.as_fd())
             .and_then(|name| Ok((sys::mtu(&name)?, name)))
             .ok();
-        let fd = Arc::new(AsyncFd::new(self.fd)?);
+        let fd = Arc::new(register::<OwnedFd>(self.fd)?);
         let (sender, receiver) = watch::channel(watched.as_ref().map_or(self.mtu, |w| w.0));
         let unwatched = match watched {
             Some((_, name)) => {
