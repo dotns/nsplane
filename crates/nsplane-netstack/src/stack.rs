@@ -1288,8 +1288,12 @@ impl Driver {
         }
     }
 
-    /// Rejects the held connections and flows past their deadline.
+    /// Rejects the held connections and flows past their deadline. Without
+    /// [`Admission::Decide`] it does not read the clock.
     fn expire_pending(&mut self) {
+        if self.pending.is_none() {
+            return;
+        }
         let now = Instant::now();
         let mut changed = false;
         while let Some((key, held)) = self

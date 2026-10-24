@@ -177,6 +177,9 @@ impl FlowGate {
     /// Emit the event of `decision` for `packet` from `peer` if the decision
     /// emits, a token is available and the channel has room; otherwise an
     /// emitting decision is counted as dropped. Never blocks on the channel.
+    /// Not inlined, so the packet path of a gate without events keeps its
+    /// small frame.
+    #[inline(never)]
     pub(super) fn emit_event(&self, peer: PeerId, packet: &[u8], decision: &GateDecision) {
         let (allow, enforced, reason, rule) = match decision {
             GateDecision::Pass => return,
