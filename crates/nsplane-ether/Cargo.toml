@@ -1,0 +1,19 @@
+[package]
+name = "nsplane-ether"
+description = "Ethernet adapter for one guest: ethernet frames to IP packets, with ARP, IPv6 neighbor discovery and router advertisements, and a single-lease DHCPv4 server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+nsplane-packet = { path = "../nsplane-packet", version = "0.16.2" }
