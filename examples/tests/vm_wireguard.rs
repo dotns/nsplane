@@ -17,7 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use futures_core::Stream;
 use nsplane::x25519::PublicKey;
-use nsplane::{Engine, EngineBuilder, PacketBuf, PacketSink, PacketSource, PeerId, UdpTransport};
+use nsplane::{
+    ChannelSource, Engine, EngineBuilder, MapSink, MapVerdict, MergeSource, PacketBuf, PacketSink,
+    PacketSource, PeerId, UdpTransport,
+};
 use nsplane_ether::dhcp::{self, option};
 use nsplane_ether::frame::{self, HEADER_LEN};
 use nsplane_ether::{
@@ -31,7 +34,8 @@ use nsplane_examples::vm::{self, GATEWAY_MAC, VmArgs};
 use nsplane_netstack::{
     NetStack, NetStackConfig, NetStackHandle, ReassemblyConfig, TransparentConfig,
 };
-use nsplane_packet::checksum::ipv4_header_checksum;
+use nsplane_packet::checksum::{internet_checksum, ipv4_header_checksum};
+use nsplane_packet::icmp::echo_reply_in_place;
 use nsplane_packet::{Ipv4Header, Ipv6Header, UdpHeader, protocol, udp_packet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -68,7 +72,7 @@ struct Args {
     vm: VmArgs,
 }
 
-/// The remote WireGuard peer: an engine on a netstack.
+/// The remote WireGuard peer: an engine on a netstack, answering pings.
 struct Remote {
     engine: Engine,
     stack: NetStackHandle,
@@ -100,6 +104,17 @@ async fn remote(
         ..NetStackConfig::new(addresses, MTU)
     });
     let (source, sink) = stack.split();
+    // The stack does not answer pings: echo requests are answered here, back into the
+    // engine, and never reach the stack.
+    let (replies, echo_tx, _mtu) = ChannelSource::new(64, MTU);
+    let source = MergeSource::new().source(source).source(replies);
+    let sink = MapSink::new(sink, move |packet: &mut PacketBuf, _: PeerId| {
+        if !echo_reply_in_place(packet.as_packet_mut()) {
+            return MapVerdict::Keep;
+        }
+        let _ = echo_tx.try_send(PacketBuf::from_packet(packet.as_packet()));
+        MapVerdict::Drop
+    });
     let udp = UdpTransport::bind(UDP_TRANSPORT, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let addr = udp.local_addr();
     let engine = EngineBuilder::new(source, sink)
@@ -303,6 +318,44 @@ impl Guest {
             (frame.ethertype == EtherType::ARP && arp.op == ArpOp::Reply).then_some(arp.sender_mac)
         })
         .await
+    }
+
+    /// Pings `target` with the echo identifier `id`, sending again every half second;
+    /// whether a matching echo reply came within `limit`.
+    async fn ping(&mut self, target: Ipv4Addr, id: u16, limit: Duration) -> io::Result<bool> {
+        let mut icmp = vec![8, 0, 0, 0];
+        icmp.extend_from_slice(&id.to_be_bytes());
+        icmp.extend_from_slice(&[0, 1]);
+        icmp.extend_from_slice(b"ping from the guest");
+        let sum = internet_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        let mut packet = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, protocol::ICMP, 0, 0];
+        packet[2..4].copy_from_slice(&u16::try_from(20 + icmp.len()).unwrap_or(0).to_be_bytes());
+        packet.extend_from_slice(&GUEST.octets());
+        packet.extend_from_slice(&target.octets());
+        let sum = ipv4_header_checksum(&packet);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet.extend_from_slice(&icmp);
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            self.send(GATEWAY_MAC, EtherType::IPV4, &packet)?;
+            let wait = tokio::time::Instant::now() + Duration::from_millis(500);
+            while let Ok(Some(bytes)) = tokio::time::timeout_at(wait, self.rx.recv()).await {
+                let reply = Frame::parse(&bytes).ok().and_then(|frame| {
+                    let (ip, icmp) = Ipv4Header::parse(frame.payload).ok()?;
+                    Some(
+                        ip.src() == target
+                            && ip.protocol() == protocol::ICMP
+                            && icmp.first() == Some(&0)
+                            && icmp.get(4..6) == Some(&id.to_be_bytes()[..]),
+                    )
+                });
+                if reply == Some(true) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Puts a user-space stack with `addresses` on the guest's link: its packets go to the
@@ -618,6 +671,9 @@ async fn acl_decides_both_directions_and_reloads() -> TestResult {
     .await?;
     let acl = node.acl.clone().ok_or("no ACL")?;
     guest.lease().await?;
+    // A ping the outbound rule accepts gets its echo reply back.
+    assert!(guest.ping(REMOTE, 0x4242, ALLOWED).await?);
+    assert!(acl.stats().replies > 0);
     let guest = guest.attach(vec![(IpAddr::V4(GUEST), 24), (IpAddr::V6(GUEST6), 64)]);
     echo_all(&guest);
 

@@ -264,11 +264,16 @@ pub struct AclFilterConfig {
     /// Default 1024.
     pub fragment_capacity: usize,
     /// Accept inbound packets that are neither TCP nor UDP (ICMP, IPv6
-    /// fragments, ...) without consulting the policy, and track ICMP echo
-    /// replies. Default `false`: such packets are dropped.
+    /// fragments, ...) without consulting the policy. Default `false`: such
+    /// packets are dropped unless a reply allowance, a scope rule or a rule
+    /// accepts them.
     pub allow_other_protocols: bool,
     /// Accept inbound replies to flows the local side opened (stateful
-    /// replies, not a conntrack/NAT). Default `true`.
+    /// replies, not a conntrack/NAT): every accepted outbound TCP or UDP
+    /// packet, and every accepted outbound ICMP or `ICMPv6` echo request,
+    /// records an allowance for the reversed tuple (an echo reply needs the
+    /// request's identifier); no other ICMP message and no unsolicited echo
+    /// reply passes through it. Default `true`.
     ///
     /// When `false` the filter records no reply allowance in either
     /// direction: outbound TCP, UDP and ICMP echo packets record no inbound
@@ -362,8 +367,7 @@ pub struct AclFilterScope {
     /// [`reasons::PROTOCOL`]. Non-first fragments follow their first fragment.
     /// With [`AclFilterConfig::stateful_replies`] on, an accepted packet from
     /// an outbound-restricted peer (other than an ICMP message that is not an
-    /// echo request) allows its reply back to that peer, and an outbound ICMP
-    /// echo request allows its inbound reply.
+    /// echo request) allows its reply back to that peer.
     pub other_protocols: Vec<OtherProtocolRule>,
 }
 
@@ -456,12 +460,6 @@ impl AclFilterScope {
         self.other_protocols.iter().any(|rule| rule.accepts(packet))
     }
 }
-
-/// The scope of a filter that constrains nothing.
-static UNSCOPED: AclFilterScope = AclFilterScope {
-    outbound_sources: None,
-    other_protocols: Vec::new(),
-};
 
 /// The [`AclFilterScope`]s of an [`AclFilter`], published together by
 /// [`AclFilter::replace_scopes`].
@@ -1058,13 +1056,6 @@ impl PeerInfo {
     }
 }
 
-/// An outbound-restricted peer and the scope its packet is judged under.
-#[derive(Clone, Copy)]
-struct Restricted<'a> {
-    info: &'a PeerInfo,
-    scope: &'a AclFilterScope,
-}
-
 /// The flow of a TCP or UDP five-tuple.
 const fn tcp_udp_flow(tuple: &FiveTuple, protocol: Protocol) -> Flow {
     let (src_port, dst_port) = (tuple.src_port, tuple.dst_port);
@@ -1106,10 +1097,10 @@ fn other_transport(packet: &IpPacket<'_>, protocol: u8) -> Option<Transport> {
 /// from sources outside [`AclFilterScope::outbound_sources`] when set.
 ///
 /// **Stateful replies, not a conntrack/NAT**: with
-/// [`AclFilterConfig::stateful_replies`] on, an outbound TCP or UDP packet to a
-/// peer records an allowance for the reversed tuple from that same peer, so its
-/// replies pass even when the policy would not accept them as new inbound
-/// traffic. Allowances expire after [`AclFilterConfig::reply_idle_timeout`]
+/// [`AclFilterConfig::stateful_replies`] on, an accepted outbound TCP or UDP
+/// packet, or ICMP or `ICMPv6` echo request, to a peer records an allowance for
+/// the reversed tuple from that same peer, so its replies pass even when the
+/// policy would not accept them as new inbound traffic. Allowances expire after [`AclFilterConfig::reply_idle_timeout`]
 /// without traffic.
 ///
 /// **Per-flow hook**: with a versioned identity
@@ -2026,20 +2017,14 @@ impl Inner {
         } else {
             None
         };
-        let scope = match (early, set) {
-            (Some(scope), _) => scope,
-            (None, None) => &UNSCOPED,
-            (None, Some(set)) => {
-                if identity == 0 {
-                    local = self.identity.local_identity(peer);
-                }
-                let scope = set.select(local);
-                if !scope.allows_source(bytes) {
-                    return Outcome::OutboundSource;
-                }
-                scope
+        if let (None, Some(set)) = (early, set) {
+            if identity == 0 {
+                local = self.identity.local_identity(peer);
             }
-        };
+            if !set.select(local).allows_source(bytes) {
+                return Outcome::OutboundSource;
+            }
+        }
         let restricted = info
             .as_ref()
             .is_some_and(|info| info.governed == Governed::Restricted);
@@ -2054,17 +2039,16 @@ impl Inner {
             Some(info) if restricted => info,
             info => {
                 let info = info.as_deref();
-                self.outbound_unrestricted(snapshot, peer, info, scope, &packet, table);
+                self.outbound_unrestricted(snapshot, peer, info, &packet, table);
                 return Outcome::OutboundAccepted;
             }
         };
-        let restricted = Restricted { info: &info, scope };
         if packet.fragment().is_none() {
-            return self.evaluate_outbound(snapshot, peer, restricted, identity, &packet, table);
+            return self.evaluate_outbound(snapshot, peer, &info, identity, &packet, table);
         }
         drop(table);
         self.with_fragments(peer, true, &packet, Outcome::OutboundDenied, |packet| {
-            self.evaluate_outbound(snapshot, peer, restricted, identity, packet, self.table())
+            self.evaluate_outbound(snapshot, peer, &info, identity, packet, self.table())
         })
     }
 
@@ -2075,7 +2059,6 @@ impl Inner {
         snapshot: &Snapshot,
         peer: PeerId,
         info: Option<&PeerInfo>,
-        scope: &AclFilterScope,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
     ) {
@@ -2086,7 +2069,7 @@ impl Inner {
         let dependency = info
             .and_then(|info| info.labels.as_ref())
             .and_then(|labels| self.outbound_pinhole(snapshot, labels, &tuple, &mut sweep));
-        self.track_outbound(&mut table, peer, tuple, scope, packet, dependency);
+        self.track_outbound(&mut table, peer, tuple, packet, dependency);
         drop(table);
         self.sweep_if(sweep);
     }
@@ -2123,7 +2106,7 @@ impl Inner {
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
-        Restricted { info, scope }: Restricted<'_>,
+        info: &PeerInfo,
         identity: u64,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
@@ -2133,11 +2116,10 @@ impl Inner {
         };
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
             if self.config.allow_other_protocols {
-                self.track_outbound(&mut table, peer, tuple, scope, packet, None);
+                self.track_outbound(&mut table, peer, tuple, packet, None);
                 return Outcome::OutboundAccepted;
             }
-            let restricted = Restricted { info, scope };
-            return self.outbound_other(snapshot, peer, restricted, tuple, packet, table);
+            return self.outbound_other(snapshot, peer, info, tuple, packet, table);
         };
         let key = EntryKey {
             peer,
@@ -2167,7 +2149,7 @@ impl Inner {
             }
         };
         if verdict.outcome != Outcome::OutboundDenied {
-            self.track_outbound(&mut table, peer, tuple, scope, packet, verdict.dependency);
+            self.track_outbound(&mut table, peer, tuple, packet, verdict.dependency);
         }
         drop(table);
         self.sweep_if(sweep);
@@ -2181,7 +2163,7 @@ impl Inner {
         &self,
         snapshot: &Snapshot,
         peer: PeerId,
-        Restricted { info, scope }: Restricted<'_>,
+        info: &PeerInfo,
         tuple: FiveTuple,
         packet: &IpPacket<'_>,
         mut table: MutexGuard<'_, FlowTable>,
@@ -2214,7 +2196,7 @@ impl Inner {
         if !rule {
             return Outcome::OutboundDenied;
         }
-        self.track_outbound(&mut table, peer, tuple, scope, packet, None);
+        self.track_outbound(&mut table, peer, tuple, packet, None);
         Outcome::OutboundAccepted
     }
 
@@ -2257,14 +2239,14 @@ impl Inner {
         (verdict, !expired)
     }
 
-    /// Record the inbound reply allowance of an accepted outbound packet
-    /// judged under `scope`.
+    /// Record the inbound reply allowance of an accepted outbound packet: a
+    /// TCP or UDP packet, or an ICMP or `ICMPv6` echo request, whose reply
+    /// matches the reversed tuple (the echo identifier included).
     fn track_outbound(
         &self,
         table: &mut FlowTable,
         peer: PeerId,
         tuple: FiveTuple,
-        scope: &AclFilterScope,
         packet: &IpPacket<'_>,
         dependency: Option<ReplyDependency>,
     ) {
@@ -2273,10 +2255,7 @@ impl Inner {
         }
         let tracked = match tuple.protocol {
             protocol::TCP | protocol::UDP => true,
-            p if is_icmp(p) => {
-                (self.config.allow_other_protocols || !scope.other_protocols.is_empty())
-                    && echo_type(packet) == Some(EchoType::Request)
-            }
+            p if is_icmp(p) => echo_type(packet) == Some(EchoType::Request),
             _ => false,
         };
         if tracked {
@@ -2927,15 +2906,35 @@ mod tests {
     }
 
     #[test]
-    fn icmp_echo_replies_need_allow_other_protocols() {
+    fn accepted_echo_requests_allow_their_replies() {
         let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
-        let request = || ip(l, r, protocol::ICMP, &icmp_echo(8, 77));
-        let reply = || ip(r, l, protocol::ICMP, &icmp_echo(0, 77));
+        let (r6, l6) = (addr("fd00::1"), addr("fd00::2"));
+        let request = |id| ip(l, r, protocol::ICMP, &icmp_echo(8, id));
+        let reply = |id| ip(r, l, protocol::ICMP, &icmp_echo(0, id));
+        let request6 = |id| ip(l6, r6, protocol::ICMPV6, &icmp_echo(128, id));
+        let reply6 = |id| ip(r6, l6, protocol::ICMPV6, &icmp_echo(129, id));
 
+        // Without other-protocol settings: only the reply of a request passes.
         let f = AclFilter::new(loaded_engine(deny_all()), identity());
-        outbound(&f, PEER, request());
-        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::PROTOCOL));
+        assert_eq!(inbound(&f, PEER, reply(77)), drop(reasons::PROTOCOL));
+        assert_eq!(outbound(&f, PEER, request(77)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, reply(77)), Verdict::Accept);
+        // Another identifier, an echo request with the same identifier or another
+        // ICMP message is not that reply.
+        assert_eq!(inbound(&f, PEER, reply(78)), drop(reasons::PROTOCOL));
+        assert_eq!(inbound(&f, PEER, request(77)), drop(reasons::PROTOCOL));
+        let unreachable = ip(r, l, protocol::ICMP, &icmp_echo(3, 77));
+        assert_eq!(inbound(&f, PEER, unreachable), drop(reasons::PROTOCOL));
+        // Nor does a reply from another peer pass.
+        assert_eq!(inbound(&f, OTHER_PEER, reply(77)), drop(reasons::PROTOCOL));
+        // ICMPv6.
+        assert_eq!(inbound(&f, PEER, reply6(5)), drop(reasons::PROTOCOL));
+        assert_eq!(outbound(&f, PEER, request6(5)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, reply6(5)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, reply6(6)), drop(reasons::PROTOCOL));
+        assert_eq!(f.stats().replies, 2);
 
+        // `allow_other_protocols` still accepts everything and counts replies.
         let f = AclFilter::with_config(
             loaded_engine(deny_all()),
             identity(),
@@ -2944,24 +2943,42 @@ mod tests {
                 ..AclFilterConfig::default()
             },
         );
+        outbound(&f, PEER, request(77));
+        assert_eq!(inbound(&f, PEER, reply(77)), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, request(77)), Verdict::Accept);
+        assert_eq!(f.stats().replies, 1);
+    }
+
+    #[test]
+    fn echo_reply_allowances_expire_and_need_stateful_replies() {
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        let request = || ip(l, r, protocol::ICMP, &icmp_echo(8, 9));
+        let reply = || ip(r, l, protocol::ICMP, &icmp_echo(0, 9));
+        let f = AclFilter::with_config(
+            loaded_engine(deny_all()),
+            identity(),
+            AclFilterConfig {
+                reply_idle_timeout: Duration::from_millis(50),
+                ..AclFilterConfig::default()
+            },
+        );
         outbound(&f, PEER, request());
         assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
-        assert_eq!(f.stats().replies, 1);
-        // An inbound echo request with the same id is not a reply.
-        assert_eq!(
-            inbound(&f, PEER, ip(r, l, protocol::ICMP, &icmp_echo(8, 77))),
-            Verdict::Accept
-        );
-        assert_eq!(f.stats().replies, 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::PROTOCOL));
+        assert_eq!(f.stats().reply_expired, 1);
 
-        // ICMPv6.
-        let (r6, l6) = (addr("fd00::1"), addr("fd00::2"));
-        outbound(&f, PEER, ip(l6, r6, protocol::ICMPV6, &icmp_echo(128, 5)));
-        assert_eq!(
-            inbound(&f, PEER, ip(r6, l6, protocol::ICMPV6, &icmp_echo(129, 5))),
-            Verdict::Accept
+        let f = AclFilter::with_config(
+            loaded_engine(deny_all()),
+            identity(),
+            AclFilterConfig {
+                stateful_replies: false,
+                ..AclFilterConfig::default()
+            },
         );
-        assert_eq!(f.stats().replies, 2);
+        assert_eq!(outbound(&f, PEER, request()), Verdict::Accept);
+        assert_eq!(inbound(&f, PEER, reply()), drop(reasons::PROTOCOL));
+        assert_eq!(f.inner.table().entries.len(), 0);
     }
 
     #[test]
@@ -5256,6 +5273,44 @@ mod tests {
     }
 
     #[test]
+    fn echo_request_accepted_by_an_outbound_rule_allows_its_reply() {
+        use crate::{IcmpTypes, ProtocolMatch};
+
+        let ping_rule = OutboundRule::new("ping", vec![ProtocolMatch::Icmp(IcmpTypes::Any)]);
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], Some(vec![ping_rule])))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        let request = |id| ip(local, a, protocol::ICMPV6, &icmp_echo(128, id));
+        let reply = |id| ip(a, local, protocol::ICMPV6, &icmp_echo(129, id));
+        let (a4, local4) = (addr("10.0.0.11"), addr("10.0.0.2"));
+        let request4 = || ip(local4, a4, protocol::ICMP, &icmp_echo(8, 3));
+        let reply4 = || ip(a4, local4, protocol::ICMP, &icmp_echo(0, 3));
+
+        assert_eq!(inbound(&f, A, reply(7)), drop(reasons::PROTOCOL));
+        assert_eq!(outbound(&f, A, request(7)), Verdict::Accept);
+        assert_eq!(inbound(&f, A, reply(7)), Verdict::Accept);
+        assert_eq!(inbound(&f, A, reply(8)), drop(reasons::PROTOCOL));
+        assert_eq!(outbound(&f, A, request4()), Verdict::Accept);
+        assert_eq!(inbound(&f, A, reply4()), Verdict::Accept);
+        assert_eq!(f.stats().replies, 2);
+
+        // An outbound rule without ICMP denies the request, and the reply stays out.
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace(
+                "nsd:a",
+                namespace(&[A], Some(vec![outbound_rule(true, PortSet::single(80))])),
+            )
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        assert_eq!(outbound(&f, A, request(7)), drop(reasons::OUTBOUND));
+        assert_eq!(inbound(&f, A, reply(7)), drop(reasons::PROTOCOL));
+    }
+
+    #[test]
     fn restricted_peer_echo_is_answered_through_the_reply_table() {
         let engine = scope_engine();
         let (a, local) = (peer_addr(A), addr(LOCAL));
@@ -5896,11 +5951,10 @@ mod tests {
                             let under_a = before % 2 == 0;
                             assert_eq!(accepted, a_accepts == under_a, "generation {before}");
                         }
-                        // Only `scope_b` records the echo reply's allowance, and it
-                        // accepts the second source only: both fields of one scope.
+                        // The reply passes exactly when its request was accepted.
                         let reply = ip(remote, src, protocol::ICMP, &icmp_echo(0, id));
                         let replied = inbound(f, OTHER_PEER, reply) == Verdict::Accept;
-                        assert_eq!(replied, accepted && !a_accepts, "torn scope, id {id}");
+                        assert_eq!(replied, accepted, "torn scope, id {id}");
                     }
                 });
             }

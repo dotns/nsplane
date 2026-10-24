@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process against a second engine and with a Linux guest under QEMU against wireguard-go
   (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
 
+### Fixed
+- nsplane-acl: an accepted outbound ICMP or `ICMPv6` echo request records the reply allowance
+  of its echo reply whatever the other-protocol settings, as TCP and UDP replies do. A ping
+  an outbound rule accepts towards an outbound-restricted peer (or any ping to an
+  unrestricted peer) now gets its reply instead of a `reasons::PROTOCOL` drop; only the echo
+  reply with the request's identifier passes.
+
 ## [0.17.0] - 2026-10-24
 
 Feature release (additive API).
