@@ -27,6 +27,7 @@ The package `nsplane-examples` is not published.
 | [`relay_server`](#relay_server) | A single-port relay with its own WireGuard engine, over UDP and WSS | no |
 | [`relay_transport`](#relay_transport) | Relay discovery and the direct/relay path ladder, in-process | no |
 | [`app_session`](#app_session) | App sessions on ACL namespaces: a file transfer through source-gated pinholes | no (`--tun`: yes) |
+| [`dns_netstack`](#dns_netstack) | A DNS server on an unowned address of a transparent netstack: static, fake and forwarded answers | no |
 
 ## Examples
 
@@ -376,6 +377,28 @@ Flags: `--step <a|b|c|d|e|all>` (default `all`), `--ipv6`, `--tun <NAME>`, `--st
 ```sh
 cargo run -p nsplane-examples --bin app_session
 sudo cargo run -p nsplane-examples --bin app_session -- --tun nsp-app --status app_session.json
+```
+
+### dns_netstack
+
+`nsplane-dns` on a transparent `nsplane-netstack`, in one process without engines (no root):
+a client stack (`10.0.0.1`) is wired back to back with a server stack that owns `10.0.0.2`
+and terminates any destination in `10.53.0.0/16` (`NetStackConfig::transparent`). Under
+`Admission::Decide`, connections and flows to `10.53.0.53:53` are accepted on
+`incoming_pending` and served by `Server::serve_udp_flow` / `Server::serve_tcp_connection`;
+every other one is rejected. The resolver is `StaticRecords` (`printer.lan`) falling back to a
+`FakePool` on `198.18.0.0/15`; with `--upstream` the pool hands other query types to a
+`Forwarder`. Prints `CHECK` lines for an A query of the static name and of a fake name over
+UDP, the pool's reverse lookup of the fake address, a fake name over TCP and a refused
+connection to port 80 of the DNS address, then `STATS` (server and stack counters) and
+`CHECKS PASS` (exit 0) or `CHECKS FAIL` (exit 1). With `--upstream` it also prints the result
+of one TXT query for `--forward-name` as a `FORWARD` line.
+
+Flags: `--upstream <IP:PORT>`, `--forward-name <NAME>` (default `example.com`),
+`--timeout <SECS>` (default 5), `--log <FILTER>` (default `warn`).
+
+```sh
+cargo run -p nsplane-examples --bin dns_netstack -- [--upstream 192.0.2.53:53]
 ```
 
 ## Shared flags

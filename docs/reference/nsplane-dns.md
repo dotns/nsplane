@@ -174,3 +174,5 @@ address and port to these functions.
 - [nsplane-netstack](nsplane-netstack.md): the user-space stack served by the `netstack`
   feature.
 - [ADR: simple-dns fork](../decisions/2026-10-24-simple-dns-fork.md)
+- [`dns_netstack`](../../examples/README.md#dns_netstack): a server on an address a transparent
+  netstack terminates without owning it, with static, fake and forwarded answers.
