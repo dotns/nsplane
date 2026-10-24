@@ -1,6 +1,6 @@
 # 20261024-1453-smoltcp-upstream-fixes smoltcp fork: rebase onto upstream main and reapply the fork patches
 
-- **status**: proposed
+- **status**: completed (released as 0.19.0)
 - **createdAt**: 2026-10-24 14:53
 - **relatedTask**: 20261024-1453-smoltcp-upstream-fixes
 

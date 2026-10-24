@@ -1,6 +1,6 @@
 # 20261024-1453-smoltcp-upstream-fixes smoltcp fork: rebase onto upstream main and reapply the fork patches
 
-- **status**: in progress (merged into main 51eccd7; fork tag `v0.14.0-nsplane.7`; ships with the next release)
+- **status**: completed (released as 0.19.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 14:53

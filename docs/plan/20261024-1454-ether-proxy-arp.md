@@ -1,6 +1,6 @@
 # 20261024-1454-ether-proxy-arp nsplane-ether: answer ARP and NDP for every address of the guest's link but its own
 
-- **status**: proposed
+- **status**: completed (released as 0.19.0)
 - **createdAt**: 2026-10-24 14:54
 - **relatedTask**: 20261024-1454-ether-proxy-arp
 
