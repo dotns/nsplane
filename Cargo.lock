@@ -1787,8 +1787,7 @@ dependencies = [
 [[package]]
 name = "simple-dns"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6f884fa9a8d48101774bfbd3aeb81e968dd22cffd19a372da69f183db22c1a"
+source = "git+https://github.com/dotns/simple-dns?tag=v0.12.0-nsplane.1#f92badd1a2472bb50348f46f0923ca7a37c9adae"
 dependencies = [
  "bitflags 2.11.1",
 ]

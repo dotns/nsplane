@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-simple-dns = "0.12"
+simple-dns = { version = "0.12.0", git = "https://github.com/dotns/simple-dns", tag = "v0.12.0-nsplane.1", default-features = false, features = ["std"] }
 thiserror = "2.0.21"
 
 [dev-dependencies]
