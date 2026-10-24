@@ -14,7 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::message::{
     Answer, DEFAULT_UDP_PAYLOAD_SIZE, EncodeOptions, Query, ResponseCode, encode_error,
@@ -261,9 +261,7 @@ impl<R: Resolver + 'static> Server<R> {
                 }
                 Err(err) => return Err(err),
             };
-            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-                bump(&self.counters.dropped_overload);
-                tracing::trace!(%client, "DNS query dropped: in-flight limit");
+            let Some(permit) = self.try_udp_permit(client) else {
                 continue;
             };
             let message = Bytes::copy_from_slice(&buf[..len]);
@@ -279,6 +277,17 @@ impl<R: Resolver + 'static> Server<R> {
                 }
             });
         }
+    }
+
+    /// An in-flight permit for a UDP datagram from `client`; `None` (counted in
+    /// [`ServerStats::dropped_overload`]) when none is free and the datagram is to be dropped.
+    pub(crate) fn try_udp_permit(&self, client: SocketAddr) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok();
+        if permit.is_none() {
+            bump(&self.counters.dropped_overload);
+            tracing::trace!(%client, "DNS query dropped: in-flight limit");
+        }
+        permit
     }
 
     /// Accepts connections on `listener` until it fails, serving each with
