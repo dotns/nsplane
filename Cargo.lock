@@ -1133,6 +1133,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-ether"
+version = "0.16.2"
+dependencies = [
+ "futures-core",
+ "libc",
+ "nsplane",
+ "nsplane-netstack",
+ "nsplane-packet",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nsplane-examples"
 version = "0.16.2"
 dependencies = [

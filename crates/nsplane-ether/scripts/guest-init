@@ -1,0 +1,49 @@
+#!/bin/busybox sh
+# Guest /init: brings eth0 up by DHCP and router advertisement, sends one line over TCP to
+# the gateway's echo responder on IPv4 and on IPv6, prints the result on the serial
+# console and powers off. The success line is
+# `NSPLANE-ETHER-OK <lease address> <IPv6 address>`.
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /tmp
+
+fail() {
+  echo "NSPLANE-ETHER-FAIL $*"
+  poweroff -f
+}
+
+for module in /modules/*.ko; do
+  [ -e "$module" ] && insmod "$module"
+done
+echo "guest kernel $(uname -r)"
+ip link set lo up
+ip link set eth0 up || fail "no eth0"
+ip link show eth0
+
+udhcpc -i eth0 -n -q -t 5 -T 2 -s /udhcpc.script || fail "no DHCP lease"
+lease=$(cat /tmp/lease)
+
+ipv6=
+for _ in $(seq 1 30); do
+  ipv6=$(ip -6 addr show dev eth0 scope global | grep -v tentative | awk '/inet6/ { sub("/.*", "", $2); print $2; exit }')
+  [ -n "$ipv6" ] && break
+  sleep 1
+done
+[ -n "$ipv6" ] || fail "no IPv6 address from router advertisement"
+echo "IPv6 address from RA: $ipv6"
+ip addr show dev eth0
+ip route show
+ip -6 route show
+
+reply4=$(echo "hello over ipv4" | nc -w 10 10.0.2.2 8080)
+echo "TCP 10.0.2.2:8080 reply: $reply4"
+[ "$reply4" = "echo hello over ipv4" ] || fail "IPv4 TCP exchange"
+reply6=$(echo "hello over ipv6" | nc -w 10 fd00:1::1 8080)
+echo "TCP [fd00:1::1]:8080 reply: $reply6"
+[ "$reply6" = "echo hello over ipv6" ] || fail "IPv6 TCP exchange"
+
+echo "NSPLANE-ETHER-OK $lease $ipv6"
+poweroff -f
