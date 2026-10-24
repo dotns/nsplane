@@ -30,12 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `matching` for diagnostics, counters in `PolicyStats`.
   - `Hosts`: hosts-format text to `StaticRecords` and rules, with per-line errors.
   - Example `dns_policy`.
+- nsplane-ether packet socket transport (Linux): `PacketSocket::bind(ifname)` serves a guest
+  whose host-side TAP another process holds (a virtual machine monitor such as Firecracker)
+  through an `AF_PACKET` socket bound to that interface; `split` gives a `PacketReader` and a
+  `PacketWriter` for `spawn_port`. The socket carries a virtio-net header: partial checksums
+  are completed and GSO frames (TCP over IPv4 and IPv6, UDP) split before the adapter sees
+  them; its own frames are not read back. Needs `CAP_NET_RAW`.
+- nsplane-ether `ensure_tap(&TapConfig)` (Linux): creates a persistent TAP interface with an
+  owner and group for the monitor to attach to, IPv6, address autoconfiguration and ARP off,
+  up, and deleted when the returned `TapInterface` is dropped; an existing interface is used
+  as it is and left in place.
+- nsplane-packet `vnet` module: `VirtioNetHdr`, `segment` and `OffloadError`, the virtio-net
+  header codec and GSO segmentation that nsplane-tun uses for its offload reads.
 - Example `vm_wireguard`: a virtual machine's link (QEMU `-netdev stream`, passt, libkrun on a
   Unix socket) as the local side of an engine through `nsplane-ether`, with the tunnel
   address and MTU in the DHCP lease, an optional IPv6 router advertisement and masquerade,
   and a reloadable ACL deciding which flows the guest and the peers may open. Tested in
   process against a second engine and with a Linux guest under QEMU against wireguard-go
   (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
+
+### Changed
+- nsplane-tun depends on nsplane-packet and splits offload reads with
+  `nsplane_packet::vnet::segment`; behavior unchanged.
 
 ### Fixed
 - nsplane-acl: an accepted outbound ICMP or `ICMPv6` echo request records the reply allowance

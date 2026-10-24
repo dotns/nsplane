@@ -435,6 +435,32 @@ let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
 labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
 ```
 
+#### Firecracker：由监控程序持有的 TAP
+
+Firecracker 只把 guest 接到宿主机的 TAP 设备上，并且自己持有该 TAP 的文件描述符。在 Linux 上，
+适配器于是通过 `AF_PACKET` socket（`PacketSocket`，需要 `CAP_NET_RAW`）在 TAP 的宿主机一侧读写
+guest 的帧，不需要网桥，也不需要第二个 TAP。`ensure_tap` 在监控程序启动前创建该 TAP（需要
+`CAP_NET_ADMIN`）：持久化，指定的用户和组可以接入，关闭 IPv6、地址自动配置和 ARP，使宿主机内核
+不介入 guest 的链路；返回的 `TapInterface` 被 drop 时删除它。已存在的接口按原样使用，并保留不动。
+
+```rust ignore
+use nsplane_ether::{PacketSocket, TapConfig, ensure_tap, spawn_port};
+
+// 在 Firecracker 启动之前；它的配置里写明该 TAP：
+// "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "fctap0" }]
+let tap = ensure_tap(&TapConfig::new("fctap0").owner(firecracker_uid))?;
+let (reader, writer) = PacketSocket::bind(tap.name())?.split();
+let (source, sink, ether) = spawn_port(reader, writer, config); // `config` 同上
+// ... 引擎同上；在引擎停止之前保留 `tap`。
+```
+
+- **Offload。** Firecracker 与 guest 协商校验和与分段 offload，因此一个帧可能带部分校验和，或者是
+  一个大的 GSO 帧。reader 在适配器看到之前补全校验和，并把 GSO 帧拆成 guest 分段大小的帧；发往
+  guest 的帧带完整的校验和。
+- **生命周期。** packet socket 没有流结束：guest 关机或监控程序重启时传输保持打开，重启后的监控
+  程序接入同一个持久化 TAP。停止 port 的方式是 drop 引擎；删除接口会让 reader 以 `ENETDOWN` 结束。
+- **MTU。** 大于 TAP MTU（默认 1500）的发往 guest 的帧会被丢弃；租约中的隧道 MTU 应不大于它。
+
 `vm_wireguard` 示例把这些组合在一起，策略放在可热加载的文件中。
 
 ## 8. 用户态节点：nsplane-netstack

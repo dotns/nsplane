@@ -12,7 +12,9 @@
 //! - [`port`]: the async ports ([`EtherSource`], [`EtherSink`], [`EtherHandle`]).
 //! - [`transport`]: the frame transport traits ([`FrameRead`], [`FrameWrite`]);
 //!   [`stream`] implements them over a length-prefixed byte stream (a Unix socket to passt,
-//!   QEMU or libkrun) and `tap` over a Linux TAP device.
+//!   QEMU or libkrun), `tap` over a Linux TAP device and `packet` over a Linux `AF_PACKET`
+//!   socket bound to an interface whose TAP another process holds; `tap` also creates such
+//!   an interface.
 //!
 //! The protocol layer below the adapter is sans-I/O too: pure parsers, frame builders and
 //! small state machines that take and return bytes.
@@ -36,12 +38,16 @@ pub mod dhcp;
 pub mod frame;
 pub mod mac;
 pub mod ndp;
+#[cfg(target_os = "linux")]
+pub mod packet;
 pub mod port;
 mod read;
 pub mod stream;
 #[cfg(target_os = "linux")]
 pub mod tap;
 pub mod transport;
+#[cfg(target_os = "linux")]
+mod vnet;
 
 pub use adapter::{DEFAULT_MTU, EtherAdapter, EtherConfig, EtherStats};
 
@@ -50,7 +56,9 @@ pub use dhcp::{DhcpConfig, DhcpError, DhcpMessage, DhcpServer, MessageType};
 pub use frame::{EtherType, Frame, FrameError};
 pub use mac::MacAddr;
 pub use ndp::{Ndp, NdpError, NdpMessage, RaConfig};
+#[cfg(target_os = "linux")]
+pub use packet::{PacketReader, PacketSocket, PacketWriter};
 pub use port::{EtherHandle, EtherSink, EtherSource, spawn_port};
 #[cfg(target_os = "linux")]
-pub use tap::{TapDevice, TapReader, TapWriter};
+pub use tap::{TapConfig, TapDevice, TapInterface, TapReader, TapWriter, ensure_tap};
 pub use transport::{FrameRead, FrameWrite, MAX_FRAME_LEN};

@@ -15,6 +15,7 @@
 # Unix and Windows security groups.
 crates/nsplane-cli/src/main.rs|group|and group IDs|Unix user and group IDs of a process
 crates/nsplane-uapi/src/pipe.rs|group|Administrators group|the Windows built-in Administrators security group
+crates/nsplane-ether/src/tap.rs|group|*|Unix group allowed to attach to a TAP interface (TUNSETGROUP)
 
 # A user-space stack terminates the connections addressed to it (TCP endpoint language).
 crates/nsplane-netstack/src/tcp.rs|terminate|pub async fn terminated(&self)|TcpConnection::terminated(): standard TCP state language (connection terminated)

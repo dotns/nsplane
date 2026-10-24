@@ -19,6 +19,13 @@ bytes = { workspace = true }
 smallvec = { workspace = true }
 zerocopy = { version = "0.8.59", features = ["derive"] }
 
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
 [[bench]]
 name = "checksum"
+harness = false
+
+[[bench]]
+name = "vnet"
 harness = false

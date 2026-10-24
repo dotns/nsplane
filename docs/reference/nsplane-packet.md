@@ -7,7 +7,7 @@ crate shares (`PeerId`, `TransportId`, `Path`, `Ecn`). No I/O.
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
+| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; `vnet::VirtioNetHdr` (`parse`, `encode`), `vnet::segment`, `vnet::OffloadError`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 
 ## Behavior
 
@@ -80,6 +80,37 @@ only the last slice of a chain may be odd); the result is congruent modulo `0xFF
 native-order 32-bit words (RFC 1071 section 2); `internet_checksum`, the IPv4 header and
 transport checksums and `nsplane-nat`'s `checksum::sum` all use this one implementation.
 
+### Virtio-net segmentation
+
+`nsplane-packet::vnet` is the pure codec for the virtio-net header that a Linux TUN or TAP
+device with `IFF_VNET_HDR`, or a packet socket with `PACKET_VNET_HDR`, puts in front of
+every packet. `VirtioNetHdr` is the legacy 10-byte `struct virtio_net_hdr` (16-bit fields in
+host byte order; `parse` and `encode`; `LEN`, `F_NEEDS_CSUM`, `GSO_NONE`, `GSO_TCPV4`,
+`GSO_TCPV6`, `GSO_UDP_L4`, `GSO_ECN`).
+
+`segment(hdr, packet, first, capacity, pool, out)` splits one IP packet read behind `hdr`:
+
+- `GSO_NONE` yields the packet itself, its partial checksum completed when `F_NEEDS_CSUM`
+  is set (a UDP checksum of 0 written as `0xFFFF`).
+- A TCP over IPv4 or IPv6 or a UDP super-packet yields one packet per `gso_size` payload
+  bytes (the last may be shorter), each with its own IP length, IPv4 identification (+1 per
+  segment) and header checksum, UDP length, TCP sequence number and flags (FIN and PSH only
+  on the last segment, CWR only on the first) and a complete transport checksum. The header
+  length comes from the packet (IP header plus TCP data offset or UDP header), not from
+  `hdr_len` or `csum_start`.
+- Packets come from `pool` behind `HEADROOM`, with a capacity of at least `capacity` (or the
+  length plus `TAILROOM`), and are appended to `out` from segment index `first` on. When
+  `out` fills up (`MAX_BATCH`), the call returns `Ok(Some(next))` and the caller continues
+  with `first = next`; `Ok(None)` means done.
+- A malformed input produces nothing and returns an `OffloadError` (`#[non_exhaustive]`):
+  `Truncated`, `UnsupportedGso` (UFO, ECN on UDP or on `GSO_NONE`, unknown types),
+  `ZeroGsoSize`, `BadHeaders` (version or protocol not matching the GSO type, bad IHL or
+  data offset, IPv6 extension headers, a fragment), `BadChecksumOffset`, `TooLong` (a
+  segment above 65 535 bytes).
+
+`nsplane-tun` splits its offload reads with it and `nsplane-ether`'s packet socket its GSO
+frames.
+
 ### Keyed hasher
 
 `nsplane-packet::hash::KeyedState` is a `BuildHasher` (`Default` draws two fresh random keys
@@ -96,6 +127,7 @@ cryptographic hash. `nsplane-nat`'s `TranslationTable` IPv6 indexes (`u128` keys
 |---|---|---|---|
 | ICMP Echo reply synthesis | call `icmp::echo_reply_in_place` on a request for an address the local side answers | not used | none: a plain function, only called if the embedder wires it |
 | UDP datagram builder | `build::udp_packet` / `build::write_udp` for packets to inject | not used | none: plain functions, only called if the embedder wires them |
+| Virtio-net segmentation | `vnet::segment` on packets read behind a virtio-net header | not used | none: a plain function |
 
 ## See also
 

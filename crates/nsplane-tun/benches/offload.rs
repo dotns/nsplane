@@ -1,23 +1,24 @@
 #![allow(clippy::unwrap_used, reason = "benchmark harness")]
 
-//! The virtio-net offload codec: segmenting a 64 KiB TCP over IPv4 super-packet at `gso_size`
-//! 1380 into ~47 segments, and coalescing those segments back into one super-packet.
+//! The GRO coalescer: coalescing the ~47 segments of a 64 KiB TCP over IPv4 super-packet at
+//! `gso_size` 1380 back into one super-packet.
 //!
-//! The codec is crate-internal, so its source is compiled into the bench directly.
+//! The coalescer is crate-internal, so its source is compiled into the bench directly.
 
 #[path = "../src/offload.rs"]
 #[cfg_attr(
     test,
     expect(
         dead_code,
-        reason = "the unit tests and the codec parts the bench does not use"
+        reason = "the unit tests and the coalescer parts the bench does not use"
     )
 )]
 mod offload;
 
 use criterion::{BatchSize, Criterion, Throughput};
 use nsplane::{PacketBatch, PacketBuf, PacketPool};
-use offload::{Coalescer, VirtioNetHdr, segment};
+use nsplane_packet::vnet::{VirtioNetHdr, segment};
+use offload::Coalescer;
 
 /// TCP payload bytes per segment (MTU 1420 minus IPv4 and TCP headers).
 const GSO_SIZE: u16 = 1380;
@@ -74,26 +75,6 @@ fn bench_offload(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("offload");
     group.throughput(Throughput::Bytes(packet.len() as u64));
-
-    group.bench_function("segment_tcpv4_64k", |b| {
-        let mut pool = PacketPool::new(64);
-        let mut out = PacketBatch::new();
-        b.iter(|| {
-            let next = segment(
-                &hdr,
-                &packet,
-                0,
-                HLEN + usize::from(GSO_SIZE),
-                &mut pool,
-                &mut out,
-            )
-            .unwrap();
-            for buf in out.drain() {
-                pool.put(buf);
-            }
-            next
-        });
-    });
 
     group.bench_function(format!("coalesce_tcpv4_{}", segments.len()), |b| {
         let mut coalescer = Coalescer::new(true);

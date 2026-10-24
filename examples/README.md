@@ -466,20 +466,33 @@ the engine's packet source and sink. The wiring is `nsplane_examples::vm`.
   }
   ```
 
-Exits when the guest disconnects or on Ctrl-C, logging the adapter and ACL counters. Status:
+- Firecracker (Linux): `--packet <IFNAME>` instead of `--socket` serves the guest behind the
+  host TAP `IFNAME` that Firecracker holds, through an `AF_PACKET` socket (`PacketSocket`,
+  needs `CAP_NET_RAW`); partial checksums and GSO frames from the guest's offloads are
+  handled there. `--create-tap` creates `IFNAME` first (`ensure_tap`, needs `CAP_NET_ADMIN`)
+  as a persistent TAP for Firecracker's `host_dev_name`, with `--tap-owner <UID>` /
+  `--tap-group <GID>` for a monitor that does not run as root, and deletes it on exit.
+
+Exits when the guest disconnects (Unix socket only) or on Ctrl-C, logging the adapter and ACL
+counters. Status:
 `extra.ether` (adapter counters, guest MAC), `extra.acl` (filter counters, `reloads`,
 `reload_errors`), `extra.masquerade`.
 
-Flags: node flags, `--socket <PATH>` (required), `--address <CIDR>` (required, IPv4),
+Flags: node flags, `--socket <PATH>` or `--packet <IFNAME>` (one is required),
+`--create-tap`, `--tap-owner <UID>`, `--tap-group <GID>`, `--address <CIDR>` (required, IPv4),
 `--gateway <IPV4>`, `--dns <IP>` (repeatable), `--mtu <N>` (default 1420),
 `--ipv6-prefix <CIDR>`, `--masquerade <IPV6>` (needs `--ipv6-prefix`), `--policy <PATH>`.
 `examples/tests/vm_wireguard.rs` runs it in process against a second engine;
 `crates/nsplane-ether/scripts/vm-wireguard.sh` boots a Linux guest under QEMU against
-wireguard-go (needs docker and `/dev/kvm`).
+wireguard-go (needs docker and `/dev/kvm`), `vm-wireguard.sh --firecracker` under Firecracker
+on a TAP the example creates.
 
 ```sh
 cargo run -p nsplane-examples --bin vm_wireguard -- --socket /tmp/guest.sock --private-key-file vm.key --listen 0.0.0.0:51820 --address 10.66.0.2/24 --dns 10.66.0.1 --peer <PEER_PUB>,endpoint=192.0.2.1:51820,allowed-ips=10.66.0.0/24,keepalive=25
 qemu-system-x86_64 ... -netdev stream,id=n0,server=off,addr.type=unix,addr.path=/tmp/guest.sock -device virtio-net-pci,netdev=n0
+# Firecracker: the example creates fctap0, the microVM config names it as host_dev_name
+sudo cargo run -p nsplane-examples --bin vm_wireguard -- --packet fctap0 --create-tap --private-key-file vm.key --address 10.66.0.2/24 --dns 10.66.0.1 --peer <PEER_PUB>,endpoint=192.0.2.1:51820,allowed-ips=10.66.0.0/24,keepalive=25
+firecracker --no-api --config-file vm.json
 ```
 
 ## Shared flags
