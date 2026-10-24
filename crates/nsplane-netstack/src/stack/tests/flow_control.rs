@@ -784,3 +784,72 @@ async fn retired_drops_counts_everything_discarded_for_revoked_flows() -> TestRe
     assert_eq!(handle.stats(), NetStackStats::default());
     Ok(())
 }
+
+#[tokio::test]
+async fn graceful_release_keeps_final_ack_pending_until_source_takes_it() -> TestResult {
+    let server: SocketAddrV4 = "10.9.60.1:80".parse()?;
+    let client_addr: SocketAddrV4 = "10.9.60.2:49152".parse()?;
+    let (handle, mut peer) = start(config(*server.ip()), *client_addr.ip());
+    let mut incoming = handle.incoming_tcp();
+    let (mut conn, client) = accept(&handle, &mut incoming, &mut peer, server, client_addr).await?;
+    let control = conn.control();
+    let udp = handle.bind_udp("10.9.60.1:8081".parse()?).await?;
+    assert_eq!(
+        peer.source
+            .tcp_egress_drained(&udp.control())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(!peer.source.tcp_egress_drained(&control)?);
+    conn.shutdown().await?;
+    pump_until(&mut peer, |peer| {
+        peer.state(client) == tcp::State::CloseWait
+    })
+    .await?;
+    peer.socket(client).close();
+    // Drive the peer's FIN and delayed ACK without taking stack output.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let now = peer.now();
+            peer.iface.poll(now, &mut peer.device, &mut peer.sockets);
+            let packets: Vec<_> = peer.device.drain_tx().collect();
+            for packet in packets {
+                peer.sink.send(packet, PeerId::new(0)).await?;
+            }
+            tokio::select! {
+                () = conn.terminated() => return Ok::<_, io::Error>(()),
+                () = sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    })
+    .await??;
+    assert!(
+        !peer.source.tcp_egress_drained(&control)?,
+        "release must not imply the final ACK left the stack"
+    );
+    timeout(WAIT, async {
+        while !peer.source.tcp_egress_drained(&control)? {
+            let packet = peer.source.recv().await?;
+            peer.device.inject(packet);
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    pump_until(&mut peer, |peer| peer.state(client) == tcp::State::Closed).await?;
+    let (other, _) = NetStack::new(config(Ipv4Addr::new(10, 10, 0, 1)));
+    let (other_source, _) = other.split();
+    assert_eq!(
+        other_source
+            .tcp_egress_drained(&control)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    control.revoke();
+    assert_eq!(
+        peer.source.tcp_egress_drained(&control).unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    Ok(())
+}

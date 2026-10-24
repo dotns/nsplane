@@ -264,6 +264,7 @@ pub(crate) enum Command {
     Config(ConfigChange, oneshot::Sender<()>),
     PeerId(PublicKey, oneshot::Sender<Option<PeerId>>),
     PeerStats(PeerId, oneshot::Sender<Option<PeerStats>>),
+    PeerHasSession(PeerId, oneshot::Sender<Option<bool>>),
     Peers(oneshot::Sender<Vec<PeerStats>>),
     PublicKey(oneshot::Sender<Option<PublicKey>>),
     PrivateKey(oneshot::Sender<Option<StaticSecret>>),
@@ -569,6 +570,14 @@ impl EngineHandle {
     /// The id of the peer of the default local identity with this public key.
     pub async fn peer_id(&self, key: PublicKey) -> Result<Option<PeerId>, EngineError> {
         self.call(|tx| Command::PeerId(key, tx)).await
+    }
+
+    /// Whether the peer currently has a sending session with an unexhausted key.
+    /// Returns `None` for an unknown peer. This query settles preceding crypto
+    /// work and reads the actual tunnel state; it does not start a handshake.
+    /// It does not establish transport reachability.
+    pub async fn peer_has_session(&self, peer: PeerId) -> Result<Option<bool>, EngineError> {
+        self.call(|tx| Command::PeerHasSession(peer, tx)).await
     }
 
     /// Configuration and counters of a peer.

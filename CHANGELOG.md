@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Core::peer_has_session` and `EngineHandle::peer_has_session` query whether a peer has
+  a current sending session with an unexhausted key. The engine query settles preceding
+  crypto work; a session does not establish transport reachability.
+- `NetStackSource::tcp_egress_drained` reports whether the source has taken every queued
+  packet through a released TCP connection's final output. It rejects another stack's
+  control, non-TCP flows and revoked flows; forwarding returned packets remains the caller's
+  responsibility and the query does not establish remote delivery.
+
 ## [0.19.0] - 2026-10-24
 
 Feature release (additive API); smoltcp fork rebased onto upstream `main`.
