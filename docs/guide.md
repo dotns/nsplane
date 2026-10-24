@@ -86,6 +86,7 @@ Typical combinations:
 | Gateway with access control | `nsplane`, `nsplane-tun`, `nsplane-acl` |
 | Subnet router / IPv6-only fabric | `nsplane`, `nsplane-tun`, `nsplane-nat` |
 | Behind firewalls that block UDP | add `nsplane-wss` |
+| Virtual machines reaching peers without a TUN device | `nsplane`, `nsplane-ether` |
 
 ## 3. Adding the dependency
 
@@ -382,6 +383,80 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 
 `pipe`, `pump`, `SwapSink` and `AbortSink` cover in-process wiring, live sink replacement and
 fencing a sink at shutdown; see rustdoc.
+
+### A virtual machine's link: nsplane-ether
+
+A guest runtime that carries a virtual machine's ethernet frames over a Unix socket (QEMU
+`-netdev stream`, passt, libkrun) can be the engine's local side directly: `spawn_port` puts
+an `nsplane-ether` adapter on the socket, answers the guest's DHCP, ARP and neighbor
+discovery, and exposes its IP packets as a packet source and sink:
+
+```rust ignore
+use nsplane::{EngineBuilder, FragmentConfig};
+use nsplane_ether::{DhcpConfig, EtherConfig, MacAddr, spawn_port, stream};
+
+// The guest runtime connects to `listener` (a tokio UnixListener).
+let (conn, _) = listener.accept().await?;
+let (reader, writer) = stream::unix(conn);
+let gateway: std::net::Ipv4Addr = "10.66.0.1".parse()?; // the peer's tunnel address
+let config = EtherConfig {
+    gateway_ipv4: Some(gateway),
+    dhcp: Some(DhcpConfig {
+        router: Some(gateway),
+        dns: vec![gateway],
+        mtu: Some(1420),
+        ..DhcpConfig::new(gateway, "10.66.0.2".parse()?, 24) // the guest's tunnel address
+    }),
+    mtu: 1420, // the tunnel MTU
+    ..EtherConfig::new(MacAddr([0x02, 0, 0, 0, 0, 1]))
+};
+let (source, sink, ether) = spawn_port(reader, writer, config);
+let engine = EngineBuilder::new(source, sink)
+    .private_key(key)
+    .transport(udp)
+    .fragmenter(FragmentConfig::default())
+    .build()?;
+// ether.stats(): adapter counters; ether.guest_mac(): the learned guest MAC.
+```
+
+- **Address plan.** The guest leases its tunnel address with the gateway, typically the
+  peer's own tunnel address. The adapter answers ARP for the gateway only; every IP packet
+  the guest sends enters the engine and goes to the peer whose allowed IPs contain its
+  destination, so the peer's allowed IPs name the networks the guest reaches. Other
+  addresses of the leased prefix are on-link for the guest and get no ARP answer, so hosts
+  of the tunnel network other than the gateway are out of its reach. IPv6 is optional:
+  `EtherConfig::ipv6_prefix` is advertised as a /64 and the guest picks its address in it.
+- **MTU.** The link MTU is the tunnel MTU (WireGuard's 1420 over a 1500-byte path), in the
+  lease, the router advertisement and the source the engine reads, so the guest does not
+  send larger packets. The fragmentation stage handles the ones it sends anyway: ICMP
+  Fragmentation Needed for IPv4 with DF set, fragments without DF, `ICMPv6` Packet Too Big
+  for IPv6.
+- **Masquerade.** When the tunnel gives one IPv6 address rather than a /64, a
+  `nsplane_nat::Masquerade` around the source (`forward`) and the sink (`reverse`,
+  for example in a `MapSink`) rewrites the guest's flows from the advertised prefix to that
+  address. IPv4 needs none, since the lease is the tunnel address.
+- **Access control.** An `AclFilter` decides both directions when the peers are members of a
+  namespace with outbound rules: `rules` are the flows the peers may open to the guest,
+  `outbound` the flows the guest may open; replies of accepted flows pass. Replacing the
+  namespace with `store_namespace` takes effect on the next packet.
+
+```rust ignore
+use nsplane_acl::{AclEngine, AclFilter, Label, LabelSet, NamespaceMember, NamespacePolicy, PeerLabelMap};
+
+let acl = Arc::new(AclEngine::new());
+acl.store_namespace("vm", NamespacePolicy {
+    members: vec![NamespaceMember { label: Label::from("remote"), addresses: vec![] }],
+    rules: to_guest,           // Vec<Rule>: what the peers may open to the guest
+    outbound: Some(from_guest), // Vec<OutboundRule>: what the guest may open
+    ..NamespacePolicy::default()
+})?;
+let labels = Arc::new(PeerLabelMap::new());
+let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
+// EngineBuilder::filter(Box::new(filter)); once the peer is added:
+labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
+```
+
+The `vm_wireguard` example puts these together, with the policy in a reloadable file.
 
 ## 8. A userspace node: nsplane-netstack
 
@@ -985,5 +1060,6 @@ All in `examples/` (`cargo run -p nsplane-examples --bin <name> -- --help`):
 | `relay_server` | a single-port relay that is also a WireGuard node | no |
 | `relay_transport` | relay discovery and the direct/relay path ladder | no |
 | `app_session` | app sessions on ACL namespaces and pinholes | no |
+| `vm_wireguard` | a virtual machine's link as the local side, with ACL and masquerade | no |
 
 The relay in `relay_server` / `relay_transport` is example code, not a published API.

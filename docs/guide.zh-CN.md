@@ -83,6 +83,7 @@ nsplane ─► nsplane-nat, nsplane-wss
 | 带访问控制的网关 | `nsplane`、`nsplane-tun`、`nsplane-acl` |
 | 子网路由 / 纯 IPv6 网络 | `nsplane`、`nsplane-tun`、`nsplane-nat` |
 | 位于封锁 UDP 的防火墙之后 | 再加 `nsplane-wss` |
+| 虚拟机不经 TUN 设备访问 peer | `nsplane`、`nsplane-ether` |
 
 ## 3. 添加依赖
 
@@ -368,6 +369,73 @@ let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).bu
 
 `pipe`、`pump`、`SwapSink` 和 `AbortSink` 分别用于进程内连接、运行中替换 sink、关闭时隔离 sink；
 详见 rustdoc。
+
+### 虚拟机的网络链路：nsplane-ether
+
+通过 Unix socket 承载虚拟机以太网帧的 guest 运行时（QEMU `-netdev stream`、passt、libkrun）可以直接
+作为引擎的本地侧：`spawn_port` 在该 socket 上运行一个 `nsplane-ether` 适配器，应答 guest 的 DHCP、
+ARP 和邻居发现，并把它的 IP 数据包作为 packet source 和 sink 提供出来：
+
+```rust ignore
+use nsplane::{EngineBuilder, FragmentConfig};
+use nsplane_ether::{DhcpConfig, EtherConfig, MacAddr, spawn_port, stream};
+
+// guest 运行时连接到 `listener`（一个 tokio UnixListener）。
+let (conn, _) = listener.accept().await?;
+let (reader, writer) = stream::unix(conn);
+let gateway: std::net::Ipv4Addr = "10.66.0.1".parse()?; // peer 的隧道地址
+let config = EtherConfig {
+    gateway_ipv4: Some(gateway),
+    dhcp: Some(DhcpConfig {
+        router: Some(gateway),
+        dns: vec![gateway],
+        mtu: Some(1420),
+        ..DhcpConfig::new(gateway, "10.66.0.2".parse()?, 24) // guest 的隧道地址
+    }),
+    mtu: 1420, // 隧道 MTU
+    ..EtherConfig::new(MacAddr([0x02, 0, 0, 0, 0, 1]))
+};
+let (source, sink, ether) = spawn_port(reader, writer, config);
+let engine = EngineBuilder::new(source, sink)
+    .private_key(key)
+    .transport(udp)
+    .fragmenter(FragmentConfig::default())
+    .build()?;
+// ether.stats()：适配器计数器；ether.guest_mac()：学习到的 guest MAC。
+```
+
+- **地址规划。** guest 通过 DHCP 租到自己的隧道地址和网关，网关通常就是 peer 自己的隧道地址。
+  适配器只为网关地址应答 ARP；guest 发出的每个 IP 包都进入引擎，并发往 allowed IPs 包含其目的
+  地址的 peer，因此 peer 的 allowed IPs 决定了 guest 能到达哪些网络。租约前缀内的其他地址对
+  guest 而言是同链路地址且得不到 ARP 应答，因此隧道网络中网关以外的主机 guest 无法到达。IPv6
+  可选：`EtherConfig::ipv6_prefix` 作为 /64 通告，guest 在其中自行选取地址。
+- **MTU。** 链路 MTU 即隧道 MTU（1500 字节路径上 WireGuard 的 1420），写入租约、路由通告以及
+  引擎读取的 source，guest 因而不会发送更大的包。仍然发出的大包由分片阶段处理：DF 置位的 IPv4
+  回 ICMP Fragmentation Needed，未置 DF 的拆成分片，IPv6 回 `ICMPv6` Packet Too Big。
+- **Masquerade。** 隧道只分配一个 IPv6 地址而不是 /64 时，在 source（`forward`）和 sink
+  （`reverse`，例如放在 `MapSink` 中）外包一层 `nsplane_nat::Masquerade`，把 guest 来自通告前缀的
+  flow 改写为该地址。IPv4 不需要，因为租约本身就是隧道地址。
+- **访问控制。** peer 属于一个带出站规则的命名空间时，`AclFilter` 对两个方向都做判定：`rules`
+  是 peer 可以向 guest 发起的 flow，`outbound` 是 guest 可以发起的 flow；已接受 flow 的回包放行。
+  用 `store_namespace` 替换命名空间后，从下一个包起生效。
+
+```rust ignore
+use nsplane_acl::{AclEngine, AclFilter, Label, LabelSet, NamespaceMember, NamespacePolicy, PeerLabelMap};
+
+let acl = Arc::new(AclEngine::new());
+acl.store_namespace("vm", NamespacePolicy {
+    members: vec![NamespaceMember { label: Label::from("remote"), addresses: vec![] }],
+    rules: to_guest,           // Vec<Rule>：peer 可以向 guest 发起的 flow
+    outbound: Some(from_guest), // Vec<OutboundRule>：guest 可以发起的 flow
+    ..NamespacePolicy::default()
+})?;
+let labels = Arc::new(PeerLabelMap::new());
+let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
+// EngineBuilder::filter(Box::new(filter))；添加 peer 之后：
+labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
+```
+
+`vm_wireguard` 示例把这些组合在一起，策略放在可热加载的文件中。
 
 ## 8. 用户态节点：nsplane-netstack
 
@@ -950,5 +1018,6 @@ wg setconf wg0 /path/to/wg0.conf
 | `relay_server` | 同时也是 WireGuard 节点的单端口 relay | 否 |
 | `relay_transport` | relay 发现与直连/relay 路径逐级切换 | 否 |
 | `app_session` | 基于 ACL 命名空间和临时放行的应用会话 | 否 |
+| `vm_wireguard` | 以虚拟机链路为本地侧，带 ACL 和 masquerade | 否 |
 
 `relay_server` / `relay_transport` 中的 relay 是示例代码，不是对外发布的 API。

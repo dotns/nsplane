@@ -42,10 +42,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as it is and left in place.
 - nsplane-packet `vnet` module: `VirtioNetHdr`, `segment` and `OffloadError`, the virtio-net
   header codec and GSO segmentation that nsplane-tun uses for its offload reads.
+- Example `vm_wireguard`: a virtual machine's link (QEMU `-netdev stream`, passt, libkrun on a
+  Unix socket) as the local side of an engine through `nsplane-ether`, with the tunnel
+  address and MTU in the DHCP lease, an optional IPv6 router advertisement and masquerade,
+  and a reloadable ACL deciding which flows the guest and the peers may open. Tested in
+  process against a second engine and with a Linux guest under QEMU against wireguard-go
+  (`crates/nsplane-ether/scripts/vm-wireguard.sh`).
 
 ### Changed
 - nsplane-tun depends on nsplane-packet and splits offload reads with
   `nsplane_packet::vnet::segment`; behavior unchanged.
+
+### Fixed
+- nsplane-acl: an accepted outbound ICMP or `ICMPv6` echo request records the reply allowance
+  of its echo reply whatever the other-protocol settings, as TCP and UDP replies do. A ping
+  an outbound rule accepts towards an outbound-restricted peer (or any ping to an
+  unrestricted peer) now gets its reply instead of a `reasons::PROTOCOL` drop; only the echo
+  reply with the request's identifier passes.
 
 ## [0.17.0] - 2026-10-24
 

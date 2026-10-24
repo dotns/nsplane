@@ -28,6 +28,7 @@ nsplane = { path = "../crates/nsplane", version = "0.17.0" }
 nsplane-acl = { path = "../crates/nsplane-acl", version = "0.17.0" }
 nsplane-core = { path = "../crates/nsplane-core", version = "0.17.0" }
 nsplane-dns = { path = "../crates/nsplane-dns", version = "0.17.0", features = ["netstack"] }
+nsplane-ether = { path = "../crates/nsplane-ether", version = "0.17.0" }
 nsplane-nat = { path = "../crates/nsplane-nat", version = "0.17.0" }
 nsplane-netstack = { path = "../crates/nsplane-netstack", version = "0.17.0" }
 nsplane-packet = { path = "../crates/nsplane-packet", version = "0.17.0" }

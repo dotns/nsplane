@@ -1,6 +1,6 @@
 # 20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane
 
-- **status**: in progress (owner approved 2026-10-24: "可以把vm路径的examples也放进0.18")
+- **status**: in progress (merged into main 066cc12; ships with 0.18.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:29
@@ -21,3 +21,14 @@ local `nsplane-dns`.
 
 - **blocked by**: (none)
 - **blocks**: (none)
+
+## Follow-up
+
+- The real-guest run found that an accepted outbound echo request did not allow its echo
+  reply unless other-protocol settings were present; fixed in `nsplane-acl` with this task.
+- `nsplane-ether` answers ARP / NDP only for the gateway address, so other hosts of the
+  leased prefix are out of the guest's reach (documented as current behavior). An option to
+  answer every address but the guest's own would lift it; separate work.
+- With `--masquerade`, an `ICMPv6` Packet Too Big from the fragmenter is not restored by
+  `Masquerade::reverse` (TCP, UDP and echo only); the advertised MTU keeps a conforming
+  guest below it.
