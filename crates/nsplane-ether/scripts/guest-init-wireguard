@@ -1,8 +1,10 @@
 #!/bin/busybox sh
 # Guest /init of vm-wireguard.sh: brings eth0 up by DHCP (with the tunnel MTU) and router
 # advertisement, then checks the path to the WireGuard peer through the ACL: ping and TCP
-# to the peer (10.66.0.1, fd66::1) and to an address behind it (10.66.1.1) pass, a 100 kB
-# line over TCP comes back whole, TCP to port 8 is blocked. Then it serves TCP 2222 (allowed to the peer) and 2223 (blocked) and
+# to the peer (10.66.0.1, fd66::1), to a second address of the peer in the guest's
+# on-link prefixes (10.66.0.3, fd66::3, resolved by the adapter's neighbor proxy) and to an
+# address behind it (10.66.1.1) pass, a 100 kB line over TCP comes back whole, TCP to port
+# 8 is blocked. Then it serves TCP 2222 (allowed to the peer) and 2223 (blocked) and
 # prints `GUEST-READY` until the peer sends `finish` to 2222. The success line is
 # `NSPLANE-VM-WG-OK <lease address> <IPv6 address>`.
 /bin/busybox --install -s /bin
@@ -52,12 +54,15 @@ ping_ok() {
 ping_ok 10.66.0.1 || fail "ping 10.66.0.1"
 ping_ok 10.66.1.1 || fail "ping 10.66.1.1 (behind the peer)"
 ping_ok fd66::1 || fail "ping fd66::1"
+ping_ok 10.66.0.3 || fail "ping 10.66.0.3 (on-link, second address of the peer)"
+ping_ok fd66::3 || fail "ping fd66::3 (on-link, second address of the peer)"
+ip neigh show dev eth0
 
 # tcp HOST PORT: one line to the peer's responder, which answers `peer <port> <line>`.
 tcp() {
   echo "hello from the guest" | nc -w 5 "$1" "$2"
 }
-for target in "10.66.0.1 7" "10.66.1.1 7" "fd66::1 7"; do
+for target in "10.66.0.1 7" "10.66.1.1 7" "fd66::1 7" "10.66.0.3 7" "fd66::3 7"; do
   set -- $target
   reply=$(tcp "$1" "$2")
   echo "TCP $1 port $2 reply: $reply"

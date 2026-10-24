@@ -432,13 +432,13 @@ the engine's packet source and sink. The wiring is `nsplane_examples::vm`.
 
 - Address plan: the guest leases its tunnel address (`--address`) by DHCP with the gateway
   (`--gateway`, default the first host of the prefix other than the guest, typically the
-  peer's tunnel address), the IPv4 `--dns` servers and the MTU. The adapter answers ARP for
-  the gateway only; every IP packet the guest sends enters the engine and goes to the peer
-  whose allowed IPs contain its destination, so the peer's `allowed-ips` on this node name
-  the networks the guest reaches. Other addresses of the leased prefix are on-link for the
-  guest and get no ARP answer, so hosts of the tunnel network other than the gateway are
-  out of the guest's reach; networks outside the prefix are routed through the gateway.
-  `--ipv6-prefix` advertises a /64 by router advertisement
+  peer's tunnel address), the IPv4 `--dns` servers and the MTU. The adapter answers ARP and
+  neighbor solicitations for every address but the guest's own with the gateway MAC (its
+  neighbor proxy), so the other hosts of the leased prefix, on-link for the guest, are
+  reached like the gateway and networks outside the prefix are routed through it. Every IP
+  packet the guest sends enters the engine and goes to the peer whose allowed IPs contain its
+  destination, so the peer's `allowed-ips` on this node name the hosts and networks the guest
+  reaches. `--ipv6-prefix` advertises a /64 by router advertisement
   (gateway `<prefix>::1`, IPv6 `--dns` as RDNSS); the guest picks its address in it.
 - MTU: `--mtu` (default 1420) is the tunnel MTU, in the lease (option 26), the router
   advertisement and the engine. The engine's fragmentation stage answers a larger IPv4 packet

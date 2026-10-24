@@ -11,8 +11,10 @@
 //!
 //! - **Address plan** ([`VmArgs::ether_config`]): the guest leases its tunnel IPv4 address
 //!   by DHCP, with the gateway, the DNS servers and the tunnel MTU. The adapter answers ARP
-//!   for the gateway only; every IP packet the guest sends, to the gateway or past it,
-//!   enters the engine and is routed to the peer whose allowed IPs contain its destination.
+//!   and neighbor solicitations for every address but the guest's own with the gateway MAC
+//!   (its neighbor proxy), so the other hosts of the prefix are reachable like the gateway:
+//!   every IP packet the guest sends, on-link or past the gateway, enters the engine and is
+//!   routed to the peer whose allowed IPs contain its destination.
 //!   The default gateway is the first host of the prefix other than the guest, typically
 //!   the peer's own tunnel address. IPv6 is optional: a /64 advertised by router
 //!   advertisement, where the guest picks its address itself (SLAAC).
@@ -152,7 +154,7 @@ impl VmArgs {
     }
 
     /// The adapter configuration: the DHCP lease of the tunnel address with gateway, DNS
-    /// and MTU, ARP for the gateway, and the router advertisement of `--ipv6-prefix` with
+    /// and MTU, the neighbor proxy, and the router advertisement of `--ipv6-prefix` with
     /// its `::1` as the global gateway address.
     pub fn ether_config(&self) -> anyhow::Result<EtherConfig> {
         let guest = self.guest_ipv4()?;
@@ -473,7 +475,9 @@ pub fn ether_json(ether: &EtherHandle) -> Value {
         "ip_in": stats.ip_in,
         "ip_out": stats.ip_out,
         "arp_replies": stats.arp_replies,
+        "arp_proxied": stats.arp_proxied,
         "nd_replies": stats.nd_replies,
+        "nd_proxied": stats.nd_proxied,
         "dhcp_replies": stats.dhcp_replies,
         "drop_malformed": stats.drop_malformed,
         "drop_no_guest_mac": stats.drop_no_guest_mac,

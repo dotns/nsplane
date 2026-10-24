@@ -101,6 +101,18 @@ per turn, in order), and egress TCP segments and UDP datagrams keep 32 bytes of 
   at `budget / RTT`, which limits parallel connections on a long path; see
   [Queue depths](nsplane.md#queue-depths) for when to set it. Unset, the bridge pass skips counting
   the senders and every connection's limit is `usize::MAX`.
+- `NetStackConfig::tcp_min_rto` and `tcp_initial_rto` (default 1 s each, smoltcp's
+  defaults, RFC 6298 2.4 and 2.1) are applied to every TCP socket, listener pool sockets
+  included, through smoltcp's `set_min_rto` / `set_initial_rto`. Both are taken in whole
+  milliseconds and clamped to 1 ms..=60 s, as smoltcp does; the largest RTO after
+  exponential back-off stays smoltcp's 60 s. smoltcp samples RTTs in whole milliseconds, so
+  on a path whose round trip is far below the minimum, the minimum alone sets the RTO and
+  every loss that neither fast retransmit nor the tail loss probe recovers costs at least
+  that long (see [Performance](../performance.md#netstack) for a run with 20 ms). A
+  minimum below the peer's delayed-ACK time turns its delayed ACKs into spurious
+  retransmissions; the stack's own sockets do not delay ACKs. A lowered minimum applies
+  from a connection's first RTT measurement; the initial RTO times the SYN, the SYN-ACK
+  and data sent before a round trip was measured.
 ### Oversize UDP
 
 - UDP datagrams are built with DF set over IPv4 and an application payload whose packet
@@ -199,27 +211,26 @@ per turn, in order), and egress TCP segments and UDP datagrams keep 32 bytes of 
   feature `socket-tcp-cubic`, no extra crate). Without it smoltcp sends the whole peer
   window at once and, after a retransmission timeout, all of it again; a hop that drops
   part of the burst (a full socket buffer on a loaded host) drops the retransmission too,
-  and the timeouts (1 s minimum, doubling) add up. CUBIC rather than Reno: both restart
+  and the timeouts (at least `tcp_min_rto`, doubling) add up. CUBIC rather than Reno: both restart
   from one segment after a timeout, CUBIC recovers faster under random loss and is the
   default of Linux, Windows and macOS; its `f64` arithmetic is no concern on the targets
   nsplane runs on.
 
 ### smoltcp fork
 
-smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.6`, ADR
-[2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): v0.14.0 plus the changes
-below.
+smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.7`, ADR
+[2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): upstream smoltcp `main`
+at `24bda3b` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
+retransmission timer when the peer's window closes (RFC 6298 5.1) and arms the zero-window
+probe timer when a timeout finds the window closed; it keeps a fast retransmission pending
+until its segment is emitted, also while the egress backlog is full; and it has the
+per-socket RTO bounds behind `tcp_min_rto` and `tcp_initial_rto`.
 
 Recovery when both ends send under loss:
 
 - Every empty segment carries the highest sequence number sent (RFC 9293 `SEQ=SND.NXT`)
   and does not move the send position, so a peer that already received past a
   retransmission point still accepts the acknowledgements.
-- Outstanding data stays under the retransmission timer when the peer's window closes
-  (RFC 6298 5.1); a timeout that finds the window closed probes from the oldest
-  unacknowledged byte.
-- A fast retransmission stays pending until its segment is emitted, also while the egress
-  backlog is full.
 - A FIN in flight is left to the retransmission timer; duplicate ACKs do not replace it by a
   fast retransmission.
 
@@ -244,13 +255,15 @@ Tail loss probe, in the manner of RFC 8985 section 7. Next to the retransmission
 (plus 200 ms for a delayed ACK when one segment is in flight), restarted by every
 segment sent and every ACK of new data. When it expires, the first unacknowledged
 segment is resent once, and fast recovery starts unless a recovery is already running;
-the retransmission timer keeps running for a lost probe. Unlike RFC 8985 the probe
+the retransmission timer keeps running for a lost probe. The probe is armed only when it
+expires before the retransmission timeout, so with a `tcp_min_rto` below the probe timeout
+the retransmission timer recovers the loss alone. Unlike RFC 8985 the probe
 resends the first unacknowledged segment rather than the last (smoltcp keeps no SACK
 scoreboard, so that is where the loss must be) and also runs in fast recovery and after
 a timeout, where it resends a lost retransmission: the role RACK has in RFC 8985. SACK is not used:
 smoltcp's receiver reports a single SACK block, so a sender scoreboard would see little of
 the holes; the probe needs no state beyond one flag and one timer field and no receiver
-change. A lost probe waits for a retransmission timeout of at least 1 s.
+change. A lost probe waits for a retransmission timeout of at least `tcp_min_rto`.
 
 The engine's `DROP_SINK_FULL` is ordinary loss to TCP: a decrypted segment the engine drops
 at the full sink is never acknowledged, the retransmission timer stays armed and smoltcp
@@ -449,6 +462,7 @@ not establish peer application completion or remote cleanup.
 | User-space TCP/IP stack | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |
 | Stack reassembly | `NetStackConfig::reassembly = Some(ReassemblyConfig::default())` (64 datagrams, 30 s, 65 535 bytes) | off: fragments are dropped (`unsupported`) | one `Option` check per ingress packet; no reassembler is allocated |
 | TCP socket buffers | `NetStackConfig::tcp_rx_buffer` / `tcp_tx_buffer = Some(bytes)`, clamped to `mtu - 40 ..= 65535 << 14` | `None`: `(mtu - 40) * 512` bytes each | none: the sizes are resolved once when the stack is created |
+| TCP RTO bounds | `NetStackConfig::tcp_min_rto` / `tcp_initial_rto = Duration`, whole milliseconds clamped to `1 ms ..= 60 s` | 1 s each (smoltcp's) | none: two setter calls per socket created |
 | Oversize IPv4 UDP sends | `NetStackConfig::udp_allow_fragmentation = true`, with `EngineBuilder::fragmenter` on the stack's engine | off: a packet above the MTU fails with `InvalidInput` | one length comparison per send |
 | TCP abort | `TcpConnection::abort` instead of dropping the connection | drop closes with a FIN | one state compare under the connection's lock and two empty-`Vec` takes per driver turn |
 | Fragment discard | `NetStackHandle::discard_fragments(src, dst, protocol, id)` when a flow's admission is revoked; needs `NetStackConfig::reassembly` | not called | none without reassembly; with it one atomic load per ingress packet while nothing is discarded, no lock |

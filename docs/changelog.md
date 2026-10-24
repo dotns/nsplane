@@ -368,3 +368,21 @@ One run of the release gate failed in
 `udp::tests::icmp_recovery_preserves_partial_batches_and_real_errors` (loopback ICMP error
 timing under full parallel load); it passed 50 of 50 stress runs alone and the re-run of the
 full gate was green.
+
+## 2026-10-24 [release]
+
+Prepare 0.19.0 (tag `v0.19.0`), freeze exceptions nine and ten. Two single-issue BKD
+workstreams reported to L1, which reviewed each branch and merged it after a green full gate:
+
+- Neighbor proxy in nsplane-ether (plan `20261024-1454-ether-proxy-arp`): the adapter answers
+  ARP and IPv6 neighbor solicitations for every routable address of the guest's link but the
+  guest's own, so hosts of the leased prefix other than the gateway are reachable; duplicate
+  address detection is never answered. Verified with QEMU and Firecracker guests against
+  wireguard-go.
+- smoltcp fork on upstream `main` (plan `20261024-1453-smoltcp-upstream-fixes`): tag
+  `v0.14.0-nsplane.7` on upstream `24bda3b`, nine fork patches kept, two dropped in favor of
+  upstream's equivalent fixes, the tail loss probe reduced to yield to a lower RTO;
+  `NetStackConfig::tcp_min_rto` / `tcp_initial_rto` expose upstream's per-socket RTO settings.
+  Interleaved A/B on the bench slots: loss-free and bottleneck throughput unchanged, lossy
+  medians better, TCP send microbenchmarks about 1-2 % slower (reproducible, not caused by the
+  Cubic change; accepted).

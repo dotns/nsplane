@@ -5,6 +5,28 @@
 //! back the IP packets meant for the IP side; [`to_guest`](EtherAdapter::to_guest) gives the
 //! ethernet header that carries an IP packet to the guest. The guest MAC is learned from
 //! the source address of the guest's frames.
+//!
+//! # Neighbor proxy
+//!
+//! With [`EtherConfig::proxy_neighbors`] set (the default), the adapter answers ARP requests
+//! and neighbor solicitations for every routable address except the guest's own with the
+//! gateway MAC, so the hosts the guest sees as on-link (the rest of its leased prefix or of
+//! the advertised /64) are reached through the IP side like any other destination.
+//!
+//! The guest's own addresses are:
+//!
+//! - IPv4: the address of the `DHCPv4` lease ([`DhcpConfig::guest_ip`]) and the sender
+//!   address of every ARP packet from the guest that has one (not `0.0.0.0`).
+//! - IPv6: the target of every duplicate address detection solicitation and every neighbor
+//!   advertisement from the guest, and the source address of every IPv6 packet from the
+//!   guest that lies in the advertised /64.
+//!
+//! The adapter keeps the last [`OWN_ADDRESSES`] learned addresses per family and forgets
+//! them when the guest MAC changes. A proxy answer is never given to an ARP probe (sender
+//! `0.0.0.0`), a gratuitous ARP packet or a duplicate address detection solicitation
+//! (unspecified source), so the guest's duplicate address detection succeeds for any
+//! address, nor for an unspecified, broadcast, multicast, loopback or link-local target,
+//! which the IP side cannot deliver to.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -19,6 +41,9 @@ pub const DEFAULT_MTU: u16 = 1500;
 
 /// Length of the IPv6 fixed header.
 const IPV6_HEADER_LEN: usize = 40;
+
+/// Most learned guest addresses kept per family; the oldest is forgotten first.
+pub const OWN_ADDRESSES: usize = 16;
 
 /// Configuration of the gateway the adapter stands in for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +64,15 @@ pub struct EtherConfig {
     pub dhcp: Option<DhcpConfig>,
     /// Link MTU, advertised in router advertisements.
     pub mtu: u16,
+    /// Answer ARP requests and neighbor solicitations for every routable address except the
+    /// guest's own with the gateway MAC (see [Neighbor proxy](self#neighbor-proxy)); `false`
+    /// answers only the gateway's addresses.
+    pub proxy_neighbors: bool,
 }
 
 impl EtherConfig {
-    /// A gateway at `gateway_mac` with no addresses, no prefix, no DHCP and [`DEFAULT_MTU`].
+    /// A gateway at `gateway_mac` with no addresses, no prefix, no DHCP, [`DEFAULT_MTU`] and
+    /// the neighbor proxy on.
     pub const fn new(gateway_mac: MacAddr) -> Self {
         Self {
             gateway_mac,
@@ -52,6 +82,7 @@ impl EtherConfig {
             ipv6_dns: Vec::new(),
             dhcp: None,
             mtu: DEFAULT_MTU,
+            proxy_neighbors: true,
         }
     }
 }
@@ -69,8 +100,14 @@ pub struct EtherStats {
     pub ip_out: u64,
     /// ARP replies sent.
     pub arp_replies: u64,
+    /// ARP replies sent by the neighbor proxy, for an address other than the gateway's;
+    /// also counted in [`arp_replies`](Self::arp_replies).
+    pub arp_proxied: u64,
     /// Neighbor and router advertisements sent, solicited or not.
     pub nd_replies: u64,
+    /// Neighbor advertisements sent by the neighbor proxy, for an address other than the
+    /// gateway's; also counted in [`nd_replies`](Self::nd_replies).
+    pub nd_proxied: u64,
     /// `DHCPv4` replies sent.
     pub dhcp_replies: u64,
     /// Guest frames dropped as malformed: a bad ethernet header, a multicast source, or a
@@ -99,6 +136,11 @@ pub struct EtherAdapter {
     gateway_ipv6: Vec<Ipv6Addr>,
     ra: RaConfig,
     dhcp: Option<DhcpServer>,
+    proxy_neighbors: bool,
+    /// Learned guest IPv4 addresses, oldest first; the lease address is not among them.
+    own_ipv4: Vec<Ipv4Addr>,
+    /// Learned guest IPv6 addresses, oldest first.
+    own_ipv6: Vec<Ipv6Addr>,
     guest_mac: Option<MacAddr>,
     stats: EtherStats,
 }
@@ -119,6 +161,9 @@ impl EtherAdapter {
                 ..RaConfig::default()
             },
             dhcp: config.dhcp.map(DhcpServer::new),
+            proxy_neighbors: config.proxy_neighbors,
+            own_ipv4: Vec::new(),
+            own_ipv6: Vec::new(),
             guest_mac: None,
             stats: EtherStats::default(),
         }
@@ -144,7 +189,8 @@ impl EtherAdapter {
     ///
     /// Every frame with a unicast source teaches the guest MAC; when it is learned for the
     /// first time and a prefix is configured, an unsolicited router advertisement to
-    /// all-nodes is appended to `replies`.
+    /// all-nodes is appended to `replies`. With the neighbor proxy on, the frame may also
+    /// teach a guest address (see [Neighbor proxy](self#neighbor-proxy)).
     pub fn from_guest<'a>(
         &mut self,
         bytes: &'a [u8],
@@ -215,6 +261,8 @@ impl EtherAdapter {
             Some(known) => {
                 tracing::debug!(old = %known, new = %mac, "guest MAC changed");
                 self.guest_mac = Some(mac);
+                self.own_ipv4.clear();
+                self.own_ipv6.clear();
             }
             None => {
                 tracing::debug!(%mac, "guest MAC learned");
@@ -239,16 +287,52 @@ impl EtherAdapter {
             self.stats.drop_malformed += 1;
             return;
         };
-        match self
-            .gateway_ipv4
-            .and_then(|ip| arp::reply(&packet, self.gateway_mac, ip))
+        if self.proxy_neighbors
+            && !packet.sender_ip.is_unspecified()
+            && !self.is_lease(packet.sender_ip)
         {
+            learn_address(&mut self.own_ipv4, packet.sender_ip);
+        }
+        let gateway = self
+            .gateway_ipv4
+            .and_then(|ip| arp::reply(&packet, self.gateway_mac, ip));
+        let proxied = if gateway.is_none() && self.proxies_ipv4(&packet) {
+            arp::reply(&packet, self.gateway_mac, packet.target_ip)
+        } else {
+            None
+        };
+        if proxied.is_some() {
+            self.stats.arp_proxied += 1;
+        }
+        match gateway.or(proxied) {
             Some(reply) => {
                 self.reply(reply, replies);
                 self.stats.arp_replies += 1;
             }
             None => self.stats.drop_unanswered += 1,
         }
+    }
+
+    /// Whether the neighbor proxy answers the ARP packet `packet` (not for the gateway): a
+    /// request with a sender address, for a routable target that is not the guest's.
+    fn proxies_ipv4(&self, packet: &ArpPacket) -> bool {
+        let target = packet.target_ip;
+        self.proxy_neighbors
+            && !packet.sender_ip.is_unspecified()
+            && !(target.is_unspecified()
+                || target.is_broadcast()
+                || target.is_multicast()
+                || target.is_loopback()
+                || target.is_link_local())
+            && !self.own_ipv4.contains(&target)
+            && !self.is_lease(target)
+    }
+
+    /// Whether `addr` is the address of the `DHCPv4` lease.
+    fn is_lease(&self, addr: Ipv4Addr) -> bool {
+        self.dhcp
+            .as_ref()
+            .is_some_and(|server| server.config().guest_ip == addr)
     }
 
     fn ipv4<'a>(&mut self, frame: &Frame<'a>, replies: &mut Vec<Vec<u8>>) -> Option<&'a [u8]> {
@@ -285,6 +369,12 @@ impl EtherAdapter {
             self.stats.drop_malformed += 1;
             return None;
         };
+        if self.proxy_neighbors
+            && let Some(prefix) = self.ra.prefix
+            && in_prefix(header.src(), prefix)
+        {
+            learn_address(&mut self.own_ipv6, header.src());
+        }
         let total = IPV6_HEADER_LEN + usize::from(header.payload_len());
         let packet = frame.payload.get(..total);
         let ndp = match packet.map(Ndp::parse) {
@@ -296,16 +386,18 @@ impl EtherAdapter {
             }
         };
         let reply = match ndp.message {
-            NdpMessage::NeighborSolicitation { .. } => ndp::answer_neighbor_solicitation(
-                &ndp,
-                frame.src,
-                self.gateway_mac,
-                &self.gateway_ipv6,
-            ),
+            NdpMessage::NeighborSolicitation { target, .. } => {
+                self.neighbor_solicitation(&ndp, target, frame.src)
+            }
             NdpMessage::RouterSolicitation { .. } => {
                 ndp::answer_router_solicitation(&ndp, frame.src, self.gateway_mac, &self.ra)
             }
-            NdpMessage::NeighborAdvertisement { .. } => None,
+            NdpMessage::NeighborAdvertisement { target, .. } => {
+                if self.proxy_neighbors && !self.gateway_ipv6.contains(&target) {
+                    learn_address(&mut self.own_ipv6, target);
+                }
+                None
+            }
         };
         match reply {
             Some(reply) => {
@@ -315,6 +407,45 @@ impl EtherAdapter {
             None => self.stats.drop_unanswered += 1,
         }
         None
+    }
+
+    /// The neighbor advertisement answering the solicitation `ndp` for `target`, carried by
+    /// a frame from `peer_mac`: for a gateway address, or from the neighbor proxy for a
+    /// routable target that is not the guest's. A duplicate address detection solicitation
+    /// for an address other than the gateway's teaches that address instead.
+    fn neighbor_solicitation(
+        &mut self,
+        ndp: &Ndp,
+        target: Ipv6Addr,
+        peer_mac: MacAddr,
+    ) -> Option<Vec<u8>> {
+        if self.gateway_ipv6.contains(&target) {
+            return ndp::answer_neighbor_solicitation(
+                ndp,
+                peer_mac,
+                self.gateway_mac,
+                &self.gateway_ipv6,
+            );
+        }
+        if !self.proxy_neighbors {
+            return None;
+        }
+        if ndp.src.is_unspecified() {
+            learn_address(&mut self.own_ipv6, target);
+            return None;
+        }
+        if target.is_unspecified()
+            || target.is_loopback()
+            || target.is_unicast_link_local()
+            || self.own_ipv6.contains(&target)
+        {
+            return None;
+        }
+        let reply = ndp::answer_neighbor_solicitation(ndp, peer_mac, self.gateway_mac, &[target]);
+        if reply.is_some() {
+            self.stats.nd_proxied += 1;
+        }
+        reply
     }
 
     /// Hands `packet` to the IP side; `None` (shorter than its header claims) is malformed.
@@ -331,6 +462,24 @@ impl EtherAdapter {
         self.stats.frames_out += 1;
         replies.push(frame);
     }
+}
+
+/// Adds `addr` to the learned guest addresses `own` unless it is known, forgetting the
+/// oldest one beyond [`OWN_ADDRESSES`].
+fn learn_address<T: PartialEq + Copy + std::fmt::Display>(own: &mut Vec<T>, addr: T) {
+    if own.contains(&addr) {
+        return;
+    }
+    if own.len() == OWN_ADDRESSES {
+        own.remove(0);
+    }
+    tracing::debug!(%addr, "guest address learned");
+    own.push(addr);
+}
+
+/// Whether `addr` lies in the /64 of `prefix`.
+const fn in_prefix(addr: Ipv6Addr, prefix: Ipv6Addr) -> bool {
+    addr.to_bits() >> 64 == prefix.to_bits() >> 64
 }
 
 #[cfg(test)]
@@ -352,13 +501,18 @@ mod tests {
         "fd00:1::".parse().unwrap()
     }
 
-    fn adapter(prefix: Option<Ipv6Addr>) -> EtherAdapter {
-        EtherAdapter::new(EtherConfig {
+    fn adapter_config(prefix: Option<Ipv6Addr>) -> EtherConfig {
+        EtherConfig {
             gateway_ipv4: Some(GW_IP),
+            gateway_ipv6: prefix.map(|p| Ipv6Addr::from_bits(p.to_bits() | 1)),
             ipv6_prefix: prefix,
             dhcp: Some(DhcpConfig::new(GW_IP, GUEST_IP, 24)),
             ..EtherConfig::new(GW_MAC)
-        })
+        }
+    }
+
+    fn adapter(prefix: Option<Ipv6Addr>) -> EtherAdapter {
+        EtherAdapter::new(adapter_config(prefix))
     }
 
     fn eth(dst: MacAddr, src: MacAddr, ethertype: EtherType, payload: &[u8]) -> Vec<u8> {
@@ -489,7 +643,10 @@ mod tests {
 
     #[test]
     fn arp_answered_locally() {
-        let mut a = adapter(None);
+        let mut a = EtherAdapter::new(EtherConfig {
+            proxy_neighbors: false,
+            ..adapter_config(None)
+        });
         let mut replies = Vec::new();
         let mut request = Vec::new();
         ArpPacket {
@@ -566,5 +723,293 @@ mod tests {
         assert_eq!(stats.drop_malformed, 2);
         assert_eq!(stats.drop_unsupported, 1);
         assert_eq!(stats.ip_in, 0);
+    }
+
+    /// An ARP request frame from the guest.
+    fn arp_request(sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
+        let mut request = Vec::new();
+        ArpPacket {
+            op: ArpOp::Request,
+            sender_mac: GUEST_MAC,
+            sender_ip,
+            target_mac: MacAddr([0; 6]),
+            target_ip,
+        }
+        .write(&mut request);
+        eth(MacAddr::BROADCAST, GUEST_MAC, EtherType::ARP, &request)
+    }
+
+    /// The ARP reply in `replies`, if there is exactly one.
+    fn arp_reply(replies: &mut Vec<Vec<u8>>) -> Option<ArpPacket> {
+        let reply = replies.pop()?;
+        assert_eq!(replies.len(), 0);
+        let frame = Frame::parse(&reply).unwrap();
+        assert_eq!((frame.dst, frame.src), (GUEST_MAC, GW_MAC));
+        ArpPacket::parse(frame.payload).ok()
+    }
+
+    #[test]
+    fn arp_proxy_answers_other_hosts() {
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        let peer = Ipv4Addr::new(10, 0, 2, 99);
+        a.from_guest(&arp_request(GUEST_IP, peer), &mut replies);
+        let reply = arp_reply(&mut replies).unwrap();
+        assert_eq!(
+            (reply.op, reply.sender_mac, reply.sender_ip),
+            (ArpOp::Reply, GW_MAC, peer)
+        );
+        assert_eq!((reply.target_mac, reply.target_ip), (GUEST_MAC, GUEST_IP));
+        // Outside the leased prefix too; the gateway is answered as the gateway.
+        a.from_guest(
+            &arp_request(GUEST_IP, Ipv4Addr::new(192, 0, 2, 7)),
+            &mut replies,
+        );
+        assert!(arp_reply(&mut replies).is_some());
+        a.from_guest(&arp_request(GUEST_IP, GW_IP), &mut replies);
+        assert_eq!(arp_reply(&mut replies).unwrap().sender_ip, GW_IP);
+        let stats = a.stats();
+        assert_eq!((stats.arp_replies, stats.arp_proxied), (3, 2));
+        assert_eq!(stats.drop_unanswered, 0);
+    }
+
+    #[test]
+    fn arp_proxy_leaves_the_guest_addresses_alone() {
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        let peer = Ipv4Addr::new(10, 0, 2, 99);
+        let static_ip = Ipv4Addr::new(10, 0, 2, 50);
+        let unanswered = [
+            // The leased address.
+            arp_request(Ipv4Addr::new(10, 0, 2, 51), GUEST_IP),
+            // Probes, for any address.
+            arp_request(Ipv4Addr::UNSPECIFIED, peer),
+            arp_request(Ipv4Addr::UNSPECIFIED, GUEST_IP),
+            // A gratuitous announcement, which teaches its address.
+            arp_request(static_ip, static_ip),
+            arp_request(GUEST_IP, static_ip),
+            // Addresses the IP side cannot deliver to.
+            arp_request(GUEST_IP, Ipv4Addr::BROADCAST),
+            arp_request(GUEST_IP, Ipv4Addr::new(224, 0, 0, 1)),
+            arp_request(GUEST_IP, Ipv4Addr::new(169, 254, 1, 1)),
+            arp_request(GUEST_IP, Ipv4Addr::LOCALHOST),
+            arp_request(GUEST_IP, Ipv4Addr::UNSPECIFIED),
+        ];
+        for frame in &unanswered {
+            a.from_guest(frame, &mut replies);
+        }
+        assert_eq!(replies.len(), 0);
+        // The sender of the first request (10.0.2.51) is the guest's too.
+        a.from_guest(
+            &arp_request(GUEST_IP, Ipv4Addr::new(10, 0, 2, 51)),
+            &mut replies,
+        );
+        assert_eq!(replies.len(), 0);
+        // A probe for the gateway address is still defended.
+        a.from_guest(&arp_request(Ipv4Addr::UNSPECIFIED, GW_IP), &mut replies);
+        let reply = arp_reply(&mut replies).unwrap();
+        assert_eq!(
+            (reply.sender_ip, reply.target_ip),
+            (GW_IP, Ipv4Addr::UNSPECIFIED)
+        );
+        let stats = a.stats();
+        assert_eq!((stats.arp_replies, stats.arp_proxied), (1, 0));
+        assert_eq!(stats.drop_unanswered, 11);
+    }
+
+    #[test]
+    fn learned_addresses_are_bounded_and_follow_the_guest_mac() {
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        let host = |n: u8| Ipv4Addr::new(10, 0, 3, n);
+        for n in 0..=16 {
+            a.from_guest(&arp_request(host(n), host(n)), &mut replies);
+        }
+        assert_eq!(replies.len(), 0);
+        // The oldest learned address is forgotten, the newer ones are kept.
+        a.from_guest(&arp_request(GUEST_IP, host(1)), &mut replies);
+        assert_eq!(replies.len(), 0);
+        a.from_guest(&arp_request(GUEST_IP, host(0)), &mut replies);
+        assert!(arp_reply(&mut replies).is_some());
+        // A new guest MAC forgets them all.
+        let packet = udp4(Ipv4Addr::new(1, 1, 1, 1), 53, b"q");
+        a.from_guest(
+            &eth(GW_MAC, OTHER_MAC, EtherType::IPV4, &packet),
+            &mut replies,
+        );
+        a.from_guest(
+            &eth(GW_MAC, GUEST_MAC, EtherType::IPV4, &packet),
+            &mut replies,
+        );
+        a.from_guest(&arp_request(GUEST_IP, host(1)), &mut replies);
+        assert!(arp_reply(&mut replies).is_some());
+        assert_eq!(a.stats().arp_proxied, 2);
+    }
+
+    #[test]
+    fn arp_opt_out_answers_only_the_gateway() {
+        let mut a = EtherAdapter::new(EtherConfig {
+            proxy_neighbors: false,
+            ..adapter_config(None)
+        });
+        let mut replies = Vec::new();
+        a.from_guest(
+            &arp_request(GUEST_IP, Ipv4Addr::new(10, 0, 2, 99)),
+            &mut replies,
+        );
+        assert_eq!(replies.len(), 0);
+        a.from_guest(&arp_request(GUEST_IP, GW_IP), &mut replies);
+        assert_eq!(arp_reply(&mut replies).unwrap().sender_ip, GW_IP);
+        let stats = a.stats();
+        assert_eq!((stats.arp_replies, stats.arp_proxied), (1, 0));
+        assert_eq!(stats.drop_unanswered, 1);
+    }
+
+    fn solicited_node(target: Ipv6Addr) -> Ipv6Addr {
+        let [.., x, y, z] = target.octets();
+        Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, x, y, z])
+    }
+
+    /// An IPv6 frame from the guest carrying the `ICMPv6` message `icmp` with hop limit 255.
+    fn icmpv6(src: Ipv6Addr, dst: Ipv6Addr, mut icmp: Vec<u8>) -> Vec<u8> {
+        let sum =
+            nsplane_packet::checksum::transport_checksum_v6(src, dst, protocol::ICMPV6, &icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        let mut packet = vec![0x60, 0, 0, 0];
+        packet.extend_from_slice(&u16::try_from(icmp.len()).unwrap().to_be_bytes());
+        packet.extend_from_slice(&[protocol::ICMPV6, 255]);
+        packet.extend_from_slice(&src.octets());
+        packet.extend_from_slice(&dst.octets());
+        packet.extend_from_slice(&icmp);
+        let dst_mac = if dst.is_multicast() {
+            MacAddr::ipv6_multicast(dst)
+        } else {
+            GW_MAC
+        };
+        eth(dst_mac, GUEST_MAC, EtherType::IPV6, &packet)
+    }
+
+    /// A neighbor solicitation for `target` from `src` (with a source link-layer address
+    /// option unless `src` is unspecified), to the solicited-node address.
+    fn ns(src: Ipv6Addr, target: Ipv6Addr) -> Vec<u8> {
+        let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+        if !src.is_unspecified() {
+            icmp.extend_from_slice(&[1, 1]);
+            icmp.extend_from_slice(&GUEST_MAC.0);
+        }
+        icmpv6(src, solicited_node(target), icmp)
+    }
+
+    /// The target of the neighbor advertisement in `replies`, if there is exactly one,
+    /// checking that it comes from the target with the gateway MAC.
+    fn na_target(replies: &mut Vec<Vec<u8>>) -> Option<Ipv6Addr> {
+        let reply = replies.pop()?;
+        assert_eq!(replies.len(), 0);
+        let frame = Frame::parse(&reply).unwrap();
+        assert_eq!(frame.src, GW_MAC);
+        let ndp = Ndp::parse(frame.payload).unwrap().unwrap();
+        let NdpMessage::NeighborAdvertisement {
+            target, target_mac, ..
+        } = ndp.message
+        else {
+            panic!("not a neighbor advertisement: {ndp:?}");
+        };
+        assert_eq!((ndp.src, target_mac), (target, Some(GW_MAC)));
+        Some(target)
+    }
+
+    fn v6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn ndp_proxy_answers_other_hosts() {
+        let mut a = adapter(Some(prefix()));
+        let mut replies = Vec::new();
+        let guest_ll = GUEST_MAC.link_local();
+        // Learning the guest MAC sends the unsolicited router advertisement first.
+        a.from_guest(&ns(guest_ll, v6("fd00:1::99")), &mut replies);
+        assert_eq!(replies.len(), 2);
+        replies.remove(0);
+        assert_eq!(na_target(&mut replies), Some(v6("fd00:1::99")));
+        // Outside the advertised prefix too, and unicast for neighbor unreachability
+        // detection; the gateway is answered as the gateway.
+        a.from_guest(&ns(guest_ll, v6("2001:db8::7")), &mut replies);
+        assert_eq!(na_target(&mut replies), Some(v6("2001:db8::7")));
+        let mut unicast = vec![135, 0, 0, 0, 0, 0, 0, 0];
+        unicast.extend_from_slice(&v6("fd00:1::99").octets());
+        a.from_guest(&icmpv6(guest_ll, v6("fd00:1::99"), unicast), &mut replies);
+        assert_eq!(na_target(&mut replies), Some(v6("fd00:1::99")));
+        a.from_guest(&ns(guest_ll, v6("fd00:1::1")), &mut replies);
+        assert_eq!(na_target(&mut replies), Some(v6("fd00:1::1")));
+        let stats = a.stats();
+        assert_eq!((stats.nd_replies, stats.nd_proxied), (5, 3));
+        assert_eq!(stats.drop_unanswered, 0);
+    }
+
+    #[test]
+    fn ndp_proxy_leaves_the_guest_addresses_alone() {
+        let mut a = adapter(Some(prefix()));
+        let mut replies = Vec::new();
+        let guest_ll = GUEST_MAC.link_local();
+        let slaac = v6("fd00:1::5054:ff:fe12:3456");
+        let temporary = v6("fd00:1::1234");
+        let announced = v6("fd00:1::8");
+        // Duplicate address detection: never answered, teaches the address.
+        a.from_guest(&ns(Ipv6Addr::UNSPECIFIED, slaac), &mut replies);
+        a.from_guest(&ns(Ipv6Addr::UNSPECIFIED, v6("fd00:1::99")), &mut replies);
+        // Traffic from the advertised prefix teaches its source.
+        let udp = udp_packet(
+            SocketAddr::from((temporary, 40000)),
+            SocketAddr::from((v6("2001:db8::1"), 53)),
+            b"q",
+        )
+        .unwrap();
+        let frame = eth(GW_MAC, GUEST_MAC, EtherType::IPV6, udp.as_packet());
+        assert!(a.from_guest(&frame, &mut replies).is_some());
+        // An unsolicited neighbor advertisement teaches its target.
+        let mut na = vec![136, 0, 0, 0, 0x20, 0, 0, 0];
+        na.extend_from_slice(&announced.octets());
+        a.from_guest(&icmpv6(guest_ll, ndp::ALL_NODES, na), &mut replies);
+        replies.clear();
+        let unanswered = [
+            slaac,
+            v6("fd00:1::99"),
+            temporary,
+            announced,
+            // Link-local addresses, the guest's or another.
+            guest_ll,
+            v6("fe80::99"),
+        ];
+        for target in unanswered {
+            a.from_guest(&ns(guest_ll, target), &mut replies);
+        }
+        assert_eq!(replies.len(), 0);
+        // Duplicate address detection for the gateway address is still defended.
+        a.from_guest(&ns(Ipv6Addr::UNSPECIFIED, v6("fd00:1::1")), &mut replies);
+        assert_eq!(na_target(&mut replies), Some(v6("fd00:1::1")));
+        let stats = a.stats();
+        assert_eq!(stats.nd_proxied, 0);
+        assert_eq!(stats.drop_unanswered, 9);
+    }
+
+    #[test]
+    fn ndp_opt_out_answers_only_the_gateway() {
+        let mut a = EtherAdapter::new(EtherConfig {
+            proxy_neighbors: false,
+            ..adapter_config(Some(prefix()))
+        });
+        let mut replies = Vec::new();
+        let guest_ll = GUEST_MAC.link_local();
+        a.from_guest(&ns(guest_ll, v6("fd00:1::99")), &mut replies);
+        // Only the unsolicited router advertisement.
+        assert_eq!(replies.len(), 1);
+        replies.clear();
+        a.from_guest(&ns(guest_ll, GW_MAC.link_local()), &mut replies);
+        assert_eq!(na_target(&mut replies), Some(GW_MAC.link_local()));
+        let stats = a.stats();
+        assert_eq!(stats.nd_proxied, 0);
+        assert_eq!(stats.drop_unanswered, 1);
     }
 }

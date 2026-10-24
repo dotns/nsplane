@@ -3,7 +3,7 @@
 [中文版](guide.zh-CN.md)
 
 This guide shows how to embed nsplane in an application: which crates to pick, how an engine
-is assembled, and complete code for the common deployments. It describes nsplane 0.18.0.
+is assembled, and complete code for the common deployments. It describes nsplane 0.19.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
 - Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.19.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.19.0" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns
@@ -420,11 +420,12 @@ let engine = EngineBuilder::new(source, sink)
 ```
 
 - **Address plan.** The guest leases its tunnel address with the gateway, typically the
-  peer's own tunnel address. The adapter answers ARP for the gateway only; every IP packet
-  the guest sends enters the engine and goes to the peer whose allowed IPs contain its
-  destination, so the peer's allowed IPs name the networks the guest reaches. Other
-  addresses of the leased prefix are on-link for the guest and get no ARP answer, so hosts
-  of the tunnel network other than the gateway are out of its reach. IPv6 is optional:
+  peer's own tunnel address. The adapter answers ARP and neighbor solicitations for every
+  address but the guest's own with the gateway MAC (`EtherConfig::proxy_neighbors`, on by
+  default), so the other hosts of the leased prefix, on-link for the guest, are reached like
+  the gateway. Every IP packet the guest sends enters the engine and goes to the peer whose
+  allowed IPs contain its destination, so the peer's allowed IPs name the hosts and networks
+  the guest reaches. IPv6 is optional:
   `EtherConfig::ipv6_prefix` is advertised as a /64 and the guest picks its address in it.
 - **MTU.** The link MTU is the tunnel MTU (WireGuard's 1420 over a 1500-byte path), in the
   lease, the router advertisement and the source the engine reads, so the guest does not

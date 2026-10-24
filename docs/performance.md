@@ -204,18 +204,24 @@ the TUN reader's room.
 
 ## Netstack
 
-`tests/netstack_lossy.rs` `throughput`, smoltcp `v0.14.0-nsplane.6`, 2026-10-06: two
+`tests/netstack_lossy.rs` `throughput`, smoltcp `v0.14.0-nsplane.7`, 2026-10-24: two
 netstacks over two engines on an in-process `ChannelTransport` pair, one TCP connection, MTU
 1420; `LossyTransport` drops a deterministic fraction of the data messages, `Bottleneck` is
-25 MB/s behind a 64-datagram drop-tail buffer. Median [range] of 10 interleaved runs, slot 1,
-load 11-27.
+25 MB/s behind a 64-datagram drop-tail buffer. Median [range] of 10 interleaved runs, slot 0,
+load 0.1-5.9. The lossy rows are bimodal: about 0.1 s, or about 1.1 s when a retransmission
+timeout at the 1 s minimum RTO fires.
 
 | Case | Time |
 | --- | --- |
-| TCP, 64 MiB, no loss | 0.209 s [0.180-0.242] |
-| TCP, 16 MiB, 1 % loss | 0.10 s [0.09-1.17] |
-| TCP, 16 MiB, 3 % loss | 1.01 s [0.30-3.39] |
-| TCP, 16 MiB, bottleneck | 0.86 s [0.83-0.87] |
+| TCP, 64 MiB, no loss | 0.161 s [0.117-0.169] |
+| TCP, 16 MiB, 1 % loss | 0.12 s [0.08-1.09] |
+| TCP, 16 MiB, 3 % loss | 0.83 s [0.29-3.27] |
+| TCP, 16 MiB, bottleneck | 0.79 s [0.78-0.80] |
+
+With `NetStackConfig::tcp_min_rto` at 20 ms on both stacks (one run, interleaved with the
+default, load 0.4): no loss 0.159 s (default 0.158 s), 1 % loss 0.106 s (1.100 s), 3 % loss
+0.300 s (0.356 s), bottleneck 0.796 s (0.793 s); the `parallel_echo_with_loss` test (eight
+echoes through 256-packet engine queues, 2 % loss) 133 ms (1073 ms).
 
 `tests/netstack_multistream.rs` (1 GiB per run split between the streams, default
 configuration, release, 12 pairs, load 3.2-5.5, 2026-10-05): one stream 669-782 MB/s, four
