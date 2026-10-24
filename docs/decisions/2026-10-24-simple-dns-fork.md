@@ -33,6 +33,12 @@ Tag `v0.12.0-nsplane.3` (`e17b0c7bfec7e6378bcaefda7ee782bdd1117993`) removes eve
 outside the protocol crate: the mDNS crate, the benchmarks, the Docker files and the upstream
 CI and release tooling. The crate and its fuzz targets remain.
 
+Tag `v0.12.0-nsplane.4` (`c276b6f0fec493bf3ff56a2149126366779590c0`) adds `PacketView`, a
+lenient view of a message: the header and questions are decoded, the other sections are
+skipped by RDLENGTH without decoding names or RDATA, and the first OPT record of the
+additional section is decoded with its TTL laid out as in RFC 6891 (upstream `Packet` reads
+the extended RCODE and version from swapped bytes and is left unchanged).
+
 Changes are made on `main`, tagged `v<upstream version>-nsplane.N` and recorded here.
 
 ## Consequences
