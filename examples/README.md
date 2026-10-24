@@ -29,6 +29,7 @@ The package `nsplane-examples` is not published.
 | [`app_session`](#app_session) | App sessions on ACL namespaces: a file transfer through source-gated pinholes | no (`--tun`: yes) |
 | [`dns_netstack`](#dns_netstack) | A DNS server on an unowned address of a transparent netstack: static, fake and forwarded answers | no |
 | [`dns_policy`](#dns_policy) | DNS policy routing: per-name rules to local records, a fake pool, an upstream, sinkhole, block and CNAME | no |
+| [`vm_wireguard`](#vm_wireguard) | A virtual machine's link as the local side of an engine (`nsplane-ether`), with DHCP, the tunnel MTU, an ACL and an IPv6 masquerade | no |
 
 ## Examples
 
@@ -420,6 +421,65 @@ Flags: `--upstream <IP:PORT>`, `--log <FILTER>` (default `warn`).
 
 ```sh
 cargo run -p nsplane-examples --bin dns_policy -- [--upstream 192.0.2.53:53]
+```
+
+### vm_wireguard
+
+A virtual machine reaching WireGuard peers through one engine, without TUN and without root:
+listens on `--socket` for one guest runtime speaking the length-prefixed frame protocol (QEMU
+`-netdev stream`, passt, libkrun) and runs an `nsplane-ether` adapter on it, whose IP side is
+the engine's packet source and sink. The wiring is `nsplane_examples::vm`.
+
+- Address plan: the guest leases its tunnel address (`--address`) by DHCP with the gateway
+  (`--gateway`, default the first host of the prefix other than the guest, typically the
+  peer's tunnel address), the IPv4 `--dns` servers and the MTU. The adapter answers ARP for
+  the gateway only; every IP packet the guest sends enters the engine and goes to the peer
+  whose allowed IPs contain its destination, so the peer's `allowed-ips` on this node name
+  the networks the guest reaches. Other addresses of the leased prefix are on-link for the
+  guest and get no ARP answer, so hosts of the tunnel network other than the gateway are
+  out of the guest's reach; networks outside the prefix are routed through the gateway.
+  `--ipv6-prefix` advertises a /64 by router advertisement
+  (gateway `<prefix>::1`, IPv6 `--dns` as RDNSS); the guest picks its address in it.
+- MTU: `--mtu` (default 1420) is the tunnel MTU, in the lease (option 26), the router
+  advertisement and the engine. The engine's fragmentation stage answers a larger IPv4 packet
+  with DF set with ICMP Fragmentation Needed, splits one without DF, and answers a larger IPv6
+  packet with `ICMPv6` Packet Too Big.
+- Masquerade: `--masquerade <IPV6>` rewrites the guest's IPv6 flows from `--ipv6-prefix` to
+  that tunnel address (`nsplane_nat::Masquerade` around the adapter's source and sink), for a
+  tunnel that gives one IPv6 address instead of a /64. IPv4 needs none: the lease is the
+  tunnel address.
+- ACL: `--policy <PATH>` installs an `AclFilter` with a JSON policy, re-read every second
+  (`policy reloaded`; a broken file keeps the previous policy). `from_guest` lists
+  `nsplane_acl::OutboundRule`s, the flows the guest may open by protocol and port;
+  `to_guest` lists `nsplane_acl::Rule`s, the flows the peers may open to the guest by source
+  and destination prefix, protocol and port. Replies of an accepted flow pass both ways;
+  everything else is dropped. A missing or invalid file at startup is an error.
+
+  ```json
+  {
+    "from_guest": [
+      { "id": "guest-out", "protocols": [{ "Tcp": { "Ranges": [{ "start": 7, "end": 7 }] } }, { "Icmp": "Any" }] }
+    ],
+    "to_guest": [
+      { "id": "peer-in", "sources": ["10.66.0.1/32"], "protocols": [{ "Tcp": { "Ranges": [{ "start": 2222, "end": 2222 }] } }] }
+    ]
+  }
+  ```
+
+Exits when the guest disconnects or on Ctrl-C, logging the adapter and ACL counters. Status:
+`extra.ether` (adapter counters, guest MAC), `extra.acl` (filter counters, `reloads`,
+`reload_errors`), `extra.masquerade`.
+
+Flags: node flags, `--socket <PATH>` (required), `--address <CIDR>` (required, IPv4),
+`--gateway <IPV4>`, `--dns <IP>` (repeatable), `--mtu <N>` (default 1420),
+`--ipv6-prefix <CIDR>`, `--masquerade <IPV6>` (needs `--ipv6-prefix`), `--policy <PATH>`.
+`examples/tests/vm_wireguard.rs` runs it in process against a second engine;
+`crates/nsplane-ether/scripts/vm-wireguard.sh` boots a Linux guest under QEMU against
+wireguard-go (needs docker and `/dev/kvm`).
+
+```sh
+cargo run -p nsplane-examples --bin vm_wireguard -- --socket /tmp/guest.sock --private-key-file vm.key --listen 0.0.0.0:51820 --address 10.66.0.2/24 --dns 10.66.0.1 --peer <PEER_PUB>,endpoint=192.0.2.1:51820,allowed-ips=10.66.0.0/24,keepalive=25
+qemu-system-x86_64 ... -netdev stream,id=n0,server=off,addr.type=unix,addr.path=/tmp/guest.sock -device virtio-net-pci,netdev=n0
 ```
 
 ## Shared flags

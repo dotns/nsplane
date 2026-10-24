@@ -1162,6 +1162,7 @@ dependencies = [
  "nsplane-acl",
  "nsplane-core",
  "nsplane-dns",
+ "nsplane-ether",
  "nsplane-nat",
  "nsplane-netstack",
  "nsplane-noise",

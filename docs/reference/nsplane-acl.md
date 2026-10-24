@@ -73,9 +73,12 @@ packet's peer comes from a `PeerIdentity` (`labels_for(peer, remote)`; `None` is
 peer, dropped with `reasons::UNKNOWN_PEER`, e.g. a `PeerLabelMap` filled by the caller); a
 new flow is evaluated as `evaluate` does on the packet's own addresses, and anything not
 accepted is dropped with a `reasons` constant.
-Non-first IPv4 fragments follow the outcome of their first fragment, and outbound TCP/UDP
-packets record reply allowances (with an idle timeout) so replies to flows the local side
-opened pass. `FlowTracker` placed after it counts packets and bytes per flow in a bounded
+Non-first IPv4 fragments follow the outcome of their first fragment, and accepted outbound
+TCP/UDP packets and ICMP / `ICMPv6` echo requests record reply allowances (with an idle
+timeout) so replies to flows the local side opened pass. An echo request's allowance admits
+only the echo reply of its reversed tuple, identifier included; it is consulted before the
+`reasons::PROTOCOL` drop, and no other ICMP message or unsolicited echo reply passes through
+it. `FlowTracker` placed after it counts packets and bytes per flow in a bounded
 table.
 
 ### Namespaces
@@ -143,8 +146,7 @@ packets to a restricted peer pass `allow_other_protocols`, a reply allowance or 
 rule. Rules without such entries change nothing.
 With `stateful_replies`, an accepted packet from an outbound-restricted peer (an echo request,
 or a non-ICMP packet) records the outbound allowance its reply passes through
-(`outbound_replies`), and an outbound ICMP echo request records the inbound allowance of its
-reply as with `allow_other_protocols`. Rules match destinations only, never sources. The empty
+(`outbound_replies`). Rules match destinations only, never sources. The empty
 default costs nothing on the TCP/UDP path and one branch for other protocols.
 
 ### Runtime scopes per local identity
