@@ -1,4 +1,4 @@
-//! [`Forwarder`]: a resolver that asks upstream DNS servers.
+//! [`Forwarder`]: a resolver that asks upstream DNS servers, and passes raw messages to them.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use simple_dns::{Packet, PacketFlag, header_buffer};
+use simple_dns::{PacketFlag, PacketView, header_buffer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::message::{Answer, Query, ResponseCode, normalize_name};
+
+/// Length of the fixed DNS header.
+const HEADER_LEN: usize = 12;
 use crate::resolver::Resolver;
 
 /// Receive buffer for UDP responses: the largest datagram an upstream can send.
@@ -57,13 +60,14 @@ pub enum ForwarderError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ForwarderStats {
-    /// Queries answered with an upstream response.
+    /// Queries and raw messages answered with an upstream response.
     pub forwarded: u64,
     /// Attempts that ran out of time.
     pub timeouts: u64,
     /// Truncated UDP responses retried over TCP.
     pub tcp_retries: u64,
-    /// Queries answered `SERVFAIL` because every attempt failed.
+    /// Queries answered `SERVFAIL`, and raw messages left without a response, because every
+    /// attempt failed.
     pub failures: u64,
 }
 
@@ -92,6 +96,10 @@ struct Counters {
 /// The forwarder has no cache and no policy: it forwards every query it gets. To answer some
 /// names locally, put it behind other resolvers with [`Fallback`](crate::Fallback), for example
 /// `StaticRecords::with_fallback(forwarder)`.
+///
+/// [`forward`](Self::forward) passes messages that are not decoded queries (other opcodes,
+/// other question counts) the same way; [`Server::with_passthrough`](crate::Server::with_passthrough)
+/// uses it.
 #[derive(Debug)]
 pub struct Forwarder {
     config: ForwarderConfig,
@@ -135,17 +143,67 @@ impl Forwarder {
         }
     }
 
+    /// Passes the DNS message `message` to the upstreams byte for byte and returns the
+    /// response, with the message's ID.
+    ///
+    /// Attempts, transaction IDs, the TCP retry and the counters work as for queries, but the
+    /// message is not decoded: a response is accepted when it has the transaction ID, `QR` = 1
+    /// and the message's opcode. The question is not compared, so spoofing resistance rests on
+    /// the transaction ID and the source port alone. Any accepted response is returned,
+    /// whatever its response code.
+    ///
+    /// `None` when `message` is shorter than the DNS header or every attempt failed (timeout,
+    /// ICMP refusal, I/O error); the latter counts in [`ForwarderStats::failures`].
+    pub async fn forward(&self, message: &[u8]) -> Option<Bytes> {
+        if message.len() < HEADER_LEN {
+            return None;
+        }
+        let opcode = header_buffer::opcode(message).ok()?;
+        let matches = |response: &[u8], id: u16| {
+            is_response(response, id) && header_buffer::opcode(response).ok() == Some(opcode)
+        };
+        let mut response = self.exchange(message, matches).await?.to_vec();
+        response[..2].copy_from_slice(&message[..2]);
+        Some(Bytes::from(response))
+    }
+
+    /// Runs the attempts for `message`; `None` when all failed.
+    async fn exchange(
+        &self,
+        message: &[u8],
+        matches: impl Fn(&[u8], u16) -> bool + Sync,
+    ) -> Option<Bytes> {
+        let upstreams = &self.config.upstreams;
+        let mut buf = vec![0; MAX_UDP_RESPONSE];
+        for attempt in 0..self.config.attempts {
+            let upstream = upstreams[attempt % upstreams.len()];
+            match self.attempt(message, upstream, &mut buf, &matches).await {
+                Ok(response) => {
+                    self.counters.forwarded.fetch_add(1, Ordering::Relaxed);
+                    return Some(response);
+                }
+                Err(AttemptError::Timeout) => {
+                    self.counters.timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(AttemptError::Failed) => {}
+            }
+        }
+        self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     /// One attempt against `upstream`: UDP, then TCP when the response is truncated.
     async fn attempt(
         &self,
-        query: &Query,
+        message: &[u8],
         upstream: SocketAddr,
         buf: &mut [u8],
+        matches: impl Fn(&[u8], u16) -> bool + Sync,
     ) -> Result<Bytes, AttemptError> {
         let socket = UdpSocket::bind(unspecified(upstream)).await?;
         socket.connect(upstream).await?;
         let id = self.transaction_id(socket.local_addr()?.port());
-        let mut message = query.raw().to_vec();
+        let mut message = message.to_vec();
         message[..2].copy_from_slice(&id.to_be_bytes());
 
         let deadline = Instant::now() + self.config.timeout;
@@ -154,7 +212,7 @@ impl Forwarder {
             loop {
                 let len = socket.recv(buf).await?;
                 let response = &buf[..len];
-                if matches_query(response, id, query) {
+                if matches(response, id) {
                     if header_buffer::has_flags(response, PacketFlag::TRUNCATION).unwrap_or(false) {
                         return Ok(None);
                     }
@@ -169,7 +227,7 @@ impl Forwarder {
 
         self.counters.tcp_retries.fetch_add(1, Ordering::Relaxed);
         let response = timeout(self.config.timeout, exchange_tcp(upstream, &message)).await??;
-        if matches_query(&response, id, query) {
+        if matches(&response, id) {
             Ok(response)
         } else {
             Err(AttemptError::Failed)
@@ -184,23 +242,10 @@ impl Forwarder {
 
 impl Resolver for Forwarder {
     async fn resolve(&self, query: &Query, _client: SocketAddr) -> Answer {
-        let upstreams = &self.config.upstreams;
-        let mut buf = vec![0; MAX_UDP_RESPONSE];
-        for attempt in 0..self.config.attempts {
-            let upstream = upstreams[attempt % upstreams.len()];
-            match self.attempt(query, upstream, &mut buf).await {
-                Ok(response) => {
-                    self.counters.forwarded.fetch_add(1, Ordering::Relaxed);
-                    return Answer::Raw(response);
-                }
-                Err(AttemptError::Timeout) => {
-                    self.counters.timeouts.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(AttemptError::Failed) => {}
-            }
-        }
-        self.counters.failures.fetch_add(1, Ordering::Relaxed);
-        Answer::Code(ResponseCode::ServFail)
+        let matches = |response: &[u8], id: u16| matches_query(response, id, query);
+        self.exchange(query.raw(), matches)
+            .await
+            .map_or(Answer::Code(ResponseCode::ServFail), Answer::Raw)
     }
 }
 
@@ -246,14 +291,18 @@ async fn exchange_tcp(upstream: SocketAddr, message: &[u8]) -> io::Result<Bytes>
     Ok(Bytes::from(response))
 }
 
+/// Whether `response` is a response (`QR` = 1) with ID `id`.
+fn is_response(response: &[u8], id: u16) -> bool {
+    header_buffer::id(response).ok() == Some(id)
+        && header_buffer::has_flags(response, PacketFlag::RESPONSE).unwrap_or(false)
+}
+
 /// Whether `response` is a response with ID `id` to `query`'s question.
 fn matches_query(response: &[u8], id: u16, query: &Query) -> bool {
-    if header_buffer::id(response).ok() != Some(id)
-        || !header_buffer::has_flags(response, PacketFlag::RESPONSE).unwrap_or(false)
-    {
+    if !is_response(response, id) {
         return false;
     }
-    let Ok(packet) = Packet::parse(response) else {
+    let Ok(packet) = PacketView::parse(response) else {
         return false;
     };
     let [question] = packet.questions.as_slice() else {

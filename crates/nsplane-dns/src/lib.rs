@@ -16,13 +16,16 @@
 //!   decoded query and the client's address, and [`Fallback`], which asks a second resolver
 //!   when the first answers `NXDOMAIN`.
 //! - **Static records** ([`records`]): [`StaticRecords`], a fixed name -> records table.
-//! - **Forwarding** ([`forward`]): [`Forwarder`], which passes queries to upstream servers
-//!   over UDP (TCP for truncated responses), without caching or policy.
+//! - **Forwarding** ([`forward`]): [`Forwarder`], which passes queries, and with
+//!   [`Forwarder::forward`] any message, to upstream servers over UDP (TCP for truncated
+//!   responses), without caching or policy.
 //! - **Fake addresses** ([`fake`]): [`FakePool`], which answers A / AAAA with addresses
 //!   allocated per name from configured prefixes and maps them back to names.
 //! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
 //!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
-//!   transport-neutral core. With the `netstack` feature it also serves the UDP flows and
+//!   transport-neutral core. [`Server::with_passthrough`] passes messages that do not decode
+//!   as a query (other opcodes, other question counts) to a [`Forwarder`], as a
+//!   [`PassthroughPolicy`] decides. With the `netstack` feature it also serves the UDP flows and
 //!   TCP connections of an `nsplane-netstack` user-space stack (module `netstack`).
 //!
 //! ```
@@ -74,4 +77,7 @@ pub use message::{
 };
 pub use records::StaticRecords;
 pub use resolver::{Fallback, Resolver};
-pub use server::{Server, ServerConfig, ServerStats, Transport};
+pub use server::{
+    PassthroughDecision, PassthroughPolicy, PassthroughRequest, Server, ServerConfig, ServerStats,
+    Transport,
+};

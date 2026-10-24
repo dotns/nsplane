@@ -343,3 +343,36 @@ fn record_type_display() {
     assert_eq!(RecordType(52).to_string(), "TYPE52");
     assert_eq!(ResponseCode::NxDomain.value(), 3);
 }
+
+/// Adds two additional records to a one-question query without EDNS: a record of an unknown
+/// type and class, and an OPT record with an unknown option code.
+fn with_unknown_records(mut message: Vec<u8>) -> Vec<u8> {
+    message[11] = 2;
+    // Unknown type 65280, class 77 (also unknown), owner compressed to the question name.
+    message.extend_from_slice(b"\xc0\x0c\xff\x00\x00\x4d\x00\x00\x00\x3c\x00\x03abc");
+    // OPT: UDP size 4096, option 65001 with two bytes.
+    message
+        .extend_from_slice(b"\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x06\xfd\xe9\x00\x02\xaa\xbb");
+    message
+}
+
+#[test]
+fn unknown_records_in_the_additional_section_are_skipped() {
+    let message = with_unknown_records(query_message(12, "Host.Example", TYPE::A, true, None));
+    assert!(Packet::parse(&message).is_err());
+
+    let query = Query::decode(&message).unwrap();
+    assert_eq!(query.name(), "host.example");
+    assert_eq!(query.record_type(), RecordType::A);
+    assert_eq!(query.udp_payload_size(), Some(4096));
+    assert_eq!(query.raw(), &Bytes::from(message));
+
+    let answer = Answer::Records(vec![Record::a("host.example", 60, Ipv4Addr::LOCALHOST)]);
+    let bytes = encode_response(&query, &answer, 1232, options());
+    let packet = Packet::parse(&bytes).unwrap();
+    assert_eq!(packet.id(), 12);
+    assert_eq!(packet.rcode(), RCODE::NoError);
+    assert_eq!(packet.answers.len(), 1);
+    assert_eq!(packet.questions[0].qname.to_string(), "Host.Example");
+    assert_eq!(packet.opt().unwrap().udp_packet_size, 1232);
+}
