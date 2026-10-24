@@ -251,6 +251,15 @@ an IPv6 address from the router advertisement and exchanges TCP over IPv4 and IP
 script exits 0 only when the guest prints its success marker. It needs docker and
 `/dev/kvm`; the normal test run needs neither.
 
+[`scripts/vm-wireguard.sh --firecracker`](../../crates/nsplane-ether/scripts/vm-wireguard.sh)
+checks the packet socket and `ensure_tap` against a real Firecracker guest with KVM: the
+`vm_wireguard` example creates the TAP (`--packet fctap0 --create-tap`), Firecracker attaches
+its virtio-net device to it with checksum and segmentation offloads, and the guest leases
+its address, reaches a wireguard-go peer and is reached by it (ICMP, TCP on IPv4 and IPv6,
+a 100 kB line that the guest sends as GSO frames), with the example's ACL blocking one port
+in each direction; the TAP must be gone once the example exits. Firecracker and its CI guest
+kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kvm`.
+
 ## Configuration and defaults
 
 | Setting | Field | Default |

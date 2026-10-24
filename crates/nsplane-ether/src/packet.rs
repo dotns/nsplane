@@ -160,7 +160,7 @@ impl FrameRead for PacketReader {
             };
             match vnet::process(&hdr, buf, len, &mut self.segments) {
                 Ok(Some(len)) => return Ok(Some(len)),
-                Ok(None) => {}
+                Ok(None) => tracing::trace!(len, ?hdr, "splitting a GSO frame"),
                 Err(e) => tracing::debug!(?e, ?hdr, "dropping a malformed offload frame"),
             }
         }

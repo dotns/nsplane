@@ -3,6 +3,13 @@
 # KVM, attached by `-netdev stream` to the vm_wireguard example, reaches wireguard-go in
 # another container through the example's engine, and back.
 #
+# With --firecracker the guest runs under Firecracker with KVM instead: the example creates
+# the TAP interface (`--packet fctap0 --create-tap`) and serves the guest through a packet
+# socket on it, Firecracker attaches its virtio-net device to that TAP with checksum and
+# segmentation offloads negotiated, and the guest runs the same checks. Firecracker and its
+# CI guest kernel are downloaded once into .tmp/firecracker and verified by SHA-256; the
+# runner then also gets NET_ADMIN, NET_RAW and /dev/net/tun.
+#
 # The peer container runs wireguard-go (built from scripts/bench/wireguard-go) on a TUN
 # device with 10.66.0.1/24, 10.66.1.1/24 (an address behind the peer) and fd66::1/64; the
 # runner container runs the example and QEMU, both on a labelled network. The guest leases
@@ -15,9 +22,20 @@
 # /dev/kvm on the host. The example binary is built in the dev image unless
 # NSPLANE_VM_WG_BIN names one.
 #
-#   crates/nsplane-ether/scripts/vm-wireguard.sh
+#   crates/nsplane-ether/scripts/vm-wireguard.sh [--firecracker]
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
+VMM=qemu
+case ${1:-} in
+  "") ;;
+  --firecracker) VMM=firecracker ;;
+  *) echo "usage: $0 [--firecracker]" >&2; exit 2 ;;
+esac
+FC_VERSION=v1.17.0
+FC_KERNEL=vmlinux-6.1.128
+FC_KERNEL_URL=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/$FC_KERNEL
+FC_KERNEL_SHA256=27a8310b9a727517e9eb02044524b6ceb77de5728e3491b6974d5c846227ecc8
+FC_DIR=$PWD/.tmp/firecracker
 PREFIX=nsplane-vm-wg-$$
 DEV_IMAGE=${NSPLANE_ETHER_VM_DEV_IMAGE:-ai-agent/nstun-dev}
 IMG=ai-agent/nsplane-ether-vm
@@ -47,6 +65,25 @@ fi
 BIN=$NSPLANE_VM_WG_BIN
 if [ ! -x "$BIN" ]; then echo "no vm_wireguard binary: '$BIN'"; exit 1; fi
 
+if [ "$VMM" = firecracker ]; then
+  echo "== Firecracker $FC_VERSION and the guest kernel $FC_KERNEL in $FC_DIR"
+  mkdir -p "$FC_DIR"
+  if [ ! -x "$FC_DIR/firecracker" ]; then
+    url=https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-x86_64.tgz
+    curl -fsSL -o "$FC_DIR/fc.tgz" "$url"
+    want=$(curl -fsSL "$url.sha256.txt" | awk '{ print $1 }')
+    echo "$want  $FC_DIR/fc.tgz" | sha256sum -c --quiet
+    tar -xzf "$FC_DIR/fc.tgz" -C "$FC_DIR" "release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64"
+    mv "$FC_DIR/release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64" "$FC_DIR/firecracker"
+    rm -rf "$FC_DIR/fc.tgz" "$FC_DIR/release-$FC_VERSION-x86_64"
+  fi
+  if [ ! -f "$FC_DIR/vmlinux" ]; then
+    curl -fsSL -o "$FC_DIR/vmlinux.part" "$FC_KERNEL_URL"
+    echo "$FC_KERNEL_SHA256  $FC_DIR/vmlinux.part" | sha256sum -c --quiet
+    mv "$FC_DIR/vmlinux.part" "$FC_DIR/vmlinux"
+  fi
+fi
+
 echo "== build the runner image $IMG and wireguard-go"
 docker build -q --label ai-agent=true -t "$IMG" "$SCRIPTS" >/dev/null
 docker build -q --label ai-agent=true -t "$WGGO_IMG" scripts/bench/wireguard-go >/dev/null
@@ -66,10 +103,17 @@ for _ in $(seq 1 100); do
 done
 if [ ! -e "$WORK/peer.up" ]; then docker logs "$PEER"; echo "the peer did not come up"; exit 1; fi
 
-echo "== start the runner"
-docker run -d "${LABELS[@]}" --name "$PREFIX-run" --network "$NET" --device /dev/kvm \
+echo "== start the runner ($VMM)"
+RUNNER=(--device /dev/kvm)
+if [ "$VMM" = firecracker ]; then
+  # The example creates the TAP; /proc/sys is read-only in the container, so the TAP's IPv6
+  # settings come from net.ipv6.conf.default.
+  RUNNER+=(--cap-add NET_ADMIN --cap-add NET_RAW --device /dev/net/tun -v "$FC_DIR:$FC_DIR:ro"
+    --sysctl net.ipv6.conf.default.disable_ipv6=1 --sysctl net.ipv6.conf.default.autoconf=0)
+fi
+docker run -d "${LABELS[@]}" --name "$PREFIX-run" --network "$NET" "${RUNNER[@]}" \
   -v "$PWD:$PWD" -v "$WORK:$WORK" -w "$PWD" "$IMG" \
-  bash "$SCRIPTS/vm-wireguard-run.sh" "$BIN" "$WORK" "$PEER" >/dev/null
+  bash "$SCRIPTS/vm-wireguard-run.sh" "$BIN" "$WORK" "$PEER" "$VMM" "$FC_DIR" >/dev/null
 
 probe=1
 for _ in $(seq 1 180); do

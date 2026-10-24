@@ -456,6 +456,39 @@ let filter = AclFilter::new(Arc::clone(&acl), Arc::clone(&labels));
 labels.insert(peer_id, LabelSet::new([Label::from("remote")]));
 ```
 
+#### Firecracker: a TAP that the monitor holds
+
+Firecracker attaches a guest only to a host TAP device and keeps that TAP's file descriptor
+itself. On Linux the adapter then reads and writes the guest's frames on the TAP's host side
+through an `AF_PACKET` socket (`PacketSocket`, needs `CAP_NET_RAW`), with no bridge and no
+second TAP. `ensure_tap` creates the TAP before the monitor starts (needs `CAP_NET_ADMIN`):
+persistent, attachable by the given user and group, with IPv6, address autoconfiguration and
+ARP off so the host kernel stays out of the guest's link, and deleted when the returned
+`TapInterface` is dropped. An interface that already exists is used as it is and left in
+place.
+
+```rust ignore
+use nsplane_ether::{PacketSocket, TapConfig, ensure_tap, spawn_port};
+
+// Before Firecracker starts; its config names the TAP:
+// "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "fctap0" }]
+let tap = ensure_tap(&TapConfig::new("fctap0").owner(firecracker_uid))?;
+let (reader, writer) = PacketSocket::bind(tap.name())?.split();
+let (source, sink, ether) = spawn_port(reader, writer, config); // `config` as above
+// ... the engine as above; keep `tap` until the engine stops.
+```
+
+- **Offloads.** Firecracker negotiates checksum and segmentation offload with the guest, so
+  a frame can come with a partial checksum or as one large GSO frame. The reader completes
+  the checksum and splits GSO frames into frames of the guest's segment size before the
+  adapter sees them; frames to the guest go out with complete checksums.
+- **Lifetime.** A packet socket has no end of stream: a guest that shuts down or a monitor
+  that restarts leaves the transport open, and a restarted monitor attaches to the same
+  persistent TAP. Stop the port by dropping the engine; deleting the interface ends the
+  reader with `ENETDOWN`.
+- **MTU.** Frames to the guest larger than the TAP's MTU (1500 by default) are dropped; keep
+  the tunnel MTU in the lease at or below it.
+
 The `vm_wireguard` example puts these together, with the policy in a reloadable file.
 
 ## 8. A userspace node: nsplane-netstack
