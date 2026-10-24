@@ -16,6 +16,9 @@
 //!   decoded query and the client's address, and [`Fallback`], which asks a second resolver
 //!   when the first answers `NXDOMAIN`.
 //! - **Static records** ([`records`]): [`StaticRecords`], a fixed name -> records table.
+//! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
+//!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
+//!   transport-neutral core.
 //!
 //! ```
 //! use std::net::{Ipv4Addr, SocketAddr};
@@ -48,6 +51,7 @@
 pub mod message;
 pub mod records;
 pub mod resolver;
+pub mod server;
 
 pub use message::{
     Answer, CLASS_IN, DEFAULT_UDP_PAYLOAD_SIZE, DecodeError, EncodeOptions, MIN_UDP_RESPONSE_SIZE,
@@ -56,3 +60,4 @@ pub use message::{
 };
 pub use records::StaticRecords;
 pub use resolver::{Fallback, Resolver};
+pub use server::{Server, ServerConfig, ServerStats, Transport};
