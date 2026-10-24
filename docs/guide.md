@@ -489,6 +489,143 @@ match receipt.wait().await {
   the same 5-tuple is a new flow with a new instance.
 - `NetStackHandle::retired_drops()` counts packets dropped for revoked flows.
 
+### Transparent termination
+
+With `NetStackConfig::transparent` the stack is the endpoint for TCP and UDP to any
+destination inside its prefixes, not only to its own addresses. An accepted connection or
+flow keeps the dialed address as `local_addr()` and answers from it. Which destinations
+reach the stack is decided in front of it (the peers' allowed IPs, the ACL, a `Splitter`);
+here the client routes everything to the server.
+
+Under `Admission::Decide` each new connection or flow waits on `incoming_pending` until the
+application accepts or rejects it; a rejected connection gets a RST and a rejected UDP flow
+an ICMP port unreachable, both from the dialed address. `flow_events` reports each decision.
+
+```rust
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use futures_util::StreamExt as _;
+use nsplane::x25519::{PublicKey, StaticSecret};
+use nsplane::{AllowedIp, Ecn, Engine, EngineBuilder, Path, Peer, TransportId, UdpTransport};
+use nsplane_netstack::{
+    Admission, DEFAULT_MTU, FlowEventReason, FlowEventsConfig, NetStack, NetStackConfig,
+    NetStackHandle, TransparentConfig,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+
+const UDP: TransportId = TransportId::new(0);
+const WAIT: Duration = Duration::from_secs(10);
+/// The only destination the server accepts.
+const ALLOWED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+/// Inside the server's prefix, but rejected.
+const REJECTED: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 443);
+
+/// One node: a stack built from `config`, a UDP transport on loopback.
+fn node(key: StaticSecret, config: NetStackConfig) -> anyhow::Result<(Engine, NetStackHandle, SocketAddr)> {
+    let (stack, handle) = NetStack::new(config);
+    let (source, sink) = stack.split();
+    let udp = UdpTransport::bind(UDP, "127.0.0.1:0".parse()?)?;
+    let outer = udp.local_addr();
+    let engine = EngineBuilder::new(source, sink).private_key(key).transport(udp).build()?;
+    Ok((engine, handle, outer))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let key_c = StaticSecret::random_from_rng(rand_core::OsRng);
+    let key_s = StaticSecret::random_from_rng(rand_core::OsRng);
+    let (pub_c, pub_s) = (PublicKey::from(&key_c), PublicKey::from(&key_s));
+
+    // Client: a plain stack on 10.0.0.1.
+    let client = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], DEFAULT_MTU);
+    let (c, stack_c, _) = node(key_c, client)?;
+    // Server: owns 10.0.0.2 and terminates every address of 192.0.2.0/24, asking the
+    // application about each new connection or flow.
+    let server = NetStackConfig {
+        transparent: Some(TransparentConfig {
+            prefixes: vec![("192.0.2.0".parse()?, 24)],
+            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
+            max_connections: Some(4096),
+            events: Some(FlowEventsConfig::default()),
+            ..Default::default()
+        }),
+        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
+    };
+    let (s, stack_s, outer_s) = node(key_s, server)?;
+
+    // The client routes every IPv4 destination to the server.
+    let mut peer_s = Peer::new(pub_s);
+    peer_s.allowed_ips = vec![AllowedIp { addr: Ipv4Addr::UNSPECIFIED.into(), cidr: 0 }];
+    peer_s.path = Some(Path { transport: UDP, addr: outer_s, ecn: Ecn::NotEct });
+    c.handle().add_or_update_peer(peer_s).await?;
+    let mut peer_c = Peer::new(pub_c);
+    peer_c.allowed_ips = vec![AllowedIp { addr: "10.0.0.1".parse()?, cidr: 32 }];
+    s.handle().add_or_update_peer(peer_c).await?;
+
+    // Server: decide by the dialed address.
+    let mut pending = stack_s.incoming_pending();
+    tokio::spawn(async move {
+        while let Some(flow) = pending.next().await {
+            if flow.local_addr() == ALLOWED {
+                flow.accept();
+            } else {
+                flow.reject(); // dropping `flow` rejects as well
+            }
+        }
+    });
+    // Server: accepted connections arrive here; tell the client which address it dialed.
+    let mut incoming = stack_s.incoming_tcp();
+    tokio::spawn(async move {
+        while let Some(mut conn) = incoming.next().await {
+            let dialed = conn.local_addr().to_string();
+            tokio::spawn(async move { conn.write_all(dialed.as_bytes()).await });
+        }
+    });
+
+    // Accepted: the connection terminates at the server, which answers as 192.0.2.10.
+    let mut conn = timeout(WAIT, stack_c.connect_tcp(ALLOWED)).await??;
+    let mut dialed = String::new();
+    conn.read_to_string(&mut dialed).await?;
+    assert_eq!(dialed, ALLOWED.to_string());
+
+    // Rejected: the SYN is answered with a RST from 192.0.2.11.
+    let refused = timeout(WAIT, stack_c.connect_tcp(REJECTED)).await?;
+    assert_eq!(refused.err().map(|e| e.kind()), Some(io::ErrorKind::ConnectionRefused));
+
+    // One event per decision, in order.
+    let mut events = stack_s.flow_events();
+    for (dst, reason) in [(ALLOWED, FlowEventReason::Admitted), (REJECTED, FlowEventReason::Hook)] {
+        let event = timeout(WAIT, events.next()).await?.expect("stack running");
+        assert_eq!((event.dst, event.reason), (dst, reason));
+    }
+    let stats = stack_s.stats();
+    assert_eq!((stats.accepted, stats.rejected_hook, stats.pending), (1, 1, 0));
+
+    for engine in [c, s] {
+        engine.handle().shutdown().await?;
+        engine.wait().await?;
+    }
+    Ok(())
+}
+```
+
+Dependencies: as in [the quick start](#5-quick-start-two-nodes-in-one-process).
+
+- `Admission::Immediate` (the default) accepts on arrival; `incoming_pending` then ends at
+  once. With `Decide`, a connection or flow without a decision within `timeout` is rejected
+  (`rejected_timeout`), and one beyond `max_pending` held is rejected at once
+  (`rejected_table_full`).
+- `max_connections` caps the TCP connections of the stack; a SYN beyond it gets a RST
+  (`rejected_connection_limit`).
+- A packet to a destination outside the prefixes is dropped (`rejected_prefix`, also
+  `no_address`).
+- Flow events are bounded, rate-limited and lossy: events beyond `FlowEventsConfig` count in
+  `events_dropped`. Without `events` there is no channel.
+- `connect_tcp`, `connect_udp` and `bind_udp` still use the stack's own addresses.
+
 ## 9. TUN and netstack behind one engine
 
 `Splitter` routes each decrypted packet to one of several sinks by a closure;
