@@ -1,6 +1,6 @@
 # 20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface
 
-- **status**: in progress (owner approved 2026-10-24: "用C方式最合理、不引入额外管理"; "可以")
+- **status**: in progress (merged into main 5b31bbe; ships with 0.18.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:38
@@ -17,3 +17,11 @@ socket, with no bridge and no second TAP, and asked who is responsible for creat
 
 - **blocked by**: (none)
 - **blocks**: (none)
+
+## Follow-up
+
+- Frames sent to the guest right after the virtual machine attaches can be dropped by the
+  kernel until the TAP's queue is active; guests retransmit.
+- `ensure_tap` does not set an MTU: the tunnel MTU in the lease must stay at or below the
+  TAP's MTU (default 1500).
+- In packet mode `vm_wireguard` logs "guest connected" at startup (cosmetic).
