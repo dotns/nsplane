@@ -1,6 +1,6 @@
 # 20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle
 
-- **status**: proposed
+- **status**: completed (released as 0.18.0)
 - **createdAt**: 2026-10-24 13:04
 - **relatedTask**: 20261024-1304-dns-passthrough
 

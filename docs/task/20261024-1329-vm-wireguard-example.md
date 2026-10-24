@@ -1,6 +1,6 @@
 # 20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane
 
-- **status**: in progress (merged into main 066cc12; ships with 0.18.0)
+- **status**: completed (released as 0.18.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:29

@@ -1,6 +1,6 @@
 # 20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface
 
-- **status**: in progress (merged into main 5b31bbe; ships with 0.18.0)
+- **status**: completed (released as 0.18.0)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 13:38

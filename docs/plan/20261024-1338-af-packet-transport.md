@@ -1,6 +1,6 @@
 # 20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface
 
-- **status**: proposed
+- **status**: completed (released as 0.18.0)
 - **createdAt**: 2026-10-24 13:38
 - **relatedTask**: 20261024-1338-af-packet-transport
 

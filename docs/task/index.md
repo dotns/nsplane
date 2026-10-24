@@ -62,8 +62,8 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261020-1224-darwin-utun-name Validate Darwin utun descriptors before name queries**](20261020-1224-darwin-utun-name.md) `P1`
 - [x] [**20261024-1430-netstack-any-destination Netstack mode that accepts any destination address**](20261024-1430-netstack-any-destination.md) `P2`
 - [x] [**20261024-1500-gino-egress-requests Sandboxed agent egress requests from gino-agent**](20261024-1500-gino-egress-requests.md) `P2`
-- [-] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `P2`
-- [-] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `P2`
-- [-] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `P2`
-- [-] [**20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface**](20261024-1338-af-packet-transport.md) `P2`
-- [-] [**20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository**](20261024-1437-simple-dns-in-tree.md) `P2`
+- [x] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `P2`
+- [x] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `P2`
+- [x] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `P2`
+- [x] [**20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface**](20261024-1338-af-packet-transport.md) `P2`
+- [x] [**20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository**](20261024-1437-simple-dns-in-tree.md) `P2`

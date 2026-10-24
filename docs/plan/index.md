@@ -50,8 +50,8 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261020-1224-darwin-utun-name Validate Darwin utun descriptors before name queries**](20261020-1224-darwin-utun-name.md) `2026-10-20`
 - [x] [**20261024-1430-netstack-any-destination Netstack mode that accepts any destination address**](20261024-1430-netstack-any-destination.md) `2026-10-24`
 - [x] [**20261024-1600-egress-0-17 Release 0.17.0: transparent netstack, flow events, ethernet adapter, DNS crate**](20261024-1600-egress-0-17.md) `2026-10-24`
-- [-] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `2026-10-24`
-- [-] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `2026-10-24`
-- [-] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `2026-10-24`
-- [-] [**20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface**](20261024-1338-af-packet-transport.md) `2026-10-24`
-- [-] [**20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository**](20261024-1437-simple-dns-in-tree.md) `2026-10-24`
+- [x] [**20261024-1304-dns-passthrough DNS transparent forwarding for messages nsplane-dns does not handle**](20261024-1304-dns-passthrough.md) `2026-10-24`
+- [x] [**20261024-1313-dns-policy DNS policy routing: per-name rules choose the resolver or a local action**](20261024-1313-dns-policy.md) `2026-10-24`
+- [x] [**20261024-1329-vm-wireguard-example Example: a virtual machine reaching a remote WireGuard peer through nsplane**](20261024-1329-vm-wireguard-example.md) `2026-10-24`
+- [x] [**20261024-1338-af-packet-transport Ethernet frame transport over an AF_PACKET socket bound to an existing interface**](20261024-1338-af-packet-transport.md) `2026-10-24`
+- [x] [**20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository**](20261024-1437-simple-dns-in-tree.md) `2026-10-24`

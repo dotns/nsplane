@@ -3,7 +3,7 @@
 [中文版](guide.zh-CN.md)
 
 This guide shows how to embed nsplane in an application: which crates to pick, how an engine
-is assembled, and complete code for the common deployments. It describes nsplane 0.17.0.
+is assembled, and complete code for the common deployments. It describes nsplane 0.18.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
 - Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.18.0" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns

@@ -1,6 +1,6 @@
 # 20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository
 
-- **status**: proposed
+- **status**: completed (released as 0.18.0; the standalone repository is archived after the push)
 - **createdAt**: 2026-10-24 14:37
 - **relatedTask**: 20261024-1437-simple-dns-in-tree
 

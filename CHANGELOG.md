@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-24
+
+Feature release (additive API) with one behavior fix in nsplane-acl.
+
 ### Added
 - DNS transparent forwarding in nsplane-dns: `Server::with_passthrough` sends messages the
   codec does not answer (opcodes other than `QUERY`, question counts other than one, a
@@ -54,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept in this repository; the git dependency on `github.com/dotns/simple-dns` is gone.
 - nsplane-tun depends on nsplane-packet and splits offload reads with
   `nsplane_packet::vnet::segment`; behavior unchanged.
+- The TUN offload paths sum checksums with `nsplane_packet::checksum::sum_words`: segmenting
+  a 64 KiB TCP frame and coalescing 48 segments measure about 28 % faster than in 0.17.0.
 
 ### Fixed
 - nsplane-acl: an accepted outbound ICMP or `ICMPv6` echo request records the reply allowance

@@ -1,6 +1,6 @@
 # 20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository
 
-- **status**: in progress (owner approved 2026-10-24: "放在当前仓库，然后再发0.18.0")
+- **status**: completed (released as 0.18.0; the standalone repository is archived after the push)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-24 14:37
