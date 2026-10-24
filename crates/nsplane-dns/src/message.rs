@@ -9,7 +9,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bytes::Bytes;
 use simple_dns::rdata::{A, AAAA, CNAME, OPT, PTR, RData, TXT};
-use simple_dns::{CLASS, Name, OPCODE, Packet, PacketFlag, RCODE, ResourceRecord, header_buffer};
+use simple_dns::{
+    CLASS, Name, OPCODE, Packet, PacketFlag, PacketView, RCODE, ResourceRecord, header_buffer,
+};
 
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
@@ -235,7 +237,9 @@ impl Query {
     /// Decodes a query message.
     ///
     /// The message must be a query (`QR` = 0) with opcode `QUERY` and exactly one question.
-    /// Records in the other sections are parsed but ignored, except the OPT record.
+    /// Only the header, the question and the OPT record are decoded: records in the other
+    /// sections are skipped by their length, so records of unknown types or with RDATA the
+    /// codec does not parse do not make the message fail.
     ///
     /// # Errors
     ///
@@ -254,7 +258,7 @@ impl Query {
         if !matches!(header_buffer::opcode(message), Ok(OPCODE::StandardQuery)) {
             return Err(DecodeError::Opcode { id });
         }
-        let packet = Packet::parse(message).map_err(|_| DecodeError::Malformed { id })?;
+        let packet = PacketView::parse(message).map_err(|_| DecodeError::Malformed { id })?;
         let [question] = packet.questions.as_slice() else {
             return Err(DecodeError::QuestionCount {
                 id,
@@ -332,7 +336,7 @@ pub enum DecodeError {
         /// Message ID.
         id: u16,
     },
-    /// The message does not parse.
+    /// The header, a question or the OPT record does not parse, or a record is cut off.
     #[error("message {id} is malformed")]
     Malformed {
         /// Message ID.
@@ -391,13 +395,16 @@ impl Default for EncodeOptions {
 /// The largest UDP response a query may receive: 512 bytes without EDNS, else the client's
 /// payload size clamped to `512..=options.udp_payload_size`.
 pub fn max_udp_response_size(query: &Query, options: EncodeOptions) -> usize {
-    query
-        .udp_payload_size
-        .map_or(MIN_UDP_RESPONSE_SIZE, |client| {
-            usize::from(client)
-                .min(usize::from(options.udp_payload_size))
-                .max(MIN_UDP_RESPONSE_SIZE)
-        })
+    udp_response_limit(query.udp_payload_size, options)
+}
+
+/// [`max_udp_response_size`] for a client payload size.
+pub(crate) fn udp_response_limit(client: Option<u16>, options: EncodeOptions) -> usize {
+    client.map_or(MIN_UDP_RESPONSE_SIZE, |client| {
+        usize::from(client)
+            .min(usize::from(options.udp_payload_size))
+            .max(MIN_UDP_RESPONSE_SIZE)
+    })
 }
 
 /// Encodes the response to `query`.
@@ -455,7 +462,7 @@ fn build_reply(
     truncated: bool,
 ) -> Option<Vec<u8>> {
     // The question is taken from the received bytes, so its name keeps the client's case.
-    let request = Packet::parse(&query.raw).ok()?;
+    let request = PacketView::parse(&query.raw).ok()?;
     let mut packet = Packet::new_reply(query.id);
     packet.questions = request.questions;
     let mut flags = PacketFlag::RECURSION_AVAILABLE;
