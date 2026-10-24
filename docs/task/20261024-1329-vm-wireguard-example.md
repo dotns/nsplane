@@ -12,7 +12,7 @@ The owner asked whether a virtual machine (libkrun-like) can reach a remote Wire
 directly through nsplane. The pieces exist (`nsplane-ether` gives a `PacketSource` /
 `PacketSink` that `EngineBuilder::new` accepts in place of a TUN device), but the path is not
 verified end to end and there is no example. The owner put the example and its
-verification into 0.18.0.
+verification into 0.18.0, and asked to verify the ACL on that path too.
 
 Not in this task: a unixgram frame transport, several guests on one engine, DNS split to a
 local `nsplane-dns`.
