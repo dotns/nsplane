@@ -7,6 +7,10 @@ extend-ignore-re = ["\"O:SY[^\"]*\"", "nsplane-ba-[0-9]+"]
 DAITA = "DAITA"
 # RFC 3168 ECN-Capable Transport codepoint
 ect = "ect"
+# IPv6 Neighbor Discovery (RFC 4861)
+ND = "ND"
+# passt, user-mode networking for VMs and containers
+passt = "passt"
 
 [default.extend-identifiers]
 # libc `msghdr` field
