@@ -21,6 +21,12 @@
 //!   responses), without caching or policy.
 //! - **Fake addresses** ([`fake`]): [`FakePool`], which answers A / AAAA with addresses
 //!   allocated per name from configured prefixes and maps them back to names.
+//! - **Policy** ([`policy`]): [`PolicyResolver`], which routes each query by a rule table
+//!   (exact, suffix, wildcard and default names, with type and client conditions) to one of
+//!   several registered resolvers or to a local answer (records, block, sinkhole, `NODATA`,
+//!   CNAME), replaceable at runtime.
+//! - **Hosts text** ([`hosts`]): [`Hosts`], hosts-format text as [`StaticRecords`] or
+//!   policy rules.
 //! - **Server** ([`server`]): [`Server`], answering over tokio UDP and TCP sockets or any
 //!   byte stream with a bounded number of queries in flight; [`Server::handle`] is the
 //!   transport-neutral core. [`Server::with_passthrough`] passes messages that do not decode
@@ -58,9 +64,11 @@
 
 pub mod fake;
 pub mod forward;
+pub mod hosts;
 pub mod message;
 #[cfg(feature = "netstack")]
 pub mod netstack;
+pub mod policy;
 pub mod records;
 pub mod resolver;
 pub mod server;
@@ -70,10 +78,15 @@ pub use fake::{
     FakePoolStats, NoData,
 };
 pub use forward::{Forwarder, ForwarderConfig, ForwarderError, ForwarderStats};
+pub use hosts::{Hosts, HostsError, HostsErrorKind};
 pub use message::{
     Answer, CLASS_IN, DEFAULT_UDP_PAYLOAD_SIZE, DecodeError, EncodeOptions, MIN_UDP_RESPONSE_SIZE,
     Query, Record, RecordData, RecordType, ResponseCode, encode_error, encode_response,
     max_udp_response_size, normalize_name,
+};
+pub use policy::{
+    Action, DEFAULT_POLICY_TTL, MAX_CNAME_CHAIN, NameMatch, NxDomainFallback, PolicyError,
+    PolicyResolver, PolicyStats, PolicyTable, ResolverSet, Rule,
 };
 pub use records::StaticRecords;
 pub use resolver::{Fallback, Resolver};

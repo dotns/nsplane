@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unknown types or with RDATA the codec cannot parse elsewhere in a query no longer give
     `FORMERR`, and the forwarder no longer ignores upstream responses carrying them
     (simple-dns fork tag `v0.12.0-nsplane.4`).
+- nsplane-dns policy routing: `PolicyResolver` routes each query by a `PolicyTable` of
+  `Rule`s to one of several resolvers registered under ids in a `ResolverSet`, or to a local
+  answer.
+  - Name matches exact, suffix, hosts-style wildcard (`*.name`, not the name itself) and
+    default, with precedence by match kind and length; optional query type and client
+    prefix conditions; lookup cost per label of the query name.
+  - Actions `Resolve`, `Records`, `Block`, `Sinkhole`, `NoData` and `Cname` (the target
+    resolved through the same rules, chain bounded by `MAX_CNAME_CHAIN`, loops cut);
+    per-rule `NXDOMAIN` fallback to the default rule or another resolver.
+  - Validated tables, atomic replacement of the table and the resolver set at runtime,
+    `matching` for diagnostics, counters in `PolicyStats`.
+  - `Hosts`: hosts-format text to `StaticRecords` and rules, with per-line errors.
+  - Example `dns_policy`.
 
 ## [0.17.0] - 2026-10-24
 
