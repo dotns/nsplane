@@ -420,11 +420,12 @@ let engine = EngineBuilder::new(source, sink)
 ```
 
 - **Address plan.** The guest leases its tunnel address with the gateway, typically the
-  peer's own tunnel address. The adapter answers ARP for the gateway only; every IP packet
-  the guest sends enters the engine and goes to the peer whose allowed IPs contain its
-  destination, so the peer's allowed IPs name the networks the guest reaches. Other
-  addresses of the leased prefix are on-link for the guest and get no ARP answer, so hosts
-  of the tunnel network other than the gateway are out of its reach. IPv6 is optional:
+  peer's own tunnel address. The adapter answers ARP and neighbor solicitations for every
+  address but the guest's own with the gateway MAC (`EtherConfig::proxy_neighbors`, on by
+  default), so the other hosts of the leased prefix, on-link for the guest, are reached like
+  the gateway. Every IP packet the guest sends enters the engine and goes to the peer whose
+  allowed IPs contain its destination, so the peer's allowed IPs name the hosts and networks
+  the guest reaches. IPv6 is optional:
   `EtherConfig::ipv6_prefix` is advertised as a /64 and the guest picks its address in it.
 - **MTU.** The link MTU is the tunnel MTU (WireGuard's 1420 over a 1500-byte path), in the
   lease, the router advertisement and the source the engine reads, so the guest does not

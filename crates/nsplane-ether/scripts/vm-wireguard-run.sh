@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Runs inside the vm-wireguard.sh runner container: packs the guest initramfs with
 # guest-init-wireguard, writes the ACL policy, starts the vm_wireguard example with the
-# peer's key and boots the guest, and exits 0 when the serial console shows the success line
-# and the ACL counted drops both ways. With qemu (the default) the example listens on a Unix
-# socket and QEMU attaches to it; with firecracker the example creates the TAP fctap0 and
-# serves it through a packet socket, Firecracker (from <firecracker dir>, with its kernel
-# `vmlinux` there) attaches to the TAP, and the TAP must be gone after the example exits.
+# peer's key and boots the guest, and exits 0 when the serial console shows the success line,
+# the ACL counted drops both ways and the adapter counted proxied ARP and neighbor answers.
+# With qemu (the default) the example listens on a Unix socket and QEMU attaches to it; with
+# firecracker the example creates the TAP fctap0 and serves it through a packet socket,
+# Firecracker (from <firecracker dir>, with its kernel `vmlinux` there) attaches to the TAP,
+# and the TAP must be gone after the example exits.
 #
 #   vm-wireguard-run.sh <vm_wireguard binary> <work dir> <peer host> [qemu|firecracker [<firecracker dir>]]
 set -euo pipefail
@@ -148,4 +149,5 @@ if [ "$VMM" = firecracker ] && ip link show "$TAP" >/dev/null 2>&1; then
   exit 1
 fi
 grep -q '^NSPLANE-VM-WG-OK ' "$WORK/serial.log"
-jq -e '.extra.acl.denied > 0 and .extra.acl.outbound_denied > 0' "$WORK/status.json" >/dev/null
+jq -e '.extra.acl.denied > 0 and .extra.acl.outbound_denied > 0
+  and .extra.ether.arp_proxied > 0 and .extra.ether.nd_proxied > 0' "$WORK/status.json" >/dev/null

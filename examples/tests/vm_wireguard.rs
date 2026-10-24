@@ -2,8 +2,9 @@
 //! Unix socket pair (DHCP and ARP by hand, then a user-space stack whose packets travel as
 //! ethernet frames), the adapter and engine of `nsplane_examples::vm` on the other end, and
 //! a second engine on loopback UDP whose local side is a netstack, standing for the remote
-//! WireGuard peer. Covers traffic both ways, the tunnel MTU, the ACL in both directions
-//! with a reload, and the IPv6 masquerade.
+//! WireGuard peer. Covers traffic both ways, a second host of the tunnel prefix reached
+//! through the adapter's neighbor proxy, the tunnel MTU, the ACL in both directions with a
+//! reload, and the IPv6 masquerade.
 #![cfg(unix)]
 
 use std::error::Error;
@@ -24,7 +25,7 @@ use nsplane::{
 use nsplane_ether::dhcp::{self, option};
 use nsplane_ether::frame::{self, HEADER_LEN};
 use nsplane_ether::{
-    ArpOp, ArpPacket, DhcpMessage, EtherType, Frame, MacAddr, MessageType, stream,
+    ArpOp, ArpPacket, DhcpMessage, EtherType, Frame, MacAddr, MessageType, Ndp, NdpMessage, stream,
 };
 use nsplane_examples::node::{
     NodeArgs, PeerSpec, UDP_TRANSPORT, configure_peers, encode_key, encode_public_key,
@@ -34,7 +35,7 @@ use nsplane_examples::vm::{self, GATEWAY_MAC, VmArgs};
 use nsplane_netstack::{
     NetStack, NetStackConfig, NetStackHandle, ReassemblyConfig, TransparentConfig,
 };
-use nsplane_packet::checksum::{internet_checksum, ipv4_header_checksum};
+use nsplane_packet::checksum::{internet_checksum, ipv4_header_checksum, transport_checksum_v6};
 use nsplane_packet::icmp::echo_reply_in_place;
 use nsplane_packet::{Ipv4Header, Ipv6Header, UdpHeader, protocol, udp_packet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,8 +58,12 @@ const GUEST: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 2);
 const REMOTE: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 1);
 /// An address behind the remote peer, outside the guest's prefix.
 const BEHIND: Ipv4Addr = Ipv4Addr::new(10, 66, 1, 1);
+/// A second host of the guest's prefix on the remote side, on-link for the guest.
+const SECOND: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 3);
 /// The remote peer's IPv6 tunnel address.
 const REMOTE6: Ipv6Addr = Ipv6Addr::new(0xfd66, 0, 0, 0, 0, 0, 0, 1);
+/// A second host of the advertised `fd66::/64` on the remote side.
+const SECOND6: Ipv6Addr = Ipv6Addr::new(0xfd66, 0, 0, 0, 0, 0, 0, 3);
 /// The guest's IPv6 address in the advertised `fd66::/64`, as SLAAC would pick it.
 const GUEST6: Ipv6Addr = Ipv6Addr::new(0xfd66, 0, 0, 0, 0x5054, 0xff, 0xfe12, 0x3456);
 const XID: u32 = 0x0bad_cafe;
@@ -80,8 +85,9 @@ struct Remote {
     addr: SocketAddr,
 }
 
-/// Starts the remote peer with `addresses` and the network of [`BEHIND`]; the VM node's key is `vm_key` and its allowed
-/// IPs `vm_allowed`.
+/// Starts the remote peer with `addresses`, the network of [`BEHIND`] and the hosts
+/// [`SECOND`] and [`SECOND6`]; the VM node's key is `vm_key` and its allowed IPs
+/// `vm_allowed`.
 async fn remote(
     addresses: &[&str],
     vm_key: PublicKey,
@@ -94,11 +100,15 @@ async fn remote(
         .map(|cidr| parse_cidr(cidr).map(|ip| (ip.addr, ip.cidr)))
         .collect::<Result<_, _>>()?;
     // The stack owns one address per family; it answers for the network behind the peer
-    // transparently.
+    // and the second hosts transparently.
     let (stack, handle) = NetStack::new(NetStackConfig {
         reassembly: Some(ReassemblyConfig::default()),
         transparent: Some(TransparentConfig {
-            prefixes: vec![(IpAddr::V4(BEHIND), 24)],
+            prefixes: vec![
+                (IpAddr::V4(BEHIND), 24),
+                (IpAddr::V4(SECOND), 32),
+                (IpAddr::V6(SECOND6), 128),
+            ],
             ..TransparentConfig::default()
         }),
         ..NetStackConfig::new(addresses, MTU)
@@ -320,6 +330,39 @@ impl Guest {
         .await
     }
 
+    /// Resolves `target` by neighbor solicitation from the guest's link-local address.
+    async fn ndp(&mut self, target: Ipv6Addr) -> Result<MacAddr, Box<dyn Error>> {
+        let src = GUEST_MAC.link_local();
+        let [.., x, y, z] = target.octets();
+        let dst = Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, x, y, z]);
+        let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&target.octets());
+        icmp.extend_from_slice(&[1, 1]);
+        icmp.extend_from_slice(&GUEST_MAC.0);
+        let sum = transport_checksum_v6(src, dst, protocol::ICMPV6, &icmp);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        let mut packet = vec![0x60, 0, 0, 0];
+        packet.extend_from_slice(&u16::try_from(icmp.len())?.to_be_bytes());
+        packet.extend_from_slice(&[protocol::ICMPV6, 255]);
+        packet.extend_from_slice(&src.octets());
+        packet.extend_from_slice(&dst.octets());
+        packet.extend_from_slice(&icmp);
+        self.send(MacAddr::ipv6_multicast(dst), EtherType::IPV6, &packet)?;
+        self.expect(|frame| match Ndp::parse(frame.payload) {
+            Ok(Some(Ndp {
+                message:
+                    NdpMessage::NeighborAdvertisement {
+                        target: advertised,
+                        target_mac,
+                        ..
+                    },
+                ..
+            })) if advertised == target => target_mac,
+            _ => None,
+        })
+        .await
+    }
+
     /// Pings `target` with the echo identifier `id`, sending again every half second;
     /// whether a matching echo reply came within `limit`.
     async fn ping(&mut self, target: Ipv4Addr, id: u16, limit: Duration) -> io::Result<bool> {
@@ -534,6 +577,11 @@ async fn guest_and_remote_reach_each_other() -> TestResult {
     assert_eq!(lease.dns, REMOTE.octets());
     assert_eq!(lease.mtu, MTU.to_be_bytes());
     assert_eq!(guest.arp(REMOTE).await?, GATEWAY_MAC);
+    // Another host of the prefix: the neighbor proxy answers with the gateway MAC, and the
+    // packets the guest sends it reach the remote side.
+    assert_eq!(guest.arp(SECOND).await?, GATEWAY_MAC);
+    assert_eq!(guest.ndp(SECOND6).await?, GATEWAY_MAC);
+    assert!(guest.ping(SECOND, 0x4243, ALLOWED).await?);
 
     let guest = guest.attach(vec![(IpAddr::V4(GUEST), 24), (IpAddr::V6(GUEST6), 64)]);
     echo_all(&guest);
@@ -542,6 +590,8 @@ async fn guest_and_remote_reach_each_other() -> TestResult {
     let local = SocketAddr::from((GUEST, 40_000));
     assert!(udp_echo(&guest, local, SocketAddr::from((BEHIND, 7)), ALLOWED).await);
     assert!(tcp_echo(&guest, SocketAddr::from((REMOTE6, 7)), ALLOWED).await);
+    assert!(tcp_echo(&guest, SocketAddr::from((SECOND, 7)), ALLOWED).await);
+    assert!(tcp_echo(&guest, SocketAddr::from((SECOND6, 7)), ALLOWED).await);
     // The remote side opens connections to the guest.
     assert!(tcp_echo(&remote.stack, SocketAddr::from((GUEST, 2222)), ALLOWED).await);
     assert!(tcp_echo(&remote.stack, SocketAddr::from((GUEST6, 2222)), ALLOWED).await);
@@ -550,7 +600,8 @@ async fn guest_and_remote_reach_each_other() -> TestResult {
 
     let stats = node.ether.stats();
     assert_eq!(stats.dhcp_replies, 2);
-    assert_eq!(stats.arp_replies, 1);
+    assert_eq!((stats.arp_replies, stats.arp_proxied), (2, 1));
+    assert_eq!(stats.nd_proxied, 1);
     assert!(stats.ip_in > 0 && stats.ip_out > 0);
     assert_eq!(stats.drop_backlog, 0);
     stop([node.engine, remote.engine]).await
