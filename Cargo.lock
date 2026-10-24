@@ -1119,6 +1119,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsplane-ether"
+version = "0.16.2"
+dependencies = [
+ "nsplane-packet",
+]
+
+[[package]]
 name = "nsplane-examples"
 version = "0.16.2"
 dependencies = [
