@@ -287,11 +287,12 @@ async fn expect_port_unreachable(client: &mut Client, target: SocketAddr) -> Tes
     assert_eq!(ip.src(), target.ip());
     assert_eq!(ip.dst(), client_addr(target).ip());
     let message = ip.payload();
-    let (kind, code) = match target {
-        SocketAddr::V4(_) => (3, 3),
-        SocketAddr::V6(_) => (1, 4),
+    // Destination / port unreachable: type and code.
+    let unreachable: [u8; 2] = match target {
+        SocketAddr::V4(_) => [3, 3],
+        SocketAddr::V6(_) => [1, 4],
     };
-    assert_eq!(message.get(..2), Some(&[kind, code][..]));
+    assert_eq!(message.get(..2), Some(&unreachable[..]));
     let quoted = IpPacket::parse(message.get(8..).ok_or("short ICMP message")?)?;
     assert_eq!(quoted.protocol(), protocol::UDP);
     assert_eq!(quoted.dst(), target.ip());
