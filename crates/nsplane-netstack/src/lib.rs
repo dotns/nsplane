@@ -47,18 +47,22 @@
 
 mod config;
 mod device;
+mod events;
 mod flow;
 mod ownership;
+mod pending;
 mod pmtu;
 mod stack;
 mod stats;
 mod tcp;
 mod udp;
 
-pub use config::{DEFAULT_MTU, MIN_MTU, NetStackConfig};
+pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentConfig};
+pub use events::{FlowEvent, FlowEventReason, FlowEventsConfig};
 pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
+pub use pending::{PendingFlow, PendingProtocol};
 pub use stack::{NetStack, NetStackHandle, NetStackSink, NetStackSource};
 pub use stats::NetStackStats;
 pub use tcp::TcpConnection;
