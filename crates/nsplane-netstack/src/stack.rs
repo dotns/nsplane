@@ -6,6 +6,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -14,7 +15,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use nsplane::{PacketSink, PacketSource};
 use nsplane_packet::reassembly::{Outcome, Reassembler, ReassemblyStats};
-use nsplane_packet::{IpPacket, PacketBuf, PeerId, protocol};
+use nsplane_packet::{IpPacket, PacketBuf, PeerId, checksum, protocol};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
@@ -23,10 +24,11 @@ use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
-use crate::config::{NetStackConfig, Settings};
-use crate::device::VirtualDevice;
+use crate::config::{Admission, NetStackConfig, Settings};
+use crate::device::{TAILROOM, VirtualDevice};
 use crate::flow::{Fence, Fences, FlowState, RetirementOutcome, Revocations, Target};
 use crate::ownership::{Owners, Ownership, Registration};
+use crate::pending::{self, Hold, Pending, PendingFlow, PendingProtocol};
 use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self, Counters, NetStackStats};
 use crate::tcp::{Progress, Shared, TcpConnection, WriteHalf, lock};
@@ -62,8 +64,8 @@ fn stack_gone() -> io::Error {
 /// returned [`NetStackHandle`] accepts and opens TCP connections and UDP flows.
 ///
 /// The stack is the endpoint for TCP and UDP addressed to its own addresses (any port), for IPv4
-/// and IPv6. Everything else it receives is dropped and counted in
-/// [`NetStackHandle::stats`].
+/// and IPv6, and with [`NetStackConfig::transparent`] to any in-prefix destination.
+/// Everything else it receives is dropped and counted in [`NetStackHandle::stats`].
 #[derive(Debug)]
 pub struct NetStack {
     source: NetStackSource,
@@ -90,10 +92,15 @@ impl NetStack {
         let (udp_tx, udp_rx) = mpsc::channel(settings.datagram_capacity);
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
+        let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
             settings.v6.map(|(addr, _)| addr),
+            settings
+                .transparent
+                .as_ref()
+                .map(|transparent| transparent.prefixes.clone()),
             settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
@@ -146,6 +153,7 @@ impl NetStack {
             marks: VecDeque::new(),
             fences: Arc::clone(&fences),
             barriers: Vec::new(),
+            pending,
             #[cfg(test)]
             turns: 0,
         };
@@ -165,6 +173,7 @@ impl NetStack {
             commands: commands_tx,
             incoming_tcp: Arc::new(Mutex::new(Some(incoming_tcp))),
             incoming_udp: Arc::new(Mutex::new(Some(incoming_udp))),
+            incoming_pending: Arc::new(Mutex::new(incoming_pending)),
             stats,
             owners,
         };
@@ -289,6 +298,7 @@ pub struct NetStackHandle {
     commands: mpsc::Sender<Command>,
     incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
+    incoming_pending: Arc<Mutex<Option<mpsc::Receiver<PendingFlow>>>>,
     stats: Arc<Counters>,
     owners: Arc<Owners>,
 }
@@ -318,6 +328,20 @@ impl NetStackHandle {
     /// [`NetStackConfig::accept_capacity`], then dropped and counted.
     pub fn incoming_udp(&self) -> impl Stream<Item = UdpFlow> + Send + Unpin + use<> {
         Incoming(take(&self.incoming_udp))
+    }
+
+    /// New TCP connections and UDP flows held for the application's decision, with
+    /// [`Admission::Decide`] configured in [`NetStackConfig::transparent`].
+    ///
+    /// Each [`PendingFlow`] is accepted, rejected or dropped (which rejects); an accepted
+    /// connection or flow then arrives on [`incoming_tcp`](Self::incoming_tcp) or
+    /// [`incoming_udp`](Self::incoming_udp). Items not taken are queued up to the
+    /// `max_pending` of [`Admission::Decide`]; beyond that a new connection or flow is
+    /// rejected at once. Only the first call (on any clone of the handle) gets the items;
+    /// every later call, and every call without [`Admission::Decide`], returns a stream
+    /// that ends immediately. The stream ends when the stack stops.
+    pub fn incoming_pending(&self) -> impl Stream<Item = PendingFlow> + Send + Unpin + use<> {
+        Incoming(take(&self.incoming_pending))
     }
 
     /// Opens a TCP connection from the stack to `remote`.
@@ -480,14 +504,15 @@ impl NetStackHandle {
     ///   remote); or an IPv4 or IPv6 ICMP error (destination unreachable, packet too big,
     ///   time exceeded, parameter problem) quoting a packet the stack sent on such a tuple.
     /// - [`Ownership::Listener`]: a bare TCP SYN or a UDP datagram to one of the stack's
-    ///   addresses that would open a new connection or flow.
+    ///   addresses (with [`NetStackConfig::transparent`], to an in-prefix address) that
+    ///   would open a new connection or flow.
     /// - [`Ownership::None`]: anything else, including malformed packets, IPv4 fragments
     ///   and IPv6 packets with a Fragment header without
     ///   [`NetStackConfig::reassembly`] (the stack drops them), and every packet once the
     ///   stack stopped.
     ///
     /// With [`NetStackConfig::reassembly`], every TCP or UDP fragment to one of the stack's
-    /// addresses is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
+    /// addresses (or in-prefix addresses) is the stack's: a first fragment is [`Ownership::Flow`] when its tuple is
     /// one of the above and [`Ownership::Listener`] otherwise. A later fragment carries no
     /// ports: it is [`Ownership::Flow`] when this call classified the first fragment of
     /// its datagram (same addresses, protocol and identification) as
@@ -532,11 +557,33 @@ impl<T> Stream for Incoming<T> {
     }
 }
 
-/// Creates the smoltcp interface with the stack's addresses.
+/// The pending table and the receiving end of its items, with `Admission::Decide` only.
+fn pending_table(
+    settings: &Settings,
+    notify: &Arc<Notify>,
+) -> Option<(Pending, mpsc::Receiver<PendingFlow>)> {
+    match settings.transparent.as_ref()?.admission {
+        Admission::Decide {
+            timeout,
+            max_pending,
+        } => {
+            let (offer, incoming) = mpsc::channel(max_pending);
+            let table = Pending::new(timeout, max_pending, offer, Arc::clone(notify));
+            Some((table, incoming))
+        }
+        Admission::Immediate => None,
+    }
+}
+
+/// Creates the smoltcp interface with the stack's addresses; in transparent mode it takes
+/// packets to any address (`classify` has checked the prefixes before).
 fn interface(settings: &Settings, device: &mut VirtualDevice) -> Interface {
     let mut config = Config::new(HardwareAddress::Ip);
     config.random_seed = RandomState::new().build_hasher().finish();
     let mut iface = Interface::new(config, device, SmolInstant::ZERO);
+    if settings.transparent.is_some() {
+        iface.set_any_ip(true);
+    }
     iface.update_ip_addrs(|addrs| {
         // At most one address per family; the default capacity of two always fits.
         if let Some((addr, prefix)) = settings.v4 {
@@ -566,6 +613,8 @@ enum Class {
 enum Reject {
     Malformed,
     NoAddress,
+    /// In transparent mode: neither one of the stack's addresses nor in a prefix.
+    Prefix,
     Unsupported,
 }
 
@@ -573,7 +622,13 @@ enum Reject {
 fn classify(bytes: &[u8], settings: &Settings) -> Result<Class, Reject> {
     let ip = IpPacket::parse(bytes).map_err(|_| Reject::Malformed)?;
     if !settings.is_local(ip.dst()) {
-        return Err(Reject::NoAddress);
+        match &settings.transparent {
+            None => return Err(Reject::NoAddress),
+            Some(transparent) if !transparent.prefixes.contains(ip.dst()) => {
+                return Err(Reject::Prefix);
+            }
+            Some(_) => {}
+        }
     }
     if ip.fragment().is_some() {
         return Err(Reject::Unsupported);
@@ -896,6 +951,9 @@ struct Driver {
     /// `ReassemblyConfig::max_datagrams`, each for one reassembly timeout. A revoke that
     /// needs one more fails (`RetirementOutcome::Failed`).
     barriers: Vec<Barrier>,
+    /// Connections and flows held for the application's decision; only with
+    /// `Admission::Decide`.
+    pending: Option<Pending>,
     #[cfg(test)]
     turns: u64,
 }
@@ -932,6 +990,7 @@ impl Driver {
         self.retire_revoked();
         // 1. Take a bounded batch of ingress packets and pending requests.
         self.expire_fragments();
+        self.expire_pending();
         let Some(demand) = self.ingest_batch() else {
             tracing::debug!(target: "netstack", "sink dropped; stopping");
             return false;
@@ -1007,6 +1066,9 @@ impl Driver {
         );
         self.ingest_all(&mut batch, &mut demand);
         self.batch = batch;
+        // After the batch, so that a SYN retransmitted in it is absorbed by its entry
+        // rather than held anew once the entry is accepted.
+        self.take_decisions(&mut demand);
         // Zero packets taken means the queue is closed and drained.
         (taken != Poll::Ready(0)).then_some(demand)
     }
@@ -1031,19 +1093,197 @@ impl Driver {
                         // Unanswered, the peer retransmits it once the queue may have room.
                         return stats::add(&self.stats.syn_deferred, 1);
                     }
+                    let packet = if self.settings.transparent.is_some() {
+                        match self.admit_syn(packet, demand) {
+                            Some(packet) => packet,
+                            None => return,
+                        }
+                    } else {
+                        packet
+                    };
                     *demand.entry(dst_port).or_insert(0) += 1;
+                    return self.device.inject(packet);
                 }
                 self.device.inject(packet);
             }
-            Ok(Class::Udp) => match udp::parse_udp(packet) {
-                Some(datagram) => self.dispatch_udp(datagram),
-                None => stats::add(&self.stats.malformed, 1),
-            },
+            Ok(Class::Udp) => {
+                // The whole packet is kept only for a flow that may be held.
+                let parsed = if self.pending.is_some() {
+                    udp::parse_udp_whole(packet).map(|(datagram, whole)| (datagram, Some(whole)))
+                } else {
+                    udp::parse_udp(packet).map(|datagram| (datagram, None))
+                };
+                match parsed {
+                    Some((datagram, whole)) => self.dispatch_udp(datagram, whole),
+                    None => stats::add(&self.stats.malformed, 1),
+                }
+            }
             Ok(Class::Icmp) => self.icmp(packet.as_packet()),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
+            Err(Reject::Prefix) => {
+                stats::add(&self.stats.no_address, 1);
+                stats::add(&self.stats.rejected_prefix, 1);
+            }
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
         }
+    }
+
+    /// Admits a bare SYN in transparent mode; the SYN if it goes on into smoltcp now. A
+    /// retransmitted SYN of a handshake in progress passes uncounted, and one of a held
+    /// connection is absorbed; a new connection beyond `max_connections` is answered with
+    /// RST. Under `Admission::Decide` a new connection is held (or, with the table full,
+    /// answered with RST).
+    fn admit_syn(&mut self, packet: PacketBuf, demand: &HashMap<u16, usize>) -> Option<PacketBuf> {
+        let Some((remote, local)) = tcp_tuple(packet.as_packet()) else {
+            return Some(packet);
+        };
+        if self.owners.has_tcp(local, remote) {
+            return Some(packet);
+        }
+        let key = pending::Key {
+            protocol: PendingProtocol::Tcp,
+            remote,
+            local,
+        };
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|table| table.contains(&key))
+        {
+            return None;
+        }
+        if self.at_connection_limit(demand) {
+            self.reject_connection_limit(packet.as_packet());
+            return None;
+        }
+        if self.pending.is_some() {
+            self.hold(key, pending::Held::Tcp(packet));
+            return None;
+        }
+        stats::add(&self.stats.accepted, 1);
+        Some(packet)
+    }
+
+    /// Whether the stack holds `max_connections` TCP connections, counting the connections
+    /// held, the handshakes in progress and the SYNs of this batch in `demand`.
+    fn at_connection_limit(&self, demand: &HashMap<u16, usize>) -> bool {
+        let Some(limit) = self
+            .settings
+            .transparent
+            .as_ref()
+            .and_then(|transparent| transparent.max_connections)
+        else {
+            return false;
+        };
+        let held = self.conns.len()
+            + self.connecting.len()
+            + self.inbound.len()
+            + demand.values().sum::<usize>();
+        held >= limit
+    }
+
+    /// Answers the bare SYN `packet` with RST for `max_connections`.
+    fn reject_connection_limit(&mut self, packet: &[u8]) {
+        stats::add(&self.stats.rejected_connection_limit, 1);
+        if let Some(reset) = tcp_reset(packet) {
+            self.push_reply(reset);
+        }
+    }
+
+    /// Holds a new connection or flow for the application's decision, rejecting it at
+    /// once when the table is full or the application's stream is gone.
+    fn hold(&mut self, key: pending::Key, held: pending::Held) {
+        let Some(table) = self.pending.as_mut() else {
+            return;
+        };
+        match table.hold(key, held, Instant::now()) {
+            Hold::Held => self.count_pending(),
+            Hold::Full(held) => self.reject(&held, |stats| &stats.rejected_table_full),
+            Hold::Gone(held) => self.reject(&held, |stats| &stats.rejected_hook),
+        }
+    }
+
+    /// Answers a held SYN with RST or a held datagram with port unreachable, counting it
+    /// in `counter`.
+    fn reject(&mut self, held: &pending::Held, counter: fn(&Counters) -> &AtomicU64) {
+        stats::add(counter(&self.stats), 1);
+        if let Some(reply) = held.rejection(self.settings.mtu) {
+            self.push_reply(reply);
+        }
+    }
+
+    /// Applies the application's decisions on held connections and flows: an accepted SYN
+    /// goes into smoltcp with this batch (counted in `demand`), an accepted datagram
+    /// opens its flow.
+    fn take_decisions(&mut self, demand: &mut HashMap<u16, usize>) {
+        let mut changed = false;
+        while let Some((decision, key, held)) =
+            self.pending.as_mut().and_then(Pending::next_decision)
+        {
+            changed = true;
+            if !decision.accept {
+                self.reject(&held, |stats| &stats.rejected_hook);
+                continue;
+            }
+            match held {
+                pending::Held::Tcp(syn) => {
+                    if self.at_connection_limit(demand) {
+                        self.reject_connection_limit(syn.as_packet());
+                        continue;
+                    }
+                    stats::add(&self.stats.accepted, 1);
+                    *demand.entry(key.local.port()).or_insert(0) += 1;
+                    self.device.inject(syn);
+                }
+                pending::Held::Udp { payload, .. } => {
+                    let datagram = Datagram {
+                        src: key.remote,
+                        dst: key.local,
+                        payload,
+                    };
+                    self.dispatch_udp(datagram, None);
+                }
+            }
+        }
+        if changed {
+            self.count_pending();
+        }
+    }
+
+    /// Rejects the held connections and flows past their deadline.
+    fn expire_pending(&mut self) {
+        let now = Instant::now();
+        let mut changed = false;
+        while let Some((_, held)) = self
+            .pending
+            .as_mut()
+            .and_then(|table| table.next_expired(now))
+        {
+            changed = true;
+            self.reject(&held, |stats| &stats.rejected_timeout);
+        }
+        if changed {
+            self.count_pending();
+        }
+    }
+
+    /// Publishes the number of held connections and flows.
+    fn count_pending(&self) {
+        if let Some(table) = &self.pending {
+            self.stats
+                .pending
+                .store(table.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Appends a packet the driver answers an ingress packet with to the egress backlog,
+    /// or drops and counts it while the backlog is full, as smoltcp's replies.
+    fn push_reply(&mut self, packet: PacketBuf) {
+        if self.device.tx_full() {
+            return stats::add(&self.stats.egress_full, 1);
+        }
+        self.device.tx_queue.push_back(packet);
     }
 
     /// Applies an ICMP Fragmentation Needed or `ICMPv6` Packet Too Big to the connection
@@ -1064,9 +1304,10 @@ impl Driver {
     /// Lowers the MSS of the live connection `too_big` quotes; whether it did. smoltcp
     /// checks that the quoted sequence number lies within SND.UNA..SND.NXT and that the
     /// MSS goes down, and resends the data in flight at once in segments of the new size.
+    /// In transparent mode the quoted tuple alone finds the connection.
     fn reduce_mss(&mut self, too_big: &TooBig) -> bool {
         if too_big.mtu >= u32::from(self.settings.mtu)
-            || !self.settings.is_local(too_big.local.ip())
+            || (self.settings.transparent.is_none() && !self.settings.is_local(too_big.local.ip()))
         {
             return false;
         }
@@ -1087,7 +1328,7 @@ impl Driver {
             })
     }
 
-    /// Feeds a packet to the stack's address through the reassembler, if there is one:
+    /// Feeds a packet to an address the stack accepts through the reassembler, if there is one:
     /// the packet to route (the packet itself or a completed datagram), or `None` while
     /// its datagram is incomplete or once the fragment is dropped.
     fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
@@ -1099,7 +1340,7 @@ impl Driver {
             // `classify` counts it.
             return Some(packet);
         };
-        if !self.settings.is_local(ip.dst()) {
+        if !self.settings.accepts(ip.dst()) {
             return Some(packet);
         }
         if self.owners.is_discarded(&ip, now) {
@@ -1208,8 +1449,10 @@ impl Driver {
         stats::add(&self.stats.malformed, rejected);
     }
 
-    /// Delivers a datagram to its connected socket, its bound socket, or to its flow.
-    fn dispatch_udp(&mut self, datagram: Datagram) {
+    /// Delivers a datagram to its connected socket, its bound socket, or to its flow;
+    /// `whole` is the packet of an ingress datagram whose new flow may be held, `None`
+    /// without `Admission::Decide` or for an accepted held datagram.
+    fn dispatch_udp(&mut self, datagram: Datagram, whole: Option<Bytes>) {
         let Datagram {
             src,
             dst,
@@ -1250,11 +1493,18 @@ impl Driver {
                 }
             }
         }
-        self.dispatch_flow(src, dst, payload);
+        self.dispatch_flow(src, dst, payload, whole);
     }
 
-    /// Routes a datagram into the flow table, opening a flow for a new tuple.
-    fn dispatch_flow(&mut self, remote: SocketAddr, local: SocketAddr, payload: Bytes) {
+    /// Routes a datagram into the flow table, opening a flow for a new tuple, or holding it
+    /// for the application's decision (see [`dispatch_udp`](Self::dispatch_udp)).
+    fn dispatch_flow(
+        &mut self,
+        remote: SocketAddr,
+        local: SocketAddr,
+        payload: Bytes,
+        whole: Option<Bytes>,
+    ) {
         let key = (remote, local);
         // Existing flow: a full queue drops the datagram (normal UDP backpressure); a
         // closed one means the application dropped the flow, so it is replaced by a new
@@ -1274,6 +1524,26 @@ impl Driver {
             },
             None => payload,
         };
+        if let Some(packet) = whole {
+            let key = pending::Key {
+                protocol: PendingProtocol::Udp,
+                remote,
+                local,
+            };
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|table| table.contains(&key))
+            {
+                // A held flow queues its first datagram only.
+                stats::add(&self.stats.udp_queue_full, 1);
+                return;
+            }
+            return self.hold(key, pending::Held::Udp { payload, packet });
+        }
+        if self.settings.transparent.is_some() {
+            stats::add(&self.stats.accepted, 1);
+        }
         // Bound the table: refuse a new flow when it is full of live flows rather than
         // grow without limit under a spray of distinct tuples.
         if self.flows.len() >= self.settings.max_udp_flows {
@@ -2026,7 +2296,7 @@ impl Driver {
     /// `false` once the stack must stop.
     async fn wait(&mut self, now: SmolInstant) -> bool {
         let tx_full = self.device.tx_full();
-        let delay = if tx_full {
+        let mut delay = if tx_full {
             MAX_POLL_DELAY
         } else {
             self.iface
@@ -2035,6 +2305,9 @@ impl Driver {
                     Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
                 })
         };
+        if let Some(deadline) = self.pending.as_mut().and_then(Pending::next_deadline) {
+            delay = delay.min(deadline.saturating_duration_since(Instant::now()));
+        }
         if delay.is_zero() {
             tokio::task::yield_now().await;
             return true;
@@ -2173,6 +2446,64 @@ pub(crate) fn tcp_tuple(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
 /// later packets' egress positions and which the source discards.
 fn placeholder() -> PacketBuf {
     PacketBuf::with_capacity(0)
+}
+
+/// The RST answering the bare SYN `syn`, from its destination (RFC 9293 section 3.10.7.1:
+/// sequence number 0, acknowledging the SYN and its data).
+pub(crate) fn tcp_reset(syn: &[u8]) -> Option<PacketBuf> {
+    const RST_ACK: u8 = 0x14;
+    const FIN: u8 = 0x01;
+    let segment = tcp_segment(syn)?;
+    let (&[src_hi, src_lo, dst_hi, dst_lo, s0, s1, s2, s3], rest) =
+        segment.split_first_chunk::<8>()?;
+    let offset = usize::from(rest.get(4)? >> 4) * 4;
+    let flags = *rest.get(5)?;
+    let data = segment.len().checked_sub(offset)?;
+    let length = u32::try_from(data).ok()? + 1 + u32::from(flags & FIN);
+    let ack = u32::from_be_bytes([s0, s1, s2, s3]).wrapping_add(length);
+    let mut reply = [0u8; 20];
+    reply[0..2].copy_from_slice(&[dst_hi, dst_lo]);
+    reply[2..4].copy_from_slice(&[src_hi, src_lo]);
+    reply[8..12].copy_from_slice(&ack.to_be_bytes());
+    reply[12] = 5 << 4;
+    reply[13] = RST_ACK;
+    let ip = IpPacket::parse(syn).ok()?;
+    let (src, dst) = (ip.dst(), ip.src());
+    let (header, total) = match src {
+        IpAddr::V4(_) => (20, 40),
+        IpAddr::V6(_) => (40, 60),
+    };
+    let mut packet = PacketBuf::with_capacity(total + TAILROOM);
+    packet.set_len(total);
+    let bytes = packet.as_packet_mut();
+    let (head, tcp) = bytes.split_at_mut(header);
+    tcp.copy_from_slice(&reply);
+    let sum = match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            head[0] = 0x45;
+            head[2..4].copy_from_slice(&40u16.to_be_bytes());
+            head[6] = 0x40;
+            head[8] = 64;
+            head[9] = protocol::TCP;
+            head[12..16].copy_from_slice(&src.octets());
+            head[16..20].copy_from_slice(&dst.octets());
+            let header_checksum = checksum::ipv4_header_checksum(head);
+            head[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+            checksum::transport_checksum_v4(src, dst, protocol::TCP, tcp)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            head[0] = 0x60;
+            head[4..6].copy_from_slice(&20u16.to_be_bytes());
+            head[6] = protocol::TCP;
+            head[7] = 64;
+            head[8..24].copy_from_slice(&src.octets());
+            head[24..40].copy_from_slice(&dst.octets());
+            checksum::transport_checksum_v6(src, dst, protocol::TCP, tcp)
+        }
+        _ => return None,
+    };
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    Some(packet)
 }
 
 fn tcp_dst_port(pkt: &[u8]) -> Option<u16> {
