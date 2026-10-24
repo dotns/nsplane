@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use nsplane_packet::reassembly::ReassemblyConfig;
 use nsplane_packet::{IcmpHeader, IpPacket, UdpHeader, protocol};
 
+use crate::config::Prefixes;
 use crate::stack::tcp_segment;
 
 /// Whether an ingress packet belongs to the stack, from
@@ -30,7 +31,7 @@ pub enum Ownership {
     /// UDP flow, or it is an ICMP error about a packet one of them sent.
     Flow,
     /// The packet opens something new the stack accepts: a bare TCP SYN or a UDP datagram
-    /// to one of the stack's addresses.
+    /// to one of the stack's addresses, or in transparent mode to an in-prefix address.
     Listener,
     /// The packet is not the stack's.
     None,
@@ -121,6 +122,9 @@ fn now() -> Instant {
 pub(crate) struct Owners {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
+    /// The destination prefixes the stack accepts besides its addresses; only in
+    /// transparent mode.
+    transparent: Option<Prefixes>,
     /// Only when the stack reassembles fragments, so they are its packets too.
     fragments: Option<Fragments>,
     /// Registrations per key; a key can be held more than once (a connect registered by
@@ -167,11 +171,13 @@ impl Owners {
     pub(crate) fn new(
         v4: Option<Ipv4Addr>,
         v6: Option<Ipv6Addr>,
+        transparent: Option<Prefixes>,
         reassembly: Option<&ReassemblyConfig>,
     ) -> Self {
         Self {
             v4,
             v6,
+            transparent,
             fragments: reassembly.map(|config| Fragments {
                 timeout: config.timeout,
                 limit: config.max_datagrams.max(1),
@@ -222,8 +228,19 @@ impl Owners {
         }
     }
 
-    fn is_local(&self, addr: IpAddr) -> bool {
+    /// Whether the stack accepts packets to `addr`: one of its addresses, or in
+    /// transparent mode an in-prefix address.
+    fn accepts(&self, addr: IpAddr) -> bool {
         self.local_for(addr) == Some(addr)
+            || self
+                .transparent
+                .as_ref()
+                .is_some_and(|prefixes| prefixes.contains(addr))
+    }
+
+    /// Whether the TCP tuple from `local` to `remote` is registered.
+    pub(crate) fn has_tcp(&self, local: SocketAddr, remote: SocketAddr) -> bool {
+        self.lock().contains_key(&Key::Tcp(local, remote))
     }
 
     /// Classifies an ingress packet, see [`NetStackHandle::owns`](crate::NetStackHandle::owns).
@@ -231,7 +248,7 @@ impl Owners {
         let Ok(ip) = IpPacket::parse(packet) else {
             return Ownership::None;
         };
-        if !self.is_local(ip.dst()) {
+        if !self.accepts(ip.dst()) {
             return Ownership::None;
         }
         let (src, dst) = (ip.src(), ip.dst());
@@ -406,7 +423,7 @@ impl Owners {
         let Some((proto, local, remote, _)) = icmp.get(ICMP_HEADER..).and_then(quoted_tuple) else {
             return Ownership::None;
         };
-        if !self.is_local(local.ip()) {
+        if !self.accepts(local.ip()) {
             return Ownership::None;
         }
         let owned = match proto {

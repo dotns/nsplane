@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Server` over tokio UDP and TCP sockets or any byte stream, with a bound on queries in
     flight, resolve and TCP idle timeouts and counters in `ServerStats`; feature `netstack`
     serves the UDP flows and TCP connections of an `nsplane-netstack` stack.
+- Transparent termination in nsplane-netstack: `NetStackConfig::transparent` with
+  `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`) makes the stack
+  the endpoint for TCP and UDP to any destination in the prefixes; accepted connections and
+  flows report the dialed address as `local_addr()` and answer from it.
+- Per-flow admission: `Admission::Decide { timeout, max_pending }` holds each new
+  connection or flow as a `PendingFlow` on `NetStackHandle::incoming_pending` until it is
+  accepted or rejected; a rejection answers with a RST or an ICMP / `ICMPv6` port
+  unreachable from the dialed address. `NetStackStats` counts `pending`, `accepted` and
+  `rejected_hook`, `rejected_timeout`, `rejected_table_full`, `rejected_connection_limit`,
+  `rejected_prefix`.
+- Flow events: bounded, rate-limited, lossy decision events, off by default.
+  `TransparentConfig::events` (`FlowEventsConfig`) and `NetStackHandle::flow_events` yield
+  `FlowEvent`s with a `FlowEventReason`; `FlowGate::enable_events` (`GateEventsConfig`)
+  returns `GateEvents` with a `GateEvent` per new-flow decision, `FlowGate::disable_events`
+  turns them off. Drops are counted in `NetStackStats::events_dropped` and
+  `GateCounters::events_dropped`, deliveries in `events_emitted`.
 
 ## [0.16.2] - 2026-10-20
 
