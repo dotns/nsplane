@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// counters also count datagrams completed. The admission counters from
 /// [`pending`](Self::pending) on belong to
 /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) and are always 0
-/// without it. Counters only grow.
+/// without it. Counters only grow, except the gauge [`pending`](Self::pending).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetStackStats {
     /// Ingress packets that are not a parseable IPv4/IPv6 packet, or whose TCP/UDP header
@@ -61,14 +61,17 @@ pub struct NetStackStats {
     /// family's minimum (576 for IPv4, 1280 for IPv6), or not below the configured MTU
     /// and the connection's current path MTU. Applied messages are not counted.
     pub icmp_ignored: u64,
-    /// TCP connections and UDP flows held for the application's decision under
-    /// [`Admission::Decide`](crate::Admission::Decide).
+    /// A gauge, not a counter: the TCP connections and UDP flows held for the
+    /// application's decision under [`Admission::Decide`](crate::Admission::Decide) now.
+    /// Each leaves it accepted or counted in one of the `rejected_` fields.
     pub pending: u64,
     /// Bare SYNs and UDP flows' first datagrams admitted in transparent mode, to the
     /// stack's own addresses and to in-prefix destinations. A retransmitted SYN of a
     /// handshake in progress is not counted again. A SYN admitted here may still be
     /// refused by the listener pool ([`syn_refused`](Self::syn_refused)), and a datagram
-    /// by the flow limit or the accept queue.
+    /// by the flow limit or the accept queue. Under
+    /// [`Admission::Decide`](crate::Admission::Decide) a connection or flow is counted
+    /// when the application accepts it.
     pub accepted: u64,
     /// Connections and flows the application rejected under
     /// [`Admission::Decide`](crate::Admission::Decide), or whose pending item it dropped.

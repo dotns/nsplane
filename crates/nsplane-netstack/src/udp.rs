@@ -44,6 +44,21 @@ pub(crate) struct Datagram {
 /// Returns `None` if the packet is not an unfragmented UDP datagram or is malformed.
 /// IPv6 extension headers are not walked.
 pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
+    let (src, dst, payload) = udp_payload(&packet)?;
+    let payload = packet.freeze().slice(payload);
+    Some(Datagram { src, dst, payload })
+}
+
+/// [`parse_udp`], also returning the whole packet the datagram's payload is a view into.
+pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
+    let (src, dst, payload) = udp_payload(&packet)?;
+    let whole = packet.freeze();
+    let payload = whole.slice(payload);
+    Some((Datagram { src, dst, payload }, whole))
+}
+
+/// The source, destination and payload range of an unfragmented UDP datagram.
+fn udp_payload(packet: &PacketBuf) -> Option<(SocketAddr, SocketAddr, std::ops::Range<usize>)> {
     let bytes = packet.as_packet();
     let ip = IpPacket::parse(bytes).ok()?;
     if ip.protocol() != protocol::UDP || ip.fragment().is_some() {
@@ -62,8 +77,7 @@ pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
     let dst = SocketAddr::new(ip.dst(), udp.dst_port());
     let start = header_len + UDP_HEADER;
     let end = header_len + udp_len;
-    let payload = packet.freeze().slice(start..end);
-    Some(Datagram { src, dst, payload })
+    Some((src, dst, start..end))
 }
 
 /// Builds an IP/UDP packet from `src` to `dst` carrying `payload`.
