@@ -11,9 +11,11 @@
 # runner then also gets NET_ADMIN, NET_RAW and /dev/net/tun.
 #
 # The peer container runs wireguard-go (built from scripts/bench/wireguard-go) on a TUN
-# device with 10.66.0.1/24, 10.66.1.1/24 (an address behind the peer) and fd66::1/64; the
-# runner container runs the example and QEMU, both on a labelled network. The guest leases
-# 10.66.0.2/24 with MTU 1420, pings and opens TCP to the peer and to the address behind it,
+# device with 10.66.0.1/24, 10.66.1.1/24 (an address behind the peer), fd66::1/64 and the
+# second addresses 10.66.0.3 and fd66::3; the runner container runs the example and QEMU,
+# both on a labelled network. The guest leases 10.66.0.2/24 with MTU 1420, pings and opens
+# TCP to the peer, to the second addresses (on-link for the guest, answered by the adapter's
+# neighbor proxy) and to the address behind it,
 # and finds TCP port 8 blocked by the example's ACL; the peer pings the guest, opens TCP
 # 2222 and finds 2223 blocked. Prints the serial console, the example's log and status, and
 # the peer's probe; exits 0 when every check passed.

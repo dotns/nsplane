@@ -405,10 +405,10 @@ let engine = EngineBuilder::new(source, sink)
 ```
 
 - **地址规划。** guest 通过 DHCP 租到自己的隧道地址和网关，网关通常就是 peer 自己的隧道地址。
-  适配器只为网关地址应答 ARP；guest 发出的每个 IP 包都进入引擎，并发往 allowed IPs 包含其目的
-  地址的 peer，因此 peer 的 allowed IPs 决定了 guest 能到达哪些网络。租约前缀内的其他地址对
-  guest 而言是同链路地址且得不到 ARP 应答，因此隧道网络中网关以外的主机 guest 无法到达。IPv6
-  可选：`EtherConfig::ipv6_prefix` 作为 /64 通告，guest 在其中自行选取地址。
+  适配器以网关 MAC 应答除 guest 自身地址以外所有地址的 ARP 请求和邻居请求
+  （`EtherConfig::proxy_neighbors`，默认开启），因此租约前缀内的其他主机虽对 guest 而言是同链路
+  地址，也能像网关一样到达。guest 发出的每个 IP 包都进入引擎，并发往 allowed IPs 包含其目的地址的
+  peer，因此 peer 的 allowed IPs 决定了 guest 能到达哪些主机和网络。IPv6 可选：`EtherConfig::ipv6_prefix` 作为 /64 通告，guest 在其中自行选取地址。
 - **MTU。** 链路 MTU 即隧道 MTU（1500 字节路径上 WireGuard 的 1420），写入租约、路由通告以及
   引擎读取的 source，guest 因而不会发送更大的包。仍然发出的大包由分片阶段处理：DF 置位的 IPv4
   回 ICMP Fragmentation Needed，未置 DF 的拆成分片，IPv6 回 `ICMPv6` Packet Too Big。

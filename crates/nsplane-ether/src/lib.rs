@@ -7,8 +7,9 @@
 //! user-space stack or an engine plugs in unchanged:
 //!
 //! - [`adapter`]: the sans-I/O core ([`EtherAdapter`], [`EtherConfig`], [`EtherStats`]):
-//!   learns the guest MAC, answers ARP, neighbor discovery and DHCP, and converts between
-//!   frames and IP packets.
+//!   learns the guest MAC, answers ARP and neighbor discovery for the gateway and, as a
+//!   neighbor proxy, for every other address but the guest's, answers DHCP, and converts
+//!   between frames and IP packets.
 //! - [`port`]: the async ports ([`EtherSource`], [`EtherSink`], [`EtherHandle`]).
 //! - [`transport`]: the frame transport traits ([`FrameRead`], [`FrameWrite`]);
 //!   [`stream`] implements them over a length-prefixed byte stream (a Unix socket to passt,

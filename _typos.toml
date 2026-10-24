@@ -10,7 +10,7 @@ ect = "ect"
 # IPv6 Neighbor Discovery (RFC 4861)
 ND = "ND"
 # TCP retransmission timeout (RFC 6298)
-rto = "rto"
+RTO = "RTO"
 # passt, user-mode networking for VMs and containers
 passt = "passt"
 

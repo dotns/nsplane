@@ -5,6 +5,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Neighbor proxy in nsplane-ether: the adapter answers ARP requests and IPv6 neighbor
+  solicitations for every routable address except the guest's own with the gateway MAC, so
+  the hosts of the guest's on-link prefixes other than the gateway are reached through the
+  IP side. On by default; `EtherConfig::proxy_neighbors = false` answers only the gateway
+  addresses, as before.
+  - The guest's own addresses are the `DHCPv4` lease, the sender addresses of its ARP
+    packets, the targets of its duplicate address detection solicitations and neighbor
+    advertisements, and its IPv6 sources in the advertised /64 (at most
+    `adapter::OWN_ADDRESSES` learned per family, forgotten when the guest MAC changes).
+  - ARP probes, gratuitous ARP and duplicate address detection solicitations are never
+    answered by the proxy; link-local, loopback, multicast, broadcast and unspecified
+    targets neither.
+  - `EtherStats::arp_proxied` and `nd_proxied` count the proxied answers (also counted in
+    `arp_replies` and `nd_replies`).
+  - The `vm_wireguard` example reaches the other hosts of the tunnel prefix; its status
+    reports the two counters.
+
 ## [0.18.0] - 2026-10-24
 
 Feature release (additive API) with one behavior fix in nsplane-acl.

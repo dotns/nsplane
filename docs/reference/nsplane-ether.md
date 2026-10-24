@@ -11,7 +11,7 @@ on `nsplane` and `nsplane-packet`.
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| adapter | `EtherAdapter` (`new`, `from_guest`, `to_guest`, `guest_mac`, `stats`, `count_backlog_drop`), `EtherConfig` (`new`) | `EtherStats`, `DEFAULT_MTU` |
+| adapter | `EtherAdapter` (`new`, `from_guest`, `to_guest`, `guest_mac`, `stats`, `count_backlog_drop`), `EtherConfig` (`new`) | `EtherStats`, `DEFAULT_MTU`, `adapter::OWN_ADDRESSES` |
 | ports | `spawn_port` | `EtherSource` (`PacketSource`), `EtherSink` (`PacketSink`), `EtherHandle` (`stats`, `guest_mac`) |
 | transports | `FrameRead`, `FrameWrite`; `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux); `PacketSocket` (`bind`, `index`, `split`; Linux) | `TapReader`, `TapWriter`, `PacketReader`, `PacketWriter` (Linux), `MAX_FRAME_LEN` |
 | interfaces | `ensure_tap` (Linux) | `TapConfig` (`new`, `owner`, `group`, `name`), `TapInterface` (`name`, `index`, `created`) |
@@ -42,18 +42,20 @@ A guest frame goes through these steps in order:
 ### Guest MAC learning
 
 Every frame with a unicast source MAC sets the guest MAC; a new source replaces the old one,
-so the adapter follows a guest whose MAC changes. Until a MAC is learned, IP packets for the
+so the adapter follows a guest whose MAC changes, forgetting the guest addresses learned by
+the neighbor proxy. Until a MAC is learned, IP packets for the
 guest are dropped (`drop_no_guest_mac`). The first time a MAC is learned and an IPv6 prefix
 is configured, an unsolicited router advertisement to all-nodes (`ff02::1`) is sent.
 
 ### ARP
 
 ARP requests for `EtherConfig::gateway_ipv4` from a unicast sender get a reply from the
-gateway MAC, unicast to the requester. Only the ethernet / IPv4 form is accepted (hardware
-type 1, protocol `0x0800`, lengths 6 and 4); trailing padding is ignored. Replies,
-gratuitous announcements (sender IP equal to target IP), requests for other addresses and
-every request when `gateway_ipv4` is `None` are consumed without a reply
-(`drop_unanswered`). ARP never reaches the IP side.
+gateway MAC, unicast to the requester; a probe (sender IP `0.0.0.0`) for it is answered
+too, so the gateway address is defended. Requests for other addresses are answered by the
+[neighbor proxy](#neighbor-proxy). Only the ethernet / IPv4 form is accepted (hardware type
+1, protocol `0x0800`, lengths 6 and 4); trailing padding is ignored. Replies, gratuitous
+announcements (sender IP equal to target IP) and requests neither the gateway nor the proxy
+answers are consumed without a reply (`drop_unanswered`). ARP never reaches the IP side.
 
 ### IPv6 neighbor discovery and router advertisements
 
@@ -72,7 +74,8 @@ multicast. A message that fails is dropped as `drop_malformed`.
   target link-layer address option. It goes to the solicitor at the MAC of its source
   link-layer address option, else the frame's source MAC, with the solicited flag; a
   solicitation from the unspecified address (duplicate address detection) is answered to
-  all-nodes without it. Solicitations for other addresses get no reply.
+  all-nodes without it. Solicitations for other addresses are answered by the
+  [neighbor proxy](#neighbor-proxy) or get no reply.
 - Router solicitations get a router advertisement, unicast to the solicitor or to
   all-nodes when the source is unspecified, whether or not a prefix is configured.
 - Neighbor advertisements from the guest are consumed without a reply.
@@ -87,6 +90,37 @@ multicast. A message that fails is dropped as `drop_malformed`.
 
 Unanswered solicitations and advertisements count as `drop_unanswered`, sent
 advertisements (solicited or not) as `nd_replies`.
+
+### Neighbor proxy
+
+With `EtherConfig::proxy_neighbors` set (the default), the adapter answers ARP requests and
+neighbor solicitations for every routable address except the guest's own, in the same form
+as for the gateway address but with the target address as the sender (ARP) or source and
+target (neighbor advertisement). The guest resolves every host it considers on-link (the
+rest of its leased IPv4 prefix, the advertised /64) to the gateway MAC, and its packets to
+them go to the IP side like any other; whether they get anywhere is up to the IP side.
+
+The guest's own addresses, never answered by the proxy:
+
+- IPv4: `DhcpConfig::guest_ip` of the lease, and the sender IP of every ARP packet from the
+  guest other than `0.0.0.0` (requests, replies and gratuitous announcements).
+- IPv6: the target of every duplicate address detection solicitation (unspecified source)
+  and every neighbor advertisement from the guest, other than a gateway address, and the
+  source of every IPv6 packet from the guest that lies in `EtherConfig::ipv6_prefix`.
+
+The learned addresses are kept per family, at most `OWN_ADDRESSES` (16) each, the oldest
+forgotten first, and all are forgotten when the guest MAC changes.
+
+The proxy never answers:
+
+- an ARP probe (sender IP `0.0.0.0`) or a gratuitous ARP packet, and never a duplicate
+  address detection solicitation, whatever the address: the guest's duplicate address
+  detection succeeds for any address that is not the gateway's;
+- a target that is unspecified, broadcast, multicast, loopback or link-local
+  (`169.254.0.0/16`, `fe80::/10`): the IP side cannot deliver to it.
+
+Proxied answers count in `arp_replies` and `nd_replies` and also in `arp_proxied` and
+`nd_proxied`. With `proxy_neighbors` false the adapter answers only the gateway addresses.
 
 ### DHCPv4
 
@@ -256,8 +290,9 @@ checks the packet socket and `ensure_tap` against a real Firecracker guest with 
 `vm_wireguard` example creates the TAP (`--packet fctap0 --create-tap`), Firecracker attaches
 its virtio-net device to it with checksum and segmentation offloads, and the guest leases
 its address, reaches a wireguard-go peer and is reached by it (ICMP, TCP on IPv4 and IPv6,
-a 100 kB line that the guest sends as GSO frames), with the example's ACL blocking one port
-in each direction; the TAP must be gone once the example exits. Firecracker and its CI guest
+a 100 kB line that the guest sends as GSO frames, second addresses of the peer in the
+guest's on-link prefixes resolved by the neighbor proxy), with the example's ACL blocking
+one port in each direction; the TAP must be gone once the example exits. Firecracker and its CI guest
 kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kvm`.
 
 ## Configuration and defaults
@@ -265,11 +300,12 @@ kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kv
 | Setting | Field | Default |
 |---|---|---|
 | Gateway MAC | `EtherConfig::gateway_mac` | required (`EtherConfig::new`) |
-| Gateway IPv4 (answered by ARP) | `EtherConfig::gateway_ipv4` | `None`: no ARP replies |
+| Gateway IPv4 (answered by ARP) | `EtherConfig::gateway_ipv4` | `None`: no gateway ARP replies |
 | Gateway global IPv6 (answered by neighbor discovery next to the link-local one) | `EtherConfig::gateway_ipv6` | `None` |
 | Advertised /64 | `EtherConfig::ipv6_prefix` | `None`: no prefix option, no unsolicited advertisement |
 | Advertised IPv6 DNS servers | `EtherConfig::ipv6_dns` | empty: no RDNSS option |
 | Link MTU (router advertisements, `EtherSource` MTU) | `EtherConfig::mtu` | `DEFAULT_MTU`, 1500 |
+| Neighbor proxy | `EtherConfig::proxy_neighbors` | `true`: ARP and neighbor solicitations answered for every routable address but the guest's |
 | DHCP server | `EtherConfig::dhcp = Some(DhcpConfig::new(server_ip, guest_ip, prefix_len))` | `None`: DHCP goes to the IP side |
 | DHCP router, DNS servers, MTU option | `DhcpConfig::router`, `dns`, `mtu` | none of them sent |
 | DHCP lease time | `DhcpConfig::lease_secs` | 86 400 s (renewal 43 200 s, rebinding 75 600 s) |
@@ -280,7 +316,7 @@ kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kv
 
 Everything the adapter discards is counted in `EtherStats` (from `EtherAdapter::stats` or
 `EtherHandle::stats`) next to `frames_in`, `frames_out`, `ip_in`, `ip_out`, `arp_replies`,
-`nd_replies` and `dhcp_replies`:
+`arp_proxied`, `nd_replies`, `nd_proxied` and `dhcp_replies`:
 
 | Counter | Dropped |
 |---|---|
@@ -299,6 +335,7 @@ once the transport is gone.
 ## Limits and bounds
 
 - One guest per adapter: one learned MAC, one DHCP lease.
+- Neighbor proxy: at most `OWN_ADDRESSES` (16) learned guest addresses per family.
 - Frames up to `MAX_FRAME_LEN` (65 549 bytes: a 64 KiB IP packet behind the ethernet
   header); the reader task holds one buffer of that size.
 - No VLAN tags (802.1Q / 802.1ad frames are dropped), no 802.3 length framing.
