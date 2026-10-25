@@ -398,3 +398,10 @@ inbound policy. A first version that recorded the dependency on every inbound pa
 to +50 ns per packet and was replaced; the shipped version measured (slot 0, interleaved A/B
 against main) +1.5 to +3 ns on established inbound flows, +4 to +10 % on new flows and -17 %
 on repeated outbound packets.
+
+## 2026-10-25 [release]
+
+Prepare 0.19.1 (tag `v0.19.1`) at the owner's request: the reply allowance revocation fix
+(task `20261024-2224-acl-rule-reply-revocation`, GitHub issue #8) and two additive queries
+merged from the peer session readiness branch (`peer_has_session`, `NetStackSource::tcp_egress_drained`).
+Workspace versions, internal requirements and guide tags synchronized.

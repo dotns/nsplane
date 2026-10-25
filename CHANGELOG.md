@@ -5,6 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-25
+
+Fix release: reply allowances of rule-accepted flows are revoked with their authority
+(GitHub issue #8). Also carries two additive queries.
+
 ### Added
 - `Core::peer_has_session` and `EngineHandle::peer_has_session` query whether a peer has
   a current sending session with an unexhausted key. The engine query settles preceding
