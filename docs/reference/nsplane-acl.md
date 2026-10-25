@@ -183,6 +183,19 @@ Removal is lazy: once the grant or pinhole is gone from the current snapshot, a 
 allowance is removed on its next lookup (`AclFilterStats::reply_revoked`) and the flow's
 packets are evaluated from scratch.
 
+Reply allowances of an inbound flow accepted by a rule (default or namespace) or by
+`NotInstalled::Accept` depend on that flow: the reply of the local node, the outbound
+allowance of a restricted peer and, for a flow forwarded to another member, the allowance
+of the destination's replies. After any policy or identity generation change, the flow is
+evaluated again from its source peer on the next lookup of such an allowance: still
+accepted, the allowance stays (and depends on whatever accepts the flow now, a grant
+included); otherwise it is revoked as above. An unversioned `PeerIdentity` gets this check
+on every lookup. A new inbound allowance recorded by an outbound packet with no inbound flow
+behind it (a flow the local node opened) depends on nothing and survives policy changes,
+unless the inbound rules also accept its reverse direction when it is recorded. Under the
+default rules (no namespace) only the local node's replies are tied to the flow; the replies
+of a flow forwarded between two peers expire with the idle timeout.
+
 ### Flow verdict cache
 
 The filter evaluates a flow once, not every packet. `AclEngine::generation`

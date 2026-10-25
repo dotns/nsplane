@@ -386,3 +386,15 @@ workstreams reported to L1, which reviewed each branch and merged it after a gre
   Interleaved A/B on the bench slots: loss-free and bottleneck throughput unchanged, lossy
   medians better, TCP send microbenchmarks about 1-2 % slower (reproducible, not caused by the
   Cubic change; accepted).
+
+## 2026-10-25 [fix]
+
+Revoke reply allowances of rule-accepted flows (task and plan
+`20261024-2224-acl-rule-reply-revocation`, GitHub issue #8). A reply allowance recorded for an
+inbound flow accepted by an ordinary rule had no dependency and survived policy and identity
+changes. Such allowances now carry the flow as their dependency and are re-evaluated after any
+generation change; new inbound allowances without a pending dependency derive it once from the
+inbound policy. A first version that recorded the dependency on every inbound packet cost up
+to +50 ns per packet and was replaced; the shipped version measured (slot 0, interleaved A/B
+against main) +1.5 to +3 ns on established inbound flows, +4 to +10 % on new flows and -17 %
+on repeated outbound packets.

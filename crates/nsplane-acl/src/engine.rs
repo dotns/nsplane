@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use nsplane_core::cell::SnapshotCell;
+use nsplane_packet::PeerId;
 use tracing::{debug, warn};
 
+use crate::lru::FlowHash;
 use crate::{
     Error,
     namespace::{Grant, GrantEnd, NamespaceId, NamespaceKind, NamespacePolicy},
@@ -30,13 +32,29 @@ use crate::{
 
 /// What a reply allowance depends on. An allowance whose dependency is gone
 /// from the current [`Snapshot`] (or, for a pinhole, expired) is revoked on
-/// its next lookup.
+/// its next lookup; one continuing a [`FlowOrigin`] is revoked when its flow
+/// is no longer accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReplyDependency {
     /// A directed grant, by id.
     Grant(Arc<str>),
     /// A pinhole.
     Pinhole(PinholeId),
+    /// An inbound flow accepted by a rule or by [`NotInstalled::Accept`].
+    Flow(FlowOrigin),
+}
+
+/// An inbound flow and the policy and identity generations it was accepted
+/// under (identity 0: unversioned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlowOrigin {
+    pub(crate) peer: PeerId,
+    pub(crate) flow: Flow,
+    pub(crate) generation: u64,
+    pub(crate) identity: u64,
+    /// The destination is another namespace member: the flow's pending entry
+    /// carries the dependency to the destination's allowance.
+    pub(crate) forwarded: bool,
 }
 
 /// The open pinhole matching a flow, if any.
@@ -55,10 +73,12 @@ pub(crate) enum PinholeMatch {
 /// rule ID is cloned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Evaluation<'s> {
-    /// Accepted by a default rule (`namespace: None`) or a namespace rule.
+    /// Accepted by a default rule (`namespace: None`) or a namespace rule;
+    /// `to_member`: the destination is a namespace member, not the local node.
     Rule {
         namespace: Option<&'s NamespaceId>,
         id: &'s RuleId,
+        to_member: bool,
     },
     /// Accepted by the directed grant with this id.
     Grant(&'s RuleId),
@@ -96,7 +116,7 @@ impl Evaluation<'_> {
         // `debug!`, not `warn!`: the data path evaluates new flows, so a
         // warning per denied flow would flood the log.
         match self {
-            Self::Rule { namespace, id } => {
+            Self::Rule { namespace, id, .. } => {
                 debug!(%src, %dst, proto, ?port, rule = %id, namespace = ?namespace.map(NamespaceId::as_str), "ACL accept");
             }
             Self::Grant(id) => debug!(%src, %dst, proto, ?port, grant = %id, "ACL accept"),
@@ -249,7 +269,7 @@ pub(crate) struct Snapshot {
     /// Member label -> its namespaces (derived from `namespaces`).
     memberships: HashMap<Label, Arc<Membership>>,
     /// Member host addresses (`/32`, `/128`) with their member label (derived).
-    hosts: HashMap<IpAddr, Label>,
+    hosts: HashMap<IpAddr, Label, FlowHash>,
     /// The other member addresses with their member label, longest prefix
     /// first (derived).
     addresses: Vec<(IpNet, Label)>,
@@ -379,6 +399,8 @@ impl Snapshot {
                 .pinholes
                 .get(id)
                 .is_some_and(|pinhole| pinhole.is_open_at(now())),
+            // The filter checks it against the generations.
+            ReplyDependency::Flow(_) => true,
         }
     }
 
@@ -408,6 +430,11 @@ impl Snapshot {
     }
 
     /// The member label owning `ip` (longest prefix), with its namespaces.
+    /// Whether `ip` is a namespace member's address.
+    pub(crate) fn is_member(&self, ip: IpAddr) -> bool {
+        self.member_at(ip).is_some()
+    }
+
     fn member_at(&self, ip: IpAddr) -> Option<(&Label, &Membership)> {
         // A host address is always the longest prefix.
         let owner = match self.hosts.get(&ip) {
@@ -447,6 +474,7 @@ impl Snapshot {
                     .map_or(Evaluation::Deny(reasons::DENIED), |id| Evaluation::Rule {
                         namespace: None,
                         id,
+                        to_member: false,
                     })
             }
             DefaultRules::Failed => Evaluation::Deny(reasons::POLICY_FAILED),
@@ -475,6 +503,7 @@ impl Snapshot {
                 return Evaluation::Rule {
                     namespace: Some(id),
                     id: rule,
+                    to_member: dst.is_some(),
                 };
             }
         }
@@ -553,7 +582,7 @@ impl Snapshot {
                 .then_with(|| a_owner.cmp(b_owner))
         });
         addresses.dedup();
-        let mut hosts = HashMap::new();
+        let mut hosts = HashMap::default();
         addresses.retain(|(net, owner)| {
             let host = net.prefix_len() == if net.network().is_ipv4() { 32 } else { 128 };
             if host {
@@ -844,7 +873,7 @@ impl AclEngine {
             let membership = snapshot.membership_of(labels);
             let evaluation = snapshot.evaluate(labels, membership.as_deref(), flow, || self.now());
             match evaluation {
-                Evaluation::Rule { namespace, id } => Decision::Accept(Matched::Rule {
+                Evaluation::Rule { namespace, id, .. } => Decision::Accept(Matched::Rule {
                     namespace: namespace.cloned(),
                     id: id.clone(),
                 }),

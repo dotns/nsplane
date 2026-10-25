@@ -159,8 +159,22 @@
 //! lookup (counted in [`AclFilterStats::reply_revoked`]) and the flow's
 //! packets are evaluated from scratch. A hub forwarding `A -> C` under a
 //! grant therefore stops passing `C`'s replies to `A` as soon as the grant is
-//! removed. Other outbound packets to unrestricted peers record allowances
-//! without a dependency, as they always have.
+//! removed.
+//!
+//! The reply allowances of an inbound flow accepted by a rule (default or
+//! namespace) or by [`NotInstalled::Accept`] depend on that flow: the local
+//! node's reply, the outbound allowance of a restricted peer and, for a flow
+//! forwarded to another member, the allowance of the destination's replies.
+//! After a change of the policy or identity generation, the next lookup of
+//! such an allowance evaluates the flow again from its source peer: still
+//! accepted, the allowance stays and depends on what accepts the flow now;
+//! otherwise it is revoked (counted in [`AclFilterStats::reply_revoked`]).
+//! An unversioned [`PeerIdentity`] gets this check on every lookup. A new
+//! inbound allowance with no inbound flow behind it (a flow the local node
+//! opened) depends on nothing, unless the policy also accepts its reverse
+//! direction when it is recorded. Under the default rules the replies of a
+//! flow forwarded between two peers are not tied to it and expire with the
+//! idle timeout.
 //!
 //! # Typed rules
 //!

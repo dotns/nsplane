@@ -12,7 +12,9 @@ use nsplane_core::cell::SnapshotCell;
 use nsplane_core::{LocalIdentityId, PacketFilter, Verdict};
 use nsplane_packet::{FiveTuple, IcmpHeader, IpPacket, PacketBuf, PeerId, protocol};
 
-use crate::engine::{AclEngine, Evaluation, Membership, PinholeMatch, ReplyDependency, Snapshot};
+use crate::engine::{
+    AclEngine, Evaluation, FlowOrigin, Membership, PinholeMatch, ReplyDependency, Snapshot,
+};
 use crate::lru::{FlowHash, LruMap};
 use crate::net::{IpNet, Protocol};
 use crate::pinhole::Direction;
@@ -885,7 +887,8 @@ fn is_icmp_echo_reply(bytes: &[u8]) -> bool {
 /// full and fewer than an eighth of it are verdicts.
 ///
 /// `pending` remembers the dependency of inbound flows accepted through a
-/// grant, a pinhole or a dependent allowance, keyed by the packet's tuple:
+/// grant, a pinhole, a dependent allowance or a rule towards another
+/// namespace member, keyed by the packet's tuple:
 /// the inbound allowance recorded when the flow leaves again (forwarded to
 /// another peer, or answered by the local node) inherits it, so it is revoked
 /// with the grant or pinhole even towards an unrestricted peer. Same bounds
@@ -947,6 +950,13 @@ impl FlowVerdict {
             dependency: None,
             restricted: false,
         }
+    }
+
+    /// The dependency the flow's pending entry records.
+    fn pending(&self) -> Option<&ReplyDependency> {
+        self.dependency
+            .as_ref()
+            .filter(|dependency| is_pending(dependency))
     }
 }
 
@@ -1509,7 +1519,7 @@ impl Inner {
         let mut table = self.table();
         let info = match self.lookup(&mut table, snapshot, key, identity, &mut sweep) {
             Some(Hit::Allowance(dependency)) => {
-                if let Some(dependency) = dependency {
+                if let Some(dependency) = dependency.filter(is_pending) {
                     self.record_pending(&mut table, tuple, dependency);
                 }
                 drop(table);
@@ -1530,6 +1540,16 @@ impl Inner {
                     return Outcome::Internal;
                 };
                 if info.bypass {
+                    // As an evaluation would: a flow forwarded to another
+                    // member records its pending dependency.
+                    if self.config.stateful_replies
+                        && info.membership.is_some()
+                        && snapshot.is_member(tuple.dst)
+                    {
+                        let flow = tcp_udp_flow(&tuple, protocol);
+                        let dependency = Self::flow_origin(snapshot, peer, info, flow, true);
+                        self.record_pending(&mut table, tuple, dependency);
+                    }
                     drop(table);
                     self.sweep_if(sweep);
                     return Outcome::Accepted;
@@ -1538,7 +1558,7 @@ impl Inner {
                     // The default rules: a few rules and no side effects,
                     // cheaper to evaluate under this lock than to cache.
                     let flow = tcp_udp_flow(&tuple, protocol);
-                    let (verdict, _) = self.evaluate_new(snapshot, info, flow);
+                    let (verdict, _) = self.evaluate_new(snapshot, peer, info, flow);
                     drop(table);
                     self.sweep_if(sweep);
                     return verdict.outcome;
@@ -1558,9 +1578,9 @@ impl Inner {
             ))
         });
         let flow = tcp_udp_flow(&tuple, protocol);
-        let (verdict, cacheable) = self.evaluate_new(snapshot, &info, flow);
+        let (verdict, cacheable) = self.evaluate_new(snapshot, peer, &info, flow);
         let cache = cacheable && identity != 0;
-        if cache || verdict.dependency.is_some() || verdict.restricted {
+        if cache || verdict.pending().is_some() || verdict.restricted {
             let mut table = self.table();
             self.replay(&mut table, peer, tuple, &verdict);
             if cache {
@@ -1595,7 +1615,7 @@ impl Inner {
             let mut table = self.table();
             let reply = match self.lookup(&mut table, snapshot, key, 0, &mut sweep) {
                 Some(Hit::Allowance(dependency)) => {
-                    if let Some(dependency) = dependency {
+                    if let Some(dependency) = dependency.filter(is_pending) {
                         self.record_pending(&mut table, tuple, dependency);
                     }
                     true
@@ -1673,17 +1693,24 @@ impl Inner {
             Arc::clone(info)
         };
         drop(table);
-        let (verdict, _) = self.evaluate_new(snapshot, &info, flow);
+        let (verdict, _) = self.evaluate_new(snapshot, peer, &info, flow);
         if verdict.outcome != Outcome::Accepted {
             return Outcome::Protocol;
         }
-        if verdict.dependency.is_some() || (verdict.restricted && allows_reply) {
+        if verdict.pending().is_some() || (verdict.restricted && allows_reply) {
             let mut table = self.table();
-            if let Some(dependency) = &verdict.dependency {
+            if let Some(dependency) = verdict.pending() {
                 self.record_pending(&mut table, tuple, dependency.clone());
             }
             if verdict.restricted && allows_reply {
-                self.record_reply(&mut table, peer, true, reversed(tuple), verdict.dependency);
+                self.record_reply(
+                    &mut table,
+                    None,
+                    peer,
+                    true,
+                    reversed(tuple),
+                    verdict.dependency,
+                );
             }
         }
         Outcome::Accepted
@@ -1696,7 +1723,7 @@ impl Inner {
         if identity == 0 {
             let info = PeerInfo::resolve(&*self.identity, snapshot, peer, tuple.src, 0);
             if info.governed == Governed::Restricted {
-                self.record_reply(&mut self.table(), peer, true, reversed(tuple), None);
+                self.record_reply(&mut self.table(), None, peer, true, reversed(tuple), None);
             }
             return;
         }
@@ -1704,8 +1731,27 @@ impl Inner {
         let info = self.cached_peer(&mut table, snapshot, peer, Some(tuple.src), identity);
         // Without the peer no allowance is recorded: its replies stay denied.
         if info.is_some_and(|info| info.governed == Governed::Restricted) {
-            self.record_reply(&mut table, peer, true, reversed(tuple), None);
+            self.record_reply(&mut table, None, peer, true, reversed(tuple), None);
         }
+    }
+
+    /// The dependency of `flow` from `peer`, accepted by the rules under the
+    /// snapshot and `info`'s identity generation; `forwarded`: to another
+    /// namespace member.
+    const fn flow_origin(
+        snapshot: &Snapshot,
+        peer: PeerId,
+        info: &PeerInfo,
+        flow: Flow,
+        forwarded: bool,
+    ) -> ReplyDependency {
+        ReplyDependency::Flow(FlowOrigin {
+            peer,
+            flow,
+            generation: snapshot.generation(),
+            identity: info.identity,
+            forwarded,
+        })
     }
 
     /// Evaluate a new inbound `flow` from the resolved peer `info`, as
@@ -1714,6 +1760,7 @@ impl Inner {
     fn evaluate_new(
         &self,
         snapshot: &Snapshot,
+        peer: PeerId,
         info: &PeerInfo,
         flow: Flow,
     ) -> (FlowVerdict, bool) {
@@ -1741,9 +1788,18 @@ impl Inner {
                 return (FlowVerdict::new(outcome), true);
             }
         };
+        let dependency = match evaluation {
+            Evaluation::Rule { to_member, .. } if self.config.stateful_replies => {
+                Some(Self::flow_origin(snapshot, peer, info, flow, to_member))
+            }
+            Evaluation::NotInstalled if self.config.stateful_replies => {
+                Some(Self::flow_origin(snapshot, peer, info, flow, false))
+            }
+            evaluation => evaluation.dependency(),
+        };
         let verdict = FlowVerdict {
             outcome,
-            dependency: evaluation.dependency(),
+            dependency,
             restricted: membership.is_some_and(Membership::outbound_restricted),
         };
         (verdict, true)
@@ -1751,12 +1807,13 @@ impl Inner {
 
     /// The side effects of an inbound packet of a flow with `verdict`.
     fn replay(&self, table: &mut FlowTable, peer: PeerId, tuple: FiveTuple, verdict: &FlowVerdict) {
-        if let Some(dependency) = &verdict.dependency {
+        if let Some(dependency) = verdict.pending() {
             self.record_pending(table, tuple, dependency.clone());
         }
         if verdict.restricted && self.config.stateful_replies {
             self.record_reply(
                 table,
+                None,
                 peer,
                 true,
                 reversed(tuple),
@@ -1862,16 +1919,19 @@ impl Inner {
                     bump(&self.counters.reply_expired);
                     return None;
                 }
-                let revoked = allowance
-                    .dependency
-                    .as_ref()
-                    .filter(|dependency| !snapshot.is_live(dependency, || self.engine.now()));
-                if let Some(revoked) = revoked {
-                    // The pinhole may only have expired: sweep it.
-                    *sweep = matches!(revoked, ReplyDependency::Pinhole(_));
-                    table.entries.remove(&key);
-                    bump(&self.counters.reply_revoked);
-                    return None;
+                match &allowance.dependency {
+                    Some(ReplyDependency::Flow(origin)) if !self.is_current(snapshot, origin) => {
+                        let origin = *origin;
+                        return self.revalidate(table, snapshot, key, origin, now);
+                    }
+                    Some(dependency) if !snapshot.is_live(dependency, || self.engine.now()) => {
+                        // The pinhole may only have expired: sweep it.
+                        *sweep = matches!(dependency, ReplyDependency::Pinhole(_));
+                        table.entries.remove(&key);
+                        bump(&self.counters.reply_revoked);
+                        return None;
+                    }
+                    _ => {}
                 }
                 allowance.last_seen = now;
                 let dependency = allowance.dependency.clone();
@@ -1889,13 +1949,82 @@ impl Inner {
                             || snapshot.is_live(dependency, || self.engine.now())
                     });
                 if valid {
-                    return Some(Hit::Verdict(cached.verdict.clone()));
+                    // The dependency is only needed for the side effects.
+                    let verdict = &cached.verdict;
+                    return Some(Hit::Verdict(FlowVerdict {
+                        outcome: verdict.outcome,
+                        dependency: verdict
+                            .dependency
+                            .as_ref()
+                            .filter(|dependency| verdict.restricted || is_pending(dependency))
+                            .cloned(),
+                        restricted: verdict.restricted,
+                    }));
                 }
                 table.entries.remove(&key);
                 table.verdicts -= 1;
                 None
             }
         }
+    }
+
+    /// Whether `origin` was accepted under the snapshot's generation and the
+    /// current identity generation (never with an unversioned identity).
+    fn is_current(&self, snapshot: &Snapshot, origin: &FlowOrigin) -> bool {
+        let identity = self.identity_generation();
+        identity != 0 && origin.generation == snapshot.generation() && origin.identity == identity
+    }
+
+    /// Evaluate the flow of the allowance under `key` again from its origin
+    /// peer: still accepted, the allowance is refreshed with the new
+    /// dependency; else it is revoked.
+    fn revalidate(
+        &self,
+        table: &mut FlowTable,
+        snapshot: &Snapshot,
+        key: EntryKey,
+        origin: FlowOrigin,
+        now: Instant,
+    ) -> Option<Hit> {
+        let identity = self.identity_generation();
+        let info = if identity == 0 {
+            Some(Arc::new(PeerInfo::resolve(
+                &*self.identity,
+                snapshot,
+                origin.peer,
+                origin.flow.src,
+                0,
+            )))
+        } else {
+            self.cached_peer(
+                table,
+                snapshot,
+                origin.peer,
+                Some(origin.flow.src),
+                identity,
+            )
+            .map(Arc::clone)
+        };
+        let verdict = info.map(|info| {
+            self.evaluate_new(snapshot, origin.peer, &info, origin.flow)
+                .0
+        });
+        let Some(FlowVerdict {
+            outcome: Outcome::Accepted,
+            dependency,
+            ..
+        }) = verdict
+        else {
+            table.entries.remove(&key);
+            bump(&self.counters.reply_revoked);
+            return None;
+        };
+        if let Some(FlowEntry::Allowance(allowance)) = table.entries.get_mut(&key) {
+            allowance.last_seen = now;
+            allowance.dependency.clone_from(&dependency);
+        }
+        table.entries.touch(&key);
+        Some(Hit::Allowance(dependency))
     }
 
     /// Cache `cached` under `key`, unless an allowance holds it or the table
@@ -2069,7 +2198,7 @@ impl Inner {
         let dependency = info
             .and_then(|info| info.labels.as_ref())
             .and_then(|labels| self.outbound_pinhole(snapshot, labels, &tuple, &mut sweep));
-        self.track_outbound(&mut table, peer, tuple, packet, dependency);
+        self.track_outbound(&mut table, snapshot, peer, tuple, packet, dependency);
         drop(table);
         self.sweep_if(sweep);
     }
@@ -2116,7 +2245,7 @@ impl Inner {
         };
         let Some(protocol) = Protocol::from_ip_number(tuple.protocol) else {
             if self.config.allow_other_protocols {
-                self.track_outbound(&mut table, peer, tuple, packet, None);
+                self.track_outbound(&mut table, snapshot, peer, tuple, packet, None);
                 return Outcome::OutboundAccepted;
             }
             return self.outbound_other(snapshot, peer, info, tuple, packet, table);
@@ -2149,7 +2278,14 @@ impl Inner {
             }
         };
         if verdict.outcome != Outcome::OutboundDenied {
-            self.track_outbound(&mut table, peer, tuple, packet, verdict.dependency);
+            self.track_outbound(
+                &mut table,
+                snapshot,
+                peer,
+                tuple,
+                packet,
+                verdict.dependency,
+            );
         }
         drop(table);
         self.sweep_if(sweep);
@@ -2196,7 +2332,7 @@ impl Inner {
         if !rule {
             return Outcome::OutboundDenied;
         }
-        self.track_outbound(&mut table, peer, tuple, packet, None);
+        self.track_outbound(&mut table, snapshot, peer, tuple, packet, None);
         Outcome::OutboundAccepted
     }
 
@@ -2245,6 +2381,7 @@ impl Inner {
     fn track_outbound(
         &self,
         table: &mut FlowTable,
+        snapshot: &Snapshot,
         peer: PeerId,
         tuple: FiveTuple,
         packet: &IpPacket<'_>,
@@ -2259,37 +2396,51 @@ impl Inner {
             _ => false,
         };
         if tracked {
-            self.record_reply(table, peer, false, reversed(tuple), dependency);
+            self.record_reply(
+                table,
+                Some(snapshot),
+                peer,
+                false,
+                reversed(tuple),
+                dependency,
+            );
         }
     }
 
+    /// Record or refresh the allowance of `tuple`. A new inbound allowance
+    /// without a dependency inherits the pending one, or else (with `origin`)
+    /// the one of the inbound flow `tuple` itself when the policy accepts it.
     fn record_reply(
         &self,
         table: &mut FlowTable,
+        origin: Option<&Snapshot>,
         peer: PeerId,
         outbound: bool,
         tuple: FiveTuple,
         dependency: Option<ReplyDependency>,
     ) {
         let now = Instant::now();
-        // An inbound allowance inherits the dependency of the inbound flow it
-        // continues: the same tuple forwarded to another peer, or the reply of
-        // the local node.
-        let dependency = match dependency {
-            None if !outbound && !table.pending.is_empty() => [tuple, reversed(tuple)]
-                .iter()
-                .find_map(|tuple| {
-                    table.pending.get(tuple).filter(|pending| {
-                        now.duration_since(pending.last_seen) <= self.config.reply_idle_timeout
-                    })
-                })
-                .and_then(|pending| pending.dependency.clone()),
-            dependency => dependency,
-        };
         let key = EntryKey {
             peer,
             outbound,
             tuple,
+        };
+        // A refresh without a dependency keeps the allowance's own.
+        if let Some(FlowEntry::Allowance(allowance)) = table.entries.get_mut(&key) {
+            allowance.last_seen = now;
+            if dependency.is_some() {
+                allowance.dependency = dependency;
+            } else if allowance.dependency.is_none() && !outbound {
+                allowance.dependency = self.pending_dependency(&table.pending, tuple, now);
+            }
+            table.entries.touch(&key);
+            return;
+        }
+        let dependency = match dependency {
+            None if !outbound => self
+                .pending_dependency(&table.pending, tuple, now)
+                .or_else(|| origin.and_then(|snapshot| self.inbound_origin(table, snapshot, key))),
+            dependency => dependency,
         };
         let allowance = ReplyEntry {
             last_seen: now,
@@ -2311,6 +2462,73 @@ impl Inner {
         }
     }
 
+    /// The dependency of the inbound flow an inbound allowance for `tuple`
+    /// continues: the same tuple forwarded to another peer, or the reply of
+    /// the local node.
+    fn pending_dependency(
+        &self,
+        pending: &LruMap<FiveTuple, ReplyEntry>,
+        tuple: FiveTuple,
+        now: Instant,
+    ) -> Option<ReplyDependency> {
+        if pending.is_empty() {
+            return None;
+        }
+        [tuple, reversed(tuple)]
+            .iter()
+            .find_map(|tuple| {
+                pending.get(tuple).filter(|pending| {
+                    now.duration_since(pending.last_seen) <= self.config.reply_idle_timeout
+                })
+            })
+            .and_then(|pending| pending.dependency.clone())
+    }
+
+    /// The dependency of the inbound TCP or UDP flow of the allowance `key`
+    /// when the policy accepts it (its verdict cached under the current
+    /// generations, else evaluated), `None` when it does not: the allowance
+    /// then belongs to a flow the local node opened.
+    fn inbound_origin(
+        &self,
+        table: &mut FlowTable,
+        snapshot: &Snapshot,
+        key: EntryKey,
+    ) -> Option<ReplyDependency> {
+        let protocol = Protocol::from_ip_number(key.tuple.protocol)?;
+        let identity = self.identity_generation();
+        if let Some(FlowEntry::Verdict(cached)) = table.entries.get(&key)
+            && identity != 0
+            && cached.generation == snapshot.generation()
+            && cached.identity == identity
+        {
+            return (cached.verdict.outcome == Outcome::Accepted)
+                .then(|| cached.verdict.dependency.clone())
+                .flatten();
+        }
+        let info = if identity == 0 {
+            Arc::new(PeerInfo::resolve(
+                &*self.identity,
+                snapshot,
+                key.peer,
+                key.tuple.src,
+                0,
+            ))
+        } else {
+            Arc::clone(self.cached_peer(
+                table,
+                snapshot,
+                key.peer,
+                Some(key.tuple.src),
+                identity,
+            )?)
+        };
+        let flow = tcp_udp_flow(&key.tuple, protocol);
+        let (verdict, _) = self.evaluate_new(snapshot, key.peer, &info, flow);
+        (verdict.outcome == Outcome::Accepted)
+            .then_some(verdict.dependency)
+            .flatten()
+    }
+
     /// Remember that the inbound flow `tuple` depends on `dependency`.
     fn record_pending(&self, table: &mut FlowTable, tuple: FiveTuple, dependency: ReplyDependency) {
         if !self.config.stateful_replies {
@@ -2330,6 +2548,16 @@ impl Inner {
                 dependency: Some(dependency),
             },
         );
+    }
+}
+
+/// Whether a packet carrying `dependency` records it as pending: a grant, a
+/// pinhole, or a flow forwarded to another member (the dependency of a flow
+/// to the local node stays with its allowances).
+const fn is_pending(dependency: &ReplyDependency) -> bool {
+    match dependency {
+        ReplyDependency::Flow(origin) => origin.forwarded,
+        ReplyDependency::Grant(_) | ReplyDependency::Pinhole(_) => true,
     }
 }
 
@@ -3286,6 +3514,318 @@ mod tests {
         assert_eq!(stats.reply_revoked, 2);
         assert_eq!(stats.cross_namespace, 2);
         assert_eq!(stats.outbound_denied, 1);
+    }
+
+    /// `namespace` without its accept rule.
+    fn closed_namespace(peers: &[PeerId], outbound: Option<Vec<OutboundRule>>) -> NamespacePolicy {
+        NamespacePolicy {
+            rules: Vec::new(),
+            ..namespace(peers, outbound)
+        }
+    }
+
+    #[test]
+    fn rule_removal_revokes_the_replies_of_rule_accepted_flows() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+
+        // An unrelated change keeps the flow.
+        engine
+            .store_namespace("nsd:b", namespace(&[B], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(f.stats().reply_revoked, 0);
+
+        engine
+            .store_namespace("nsd:a", closed_namespace(&[A], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4001, local, 22)),
+            drop(reasons::DENIED)
+        );
+        let stats = f.stats();
+        assert_eq!((stats.replies, stats.reply_revoked), (2, 1));
+    }
+
+    #[test]
+    fn rule_removal_revokes_both_allowances_of_a_restricted_peer() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], Some(Vec::new())))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+            Verdict::Accept
+        );
+
+        engine
+            .store_namespace("nsd:a", closed_namespace(&[A], Some(Vec::new())))
+            .unwrap();
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+            drop(reasons::OUTBOUND)
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().reply_revoked, 2);
+    }
+
+    #[test]
+    fn label_change_revokes_the_replies_of_rule_accepted_flows() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        let identity = ns_identity();
+        let f = AclFilter::with_config(
+            Arc::clone(&engine),
+            Arc::clone(&identity),
+            AclFilterConfig::default(),
+        );
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+            Verdict::Accept
+        );
+
+        identity.insert(A, LabelSet::new([Label::from("other-account")]));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            drop(reasons::NO_POLICY)
+        );
+        assert_eq!(f.stats().reply_revoked, 1);
+    }
+
+    #[test]
+    fn default_rule_removal_revokes_the_replies_of_accepted_flows() {
+        let engine = loaded_engine(vec![tcp_rule(PortSet::single(22))]);
+        let f = AclFilter::new(Arc::clone(&engine), identity());
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            Verdict::Accept
+        );
+        outbound(&f, PEER, tcp_packet(l, 22, r, 4000));
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            Verdict::Accept
+        );
+
+        engine.install(RuleSet::new(deny_all()).unwrap());
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().reply_revoked, 1);
+    }
+
+    #[test]
+    fn an_unversioned_identity_checks_the_flow_on_every_reply() {
+        let engine = loaded_engine(vec![tcp_rule(PortSet::single(22))]);
+        let revoked = Arc::new(AtomicBool::new(false));
+        let identity = {
+            let revoked = Arc::clone(&revoked);
+            move |_: PeerId| (!revoked.load(Ordering::Relaxed)).then(|| label_set(&[ADDR]))
+        };
+        let f = AclFilter::new(engine, identity);
+        let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            Verdict::Accept
+        );
+        outbound(&f, PEER, tcp_packet(l, 22, r, 4000));
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            Verdict::Accept
+        );
+
+        revoked.store(true, Ordering::Relaxed);
+        assert_eq!(
+            inbound(&f, PEER, tcp_packet(r, 4000, l, 22)),
+            drop(reasons::UNKNOWN_PEER)
+        );
+        assert_eq!(f.stats().reply_revoked, 1);
+    }
+
+    #[test]
+    fn rule_removal_keeps_the_replies_of_local_flows() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 5000, a, 80)),
+            Verdict::Accept
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 80, local, 5000)),
+            Verdict::Accept
+        );
+
+        engine
+            .store_namespace("nsd:a", closed_namespace(&[A], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 80, local, 5000)),
+            Verdict::Accept
+        );
+        assert_eq!(f.stats().reply_revoked, 0);
+    }
+
+    #[test]
+    fn rule_removal_revokes_the_replies_of_a_forwarded_flow() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A, C], None))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, c) = (peer_addr(A), peer_addr(C));
+        // The hub forwards A -> C and C's reply back to A.
+        assert_eq!(inbound(&f, A, tcp_packet(a, 4000, c, 22)), Verdict::Accept);
+        assert_eq!(outbound(&f, C, tcp_packet(a, 4000, c, 22)), Verdict::Accept);
+        assert_eq!(inbound(&f, C, tcp_packet(c, 22, a, 4000)), Verdict::Accept);
+        assert_eq!(outbound(&f, A, tcp_packet(c, 22, a, 4000)), Verdict::Accept);
+
+        engine
+            .store_namespace("nsd:a", closed_namespace(&[A, C], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, C, tcp_packet(c, 22, a, 4000)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, c, 22)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().reply_revoked, 2);
+    }
+
+    #[test]
+    fn a_rule_replaced_by_a_grant_keeps_the_flow_until_the_grant_goes() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A, B], None))
+            .unwrap();
+        let f = ns_filter(&engine, AclFilterConfig::default());
+        let (a, b) = (peer_addr(A), peer_addr(B));
+        assert_eq!(inbound(&f, A, tcp_packet(a, 4000, b, 22)), Verdict::Accept);
+        assert_eq!(outbound(&f, B, tcp_packet(a, 4000, b, 22)), Verdict::Accept);
+        assert_eq!(inbound(&f, B, tcp_packet(b, 22, a, 4000)), Verdict::Accept);
+        assert_eq!(outbound(&f, A, tcp_packet(b, 22, a, 4000)), Verdict::Accept);
+
+        // B moves to its own namespace; a grant lets A reach it on TCP 22.
+        engine
+            .store_grant(
+                "a-to-b",
+                Grant {
+                    from: GrantEnd::Label(label(A)),
+                    to: GrantEnd::Namespace("nsd:b".into()),
+                    protocols: vec![ProtocolMatch::Tcp(PortSet::single(22))],
+                },
+            )
+            .unwrap();
+        engine
+            .store_namespace("nsd:b", namespace(&[B], None))
+            .unwrap();
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        assert_eq!(inbound(&f, A, tcp_packet(a, 4000, b, 22)), Verdict::Accept);
+        assert_eq!(inbound(&f, B, tcp_packet(b, 22, a, 4000)), Verdict::Accept);
+        assert_eq!(f.stats().reply_revoked, 0);
+
+        assert!(engine.remove_grant("a-to-b"));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, b, 22)),
+            drop(reasons::CROSS_NAMESPACE)
+        );
+        assert_eq!(
+            inbound(&f, B, tcp_packet(b, 22, a, 4000)),
+            drop(reasons::CROSS_NAMESPACE)
+        );
+        assert_eq!(f.stats().reply_revoked, 2);
+    }
+
+    #[test]
+    fn a_long_flow_keeps_its_rule_dependency() {
+        let engine = Arc::new(AclEngine::new());
+        engine
+            .store_namespace("nsd:a", namespace(&[A], None))
+            .unwrap();
+        let f = ns_filter(
+            &engine,
+            AclFilterConfig {
+                reply_idle_timeout: Duration::from_millis(200),
+                ..AclFilterConfig::default()
+            },
+        );
+        let (a, local) = (peer_addr(A), addr(LOCAL));
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            Verdict::Accept
+        );
+        // The flow outlives the idle timeout of the first packet's state.
+        for _ in 0..3 {
+            assert_eq!(
+                outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+                Verdict::Accept
+            );
+            assert_eq!(
+                inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+                Verdict::Accept
+            );
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        assert_eq!(
+            outbound(&f, A, tcp_packet(local, 22, a, 4000)),
+            Verdict::Accept
+        );
+
+        engine
+            .store_namespace("nsd:a", closed_namespace(&[A], None))
+            .unwrap();
+        assert_eq!(
+            inbound(&f, A, tcp_packet(a, 4000, local, 22)),
+            drop(reasons::DENIED)
+        );
+        assert_eq!(f.stats().reply_revoked, 1);
     }
 
     #[test]

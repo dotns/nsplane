@@ -69,3 +69,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-1437-simple-dns-in-tree Keep the simple-dns protocol crate in this repository**](20261024-1437-simple-dns-in-tree.md) `P2`
 - [x] [**20261024-1453-smoltcp-upstream-fixes smoltcp fork: rebase onto upstream main and reapply the fork patches**](20261024-1453-smoltcp-upstream-fixes.md) `P2`
 - [x] [**20261024-1454-ether-proxy-arp nsplane-ether: answer ARP and NDP for every address of the guest's link but its own**](20261024-1454-ether-proxy-arp.md) `P2`
+- [x] [**20261024-2224-acl-rule-reply-revocation Revoke reply allowances of rule-accepted flows when their authority is gone**](20261024-2224-acl-rule-reply-revocation.md) `P1`

@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control, non-TCP flows and revoked flows; forwarding returned packets remains the caller's
   responsibility and the query does not establish remote delivery.
 
+### Fixed
+- `nsplane-acl`: reply allowances of flows accepted by an ordinary rule (default or
+  namespace) or by `NotInstalled::Accept` no longer outlive the authority that accepted
+  them. After a policy or identity change the flow is evaluated again on the next lookup of
+  its allowance and the allowance is revoked (`AclFilterStats::reply_revoked`) when the flow
+  is no longer accepted; flows still accepted and flows the local node opened keep working.
+  Behavior change: established flows that the new policy no longer accepts are cut. GitHub
+  issue #8.
+
 ## [0.19.0] - 2026-10-24
 
 Feature release (additive API); smoltcp fork rebased onto upstream `main`.
