@@ -628,3 +628,11 @@ Owner decisions, 2026-10-26:
    the note adds, are answered in that note's review. Design note:
    [notes/20261026-0834-packet-tag-carrier.md](notes/20261026-0834-packet-tag-carrier.md)
    (status: for owner and consumer review).
+5. Release C answers recorded on 2026-10-26, as recommended in the design note:
+   - O11: the tag on `PacketBuf`, variant A first (64 bytes), variant B (`u32` offsets) only if
+     A is outside the noise.
+   - O12: labels, not a barrier with ingress sequence numbers.
+   - O14: a bounded tombstone table per stack, `NetStackConfig::max_revoked_labels`, default
+     65,536.
+   O8, O9, O10 and O13 wait for the gateway's review, which has started; the twelfth freeze
+   exception and the go-ahead for release C are not decided.

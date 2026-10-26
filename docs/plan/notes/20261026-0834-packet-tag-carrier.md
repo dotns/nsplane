@@ -61,9 +61,10 @@ usize`, `end: usize` (16), `shared: bool` (1), padded to 56 bytes on 64-bit targ
 
 The receipt marker of W6 (a `bool`) fits the padding of either variant. Every `PacketBuf`
 moves by value through bounded queues and `PacketBatch`, whose inline
-`SmallVec<[PacketBuf; MAX_BATCH]>` grows from 3584 to 4096 bytes under A. Recommendation:
-implement A, measure it against B on the slot A/B (budget below), and take B only if A is
-outside the noise. B's conversions sit on the hottest accessors, so it is not free either.
+`SmallVec<[PacketBuf; MAX_BATCH]>` grows from 3584 to 4096 bytes under A. Decided (O11,
+owner, 2026-10-26): implement A, measure it against B on the slot A/B (budget below), and take
+B only if A is outside the noise. B's conversions sit on the hottest accessors, so it is not
+free either.
 
 ## Carrier sites
 
@@ -335,6 +336,9 @@ of the carrier); with release B's barrier it can use either.
 
 ## Open questions
 
+Decided by the owner on 2026-10-26: O11, O12 and O14, as recommended. Open for the gateway's
+review (started): O8, O9, O10 and O13.
+
 - O8 (R5 part 2) Opt-in per peer through `Core::set_plaintext_egress(peer, bool)` and the engine
   equivalent (recommended: runtime, no `PeerConfig` change, reverts with the call), or a
   `PeerConfig` field. Across peer changes the runtime flag follows the `PeerId`, like
@@ -345,7 +349,7 @@ of the carrier); with release B's barrier it can use either.
   and no packet of the removed peer reaches the egress queue under the new id. Such a peer
   starts no handshake for data. Recommended: it may still answer and start handshakes for
   inbound sealed traffic, unchanged, so a peer moves between plaintext and sealed egress without
-  a gap. For the gateway's review.
+  a gap. Open, for the gateway's review.
 - O9 (R6) Without a session. `encapsulate_in_place` / `reserve_in_place` copy the packet into
   `Tunn::packet_queue` (`VecDeque<Vec<u8>>`, `MAX_QUEUE_DEPTH` 256, silently not queued beyond,
   cleared by `clear_all` in the timers) and write an initiation into the buffer. Recommended:
@@ -356,21 +360,25 @@ of the carrier); with release B's barrier it can use either.
   `nsplane-noise` change. Consequence for the consumer: a tracked packet right after a session
   expiry fails and the consumer retries once the session is up. The alternative keeps the tag in
   the queue and reports overflow, `clear_all` and the later flush, which changes
-  `nsplane-noise`'s queue and `Core::flush_queue`. For the gateway's review.
+  `nsplane-noise`'s queue and `Core::flush_queue`. Open, for the gateway's review.
 - O10 (R6) A tracked packet above the MTU: `NotSent { oversize }` (recommended; `split_ipv4`
   copies the tag, so one packet would become several datagrams with one token and the result
   would wait for all of them, through possibly different calls), or one result after the last
   fragment's call (a per-token fragment count in the engine). An IPv6 or DF packet answered with
-  an ICMP error is `NotSent` with `FRAGMENT_OVERSIZE` either way. For the gateway's review.
-- O11 (C) The tag on `PacketBuf` (recommended: every queue and the filters see it with no new
-  item type; untagged traffic pays one word; a consumer's own queue of `PacketBuf`s carries it
-  unchanged) or per-queue side fields (`(PacketBuf, Tag)` in the local queue, `CryptoJob`,
-  `Datagram`, the netstack ingress: no size change for untagged queues, but every queue, trait
-  (`PacketSource::recv_batch`, `PacketSink::send_batch`, `PacketFilter`) and adapter changes,
-  consumers carry the label beside every packet through their own queues, and a forgotten site
-  loses the tag at compile time only if its type changes). `Output` becomes `#[non_exhaustive]`
-  together with `Output::Plaintext`. The node agrees (variant A first).
-- O12 (R2) Labels (recommended: they compose with release B's first-input control, attribute
+  an ICMP error is `NotSent` with `FRAGMENT_OVERSIZE` either way. Open, for the gateway's
+  review.
+- O11 (C) **Decided 2026-10-26 (owner): the tag on `PacketBuf`, variant A first, B only if A
+  is outside the noise.** The tag on `PacketBuf` (recommended: every queue and the filters see
+  it with no new item type; untagged traffic pays one word; a consumer's own queue of
+  `PacketBuf`s carries it unchanged) or per-queue side fields (`(PacketBuf, Tag)` in the local
+  queue, `CryptoJob`, `Datagram`, the netstack ingress: no size change for untagged queues,
+  but every queue, trait (`PacketSource::recv_batch`, `PacketSink::send_batch`,
+  `PacketFilter`) and adapter changes, consumers carry the label beside every packet through
+  their own queues, and a forgotten site loses the tag at compile time only if its type
+  changes). `Output` becomes `#[non_exhaustive]` together with `Output::Plaintext`. The node
+  agrees (variant A first).
+- O12 (R2) **Decided 2026-10-26 (owner): labels, not a barrier with ingress sequence
+  numbers.** Labels (recommended: they compose with release B's first-input control, attribute
   every handle without timing, separate an identical reinstall by a fresh label, and use the
   same carrier) or a barrier with ingress sequence numbers on handles (completion waits on
   handshakes that may never finish; every handle needs the sequence anyway, and the consumer
@@ -381,10 +389,12 @@ of the carrier); with release B's barrier it can use either.
   Alternatives: every tagged packet tracked while a `SendResults` receiver exists (costs a
   result per R4-tagged packet), or a field in the engine's queue items (`Datagram` grows, and
   the core cannot see it for its own drops). The node's condition (no tag bits, no change for
-  untracked packets) and the planning review's (documented, not hidden) are met. For the
+  untracked packets) and the planning review's (documented, not hidden) are met. Open, for the
   gateway's review.
-- O14 (R2, new) How long nsplane remembers a revoked label. Recommended: a tombstone table per
-  stack (`NetStackConfig::max_revoked_labels`, proposed default 65,536 labels, about 1 MiB),
+- O14 (R2, new) **Decided 2026-10-26 (owner): a bounded tombstone table per stack,
+  `NetStackConfig::max_revoked_labels`, default 65,536.** How long nsplane remembers a revoked
+  label. Recommended: a tombstone table per stack (`NetStackConfig::max_revoked_labels`, default
+  65,536 labels, about 1 MiB),
   oldest entry replaced when full, so a label used after its revoke is dropped and counted for at
   least the next 65,536 revocations, far past the time input can sit in a consumer's queue.
   Alternatives: tombstones for the stack's lifetime (exact, grows with every revocation), or none
@@ -498,8 +508,9 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
 
 ## Open items for review
 
-- Owner: O8-O14, the variant A / B decision rule (A unless it is outside the noise), the
-  labeled-path allowance (proposed 3 %), and the twelfth freeze exception.
+- Owner: O8-O10 and O13 after the gateway's review, the labeled-path allowance (proposed 3 %),
+  the twelfth freeze exception and the go-ahead for release C. Decided on 2026-10-26: O11 (with
+  the variant A / B rule), O12 and O14.
 - The gateway: O8-O10 and O13; token = tag with packing; whether release B's barrier makes R4
   proposal A unnecessary; whether it needs `recv_labeled` on bound sockets (dropped from release
   C unless it asks: it costs a word per queued bound datagram and the node does not need it).
@@ -519,7 +530,12 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   untagged-after-merge rule in nsplane-nat, a documented instead of a hidden receipt marker, the
   labeled-path bar, the consumer's retry under O9, the plaintext-egress flag across peer removal
   and re-add, and explicit owner answers.
-- Gateway review: pending.
+- Owner decisions, 2026-10-26: O11 (the tag on `PacketBuf`, variant A first, B only if A is
+  outside the noise), O12 (labels) and O14 (a bounded tombstone table per stack,
+  `NetStackConfig::max_revoked_labels`, default 65,536) take the recommended answers. O8, O9,
+  O10 and O13 wait for the gateway's review; the twelfth freeze exception and the go-ahead for
+  release C are not decided.
+- Gateway review: started, pending.
 - Changes in this revision: the carrier's `None` rule and the clone statement (checked by
   building without `Clone`); the receipt marker made a documented public property with a clone
   rule and cleared at the engine's other entries; `Mixed` dropped and counted in nsplane-nat too
