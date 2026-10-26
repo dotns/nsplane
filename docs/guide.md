@@ -654,16 +654,14 @@ async fn main() -> anyhow::Result<()> {
     let (c, stack_c, _) = node(key_c, client)?;
     // Server: owns 10.0.0.2 and terminates every address of 192.0.2.0/24, asking the
     // application about each new connection or flow.
-    let server = NetStackConfig {
-        transparent: Some(TransparentConfig {
-            prefixes: vec![("192.0.2.0".parse()?, 24)],
-            max_connections: Some(4096),
-            events: Some(FlowEventsConfig::default()),
-            ..Default::default()
-        }),
-        admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
-        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
-    };
+    let mut server = NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU);
+    server.transparent = Some(TransparentConfig {
+        prefixes: vec![("192.0.2.0".parse()?, 24)],
+        max_connections: Some(4096),
+        events: Some(FlowEventsConfig::default()),
+        ..Default::default()
+    });
+    server.admission = Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 };
     let (s, stack_s, outer_s) = node(key_s, server)?;
 
     // The client routes every IPv4 destination to the server.

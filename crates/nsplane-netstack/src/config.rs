@@ -22,6 +22,20 @@ const MAX_TCP_BUFFER: usize = 65_535 << 14;
 ///
 /// Every capacity is a bound: no queue inside the stack grows past the value given here.
 /// A capacity of zero is raised to one.
+///
+/// Fields may be added in any release. Start from [`NetStackConfig::new`] or
+/// [`Default::default`] and assign the fields to change:
+///
+/// ```
+/// use nsplane_netstack::{Admission, NetStackConfig};
+///
+/// let mut config = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], 1360);
+/// config.accept_capacity = 256;
+/// config.admission = Admission::Immediate;
+/// assert_eq!(config.mtu, 1360);
+/// # Ok::<(), std::net::AddrParseError>(())
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetStackConfig {
     /// The stack's own addresses, each with its prefix length.
@@ -185,13 +199,11 @@ pub struct NetStackConfig {
     /// ```
     /// use nsplane_netstack::{NetStackConfig, TransparentConfig};
     ///
-    /// let config = NetStackConfig {
-    ///     transparent: Some(TransparentConfig {
-    ///         prefixes: vec![],
-    ///         ..Default::default()
-    ///     }),
+    /// let mut config = NetStackConfig::default();
+    /// config.transparent = Some(TransparentConfig {
+    ///     prefixes: vec![],
     ///     ..Default::default()
-    /// };
+    /// });
     /// assert!(config.transparent.is_some());
     /// ```
     ///

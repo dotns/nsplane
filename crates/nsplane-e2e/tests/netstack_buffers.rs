@@ -60,11 +60,10 @@ fn stack_node(
 ) -> TestResult<StackNode> {
     let ip4 = Ipv4Addr::new(10, 0, 0, seed);
     let ip6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed));
-    let (stack, handle) = NetStack::new(NetStackConfig {
-        tcp_rx_buffer: buffers.rx,
-        tcp_tx_buffer: buffers.tx,
-        ..NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU)
-    });
+    let mut config = NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU);
+    config.tcp_rx_buffer = buffers.rx;
+    config.tcp_tx_buffer = buffers.tx;
+    let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     let engine = EngineBuilder::new(source, sink)
         .private_key(StaticSecret::from([seed; 32]))

@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `rejected_timeout` and `rejected_table_full` count. [`events_emitted`](Self::events_emitted) and
 /// [`events_dropped`](Self::events_dropped) count admission events, not packets. Counters
 /// only grow, except the gauge [`pending`](Self::pending).
+///
+/// Fields may be added in any release: read the fields, or compare against
+/// [`Default::default`] with the expected fields assigned.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetStackStats {
     /// Ingress packets that are not a parseable IPv4/IPv6 packet, or whose TCP/UDP header

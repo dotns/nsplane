@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - nsplane-netstack: `NetStackConfig` and `NetStackStats` gain a field each (`admission`,
   `handshake_failed`); struct literals without `..Default::default()` must name them.
+- Breaking: nsplane-netstack `NetStackConfig` and `NetStackStats` are `#[non_exhaustive]`,
+  so later fields are not breaking again. Other crates can no longer build them with a struct
+  expression, also not with `..Default::default()`: start from `NetStackConfig::new` or
+  `Default::default()` and assign the fields (for an expected `NetStackStats`, assign the
+  expected counters on a default value). Reading fields is unchanged.
+
+  ```rust
+  // Before
+  let config = NetStackConfig { accept_capacity: 256, ..NetStackConfig::new(addresses, mtu) };
+  // After
+  let mut config = NetStackConfig::new(addresses, mtu);
+  config.accept_capacity = 256;
+  ```
 - nsplane-netstack: under `Admission::Decide`, `incoming_tcp` and `incoming_udp` skip a
   handle whose lifetime ended while it was queued, also when the stack stopped; an accepted
   held datagram opens its flow in the flow table even if a socket bound or connected

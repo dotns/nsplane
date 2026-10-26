@@ -114,13 +114,12 @@ impl Side {
 fn side(seed: u8, at: (TransportId, SocketAddr), transport: ChannelTransport) -> TestResult<Side> {
     let ip4 = Ipv4Addr::new(10, 0, 0, seed);
     let ip6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(seed));
-    let (stack, handle) = NetStack::new(NetStackConfig {
-        egress_capacity: EGRESS,
-        tcp_rx_buffer: Some(BUFFER),
-        tcp_tx_buffer: Some(BUFFER),
-        stream_buffer: BUFFER,
-        ..NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU)
-    });
+    let mut config = NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU);
+    config.egress_capacity = EGRESS;
+    config.tcp_rx_buffer = Some(BUFFER);
+    config.tcp_tx_buffer = Some(BUFFER);
+    config.stream_buffer = BUFFER;
+    let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     let (gate, open) = watch::channel(true);
     let log = Log::default();

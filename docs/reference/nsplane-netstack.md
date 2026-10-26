@@ -529,6 +529,10 @@ not establish peer application completion or remote cleanup.
 
 ## Configuration and defaults
 
+`NetStackConfig` and `NetStackStats` are `#[non_exhaustive]`: build a configuration from
+`NetStackConfig::new` or `Default::default()` and assign the fields to change, and compare
+statistics against a default value with the expected fields assigned.
+
 | Feature | How to enable | Default | Cost when not enabled |
 |---|---|---|---|
 | User-space TCP/IP stack | `NetStack::new(NetStackConfig)`, `NetStack::split` as the builder's source and sink | not used | none: the crate is not a dependency of `nsplane` or `nsplane-tun` |

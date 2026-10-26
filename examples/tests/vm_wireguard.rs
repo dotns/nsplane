@@ -101,18 +101,17 @@ async fn remote(
         .collect::<Result<_, _>>()?;
     // The stack owns one address per family; it answers for the network behind the peer
     // and the second hosts transparently.
-    let (stack, handle) = NetStack::new(NetStackConfig {
-        reassembly: Some(ReassemblyConfig::default()),
-        transparent: Some(TransparentConfig {
-            prefixes: vec![
-                (IpAddr::V4(BEHIND), 24),
-                (IpAddr::V4(SECOND), 32),
-                (IpAddr::V6(SECOND6), 128),
-            ],
-            ..TransparentConfig::default()
-        }),
-        ..NetStackConfig::new(addresses, MTU)
+    let mut config = NetStackConfig::new(addresses, MTU);
+    config.reassembly = Some(ReassemblyConfig::default());
+    config.transparent = Some(TransparentConfig {
+        prefixes: vec![
+            (IpAddr::V4(BEHIND), 24),
+            (IpAddr::V4(SECOND), 32),
+            (IpAddr::V6(SECOND6), 128),
+        ],
+        ..TransparentConfig::default()
     });
+    let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     // The stack does not answer pings: echo requests are answered here, back into the
     // engine, and never reach the stack.
