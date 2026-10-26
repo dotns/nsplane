@@ -2,16 +2,18 @@
 
 A user-space TCP/IP stack on smoltcp that an engine uses in place of a TUN device: TCP
 connections and UDP flows and sockets for the application, transparent termination of
-traffic to any destination in configured prefixes with optional per-flow admission and
-admission events, per-flow revocation, optional reassembly, and an ownership query for local sides that share one decrypted stream. Builds on
+traffic to any destination in configured prefixes with admission events, optional
+per-flow admission on every stack with control of each connection or flow from its first
+input, per-flow revocation, optional reassembly, and an ownership query for local sides that share one decrypted stream. Builds on
 `nsplane`, `nsplane-core` and `nsplane-packet`.
 
 ## Public API
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::incoming_pending`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `admission`, `max_connections`, `events`), `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
+| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`; `admission` deprecated, replaced by `NetStackConfig::admission`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
 ## Behavior
 
@@ -295,53 +297,19 @@ own `addresses`.
   SYN or datagram). `connect_tcp`, `connect_udp` and `bind_udp` still require one of the
   stack's own `addresses`.
 
-#### Admission
-
-`TransparentConfig::admission` decides how a new TCP connection (a bare SYN) or UDP flow (its
-first datagram) is admitted. It applies to every new connection and flow of a transparent
-stack, to its own addresses too.
-
-- `Admission::Immediate` (default): accepted on arrival, as for the stack's own addresses,
-  and counted in `accepted`.
-- `Admission::Decide { timeout, max_pending }`: the SYN or first datagram is held in a
-  pending table and offered on `NetStackHandle::incoming_pending` as a `PendingFlow` with
-  its `protocol()`, `peer_addr()` (the source) and `local_addr()` (the original
-  destination). `accept()` admits it: the stack answers the held SYN with SYN-ACK (the
-  connection arrives on `incoming_tcp` once established) or opens the flow with the held
-  datagram on `incoming_udp`, and counts it in `accepted`. `reject()`, or dropping the item,
-  rejects it (`rejected_hook`). Decisions take effect on the next driver turn and never
-  wait; a decision after the timeout or after the stack stopped does nothing.
-  - No decision within `timeout`: rejected, counted in `rejected_timeout`.
-  - `max_pending` entries held, or `max_pending` items not taken from `incoming_pending`:
-    a new connection or flow is rejected at once, counted in `rejected_table_full`.
-  - While a connection is held, its retransmitted SYNs are absorbed. While a flow is held,
-    its further datagrams are dropped and counted in `udp_queue_full`: a held flow queues
-    its first datagram only.
-  - `incoming_pending` hands its items to the first call only (on any clone of the handle);
-    later calls, and every call without `Decide`, return a stream that ends at once. The
-    stream ends when the stack stops.
-
-A rejected TCP connection is answered with a RST and a rejected UDP flow with an ICMP port
-unreachable (type 3 code 3) or `ICMPv6` port unreachable (type 1 code 4) quoting the
-datagram, both sourced from the original destination, so the peer sees a refused
-connection or an unreachable port at the address it dialed.
+#### Connection limit and counters
 
 `TransparentConfig::max_connections` bounds the TCP connections the stack holds at once
 (accepted, mid handshake, or opened with `connect_tcp`, until released). At the limit, the
 bare SYN of a new connection is answered with a RST from its original destination and
 counted in `rejected_connection_limit`; a retransmitted SYN of a handshake in progress is not
-a new connection. Under `Decide` the limit is checked when the SYN arrives and again when the
-connection is accepted. Default `None`: no limit beyond the listener pool and the accept
-queue.
+a new connection. Under `Admission::Decide` the limit is checked when the SYN arrives and
+again when the connection is accepted. Default `None`: no limit beyond the listener pool and
+the accept queue.
 
-#### Counters
-
-`NetStackStats` carries the admission outcome: `pending` (a gauge: connections and flows
-held now), `accepted`, `rejected_hook`, `rejected_timeout`, `rejected_table_full`,
-`rejected_connection_limit` and `rejected_prefix` (per packet, also in `no_address`). Each
-held connection or flow leaves `pending` accepted or counted in exactly one `rejected_`
-field. An accepted SYN may still be refused by the listener pool (`syn_refused`), and an
-accepted datagram by the flow limit or the accept queue.
+Under `Admission::Immediate` a transparent stack counts every new connection and flow in
+`accepted`; `rejected_prefix` counts per packet (also in `no_address`). The other admission
+counters are under [Admission](#admission).
 
 #### Flow events
 
@@ -377,6 +345,50 @@ words; expiry rides on the driver's timer, with no task per entry. `nsplane-e2e`
 `netstack_transparent` covers Immediate admission for both families, Decide accept and
 reject (RST and ICMP / `ICMPv6` port unreachable observed at the client) and the
 `no_address` drops without transparent mode.
+
+### Admission
+
+`NetStackConfig::admission` decides how a new TCP connection (a bare SYN) or UDP flow (its
+first datagram) is admitted, on every stack: to the stack's own addresses, and on a
+transparent stack to every in-prefix destination too. A transparent stack also honours the
+deprecated `TransparentConfig::admission` while the top-level field is `Immediate`; a
+`Decide` at the top level takes precedence.
+
+- `Admission::Immediate` (default): accepted on arrival.
+- `Admission::Decide { timeout, max_pending }`: the SYN or first datagram is held in a
+  pending table and offered on `NetStackHandle::incoming_pending` as a `PendingFlow` with
+  its `protocol()`, `peer_addr()` (the source), `local_addr()` (the destination the peer
+  dialed) and `control()` (see [Control from the first input](#control-from-the-first-input)).
+  `accept()` admits it: the stack answers the held SYN with SYN-ACK (the connection arrives
+  on `incoming_tcp` once established) or opens the flow with the held datagram on
+  `incoming_udp`, and counts it in `accepted`. `reject()`, or dropping the item, rejects it
+  (`rejected_hook`). Decisions take effect on the next driver turn and never wait; a
+  decision after the timeout, after a revoke or after the stack stopped does nothing.
+  - No decision within `timeout`: rejected, counted in `rejected_timeout`.
+  - `max_pending` entries held, or `max_pending` items not taken from `incoming_pending`:
+    a new connection or flow is rejected at once, counted in `rejected_table_full`.
+  - While a connection is held, its retransmitted SYNs are absorbed. While a flow is held,
+    its further datagrams are dropped and counted in `udp_queue_full`: a held flow queues
+    its first datagram only. An accepted flow opens in the flow table with its held
+    datagram.
+  - `incoming_pending` hands its items to the first call only (on any clone of the handle);
+    later calls, and every call without `Decide`, return a stream that ends at once. The
+    stream ends when the stack stops.
+
+A rejected TCP connection is answered with a RST and a rejected UDP flow with an ICMP port
+unreachable (type 3 code 3) or `ICMPv6` port unreachable (type 1 code 4) quoting the
+datagram, both sourced from the destination the peer dialed (on a stack without
+`transparent`, one of its own addresses), so the peer sees a refused connection or an
+unreachable port at the address it dialed. Without `transparent` there is no connection
+limit beyond the listener pool and the accept queue.
+
+`NetStackStats` carries the outcome: `pending` (a gauge: connections and flows held now),
+`accepted`, `rejected_hook`, `rejected_timeout`, `rejected_table_full` and, on a transparent
+stack, `rejected_connection_limit`. Each held connection or flow leaves `pending` accepted,
+counted in exactly one `rejected_` field, or revoked (counted nowhere). An accepted SYN may
+still be refused by the listener pool (`syn_refused`) or fail its handshake
+(`handshake_failed`), and an accepted datagram may meet the flow limit or a full accept
+queue.
 
 ### Per-flow control and retirement
 
@@ -430,6 +442,65 @@ The unit tests `src/stack/tests/flow_control.rs`, `flow_context.rs` and `flow_bo
 and `nsplane-e2e`'s `tests/netstack_flow_retirement.rs` cover the outcomes, the bounds and
 same-tuple re-opens.
 
+### Control from the first input
+
+Under `Admission::Decide` a connection's or flow's lifetime gets its `FlowState` when the
+driver holds its first input, not when the handle is created. `PendingFlow::control`
+returns its `FlowControl`, and the `TcpConnection` or `UdpFlow` handed out later carries the
+same control: a `FlowContext` bound on the pending control stays on the handle, and a
+revoke through either is one revoke. The driver binds the lifetime's target once: held (the
+tuple), then the listener socket that takes the accepted SYN, or the flow entry.
+
+- **Delivery receipt.** `FlowControl::delivery` returns a `DeliveryReceipt` (`outcome`, a
+  cancellation-safe `wait`). Each lifetime has exactly one `DeliveryOutcome`, fixed by one
+  compare-and-swap: `Delivered` when the `incoming_tcp` / `incoming_udp` stream takes the
+  handle, or `NotDelivered(Undelivered)` at the first event that ends the lifetime before.
+  A stream that finds a handle whose lifetime ended skips it, so it never returns it.
+  Handles admitted with `Immediate` and those the application opens (`connect_tcp`,
+  `bind_udp`, `connect_udp`) report `Delivered` from the start.
+
+| `Undelivered` | When | Counter |
+| --- | --- | --- |
+| `Rejected` | `reject()`, or the item dropped | `rejected_hook` |
+| `TimedOut` | no decision within `timeout` | `rejected_timeout` |
+| `ConnectionLimit` | `max_connections` reached at the accept | `rejected_connection_limit` |
+| `NoListener` | the accepted SYN found no listener socket (`listener_pool`) | `syn_refused` |
+| `HandshakeFailed` | the socket in SYN-RECEIVED was reset, or the connection closed before the stack took it | `handshake_failed` |
+| `AcceptQueueFull` | `incoming_tcp` / `incoming_udp` full (without `accept_backpressure` for TCP) | `tcp_not_accepted` / `udp_not_accepted` |
+| `AcceptQueueGone` | the stream was dropped: before the hand-out, or with the handle in its queue | `tcp_not_accepted` / `udp_not_accepted` before the hand-out |
+| `FlowLimit` | `max_udp_flows` reached at the accept | `udp_flow_limit` |
+| `Revoked` | `FlowControl::revoke` before the hand-out | none |
+| `Stopped` | the stack stopped first | none |
+
+- **Revoke before the hand-out.** The driver turn that observes the revoke retires the
+  lifetime at its stage and sends nothing: the pending entry (no RST or port unreachable; a
+  decision on the item afterwards does nothing); an accepted SYN not in smoltcp yet; the
+  listener socket in SYN-RECEIVED, released without an RST, with its SYN-ACK dropped from
+  the backlog or fenced in the egress queue from the egress position the socket took the
+  SYN at; the established connection waiting for `incoming_tcp`; the flow entry with its
+  queued datagrams; and a reassembly barrier as for any revoke. `RetirementOutcome` keeps
+  its meaning: `Retired` when the stack holds nothing of the lifetime, `Failed` when a
+  bounded table is full, `Unknown` when the stack stopped. A lifetime that already ended
+  undelivered holds nothing and retires at once; an answer already sent (the RST or port
+  unreachable of a rejection) is not withdrawn. A later SYN or datagram on the tuple is a
+  new lifetime.
+- **Refusals** are those of every control: `bind_context` on a revoked lifetime, a second
+  bind, exhausted instances. `NetStackSource::tcp_egress_drained` rejects a lifetime that
+  has no connection yet (`InvalidInput`).
+- **Bounds.** The stack tracks the lifetimes whose delivery is open to end them when it
+  stops: a list pruned of decided ones whenever it doubles, so at most twice the open ones
+  (the pending table, the listener pool, the waiting connections and the accept queues
+  bound those).
+- **Cost.** `Immediate` keeps its path: no state before the hand-out, one load per handle
+  taken from a stream. Under `Decide` the `FlowState` is allocated at the hold instead of
+  at adoption, plus one compare-and-swap per hand-out and one stage check per item the
+  streams take.
+
+The unit tests `src/stack/tests/first_input.rs` cover a revoke at every stage, every
+`Undelivered` reason, a revoke racing the hand-out on a multi-thread runtime, ordinary stacks
+deciding, and same-tuple lifetimes; `nsplane-e2e`'s `tests/netstack_first_input.rs` revokes
+TCP and UDP lifetimes at each stage between two engines while an accepted one echoes.
+
 ### Graceful TCP egress drain
 
 `TcpConnection::terminated` reports socket release. The final TCP ACK can still be
@@ -437,7 +508,8 @@ queued in the driver or `NetStackSource` at that point. Before revoking a gracef
 closed flow, keep receiving and forwarding packets until
 `NetStackSource::tcp_egress_drained(&control)` returns true. Finish each external send
 before checking the barrier; it does not cover a packet already returned by `recv`.
-The query rejects another stack's control, non-TCP flows and revoked flows. It does
+The query rejects another stack's control, non-TCP flows, revoked flows and lifetimes held
+under `Admission::Decide` that have no connection yet. It does
 not establish peer application completion or remote cleanup.
 
 ### Tests
@@ -468,7 +540,7 @@ not establish peer application completion or remote cleanup.
 | Fragment discard | `NetStackHandle::discard_fragments(src, dst, protocol, id)` when a flow's admission is revoked; needs `NetStackConfig::reassembly` | not called | none without reassembly; with it one atomic load per ingress packet while nothing is discarded, no lock |
 | Later-fragment ownership | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
 | Transparent termination | `NetStackConfig::transparent = Some(TransparentConfig { prefixes, ..Default::default() })` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
-| Per-flow admission | `TransparentConfig::admission = Admission::Decide { timeout, max_pending }`, decisions on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none |
+| Per-flow admission | `NetStackConfig::admission = Admission::Decide { timeout, max_pending }` (every stack), decisions and controls on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none: one `Option` check per bare SYN |
 | TCP connection limit | `TransparentConfig::max_connections = Some(n)` | `None`: listener pool and accept queue only | one `Option` check per bare SYN in transparent mode |
 | Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |
 | Connected UDP sockets | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
@@ -478,10 +550,12 @@ not establish peer application completion or remote cleanup.
 Everything the stack discards is counted per reason in `NetStackStats` (malformed, foreign
 and unsupported packets, refused and deferred SYNs, connections and flows not accepted, full
 UDP queues, the flow limit, egress over the backlog, ignored ICMP, reassembly timeouts and
-overflows, and in transparent mode the admission outcome: `accepted` and `rejected_hook`,
-`rejected_timeout`, `rejected_table_full`, `rejected_connection_limit`, `rejected_prefix`);
+overflows, failed inbound handshakes (`handshake_failed`), the admission outcome: `accepted`
+and `rejected_hook`, `rejected_timeout`, `rejected_table_full`, and in transparent mode
+`rejected_connection_limit`, `rejected_prefix`); a lifetime held under `Admission::Decide`
+also ends with one `DeliveryOutcome` on its `DeliveryReceipt`;
 packets dropped for a revoked flow are counted in `NetStackHandle::retired_drops`. A
-connection rejected in transparent mode reaches the peer as a RST (`connect_tcp` on a peer
+connection rejected under `Admission::Decide` reaches the peer as a RST (`connect_tcp` on a peer
 stack fails with `ConnectionRefused`), a rejected UDP flow as an ICMP or `ICMPv6` port
 unreachable from the original destination. Flow events lost to the token bucket, a full
 buffer or a dropped receiver are counted in `events_dropped`. Handle calls fail with `std::io::Error` kinds:
@@ -498,7 +572,9 @@ revoked flow) and `BrokenPipe` (the stack stopped).
 - Reassembly and the fragment memories: `ReassemblyConfig` (64 datagrams, 30 s, 65 535 bytes
   by default).
 - Pending table of `Admission::Decide`: `max_pending` entries (0 is taken as 1), each held
-  for at most `timeout` (at most one day); a held flow queues one datagram.
+  for at most `timeout` (at most one day); a held flow queues one datagram. Lifetimes with
+  an open delivery: at most twice those the pending table, listener pool, waiting
+  connections and accept queues hold.
 - TCP connections in transparent mode: `TransparentConfig::max_connections`, otherwise the
   listener pool and the accept queue.
 - Flow events: `FlowEventsConfig::capacity` buffered events (0 is taken as 1) and a token

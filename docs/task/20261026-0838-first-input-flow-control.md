@@ -44,4 +44,22 @@ Implementing netstack flow control from the first input
 
 ## Notes
 
-(none yet)
+- Lifetime state: `FlowState` is created at the hold (`FlowState::held`), its target bound
+  once by the driver (the listener socket at SYN-RECEIVED, the flow entry at accept); the
+  delivery stage is one `AtomicU8` fixed by compare-and-swap (`deliver` at the stream,
+  `undeliver(reason)` at the first terminal event, the revoke included). Rejection, timeout
+  and connection-limit answers are sent only when the driver wins that swap, so a
+  concurrent revoke never ends `Revoked` with an answer sent.
+- Retirement per stage: held entry removed; accepted SYN dropped in `take_decisions` when
+  revoked; SYN-RECEIVED socket removed without RST plus TCP fence from the socket's start
+  mark; connection removed from `waiting`; the flow entry; a reassembly barrier from the
+  held tuple. A SYN refused by the pool after a concurrent revoke has smoltcp's RST purged.
+- `tcp_egress_drained` rejects a lifetime without a connection (adopted flag), as the plan
+  states.
+- An accepted UDP lifetime opens in the flow table directly (no socket precedence), so the
+  lifetime always maps to one `UdpFlow`.
+- Stop: `Pending` keeps weak references to open lifetimes, pruned on doubling; the driver's
+  drop ends them `Stopped` before its fields drop.
+- Out-of-scope files touched only to migrate off the deprecated field: the
+  `dns_netstack` example, `nsplane-e2e` `netstack_transparent.rs` and the guide snippets
+  (English and Chinese).
