@@ -1,6 +1,6 @@
 # 20261026-0838-first-input-flow-control Netstack flow control from the first input
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P1
 - **owner**: w1/first-input-flow-control
 - **createdAt**: 2026-10-26 08:38
@@ -63,3 +63,26 @@ Implementing netstack flow control from the first input
 - Out-of-scope files touched only to migrate off the deprecated field: the
   `dns_netstack` example, `nsplane-e2e` `netstack_transparent.rs` and the guide snippets
   (English and Chinese).
+- Slot A/B, `cargo bench -p nsplane-netstack --bench send_stream`, default configuration,
+  A = 52eb983, B = this branch, interleaved A,B,A,B per `scripts/bench/slot.sh`, means in
+  ms (TCP) and us (UDP):
+
+  | Case | Run 1 A | Run 1 B | Run 2 (round 2) A | B | Run 4 A (3 rounds) | B |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | `netstack_send/streams_1` | 3.273, 3.263 | 3.243, 3.260 | 3.294 | 3.240 | | |
+  | `netstack_send/streams_4` | 2.086, 2.441* | 2.050, 2.062 | 2.038 | 2.012 | | |
+  | `netstack_udp_send/flows_1` | 563.6, 564.4 | 566.2, 571.6 | 570.9 | 563.6 | 594.6, 583.3, 597.6 | 579.2, 592.7, 585.2 |
+  | `netstack_udp_send/flows_4` | 474.3, 480.6 | 477.0, 475.7 | 482.0 | 471.4 | 491.8, 527.0*, 486.2 | 491.0, 483.4, 481.1 |
+
+  Run 1 measured the implementation commit, runs 2-4 the final head (run 2's round 1, at
+  load 6-7, and run 3, at load 12-39, were discarded). `*`: outliers with wide intervals,
+  seen on either side. Within noise; no regression on the default path.
+- Gate: `just check` exit 100 on two tests outside this change
+  (`nsplane udp::tests::burst_fits_default_buffer`,
+  `nsplane-e2e offload_udp bulk_transfer_ipv6_offload_on_on_workers`, both 5 s timeouts on
+  kernel loopback UDP); they fail identically on 52eb983 on this host. Every other test
+  (2367) and every other recipe (fmt, clippy, doc-test, deny, shear, typos, msrv, examples,
+  product-terms, docs) passes; `cargo doc` with warnings denied passes. `just cross` was
+  not run: `cargo-zigbuild` is not installed on this host.
+
+- complete: implemented on feat/first-input-flow-control; merges last in release B
