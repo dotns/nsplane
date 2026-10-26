@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- nsplane-noise logs the routine timer events `HANDSHAKE(REKEY_TIMEOUT)`,
+  `HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)`, the rekey on receive and both `CONNECTION_EXPIRED`
+  events at debug instead of warn / error, like the other rekey events: a peer that leaves
+  without notice is normal protocol behavior and filled server logs at the info level.
 - nsplane-tun and nsplane-ether require `tokio` 1.54.0: they call `AsyncFd::register`, which
   1.53 lacks, but declared 1.53.1, so a consumer locked to tokio 1.53 failed to compile them
   instead of getting a resolver error.

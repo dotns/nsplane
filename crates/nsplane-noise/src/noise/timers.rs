@@ -245,7 +245,7 @@ impl Tunn {
         // All ephemeral private keys and symmetric session keys are zeroed out after
         // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
         if now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3 {
-            tracing::error!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
+            tracing::debug!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
             self.handshake.set_expired();
             self.clear_all();
             return Err(WireGuardError::ConnectionExpired);
@@ -258,7 +258,7 @@ impl Tunn {
         if self.handshake.is_init_sent()
             && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= REKEY_ATTEMPT_TIME
         {
-            tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+            tracing::debug!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
             self.handshake.set_expired();
             self.clear_all();
             return Err(WireGuardError::ConnectionExpired);
@@ -275,7 +275,7 @@ impl Tunn {
             let due = now.saturating_sub(self.timers.handshake_init_sent)
                 >= REKEY_TIMEOUT + self.timers.handshake_jitter;
             if due {
-                tracing::warn!("HANDSHAKE(REKEY_TIMEOUT)");
+                tracing::debug!("HANDSHAKE(REKEY_TIMEOUT)");
             }
             return due;
         }
@@ -312,7 +312,7 @@ impl Tunn {
             if session_established < self.timers[TimeLastDataPacketReceived]
                 && session_age >= REKEY_ON_RECEIVE_TIME
             {
-                tracing::warn!(
+                tracing::debug!(
                     "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT (on receive))"
                 );
                 return true;
@@ -326,7 +326,7 @@ impl Tunn {
             .handshake_due_from
             .is_some_and(|sent| now.saturating_sub(sent) >= KEEPALIVE_TIMEOUT + REKEY_TIMEOUT)
         {
-            tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
+            tracing::debug!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
             self.timers.handshake_due_from = None;
             return true;
         }
