@@ -8,9 +8,11 @@ use std::time::Duration;
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{CoreConfig, PacketFilter, PathPolicy, StandardRoaming};
 use nsplane_packet::TransportId;
+use tokio::sync::mpsc;
 
 use crate::engine::{self, Engine, NewTransport};
 use crate::fragment::{FragmentConfig, Fragmenter};
+use crate::handle::{Plaintext, PlaintextIngress};
 use crate::io::{PacketSink, PacketSource};
 use crate::path_mtu;
 use crate::transport::Transport;
@@ -63,6 +65,7 @@ pub struct EngineBuilder<Src, Snk> {
     crypto_workers: usize,
     transport_max: BTreeMap<TransportId, u16>,
     path_mtu_expiry: Duration,
+    plaintext: Option<mpsc::Receiver<Plaintext>>,
 }
 
 impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
@@ -79,6 +82,7 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("crypto_workers", &self.crypto_workers)
             .field("transport_max", &self.transport_max)
             .field("path_mtu_expiry", &self.path_mtu_expiry)
+            .field("plaintext_ingress", &self.plaintext.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -101,6 +105,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             crypto_workers: 0,
             transport_max: BTreeMap::new(),
             path_mtu_expiry: path_mtu::DEFAULT_EXPIRY,
+            plaintext: None,
         }
     }
 
@@ -216,6 +221,17 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         self
     }
 
+    /// A bounded entry of `capacity` packets (at least 1) for plaintext packets attributed to
+    /// a peer, checked like decrypted data; see [`PlaintextIngress`]. Without it the engine
+    /// has no such queue and polls none. A second call replaces the first entry, whose
+    /// calls then fail as if the engine had stopped.
+    #[must_use]
+    pub fn plaintext_ingress(mut self, capacity: usize) -> (Self, PlaintextIngress) {
+        let (queue, packets) = mpsc::channel(capacity.max(1));
+        self.plaintext = Some(packets);
+        (self, PlaintextIngress::new(queue))
+    }
+
     /// Spawns the engine's tasks and returns the running engine.
     ///
     /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
@@ -258,6 +274,7 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             crypto_workers: self.crypto_workers,
             transport_max: self.transport_max,
             path_mtu_expiry: self.path_mtu_expiry,
+            plaintext: self.plaintext,
         }))
     }
 }

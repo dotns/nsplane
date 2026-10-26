@@ -60,22 +60,7 @@ impl Owner {
                 let _ = reply.send(self.remove_transport(id).await);
             }
             Command::ReplaceTransport(transport, reply) => {
-                let result = match self.transports.remove(&transport.id) {
-                    Some(old) => {
-                        // The datagrams queued for the old transport go out on the new one,
-                        // and its counters keep running.
-                        let traffic = Arc::clone(&old.traffic);
-                        let pending = old.stop().await;
-                        // The old transmit task is gone with what it held.
-                        traffic.outstanding.store(0, Ordering::Relaxed);
-                        let slot = self.start_transport(transport.start, pending, Some(traffic));
-                        self.transports.insert(transport.id, slot);
-                        self.drain(false);
-                        Ok(())
-                    }
-                    None => Err(TransportError::Unknown(transport.id)),
-                };
-                let _ = reply.send(result);
+                let _ = reply.send(self.replace_transport(transport).await);
             }
             Command::Suspend(reply) => {
                 self.suspend();
@@ -112,6 +97,7 @@ impl Owner {
             | Command::PeerMtus(..)
             | Command::PathMtuStats(..)) => self.path_mtu_command(command),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
+            Command::LocalBarrier(position, reply) => self.local_barrier(position, reply),
             Command::UnansweredHandshakes(peer, reply) => {
                 let _ = reply.send(self.core.unanswered_handshakes(peer));
             }
@@ -311,6 +297,24 @@ impl Owner {
             self.core.recycle(data);
             self.dropped(None, DROP_TRANSPORT_REMOVED);
         }
+        Ok(())
+    }
+
+    /// Replaces the transport with `transport`'s id by `transport`.
+    async fn replace_transport(&mut self, transport: NewTransport) -> Result<(), TransportError> {
+        let old = self
+            .transports
+            .remove(&transport.id)
+            .ok_or(TransportError::Unknown(transport.id))?;
+        // The datagrams queued for the old transport go out on the new one, and its counters
+        // keep running.
+        let traffic = Arc::clone(&old.traffic);
+        let pending = old.stop().await;
+        // The old transmit task is gone with what it held.
+        traffic.outstanding.store(0, Ordering::Relaxed);
+        let slot = self.start_transport(transport.start, pending, Some(traffic));
+        self.transports.insert(transport.id, slot);
+        self.drain(false);
         Ok(())
     }
 

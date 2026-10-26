@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{
@@ -11,6 +12,7 @@ use nsplane_core::{
     PeerConfig, PeerStats,
 };
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::engine::NewTransport;
@@ -46,6 +48,105 @@ impl fmt::Display for EngineError {
 }
 
 impl Error for EngineError {}
+
+/// A plaintext packet for [`nsplane_core::Core::receive_plaintext`]: the peer it is
+/// attributed to, the path it arrived on and the packet.
+pub(crate) type Plaintext = (PeerId, Path, PacketBuf);
+
+/// A bounded entry for plaintext packets attributed to a peer, checked like decrypted data;
+/// from [`crate::EngineBuilder::plaintext_ingress`]. Cheap to clone; every clone feeds the
+/// same queue.
+///
+/// The engine's owner task takes the packets in order, at most a batch at a time, while the
+/// deliver queue has room (like received datagrams), and runs each through
+/// [`Core::receive_plaintext`](nsplane_core::Core::receive_plaintext): the sending peer's
+/// allowed-IP source check, its inbound destinations, the inbound filters in install order
+/// ([`crate::PacketFilter::inbound_from`] with the given path) and delivery to the sink.
+/// Drops count under the same reasons as for decrypted data, a peer that does not exist or
+/// was removed under [`crate::reasons::UNKNOWN_PLAINTEXT_PEER`]. Nothing is authenticated:
+/// no handshake accounting, no path policy, no roaming and no `Event::Authenticated`, and a
+/// filter that answers on the arrival path answers on the given one. Delivered bytes count in
+/// the peer's `data_rx`, not in `rx`.
+///
+/// Unlike [`EngineHandle::inject_inbound`], which bypasses the checks and the filters, this
+/// entry runs them all. While the engine is suspended the queue is not read.
+#[derive(Debug, Clone)]
+pub struct PlaintextIngress {
+    queue: mpsc::Sender<Plaintext>,
+}
+
+impl PlaintextIngress {
+    pub(crate) const fn new(queue: mpsc::Sender<Plaintext>) -> Self {
+        Self { queue }
+    }
+
+    /// Queues `packet` as received from `peer` on `from`; waits while the queue is full.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] once the engine has stopped; the packet is dropped.
+    pub async fn send(
+        &self,
+        peer: PeerId,
+        from: Path,
+        packet: PacketBuf,
+    ) -> Result<(), EngineError> {
+        self.queue
+            .send((peer, from, packet))
+            .await
+            .map_err(|_| EngineError)
+    }
+
+    /// Like [`PlaintextIngress::send`], but refuses at once with the packet when the queue
+    /// is full.
+    ///
+    /// # Errors
+    ///
+    /// [`PlaintextRefused::Full`] when the queue is full, [`PlaintextRefused::Stopped`] once
+    /// the engine has stopped; both carry the packet back.
+    pub fn try_send(
+        &self,
+        peer: PeerId,
+        from: Path,
+        packet: PacketBuf,
+    ) -> Result<(), PlaintextRefused> {
+        self.queue
+            .try_send((peer, from, packet))
+            .map_err(|e| match e {
+                TrySendError::Full((_, _, packet)) => PlaintextRefused::Full(packet),
+                TrySendError::Closed((_, _, packet)) => PlaintextRefused::Stopped(packet),
+            })
+    }
+}
+
+/// Why [`PlaintextIngress::try_send`] refused a packet, with the packet.
+#[derive(Debug)]
+pub enum PlaintextRefused {
+    /// The queue is full.
+    Full(PacketBuf),
+    /// The engine has stopped.
+    Stopped(PacketBuf),
+}
+
+impl PlaintextRefused {
+    /// The refused packet.
+    pub fn into_packet(self) -> PacketBuf {
+        match self {
+            Self::Full(packet) | Self::Stopped(packet) => packet,
+        }
+    }
+}
+
+impl fmt::Display for PlaintextRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => f.write_str("the plaintext ingress queue is full"),
+            Self::Stopped(_) => EngineError.fmt(f),
+        }
+    }
+}
+
+impl Error for PlaintextRefused {}
 
 /// The error of the transport calls of [`EngineHandle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +400,9 @@ pub(crate) enum Command {
     SetLocalSources(LocalIdentityId, Vec<AllowedIp>, oneshot::Sender<bool>),
     LocalIdentities(oneshot::Sender<Vec<LocalIdentity>>),
     PeerIdIn(LocalIdentityId, PublicKey, oneshot::Sender<Option<PeerId>>),
+    /// Replies once the owner has taken this many local packets through routing and the
+    /// outbound filters.
+    LocalBarrier(u64, oneshot::Sender<()>),
 }
 
 /// A cheap, cloneable handle to a running engine.
@@ -309,19 +413,24 @@ pub(crate) enum Command {
 #[derive(Clone)]
 pub struct EngineHandle {
     commands: mpsc::Sender<Command>,
+    /// Local packets the source task took from the source so far.
+    source_taken: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for EngineHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EngineHandle")
             .field("closed", &self.commands.is_closed())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl EngineHandle {
-    pub(crate) const fn new(commands: mpsc::Sender<Command>) -> Self {
-        Self { commands }
+    pub(crate) const fn new(commands: mpsc::Sender<Command>, source_taken: Arc<AtomicU64>) -> Self {
+        Self {
+            commands,
+            source_taken,
+        }
     }
 
     /// Sends the command built by `command` and waits for its reply.
@@ -897,6 +1006,30 @@ impl EngineHandle {
     /// then find the peer with [`EngineHandle::unanswered_handshakes`].
     pub async fn total_unanswered_handshakes(&self) -> Result<u64, EngineError> {
         self.call(Command::TotalUnansweredHandshakes).await
+    }
+
+    /// Waits until every packet the engine took from its [`crate::PacketSource`] before this
+    /// call has been routed and passed or been dropped by the outbound filters (or dropped
+    /// for no route, by the fragmentation stage or by the tunnel's queue).
+    ///
+    /// A packet counts as taken once the engine's source task has it back from
+    /// [`crate::PacketSource::recv_batch`] and counted it, right after the read; this
+    /// includes packets in the engine's local queue and those the source task holds while
+    /// that queue is full. With the fragmentation stage the barrier waits for every fragment
+    /// of a taken packet, and with crypto workers only for routing and the filters, which run
+    /// on the owner task before a packet is handed to a worker. Packets still in the source
+    /// (a kernel TUN queue, the caller's own queue before `recv_batch` returns them) are not
+    /// covered: a caller that changes the ownership of an address fences its source first,
+    /// then takes the barrier. The call returns at once when nothing taken is waiting, and
+    /// while the engine is suspended it completes only after [`EngineHandle::resume`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] once the engine has stopped before the barrier passed; a stopped
+    /// engine never reports a barrier it did not pass.
+    pub async fn local_barrier(&self) -> Result<(), EngineError> {
+        let position = self.source_taken.load(Ordering::Acquire);
+        self.call(|tx| Command::LocalBarrier(position, tx)).await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and

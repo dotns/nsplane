@@ -1,11 +1,31 @@
 //! Feeding local packets and received datagrams to the core or the crypto workers.
 
 use nsplane_packet::{MAX_BATCH, PacketBuf};
+use tokio::sync::{mpsc, oneshot};
 
 use super::transport::Datagram;
 use super::workers::JobBatch;
 use super::{Owner, now};
 use crate::fragment::Action;
+use crate::handle::Plaintext;
+
+/// Local barriers ([`EngineHandle::local_barrier`]) and how far the owner task is.
+///
+/// [`EngineHandle::local_barrier`]: crate::EngineHandle::local_barrier
+#[derive(Default)]
+pub(super) struct Barriers {
+    /// Local packets taken through routing and the outbound filters so far.
+    done: u64,
+    /// Barriers waiting for `done` to reach their position.
+    waiting: Vec<(u64, oneshot::Sender<()>)>,
+}
+
+/// The queue of [`crate::PlaintextIngress`].
+pub(super) struct PlaintextQueue {
+    pub(super) packets: mpsc::Receiver<Plaintext>,
+    /// Alternates which of plaintext packets and datagrams is polled first.
+    pub(super) first: bool,
+}
 
 impl Owner {
     /// Feeds `first` and the datagrams queued behind it to the core as one batch, or their
@@ -115,6 +135,54 @@ impl Owner {
             self.dispatch_jobs(false);
         } else {
             self.core.handle_locals(batch.drain(..), now);
+        }
+        // Routing and the outbound filters ran in the call above, also for deferred jobs.
+        self.barriers.done += taken as u64;
+        if !self.barriers.waiting.is_empty() {
+            self.pass_barriers();
+        }
+    }
+
+    /// Replies to the local barrier at `position` at once if the owner reached it, or once
+    /// it does.
+    pub(super) fn local_barrier(&mut self, position: u64, reply: oneshot::Sender<()>) {
+        self.barriers.waiting.push((position, reply));
+        self.pass_barriers();
+    }
+
+    /// Replies to the local barriers whose position the owner reached, or to every one once
+    /// no local packet comes any more.
+    #[cold]
+    pub(super) fn pass_barriers(&mut self) {
+        let done = if self.local.is_some() {
+            self.barriers.done
+        } else {
+            u64::MAX
+        };
+        let (passed, waiting) = std::mem::take(&mut self.barriers.waiting)
+            .into_iter()
+            .partition(|(position, _)| *position <= done);
+        self.barriers.waiting = waiting;
+        for (_, reply) in passed {
+            let _ = reply.send(());
+        }
+    }
+
+    /// Runs `first` and the plaintext packets queued behind it through the core's checks of
+    /// decrypted data: at most [`MAX_BATCH`] and, since each may deliver a packet, no more
+    /// than the deliver queue has room for beyond the received datagrams with the crypto
+    /// workers (but always `first`, read only once there is room).
+    pub(super) fn input_plaintext(&mut self, first: Plaintext) {
+        let room = MAX_BATCH.min(self.deliver_room());
+        let (peer, from, packet) = first;
+        self.core.receive_plaintext(peer, from, packet);
+        let mut taken = 1;
+        while taken < room
+            && let Some(plaintext) = &mut self.plaintext
+            && let Ok((peer, from, packet)) = plaintext.packets.try_recv()
+        {
+            self.core.receive_plaintext(peer, from, packet);
+            taken += 1;
         }
     }
 

@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 
 use nsplane_core::x25519::StaticSecret;
@@ -29,7 +29,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep, sleep_until};
 
-use self::output::{Backoff, Inline, InlineSink};
+use self::input::{Barriers, PlaintextQueue};
+use self::output::{Inline, InlineSink};
 use self::path_mtu::PathMtus;
 use self::queue::{BatchQueue, BatchSender, batch_queue};
 use self::tasks::{read_source, watch_mtu, write_sink};
@@ -37,7 +38,7 @@ pub(crate) use self::transport::NewTransport;
 use self::transport::{Datagram, DeliverRoom, Recycle, SendErrors, TransportSlot};
 use self::workers::Workers;
 use crate::fragment::Fragmenter;
-use crate::handle::{Command, EngineHandle, QueueDepth, QueueStats};
+use crate::handle::{Command, EngineHandle, Plaintext, QueueDepth, QueueStats};
 use crate::io::{PacketSink, PacketSource};
 #[cfg(doc)]
 use crate::transport::Transport;
@@ -199,6 +200,15 @@ const PATH_MTU_REPORTS: usize = 16;
 /// waits for the packets with the workers, so the call sees (and acts after) every packet
 /// read before it, as without workers.
 ///
+/// Local barrier: [`EngineHandle::local_barrier`] waits until every local packet the source
+/// task took before the call has been routed and filtered or dropped; the source task counts
+/// each read in a counter the handles share, the owner counts what it took through the core.
+///
+/// Plaintext ingress: with [`EngineBuilder::plaintext_ingress`] the owner also polls a
+/// bounded queue of plaintext packets attributed to peers, next to the received datagrams and
+/// under the same deliver-queue backpressure, and runs each through
+/// [`Core::receive_plaintext`].
+///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
 /// keeps running without it; other I/O errors are logged and the task continues. A datagram
 /// the transport fails to send (any error, [`io::ErrorKind::BrokenPipe`] included) is
@@ -215,6 +225,7 @@ const PATH_MTU_REPORTS: usize = 16;
 /// [`PathPolicy`]: nsplane_core::PathPolicy
 /// [`DynTransport`]: crate::DynTransport
 /// [`EngineBuilder::crypto_workers`]: crate::EngineBuilder::crypto_workers
+/// [`EngineBuilder::plaintext_ingress`]: crate::EngineBuilder::plaintext_ingress
 /// [`EngineBuilder::transport_max_datagram`]: crate::EngineBuilder::transport_max_datagram
 pub struct Engine {
     handle: EngineHandle,
@@ -271,6 +282,8 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) transport_max: BTreeMap<TransportId, u16>,
     /// How long a learned path MTU lasts.
     pub(crate) path_mtu_expiry: Duration,
+    /// The queue of [`crate::PlaintextIngress`], if built.
+    pub(crate) plaintext: Option<mpsc::Receiver<Plaintext>>,
 }
 
 /// Spawns the owner task and the I/O tasks.
@@ -292,6 +305,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let (mtu_tx, mtu_changes) = mpsc::channel(1);
     let mut mtu_watch = parts.source.mtu();
     let mtu = *mtu_watch.borrow_and_update();
+    let source_taken = Arc::new(AtomicU64::new(0));
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.
@@ -334,6 +348,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
                 local_tx,
                 source_recycled,
                 Arc::clone(&recycle.declined),
+                Arc::clone(&source_taken),
                 suspended.subscribe(),
             )),
             Task::spawn(write_sink(
@@ -357,18 +372,16 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         },
         staged: false,
         deliver_room: None,
-        sink: InlineSink {
-            try_deliver: Box::new(move |packets| sink.try_send_batch(packets)),
-            outstanding: sink_outstanding,
-            allowed: fast_path,
-            closed: false,
-            backoff: Backoff::default(),
-            delivered: VecDeque::with_capacity(MAX_BATCH),
-        },
+        sink: InlineSink::new(sink, sink_outstanding, fast_path),
         workers,
         datagram_batch: Vec::with_capacity(MAX_BATCH),
         local_batch: Vec::with_capacity(MAX_BATCH),
         jobs: Vec::with_capacity(MAX_BATCH),
+        barriers: Barriers::default(),
+        plaintext: parts.plaintext.map(|packets| PlaintextQueue {
+            packets,
+            first: false,
+        }),
     };
     for transport in parts.transports {
         let slot = owner.start_transport(transport.start, VecDeque::new(), None);
@@ -376,7 +389,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     }
 
     Engine {
-        handle: EngineHandle::new(command_tx),
+        handle: EngineHandle::new(command_tx, source_taken),
         owner: Some(tokio::spawn(owner.run())),
     }
 }
@@ -484,4 +497,7 @@ struct Owner {
     local_batch: Vec<PacketBuf>,
     /// Reused for the crypto jobs of each batch.
     jobs: Vec<CryptoJob>,
+    barriers: Barriers,
+    /// The plaintext ingress queue; `None` without one or once every entry is gone.
+    plaintext: Option<PlaintextQueue>,
 }

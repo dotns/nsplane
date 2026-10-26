@@ -55,7 +55,7 @@ pub use events::{
 pub use fragment::{FragmentConfig, FragmentStats};
 pub use handle::{
     EngineError, EngineHandle, EngineStatus, LocalIdentity, PathMtuStats, Peer, PeerMtus,
-    QueueDepth, QueueStats, TransportError, TransportStats,
+    PlaintextIngress, PlaintextRefused, QueueDepth, QueueStats, TransportError, TransportStats,
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};

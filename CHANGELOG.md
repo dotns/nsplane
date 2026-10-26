@@ -5,6 +5,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `EngineHandle::local_barrier` waits until every packet the engine took from its
+  `PacketSource` before the call has been routed and passed or been dropped by the outbound
+  filters (or dropped for no route, by the fragmentation stage or by the tunnel's queue),
+  including the packets in the local queue and those the source task holds while it is full,
+  with the fragmentation stage and with crypto workers. A suspended engine passes it after
+  resuming; a stopped one returns `EngineError` and never reports a barrier it did not pass.
+  Packets still in the source itself are not covered. Cost: one atomic add per source read.
+- Validated plaintext ingress: `Core::receive_plaintext` runs a plaintext IP packet
+  attributed to a peer through the post-decryption code of a transport data packet (source
+  check, inbound destinations, `PacketFilter::inbound_from` in install order with the given
+  path, delivery), shared with it, so both meet the same verdicts and drop reasons. Unknown or
+  removed peers are dropped as the new `reasons::UNKNOWN_PLAINTEXT_PEER`; a packet without a
+  readable IPv4 or IPv6 source as `SOURCE_NOT_ALLOWED`. Nothing is authenticated (no
+  handshake accounting, path policy, roaming or `Event::Authenticated`); delivered bytes
+  count in `data_rx`. `EngineBuilder::plaintext_ingress(capacity)` returns a bounded
+  `PlaintextIngress` (`send` waits, `try_send` refuses with `PlaintextRefused`) that the
+  engine polls next to the received datagrams under the deliver-queue backpressure.
+  `inject_inbound` keeps its bypass contract.
+
 ## [0.19.3] - 2026-10-26
 
 Patch release; no public API change.

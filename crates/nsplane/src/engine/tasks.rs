@@ -6,7 +6,7 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, PeerId};
@@ -65,6 +65,7 @@ pub(super) async fn read_source<Src: PacketSource>(
     local: BatchSender<PacketBuf>,
     mut recycled: BatchQueue<PacketBuf>,
     declined: Arc<AtomicBool>,
+    taken: Arc<AtomicU64>,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut batch = PacketBatch::new();
@@ -83,6 +84,9 @@ pub(super) async fn read_source<Src: PacketSource>(
             bufs.clear();
         }
         let result = source.recv_batch(&mut batch).await;
+        if !batch.is_empty() {
+            taken.fetch_add(batch.len() as u64, Ordering::Release);
+        }
         packets.extend(batch.drain());
         if local.send(&mut packets).await.is_err() {
             return;
