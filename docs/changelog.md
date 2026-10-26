@@ -413,3 +413,11 @@ Prepare 0.19.2 (tag `v0.19.2`) at the owner's request: nsplane-tun and nsplane-e
 compile them), and nsplane-noise logs the routine handshake timer events at debug instead of
 warn / error (a server with about 110 clients logged some 380 such lines per 30 minutes at the
 info level). Workspace versions, internal requirements and guide tags synchronized.
+
+## 2026-10-26 [release]
+
+Prepare 0.19.3 (tag `v0.19.3`) at the owner's request: nsplane-ether and nsplane-tun build for
+Linux musl targets (`msg_iovlen` and the `ioctl` request type differ between glibc and musl), and
+`just cross` runs clippy for `x86_64-unknown-linux-musl`. Also carries the module splits of
+nsplane-core `core.rs` and nsplane-netstack `stack.rs` (pure moves, no API change). Workspace
+versions, internal requirements and guide tags synchronized.

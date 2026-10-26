@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-10-26
+
+Patch release; no public API change.
+
 ### Fixed
 - nsplane-ether and nsplane-tun build for Linux musl targets: `msg_iovlen` and the `ioctl`
   request type differ between glibc and musl, and nsplane-ether passed the glibc types, so a
