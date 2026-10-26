@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-26
+
+Patch release; no public API change.
+
 ### Fixed
 - nsplane-noise logs the routine timer events `HANDSHAKE(REKEY_TIMEOUT)`,
   `HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)`, the rekey on receive and both `CONNECTION_EXPIRED`

@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-acl"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "criterion",
  "nix",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-cli"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-core"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "criterion",
  "ip_network",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-dns"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-e2e"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-ether"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "futures-core",
  "libc",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-examples"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-nat"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "criterion",
  "nsplane",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-netstack"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-noise"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "aead",
  "aws-lc-rs",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-packet"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-tun"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "criterion",
  "futures-core",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-uapi"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "nsplane-wss"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "bytes",
  "futures-util",

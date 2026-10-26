@@ -405,3 +405,11 @@ Prepare 0.19.1 (tag `v0.19.1`) at the owner's request: the reply allowance revoc
 (task `20261024-2224-acl-rule-reply-revocation`, GitHub issue #8) and two additive queries
 merged from the peer session readiness branch (`peer_has_session`, `NetStackSource::tcp_egress_drained`).
 Workspace versions, internal requirements and guide tags synchronized.
+
+## 2026-10-26 [release]
+
+Prepare 0.19.2 (tag `v0.19.2`) at the owner's request: nsplane-tun and nsplane-ether declare
+`tokio` 1.54.0, the first release with `AsyncFd::register` (a consumer locked to 1.53 failed to
+compile them), and nsplane-noise logs the routine handshake timer events at debug instead of
+warn / error (a server with about 110 clients logged some 380 such lines per 30 minutes at the
+info level). Workspace versions, internal requirements and guide tags synchronized.
