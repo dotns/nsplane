@@ -10,8 +10,19 @@ use tokio::sync::mpsc::error::TrySendError;
 use crate::stats::{self, Counters};
 
 /// Bounds of the admission event channel of
-/// [`TransparentConfig::events`](crate::TransparentConfig::events). Build it with
-/// `..Default::default()` so fields added later keep the construction compiling.
+/// [`TransparentConfig::events`](crate::TransparentConfig::events).
+///
+/// Fields may be added in any release. Start from [`Default::default`] and assign the
+/// fields to change:
+///
+/// ```
+/// use nsplane_netstack::FlowEventsConfig;
+///
+/// let mut events = FlowEventsConfig::default();
+/// events.rate = 100;
+/// assert_eq!(events.capacity, 1024);
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowEventsConfig {
     /// Events buffered for the receiver; an event finding the buffer full is dropped. A

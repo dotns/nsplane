@@ -200,10 +200,7 @@ pub struct NetStackConfig {
     /// use nsplane_netstack::{NetStackConfig, TransparentConfig};
     ///
     /// let mut config = NetStackConfig::default();
-    /// config.transparent = Some(TransparentConfig {
-    ///     prefixes: vec![],
-    ///     ..Default::default()
-    /// });
+    /// config.transparent = Some(TransparentConfig::default());
     /// assert!(config.transparent.is_some());
     /// ```
     ///
@@ -228,21 +225,20 @@ pub struct NetStackConfig {
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
 ///
-/// Build it with `..Default::default()` so that fields added later keep the literal
-/// compiling:
+/// Fields may be added in any release. Start from [`Default::default`] and assign the
+/// fields to change:
 ///
 /// ```
 /// use std::net::{IpAddr, Ipv4Addr};
 ///
 /// use nsplane_netstack::TransparentConfig;
 ///
-/// let config = TransparentConfig {
-///     prefixes: vec![(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)],
-///     max_connections: Some(1024),
-///     ..Default::default()
-/// };
+/// let mut config = TransparentConfig::default();
+/// config.prefixes = vec![(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)];
+/// config.max_connections = Some(1024);
 /// assert_eq!(config.max_connections, Some(1024));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransparentConfig {
     /// Destination prefixes the stack accepts, each an address with its prefix length;

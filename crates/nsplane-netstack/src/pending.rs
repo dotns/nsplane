@@ -16,6 +16,22 @@ use crate::device::TAILROOM;
 use crate::flow::{FlowControl, FlowState, Revocations, Undelivered};
 
 /// The transport protocol of a [`PendingFlow`].
+///
+/// Variants may be added in any release: a `match` outside this crate needs a wildcard arm.
+///
+/// ```
+/// use nsplane_netstack::PendingProtocol;
+///
+/// fn name(protocol: PendingProtocol) -> &'static str {
+///     match protocol {
+///         PendingProtocol::Tcp => "tcp",
+///         PendingProtocol::Udp => "udp",
+///         _ => "other",
+///     }
+/// }
+/// assert_eq!(name(PendingProtocol::Udp), "udp");
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingProtocol {
     /// A TCP connection, held at its bare SYN.

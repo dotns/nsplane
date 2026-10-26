@@ -66,6 +66,13 @@ fn prefixes() -> Vec<(IpAddr, u8)> {
     ]
 }
 
+/// Transparent mode for [`prefixes`].
+fn in_prefixes() -> TransparentConfig {
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = prefixes();
+    transparent
+}
+
 /// The client node: a plain stack whose engine routes everything to the server, with the
 /// ICMP and `ICMPv6` packets it receives split off to `icmp` instead of its stack.
 struct Client {
@@ -308,14 +315,7 @@ async fn expect_port_unreachable(client: &mut Client, target: SocketAddr) -> Tes
 
 #[tokio::test]
 async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
-    let (client, server) = pair(
-        Some(TransparentConfig {
-            prefixes: prefixes(),
-            ..Default::default()
-        }),
-        Admission::Immediate,
-    )
-    .await?;
+    let (client, server) = pair(Some(in_prefixes()), Admission::Immediate).await?;
     let mut reports = serve_echo(&server.stack);
 
     for target in [TCP4, TCP6] {
@@ -342,10 +342,7 @@ async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
 #[tokio::test]
 async fn decide_admission_accepts_and_rejects() -> TestResult {
     let (mut client, server) = pair(
-        Some(TransparentConfig {
-            prefixes: prefixes(),
-            ..Default::default()
-        }),
+        Some(in_prefixes()),
         Admission::Decide {
             timeout: WAIT,
             max_pending: 16,

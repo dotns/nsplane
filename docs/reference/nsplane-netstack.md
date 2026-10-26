@@ -529,9 +529,11 @@ not establish peer application completion or remote cleanup.
 
 ## Configuration and defaults
 
-`NetStackConfig` and `NetStackStats` are `#[non_exhaustive]`: build a configuration from
-`NetStackConfig::new` or `Default::default()` and assign the fields to change, and compare
-statistics against a default value with the expected fields assigned.
+`NetStackConfig`, `TransparentConfig`, `FlowEventsConfig` and `NetStackStats` are
+`#[non_exhaustive]`: build a configuration from `NetStackConfig::new` or
+`Default::default()` and assign the fields to change, and compare statistics against a
+default value with the expected fields assigned. `PendingProtocol` is `#[non_exhaustive]`
+too: a `match` on it outside the crate needs a wildcard arm.
 
 | Feature | How to enable | Default | Cost when not enabled |
 |---|---|---|---|
@@ -543,7 +545,7 @@ statistics against a default value with the expected fields assigned.
 | TCP abort | `TcpConnection::abort` instead of dropping the connection | drop closes with a FIN | one state compare under the connection's lock and two empty-`Vec` takes per driver turn |
 | Fragment discard | `NetStackHandle::discard_fragments(src, dst, protocol, id)` when a flow's admission is revoked; needs `NetStackConfig::reassembly` | not called | none without reassembly; with it one atomic load per ingress packet while nothing is discarded, no lock |
 | Later-fragment ownership | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
-| Transparent termination | `NetStackConfig::transparent = Some(TransparentConfig { prefixes, ..Default::default() })` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
+| Transparent termination | `NetStackConfig::transparent = Some(transparent)` with `transparent.prefixes` assigned on `TransparentConfig::default()` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
 | Per-flow admission | `NetStackConfig::admission = Admission::Decide { timeout, max_pending }` (every stack), decisions and controls on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none: one `Option` check per bare SYN |
 | TCP connection limit | `TransparentConfig::max_connections = Some(n)` | `None`: listener pool and accept queue only | one `Option` check per bare SYN in transparent mode |
 | Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |

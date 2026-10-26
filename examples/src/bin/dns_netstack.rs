@@ -97,10 +97,9 @@ fn stacks() -> (NetStackHandle, NetStackHandle) {
     let (client_stack, client) =
         NetStack::new(NetStackConfig::new(vec![(CLIENT_ADDR, 24)], DEFAULT_MTU));
     let mut config = NetStackConfig::new(vec![(SERVER_ADDR, 24)], DEFAULT_MTU);
-    config.transparent = Some(TransparentConfig {
-        prefixes: vec![TRANSPARENT_PREFIX],
-        ..TransparentConfig::default()
-    });
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = vec![TRANSPARENT_PREFIX];
+    config.transparent = Some(transparent);
     config.admission = Admission::Decide {
         timeout: Duration::from_secs(1),
         max_pending: 64,

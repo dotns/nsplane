@@ -30,18 +30,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - nsplane-netstack: `NetStackConfig` and `NetStackStats` gain a field each (`admission`,
   `handshake_failed`); struct literals without `..Default::default()` must name them.
-- Breaking: nsplane-netstack `NetStackConfig` and `NetStackStats` are `#[non_exhaustive]`,
-  so later fields are not breaking again. Other crates can no longer build them with a struct
-  expression, also not with `..Default::default()`: start from `NetStackConfig::new` or
-  `Default::default()` and assign the fields (for an expected `NetStackStats`, assign the
-  expected counters on a default value). Reading fields is unchanged.
+- Breaking: nsplane-netstack `NetStackConfig`, `TransparentConfig`, `FlowEventsConfig`,
+  `NetStackStats` and the enum `PendingProtocol` are `#[non_exhaustive]`, so later fields
+  and variants are not breaking again. Other crates can no longer build the structs with a
+  struct expression, also not with `..Default::default()`: start from
+  `NetStackConfig::new` or `Default::default()` and assign the fields (for an expected
+  `NetStackStats`, assign the expected counters on a default value). A `match` on
+  `PendingProtocol` needs a wildcard arm. Reading fields and comparing values is unchanged.
 
   ```rust
   // Before
-  let config = NetStackConfig { accept_capacity: 256, ..NetStackConfig::new(addresses, mtu) };
+  let config = NetStackConfig {
+      accept_capacity: 256,
+      transparent: Some(TransparentConfig { prefixes, ..Default::default() }),
+      ..NetStackConfig::new(addresses, mtu)
+  };
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      PendingProtocol::Udp => false,
+  };
   // After
+  let mut transparent = TransparentConfig::default();
+  transparent.prefixes = prefixes;
   let mut config = NetStackConfig::new(addresses, mtu);
   config.accept_capacity = 256;
+  config.transparent = Some(transparent);
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      _ => false,
+  };
   ```
 - nsplane-netstack: under `Admission::Decide`, `incoming_tcp` and `incoming_udp` skip a
   handle whose lifetime ended while it was queued, also when the stack stopped; an accepted

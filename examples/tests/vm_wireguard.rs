@@ -103,14 +103,13 @@ async fn remote(
     // and the second hosts transparently.
     let mut config = NetStackConfig::new(addresses, MTU);
     config.reassembly = Some(ReassemblyConfig::default());
-    config.transparent = Some(TransparentConfig {
-        prefixes: vec![
-            (IpAddr::V4(BEHIND), 24),
-            (IpAddr::V4(SECOND), 32),
-            (IpAddr::V6(SECOND6), 128),
-        ],
-        ..TransparentConfig::default()
-    });
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = vec![
+        (IpAddr::V4(BEHIND), 24),
+        (IpAddr::V4(SECOND), 32),
+        (IpAddr::V6(SECOND6), 128),
+    ];
+    config.transparent = Some(transparent);
     let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     // The stack does not answer pings: echo requests are answered here, back into the

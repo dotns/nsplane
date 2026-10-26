@@ -655,12 +655,11 @@ async fn main() -> anyhow::Result<()> {
     // Server: owns 10.0.0.2 and terminates every address of 192.0.2.0/24, asking the
     // application about each new connection or flow.
     let mut server = NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU);
-    server.transparent = Some(TransparentConfig {
-        prefixes: vec![("192.0.2.0".parse()?, 24)],
-        max_connections: Some(4096),
-        events: Some(FlowEventsConfig::default()),
-        ..Default::default()
-    });
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = vec![("192.0.2.0".parse()?, 24)];
+    transparent.max_connections = Some(4096);
+    transparent.events = Some(FlowEventsConfig::default());
+    server.transparent = Some(transparent);
     server.admission = Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 };
     let (s, stack_s, outer_s) = node(key_s, server)?;
 
