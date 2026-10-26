@@ -11,6 +11,7 @@ use std::time::Instant;
 use nsplane_noise::noise::{DATA_HEADER_SZ, Tunn, TunnResult};
 use nsplane_packet::{Ecn, HEADROOM, PacketBuf, PacketPool, Path, PeerId, TAILROOM};
 
+use super::route_cache::Lookups;
 use super::{BUF_SIZE, Core, HANDSHAKE_INIT_SZ, message_kind};
 use crate::filter::Verdict;
 use crate::job::{self, CryptoJob, Outcome};
@@ -30,6 +31,41 @@ impl Core {
     pub fn inject_inbound(&mut self, peer: PeerId, packet: PacketBuf) {
         self.outputs
             .push_back(Output::Deliver { from: peer, packet });
+    }
+
+    /// Runs `packet`, a plaintext IP packet attributed to `peer` that arrived on `from`,
+    /// through the checks and filters of a decrypted transport data packet, sharing their
+    /// code: the allowed-IP source check ([`reasons::SOURCE_NOT_ALLOWED`]), the peer's inbound
+    /// destinations ([`reasons::DESTINATION_NOT_ALLOWED`]), the inbound filters in install
+    /// order ([`PacketFilter::inbound_from`] with `from`), then `Output::Deliver`.
+    ///
+    /// As the tunnel does with decrypted data, the packet is cut to the length its IP header
+    /// states; one that is not a whole IPv4 or IPv6 packet (version, header, length) has no
+    /// readable source and is dropped as [`reasons::SOURCE_NOT_ALLOWED`]. A `peer` that does
+    /// not exist or was removed is dropped as [`reasons::UNKNOWN_PLAINTEXT_PEER`], never
+    /// delivered; peer ids are never reused.
+    ///
+    /// Nothing about the packet is authenticated: no handshake accounting, no
+    /// [`PathPolicy::on_authenticated`], no roaming and no `Event::Authenticated`; the
+    /// peer's path stays as it is and `from` is only what the filters see. A delivered
+    /// packet counts in the peer's `data_rx`, not in `rx`.
+    ///
+    /// [`PacketFilter::inbound_from`]: crate::PacketFilter::inbound_from
+    pub fn receive_plaintext(&mut self, peer: PeerId, from: Path, mut packet: PacketBuf) {
+        let Some(slot) = self.peers.slot(peer) else {
+            self.pool.put(packet);
+            return self.dropped(Some(peer), reasons::UNKNOWN_PLAINTEXT_PEER);
+        };
+        let Some((src, len)) = ip_source(packet.as_packet()) else {
+            self.pool.put(packet);
+            return self.dropped(Some(peer), reasons::SOURCE_NOT_ALLOWED);
+        };
+        packet.set_len(len);
+        let dst = || Tunn::dst_address(packet.as_packet());
+        if !self.addresses_allowed(peer, slot, src, dst, &mut Lookups::default()) {
+            return self.pool.put(packet);
+        }
+        self.deliver_filtered(peer, Some(slot), from, packet, len);
     }
 
     /// Encrypts `packet` like `Input::Local`, bypassing the outbound filters.
@@ -316,4 +352,23 @@ fn src_address(packet: &[u8]) -> Option<IpAddr> {
         }
         _ => None,
     }
+}
+
+/// The source address of a whole IPv4 or IPv6 packet at the start of `packet` and the length
+/// its header states, read as the tunnel reads decrypted data.
+fn ip_source(packet: &[u8]) -> Option<(IpAddr, usize)> {
+    let (src, len) = match packet.first()? >> 4 {
+        4 if packet.len() >= 20 => {
+            let src: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+            let len: [u8; 2] = packet.get(2..4)?.try_into().ok()?;
+            (IpAddr::from(src), usize::from(u16::from_be_bytes(len)))
+        }
+        6 if packet.len() >= 40 => {
+            let src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+            let len: [u8; 2] = packet.get(4..6)?.try_into().ok()?;
+            (IpAddr::from(src), usize::from(u16::from_be_bytes(len)) + 40)
+        }
+        _ => return None,
+    };
+    (len <= packet.len()).then_some((src, len))
 }

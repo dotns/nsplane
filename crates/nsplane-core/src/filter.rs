@@ -25,6 +25,10 @@ pub enum Verdict {
 /// verdict other than [`Verdict::Accept`] ends the chain. Local packets are routed to a peer
 /// before the chain runs.
 ///
+/// Plaintext packets handed to [`Core::receive_plaintext`](crate::Core::receive_plaintext)
+/// meet the inbound chain like decrypted ones, with the arrival path the caller names and
+/// without being authenticated first.
+///
 /// Packets injected with [`Core::inject_inbound`](crate::Core::inject_inbound),
 /// [`Core::inject_outbound`](crate::Core::inject_outbound) or
 /// [`Core::inject_outbound_on`](crate::Core::inject_outbound_on) skip the chain (part of the

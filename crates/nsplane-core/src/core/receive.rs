@@ -3,6 +3,7 @@
 
 //! The receive path: transport data, handshake messages and roaming.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use nsplane_noise::noise::handshake::parse_handshake_anon;
@@ -114,8 +115,19 @@ impl Core {
             return self.dropped(Some(id), reasons::DECAPSULATE_ERROR);
         }
         data.set_len(plain_len);
-        let mut packet = data;
+        self.deliver_filtered(id, slot, path, data, plain_len);
+    }
 
+    /// Delivers `packet`, `len` bytes from peer `id` at `slot` that arrived on `path` and
+    /// passed the address checks, after the inbound filters.
+    pub(super) fn deliver_filtered(
+        &mut self,
+        id: PeerId,
+        slot: Option<usize>,
+        path: Path,
+        mut packet: PacketBuf,
+        len: usize,
+    ) {
         for filter in &self.filters {
             match filter.inbound_from(id, &path, &mut packet) {
                 Verdict::Accept => {}
@@ -131,7 +143,7 @@ impl Core {
         }
 
         if let Some(peer) = slot.and_then(|slot| self.peers.at_mut(slot)) {
-            peer.add_data_rx(plain_len as u64);
+            peer.add_data_rx(len as u64);
         }
         self.outputs.push_back(Output::Deliver { from: id, packet });
     }
@@ -185,15 +197,33 @@ impl Core {
         }
 
         let src = src?;
-        if !self.routes.source_allowed(&self.peers, src, id) {
-            self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
-            return None;
-        }
-        if let Some(destinations) = self.peers.inbound_destinations(slot) {
-            let dst = datagram
+        let dst = || {
+            datagram
                 .as_packet()
                 .get(DATA_HEADER_SZ..DATA_HEADER_SZ + plain_len)
-                .and_then(Tunn::dst_address);
+                .and_then(Tunn::dst_address)
+        };
+        self.addresses_allowed(id, slot, src, dst, lookups)
+            .then_some(plain_len)
+    }
+
+    /// Whether peer `id` at `slot` may send a packet from `src` to `dst` (read only when the
+    /// peer has inbound destinations): the allowed-IP source check and the peer's inbound
+    /// destinations; a refusal is reported.
+    pub(super) fn addresses_allowed(
+        &mut self,
+        id: PeerId,
+        slot: usize,
+        src: IpAddr,
+        dst: impl FnOnce() -> Option<IpAddr>,
+        lookups: &mut Lookups,
+    ) -> bool {
+        if !self.routes.source_allowed(&self.peers, src, id) {
+            self.dropped(Some(id), reasons::SOURCE_NOT_ALLOWED);
+            return false;
+        }
+        if let Some(destinations) = self.peers.inbound_destinations(slot) {
+            let dst = dst();
             // A shared source is consulted per packet, never cached: it may change any time.
             let allowed = dst.is_some_and(|dst| match destinations {
                 Destinations::Owned(set) => lookups.destination_allowed(set, dst, id),
@@ -201,10 +231,10 @@ impl Core {
             });
             if !allowed {
                 self.dropped(Some(id), reasons::DESTINATION_NOT_ALLOWED);
-                return None;
+                return false;
             }
         }
-        Some(plain_len)
+        true
     }
 
     /// Verifies a handshake message with the handshake gate of the local identity it is for,

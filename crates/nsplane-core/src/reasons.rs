@@ -1,6 +1,6 @@
 //! The reasons of [`Event::Dropped`](crate::Event::Dropped).
 //!
-//! The core emits the reasons from [`INVALID_PACKET`] to [`NO_FREE_PEER_ID`]; the driver
+//! The core emits the reasons from [`INVALID_PACKET`] to [`UNKNOWN_PLAINTEXT_PEER`]; the driver
 //! (`nsplane`) emits the rest for drops it decides itself. Packet filters may drop with
 //! reasons of their own.
 
@@ -10,9 +10,11 @@ pub const INVALID_PACKET: &str = "invalid packet";
 pub const UNKNOWN_SESSION: &str = "unknown session";
 /// Transport data could not be decrypted (no such session, bad tag, replay, expired keys).
 pub const DECAPSULATE_ERROR: &str = "decapsulate error";
-/// A decrypted packet's source address is not in the sending peer's allowed IPs.
+/// A decrypted packet's source address is not in the sending peer's allowed IPs; also a
+/// plaintext packet ([`Core::receive_plaintext`](crate::Core::receive_plaintext)) that is
+/// not a whole IPv4 or IPv6 packet, so it has no readable source.
 pub const SOURCE_NOT_ALLOWED: &str = "source not allowed";
-/// A decrypted packet's destination address is not in the sending peer's inbound
+/// A decrypted or plaintext packet's destination address is not in the sending peer's inbound
 /// destinations (`PeerConfig::inbound_destinations`), or cannot be read.
 pub const DESTINATION_NOT_ALLOWED: &str = "destination not allowed";
 /// A handshake message arrived, or a peer was to be added, before a private key was set.
@@ -41,6 +43,9 @@ pub const NO_PATH: &str = "no path";
 pub const NO_FREE_SESSION_INDEX: &str = "no free session index";
 /// A peer could not be added: every peer id is in use.
 pub const NO_FREE_PEER_ID: &str = "no free peer id";
+/// A plaintext packet ([`Core::receive_plaintext`](crate::Core::receive_plaintext)) names a
+/// peer that does not exist or was removed.
+pub const UNKNOWN_PLAINTEXT_PEER: &str = "plaintext from unknown peer";
 
 /// Emitted by the driver: a decrypted packet was dropped because the sink queue was full.
 pub const SINK_FULL: &str = "sink full";

@@ -1227,3 +1227,370 @@ fn a_path_change_or_handshake_reports_the_source_again() {
     assert_eq!(reported(&data(&mut a, &mut b, path(3), 2)), []);
     assert_eq!(reported(&data(&mut a, &mut b, path(1), 2)), [path(1)]);
 }
+
+mod plaintext {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::filter::Verdict;
+    use crate::types::InboundDestinations;
+
+    const FILTER_DROP: &str = "test filter drop";
+
+    /// What the recording filter saw: the peer, the arrival path and the packet.
+    type Seen = Vec<(PeerId, Path, Vec<u8>)>;
+
+    /// Records every inbound packet; drops one whose last byte is 1 and handles one whose
+    /// last byte is 2.
+    #[derive(Default, Clone)]
+    struct Recording(Arc<Mutex<Seen>>);
+
+    impl Recording {
+        fn take(&self) -> Seen {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    impl PacketFilter for Recording {
+        fn inbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+            unreachable!("the core calls inbound_from")
+        }
+
+        fn inbound_from(&self, peer: PeerId, from: &Path, packet: &mut PacketBuf) -> Verdict {
+            let bytes = packet.as_packet().to_vec();
+            let last = bytes.last().copied();
+            self.0.lock().unwrap().push((peer, *from, bytes));
+            match last {
+                Some(1) => Verdict::Drop {
+                    reason: FILTER_DROP,
+                },
+                Some(2) => Verdict::Handled,
+                _ => Verdict::Accept,
+            }
+        }
+
+        fn outbound(&self, _peer: PeerId, _packet: &mut PacketBuf) -> Verdict {
+            Verdict::Accept
+        }
+    }
+
+    /// What a receiving core did with one packet.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Fate {
+        delivered: Vec<(PeerId, Vec<u8>)>,
+        drops: Vec<&'static str>,
+        seen: Seen,
+    }
+
+    /// Outputs of `core` since the last call, as a [`Fate`] with what `filter` saw; also
+    /// returns the other events.
+    fn fate(core: &mut Core, filter: &Recording) -> (Fate, Vec<Event>) {
+        let (mut delivered, mut drops, mut events) = (Vec::new(), Vec::new(), Vec::new());
+        while let Some(output) = core.poll_output() {
+            match output {
+                Output::Deliver { from, packet } => {
+                    delivered.push((from, packet.as_packet().to_vec()));
+                }
+                Output::Event(Event::Dropped { reason, .. }) => drops.push(reason),
+                Output::Event(event) => events.push(event),
+                Output::Transmit { .. } => {}
+            }
+        }
+        let seen = filter.take();
+        (
+            Fate {
+                delivered,
+                drops,
+                seen,
+            },
+            events,
+        )
+    }
+
+    /// An IP packet of 100 bytes from `src` to `dst` (both of one family) whose last
+    /// byte is `last`.
+    fn ip(src: &str, dst: &str, last: u8) -> PacketBuf {
+        let (src, dst): (IpAddr, IpAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+        let mut buf = PacketBuf::with_capacity(2048);
+        buf.set_len(100);
+        let p = buf.as_packet_mut();
+        match (src, dst) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                p[0] = 0x45;
+                p[2..4].copy_from_slice(&100u16.to_be_bytes());
+                p[8] = 64;
+                p[9] = 17;
+                p[12..16].copy_from_slice(&src.octets());
+                p[16..20].copy_from_slice(&dst.octets());
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                p[0] = 0x60;
+                p[4..6].copy_from_slice(&60u16.to_be_bytes());
+                p[6] = 17;
+                p[7] = 64;
+                p[8..24].copy_from_slice(&src.octets());
+                p[24..40].copy_from_slice(&dst.octets());
+            }
+            _ => unreachable!("one family"),
+        }
+        p[99] = last;
+        buf
+    }
+
+    /// Sender `a` (`10.0.0.1`, `fd00::1`, routing `10.0.0.0/24` and `fd00::/64` to `b`)
+    /// and receiver `b` with the recording filter, whose peer `a` may send from `a`'s
+    /// addresses to `10.0.0.2` and `fd00::2` only; after a handshake, `b` reaching `a`
+    /// on `path(1)`. Returns `a`'s id in `b`.
+    fn sender_and_receiver(filter: &Recording) -> (Core, Core, PeerId) {
+        let now = Instant::now();
+        let keys = [1u8, 2].map(|k| x25519::StaticSecret::from([k; 32]));
+        let mut a = Core::new(CoreConfig {
+            private_key: Some(keys[0].clone()),
+            ..CoreConfig::default()
+        });
+        let mut to_b = PeerConfig::new(x25519::PublicKey::from(&keys[1]));
+        to_b.allowed_ips = vec!["10.0.0.0/24".parse().unwrap(), "fd00::/64".parse().unwrap()];
+        to_b.path = Some(path(2));
+        a.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(to_b)), now);
+
+        let mut b = Core::new(CoreConfig {
+            private_key: Some(keys[1].clone()),
+            filters: vec![Box::new(filter.clone())],
+            ..CoreConfig::default()
+        });
+        let a_key = x25519::PublicKey::from(&keys[0]);
+        let mut to_a = PeerConfig::new(a_key);
+        to_a.allowed_ips = vec![
+            "10.0.0.1/32".parse().unwrap(),
+            "fd00::1/128".parse().unwrap(),
+        ];
+        to_a.inbound_destinations = Some(vec![
+            "10.0.0.2/32".parse().unwrap(),
+            "fd00::2/128".parse().unwrap(),
+        ]);
+        to_a.path = Some(path(1));
+        b.handle_input(Input::Config(ConfigChange::AddOrUpdatePeer(to_a)), now);
+        let a_id = b.peer_id(&a_key).unwrap();
+
+        let (fate_of_first, _) = decrypted(&mut a, &mut b, filter, ip("10.0.0.1", "10.0.0.2", 0));
+        assert_eq!(fate_of_first.delivered.len(), 1);
+        (a, b, a_id)
+    }
+
+    /// Sends `packet` from `a` to `b`, every datagram arriving on `path(1)`; returns what
+    /// `b` did with it.
+    fn decrypted(
+        a: &mut Core,
+        b: &mut Core,
+        filter: &Recording,
+        packet: PacketBuf,
+    ) -> (Fate, Vec<Event>) {
+        a.handle_input(Input::Local { packet }, Instant::now());
+        loop {
+            let (sent, _) = drain(a);
+            if sent.is_empty() {
+                break;
+            }
+            arrive(b, sent, path(1));
+            let mut replies = Vec::new();
+            let mut kept = VecDeque::new();
+            while let Some(output) = b.poll_output() {
+                match output {
+                    Output::Transmit { data, .. } => replies.push(data),
+                    other => kept.push_back(other),
+                }
+            }
+            b.outputs = kept;
+            arrive(a, replies, path(2));
+        }
+        fate(b, filter)
+    }
+
+    fn cases() -> Vec<(&'static str, PacketBuf, PacketBuf)> {
+        let pair = |src, dst, last| (ip(src, dst, last), ip(src, dst, last));
+        [
+            ("accepted v4", pair("10.0.0.1", "10.0.0.2", 0)),
+            ("accepted v6", pair("fd00::1", "fd00::2", 0)),
+            ("source not allowed v4", pair("10.0.0.9", "10.0.0.2", 0)),
+            ("source not allowed v6", pair("fd00::9", "fd00::2", 0)),
+            (
+                "destination not allowed v4",
+                pair("10.0.0.1", "10.0.0.3", 0),
+            ),
+            ("destination not allowed v6", pair("fd00::1", "fd00::3", 0)),
+            ("filter drop v4", pair("10.0.0.1", "10.0.0.2", 1)),
+            ("filter drop v6", pair("fd00::1", "fd00::2", 1)),
+            ("handled v4", pair("10.0.0.1", "10.0.0.2", 2)),
+            ("handled v6", pair("fd00::1", "fd00::2", 2)),
+        ]
+        .into_iter()
+        .map(|(name, (x, y))| (name, x, y))
+        .collect()
+    }
+
+    #[test]
+    fn plaintext_meets_the_checks_of_decrypted_data() {
+        let filter = Recording::default();
+        let (mut a, mut b, a_id) = sender_and_receiver(&filter);
+        for (name, sealed, plain) in cases() {
+            let (by_tunnel, _) = decrypted(&mut a, &mut b, &filter, sealed);
+            b.receive_plaintext(a_id, path(1), plain);
+            let (by_plaintext, _) = fate(&mut b, &filter);
+            assert_eq!(by_plaintext, by_tunnel, "{name}");
+        }
+        // Each verdict was met: delivered, dropped by the checks and the filter, handled.
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        let mut delivered = 0;
+        let mut drops = Vec::new();
+        let mut seen = 0;
+        for (_, _, plain) in cases() {
+            b.receive_plaintext(a_id, path(1), plain);
+            let (fate, _) = fate(&mut b, &filter);
+            delivered += fate.delivered.len();
+            drops.extend(fate.drops);
+            seen += fate.seen.len();
+        }
+        assert_eq!(delivered, 2);
+        assert_eq!(
+            drops,
+            [
+                reasons::SOURCE_NOT_ALLOWED,
+                reasons::SOURCE_NOT_ALLOWED,
+                reasons::DESTINATION_NOT_ALLOWED,
+                reasons::DESTINATION_NOT_ALLOWED,
+                FILTER_DROP,
+                FILTER_DROP,
+            ]
+        );
+        assert_eq!(
+            seen, 6,
+            "accepted, filter drops and handled reach the filter"
+        );
+    }
+
+    #[test]
+    fn a_shared_destination_source_is_consulted_for_plaintext() {
+        #[derive(Debug)]
+        struct Only(IpAddr);
+        impl InboundDestinations for Only {
+            fn allows(&self, dst: IpAddr) -> bool {
+                dst == self.0
+            }
+        }
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        let a_key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        b.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinationSource {
+                peer: a_key,
+                source: Some(Arc::new(Only("10.0.0.3".parse().unwrap()))),
+            }),
+            Instant::now(),
+        );
+        b.receive_plaintext(a_id, path(1), ip("10.0.0.1", "10.0.0.2", 0));
+        assert_eq!(
+            fate(&mut b, &filter).0.drops,
+            [reasons::DESTINATION_NOT_ALLOWED]
+        );
+        b.receive_plaintext(a_id, path(1), ip("10.0.0.1", "10.0.0.3", 0));
+        assert_eq!(fate(&mut b, &filter).0.delivered.len(), 1);
+    }
+
+    #[test]
+    fn the_filters_see_the_given_path_and_nothing_is_authenticated() {
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        let before = b.peer_stats(a_id).unwrap();
+        let packet = ip("10.0.0.1", "10.0.0.2", 0);
+        let bytes = packet.as_packet().to_vec();
+        b.receive_plaintext(a_id, path(7), packet);
+        let (fate, events) = fate(&mut b, &filter);
+        assert_eq!(fate.delivered, [(a_id, bytes.clone())]);
+        assert_eq!(fate.seen, [(a_id, path(7), bytes)]);
+        assert!(
+            events.is_empty(),
+            "no authentication, path or handshake event: {events:?}"
+        );
+        assert_eq!(b.data_path(a_id), Some(path(1)));
+        let after = b.peer_stats(a_id).unwrap();
+        assert_eq!(after.path, before.path);
+        assert_eq!(after.rx, before.rx, "no datagram arrived");
+        assert_eq!(after.data_rx, before.data_rx + 100);
+        assert_eq!(after.last_handshake, before.last_handshake);
+    }
+
+    #[test]
+    fn unknown_and_removed_peers_are_dropped() {
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        b.receive_plaintext(
+            PeerId::new(a_id.get() + 100),
+            path(1),
+            ip("10.0.0.1", "10.0.0.2", 0),
+        );
+        let (unknown, _) = fate(&mut b, &filter);
+        assert_eq!(unknown.drops, [reasons::UNKNOWN_PLAINTEXT_PEER]);
+        assert!(unknown.delivered.is_empty() && unknown.seen.is_empty());
+
+        let a_key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        b.handle_input(
+            Input::Config(ConfigChange::RemovePeer(a_key)),
+            Instant::now(),
+        );
+        let _ = fate(&mut b, &filter);
+        b.receive_plaintext(a_id, path(1), ip("10.0.0.1", "10.0.0.2", 0));
+        let (removed, _) = fate(&mut b, &filter);
+        assert_eq!(removed.drops, [reasons::UNKNOWN_PLAINTEXT_PEER]);
+        assert!(removed.delivered.is_empty() && removed.seen.is_empty());
+
+        // The same key again is a new peer: the old id stays unknown.
+        let mut config = PeerConfig::new(a_key);
+        config.allowed_ips = vec!["10.0.0.1/32".parse().unwrap()];
+        b.handle_input(
+            Input::Config(ConfigChange::AddOrUpdatePeer(config)),
+            Instant::now(),
+        );
+        assert_ne!(b.peer_id(&a_key), Some(a_id));
+        b.receive_plaintext(a_id, path(1), ip("10.0.0.1", "10.0.0.2", 0));
+        assert_eq!(
+            fate(&mut b, &filter).0.drops,
+            [reasons::UNKNOWN_PLAINTEXT_PEER]
+        );
+    }
+
+    #[test]
+    fn packets_are_read_like_decrypted_data() {
+        let filter = Recording::default();
+        let (mut a, mut b, a_id) = sender_and_receiver(&filter);
+        // Bytes behind the IP length are cut, as the tunnel cuts its padding.
+        let long = || {
+            let mut packet = ip("10.0.0.1", "10.0.0.2", 0);
+            packet.as_packet_mut()[2..4].copy_from_slice(&60u16.to_be_bytes());
+            packet
+        };
+        let (by_tunnel, _) = decrypted(&mut a, &mut b, &filter, long());
+        assert_eq!(by_tunnel.delivered[0].1.len(), 60);
+        b.receive_plaintext(a_id, path(1), long());
+        assert_eq!(fate(&mut b, &filter).0, by_tunnel);
+
+        // No readable IPv4 or IPv6 source: dropped as a source not allowed.
+        let short_v6 = PacketBuf::from_packet(&ip("fd00::1", "fd00::2", 0).as_packet()[..39]);
+        let mut overlong = ip("10.0.0.1", "10.0.0.2", 0);
+        overlong.as_packet_mut()[2..4].copy_from_slice(&101u16.to_be_bytes());
+        let mut version = ip("10.0.0.1", "10.0.0.2", 0);
+        version.as_packet_mut()[0] = 0x55;
+        for (name, packet) in [
+            ("empty", PacketBuf::from_packet(&[])),
+            ("short v4", PacketBuf::from_packet(&[0x45; 19])),
+            ("short v6", short_v6),
+            ("length beyond the packet", overlong),
+            ("version 5", version),
+        ] {
+            b.receive_plaintext(a_id, path(1), packet);
+            let (fate, _) = fate(&mut b, &filter);
+            assert_eq!(fate.drops, [reasons::SOURCE_NOT_ALLOWED], "{name}");
+            assert!(fate.delivered.is_empty() && fate.seen.is_empty(), "{name}");
+        }
+    }
+}
