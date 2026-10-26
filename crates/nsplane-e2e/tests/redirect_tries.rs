@@ -9,17 +9,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use nsplane::{PacketBuf, PacketSink, PacketSource};
+use nsplane_e2e::redirect::{CLIENT, Rig, STACK, start_rig, v4};
 use nsplane_e2e::{QUIET, TestResult, WAIT, next_within};
-use nsplane_nat::{Redirect, RedirectDecision, RedirectVerdict};
-use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, UdpFlow, UdpSocket};
-use nsplane_packet::{FiveTuple, PeerId, protocol};
+use nsplane_nat::{Redirect, RedirectDecision};
+use nsplane_netstack::{UdpFlow, UdpSocket};
+use nsplane_packet::{FiveTuple, protocol};
 use tokio::time::timeout;
 
-/// The client's address.
-const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-/// The address of the stack the flows are redirected to.
-const STACK: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 1);
 /// The service port; the service addresses are `100.64.0.n`, owned by nobody.
 const SERVICE_PORT: u16 = 53;
 /// The endpoint pool: ports of the stack.
@@ -28,15 +24,6 @@ const POOL: [u16; 3] = [40_000, 40_001, 40_002];
 /// The `n`th service address.
 const fn service(n: u8) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, n), SERVICE_PORT)
-}
-
-/// The client, the service stack and the redirect between them.
-struct Rig {
-    client: NetStackHandle,
-    stack: NetStackHandle,
-    redirect: Arc<Redirect>,
-    /// Calls of the decision closure.
-    decisions: Arc<AtomicUsize>,
 }
 
 /// Starts both stacks and the redirect between them.
@@ -67,64 +54,7 @@ fn rig() -> Rig {
     slot.set(Arc::downgrade(&redirect))
         .unwrap_or_else(|_| unreachable!("the slot is set once"));
 
-    let (client_stack, client) = NetStack::new(NetStackConfig::new(
-        vec![(IpAddr::V4(CLIENT), 32)],
-        DEFAULT_MTU,
-    ));
-    let (stack_stack, stack) = NetStack::new(NetStackConfig::new(
-        vec![(IpAddr::V4(STACK), 32)],
-        DEFAULT_MTU,
-    ));
-    let (client_out, client_in) = client_stack.split();
-    let (stack_out, stack_in) = stack_stack.split();
-    pump(
-        client_out,
-        stack_in,
-        Arc::clone(&redirect),
-        Redirect::forward,
-    );
-    pump(
-        stack_out,
-        client_in,
-        Arc::clone(&redirect),
-        Redirect::reverse,
-    );
-    Rig {
-        client,
-        stack,
-        redirect,
-        decisions,
-    }
-}
-
-/// Moves packets from `from` to `to` through `step` until either side stops, as the local
-/// path would: rewritten and passed packets go on, dropped ones do not.
-fn pump<S, K>(
-    mut from: S,
-    to: K,
-    redirect: Arc<Redirect>,
-    step: fn(&Redirect, &mut PacketBuf) -> RedirectVerdict,
-) where
-    S: PacketSource + Send + 'static,
-    K: PacketSink + Send + Sync + 'static,
-{
-    tokio::spawn(async move {
-        while let Ok(mut packet) = from.recv().await {
-            if matches!(step(&redirect, &mut packet), RedirectVerdict::Drop(_)) {
-                continue;
-            }
-            if to.send(packet, PeerId::new(0)).await.is_err() {
-                break;
-            }
-        }
-    });
-}
-
-fn v4(addr: SocketAddr) -> TestResult<SocketAddrV4> {
-    match addr {
-        SocketAddr::V4(addr) => Ok(addr),
-        SocketAddr::V6(addr) => Err(format!("IPv6 address {addr}").into()),
-    }
+    start_rig(redirect, decisions)
 }
 
 /// Sends `payload` from `socket` to `service`, accepts the flow the stack reports for it,

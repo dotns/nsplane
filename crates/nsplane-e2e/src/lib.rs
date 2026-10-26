@@ -46,6 +46,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant, timeout, timeout_at};
 
+pub mod acl;
+pub mod bulk;
+pub mod redirect;
+pub mod translate;
+
 /// Upper bound for anything that is expected to happen.
 pub const WAIT: Duration = Duration::from_secs(5);
 /// Upper bound for a TCP connection setup or a bulk transfer through a netstack.

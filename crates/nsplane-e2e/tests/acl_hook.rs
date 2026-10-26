@@ -10,88 +10,22 @@
 //! that re-allowing it restores delivery on the next packet. A peer of a namespace accepting
 //! everything bypasses the evaluation: its traffic is delivered both ways.
 
-use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use nsplane::x25519::PublicKey;
-use nsplane::{AllowedIp, ChannelTransport, Event, Path, TransportId};
+use nsplane::{AllowedIp, ChannelTransport, Path};
 use nsplane_acl::{
-    AclEngine, AclFilter, Direction, Grant, GrantEnd, Label, LabelSet, NamespaceKind,
-    NamespaceMember, NamespacePolicy, PeerLabelMap, PinholeSpec, PortSet, Protocol, ProtocolMatch,
-    Rule, reasons,
+    AclEngine, Direction, Grant, GrantEnd, NamespaceKind, NamespaceMember, NamespacePolicy,
+    PinholeSpec, PortSet, Protocol, ProtocolMatch, Rule, reasons,
 };
-use nsplane_e2e::{Events, Node, Options, TestResult, introduce, udp};
-use nsplane_packet::PeerId;
+use nsplane_e2e::acl::{
+    APP_PORT, Acl, AclNode, CAPACITY, QUICK_PORT, SRC_PORT, TRANSFER_KIND, delivered, dropped, end,
+    label, member, packet_pair, relayed, udp_to,
+};
+use nsplane_e2e::{Node, Options, TestResult};
 
-/// Capacity of every channel link.
-const CAPACITY: usize = 1024;
-/// The port the peers' packets come from.
-const SRC_PORT: u16 = 40000;
-/// The port the "quick" namespace allows on `b`.
-const QUICK_PORT: u16 = 7000;
-/// The port of the app session's pinhole.
-const APP_PORT: u16 = 9000;
-/// The app kind of the pinhole.
-const TRANSFER_KIND: &str = "transfer";
 /// Packets that establish a flow before the policy changes.
 const ESTABLISH: usize = 3;
-
-type AclNode = Node<ChannelTransport>;
-
-/// The ACL state of `b` the tests keep.
-struct Acl {
-    engine: Arc<AclEngine>,
-    identities: Arc<PeerLabelMap>,
-    filter: AclFilter,
-}
-
-impl Acl {
-    fn new() -> Self {
-        let engine = Arc::new(AclEngine::new());
-        let identities = Arc::new(PeerLabelMap::new());
-        let filter = AclFilter::new(Arc::clone(&engine), Arc::clone(&identities));
-        Self {
-            engine,
-            identities,
-            filter,
-        }
-    }
-
-    /// Labels the peer `peer` of `b` by its WireGuard key.
-    fn identify(&self, peer: PeerId, key: &PublicKey) {
-        self.identities.insert(peer, LabelSet::new([label(key)]));
-    }
-}
-
-/// The endpoint `host` of a channel link: transport id and address.
-fn end(id: u16, host: u8) -> (TransportId, SocketAddr) {
-    (
-        TransportId::new(id),
-        SocketAddr::from(([192, 0, 2, host], 1000 + id)),
-    )
-}
-
-/// The label of a node's key.
-fn label(key: &PublicKey) -> Label {
-    Label::from(
-        key.to_bytes()
-            .iter()
-            .fold(String::from("key:"), |mut text, b| {
-                let _ = write!(text, "{b:02x}");
-                text
-            }),
-    )
-}
-
-/// A namespace member with both tunnel addresses of a node.
-fn member(key: &PublicKey, ip4: Ipv4Addr, ip6: Ipv6Addr) -> TestResult<NamespaceMember> {
-    Ok(NamespaceMember {
-        label: label(key),
-        addresses: vec![format!("{ip4}/32").parse()?, format!("{ip6}/128").parse()?],
-    })
-}
 
 /// A namespace with `members` and `rule`, if any; pinholes of the kinds `apps` are
 /// permitted.
@@ -117,42 +51,6 @@ fn quick(a: &AclNode, open: bool) -> TestResult<NamespacePolicy> {
     ))
 }
 
-/// Packet nodes `a` (seed 1) and `b` (seed 2) linked and introduced, `b` filtering with
-/// `acl`; `a` is identified by its key.
-async fn packet_pair(acl: &Acl) -> TestResult<(AclNode, AclNode)> {
-    let (a_end, b_end) = (end(1, 1), end(2, 2));
-    let (link_a, link_b) = ChannelTransport::pair(CAPACITY, a_end, b_end);
-    let a = Node::with_builder(1, a_end.0, a_end.1, Options::default(), |builder| {
-        builder.transport(link_a)
-    })?;
-    let filter = acl.filter.clone();
-    let b = Node::with_builder(2, b_end.0, b_end.1, Options::default(), |builder| {
-        builder.transport(link_b).filter(Box::new(filter))
-    })?;
-    introduce(&a, &b, None).await?;
-    acl.identify(b.peer_of(&a).await?, &a.public());
-    Ok((a, b))
-}
-
-/// A UDP packet from `from`'s IPv4 address and `src_port` to `to` port `dst_port`.
-fn udp_to(from: &AclNode, src_port: u16, to: Ipv4Addr, dst_port: u16) -> Vec<u8> {
-    udp(
-        SocketAddr::from((from.ip4, src_port)),
-        SocketAddr::from((to, dst_port)),
-        b"datagram",
-    )
-}
-
-/// Sends `packet` from `from` and checks that `to` delivers it unchanged.
-async fn delivered(from: &AclNode, to: &mut AclNode, packet: &[u8]) -> TestResult {
-    from.send(packet).await?;
-    let (_, got) = to.expect_delivery().await?;
-    if got != packet {
-        return Err("packet changed in transit".into());
-    }
-    Ok(())
-}
-
 /// Sends `packet` [`ESTABLISH`] times from `from`, each delivered by `to`.
 async fn established(from: &AclNode, to: &mut AclNode, packet: &[u8]) -> TestResult {
     for _ in 0..ESTABLISH {
@@ -161,38 +59,11 @@ async fn established(from: &AclNode, to: &mut AclNode, packet: &[u8]) -> TestRes
     Ok(())
 }
 
-/// Sends `packet` from `from` and checks that `b` drops it with `reason`.
-async fn dropped(
-    from: &AclNode,
-    b: &mut AclNode,
-    events: &mut Events,
-    packet: &[u8],
-    reason: &'static str,
-) -> TestResult {
-    from.send(packet).await?;
-    events
-        .expect(|e| matches!(e, Event::Dropped { reason: r, .. } if *r == reason))
-        .await?;
-    b.expect_no_delivery().await
-}
-
-/// Sends `packet` from `from` to the hub `b`, which forwards what it delivers back into the
-/// tunnel (as its kernel would route it), and checks that `to` delivers it unchanged.
-async fn relayed(from: &AclNode, b: &mut AclNode, to: &mut AclNode, packet: &[u8]) -> TestResult {
-    delivered(from, b, packet).await?;
-    b.send(packet).await?;
-    let (_, got) = to.expect_delivery().await?;
-    if got != packet {
-        return Err("packet changed in the hub".into());
-    }
-    Ok(())
-}
-
 /// A namespace change that removes the permission drops the established flow on its next
 /// packet; restoring it delivers the next one.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn namespace_change_applies_to_the_next_packet() -> TestResult {
-    let acl = Acl::new();
+    let acl = Acl::new(AclEngine::new());
     let (a, mut b) = packet_pair(&acl).await?;
     let mut events = b.subscribe().await?;
     let flow = udp_to(&a, SRC_PORT, b.ip4, QUICK_PORT);
@@ -216,7 +87,7 @@ async fn namespace_change_applies_to_the_next_packet() -> TestResult {
 /// grant drops the established flow on its next packet, storing it again restores it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn removed_grant_applies_to_the_next_packet() -> TestResult {
-    let acl = Acl::new();
+    let acl = Acl::new(AclEngine::new());
     let (a_end, b_a_end, c_end, b_c_end) = (end(1, 1), end(2, 2), end(3, 3), end(4, 4));
     let (link_a, link_b_a) = ChannelTransport::pair(CAPACITY, a_end, b_a_end);
     let (link_c, link_b_c) = ChannelTransport::pair(CAPACITY, c_end, b_c_end);
@@ -301,7 +172,7 @@ async fn removed_grant_applies_to_the_next_packet() -> TestResult {
 /// guard is dropped; a new pinhole restores it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
-    let acl = Acl::new();
+    let acl = Acl::new(AclEngine::new());
     let (a, mut b) = packet_pair(&acl).await?;
     let mut events = b.subscribe().await?;
     acl.engine.store_namespace("quick", quick(&a, false)?)?;
@@ -341,7 +212,7 @@ async fn dropped_pinhole_guard_applies_to_the_next_packet() -> TestResult {
 /// namespace again restores it. Forgetting the peer's identity drops it as unknown.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult {
-    let acl = Acl::new();
+    let acl = Acl::new(AclEngine::new());
     let (a, mut b) = packet_pair(&acl).await?;
     let mut events = b.subscribe().await?;
     let flow = udp_to(&a, SRC_PORT, b.ip4, QUICK_PORT);
@@ -371,7 +242,7 @@ async fn clear_all_and_identity_changes_apply_to_the_next_packet() -> TestResult
 /// and `b`'s traffic to it are delivered, and the bypass ends with the namespace's rule.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn bypass_peer_traffic_is_delivered() -> TestResult {
-    let acl = Acl::new();
+    let acl = Acl::new(AclEngine::new());
     let (mut a, mut b) = packet_pair(&acl).await?;
     let mut events = b.subscribe().await?;
     let everything = |a: &AclNode| -> TestResult<NamespacePolicy> {

@@ -6,20 +6,19 @@
 //! `peer6_eam4`. Covers UDP, TCP and ICMP echo, next to the peer's `eam4` and `local6`.
 //! Every packet is checked by recomputing its checksums in full where it arrives.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use nsplane::{AllowedIp, ChannelTransport};
+use nsplane_e2e::translate::{
+    ACK, PSH_ACK, SELF_EAM4, SELF_EAM6, SYN, TestNode, allowed, assert_same_segment, expect_v4,
+    expect_v6, v4, v6,
+};
 use nsplane_e2e::{
-    Node, Options, SharedFilter, TestResult, channel_pair_with, icmp, introduce, payload, tcp, udp,
-    verify_checksums,
+    Options, SharedFilter, TestResult, channel_pair_with, icmp, introduce, payload, tcp, udp,
 };
 use nsplane_nat::{PeerMapping, SelfMapping, TranslationTable, Translator};
-use nsplane_packet::{Ipv4Header, Ipv6Header, PeerId, protocol};
+use nsplane_packet::{PeerId, protocol};
 
-/// Node `a`'s own IPv4 address, translated to and from `SELF_EAM6`.
-const SELF_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 100);
-const SELF_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0xff, 1);
 /// Node `b`'s `peer6`, `eam6` and node `a`'s local addresses for it.
 const PEER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 0);
 const PEER_EAM6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 2, 1);
@@ -27,13 +26,6 @@ const PEER_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 const PEER_LOCAL6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 2);
 /// The IPv4 EAM to `peer6`: a local IPv4 address for `b`'s `peer6`.
 const PEER6_EAM4: Ipv4Addr = Ipv4Addr::new(100, 64, 1, 2);
-
-/// TCP flags.
-const SYN: u8 = 0x02;
-const ACK: u8 = 0x10;
-const PSH_ACK: u8 = 0x18;
-
-type TestNode = Node<ChannelTransport>;
 
 /// `a`'s table with `b` as `peer`.
 fn table(peer: PeerId) -> TestResult<TranslationTable> {
@@ -53,21 +45,6 @@ fn table(peer: PeerId) -> TestResult<TranslationTable> {
             PEER6_EAM4,
         )
         .build()?)
-}
-
-fn allowed(addr: impl Into<IpAddr>, cidr: u8) -> AllowedIp {
-    AllowedIp {
-        addr: addr.into(),
-        cidr,
-    }
-}
-
-const fn v4(ip: Ipv4Addr, port: u16) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-const fn v6(ip: Ipv6Addr, port: u16) -> SocketAddr {
-    SocketAddr::new(IpAddr::V6(ip), port)
 }
 
 /// Two peers, `a` translating with the table above and `b` IPv6-only.
@@ -97,53 +74,6 @@ async fn pair() -> TestResult<(TestNode, TestNode, Arc<Translator>)> {
     b.handle.add_or_update_peer(peer).await?;
     translator.store(table(a.peer_of(&b).await?)?);
     Ok((a, b, translator))
-}
-
-/// The next packet `node` delivers, checked to be IPv6 from `src` to `dst` with protocol
-/// `proto`, a hop limit of 63 and valid checksums; returns its transport segment.
-async fn expect_v6(
-    node: &mut TestNode,
-    (src, dst): (Ipv6Addr, Ipv6Addr),
-    proto: u8,
-) -> TestResult<Vec<u8>> {
-    let (_, packet) = node.expect_delivery().await?;
-    verify_checksums(&packet)?;
-    let (ip, segment) = Ipv6Header::parse(&packet)?;
-    assert_eq!((ip.src(), ip.dst()), (src, dst));
-    assert_eq!((ip.next_header(), ip.hop_limit()), (proto, 63));
-    Ok(segment.to_vec())
-}
-
-/// The next packet `node` delivers, checked to be IPv4 from `src` to `dst` with protocol
-/// `proto`, a TTL of 63 and valid checksums; returns its transport segment.
-async fn expect_v4(
-    node: &mut TestNode,
-    (src, dst): (Ipv4Addr, Ipv4Addr),
-    proto: u8,
-) -> TestResult<Vec<u8>> {
-    let (_, packet) = node.expect_delivery().await?;
-    verify_checksums(&packet)?;
-    let (ip, segment) = Ipv4Header::parse(&packet)?;
-    assert_eq!((ip.src(), ip.dst()), (src, dst));
-    assert_eq!((ip.protocol(), ip.ttl()), (proto, 63));
-    Ok(segment.to_vec())
-}
-
-/// The transport segment of `packet`.
-fn segment(packet: &[u8]) -> &[u8] {
-    match packet.first().map(|byte| byte >> 4) {
-        Some(4) => &packet[20..],
-        _ => &packet[40..],
-    }
-}
-
-/// Checks that the translated segment `got` equals the segment of `sent` except for the
-/// checksum at `checksum` (moved to the new pseudo-header).
-fn assert_same_segment(got: &[u8], sent: &[u8], checksum: usize) {
-    let sent = segment(sent);
-    assert_eq!(got.len(), sent.len());
-    assert_eq!(got[..checksum], sent[..checksum]);
-    assert_eq!(got[checksum + 2..], sent[checksum + 2..]);
 }
 
 #[tokio::test]
