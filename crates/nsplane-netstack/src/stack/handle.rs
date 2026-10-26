@@ -18,6 +18,10 @@ use crate::udp::{UdpFlow, UdpSocket};
 
 use super::commands::unspecified;
 use super::stack_gone;
+#[cfg(doc)]
+use super::{NetStack, NetStackSink, NetStackSource};
+#[cfg(doc)]
+use crate::config::{Admission, NetStackConfig};
 
 /// Requests from a [`NetStackHandle`] to the driver.
 #[derive(Debug)]
