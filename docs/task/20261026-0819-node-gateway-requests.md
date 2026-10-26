@@ -1,6 +1,6 @@
 # 20261026-0819-node-gateway-requests Requests from the node and the gateway at 0.19.2, and two defects
 
-- **status**: pending (proposed, awaiting owner approval)
+- **status**: in progress (releases A and B approved 2026-10-26; release C in design)
 - **plan**: 20261026-0822-node-gateway-requests
 - **priority**: P2
 - **owner**: (unassigned)
@@ -67,8 +67,8 @@ carries them as the regression tests.
 
 ## Dependencies
 
-- **blocked by**: owner approval of plan `20261026-0822-node-gateway-requests` (the freeze
-  exceptions and the open questions it lists)
+- **blocked by**: (none; the owner approved releases A and B and O1-O7 on 2026-10-26, see the
+  plan's annotations). Release C waits for the review of its design note.
 - **blocks**: (none)
 
 ## Notes

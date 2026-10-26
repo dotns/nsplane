@@ -1,8 +1,9 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
-- **status**: draft (proposed, awaiting owner approval)
+- **status**: implementing (releases A and B approved; release C designed first, design note
+  for review)
 - **createdAt**: 2026-10-26 08:22
-- **approvedAt**: (pending)
+- **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
 
 ## Context
@@ -605,4 +606,24 @@ after it is approved.
 
 ## Annotations
 
-(none yet)
+Owner decisions, 2026-10-26:
+
+1. Release A (0.19.3, W0: D1 and D2) is approved as a bug-fix release, including the D2
+   behaviour change (a later fragment as a ninth extension header is denied `Malformed`).
+2. Release B (0.20.0: W1 R1, W2 R3, W3 R4 barrier and R5 part 1) is approved as the eleventh
+   freeze exception with the shapes above.
+3. O1-O7 take the recommended answers:
+   - O1: a top-level `NetStackConfig::admission`; `TransparentConfig::admission` is deprecated
+     and transparent stacks honour either until its removal in a breaking release.
+   - O2: a revoke before the hand-out sends nothing.
+   - O3: R1 applies to `Decide` lifetimes only.
+   - O4: a later fragment's scoped decision reports `rule: None`.
+   - O5: `OutOfScope` denials count as enforced denials and emit decision events; `GateCounters`
+     gets no new field.
+   - O6: the barrier now; the per-packet tag comes with release C.
+   - O7: `from: Path` is mandatory, the authenticated bookkeeping is not run, delivered bytes
+     count in `data_rx`.
+4. Release C (0.21.0) is designed first as one carrier, the packet tag, in a design note for
+   review by the owner and both consumers; it is not implemented. O8-O12 are answered in that
+   note's review. Design note: [notes/20261026-0834-packet-tag-carrier.md](notes/20261026-0834-packet-tag-carrier.md)
+   (status: for owner and consumer review).

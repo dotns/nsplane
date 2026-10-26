@@ -421,3 +421,14 @@ Linux musl targets (`msg_iovlen` and the `ioctl` request type differ between gli
 `just cross` runs clippy for `x86_64-unknown-linux-musl`. Also carries the module splits of
 nsplane-core `core.rs` and nsplane-netstack `stack.rs` (pure moves, no API change). Workspace
 versions, internal requirements and guide tags synchronized.
+
+## 2026-10-26 08:34 [decision]
+
+Owner decisions on plan `20261026-0822-node-gateway-requests` (task
+`20261026-0819-node-gateway-requests`): release A (0.19.3, the vnet IPv4 IHL 10 and `walk_v6`
+later-fragment fixes, including the latter's behaviour change) approved as a bug-fix release;
+release B (0.20.0: netstack control from the first input, scoped flow-gate decisions, the local
+barrier and validated plaintext ingress) approved as the eleventh freeze exception with the
+plan's shapes and the recommended answers to O1-O7; release C (0.21.0: netstack ingress labels,
+plaintext egress, send receipts) is designed first as one carrier, the packet tag, in a design
+note for owner and consumer review, and is not implemented.
