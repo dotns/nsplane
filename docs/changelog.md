@@ -421,3 +421,23 @@ Linux musl targets (`msg_iovlen` and the `ioctl` request type differ between gli
 `just cross` runs clippy for `x86_64-unknown-linux-musl`. Also carries the module splits of
 nsplane-core `core.rs` and nsplane-netstack `stack.rs` (pure moves, no API change). Workspace
 versions, internal requirements and guide tags synchronized.
+
+## 2026-10-26 [fix]
+
+Fix the two defects of release A (0.19.4), plan `20261026-0822-node-gateway-requests`
+(task `20261026-0851-vnet-walk-v6-fixes`), each with its regression test first:
+
+- `vnet::segment` segmented an IPv4 super-packet with IHL 10 as IPv6, because `fix_segment` and
+  `pseudo_sum` chose by header length; they now take the IP version. `nsplane-tun`'s coalescer
+  keeps the version per group for the same choice (unreachable before: it merges only
+  option-less IPv4 headers).
+- The flow gate's `walk_v6` ran nine iterations and returned on a later Fragment header, so a
+  ninth header passed; the ninth extension header of any kind is now malformed.
+
+Slot A/B against `main`, interleaved, slot 1: `vnet/segment_tcpv4_64k` 3.185 vs 3.183 us (mean
+of 3 rounds); `offload/coalesce_tcpv4_48` no regression (B at or below A in all 5 rounds, the
+spread too wide to claim a gain); gate `established/*`, `baseline/pass_gate` and the IPv6 cases
+within the round-to-round noise. A first `walk_v6` that left the loop with `break` and checked
+the next header after it cost `icmp_error/v6` +4 ns (48 to 53 ns, two rounds); the shipped
+version keeps the original loop and adds one bound check per header (48.0 / 48.3 ns against
+48.9 / 47.9 ns).

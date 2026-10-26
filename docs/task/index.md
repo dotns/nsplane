@@ -71,3 +71,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-1454-ether-proxy-arp nsplane-ether: answer ARP and NDP for every address of the guest's link but its own**](20261024-1454-ether-proxy-arp.md) `P2`
 - [x] [**20261024-2224-acl-rule-reply-revocation Revoke reply allowances of rule-accepted flows when their authority is gone**](20261024-2224-acl-rule-reply-revocation.md) `P1`
 - [x] [**20261026-1848-split-large-modules Split the largest modules by responsibility and share e2e scenario setup**](20261026-1848-split-large-modules.md) `P3`
+- [x] [**20261026-0851-vnet-walk-v6-fixes Fix vnet IPv4 IHL 10 segmentation and the walk_v6 later-fragment header limit**](20261026-0851-vnet-walk-v6-fixes.md) `P1`

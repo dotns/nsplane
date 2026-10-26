@@ -90,6 +90,39 @@ fn at_most_eight_extension_headers_are_walked() {
         denied(GateReason::Malformed),
         "a Fragment header counts"
     );
+    let mut with_later_fragment = vec![options(60, 1); 8];
+    with_later_fragment.push(fragment6(2, 2, true));
+    assert_eq!(
+        gate.evaluate_inbound(
+            PEER,
+            &ipv6_with(REMOTE6, LOCAL6, &with_later_fragment, 6, &[0; 8])
+        ),
+        denied(GateReason::Malformed),
+        "a later fragment's Fragment header counts"
+    );
+}
+
+#[test]
+fn a_later_fragment_as_ninth_header_is_malformed() {
+    let gate = gate_with(policy(vec![open_scope6(GateMode::Enforce)]));
+    let id = 0x0bad_cafe;
+    assert_eq!(
+        gate.evaluate_inbound(PEER, &first_fragment6(REMOTE6, LOCAL6, 40_000, 53, id)),
+        granted("in")
+    );
+    let mut nine = vec![options(60, 1); 8];
+    nine.push(fragment6(id, 2, true));
+    assert_eq!(
+        gate.evaluate_inbound(PEER, &ipv6_with(REMOTE6, LOCAL6, &nine, 17, &[0; 8])),
+        denied(GateReason::Malformed)
+    );
+    let mut eight = vec![options(60, 1); 7];
+    eight.push(fragment6(id, 2, true));
+    assert_eq!(
+        gate.evaluate_inbound(PEER, &ipv6_with(REMOTE6, LOCAL6, &eight, 17, &[0; 8])),
+        valid(),
+        "eight headers, the Fragment header included, are walked"
+    );
 }
 
 #[test]

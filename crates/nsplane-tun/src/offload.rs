@@ -80,6 +80,7 @@ pub(crate) struct Group {
     /// Header bytes of the first packet that the following packets skip.
     hlen: usize,
     ip_len: usize,
+    v6: bool,
     proto: u8,
     gso_size: usize,
     /// Sum of the payload lengths.
@@ -159,10 +160,10 @@ impl Coalescer {
         self.next.resize(packets.len(), None);
         for (i, packet) in packets.iter().enumerate() {
             match classify(packet.as_packet(), self.udp) {
-                Class::Other => self.single(i, 0, 0, 0, 0),
+                Class::Other => self.single(i, false, 0, 0, 0, 0),
                 Class::Unknown => {
                     self.open.clear();
-                    self.single(i, 0, 0, 0, 0);
+                    self.single(i, false, 0, 0, 0, 0);
                 }
                 Class::Flow(c) => {
                     if let Some(pos) = self.open.iter().position(|o| o.key == c.key) {
@@ -171,7 +172,7 @@ impl Coalescer {
                         }
                         self.open.swap_remove(pos);
                     }
-                    self.single(i, c.ip_len, c.hlen, c.key.proto, c.payload);
+                    self.single(i, c.key.v6, c.ip_len, c.hlen, c.key.proto, c.payload);
                     if c.mergeable && !c.psh {
                         self.open.push(Open {
                             group: self.groups.len() - 1,
@@ -219,7 +220,15 @@ impl Coalescer {
     }
 
     /// Starts a group holding packet `i` alone.
-    fn single(&mut self, i: usize, ip_len: usize, hlen: usize, proto: u8, payload: usize) {
+    fn single(
+        &mut self,
+        i: usize,
+        v6: bool,
+        ip_len: usize,
+        hlen: usize,
+        proto: u8,
+        payload: usize,
+    ) {
         self.groups.push(Group {
             hdr: VirtioNetHdr::default(),
             first: i,
@@ -227,6 +236,7 @@ impl Coalescer {
             count: 1,
             hlen,
             ip_len,
+            v6,
             proto,
             gso_size: payload,
             payload,
@@ -269,11 +279,10 @@ impl Coalescer {
     /// and sets its virtio header.
     fn finish(&mut self, g: usize, packets: &mut [PacketBuf]) {
         let group = &mut self.groups[g];
-        let (ip_len, hlen) = (group.ip_len, group.hlen);
+        let (v6, ip_len, hlen) = (group.v6, group.ip_len, group.hlen);
         let len = hlen + group.payload;
         let psh = group.proto == TCP && packets[group.last].as_packet()[ip_len + 13] & TCP_PSH != 0;
         let p = packets[group.first].as_packet_mut();
-        let v6 = ip_len == IPV6_HDR;
         if v6 {
             put16(p, 4, len - IPV6_HDR);
         } else {
@@ -296,7 +305,7 @@ impl Coalescer {
             put16(p, ip_len + 4, len - ip_len);
             (VirtioNetHdr::GSO_UDP_L4, UDP_CSUM_OFFSET)
         };
-        let partial = fold(pseudo_sum(p, ip_len, group.proto, len - ip_len));
+        let partial = fold(pseudo_sum(p, v6, group.proto, len - ip_len));
         p[ip_len + csum_offset..ip_len + csum_offset + 2].copy_from_slice(&partial.to_be_bytes());
         group.hdr = VirtioNetHdr {
             flags: VirtioNetHdr::F_NEEDS_CSUM,
@@ -375,7 +384,7 @@ fn classify(packet: &[u8], udp: bool) -> Class {
         mergeable &= usize::from(u16::from_be_bytes([l4[4], l4[5]])) == l4.len();
         (0, false)
     };
-    mergeable = mergeable && payload > 0 && checksum_valid(packet, ip_len, proto);
+    mergeable = mergeable && payload > 0 && checksum_valid(packet, v6, ip_len, proto);
     Class::Flow(Candidate {
         key,
         ip_len,
@@ -408,21 +417,17 @@ fn same_tcp_fields(a: &[u8], b: &[u8], ip_len: usize, hlen: usize) -> bool {
 
 /// Whether the transport checksum of `packet` is valid (an IPv4 UDP checksum of 0
 /// means none).
-fn checksum_valid(packet: &[u8], ip_len: usize, proto: u8) -> bool {
+fn checksum_valid(packet: &[u8], v6: bool, ip_len: usize, proto: u8) -> bool {
     let l4 = &packet[ip_len..];
-    if proto == UDP && ip_len != IPV6_HDR && l4[6..8] == [0, 0] {
+    if proto == UDP && !v6 && l4[6..8] == [0, 0] {
         return true;
     }
-    fold(sum_words(pseudo_sum(packet, ip_len, proto, l4.len()), l4)) == 0xFFFF
+    fold(sum_words(pseudo_sum(packet, v6, proto, l4.len()), l4)) == 0xFFFF
 }
 
 /// Unfolded sum of the pseudo-header of `packet` for a transport length `l4_len`.
-fn pseudo_sum(packet: &[u8], ip_len: usize, proto: u8, l4_len: usize) -> u64 {
-    let addrs = if ip_len == IPV6_HDR {
-        &packet[8..40]
-    } else {
-        &packet[12..20]
-    };
+fn pseudo_sum(packet: &[u8], v6: bool, proto: u8, l4_len: usize) -> u64 {
+    let addrs = if v6 { &packet[8..40] } else { &packet[12..20] };
     sum_words(u64::from(proto) + l4_len as u64, addrs)
 }
 
@@ -916,6 +921,23 @@ mod tests {
         s.ip_options = vec![1; 4];
         let (_, _, layout) = coalesce(false, &flow(&s, &[300; 2]));
         assert_eq!(layout, [vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn ipv4_with_twenty_option_bytes_is_not_merged() {
+        for proto in [TCP, UDP] {
+            let mut s = spec(false, proto);
+            // IHL 10: the length of an IPv6 header.
+            s.ip_options = vec![1; 19];
+            s.ip_options.push(0);
+            assert_eq!(s.ip_len(), 40);
+            let packets = flow(&s, &[300; 3]);
+            for p in &packets {
+                assert!(checksum_valid(p, false, 40, proto), "proto {proto}");
+            }
+            let (_, _, layout) = coalesce(true, &packets);
+            assert_eq!(layout, [vec![0], vec![1], vec![2]], "proto {proto}");
+        }
     }
 
     #[test]

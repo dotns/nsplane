@@ -97,7 +97,8 @@ host byte order; `parse` and `encode`; `LEN`, `F_NEEDS_CSUM`, `GSO_NONE`, `GSO_T
   segment) and header checksum, UDP length, TCP sequence number and flags (FIN and PSH only
   on the last segment, CWR only on the first) and a complete transport checksum. The header
   length comes from the packet (IP header plus TCP data offset or UDP header), not from
-  `hdr_len` or `csum_start`.
+  `hdr_len` or `csum_start`; the IP version comes from the GSO type (from the first nibble
+  for `GSO_UDP_L4`), so IPv4 headers with options of any length are segmented as IPv4.
 - Packets come from `pool` behind `HEADROOM`, with a capacity of at least `capacity` (or the
   length plus `TAILROOM`), and are appended to `out` from segment index `first` on. When
   `out` fills up (`MAX_BATCH`), the call returns `Ok(Some(next))` and the caller continues
