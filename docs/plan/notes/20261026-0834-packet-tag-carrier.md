@@ -188,8 +188,9 @@ fences the ingress queue). Refinements from the code:
   stack checks it against its lifetime's label (one hash lookup per segment while any labeled
   lifetime exists); this is the main cost of W5 and is measured with labels on.
 - `revoke_label` also calls `Reassembler::discard_tagged`.
-- `NetStackStats` is an exhaustive struct; `label_mismatch` (and release B's `handshake_failed`)
-  break struct literals. Release C makes it `#[non_exhaustive]`.
+- Release B makes `NetStackStats` (with `NetStackConfig`, `TransparentConfig`,
+  `FlowEventsConfig` and `PendingProtocol`) `#[non_exhaustive]`, so the `label_mismatch` counter
+  is additive in release C.
 
 R4 proposal A: `PacketFilter::outbound` sees the tag of the packet `read_source` took, through
 the fragmenter (`split_ipv4` copies it) and the translators (they copy it). No trait change. The
@@ -258,8 +259,8 @@ only source changes are the breaking items below.
 
 The node, from the release C tag:
 
-1. Bump; add the `_ =>` arm for `Output` if it drives `Core` directly, and `..` in
-   `NetStackStats` patterns.
+1. Bump; add the `_ =>` arm for `Output` if it drives `Core` directly (the netstack structs
+   are already `#[non_exhaustive]` since release B).
 2. Set the tag to the listener incarnation's label where it admits input for the shared stack
    (its inbound filter or the sink in front of `NetStackSink`), and read
    `TcpConnection::ingress_label` / `UdpFlow::ingress_label` / `recv_labeled`.
@@ -283,9 +284,8 @@ The gateway, from the release C tag:
 | --- | --- | --- |
 | `Output` `#[non_exhaustive]` plus `Output::Plaintext` | code matching `Core::poll_output` exhaustively (the engine, consumers driving `Core` themselves) | add a wildcard arm; handle `Plaintext` only if `set_plaintext_egress` is used |
 | `PacketBuf` 56 -> 64 bytes (variant A) | nobody at the source level (fields are private, no literal outside `buf.rs`); stack size of `PacketBatch` (+512 bytes) and of queues | none; `size_of` assumptions in consumer code, if any |
-| `NetStackStats` `#[non_exhaustive]`, new counters | struct literals and exhaustive patterns | `..Default::default()` / `..` |
 | `PacketSource::recycle` receives untagged buffers | none (documented behaviour) | none |
-| additive: `PacketBuf::{tag, set_tag, take_tag}`, `Reassembler::{push_tagged, discard_tagged}`, `FragmentTags`, netstack labels, `TrackedSender`, `PlaintextEgress` | none | |
+| additive: `PacketBuf::{tag, set_tag, take_tag}`, `Reassembler::{push_tagged, discard_tagged}`, `FragmentTags`, netstack labels, `NetStackStats::label_mismatch` (the struct is `#[non_exhaustive]` since release B), `TrackedSender`, `PlaintextEgress` | none | |
 
 `Input` and `Event` stay as they are (exhaustive); the receipt output is a new `Output` variant
 behind the same `#[non_exhaustive]`. The changelog lists the breaking items under their own
