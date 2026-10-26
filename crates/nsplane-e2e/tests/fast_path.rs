@@ -206,8 +206,9 @@ impl Transport for TestTransport {
 
     async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
         self.control.pass().await;
-        self.net.send(self.addr, to.addr, datagram);
+        // Counted before the hand-off, so a reader that has seen the datagram sees the count.
         self.control.task_done.fetch_add(1, Ordering::Relaxed);
+        self.net.send(self.addr, to.addr, datagram);
         Ok(())
     }
 
@@ -223,8 +224,8 @@ impl Transport for TestTransport {
             if taken == room {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
-            self.net.send(self.addr, to.addr, datagram.as_packet());
             self.control.try_done.fetch_add(1, Ordering::Relaxed);
+            self.net.send(self.addr, to.addr, datagram.as_packet());
             *sent += 1;
             taken += 1;
         }
@@ -245,8 +246,9 @@ impl PacketSink for TestSink {
         if self.control.closed.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        let _ = self.tx.send((from, packet));
+        // Counted before the hand-off, so a reader that has seen the packet sees the count.
         self.control.task_done.fetch_add(1, Ordering::Relaxed);
+        let _ = self.tx.send((from, packet));
         Ok(())
     }
 
@@ -261,10 +263,10 @@ impl PacketSink for TestSink {
             if taken == room {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
+            self.control.try_done.fetch_add(1, Ordering::Relaxed);
             if let Some(packet) = packets.pop_front() {
                 let _ = self.tx.send(packet);
             }
-            self.control.try_done.fetch_add(1, Ordering::Relaxed);
             taken += 1;
         }
         Ok(())

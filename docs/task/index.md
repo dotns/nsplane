@@ -52,7 +52,7 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261013-1300-lan-prefix-mappings Prefix address mappings for LAN prefixes**](20261013-1300-lan-prefix-mappings.md) `P1`
 - [x] [**20261013-1301-per-identity-routing Cryptokey routing per local identity**](20261013-1301-per-identity-routing.md) `P1`
 - [x] [**20261013-1600-perf-residuals Performance residuals left after 0.13/0.14**](20261013-1600-perf-residuals.md) `P2`
-- [ ] [**20261017-1600-flaky-crypto-workers-test Flaky sink count in a crypto-workers e2e test**](20261017-1600-flaky-crypto-workers-test.md) `P3`
+- [x] [**20261017-1600-flaky-crypto-workers-test Flaky sink count in a crypto-workers e2e test**](20261017-1600-flaky-crypto-workers-test.md) `P3`
 - [-] [**20261017-1700-flow-lifecycle-request Per-flow retirement, flow context and delivery gates (request, draft)**](20261017-1700-flow-lifecycle-request.md) `P3`
 - [x] [**20261018-1000-doc-system One documentation standard: behavior-only product docs and comments**](20261018-1000-doc-system.md) `P2`
 - [x] [**20261020-0854-udp-icmp-isolation Isolate asynchronous errors on shared UDP sockets**](20261020-0854-udp-icmp-isolation.md) `P1`
