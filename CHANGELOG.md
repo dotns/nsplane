@@ -5,6 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `nsplane-acl`: scope-qualified flow gate decisions. `FlowGate::evaluate_inbound_in` and
+  `evaluate_outbound_in` decide a packet for a `ScopeSelection` (one scope or a non-empty set;
+  `ScopeSelection::any_of` refuses an empty set with `EmptySelection`) and return a
+  `ScopedDecision` with the decision, the deciding `ScopeId`, the `RuleId` (the flow's grant
+  for `ValidState` too, `None` for a later fragment) and the policy generation. A packet whose
+  scope is outside the selection, or that binds no scope, is denied with the new
+  `GateReason::OutOfScope` without reading or writing any state; held, ambiguous and
+  malformed packets are enforced denials whatever the scopes' modes. Out-of-scope denials
+  count as enforced denials and emit decision events. The unscoped calls are unchanged.
+
 ## [0.19.3] - 2026-10-26
 
 Patch release; no public API change.

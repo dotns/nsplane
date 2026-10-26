@@ -415,13 +415,6 @@ impl<A: GateAddr> FamilyShard<'_, A> {
         Lookup::Missing
     }
 
-    /// Whether `key` has a live flow; its idle lifetime is refreshed.
-    pub(super) fn touch_flow(&mut self, key: &FlowKey<A>, now: Instant, counts: &Counts) -> bool {
-        self.with_live_flow(key, now, counts, |state| {
-            state.touch::<A>(key.protocol, now, &counts.timeouts);
-        }) != Lookup::Missing
-    }
-
     pub(super) fn fragment_disposition(
         &mut self,
         key: &FragmentKey<A>,

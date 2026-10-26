@@ -194,6 +194,7 @@ fn a_stale_snapshot_retries_instead_of_touching_migrated_state() {
         meta: PacketMeta::parse(&packet),
         now: Instant::now().into(),
         swept: false,
+        scoping: None,
     };
     assert_eq!(gate.evaluate_once(&stale, &input), Step::Retry);
     assert_eq!(audit(&gate), (0, 0), "the stale allow created no state");
