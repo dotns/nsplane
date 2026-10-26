@@ -1,13 +1,35 @@
+use std::collections::HashMap;
 use std::error::Error;
-use std::task::Waker;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
+use futures_core::Stream;
+use nsplane::{PacketSink, PacketSource};
+use nsplane_packet::{IpPacket, PacketBuf, PeerId, checksum, protocol};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::socket::tcp;
 use smoltcp::socket::tcp as client_tcp;
-use smoltcp::wire::IpListenEndpoint;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use tokio::io::ReadBuf;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
+use super::connections::{
+    IDLE_TIMEOUT, record_receive_activity, tcp_idle_timeout_expired, tcp_terminal_ready,
+};
+use super::ingress::{Class, Reject, classify};
+use super::listeners::{ensure_tcp_listeners, new_tcp_socket, tcp_listener_ready_for_promotion};
+use super::wire::{tcp_dst_port, tcp_is_syn, tcp_tuple};
 use super::*;
-use crate::udp::build_udp;
+use crate::config::{Admission, NetStackConfig, Settings, TcpRto};
+use crate::device::VirtualDevice;
+use crate::stats::NetStackStats;
+use crate::tcp::TcpConnection;
+use crate::udp::{self, UdpSocket, build_udp};
 
 mod abort;
 mod basic_udp;
