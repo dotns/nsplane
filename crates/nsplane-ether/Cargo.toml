@@ -17,7 +17,7 @@ workspace = true
 [dependencies]
 nsplane = { path = "../nsplane", version = "0.19.1" }
 nsplane-packet = { path = "../nsplane-packet", version = "0.19.1" }
-tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync"] }
+tokio = { version = "1.54.0", features = ["io-util", "net", "rt", "sync"] }
 tracing = "0.1.40"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -26,4 +26,4 @@ libc = "0.2"
 [dev-dependencies]
 futures-core = "0.3.32"
 nsplane-netstack = { path = "../nsplane-netstack", version = "0.19.1" }
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
