@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- nsplane-ether and nsplane-tun build for Linux musl targets: `msg_iovlen` and the `ioctl`
+  request type differ between glibc and musl, and nsplane-ether passed the glibc types, so a
+  musl build of nsplane-ether failed to compile. `just cross` now runs clippy for
+  `x86_64-unknown-linux-musl`.
+
 ## [0.19.2] - 2026-10-26
 
 Patch release; no public API change.

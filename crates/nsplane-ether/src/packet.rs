@@ -241,7 +241,9 @@ fn recv(fd: &OwnedFd, hdr: &mut [u8; VirtioNetHdr::LEN], buf: &mut [u8]) -> io::
     msg.msg_namelen = socklen_t::try_from(size_of::<sockaddr_ll>()).unwrap_or_default();
     // `IoSliceMut` is ABI compatible with `struct iovec` on Unix.
     msg.msg_iov = iov.as_mut_ptr().cast();
-    msg.msg_iovlen = iov.len();
+    // The two entries of `iov`; a literal, because the type of `msg_iovlen` differs between
+    // C libraries (`size_t` on glibc, `int` on musl).
+    msg.msg_iovlen = 2;
     #[allow(unsafe_code, reason = "recvmsg(2) on an owned socket")]
     // SAFETY: `msg` points at `addr` and at the two iovecs, which are valid for writes of
     // their lengths and live for the duration of the call.

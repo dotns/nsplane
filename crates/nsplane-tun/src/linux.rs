@@ -155,12 +155,24 @@ pub(crate) fn vnet_hdr(fd: BorrowedFd<'_>) -> io::Result<bool> {
     Ok(c_int::from(flags) & IFF_VNET_HDR != 0)
 }
 
+/// `request` as the `ioctl` request type of the C library (`c_ulong` on glibc, `c_int` on
+/// musl). Socket ioctl numbers fit in 16 bits, so the conversion is lossless.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request type depends on the C library; the value fits either"
+)]
+const fn request(request: c_ulong) -> libc::Ioctl {
+    request as libc::Ioctl
+}
+
 /// The MTU of the interface `name` (`SIOCGIFMTU`).
 pub(crate) fn mtu(name: &str) -> io::Result<u16> {
     let sock = ioctl_socket()?;
     let mut ifr = IfReq::new(name)?;
     // SAFETY: SIOCGIFMTU writes into the `ifreq` that lives for the duration of the call.
-    cvt(unsafe { ioctl(sock.as_raw_fd(), SIOCGIFMTU as _, &raw mut ifr) })?;
+    cvt(unsafe { ioctl(sock.as_raw_fd(), request(SIOCGIFMTU), &raw mut ifr) })?;
     // SAFETY: the union was fully zero-initialised and SIOCGIFMTU set `mtu`; every bit
     // pattern is a valid `c_int`.
     let mtu = unsafe { ifr.data.mtu };

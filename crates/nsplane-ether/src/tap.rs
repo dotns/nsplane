@@ -364,6 +364,18 @@ fn ipv6_conf(name: &str, key: &str, value: &str) -> io::Result<()> {
     }
 }
 
+/// `request` as the `ioctl` request type of the C library (`c_ulong` on glibc, `c_int` on
+/// musl). Socket ioctl numbers fit in 16 bits, so the conversion is lossless.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request type depends on the C library; the value fits either"
+)]
+const fn request(request: c_ulong) -> libc::Ioctl {
+    request as libc::Ioctl
+}
+
 /// Sets `IFF_UP` and `IFF_NOARP` on the interface `name`.
 fn set_up_noarp(name: &str) -> io::Result<()> {
     let sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)?;
@@ -371,14 +383,14 @@ fn set_up_noarp(name: &str) -> io::Result<()> {
     #[allow(unsafe_code, reason = "SIOCGIFFLAGS ioctl")]
     // SAFETY: SIOCGIFFLAGS writes the flags into the `ifreq` that lives for the duration of
     // the call; `IfReq` matches the kernel's 40-byte layout.
-    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCGIFFLAGS, &raw mut ifr) };
+    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), request(SIOCGIFFLAGS), &raw mut ifr) };
     if ret == -1 {
         return Err(io::Error::last_os_error());
     }
     ifr.flags |= c_short::try_from(IFF_UP | IFF_NOARP).unwrap_or_default();
     #[allow(unsafe_code, reason = "SIOCSIFFLAGS ioctl")]
     // SAFETY: SIOCSIFFLAGS reads the `ifreq` that lives for the duration of the call.
-    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCSIFFLAGS, &raw mut ifr) };
+    let ret = unsafe { libc::ioctl(sock.as_raw_fd(), request(SIOCSIFFLAGS), &raw mut ifr) };
     if ret == -1 {
         return Err(io::Error::last_os_error());
     }

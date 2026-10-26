@@ -43,9 +43,10 @@ product-terms:
 docs:
     scripts/check-docs.sh
 
-# Cross-target clippy: macOS through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
+# Cross-target clippy: macOS and Linux musl through zig (cargo-zigbuild), Windows through mingw-w64 + nasm.
 cross:
     cargo-zigbuild clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
+    cargo-zigbuild clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-musl
     cargo hack clippy -p nsplane-noise -p nsplane -p nsplane-tun -p nsplane-uapi -p nsplane-ether -p nsplane-dns --each-feature --all-targets --target x86_64-pc-windows-gnu
 
 # Windows unit tests under wine (no Wintun driver: the device itself cannot start).
