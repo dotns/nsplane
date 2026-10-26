@@ -86,3 +86,25 @@ Implementing netstack flow control from the first input
   not run: `cargo-zigbuild` is not installed on this host.
 
 - complete: implemented on feat/first-input-flow-control; merges last in release B
+- Follow-up (owner decision: 0.20.0 is breaking for both structs): `NetStackConfig` and
+  `NetStackStats` are `#[non_exhaustive]`. Callers outside the crate build from
+  `NetStackConfig::new` / `Default::default()` and assign fields; no builder or new
+  constructor was needed. Call sites changed outside the W1 write scope (approved for these
+  mechanical changes): `nsplane-e2e` tests `netstack_buffers`, `netstack_flow_retirement`,
+  `netstack_multistream`, `netstack_fragment_admission`, `netstack_progress`,
+  `netstack_reassembly`, `netstack_transparent`; `examples/tests/vm_wireguard.rs`;
+  `docs/guide.md`, `docs/guide.zh-CN.md`. Inside scope: `config.rs` (doc tests), `stats.rs`,
+  `tests/tcp_pipeline.rs`, e2e `netstack_first_input`, the reference page, `CHANGELOG.md`.
+- `cargo semver-checks check-release -p nsplane-netstack --baseline-rev 52eb983`
+  (0.51.0): "semver requires new major version", one failed lint
+  `struct_marked_non_exhaustive` on both structs (it has no lint for the fields added to
+  the formerly exhaustive structs).
+- Gate on fddd325: `just check` exit 100 at `test`, 2366 passed, 3 failed: the two known
+  host failures plus `offload_udp bulk_transfer_ipv4_offload_on_on_workers`. All three are
+  kernel loopback UDP 5 s timeouts in crates this branch does not change; the two
+  `offload_on_on_workers` tests interleaved branch/base over 4 rounds passed 1 of 8 on each
+  side. fmt and clippy passed before `test`; doc-test, deny, shear, typos, msrv, examples,
+  product-terms and docs pass (exit 0); rustdoc with warnings denied passes.
+- Other exhaustive public structs with the same exposure, left unchanged:
+  `TransparentConfig`, `FlowEventsConfig`, and the re-exported `ReassemblyConfig`
+  (defined in `nsplane-packet`); also the exhaustive public enum `PendingProtocol`.
