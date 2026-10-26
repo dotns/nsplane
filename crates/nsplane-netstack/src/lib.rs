@@ -59,7 +59,10 @@ mod udp;
 
 pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentConfig};
 pub use events::{FlowEvent, FlowEventReason, FlowEventsConfig};
-pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
+pub use flow::{
+    DeliveryOutcome, DeliveryReceipt, FlowContext, FlowControl, RetirementOutcome,
+    RetirementReceipt, Undelivered,
+};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
 pub use pending::{PendingFlow, PendingProtocol};

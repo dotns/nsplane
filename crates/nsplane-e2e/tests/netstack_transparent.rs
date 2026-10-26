@@ -81,7 +81,10 @@ struct Server {
 }
 
 /// A client and a server whose stack runs with `transparent`, peers of each other.
-async fn pair(transparent: Option<TransparentConfig>) -> TestResult<(Client, Server)> {
+async fn pair(
+    transparent: Option<TransparentConfig>,
+    admission: Admission,
+) -> TestResult<(Client, Server)> {
     let client_path = (
         TransportId::new(1),
         SocketAddr::from(([192, 0, 2, 1], 1000)),
@@ -114,6 +117,7 @@ async fn pair(transparent: Option<TransparentConfig>) -> TestResult<(Client, Ser
 
     let (server_stack, server_handle) = NetStack::new(NetStackConfig {
         transparent,
+        admission,
         ..NetStackConfig::new(
             vec![(IpAddr::V4(STACK4), 32), (IpAddr::V6(STACK6), 128)],
             DEFAULT_MTU,
@@ -305,10 +309,13 @@ async fn expect_port_unreachable(client: &mut Client, target: SocketAddr) -> Tes
 
 #[tokio::test]
 async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
-    let (client, server) = pair(Some(TransparentConfig {
-        prefixes: prefixes(),
-        ..Default::default()
-    }))
+    let (client, server) = pair(
+        Some(TransparentConfig {
+            prefixes: prefixes(),
+            ..Default::default()
+        }),
+        Admission::Immediate,
+    )
     .await?;
     let mut reports = serve_echo(&server.stack);
 
@@ -339,14 +346,16 @@ async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
 
 #[tokio::test]
 async fn decide_admission_accepts_and_rejects() -> TestResult {
-    let (mut client, server) = pair(Some(TransparentConfig {
-        prefixes: prefixes(),
-        admission: Admission::Decide {
+    let (mut client, server) = pair(
+        Some(TransparentConfig {
+            prefixes: prefixes(),
+            ..Default::default()
+        }),
+        Admission::Decide {
             timeout: WAIT,
             max_pending: 16,
         },
-        ..Default::default()
-    }))
+    )
     .await?;
     let mut reports = serve_echo(&server.stack);
     let (offered_tx, mut offered) = mpsc::unbounded_channel();
@@ -404,7 +413,7 @@ async fn decide_admission_accepts_and_rejects() -> TestResult {
 
 #[tokio::test]
 async fn without_transparent_mode_the_packets_have_no_address() -> TestResult {
-    let (client, server) = pair(None).await?;
+    let (client, server) = pair(None, Admission::Immediate).await?;
     let mut reports = serve_echo(&server.stack);
 
     let connects: Vec<_> = [TCP4, TCP6]

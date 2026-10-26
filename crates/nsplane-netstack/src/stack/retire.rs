@@ -73,15 +73,30 @@ impl Driver {
     /// an RST) or the queue entry, its packets in the backlog, a fence for those already
     /// in the egress queue, and a barrier for its fragments the reassembler may hold.
     /// `Failed` if the fence or the barrier table is full.
+    ///
+    /// A lifetime not handed out yet is found at its stage: the pending entry, the
+    /// listener socket mid handshake, the connection waiting for `incoming_tcp`, or the
+    /// flow entry.
     fn retire(&mut self, flow: &Arc<FlowState>) -> RetirementOutcome {
         let fenced = match flow.target() {
-            &Target::Tcp {
+            None => {
+                // Held, or accepted and dropped in `take_decisions`: no output yet.
+                if self
+                    .pending
+                    .as_mut()
+                    .is_some_and(|table| table.remove_lifetime(flow))
+                {
+                    self.count_pending();
+                }
+                true
+            }
+            Some(&Target::Tcp {
                 handle,
                 local,
                 peer,
                 start,
                 ..
-            } => {
+            }) => {
                 if self
                     .conns
                     .get(&handle)
@@ -89,10 +104,21 @@ impl Driver {
                 {
                     self.aborting.retain(|&aborting| aborting != handle);
                     self.release_conn(handle);
+                } else if self.inbound.get(&handle).is_some_and(|inbound| {
+                    inbound
+                        .flow
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, flow))
+                }) {
+                    self.release_handshake(handle, local.port());
+                    flow.set_end(self.position());
+                }
+                if !self.waiting.is_empty() {
+                    self.waiting.retain(|conn| !Arc::ptr_eq(conn.flow(), flow));
                 }
                 self.purge_tcp(local, peer, start, flow.end())
             }
-            Target::UdpFlow(key) => {
+            Some(Target::UdpFlow(key)) => {
                 if self
                     .flows
                     .get(key)
@@ -102,7 +128,7 @@ impl Driver {
                 }
                 self.purge_udp(flow)
             }
-            Target::UdpBound(local) => {
+            Some(Target::UdpBound(local)) => {
                 if self
                     .bound
                     .get(local)
@@ -112,7 +138,7 @@ impl Driver {
                 }
                 self.purge_udp(flow)
             }
-            Target::UdpConnected(key) => {
+            Some(Target::UdpConnected(key)) => {
                 if self
                     .connected
                     .get(key)
@@ -123,7 +149,7 @@ impl Driver {
                 self.purge_udp(flow)
             }
         };
-        let barred = self.bar(flow.target());
+        let barred = self.bar(flow);
         if fenced && barred {
             RetirementOutcome::Retired
         } else {

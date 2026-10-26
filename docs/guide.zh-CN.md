@@ -623,11 +623,11 @@ async fn main() -> anyhow::Result<()> {
     let server = NetStackConfig {
         transparent: Some(TransparentConfig {
             prefixes: vec![("192.0.2.0".parse()?, 24)],
-            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
             max_connections: Some(4096),
             events: Some(FlowEventsConfig::default()),
             ..Default::default()
         }),
+        admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
         ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
     };
     let (s, stack_s, outer_s) = node(key_s, server)?;

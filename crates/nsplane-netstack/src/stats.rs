@@ -10,8 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly) the reassembly
 /// counters also count datagrams completed. The admission counters from
 /// [`pending`](Self::pending) on belong to
-/// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) and are always 0
-/// without it. [`events_emitted`](Self::events_emitted) and
+/// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) and
+/// [`Admission::Decide`](crate::Admission::Decide): on a stack with neither they are
+/// always 0, and without `transparent` only `pending`, `accepted`, `rejected_hook`,
+/// `rejected_timeout` and `rejected_table_full` count. [`events_emitted`](Self::events_emitted) and
 /// [`events_dropped`](Self::events_dropped) count admission events, not packets. Counters
 /// only grow, except the gauge [`pending`](Self::pending).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,6 +37,10 @@ pub struct NetStackStats {
     /// Bare SYNs left unanswered because `incoming_tcp` was full, with
     /// `NetStackConfig::accept_backpressure`; the peer retransmits them.
     pub syn_deferred: u64,
+    /// Inbound TCP handshakes that ended before the connection was established: the
+    /// peer reset the socket in SYN-RECEIVED, or the connection closed before the stack
+    /// took it.
+    pub handshake_failed: u64,
     /// Datagrams dropped because their UDP flow or bound socket queue was full.
     pub udp_queue_full: u64,
     /// Datagrams dropped because opening their flow would exceed the flow limit.
@@ -65,7 +71,8 @@ pub struct NetStackStats {
     pub icmp_ignored: u64,
     /// A gauge, not a counter: the TCP connections and UDP flows held for the
     /// application's decision under [`Admission::Decide`](crate::Admission::Decide) now.
-    /// Each leaves it accepted or counted in one of the `rejected_` fields.
+    /// Each leaves it accepted, counted in one of the `rejected_` fields, or revoked
+    /// with [`FlowControl::revoke`](crate::FlowControl::revoke) (counted nowhere).
     pub pending: u64,
     /// Bare SYNs and UDP flows' first datagrams admitted in transparent mode, to the
     /// stack's own addresses and to in-prefix destinations. A retransmitted SYN of a
@@ -73,7 +80,7 @@ pub struct NetStackStats {
     /// refused by the listener pool ([`syn_refused`](Self::syn_refused)), and a datagram
     /// by the flow limit or the accept queue. Under
     /// [`Admission::Decide`](crate::Admission::Decide) a connection or flow is counted
-    /// when the application accepts it.
+    /// when the application accepts it, on every stack.
     pub accepted: u64,
     /// Connections and flows the application rejected under
     /// [`Admission::Decide`](crate::Admission::Decide), or whose pending item it dropped.
@@ -111,6 +118,7 @@ pub(crate) struct Counters {
     pub(crate) syn_refused: AtomicU64,
     pub(crate) tcp_not_accepted: AtomicU64,
     pub(crate) syn_deferred: AtomicU64,
+    pub(crate) handshake_failed: AtomicU64,
     pub(crate) udp_queue_full: AtomicU64,
     pub(crate) udp_flow_limit: AtomicU64,
     pub(crate) udp_not_accepted: AtomicU64,
@@ -149,6 +157,7 @@ impl Counters {
             syn_refused: get(&self.syn_refused),
             tcp_not_accepted: get(&self.tcp_not_accepted),
             syn_deferred: get(&self.syn_deferred),
+            handshake_failed: get(&self.handshake_failed),
             udp_queue_full: get(&self.udp_queue_full),
             udp_flow_limit: get(&self.udp_flow_limit),
             udp_not_accepted: get(&self.udp_not_accepted),

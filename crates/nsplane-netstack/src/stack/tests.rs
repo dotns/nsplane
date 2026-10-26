@@ -36,6 +36,7 @@ mod basic_udp;
 mod buffers;
 mod connected_udp;
 mod events;
+mod first_input;
 mod flow_bounds;
 mod flow_context;
 mod flow_control;

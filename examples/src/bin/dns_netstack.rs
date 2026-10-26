@@ -99,12 +99,12 @@ fn stacks() -> (NetStackHandle, NetStackHandle) {
     let mut config = NetStackConfig::new(vec![(SERVER_ADDR, 24)], DEFAULT_MTU);
     config.transparent = Some(TransparentConfig {
         prefixes: vec![TRANSPARENT_PREFIX],
-        admission: Admission::Decide {
-            timeout: Duration::from_secs(1),
-            max_pending: 64,
-        },
         ..TransparentConfig::default()
     });
+    config.admission = Admission::Decide {
+        timeout: Duration::from_secs(1),
+        max_pending: 64,
+    };
     let (server_stack, server) = NetStack::new(config);
     let (client_source, client_sink) = client_stack.split();
     let (server_source, server_sink) = server_stack.split();

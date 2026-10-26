@@ -11,7 +11,7 @@ use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
 
-use crate::flow::{FlowState, Target};
+use crate::flow::{FlowState, Target, Undelivered};
 use crate::ownership::Registration;
 use crate::stats::{self};
 use crate::tcp::{Progress, Shared, TcpConnection};
@@ -19,7 +19,7 @@ use crate::tcp::{Progress, Shared, TcpConnection};
 use super::connections::Conn;
 use super::listeners::tcp_listener_ready_for_promotion;
 use super::wire::endpoint_to_socket_addr;
-use super::{CONNECT_TIMEOUT, Driver};
+use super::{CONNECT_TIMEOUT, Driver, Inbound};
 
 /// A `connect_tcp` waiting for its handshake.
 pub(super) struct Connecting {
@@ -57,16 +57,21 @@ impl Driver {
 
         for (handle, port) in accepted {
             // A socket the batch tracking missed counts from the start, which covers it.
-            let start = self.inbound.get(&handle).map_or(0, |&(_, start)| start);
-            let connection = self.adopt(handle, now, start);
-            self.inbound.remove(&handle);
+            let (start, lifetime) = self
+                .inbound
+                .remove(&handle)
+                .map_or((0, None), |inbound| (inbound.start, inbound.flow));
+            let connection = self.adopt(handle, now, start, lifetime);
             tracing::debug!(
                 target: "netstack",
                 port,
                 remote = %connection.peer_addr(),
                 "TCP connection accepted"
             );
-            self.offer(connection);
+            // A lifetime revoked meanwhile is not offered; the next turn retires it.
+            if !connection.flow().is_revoked() {
+                self.offer(connection);
+            }
         }
     }
 
@@ -88,9 +93,15 @@ impl Driver {
             Err(TrySendError::Full(connection)) if self.settings.accept_backpressure => {
                 self.waiting.push_back(connection);
             }
-            Err(_) => {
-                tracing::debug!(target: "netstack", "incoming_tcp full or gone; closing");
+            Err(TrySendError::Full(connection)) => {
+                tracing::debug!(target: "netstack", "incoming_tcp full; closing");
                 stats::add(&self.stats.tcp_not_accepted, 1);
+                connection.flow().undeliver(Undelivered::AcceptQueueFull);
+            }
+            Err(TrySendError::Closed(connection)) => {
+                tracing::debug!(target: "netstack", "incoming_tcp gone; closing");
+                stats::add(&self.stats.tcp_not_accepted, 1);
+                connection.flow().undeliver(Undelivered::AcceptQueueGone);
             }
         }
     }
@@ -125,7 +136,7 @@ impl Driver {
                 tcp::State::Established | tcp::State::CloseWait => {
                     socket.set_timeout(None);
                     // A caller that gave up drops the connection, which closes it.
-                    let _ = reply.send(Ok(self.adopt(handle, now, start)));
+                    let _ = reply.send(Ok(self.adopt(handle, now, start, None)));
                 }
                 tcp::State::Closed => {
                     self.sockets.remove(handle);
@@ -153,8 +164,16 @@ impl Driver {
     }
 
     /// Registers an established socket as a connection and returns the application side;
-    /// `start` is the egress position when the socket took or sent the SYN.
-    fn adopt(&mut self, handle: SocketHandle, now: SmolInstant, start: u64) -> TcpConnection {
+    /// `start` is the egress position when the socket took or sent the SYN, and
+    /// `lifetime` the state of a SYN accepted under `Admission::Decide`, bound to the
+    /// socket.
+    fn adopt(
+        &mut self,
+        handle: SocketHandle,
+        now: SmolInstant,
+        start: u64,
+        lifetime: Option<Arc<FlowState>>,
+    ) -> TcpConnection {
         let socket = self.sockets.get::<tcp::Socket<'_>>(handle);
         let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let local = socket
@@ -163,21 +182,19 @@ impl Driver {
         let peer = socket
             .remote_endpoint()
             .map_or(unspecified, endpoint_to_socket_addr);
-        let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
         let (terminal, terminal_rx) = watch::channel(false);
         let progress = Arc::new(Progress::new(self.epoch.into_std()));
         // Taken before the caller drops the connect's or the handshake's registration.
         let registration = self.owners.tcp(local, peer);
-        let flow = FlowState::new(
-            Target::Tcp {
-                handle,
-                shared: Arc::clone(&shared),
-                local,
-                peer,
-                start,
-            },
-            &self.revocations,
-        );
+        let bound = lifetime.and_then(|flow| match flow.target() {
+            Some(Target::Tcp { shared, .. }) => {
+                let shared = Arc::clone(shared);
+                flow.mark_adopted();
+                Some((flow, shared))
+            }
+            _ => None,
+        });
+        let (flow, shared) = bound.unwrap_or_else(|| self.tcp_state(handle, local, peer, start));
         self.conns.insert(
             handle,
             Conn {
@@ -203,20 +220,43 @@ impl Driver {
     }
 
     /// Unregisters listener sockets that left the handshake without being established
-    /// (reset back to `Listen`, or closed).
+    /// (reset back to `Listen`, or closed), counting each; the lifetime of an accepted SYN
+    /// ends undelivered.
     pub(super) fn release_inbound(&mut self) {
-        let sockets = &self.sockets;
-        self.inbound.retain(|&handle, _| {
-            !matches!(
+        let (sockets, stats, end) = (&self.sockets, &self.stats, self.position());
+        self.inbound.retain(|&handle, inbound| {
+            let failed = matches!(
                 sockets.get::<tcp::Socket<'_>>(handle).state(),
                 tcp::State::Listen | tcp::State::Closed | tcp::State::TimeWait
-            )
+            );
+            if failed {
+                stats::add(&stats.handshake_failed, 1);
+                if let Some(flow) = &inbound.flow {
+                    flow.set_end(end);
+                    flow.undeliver(Undelivered::HandshakeFailed);
+                }
+            }
+            !failed
         });
+    }
+
+    /// Removes the listener socket `handle` of `port` mid handshake, without an RST: a
+    /// revoked lifetime.
+    pub(super) fn release_handshake(&mut self, handle: SocketHandle, port: u16) {
+        self.inbound.remove(&handle);
+        if let Some(handles) = self.listeners.get_mut(&port) {
+            handles.retain(|&listener| listener != handle);
+            if handles.is_empty() {
+                self.listeners.remove(&port);
+            }
+        }
+        self.sockets.remove(handle);
     }
 
     /// Registers the tuples of listener sockets a SYN of this batch moved into
     /// `SynReceived`, before their SYN-ACK leaves, with `mark`, the egress position before
-    /// the batch.
+    /// the batch. A socket that took a SYN accepted under `Admission::Decide` becomes the
+    /// target of its lifetime; an accepted SYN no socket took ends undelivered.
     pub(super) fn track_inbound(&mut self, demand: &HashMap<u16, usize>, mark: u64) {
         for port in demand.keys() {
             let Some(handles) = self.listeners.get(port) else {
@@ -239,12 +279,35 @@ impl Driver {
                 if self
                     .inbound
                     .get(&handle)
-                    .is_none_or(|(registration, _)| !registration.is(local, remote))
+                    .is_none_or(|inbound| !inbound.registration.is(local, remote))
                 {
-                    self.inbound
-                        .insert(handle, (self.owners.tcp(local, remote), mark));
+                    let flow = self
+                        .pending
+                        .as_mut()
+                        .and_then(|table| table.take_admitted(local, remote));
+                    if let Some(flow) = &flow {
+                        flow.bind(Target::Tcp {
+                            handle,
+                            shared: Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer))),
+                            local,
+                            peer: remote,
+                            start: mark,
+                        });
+                    }
+                    let registration = self.owners.tcp(local, remote);
+                    self.inbound.insert(
+                        handle,
+                        Inbound {
+                            registration,
+                            start: mark,
+                            flow,
+                        },
+                    );
                 }
             }
+        }
+        if let Some(table) = self.pending.as_mut() {
+            table.refuse_admitted();
         }
     }
 }

@@ -123,7 +123,7 @@ impl Driver {
                         // Unanswered, the peer retransmits it once the queue may have room.
                         return stats::add(&self.stats.syn_deferred, 1);
                     }
-                    let packet = if self.settings.transparent.is_some() {
+                    let packet = if self.settings.transparent.is_some() || self.pending.is_some() {
                         match self.admit_syn(packet, demand) {
                             Some(packet) => packet,
                             None => return,
@@ -159,23 +159,23 @@ impl Driver {
     #[inline(never)]
     fn ingest_held_udp(&mut self, packet: PacketBuf) {
         match udp::parse_udp_whole(packet) {
-            Some((datagram, whole)) => self.dispatch_held_udp(datagram, Some(whole)),
+            Some((datagram, whole)) => self.dispatch_held_udp(datagram, whole),
             None => stats::add(&self.stats.malformed, 1),
         }
     }
 
-    /// [`dispatch_udp`](Self::dispatch_udp) out of line, for the `Admission::Decide` paths.
+    /// [`dispatch_udp`](Self::dispatch_udp) out of line, for the `Admission::Decide` path.
     #[cold]
     #[inline(never)]
-    pub(super) fn dispatch_held_udp(&mut self, datagram: Datagram, whole: Option<Bytes>) {
-        self.dispatch_udp(datagram, whole);
+    pub(super) fn dispatch_held_udp(&mut self, datagram: Datagram, whole: Bytes) {
+        self.dispatch_udp(datagram, Some(whole));
     }
 
-    /// Admits a bare SYN in transparent mode; the SYN if it goes on into smoltcp now. A
-    /// retransmitted SYN of a handshake in progress passes uncounted, and one of a held
-    /// connection is absorbed; a new connection beyond `max_connections` is answered with
-    /// RST. Under `Admission::Decide` a new connection is held (or, with the table full,
-    /// answered with RST).
+    /// Admits a bare SYN in transparent mode or under `Admission::Decide`; the SYN if it
+    /// goes on into smoltcp now. A retransmitted SYN of a handshake in progress passes
+    /// uncounted, and one of a held connection is absorbed; a new connection beyond
+    /// `max_connections` is answered with RST. Under `Admission::Decide` a new connection
+    /// is held (or, with the table full, answered with RST).
     fn admit_syn(&mut self, packet: PacketBuf, demand: &HashMap<u16, usize>) -> Option<PacketBuf> {
         let Some((remote, local)) = tcp_tuple(packet.as_packet()) else {
             return Some(packet);
@@ -279,7 +279,7 @@ impl Driver {
 
     /// Delivers a datagram to its connected socket, its bound socket, or to its flow;
     /// `whole` is the packet of an ingress datagram whose new flow may be held, `None`
-    /// without `Admission::Decide` or for an accepted held datagram.
+    /// without `Admission::Decide`.
     #[allow(
         clippy::inline_always,
         reason = "the ingress path keeps its own copy, with `whole` a constant `None`"

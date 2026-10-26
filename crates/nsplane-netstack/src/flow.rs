@@ -1,5 +1,6 @@
 //! Per-flow control: revoking one connection or flow of a shared stack, the receipt that
-//! tells when the stack holds nothing of it any more, and the caller's label on the flow.
+//! tells when the stack holds nothing of it any more, the receipt of its hand-out, and the
+//! caller's label on the flow.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -13,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use smoltcp::iface::SocketHandle;
 use tokio::sync::Notify;
 
+use crate::pending::Key;
 use crate::tcp::{self, Shared};
 
 /// Most fences the egress holds at once, TCP and UDP together; a revoke that needs one
@@ -23,6 +25,11 @@ const PENDING: u8 = 0;
 const RETIRED: u8 = 1;
 const FAILED: u8 = 2;
 const UNKNOWN: u8 = 3;
+
+/// The delivery stage before it is fixed; `DELIVERED` once handed out, an
+/// [`Undelivered::code`] once it ended without.
+const UNDECIDED: u8 = 0;
+const DELIVERED: u8 = 1;
 
 /// The next instance [`FlowControl::bind_context`] hands out, shared by every stack of the
 /// process.
@@ -80,10 +87,80 @@ pub enum RetirementOutcome {
     Unknown,
 }
 
+/// How the hand-out of a connection's or flow's lifetime ended, see [`DeliveryReceipt`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeliveryOutcome {
+    /// Handed out on [`incoming_tcp`](crate::NetStackHandle::incoming_tcp) or
+    /// [`incoming_udp`](crate::NetStackHandle::incoming_udp), or opened by the application.
+    Delivered,
+    /// Never handed out; no handle of this lifetime appears afterwards.
+    NotDelivered(Undelivered),
+}
+
+/// Why a lifetime held under [`Admission::Decide`](crate::Admission::Decide) was never
+/// handed out, see [`DeliveryOutcome::NotDelivered`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Undelivered {
+    /// [`PendingFlow::reject`](crate::PendingFlow::reject), or the item was dropped; see
+    /// [`rejected_hook`](crate::NetStackStats::rejected_hook).
+    Rejected,
+    /// No decision within the [`Admission::Decide`](crate::Admission::Decide) timeout; see
+    /// [`rejected_timeout`](crate::NetStackStats::rejected_timeout).
+    TimedOut,
+    /// [`TransparentConfig::max_connections`](crate::TransparentConfig::max_connections)
+    /// was reached at the accept; see
+    /// [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit).
+    ConnectionLimit,
+    /// The accepted SYN found no socket of the listener pool; see
+    /// [`syn_refused`](crate::NetStackStats::syn_refused).
+    NoListener,
+    /// The handshake ended before the connection was established: the peer reset it, or
+    /// it closed; see [`handshake_failed`](crate::NetStackStats::handshake_failed).
+    HandshakeFailed,
+    /// `incoming_tcp` or `incoming_udp` was full (without
+    /// [`accept_backpressure`](crate::NetStackConfig::accept_backpressure) for TCP); see
+    /// [`tcp_not_accepted`](crate::NetStackStats::tcp_not_accepted) and
+    /// [`udp_not_accepted`](crate::NetStackStats::udp_not_accepted).
+    AcceptQueueFull,
+    /// The `incoming_tcp` or `incoming_udp` stream was dropped, before the connection or
+    /// flow reached it or with it in its queue.
+    AcceptQueueGone,
+    /// The UDP flow table held [`max_udp_flows`](crate::NetStackConfig::max_udp_flows)
+    /// flows at the accept; see [`udp_flow_limit`](crate::NetStackStats::udp_flow_limit).
+    FlowLimit,
+    /// [`FlowControl::revoke`] before the hand-out.
+    Revoked,
+    /// The stack stopped first.
+    Stopped,
+}
+
+impl Undelivered {
+    const ALL: [Self; 10] = [
+        Self::Rejected,
+        Self::TimedOut,
+        Self::ConnectionLimit,
+        Self::NoListener,
+        Self::HandshakeFailed,
+        Self::AcceptQueueFull,
+        Self::AcceptQueueGone,
+        Self::FlowLimit,
+        Self::Revoked,
+        Self::Stopped,
+    ];
+
+    /// The delivery stage that stands for `self`.
+    const fn code(self) -> u8 {
+        DELIVERED + 1 + self as u8
+    }
+}
+
 /// Where the driver finds a flow's state.
 #[derive(Debug)]
 pub(crate) enum Target {
-    /// A TCP connection; `start` is the egress position of the socket's first packet.
+    /// A TCP connection, or the socket of one mid handshake; `start` is the egress
+    /// position of the socket's first packet.
     Tcp {
         handle: SocketHandle,
         shared: Arc<Mutex<Shared>>,
@@ -101,11 +178,23 @@ pub(crate) enum Target {
 
 /// The state of one flow shared by its data handles, its controls, its receipts and the
 /// driver. Queued output refers to this state, not to a copy of anything in it.
+///
+/// A lifetime held under `Admission::Decide` gets its state at its first input, with its
+/// `held` tuple and no target yet; the driver binds the target once it has a socket or a
+/// flow entry. Every other flow is created with its target, already delivered.
 pub(crate) struct FlowState {
-    target: Target,
+    target: OnceLock<Target>,
+    /// The tuple of a lifetime held under `Admission::Decide`, by which the driver finds it
+    /// before its target is bound.
+    held: Option<Key>,
+    /// TCP: the lifetime has a connection (the handshake completed), not only a socket.
+    adopted: AtomicBool,
     revoked: AtomicBool,
+    /// `UNDECIDED`, `DELIVERED` or an [`Undelivered::code`]; fixed by the first
+    /// compare-and-swap away from `UNDECIDED`.
+    delivery: AtomicU8,
     outcome: AtomicU8,
-    /// Wakes the receipts' waiters once the outcome is written.
+    /// Wakes the receipts' waiters once the retirement or the delivery outcome is written.
     done: Notify,
     /// Wakes the flow's handles parked on a full queue or an empty one at the revoke.
     wake: Notify,
@@ -122,10 +211,29 @@ pub(crate) struct FlowState {
 }
 
 impl FlowState {
+    /// The state of a flow created with its target and handed out.
     pub(crate) fn new(target: Target, revocations: &Arc<Revocations>) -> Arc<Self> {
+        Self::with(OnceLock::from(target), None, true, revocations)
+    }
+
+    /// The state of the lifetime of `key`, held under `Admission::Decide`.
+    pub(crate) fn held(key: Key, revocations: &Arc<Revocations>) -> Arc<Self> {
+        Self::with(OnceLock::new(), Some(key), false, revocations)
+    }
+
+    /// A delivered and adopted state, or an undecided one not adopted yet.
+    fn with(
+        target: OnceLock<Target>,
+        held: Option<Key>,
+        delivered: bool,
+        revocations: &Arc<Revocations>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             target,
+            held,
+            adopted: AtomicBool::new(delivered),
             revoked: AtomicBool::new(false),
+            delivery: AtomicU8::new(if delivered { DELIVERED } else { UNDECIDED }),
             outcome: AtomicU8::new(PENDING),
             done: Notify::new(),
             wake: Notify::new(),
@@ -139,8 +247,72 @@ impl FlowState {
         })
     }
 
-    pub(crate) const fn target(&self) -> &Target {
-        &self.target
+    /// Where the driver finds the flow, once bound.
+    pub(crate) fn target(&self) -> Option<&Target> {
+        self.target.get()
+    }
+
+    /// Binds the target of a held lifetime; only the first call does anything.
+    pub(crate) fn bind(&self, target: Target) {
+        let _ = self.target.set(target);
+    }
+
+    /// Records that the TCP lifetime has its connection.
+    pub(crate) fn mark_adopted(&self) {
+        self.adopted.store(true, Ordering::SeqCst);
+    }
+
+    /// The tuple of a lifetime held under `Admission::Decide`.
+    pub(crate) const fn held_key(&self) -> Option<&Key> {
+        self.held.as_ref()
+    }
+
+    /// Fixes the delivery as handed out unless it ended before; whether the lifetime is
+    /// delivered.
+    pub(crate) fn deliver(&self) -> bool {
+        match self.delivery.load(Ordering::SeqCst) {
+            DELIVERED => true,
+            UNDECIDED => match self.delivery.compare_exchange(
+                UNDECIDED,
+                DELIVERED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.done.notify_waiters();
+                    true
+                }
+                Err(current) => current == DELIVERED,
+            },
+            _ => false,
+        }
+    }
+
+    /// Fixes the delivery as never handed out for `reason` unless it is fixed already.
+    pub(crate) fn undeliver(&self, reason: Undelivered) {
+        if self
+            .delivery
+            .compare_exchange(UNDECIDED, reason.code(), Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.done.notify_waiters();
+        }
+    }
+
+    /// Whether the delivery is still open.
+    pub(crate) fn undecided(&self) -> bool {
+        self.delivery.load(Ordering::SeqCst) == UNDECIDED
+    }
+
+    fn delivery(&self) -> Option<DeliveryOutcome> {
+        match self.delivery.load(Ordering::SeqCst) {
+            UNDECIDED => None,
+            DELIVERED => Some(DeliveryOutcome::Delivered),
+            code => Undelivered::ALL
+                .into_iter()
+                .find(|reason| reason.code() == code)
+                .map(DeliveryOutcome::NotDelivered),
+        }
     }
 
     pub(crate) fn is_revoked(&self) -> bool {
@@ -168,12 +340,13 @@ impl FlowState {
     }
 
     /// Revokes the flow on the handle side and queues it for the driver; only the first
-    /// call does anything.
+    /// call does anything. A lifetime not handed out yet never will be.
     fn revoke(self: &Arc<Self>) {
         if self.revoked.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Target::Tcp { shared, .. } = &self.target {
+        self.undeliver(Undelivered::Revoked);
+        if let Some(Target::Tcp { shared, .. }) = self.target() {
             let mut shared = tcp::lock(shared);
             shared.rx.clear();
             shared.tx.clear();
@@ -234,8 +407,10 @@ impl FlowState {
 impl fmt::Debug for FlowState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlowState")
-            .field("target", &self.target)
+            .field("target", &self.target())
+            .field("held", &self.held)
             .field("revoked", &self.is_revoked())
+            .field("delivery", &self.delivery())
             .field("outcome", &self.outcome())
             .finish_non_exhaustive()
     }
@@ -396,6 +571,11 @@ impl Fences {
 /// the same flow; it stays valid after the data handles moved to other tasks, were
 /// aborted, dropped or released. Dropping a control does nothing.
 ///
+/// Under [`Admission::Decide`](crate::Admission::Decide) the control exists from the
+/// lifetime's first input on: [`PendingFlow::control`](crate::PendingFlow::control)
+/// returns the control the delivered handle carries later, and a revoke before the
+/// hand-out ends the lifetime undelivered (see [`delivery`](Self::delivery)).
+///
 /// # Proof boundary
 ///
 /// [`revoke`](Self::revoke) covers the stack only: the flow's sockets, buffers, timers and
@@ -416,7 +596,8 @@ impl FlowControl {
 
     pub(crate) fn tcp_egress_end(&self, owner: &Arc<Revocations>) -> io::Result<Option<u64>> {
         if !Arc::ptr_eq(owner, &self.state.revocations)
-            || !matches!(self.state.target, Target::Tcp { .. })
+            || !matches!(self.state.target(), Some(Target::Tcp { .. }))
+            || !self.state.adopted.load(Ordering::SeqCst)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -450,6 +631,17 @@ impl FlowControl {
     /// waiting for the peer, an RST, TIME-WAIT or room in the egress queue. Other flows of
     /// the stack are untouched; a later packet of the peer on the same tuple is new
     /// traffic (a new UDP flow, or the RST above).
+    ///
+    /// Before the hand-out the same holds at every stage of a lifetime held under
+    /// [`Admission::Decide`](crate::Admission::Decide): the driver turn that observes the
+    /// revoke removes the held entry (no RST or port unreachable follows, and a later
+    /// decision on the [`PendingFlow`](crate::PendingFlow) does nothing), the listener
+    /// socket of an accepted SYN in SYN-RECEIVED (its SYN-ACK still queued in the stack is
+    /// dropped), the established connection waiting for `incoming_tcp`, or the flow
+    /// entry with its queued datagrams; the handle is never returned by `incoming_tcp`
+    /// or `incoming_udp`, and the delivery ends
+    /// [`NotDelivered(Revoked)`](Undelivered::Revoked). A later SYN or datagram on the
+    /// tuple is a new lifetime.
     pub fn revoke(&self) -> RetirementReceipt {
         self.state.revoke();
         RetirementReceipt {
@@ -462,6 +654,21 @@ impl FlowControl {
         self.state.is_revoked()
     }
 
+    /// The receipt of the hand-out of this connection's or flow's lifetime: delivered, or
+    /// never delivered and why.
+    ///
+    /// A lifetime held under [`Admission::Decide`](crate::Admission::Decide) is delivered
+    /// when the [`incoming_tcp`](crate::NetStackHandle::incoming_tcp) or
+    /// [`incoming_udp`](crate::NetStackHandle::incoming_udp) stream takes its handle;
+    /// until then the outcome is open. Every other connection, flow and socket (admitted
+    /// with [`Admission::Immediate`](crate::Admission::Immediate) or opened by the
+    /// application) reports [`Delivered`](DeliveryOutcome::Delivered) from the start.
+    pub fn delivery(&self) -> DeliveryReceipt {
+        DeliveryReceipt {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     /// Labels the flow with `domain` and a new instance, and returns that
     /// [`FlowContext`].
     ///
@@ -472,7 +679,10 @@ impl FlowControl {
     /// process's instances are used up; a failed call leaves the flow as it was.
     ///
     /// Bind right after the flow is handed out ([`incoming_tcp`], [`incoming_udp`],
-    /// [`connect_tcp`], [`connect_udp`], [`bind_udp`]). A later bind loses nothing: the
+    /// [`connect_tcp`], [`connect_udp`], [`bind_udp`]), or under
+    /// [`Admission::Decide`](crate::Admission::Decide) on the
+    /// [`PendingFlow`](crate::PendingFlow)'s control at the decision: the delivered handle
+    /// carries the same control and context. A later bind loses nothing: the
     /// stack tracks a flow's queued output by the flow itself from its creation, so the
     /// context labels output queued before the bind too, and a revoke drops it either way.
     /// The stack never reads the context and treats flows with and without one alike.
@@ -603,6 +813,51 @@ impl RetirementReceipt {
 impl fmt::Debug for RetirementReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RetirementReceipt")
+            .field("outcome", &self.outcome())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The receipt of a lifetime's hand-out, see [`FlowControl::delivery`].
+///
+/// Each lifetime has exactly one [`DeliveryOutcome`], shared by every clone and every
+/// receipt of the lifetime's controls and fixed once by whichever comes first: the
+/// `incoming_tcp` / `incoming_udp` stream taking its handle, or the first event that ends
+/// it before (an [`Undelivered`] reason). A stream that finds a handle whose lifetime ended
+/// skips it, so a lifetime revoked while its handle waits in the stream's queue is never
+/// returned.
+#[derive(Clone)]
+pub struct DeliveryReceipt {
+    state: Arc<FlowState>,
+}
+
+impl DeliveryReceipt {
+    /// The outcome, or `None` while the lifetime is neither handed out nor ended.
+    pub fn outcome(&self) -> Option<DeliveryOutcome> {
+        self.state.delivery()
+    }
+
+    /// Waits for the outcome.
+    ///
+    /// Cancellation-safe and repeatable, like [`RetirementReceipt::wait`]. There is no
+    /// internal timeout; a lifetime is held at most for the
+    /// [`Admission::Decide`](crate::Admission::Decide) timeout, but one accepted waits for
+    /// its handshake and then for the application to take it.
+    pub async fn wait(&self) -> DeliveryOutcome {
+        loop {
+            let mut notified = pin!(self.state.done.notified());
+            notified.as_mut().enable();
+            if let Some(outcome) = self.outcome() {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl fmt::Debug for DeliveryReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeliveryReceipt")
             .field("outcome", &self.outcome())
             .finish_non_exhaustive()
     }

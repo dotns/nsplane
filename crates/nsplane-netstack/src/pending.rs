@@ -1,5 +1,5 @@
 //! Connections and flows held for the application's decision under
-//! [`Admission::Decide`](crate::Admission::Decide).
+//! [`Admission::Decide`](crate::Admission::Decide), and the lifetimes they start.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +13,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
 use crate::device::TAILROOM;
+use crate::flow::{FlowControl, FlowState, Revocations, Undelivered};
 
 /// The transport protocol of a [`PendingFlow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,13 +38,19 @@ pub enum PendingProtocol {
 /// the item without a decision rejects it the same way.
 ///
 /// Both take effect on the stack's next driver turn and never wait. A decision made after
-/// the connection or flow timed out, or after the stack stopped, does nothing.
+/// the connection or flow timed out, after it was revoked, or after the stack stopped,
+/// does nothing.
+///
+/// The item starts the lifetime of the connection or flow: [`control`](Self::control)
+/// returns its [`FlowControl`] from the first input on, the same control the handle
+/// delivered later carries.
 #[derive(Debug)]
 pub struct PendingFlow {
     key: Key,
     id: u64,
     decisions: mpsc::UnboundedSender<Decision>,
     notify: Arc<Notify>,
+    state: Arc<FlowState>,
     /// A decision was sent, or the item was never offered.
     decided: bool,
 }
@@ -63,6 +70,18 @@ impl PendingFlow {
     /// which the connection or flow keeps as its local address.
     pub const fn local_addr(&self) -> SocketAddr {
         self.key.local
+    }
+
+    /// The control of this connection's or flow's lifetime, from its first input on.
+    ///
+    /// The [`TcpConnection`](crate::TcpConnection) or [`UdpFlow`](crate::UdpFlow) the
+    /// stack hands out for it carries the same control, and a
+    /// [`FlowContext`](crate::FlowContext) bound here stays on it.
+    /// [`revoke`](FlowControl::revoke) retires the lifetime at whatever stage it is (held,
+    /// accepted, mid handshake, queued for the application) and sends nothing; its
+    /// [`delivery`](FlowControl::delivery) receipt tells whether a handle was handed out.
+    pub fn control(&self) -> FlowControl {
+        FlowControl::new(Arc::clone(&self.state))
     }
 
     /// Admits the connection or flow. With
@@ -141,6 +160,7 @@ impl Held {
 struct Entry {
     id: u64,
     held: Held,
+    state: Arc<FlowState>,
 }
 
 /// What [`Pending::hold`] did with a packet.
@@ -157,6 +177,10 @@ pub(crate) enum Hold {
 /// The driver's table of held connections and flows: at most `max` entries, each with
 /// the deadline `timeout` after it was held. Deadlines grow with insertion, so the
 /// earliest is at the front of `deadlines`.
+///
+/// It also tracks the lifetimes the entries start until their delivery is fixed: the
+/// accepted SYNs of the current driver turn until a listener socket takes them, and every
+/// lifetime not delivered yet, which a stopping stack ends.
 #[derive(Debug)]
 pub(crate) struct Pending {
     timeout: Duration,
@@ -170,16 +194,30 @@ pub(crate) struct Pending {
     decisions: mpsc::UnboundedReceiver<Decision>,
     offer: mpsc::Sender<PendingFlow>,
     notify: Arc<Notify>,
+    revocations: Arc<Revocations>,
+    /// Accepted SYNs injected in this driver turn, not on a socket yet; empty between
+    /// turns.
+    admitted: Vec<Arc<FlowState>>,
+    /// Lifetimes whose delivery may still be open; pruned of fixed ones once it doubled
+    /// since the last prune, so it stays within twice the open ones.
+    lifetimes: Vec<Arc<FlowState>>,
+    /// The length of `lifetimes` after the last prune.
+    pruned: usize,
 }
+
+/// `lifetimes` is never pruned below this length.
+const MIN_LIFETIMES: usize = 64;
 
 impl Pending {
     /// A table of at most `max` (at least 1) entries offering them through `offer`, whose
-    /// decisions wake the driver through `notify`.
+    /// decisions wake the driver through `notify` and whose lifetimes are revoked through
+    /// `revocations`.
     pub(crate) fn new(
         timeout: Duration,
         max: usize,
         offer: mpsc::Sender<PendingFlow>,
         notify: Arc<Notify>,
+        revocations: Arc<Revocations>,
     ) -> Self {
         let (decisions_tx, decisions) = mpsc::unbounded_channel();
         Self {
@@ -192,6 +230,10 @@ impl Pending {
             decisions,
             offer,
             notify,
+            revocations,
+            admitted: Vec::new(),
+            lifetimes: Vec::new(),
+            pruned: 0,
         }
     }
 
@@ -206,18 +248,20 @@ impl Pending {
     }
 
     /// Holds `held` for `key`, which is not held, until a decision or `now + timeout`,
-    /// offering it to the application.
+    /// offering it to the application with the state of a new lifetime.
     pub(crate) fn hold(&mut self, key: Key, held: Held, now: Instant) -> Hold {
         if self.entries.len() >= self.max {
             return Hold::Full(held);
         }
         let id = self.next_id;
         self.next_id += 1;
+        let state = FlowState::held(key, &self.revocations);
         let item = PendingFlow {
             key,
             id,
             decisions: self.decisions_tx.clone(),
             notify: Arc::clone(&self.notify),
+            state: Arc::clone(&state),
             decided: false,
         };
         if let Err(error) = self.offer.try_send(item) {
@@ -231,7 +275,8 @@ impl Pending {
                 Hold::Gone(held)
             };
         }
-        self.entries.insert(key, Entry { id, held });
+        self.track(Arc::clone(&state));
+        self.entries.insert(key, Entry { id, held, state });
         if self.deadlines.len() >= self.max.saturating_mul(2) {
             let entries = &self.entries;
             self.deadlines
@@ -241,30 +286,88 @@ impl Pending {
         Hold::Held
     }
 
-    /// The next decision whose entry is still held, with what it holds; decisions on
-    /// entries that timed out are skipped.
-    pub(crate) fn next_decision(&mut self) -> Option<(Decision, Key, Held)> {
+    /// The next decision whose entry is still held, with what it holds and its lifetime;
+    /// decisions on entries that timed out or were revoked are skipped.
+    pub(crate) fn next_decision(&mut self) -> Option<(Decision, Key, Held, Arc<FlowState>)> {
         while let Ok(decision) = self.decisions.try_recv() {
-            if let Some(held) = self.remove(&decision.key, decision.id) {
+            if let Some(entry) = self.remove(&decision.key, decision.id) {
                 let key = decision.key;
-                return Some((decision, key, held));
+                return Some((decision, key, entry.held, entry.state));
             }
         }
         None
     }
 
     /// The next entry whose deadline is at or before `now`, removed.
-    pub(crate) fn next_expired(&mut self, now: Instant) -> Option<(Key, Held)> {
+    pub(crate) fn next_expired(&mut self, now: Instant) -> Option<(Key, Held, Arc<FlowState>)> {
         while let Some(&(deadline, key, id)) = self.deadlines.front() {
             if deadline > now {
                 return None;
             }
             self.deadlines.pop_front();
-            if let Some(held) = self.remove(&key, id) {
-                return Some((key, held));
+            if let Some(entry) = self.remove(&key, id) {
+                return Some((key, entry.held, entry.state));
             }
         }
         None
+    }
+
+    /// Removes the entry of the lifetime `state`, if it is still held; whether it was.
+    pub(crate) fn remove_lifetime(&mut self, state: &Arc<FlowState>) -> bool {
+        let Some(key) = state.held_key() else {
+            return false;
+        };
+        if !self
+            .entries
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.state, state))
+        {
+            return false;
+        }
+        self.entries.remove(key);
+        true
+    }
+
+    /// Records that the accepted SYN of `state` went into smoltcp in this turn.
+    pub(crate) fn admit(&mut self, state: Arc<FlowState>) {
+        self.admitted.push(state);
+    }
+
+    /// The lifetime of the SYN from `remote` to `local` accepted in this turn, taken out.
+    pub(crate) fn take_admitted(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<Arc<FlowState>> {
+        let index = self.admitted.iter().position(|state| {
+            state
+                .held_key()
+                .is_some_and(|key| key.local == local && key.remote == remote)
+        })?;
+        Some(self.admitted.swap_remove(index))
+    }
+
+    /// Ends the accepted SYNs of this turn that no listener socket took.
+    pub(crate) fn refuse_admitted(&mut self) {
+        for state in self.admitted.drain(..) {
+            state.undeliver(Undelivered::NoListener);
+        }
+    }
+
+    /// Ends every lifetime not delivered yet: the stack stops.
+    pub(crate) fn stop(&mut self) {
+        for state in self.lifetimes.drain(..) {
+            state.undeliver(Undelivered::Stopped);
+        }
+    }
+
+    /// Adds `state` to the lifetimes a stop ends, pruning those whose delivery is fixed.
+    fn track(&mut self, state: Arc<FlowState>) {
+        if self.lifetimes.len() >= self.pruned.max(MIN_LIFETIMES).saturating_mul(2) {
+            self.lifetimes.retain(|state| state.undecided());
+            self.pruned = self.lifetimes.len();
+        }
+        self.lifetimes.push(state);
     }
 
     /// The earliest deadline of a held entry, if any.
@@ -278,11 +381,11 @@ impl Pending {
         None
     }
 
-    fn remove(&mut self, key: &Key, id: u64) -> Option<Held> {
+    fn remove(&mut self, key: &Key, id: u64) -> Option<Entry> {
         if self.entries.get(key)?.id != id {
             return None;
         }
-        self.entries.remove(key).map(|entry| entry.held)
+        self.entries.remove(key)
     }
 }
 
