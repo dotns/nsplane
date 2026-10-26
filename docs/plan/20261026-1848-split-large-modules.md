@@ -1,6 +1,6 @@
 # 20261026-1848-split-large-modules Split the largest modules by responsibility and share e2e scenario setup
 
-- **status**: proposed
+- **status**: completed (all four steps merged 2026-10-26)
 - **createdAt**: 2026-10-26 18:48
 - **relatedTask**: 20261026-1848-split-large-modules
 
