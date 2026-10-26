@@ -25,6 +25,8 @@ impl Core {
     ///
     /// Part of the contract: no inbound [`PacketFilter`] sees the packet, so a stateful
     /// filter records nothing about it and a translating filter does not translate it.
+    ///
+    /// [`PacketFilter`]: crate::PacketFilter
     pub fn inject_inbound(&mut self, peer: PeerId, packet: PacketBuf) {
         self.outputs
             .push_back(Output::Deliver { from: peer, packet });
@@ -36,6 +38,8 @@ impl Core {
     /// sees the packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply
     /// state for it, so the peer's replies are judged by the inbound rules alone, and a
     /// translating filter does not translate it.
+    ///
+    /// [`PacketFilter`]: crate::PacketFilter
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
         self.send(packet, false);
@@ -51,6 +55,8 @@ impl Core {
     /// Like [`Core::inject_outbound`], part of the contract: no outbound [`PacketFilter`]
     /// sees the packet, so a stateful filter records no reply state for it (its replies are
     /// judged by the inbound rules alone) and a translating filter does not translate it.
+    ///
+    /// [`PacketFilter`]: crate::PacketFilter
     pub fn inject_outbound_on(
         &mut self,
         peer: PeerId,

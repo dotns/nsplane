@@ -214,6 +214,8 @@ impl Core {
     /// `limit` bytes are not padded. `None` (the default) pads every packet to a multiple of
     /// 16 bytes. Both [`Core::handle_input`] and [`CryptoJob`]s honor it. Unknown peers are
     /// ignored.
+    ///
+    /// [`CryptoJob`]: crate::CryptoJob
     pub fn set_peer_pad_limit(&mut self, peer: PeerId, limit: Option<u16>) {
         if let Some(p) = self.peers.peer_mut(peer) {
             p.tunnel_mut().set_pad_limit(limit.map(usize::from));

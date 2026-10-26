@@ -247,6 +247,8 @@ impl Core {
     ///
     /// Complete the jobs of one peer in the order they were handed out to keep its packets
     /// in order; see [`CryptoJob`].
+    ///
+    /// [`reasons::ENCAPSULATE_ERROR`]: crate::reasons::ENCAPSULATE_ERROR
     pub fn complete_job(&mut self, mut job: CryptoJob) {
         let id = job.peer;
         match job.direction {
