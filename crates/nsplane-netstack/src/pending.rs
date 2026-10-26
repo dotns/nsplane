@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -198,9 +198,10 @@ pub(crate) struct Pending {
     /// Accepted SYNs injected in this driver turn, not on a socket yet; empty between
     /// turns.
     admitted: Vec<Arc<FlowState>>,
-    /// Lifetimes whose delivery may still be open; pruned of fixed ones once it doubled
-    /// since the last prune, so it stays within twice the open ones.
-    lifetimes: Vec<Arc<FlowState>>,
+    /// Lifetimes whose delivery may still be open; pruned of fixed and dropped ones once
+    /// it doubled since the last prune, so it stays within twice the open ones. Weak: a
+    /// lifetime nothing refers to any more has nobody to tell.
+    lifetimes: Vec<Weak<FlowState>>,
     /// The length of `lifetimes` after the last prune.
     pruned: usize,
 }
@@ -275,7 +276,7 @@ impl Pending {
                 Hold::Gone(held)
             };
         }
-        self.track(Arc::clone(&state));
+        self.track(&state);
         self.entries.insert(key, Entry { id, held, state });
         if self.deadlines.len() >= self.max.saturating_mul(2) {
             let entries = &self.entries;
@@ -347,27 +348,26 @@ impl Pending {
         Some(self.admitted.swap_remove(index))
     }
 
-    /// Ends the accepted SYNs of this turn that no listener socket took.
-    pub(crate) fn refuse_admitted(&mut self) {
-        for state in self.admitted.drain(..) {
-            state.undeliver(Undelivered::NoListener);
-        }
+    /// The accepted SYNs of this turn that no listener socket took, taken out.
+    pub(crate) fn take_refused(&mut self) -> Vec<Arc<FlowState>> {
+        std::mem::take(&mut self.admitted)
     }
 
     /// Ends every lifetime not delivered yet: the stack stops.
     pub(crate) fn stop(&mut self) {
-        for state in self.lifetimes.drain(..) {
+        for state in self.lifetimes.drain(..).filter_map(|state| state.upgrade()) {
             state.undeliver(Undelivered::Stopped);
         }
     }
 
     /// Adds `state` to the lifetimes a stop ends, pruning those whose delivery is fixed.
-    fn track(&mut self, state: Arc<FlowState>) {
+    fn track(&mut self, state: &Arc<FlowState>) {
         if self.lifetimes.len() >= self.pruned.max(MIN_LIFETIMES).saturating_mul(2) {
-            self.lifetimes.retain(|state| state.undecided());
+            self.lifetimes
+                .retain(|state| state.upgrade().is_some_and(|state| state.undecided()));
             self.pruned = self.lifetimes.len();
         }
-        self.lifetimes.push(state);
+        self.lifetimes.push(Arc::downgrade(state));
     }
 
     /// The earliest deadline of a held entry, if any.

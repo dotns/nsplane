@@ -243,13 +243,9 @@ pub struct TransparentConfig {
     /// transparent mode, and also in
     /// [`rejected_prefix`](crate::NetStackStats::rejected_prefix).
     pub prefixes: Vec<(IpAddr, u8)>,
-    /// How a new connection or flow is admitted, honoured while
-    /// [`NetStackConfig::admission`] is [`Admission::Immediate`]. Default
-    /// [`Admission::Immediate`].
-    #[deprecated(
-        since = "0.20.0",
-        note = "use `NetStackConfig::admission`, which applies to every stack"
-    )]
+    /// Deprecated: replaced by [`NetStackConfig::admission`], and honoured while that field
+    /// is [`Admission::Immediate`]. Default [`Admission::Immediate`].
+    #[deprecated(note = "use `NetStackConfig::admission`, which applies to every stack")]
     pub admission: Admission,
     /// Most TCP connections the stack holds at once: accepted, mid handshake or opened
     /// with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until they are released.

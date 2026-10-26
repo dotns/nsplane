@@ -11,7 +11,7 @@ use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
 
-use crate::flow::{FlowState, Target, Undelivered};
+use crate::flow::{FlowState, RetirementOutcome, Target, Undelivered};
 use crate::ownership::Registration;
 use crate::stats::{self};
 use crate::tcp::{Progress, Shared, TcpConnection};
@@ -306,8 +306,19 @@ impl Driver {
                 }
             }
         }
-        if let Some(table) = self.pending.as_mut() {
-            table.refuse_admitted();
+        let Some(refused) = self.pending.as_mut().map(|table| table.take_refused()) else {
+            return;
+        };
+        for flow in refused {
+            if flow.undeliver(Undelivered::NoListener) {
+                continue;
+            }
+            // Revoked during this turn: smoltcp's RST for the SYN goes too.
+            if let Some(key) = flow.held_key()
+                && !self.purge_tcp(key.local, key.remote, mark, self.position())
+            {
+                flow.finish(RetirementOutcome::Failed);
+            }
         }
     }
 }

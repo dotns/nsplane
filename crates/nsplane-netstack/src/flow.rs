@@ -288,15 +288,17 @@ impl FlowState {
         }
     }
 
-    /// Fixes the delivery as never handed out for `reason` unless it is fixed already.
-    pub(crate) fn undeliver(&self, reason: Undelivered) {
-        if self
+    /// Fixes the delivery as never handed out for `reason` unless it is fixed already;
+    /// whether this call fixed it.
+    pub(crate) fn undeliver(&self, reason: Undelivered) -> bool {
+        let fixed = self
             .delivery
             .compare_exchange(UNDECIDED, reason.code(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+            .is_ok();
+        if fixed {
             self.done.notify_waiters();
         }
+        fixed
     }
 
     /// Whether the delivery is still open.
@@ -345,6 +347,7 @@ impl FlowState {
         if self.revoked.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The driver answers a rejection only if it fixed the delivery first.
         self.undeliver(Undelivered::Revoked);
         if let Some(Target::Tcp { shared, .. }) = self.target() {
             let mut shared = tcp::lock(shared);

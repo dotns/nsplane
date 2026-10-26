@@ -74,15 +74,18 @@ impl Driver {
                 continue;
             }
             if !decision.accept {
-                flow.undeliver(Undelivered::Rejected);
-                self.reject(&key, &held, FlowEventReason::Hook);
+                // Not answered when a concurrent revoke ended the lifetime first.
+                if flow.undeliver(Undelivered::Rejected) {
+                    self.reject(&key, &held, FlowEventReason::Hook);
+                }
                 continue;
             }
             match held {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
-                        flow.undeliver(Undelivered::ConnectionLimit);
-                        self.reject_connection_limit(&key, syn.as_packet());
+                        if flow.undeliver(Undelivered::ConnectionLimit) {
+                            self.reject_connection_limit(&key, syn.as_packet());
+                        }
                         continue;
                     }
                     stats::add(&self.stats.accepted, 1);
@@ -114,7 +117,8 @@ impl Driver {
             if self.flows.len() >= self.settings.max_udp_flows {
                 tracing::warn!(%remote, %local, "UDP flow table at capacity; dropping new flow");
                 stats::add(&self.stats.udp_flow_limit, 1);
-                return flow.undeliver(Undelivered::FlowLimit);
+                flow.undeliver(Undelivered::FlowLimit);
+                return;
             }
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
@@ -197,11 +201,9 @@ impl Driver {
             .and_then(|table| table.next_expired(now))
         {
             changed = true;
-            if flow.is_revoked() {
-                continue;
+            if flow.undeliver(Undelivered::TimedOut) {
+                self.reject(&key, &held, FlowEventReason::Timeout);
             }
-            flow.undeliver(Undelivered::TimedOut);
-            self.reject(&key, &held, FlowEventReason::Timeout);
         }
         if changed {
             self.count_pending();

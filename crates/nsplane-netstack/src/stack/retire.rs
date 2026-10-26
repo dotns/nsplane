@@ -160,7 +160,13 @@ impl Driver {
     /// Drops the TCP packets from `local` to `peer` at egress positions in `[start, end)`
     /// from the backlog and fences those possibly in the egress queue; `false` if the
     /// fence table is full.
-    fn purge_tcp(&mut self, local: SocketAddr, peer: SocketAddr, start: u64, end: u64) -> bool {
+    pub(super) fn purge_tcp(
+        &mut self,
+        local: SocketAddr,
+        peer: SocketAddr,
+        start: u64,
+        end: u64,
+    ) -> bool {
         let sent = self.sent;
         let mut dropped = 0;
         for (position, packet) in (sent..).zip(self.device.tx_queue.iter_mut()) {
