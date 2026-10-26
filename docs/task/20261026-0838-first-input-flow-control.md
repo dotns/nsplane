@@ -105,6 +105,19 @@ Implementing netstack flow control from the first input
   `offload_on_on_workers` tests interleaved branch/base over 4 rounds passed 1 of 8 on each
   side. fmt and clippy passed before `test`; doc-test, deny, shear, typos, msrv, examples,
   product-terms and docs pass (exit 0); rustdoc with warnings denied passes.
-- Other exhaustive public structs with the same exposure, left unchanged:
-  `TransparentConfig`, `FlowEventsConfig`, and the re-exported `ReassemblyConfig`
-  (defined in `nsplane-packet`); also the exhaustive public enum `PendingProtocol`.
+- Other exhaustive public types with the same exposure: `TransparentConfig`,
+  `FlowEventsConfig`, the enum `PendingProtocol`, and the re-exported `ReassemblyConfig`
+  (defined in `nsplane-packet`).
+- Second follow-up (owner decision): `TransparentConfig`, `FlowEventsConfig` and
+  `PendingProtocol` are `#[non_exhaustive]` too, with rustdoc examples (default-then-assign;
+  a wildcard arm for `PendingProtocol`); `ReassemblyConfig` stays as it is. No exhaustive
+  match on `PendingProtocol` existed outside the crate. Call sites changed outside the W1
+  write scope: `nsplane-e2e` `netstack_transparent.rs` (an `in_prefixes` helper),
+  `examples/src/bin/dns_netstack.rs`, `examples/tests/vm_wireguard.rs`, `docs/guide.md`,
+  `docs/guide.zh-CN.md`. Inside scope: `config.rs`, `events.rs`, `pending.rs`, the reference
+  page, `CHANGELOG.md` (the Breaking entry names all five types, with a `match` migration).
+- `cargo semver-checks` against 52eb983: major; `enum_marked_non_exhaustive`
+  (`PendingProtocol`) and `struct_marked_non_exhaustive` (`NetStackConfig`,
+  `TransparentConfig`, `FlowEventsConfig`, `NetStackStats`).
+- Gate on 00a8704: `just check` exit 0, 2369 of 2369 tests passed (the three host-flaky
+  UDP tests passed in this run), every recipe through `docs` green.
