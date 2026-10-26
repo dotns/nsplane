@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use nsplane_e2e::bulk::{bulk_tcp, data, mb_per_s};
 use nsplane_e2e::{
     Bottleneck, Family, LossyTransport, StackNode, TRANSFER, TestResult, next_within,
     serve_tcp_echo, stack_pair_over,
@@ -57,8 +58,6 @@ const PARALLEL_LOSS_PERMILLE: u64 = 20;
 const PARALLEL_BOUND: Duration = Duration::from_secs(60);
 /// TCP port of the echo server of the parallel tests.
 const ECHO_PORT: u16 = 7;
-/// TCP port of the receiving stack.
-const TCP_PORT: u16 = 9000;
 /// UDP port of the receiving stack.
 const UDP_PORT: u16 = 9001;
 /// Datagrams sent per UDP measurement.
@@ -67,17 +66,6 @@ const DATAGRAMS: usize = 50_000;
 const DATAGRAM: usize = 1200;
 /// How long the UDP receiver waits for a further datagram before it stops counting.
 const UDP_GAP: Duration = Duration::from_millis(500);
-
-/// `len` bytes whose pattern (period 251) does not line up with any segment size, so
-/// reordered or duplicated segments change the data.
-fn data(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i % 251).to_le_bytes()[0]).collect()
-}
-
-/// Megabytes (10^6 bytes) per second.
-fn mb_per_s(bytes: usize, elapsed: Duration) -> f64 {
-    f64::from(u32::try_from(bytes).unwrap_or(u32::MAX)) / elapsed.as_secs_f64() / 1e6
-}
 
 /// Two stack nodes whose link drops `permille` of the data messages in each direction, and
 /// the count of messages dropped so far.
@@ -90,43 +78,6 @@ async fn lossy_pair(permille: u64) -> TestResult<(StackNode, StackNode, Arc<Atom
     )
     .await?;
     Ok((a, b, dropped))
-}
-
-/// Sends `len` bytes from `client` to a connection `server` accepts, half-closes and checks
-/// that the server read exactly those bytes within `limit`. Returns the time from the
-/// established connection to the last byte read.
-async fn bulk_tcp(
-    client: &StackNode,
-    server: &StackNode,
-    len: usize,
-    limit: Duration,
-) -> TestResult<Duration> {
-    let mut incoming = server.stack.incoming_tcp();
-    let receiver = tokio::spawn(async move {
-        let mut conn = next_within(&mut incoming, TRANSFER).await?;
-        let mut received = Vec::with_capacity(len);
-        conn.read_to_end(&mut received).await?;
-        TestResult::Ok(received)
-    });
-    let target = server.socket_addr(Family::V4, TCP_PORT);
-    let mut conn = timeout(TRANSFER, client.stack.connect_tcp(target)).await??;
-    let started = Instant::now();
-    let deadline = started + limit;
-    let sent = data(len);
-    let write = async {
-        conn.write_all(&sent).await?;
-        conn.shutdown().await
-    };
-    timeout_at(deadline, write).await??;
-    let received = timeout_at(deadline, receiver).await???;
-    let elapsed = started.elapsed();
-    if received.len() != len {
-        return Err(format!("{} of {len} bytes received", received.len()).into());
-    }
-    if received != sent {
-        return Err("the transfer changed the data".into());
-    }
-    Ok(elapsed)
 }
 
 /// [`bulk_tcp`] of `len` bytes within [`THROUGHPUT_LIMIT`] as a report line; a transfer
