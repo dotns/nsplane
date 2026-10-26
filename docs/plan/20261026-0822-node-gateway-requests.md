@@ -624,6 +624,7 @@ Owner decisions, 2026-10-26:
    - O7: `from: Path` is mandatory, the authenticated bookkeeping is not run, delivered bytes
      count in `data_rx`.
 4. Release C (0.21.0) is designed first as one carrier, the packet tag, in a design note for
-   review by the owner and both consumers; it is not implemented. O8-O12 are answered in that
-   note's review. Design note: [notes/20261026-0834-packet-tag-carrier.md](notes/20261026-0834-packet-tag-carrier.md)
+   review by the owner and both consumers; it is not implemented. O8-O12, and O13 which the
+   note adds, are answered in that note's review. Design note:
+   [notes/20261026-0834-packet-tag-carrier.md](notes/20261026-0834-packet-tag-carrier.md)
    (status: for owner and consumer review).
