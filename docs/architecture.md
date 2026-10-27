@@ -99,9 +99,11 @@ Dependencies point downward only. `nsplane-core` is the only crate that depends 
 The core takes inputs and produces outputs; the driver moves them between the I/O sides:
 
 ```text
-Input::Datagram { path, data }  ─┐                                  ┌─► Output::Transmit { path, data }
-Input::Local    { packet }       ├─► Core::handle_input(now) ─► poll_output ─┼─► Output::Deliver  { from, packet }
-Input::Config   (ConfigChange)  ─┘                                  └─► Output::Event (handshake, authenticated,
+Input::Datagram { path, data }  ─┐                                  ┌─► Output::Transmit  { path, data }
+Input::Local    { packet }       ├─► Core::handle_input(now) ─► poll_output ─┼─► Output::Deliver   { from, packet }
+Input::Config   (ConfigChange)  ─┘                                  ├─► Output::Plaintext { to, packet }
+                                                                    ├─► Output::Tracked   { tag, peer, outcome }
+                                                                    └─► Output::Event (handshake, authenticated,
                                                                          path adopted, session expired, drops)
 Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter reset
 ```
@@ -125,6 +127,37 @@ Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter
   completes once every packet taken before the call has been routed and passed or been
   dropped by the outbound filters, so a change of address ownership can wait until no older
   local packet is still ahead of routing.
+- Every `PacketBuf` carries an optional opaque tag (`Option<NonZeroU64>`) and a receipt
+  marker. Both belong to the consumer, and neither is ever written to the wire. nsplane moves
+  them with the packet through its queues, the filters, the crypto workers and the transmit
+  queues up to the transport call, and copies them where it copies a packet into another
+  buffer (the core's copy of a packet without headroom, the translators' grown copies; each
+  fragment of the fragmentation stage takes the tag, never the marker). It clears both where a
+  buffer stops being that packet: buffers from a pool, buffers handed to
+  `PacketSource::recycle` by the engine and by `pump`, and a handshake initiation the tunnel
+  writes into a packet's buffer. A datagram reassembled from fragments keeps a tag only if
+  every fragment carried the same one (`None` included); a mixed set is dropped and counted.
+  The outbound filters see a local packet's tag, so a consumer can stamp each packet at its
+  producers with the ownership epoch its destination was chosen under and drop stale packets
+  in its own filter, across every queue in between.
+- The receipt marker makes a tagged packet tracked: the engine honours it only on packets its
+  `TrackedSender` accepted, and clears it on every other entry (source, inject calls,
+  `PlaintextIngress`) and on every packet it hands out (delivery, plaintext egress,
+  recycling). A clone is never tracked.
+- A tracked packet (its tag is the token) gets exactly one `SendResult`: `Sent { peer, bytes }`
+  once the transport call that carried its datagram succeeded, or `NotSent { reason }` with
+  the drop reason wherever it ended (routing, filters, no session, fragmentation, transmit
+  queue, transport, plaintext egress, engine stop). The core reports each tracked packet once
+  (`Output::Tracked`: sealed, right before its datagram, or not sent); the engine ends a
+  transmit batch after every tracked datagram so that the transport call's outcome attributes
+  it exactly, and reports every outstanding packet `ENGINE_STOPPED` when it stops. Results are
+  bounded by the sender's capacity and never dropped. Untracked packets take no receipt path.
+- A peer marked for plaintext egress (`Core::set_plaintext_egress`,
+  `EngineHandle::set_plaintext_egress`) gets the local packets routed to it after the mark as
+  `Output::Plaintext` once they passed the outbound filters, instead of sealed datagrams; the
+  engine hands them to a bounded `PlaintextEgress`. The mark is runtime state of the `PeerId`
+  (kept on an update, gone with the peer); the peer starts no handshake for data and still
+  answers and starts handshakes for inbound sealed traffic.
 - A flow gate can decide for a caller's selection of scopes (`FlowGate::evaluate_inbound_in`
   / `evaluate_outbound_in`): on the same snapshot and state as the unscoped calls, inside the
   selection the normal decision with its scope, rule and policy generation, outside it an
@@ -134,6 +167,14 @@ Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter
   its delivery receipt exist from the held input on: a revoke before the hand-out retires the
   lifetime at its stage and no handle of it is delivered, and every such lifetime ends
   delivered or not delivered with one reason.
+- A packet's tag at `NetStackSink` is its netstack ingress label. Each connection or flow
+  takes the label of its first input, and input with another label is dropped and counted, so
+  a lifetime never takes input meant for another owner of the same tuple.
+  `NetStackHandle::revoke_label` retires every lifetime of a label at every stage, handles
+  already handed out included, discards the label's input still queued in the stack and its
+  partial datagrams, and keeps a bounded tombstone so later input with the label opens
+  nothing; `Retired` means nothing of the label is delivered from then on. A stack without
+  labeled lifetimes keeps the unlabeled path.
 - Fragmentation and Packet Too Big are handled once, by an optional stage on the local path
   in front of the core; TUN and netstack share the same MTU limits, and the netstack derives
   its advertised MSS from the engine MTU.

@@ -1,6 +1,6 @@
 # 20261027-0305-netstack-ingress-labels Netstack ingress labels and label revocation (release C, W5)
 
-- **status**: completed on `feat/netstack-ingress-labels` (not merged, not released)
+- **status**: completed (integrated into 0.21.0 on `release/0.21.0`, not released)
 - **priority**: P1
 - **owner**: w5/netstack-ingress-labels
 - **createdAt**: 2026-10-27 03:05
@@ -202,3 +202,6 @@ from the shared host's ports, untouched by W5, passing 5 of 5 alone and in the r
 `cargo semver-checks --workspace --baseline-rev v0.20.1`: no semver update required in any
 crate (W5's items are additive).
 
+Integration into 0.21.0 (`release/0.21.0` from `v0.20.2`, 2026-10-27): merged as `25debab`,
+commits unchanged; the only conflict was this file. The performance section's wording was
+cleaned to the writing rules by the integration.

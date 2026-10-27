@@ -1,7 +1,8 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
 - **status**: implementing (releases A and B released as 0.20.0 on 2026-10-27; release C
-  approved for implementation on 2026-10-27 as the twelfth freeze exception, not started)
+  implemented and integrated as 0.21.0 on `release/0.21.0`, not merged into `main`, not
+  released)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
@@ -686,3 +687,20 @@ plus 3 % (labeled against unlabeled `send_stream` runs on the same build); if TC
 per-socket label checked after smoltcp's demultiplexing is measured instead. This was the last
 open owner item of the design note.
 
+Integration, 2026-10-27: release C (tasks `20261027-0305-packet-tag-carrier`,
+`20261027-0305-netstack-ingress-labels`, `20261027-0305-plaintext-egress-send-receipts`, W6
+containing W5 containing W4, all on `v0.20.1`) is merged on `release/0.21.0` from `v0.20.2`
+(`af5d41c`) in the order plan, W4, W5, W6, each workstream's commits unchanged under a merge
+commit, and versioned 0.21.0, not tagged. Conflicts were in documents only (CHANGELOG, the
+development changelog, the freeze ADR, the task index, the `nsplane-nat` reference and the
+task files). 0.20.2's wrapper sinks hand the buffers of the packets they drop back through
+`send_batch_spent`; `pump` clears the tag and the marker before it recycles them, now tested
+over `MapSink`, `AbortSink`, `SwapSink` and `Splitter`. As shipped: `Output` is
+`#[non_exhaustive]` with `Plaintext` and `Tracked`, `TranslatorStats` stays exhaustive
+(`reasons::FRAGMENT_MIXED_TAGS`), `PacketBuf` keeps 56 bytes with `u32` offsets (layout B).
+The integration's review of W6's deviations kept all of them and fixed one gap they bordered
+on: a receipt marker an outbound filter set on an untracked packet was kept, so the packet
+reported a result (O13: a mark set elsewhere never produces one); the core now clears it.
+Still scheduled for 0.21.0 by plan `20261027-0433-post-freeze-schedule` and not part of this
+integration: the peer expiry signal (M3, `Event` and `PeerStats` `#[non_exhaustive]`) and the
+removal of the deprecated `WsFrame` carrier and `TransparentConfig::admission`.

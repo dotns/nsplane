@@ -5,15 +5,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-27
+
+Feature release: one opaque packet tag carried on `PacketBuf` through the engine, the
+translators and the netstack, netstack ingress labels with label revocation, plaintext egress
+per peer and per-packet send receipts. Approved as the twelfth exception to the 0.11 feature
+freeze, before the freeze was lifted (ADR `2026-10-27-normal-maintenance`). Breaking:
+`nsplane-core` `Output` is `#[non_exhaustive]` with two new variants, and `PacketBuf` packet
+offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
+
 ### Added
 - Packet tag carrier (`nsplane-packet`): `PacketBuf::{tag, set_tag, take_tag}` carry an opaque
   `Option<NonZeroU64>` of the caller's that nsplane never interprets and never writes to the
   wire, and `PacketBuf::{is_tracked, set_tracked}` a receipt marker separate from it. New
   buffers and every buffer `PacketPool` and `SharedPacketPool` hand out carry neither; `Clone`
   copies the tag and clears the marker; `into_bytes` and `freeze` drop both. `PacketBuf` stays
-  56 bytes on 64-bit targets: its packet offsets are `u32`, so a packet ends at most
-  `u32::MAX` bytes into its buffer (`set_len`, `extend_from_slice` and `PacketPool::get_len`
-  stop there, `from_shared` and `reserve_front` refuse a range past it).
+  56 bytes on 64-bit targets (see Changed).
 - nsplane keeps the tag where it moves a packet into another buffer on its way to a
   transport or a sink: the core's copy of a packet without headroom for sealing and the
   translators' grown copies (`Translator`, `Nat64Lan::reverse`) take the tag and the marker;
@@ -91,7 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Output::Transmit` of its datagram, or `TrackedOutcome::NotSent { reason }` at every
   drop site of the send path. Without a session it is not queued in the tunnel (reported
   `NO_SESSION`, counted as a drop) and the handshake starts as for an untracked packet; what
-  an outbound filter does to its tag or marker is undone after the chain.
+  an outbound filter does to its tag or marker is undone after the chain, and a marker a
+  filter sets on an untracked packet is cleared.
 - New reasons: `reasons::PLAINTEXT_EGRESS` and `reasons::FILTER_HANDLED` (results of tracked
   packets, not drops), `reasons::PLAINTEXT_EGRESS_FULL`, `reasons::PLAINTEXT_EGRESS_CLOSED`
   and `reasons::ENGINE_STOPPED`.
@@ -107,6 +115,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Core::poll_output` exhaustively (a driver of its own) needs a wildcard arm; it handles
   `Plaintext` only if it marks peers with `Core::set_plaintext_egress`, and `Tracked` only if
   it feeds tracked packets. The engine handles both.
+
+  ```rust
+  // Before
+  while let Some(output) = core.poll_output() {
+      match output {
+          Output::Transmit { path, data } => transmit(path, data),
+          Output::Deliver { from, packet } => deliver(from, packet),
+          Output::Event(event) => report(event),
+      }
+  }
+  // After
+  while let Some(output) = core.poll_output() {
+      match output {
+          Output::Transmit { path, data } => transmit(path, data),
+          Output::Deliver { from, packet } => deliver(from, packet),
+          Output::Event(event) => report(event),
+          // Output::Plaintext and Output::Tracked appear only when the driver marks peers
+          // for plaintext egress or feeds tracked packets.
+          _ => {}
+      }
+  }
+  ```
+- `nsplane-packet` `PacketBuf` keeps 56 bytes on 64-bit targets with the tag added: its packet
+  offsets are `u32`, so a packet ends at most `u32::MAX` bytes into its buffer.
+  `PacketBuf::set_len`, `extend_from_slice` and `PacketPool::get_len` stop there, and
+  `PacketBuf::from_shared` and `reserve_front` return `BoundsError` for a range past it. IP
+  packets are far below the bound; no source change.
+
+#### Migration
+- Every consumer: bump the nsplane crates together. A consumer that sets no tag, marks no peer
+  and builds no tracked sender sees no behaviour change; a driver of `Core` adds the wildcard
+  arm above. `TranslatorStats` stays exhaustive: the translator's mixed-tag drop is counted in
+  `dropped_out` under `reasons::FRAGMENT_MIXED_TAGS`. A consumer coming from 0.19.x also takes
+  0.20.0's breaking change (the netstack configuration and statistics structs are
+  `#[non_exhaustive]`).
+- Ownership epochs on local packets: stamp each packet with `PacketBuf::set_tag` where the
+  consumer chooses its destination, as early as its own producers, and drop stale or untagged
+  packets in an outbound `PacketFilter` that reads `PacketBuf::tag`; the tag survives the
+  consumer's own queues, the engine's queues and the fragmentation stage.
+- Netstack ingress labels: set the label on the sink side, after the consumer's own
+  classification and before its queue toward `NetStackSink`, with a fresh label per owner
+  incarnation (an identical reinstall included). Find the owner of an accepted connection or
+  flow by `ingress_label`. To replace or withdraw an owner: cancel its label in the
+  consumer's own queue, call `NetStackHandle::revoke_label`, wait for the receipt, and install
+  the successor only after `Retired`; on `Failed` keep the owner withdrawn and call again.
+  Never reuse a revoked label.
+- Plaintext egress: a consumer that learns a `PeerId` only by reading it back adds the peer
+  closed (no allowed IPs), reads the id back, calls `set_plaintext_egress`, then opens the
+  peer, and reads the packets from the `PlaintextEgress` of
+  `EngineBuilder::plaintext_egress`.
+- Send receipts: build the engine with `EngineBuilder::tracked_sender`, hand tagged packets
+  (the tag is the token, unique while outstanding) to `TrackedSender`, keep a copy if a retry
+  may be needed, and read one `SendResult` per accepted packet from `SendResults`; a packet
+  `NotSent` with `NO_SESSION` may be sent again once the session is up.
 
 #### Other
 - `nsplane-netstack`: a connection or flow revoked while it waits in `incoming_tcp` or

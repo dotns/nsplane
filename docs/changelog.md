@@ -637,3 +637,18 @@ noise against `25debab` on `data_path`, `local_graph`, `udp_offload` and `send_s
 (`netstack_udp_send/flows_4` bimodal on both binaries, left for the integration's quiet
 re-measure); tracked packets cost about +1 % on the core round trip and up to +3 % end to end
 through an engine. Not merged, not released.
+
+## 2026-10-27 [integration]
+
+Release C of plan `20261026-0822-node-gateway-requests` integrated as 0.21.0 on
+`release/0.21.0` from `v0.20.2`, at the owner's request (merge into `main`, tag and
+publication wait for the owner): the plan branch, then W4 (`dbee734`), W5 (`25debab`) and W6
+(`dfd8ef3`) merged with their commits unchanged; conflicts in documents only. With 0.20.2's
+wrapper sinks forwarding `send_batch_spent`, the buffers of the packets they drop reach the
+source through `pump`, which clears the tag and the marker: tested over the four wrappers. The
+review of W6's deviations against the design note kept all of them and fixed one gap: a
+receipt marker an outbound filter set on an untracked packet now gets cleared (O13). The
+CHANGELOG `[0.21.0]` section (with the breaking `Output` and `PacketBuf` items and migration
+notes), the architecture's contracts for the tag, the receipt marker, send results, plaintext
+egress and netstack ingress labels, the freeze ADR's twelfth exception as shipped, and the
+plan and task records are written; versions are 0.21.0.

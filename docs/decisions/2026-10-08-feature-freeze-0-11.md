@@ -83,6 +83,9 @@ slot A/B when it touches the data path.
   plaintext egress per peer and per-packet send receipts, with the answers to O8-O14 recorded in
   the design note `docs/plan/notes/20261026-0834-packet-tag-carrier.md`. It is breaking
   (`Output` and `TranslatorStats` become `#[non_exhaustive]`, `PacketBuf` grows by one word) and
-  ships as 0.21.0.
+  ships as 0.21.0. As integrated: `Output` becomes `#[non_exhaustive]` with `Plaintext` and
+  `Tracked`; `TranslatorStats` stays exhaustive (the mixed-tag drop is a drop reason) and
+  `PacketBuf` keeps 56 bytes with `u32` packet offsets (layout B of the note, the one-word
+  layout was outside the noise).
 - 2026-10-27: the owner lifted the freeze ("后续走正常维护，解除冻结，只是提示api兼容性"); see
   [2026-10-27-normal-maintenance](2026-10-27-normal-maintenance.md).

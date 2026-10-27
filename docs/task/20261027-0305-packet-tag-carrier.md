@@ -1,6 +1,6 @@
 # 20261027-0305-packet-tag-carrier Packet tag carrier on PacketBuf (release C, W4)
 
-- **status**: completed on `feat/packet-tag-carrier` (not merged, not released)
+- **status**: completed (integrated into 0.21.0 on `release/0.21.0`, not released)
 - **priority**: P1
 - **owner**: w4/packet-tag-carrier
 - **createdAt**: 2026-10-27 03:05
@@ -149,3 +149,16 @@ Benchmarks (slot 0, interleaved against `v0.20.0`, each run started at load < 3;
   5.2; base tight at 476-488 us; prototype B equal to base here). Open: re-measure
   `send_stream` `streams_1`, `flows_1` and `flows_4` on a quiet host before the release.
 - The labeled-path bar (noise plus 3 %) belongs to W5; W4 adds no labeled path.
+
+Integration into 0.21.0 (`release/0.21.0` from `v0.20.2`, 2026-10-27): merged as `dbee734`,
+commits unchanged. Conflicts were in documents only (`CHANGELOG.md`, `docs/changelog.md`,
+`docs/reference/nsplane-nat.md`, where 0.20.2's `Nat64LanSink::send_batch_spent` sentence and
+the tag sentence are both kept, and this file). 0.20.2's wrapper sinks (`MapSink`,
+`AbortSink`, `SwapSink`, `Splitter`, `Nat64LanSink`) forward `send_batch_spent` and append
+the buffers of the packets they drop; those buffers keep their tag and marker until `pump`
+clears both before `PacketSource::recycle`, so the carrier rule holds without a change. Added
+with the integration: `pump::tests::wrapper_sinks_hand_spent_and_dropped_buffers_back_untagged_and_unmarked`
+(kept packets reach the inner sink with tag and marker; dropped and spent buffers reach the
+source with neither; fails with `pump`'s clear removed) and a sentence on
+`PacketSink::send_batch_spent` that spent buffers still carry both. The owner accepted variant
+B and the exhaustive `TranslatorStats` with `reasons::FRAGMENT_MIXED_TAGS` (2026-10-27).

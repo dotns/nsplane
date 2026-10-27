@@ -1,6 +1,6 @@
 # 20261027-0305-plaintext-egress-send-receipts Plaintext egress and per-packet send receipts (release C, W6)
 
-- **status**: completed on `feat/plaintext-egress-send-receipts` (not merged, not released)
+- **status**: completed (integrated into 0.21.0 on `release/0.21.0`, not released)
 - **priority**: P1
 - **owner**: w6/plaintext-egress-send-receipts
 - **createdAt**: 2026-10-27 03:05
@@ -215,3 +215,40 @@ Gates on the code head (`bd5a539` plus these records):
   `enum_marked_non_exhaustive` on `nsplane_core::Output` (`types.rs`); the new variants are
   covered by it. Every other crate: no semver update required.
 
+Integration into 0.21.0 (`release/0.21.0` from `v0.20.2`, 2026-10-27): merged as `dfd8ef3`,
+commits unchanged; the only conflict was this file. The integration reviewed the deviations
+against the design note (the specification):
+
+- `TrackedRefused::Duplicate`: stands. The note makes the tag the token and reports
+  `SendResult { tag, outcome }`; with two outstanding packets under one tag neither the
+  engine nor the consumer could tell their results apart. The note says nothing about
+  duplicates, refusing returns the packet, and the tag is free again once its result is out.
+- `reasons::FILTER_HANDLED` and `reasons::ENGINE_STOPPED`: stand. The note lists "handled by a
+  filter" and "engine stopped" among the outcomes "with the existing reason strings", but
+  `v0.20.2` has no string for either (`Verdict::Handled` was never a drop, a stop never a
+  drop reason), so they need names; both are results only and never counted as drops.
+  `PLAINTEXT_EGRESS_FULL` / `_CLOSED` are the plan's names, and the engine aliases follow the
+  `DROP_*` convention.
+- A tracked packet without a session also counted as a `NO_SESSION` drop: stands. The note
+  defines the result (`NotSent { no session }` at once) and not the counters; unlike an
+  untracked packet, which the tunnel queues, a tracked one is discarded, and drops are
+  counted (principle 5); `inject_outbound_on` already counts the same case as a
+  `NO_SESSION` drop.
+- The core undoing what an outbound filter does to a tracked packet's tag or marker: stands.
+  The carrier table lets a filter read and set the tag (R4 proposal A reads it), but for a
+  tracked packet the tag is the token, and "exactly one result per accepted packet" needs
+  the token to reach the result. The review found the case next to it uncovered: a marker a
+  filter set on an untracked tagged packet was kept, so the core reported that packet
+  `Sealed` under its tag, and the engine could post it as the result of an outstanding
+  tracked packet with the same tag; this contradicts O13 ("a mark set elsewhere never
+  produces a result"). Fixed with the integration: the core clears the marker of every other
+  packet after the chain (`a_filter_cannot_make_an_untracked_packet_tracked`, inline and
+  crypto jobs, failed before the fix), and `PacketFilter::outbound` states the rule.
+- `inject_outbound` following the plaintext egress mark: stands. The note marks the peer's
+  routed local packets; `inject_outbound` is routed (it only bypasses the filters, by its
+  contract) and `inject_outbound_on` names its path and is not routed, so it stays sealed.
+  The engine clears the marker on both entries as the note requires, so neither is tracked
+  through the engine. The rustdoc of both `inject_outbound` entries now says so.
+- The remaining deviations (the marker of an untagged packet cleared, jobs of a panicked
+  crypto worker reported `ENGINE_STOPPED`, files outside the listed scope, two W4 tests
+  adapted to O9 and O10, the extra benches) follow the note or are scope notes; recorded.

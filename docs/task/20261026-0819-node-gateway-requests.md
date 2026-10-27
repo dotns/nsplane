@@ -1,7 +1,8 @@
 # 20261026-0819-node-gateway-requests Requests from the node and the gateway at 0.19.2, and two defects
 
 - **status**: in progress (D1, D2, R1, R3, R4 barrier and R5 part 1 released in 0.20.0; R2,
-  R4 tag variant, R5 part 2 and R6 are release C, in design)
+  R4 tag variant, R5 part 2 and R6 implemented as release C and integrated as 0.21.0 on
+  `release/0.21.0`, not released)
 - **plan**: 20261026-0822-node-gateway-requests
 - **priority**: P2
 - **owner**: (unassigned)
