@@ -432,3 +432,11 @@ barrier and validated plaintext ingress) approved as the eleventh freeze excepti
 plan's shapes and the recommended answers to O1-O7; release C (0.21.0: netstack ingress labels,
 plaintext egress, send receipts) is designed first as one carrier, the packet tag, in a design
 note for owner and consumer review, and is not implemented.
+
+## 2026-10-27 [decision]
+
+Owner decision on plan `20261026-0822-node-gateway-requests`: `main` moved to `fb67db9` (0.19.3
+released upstream, then the large module split), so release A becomes 0.19.4, and the plan,
+release A and the release B workstreams are rebased onto `fb67db9` as new branches and release
+B is integrated again; the branches go to the Gitea remote only.
+

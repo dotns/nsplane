@@ -508,7 +508,7 @@ Documentation: `nsplane-packet.md` (tag), `nsplane-netstack.md` (ingress labels)
 
 | Release | Content | Policy | Ready |
 | --- | --- | --- | --- |
-| A, 0.19.3 | W0: D1, D2 | bug-fix release under the freeze rules (regression tests, full gate, slot A/B of `vnet`, `offload`, `gate`) | on approval |
+| A, 0.19.4 | W0: D1, D2 | bug-fix release under the freeze rules (regression tests, full gate, slot A/B of `vnet`, `offload`, `gate`) | on approval |
 | B, 0.20.0 | W1 (R1), W2 (R3), W3 (R4 barrier, R5 part 1) | eleventh freeze exception; additive API, no cost on default paths | on approval of this plan and O1-O7 |
 | C, 0.21.0 | W4 (tag), W5 (R2), W6 (R5 part 2, R6) | twelfth exception; breaking (`Output`, `PacketBuf` size); after a design note the owner and both consumers review | needs more design |
 
@@ -608,8 +608,9 @@ after it is approved.
 
 Owner decisions, 2026-10-26:
 
-1. Release A (0.19.3, W0: D1 and D2) is approved as a bug-fix release, including the D2
-   behaviour change (a later fragment as a ninth extension header is denied `Malformed`).
+1. Release A (0.19.3 then, 0.19.4 since 2026-10-27; W0: D1 and D2) is approved as a bug-fix
+   release, including the D2 behaviour change (a later fragment as a ninth extension header is
+   denied `Malformed`).
 2. Release B (0.20.0: W1 R1, W2 R3, W3 R4 barrier and R5 part 1) is approved as the eleventh
    freeze exception with the shapes above.
 3. O1-O7 take the recommended answers:
@@ -636,3 +637,12 @@ Owner decisions, 2026-10-26:
      65,536.
    O8, O9, O10 and O13 wait for the gateway's review, which has started; the twelfth freeze
    exception and the go-ahead for release C are not decided.
+
+Owner decision, 2026-10-27: `main` moved to `fb67db9` (0.19.3 released with a musl build fix,
+then the largest modules split: `nsplane-core` `core.rs`, `nsplane` `engine.rs` and `udp.rs`,
+`nsplane-netstack` `stack.rs`, `nsplane-acl` `filter.rs`). Release A is numbered 0.19.4. This
+plan, release A and the three release B workstreams are rebased onto `fb67db9` as new
+branches, each change moved into the module its code now lives in, and release B is integrated
+again from there. Source references in this plan and the design note stay at `52eb983`; the
+split moved functions between files without changing them.
+
