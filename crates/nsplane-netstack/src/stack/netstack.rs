@@ -67,7 +67,6 @@ impl NetStack {
         let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
         let (pending, incoming_pending) = pending_table(&settings, &notify, &revocations).unzip();
         let (events, flow_events) = event_sink(&settings).unzip();
-        let events = events.map(Box::new);
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -123,13 +122,14 @@ impl NetStack {
             reassembler,
             reassembly_counted: ReassemblyStats::default(),
             revocations: Arc::clone(&revocations),
+            next_label_sweep: SmolInstant::ZERO,
             retiring: Vec::new(),
             sent: 0,
             marks: VecDeque::new(),
             fences: Arc::clone(&fences),
             barriers: Vec::new(),
             pending,
-            events,
+            events: events.map(Box::new),
             #[cfg(test)]
             turns: 0,
         };

@@ -59,6 +59,8 @@ const EGRESS_BACKLOG: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// Longest the driver sleeps without a timer from smoltcp.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
+/// Minimum spacing between bounded label-registry maintenance passes.
+const LABEL_SWEEP_INTERVAL: SmolDuration = SmolDuration::from_millis(50);
 /// Maximum interval without application payload in either direction of a connection.
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
@@ -141,6 +143,7 @@ struct Driver {
     /// The reassembler's counts already added to `stats`.
     reassembly_counted: ReassemblyStats,
     revocations: Arc<Revocations>,
+    next_label_sweep: SmolInstant,
     /// Revoked flows taken in this turn and not retired yet; empty between turns.
     retiring: Vec<Arc<FlowState>>,
     /// Packets moved from the backlog into the egress queue. The packet at `tx_queue[i]`
@@ -217,6 +220,10 @@ impl Driver {
         // every SYN in the batch up front: sizing it against the current state would leave
         // the 2nd..Nth simultaneous SYN without a socket to land on.
         let now = self.now();
+        if now >= self.next_label_sweep {
+            self.revocations.sweep_labeled();
+            self.next_label_sweep = now + LABEL_SWEEP_INTERVAL;
+        }
         // Before the pool reclaims sockets that left the handshake.
         self.release_inbound();
         let mark = self.position();

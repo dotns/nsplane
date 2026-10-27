@@ -26,6 +26,8 @@ pub(crate) const MAX_FENCES: usize = 1024;
 
 /// Most old label registrations inspected when adding one lifetime.
 const LABEL_SWEEP_BUDGET: usize = 8;
+/// Most label registrations inspected by one driver maintenance pass.
+const IDLE_LABEL_SWEEP_BUDGET: usize = 256;
 
 const PENDING: u8 = 0;
 const RETIRED: u8 = 1;
@@ -482,7 +484,15 @@ struct Queue {
 
 impl Queue {
     fn track_labeled(&mut self, flow: &Arc<FlowState>) {
-        for _ in 0..self.labeled.len().min(LABEL_SWEEP_BUDGET) {
+        if self.closed {
+            return;
+        }
+        self.sweep_labeled(LABEL_SWEEP_BUDGET);
+        self.labeled.push(Arc::downgrade(flow));
+    }
+
+    fn sweep_labeled(&mut self, budget: usize) {
+        for _ in 0..self.labeled.len().min(budget) {
             if self.labeled_cursor >= self.labeled.len() {
                 self.labeled_cursor = 0;
             }
@@ -493,7 +503,6 @@ impl Queue {
                 self.labeled_cursor += 1;
             }
         }
-        self.labeled.push(Arc::downgrade(flow));
     }
 }
 
@@ -508,6 +517,16 @@ impl Revocations {
 
     fn lock(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reclaims expired registrations even when no new lifetimes arrive.
+    pub(crate) fn sweep_labeled(&self) {
+        let mut queue = self.lock();
+        queue.sweep_labeled(IDLE_LABEL_SWEEP_BUDGET);
+        if queue.labeled.is_empty() {
+            queue.labeled = Vec::new();
+            queue.labeled_cursor = 0;
+        }
     }
 
     pub(crate) fn labeled(&self, label: NonZeroU64) -> Vec<Arc<FlowState>> {
@@ -536,6 +555,8 @@ impl Revocations {
     pub(crate) fn close(&self, retiring: &mut Vec<Arc<FlowState>>) {
         let mut queue = self.lock();
         queue.closed = true;
+        queue.labeled = Vec::new();
+        queue.labeled_cursor = 0;
         for flow in queue.pending.drain(..).chain(retiring.drain(..)) {
             flow.finish(RetirementOutcome::Unknown);
         }
