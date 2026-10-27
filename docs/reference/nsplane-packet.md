@@ -7,7 +7,7 @@ crate shares (`PeerId`, `TransportId`, `Path`, `Ecn`). No I/O.
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; `vnet::VirtioNetHdr` (`parse`, `encode`), `vnet::segment`, `vnet::OffloadError`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
+| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds; `tag` / `set_tag` / `take_tag`, `is_tracked` / `set_tracked`), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `push_tagged`, `discard_tagged`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome, FragmentTags}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; `vnet::VirtioNetHdr` (`parse`, `encode`), `vnet::segment`, `vnet::OffloadError`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 
 ## Behavior
 
@@ -18,6 +18,33 @@ header, so sealing never moves the payload) and `TAILROOM` behind it (padding an
 tag). `advance` / `reserve_front` move the start, every bounds change is fallible
 (`BoundsError`), and `from_shared` adopts a buffer of a pool. `PacketPool` is a plain free
 list; `PacketBatch` carries up to `MAX_BATCH` packets between the engine's tasks.
+
+### Packet tag and receipt marker
+
+A `PacketBuf` carries two properties of the caller's that never reach the wire (transports and
+sinks write the `as_packet` bytes only):
+
+- The tag, `Option<NonZeroU64>` (`tag`, `set_tag`, `take_tag`): opaque, never interpreted by
+  nsplane; the value space belongs to the consumer, which packs several meanings into the 64
+  bits if it needs them. Where tags are in use, no tag is a value of its own, not a wildcard.
+- The receipt marker, a `bool` (`is_tracked`, `set_tracked`), separate from the tag.
+
+Rules, which every nsplane crate follows:
+
+| Where | Tag | Marker |
+| --- | --- | --- |
+| `with_capacity`, `from_packet`, `from_shared`; every buffer `PacketPool` (`get`, `get_len`) and `SharedPacketPool` (`alloc`, `alloc_from`) hand out | none | clear |
+| the buffer moves (queues, `PacketBatch`, filters, sources and sinks) | kept | kept |
+| `Clone` | copied | clear |
+| `into_bytes`, `freeze` | dropped with the buffer | dropped |
+| a copy of the same packet into a new buffer (the core's layout for sealing of a packet without headroom, the translators' grown copies) | copied | copied |
+| the fragments of a split packet (`nsplane`'s fragmentation stage) | copied to each | clear |
+| a reassembled datagram (`push_tagged`) | kept if every fragment carried the same tag (none included); otherwise `FragmentTags::Mixed`, which callers drop | |
+| a buffer that stops being the packet (a handshake initiation written into it, a buffer handed to `PacketSource::recycle`) | cleared | cleared |
+
+The pools store the allocation, not the `PacketBuf`, so a pooled buffer comes back untagged at
+no cost. The fields make `PacketBuf` 64 bytes on 64-bit targets, and the inline storage of a
+`PacketBatch` 4096 bytes.
 
 ### Shared pool
 
@@ -51,6 +78,16 @@ IPv4 and (source, destination, identification) for IPv6; fragments may arrive in
 an identical retransmitted fragment is ignored, and fragments that overlap with different
 coverage drop the whole datagram (RFC 5722, for both families). `stats` and `pending` report
 the state.
+
+`push_tagged(packet, tag, now) -> (Outcome, FragmentTags)` records each fragment's packet tag
+(16 bytes per held datagram): a completed datagram reports `FragmentTags::Same(tag)` when every
+fragment, exact duplicates included, carried that tag (or every one none), and
+`FragmentTags::Mixed` otherwise, counted in `ReassemblyStats::mixed_tags`; other outcomes report
+the packet's own tag. `push` is `push_tagged` without a tag. A caller that labels packets by tag
+drops a `Mixed` datagram, so a merge never turns tagged input into an untagged packet.
+`discard_tagged(tag)` drops the incomplete datagrams that may hold a fragment with the tag (those
+whose fragments carry it, and mixed ones) and returns how many; their later fragments open new
+datagrams.
 
 ### UDP builder
 

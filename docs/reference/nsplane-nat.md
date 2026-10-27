@@ -81,11 +81,16 @@ netstack driver uses; the translator keeps the byte budget and the markers on to
 reassembled the same way and sent unfragmented; with nothing held, in-order fragments of a
 checksummed datagram are translated one by one, without holding or waiting. A reassembled
 datagram larger than the translator's MTU (`Translator::set_mtu`, 1280 by default; set it
-to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent oversize.
-`TranslatorStats` counts `fragments_held` (exact duplicates, ignored, included), `fragment_timeouts`, `fragment_budget_drops`,
+to the tunnel MTU) is dropped as `reasons::REASSEMBLED_TOO_BIG`, never sent oversize. A
+reassembled datagram keeps the packet tag its fragments share (no tag counting as a value of
+its own, see [nsplane-packet](nsplane-packet.md#packet-tag-and-receipt-marker)); one whose
+fragments carried different tags, or some a tag and others none, is dropped as
+`reasons::FRAGMENT_MIXED_TAGS` (counted in `dropped_out`), so a merge never passes tagged input
+untagged to a filter installed after the translator. `TranslatorStats` counts `fragments_held` (exact duplicates, ignored, included), `fragment_timeouts`, `fragment_budget_drops`,
 `fragment_marker_evictions` and `reassembled_too_big`. A translated packet grows by 20
-bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied
-into a larger buffer (`TranslatorStats::grown_copies`); TUN reads leave that room. A
+bytes (28 with a fragment header) inside its buffer when it has the room, else it is copied,
+with its tag and receipt marker, into a larger buffer (`TranslatorStats::grown_copies`); TUN
+reads leave that room. A
 translated IPv6 packet shrinks without moving its payload: the IPv4 header is written in
 front of it and the packet start moves forward (the headroom grows by 20 or 28 bytes).
 Transport checksums are verified with `checksum::transport_valid` (32-bit word sums) and
@@ -132,7 +137,8 @@ on the **local side**: the LAN's replies are addressed to `snat_source`, which n
 allowed IPs contain, so the core could not route them to a peer before a filter ran.
 `Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
 `reverse` on local packets before the core routes them (the IPv6 result goes to the peer
-owning the original source). The clients route the mapped /96 to the gateway (it is in their
+owning the original source). Both keep the packet's tag and receipt marker; a reply without
+the 20 bytes of headroom `reverse` grows into is copied once, with both. The clients route the mapped /96 to the gateway (it is in their
 allowed IPs for it), and the gateway's local side routes `snat_source` back to itself. The
 wrappers make `nsplane-nat` depend on `nsplane`; `nsplane` does not depend on `nsplane-nat`.
 

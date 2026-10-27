@@ -110,6 +110,27 @@ and a decrypted packet of the same peer meet the same verdicts.
 Unlike `inject_inbound`, which delivers past every check, this entry is a second way into the
 inbound filter chain; `nsplane`'s `PlaintextIngress` feeds it.
 
+### Packet tags
+
+The core moves the packet tag and the receipt marker of
+[nsplane-packet](nsplane-packet.md#packet-tag-and-receipt-marker) with the `PacketBuf` and
+never interprets them:
+
+- A local packet (`Input::Local`, `handle_locals`, the `_deferred` forms, `inject_outbound`,
+  `inject_outbound_on`) keeps both through routing, the outbound filters (a filter reads the
+  tag and may set it), sealing in place or on a `CryptoJob`, and `Output::Transmit`, whose
+  datagram is the packet's buffer.
+- A packet without headroom for the data header (a slice of a shared buffer) is copied once
+  into a pooled buffer for sealing; the copy takes the tag and the marker.
+- When the tunnel has no session, the packet's bytes are queued in the tunnel and a handshake
+  initiation is written into its buffer: a sealed message other than data carries neither tag
+  nor marker. The queued packets go out untagged once the session is up (new buffers), as do
+  handshake, cookie and keepalive messages.
+- Received datagrams are opened in place; transports hand over untagged buffers, an inbound
+  filter may set a tag, and `Output::Deliver` carries it. `inject_inbound` and
+  `receive_plaintext` keep the tag and the marker of the packet they are given.
+- `recycle` and the pool drop both with the buffer.
+
 ### Padding
 
 Used by the driver's per-path MTU (see [nsplane](nsplane.md)); unused otherwise: `Core::data_path(peer)` is the path the peer's next data message leaves on (what the policy
