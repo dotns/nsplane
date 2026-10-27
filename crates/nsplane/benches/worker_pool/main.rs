@@ -12,15 +12,24 @@
 //! The one-peer case links the hub to a single spoke with as many crypto workers as the hub
 //! and sends `SPOKES * BURST` packets each way per iteration: one peer's packets spread over
 //! the workers.
+//!
+//! `tracked_send` links the hub (pool off, with a tracked sender) to one spoke and sends
+//! `TRACKED_BURST` packets from the hub per iteration, `untracked` from its source and waiting
+//! until the spoke delivered them, `tracked` from its `TrackedSender` and waiting also for
+//! every `SendResult`: the cost of the receipts, including a transport call per tracked
+//! datagram.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use nsplane::x25519::{PublicKey, StaticSecret};
+use std::num::NonZeroU64;
+
 use nsplane::{
     AllowedIp, ChannelSink, ChannelSource, ChannelTransport, Ecn, Engine, EngineBuilder,
-    EngineHandle, PacketBuf, Path, Peer, PeerId, TransportId,
+    EngineHandle, PacketBuf, Path, Peer, PeerId, SendOutcome, SendResults, TrackedSender,
+    TransportId,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -32,6 +41,8 @@ const SPOKES: u8 = 8;
 const BURST: usize = 120;
 /// Capacity of every queue and link.
 const CAPACITY: usize = 1024;
+/// Packets the hub sends per iteration of `tracked_send`.
+const TRACKED_BURST: usize = 256;
 /// Transport id of every spoke's link to the hub.
 const SPOKE_LINK: TransportId = TransportId::new(1);
 
@@ -57,15 +68,23 @@ struct Node {
     seed: u8,
     local: mpsc::Sender<PacketBuf>,
     delivered: mpsc::Receiver<(PeerId, PacketBuf)>,
+    tracked: Option<(TrackedSender, SendResults)>,
 }
 
 impl Node {
-    fn new(seed: u8, transports: Vec<ChannelTransport>, workers: usize) -> Self {
+    fn new(seed: u8, transports: Vec<ChannelTransport>, workers: usize, tracked: bool) -> Self {
         let (source, local, _mtu) = ChannelSource::new(CAPACITY, 1420);
         let (sink, delivered) = ChannelSink::new(CAPACITY);
-        let builder = EngineBuilder::new(source, sink)
+        let mut builder = EngineBuilder::new(source, sink)
             .private_key(StaticSecret::from([seed; 32]))
             .crypto_workers(workers);
+        let sender = if tracked {
+            let (b, tracked_sender, results) = builder.tracked_sender(CAPACITY);
+            builder = b;
+            Some((tracked_sender, results))
+        } else {
+            None
+        };
         let engine = transports
             .into_iter()
             .fold(builder, EngineBuilder::transport)
@@ -77,6 +96,7 @@ impl Node {
             seed,
             local,
             delivered,
+            tracked: sender,
         }
     }
 
@@ -109,9 +129,9 @@ const fn at(transport: TransportId, addr: SocketAddr) -> Path {
     }
 }
 
-/// The hub with `workers` crypto workers and `count` peered spokes with `spoke_workers`,
-/// with sessions up.
-async fn star(count: u8, workers: usize, spoke_workers: usize) -> (Node, Vec<Node>) {
+/// The hub with `workers` crypto workers (and a tracked sender with `tracked`) and `count`
+/// peered spokes with `spoke_workers`, with sessions up.
+async fn star(count: u8, workers: usize, spoke_workers: usize, tracked: bool) -> (Node, Vec<Node>) {
     let mut hub_links = Vec::new();
     let mut spokes = Vec::new();
     for seed in 2..2 + count {
@@ -121,9 +141,9 @@ async fn star(count: u8, workers: usize, spoke_workers: usize) -> (Node, Vec<Nod
             (SPOKE_LINK, addr(seed, 2000)),
         );
         hub_links.push(hub_end);
-        spokes.push(Node::new(seed, vec![spoke_end], spoke_workers));
+        spokes.push(Node::new(seed, vec![spoke_end], spoke_workers, false));
     }
-    let mut hub = Node::new(1, hub_links, workers);
+    let mut hub = Node::new(1, hub_links, workers, tracked);
     for spoke in &mut spokes {
         let id = TransportId::new(u16::from(spoke.seed));
         hub.handle
@@ -210,7 +230,7 @@ fn bench_star(
         group.throughput(Throughput::Elements(packets as u64));
         for workers in [0, 2, 4] {
             let (mut hub, mut spokes) =
-                runtime.block_on(star(count, workers, spoke_workers(workers)));
+                runtime.block_on(star(count, workers, spoke_workers(workers), false));
             group.bench_with_input(
                 BenchmarkId::new(format!("{len}B"), workers),
                 &len,
@@ -233,6 +253,66 @@ fn bench_star(
     group.finish();
 }
 
+/// Sends `TRACKED_BURST` packets of `len` bytes from the hub to the spoke, tracked or not,
+/// and waits until the spoke delivered them and, tracked, every result came.
+async fn one_way(hub: &mut Node, spoke: &mut Node, len: usize, tracked: bool) {
+    let packet = ipv4_packet(ip(1), ip(spoke.seed), len);
+    let sender = if tracked {
+        let (sender, _) = hub.tracked.as_ref().unwrap();
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            for token in 1..=TRACKED_BURST as u64 {
+                let mut packet = PacketBuf::from_packet(&packet);
+                packet.set_tag(NonZeroU64::new(token));
+                sender.send(packet).await.unwrap();
+            }
+        })
+    } else {
+        let local = hub.local.clone();
+        tokio::spawn(async move {
+            for _ in 0..TRACKED_BURST {
+                local.send(PacketBuf::from_packet(&packet)).await.unwrap();
+            }
+        })
+    };
+    for _ in 0..TRACKED_BURST {
+        spoke.delivered.recv().await.unwrap();
+    }
+    if tracked {
+        let (_, results) = hub.tracked.as_mut().unwrap();
+        for _ in 0..TRACKED_BURST {
+            let result = results.recv().await.unwrap();
+            assert!(matches!(result.outcome, SendOutcome::Sent { .. }));
+        }
+    }
+    sender.await.unwrap();
+}
+
+fn bench_tracked_send(c: &mut Criterion, runtime: &Runtime) {
+    let mut group = c.benchmark_group("tracked_send");
+    group.throughput(Throughput::Elements(TRACKED_BURST as u64));
+    for len in [64, 1420] {
+        let (mut hub, mut spokes) = runtime.block_on(star(1, 0, 0, true));
+        let mut spoke = spokes.pop().unwrap();
+        for (name, tracked) in [("untracked", false), ("tracked", true)] {
+            group.bench_function(BenchmarkId::new(format!("{len}B"), name), |b| {
+                b.iter_custom(|iters| {
+                    runtime.block_on(async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            one_way(&mut hub, &mut spoke, len, tracked).await;
+                        }
+                        start.elapsed()
+                    })
+                });
+            });
+        }
+        let drops = runtime.block_on(hub.handle.drop_counters()).unwrap();
+        assert!(drops.is_empty(), "the hub dropped packets: {drops:?}");
+    }
+    group.finish();
+}
+
 fn bench_worker_pool(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     bench_star(c, &runtime, "worker_pool", SPOKES, BURST, |_| 0);
@@ -245,6 +325,7 @@ fn bench_worker_pool(c: &mut Criterion) {
         per_spoke,
         |workers| workers,
     );
+    bench_tracked_send(c, &runtime);
 }
 
 criterion::criterion_group!(worker_pool, bench_worker_pool);

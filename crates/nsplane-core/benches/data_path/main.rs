@@ -16,11 +16,18 @@
 //! addresses of a /8 the sender's peer holds: more flows than the core's route cache holds, so
 //! most sends look their route up in the allowed IPs.
 //!
+//! `core_round_trip_tracked` is `core_round_trip` with every local packet tracked (tagged and
+//! marked), so the core also reports it sealed (`Output::Tracked`) before its datagram.
+//! `core_plaintext_egress` routes and filters a local packet to a peer marked for plaintext
+//! egress and takes it back as `Output::Plaintext`; compare it with `core_encapsulate`, the
+//! sealing it replaces.
+//!
 //! The `*_batch32` cases feed the core [`BATCH`] packets per call through
 //! `Core::handle_locals` and `Core::handle_datagrams`; they report the time of a whole batch,
 //! with a throughput of [`BATCH`] elements: divide the time by [`BATCH`] for one packet.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use criterion::measurement::WallTime;
@@ -458,6 +465,55 @@ fn bench_flows(group: &mut BenchmarkGroup<'_, WallTime>, len: usize) {
     );
 }
 
+/// `core_round_trip_tracked` and `core_plaintext_egress`.
+fn bench_tracked(group: &mut BenchmarkGroup<'_, WallTime>, len: usize, packet: &[u8]) {
+    group.bench_with_input(
+        BenchmarkId::new("core_round_trip_tracked", len),
+        &packet,
+        |b, p| {
+            let (mut tx, mut rx) = connected_pair();
+            let now = Instant::now();
+            let tag = NonZeroU64::new(1);
+            let mut slot = Some(PacketBuf::with_capacity(BUF_CAPACITY));
+            b.iter(|| {
+                let mut buf = slot.take().unwrap();
+                fill(&mut buf, p);
+                buf.set_tag(tag);
+                buf.set_tracked(true);
+                tx.handle_input(Input::Local { packet: buf }, now);
+                let Some(Output::Tracked { .. }) = tx.poll_output() else {
+                    panic!("not reported sealed");
+                };
+                let Some(Output::Transmit { data, .. }) = tx.poll_output() else {
+                    panic!("encapsulate");
+                };
+                slot = Some(decapsulate(&mut rx, data, now));
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("core_plaintext_egress", len),
+        &packet,
+        |b, p| {
+            let (mut tx, _rx) = connected_pair();
+            let peer = tx.peers().next().unwrap();
+            assert!(tx.set_plaintext_egress(peer, true));
+            let now = Instant::now();
+            let mut slot = Some(PacketBuf::with_capacity(BUF_CAPACITY));
+            b.iter(|| {
+                let mut buf = slot.take().unwrap();
+                fill(&mut buf, p);
+                tx.handle_input(Input::Local { packet: buf }, now);
+                let Some(Output::Plaintext { packet, .. }) = tx.poll_output() else {
+                    panic!("not handed out");
+                };
+                slot = Some(packet);
+            });
+        },
+    );
+}
+
 fn bench_data_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("data_path");
     for len in [64, 1420] {
@@ -559,6 +615,7 @@ fn bench_data_path(c: &mut Criterion) {
             },
         );
 
+        bench_tracked(&mut group, len, &packet);
         bench_two_identities(&mut group, len, &packet);
         bench_flows(&mut group, len);
         bench_batches(&mut group, len, &packet);
