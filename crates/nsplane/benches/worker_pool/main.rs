@@ -17,7 +17,7 @@
 //! `TRACKED_BURST` packets from the hub per iteration, `untracked` from its source and waiting
 //! until the spoke delivered them, `tracked` from its `TrackedSender` and waiting also for
 //! every `SendResult`: the cost of the receipts, including a transport call per tracked
-//! datagram.
+//! datagram. `engine_one_way` is the `untracked` case on a hub without a tracked sender.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -313,6 +313,43 @@ fn bench_tracked_send(c: &mut Criterion, runtime: &Runtime) {
     group.finish();
 }
 
+/// Sends `TRACKED_BURST` untracked packets of `len` bytes from the hub's source to the spoke
+/// and waits until the spoke delivered them.
+async fn plain_one_way(hub: &Node, spoke: &mut Node, len: usize) {
+    let packet = ipv4_packet(ip(1), ip(spoke.seed), len);
+    let local = hub.local.clone();
+    let sender = tokio::spawn(async move {
+        for _ in 0..TRACKED_BURST {
+            local.send(PacketBuf::from_packet(&packet)).await.unwrap();
+        }
+    });
+    for _ in 0..TRACKED_BURST {
+        spoke.delivered.recv().await.unwrap();
+    }
+    sender.await.unwrap();
+}
+
+fn bench_engine_one_way(c: &mut Criterion, runtime: &Runtime) {
+    let mut group = c.benchmark_group("engine_one_way");
+    group.throughput(Throughput::Elements(TRACKED_BURST as u64));
+    for len in [64, 1420] {
+        let (hub, mut spokes) = runtime.block_on(star(1, 0, 0, false));
+        let mut spoke = spokes.pop().unwrap();
+        group.bench_function(format!("{len}B"), |b| {
+            b.iter_custom(|iters| {
+                runtime.block_on(async {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        plain_one_way(&hub, &mut spoke, len).await;
+                    }
+                    start.elapsed()
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_worker_pool(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     bench_star(c, &runtime, "worker_pool", SPOKES, BURST, |_| 0);
@@ -326,6 +363,7 @@ fn bench_worker_pool(c: &mut Criterion) {
         |workers| workers,
     );
     bench_tracked_send(c, &runtime);
+    bench_engine_one_way(c, &runtime);
 }
 
 criterion::criterion_group!(worker_pool, bench_worker_pool);
