@@ -1,7 +1,7 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
 - **status**: implementing (releases A and B released as 0.20.0 on 2026-10-27; release C
-  designed first, design note for review)
+  approved for implementation on 2026-10-27 as the twelfth freeze exception, not started)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
@@ -637,6 +637,14 @@ Owner decisions, 2026-10-26:
      65,536.
    O8, O9, O10 and O13 wait for the gateway's review, which has started; the twelfth freeze
    exception and the go-ahead for release C are not decided.
+6. Release C answers recorded on 2026-10-27, after the gateway's review, as recommended in the
+   design note: O8 (the runtime opt-in that follows the `PeerId`, with the add-closed, read
+   back, mark, open order), O9 (`NotSent { no session }` at once, the consumer may retry), O10
+   (`NotSent { oversize }` with a fragmenter; sealed as usual without one) and O13 (the
+   documented `is_tracked` / `set_tracked` marker, also cleared on hand-out). R4 proposal A stays
+   in release C; `recv_labeled` stays out. Open for the owner: the barrier's count window (O15 in
+   the note); the twelfth freeze exception and the go-ahead for implementing release C are not
+   decided.
 
 Owner decision, 2026-10-27: `main` moved to `fb67db9` (0.19.3 released with a musl build fix,
 then the largest modules split: `nsplane-core` `core.rs`, `nsplane` `engine.rs` and `udp.rs`,
@@ -656,4 +664,25 @@ made `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` 
 
 Release, 2026-10-27: 0.20.0 (tag `v0.20.0`) ships release B and release A's fixes; 0.19.4 is not
 released separately.
+
+Owner decision, 2026-10-27: release C (0.21.0: W4 packet tag carrier, W5 netstack ingress
+labels, W6 plaintext egress and send receipts) is approved for implementation as the twelfth
+freeze exception, with the answers to O8-O14 as recorded in the design note (O11 the tag on
+`PacketBuf`, variant A first; O12 labels; O13 the documented receipt marker; O14 a bounded
+tombstone table, default 65,536; O8, O9, O10 as refined by the gateway review). The design note
+is approved and is the specification. Tasks: `20261027-0305-packet-tag-carrier` (W4, first),
+`20261027-0305-netstack-ingress-labels` (W5) and `20261027-0305-plaintext-egress-send-receipts`
+(W6), the last two after W4. O15, the barrier's count window, is a release B item outside this
+approval. Implementation has not started.
+
+Owner decision, 2026-10-27: O15 of the design note, the `local_barrier` count window (a batch
+is counted only after `PacketSource::recv_batch` returned it, so a barrier taken in between can
+exclude it), is fixed in nsplane and released as 0.20.1 on the Gitea remote only. The release B
+barrier's workstream (task `20261026-0836-local-barrier-plaintext-ingress`) implements and
+releases it; it is not part of release C.
+
+Owner decision, 2026-10-27: the labeled-path acceptance allowance of release C (W5) is the noise
+plus 3 % (labeled against unlabeled `send_stream` runs on the same build); if TCP misses it, the
+per-socket label checked after smoltcp's demultiplexing is measured instead. This was the last
+open owner item of the design note.
 

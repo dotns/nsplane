@@ -504,6 +504,27 @@ in the version commit.
 
 ## 2026-10-27 [decision]
 
+Release C of plan `20261026-0822-node-gateway-requests` approved for implementation as the
+twelfth freeze exception (ADR `2026-10-08-feature-freeze-0-11` amended): the packet tag carrier,
+netstack ingress labels, plaintext egress and send receipts, with the answers to O8-O14 recorded
+in the design note, which is now approved. Tasks for W4, W5 and W6 written; W4 goes first.
+Implementation has not started.
+
+## 2026-10-27 [decision]
+
+O15 of the release C design note (plan `20261026-0822-node-gateway-requests`): the
+`local_barrier` count window is fixed in nsplane and released as 0.20.1 on the Gitea remote
+only, implemented and released by the release B barrier's workstream; it is not part of
+release C.
+
+## 2026-10-27 [decision]
+
+Release C's labeled-path acceptance allowance (plan `20261026-0822-node-gateway-requests`, W5):
+the noise plus 3 %; if TCP misses it, the per-socket label checked after smoltcp's
+demultiplexing is measured instead. No owner item of the design note remains open.
+
+## 2026-10-27 [decision]
+
 The owner lifted the 0.11 feature freeze: normal maintenance, with breaking public API changes
 called out in the plan and in the CHANGELOG (ADR `2026-10-27-normal-maintenance`, superseding
 `2026-10-08-feature-freeze-0-11`).
