@@ -1,6 +1,6 @@
 # nstun - Plan Index
 
-> Updated: 2026-10-20
+> Updated: 2026-10-27
 
 ## Usage
 
@@ -60,3 +60,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-2224-acl-rule-reply-revocation Revoke reply allowances of rule-accepted flows when their authority is gone**](20261024-2224-acl-rule-reply-revocation.md) `2026-10-24`
 - [x] [**20261026-1848-split-large-modules Split the largest modules by responsibility and share e2e scenario setup**](20261026-1848-split-large-modules.md) `2026-10-26`
 - [-] [**20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping**](20261026-0822-node-gateway-requests.md) `2026-10-26`
+- [-] [**20261027-0433-post-freeze-schedule Schedule of the follow-ups the 0.11 freeze left open**](20261027-0433-post-freeze-schedule.md) `2026-10-27`
