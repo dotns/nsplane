@@ -6,7 +6,8 @@ use nsplane_packet::reassembly::Outcome;
 use nsplane_packet::{IpPacket, PacketBuf, protocol};
 use tokio::time::Instant;
 
-use crate::flow::Target;
+use crate::flow::{FlowState, Target};
+use crate::pending::PendingProtocol;
 use crate::stats::{self};
 
 use super::Driver;
@@ -122,7 +123,7 @@ impl Driver {
 
     /// Bars the datagrams of a revoked flow the reassembler may still complete, see
     /// [`Barrier`]; `false` if the table is full. Nothing while no datagram is held.
-    pub(super) fn bar(&mut self, target: &Target) -> bool {
+    pub(super) fn bar(&mut self, flow: &FlowState) -> bool {
         let Some(reassembler) = self.reassembler.as_ref() else {
             return true;
         };
@@ -132,12 +133,21 @@ impl Driver {
         if self.barriers.len() >= reassembler.config().max_datagrams {
             return false;
         }
-        let (protocol, local, remote) = match *target {
-            Target::Tcp { local, peer, .. } => (protocol::TCP, local, Some(peer)),
-            Target::UdpFlow((remote, local)) | Target::UdpConnected((remote, local)) => {
-                (protocol::UDP, local, Some(remote))
+        let (protocol, local, remote) = match (flow.target(), flow.held_key()) {
+            (Some(&Target::Tcp { local, peer, .. }), _) => (protocol::TCP, local, Some(peer)),
+            (
+                Some(&(Target::UdpFlow((remote, local)) | Target::UdpConnected((remote, local)))),
+                _,
+            ) => (protocol::UDP, local, Some(remote)),
+            (Some(&Target::UdpBound(local)), _) => (protocol::UDP, local, None),
+            (None, Some(key)) => {
+                let protocol = match key.protocol {
+                    PendingProtocol::Tcp => protocol::TCP,
+                    PendingProtocol::Udp => protocol::UDP,
+                };
+                (protocol, key.local, Some(key.remote))
             }
-            Target::UdpBound(local) => (protocol::UDP, local, None),
+            (None, None) => return true,
         };
         let until = Instant::now().into_std() + reassembler.config().timeout;
         self.barriers.push(Barrier {

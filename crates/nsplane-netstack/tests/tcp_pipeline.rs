@@ -280,10 +280,8 @@ async fn settle_unacked(conn: &TcpConnection, expected: u32) -> TestResult {
 async fn send_budget_splits_between_senders() -> TestResult {
     const BUDGET: usize = 16 << 10;
     let server: SocketAddr = "10.0.0.1:8080".parse()?;
-    let config = NetStackConfig {
-        tcp_send_budget: Some(BUDGET),
-        ..v4(Ipv4Addr::new(10, 0, 0, 1), 1360)
-    };
+    let mut config = v4(Ipv4Addr::new(10, 0, 0, 1), 1360);
+    config.tcp_send_budget = Some(BUDGET);
     let (handle, mut source, sink) = start(config);
     let mut incoming = handle.incoming_tcp();
     let mut first = accept(
@@ -316,10 +314,8 @@ async fn send_budget_splits_between_senders() -> TestResult {
 #[tokio::test]
 async fn no_send_budget_by_default() -> TestResult {
     let server: SocketAddr = "10.0.0.1:8080".parse()?;
-    let config = NetStackConfig {
-        tcp_tx_buffer: Some(16 << 10),
-        ..v4(Ipv4Addr::new(10, 0, 0, 1), 1360)
-    };
+    let mut config = v4(Ipv4Addr::new(10, 0, 0, 1), 1360);
+    config.tcp_tx_buffer = Some(16 << 10);
     let (handle, mut source, sink) = start(config);
     let mut incoming = handle.incoming_tcp();
     let mut first = accept(

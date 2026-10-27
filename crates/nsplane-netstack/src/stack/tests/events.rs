@@ -28,6 +28,7 @@ fn with_events(events: Option<FlowEventsConfig>) -> TransparentConfig {
 }
 
 /// [`with_events`] deciding with `timeout` and `max_pending`.
+#[allow(deprecated, reason = "the deprecated field is still honoured")]
 fn deciding(timeout: Duration, max_pending: usize) -> TransparentConfig {
     TransparentConfig {
         admission: Admission::Decide {

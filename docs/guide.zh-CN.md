@@ -620,16 +620,13 @@ async fn main() -> anyhow::Result<()> {
     let (c, stack_c, _) = node(key_c, client)?;
     // 服务端：拥有 10.0.0.2，并终结 192.0.2.0/24 内的所有地址，每个新连接或 flow
     // 都交由应用决定。
-    let server = NetStackConfig {
-        transparent: Some(TransparentConfig {
-            prefixes: vec![("192.0.2.0".parse()?, 24)],
-            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
-            max_connections: Some(4096),
-            events: Some(FlowEventsConfig::default()),
-            ..Default::default()
-        }),
-        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
-    };
+    let mut server = NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU);
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = vec![("192.0.2.0".parse()?, 24)];
+    transparent.max_connections = Some(4096);
+    transparent.events = Some(FlowEventsConfig::default());
+    server.transparent = Some(transparent);
+    server.admission = Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 };
     let (s, stack_s, outer_s) = node(key_s, server)?;
 
     // 客户端把所有 IPv4 目的地址路由到服务端。

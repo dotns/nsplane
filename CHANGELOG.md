@@ -33,6 +33,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PlaintextIngress` (`send` waits, `try_send` refuses with `PlaintextRefused`) that the
   engine polls next to the received datagrams under the deliver-queue backpressure.
   `inject_inbound` keeps its bypass contract.
+- nsplane-netstack: control of a connection's or flow's lifetime from its first input.
+  Under `Admission::Decide`, `PendingFlow::control` returns the lifetime's `FlowControl`,
+  the same control the `TcpConnection` or `UdpFlow` handed out later carries (a
+  `FlowContext` bound on it stays on the handle). Revoking it before the hand-out retires
+  the lifetime at its stage (held, accepted before the next driver turn, listener socket in
+  SYN-RECEIVED with its queued SYN-ACK, established and waiting for `incoming_tcp`, queued
+  in `incoming_tcp` / `incoming_udp`) and sends nothing; the handle is never returned
+  afterwards and a later SYN or datagram on the tuple is a new lifetime.
+  `RetirementOutcome` keeps its meaning.
+- nsplane-netstack: `FlowControl::delivery` returns a `DeliveryReceipt` (`outcome`,
+  `wait`) with exactly one `DeliveryOutcome` per lifetime: `Delivered` when the stream takes
+  the handle, or `NotDelivered(Undelivered)` with `Rejected`, `TimedOut`,
+  `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`,
+  `AcceptQueueGone`, `FlowLimit`, `Revoked` or `Stopped`. Handles admitted with
+  `Admission::Immediate` and those the application opens report `Delivered`.
+- nsplane-netstack: `NetStackConfig::admission` applies admission to every stack; on a
+  stack without `transparent`, `Decide` holds SYNs and first datagrams to the stack's own
+  addresses and rejections are sourced from them.
+- nsplane-netstack: `NetStackStats::handshake_failed` counts inbound TCP handshakes that
+  ended before the connection was established.
+
+### Changed
+- nsplane-netstack: `NetStackConfig` and `NetStackStats` gain a field each (`admission`,
+  `handshake_failed`); struct literals without `..Default::default()` must name them.
+- Breaking: nsplane-netstack `NetStackConfig`, `TransparentConfig`, `FlowEventsConfig`,
+  `NetStackStats` and the enum `PendingProtocol` are `#[non_exhaustive]`, so later fields
+  and variants are not breaking again. Other crates can no longer build the structs with a
+  struct expression, also not with `..Default::default()`: start from
+  `NetStackConfig::new` or `Default::default()` and assign the fields (for an expected
+  `NetStackStats`, assign the expected counters on a default value). A `match` on
+  `PendingProtocol` needs a wildcard arm. Reading fields and comparing values is unchanged.
+
+  ```rust
+  // Before
+  let config = NetStackConfig {
+      accept_capacity: 256,
+      transparent: Some(TransparentConfig { prefixes, ..Default::default() }),
+      ..NetStackConfig::new(addresses, mtu)
+  };
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      PendingProtocol::Udp => false,
+  };
+  // After
+  let mut transparent = TransparentConfig::default();
+  transparent.prefixes = prefixes;
+  let mut config = NetStackConfig::new(addresses, mtu);
+  config.accept_capacity = 256;
+  config.transparent = Some(transparent);
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      _ => false,
+  };
+  ```
+- nsplane-netstack: under `Admission::Decide`, `incoming_tcp` and `incoming_udp` skip a
+  handle whose lifetime ended while it was queued, also when the stack stopped; an accepted
+  held datagram opens its flow in the flow table even if a socket bound or connected
+  meanwhile claims its tuple.
+
+### Deprecated
+- nsplane-netstack: `TransparentConfig::admission`, replaced by
+  `NetStackConfig::admission`. A transparent stack honours it while the top-level field is
+  `Admission::Immediate`.
 
 ## [0.19.4] - unreleased
 

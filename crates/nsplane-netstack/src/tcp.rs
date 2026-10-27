@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
 
-use crate::flow::{FlowControl, FlowState};
+use crate::flow::{FlowControl, FlowState, Undelivered};
 
 /// Progress of the application's write half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +176,11 @@ impl TcpConnection {
     /// The connection's control, which can revoke it from any task; see [`FlowControl`].
     pub fn control(&self) -> FlowControl {
         FlowControl::new(Arc::clone(&self.flow))
+    }
+
+    /// The state of the connection's lifetime.
+    pub(crate) const fn flow(&self) -> &Arc<FlowState> {
+        &self.flow
     }
 
     /// The stack's end of the connection: the destination of the peer's SYN for an
@@ -367,7 +372,10 @@ impl AsyncWrite for TcpConnection {
 }
 
 impl Drop for TcpConnection {
+    /// Closes the connection; one dropped before it was handed out (with the accept queue)
+    /// ends its lifetime undelivered.
     fn drop(&mut self) {
+        self.flow.undeliver(Undelivered::AcceptQueueGone);
         lock(&self.shared).app_dropped = true;
         self.driver.notify_one();
     }

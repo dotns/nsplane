@@ -66,6 +66,13 @@ fn prefixes() -> Vec<(IpAddr, u8)> {
     ]
 }
 
+/// Transparent mode for [`prefixes`].
+fn in_prefixes() -> TransparentConfig {
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = prefixes();
+    transparent
+}
+
 /// The client node: a plain stack whose engine routes everything to the server, with the
 /// ICMP and `ICMPv6` packets it receives split off to `icmp` instead of its stack.
 struct Client {
@@ -81,7 +88,10 @@ struct Server {
 }
 
 /// A client and a server whose stack runs with `transparent`, peers of each other.
-async fn pair(transparent: Option<TransparentConfig>) -> TestResult<(Client, Server)> {
+async fn pair(
+    transparent: Option<TransparentConfig>,
+    admission: Admission,
+) -> TestResult<(Client, Server)> {
     let client_path = (
         TransportId::new(1),
         SocketAddr::from(([192, 0, 2, 1], 1000)),
@@ -112,13 +122,13 @@ async fn pair(transparent: Option<TransparentConfig>) -> TestResult<(Client, Ser
         .transport(link_c)
         .build()?;
 
-    let (server_stack, server_handle) = NetStack::new(NetStackConfig {
-        transparent,
-        ..NetStackConfig::new(
-            vec![(IpAddr::V4(STACK4), 32), (IpAddr::V6(STACK6), 128)],
-            DEFAULT_MTU,
-        )
-    });
+    let mut config = NetStackConfig::new(
+        vec![(IpAddr::V4(STACK4), 32), (IpAddr::V6(STACK6), 128)],
+        DEFAULT_MTU,
+    );
+    config.transparent = transparent;
+    config.admission = admission;
+    let (server_stack, server_handle) = NetStack::new(config);
     let (server_source, server_sink) = server_stack.split();
     let server_secret = StaticSecret::from([2; 32]);
     let server_engine = EngineBuilder::new(server_source, server_sink)
@@ -305,11 +315,7 @@ async fn expect_port_unreachable(client: &mut Client, target: SocketAddr) -> Tes
 
 #[tokio::test]
 async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
-    let (client, server) = pair(Some(TransparentConfig {
-        prefixes: prefixes(),
-        ..Default::default()
-    }))
-    .await?;
+    let (client, server) = pair(Some(in_prefixes()), Admission::Immediate).await?;
     let mut reports = serve_echo(&server.stack);
 
     for target in [TCP4, TCP6] {
@@ -324,29 +330,24 @@ async fn immediate_admission_answers_for_the_dialed_address() -> TestResult {
     let socket = client.stack.bind_udp(client_addr(OUTSIDE)).await?;
     socket.send_to(b"outside", OUTSIDE).await?;
     let stats = stats_until(&server.stack, |s| s.rejected_prefix > 0).await?;
-    assert_eq!(
-        stats,
-        NetStackStats {
-            accepted: 3,
-            rejected_prefix: 1,
-            no_address: 1,
-            ..NetStackStats::default()
-        }
-    );
+    let mut expected = NetStackStats::default();
+    expected.accepted = 3;
+    expected.rejected_prefix = 1;
+    expected.no_address = 1;
+    assert_eq!(stats, expected);
     assert!(reports.try_recv().is_err(), "nothing else was accepted");
     Ok(())
 }
 
 #[tokio::test]
 async fn decide_admission_accepts_and_rejects() -> TestResult {
-    let (mut client, server) = pair(Some(TransparentConfig {
-        prefixes: prefixes(),
-        admission: Admission::Decide {
+    let (mut client, server) = pair(
+        Some(in_prefixes()),
+        Admission::Decide {
             timeout: WAIT,
             max_pending: 16,
         },
-        ..Default::default()
-    }))
+    )
     .await?;
     let mut reports = serve_echo(&server.stack);
     let (offered_tx, mut offered) = mpsc::unbounded_channel();
@@ -390,21 +391,17 @@ async fn decide_admission_accepts_and_rejects() -> TestResult {
     }
 
     let stats = stats_until(&server.stack, |s| s.rejected_hook >= 4).await?;
-    assert_eq!(
-        stats,
-        NetStackStats {
-            accepted: 3,
-            rejected_hook: 4,
-            ..NetStackStats::default()
-        }
-    );
+    let mut expected = NetStackStats::default();
+    expected.accepted = 3;
+    expected.rejected_hook = 4;
+    assert_eq!(stats, expected);
     assert!(reports.try_recv().is_err(), "no rejected flow was accepted");
     Ok(())
 }
 
 #[tokio::test]
 async fn without_transparent_mode_the_packets_have_no_address() -> TestResult {
-    let (client, server) = pair(None).await?;
+    let (client, server) = pair(None, Admission::Immediate).await?;
     let mut reports = serve_echo(&server.stack);
 
     let connects: Vec<_> = [TCP4, TCP6]
@@ -419,13 +416,9 @@ async fn without_transparent_mode_the_packets_have_no_address() -> TestResult {
 
     // Two SYNs and a datagram at least; SYN retransmissions may add more.
     let stats = stats_until(&server.stack, |s| s.no_address >= 3).await?;
-    assert_eq!(
-        stats,
-        NetStackStats {
-            no_address: stats.no_address,
-            ..NetStackStats::default()
-        }
-    );
+    let mut expected = NetStackStats::default();
+    expected.no_address = stats.no_address;
+    assert_eq!(stats, expected);
     sleep(QUIET).await;
     for connect in &connects {
         assert!(!connect.is_finished(), "a SYN was answered");

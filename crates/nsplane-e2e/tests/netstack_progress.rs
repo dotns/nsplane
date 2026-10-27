@@ -123,10 +123,9 @@ async fn stack_and_raw(allow: bool) -> TestResult<(StackNode, Node<ChannelTransp
     let (link_a, link_b) = ChannelTransport::pair(1024, a, b);
     let ip4 = std::net::Ipv4Addr::new(10, 0, 0, 1);
     let ip6 = std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
-    let (stack, handle) = NetStack::new(NetStackConfig {
-        udp_allow_fragmentation: allow,
-        ..NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU)
-    });
+    let mut config = NetStackConfig::new(vec![(IpAddr::V4(ip4), 32), (IpAddr::V6(ip6), 128)], MTU);
+    config.udp_allow_fragmentation = allow;
+    let (stack, handle) = NetStack::new(config);
     let (source, sink) = stack.split();
     let engine = EngineBuilder::new(source, sink)
         .private_key(StaticSecret::from([1; 32]))

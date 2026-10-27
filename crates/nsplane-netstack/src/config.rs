@@ -22,6 +22,20 @@ const MAX_TCP_BUFFER: usize = 65_535 << 14;
 ///
 /// Every capacity is a bound: no queue inside the stack grows past the value given here.
 /// A capacity of zero is raised to one.
+///
+/// Fields may be added in any release. Start from [`NetStackConfig::new`] or
+/// [`Default::default`] and assign the fields to change:
+///
+/// ```
+/// use nsplane_netstack::{Admission, NetStackConfig};
+///
+/// let mut config = NetStackConfig::new(vec![("10.0.0.1".parse()?, 32)], 1360);
+/// config.accept_capacity = 256;
+/// config.admission = Admission::Immediate;
+/// assert_eq!(config.mtu, 1360);
+/// # Ok::<(), std::net::AddrParseError>(())
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetStackConfig {
     /// The stack's own addresses, each with its prefix length.
@@ -185,38 +199,46 @@ pub struct NetStackConfig {
     /// ```
     /// use nsplane_netstack::{NetStackConfig, TransparentConfig};
     ///
-    /// let config = NetStackConfig {
-    ///     transparent: Some(TransparentConfig {
-    ///         prefixes: vec![],
-    ///         ..Default::default()
-    ///     }),
-    ///     ..Default::default()
-    /// };
+    /// let mut config = NetStackConfig::default();
+    /// config.transparent = Some(TransparentConfig::default());
     /// assert!(config.transparent.is_some());
     /// ```
     ///
     /// Default `None`: the stack is the endpoint for its own addresses only, and the transparent
     /// checks cost nothing per packet.
     pub transparent: Option<TransparentConfig>,
+    /// How a new TCP connection (a bare SYN) or UDP flow (its first datagram) is admitted,
+    /// on every stack: to the stack's own addresses, and with
+    /// [`transparent`](Self::transparent) to every in-prefix destination too.
+    ///
+    /// Under [`Admission::Decide`] each new connection or flow is offered as a
+    /// [`PendingFlow`](crate::PendingFlow) whose [`control`](crate::PendingFlow::control)
+    /// covers the lifetime from its first input on. On a stack without `transparent`,
+    /// rejections are sourced from the stack's own addresses and there is no connection
+    /// limit beyond the listener pool and the accept queue.
+    ///
+    /// A transparent stack also honours the deprecated
+    /// [`TransparentConfig::admission`] while this field is [`Admission::Immediate`]; a
+    /// `Decide` here takes precedence. Default [`Admission::Immediate`].
+    pub admission: Admission,
 }
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
 ///
-/// Build it with `..Default::default()` so that fields added later keep the literal
-/// compiling:
+/// Fields may be added in any release. Start from [`Default::default`] and assign the
+/// fields to change:
 ///
 /// ```
 /// use std::net::{IpAddr, Ipv4Addr};
 ///
 /// use nsplane_netstack::TransparentConfig;
 ///
-/// let config = TransparentConfig {
-///     prefixes: vec![(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)],
-///     max_connections: Some(1024),
-///     ..Default::default()
-/// };
-/// assert_eq!(config.admission, nsplane_netstack::Admission::Immediate);
+/// let mut config = TransparentConfig::default();
+/// config.prefixes = vec![(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)];
+/// config.max_connections = Some(1024);
+/// assert_eq!(config.max_connections, Some(1024));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransparentConfig {
     /// Destination prefixes the stack accepts, each an address with its prefix length;
@@ -229,7 +251,9 @@ pub struct TransparentConfig {
     /// transparent mode, and also in
     /// [`rejected_prefix`](crate::NetStackStats::rejected_prefix).
     pub prefixes: Vec<(IpAddr, u8)>,
-    /// How a new connection or flow is admitted. Default [`Admission::Immediate`].
+    /// Deprecated: replaced by [`NetStackConfig::admission`], and honoured while that field
+    /// is [`Admission::Immediate`]. Default [`Admission::Immediate`].
+    #[deprecated(note = "use `NetStackConfig::admission`, which applies to every stack")]
     pub admission: Admission,
     /// Most TCP connections the stack holds at once: accepted, mid handshake or opened
     /// with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until they are released.
@@ -254,8 +278,8 @@ pub struct TransparentConfig {
     pub events: Option<FlowEventsConfig>,
 }
 
-/// How a transparent stack admits a new TCP connection or UDP flow, see
-/// [`TransparentConfig::admission`].
+/// How a stack admits a new TCP connection or UDP flow, see
+/// [`NetStackConfig::admission`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Admission {
@@ -271,7 +295,12 @@ pub enum Admission {
     /// the SYN with SYN-ACK, or opens the flow, only once it is accepted. A rejected
     /// connection is answered with a RST and a rejected flow with an ICMP or `ICMPv6`
     /// port unreachable, both sourced from the original destination. This applies to
-    /// every new connection and flow of a transparent stack, to its own addresses too.
+    /// every new connection and flow of the stack: to its own addresses, and on a
+    /// transparent stack to in-prefix destinations too.
+    ///
+    /// The item's [`control`](crate::PendingFlow::control) covers the lifetime from its
+    /// first input to its handle, and its [`delivery`](crate::FlowControl::delivery)
+    /// receipt ends with exactly one outcome.
     ///
     /// - A connection or flow with no decision within `timeout` is rejected the same way
     ///   and counted in [`rejected_timeout`](crate::NetStackStats::rejected_timeout); a
@@ -283,8 +312,8 @@ pub enum Admission {
     ///   held, its further datagrams are dropped and counted in
     ///   [`udp_queue_full`](crate::NetStackStats::udp_queue_full): a held flow queues its
     ///   first datagram only.
-    /// - [`TransparentConfig::max_connections`] is checked when the SYN arrives and again
-    ///   when the connection is accepted.
+    /// - On a transparent stack, [`TransparentConfig::max_connections`] is checked when the
+    ///   SYN arrives and again when the connection is accepted.
     ///
     /// An entry costs the held packet and a few words; expiry rides on the driver's
     /// timer, with no task per entry. A `max_pending` of 0 is taken as 1, and a `timeout`
@@ -330,6 +359,7 @@ impl Default for NetStackConfig {
             udp_allow_fragmentation: false,
             reassembly: None,
             transparent: None,
+            admission: Admission::Immediate,
         }
     }
 }
@@ -356,6 +386,8 @@ pub(crate) struct Settings {
     pub(crate) reassembly: Option<ReassemblyConfig>,
     /// Boxed, so that it does not grow the driver.
     pub(crate) transparent: Option<Box<Transparent>>,
+    /// The top-level admission, or the deprecated transparent one.
+    pub(crate) admission: Admission,
 }
 
 /// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
@@ -385,7 +417,6 @@ impl TcpRto {
 #[derive(Debug, Clone)]
 pub(crate) struct Transparent {
     pub(crate) prefixes: Prefixes,
-    pub(crate) admission: Admission,
     pub(crate) max_connections: Option<usize>,
     pub(crate) events: Option<FlowEventsConfig>,
 }
@@ -472,6 +503,14 @@ impl Settings {
                 }
             }
         }
+        #[allow(deprecated, reason = "honoured until it is removed")]
+        let admission = match config.admission {
+            Admission::Immediate => config
+                .transparent
+                .as_ref()
+                .map_or(Admission::Immediate, |transparent| transparent.admission),
+            admission => admission,
+        };
         let mtu = config.mtu.max(MIN_MTU);
         let mss = usize::from(mtu) - 40;
         let tcp_buffer = |size: Option<usize>| {
@@ -500,21 +539,21 @@ impl Settings {
             transparent: config.transparent.map(|transparent| {
                 Box::new(Transparent {
                     prefixes: Prefixes::new(transparent.prefixes),
-                    admission: match transparent.admission {
-                        Admission::Decide {
-                            timeout,
-                            max_pending,
-                        } => Admission::Decide {
-                            timeout: timeout.min(MAX_PENDING_TIMEOUT),
-                            // Within the bound of the channel that offers the items.
-                            max_pending: max_pending.clamp(1, usize::MAX >> 3),
-                        },
-                        admission => admission,
-                    },
                     max_connections: transparent.max_connections,
                     events: transparent.events,
                 })
             }),
+            admission: match admission {
+                Admission::Decide {
+                    timeout,
+                    max_pending,
+                } => Admission::Decide {
+                    timeout: timeout.min(MAX_PENDING_TIMEOUT),
+                    // Within the bound of the channel that offers the items.
+                    max_pending: max_pending.clamp(1, usize::MAX >> 3),
+                },
+                admission => admission,
+            },
         }
     }
 
@@ -626,6 +665,45 @@ mod tests {
         assert_eq!(
             buffers(usize::MAX, (65_535 << 14) + 1),
             (65_535 << 14, 65_535 << 14)
+        );
+    }
+
+    #[test]
+    #[allow(deprecated, reason = "the deprecated field is still honoured")]
+    fn admission_is_top_level_first_then_transparent() {
+        let decide = |timeout| Admission::Decide {
+            timeout,
+            max_pending: 0,
+        };
+        let admission = |top, transparent: Option<Admission>| {
+            Settings::new(NetStackConfig {
+                admission: top,
+                transparent: transparent.map(|admission| TransparentConfig {
+                    admission,
+                    ..TransparentConfig::default()
+                }),
+                ..NetStackConfig::default()
+            })
+            .admission
+        };
+        let normalised = |timeout| Admission::Decide {
+            timeout,
+            max_pending: 1,
+        };
+        let second = Duration::from_secs(1);
+        assert_eq!(admission(Admission::Immediate, None), Admission::Immediate);
+        assert_eq!(admission(decide(second), None), normalised(second));
+        assert_eq!(
+            admission(Admission::Immediate, Some(decide(second))),
+            normalised(second)
+        );
+        assert_eq!(
+            admission(decide(second), Some(decide(Duration::from_secs(2)))),
+            normalised(second)
+        );
+        assert_eq!(
+            admission(decide(Duration::MAX), Some(Admission::Immediate)),
+            normalised(MAX_PENDING_TIMEOUT)
         );
     }
 

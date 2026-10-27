@@ -2,16 +2,20 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use nsplane_packet::{IpPacket, protocol};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
 
 use crate::events::FlowEventReason;
+use crate::flow::{FlowState, Target, Undelivered};
 use crate::pending::{self, Hold, Pending, PendingProtocol};
 use crate::stats::{self};
-use crate::udp::Datagram;
+use crate::udp::{UdpFlow, UdpReply};
 
 use super::Driver;
 use super::wire::tcp_reset;
@@ -56,42 +60,89 @@ impl Driver {
 
     /// Applies the application's decisions on held connections and flows: an accepted SYN
     /// goes into smoltcp with this batch (counted in `demand`), an accepted datagram
-    /// opens its flow. Only with `Admission::Decide`.
+    /// opens its flow. A lifetime revoked meanwhile is dropped without an answer; the
+    /// next turn retires it. Only with `Admission::Decide`.
     #[cold]
     #[inline(never)]
     pub(super) fn take_decisions(&mut self, demand: &mut HashMap<u16, usize>) {
         let mut changed = false;
-        while let Some((decision, key, held)) =
+        while let Some((decision, key, held, flow)) =
             self.pending.as_deref_mut().and_then(Pending::next_decision)
         {
             changed = true;
+            if flow.is_revoked() {
+                continue;
+            }
             if !decision.accept {
-                self.reject(&key, &held, FlowEventReason::Hook);
+                // Not answered when a concurrent revoke ended the lifetime first.
+                if flow.undeliver(Undelivered::Rejected) {
+                    self.reject(&key, &held, FlowEventReason::Hook);
+                }
                 continue;
             }
             match held {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
-                        self.reject_connection_limit(&key, syn.as_packet());
+                        if flow.undeliver(Undelivered::ConnectionLimit) {
+                            self.reject_connection_limit(&key, syn.as_packet());
+                        }
                         continue;
                     }
                     stats::add(&self.stats.accepted, 1);
                     self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
                     self.device.inject(syn);
+                    if let Some(table) = self.pending.as_mut() {
+                        table.admit(flow);
+                    }
                 }
-                pending::Held::Udp { payload, .. } => {
-                    let datagram = Datagram {
-                        src: key.remote,
-                        dst: key.local,
-                        payload,
-                    };
-                    self.dispatch_held_udp(datagram, None);
-                }
+                pending::Held::Udp { payload, .. } => self.open_admitted(&key, payload, flow),
             }
         }
         if changed {
             self.count_pending();
+        }
+    }
+
+    /// Opens the flow of `key` accepted under `Admission::Decide` with its first datagram
+    /// and hands it to `incoming_udp`, or ends the lifetime `flow` undelivered at the flow
+    /// limit or a full or gone accept queue. The flow table has no live flow of `key`:
+    /// while the flow was held, its datagrams were dropped.
+    fn open_admitted(&mut self, key: &pending::Key, payload: Bytes, flow: Arc<FlowState>) {
+        let (remote, local) = (key.remote, key.local);
+        stats::add(&self.stats.accepted, 1);
+        self.emit(key, FlowEventReason::Admitted);
+        if self.flows.len() >= self.settings.max_udp_flows {
+            self.flows.retain(|_, (tx, _)| !tx.is_closed());
+            if self.flows.len() >= self.settings.max_udp_flows {
+                tracing::warn!(%remote, %local, "UDP flow table at capacity; dropping new flow");
+                stats::add(&self.stats.udp_flow_limit, 1);
+                flow.undeliver(Undelivered::FlowLimit);
+                return;
+            }
+        }
+        let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
+        // The queue is empty, so the first datagram always fits.
+        let _ = tx.try_send(payload);
+        let registration = self.owners.udp_flow(local, remote);
+        flow.bind(Target::UdpFlow((remote, local)));
+        let handle = UdpFlow::new(
+            registration,
+            rx,
+            UdpReply::new(local, remote, self.out.clone(), Arc::clone(&flow)),
+        );
+        match self.accept_udp.try_send(handle) {
+            Ok(()) => {
+                self.flows.insert((remote, local), (tx, flow));
+            }
+            Err(error) => {
+                tracing::debug!(%remote, %local, "incoming_udp full or gone; dropping UDP flow");
+                stats::add(&self.stats.udp_not_accepted, 1);
+                flow.undeliver(match error {
+                    TrySendError::Full(_) => Undelivered::AcceptQueueFull,
+                    TrySendError::Closed(_) => Undelivered::AcceptQueueGone,
+                });
+            }
         }
     }
 
@@ -144,13 +195,15 @@ impl Driver {
     pub(super) fn expire_pending(&mut self) {
         let now = Instant::now();
         let mut changed = false;
-        while let Some((key, held)) = self
+        while let Some((key, held, flow)) = self
             .pending
             .as_mut()
             .and_then(|table| table.next_expired(now))
         {
             changed = true;
-            self.reject(&key, &held, FlowEventReason::Timeout);
+            if flow.undeliver(Undelivered::TimedOut) {
+                self.reject(&key, &held, FlowEventReason::Timeout);
+            }
         }
         if changed {
             self.count_pending();
@@ -191,7 +244,7 @@ impl Driver {
     }
 
     /// Publishes the number of held connections and flows.
-    fn count_pending(&self) {
+    pub(super) fn count_pending(&self) {
         if let Some(table) = &self.pending {
             self.stats
                 .pending
