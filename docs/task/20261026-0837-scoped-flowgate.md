@@ -1,6 +1,6 @@
 # 20261026-0837-scoped-flowgate nsplane-acl: scope-qualified flow gate decisions
 
-- **status**: completed (integrated into 0.20.0)
+- **status**: completed (released in 0.20.0)
 - **priority**: P1
 - **owner**: feat/scoped-flowgate
 - **createdAt**: 2026-10-26 08:37

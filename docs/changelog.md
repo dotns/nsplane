@@ -491,3 +491,14 @@ in RIP-relative offsets) and the bench's round-trip routines at another 16-byte 
 change made (`docs/performance.md`, "0.20.0 against 0.19.3"). `perf` and `valgrind` are not
 available on the host, so instruction counts come from the disassembly, not from counters.
 
+## 2026-10-27 [release]
+
+Release 0.20.0 (tag `v0.20.0`) at the owner's request: release B of plan
+`20261026-0822-node-gateway-requests` (netstack control from the first input with admission on
+every stack, scope-qualified flow gate decisions, the engine's local barrier and validated
+plaintext ingress; five netstack types `#[non_exhaustive]`) and release A, whose two fixes (IPv4
+GSO segmentation with IHL 10, the `walk_v6` later-fragment header limit) ship in 0.20.0; 0.19.4
+is not released separately and its changelog section is folded into 0.20.0. `main` fast-forwards
+to the release head. Workspace versions, internal requirements and guide tags were synchronized
+in the version commit.
+

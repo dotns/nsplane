@@ -1,6 +1,6 @@
 # 20261026-0836-local-barrier-plaintext-ingress Engine local barrier and validated plaintext ingress
 
-- **status**: completed
+- **status**: completed (released in 0.20.0)
 - **priority**: P2
 - **owner**: w3/local-barrier-plaintext-ingress
 - **createdAt**: 2026-10-26 08:36

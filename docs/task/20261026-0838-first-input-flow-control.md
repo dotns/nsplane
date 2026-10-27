@@ -1,6 +1,6 @@
 # 20261026-0838-first-input-flow-control Netstack flow control from the first input
 
-- **status**: completed
+- **status**: completed (released in 0.20.0)
 - **priority**: P1
 - **owner**: w1/first-input-flow-control
 - **createdAt**: 2026-10-26 08:38

@@ -1,7 +1,7 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
-- **status**: implementing (releases A and B implemented and integrated as 0.20.0, not
-  released; release C designed first, design note for review)
+- **status**: implementing (releases A and B released as 0.20.0 on 2026-10-27; release C
+  designed first, design note for review)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
@@ -653,4 +653,7 @@ B (tasks `20261026-0837-scoped-flowgate`, `20261026-0836-local-barrier-plaintext
 0.19.4 section of the changelog stays as prepared; 0.20.0 contains its fixes. The owner also
 made `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` and
 `PendingProtocol` `#[non_exhaustive]` in release B, the release's one breaking change.
+
+Release, 2026-10-27: 0.20.0 (tag `v0.20.0`) ships release B and release A's fixes; 0.19.4 is not
+released separately.
 

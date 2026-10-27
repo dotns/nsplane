@@ -5,12 +5,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.0] - unreleased
+## [0.20.0] - 2026-10-27
 
 Feature release under the eleventh exception to the 0.11 feature freeze: netstack control of a
 lifetime from its first input, scope-qualified flow gate decisions, the engine's local barrier
 and a validated plaintext ingress. Breaking: five netstack configuration and statistics types
-are `#[non_exhaustive]` (see Changed). It contains the fixes of 0.19.4.
+are `#[non_exhaustive]` (see Changed). Also fixes IPv4 GSO segmentation with 20 option bytes and
+the flow gate's IPv6 extension-header limit for later fragments (behaviour change).
 
 ### Added
 - `nsplane-acl`: scope-qualified flow gate decisions. `FlowGate::evaluate_inbound_in` and
@@ -107,16 +108,6 @@ are `#[non_exhaustive]` (see Changed). It contains the fixes of 0.19.4.
 - nsplane-netstack: `TransparentConfig::admission`, replaced by
   `NetStackConfig::admission`. A transparent stack honours it while the top-level field is
   `Admission::Immediate`.
-
-### Fixed
-- The two fixes of 0.19.4 (below): `nsplane-packet` `vnet::segment` segments an IPv4
-  super-packet with 20 option bytes (IHL 10) as IPv4, and the `nsplane-acl` flow gate counts
-  a later fragment's Fragment header toward the limit of 8 IPv6 extension headers, so a later
-  fragment behind 8 other extension headers is denied `Malformed` (behaviour change).
-
-## [0.19.4] - unreleased
-
-Patch release; no public API change.
 
 ### Fixed
 - `nsplane-packet` `vnet::segment`: an IPv4 TCP or UDP super-packet whose header carries

@@ -1,6 +1,6 @@
 # 20261026-0851-vnet-walk-v6-fixes Fix vnet IPv4 IHL 10 segmentation and the walk_v6 later-fragment header limit
 
-- **status**: completed (release 0.19.4 prepared, not tagged; integrated into 0.20.0)
+- **status**: completed (released in 0.20.0; 0.19.4 not released separately)
 - **priority**: P1
 - **owner**: fix/0.19.4-vnet-walk-v6
 - **createdAt**: 2026-10-26 08:51
