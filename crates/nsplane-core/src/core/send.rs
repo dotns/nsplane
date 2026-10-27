@@ -230,10 +230,13 @@ impl Core {
                 }
             }
             // The tag of a tracked packet is its token: what a filter did to it or to the
-            // marker is undone.
+            // marker is undone, and a marker a filter set on an untracked packet is cleared,
+            // so it never yields a result (nor takes one of a tracked packet with its tag).
             if let Some(token) = token {
                 packet.set_tag(Some(token));
                 packet.set_tracked(true);
+            } else {
+                packet.set_tracked(false);
             }
         }
 

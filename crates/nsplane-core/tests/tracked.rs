@@ -36,6 +36,8 @@ enum Mode {
     Handled,
     /// Changes the tag and clears the marker, then accepts.
     Rewrite,
+    /// Sets the marker, then accepts.
+    Mark,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +70,10 @@ impl PacketFilter for Installed {
             Mode::Rewrite => {
                 packet.set_tag(Some(tag(999)));
                 packet.set_tracked(false);
+                Verdict::Accept
+            }
+            Mode::Mark => {
+                packet.set_tracked(true);
                 Verdict::Accept
             }
         }
@@ -232,6 +238,25 @@ fn a_filter_cannot_change_the_tag_or_the_marker_of_a_tracked_packet() {
         ));
         assert_eq!(in_flight[0].data.tag(), Some(tag(4)));
         assert!(in_flight[0].data.is_tracked());
+    }
+}
+
+#[test]
+fn a_filter_cannot_make_an_untracked_packet_tracked() {
+    for crypto_jobs in [false, true] {
+        let filter = Arc::new(Outbound::default());
+        let mut net = net(&filter, crypto_jobs);
+        net.handshake(0, 1);
+        net.clear_logs();
+        *filter.mode.lock().unwrap() = Mode::Mark;
+        let mut tagged = packet_buf(&udp4(ip4(0), ip4(1), b"tagged"));
+        tagged.set_tag(Some(tag(5)));
+        send(&mut net, tagged, crypto_jobs);
+        let in_flight = net.drain();
+        assert_eq!(*filter.seen.lock().unwrap(), [(Some(tag(5)), false)]);
+        assert_eq!(net.tracked[0], []);
+        assert_eq!(in_flight[0].data.tag(), Some(tag(5)));
+        assert!(!in_flight[0].data.is_tracked());
     }
 }
 

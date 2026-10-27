@@ -183,8 +183,9 @@ its send path takes (`Input::Local`, `handle_locals`, the `_deferred` forms with
   that is not queued for lack of a session also counts as a `NO_SESSION` drop. A handled
   packet and one handed out for plaintext egress are not drops.
 - The outbound filters see the token as the tag; what a filter does to the tag or the marker
-  of a tracked packet is undone after the chain. A marked packet without a tag is not
-  tracked: its marker is cleared.
+  of a tracked packet is undone after the chain, and a marker a filter sets on an untracked
+  packet is cleared, so only the packets that entered tracked report results. A marked
+  packet without a tag is not tracked: its marker is cleared.
 - Cost: the send path reads the marker once per local packet; the rest runs only for
   tracked packets.
 
