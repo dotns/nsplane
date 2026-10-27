@@ -43,8 +43,11 @@ Rules, which every nsplane crate follows:
 | a buffer that stops being the packet (a handshake initiation written into it, a buffer handed to `PacketSource::recycle`) | cleared | cleared |
 
 The pools store the allocation, not the `PacketBuf`, so a pooled buffer comes back untagged at
-no cost. The fields make `PacketBuf` 64 bytes on 64-bit targets, and the inline storage of a
-`PacketBatch` 4096 bytes.
+no cost. The packet offsets are `u32`, which keeps `PacketBuf` at 56 bytes on 64-bit targets
+with the tag and the marker (a `PacketBatch` stores 3584 bytes inline): a packet ends at most
+`u32::MAX` bytes into its buffer, far past any IP packet. `set_len`, `extend_from_slice` and
+`PacketPool::get_len` stop there instead of panicking; `from_shared` and `reserve_front` return
+`BoundsError` for a range past it.
 
 ### Shared pool
 

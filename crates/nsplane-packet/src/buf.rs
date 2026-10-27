@@ -18,6 +18,23 @@ pub const TAILROOM: usize = 15 + 16;
 /// Maximum number of packets in a [`PacketBatch`].
 pub const MAX_BATCH: usize = 64;
 
+/// The packet offsets are `u32`, which keeps a [`PacketBuf`] at 56 bytes with its tag: a
+/// packet ends at most this many bytes into its buffer.
+const MAX_END: usize = u32::MAX as usize;
+
+/// [`HEADROOM`] as a packet offset.
+const HEADROOM_OFFSET: u32 = 32;
+const _: () = assert!(HEADROOM_OFFSET as usize == HEADROOM);
+
+/// `n` as a packet offset, at most [`MAX_END`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the value is at most u32::MAX after the check"
+)]
+const fn to_offset(n: usize) -> u32 {
+    if n > MAX_END { u32::MAX } else { n as u32 }
+}
+
 /// A requested range does not fit the packet or its headroom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundsError;
@@ -41,14 +58,20 @@ impl std::error::Error for BoundsError {}
 /// moves a packet into another buffer for the same packet, and clears them where a buffer
 /// stops being that packet.
 ///
-/// Invariant: `start <= end <= buf.len()`; bytes `[0, start)` are headroom, bytes
-/// `[start, end)` are the packet, and bytes `[end, buf.len())` are initialized bytes a
-/// pooled buffer kept from earlier use, so growing over them needs no zero-fill.
+/// A packet ends at most `u32::MAX` bytes into its buffer, far beyond any IP packet:
+/// [`set_len`](Self::set_len), [`extend_from_slice`](Self::extend_from_slice) and
+/// [`PacketPool::get_len`] stop there instead of panicking, and
+/// [`from_shared`](Self::from_shared) and [`reserve_front`](Self::reserve_front) refuse a
+/// range past it.
+///
+/// Invariant: `start <= end <= buf.len()` and `end <= u32::MAX`; bytes `[0, start)` are
+/// headroom, bytes `[start, end)` are the packet, and bytes `[end, buf.len())` are initialized
+/// bytes a pooled buffer kept from earlier use, so growing over them needs no zero-fill.
 #[derive(Debug)]
 pub struct PacketBuf {
     buf: BytesMut,
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
     /// The caller's tag; see [`tag`](Self::tag).
     tag: Option<NonZeroU64>,
     /// Created by [`from_shared`](Self::from_shared); never returned to a [`PacketPool`].
@@ -93,8 +116,8 @@ impl PacketBuf {
         buf[..HEADROOM].fill(0);
         Self {
             buf,
-            start: HEADROOM,
-            end: HEADROOM,
+            start: HEADROOM_OFFSET,
+            end: HEADROOM_OFFSET,
             tag: None,
             shared: false,
             tracked: false,
@@ -112,17 +135,18 @@ impl PacketBuf {
     ///
     /// # Errors
     ///
-    /// Returns [`BoundsError`] if `offset + len` overflows or exceeds `buf.len()`.
+    /// Returns [`BoundsError`] if `offset + len` overflows or exceeds `buf.len()` or
+    /// `u32::MAX`.
     pub fn from_shared(mut buf: BytesMut, offset: usize, len: usize) -> Result<Self, BoundsError> {
         let end = offset.checked_add(len).ok_or(BoundsError)?;
-        if end > buf.len() {
+        if end > buf.len() || end > MAX_END {
             return Err(BoundsError);
         }
         buf.truncate(end);
         Ok(Self {
             buf,
-            start: offset,
-            end,
+            start: to_offset(offset),
+            end: to_offset(end),
             tag: None,
             shared: true,
             tracked: false,
@@ -170,27 +194,27 @@ impl PacketBuf {
 
     /// The packet bytes.
     pub fn as_packet(&self) -> &[u8] {
-        &self.buf[self.start..self.end]
+        &self.buf[self.start as usize..self.end as usize]
     }
 
     /// The packet bytes, mutably.
     pub fn as_packet_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[self.start..self.end]
+        &mut self.buf[self.start as usize..self.end as usize]
     }
 
     /// The headroom followed by the packet; `headroom() + len()` bytes.
     pub fn with_headroom_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.end]
+        &mut self.buf[..self.end as usize]
     }
 
     /// Packet length in bytes.
     pub const fn len(&self) -> usize {
-        self.end - self.start
+        (self.end - self.start) as usize
     }
 
     /// Bytes in front of the packet.
     pub const fn headroom(&self) -> usize {
-        self.start
+        self.start as usize
     }
 
     /// Drops the first `n` packet bytes by moving the packet start forward, without
@@ -203,7 +227,8 @@ impl PacketBuf {
         if n > self.len() {
             return Err(BoundsError);
         }
-        self.start += n;
+        // At most `len()`, which fits.
+        self.start += to_offset(n);
         Ok(())
     }
 
@@ -214,6 +239,7 @@ impl PacketBuf {
     ///
     /// Returns [`BoundsError`] if `n > headroom()`; the packet is left unchanged.
     pub fn reserve_front(&mut self, n: usize) -> Result<(), BoundsError> {
+        let n = u32::try_from(n).map_err(|_| BoundsError)?;
         self.start = self.start.checked_sub(n).ok_or(BoundsError)?;
         Ok(())
     }
@@ -225,40 +251,45 @@ impl PacketBuf {
 
     /// Packet bytes that fit without reallocating.
     pub fn capacity(&self) -> usize {
-        self.buf.capacity() - self.start
+        self.buf.capacity() - self.start as usize
     }
 
     /// Resizes the packet; shrinking truncates.
     ///
     /// Growing exposes the bytes the buffer already initialized (unspecified: a buffer
     /// reused by a [`PacketPool`] keeps what it held) and zero-fills only the bytes it
-    /// never initialized, so the new bytes are to be written before they are read.
+    /// never initialized, so the new bytes are to be written before they are read. The
+    /// packet ends at most `u32::MAX` bytes into the buffer.
     pub fn set_len(&mut self, len: usize) {
-        let end = self.start + len;
-        if end > self.buf.len() {
-            self.buf.resize(end, 0);
+        let end = to_offset((self.start as usize).saturating_add(len));
+        if end as usize > self.buf.len() {
+            self.buf.resize(end as usize, 0);
         }
         self.end = end;
     }
 
     /// Appends `bytes` to the packet without zero-filling first; the headroom is kept.
     ///
-    /// Reallocates only if the packet grows past [`capacity`](Self::capacity).
+    /// Reallocates only if the packet grows past [`capacity`](Self::capacity). Appends no
+    /// bytes past `u32::MAX` bytes into the buffer.
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        let end = self.end as usize;
+        let bytes = bytes.get(..MAX_END - end).unwrap_or(bytes);
         // Overwrite the initialized bytes behind the packet, then append the rest.
-        let kept = (self.buf.len() - self.end).min(bytes.len());
+        let kept = (self.buf.len() - end).min(bytes.len());
         let (over, rest) = bytes.split_at(kept);
-        self.buf[self.end..self.end + kept].copy_from_slice(over);
+        self.buf[end..end + kept].copy_from_slice(over);
         self.buf.extend_from_slice(rest);
-        self.end += bytes.len();
+        // Within `MAX_END`, so it fits.
+        self.end += to_offset(bytes.len());
     }
 
     /// The packet bytes without the headroom, without copying; the tag and the marker are
     /// dropped.
     pub fn into_bytes(self) -> BytesMut {
         let mut buf = self.buf;
-        buf.truncate(self.end);
-        buf.split_off(self.start)
+        buf.truncate(self.end as usize);
+        buf.split_off(self.start as usize)
     }
 
     /// The packet bytes as immutable [`Bytes`], without copying; the tag and the marker are
@@ -306,9 +337,11 @@ impl PacketPool {
     /// The packet bytes are unspecified: a reused buffer keeps the bytes it already held
     /// and zero-fills only the bytes it never initialized, so getting the same length again
     /// writes nothing. Use it for a buffer that is written to before it is read, e.g. one a
-    /// handshake message is formatted into.
+    /// handshake message is formatted into. The packet ends at most `u32::MAX` bytes into
+    /// the buffer.
     pub fn get_len(&mut self, len: usize) -> PacketBuf {
-        let needed = HEADROOM + len;
+        let end = to_offset(HEADROOM.saturating_add(len));
+        let needed = end as usize;
         let mut buf = self
             .free
             .pop()
@@ -317,8 +350,8 @@ impl PacketPool {
         buf.resize(needed, 0);
         PacketBuf {
             buf,
-            start: HEADROOM,
-            end: needed,
+            start: HEADROOM_OFFSET,
+            end,
             tag: None,
             shared: false,
             tracked: false,
@@ -918,8 +951,26 @@ mod tests {
 
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn packet_buf_is_64_bytes() {
-        assert_eq!(size_of::<PacketBuf>(), 64);
+    fn offsets_past_u32_are_refused() {
+        let mut buf = PacketBuf::from_packet(&[1]);
+        let past = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(buf.reserve_front(past), Err(BoundsError));
+        assert_eq!(buf.advance(past), Err(BoundsError));
+        assert_eq!(buf.as_packet(), [1]);
+        let mut whole = BytesMut::new();
+        whole.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            PacketBuf::from_shared(whole, past, 0).unwrap_err(),
+            BoundsError
+        );
+        assert_eq!(to_offset(past), u32::MAX);
+        assert_eq!(to_offset(1500), 1500);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn packet_buf_is_56_bytes() {
+        assert_eq!(size_of::<PacketBuf>(), 56);
     }
 
     #[test]

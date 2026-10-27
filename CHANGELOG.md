@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Option<NonZeroU64>` of the caller's that nsplane never interprets and never writes to the
   wire, and `PacketBuf::{is_tracked, set_tracked}` a receipt marker separate from it. New
   buffers and every buffer `PacketPool` and `SharedPacketPool` hand out carry neither; `Clone`
-  copies the tag and clears the marker; `into_bytes` and `freeze` drop both. `PacketBuf` grows
-  from 56 to 64 bytes on 64-bit targets (a `PacketBatch` from 3584 to 4096 bytes).
+  copies the tag and clears the marker; `into_bytes` and `freeze` drop both. `PacketBuf` stays
+  56 bytes on 64-bit targets: its packet offsets are `u32`, so a packet ends at most
+  `u32::MAX` bytes into its buffer (`set_len`, `extend_from_slice` and `PacketPool::get_len`
+  stop there, `from_shared` and `reserve_front` refuse a range past it).
 - nsplane keeps the tag where it moves a packet into another buffer on its way to a
   transport or a sink: the core's copy of a packet without headroom for sealing and the
   translators' grown copies (`Translator`, `Nat64Lan::reverse`) take the tag and the marker;
@@ -22,9 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes into a packet's buffer, and the buffers the engine and `pump` hand to
   `PacketSource::recycle`. The engine clears the marker on every packet it takes in (source,
   inject calls, `PlaintextIngress`) and on every packet it delivers. A packet queued in the
-  tunnel while its peer has no session goes out untagged. Cost for untagged traffic: 8 more
-  bytes per buffer, one store per packet at the engine's entries and deliveries and per
-  recycled buffer, one word copied at the copy sites.
+  tunnel while its peer has no session goes out untagged. Cost for untagged traffic: one
+  store per packet at the engine's entries and deliveries and per recycled buffer, one word
+  copied at the copy sites.
 - `Reassembler::push_tagged` records each fragment's tag and reports the completed datagram's
   `FragmentTags` (`Same(tag)`, no tag included, or `Mixed`), counted in the new
   `ReassemblyStats::mixed_tags`; `Reassembler::discard_tagged` drops the incomplete datagrams
