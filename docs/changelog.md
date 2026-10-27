@@ -565,3 +565,23 @@ of recent tuples; a per-segment lookup cost +5 %); untagged within the noise exc
 `netstack_send_1cpu/streams_1` at the edge (+2.1 % median) and the bimodal
 `netstack_udp_send/flows_4` (open for the integration's quiet re-measure). `cargo
 semver-checks` against `v0.20.1`: no semver update required. Not merged, not released.
+
+## 2026-10-27 [implementation]
+
+Release C W6 (task `20261027-0305-plaintext-egress-send-receipts`, plan
+`20261026-0822-node-gateway-requests`) on `feat/plaintext-egress-send-receipts` from W5's
+`feat/netstack-ingress-labels` (`25debab`): plaintext egress (`Core::set_plaintext_egress`
+and the engine's, a mark that follows the `PeerId`, `Output::Plaintext`, the bounded
+`PlaintextEgress` with `DROP_PLAINTEXT_EGRESS_FULL` / `_CLOSED`; tunnel-queued packets stay
+sealed, no handshake for data, handshakes for inbound traffic kept) and send receipts
+(`EngineBuilder::tracked_sender`, `TrackedSender` / `SendResults`, token = tag, exactly one
+`SendResult` per accepted packet through `Output::Tracked` from the core and a receipt table
+in the engine; a tracked datagram ends its transmit batch; `NotSent` at every drop site,
+`ENGINE_STOPPED` on stop; the local barrier covers accepted packets). `Output` is
+`#[non_exhaustive]` (the one break; `cargo semver-checks` against `v0.20.1` reports exactly
+`enum_marked_non_exhaustive` on `Output`). Tests first: core 18 of 19 and engine 23 of 28
+failing against API stubs; an e2e between two engines over UDP. Untracked traffic within the
+noise against `25debab` on `data_path`, `local_graph`, `udp_offload` and `send_stream`
+(`netstack_udp_send/flows_4` bimodal on both binaries, left for the integration's quiet
+re-measure); tracked packets cost about +1 % on the core round trip and up to +3 % end to end
+through an engine. Not merged, not released.

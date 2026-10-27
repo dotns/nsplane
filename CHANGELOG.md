@@ -56,9 +56,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Retired` the same tuple opens a fresh lifetime with its new label.
 - `send_stream` bench: every case also with the receiver's input labeled (`_labeled`), and
   the new `netstack_udp_flow_send` / `_1cpu` groups, UDP to flows from `incoming_udp`.
+- Plaintext egress (`nsplane-core`, `nsplane`): `Core::set_plaintext_egress(peer, bool)` and
+  `EngineHandle::set_plaintext_egress` mark a peer whose local packets routed after the call
+  leave after the outbound filters as the new `Output::Plaintext { to, packet }` instead of
+  being sealed, tag kept, receipt marker cleared. The mark is runtime state of the `PeerId`:
+  kept on an update in place, absent after the peer is removed and added again. Packets
+  routed before the mark and those the tunnel queued behind a handshake stay sealed. A
+  marked peer starts no handshake for data, and still answers handshakes and starts them for
+  inbound sealed traffic. The engine hands the packets to the bounded `PlaintextEgress`
+  receiver of `EngineBuilder::plaintext_egress(capacity)`; a full queue drops them under the
+  new `DROP_PLAINTEXT_EGRESS_FULL`, a missing or dropped receiver under
+  `DROP_PLAINTEXT_EGRESS_CLOSED`. Consumers that learn a `PeerId` only by reading it back add
+  the peer closed, read the id, mark it, then open it.
+- Send receipts (`nsplane`): `EngineBuilder::tracked_sender(capacity)` returns a
+  `TrackedSender` and its `SendResults`. `TrackedSender::send` / `try_send` accept a tagged
+  packet (the tag is its token; untagged, outstanding tags and a stopped engine are refused
+  with the packet as `TrackedRefused`), mark it and enter it into the local path next to the
+  source's packets. Each accepted packet gets exactly one `SendResult { tag, outcome }`:
+  `SendOutcome::Sent { peer, bytes }` once the transport call carrying its datagram
+  succeeded (`bytes`: the plaintext length handed to sealing, as `data_tx` counts), or
+  `SendOutcome::NotSent { reason }` at every drop site, with the drop counters' reason (no
+  route, filter drop, handled, no session, oversize with a fragmenter, no path, encapsulate
+  error, no transport, transmit full, transport closed, removed, send error, plaintext
+  egress, engine stopped). Without a session a tracked packet is not sent at once and the
+  handshake starts as for an untracked one; with a fragmenter it is never split; without one
+  a tracked packet above the MTU is sealed as usual. A tracked datagram ends its transmit
+  batch (the owner's call, the message to the transmit task and the transmit task's call), so
+  the call attributes it exactly. At most `capacity` results are outstanding (`send` waits,
+  `try_send` refuses with `Full`), so none is ever dropped; on stop every outstanding packet
+  is reported `ENGINE_STOPPED`. `EngineHandle::local_barrier` also waits for the packets the
+  tracked sender accepted before the call.
+- `nsplane-core`: a tracked local packet (tagged, receipt marker set) gets exactly one
+  `Output::Tracked { tag, peer, outcome }`: `TrackedOutcome::Sealed { bytes }` right before
+  the `Output::Transmit` of its datagram, or `TrackedOutcome::NotSent { reason }` at every
+  drop site of the send path. Without a session it is not queued in the tunnel (reported
+  `NO_SESSION`, counted as a drop) and the handshake starts as for an untracked packet; what
+  an outbound filter does to its tag or marker is undone after the chain.
+- New reasons: `reasons::PLAINTEXT_EGRESS` and `reasons::FILTER_HANDLED` (results of tracked
+  packets, not drops), `reasons::PLAINTEXT_EGRESS_FULL`, `reasons::PLAINTEXT_EGRESS_CLOSED`
+  and `reasons::ENGINE_STOPPED`.
+- Benches: `data_path` `core_round_trip_tracked` and `core_plaintext_egress`; `worker_pool`
+  `tracked_send` (tracked against untracked packets through an engine) and `engine_one_way`
+  (untracked packets one way through an engine).
 
 ### Changed
 
+#### Breaking
+- `nsplane-core` `Output` is `#[non_exhaustive]` and gains `Output::Plaintext` (plaintext
+  egress) and `Output::Tracked` (tracked local packets). Code that matches
+  `Core::poll_output` exhaustively (a driver of its own) needs a wildcard arm; it handles
+  `Plaintext` only if it marks peers with `Core::set_plaintext_egress`, and `Tracked` only if
+  it feeds tracked packets. The engine handles both.
+
+#### Other
 - `nsplane-netstack`: a connection or flow revoked while it waits in `incoming_tcp` or
   `incoming_udp` is skipped by the stream also when it was admitted with
   `Admission::Immediate` (before, only lifetimes held under `Admission::Decide` were).
