@@ -555,3 +555,12 @@ clock and replay-lock claims, the NAT address-model summary, and appended a date
 correction to the historical optimization plan's dependency constraint. Original process
 records are preserved. This follow-up changes Markdown only; `just docs` and `just typos`
 passed, and local diff review found no issue.
+
+## 2026-10-27 [release]
+
+Prepare 0.20.2 (tag `v0.20.2`) at the owner's request: wrapper sinks (`MapSink`, `AbortSink`,
+`SwapSink`, `Splitter`, `Nat64LanSink`) forward `send_batch_spent` (task
+`20261027-0433-sink-spent-forwarding`), `AclFilter` reply allowances and the default `AclEngine`
+clock read the coarse monotonic clock (task `20261027-0433-filter-coarse-clock`), plus the DNS
+fixture and documentation cleanup merged after 0.20.1. Workspace versions, internal requirements
+and guide tags synchronized.
