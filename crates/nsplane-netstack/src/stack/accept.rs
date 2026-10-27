@@ -194,7 +194,12 @@ impl Driver {
             }
             _ => None,
         });
-        let (flow, shared) = bound.unwrap_or_else(|| self.tcp_state(handle, local, peer, start));
+        let (flow, shared) = bound.unwrap_or_else(|| {
+            let label = self.labels.socket_label((peer, local), handle);
+            let (flow, shared) = self.tcp_state(handle, local, peer, start, label);
+            self.labels.register(&flow);
+            (flow, shared)
+        });
         self.conns.insert(
             handle,
             Conn {
@@ -224,6 +229,7 @@ impl Driver {
     /// ends undelivered.
     pub(super) fn release_inbound(&mut self) {
         let (sockets, stats, end) = (&self.sockets, &self.stats, self.position());
+        let labels = &mut self.labels;
         self.inbound.retain(|&handle, inbound| {
             let failed = matches!(
                 sockets.get::<tcp::Socket<'_>>(handle).state(),
@@ -231,6 +237,7 @@ impl Driver {
             );
             if failed {
                 stats::add(&stats.handshake_failed, 1);
+                labels.release(inbound.tuple, handle);
                 if let Some(flow) = &inbound.flow {
                     flow.set_end(end);
                     flow.undeliver(Undelivered::HandshakeFailed);
@@ -240,10 +247,14 @@ impl Driver {
         });
     }
 
-    /// Removes the listener socket `handle` of `port` mid handshake, without an RST: a
-    /// revoked lifetime.
-    pub(super) fn release_handshake(&mut self, handle: SocketHandle, port: u16) {
-        self.inbound.remove(&handle);
+    /// Removes the listener socket `handle` mid handshake, without an RST: a revoked
+    /// lifetime.
+    pub(super) fn release_handshake(&mut self, handle: SocketHandle) {
+        let Some(inbound) = self.inbound.remove(&handle) else {
+            return;
+        };
+        self.labels.release(inbound.tuple, handle);
+        let port = inbound.tuple.1.port();
         if let Some(handles) = self.listeners.get_mut(&port) {
             handles.retain(|&listener| listener != handle);
             if handles.is_empty() {
@@ -295,10 +306,12 @@ impl Driver {
                         });
                     }
                     let registration = self.owners.tcp(local, remote);
+                    self.labels.bind_socket((remote, local), handle);
                     self.inbound.insert(
                         handle,
                         Inbound {
                             registration,
+                            tuple: (remote, local),
                             start: mark,
                             flow,
                         },
@@ -306,6 +319,7 @@ impl Driver {
                 }
             }
         }
+        self.labels.expire_syns();
         let Some(refused) = self.pending.as_mut().map(|table| table.take_refused()) else {
             return;
         };
@@ -315,7 +329,9 @@ impl Driver {
             }
             // Revoked during this turn: smoltcp's RST for the SYN goes too.
             if let Some(key) = flow.held_key()
-                && !self.purge_tcp(key.local, key.remote, mark, self.position())
+                && self
+                    .purge_tcp(key.local, key.remote, mark, self.position())
+                    .is_err()
             {
                 flow.finish(RetirementOutcome::Failed);
             }

@@ -26,6 +26,7 @@ use crate::udp::UdpOut;
 
 use super::commands::random_ephemeral;
 use super::handle::NetStackHandle;
+use super::labels::Labels;
 use super::wire::tcp_tuple;
 use super::{COMMAND_CAPACITY, Driver, EGRESS_BACKLOG, MAX_INJECT_PER_ITER, stack_gone};
 
@@ -66,9 +67,7 @@ impl NetStack {
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
         let (pending, incoming_pending) = pending_table(&settings, &notify, &revocations).unzip();
-        let pending = pending.map(Box::new);
         let (events, flow_events) = event_sink(&settings).unzip();
-        let events = events.map(Box::new);
         let (_, mtu) = watch::channel(settings.mtu);
         let owners = Arc::new(Owners::new(
             settings.v4.map(|(addr, _)| addr),
@@ -90,6 +89,7 @@ impl NetStack {
             allow_fragmentation: settings.udp_allow_fragmentation,
         };
         let driver = Driver {
+            labels: Labels::new(settings.max_revoked_labels),
             settings,
             iface,
             device,
@@ -128,8 +128,8 @@ impl NetStack {
             marks: VecDeque::new(),
             fences: Arc::clone(&fences),
             barriers: Vec::new(),
-            pending,
-            events,
+            pending: pending.map(Box::new),
+            events: events.map(Box::new),
             #[cfg(test)]
             turns: 0,
         };
@@ -140,7 +140,7 @@ impl NetStack {
                 rx: egress_rx,
                 mtu,
                 received: 0,
-                revocations,
+                revocations: Arc::clone(&revocations),
                 fences,
                 stats: Arc::clone(&stats),
             },
@@ -154,6 +154,7 @@ impl NetStack {
             flow_events: Arc::new(Mutex::new(flow_events)),
             stats,
             owners,
+            revocations,
         };
         (stack, handle)
     }
@@ -252,7 +253,10 @@ impl PacketSource for NetStackSource {
 ///
 /// [`send`](PacketSink::send) waits while the stack's ingress queue is full and returns
 /// [`io::ErrorKind::BrokenPipe`] once the driver stopped. The peer a packet came from is
-/// not used: the stack routes by addresses only.
+/// not used: the stack routes by addresses only. A packet's tag
+/// ([`PacketBuf::tag`]) is its ingress label: a connection or flow takes the label of its
+/// first input and drops input with another one, see
+/// [`NetStackHandle::revoke_label`].
 #[derive(Debug)]
 pub struct NetStackSink {
     tx: mpsc::Sender<PacketBuf>,
