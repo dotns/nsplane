@@ -283,8 +283,8 @@ a side), `gate` 0.7-1.0 (a first run at 3.8-5.3 was discarded), `send_stream` 1.
 The gate's first A round had wide intervals (`pass_gate` 2.34 ns), so the changes on the
 established paths are taken from the second round: the scoped check costs about 0.5-0.8 ns
 there, as measured on its branch (+0.5 to +1 ns). `core_round_trip/1420` is +20 ns in each of
-five rounds with tight intervals, while the 64-byte and batched round trips are unchanged; it is
-open whether this is the shared post-decryption delivery or code placement. The other changes
+five rounds with tight intervals, while the 64-byte and batched round trips are unchanged; this
+is code placement, not added work (below). The other changes
 stay within the noise. Per workstream, each against `52eb983` on its branch before the rebase:
 
 - Netstack control from the first input, default configuration: `netstack_send/streams_{1,4}`
@@ -298,3 +298,27 @@ stay within the noise. Per workstream, each against `52eb983` on its branch befo
 - The 0.19.4 fixes: `vnet/segment_tcpv4_64k` 3.185 / 3.183 us, the coalescer unchanged, the
   gate's IPv6 cases within the noise.
 
+`core_round_trip/1420` by step (2026-10-27, slot 0, three interleaved rounds per build, load
+1.2-2.0, change of the mean against `fb67db9`):
+
+| Build | Code | Version | `/1420` | `/64` |
+| --- | --- | --- | --- | --- |
+| `fb67db9` | 0.19.3 | 0.19.3 | reference | reference |
+| release A, W2, W1 (each alone) | binary identical to `fb67db9` | 0.19.3 | +0.1 % (release A) | -0.3 % |
+| W3 alone, and the integration before the version commit (binary identical to W3) | release B | 0.19.3 | +0.0 % / -0.1 % | -0.6 % |
+| `fb67db9` with the version set to 0.20.0 | 0.19.3 | 0.20.0 | -0.0 % | -0.1 % |
+| 0.20.0 head | release B | 0.20.0 | +1.8 % / +0.8 % | -0.4 % / -0.5 % |
+| 0.20.0 head with the version set to 0.20.1 | release B | 0.20.1 | -1.0 % | -0.1 % |
+
+Only `nsplane-core`, `nsplane-packet` and `nsplane-noise` reach this bench, so the binaries of
+release A, W2 and W1 equal `fb67db9`'s, and the merges from W3 on up to the version commit equal
+W3's.
+The cost appears with the version change alone, and the same source at 0.20.1 is faster than
+0.19.3. The version is part of every crate's symbol hash, so it moves functions in the binary:
+`objdump` of the W3 and the 0.20.0 builds shows the same instruction count (526,948) with every
+function body of equal length, the 81 bodies that differ differing only in RIP-relative data
+offsets, and the round-trip routines of the bench (the criterion closures the core path is
+inlined into, `encapsulate_batch`, `decapsulate_batch`) starting at another 16-byte offset of a
+cache line. The 0.20.0 and 0.20.1 builds agree in every hot function's instructions as well. The
+AEAD code is at the same alignment in all of them. A per-packet cost of this size that depends on
+the version string is placement; nothing is added on the 1420-byte path.

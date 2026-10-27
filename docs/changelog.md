@@ -479,3 +479,15 @@ against `fb67db9` (`docs/performance.md`, "0.20.0 against 0.19.3"): the gate's e
 reproducible; 64-byte and batched round trips unchanged), open; `send_stream` and `local_graph`
 within the noise.
 
+## 2026-10-27 [investigation]
+
+`core_round_trip/1420` +20 ns at 0.20.0 against 0.19.3: code placement, not added work. Bisected
+by workstream on a quiet host: the bench binaries of release A, W2 and W1 equal `fb67db9`'s, W3
+alone and every merge before the version commit measure as `fb67db9`, and the cost appears with
+the version commit only; the same source at version 0.20.1 is 1 % faster than 0.19.3, and
+`fb67db9` at version 0.20.0 is unchanged. The version enters every symbol hash and moves the
+code: `objdump` shows the same instructions (526,948, equal function lengths, differences only
+in RIP-relative offsets) and the bench's round-trip routines at another 16-byte offset. No
+change made (`docs/performance.md`, "0.20.0 against 0.19.3"). `perf` and `valgrind` are not
+available on the host, so instruction counts come from the disassembly, not from counters.
+
