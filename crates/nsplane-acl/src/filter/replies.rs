@@ -26,7 +26,7 @@ impl Inner {
         tuple: FiveTuple,
         dependency: Option<ReplyDependency>,
     ) {
-        let now = Instant::now();
+        let now = self.engine.now();
         let key = EntryKey {
             peer,
             outbound,
@@ -156,7 +156,7 @@ impl Inner {
         table.pending.insert(
             tuple,
             ReplyEntry {
-                last_seen: Instant::now(),
+                last_seen: self.engine.now(),
                 dependency: Some(dependency),
             },
         );

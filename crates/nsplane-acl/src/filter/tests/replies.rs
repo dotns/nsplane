@@ -225,3 +225,90 @@ fn stateful_replies_can_be_disabled() {
     );
     assert_eq!(f.stats().replies, 0);
 }
+
+#[test]
+fn reply_allowances_expire_on_the_engine_clock() {
+    let (engine, clock) = clocked_engine(RuleSet::new(deny_all()).unwrap());
+    let f = AclFilter::new(engine, identity());
+    let timeout = AclFilterConfig::default().reply_idle_timeout;
+    let (r, l) = (addr("10.0.0.1"), addr("10.0.0.2"));
+    let reply = || udp_packet(r, 53, l, 40000);
+    outbound(&f, PEER, udp_packet(l, 40000, r, 53));
+
+    // Alive at exactly the idle timeout; the hit refreshes it.
+    advance(&clock, timeout);
+    assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
+    advance(&clock, timeout + Duration::from_millis(1));
+    assert_eq!(inbound(&f, PEER, reply()), drop(reasons::DENIED));
+    let stats = f.stats();
+    assert_eq!((stats.replies, stats.reply_expired), (1, 1));
+
+    // Outbound traffic refreshes an allowance on the same clock.
+    outbound(&f, PEER, udp_packet(l, 40000, r, 53));
+    advance(&clock, timeout / 2);
+    outbound(&f, PEER, udp_packet(l, 40000, r, 53));
+    advance(&clock, timeout);
+    assert_eq!(inbound(&f, PEER, reply()), Verdict::Accept);
+}
+
+#[test]
+fn pending_dependencies_age_on_the_engine_clock() {
+    use super::super::table::{EntryKey, FlowEntry};
+    use crate::engine::ReplyDependency;
+    use nsplane_packet::FiveTuple;
+
+    let (engine, clock) = clocked_engine(RuleSet::new(deny_all()).unwrap());
+    let f = AclFilter::new(engine, identity());
+    let timeout = AclFilterConfig::default().reply_idle_timeout;
+    let tuple = FiveTuple {
+        src: addr("10.0.0.1"),
+        dst: addr("10.0.0.2"),
+        protocol: protocol::UDP,
+        src_port: 53,
+        dst_port: 40000,
+    };
+    let dependency = |tuple| {
+        let key = EntryKey {
+            peer: PEER,
+            outbound: false,
+            tuple,
+        };
+        let mut table = f.inner.table();
+        f.inner
+            .record_reply(&mut table, None, PEER, false, tuple, None);
+        match table.entries.get(&key) {
+            Some(FlowEntry::Allowance(allowance)) => allowance.dependency.clone(),
+            _ => panic!("no allowance for {tuple:?}"),
+        }
+    };
+
+    advance(&clock, Duration::from_secs(1000));
+    let grant = ReplyDependency::Grant("g".into());
+    f.inner
+        .record_pending(&mut f.inner.table(), tuple, grant.clone());
+    assert_eq!(
+        f.inner
+            .table()
+            .pending
+            .get(&tuple)
+            .map(|entry| entry.last_seen),
+        Some(*clock.lock().unwrap())
+    );
+
+    // A new allowance inherits the pending dependency within the timeout...
+    advance(&clock, timeout);
+    assert_eq!(dependency(tuple), Some(grant));
+    // ...and not after it.
+    advance(&clock, Duration::from_millis(1));
+    let later = FiveTuple {
+        src_port: 54,
+        ..tuple
+    };
+    f.inner.record_pending(
+        &mut f.inner.table(),
+        later,
+        ReplyDependency::Grant("h".into()),
+    );
+    advance(&clock, timeout + Duration::from_millis(1));
+    assert_eq!(dependency(later), None);
+}

@@ -5,6 +5,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `nsplane-acl`: `AclFilter` reply allowances and the default `AclEngine` clock read the coarse
+  monotonic clock (`CLOCK_MONOTONIC_COARSE` on Linux and Android, `Instant::now` elsewhere), as
+  the flow gate already did. Expiry of reply allowances, pinholes and fragment entries is
+  accurate to one scheduler tick (1-4 ms) instead of nanoseconds. Reply allowances now follow
+  the engine clock, so a clock given to `AclEngine::with_clock` also drives their expiry. No
+  API change.
+
 ## [0.20.0] - 2026-10-27
 
 Feature release under the eleventh exception to the 0.11 feature freeze: netstack control of a
