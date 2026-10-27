@@ -188,6 +188,9 @@ snapshot read every packet pays) 3.10 ns, `default/inbound` 44.22 ns, `default/o
 | `baseline/pass_filter` (inert gate in front of the ACL) | 35.46 ns |
 | `baseline/pass_gate` (inert gate alone) | 0.80 ns |
 
+Scoped decisions (`evaluate_inbound_in`, 0.20.0, slot 0, 2026-10-27, load 0.9-1.0):
+`scoped/established` 58.2-58.5 ns, `scoped/out_of_scope` 25.5-26.0 ns.
+
 ## Translator
 
 `cargo bench -p nsplane-nat --bench translate` on 0.14.1, 2026-10-15, interleaved A/B,
@@ -245,3 +248,53 @@ and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's f
 
 A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
 tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.
+
+## 0.20.0 against 0.19.3
+
+The integrated 0.20.0 head (netstack control from the first input, scoped flow gate
+decisions, local barrier and plaintext ingress, the 0.19.4 fixes) against `fb67db9` (0.19.3
+with the large module split), 2026-10-27, interleaved A/B in one `slot.sh` invocation per
+bench, slot 0, criterion means of the rounds. `data_path`, `gate` and `local_graph` ran on
+`BENCH_CPUS_A`, `send_stream` on `BENCH_CPUS` (its four runtime workers and both stacks need
+more than three CPUs). The 1-minute load per round: `data_path` 0.9-1.5 (two runs, five rounds
+a side), `gate` 0.7-1.0 (a first run at 3.8-5.3 was discarded), `send_stream` 1.4-2.4,
+`local_graph` 0.4-1.3.
+
+| Bench / case | 0.19.3 | 0.20.0 | Change |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 417.1 ns | 416.5 ns | -0.1 % |
+| `data_path` `core_round_trip_batch32/64` | 13.02 us | 13.04 us | +0.1 % |
+| `data_path` `core_round_trip/1420` | 1.227 us | 1.247 us | +1.7 % |
+| `data_path` `core_round_trip_batch32/1420` | 39.11 us | 39.24 us | +0.3 % |
+| `gate` `established/gate` | 42.73 / 40.92 ns | 41.74 / 41.40 ns | +1.2 % in round 2 |
+| `gate` `established/outbound` | 42.88 / 40.78 ns | 41.98 / 41.58 ns | +2.0 % in round 2 |
+| `gate` `established/filter` | 45.59 / 45.54 ns | 45.97 / 45.59 ns | +0.5 % |
+| `gate` `baseline/pass_gate` | 0.62 ns | 0.62 ns | 0 |
+| `send_stream` `netstack_send/streams_1` | 3.268 ms | 3.240 ms | -0.9 % |
+| `send_stream` `netstack_send/streams_4` | 2.082 ms | 2.128 ms | +2.2 % (one wide B round) |
+| `send_stream` `netstack_send_1cpu/streams_1` | 3.406 ms | 3.400 ms | -0.2 % |
+| `send_stream` `netstack_send_1cpu/streams_4` | 4.152 ms | 4.131 ms | -0.5 % |
+| `send_stream` `netstack_udp_send/flows_1` | 563.7 us | 552.9 us | -1.9 % |
+| `send_stream` `netstack_udp_send/flows_4` | 479.1 us | 472.0 us | -1.5 % |
+| `send_stream` `netstack_udp_send_1cpu/flows_1` | 428.8 us | 423.7 us | -1.2 % |
+| `send_stream` `netstack_udp_send_1cpu/flows_4` | 430.4 us | 427.0 us | -0.8 % |
+| `local_graph`, all 34 cases | | | -1.3 % to +1.1 %, and `swap_sink/bare_send_batch_*` +3.4 % from one B round (equal in the other) |
+
+The gate's first A round had wide intervals (`pass_gate` 2.34 ns), so the changes on the
+established paths are taken from the second round: the scoped check costs about 0.5-0.8 ns
+there, as measured on its branch (+0.5 to +1 ns). `core_round_trip/1420` is +20 ns in each of
+five rounds with tight intervals, while the 64-byte and batched round trips are unchanged; it is
+open whether this is the shared post-decryption delivery or code placement. The other changes
+stay within the noise. Per workstream, each against `52eb983` on its branch before the rebase:
+
+- Netstack control from the first input, default configuration: `netstack_send/streams_{1,4}`
+  and `netstack_udp_send/flows_{1,4}` within the noise over four runs (the `Decide` path is
+  not on these benches).
+- Scoped flow gate decisions: `established/gate` +0.5 to +1 ns, new flows, later fragments and
+  ICMP errors +1.5 to +2.5 ns, the inert gate unchanged; a const-generic variant was rejected
+  for outlining shared helpers (+6 ns on `icmp_error/v6`).
+- Local barrier and plaintext ingress: `core_round_trip/64` 423.5 / 423.3 ns,
+  `core_round_trip_batch32/64` +0.7 %; `local_graph` -1.7 % to +1.3 % on a quiet host.
+- The 0.19.4 fixes: `vnet/segment_tcpv4_64k` 3.185 / 3.183 us, the coalescer unchanged, the
+  gate's IPv6 cases within the noise.
+

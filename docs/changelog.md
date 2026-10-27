@@ -473,5 +473,9 @@ release A, 0.19.4 (task `20261026-0851-vnet-walk-v6-fixes`). Each branch was reb
 W2, W3, W1 on `release/0.20.0-v2`, where the conflicts were the changelogs and the task index
 only. Breaking: `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` and
 `PendingProtocol` are `#[non_exhaustive]`. The 0.19.4 section of `CHANGELOG.md` stays as
-prepared, unreleased; 0.20.0 lists its fixes under Fixed.
+prepared, unreleased; 0.20.0 lists its fixes under Fixed. Slot A/B of the integrated head
+against `fb67db9` (`docs/performance.md`, "0.20.0 against 0.19.3"): the gate's established paths
++1.2 % / +2.0 % (the scoped check, as on its branch); `core_round_trip/1420` +1.7 % (+20 ns,
+reproducible; 64-byte and batched round trips unchanged), open; `send_stream` and `local_graph`
+within the noise.
 
