@@ -1,6 +1,7 @@
 //! Packet buffers with reserved headroom, a buffer pool, and fixed-size batches.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
@@ -16,6 +17,23 @@ pub const TAILROOM: usize = 15 + 16;
 
 /// Maximum number of packets in a [`PacketBatch`].
 pub const MAX_BATCH: usize = 64;
+
+/// The packet offsets are `u32`, which keeps a [`PacketBuf`] at 56 bytes with its tag: a
+/// packet ends at most this many bytes into its buffer.
+const MAX_END: usize = u32::MAX as usize;
+
+/// [`HEADROOM`] as a packet offset.
+const HEADROOM_OFFSET: u32 = 32;
+const _: () = assert!(HEADROOM_OFFSET as usize == HEADROOM);
+
+/// `n` as a packet offset, at most [`MAX_END`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the value is at most u32::MAX after the check"
+)]
+const fn to_offset(n: usize) -> u32 {
+    if n > MAX_END { u32::MAX } else { n as u32 }
+}
 
 /// A requested range does not fit the packet or its headroom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,16 +52,46 @@ impl std::error::Error for BoundsError {}
 /// Fresh buffers start with [`HEADROOM`] zeroed bytes of headroom; [`advance`](Self::advance)
 /// and [`reserve_front`](Self::reserve_front) move the packet start in O(1).
 ///
-/// Invariant: `start <= end <= buf.len()`; bytes `[0, start)` are headroom, bytes
-/// `[start, end)` are the packet, and bytes `[end, buf.len())` are initialized bytes a
-/// pooled buffer kept from earlier use, so growing over them needs no zero-fill.
-#[derive(Debug, Clone)]
+/// A packet also carries two properties of the caller's that never reach the wire: an
+/// opaque [`tag`](Self::tag) and the [receipt marker](Self::is_tracked). A new buffer, and
+/// every buffer a [`PacketPool`] hands out, has neither. nsplane keeps both wherever it
+/// moves a packet into another buffer for the same packet, and clears them where a buffer
+/// stops being that packet.
+///
+/// A packet ends at most `u32::MAX` bytes into its buffer, far beyond any IP packet:
+/// [`set_len`](Self::set_len), [`extend_from_slice`](Self::extend_from_slice) and
+/// [`PacketPool::get_len`] stop there instead of panicking, and
+/// [`from_shared`](Self::from_shared) and [`reserve_front`](Self::reserve_front) refuse a
+/// range past it.
+///
+/// Invariant: `start <= end <= buf.len()` and `end <= u32::MAX`; bytes `[0, start)` are
+/// headroom, bytes `[start, end)` are the packet, and bytes `[end, buf.len())` are initialized
+/// bytes a pooled buffer kept from earlier use, so growing over them needs no zero-fill.
+#[derive(Debug)]
 pub struct PacketBuf {
     buf: BytesMut,
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
+    /// The caller's tag; see [`tag`](Self::tag).
+    tag: Option<NonZeroU64>,
     /// Created by [`from_shared`](Self::from_shared); never returned to a [`PacketPool`].
     shared: bool,
+    /// The receipt marker; see [`is_tracked`](Self::is_tracked).
+    tracked: bool,
+}
+
+impl Clone for PacketBuf {
+    /// Copies the packet and its tag; the clone is never tracked.
+    fn clone(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            start: self.start,
+            end: self.end,
+            tag: self.tag,
+            shared: self.shared,
+            tracked: false,
+        }
+    }
 }
 
 impl PacketBuf {
@@ -68,9 +116,11 @@ impl PacketBuf {
         buf[..HEADROOM].fill(0);
         Self {
             buf,
-            start: HEADROOM,
-            end: HEADROOM,
+            start: HEADROOM_OFFSET,
+            end: HEADROOM_OFFSET,
+            tag: None,
             shared: false,
+            tracked: false,
         }
     }
 
@@ -85,44 +135,86 @@ impl PacketBuf {
     ///
     /// # Errors
     ///
-    /// Returns [`BoundsError`] if `offset + len` overflows or exceeds `buf.len()`.
+    /// Returns [`BoundsError`] if `offset + len` overflows or exceeds `buf.len()` or
+    /// `u32::MAX`.
     pub fn from_shared(mut buf: BytesMut, offset: usize, len: usize) -> Result<Self, BoundsError> {
         let end = offset.checked_add(len).ok_or(BoundsError)?;
-        if end > buf.len() {
+        if end > buf.len() || end > MAX_END {
             return Err(BoundsError);
         }
         buf.truncate(end);
         Ok(Self {
             buf,
-            start: offset,
-            end,
+            start: to_offset(offset),
+            end: to_offset(end),
+            tag: None,
             shared: true,
+            tracked: false,
         })
+    }
+
+    /// The caller's tag, or `None`.
+    ///
+    /// nsplane never interprets it and never writes it to the wire: transports and sinks
+    /// see the [`as_packet`](Self::as_packet) bytes only. It moves with the buffer through
+    /// every queue, batch and filter, and is copied wherever nsplane moves the packet into
+    /// a new buffer: a buffer grown or laid out for sealing, a translated packet, each
+    /// fragment of a split packet, a reassembled datagram whose fragments all carried it
+    /// ([`Reassembler::push_tagged`](crate::reassembly::Reassembler::push_tagged)). New
+    /// buffers, pooled ones and buffers handed back for recycling carry none.
+    pub const fn tag(&self) -> Option<NonZeroU64> {
+        self.tag
+    }
+
+    /// Sets or clears the tag.
+    pub const fn set_tag(&mut self, tag: Option<NonZeroU64>) {
+        self.tag = tag;
+    }
+
+    /// Returns the tag and clears it.
+    pub const fn take_tag(&mut self) -> Option<NonZeroU64> {
+        self.tag.take()
+    }
+
+    /// Whether the packet is tracked: the receipt marker, a property of the caller's that
+    /// takes no bits of the [`tag`](Self::tag).
+    ///
+    /// Clones, new, pooled and recycled buffers are never tracked. The marker moves with the
+    /// buffer and with the copies nsplane makes of the same packet, never to the fragments of
+    /// a split packet. The engine clears it on every packet it takes in (from its source, the
+    /// inject calls and its plaintext ingress) and on every packet it hands out.
+    pub const fn is_tracked(&self) -> bool {
+        self.tracked
+    }
+
+    /// Marks or unmarks the packet; see [`is_tracked`](Self::is_tracked).
+    pub const fn set_tracked(&mut self, tracked: bool) {
+        self.tracked = tracked;
     }
 
     /// The packet bytes.
     pub fn as_packet(&self) -> &[u8] {
-        &self.buf[self.start..self.end]
+        &self.buf[self.start as usize..self.end as usize]
     }
 
     /// The packet bytes, mutably.
     pub fn as_packet_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[self.start..self.end]
+        &mut self.buf[self.start as usize..self.end as usize]
     }
 
     /// The headroom followed by the packet; `headroom() + len()` bytes.
     pub fn with_headroom_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.end]
+        &mut self.buf[..self.end as usize]
     }
 
     /// Packet length in bytes.
     pub const fn len(&self) -> usize {
-        self.end - self.start
+        (self.end - self.start) as usize
     }
 
     /// Bytes in front of the packet.
     pub const fn headroom(&self) -> usize {
-        self.start
+        self.start as usize
     }
 
     /// Drops the first `n` packet bytes by moving the packet start forward, without
@@ -135,7 +227,8 @@ impl PacketBuf {
         if n > self.len() {
             return Err(BoundsError);
         }
-        self.start += n;
+        // At most `len()`, which fits.
+        self.start += to_offset(n);
         Ok(())
     }
 
@@ -146,6 +239,7 @@ impl PacketBuf {
     ///
     /// Returns [`BoundsError`] if `n > headroom()`; the packet is left unchanged.
     pub fn reserve_front(&mut self, n: usize) -> Result<(), BoundsError> {
+        let n = u32::try_from(n).map_err(|_| BoundsError)?;
         self.start = self.start.checked_sub(n).ok_or(BoundsError)?;
         Ok(())
     }
@@ -157,42 +251,49 @@ impl PacketBuf {
 
     /// Packet bytes that fit without reallocating.
     pub fn capacity(&self) -> usize {
-        self.buf.capacity() - self.start
+        self.buf.capacity() - self.start as usize
     }
 
     /// Resizes the packet; shrinking truncates.
     ///
     /// Growing exposes the bytes the buffer already initialized (unspecified: a buffer
     /// reused by a [`PacketPool`] keeps what it held) and zero-fills only the bytes it
-    /// never initialized, so the new bytes are to be written before they are read.
+    /// never initialized, so the new bytes are to be written before they are read. The
+    /// packet ends at most `u32::MAX` bytes into the buffer.
     pub fn set_len(&mut self, len: usize) {
-        let end = self.start + len;
-        if end > self.buf.len() {
-            self.buf.resize(end, 0);
+        let end = to_offset((self.start as usize).saturating_add(len));
+        if end as usize > self.buf.len() {
+            self.buf.resize(end as usize, 0);
         }
         self.end = end;
     }
 
     /// Appends `bytes` to the packet without zero-filling first; the headroom is kept.
     ///
-    /// Reallocates only if the packet grows past [`capacity`](Self::capacity).
+    /// Reallocates only if the packet grows past [`capacity`](Self::capacity). Appends no
+    /// bytes past `u32::MAX` bytes into the buffer.
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        let end = self.end as usize;
+        let bytes = bytes.get(..MAX_END - end).unwrap_or(bytes);
         // Overwrite the initialized bytes behind the packet, then append the rest.
-        let kept = (self.buf.len() - self.end).min(bytes.len());
+        let kept = (self.buf.len() - end).min(bytes.len());
         let (over, rest) = bytes.split_at(kept);
-        self.buf[self.end..self.end + kept].copy_from_slice(over);
+        self.buf[end..end + kept].copy_from_slice(over);
         self.buf.extend_from_slice(rest);
-        self.end += bytes.len();
+        // Within `MAX_END`, so it fits.
+        self.end += to_offset(bytes.len());
     }
 
-    /// The packet bytes without the headroom, without copying.
+    /// The packet bytes without the headroom, without copying; the tag and the marker are
+    /// dropped.
     pub fn into_bytes(self) -> BytesMut {
         let mut buf = self.buf;
-        buf.truncate(self.end);
-        buf.split_off(self.start)
+        buf.truncate(self.end as usize);
+        buf.split_off(self.start as usize)
     }
 
-    /// The packet bytes as immutable [`Bytes`], without copying.
+    /// The packet bytes as immutable [`Bytes`], without copying; the tag and the marker are
+    /// dropped.
     pub fn freeze(self) -> Bytes {
         self.into_bytes().freeze()
     }
@@ -236,9 +337,11 @@ impl PacketPool {
     /// The packet bytes are unspecified: a reused buffer keeps the bytes it already held
     /// and zero-fills only the bytes it never initialized, so getting the same length again
     /// writes nothing. Use it for a buffer that is written to before it is read, e.g. one a
-    /// handshake message is formatted into.
+    /// handshake message is formatted into. The packet ends at most `u32::MAX` bytes into
+    /// the buffer.
     pub fn get_len(&mut self, len: usize) -> PacketBuf {
-        let needed = HEADROOM + len;
+        let end = to_offset(HEADROOM.saturating_add(len));
+        let needed = end as usize;
         let mut buf = self
             .free
             .pop()
@@ -247,9 +350,11 @@ impl PacketPool {
         buf.resize(needed, 0);
         PacketBuf {
             buf,
-            start: HEADROOM,
-            end: needed,
+            start: HEADROOM_OFFSET,
+            end,
+            tag: None,
             shared: false,
+            tracked: false,
         }
     }
 
@@ -735,6 +840,137 @@ mod tests {
 
         let drained: Vec<u8> = batch.into_iter().map(|p| p.as_packet()[0]).collect();
         assert_eq!(drained, [10, 11, 12]);
+    }
+
+    fn tag(value: u64) -> Option<NonZeroU64> {
+        NonZeroU64::new(value)
+    }
+
+    /// A packet with `tag` and the receipt marker set.
+    fn tagged(packet: &[u8], value: u64) -> PacketBuf {
+        let mut buf = PacketBuf::from_packet(packet);
+        buf.set_tag(tag(value));
+        buf.set_tracked(true);
+        buf
+    }
+
+    #[test]
+    fn new_buffers_are_untagged_and_untracked() {
+        let mut whole = BytesMut::new();
+        whole.extend_from_slice(&[0; 16]);
+        let mut pool = PacketPool::new(1);
+        for buf in [
+            PacketBuf::with_capacity(16),
+            PacketBuf::from_packet(&[1, 2, 3]),
+            PacketBuf::from_shared(whole, 4, 8).unwrap(),
+            pool.get(16),
+            pool.get_len(16),
+        ] {
+            assert_eq!(buf.tag(), None);
+            assert!(!buf.is_tracked());
+        }
+    }
+
+    #[test]
+    fn tag_set_take_and_marker() {
+        let mut buf = PacketBuf::from_packet(&[1]);
+        buf.set_tag(tag(7));
+        assert_eq!(buf.tag(), tag(7));
+        assert!(!buf.is_tracked());
+        buf.set_tracked(true);
+        assert!(buf.is_tracked());
+        assert_eq!(buf.tag(), tag(7));
+        assert_eq!(buf.take_tag(), tag(7));
+        assert_eq!(buf.tag(), None);
+        assert_eq!(buf.take_tag(), None);
+        assert!(buf.is_tracked());
+        buf.set_tag(tag(9));
+        buf.set_tag(None);
+        assert_eq!(buf.tag(), None);
+        buf.set_tracked(false);
+        assert!(!buf.is_tracked());
+        // Neither is part of the packet bytes.
+        assert_eq!(buf.as_packet(), [1]);
+    }
+
+    #[test]
+    fn clone_copies_the_tag_and_clears_the_marker() {
+        let buf = tagged(&[1, 2], 5);
+        let clone = buf.clone();
+        assert_eq!(clone.tag(), tag(5));
+        assert!(!clone.is_tracked());
+        assert_eq!(clone.as_packet(), [1, 2]);
+        // The original keeps both.
+        assert_eq!(buf.tag(), tag(5));
+        assert!(buf.is_tracked());
+    }
+
+    #[test]
+    fn pool_hands_out_untagged_untracked_buffers() {
+        let mut pool = PacketPool::new(2);
+        pool.put(tagged(&[1; 8], 3));
+        let buf = pool.get(16);
+        assert_eq!((buf.tag(), buf.is_tracked()), (None, false));
+        pool.put(buf);
+        pool.put(tagged(&[1; 8], 4));
+        for _ in 0..2 {
+            let buf = pool.get_len(8);
+            assert_eq!((buf.tag(), buf.is_tracked()), (None, false));
+        }
+        assert_eq!(pool.free_len(), 0);
+    }
+
+    #[test]
+    fn batch_preserves_tags_and_markers() {
+        let mut batch = PacketBatch::new();
+        for i in 1..=3u8 {
+            batch.push(tagged(&[i], u64::from(i))).unwrap();
+        }
+        batch.push(PacketBuf::from_packet(&[4])).unwrap();
+        let seen: Vec<_> = batch.iter().map(|p| (p.tag(), p.is_tracked())).collect();
+        let expected = [
+            (tag(1), true),
+            (tag(2), true),
+            (tag(3), true),
+            (None, false),
+        ];
+        assert_eq!(seen, expected);
+        let drained: Vec<_> = batch.drain().map(|p| (p.tag(), p.is_tracked())).collect();
+        assert_eq!(drained, expected);
+
+        let mut batch = PacketBatch::new();
+        let full = tagged(&[0], 8);
+        while !batch.is_full() {
+            batch.push(full.clone()).unwrap();
+        }
+        // A packet handed back keeps its tag and marker.
+        let rejected = batch.push(tagged(&[1], 9)).unwrap_err();
+        assert_eq!((rejected.tag(), rejected.is_tracked()), (tag(9), true));
+        assert!(batch.into_iter().all(|p| p.tag() == tag(8)));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn offsets_past_u32_are_refused() {
+        let mut buf = PacketBuf::from_packet(&[1]);
+        let past = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(buf.reserve_front(past), Err(BoundsError));
+        assert_eq!(buf.advance(past), Err(BoundsError));
+        assert_eq!(buf.as_packet(), [1]);
+        let mut whole = BytesMut::new();
+        whole.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            PacketBuf::from_shared(whole, past, 0).unwrap_err(),
+            BoundsError
+        );
+        assert_eq!(to_offset(past), u32::MAX);
+        assert_eq!(to_offset(1500), 1500);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn packet_buf_is_56_bytes() {
+        assert_eq!(size_of::<PacketBuf>(), 56);
     }
 
     #[test]

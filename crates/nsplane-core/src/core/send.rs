@@ -213,10 +213,12 @@ impl Core {
         // handshake initiation if the packet is queued instead.
         if packet.reserve_front(DATA_HEADER_SZ).is_err() {
             // E.g. a slice of a shared buffer: copy it behind the data header of a pooled
-            // buffer.
+            // buffer, with its tag and receipt marker.
             let mut copy = self.pool.get((len + TAILROOM).max(HANDSHAKE_INIT_SZ));
             copy.set_len(DATA_HEADER_SZ + len);
             copy.as_packet_mut()[DATA_HEADER_SZ..].copy_from_slice(packet.as_packet());
+            copy.set_tag(packet.tag());
+            copy.set_tracked(packet.is_tracked());
             self.pool.put(mem::replace(&mut packet, copy));
         }
         packet.set_len((DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ));
@@ -280,7 +282,8 @@ impl PathPolicy for Fixed {
     }
 }
 
-/// Transmits the local packet that peer `id`'s tunnel sealed in `packet` with `outcome`.
+/// Transmits the local packet that peer `id`'s tunnel sealed in `packet` with `outcome`. A data
+/// message keeps the packet's tag and receipt marker; any other message clears both.
 pub(super) fn sealed(
     outputs: &mut VecDeque<Output>,
     pool: &mut PacketPool,
@@ -309,6 +312,12 @@ pub(super) fn sealed(
     };
     packet.set_len(sealed_len);
     let kind = message_kind(packet.as_packet());
+    if kind != MessageKind::Data {
+        // A handshake initiation written into the buffer of a packet queued behind it: the
+        // buffer is no longer that packet.
+        packet.set_tag(None);
+        packet.set_tracked(false);
+    }
     transmit(outputs, pool, policy, id, peer, kind, packet);
 }
 

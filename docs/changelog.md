@@ -585,3 +585,17 @@ Prepare 0.20.2 (tag `v0.20.2`) at the owner's request: wrapper sinks (`MapSink`,
 clock read the coarse monotonic clock (task `20261027-0433-filter-coarse-clock`), plus the DNS
 fixture and documentation cleanup merged after 0.20.1. Workspace versions, internal requirements
 and guide tags synchronized.
+
+## 2026-10-27 [implementation]
+
+Release C W4 (task `20261027-0305-packet-tag-carrier`, plan `20261026-0822-node-gateway-requests`)
+on `feat/packet-tag-carrier` from `v0.20.0`, rebased onto `v0.20.1`: `PacketBuf` tag and
+receipt marker, every carrier site of the design note with a test (each copy and clear site
+failing before its change),
+`Reassembler::push_tagged` / `discard_tagged`, the translator's mixed-tag drop as a new reason
+(`TranslatorStats` kept exhaustive: semver-checks additive only). Layout: variant A (64 bytes)
+was outside the noise on `local_graph` (`splitter/*` +6.5 to +8.3 % over four rotated rounds),
+so variant B (`u32` offsets, 56 bytes) ships; against 0.20.0 it is within the noise on
+`data_path`, `udp_offload` and `translate`, faster on `local_graph`, +1.7 % on `vnet`, and
+`send_stream` `streams_1` / `flows_{1,4}` are to be re-measured (disturbed runs); measured
+before the rebase, against `v0.20.0`. Not merged, not released.

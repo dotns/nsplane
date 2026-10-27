@@ -83,13 +83,17 @@
 //! `reasons::OVERLAP`: the first copy's payload wins, so a reassembled
 //! datagram never mixes bytes of the two copies, but a later copy without the
 //! M flag still marks the end of the datagram. At the byte limit, a duplicate is dropped
-//! with `reasons::BUDGET_EXCEEDED` instead of being ignored.
+//! with `reasons::BUDGET_EXCEEDED` instead of being ignored. A reassembled
+//! datagram keeps the [packet tag](PacketBuf::tag) its fragments share (none
+//! counting as a value of its own); one whose fragments carried different
+//! tags is dropped with [`reasons::FRAGMENT_MIXED_TAGS`] and counted in
+//! [`TranslatorStats::dropped_out`].
 //!
 //! A translated IPv4 packet grows by 20 bytes (28 with a fragment header),
 //! in place when the packet buffer's capacity allows it. A packet without
 //! that room (e.g. from [`PacketBuf::from_packet`] or
 //! [`PacketBuf::from_shared`]) is copied into a fresh buffer with the
-//! standard headroom and translated there, which
+//! standard headroom, with its tag and receipt marker, and translated there, which
 //! [`TranslatorStats::grown_copies`] counts; sources that leave 28 bytes of
 //! room past the MTU keep translation in place. Callers that fragment IPv4
 //! before the core can use [`Translator::ipv4_translated_predicate`] to

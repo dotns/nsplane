@@ -242,13 +242,17 @@ pub(super) fn reply_tuple(bytes: &[u8]) -> Option<(FiveTuple, u8)> {
 
 /// Restores a reply of the flow whose first packet was `original` to IPv6,
 /// in place: the packet grows by 20 bytes into its headroom, or is copied
-/// once into a buffer with the standard headroom when it has less.
+/// once, with its tag and receipt marker, into a buffer with the standard
+/// headroom when it has less.
 pub(super) fn to_ipv6(packet: &mut PacketBuf, original: &FiveTuple, max_tcp_mss: Option<u16>) {
     let (IpAddr::V6(src), IpAddr::V6(dst)) = (original.dst, original.src) else {
         return;
     };
     if packet.headroom() < HEADER_DELTA {
-        *packet = PacketBuf::from_packet(packet.as_packet());
+        let mut copy = PacketBuf::from_packet(packet.as_packet());
+        copy.set_tag(packet.tag());
+        copy.set_tracked(packet.is_tracked());
+        *packet = copy;
     }
     let bytes = packet.as_packet();
     let traffic_class = bytes[1];

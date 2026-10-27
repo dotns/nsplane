@@ -45,7 +45,8 @@ pub trait PacketSource: Send + 'static {
     /// Hands back buffers the engine no longer needs, so the source can read into them
     /// again instead of allocating.
     ///
-    /// The source may take buffers out of `bufs` up to the bound of its pool and must drop
+    /// The engine and [`pump`](crate::pump()) hand the buffers over untagged and unmarked
+    /// ([`PacketBuf::tag`], [`PacketBuf::is_tracked`]). The source may take buffers out of `bufs` up to the bound of its pool and must drop
     /// the rest; the caller drops whatever it leaves in `bufs`. It never blocks.
     ///
     /// The default takes nothing.

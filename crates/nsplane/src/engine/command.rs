@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use nsplane_core::x25519::PublicKey;
 use nsplane_core::{ConfigChange, Event, Input, PeerStats};
-use nsplane_packet::{MAX_BATCH, TransportId};
+use nsplane_packet::{MAX_BATCH, PacketBuf, TransportId};
 use tokio::sync::{mpsc, oneshot};
 
 use super::output::Backoff;
@@ -272,14 +272,20 @@ impl Owner {
         Ok(())
     }
 
-    /// Hands an injected packet or handshake to the core and sends what it produced.
+    /// Hands an injected packet, its receipt marker cleared, or handshake to the core and
+    /// sends what it produced.
     fn inject(&mut self, injection: Injection) {
         let now = now();
+        let untracked = |mut packet: PacketBuf| {
+            packet.set_tracked(false);
+            packet
+        };
         match injection {
-            Injection::Inbound(peer, packet) => self.core.inject_inbound(peer, packet),
-            Injection::Outbound(packet) => self.core.inject_outbound(packet, now),
+            Injection::Inbound(peer, packet) => self.core.inject_inbound(peer, untracked(packet)),
+            Injection::Outbound(packet) => self.core.inject_outbound(untracked(packet), now),
             Injection::OutboundOn(peer, path, packet) => {
-                self.core.inject_outbound_on(peer, path, packet, now);
+                self.core
+                    .inject_outbound_on(peer, path, untracked(packet), now);
             }
             Injection::Handshake(peer, path) => self.core.force_handshake(peer, path, now),
             Injection::HandshakeOn(peer, path) => self.core.force_handshake_on(peer, path, now),

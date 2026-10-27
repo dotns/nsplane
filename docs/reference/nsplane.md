@@ -160,6 +160,27 @@ for plaintext IP packets attributed to a peer, checked like decrypted data. Its
   has no such queue; a second call replaces the first entry, whose calls then fail like
   those of a stopped engine.
 
+### Packet tags
+
+The engine carries the packet tag and the receipt marker of
+[nsplane-packet](nsplane-packet.md#packet-tag-and-receipt-marker) with the `PacketBuf` and
+never writes either to the wire:
+
+- A local packet keeps its tag from `PacketSource::recv_batch` through the local queue, the
+  fragmentation stage (each fragment), the outbound filters (`PacketFilter::outbound` reads
+  and may set it), sealing (inline and on the crypto workers) and the transmit path up to the
+  `Transport::send_batch` / `try_send_batch` call, whose datagram carries it. So do
+  `inject_outbound` and `inject_outbound_on`. A packet queued in the tunnel while its peer has
+  no session goes out untagged: the tunnel's queue keeps bytes, and the handshake initiation
+  written into the packet's buffer carries no tag.
+- Received packets are untagged; an inbound filter may tag one, and the sink gets the tag.
+  `inject_inbound` and `PlaintextIngress` keep the tag of the packet they are given.
+- The receipt marker is cleared on every packet the engine takes in (from its source, the
+  inject calls and `PlaintextIngress`) and on every packet it delivers to the sink.
+- The buffers handed back to `PacketSource::recycle`, by the engine and by `pump`, are
+  untagged and unmarked, so a source that reuses one (with `set_len` instead of a pool) never
+  sees a stale tag. Clearing costs one store per recycled buffer, off the packet path.
+
 ### Backpressure
 
 - Local packets are never dropped by an engine with one transport: when the transmit queue
@@ -457,7 +478,8 @@ core whatever their size.
   that `FragmentConfig::translated` (e.g. `Translator::ipv4_translated_predicate`) reports
   as translated to IPv6, whose fragments are sized to fit the MTU once translated with an
   IPv6 Fragment header (MTU - 28). A UDP datagram without a checksum toward a translated
-  destination gets one before it is split, so each fragment translates on its own.
+  destination gets one before it is split, so each fragment translates on its own. Every
+  fragment carries the packet's tag, none its receipt marker; the errors carry neither.
 - The errors look as if the packet's destination had sent them: they are delivered to the
   local side as coming from the peer `Core::route` picks for that destination (no route: no
   error) through `Core::inject_inbound`. They are rate-limited (a burst of 10, then 5 per
@@ -530,7 +552,7 @@ decisions, not packet loops:
   appends nothing). `TunSink` overrides it: plain, vnet and Wintun writes append every taken
   buffer after its write, the TSO writer a coalesced chunk's buffers once the chunk is
   written, a non-IP packet is dropped without being appended. `pump` hands `spent` to
-  `PacketSource::recycle` before its next `recv_batch`; if the source takes none of the
+  `PacketSource::recycle`, untagged and unmarked, before its next `recv_batch`; if the source takes none of the
   first non-empty offer, it uses plain `send_batch` for the rest of its run (later offers
   that take nothing do not switch it off). A cancel also drops spent buffers not yet
   recycled (buffers, never packets); `PumpStats` are unchanged; a default sink costs one

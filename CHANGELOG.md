@@ -5,6 +5,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Packet tag carrier (`nsplane-packet`): `PacketBuf::{tag, set_tag, take_tag}` carry an opaque
+  `Option<NonZeroU64>` of the caller's that nsplane never interprets and never writes to the
+  wire, and `PacketBuf::{is_tracked, set_tracked}` a receipt marker separate from it. New
+  buffers and every buffer `PacketPool` and `SharedPacketPool` hand out carry neither; `Clone`
+  copies the tag and clears the marker; `into_bytes` and `freeze` drop both. `PacketBuf` stays
+  56 bytes on 64-bit targets: its packet offsets are `u32`, so a packet ends at most
+  `u32::MAX` bytes into its buffer (`set_len`, `extend_from_slice` and `PacketPool::get_len`
+  stop there, `from_shared` and `reserve_front` refuse a range past it).
+- nsplane keeps the tag where it moves a packet into another buffer on its way to a
+  transport or a sink: the core's copy of a packet without headroom for sealing and the
+  translators' grown copies (`Translator`, `Nat64Lan::reverse`) take the tag and the marker;
+  each fragment of `nsplane`'s fragmentation stage takes the tag, never the marker. A local
+  packet's tag reaches the outbound filters (which may read or set it) and the transport
+  call's datagram, inline and with crypto workers; an inbound filter's tag reaches the sink.
+  Where a buffer stops being the packet both are cleared: a handshake initiation the tunnel
+  writes into a packet's buffer, and the buffers the engine and `pump` hand to
+  `PacketSource::recycle`. The engine clears the marker on every packet it takes in (source,
+  inject calls, `PlaintextIngress`) and on every packet it delivers. A packet queued in the
+  tunnel while its peer has no session goes out untagged. Cost for untagged traffic: one
+  store per packet at the engine's entries and deliveries and per recycled buffer, one word
+  copied at the copy sites.
+- `Reassembler::push_tagged` records each fragment's tag and reports the completed datagram's
+  `FragmentTags` (`Same(tag)`, no tag included, or `Mixed`), counted in the new
+  `ReassemblyStats::mixed_tags`; `Reassembler::discard_tagged` drops the incomplete datagrams
+  that may hold a fragment with a tag. `push` is `push_tagged` without a tag.
+- `nsplane-nat`: the translator's zero-checksum UDP reassembly keeps the tag its fragments
+  share and drops a datagram whose fragments carried different tags (or some a tag and others
+  none) as the new `reasons::FRAGMENT_MIXED_TAGS`, counted in `TranslatorStats::dropped_out`.
+
 ## [0.20.2] - 2026-10-27
 
 Patch release; no public API change. Wrapper sinks return spent buffers and the ACL filter
