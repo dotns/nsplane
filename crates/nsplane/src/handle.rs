@@ -774,6 +774,9 @@ impl EngineHandle {
     /// packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply state for
     /// it, so the peer's replies are judged by the inbound rules alone, and a translating
     /// filter does not translate it.
+    ///
+    /// A packet routed to a peer marked with [`EngineHandle::set_plaintext_egress`] goes to
+    /// the plaintext egress receiver instead of being sealed.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Outbound(packet), tx))
             .await

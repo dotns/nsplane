@@ -76,6 +76,9 @@ impl Core {
     /// state for it, so the peer's replies are judged by the inbound rules alone, and a
     /// translating filter does not translate it.
     ///
+    /// The packet is routed like a local one, so a packet routed to a peer marked with
+    /// [`Core::set_plaintext_egress`] leaves as [`Output::Plaintext`] instead of sealed.
+    ///
     /// [`PacketFilter`]: crate::PacketFilter
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
