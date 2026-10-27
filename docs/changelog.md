@@ -507,3 +507,21 @@ in the version commit.
 The owner lifted the 0.11 feature freeze: normal maintenance, with breaking public API changes
 called out in the plan and in the CHANGELOG (ADR `2026-10-27-normal-maintenance`, superseding
 `2026-10-08-feature-freeze-0-11`).
+
+## 2026-10-27 [fix]
+
+Fix the count window of `EngineHandle::local_barrier` for 0.20.1 (owner decision; task
+`20261027-0349-barrier-count-window`, from the gateway-side review of the release C note). The
+source task added a read's packets to the shared count only after `PacketSource::recv_batch`
+returned, so a barrier taken between the source handing out a packet and the `fetch_add` left
+the packet out. Now the source task publishes twice the count plus one while it polls
+`recv_batch`, and the barrier yields while that bit is set before it takes its position. The
+regression test holds the source task inside the read that hands out a packet with a
+controlled source; it fails on 0.20.0 (the barrier passes in 4 ms) and passes with the fix.
+Packets of a future `TrackedSender` can be counted at acceptance in a second counter the
+barrier reads with the source position. Slot A/B against `v0.20.0`, interleaved, quiet host:
+`data_path` (`core_round_trip` and `_batch32`, 64 and 1420 bytes; byte-identical bench
+binaries, the fix is outside `nsplane-core`) -0.6 % .. +0.3 %, load 1.2-1.6; `local_graph`,
+all 34 cases (no engine in this bench) -1.6 % .. +3.2 %, 31 within 1 %, load 1.2-2.9.
+`cargo semver-checks` against `v0.20.0`: no semver update required. A bug fix under normal
+maintenance (ADR `2026-10-27-normal-maintenance`): no freeze exception needed.

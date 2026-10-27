@@ -60,3 +60,18 @@ Fixing the local barrier's count window
   design leaves room to count them at acceptance in a second counter that `local_barrier`
   reads with the source position and the owner counts in `Barriers`, so the barrier keeps
   meaning every local packet the engine took before the call, as the review recommends.
+- Slot A/B against `v0.20.0` (`d09a0ed`), interleaved A, B, A, B, `scripts/bench/slot.sh`:
+  - `nsplane-core` `data_path`, slot 0, load 1.2-1.6 (the bench binaries are byte-identical):
+    `core_round_trip/64` 416 / 414 ns (-0.5 %), `core_round_trip_batch32/64` 12.99 / 13.02 us
+    (+0.3 %), `core_round_trip/1420` 1.229 / 1.222 us (-0.6 %), `core_round_trip_batch32/1420`
+    39.44 / 39.34 us (-0.2 %).
+  - `nsplane` `local_graph`, slot 1, every side started below load 3 (1.2-2.9): all 34 cases
+    -1.6 % .. +3.2 %, 31 within 1 % (`map_sink/send_after_1420` +3.2 %,
+    `map_sink/send_batch_after_1420` +1.6 %, `swap_sink/swap_send_batch_1420` -1.6 %); this
+    bench runs no engine. An earlier run under load 3-7 spread -20 % .. +21 % and is discarded.
+- Gates: `flock /tmp/nsplane-heavy.lock just check` exit 0 (2405 tests passed, 34 skipped; a
+  first run hit `AddrInUse` in `nsplane-dns` `passthrough`, whose stub binds TCP on the UDP
+  port it got, intermittent on the busy host and untouched here; 5 of 5 reruns passed);
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features` clean;
+  `cargo semver-checks --workspace --baseline-rev v0.20.0`: no semver update required (all
+  12 crates).
