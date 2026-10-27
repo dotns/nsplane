@@ -297,7 +297,7 @@ in the consumer's queues carry no position, so the consumer cannot fence them ex
 waiting for the queues to drain may never finish under load. The barrier serves as an interim
 measure from 0.20.0 for a consumer whose source is fenced exactly; the tag covers every queue
 between the stamp and the filter, the consumer's and the engine's. The gateway needs R4 A for
-this reason (review record). The barrier's count window is an open item (below).
+this reason (review record). The barrier's count window is fixed in 0.20.1 (O15).
 
 ### W6, plaintext egress (R5 part 2)
 
@@ -384,8 +384,8 @@ peer that follows its `PeerId` (O8, decided):
 ## Open questions
 
 Decided by the owner: O11, O12 and O14 on 2026-10-26, and O8, O9, O10 and O13 on 2026-10-27
-after the gateway's review, all as recommended. Open for the owner: the barrier's count window
-(O15, below).
+after the gateway's review, all as recommended; O15 on 2026-10-27: the barrier's count window
+is fixed in 0.20.1.
 
 - O8 (R5 part 2) **Decided 2026-10-27 (owner): the runtime opt-in that follows the `PeerId`,
   with the add-closed, read back, mark, then open order for consumers that learn the `PeerId` by
@@ -459,7 +459,9 @@ after the gateway's review, all as recommended. Open for the owner: the barrier'
   (a reused label opens a new lifetime; the consumer contract alone protects). Either way the
   consumer contract stands: labels of revoked lifetimes are never reused, and queued input of a
   label is cancelled before its revoke.
-- O15 (release B, open for the owner) The barrier's count window. `read_source` adds a batch to
+- O15 (release B) **Decided 2026-10-27 (owner): fixed in nsplane and released as 0.20.1 (Gitea
+  only), implemented and released by the release B barrier's workstream; not part of release
+  C.** The barrier's count window. `read_source` adds a batch to
   the barrier's count right after `PacketSource::recv_batch` returns it (`engine/tasks.rs`). A
   consumer that raises its source fence and calls `local_barrier` from another thread while the
   source task is between that return and the count gets a position that excludes the packet, so
@@ -592,12 +594,11 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
 
 ## Open items for review
 
-- Owner: O15 (the barrier's count window: fix in 0.20.x or document only, a release B item)
-  and the labeled-path allowance (proposed 3 %). Release C is approved (2026-10-27, twelfth
-  freeze exception). The gateway's view on scope: R5 part 2 has no production user yet and is the item
-  that could move to a later release with the least loss if release C must shrink. Decided:
-  O11 (with the variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10 and O13 on
-  2026-10-27.
+- Owner: the labeled-path allowance (proposed 3 %). Release C is approved (2026-10-27, twelfth
+  freeze exception). The gateway's view on scope: R5 part 2 has no production user yet and is
+  the item that could move to a later release with the least loss if release C must shrink.
+  Decided: O11 (with the variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10, O13 and
+  O15 (fixed in 0.20.1) on 2026-10-27.
 - The gateway (its own design, not nsplane's): which real arrival path its reference engine
   passes to `PlaintextIngress` (`from: Path` stays mandatory).
 - `recv_labeled` on bound sockets stays out of release C: neither consumer uses bound netstack
@@ -646,6 +647,8 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   exception, with the answers to O8-O14 as recorded here; this note is the specification for the
   workstreams W4 (packet tag carrier), W5 (netstack ingress labels) and W6 (plaintext egress and
   send receipts). O15 is a release B item outside the approval.
+- Owner decision, 2026-10-27: O15, the barrier's count window, is fixed in nsplane and released as
+  0.20.1 on the Gitea remote only; the release B barrier's workstream implements and releases it.
 - Changes in this revision: the carrier's `None` rule and the clone statement (checked by
   building without `Clone`); the receipt marker made a documented public property with a clone
   rule and cleared at the engine's other entries; `Mixed` dropped and counted in nsplane-nat too

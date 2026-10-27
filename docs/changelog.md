@@ -510,3 +510,10 @@ netstack ingress labels, plaintext egress and send receipts, with the answers to
 in the design note, which is now approved. Tasks for W4, W5 and W6 written; W4 goes first.
 Implementation has not started.
 
+## 2026-10-27 [decision]
+
+O15 of the release C design note (plan `20261026-0822-node-gateway-requests`): the
+`local_barrier` count window is fixed in nsplane and released as 0.20.1 on the Gitea remote
+only, implemented and released by the release B barrier's workstream; it is not part of
+release C.
+
