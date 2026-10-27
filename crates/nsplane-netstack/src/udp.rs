@@ -357,8 +357,9 @@ impl UdpReply {
 /// unless another socket is bound to the exact address. A connected socket receives only
 /// the datagrams from its remote to its local address, ahead of any socket bound to that
 /// address. Dropping the socket unbinds it. After a revoke through its
-/// [`control`](Self::control) every operation fails with
-/// [`io::ErrorKind::ConnectionAborted`].
+/// [`control`](Self::control), data operations fail with
+/// [`io::ErrorKind::ConnectionAborted`], except [`send`](Self::send) on an unconnected
+/// socket, which checks for a remote first and returns [`io::ErrorKind::NotConnected`].
 #[derive(Debug)]
 pub struct UdpSocket {
     /// Declared before `rx`: the address leaves the ownership table before the driver can

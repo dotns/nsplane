@@ -27,7 +27,8 @@ pub const HOST_TUN_DEFAULT_CAPACITY: usize = 4096;
 /// Returns the input the host pushes its packets into, the source the engine reads
 /// them from, and the sink that hands the engine's packets to `write`.
 ///
-/// `write` runs synchronously on the engine task, so it must not block for long; it
+/// `write` runs synchronously when the sink's `send` is called (on the engine's sink
+/// task when used with `Engine`), so it must not block for long; it
 /// returns `false` once the host can no longer take packets.
 /// `NEPacketTunnelFlow.writePackets` does not block.
 ///

@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{
@@ -15,7 +14,7 @@ use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::engine::NewTransport;
+use crate::engine::{NewTransport, SourceTaken};
 use crate::fragment::FragmentStats;
 use crate::transport::{PathMtuReport, Transport};
 
@@ -414,7 +413,7 @@ pub(crate) enum Command {
 pub struct EngineHandle {
     commands: mpsc::Sender<Command>,
     /// Local packets the source task took from the source so far.
-    source_taken: Arc<AtomicU64>,
+    source_taken: Arc<SourceTaken>,
 }
 
 impl fmt::Debug for EngineHandle {
@@ -426,7 +425,10 @@ impl fmt::Debug for EngineHandle {
 }
 
 impl EngineHandle {
-    pub(crate) const fn new(commands: mpsc::Sender<Command>, source_taken: Arc<AtomicU64>) -> Self {
+    pub(crate) const fn new(
+        commands: mpsc::Sender<Command>,
+        source_taken: Arc<SourceTaken>,
+    ) -> Self {
         Self {
             commands,
             source_taken,
@@ -459,8 +461,9 @@ impl EngineHandle {
 
     /// Adds a peer, or updates it in place if its public key is known in its local identity.
     ///
-    /// Peers cannot be added before a private key is set; the core then reports
-    /// `Event::Dropped { reason: "no private key", .. }`.
+    /// A peer needs a private key on its selected local identity; otherwise the core reports
+    /// `Event::Dropped { reason: "no private key", .. }`. A keyed non-default identity
+    /// accepts peers even when the default identity has no key.
     ///
     /// The methods below that name a peer by public key address the peer of the default
     /// local identity. A peer of another identity (`local_identity` set) is removed and given
@@ -600,7 +603,7 @@ impl EngineHandle {
 
     /// Adds a local identity with its own static key, which answers handshakes on every
     /// transport; returns its id, or `None` if an identity of the engine (the default one
-    /// included) already holds the key.
+    /// included) already holds the key or identity ids are exhausted.
     ///
     /// Peers are bound to an identity with [`PeerConfig::local_identity`]; the same remote
     /// key may be a peer of several identities. Ids are never reused.
@@ -938,10 +941,10 @@ impl EngineHandle {
     /// `min(source MTU, min(transport ceiling, mtu - IP header - 8) - 32)`, at least 1280:
     /// with an IPv6 path MTU of 1500, 1420. The engine does not probe for a larger MTU.
     ///
-    /// From the first ceiling or report on, the padding of every peer's data stops at its
-    /// inner MTU, as the kernel pads to the MTU, so a packet at the inner MTU makes an outer
-    /// packet of at most the path MTU (earlier, padding to a multiple of 16 bytes could
-    /// overshoot it by up to 15 bytes).
+    /// Installing a ceiling or lowering a learned path MTU recomputes peers' padding
+    /// limits at their inner MTUs. An ignored first report creates the table but does not
+    /// install padding limits by itself. A packet at its inner MTU fits the path only
+    /// when the outer ceiling can carry the 1280-byte inner floor plus encapsulation headers.
     pub async fn report_path_mtu(&self, path: Path, mtu: u16) -> Result<bool, EngineError> {
         let report = PathMtuReport::new(path, mtu);
         self.call(|tx| Command::ReportPathMtu(report, tx)).await
@@ -1012,23 +1015,25 @@ impl EngineHandle {
     /// call has been routed and passed or been dropped by the outbound filters (or dropped
     /// for no route, by the fragmentation stage or by the tunnel's queue).
     ///
-    /// A packet counts as taken once the engine's source task has it back from
-    /// [`crate::PacketSource::recv_batch`] and counted it, right after the read; this
-    /// includes packets in the engine's local queue and those the source task holds while
-    /// that queue is full. With the fragmentation stage the barrier waits for every fragment
+    /// A packet counts as taken once [`crate::PacketSource::recv_batch`] took it from the
+    /// source, also while that read is still in progress: the engine counts what a read
+    /// takes in the poll that ends it, and the call waits for a read in progress to end
+    /// before it reads the count. This includes packets in the engine's local queue and those
+    /// the source task holds while that queue is full. With the fragmentation stage the barrier waits for every fragment
     /// of a taken packet, and with crypto workers only for routing and the filters, which run
-    /// on the owner task before a packet is handed to a worker. Packets still in the source
-    /// (a kernel TUN queue, the caller's own queue before `recv_batch` returns them) are not
-    /// covered: a caller that changes the ownership of an address fences its source first,
-    /// then takes the barrier. The call returns at once when nothing taken is waiting, and
-    /// while the engine is suspended it completes only after [`EngineHandle::resume`].
+    /// on the owner task before a packet is handed to a worker. Packets the source has not
+    /// handed out (a kernel TUN queue, the caller's own queue) are not covered: a caller that
+    /// changes the ownership of an address stops its source from handing out packets admitted
+    /// before the change, then takes the barrier. The call returns at once when nothing taken
+    /// is waiting, and while the engine is suspended it completes only after
+    /// [`EngineHandle::resume`].
     ///
     /// # Errors
     ///
     /// [`EngineError`] once the engine has stopped before the barrier passed; a stopped
     /// engine never reports a barrier it did not pass.
     pub async fn local_barrier(&self) -> Result<(), EngineError> {
-        let position = self.source_taken.load(Ordering::Acquire);
+        let position = self.source_taken.position().await;
         self.call(|tx| Command::LocalBarrier(position, tx)).await
     }
 

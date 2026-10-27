@@ -507,3 +507,51 @@ in the version commit.
 The owner lifted the 0.11 feature freeze: normal maintenance, with breaking public API changes
 called out in the plan and in the CHANGELOG (ADR `2026-10-27-normal-maintenance`, superseding
 `2026-10-08-feature-freeze-0-11`).
+
+## 2026-10-27 [fix]
+
+Fix the count window of `EngineHandle::local_barrier` for 0.20.1 (owner decision; task
+`20261027-0349-barrier-count-window`, from the gateway-side review of the release C note). The
+source task added a read's packets to the shared count only after `PacketSource::recv_batch`
+returned, so a barrier taken between the source handing out a packet and the `fetch_add` left
+the packet out. Now the source task publishes twice the count plus one while it polls
+`recv_batch`, and the barrier yields while that bit is set before it takes its position. The
+regression test holds the source task inside the read that hands out a packet with a
+controlled source; it fails on 0.20.0 (the barrier passes in 4 ms) and passes with the fix.
+Packets of a future `TrackedSender` can be counted at acceptance in a second counter the
+barrier reads with the source position. Slot A/B against `v0.20.0`, interleaved, quiet host:
+`data_path` (`core_round_trip` and `_batch32`, 64 and 1420 bytes; byte-identical bench
+binaries, the fix is outside `nsplane-core`) -0.6 % .. +0.3 %, load 1.2-1.6; `local_graph`,
+all 34 cases (no engine in this bench) -1.6 % .. +3.2 %, 31 within 1 %, load 1.2-2.9.
+`cargo semver-checks` against `v0.20.0`: no semver update required. A bug fix under normal
+maintenance (ADR `2026-10-27-normal-maintenance`): no freeze exception needed.
+
+## 2026-10-27 [release]
+
+Release 0.20.1 (tag `v0.20.1`, Gitea only, as the owner decided): the `local_barrier` count fix
+alone (task `20261027-0349-barrier-count-window`), rebased onto `main` at `9e955ee` (0.20.0 plus
+docs only, the freeze lifted, so no exception). `main` fast-forwards to the release head.
+Workspace versions, internal requirements and guide tags were synchronized in the version
+commit.
+
+## 2026-10-27 [fix]
+
+Task `20261027-0537-tk-cleanup`: owner-approved DNS passthrough fixture and source documentation cleanup
+from v0.20.1. Reserve both upstream socket protocols before serving; retry only UDP
+allocation conflicts. Reconciled baseline drift entries with current code and corrected
+comments/rustdoc/README text without runtime changes. Existing historical records are
+preserved. The baseline checkout is untouched; delivery targets a Gitea branch only.
+Verification: deterministic old-fixture AddrInUse failure, normal and forced-allocation-conflict
+passthrough runs each 10/10, one complete `just check` (2,405 tests passed, 34 skipped;
+36 doctests passed, 40 ignored), and warning-denied workspace rustdoc all passed. Local
+review found no introduced issue. The four other-document drift entries remain in tk #184
+outside this comment/README scope.
+
+## 2026-10-27 [docs]
+
+The owner expanded task `20261027-0537-tk-cleanup` to the four remaining Markdown
+statements and authorized Gitea main integration without a tag. Corrected architecture
+clock and replay-lock claims, the NAT address-model summary, and appended a dated
+correction to the historical optimization plan's dependency constraint. Original process
+records are preserved. This follow-up changes Markdown only; `just docs` and `just typos`
+passed, and local diff review found no issue.

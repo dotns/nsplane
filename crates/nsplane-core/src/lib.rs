@@ -1,7 +1,9 @@
 //! Sans-I/O WireGuard engine core for the nsplane data plane.
 //!
-//! The [`Core`] performs no I/O and keeps no clock of its own: datagrams and local packets go
-//! in, datagrams to transmit, decrypted packets to deliver and events come out. Path selection
+//! The [`Core`] performs no packet I/O and schedules timers from caller-supplied time.
+//! The Noise dependency still reads clocks for timestamps, cookies and RTT measurements.
+//! Datagrams and local packets go in; datagrams to transmit, decrypted packets to deliver
+//! and events come out. Path selection
 //! and roaming are delegated to a [`PathPolicy`]; local packet rewriting and interception to
 //! [`PacketFilter`]s.
 //!

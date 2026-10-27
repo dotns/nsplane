@@ -1,7 +1,5 @@
-//! Tests of the NAT64-to-LAN translator, adapted from ns
-//! `subnet_route/tests.rs` to in-place translation on `PacketBuf`, plus the
-//! flow lifetime (port reservation, expiry, eviction, removal) and route
-//! replacement.
+//! Tests of in-place NAT64-to-LAN translation on `PacketBuf`, flow lifetime
+//! (port reservation, expiry, eviction, removal) and route replacement.
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
@@ -211,7 +209,7 @@ fn assert_not_ours(packet: &mut PacketBuf, call: impl Fn(&mut PacketBuf) -> Nat6
     assert_eq!(packet.as_packet(), before.as_slice());
 }
 
-// -- Routes (ns `SubnetRoute`). --
+// -- Route selection. --
 
 #[test]
 fn resolves_only_the_configured_virtual_prefix() {
@@ -761,7 +759,7 @@ fn default_candidates_round_robin_over_the_upper_port_range() {
     assert_eq!(ports.candidate(protocol::UDP, SNAT, 32767), 65535);
     assert_eq!(ports.candidate(protocol::UDP, SNAT, 32768), 32768);
     assert!(ports.reserve(protocol::UDP, SocketAddrV4::new(SNAT, 32768)));
-    // Shared by all protocols, as ns `reserved_snat_ports`.
+    // Port reservations are shared by all protocols.
     assert!(!ports.reserve(protocol::TCP, SocketAddrV4::new(SNAT, 32768)));
     assert!(ports.reserve(protocol::TCP, SocketAddrV4::new(HOST, 32768)));
     ports.release(protocol::UDP, SocketAddrV4::new(SNAT, 32768));

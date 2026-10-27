@@ -398,8 +398,8 @@ impl Owner {
     }
 }
 
-/// Whether `command` reads or changes peers, counters or sessions, so that it waits for the
-/// jobs with the crypto workers to act after every packet read before it.
+/// Whether `command` needs settled crypto jobs before it runs. Key/ID and transport-counter
+/// queries are outside this set; the listed commands wait for outstanding jobs.
 pub(super) const fn settles(command: &Command) -> bool {
     matches!(
         command,

@@ -19,9 +19,9 @@ pub const NO_POLICY: &str = "acl no policy";
 pub const POLICY_FAILED: &str = "acl policy failed";
 /// The sending peer has no source assertion in the [`PeerIdentity`](crate::PeerIdentity).
 pub const UNKNOWN_PEER: &str = "acl unknown peer";
-/// The packet is neither TCP nor UDP, other protocols are not allowed and no
-/// [`AclFilterScope::other_protocols`](crate::AclFilterScope::other_protocols)
-/// rule accepts it.
+/// The packet is neither TCP nor UDP and no reply allowance, global acceptance,
+/// [`AclFilterScope::other_protocols`](crate::AclFilterScope::other_protocols) rule,
+/// or applicable typed default, namespace or grant rule accepts it.
 pub const PROTOCOL: &str = "acl protocol";
 /// A non-first IPv4 fragment arrived without a recorded first fragment.
 pub const FRAGMENT: &str = "acl fragment without first";
@@ -34,7 +34,7 @@ pub const CROSS_NAMESPACE: &str = "acl cross namespace";
 /// no open outbound pinhole and no reply allowance.
 ///
 /// While other protocols are not allowed, a packet that is neither TCP nor UDP
-/// is dropped too unless a reply allowance holds it.
+/// is dropped too unless a reply allowance or typed outbound rule accepts it.
 pub const OUTBOUND: &str = "acl outbound denied";
 /// The source address of an outbound packet is outside
 /// [`AclFilterScope::outbound_sources`](crate::AclFilterScope::outbound_sources).

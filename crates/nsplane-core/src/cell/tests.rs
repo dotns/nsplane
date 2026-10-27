@@ -85,7 +85,7 @@ fn readers_on_more_threads_than_shards_see_a_store() {
 }
 
 /// Several cells with values of the same size, so a freed value of one can reuse the address
-/// of another's, replaced in a loop while readers on more threads than shards load them: a
+/// of another's, replaced in a loop while 16 reader threads (equal to the shard count) load them: a
 /// reader only ever gets its own cell's values, and never an older one than it saw before.
 #[test]
 fn cells_replaced_under_load_never_mix_or_go_back() {
@@ -341,8 +341,8 @@ fn reads_on_more_threads_than_shards_see_a_store() {
     }
 }
 
-/// Like `cells_replaced_under_load_never_mix_or_go_back`, with readers on more threads than
-/// shards that read every cell in turn, mixing `read` and `load`.
+/// Like `cells_replaced_under_load_never_mix_or_go_back`, with as many reader threads
+/// as shards, reading every cell in turn and mixing `read` and `load`.
 #[test]
 fn cells_replaced_under_read_never_mix_or_go_back() {
     const CELLS: usize = 4;

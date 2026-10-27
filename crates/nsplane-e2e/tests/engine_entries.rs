@@ -6,6 +6,9 @@
 //! with the fragmentation stage and with crypto workers too, after a suspension only once
 //! resumed, and never once the engine stopped.
 //!
+//! A controlled source holds the source task inside the read that hands out a packet: a
+//! barrier taken then still waits for that packet.
+//!
 //! Plaintext ingress: node `b` takes plaintext packets attributed to its peer `a` and runs
 //! them through the checks and filters of decrypted data; its queue is bounded and refuses
 //! once the engine stopped.
@@ -17,13 +20,15 @@
     reason = "test harness"
 )]
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
-    ChannelTransport, EngineBuilder, EngineError, FragmentConfig, PacketFilter, PeerId,
-    PlaintextIngress, PlaintextRefused, reasons,
+    AllowedIp, ChannelSink, ChannelTransport, EngineBuilder, EngineError, FragmentConfig,
+    PacketFilter, PacketSource, Peer, PeerId, PlaintextIngress, PlaintextRefused, reasons,
 };
 use nsplane_core::Verdict;
 use nsplane_e2e::{
@@ -32,6 +37,7 @@ use nsplane_e2e::{
 };
 use nsplane_packet::checksum::ipv4_header_checksum;
 use nsplane_packet::{Ecn, PacketBuf, Path, TransportId};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{sleep, timeout};
 
 /// An outbound filter that records the IPv4 identification of every packet it passes and
@@ -525,5 +531,137 @@ async fn the_plaintext_ingress_refuses_once_the_engine_stopped() -> TestResult {
         Err(PlaintextRefused::Stopped(_)) => {}
         other => panic!("expected a stopped engine, got {other:?}"),
     }
+    Ok(())
+}
+
+/// Holds the engine's source task inside its read once armed: after the source took a packet
+/// from its queue and before the read returns it.
+#[derive(Debug, Default)]
+struct Hold {
+    armed: AtomicBool,
+    held: Mutex<bool>,
+    released: Condvar,
+    taken: Notify,
+}
+
+impl Hold {
+    /// Lets the source task go on, now and for every later read.
+    fn release(&self) {
+        self.armed.store(false, Ordering::Release);
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
+    }
+
+    /// Called by the source in the poll that took a packet.
+    fn wait_if_armed(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut held = self.held.lock().unwrap();
+        *held = true;
+        self.taken.notify_one();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+    }
+}
+
+/// Releases the hold when dropped, so a failing test never leaves the source task held.
+struct Releases(Arc<Hold>);
+
+impl Drop for Releases {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A packet source that reads one packet at a time from a channel and can be held by
+/// [`Hold`] in the same poll that took the packet.
+struct HeldSource {
+    packets: mpsc::Receiver<PacketBuf>,
+    mtu: watch::Receiver<u16>,
+    hold: Arc<Hold>,
+}
+
+impl PacketSource for HeldSource {
+    async fn recv(&mut self) -> io::Result<PacketBuf> {
+        let packet = self
+            .packets
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        self.hold.wait_if_armed();
+        Ok(packet)
+    }
+
+    fn mtu(&self) -> watch::Receiver<u16> {
+        self.mtu.clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_covers_a_packet_the_source_is_handing_out() -> TestResult {
+    let hold = Arc::new(Hold::default());
+    let _releases = Releases(Arc::clone(&hold));
+    let gate = Arc::new(Gate::default());
+    let (packets, rx) = mpsc::channel(16);
+    let (_mtu, mtu) = watch::channel(1420);
+    let source = HeldSource {
+        packets: rx,
+        mtu,
+        hold: Arc::clone(&hold),
+    };
+    let (sink, _delivered) = ChannelSink::new(16);
+    let ends = (
+        (
+            TransportId::new(1),
+            SocketAddr::from(([192, 0, 2, 1], 1000)),
+        ),
+        (
+            TransportId::new(2),
+            SocketAddr::from(([192, 0, 2, 2], 2000)),
+        ),
+    );
+    let (link, _other) = ChannelTransport::pair(16, ends.0, ends.1);
+    let engine = EngineBuilder::new(source, sink)
+        .private_key(StaticSecret::from([1; 32]))
+        .filter(Box::new(SharedFilter(Arc::clone(&gate))))
+        .transport(link)
+        .build()?;
+    let handle = engine.handle();
+    let remote = Ipv4Addr::new(10, 0, 0, 2);
+    handle
+        .add_or_update_peer(Peer {
+            allowed_ips: vec![AllowedIp {
+                addr: remote.into(),
+                cidr: 32,
+            }],
+            path: Some(Path {
+                transport: ends.0.0,
+                addr: ends.1.1,
+                ecn: Ecn::NotEct,
+            }),
+            ..Peer::new(PublicKey::from(&StaticSecret::from([2; 32])))
+        })
+        .await?;
+
+    // Packet 7 has left the source's queue; the source task is inside the read that
+    // returns it.
+    hold.armed.store(true, Ordering::Release);
+    let mut packet = udp4(Ipv4Addr::new(10, 0, 0, 1), remote, &payload(64));
+    packet[4..6].copy_from_slice(&7u16.to_be_bytes());
+    packets.send(PacketBuf::from_packet(&packet)).await?;
+    timeout(WAIT, hold.taken.notified()).await?;
+
+    let barrier = handle.local_barrier();
+    tokio::pin!(barrier);
+    assert!(
+        pending(&mut barrier).await,
+        "the barrier passed before packet 7 met the filter"
+    );
+    hold.release();
+    timeout(WAIT, barrier).await??;
+    assert_eq!(gate.passed(), [7]);
+    drop(engine);
     Ok(())
 }

@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-10-27
+
+Patch release; no public API change. Wrapper sinks return spent buffers and the ACL filter
+reads the coarse clock, under normal maintenance (ADR `2026-10-27-normal-maintenance`).
+
+### Fixed
+- DNS passthrough test setup reserves TCP and UDP sockets together, retrying only a
+  conflicting UDP bind before serving; independent TCP allocation no longer flakes the tests.
+
 ### Changed
 - `nsplane-acl`: `AclFilter` reply allowances and the default `AclEngine` clock read the coarse
   monotonic clock (`CLOCK_MONOTONIC_COARSE` on Linux and Android, `Instant::now` elsewhere), as
@@ -18,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   append the buffers of the packets they drop themselves (a closure's or translation's drop,
   an aborted batch, an empty swap slot, a misrouted packet). `send`, `send_batch` and
   `try_send_batch` are unchanged.
+- Correct source comments, rustdoc, README and reference documentation claims about clocks,
+  socket and flow lifetimes, worker ownership, replay locks, routing storage, LAN address
+  mappings, protocol limits, offloads and test coverage. Runtime behavior and public API
+  are unchanged.
+
+## [0.20.1] - 2026-10-27
+
+Patch release; no public API change. A bug fix under normal maintenance: the 0.11 feature
+freeze is lifted (ADR `2026-10-27-normal-maintenance`), so it needs no freeze exception.
+
+### Fixed
+- `EngineHandle::local_barrier` covers a packet the source is handing out when the barrier is
+  taken. The engine counted a read's packets only after `PacketSource::recv_batch` returned,
+  so a barrier taken between the source handing out a packet and that count left the packet
+  out and could pass before it was routed and filtered; a consumer could not close the window
+  with a fence of its own. The source task now marks each poll of a read and counts what the
+  read took in the poll that ends it, and the barrier waits for a read in progress before it
+  takes its position. The public API is unchanged.
 
 ## [0.20.0] - 2026-10-27
 

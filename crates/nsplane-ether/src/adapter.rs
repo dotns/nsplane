@@ -24,9 +24,10 @@
 //! The adapter keeps the last [`OWN_ADDRESSES`] learned addresses per family and forgets
 //! them when the guest MAC changes. A proxy answer is never given to an ARP probe (sender
 //! `0.0.0.0`), a gratuitous ARP packet or a duplicate address detection solicitation
-//! (unspecified source), so the guest's duplicate address detection succeeds for any
-//! address, nor for an unspecified, broadcast, multicast, loopback or link-local target,
-//! which the IP side cannot deliver to.
+//! (unspecified source), nor for an unspecified, broadcast, multicast, loopback or
+//! link-local target, which the IP side cannot deliver to. Gateway IPv6 addresses,
+//! including the MAC-derived link-local address, are defended even against duplicate
+//! address detection; the proxy exclusion applies only to other targets.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -50,7 +51,8 @@ pub const OWN_ADDRESSES: usize = 16;
 pub struct EtherConfig {
     /// MAC of the gateway, the source of every frame to the guest.
     pub gateway_mac: MacAddr,
-    /// IPv4 address of the gateway, answered by ARP; `None` answers no ARP request.
+    /// IPv4 address of the gateway, answered by ARP. With `None`, the neighbor proxy
+    /// still answers eligible targets when [`proxy_neighbors`](Self::proxy_neighbors) is set.
     pub gateway_ipv4: Option<Ipv4Addr>,
     /// Global IPv6 address of the gateway, answered by neighbor discovery in addition to the
     /// link-local address derived from [`gateway_mac`](Self::gateway_mac).

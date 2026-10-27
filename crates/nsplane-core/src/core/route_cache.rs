@@ -139,7 +139,7 @@ impl RouteCache {
     }
 
     /// The peer and slot a packet from `src` to `dst` is routed to, with source sets: in the
-    /// trie of the identity whose set matches `src`, otherwise in the fallback trie.
+    /// table of the identity whose set matches `src`, otherwise in the fallback table.
     pub(super) fn route_from(
         &mut self,
         peers: &PeerTable,

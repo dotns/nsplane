@@ -117,21 +117,25 @@ filters (or dropped for no route, by the fragmentation stage or by the tunnel's 
 caller that moves the ownership of an address uses it to know that no local packet admitted
 before the move meets the outbound filters afterwards.
 
-- A packet counts as taken once the source task has it back from `recv_batch` and counted
-  it, right after the read: packets in the engine's local queue and the packets the source
-  task holds while that queue is full are covered. Packets still in the source (a kernel TUN
-  queue, the caller's own queue before `recv_batch` returns them) are not; the caller fences
-  its source first, then takes the barrier.
-- The source task adds the size of each read to a counter shared with the handles; the call
-  reads it (the barrier's position) and the owner replies once it has taken that many local
-  packets through the fragmentation stage and the core. Routing and the outbound filters run
-  on the owner in that call, also with crypto workers, so the barrier never waits for
-  sealing.
+- A packet counts as taken once `recv_batch` took it from the source, also while that read
+  is still in progress: packets in the engine's local queue, the packets the source task
+  holds while that queue is full and a packet the source is handing out at the time of the
+  call are covered. Packets the source has not handed out (a kernel TUN queue, the caller's
+  own queue) are not; the caller stops its source from handing out packets admitted before
+  the change, then takes the barrier.
+- The source task publishes its count in one word shared with the handles: twice the
+  packets taken, plus one while it polls `recv_batch`. It counts what a read took in the
+  poll that ends the read, so the call waits (yielding) while a read is in progress, then
+  takes the count as the barrier's position; the owner replies once it has taken that many
+  local packets through the fragmentation stage and the core. Routing and the outbound
+  filters run on the owner in that call, also with crypto workers, so the barrier never
+  waits for sealing.
 - The barrier passes at once when nothing taken is waiting, or once the source has closed
   and every packet it returned was taken. While the engine is suspended it passes only after
   `resume`. A stopped engine returns `EngineError` and never reports a barrier it did not
   pass.
-- Cost: one atomic add per source read and one counter add per batch of local packets.
+- Cost: two plain atomic stores per poll of the source and one counter add per batch of
+  local packets.
 
 ### Plaintext ingress
 

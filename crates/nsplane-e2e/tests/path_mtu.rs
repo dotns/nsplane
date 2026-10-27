@@ -5,10 +5,11 @@
 //! stage answers with Packet Too Big and fragments IPv4 for that peer, and a second peer on
 //! another path keeps the source MTU; the learned MTU expires and the full MTU comes back.
 //!
-//! Once the engine has a ceiling or a report, the padding of every peer's data stops at its
-//! inner MTU, also where that is the source MTU, so a packet at the inner MTU makes an outer
-//! packet of at most the path MTU, over IPv4 and IPv6 paths. A sending host without DF
-//! (`UdpTransport` today) would fragment a larger one; the router counts such datagrams once
+//! With the ceilings and lowering reports used here, padding stops at each peer's inner
+//! MTU, also where that is the source MTU. These paths can carry the 1280-byte inner floor,
+//! so packets at the inner MTU fit over IPv4 and IPv6. A sending host without DF
+//! (UDP bound without offload) can fragment a larger one; default offload-configured UDP
+//! disables IP fragmentation. The router counts such datagrams once
 //! it has reported the limit and passes them on. Reports for unknown paths, increases and
 //! wrong quotes change nothing. An engine that never uses the feature keeps no state, pads as
 //! before and spawns no report forwarder.

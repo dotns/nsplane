@@ -76,6 +76,8 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261026-0837-scoped-flowgate nsplane-acl: scope-qualified flow gate decisions**](20261026-0837-scoped-flowgate.md) `P1`
 - [x] [**20261026-0836-local-barrier-plaintext-ingress Engine local barrier and validated plaintext ingress**](20261026-0836-local-barrier-plaintext-ingress.md) `P2`
 - [x] [**20261026-0838-first-input-flow-control Netstack flow control from the first input**](20261026-0838-first-input-flow-control.md) `P1`
+- [x] [**20261027-0349-barrier-count-window Local barrier: cover a packet the source is handing out**](20261027-0349-barrier-count-window.md) `P1`
+- [x] [**20261027-0537-tk-cleanup DNS fixture and source documentation cleanup**](20261027-0537-tk-cleanup.md) `P2`
 - [x] [**20261027-0433-sink-spent-forwarding Wrapper sinks forward send_batch_spent**](20261027-0433-sink-spent-forwarding.md) `P2`
 - [x] [**20261027-0433-filter-coarse-clock AclFilter and AclEngine on the coarse clock**](20261027-0433-filter-coarse-clock.md) `P2`
 - [-] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`

@@ -42,7 +42,7 @@ impl Core {
 
     /// Adds a local identity with its own static key that answers handshakes only on
     /// `transports` (none for an empty set); returns its id, or `None` if an identity
-    /// (the default one included) already holds the key.
+    /// (the default one included) already holds the key or identity ids are exhausted.
     ///
     /// Bind peers to it with [`PeerConfig::local_identity`]. A handshake initiation is
     /// dispatched to the identity whose key its mac1 is computed with: an identity is skipped
@@ -193,7 +193,7 @@ impl Core {
 
     /// The path `peer`'s next transport data message would leave on: the one the policy
     /// selects for [`MessageKind::Data`], or the peer's current path. `None` for an unknown
-    /// peer or one without a path.
+    /// peer, or when neither the policy nor the peer supplies a path.
     pub fn data_path(&self, peer: PeerId) -> Option<Path> {
         let current = self.peers.peer(peer)?.path();
         self.policy.select(peer, MessageKind::Data).or(current)
