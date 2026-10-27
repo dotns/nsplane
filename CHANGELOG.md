@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `EngineHandle::local_barrier` covers a packet the source is handing out when the barrier is
+  taken. The engine counted a read's packets only after `PacketSource::recv_batch` returned,
+  so a barrier taken between the source handing out a packet and that count left the packet
+  out and could pass before it was routed and filtered; a consumer could not close the window
+  with a fence of its own. The source task now marks each poll of a read and counts what the
+  read took in the poll that ends it, and the barrier waits for a read in progress before it
+  takes its position. The public API is unchanged.
+
 ## [0.20.0] - 2026-10-27
 
 Feature release under the eleventh exception to the 0.11 feature freeze: netstack control of a

@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -55,9 +55,59 @@ pub(super) async fn forward_path_mtu(
     }
 }
 
+/// How many local packets the source task took from the source, shared with the handles.
+///
+/// The word holds twice the count, plus one while the task is inside a read of the source:
+/// what a read takes is counted when the read returns, in the same poll, so a reader that
+/// finds a read in progress waits until it ended ([`SourceTaken::position`]).
+#[derive(Debug, Default)]
+pub(crate) struct SourceTaken(AtomicU64);
+
+impl SourceTaken {
+    /// The packets taken so far, including every packet a read in progress has taken.
+    pub(crate) async fn position(&self) -> u64 {
+        loop {
+            let word = self.0.load(Ordering::Acquire);
+            if word & 1 == 0 {
+                return word >> 1;
+            }
+            // A read in progress ends within the poll that runs it.
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// The source task's side of [`SourceTaken`], its only writer; ends a read in progress when
+/// dropped.
+struct Reading {
+    shared: Arc<SourceTaken>,
+    /// Twice the packets counted.
+    word: u64,
+}
+
+impl Reading {
+    /// Marks a read in progress.
+    fn enter(&self) {
+        self.shared.0.store(self.word | 1, Ordering::Release);
+    }
+
+    /// Ends the read in progress, counting the `read` packets it took.
+    fn leave(&mut self, read: usize) {
+        self.word += 2 * read as u64;
+        self.shared.0.store(self.word, Ordering::Release);
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.leave(0);
+    }
+}
+
 /// Reads batches of local packets into the owner's queue until the source closes.
 ///
-/// Before each read, hands the transmitted buffers queued in `recycled` to the source
+/// Each poll of a read runs inside [`Reading::enter`] and [`Reading::leave`], so the packets
+/// a read takes are counted before a barrier can read the count. Before each read, hands the transmitted buffers queued in `recycled` to the source
 /// ([`PacketSource::recycle`]) and drops what it leaves. Sets `declined` when the source takes
 /// none of the first buffers, so that later ones go to the core's pool instead.
 pub(super) async fn read_source<Src: PacketSource>(
@@ -65,9 +115,13 @@ pub(super) async fn read_source<Src: PacketSource>(
     local: BatchSender<PacketBuf>,
     mut recycled: BatchQueue<PacketBuf>,
     declined: Arc<AtomicBool>,
-    taken: Arc<AtomicU64>,
+    taken: Arc<SourceTaken>,
     mut suspended: watch::Receiver<bool>,
 ) {
+    let mut reading = Reading {
+        shared: taken,
+        word: 0,
+    };
     let mut batch = PacketBatch::new();
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
     let mut bufs = Vec::new();
@@ -83,10 +137,19 @@ pub(super) async fn read_source<Src: PacketSource>(
             }
             bufs.clear();
         }
-        let result = source.recv_batch(&mut batch).await;
-        if !batch.is_empty() {
-            taken.fetch_add(batch.len() as u64, Ordering::Release);
-        }
+        let result = {
+            let mut read = pin!(source.recv_batch(&mut batch));
+            poll_fn(|cx| {
+                reading.enter();
+                let poll = read.as_mut().poll(cx);
+                if poll.is_pending() {
+                    reading.leave(0);
+                }
+                poll
+            })
+            .await
+        };
+        reading.leave(batch.len());
         packets.extend(batch.drain());
         if local.send(&mut packets).await.is_err() {
             return;

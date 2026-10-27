@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use nsplane_core::x25519::StaticSecret;
@@ -33,6 +33,7 @@ use self::input::{Barriers, PlaintextQueue};
 use self::output::{Inline, InlineSink};
 use self::path_mtu::PathMtus;
 use self::queue::{BatchQueue, BatchSender, batch_queue};
+pub(crate) use self::tasks::SourceTaken;
 use self::tasks::{read_source, watch_mtu, write_sink};
 pub(crate) use self::transport::NewTransport;
 use self::transport::{Datagram, DeliverRoom, Recycle, SendErrors, TransportSlot};
@@ -305,7 +306,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let (mtu_tx, mtu_changes) = mpsc::channel(1);
     let mut mtu_watch = parts.source.mtu();
     let mtu = *mtu_watch.borrow_and_update();
-    let source_taken = Arc::new(AtomicU64::new(0));
+    let source_taken = Arc::new(SourceTaken::default());
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.

@@ -66,6 +66,8 @@ Adding the engine's local barrier and validated plaintext ingress
     own source's hand-off could in principle call the barrier in the instant between the
     return and the count; the consumer's own source-side fence (no stale packet returned
     after the ownership change) plus the barrier bounds the window as the plan states.
+    Fixed in 0.20.1 (task `20261027-0349-barrier-count-window`): the barrier now waits for a
+    read in progress, so the window is gone.
   - `Owner::command` and `spawn` exceeded clippy's line limit: `replace_transport` and
     `InlineSink::new` were extracted unchanged; the new owner state is grouped in
     `Barriers` and `PlaintextQueue` (clippy's bool count).
