@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use common::{Net, ip4, packet_buf, path, udp4};
 use nsplane_core::{CoreConfig, Input, PacketBuf, PacketFilter, PeerId, Verdict};
 
-fn tag(value: u64) -> Option<NonZeroU64> {
+const fn tag(value: u64) -> Option<NonZeroU64> {
     NonZeroU64::new(value)
 }
 

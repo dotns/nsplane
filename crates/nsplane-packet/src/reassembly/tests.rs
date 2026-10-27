@@ -462,7 +462,7 @@ fn non_fragments_pass() {
     assert_eq!(reassembler.pending(), 0);
 }
 
-fn tag(value: u64) -> Option<NonZeroU64> {
+const fn tag(value: u64) -> Option<NonZeroU64> {
     NonZeroU64::new(value)
 }
 

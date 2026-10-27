@@ -10,7 +10,7 @@ use nsplane_packet::{PacketBuf, protocol};
 use super::{EAM4, PEER, SELF_EAM4, check_v6, fragment4, ipv4_simple, translator, udp4};
 use crate::translate::reasons;
 
-fn tag(value: u64) -> Option<NonZeroU64> {
+const fn tag(value: u64) -> Option<NonZeroU64> {
     NonZeroU64::new(value)
 }
 

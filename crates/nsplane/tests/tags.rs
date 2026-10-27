@@ -10,6 +10,7 @@
     reason = "test harness"
 )]
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
@@ -33,7 +34,7 @@ const IP_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 /// A tag and a receipt marker as seen somewhere.
 type Seen = (Option<NonZeroU64>, bool);
 
-fn tag(value: u64) -> Option<NonZeroU64> {
+const fn tag(value: u64) -> Option<NonZeroU64> {
     NonZeroU64::new(value)
 }
 
@@ -243,7 +244,7 @@ fn node<S: PacketSource>(
 async fn pair<S: PacketSource>(
     source: S,
     workers: usize,
-    warm: impl AsyncFn(PacketBuf),
+    warm: impl Fn(PacketBuf),
 ) -> (Node, Node) {
     let (ta, tb) = ChannelTransport::pair(
         64,
@@ -268,7 +269,7 @@ async fn pair<S: PacketSource>(
     // The first packet waits behind the handshake in the tunnel's queue, which keeps bytes
     // only: it goes out untagged.
     let mut b = b;
-    warm(PacketBuf::from_packet(&ipv4(IP_A, IP_B, b"warm"))).await;
+    warm(PacketBuf::from_packet(&ipv4(IP_A, IP_B, b"warm")));
     delivery(&mut b).await;
     for log in [&a.filter.outbound, &b.filter.inbound, &a.sent, &a.offered] {
         log.lock().unwrap().clear();
@@ -299,10 +300,14 @@ async fn logged(log: &Mutex<Vec<Seen>>, len: usize) -> Vec<Seen> {
 /// Sends tagged, marked packets 1 to 3 through `send` and checks what the filter, the
 /// transport and the receiving sink see: the tag up to the transport, no marker anywhere,
 /// and on the receiving side only the inbound filter's tag.
-async fn check_outbound<S: PacketSource>(source: S, workers: usize, send: impl AsyncFn(PacketBuf)) {
+async fn check_outbound<S: PacketSource>(
+    source: S,
+    workers: usize,
+    send: impl Fn(PacketBuf) + Sync,
+) {
     let (a, mut b) = pair(source, workers, &send).await;
     for value in 1..=3 {
-        send(tagged(IP_A, IP_B, value)).await;
+        send(tagged(IP_A, IP_B, value));
         let (_, packet) = delivery(&mut b).await;
         assert_eq!(packet.as_packet()[20..], value.to_be_bytes());
         // Received from the wire untagged; tagged by `b`'s inbound filter; delivered
@@ -328,10 +333,7 @@ async fn check_outbound<S: PacketSource>(source: S, workers: usize, send: impl A
 async fn the_tag_goes_from_a_channel_source_to_the_filter_and_the_transport() {
     for workers in [0, 2] {
         let (source, local, _mtu) = ChannelSource::new(4, 1420);
-        check_outbound(source, workers, async |packet| {
-            local.send(packet).await.unwrap();
-        })
-        .await;
+        check_outbound(source, workers, |packet| local.try_send(packet).unwrap()).await;
     }
 }
 
@@ -339,8 +341,9 @@ async fn the_tag_goes_from_a_channel_source_to_the_filter_and_the_transport() {
 async fn the_tag_goes_from_a_pipe_source_to_the_filter_and_the_transport() {
     for workers in [0, 2] {
         let (sink, source) = pipe(4, 1420);
-        check_outbound(source, workers, async |packet| {
-            sink.send(packet, PeerId::new(1)).await.unwrap();
+        check_outbound(source, workers, |packet| {
+            let mut one = VecDeque::from([(PeerId::new(1), packet)]);
+            sink.try_send_batch(&mut one).unwrap();
         })
         .await;
     }
@@ -349,7 +352,7 @@ async fn the_tag_goes_from_a_pipe_source_to_the_filter_and_the_transport() {
 #[tokio::test]
 async fn inject_calls_keep_the_tag_and_clear_the_marker() {
     let (source, local, _mtu) = ChannelSource::new(4, 1420);
-    let (a, mut b) = pair(source, 0, async |p| local.send(p).await.unwrap()).await;
+    let (a, mut b) = pair(source, 0, |p| local.try_send(p).unwrap()).await;
     a.handle
         .inject_outbound(tagged(IP_A, IP_B, 1))
         .await
@@ -382,7 +385,7 @@ async fn inject_calls_keep_the_tag_and_clear_the_marker() {
 #[tokio::test]
 async fn plaintext_ingress_keeps_the_tag_and_clears_the_marker() {
     let (source, local, _mtu) = ChannelSource::new(4, 1420);
-    let (a, mut b) = pair(source, 0, async |p| local.send(p).await.unwrap()).await;
+    let (a, mut b) = pair(source, 0, |p| local.try_send(p).unwrap()).await;
     let from_a = b.handle.peer_id(a.key).await.unwrap().unwrap();
     let from = peer(a.key, IP_A, 2, addr(1)).path.unwrap();
     b.plaintext
@@ -405,7 +408,7 @@ async fn recycled_buffers_reach_the_source_untagged_and_unmarked() {
             kept: Vec::new(),
             seen: Arc::clone(&seen),
         };
-        let warm = async |p| local.send(p).await.unwrap();
+        let warm = |p| local.try_send(p).unwrap();
         let (_a, mut b) = pair(source, workers, warm).await;
         // The source task hands the buffers back before its next read.
         for value in 1..=8 {

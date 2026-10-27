@@ -310,11 +310,14 @@ mod tests {
         Ok(())
     }
 
+    /// The tag and the receipt marker of each buffer recycled to a [`TaggedSource`].
+    type Recycled = Arc<Mutex<Vec<(Option<std::num::NonZeroU64>, bool)>>>;
+
     /// A source that yields one tagged, marked packet per batch, then ends, and records the
     /// tag and marker of every buffer recycled to it.
     struct TaggedSource {
         left: u64,
-        recycled: Arc<Mutex<Vec<(Option<std::num::NonZeroU64>, bool)>>>,
+        recycled: Recycled,
     }
 
     impl PacketSource for TaggedSource {
@@ -352,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn spent_buffers_reach_recycle_untagged_and_unmarked() -> TestResult {
-        let recycled = Arc::default();
+        let recycled = Recycled::default();
         let source = TaggedSource {
             left: 3,
             recycled: Arc::clone(&recycled),
