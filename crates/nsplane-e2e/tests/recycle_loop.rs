@@ -1,7 +1,7 @@
 //! A producer that allocates its packets with `PipeSink::alloc` or from a
 //! `ChannelSource::pool` gets the buffers back from the engine it feeds, from the consumer
-//! of the packets the engine delivered, or from the TUN sink a `pump` writes them to: after a
-//! warm-up, it allocates nothing new.
+//! of the packets the engine delivered, or from the TUN sink a `pump` writes them to, also
+//! behind the wrapper sinks: after a warm-up, it allocates nothing new.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -156,7 +156,7 @@ async fn consumer_returns_delivered_buffers_to_the_producer_pool() -> TestResult
 mod pump_to_tun {
     use std::os::fd::OwnedFd;
 
-    use nsplane::pump;
+    use nsplane::{AbortSink, MapSink, MapVerdict, Splitter, SwapSink, pump};
     use nsplane_tun::{Tun, TunSink};
     use tokio::net::UnixDatagram;
 
@@ -202,9 +202,9 @@ mod pump_to_tun {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn pipe_producer_reuses_the_written_buffers() -> TestResult {
-        let (tun, host) = device()?;
+    /// A `pump` from a pipe into `tun` returns every buffer written to `host` to the pipe's
+    /// pool: after the warm-up rounds no packet gets a new buffer.
+    async fn pipe_producer_reuses(tun: impl PacketSink, host: UnixDatagram) -> TestResult {
         let (sink, source) = pipe(64, MTU);
         let pumping = tokio::spawn(pump(source, tun, PeerId::new(1)));
 
@@ -227,6 +227,26 @@ mod pump_to_tun {
         drop(sink);
         timeout(WAIT, pumping).await???;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipe_producer_reuses_the_written_buffers() -> TestResult {
+        let (tun, host) = device()?;
+        pipe_producer_reuses(tun, host).await
+    }
+
+    #[tokio::test]
+    async fn pipe_producer_reuses_the_buffers_written_through_wrappers() -> TestResult {
+        let (tun, host) = device()?;
+        let map = MapSink::new(tun, |_: &mut PacketBuf, _| MapVerdict::Keep);
+        let (abortable, _abort) = AbortSink::new(map);
+        pipe_producer_reuses(SwapSink::new(Some(abortable)), host).await
+    }
+
+    #[tokio::test]
+    async fn pipe_producer_reuses_the_buffers_written_through_a_splitter() -> TestResult {
+        let (tun, host) = device()?;
+        pipe_producer_reuses(Splitter::new(|_, _| 0).sink(tun), host).await
     }
 
     #[tokio::test]

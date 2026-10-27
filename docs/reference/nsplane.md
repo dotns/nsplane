@@ -530,8 +530,15 @@ decisions, not packet loops:
   first non-empty offer, it uses plain `send_batch` for the rest of its run (later offers
   that take nothing do not switch it off). A cancel also drops spent buffers not yet
   recycled (buffers, never packets); `PumpStats` are unchanged; a default sink costs one
-  `is_empty` branch per batch. The wrappers (`MapSink`, `SwapSink`, `AbortSink`, `Splitter`)
-  keep the default, so the loop closes only for a bare sink or one that forwards it.
+  `is_empty` branch per batch. The wrappers forward it under the contract of their own
+  `send_batch`, so the loop also closes behind them: `MapSink` appends the buffers of the
+  packets its closure dropped, in order, then the inner sink's (its `after` hook reads its
+  copies); `AbortSink` races the inner `send_batch_spent` and, aborted, appends the buffers
+  of the packets it drops except the one being delivered; `SwapSink` forwards to the
+  current sink and appends the buffers it drops (empty slot, or left by a replaced sink that
+  failed); `Splitter` hands each packet to the chosen sink's `send_batch_spent` as a batch
+  of one (a packet goes to one sink only) and appends the buffers of misrouted packets and
+  of a packet failed because every sink is gone.
 
 ```text
 TUN source ─► pump ─► Splitter ─┬─► pipe ─► MergeSource ─► engine A

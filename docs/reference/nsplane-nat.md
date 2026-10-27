@@ -132,7 +132,9 @@ on the **local side**: the LAN's replies are addressed to `snat_source`, which n
 allowed IPs contain, so the core could not route them to a peer before a filter ran.
 `Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
 `reverse` on local packets before the core routes them (the IPv6 result goes to the peer
-owning the original source). The clients route the mapped /96 to the gateway (it is in their
+owning the original source). `Nat64LanSink::send_batch_spent` appends the buffers of the
+packets `forward` dropped, in order, then forwards to the inner sink's `send_batch_spent`.
+The clients route the mapped /96 to the gateway (it is in their
 allowed IPs for it), and the gateway's local side routes `snat_source` back to itself. The
 wrappers make `nsplane-nat` depend on `nsplane`; `nsplane` does not depend on `nsplane-nat`.
 

@@ -1184,3 +1184,75 @@ fn nested_routes_stay_ambiguous_by_default() {
     );
     assert_eq!(lan.stats().ambiguous_route, 1);
 }
+
+/// Records the packets it takes over and hands their buffers back through
+/// `send_batch_spent`.
+#[derive(Clone, Default)]
+struct SpentSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl PacketSink for SpentSink {
+    fn send(
+        &self,
+        packet: PacketBuf,
+        _from: PeerId,
+    ) -> impl Future<Output = std::io::Result<()>> + Send {
+        self.0.lock().unwrap().push(packet.as_packet().to_vec());
+        std::future::ready(Ok(()))
+    }
+
+    fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> impl Future<Output = std::io::Result<()>> + Send {
+        for (_, packet) in packets.drain(..) {
+            self.0.lock().unwrap().push(packet.as_packet().to_vec());
+            spent.push(packet);
+        }
+        std::future::ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn sink_spent_returns_dropped_and_delivered_buffers_in_order() {
+    let nat = Arc::new(lan());
+    let inner = SpentSink::default();
+    let sink = Nat64LanSink::new(inner.clone(), Arc::clone(&nat));
+    let unsafe_target = ipv6_bytes(
+        protocol::UDP,
+        CLIENT,
+        mapped(Ipv4Addr::LOCALHOST),
+        udp(1, 53, b""),
+    );
+    let not_ours = reply(protocol::UDP, udp(53, 1, b""));
+    let mut packets = VecDeque::from([
+        (PeerId::new(1), PacketBuf::from_packet(&unsafe_target)),
+        (PeerId::new(1), ipv6(protocol::UDP, udp(4321, 53, b"query"))),
+        (PeerId::new(1), PacketBuf::from_packet(&unsafe_target)),
+        (PeerId::new(2), PacketBuf::from_packet(not_ours.as_packet())),
+    ]);
+    let mut spent = Vec::new();
+    sink.send_batch_spent(&mut packets, &mut spent)
+        .await
+        .unwrap();
+    assert!(packets.is_empty());
+    let taken = inner.0.lock().unwrap().clone();
+    assert_eq!(taken.len(), 2);
+    assert_eq!(taken[0][16..20], HOST.octets());
+    assert_eq!(taken[1], not_ours.as_packet());
+    let spent: Vec<_> = spent.iter().map(|p| p.as_packet().to_vec()).collect();
+    assert_eq!(
+        spent,
+        [
+            unsafe_target.clone(),
+            unsafe_target,
+            taken[0].clone(),
+            taken[1].clone()
+        ]
+    );
+    let stats = nat.stats();
+    assert_eq!(
+        (stats.forwarded, stats.unsafe_target, stats.not_ours),
+        (1, 2, 1)
+    );
+}

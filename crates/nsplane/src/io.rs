@@ -141,3 +141,84 @@ pub trait PacketSink: Send + Sync + 'static {
         Err(io::ErrorKind::WouldBlock.into())
     }
 }
+
+/// Sinks for the tests of the wrappers.
+#[cfg(test)]
+pub(crate) mod test_sinks {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use nsplane_packet::{PacketBuf, PeerId};
+    use tokio::sync::Notify;
+
+    use super::PacketSink;
+
+    /// A sink that takes packets over front first, records their bytes and, through
+    /// `send_batch_spent`, appends their buffers to `spent`. A packet whose first byte is
+    /// [`SpentSink::FAIL`] fails with [`io::ErrorKind::Other`] (dropped, not appended); one
+    /// whose first byte is [`SpentSink::HOLD`] waits for [`SpentSink::release`], then fails
+    /// the same way. Clones share the record.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct SpentSink {
+        taken: Arc<Mutex<Vec<Vec<u8>>>>,
+        released: Arc<Notify>,
+    }
+
+    impl SpentSink {
+        pub(crate) const FAIL: u8 = 0xEE;
+        pub(crate) const HOLD: u8 = 0xBB;
+
+        /// The bytes of the packets taken over so far, in order.
+        pub(crate) fn taken(&self) -> Vec<Vec<u8>> {
+            self.taken
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Lets a held packet fail.
+        pub(crate) fn release(&self) {
+            self.released.notify_one();
+        }
+
+        async fn take(&self, packet: &PacketBuf) -> io::Result<()> {
+            match packet.as_packet().first() {
+                Some(&Self::FAIL) => return Err(io::Error::other("refused")),
+                Some(&Self::HOLD) => {
+                    self.released.notified().await;
+                    return Err(io::Error::other("refused"));
+                }
+                _ => {}
+            }
+            self.taken
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(packet.as_packet().to_vec());
+            Ok(())
+        }
+    }
+
+    impl PacketSink for SpentSink {
+        async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
+            self.take(&packet).await
+        }
+
+        async fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> io::Result<()> {
+            while let Some((_, packet)) = packets.pop_front() {
+                self.take(&packet).await?;
+                spent.push(packet);
+            }
+            Ok(())
+        }
+    }
+
+    /// The bytes of each buffer in `bufs`.
+    pub(crate) fn bytes(bufs: &[PacketBuf]) -> Vec<Vec<u8>> {
+        bufs.iter().map(|buf| buf.as_packet().to_vec()).collect()
+    }
+}

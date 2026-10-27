@@ -7,7 +7,8 @@
 //! task drains the second pipe. `pipe_to_writer` has a long-running `pump` move packets a
 //! producer allocates with `PipeSink::alloc` into a sink that consumes them like a device
 //! write and drops the buffers; `pipe_to_writer_spent` has the sink hand them back through
-//! `send_batch_spent`, so `pump` recycles them into the pipe's pool.
+//! `send_batch_spent`, so `pump` recycles them into the pipe's pool;
+//! `pipe_to_wrapped_writer_spent` puts that sink behind `SwapSink<AbortSink<_>>`.
 //!
 //! The wrapper groups send through a wrapper into roomy pipes and read the packets back,
 //! each with its baseline next to it: `splitter` compares a reading route closure
@@ -225,11 +226,21 @@ fn bench_pump(c: &mut Criterion) {
             );
         });
     }
-    for (name, spent) in [("pipe_to_writer", false), ("pipe_to_writer_spent", true)] {
+    for (name, spent, wrapped) in [
+        ("pipe_to_writer", false, false),
+        ("pipe_to_writer_spent", true, false),
+        ("pipe_to_wrapped_writer_spent", true, true),
+    ] {
         for size in SIZES {
             let (input, source) = pipe(PACKETS, 1420);
             let (written, mut counted) = watch::channel(0);
-            runtime.spawn(pump(source, Writer { spent, written }, PeerId::new(1)));
+            let writer = Writer { spent, written };
+            if wrapped {
+                let (abortable, _abort) = AbortSink::new(writer);
+                runtime.spawn(pump(source, SwapSink::new(Some(abortable)), PeerId::new(1)));
+            } else {
+                runtime.spawn(pump(source, writer, PeerId::new(1)));
+            }
             let mut target = 0;
             group.bench_function(format!("{name}_{size}"), |bench| {
                 bench.iter(|| {

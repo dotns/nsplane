@@ -1,5 +1,6 @@
 //! A [`PacketSink`] that routes each packet to one of several sinks.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -12,11 +13,25 @@ use crate::transport::BoxFuture;
 /// The object-safe form of [`PacketSink`], so sinks of different types share one list.
 trait DynSink: Send + Sync + 'static {
     fn send_boxed(&self, packet: PacketBuf, from: PeerId) -> BoxFuture<'_, io::Result<()>>;
+
+    fn send_batch_spent_boxed<'a>(
+        &'a self,
+        packets: &'a mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &'a mut Vec<PacketBuf>,
+    ) -> BoxFuture<'a, io::Result<()>>;
 }
 
 impl<S: PacketSink> DynSink for S {
     fn send_boxed(&self, packet: PacketBuf, from: PeerId) -> BoxFuture<'_, io::Result<()>> {
         Box::pin(PacketSink::send(self, packet, from))
+    }
+
+    fn send_batch_spent_boxed<'a>(
+        &'a self,
+        packets: &'a mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &'a mut Vec<PacketBuf>,
+    ) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(PacketSink::send_batch_spent(self, packets, spent))
     }
 }
 
@@ -66,6 +81,13 @@ type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 ///   every sink is gone (or none was added), `send` returns [`io::ErrorKind::BrokenPipe`]
 ///   for every packet without calling the closure, and counts it in
 ///   [`SplitterStats::failed`].
+///
+/// [`PacketSink::send_batch`] calls `send` for each packet in order.
+/// [`PacketSink::send_batch_spent`] does the same, handing each packet to the chosen sink's
+/// `send_batch_spent` as a batch of one, so that sink's spent buffers reach the caller. Each
+/// packet goes to one sink and is never shared: only that sink may append its buffer, and the
+/// splitter appends the buffers of the packets it drops itself (misrouted, or failed because
+/// every sink is gone).
 ///
 /// [`Splitter::stats`] reads both counters; a delivered packet costs no counter update.
 pub struct Splitter {
@@ -165,16 +187,26 @@ impl Splitter {
             failed: self.failed.load(Ordering::Relaxed),
         }
     }
+
+    /// Counts a packet failed because every sink is gone and returns its error.
+    fn all_closed(&self) -> io::Error {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        io::Error::new(io::ErrorKind::BrokenPipe, "all splitter sinks closed")
+    }
+
+    /// Counts a packet `route` failed with `err`, and the sink as gone on a broken pipe.
+    fn failed(&self, route: &Route, err: &io::Error) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        if err.kind() == io::ErrorKind::BrokenPipe && !route.gone.swap(true, Ordering::AcqRel) {
+            self.open.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl PacketSink for Splitter {
     async fn send(&self, mut packet: PacketBuf, from: PeerId) -> io::Result<()> {
         if self.open.load(Ordering::Acquire) == 0 {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "all splitter sinks closed",
-            ));
+            return Err(self.all_closed());
         }
         let Some(route) = self.routes.get((self.route)(from, &mut packet)) else {
             self.misrouted.fetch_add(1, Ordering::Relaxed);
@@ -182,12 +214,36 @@ impl PacketSink for Splitter {
         };
         let result = route.sink.send_boxed(packet, from).await;
         if let Err(err) = &result {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-            if err.kind() == io::ErrorKind::BrokenPipe && !route.gone.swap(true, Ordering::AcqRel) {
-                self.open.fetch_sub(1, Ordering::AcqRel);
-            }
+            self.failed(route, err);
         }
         result
+    }
+
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        // The batch of one each packet is handed over in.
+        let mut one = VecDeque::with_capacity(1);
+        while let Some((from, mut packet)) = packets.pop_front() {
+            if self.open.load(Ordering::Acquire) == 0 {
+                spent.push(packet);
+                return Err(self.all_closed());
+            }
+            let Some(route) = self.routes.get((self.route)(from, &mut packet)) else {
+                self.misrouted.fetch_add(1, Ordering::Relaxed);
+                spent.push(packet);
+                continue;
+            };
+            one.push_back((from, packet));
+            // On an error the packet was dropped, so `one` is empty either way.
+            if let Err(err) = route.sink.send_batch_spent_boxed(&mut one, spent).await {
+                self.failed(route, &err);
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +264,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::ChannelSink;
+    use crate::io::test_sinks::{SpentSink, bytes};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -456,6 +513,85 @@ mod tests {
         });
         let err = send(&splitter, 0).await.err().ok_or("expected an error")?;
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(splitter.stats().failed, 1);
+        Ok(())
+    }
+
+    /// Packets of `bytes`, each from the peer of its byte.
+    fn batch(bytes: &[u8]) -> VecDeque<(PeerId, PacketBuf)> {
+        bytes
+            .iter()
+            .map(|&byte| {
+                (
+                    PeerId::new(u32::from(byte)),
+                    PacketBuf::from_packet(&[byte]),
+                )
+            })
+            .collect()
+    }
+
+    /// Routes odd first bytes to sink 1, even ones to sink 0.
+    fn by_parity(_from: PeerId, packet: &PacketBuf) -> usize {
+        usize::from(packet.as_packet().first().is_some_and(|byte| byte % 2 == 1))
+    }
+
+    #[tokio::test]
+    async fn spent_returns_delivered_and_misrouted_buffers_in_order() -> TestResult {
+        let (a, b) = (SpentSink::default(), SpentSink::default());
+        let splitter = Splitter::new(by_first_byte).sink(a.clone()).sink(b.clone());
+        let mut packets = batch(&[0, 1, 5, 0]);
+        let mut spent = Vec::new();
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[0], [1], [5], [0]]);
+        assert_eq!(a.taken(), [[0], [0]]);
+        assert_eq!(b.taken(), [[1]]);
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 1,
+                failed: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_stops_at_a_sink_error() -> TestResult {
+        let (a, b) = (SpentSink::default(), SpentSink::default());
+        let splitter = Splitter::new(by_parity).sink(a.clone()).sink(b.clone());
+        let mut packets = batch(&[2, 3, SpentSink::FAIL, 5]);
+        let mut spent = Vec::new();
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(bytes(&spent), [[2], [3]]);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(splitter.stats().failed, 1);
+
+        // The caller delivers the rest with another call.
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert_eq!(bytes(&spent), [[2], [3], [5]]);
+        assert_eq!(b.taken(), [[3], [5]]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_without_open_sinks_is_broken_pipe() -> TestResult {
+        let splitter = Splitter::new(by_first_byte);
+        let mut packets = batch(&[1, 2]);
+        let mut spent = Vec::new();
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(bytes(&spent), [[1]]);
+        assert_eq!(packets.len(), 1);
         assert_eq!(splitter.stats().failed, 1);
         Ok(())
     }
