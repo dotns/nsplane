@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::MAX_DATAGRAM;
 use super::queue::{BatchQueue, BatchSender};
 use super::transport::{Datagram, Recycle, Traffic, Unsent};
+use crate::events::{DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_SEND_ERROR};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::{PathMtuReport, Transport};
 
@@ -256,6 +257,18 @@ async fn unless_stopped<F: Future>(
     .await
 }
 
+/// Reports the tracked datagrams of `unsent` and of `queue`, which closes, as not sent: the
+/// transport closed.
+#[cold]
+fn closed_with(queue: &mut BatchQueue<Datagram>, unsent: &[Datagram], traffic: &Traffic) {
+    queue.close();
+    let mut queued = Vec::new();
+    queue.take_all(&mut queued);
+    for (_, data) in unsent.iter().chain(&queued) {
+        traffic.finish_tracked(data, Some(DROP_TRANSPORT_CLOSED));
+    }
+}
+
 /// Sends queued datagrams in batches of up to [`MAX_BATCH`] until the transport closes;
 /// returns the buffers of each batch for reuse as one message and counts the datagrams it is
 /// done with, and every failed one, in `traffic`. Once `stop` fires, hands back its queue and
@@ -263,7 +276,9 @@ async fn unless_stopped<F: Future>(
 ///
 /// A batch takes what is queued, across the owner's messages, and keeps the slots of its
 /// datagrams in the queue until it is done, so the queue and the batch together hold no
-/// more than the queue's capacity.
+/// more than the queue's capacity. A tracked datagram ends its batch, so the call that sends
+/// it attributes it exactly: its result is reported once the call is done with it, and when
+/// the transport closes, the tracked datagrams it did not get to are reported closed.
 pub(super) async fn transmit<T: Transport>(
     transport: Arc<T>,
     mut queue: BatchQueue<Datagram>,
@@ -279,11 +294,15 @@ pub(super) async fn transmit<T: Transport>(
         };
         batch.push(next?);
         while batch.len() < MAX_BATCH
+            && !batch.last().is_some_and(|(_, data)| data.is_tracked())
             && let Some(next) = queue.try_recv()
         {
             batch.push(next);
         }
         let mut sent = 0;
+        // Whether the call that was done with the last datagram done failed it.
+        let mut last_failed = false;
+        let mut closed = false;
         let outcome = unless_stopped(&mut stop, async {
             // `false` once the engine is gone or the transport is closed.
             if !running(&mut suspended).await {
@@ -294,6 +313,7 @@ pub(super) async fn transmit<T: Transport>(
                 let mut failed = 0;
                 let Err(e) = transport.send_batch(&batch, &mut sent, &mut failed).await else {
                     sent = batch.len();
+                    last_failed = false;
                     return true;
                 };
                 // The failed datagram is dropped, even if the transport did not count it or
@@ -302,8 +322,10 @@ pub(super) async fn transmit<T: Transport>(
                 // it), at least one and never more than the call was done with.
                 sent = sent.max(before + 1).min(batch.len());
                 traffic.failed(failed.clamp(1, sent - before));
+                last_failed = true;
                 if e.kind() == io::ErrorKind::BrokenPipe {
                     tracing::debug!("Transport closed for sending");
+                    closed = true;
                     return false;
                 }
                 tracing::debug!(message = "Transport send error", error = ?e);
@@ -315,7 +337,15 @@ pub(super) async fn transmit<T: Transport>(
         .await;
         let done = sent.min(batch.len());
         traffic.sent(&batch[..done]);
+        if done == batch.len()
+            && let Some((_, last)) = batch.last()
+        {
+            traffic.finish_tracked(last, last_failed.then_some(DROP_TRANSPORT_SEND_ERROR));
+        }
         if outcome == Some(false) {
+            if closed {
+                closed_with(&mut queue, &batch[done..], &traffic);
+            }
             return None;
         }
         let mut bufs: Vec<PacketBuf> = batch.drain(..done).map(|(_, data)| data).collect();

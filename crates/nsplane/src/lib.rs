@@ -40,6 +40,7 @@ mod pipe;
 mod pump;
 mod splitter;
 mod swap;
+mod tracked;
 mod transport;
 mod udp;
 
@@ -49,13 +50,15 @@ pub use channel::{ChannelSink, ChannelSource, ChannelTransport};
 pub use engine::Engine;
 pub use events::{
     DROP_FRAGMENT_NO_ROUTE, DROP_FRAGMENT_OVERSIZE, DROP_FRAGMENT_RATE_LIMITED, DROP_NO_TRANSPORT,
-    DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED,
-    DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR, Event,
+    DROP_PLAINTEXT_EGRESS_CLOSED, DROP_PLAINTEXT_EGRESS_FULL, DROP_SINK_CLOSED, DROP_SINK_FULL,
+    DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_REMOVED, DROP_TRANSPORT_SEND_ERROR,
+    Event,
 };
 pub use fragment::{FragmentConfig, FragmentStats};
 pub use handle::{
     EngineError, EngineHandle, EngineStatus, LocalIdentity, PathMtuStats, Peer, PeerMtus,
-    PlaintextIngress, PlaintextRefused, QueueDepth, QueueStats, TransportError, TransportStats,
+    PlaintextEgress, PlaintextIngress, PlaintextRefused, QueueDepth, QueueStats, TransportError,
+    TransportStats,
 };
 pub use io::{PacketSink, PacketSource};
 pub use link::{LinkConfig, LinkDialer, LinkReceiver, LinkSender, LinkState, LinkTransport};
@@ -74,5 +77,6 @@ pub use pipe::{PipeSink, PipeSource, pipe};
 pub use pump::{PumpStats, pump};
 pub use splitter::{Splitter, SplitterStats};
 pub use swap::SwapSink;
+pub use tracked::{SendOutcome, SendResult, SendResults, TrackedRefused, TrackedSender};
 pub use transport::{BoxFuture, DynTransport, PathMtuReport, Transport};
 pub use udp::{SideDatagram, SideSender, SideStats, UdpTransport};

@@ -9,7 +9,7 @@ local-side graph primitives (pipes, pumps, splitters and sink wrappers). Builds 
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `plaintext_ingress`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `local_barrier`, `subscribe`, `peers` / `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `remove_peer_in`, `set_inbound_destinations_in` / `set_inbound_destination_source_in`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `LocalIdentity`, `PlaintextIngress` (`send`, `try_send`) / `PlaintextRefused`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
+| main | `EngineBuilder` (`transport`, `private_key`, `policy`, `filter`, `fragmenter`, `transport_max_datagram`, `path_mtu_expiry`, `crypto_workers`, `queue_capacity`, `event_capacity`, `stats_interval`, `plaintext_ingress`, `plaintext_egress`, `tracked_sender`, `build`), `Engine` (`handle`, `wait`), `EngineHandle` (peers, keys, allowed IPs, PSK, keepalive, `set_path`, `set_transport_max_datagram`, `report_path_mtu`, `peer_mtu` / `peer_mtus`, `path_mtu_stats`, `add_transport` / `remove_transport` / `replace_transport`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `suspend` / `resume`, `local_barrier`, `set_plaintext_egress`, `subscribe`, `peers` / `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `drop_counters`, `queue_stats`, `fragment_stats`, `transport_stats`, `status`, `shutdown`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `remove_peer_in`, `set_inbound_destinations_in` / `set_inbound_destination_source_in`); traits `PacketSource`, `PacketSink` (`send_batch_spent`), `Transport` (each with batch methods; `Transport::path_mtu_reports`), `DynTransport`; `LinkTransport` with the traits `LinkDialer`, `LinkSender`, `LinkReceiver` | `UdpTransport` (`with_side_channel`, `set_path_mtu_discovery`, `path_mtu_reports_dropped`), `SideSender` (`send_to`, `send_to_async`), `SideDatagram`, `SideStats`, `LinkConfig`, `LinkState`, `ChannelSource` (`pool`) / `ChannelSink` / `ChannelTransport`, `Splitter` (`new_map`, `stats`) / `SplitterStats`, `MergeSource` (`recycle`), `MapSink` (`with_after`) / `MapSource` / `MapVerdict`, `SwapSink` (`replace`, `dropped`), `AbortSink` / `SinkAbort` (`abort`, `is_aborted`), `pipe` / `PipeSink` (`alloc`, `recycle`) / `PipeSource` (`mtu_sender`), `pump` / `PumpStats`, `FragmentConfig` / `FragmentStats`, `EngineStatus`, `PathMtuReport`, `PeerMtus`, `PathMtuStats`, `TransportStats`, `QueueStats` / `QueueDepth`, `Peer`, `LocalIdentity`, `PlaintextIngress` (`send`, `try_send`) / `PlaintextRefused`, `PlaintextEgress` (`recv`, `try_recv`), `TrackedSender` (`send`, `try_send`) / `TrackedRefused`, `SendResults` (`recv`, `try_recv`) / `SendResult` / `SendOutcome`, `Event`, the `DROP_*` reasons, `EngineError`, `TransportError`, `BuildError`, `BoxFuture`; re-exports of the value types and `SharedPacketPool` |
 
 ## Behavior
 
@@ -112,8 +112,9 @@ alone is not a live path.
 ### Local barrier
 
 `EngineHandle::local_barrier` returns once every packet the engine took from its
-`PacketSource` before the call has been routed and passed or been dropped by the outbound
-filters (or dropped for no route, by the fragmentation stage or by the tunnel's queue). A
+`PacketSource`, and every packet its `TrackedSender` accepted, before the call has been
+routed and passed or been dropped by the outbound filters (or dropped for no route, by the
+fragmentation stage or by the tunnel's queue). A
 caller that moves the ownership of an address uses it to know that no local packet admitted
 before the move meets the outbound filters afterwards.
 
@@ -130,6 +131,10 @@ before the move meets the outbound filters afterwards.
   local packets through the fragmentation stage and the core. Routing and the outbound
   filters run on the owner in that call, also with crypto workers, so the barrier never
   waits for sealing.
+- A packet counts as accepted once `TrackedSender::send` or `try_send` returned `Ok`: the
+  sender counts it in queue order, under its lock, and the barrier's position includes that
+  count; the owner counts the tracked packets it took through the core separately, and the
+  barrier passes when both counts reach its position.
 - The barrier passes at once when nothing taken is waiting, or once the source has closed
   and every packet it returned was taken. While the engine is suspended it passes only after
   `resume`. A stopped engine returns `EngineError` and never reports a barrier it did not
@@ -160,6 +165,74 @@ for plaintext IP packets attributed to a peer, checked like decrypted data. Its
   has no such queue; a second call replaces the first entry, whose calls then fail like
   those of a stopped engine.
 
+### Plaintext egress
+
+`EngineBuilder::plaintext_egress(capacity)` returns a `PlaintextEgress`: a bounded receiver
+of the local packets routed to peers marked for plaintext egress.
+`EngineHandle::set_plaintext_egress(peer, true)` marks a peer (`Ok(false)` for an unknown
+one) and `false` unmarks it; the core's rule applies (see
+[nsplane-core, plaintext egress](nsplane-core.md#plaintext-egress)).
+
+- A packet routed to a marked peer after the call leaves after the outbound filters as
+  `(PeerId, PacketBuf)` on the receiver instead of being sealed, with its tag and without
+  its receipt marker. Packets routed before the call, those with the crypto workers and
+  those the peer's tunnel queued behind a handshake stay sealed.
+- `recv` waits for the next packet and returns `None` once the engine stopped and every
+  packet was received; `try_recv` returns at once.
+- The owner hands packets over without waiting: a full queue drops the packet under
+  `DROP_PLAINTEXT_EGRESS_FULL`, a receiver that is gone (or none built) under
+  `DROP_PLAINTEXT_EGRESS_CLOSED`, both counted for the routed peer.
+- The mark follows the `PeerId`: kept on an update in place, absent after the peer is removed
+  and added again (new id). Peer ids are never reused, so a packet of a removed peer is never
+  attributed to a later one. `add_or_update_peer` returns no id: add the peer closed (no
+  allowed IPs), read the id back with `peer_id`, mark it, then open it with
+  `set_allowed_ips`.
+- A marked peer starts no handshake for data and still answers handshakes and starts them
+  for inbound sealed traffic, so it moves between plaintext and sealed egress without a gap.
+
+### Tracked packets
+
+`EngineBuilder::tracked_sender(capacity)` returns a `TrackedSender` and its `SendResults`.
+`TrackedSender::send(packet)` takes a tagged packet (the tag is its token), marks it and
+enters it into the engine's local path next to the packets of the `PacketSource`: the
+fragmentation stage, routing, the outbound filters, sealing and the transport. The engine
+reports exactly one `SendResult { tag, outcome }` per accepted packet:
+
+- `SendOutcome::Sent { peer, bytes }` once the transport call that carried its datagram
+  succeeded: the routed peer and the plaintext length handed to sealing (what `data_tx`
+  counts, without padding or the data message header).
+- `SendOutcome::NotSent { reason }` at every place it can be dropped, with the reason the
+  drop counters use: no route, a filter's drop, `FILTER_HANDLED`, `NO_SESSION` (at once,
+  inline and with crypto workers; the handshake starts as for an untracked packet, and the
+  caller may retry once the session is up), `DROP_FRAGMENT_OVERSIZE` (with a fragmenter, a
+  packet it would split or answer with an ICMP error; the error is still delivered),
+  `DROP_FRAGMENT_NO_ROUTE` / `DROP_FRAGMENT_RATE_LIMITED`, `NO_PATH`, `ENCAPSULATE_ERROR`,
+  `DROP_NO_TRANSPORT`, `DROP_TRANSMIT_FULL`, `DROP_TRANSPORT_CLOSED`,
+  `DROP_TRANSPORT_REMOVED`, `DROP_TRANSPORT_SEND_ERROR`, `PLAINTEXT_EGRESS` (the packet goes
+  to `PlaintextEgress` untracked) and `ENGINE_STOPPED`. Without a fragmenter a tracked packet
+  above the MTU is sealed like any packet and its result follows the transport call.
+- `send` refuses an untagged packet (`TrackedRefused::Untagged`), a tag that is outstanding
+  (`Duplicate`) and every packet once the engine stopped (`Stopped`), each with the packet;
+  a refused packet gets no result. A result is outstanding until `SendResults` received it;
+  at `capacity` outstanding results `send` waits and `try_send` refuses with `Full`, so no
+  result is ever dropped. Dropping `SendResults` discards the results.
+- A tracked datagram ends its transmit batch: the owner task's `try_send_batch` call, the
+  message to the transmit task and the transmit task's `send_batch` call that carry it end
+  with it. A transport promises that on an error at least the last datagram the call was
+  done with failed, so the call attributes the tracked datagram exactly: `Ok` means sent, an
+  error with the call done with it means `DROP_TRANSPORT_SEND_ERROR`, `WouldBlock` before it
+  means not yet. When the transport closes, the tracked datagrams it did not get to are
+  `DROP_TRANSPORT_CLOSED`.
+- When the engine stops (`shutdown`, or the `Engine` dropped), every accepted packet without
+  a result gets `NotSent` with `ENGINE_STOPPED`, before `shutdown` returns; then
+  `SendResults::recv` returns `None`.
+- Only packets `TrackedSender` accepted are tracked: the engine clears the marker on every
+  other entry, and a clone of a tracked packet is untracked. `SendResult` returns no buffer;
+  a caller that retries keeps its own copy.
+- Cost: an untracked packet pays one marker read in the core and in the transmit path; the
+  receipts (a map of outstanding tags under a lock, touched at acceptance, sealing and the
+  result) run only for tracked packets.
+
 ### Packet tags
 
 The engine carries the packet tag and the receipt marker of
@@ -175,8 +248,9 @@ never writes either to the wire:
   written into the packet's buffer carries no tag.
 - Received packets are untagged; an inbound filter may tag one, and the sink gets the tag.
   `inject_inbound` and `PlaintextIngress` keep the tag of the packet they are given.
-- The receipt marker is cleared on every packet the engine takes in (from its source, the
-  inject calls and `PlaintextIngress`) and on every packet it delivers to the sink.
+- The receipt marker is set by `TrackedSender` and cleared on every packet the engine takes in
+  otherwise (from its source, the inject calls and `PlaintextIngress`) and on every packet it
+  hands out (to the sink and to `PlaintextEgress`).
 - The buffers handed back to `PacketSource::recycle`, by the engine and by `pump`, are
   untagged and unmarked, so a source that reuses one (with `set_len` instead of a pool) never
   sees a stale tag. Clearing costs one store per recycled buffer, off the packet path.
@@ -479,7 +553,9 @@ core whatever their size.
   as translated to IPv6, whose fragments are sized to fit the MTU once translated with an
   IPv6 Fragment header (MTU - 28). A UDP datagram without a checksum toward a translated
   destination gets one before it is split, so each fragment translates on its own. Every
-  fragment carries the packet's tag, none its receipt marker; the errors carry neither.
+  fragment carries the packet's tag, none its receipt marker; the errors carry neither. A
+  tracked packet is never split: it is dropped under `DROP_FRAGMENT_OVERSIZE` (counted in
+  `dropped`).
 - The errors look as if the packet's destination had sent them: they are delivered to the
   local side as coming from the peer `Core::route` picks for that destination (no route: no
   error) through `Core::inject_inbound`. They are rate-limited (a burst of 10, then 5 per
@@ -675,6 +751,8 @@ translator grows full-MTU IPv4 in place with offload off too.
 | UDP path MTU discovery | `UdpTransport::set_path_mtu_discovery(true)` before handing the transport to the engine (Linux, Android) | off | none: no socket option, no error-queue read, no report queue |
 | Awaiting side send | `SideSender::send_to_async` instead of `send_to` | not used | none |
 | Plaintext ingress | `EngineBuilder::plaintext_ingress(capacity)` | off | one `Option` check per poll of the received datagrams; no queue |
+| Plaintext egress | `EngineBuilder::plaintext_egress(capacity)` and `EngineHandle::set_plaintext_egress(peer, true)` | off: no receiver, no peer marked | one `bool` of the core per routed local packet; a marked peer's packets are dropped under `DROP_PLAINTEXT_EGRESS_CLOSED` without a receiver |
+| Tracked packets | `EngineBuilder::tracked_sender(capacity)` | off | one `Option` check per poll of the local packets; one marker read per local packet in the core and per datagram in the transmit path |
 | Message-link transport | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task is spawned and no dependency added; the dialer (WebSocket, TLS) is the embedder's |
 
 ## Errors and drop reasons
@@ -683,7 +761,10 @@ The engine counts every dropped packet under a reason (`EngineHandle::drop_count
 publishes it as `Event::Dropped`: the core's and the filters' reasons plus the engine's own,
 among them `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_TRANSMIT_FULL`,
 `DROP_TRANSPORT_CLOSED`, `DROP_TRANSPORT_SEND_ERROR`, `DROP_NO_TRANSPORT`,
-`DROP_FRAGMENT_RATE_LIMITED`, `DROP_FRAGMENT_NO_ROUTE` and `DROP_FRAGMENT_OVERSIZE`.
+`DROP_FRAGMENT_RATE_LIMITED`, `DROP_FRAGMENT_NO_ROUTE`, `DROP_FRAGMENT_OVERSIZE`,
+`DROP_PLAINTEXT_EGRESS_FULL` and `DROP_PLAINTEXT_EGRESS_CLOSED`. A tracked packet's
+`NotSent` result carries the reason of its drop; `FILTER_HANDLED`, `PLAINTEXT_EGRESS` and
+`ENGINE_STOPPED` are results only, not drops.
 Plaintext ingress drops count under the core's reasons (`SOURCE_NOT_ALLOWED`,
 `DESTINATION_NOT_ALLOWED`, `UNKNOWN_PLAINTEXT_PEER`) and the filters'. An I/O side that
 reports `BrokenPipe` stops its task; the engine keeps running without it.
@@ -693,7 +774,9 @@ reports `BrokenPipe` stops its task; the engine keeps running without it.
 - Every queue between the tasks is bounded (`queue_capacity`, default 1024; commands 64;
   `event_capacity`, default 1024); batches are at most `MAX_BATCH` (64).
 - With crypto workers at most `queue_capacity` jobs are in flight.
-- The plaintext ingress queue holds its `capacity` (at least 1) packets.
+- The plaintext ingress queue holds its `capacity` (at least 1) packets, the plaintext egress
+  queue its `capacity` (at least 1).
+- A tracked sender has at most its `capacity` (at least 1) results outstanding.
 - `LinkConfig::queue` (256) datagrams wait for a link.
 - At most 64 path MTU reports wait; further ones are counted and dropped.
 - Fragmentation errors: a burst of 10, then 5 per second.

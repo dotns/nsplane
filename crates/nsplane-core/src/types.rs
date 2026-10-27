@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,7 +318,10 @@ pub enum Input {
 }
 
 /// Output of the core.
+///
+/// Drivers match it with a wildcard arm: variants are added as the core gains outputs.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Output {
     /// Send this datagram on this path (ECN included).
     Transmit {
@@ -335,6 +339,46 @@ pub enum Output {
     },
     /// Something the driver may want to report.
     Event(Event),
+    /// Hand this local packet to the local side's plaintext egress instead of sealing it:
+    /// it was routed to `to`, a peer marked with [`Core::set_plaintext_egress`], and passed
+    /// the outbound filters. The packet keeps its tag; its receipt marker is cleared.
+    ///
+    /// [`Core::set_plaintext_egress`]: crate::Core::set_plaintext_egress
+    Plaintext {
+        /// The peer the packet was routed to.
+        to: PeerId,
+        /// The IP packet.
+        packet: PacketBuf,
+    },
+    /// What became of a tracked local packet: one whose receipt marker is set
+    /// ([`PacketBuf::is_tracked`]) and that carries a tag. Exactly one is emitted for each
+    /// tracked packet the send path takes.
+    Tracked {
+        /// The packet's tag when it entered the core.
+        tag: NonZeroU64,
+        /// The peer it was routed to; `None` without a route.
+        peer: Option<PeerId>,
+        /// Sealed, or not sent and why.
+        outcome: TrackedOutcome,
+    },
+}
+
+/// What the core did with a tracked local packet; see [`Output::Tracked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrackedOutcome {
+    /// Sealed into the datagram of the `Output::Transmit` that comes next, which keeps the
+    /// tag and the receipt marker.
+    Sealed {
+        /// The plaintext bytes handed to sealing, without padding or the data message
+        /// header: what the peer's `data_tx` counts.
+        bytes: usize,
+    },
+    /// Not sent, for this reason (one of [`crate::reasons`]).
+    NotSent {
+        /// Why.
+        reason: &'static str,
+    },
 }
 
 /// An event reported by the core.

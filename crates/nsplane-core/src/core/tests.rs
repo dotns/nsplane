@@ -668,7 +668,7 @@ fn pump(cores: &mut [Core; 2]) -> [Vec<Vec<u8>>; 2] {
                     Output::Deliver { packet, .. } => {
                         delivered[i].push(packet.as_packet().to_vec());
                     }
-                    Output::Event(_) => {}
+                    Output::Event(_) | Output::Plaintext { .. } | Output::Tracked { .. } => {}
                 }
             }
         }
@@ -783,7 +783,7 @@ fn pump_from(cores: &mut [Core; 2], crypto_jobs: bool) -> [Vec<(PeerId, Vec<u8>)
                     Output::Deliver { from, packet } => {
                         delivered[i].push((from, packet.as_packet().to_vec()));
                     }
-                    Output::Event(_) => {}
+                    Output::Event(_) | Output::Plaintext { .. } | Output::Tracked { .. } => {}
                 }
             }
         }
@@ -1061,7 +1061,7 @@ fn drain(core: &mut Core) -> (Vec<PacketBuf>, Vec<Event>) {
         match output {
             Output::Transmit { data, .. } => sent.push(data),
             Output::Event(event) => events.push(event),
-            Output::Deliver { .. } => {}
+            Output::Deliver { .. } | Output::Plaintext { .. } | Output::Tracked { .. } => {}
         }
     }
     (sent, events)
@@ -1293,7 +1293,7 @@ mod plaintext {
                 }
                 Output::Event(Event::Dropped { reason, .. }) => drops.push(reason),
                 Output::Event(event) => events.push(event),
-                Output::Transmit { .. } => {}
+                Output::Transmit { .. } | Output::Plaintext { .. } | Output::Tracked { .. } => {}
             }
         }
         let seen = filter.take();

@@ -159,7 +159,10 @@ fn a_handshake_initiation_written_into_a_packet_carries_neither() {
         });
         net.clear_logs();
         // No session: the packet is queued and an initiation (type 1) goes out in its buffer.
-        send(&mut net, tagged_local(5), crypto_jobs);
+        // Only an untracked packet is queued; a tracked one is not sent (tracked.rs).
+        let mut packet = tagged_local(5);
+        packet.set_tracked(false);
+        send(&mut net, packet, crypto_jobs);
         let sent = net.drain();
         assert_eq!(sent.len(), 1);
         let initiation = &sent[0].data;

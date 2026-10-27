@@ -270,6 +270,10 @@ impl Fragmenter {
             return Action::Reply(peer, fragmentation_needed(bytes, src, dst, ceiling));
         }
 
+        // A tracked packet is never split: its one result could not cover several datagrams.
+        if packet.is_tracked() {
+            return self.drop("tracked IPv4 packet above the ceiling");
+        }
         let header_bytes = &bytes[..header.header_len()];
         let mut payload = payload.to_vec();
         if translated && !fragment && header.protocol() == protocol::UDP {
@@ -988,9 +992,10 @@ mod tests {
         for translated in [false, true] {
             let packet = ipv4(4000, protocol::UDP, 0, &[]);
             let mut f = fragmenter(translated);
-            let action = f.process(tagged(&packet, 9), 1420, Instant::now(), |_, _| {
-                (Some(PEER), 1420)
-            });
+            // Only an untracked packet is split (see the next test).
+            let mut tagged = tagged(&packet, 9);
+            tagged.set_tracked(false);
+            let action = f.process(tagged, 1420, Instant::now(), |_, _| (Some(PEER), 1420));
             let Action::Fragments(fragments) = action else {
                 panic!("not split: {action:?}");
             };
@@ -999,6 +1004,22 @@ mod tests {
                 assert_eq!(fragment.tag(), NonZeroU64::new(9));
                 assert!(!fragment.is_tracked());
             }
+        }
+    }
+
+    #[test]
+    fn a_tracked_packet_is_never_split() {
+        for translated in [false, true] {
+            let packet = ipv4(4000, protocol::UDP, 0, &[]);
+            let mut f = fragmenter(translated);
+            let action = f.process(tagged(&packet, 9), 1420, Instant::now(), |_, _| {
+                (Some(PEER), 1420)
+            });
+            assert!(
+                matches!(action, Action::Drop(FRAGMENT_OVERSIZE)),
+                "{action:?}"
+            );
+            assert_eq!((f.stats().fragmented, f.stats().dropped), (0, 1));
         }
     }
 

@@ -312,6 +312,67 @@ slot's noise: `data_path` `core_round_trip{,_batch32}/{64,1420}` -1.5 .. +1.0 %;
 rounds up to -15 % and +35 %.
 
 
+## Plaintext egress and send receipts
+
+Plaintext egress (`set_plaintext_egress`, `PlaintextEgress`) and tracked packets
+(`TrackedSender`, `SendResults`) against `25debab` (the netstack ingress labels build they
+are based on), 2026-10-27, slot 0, interleaved base / build in one `slot.sh` invocation per
+bench, each invocation started at a 1-minute load below 3 (the shared host rose to 4-14
+during some rounds; the load at the start of each run is in the logs), criterion means per
+round. `data_path`, `local_graph` and `tracked_send` ran on `BENCH_CPUS_A`, `send_stream`,
+`udp_offload` and `worker_pool` on `BENCH_CPUS`.
+
+Untracked traffic, peers without the mark (build against base, per round):
+
+| Bench / case | Base | Build | Change per round |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 429.6 / 424.6 ns | 425.0 / 419.3 ns | -1.1 / -1.3 % |
+| `data_path` `core_round_trip_batch32/64` | 13.24 / 13.04 us | 13.23 / 13.32 us | -0.1 / +2.2 % |
+| `data_path` `core_round_trip/1420` | 1.238 / 1.235 us | 1.248 / 1.228 us | +0.8 / -0.6 % |
+| `data_path` `core_round_trip_batch32/1420` | 40.02 / 39.31 us | 39.54 / 39.58 us | -1.2 / +0.7 % |
+| `data_path` `core_encapsulate/{64,1420}` | 217.6 / 213.3, 628.7 / 624.1 ns | 216.4 / 214.7, 620.1 / 618.9 ns | -0.6 / +0.6, -1.4 / -0.8 % |
+| `local_graph` `pipe/send_recv_{64,1420}` | 63.46 / 63.27 / 62.63, 63.30 / 63.06 / 62.76 us | 63.23 / 63.84 / 63.25, 63.92 / 63.28 / 64.48 us | -0.4 / +0.9 / +1.0, +1.0 / +0.3 / +2.7 % |
+| `local_graph` `pipe/alloc_send_recv_{64,1420}` | 84.79 / 83.01 / 83.11, 83.59 / 84.04 / 83.05 us | 84.59 / 83.15 / 84.44, 83.51 / 83.71 / 83.34 us | -0.2 / +0.2 / +1.6, -0.1 / -0.4 / +0.4 % |
+| `udp_offload` `udp_loopback/batch_64x1420_*`, 4 cases | | | -5.6 % to +6.3 %, both signs in three of the four cases |
+| `send_stream` `netstack_send/streams_1` | 3280 / 3367 / 3326 us | 3330 / 3295 / 3351 us | +1.5 / -2.1 / +0.7 % |
+| `send_stream` `netstack_send/streams_4` | 2067 / 2088 / 2081 us | 2046 / 2046 / 2058 us | -1.0 / -2.0 / -1.1 % |
+| `send_stream` `netstack_udp_send/flows_1` | 571.6 / 563.0 / 576.5 us | 560.8 / 543.9 / 560.8 us | -1.9 / -3.4 / -2.7 % |
+| `send_stream` `netstack_udp_send/flows_4` | 483.1 / 727.4 / 872.4 / 479.9 / 477.2 / 479.5 us | 487.8 / 483.4 / 742.5 / 478.7 / 648.5 / 578.1 us | bimodal on both binaries, below |
+| `worker_pool` `engine_one_way/64B` (256 untracked packets one way through an engine, 0 workers, in-memory link) | 269.4 / 262.1 us | 243.5 / 245.0 us | -9.6 / -6.5 % |
+| `worker_pool` `engine_one_way/1420B` | 497.9 / 481.6 us | 535.0 / 481.9 us | +7.5 / +0.1 % |
+
+`data_path` is the second of two invocations (two rounds, load 1.6-2.8); the first (three
+rounds, the load rising to 7.9) measured -2.0 % to +2.1 % on the same cases, apart from two
+disturbed base runs (`core_round_trip_batch32` -9.0 % and -27 % against them). The
+`send_stream` rows are the rounds whose runs were not disturbed, from two invocations: the
+others ran while the load rose to 6-14, every case of a round 15 % to 75 % off in the same
+direction. `netstack_udp_send/flows_4` is bimodal for both binaries, as in the earlier
+measurements: runs land near 480 us or between 580 and 870 us, the base's included. Not
+attributed; to be measured again on a quiet host. `send_stream`, `local_graph` and
+`udp_offload` do not run the engine or the core (two netstacks, the local-side graph types
+and a bare `UdpTransport`): their changes measure the slot's noise. The engine's own path is
+measured by `engine_one_way` (identical bench code built on both; the two rounds started
+below load 3; two more ran at load 9-11, every case 6 % to 37 % off in either direction):
+both signs, within about 10 % here. The eight-spoke `worker_pool` groups at 0 workers spread
+-43 % to +45 % in both directions over three rounds while the load rose from 2.8 to 7.3, too
+wide to compare on the shared host.
+
+Costs of the new paths, on the build:
+
+| Case | Without | With | Change per round |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip_tracked/64` against `core_round_trip/64` (every packet tracked: the core reports it sealed before its datagram) | 425.0 / 419.3 ns | 432.0 / 426.8 ns | +1.6 / +1.8 % (the first invocation: +1.1 / +1.7 / +0.5 %) |
+| `data_path` `core_round_trip_tracked/1420` against `core_round_trip/1420` | 1.248 / 1.228 us | 1.245 / 1.239 us | -0.2 / +0.9 % (+0.8 / +0.9 / +0.7 %) |
+| `data_path` `core_plaintext_egress/{64,1420}` against `core_encapsulate/{64,1420}` (routing and the filters, then `Output::Plaintext` instead of sealing) | 216.4 / 214.7, 620.1 / 618.9 ns | 29.1 / 29.0, 34.9 / 33.9 ns | the egress path replaces sealing |
+| `worker_pool` `tracked_send/64B`, 256 packets one way through an engine (0 workers, an in-memory link), tracked against untracked | 250.6 / 254.9 / 252.7 us | 257.3 / 255.2 / 293.5 us | +2.7 / +0.1 / +16 % (third tracked run disturbed) |
+| `worker_pool` `tracked_send/1420B` | 479.3 / 505.8 / 481.9 us | 488.9 / 504.6 / 509.3 us | +2.0 / -0.2 / +5.7 % |
+
+A tracked packet pays the receipt table (a map of outstanding tags under a lock, touched when
+it is accepted, sealed and decided), its result, and a transport call of its own: its
+datagram ends the batch that carries it. `tracked_send` is three rounds in one invocation,
+load 2.2-2.7. An untracked packet pays one read of the receipt marker in the core's send path
+and in the transmit path, and one `bool` of the core for the plaintext egress mark.
+
 ## Packet tag carrier against 0.20.0
 
 The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,
