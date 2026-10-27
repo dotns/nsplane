@@ -459,3 +459,19 @@ Owner decision on plan `20261026-0822-node-gateway-requests`: `main` moved to `f
 released upstream, then the large module split), so release A becomes 0.19.4, and the plan,
 release A and the release B workstreams are rebased onto `fb67db9` as new branches and release
 B is integrated again; the branches go to the Gitea remote only.
+
+## 2026-10-27 [release]
+
+Prepare 0.20.0 (not tagged) on `fb67db9`, release B of plan
+`20261026-0822-node-gateway-requests` under the eleventh freeze exception (ADR
+`2026-10-08-feature-freeze-0-11` amended): scope-qualified flow gate decisions (task
+`20261026-0837-scoped-flowgate`), the engine's local barrier and validated plaintext ingress
+(task `20261026-0836-local-barrier-plaintext-ingress`), netstack control from the first input
+with admission on every stack (task `20261026-0838-first-input-flow-control`), and the fixes of
+release A, 0.19.4 (task `20261026-0851-vnet-walk-v6-fixes`). Each branch was rebased onto
+`fb67db9` first, its changes moved into the modules of the split; merged in the order plan, A,
+W2, W3, W1 on `release/0.20.0-v2`, where the conflicts were the changelogs and the task index
+only. Breaking: `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` and
+`PendingProtocol` are `#[non_exhaustive]`. The 0.19.4 section of `CHANGELOG.md` stays as
+prepared, unreleased; 0.20.0 lists its fixes under Fixed.
+

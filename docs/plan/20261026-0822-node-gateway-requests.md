@@ -1,7 +1,7 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
-- **status**: implementing (releases A and B approved; release C designed first, design note
-  for review)
+- **status**: implementing (releases A and B implemented and integrated as 0.20.0, not
+  released; release C designed first, design note for review)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
@@ -645,4 +645,12 @@ plan, release A and the three release B workstreams are rebased onto `fb67db9` a
 branches, each change moved into the module its code now lives in, and release B is integrated
 again from there. Source references in this plan and the design note stay at `52eb983`; the
 split moved functions between files without changing them.
+
+Integration, 2026-10-27: release A (0.19.4, task `20261026-0851-vnet-walk-v6-fixes`) and release
+B (tasks `20261026-0837-scoped-flowgate`, `20261026-0836-local-barrier-plaintext-ingress`,
+`20261026-0838-first-input-flow-control`), rebased onto `fb67db9`, are merged on
+`release/0.20.0-v2` in the order plan, A, W2, W3, W1, versioned 0.20.0 and not tagged. The
+0.19.4 section of the changelog stays as prepared; 0.20.0 contains its fixes. The owner also
+made `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` and
+`PendingProtocol` `#[non_exhaustive]` in release B, the release's one breaking change.
 

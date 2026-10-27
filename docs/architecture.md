@@ -114,6 +114,24 @@ Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter
 - The filter chain is onion-ordered: filters are installed from the wire side to the local
   side, decrypted packets run through them in install order and local packets in reverse. The usual stack is
   `[AclFilter, PortMap, Translator]`, so the ACL sees the tunnel's IPv6 in both directions.
+- Plaintext packets attributed to a peer enter the inbound order after the open step:
+  `Core::receive_plaintext` (in the engine, a bounded `PlaintextIngress`) runs the allowed-IP
+  source check, the inbound destinations, the inbound filters with the caller's arrival path
+  and delivery, the same code as for decrypted data, without authenticating anything.
+  `Core::inject_inbound` keeps bypassing the checks and the filters.
+- The engine counts the packets it takes from its local source; `EngineHandle::local_barrier`
+  completes once every packet taken before the call has been routed and passed or been
+  dropped by the outbound filters, so a change of address ownership can wait until no older
+  local packet is still ahead of routing.
+- A flow gate can decide for a caller's selection of scopes (`FlowGate::evaluate_inbound_in`
+  / `evaluate_outbound_in`): on the same snapshot and state as the unscoped calls, inside the
+  selection the normal decision with its scope, rule and policy generation, outside it an
+  enforced `OutOfScope` denial that reads and writes no state.
+- A netstack admits new connections and flows at their first input on every stack
+  (`NetStackConfig::admission`). Under `Admission::Decide` the lifetime's `FlowControl` and
+  its delivery receipt exist from the held input on: a revoke before the hand-out retires the
+  lifetime at its stage and no handle of it is delivered, and every such lifetime ends
+  delivered or not delivered with one reason.
 - Fragmentation and Packet Too Big are handled once, by an optional stage on the local path
   in front of the core; TUN and netstack share the same MTU limits, and the netstack derives
   its advertised MSS from the engine MTU.

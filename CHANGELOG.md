@@ -5,6 +5,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - unreleased
+
+Feature release under the eleventh exception to the 0.11 feature freeze: netstack control of a
+lifetime from its first input, scope-qualified flow gate decisions, the engine's local barrier
+and a validated plaintext ingress. Breaking: five netstack configuration and statistics types
+are `#[non_exhaustive]` (see Changed). It contains the fixes of 0.19.4.
+
 ### Added
 - `nsplane-acl`: scope-qualified flow gate decisions. `FlowGate::evaluate_inbound_in` and
   `evaluate_outbound_in` decide a packet for a `ScopeSelection` (one scope or a non-empty set;
@@ -55,15 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended before the connection was established.
 
 ### Changed
-- nsplane-netstack: `NetStackConfig` and `NetStackStats` gain a field each (`admission`,
-  `handshake_failed`); struct literals without `..Default::default()` must name them.
-- Breaking: nsplane-netstack `NetStackConfig`, `TransparentConfig`, `FlowEventsConfig`,
+
+#### Breaking
+- nsplane-netstack `NetStackConfig`, `TransparentConfig`, `FlowEventsConfig`,
   `NetStackStats` and the enum `PendingProtocol` are `#[non_exhaustive]`, so later fields
   and variants are not breaking again. Other crates can no longer build the structs with a
   struct expression, also not with `..Default::default()`: start from
   `NetStackConfig::new` or `Default::default()` and assign the fields (for an expected
   `NetStackStats`, assign the expected counters on a default value). A `match` on
   `PendingProtocol` needs a wildcard arm. Reading fields and comparing values is unchanged.
+  `NetStackConfig` gains `admission` and `NetStackStats` gains `handshake_failed` in the same
+  release.
 
   ```rust
   // Before
@@ -87,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       _ => false,
   };
   ```
+
+#### Other
 - nsplane-netstack: under `Admission::Decide`, `incoming_tcp` and `incoming_udp` skip a
   handle whose lifetime ended while it was queued, also when the stack stopped; an accepted
   held datagram opens its flow in the flow table even if a socket bound or connected
@@ -96,6 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-netstack: `TransparentConfig::admission`, replaced by
   `NetStackConfig::admission`. A transparent stack honours it while the top-level field is
   `Admission::Immediate`.
+
+### Fixed
+- The two fixes of 0.19.4 (below): `nsplane-packet` `vnet::segment` segments an IPv4
+  super-packet with 20 option bytes (IHL 10) as IPv4, and the `nsplane-acl` flow gate counts
+  a later fragment's Fragment header toward the limit of 8 IPv6 extension headers, so a later
+  fragment behind 8 other extension headers is denied `Malformed` (behaviour change).
 
 ## [0.19.4] - unreleased
 
