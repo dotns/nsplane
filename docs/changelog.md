@@ -533,3 +533,17 @@ alone (task `20261027-0349-barrier-count-window`), rebased onto `main` at `9e955
 docs only, the freeze lifted, so no exception). `main` fast-forwards to the release head.
 Workspace versions, internal requirements and guide tags were synchronized in the version
 commit.
+
+## 2026-10-27 [implementation]
+
+Release C W4 (task `20261027-0305-packet-tag-carrier`, plan `20261026-0822-node-gateway-requests`)
+on `feat/packet-tag-carrier` from `v0.20.0`, rebased onto `v0.20.1`: `PacketBuf` tag and
+receipt marker, every carrier site of the design note with a test (each copy and clear site
+failing before its change),
+`Reassembler::push_tagged` / `discard_tagged`, the translator's mixed-tag drop as a new reason
+(`TranslatorStats` kept exhaustive: semver-checks additive only). Layout: variant A (64 bytes)
+was outside the noise on `local_graph` (`splitter/*` +6.5 to +8.3 % over four rotated rounds),
+so variant B (`u32` offsets, 56 bytes) ships; against 0.20.0 it is within the noise on
+`data_path`, `udp_offload` and `translate`, faster on `local_graph`, +1.7 % on `vnet`, and
+`send_stream` `streams_1` / `flows_{1,4}` are to be re-measured (disturbed runs); measured
+before the rebase, against `v0.20.0`. Not merged, not released.

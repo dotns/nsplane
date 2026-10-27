@@ -249,6 +249,61 @@ and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's f
 A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
 tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.
 
+## Packet tag carrier against 0.20.0
+
+The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,
+2026-10-27, slot 0, interleaved base / build in one `slot.sh` invocation per bench, each run
+started at a 1-minute load below 3 (the shared host rose to 3-7 during some runs), criterion
+means of the rounds. `data_path`, `local_graph`, `vnet` and `translate` (the eight one-peer
+cases of each direction) ran on `BENCH_CPUS_A`, `send_stream` and `udp_offload` on
+`BENCH_CPUS`. Two layouts were built: A, the tag added to the 56-byte `PacketBuf` (64 bytes),
+and B, `u32` packet offsets (56 bytes); the shipped build is B.
+
+First run, base / A / B in that order per round (`data_path` and `vnet` three rounds, the
+others two):
+
+| Bench / case | 0.20.0 | A (64 B) | B (56 B) |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 424.9 ns | -1.3 % | -1.3 % |
+| `data_path` `core_round_trip_batch32/64` | 13.36 us | -1.1 % | -1.4 % |
+| `data_path` `core_round_trip/1420` | 1.243 us | +0.6 % | -0.5 % |
+| `send_stream` `netstack_send/streams_{1,4}` | 3.221 / 2.053 ms | -2.7 / -2.5 % | +1.7 / +0.4 % |
+| `send_stream` `netstack_udp_send/flows_{1,4}` | 554.6 / 474.5 us | -1.1 / -2.1 % | +1.0 / -0.1 % |
+| `local_graph`, 34 cases | | -1.3 % to +22 % (`splitter/*` +10 to +22 %) | -8.7 % to +8.8 % |
+| `udp_offload`, 4 cases | | -2.1 % to +3.8 % | -8.9 % to +0.5 % |
+| `vnet` `segment_tcpv4_64k` | 3.110 us | +0.5 % | +0.7 % |
+| `translate`, 16 cases | | -7.2 % to +0.7 % | -11.1 % to +3.9 % |
+
+`local_graph` again, its 16 pipe, splitter, map and bare swap cases, four rounds with the order
+rotated: A against 0.20.0 `splitter/*` +6.5 to +8.3 % in every round, `pipe/send_recv_1420`
++3.4 %, `swap_sink/bare_send_*` +2.5 to +4.4 %, the rest -2.5 % to +2.2 %; B -5.5 % to -12.6 %
+in every case. A is outside the noise on the local graph, so B ships.
+
+The shipped build (B, with the bounds at `u32::MAX`) against 0.20.0:
+
+| Bench / case | 0.20.0 | B | Change |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 421.9 ns | 424.2 ns | +0.5 % |
+| `data_path` `core_round_trip_batch32/64` | 13.18 us | 13.23 us | +0.4 % |
+| `data_path` `core_round_trip/1420` | 1.239 us | 1.248 us | +0.8 % |
+| `data_path` `core_round_trip_batch32/1420` | 39.73 us | 39.77 us | +0.1 % |
+| `data_path`, the other 16 cases | | | -4.6 % to +1.7 % |
+| `local_graph`, 34 cases | | | -12.0 % to -1.2 % |
+| `send_stream` `netstack_send/streams_{1,4}` | 3.226 / 2.217 ms | 3.325 / 2.144 ms | +3.1 / -3.3 % |
+| `send_stream` `netstack_send_1cpu/streams_{1,4}` | 3.385 / 4.107 ms | 3.437 / 4.191 ms | +1.5 / +2.1 % |
+| `send_stream` `netstack_udp_send/flows_{1,4}` | 566.4 / 479.3 us | 591.5 / 681.9 us | +4.4 / +42 % (disturbed, below) |
+| `send_stream` `netstack_udp_send_1cpu/flows_{1,4}` | 425.3 / 427.8 us | 429.6 / 428.2 us | +1.0 / +0.1 % |
+| `udp_offload`, 4 cases | | | -2.3 % to +2.1 % |
+| `vnet` `segment_tcpv4_64k` | 3.112 us | 3.170 / 3.167 us | +1.7 % (a third run at 5.2 us disturbed) |
+| `translate`, 16 cases | | | -3.1 % to +4.8 %, both signs per round |
+
+The B runs of `netstack_udp_send/flows_4` had wide intervals ([725, 862] us and [523, 597] us,
+the load rising to 5.2) where the base runs were tight ([476, 488] us, [473, 479] us); the same
+layout before the bounds measured 475.4 / 472.6 us against 473.9 / 475.2 us. That case and
+`streams_1` are to be measured again on a quiet host. `vnet` segments a 64 KiB packet into 45
+buffers through `set_len` and `extend_from_slice`, where the bound adds a compare: +53 ns per
+packet, about 1 ns per segment.
+
 ## 0.20.0 against 0.19.3
 
 The integrated 0.20.0 head (netstack control from the first input, scoped flow gate

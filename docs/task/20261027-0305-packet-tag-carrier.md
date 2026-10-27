@@ -1,8 +1,8 @@
 # 20261027-0305-packet-tag-carrier Packet tag carrier on PacketBuf (release C, W4)
 
-- **status**: pending
+- **status**: completed on `feat/packet-tag-carrier` (not merged, not released)
 - **priority**: P1
-- **owner**: (unassigned)
+- **owner**: w4/packet-tag-carrier
 - **createdAt**: 2026-10-27 03:05
 - **relatedPlan**: 20261026-0822-node-gateway-requests (W4, release C)
 
@@ -82,4 +82,70 @@ Adding the packet tag carrier on PacketBuf
 
 ## Notes
 
-(none)
+Implemented on `feat/packet-tag-carrier` from `v0.20.0` (`d09a0ed`), 2026-10-27, and rebased
+onto `v0.20.1` (`7ff04fd`) once it was released; the one conflict, `read_source`, keeps
+0.20.1's per-poll read accounting and adds the marker clear. The benchmarks below ran on the
+branch before the rebase, against `v0.20.0`.
+
+Deviations from the description, with reasons:
+
+- `TranslatorStats` stays exhaustive: the brief for this workstream required semver-checks
+  against `v0.20.0` to be additive only. The translator's mixed-tag drop is counted through
+  the new drop reason `reasons::FRAGMENT_MIXED_TAGS` (in `dropped_out` and the engine's
+  `drop_counters`) instead of a `fragment_mixed_tags` field. Adding the field, with
+  `#[non_exhaustive]`, stays open for the release C integration if the owner wants it.
+- Layout variant B was taken (`PacketBuf` stays 56 bytes, `u32` offsets): variant A was
+  outside the noise on `local_graph` (below). A packet ends at most `u32::MAX` bytes into its
+  buffer; `set_len`, `extend_from_slice` and `PacketPool::get_len` stop there instead of
+  panicking, `from_shared` and `reserve_front` return `BoundsError` past it.
+- The engine's inject entry clears the marker in `engine/command.rs` and
+  `PacketSource::recycle`'s docs are in `io.rs`; both are outside the listed files.
+- `docs/architecture.md` (contracts: the tag) is left to the integrator, as the task says.
+  No netstack change: the netstack sites of the note belong to W5.
+
+Carrier-site test matrix (every copy and clear site failed before its change; the failing
+output was recorded during the work):
+
+| Site | Rule | Test |
+| --- | --- | --- |
+| new buffers, `PacketPool::{get, get_len, put}` | none | `buf::tests::new_buffers_are_untagged_and_untracked`, `pool_hands_out_untagged_untracked_buffers` |
+| `SharedPacketPool::{alloc, alloc_from, recycle}` | none | `pool::tests::recycled_buffers_come_back_untagged_and_untracked` |
+| `Clone` | tag copied, marker cleared | `buf::tests::clone_copies_the_tag_and_clears_the_marker` |
+| `PacketBatch` push / drain / into_iter / rejected push | move | `buf::tests::batch_preserves_tags_and_markers` |
+| `Reassembler::push_tagged` (same, untagged, mixed incl. `None`, duplicates, expiry), `discard_tagged` | merge | `reassembly::tests::push_tagged_*`, `discard_tagged_drops_the_datagrams_holding_the_tag` |
+| `Core::prepare_send` filter loop (read and set) | move | `nsplane-core` `tests/tags.rs` `local_packets_carry_the_tag_to_the_filter_and_the_datagram` (inline and crypto jobs) |
+| `layout_for_sealing` copy | copy tag and marker (failed before) | `a_packet_without_headroom_keeps_its_tag_and_marker_through_the_copy` |
+| `sealed` for non-data (no-session initiation), `flush_queue` | clear (failed before); untagged | `a_handshake_initiation_written_into_a_packet_carries_neither` (inline and crypto jobs) |
+| `inject_inbound`, `inject_outbound`, `inject_outbound_on`, `receive_plaintext` | move | `inject_calls_and_plaintext_keep_the_tag` |
+| inbound filter tag to `Output::Deliver` | move | `an_inbound_filter_tag_reaches_the_delivery` |
+| `read_source` from `ChannelSource` / `PipeSource` to filter and transport (`send_batch`, `try_send_batch`) | move, marker cleared (failed before) | `nsplane` `tests/tags.rs` `the_tag_goes_from_a_{channel,pipe}_source_to_the_filter_and_the_transport` (0 and 2 workers) |
+| engine inject calls, `PlaintextIngress`, `Output::Deliver` | marker cleared (failed before) | `inject_calls_keep_the_tag_and_clear_the_marker`, `plaintext_ingress_keeps_the_tag_and_clears_the_marker` |
+| `read_source` recycle hand-off | clear (failed before) | `recycled_buffers_reach_the_source_untagged_and_unmarked` (0 and 2 workers) |
+| `pump` recycle hand-off | clear (failed before) | `pump::tests::spent_buffers_reach_recycle_untagged_and_unmarked` |
+| `split_ipv4` | tag to every fragment, no marker (failed before) | `fragment::tests::every_fragment_carries_the_tag_and_none_the_marker` (native and translated) |
+| `Action::Send`, `Action::Reply` | move; new buffer untagged | `sent_packets_keep_the_tag_and_marker_and_replies_carry_neither` |
+| `rfc7915::make_room` | copy tag and marker (failed before) | `translate::tests::tags::a_grown_copy_keeps_the_tag_and_the_marker` |
+| translator reassembly | same tag kept, mixed dropped and counted (failed before) | `a_reassembled_datagram_keeps_the_tag_its_fragments_share`, `fragments_with_different_tags_are_dropped_and_counted` |
+| `nat64_lan::to_ipv6` | copy tag and marker (failed before) | `nat64_lan::tests::reverse_keeps_the_tag_and_the_marker_in_place_and_through_the_copy` |
+
+No runtime path clones a `PacketBuf`: with `Clone` removed, `cargo check --workspace
+--all-features --lib --bins` builds all 14 crates; only tests need it.
+
+Benchmarks (slot 0, interleaved against `v0.20.0`, each run started at load < 3; tables in
+`docs/performance.md`, "Packet tag carrier against 0.20.0"):
+
+- Variant A (64 bytes) against 0.20.0: `data_path` -1.3 % (`core_round_trip/64`), -1.1 %
+  (`batch32/64`); `send_stream` -1 % to -3 %; `vnet` +0.5 %; `translate` -7 % to +1 %; but
+  `local_graph` `splitter/*` +6.5 to +8.3 % in all four rotated rounds (+10 to +22 % in the
+  first two), `pipe/send_recv_1420` +3.4 %, `swap_sink/bare_send_*` +2.5 to +4.4 %: outside
+  the noise. Prototype B (56 bytes): `local_graph` -5 % to -13 %, the rest within the noise.
+  Decision per O11: variant B.
+- Shipped build (B) against 0.20.0: `data_path` -4.6 % to +1.7 % (`core_round_trip/64`
+  +0.5 %, `batch32/64` +0.4 %); `local_graph` -12 % to -1 %; `udp_offload` -2.3 % to +2.1 %;
+  `translate` -3.1 % to +4.8 % (both signs per round); `vnet` +1.7 % (+53 ns per 64 KiB
+  packet: the bound in `set_len` / `extend_from_slice`, 45 segments); `send_stream` +1.0 % to
+  +2.1 % on the 1-CPU cases, `streams_4` -3.3 %, `streams_1` +3.1 %, `flows_1` +4.4 % and
+  `flows_4` +42 % from disturbed runs (B intervals [725, 862] / [523, 597] us at load up to
+  5.2; base tight at 476-488 us; prototype B equal to base here). Open: re-measure
+  `send_stream` `streams_1`, `flows_1` and `flows_4` on a quiet host before the release.
+- The labeled-path bar (noise plus 3 %) belongs to W5; W4 adds no labeled path.
