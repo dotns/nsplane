@@ -76,3 +76,6 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261026-0837-scoped-flowgate nsplane-acl: scope-qualified flow gate decisions**](20261026-0837-scoped-flowgate.md) `P1`
 - [x] [**20261026-0836-local-barrier-plaintext-ingress Engine local barrier and validated plaintext ingress**](20261026-0836-local-barrier-plaintext-ingress.md) `P2`
 - [x] [**20261026-0838-first-input-flow-control Netstack flow control from the first input**](20261026-0838-first-input-flow-control.md) `P1`
+- [ ] [**20261027-0305-packet-tag-carrier Packet tag carrier on PacketBuf (release C, W4)**](20261027-0305-packet-tag-carrier.md) `P1`
+- [ ] [**20261027-0305-netstack-ingress-labels Netstack ingress labels and label revocation (release C, W5)**](20261027-0305-netstack-ingress-labels.md) `P1`
+- [ ] [**20261027-0305-plaintext-egress-send-receipts Plaintext egress and per-packet send receipts (release C, W6)**](20261027-0305-plaintext-egress-send-receipts.md) `P1`

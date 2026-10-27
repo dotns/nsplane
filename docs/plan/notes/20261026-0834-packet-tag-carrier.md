@@ -1,6 +1,6 @@
 # Release C: one carrier, the packet tag
 
-Design note, no code. Status: for owner review. Plan:
+Design note, no code. Status: approved (owner, 2026-10-27; twelfth freeze exception). Plan:
 [20261026-0822-node-gateway-requests](../20261026-0822-node-gateway-requests.md) (W4-W6,
 release C, open questions O8-O12); task:
 [20261026-0819-node-gateway-requests](../../task/20261026-0819-node-gateway-requests.md) (R2,
@@ -592,9 +592,9 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
 
 ## Open items for review
 
-- Owner: O15 (the barrier's count window: fix in 0.20.x or document only), the labeled-path
-  allowance (proposed 3 %), the twelfth freeze exception and the go-ahead for implementing
-  release C. The gateway's view on scope: R5 part 2 has no production user yet and is the item
+- Owner: O15 (the barrier's count window: fix in 0.20.x or document only, a release B item)
+  and the labeled-path allowance (proposed 3 %). Release C is approved (2026-10-27, twelfth
+  freeze exception). The gateway's view on scope: R5 part 2 has no production user yet and is the item
   that could move to a later release with the least loss if release C must shrink. Decided:
   O11 (with the variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10 and O13 on
   2026-10-27.
@@ -642,6 +642,10 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   the gateway review; R4 proposal A stays in release C; `recv_labeled` stays out. The barrier's
   count window is open (O15); the twelfth freeze exception and the go-ahead for implementing
   release C are not decided. Release B shipped as 0.20.0.
+- Owner approval, 2026-10-27: release C is approved for implementation as the twelfth freeze
+  exception, with the answers to O8-O14 as recorded here; this note is the specification for the
+  workstreams W4 (packet tag carrier), W5 (netstack ingress labels) and W6 (plaintext egress and
+  send receipts). O15 is a release B item outside the approval.
 - Changes in this revision: the carrier's `None` rule and the clone statement (checked by
   building without `Clone`); the receipt marker made a documented public property with a clone
   rule and cleared at the engine's other entries; `Mixed` dropped and counted in nsplane-nat too

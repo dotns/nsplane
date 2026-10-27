@@ -77,3 +77,10 @@ slot A/B when it touches the data path.
   one breaking change). It ships as 0.20.0, together with the fixes of 0.19.4. Release C of the
   same plan (ingress labels, plaintext egress, send receipts) is in design and needs its own
   exception.
+- 2026-10-27: twelfth exception (owner decision on plan
+  `20261026-0822-node-gateway-requests`, release C): one opaque packet tag on `PacketBuf` as the
+  carrier (with a documented receipt marker), netstack ingress labels with label revocation,
+  plaintext egress per peer and per-packet send receipts, with the answers to O8-O14 recorded in
+  the design note `docs/plan/notes/20261026-0834-packet-tag-carrier.md`. It is breaking
+  (`Output` and `TranslatorStats` become `#[non_exhaustive]`, `PacketBuf` grows by one word) and
+  ships as 0.21.0.

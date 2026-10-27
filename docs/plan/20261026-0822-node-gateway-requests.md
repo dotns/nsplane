@@ -1,7 +1,7 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
 - **status**: implementing (releases A and B released as 0.20.0 on 2026-10-27; release C
-  designed first, design note for review)
+  approved for implementation on 2026-10-27 as the twelfth freeze exception, not started)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests
@@ -664,4 +664,14 @@ made `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` 
 
 Release, 2026-10-27: 0.20.0 (tag `v0.20.0`) ships release B and release A's fixes; 0.19.4 is not
 released separately.
+
+Owner decision, 2026-10-27: release C (0.21.0: W4 packet tag carrier, W5 netstack ingress
+labels, W6 plaintext egress and send receipts) is approved for implementation as the twelfth
+freeze exception, with the answers to O8-O14 as recorded in the design note (O11 the tag on
+`PacketBuf`, variant A first; O12 labels; O13 the documented receipt marker; O14 a bounded
+tombstone table, default 65,536; O8, O9, O10 as refined by the gateway review). The design note
+is approved and is the specification. Tasks: `20261027-0305-packet-tag-carrier` (W4, first),
+`20261027-0305-netstack-ingress-labels` (W5) and `20261027-0305-plaintext-egress-send-receipts`
+(W6), the last two after W4. O15, the barrier's count window, is a release B item outside this
+approval. Implementation has not started.
 

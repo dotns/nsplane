@@ -502,3 +502,11 @@ is not released separately and its changelog section is folded into 0.20.0. `mai
 to the release head. Workspace versions, internal requirements and guide tags were synchronized
 in the version commit.
 
+## 2026-10-27 [decision]
+
+Release C of plan `20261026-0822-node-gateway-requests` approved for implementation as the
+twelfth freeze exception (ADR `2026-10-08-feature-freeze-0-11` amended): the packet tag carrier,
+netstack ingress labels, plaintext egress and send receipts, with the answers to O8-O14 recorded
+in the design note, which is now approved. Tasks for W4, W5 and W6 written; W4 goes first.
+Implementation has not started.
+
