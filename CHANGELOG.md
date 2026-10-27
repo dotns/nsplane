@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accurate to one scheduler tick (1-4 ms) instead of nanoseconds. Reply allowances now follow
   the engine clock, so a clock given to `AclEngine::with_clock` also drives their expiry. No
   API change.
+- `MapSink`, `AbortSink`, `SwapSink`, `Splitter` and `nsplane-nat`'s `Nat64LanSink` forward
+  `PacketSink::send_batch_spent` under the contract of their own `send_batch`, so a `pump`
+  into a `TunSink` behind them recycles the written buffers into its source. They also
+  append the buffers of the packets they drop themselves (a closure's or translation's drop,
+  an aborted batch, an empty swap slot, a misrouted packet). `send`, `send_batch` and
+  `try_send_batch` are unchanged.
 
 ## [0.20.0] - 2026-10-27
 

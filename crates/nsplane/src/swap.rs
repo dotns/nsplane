@@ -62,6 +62,11 @@ struct SwapState<S> {
 ///   [`SwapSink::dropped`] and returns `Ok`, so the engine does not take the local side
 ///   for gone. An error from the current sink is returned unchanged.
 ///
+/// [`PacketSink::send_batch_spent`] behaves like `send_batch` over the sink's
+/// `send_batch_spent`, so that sink's spent buffers reach the caller; the packets it drops
+/// (the slot is empty, or they were left by a replaced sink that failed) have their
+/// buffers appended to `spent`.
+///
 /// [`PacketSink::try_send_batch`] goes to the current sink, which returns
 /// [`io::ErrorKind::WouldBlock`] when it would wait; while the slot is empty it drops and
 /// counts every packet and returns `Ok`.
@@ -130,6 +135,19 @@ impl<S: PacketSink> SwapSink<S> {
             .fetch_add(packets.len() as u64 + failed, Ordering::Relaxed);
         packets.clear();
     }
+
+    /// Like [`SwapSink::drop_all`], appending the buffers to `spent`.
+    fn drop_all_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+        failed: u64,
+    ) {
+        self.state
+            .dropped
+            .fetch_add(packets.len() as u64 + failed, Ordering::Relaxed);
+        spent.extend(packets.drain(..).map(|(_, packet)| packet));
+    }
 }
 
 impl<S> Clone for SwapSink<S> {
@@ -169,6 +187,24 @@ impl<S: PacketSink> PacketSink for SwapSink<S> {
         }
     }
 
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        let Some(sink) = self.current() else {
+            self.drop_all_spent(packets, spent, 0);
+            return Ok(());
+        };
+        match sink.send_batch_spent(packets, spent).await {
+            Err(_) if !self.is_current(&sink) => {
+                self.drop_all_spent(packets, spent, 1);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
         let Some(sink) = self.current() else {
             self.drop_all(packets, 0);
@@ -202,6 +238,7 @@ mod tests {
 
     use super::*;
     use crate::ChannelSink;
+    use crate::io::test_sinks::{SpentSink, bytes};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -363,6 +400,64 @@ mod tests {
         assert!(engine_side.replace(None).is_some());
         swap.send(packet(3), PeerId::new(3)).await?;
         assert_eq!(engine_side.dropped(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_empty_slot_returns_the_dropped_buffers() -> TestResult {
+        let swap = SwapSink::<SpentSink>::new(None);
+        let mut packets = batch(&[1, 2]);
+        let mut spent = Vec::new();
+        swap.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[1], [2]]);
+        assert_eq!(swap.dropped(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_forwards_to_the_current_sink() -> TestResult {
+        let inner = SpentSink::default();
+        let swap = SwapSink::new(Some(inner.clone()));
+        let mut packets = batch(&[1, 2]);
+        let mut spent = Vec::new();
+        swap.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[1], [2]]);
+        assert_eq!(inner.taken(), [[1], [2]]);
+
+        // An error from the current sink comes back unchanged, the rest left.
+        let mut packets = batch(&[SpentSink::FAIL, 4]);
+        let mut spent = Vec::new();
+        let err = swap
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(spent.is_empty());
+        assert_eq!(packets.len(), 1);
+        assert_eq!(swap.dropped(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_error_from_replaced_sink_returns_the_dropped_buffers() -> TestResult {
+        let old = SpentSink::default();
+        let swap = SwapSink::new(Some(old.clone()));
+        let mut packets = batch(&[1, SpentSink::HOLD, 3, 4]);
+        let mut spent = Vec::new();
+        {
+            let mut pending = Box::pin(swap.send_batch_spent(&mut packets, &mut spent));
+            assert!(timeout(PENDING, &mut pending).await.is_err());
+            assert!(swap.replace(Some(SpentSink::default())).is_some());
+            old.release();
+            timeout(WAIT, pending).await??;
+        }
+        assert!(packets.is_empty());
+        // 1 was written; the held packet failed; 3 and 4 were left.
+        assert_eq!(bytes(&spent), [vec![1], vec![3], vec![4]]);
+        assert_eq!(swap.dropped(), 3);
         Ok(())
     }
 }
