@@ -15,6 +15,150 @@ fn labeled(revocations: &Arc<Revocations>, label: u64) -> Arc<FlowState> {
 }
 
 #[test]
+fn clean_registry_skips_the_maintenance_lock() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let _live: Vec<_> = (0..1024).map(|_| labeled(&revocations, 1)).collect();
+    let queue = revocations.lock();
+    let (sent, received) = std::sync::mpsc::channel();
+    let registry = Arc::clone(&revocations);
+    let worker = std::thread::spawn(move || {
+        registry.sweep_labeled();
+        sent.send(()).unwrap();
+    });
+    let result = received.recv_timeout(std::time::Duration::from_secs(2));
+    drop(queue);
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "clean maintenance must not acquire the registry lock"
+    );
+}
+
+#[test]
+fn only_the_last_labeled_reference_marks_a_release() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let live = labeled(&revocations, 1);
+    drop(Arc::clone(&live));
+    drop(FlowState::new(
+        Target::Label(NonZeroU64::new(2).unwrap()),
+        &revocations,
+    ));
+    assert_eq!(revocations.label_generation.load(Ordering::Acquire), 0);
+    // Release notifications must also work under the registry lock.
+    let queue = revocations.lock();
+    drop(live);
+    assert_eq!(revocations.label_generation.load(Ordering::Acquire), 1);
+    drop(queue);
+    revocations.sweep_labeled();
+    assert_eq!(revocations.lock().labeled.capacity(), 0);
+    assert_eq!(
+        revocations.clean_label_generation.load(Ordering::Acquire),
+        1
+    );
+}
+
+#[test]
+fn a_release_during_a_pass_is_not_acknowledged_by_that_pass() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let mut live: Vec<_> = (0..512).map(|_| labeled(&revocations, 1)).collect();
+    drop(labeled(&revocations, 2));
+    revocations.sweep_labeled();
+    assert_eq!(
+        revocations.lock().labeled_end,
+        513 - IDLE_LABEL_SWEEP_BUDGET
+    );
+    let visited = live.pop().unwrap();
+    let released = Arc::downgrade(&visited);
+    let queue = revocations.lock();
+    // A release on another thread cannot take this lock or be lost on completion.
+    std::thread::spawn(move || drop(visited)).join().unwrap();
+    drop(queue);
+    for _ in 0..2 {
+        revocations.sweep_labeled();
+    }
+    assert_ne!(
+        revocations.label_generation.load(Ordering::Acquire),
+        revocations.clean_label_generation.load(Ordering::Acquire)
+    );
+    assert!(
+        revocations
+            .lock()
+            .labeled
+            .iter()
+            .any(|entry| Weak::ptr_eq(entry, &released))
+    );
+    for _ in 0..3 {
+        revocations.sweep_labeled();
+    }
+    assert_eq!(revocations.lock().labeled.len(), live.len());
+    assert_eq!(
+        revocations.label_generation.load(Ordering::Acquire),
+        revocations.clean_label_generation.load(Ordering::Acquire)
+    );
+}
+
+#[test]
+fn appended_registrations_do_not_hide_unvisited_expired_entries() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let live: Vec<_> = (0..512).map(|_| labeled(&revocations, 1)).collect();
+    let expired: Vec<_> = (0..512).map(|_| labeled(&revocations, 2)).collect();
+    drop(expired);
+    let appended: Vec<_> = (0..256).map(|_| labeled(&revocations, 3)).collect();
+    let queue = revocations.lock();
+    assert_eq!(queue.labeled.len(), live.len() + appended.len());
+    assert!(queue.labeled.iter().all(|entry| entry.strong_count() != 0));
+    assert_eq!(
+        revocations.label_generation.load(Ordering::Acquire),
+        revocations.clean_label_generation.load(Ordering::Acquire)
+    );
+    drop(queue);
+    assert_eq!(
+        revocations.labeled(NonZeroU64::new(1).unwrap()).len(),
+        live.len()
+    );
+    assert_eq!(
+        revocations.labeled(NonZeroU64::new(3).unwrap()).len(),
+        appended.len()
+    );
+}
+
+#[test]
+fn short_lived_registrations_reuse_expired_tail_during_a_long_pass() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let live: Vec<_> = (0..4096).map(|_| labeled(&revocations, 1)).collect();
+    for _ in 0..32 {
+        drop(labeled(&revocations, 2));
+    }
+    assert!(revocations.lock().labeled.len() <= live.len() + 1);
+    assert!(
+        revocations
+            .labeled(NonZeroU64::new(1).unwrap())
+            .iter()
+            .any(|entry| Arc::ptr_eq(entry, &live[0]))
+    );
+}
+
+#[test]
+fn full_lookup_resets_partial_coverage_and_releases_empty_storage() {
+    let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
+    let live: Vec<_> = (0..512).map(|_| labeled(&revocations, 1)).collect();
+    drop(labeled(&revocations, 2));
+    revocations.sweep_labeled();
+    assert_eq!(
+        revocations.labeled(NonZeroU64::new(1).unwrap()).len(),
+        live.len()
+    );
+    drop(live);
+    for _ in 0..2 {
+        revocations.sweep_labeled();
+    }
+    assert_eq!(revocations.lock().labeled.capacity(), 0);
+    drop(labeled(&revocations, 3));
+    assert!(revocations.labeled(NonZeroU64::new(3).unwrap()).is_empty());
+    assert_eq!(revocations.lock().labeled.capacity(), 0);
+}
+
+#[test]
 fn registration_bounds_cleanup_and_eventually_reclaims_expired_entries() {
     let revocations = Arc::new(Revocations::new(Arc::new(Notify::new())));
     let live: Vec<_> = (0..1024).map(|_| labeled(&revocations, 1)).collect();

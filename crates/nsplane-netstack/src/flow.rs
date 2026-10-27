@@ -450,6 +450,17 @@ impl FlowState {
     }
 }
 
+impl Drop for FlowState {
+    fn drop(&mut self) {
+        if self.ingress_label.is_some() {
+            // Destruction can run while the registry is locked.
+            self.revocations
+                .label_generation
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 impl fmt::Debug for FlowState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlowState")
@@ -468,6 +479,8 @@ pub(crate) struct Revocations {
     queue: Mutex<Queue>,
     /// Set while `queue.pending` may hold flows: the driver's only cost per turn.
     hint: AtomicBool,
+    label_generation: AtomicU64,
+    clean_label_generation: AtomicU64,
     driver: Arc<Notify>,
 }
 
@@ -478,8 +491,10 @@ struct Queue {
     pending: Vec<Arc<FlowState>>,
     /// Weak references keep delivered handles revocable after socket release.
     labeled: Vec<Weak<FlowState>>,
-    /// Next entry inspected by incremental cleanup; may equal the vector's length.
-    labeled_cursor: usize,
+    /// The unvisited prefix of this pass; visited and appended entries stay after it.
+    labeled_end: usize,
+    /// Only releases observed before this pass can be acknowledged on completion.
+    labeled_generation: u64,
 }
 
 impl Queue {
@@ -487,22 +502,44 @@ impl Queue {
         if self.closed {
             return;
         }
-        self.sweep_labeled(LABEL_SWEEP_BUDGET);
+        // Reserve one inspection for short-lived entries appended during the pass.
+        if self.sweep_labeled(&flow.revocations, LABEL_SWEEP_BUDGET - 1)
+            && let Some(tail) = self.labeled.last_mut()
+            && tail.strong_count() == 0
+        {
+            // An unvisited slot can be reused too: its old entry was just inspected.
+            *tail = Arc::downgrade(flow);
+            return;
+        }
         self.labeled.push(Arc::downgrade(flow));
     }
 
-    fn sweep_labeled(&mut self, budget: usize) {
-        for _ in 0..self.labeled.len().min(budget) {
-            if self.labeled_cursor >= self.labeled.len() {
-                self.labeled_cursor = 0;
+    /// Returns whether this call had a release-triggered pass to advance.
+    fn sweep_labeled(&mut self, registry: &Revocations, budget: usize) -> bool {
+        if self.closed {
+            return false;
+        }
+        if self.labeled_end == 0 {
+            let generation = registry.label_generation.load(Ordering::Acquire);
+            if generation == registry.clean_label_generation.load(Ordering::Relaxed) {
+                return false;
             }
-            if self.labeled[self.labeled_cursor].strong_count() == 0 {
-                // Inspect the entry moved from the tail on the next step.
-                self.labeled.swap_remove(self.labeled_cursor);
-            } else {
-                self.labeled_cursor += 1;
+            self.labeled_generation = generation;
+            self.labeled_end = self.labeled.len();
+        }
+        for _ in 0..budget.min(self.labeled_end) {
+            self.labeled_end -= 1;
+            if self.labeled[self.labeled_end].strong_count() == 0 {
+                // The tail is already outside the unvisited prefix.
+                self.labeled.swap_remove(self.labeled_end);
             }
         }
+        if self.labeled_end == 0 {
+            registry
+                .clean_label_generation
+                .store(self.labeled_generation, Ordering::Release);
+        }
+        true
     }
 }
 
@@ -511,6 +548,8 @@ impl Revocations {
         Self {
             queue: Mutex::default(),
             hint: AtomicBool::new(false),
+            label_generation: AtomicU64::new(0),
+            clean_label_generation: AtomicU64::new(0),
             driver,
         }
     }
@@ -521,18 +560,29 @@ impl Revocations {
 
     /// Reclaims expired registrations even when no new lifetimes arrive.
     pub(crate) fn sweep_labeled(&self) {
+        if self.label_generation.load(Ordering::Acquire)
+            == self.clean_label_generation.load(Ordering::Relaxed)
+        {
+            return;
+        }
         let mut queue = self.lock();
-        queue.sweep_labeled(IDLE_LABEL_SWEEP_BUDGET);
+        queue.sweep_labeled(self, IDLE_LABEL_SWEEP_BUDGET);
         if queue.labeled.is_empty() {
             queue.labeled = Vec::new();
-            queue.labeled_cursor = 0;
+            queue.labeled_end = 0;
         }
     }
 
     pub(crate) fn labeled(&self, label: NonZeroU64) -> Vec<Arc<FlowState>> {
         let mut queue = self.lock();
+        let generation = self.label_generation.load(Ordering::Acquire);
         queue.labeled.retain(|flow| flow.strong_count() != 0);
-        queue.labeled_cursor = 0;
+        if queue.labeled.is_empty() {
+            queue.labeled = Vec::new();
+        }
+        queue.labeled_end = 0;
+        self.clean_label_generation
+            .store(generation, Ordering::Release);
         queue
             .labeled
             .iter()
@@ -556,7 +606,7 @@ impl Revocations {
         let mut queue = self.lock();
         queue.closed = true;
         queue.labeled = Vec::new();
-        queue.labeled_cursor = 0;
+        queue.labeled_end = 0;
         for flow in queue.pending.drain(..).chain(retiring.drain(..)) {
             flow.finish(RetirementOutcome::Unknown);
         }
