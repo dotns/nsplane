@@ -1,6 +1,6 @@
 # 20261027-0433-sink-spent-forwarding Wrapper sinks forward send_batch_spent
 
-- **status**: pending
+- **status**: completed (merged 2026-10-27, ships in 0.20.1)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-27 04:33

@@ -1,6 +1,6 @@
 # 20261027-0433-filter-coarse-clock AclFilter and AclEngine on the coarse clock
 
-- **status**: pending
+- **status**: completed (merged 2026-10-27, ships in 0.20.1)
 - **priority**: P2
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-27 04:33
