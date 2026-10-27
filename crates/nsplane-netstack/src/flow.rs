@@ -17,9 +17,15 @@ use tokio::sync::Notify;
 use crate::pending::Key;
 use crate::tcp::{self, Shared};
 
+#[cfg(test)]
+mod tests;
+
 /// Most fences the egress holds at once, TCP and UDP together; a revoke that needs one
 /// more fails. A fence is dropped once the source took every position it holds back.
 pub(crate) const MAX_FENCES: usize = 1024;
+
+/// Most old label registrations inspected when adding one lifetime.
+const LABEL_SWEEP_BUDGET: usize = 8;
 
 const PENDING: u8 = 0;
 const RETIRED: u8 = 1;
@@ -268,9 +274,7 @@ impl FlowState {
             completed_turn: AtomicU64::new(0),
         });
         if ingress_label.is_some() {
-            let mut queue = revocations.lock();
-            queue.labeled.retain(|flow| flow.strong_count() != 0);
-            queue.labeled.push(Arc::downgrade(&state));
+            revocations.lock().track_labeled(&state);
         }
         state
     }
@@ -472,6 +476,25 @@ struct Queue {
     pending: Vec<Arc<FlowState>>,
     /// Weak references keep delivered handles revocable after socket release.
     labeled: Vec<Weak<FlowState>>,
+    /// Next entry inspected by incremental cleanup; may equal the vector's length.
+    labeled_cursor: usize,
+}
+
+impl Queue {
+    fn track_labeled(&mut self, flow: &Arc<FlowState>) {
+        for _ in 0..self.labeled.len().min(LABEL_SWEEP_BUDGET) {
+            if self.labeled_cursor >= self.labeled.len() {
+                self.labeled_cursor = 0;
+            }
+            if self.labeled[self.labeled_cursor].strong_count() == 0 {
+                // Inspect the entry moved from the tail on the next step.
+                self.labeled.swap_remove(self.labeled_cursor);
+            } else {
+                self.labeled_cursor += 1;
+            }
+        }
+        self.labeled.push(Arc::downgrade(flow));
+    }
 }
 
 impl Revocations {
@@ -490,6 +513,7 @@ impl Revocations {
     pub(crate) fn labeled(&self, label: NonZeroU64) -> Vec<Arc<FlowState>> {
         let mut queue = self.lock();
         queue.labeled.retain(|flow| flow.strong_count() != 0);
+        queue.labeled_cursor = 0;
         queue
             .labeled
             .iter()
