@@ -5,6 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-27
+
+Patch release; no public API change. A bug fix under normal maintenance: the 0.11 feature
+freeze is lifted (ADR `2026-10-27-normal-maintenance`), so it needs no freeze exception.
+
 ### Fixed
 - `EngineHandle::local_barrier` covers a packet the source is handing out when the barrier is
   taken. The engine counted a read's packets only after `PacketSource::recv_batch` returned,

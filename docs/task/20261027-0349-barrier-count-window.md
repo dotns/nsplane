@@ -1,6 +1,6 @@
 # 20261027-0349-barrier-count-window Local barrier: cover a packet the source is handing out
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P1
 - **owner**: w3/barrier-count-0201
 - **createdAt**: 2026-10-27 03:49
@@ -40,7 +40,9 @@ Fixing the local barrier's count window
 ## Notes
 
 - Base: `main` at `3e9f684` (the `v0.20.0` release `d09a0ed` plus a docs-only merge), branch
-  `fix/0.20.1-barrier-count`.
+  `fix/0.20.1-barrier-count`; rebased onto `main` at `9e955ee` before the release (docs only
+  since `v0.20.0`, so the A/B against `v0.20.0` stands). The 0.11 feature freeze is lifted
+  upstream (ADR `2026-10-27-normal-maintenance`): this bug fix needs no freeze exception.
 - Test (`nsplane-e2e/tests/engine_entries.rs`,
   `a_barrier_covers_a_packet_the_source_is_handing_out`): `HeldSource` takes packet 7 from its
   channel and then blocks inside the same poll on a `Hold` until released; with the source
@@ -75,3 +77,5 @@ Fixing the local barrier's count window
   `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features` clean;
   `cargo semver-checks --workspace --baseline-rev v0.20.0`: no semver update required (all
   12 crates).
+
+- complete: released in 0.20.1

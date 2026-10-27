@@ -525,3 +525,11 @@ binaries, the fix is outside `nsplane-core`) -0.6 % .. +0.3 %, load 1.2-1.6; `lo
 all 34 cases (no engine in this bench) -1.6 % .. +3.2 %, 31 within 1 %, load 1.2-2.9.
 `cargo semver-checks` against `v0.20.0`: no semver update required. A bug fix under normal
 maintenance (ADR `2026-10-27-normal-maintenance`): no freeze exception needed.
+
+## 2026-10-27 [release]
+
+Release 0.20.1 (tag `v0.20.1`, Gitea only, as the owner decided): the `local_barrier` count fix
+alone (task `20261027-0349-barrier-count-window`), rebased onto `main` at `9e955ee` (0.20.0 plus
+docs only, the freeze lifted, so no exception). `main` fast-forwards to the release head.
+Workspace versions, internal requirements and guide tags were synchronized in the version
+commit.
