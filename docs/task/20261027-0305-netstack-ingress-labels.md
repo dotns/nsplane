@@ -63,9 +63,9 @@ Acceptance criteria (tests first), on an ordinary stack and on a transparent one
   a new label, for UDP and for TCP.
 - Benchmarks: unlabeled `send_stream` (`netstack_send/*`, `netstack_udp_send/*` with `flows_4`)
   within the noise against the base; labeled against unlabeled on the same build, interleaved,
-  within the noise plus the owner's allowance (proposed 3 %) on `netstack_send/streams_{1,4}`,
+  within the noise plus 3 % (owner decision, 2026-10-27) on `netstack_send/streams_{1,4}`,
   `netstack_send_1cpu/*` and the new `netstack_udp_flow_send/flows_{1,4}`. If TCP misses the
-  bar, measure the per-socket label alternative of the note.
+  bar, the per-socket label checked after smoltcp's demultiplexing is measured instead.
 - Full gate, rustdoc with warnings denied, `cargo semver-checks` (additive for nsplane-netstack:
   its structs are `#[non_exhaustive]` since 0.20.0).
 

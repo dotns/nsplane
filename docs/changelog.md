@@ -517,3 +517,9 @@ O15 of the release C design note (plan `20261026-0822-node-gateway-requests`): t
 only, implemented and released by the release B barrier's workstream; it is not part of
 release C.
 
+## 2026-10-27 [decision]
+
+Release C's labeled-path acceptance allowance (plan `20261026-0822-node-gateway-requests`, W5):
+the noise plus 3 %; if TCP misses it, the per-socket label checked after smoltcp's
+demultiplexing is measured instead. No owner item of the design note remains open.
+

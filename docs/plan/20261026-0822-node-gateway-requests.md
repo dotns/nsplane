@@ -681,3 +681,8 @@ exclude it), is fixed in nsplane and released as 0.20.1 on the Gitea remote only
 barrier's workstream (task `20261026-0836-local-barrier-plaintext-ingress`) implements and
 releases it; it is not part of release C.
 
+Owner decision, 2026-10-27: the labeled-path acceptance allowance of release C (W5) is the noise
+plus 3 % (labeled against unlabeled `send_stream` runs on the same build); if TCP misses it, the
+per-socket label checked after smoltcp's demultiplexing is measured instead. This was the last
+open owner item of the design note.
+

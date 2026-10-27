@@ -193,8 +193,8 @@ Acceptance bar for untagged traffic: within the slot A/B noise against `main` on
 
 Acceptance bar for the labeled path (a stack that runs labeled all the time, as the node's
 shared stack will): in `send_stream`, the receiving stack's input labeled versus the same run
-unlabeled, on the same build, interleaved, within the noise bar plus an allowance the owner
-names (proposed: 3 %):
+unlabeled, on the same build, interleaved, within the noise bar plus 3 % (owner decision,
+2026-10-27):
 
 - TCP: `netstack_send/streams_{1,4}` and `netstack_send_1cpu/*` (the receiver's per-segment
   label check sits on every data segment);
@@ -202,11 +202,11 @@ names (proposed: 3 %):
   `netstack_udp_flow_send` group sends the same load to flows the receiver takes from
   `incoming_udp` (`flows_1`, `flows_4`), labeled and unlabeled.
 
-If TCP misses the bar, the alternative to measure is a per-socket label: stored next to the
-socket handle and checked after smoltcp's demultiplexing (in the driver's poll of the socket
-that took the segment) instead of a tuple lookup before `inject`. It saves the lookup but sees a
-mismatch only after smoltcp has processed the segment, so it needs a way to undo that segment's
-effect, which is why it is the fallback, not the default.
+If TCP misses the bar, the per-socket label is measured instead (owner decision, 2026-10-27):
+stored next to the socket handle and checked after smoltcp's demultiplexing (in the driver's
+poll of the socket that took the segment) instead of a tuple lookup before `inject`. It saves
+the lookup but sees a mismatch only after smoltcp has processed the segment, so it needs a way
+to undo that segment's effect, which is why it is the fallback, not the default.
 
 Variant A and B are both measured; `docs/performance.md` records the results, labeled and
 unlabeled.
@@ -594,11 +594,11 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
 
 ## Open items for review
 
-- Owner: the labeled-path allowance (proposed 3 %). Release C is approved (2026-10-27, twelfth
-  freeze exception). The gateway's view on scope: R5 part 2 has no production user yet and is
-  the item that could move to a later release with the least loss if release C must shrink.
-  Decided: O11 (with the variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10, O13 and
-  O15 (fixed in 0.20.1) on 2026-10-27.
+- No owner item is open. Release C is approved (2026-10-27, twelfth freeze exception). The
+  gateway's view on scope: R5 part 2 has no production user yet and is the item that could move
+  to a later release with the least loss if release C must shrink. Decided: O11 (with the
+  variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10, O13, O15 (fixed in 0.20.1) and
+  the labeled-path allowance (noise plus 3 %) on 2026-10-27.
 - The gateway (its own design, not nsplane's): which real arrival path its reference engine
   passes to `PlaintextIngress` (`from: Path` stays mandatory).
 - `recv_labeled` on bound sockets stays out of release C: neither consumer uses bound netstack
@@ -649,6 +649,9 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   send receipts). O15 is a release B item outside the approval.
 - Owner decision, 2026-10-27: O15, the barrier's count window, is fixed in nsplane and released as
   0.20.1 on the Gitea remote only; the release B barrier's workstream implements and releases it.
+- Owner decision, 2026-10-27: the labeled-path acceptance allowance is the noise plus 3 %; if TCP
+  misses it, the per-socket label checked after smoltcp's demultiplexing is measured instead.
+  No owner item of this note remains open.
 - Changes in this revision: the carrier's `None` rule and the clone statement (checked by
   building without `Clone`); the receipt marker made a documented public property with a clone
   rule and cleared at the engine's other entries; `Mixed` dropped and counted in nsplane-nat too
