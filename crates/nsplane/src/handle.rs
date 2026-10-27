@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::engine::{NewTransport, SourceTaken};
 use crate::fragment::FragmentStats;
+use crate::tracked::Receipts;
 use crate::transport::{PathMtuReport, Transport};
 
 /// The description of a peer for [`EngineHandle::add_or_update_peer`].
@@ -146,6 +147,37 @@ impl fmt::Display for PlaintextRefused {
 }
 
 impl Error for PlaintextRefused {}
+
+/// The receiver of the local packets routed to peers marked for plaintext egress; from
+/// [`crate::EngineBuilder::plaintext_egress`].
+///
+/// The engine hands it each such packet after the outbound filters, instead of sealing it,
+/// with the peer it was routed to: the packet as the filters left it, tag included, receipt
+/// marker cleared. Peer ids are never reused, so a packet of a removed peer is never
+/// attributed to a later one. When the queue is full the packet is dropped under
+/// [`crate::DROP_PLAINTEXT_EGRESS_FULL`]; once this receiver is dropped, under
+/// [`crate::DROP_PLAINTEXT_EGRESS_CLOSED`].
+#[derive(Debug)]
+pub struct PlaintextEgress {
+    packets: mpsc::Receiver<(PeerId, PacketBuf)>,
+}
+
+impl PlaintextEgress {
+    pub(crate) const fn new(packets: mpsc::Receiver<(PeerId, PacketBuf)>) -> Self {
+        Self { packets }
+    }
+
+    /// The next packet and the peer it was routed to; waits for one. `None` once the engine
+    /// has stopped and every packet was received.
+    pub async fn recv(&mut self) -> Option<(PeerId, PacketBuf)> {
+        self.packets.recv().await
+    }
+
+    /// The next packet if one is queued.
+    pub fn try_recv(&mut self) -> Option<(PeerId, PacketBuf)> {
+        self.packets.try_recv().ok()
+    }
+}
 
 /// The error of the transport calls of [`EngineHandle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,9 +431,17 @@ pub(crate) enum Command {
     SetLocalSources(LocalIdentityId, Vec<AllowedIp>, oneshot::Sender<bool>),
     LocalIdentities(oneshot::Sender<Vec<LocalIdentity>>),
     PeerIdIn(LocalIdentityId, PublicKey, oneshot::Sender<Option<PeerId>>),
-    /// Replies once the owner has taken this many local packets through routing and the
-    /// outbound filters.
-    LocalBarrier(u64, oneshot::Sender<()>),
+    /// Replies once the owner has taken this many local packets from the source and from
+    /// the tracked sender through routing and the outbound filters.
+    LocalBarrier(LocalPosition, oneshot::Sender<()>),
+    SetPlaintextEgress(PeerId, bool, oneshot::Sender<bool>),
+}
+
+/// How many local packets were taken: from the source and from the tracked sender.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalPosition {
+    pub(crate) source: u64,
+    pub(crate) tracked: u64,
 }
 
 /// A cheap, cloneable handle to a running engine.
@@ -414,6 +454,8 @@ pub struct EngineHandle {
     commands: mpsc::Sender<Command>,
     /// Local packets the source task took from the source so far.
     source_taken: Arc<SourceTaken>,
+    /// The tracked sender's receipts, if built.
+    receipts: Option<Arc<Receipts>>,
 }
 
 impl fmt::Debug for EngineHandle {
@@ -428,10 +470,12 @@ impl EngineHandle {
     pub(crate) const fn new(
         commands: mpsc::Sender<Command>,
         source_taken: Arc<SourceTaken>,
+        receipts: Option<Arc<Receipts>>,
     ) -> Self {
         Self {
             commands,
             source_taken,
+            receipts,
         }
     }
 
@@ -1010,9 +1054,10 @@ impl EngineHandle {
         self.call(Command::TotalUnansweredHandshakes).await
     }
 
-    /// Waits until every packet the engine took from its [`crate::PacketSource`] before this
-    /// call has been routed and passed or been dropped by the outbound filters (or dropped
-    /// for no route, by the fragmentation stage or by the tunnel's queue).
+    /// Waits until every packet the engine took from its [`crate::PacketSource`], and every
+    /// packet its [`crate::TrackedSender`] accepted, before this call has been routed and
+    /// passed or been dropped by the outbound filters (or dropped for no route, by the
+    /// fragmentation stage or by the tunnel's queue).
     ///
     /// A packet counts as taken once [`crate::PacketSource::recv_batch`] took it from the
     /// source, also while that read is still in progress: the engine counts what a read
@@ -1032,8 +1077,33 @@ impl EngineHandle {
     /// [`EngineError`] once the engine has stopped before the barrier passed; a stopped
     /// engine never reports a barrier it did not pass.
     pub async fn local_barrier(&self) -> Result<(), EngineError> {
-        let position = self.source_taken.position().await;
+        let position = LocalPosition {
+            source: self.source_taken.position().await,
+            tracked: self.receipts.as_ref().map_or(0, |r| r.accepted()),
+        };
         self.call(|tx| Command::LocalBarrier(position, tx)).await
+    }
+
+    /// Marks or unmarks `peer` for plaintext egress; `Ok(false)` for an unknown peer.
+    ///
+    /// The local packets routed to a marked peer after the call leave after the outbound
+    /// filters through [`PlaintextEgress`] instead of being sealed; packets routed before
+    /// it, and those the peer's tunnel queued behind a handshake, stay sealed. A marked peer
+    /// starts no handshake for data, and still answers handshakes and starts them for
+    /// inbound sealed traffic, so it moves between plaintext and sealed egress without a
+    /// gap. The mark is runtime state of the [`PeerId`]: an update of the peer in place keeps
+    /// it, a peer removed and added again gets a new id and starts unmarked.
+    ///
+    /// [`EngineHandle::add_or_update_peer`] returns no id. To keep a new peer's first
+    /// packets from being sealed, add it closed (without allowed IPs), read its id back with
+    /// [`EngineHandle::peer_id`], mark it, then open it ([`EngineHandle::set_allowed_ips`]).
+    pub async fn set_plaintext_egress(
+        &self,
+        peer: PeerId,
+        plaintext: bool,
+    ) -> Result<bool, EngineError> {
+        self.call(|tx| Command::SetPlaintextEgress(peer, plaintext, tx))
+            .await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and

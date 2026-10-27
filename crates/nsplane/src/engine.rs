@@ -41,6 +41,7 @@ use self::workers::Workers;
 use crate::fragment::Fragmenter;
 use crate::handle::{Command, EngineHandle, Plaintext, QueueDepth, QueueStats};
 use crate::io::{PacketSink, PacketSource};
+use crate::tracked::TrackedInput;
 #[cfg(doc)]
 use crate::transport::Transport;
 
@@ -202,13 +203,31 @@ const PATH_MTU_REPORTS: usize = 16;
 /// read before it, as without workers.
 ///
 /// Local barrier: [`EngineHandle::local_barrier`] waits until every local packet the source
-/// task took before the call has been routed and filtered or dropped; the source task counts
-/// each read in a counter the handles share, the owner counts what it took through the core.
+/// task took, and every packet the tracked sender accepted, before the call has been routed
+/// and filtered or dropped; the source task counts each read and the tracked sender each
+/// packet in counters the handles share, the owner counts what it took through the core.
 ///
 /// Plaintext ingress: with [`EngineBuilder::plaintext_ingress`] the owner also polls a
 /// bounded queue of plaintext packets attributed to peers, next to the received datagrams and
 /// under the same deliver-queue backpressure, and runs each through
 /// [`Core::receive_plaintext`].
+///
+/// Plaintext egress: the local packets routed to a peer marked with
+/// [`EngineHandle::set_plaintext_egress`] leave after the outbound filters through the
+/// bounded [`crate::PlaintextEgress`] receiver of [`EngineBuilder::plaintext_egress`]
+/// instead of being sealed; the owner hands them over without waiting and drops them under
+/// [`crate::DROP_PLAINTEXT_EGRESS_FULL`] or [`crate::DROP_PLAINTEXT_EGRESS_CLOSED`].
+///
+/// Tracked packets: with [`EngineBuilder::tracked_sender`] the owner also polls the queue of
+/// the packets the [`crate::TrackedSender`] accepted, next to the local packets (alternating
+/// which comes first) and under the same room, and takes them through the same path. Each
+/// gets exactly one [`crate::SendResult`]: the core reports a tracked packet sealed or not
+/// sent, and the engine reports it sent once the transport call that carried its datagram
+/// succeeded, or not sent where it drops it. A tracked datagram ends its transmit batch (the
+/// owner's `try_send_batch` call, the message to the transmit task and the transmit task's
+/// `send_batch` call), so the call attributes it exactly. When the engine stops, every
+/// accepted packet without a result is reported not sent under
+/// [`nsplane_core::reasons::ENGINE_STOPPED`].
 ///
 /// When an I/O side reports [`io::ErrorKind::BrokenPipe`], its task stops and the engine
 /// keeps running without it; other I/O errors are logged and the task continues. A datagram
@@ -227,6 +246,8 @@ const PATH_MTU_REPORTS: usize = 16;
 /// [`DynTransport`]: crate::DynTransport
 /// [`EngineBuilder::crypto_workers`]: crate::EngineBuilder::crypto_workers
 /// [`EngineBuilder::plaintext_ingress`]: crate::EngineBuilder::plaintext_ingress
+/// [`EngineBuilder::plaintext_egress`]: crate::EngineBuilder::plaintext_egress
+/// [`EngineBuilder::tracked_sender`]: crate::EngineBuilder::tracked_sender
 /// [`EngineBuilder::transport_max_datagram`]: crate::EngineBuilder::transport_max_datagram
 pub struct Engine {
     handle: EngineHandle,
@@ -285,6 +306,10 @@ pub(crate) struct Parts<Src, Snk> {
     pub(crate) path_mtu_expiry: Duration,
     /// The queue of [`crate::PlaintextIngress`], if built.
     pub(crate) plaintext: Option<mpsc::Receiver<Plaintext>>,
+    /// The queue of [`crate::PlaintextEgress`], if built.
+    pub(crate) plaintext_egress: Option<mpsc::Sender<(PeerId, PacketBuf)>>,
+    /// The owner's side of [`crate::TrackedSender`], if built.
+    pub(crate) tracked: Option<TrackedInput>,
 }
 
 /// Spawns the owner task and the I/O tasks.
@@ -307,6 +332,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let mut mtu_watch = parts.source.mtu();
     let mtu = *mtu_watch.borrow_and_update();
     let source_taken = Arc::new(SourceTaken::default());
+    let receipts = parts.tracked.as_ref().map(|t| Arc::clone(&t.receipts.0));
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.
@@ -328,10 +354,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         datagram_tx,
         recycled,
         recycle_bufs: Vec::new(),
-        send_errors: SendErrors {
-            count: Arc::default(),
-            signal,
-        },
+        send_errors: SendErrors::new(signal, receipts.clone()),
         send_error_signal,
         deliver,
         transports: BTreeMap::new(),
@@ -383,6 +406,8 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
             packets,
             first: false,
         }),
+        plaintext_egress: parts.plaintext_egress,
+        tracked: parts.tracked,
     };
     for transport in parts.transports {
         let slot = owner.start_transport(transport.start, VecDeque::new(), None);
@@ -390,7 +415,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     }
 
     Engine {
-        handle: EngineHandle::new(command_tx, source_taken),
+        handle: EngineHandle::new(command_tx, source_taken, receipts),
         owner: Some(tokio::spawn(owner.run())),
     }
 }
@@ -501,4 +526,8 @@ struct Owner {
     barriers: Barriers,
     /// The plaintext ingress queue; `None` without one or once every entry is gone.
     plaintext: Option<PlaintextQueue>,
+    /// Where packets for plaintext egress go; `None` without a receiver.
+    plaintext_egress: Option<mpsc::Sender<(PeerId, PacketBuf)>>,
+    /// Tracked local packets and their receipts; `None` without a tracked sender.
+    tracked: Option<TrackedInput>,
 }

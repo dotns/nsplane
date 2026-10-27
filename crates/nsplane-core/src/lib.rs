@@ -13,6 +13,10 @@
 //! datagrams or local packets in batches feeds them with [`Core::handle_datagrams`] and
 //! [`Core::handle_locals`], which share the dispatch work across the batch.
 //!
+//! A peer marked with [`Core::set_plaintext_egress`] gets its routed local packets as
+//! `Output::Plaintext` instead of sealed, and a tracked local packet (tagged, with its
+//! receipt marker set) gets one `Output::Tracked` with what became of it.
+//!
 //! A driver that encrypts and decrypts on several threads builds the core with
 //! [`CoreConfig::crypto_jobs`] and feeds inputs with [`Core::handle_input_deferred`] instead:
 //! the cryptography of each data packet comes back as a [`CryptoJob`] to run anywhere,

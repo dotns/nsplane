@@ -246,12 +246,14 @@ impl Core {
     /// A received message is only now marked as received in its session's replay window, so
     /// a duplicate is rejected here; a datagram sealed in a session that expired or was
     /// replaced in the meantime is dropped and counted under [`reasons::ENCAPSULATE_ERROR`].
-    /// A job whose peer was removed in the meantime is discarded.
+    /// A job whose peer was removed in the meantime is discarded (a tracked packet's is
+    /// reported not sent under [`reasons::NO_ROUTE`]).
     ///
     /// Complete the jobs of one peer in the order they were handed out to keep its packets
     /// in order; see [`CryptoJob`].
     ///
     /// [`reasons::ENCAPSULATE_ERROR`]: crate::reasons::ENCAPSULATE_ERROR
+    /// [`reasons::NO_ROUTE`]: crate::reasons::NO_ROUTE
     pub fn complete_job(&mut self, mut job: CryptoJob) {
         let id = job.peer;
         match job.direction {

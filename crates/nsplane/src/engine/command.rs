@@ -98,6 +98,9 @@ impl Owner {
             | Command::PathMtuStats(..)) => self.path_mtu_command(command),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
             Command::LocalBarrier(position, reply) => self.local_barrier(position, reply),
+            Command::SetPlaintextEgress(peer, plaintext, reply) => {
+                let _ = reply.send(self.core.set_plaintext_egress(peer, plaintext));
+            }
             Command::UnansweredHandshakes(peer, reply) => {
                 let _ = reply.send(self.core.unanswered_handshakes(peer));
             }
@@ -300,6 +303,7 @@ impl Owner {
             .remove(&id)
             .ok_or(TransportError::Unknown(id))?;
         for (_, data) in old.stop().await {
+            self.finish_tracked(&data, DROP_TRANSPORT_REMOVED);
             self.core.recycle(data);
             self.dropped(None, DROP_TRANSPORT_REMOVED);
         }
@@ -400,6 +404,10 @@ impl Owner {
         }
         for task in self.tasks.drain(..) {
             task.stop().await;
+        }
+        // Every tracked packet without a result is reported before the shutdown returns.
+        if let Some(receipts) = &self.send_errors.receipts {
+            receipts.stop();
         }
     }
 }
