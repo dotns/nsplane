@@ -1,4 +1,6 @@
 use super::*;
+use std::num::NonZeroU64;
+
 use crate::checksum::{internet_checksum, transport_checksum_v4, transport_checksum_v6};
 use crate::{IpPacket, UdpHeader, protocol};
 
@@ -458,4 +460,175 @@ fn non_fragments_pass() {
     }
     assert_eq!(reassembler.stats(), ReassemblyStats::default());
     assert_eq!(reassembler.pending(), 0);
+}
+
+fn tag(value: u64) -> Option<NonZeroU64> {
+    NonZeroU64::new(value)
+}
+
+/// Pushes `fragments` with `tags`, in order, expecting every one but the last to be held,
+/// and returns the completed packet and its fragments' tags.
+fn reassemble_tagged(
+    reassembler: &mut Reassembler,
+    fragments: &[Vec<u8>],
+    tags: &[Option<NonZeroU64>],
+) -> (Vec<u8>, FragmentTags) {
+    let now = Instant::now();
+    let last = fragments.len() - 1;
+    for (fragment, &tag) in fragments[..last].iter().zip(tags) {
+        assert_eq!(
+            reassembler.push_tagged(fragment, tag, now),
+            (Outcome::Held, FragmentTags::Same(tag))
+        );
+    }
+    match reassembler.push_tagged(&fragments[last], tags[last], now) {
+        (Outcome::Complete(packet), tags) => (packet, tags),
+        other => panic!("expected a complete datagram, got {other:?}"),
+    }
+}
+
+#[test]
+fn push_tagged_same_tags_complete_with_the_tag() {
+    let original = udp_v4(300, 21);
+    let fragments = fragment_v4(&original, 160);
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let tags = [tag(7); 2];
+    let (packet, tags) = reassemble_tagged(&mut reassembler, &fragments, &tags);
+    assert_eq!(packet, original);
+    assert_eq!(tags, FragmentTags::Same(tag(7)));
+    assert_eq!(reassembler.stats().mixed_tags, 0);
+
+    // IPv6 too.
+    let original = udp_v6(300, false);
+    let fragments = fragment_v6(&original, 40, 6, 160, 0x77);
+    let all = vec![tag(9); fragments.len()];
+    let (_, tags) = reassemble_tagged(&mut reassembler, &fragments, &all);
+    assert_eq!(tags, FragmentTags::Same(tag(9)));
+    assert_eq!(reassembler.stats().reassembled, 2);
+}
+
+#[test]
+fn push_tagged_untagged_completes_untagged() {
+    let fragments = fragment_v4(&udp_v4(300, 22), 160);
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let (_, tags) = reassemble_tagged(&mut reassembler, &fragments, &[None; 2]);
+    assert_eq!(tags, FragmentTags::Same(None));
+    // `push` is `push_tagged` without a tag.
+    let fragments = fragment_v4(&udp_v4(300, 23), 160);
+    let now = Instant::now();
+    assert_eq!(reassembler.push(&fragments[0], now), Outcome::Held);
+    let (outcome, tags) = reassembler.push_tagged(&fragments[1], None, now);
+    assert!(matches!(outcome, Outcome::Complete(_)));
+    assert_eq!(tags, FragmentTags::Same(None));
+    assert_eq!(reassembler.stats().mixed_tags, 0);
+}
+
+#[test]
+fn push_tagged_mixed_tags_are_reported_and_counted() {
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let cases: [&[Option<NonZeroU64>]; 4] = [
+        &[tag(1), tag(2), tag(1)],
+        &[tag(1), None, tag(1)],
+        &[None, None, tag(3)],
+        &[tag(4), tag(4), None],
+    ];
+    for (n, case) in cases.iter().enumerate() {
+        let original = udp_v4(400, 30 + u16::try_from(n).unwrap());
+        let fragments = fragment_v4(&original, 160);
+        assert_eq!(fragments.len(), 3);
+        let now = Instant::now();
+        for (fragment, &tag) in fragments[..2].iter().zip(*case) {
+            assert_eq!(reassembler.push_tagged(fragment, tag, now).0, Outcome::Held);
+        }
+        let (outcome, tags) = reassembler.push_tagged(&fragments[2], case[2], now);
+        assert_eq!(outcome, Outcome::Complete(original));
+        assert_eq!(tags, FragmentTags::Mixed, "case {n}");
+    }
+    let stats = reassembler.stats();
+    assert_eq!((stats.mixed_tags, stats.reassembled), (4, 4));
+
+    // A duplicate with another tag mixes the set too.
+    let original = udp_v4(300, 40);
+    let fragments = fragment_v4(&original, 160);
+    let now = Instant::now();
+    reassembler.push_tagged(&fragments[0], tag(5), now);
+    reassembler.push_tagged(&fragments[0], tag(6), now);
+    let (_, tags) = reassembler.push_tagged(&fragments[1], tag(5), now);
+    assert_eq!(tags, FragmentTags::Mixed);
+    assert_eq!(reassembler.stats().mixed_tags, 5);
+}
+
+#[test]
+fn push_tagged_non_fragments_and_drops_report_their_own_tag() {
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let now = Instant::now();
+    let whole = udp_v4(100, 50);
+    assert_eq!(
+        reassembler.push_tagged(&whole, tag(3), now),
+        (Outcome::Pass, FragmentTags::Same(tag(3)))
+    );
+    // An invalid fragment: MF with a length that is not a multiple of 8.
+    let mut bad = fragment_v4(&udp_v4(300, 51), 160).remove(0);
+    bad.truncate(bad.len() - 1);
+    let total = u16::try_from(bad.len()).unwrap();
+    bad[2..4].copy_from_slice(&total.to_be_bytes());
+    bad[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&bad[..20]);
+    bad[10..12].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(
+        reassembler.push_tagged(&bad, tag(4), now),
+        (Outcome::Dropped, FragmentTags::Same(tag(4)))
+    );
+}
+
+#[test]
+fn push_tagged_tags_expire_with_their_datagram() {
+    let fragments = fragment_v4(&udp_v4(300, 60), 160);
+    let start = Instant::now();
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    reassembler.push_tagged(&fragments[0], tag(1), start);
+    assert_eq!(reassembler.expire(start + Duration::from_secs(30)), 1);
+    // The same datagram again under another tag starts afresh.
+    let later = start + Duration::from_secs(31);
+    reassembler.push_tagged(&fragments[0], tag(2), later);
+    let (outcome, tags) = reassembler.push_tagged(&fragments[1], tag(2), later);
+    assert!(matches!(outcome, Outcome::Complete(_)));
+    assert_eq!(tags, FragmentTags::Same(tag(2)));
+    assert_eq!(reassembler.stats().mixed_tags, 0);
+}
+
+#[test]
+fn discard_tagged_drops_the_datagrams_holding_the_tag() {
+    let now = Instant::now();
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let a = fragment_v4(&udp_v4(300, 70), 160);
+    let b = fragment_v4(&udp_v4(300, 71), 160);
+    let c = fragment_v4(&udp_v4(300, 72), 160);
+    let d = fragment_v4(&udp_v4(400, 73), 160);
+    let v6 = fragment_v6(&udp_v6(300, false), 40, 6, 160, 0x74);
+    reassembler.push_tagged(&a[0], tag(1), now);
+    reassembler.push_tagged(&b[0], tag(2), now);
+    reassembler.push_tagged(&c[0], None, now);
+    // A mixed set may hold a fragment with any tag.
+    reassembler.push_tagged(&d[0], tag(3), now);
+    reassembler.push_tagged(&d[1], tag(4), now);
+    reassembler.push_tagged(&v6[0], tag(1), now);
+    assert_eq!(reassembler.pending(), 5);
+
+    assert_eq!(reassembler.discard_tagged(NonZeroU64::new(1).unwrap()), 3);
+    assert_eq!(reassembler.pending(), 2);
+    assert_eq!(reassembler.discard_tagged(NonZeroU64::new(1).unwrap()), 0);
+    assert_eq!(reassembler.discard_tagged(NonZeroU64::new(9).unwrap()), 0);
+
+    // The discarded datagram's later fragment opens a new entry and does not complete.
+    assert_eq!(reassembler.push_tagged(&a[1], tag(1), now).0, Outcome::Held);
+    // The others are untouched.
+    let (outcome, tags) = reassembler.push_tagged(&b[1], tag(2), now);
+    assert!(matches!(outcome, Outcome::Complete(_)));
+    assert_eq!(tags, FragmentTags::Same(tag(2)));
+    let (outcome, tags) = reassembler.push_tagged(&c[1], None, now);
+    assert!(matches!(outcome, Outcome::Complete(_)));
+    assert_eq!(tags, FragmentTags::Same(None));
+    let stats = reassembler.stats();
+    assert_eq!((stats.timeout, stats.overflow, stats.mixed_tags), (0, 0, 0));
 }

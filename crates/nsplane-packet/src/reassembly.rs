@@ -11,9 +11,14 @@
 //! may arrive in any order and an identical retransmitted fragment is ignored, but
 //! fragments that overlap with different coverage drop the whole datagram (RFC 5722;
 //! the same policy applies to IPv4).
+//!
+//! [`Reassembler::push_tagged`] records each fragment's [packet tag](crate::PacketBuf::tag)
+//! with it: a completed datagram reports whether its fragments all carried the same tag
+//! (no tag counting as a value of its own) or different ones ([`FragmentTags`]).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use crate::checksum::ipv4_header_checksum;
@@ -69,9 +74,40 @@ pub struct ReassemblyStats {
     pub overlap: u64,
     /// Fragments dropped as invalid, and datagrams whose fragments disagree on the length.
     pub malformed: u64,
+    /// Datagrams completed by [`Reassembler::push_tagged`] whose fragments carried
+    /// different tags ([`FragmentTags::Mixed`]); they count in `reassembled` too.
+    pub mixed_tags: u64,
 }
 
-/// What [`Reassembler::push`] did with a packet.
+/// The tags of a datagram's fragments, as [`Reassembler::push_tagged`] reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FragmentTags {
+    /// Every fragment carried this tag, or every fragment carried none.
+    Same(Option<NonZeroU64>),
+    /// The fragments carried different tags, or some carried a tag and others none.
+    Mixed,
+}
+
+impl FragmentTags {
+    /// The tags of a set that adds a fragment with `tag`.
+    fn with(self, tag: Option<NonZeroU64>) -> Self {
+        match self {
+            Self::Same(same) if same == tag => self,
+            _ => Self::Mixed,
+        }
+    }
+
+    /// Whether a fragment of the set may have carried `tag`.
+    fn may_hold(self, tag: NonZeroU64) -> bool {
+        match self {
+            Self::Same(same) => same == Some(tag),
+            Self::Mixed => true,
+        }
+    }
+}
+
+/// What [`Reassembler::push`] or [`Reassembler::push_tagged`] did with a packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Not a fragment (or not a parseable IP packet): handle the packet as it is.
@@ -135,6 +171,8 @@ struct Datagram {
     received: usize,
     /// Length of the fragmentable part, known once the last fragment arrived.
     total: Option<usize>,
+    /// The tags of the fragments received so far.
+    tags: FragmentTags,
 }
 
 /// Why a fragment ended its datagram.
@@ -144,7 +182,7 @@ enum Reject {
 }
 
 impl Datagram {
-    const fn new(now: Instant) -> Self {
+    const fn new(now: Instant, tag: Option<NonZeroU64>) -> Self {
         Self {
             first_seen: now,
             header: None,
@@ -153,6 +191,7 @@ impl Datagram {
             ranges: Vec::new(),
             received: 0,
             total: None,
+            tags: FragmentTags::Same(tag),
         }
     }
 
@@ -280,17 +319,35 @@ impl Reassembler {
         self.datagrams.len()
     }
 
-    /// Feeds one IP packet received at `now`.
+    /// Feeds one IP packet received at `now`; [`push_tagged`](Self::push_tagged) without a
+    /// tag.
     ///
     /// An IPv6 Fragment header with offset 0 and no more fragments (an atomic
     /// fragment, RFC 6946) completes at once.
     pub fn push(&mut self, packet: &[u8], now: Instant) -> Outcome {
+        self.push_tagged(packet, None, now).0
+    }
+
+    /// Like [`push`](Self::push), recording `tag` with the fragment: a completed datagram
+    /// reports its fragments' tags, [`FragmentTags::Mixed`] (counted in
+    /// [`ReassemblyStats::mixed_tags`]) if they differ, an exact duplicate included. Every
+    /// other outcome reports `Same(tag)`, the packet's own tag.
+    ///
+    /// A caller that labels packets by their tag drops a `Mixed` datagram rather than handle
+    /// it untagged: a merge never turns tagged input into an untagged packet.
+    pub fn push_tagged(
+        &mut self,
+        packet: &[u8],
+        tag: Option<NonZeroU64>,
+        now: Instant,
+    ) -> (Outcome, FragmentTags) {
+        let own = FragmentTags::Same(tag);
         let piece = match parse(packet) {
             Ok(Some(piece)) => piece,
-            Ok(None) => return Outcome::Pass,
+            Ok(None) => return (Outcome::Pass, own),
             Err(()) => {
                 self.stats.malformed += 1;
-                return Outcome::Dropped;
+                return (Outcome::Dropped, own);
             }
         };
         self.expire(now);
@@ -298,28 +355,29 @@ impl Reassembler {
         if end > self.config.max_bytes {
             self.datagrams.remove(&piece.key);
             self.stats.overflow += 1;
-            return Outcome::Dropped;
+            return (Outcome::Dropped, own);
         }
         if !self.datagrams.contains_key(&piece.key)
             && self.datagrams.len() >= self.config.max_datagrams
         {
             self.stats.overflow += 1;
-            return Outcome::Dropped;
+            return (Outcome::Dropped, own);
         }
         let datagram = self
             .datagrams
             .entry(piece.key)
-            .or_insert_with(|| Datagram::new(now));
+            .or_insert_with(|| Datagram::new(now, tag));
         if let Err(reject) = datagram.insert(&piece) {
             self.datagrams.remove(&piece.key);
             match reject {
                 Reject::Overlap => self.stats.overlap += 1,
                 Reject::Malformed => self.stats.malformed += 1,
             }
-            return Outcome::Dropped;
+            return (Outcome::Dropped, own);
         }
+        datagram.tags = datagram.tags.with(tag);
         let Some(header_len) = datagram.header.as_ref().map(Vec::len) else {
-            return Outcome::Held;
+            return (Outcome::Held, own);
         };
         if datagram
             .total
@@ -327,14 +385,28 @@ impl Reassembler {
         {
             self.datagrams.remove(&piece.key);
             self.stats.overflow += 1;
-            return Outcome::Dropped;
+            return (Outcome::Dropped, own);
         }
         let Some(complete) = datagram.assemble() else {
-            return Outcome::Held;
+            return (Outcome::Held, own);
         };
+        let tags = datagram.tags;
         self.datagrams.remove(&piece.key);
         self.stats.reassembled += 1;
-        Outcome::Complete(complete)
+        if tags == FragmentTags::Mixed {
+            self.stats.mixed_tags += 1;
+        }
+        (Outcome::Complete(complete), tags)
+    }
+
+    /// Discards the incomplete datagrams holding a fragment with `tag`, and those whose
+    /// fragments carry different tags (they can only complete as [`FragmentTags::Mixed`]);
+    /// returns how many. Their later fragments open new datagrams.
+    pub fn discard_tagged(&mut self, tag: NonZeroU64) -> usize {
+        let before = self.datagrams.len();
+        self.datagrams
+            .retain(|_, datagram| !datagram.tags.may_hold(tag));
+        before - self.datagrams.len()
     }
 
     /// Discards the incomplete datagrams whose first fragment is at least
