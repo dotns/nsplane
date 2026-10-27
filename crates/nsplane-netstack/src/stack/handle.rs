@@ -229,7 +229,8 @@ impl NetStackHandle {
     /// Packets and datagrams the stack discarded because their flow was revoked with
     /// [`FlowControl::revoke`](crate::FlowControl::revoke): queued output removed from the
     /// egress backlog, held back at the [`NetStackSource`], or still waiting in the UDP
-    /// send queue. Counted here and not in [`stats`](Self::stats); bytes and datagrams a
+    /// send queue, plus reassembled ingress datagrams rejected by retirement barriers.
+    /// Counted here and not in [`stats`](Self::stats); bytes and datagrams a
     /// revoked flow had buffered for the application are not counted. Only grows.
     pub fn retired_drops(&self) -> u64 {
         self.stats

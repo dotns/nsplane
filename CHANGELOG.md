@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- DNS passthrough test setup reserves TCP and UDP sockets together, retrying only a
+  conflicting UDP bind before serving; independent TCP allocation no longer flakes the tests.
+
+### Changed
+- Correct source comments, rustdoc and README claims about clocks, socket and flow lifetimes,
+  worker ownership, routing storage, protocol limits, offloads and test coverage. Runtime
+  behavior and public API are unchanged.
+
 ## [0.20.1] - 2026-10-27
 
 Patch release; no public API change. A bug fix under normal maintenance: the 0.11 feature

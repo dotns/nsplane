@@ -99,7 +99,9 @@ pub struct NetStackConfig {
     /// `queue_capacity`, this stack's `ingress_capacity`, both 1024 packets by default)
     /// drops the rest. smoltcp recovers such losses by fast retransmit and New Reno's
     /// retransmission on partial ACKs, but without SACK one hole per round trip, and a lost
-    /// retransmission still waits for a retransmission timeout of at least 1 s. Measured
+    /// retransmission still waits for a retransmission timeout (at least 1 s by default;
+    /// [`tcp_min_rto`](Self::tcp_min_rto) and [`tcp_initial_rto`](Self::tcp_initial_rto)
+    /// can each be configured down to 1 ms). Measured
     /// in-process at the default MTU before the fork had New Reno, 4 MiB (about 3000
     /// segments) dropped packets at the receiving engine's full sink in most runs and moved
     /// 64 MiB at about 50 MB/s instead of 250-450 MB/s; with 8192-packet queues it ran

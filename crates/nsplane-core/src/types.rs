@@ -176,7 +176,8 @@ impl fmt::Debug for PeerConfig {
 /// ([`LocalIdentityId::DEFAULT`]); wrap them in [`ConfigChange::InLocalIdentity`] for a peer
 /// of another identity.
 pub enum ConfigChange {
-    /// Replaces the private key; every peer is re-keyed and its sessions are cleared.
+    /// Replaces the default identity's private key; only its peers are re-keyed and
+    /// their sessions cleared. A key already held by any identity leaves state unchanged.
     SetPrivateKey(x25519::StaticSecret),
     /// Adds a peer, or updates it in place if its public key is known.
     AddOrUpdatePeer(PeerConfig),

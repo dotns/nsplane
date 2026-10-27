@@ -4,12 +4,12 @@ nsplane is the WireGuard<sup>®</sup> data plane for dotns projects, a userspace
 implementation of the WireGuard protocol written in Rust. It:
 
 - uses `aws-lc-rs` for ChaCha20-Poly1305,
-- follows the pma-rust baseline (edition 2024, strict workspace lints, no panics in
-  runtime code, documented `unsafe` only in platform modules),
+- uses edition 2024 and strict workspace lints; runtime code retains invariant
+  assertions and constructor panic conditions, with documented `unsafe` in platform modules,
 - has a zero-copy data path (in-place seal/open, `zerocopy` message views),
 - batches I/O with segmentation offload: virtio-net TSO/USO on Linux/Android TUN devices
-  and UDP GSO/GRO through `quinn-udp`, falling back to one packet at a time where the
-  kernel lacks them,
+  and UDP GSO/GRO through `quinn-udp`; without offload, TUN handles individual packets
+  while Linux/Android UDP still batches messages with `sendmmsg`/`recvmmsg` where available,
 - is built from a sans-I/O core (`nsplane-core`) and a tokio driver (`nsplane`), with TUN
   devices (including Windows through Wintun) in `nsplane-tun` and a user-space TCP/IP
   stack in `nsplane-netstack`.
@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details, and the usage guide
 | `crates/nsplane-acl/`    | `nsplane-acl`    | Accept-only ACL policy engine with atomic reload, per-source rule namespaces, directed grants, outbound rules and pinholes, and the `AclFilter` and `FlowTracker` packet filters |
 | `crates/nsplane-nat/`    | `nsplane-nat`    | IPv4/IPv6 translation (`Translator`, RFC 7915) and service-publishing DNAT/SNAT (`PortMap`, `Conntrack`) packet filters |
 | `crates/nsplane/`        | `nsplane`        | Tokio driver: `Engine` (several transports at once, suspend/resume, MTU change events, optional fragmentation stage), `EngineBuilder`, `EngineHandle`, events, I/O traits, UDP transport (with an optional side channel), `LinkTransport` over a dialed message link |
-| `crates/nsplane-wss/`    | `nsplane-wss`    | WebSocket-over-TLS carriers: `WssDialer` (datagrams for `LinkTransport`), `WssServerTransport` (its server side: a transport over the WebSocket sessions the embedder accepts and hands to a `WssAcceptor`), and the deprecated stream carrier (`WssStreamClient` and `WssStreamServer`, TCP streams and UDP flows multiplexed per session), removed once its users have switched; the replacement is a WireGuard peer over `WssDialer` |
+| `crates/nsplane-wss/`    | `nsplane-wss`    | WebSocket carriers (TLS by default; plain `ws://` requires explicit `allow_plaintext`): `WssDialer` (datagrams for `LinkTransport`), `WssServerTransport` (its server side: a transport over the WebSocket sessions the embedder accepts and hands to a `WssAcceptor`), and the deprecated stream carrier (`WssStreamClient` and `WssStreamServer`, TCP streams and UDP flows multiplexed per session), removed once its users have switched; the replacement is a WireGuard peer over `WssDialer` |
 | `crates/nsplane-tun/`    | `nsplane-tun`    | OS TUN devices (Linux, Android, macOS, iOS, Windows through Wintun) as packet sources and sinks |
 | `crates/nsplane-netstack/` | `nsplane-netstack` | User-space TCP/IP stack on smoltcp ([dotns/smoltcp](https://github.com/dotns/smoltcp) fork; TCP and UDP endpoints, IPv4 and IPv6) as a packet source and sink |
 | `crates/nsplane-ether/` | `nsplane-ether` | Ethernet adapter for one guest: ethernet frames to IP packets as a packet source and sink, with ARP, IPv6 neighbor discovery and router advertisements, and a single-lease DHCPv4 server; length-prefixed stream and Linux TAP transports |
@@ -103,10 +103,10 @@ installed is not on the data path, so such a client pays no extra latency for it
 | `AclFilter` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(AclFilter::new(engine, identity)))` | off | none |
 | `FlowTracker` (`nsplane-acl`) | `EngineBuilder::filter(Box::new(FlowTracker::new(capacity)))` | off | none |
 | Fragmentation stage | `EngineBuilder::fragmenter(FragmentConfig::default())` | off | one `Option` check per local packet |
-| Crypto worker pool | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0 (owner task) | one `Option` check per packet; each peer owns its tunnel, no lock (with workers it is shared behind a `Mutex`) |
+| Crypto worker pool | `EngineBuilder::crypto_workers(n)`, `n` >= 2 | 0 (owner task) | one `Option` check per packet; each peer owns its tunnel; receive replay validation takes a lock. With workers only the owner locks the tunnel, and jobs carry session-key tickets |
 | Netstack (`nsplane-netstack`), `Splitter`, `MergeSource` | `NetStack::split`, `Splitter`, `MergeSource` as the builder's source and sink | not used | none |
 | TUN offload (Linux, Android) | on with `Tun::create`; `TunOptions::new().offload(false)` opts out | on where the kernel supports it | off: one system call per packet |
-| UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: one system call per datagram |
+| UDP offload (GSO/GRO) | on with `UdpTransport::bind`; `UdpTransport::bind_with_offload(.., false)` opts out | on | off: Linux/Android still batch separate datagrams with `sendmmsg`/`recvmmsg` where available |
 | UDP side channel | `UdpTransport::with_side_channel(classify, capacity)` | off | one `Option` check per received datagram; nothing is classified |
 | `LinkTransport` | `LinkTransport::new(id, peer, dialer, config)` as a transport | not used | none: no task runs unless it is created |
 | WSS carriers (`nsplane-wss`) | add the crate: `WssDialer::into_transport`, `WssServerTransport::new`, and the deprecated `WssStreamClient::new` / `WssStreamServer::new` | not a dependency | none: `nsplane` has no WebSocket or TLS dependency; only `nsplane-wss` pulls in `tokio-tungstenite` and `rustls` (aws-lc-rs), and it bundles no system or web PKI roots (the caller passes a `RootCertStore` or a `rustls::ClientConfig`) |

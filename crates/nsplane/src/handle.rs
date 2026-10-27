@@ -461,8 +461,9 @@ impl EngineHandle {
 
     /// Adds a peer, or updates it in place if its public key is known in its local identity.
     ///
-    /// Peers cannot be added before a private key is set; the core then reports
-    /// `Event::Dropped { reason: "no private key", .. }`.
+    /// A peer needs a private key on its selected local identity; otherwise the core reports
+    /// `Event::Dropped { reason: "no private key", .. }`. A keyed non-default identity
+    /// accepts peers even when the default identity has no key.
     ///
     /// The methods below that name a peer by public key address the peer of the default
     /// local identity. A peer of another identity (`local_identity` set) is removed and given
@@ -602,7 +603,7 @@ impl EngineHandle {
 
     /// Adds a local identity with its own static key, which answers handshakes on every
     /// transport; returns its id, or `None` if an identity of the engine (the default one
-    /// included) already holds the key.
+    /// included) already holds the key or identity ids are exhausted.
     ///
     /// Peers are bound to an identity with [`PeerConfig::local_identity`]; the same remote
     /// key may be a peer of several identities. Ids are never reused.
@@ -940,10 +941,10 @@ impl EngineHandle {
     /// `min(source MTU, min(transport ceiling, mtu - IP header - 8) - 32)`, at least 1280:
     /// with an IPv6 path MTU of 1500, 1420. The engine does not probe for a larger MTU.
     ///
-    /// From the first ceiling or report on, the padding of every peer's data stops at its
-    /// inner MTU, as the kernel pads to the MTU, so a packet at the inner MTU makes an outer
-    /// packet of at most the path MTU (earlier, padding to a multiple of 16 bytes could
-    /// overshoot it by up to 15 bytes).
+    /// Installing a ceiling or lowering a learned path MTU recomputes peers' padding
+    /// limits at their inner MTUs. An ignored first report creates the table but does not
+    /// install padding limits by itself. A packet at its inner MTU fits the path only
+    /// when the outer ceiling can carry the 1280-byte inner floor plus encapsulation headers.
     pub async fn report_path_mtu(&self, path: Path, mtu: u16) -> Result<bool, EngineError> {
         let report = PathMtuReport::new(path, mtu);
         self.call(|tx| Command::ReportPathMtu(report, tx)).await

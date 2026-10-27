@@ -233,8 +233,8 @@ pub enum PolicyError {
 ///
 /// Among the rules of one name (an exact name, a suffix or wildcard anchor, or the default
 /// rules) the first in declaration order whose conditions hold wins; when none holds, the
-/// search goes on. A lookup costs a few hash lookups per
-/// label of the query name, independent of the number of rules.
+/// search goes on. A lookup costs a few hash lookups per label of the query name,
+/// plus a scan of the candidate rules in each matching bucket and, if reached, the defaults.
 #[derive(Debug, Clone)]
 pub struct PolicyTable {
     rules: Vec<Rule>,

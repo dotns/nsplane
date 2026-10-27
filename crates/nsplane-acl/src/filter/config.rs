@@ -174,8 +174,8 @@ pub struct AclFilterStats {
     /// Outbound packets to outbound-restricted peers accepted as replies to
     /// accepted inbound flows.
     pub outbound_replies: u64,
-    /// Reply-table entries removed because what they depended on (a grant or
-    /// a pinhole) is gone.
+    /// Flow continuations removed because their grant, pinhole, rule or default-accept
+    /// decision no longer admits them.
     pub reply_revoked: u64,
     /// Pending-dependency entries (the dependency of an inbound flow accepted
     /// through a grant, a pinhole or a dependent allowance) evicted because

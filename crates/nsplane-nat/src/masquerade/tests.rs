@@ -1,8 +1,7 @@
-//! Tests of the local-side masquerade: round trips with checksums, the pass
-//! cases, expiry, re-entrancy, and the ns parity cases (`parity_*`) ported
-//! from ns `subnet/tests/lan_translation.rs` (route change kills the
-//! reverse, the SYN-only rule, token wrap, capacity) to in-place rewriting
-//! on `PacketBuf`.
+//! Tests of in-place local-side masquerade on `PacketBuf`: round trips and
+//! checksums, pass-through cases, expiry, re-entrancy, route changes, SYN-only
+//! admission, token wrap and capacity. These test the local implementation;
+//! the `parity_*` names do not establish equivalence with another implementation.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::AtomicUsize;
@@ -11,13 +10,12 @@ use std::thread;
 
 use super::*;
 
-/// The LAN host opening flows (ns `fd00:aa::10`).
+/// The LAN host opening flows.
 const HOST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 0, 0x10);
-/// The remote the flows go to (ns `fd00:1:2:1:0:b:c0a8:b01`).
+/// The remote the flows go to.
 const REMOTE: Ipv6Addr = Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 0xb, 0xc0a8, 0xb01);
 const OTHER_REMOTE: Ipv6Addr = Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 0xb, 0xc0a8, 0xb02);
-/// The gateway return identity the flows take as their source (ns
-/// `fd00:1:2:2::6440:1`).
+/// The gateway return identity the flows take as their source.
 const SOURCE: Ipv6Addr = Ipv6Addr::new(0xfd00, 1, 2, 2, 0, 0, 0x6440, 1);
 const ROUTE: u64 = 7;
 const HOST_PORT: u16 = 10_000;
@@ -539,7 +537,7 @@ fn without_verification_a_bad_checksum_is_recomputed() {
     f.reverse(corrupt(&reply(&forwarded)));
 }
 
-// -- ns parity. --
+// -- Route changes, SYN admission and resource bounds. --
 
 #[test]
 fn parity_route_change_kills_the_reverse() {

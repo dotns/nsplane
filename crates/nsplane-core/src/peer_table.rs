@@ -92,12 +92,13 @@ impl Hasher for IndexHasher {
 /// messages, and by allowed IP (cryptokey routing). Session indices and peer ids are shared by
 /// all identities, so they are unique across them. Peer ids are never reused.
 ///
-/// Each identity routes its peers' allowed IPs in its own trie: within an identity a range
-/// that a newer peer claims is moved away from its previous owner. Unrouted local packets
-/// take the fallback trie: the default identity's, or the merged trie of all identities while
-/// a non-default identity holds allowed IPs. In the merged trie the last insert owns a range;
+/// Each identity routes its peers' allowed IPs in its own prefix-length hash tables
+/// ([`AllowedIps`]): within an identity, a range claimed by a newer peer moves away from
+/// its previous owner. Unrouted local packets
+/// take the fallback table: the default identity's, or the merged table of all identities while
+/// a non-default identity holds allowed IPs. In the merged table the last insert owns a range;
 /// a range its owner loses goes to the lowest identity that still holds exactly that range.
-/// Source sets pick the identity whose trie routes a local packet, by its source. A peer's
+/// Source sets pick the identity whose table routes a local packet, by its source. A peer's
 /// inbound destinations are kept apart from the routing tables, by slot.
 pub(crate) struct PeerTable {
     /// Ids of the peers, ascending: ids are handed out in order, so a new peer goes last.
@@ -124,7 +125,7 @@ pub(crate) struct PeerTable {
     /// Whether peers share their tunnels with crypto jobs.
     shared_tunnels: bool,
     /// Moves on every change of the routing state: the peers' slots, the identities, their
-    /// allowed IPs, the merged trie and the source sets.
+    /// allowed IPs, the merged table and the source sets.
     generation: u64,
 }
 
@@ -427,7 +428,7 @@ impl PeerTable {
         Ok(id)
     }
 
-    /// Routes `ip` to `peer` of `identity`, in the identity's trie and in the merged trie,
+    /// Routes `ip` to `peer` of `identity`, in the identity's table and in the merged table,
     /// which the first allowed IP of a non-default identity builds from the default one's.
     fn insert_allowed_ip(&mut self, identity: LocalIdentityId, ip: AllowedIp, peer: PeerId) {
         if identity != LocalIdentityId::DEFAULT && self.merged.is_none() {
@@ -448,7 +449,7 @@ impl PeerTable {
     }
 
     /// Removes the allowed IPs of `peer` of `identity`. A range the peer owned in the merged
-    /// trie goes to the lowest identity that still holds exactly that range.
+    /// table goes to the lowest identity that still holds exactly that range.
     fn remove_allowed_ips(&mut self, identity: LocalIdentityId, peer: PeerId) {
         let Ok(i) = self.identities.binary_search_by_key(&identity, |i| i.id) else {
             return;
@@ -479,14 +480,14 @@ impl PeerTable {
         }
     }
 
-    /// Drops the merged trie once no non-default identity holds allowed IPs.
+    /// Drops the merged table once no non-default identity holds allowed IPs.
     fn drop_unused_merged(&mut self) {
         if self.merged.is_some() && self.identities.iter().skip(1).all(|i| i.ips.is_empty()) {
             self.merged = None;
         }
     }
 
-    /// Rebuilds what the configuration change written so far left dirty in the tries, once
+    /// Rebuilds what the configuration change written so far left dirty in the tables, once
     /// per family; every entry point that writes one ends with it.
     fn commit(&mut self) {
         for identity in &mut self.identities {
@@ -580,14 +581,14 @@ impl PeerTable {
         self.by_index.get(&(receiver_idx >> 8)).copied()
     }
 
-    /// The fallback trie: the merged one while it exists, otherwise the default identity's.
+    /// The fallback table: the merged one while it exists, otherwise the default identity's.
     fn fallback(&self) -> Option<&AllowedIps<PeerId>> {
         self.merged
             .as_ref()
             .or_else(|| self.identities.first().map(|i| &i.ips))
     }
 
-    /// The peer to send a packet for `dst` to in the fallback trie (cryptokey routing).
+    /// The peer to send a packet for `dst` to in the fallback table (cryptokey routing).
     pub(crate) fn by_destination(&self, dst: IpAddr) -> Option<PeerId> {
         self.fallback()?.find(dst).copied()
     }
@@ -602,8 +603,8 @@ impl PeerTable {
         self.sources.as_ref()?.find(src).copied()
     }
 
-    /// The peer to send a packet for `dst` to in the trie of `identity` alone, or in the
-    /// fallback trie for `None`.
+    /// The peer to send a packet for `dst` to in the table of `identity` alone, or in the
+    /// fallback table for `None`.
     pub(crate) fn route_in(
         &self,
         identity: Option<LocalIdentityId>,
@@ -615,8 +616,8 @@ impl PeerTable {
         }
     }
 
-    /// The peer to send a packet from `src` to `dst` to: in the trie of the identity whose
-    /// source set matches `src`, otherwise in the fallback trie.
+    /// The peer to send a packet from `src` to `dst` to: in the table of the identity whose
+    /// source set matches `src`, otherwise in the fallback table.
     pub(crate) fn route_from(&self, src: IpAddr, dst: IpAddr) -> Option<PeerId> {
         if !self.has_sources() {
             return self.by_destination(dst);
@@ -692,7 +693,7 @@ impl PeerTable {
         })
     }
 
-    /// Whether the merged trie exists.
+    /// Whether the merged table exists.
     #[cfg(test)]
     pub(crate) const fn merged(&self) -> bool {
         self.merged.is_some()
@@ -1477,7 +1478,7 @@ mod tests {
         assert!(!table.routes_to(ip("10.0.1.1"), other_peer));
         assert_eq!(table.allowed_ips(default_peer), vec![net("10.0.0.0/24")]);
         assert_eq!(table.allowed_ips(other_peer), vec![net("10.0.0.0/24")]);
-        // The fallback trie: the last insert owns the range.
+        // The fallback table: the last insert owns the range.
         assert_eq!(table.by_destination(ip("10.0.0.1")), Some(other_peer));
 
         // Within an identity the last insert still moves a range.
@@ -1519,7 +1520,7 @@ mod tests {
         assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
         assert!(table.merged());
 
-        // No non-default identity holds allowed IPs: the merged trie goes.
+        // No non-default identity holds allowed IPs: the merged table goes.
         assert_eq!(table.remove(first, &c), Some(first_peer));
         assert!(!table.merged());
         let default_peer = add(&mut table, a, &["10.0.0.0/24"]);
@@ -1557,7 +1558,7 @@ mod tests {
         );
         // A selected identity without a route has none, whatever the others route.
         assert_eq!(table.route_from(ip("100.65.0.1"), ip("10.0.0.1")), None);
-        // No set: the fallback trie.
+        // No set: the fallback table.
         assert_eq!(
             table.route_from(ip("192.0.2.1"), ip("10.0.0.1")),
             table.by_destination(ip("10.0.0.1"))
@@ -1676,7 +1677,7 @@ mod tests {
         assert_eq!(rebuilds(&table, 0), 2);
         assert_eq!(merged(&table), None);
 
-        // The first allowed IPs of another identity build the merged trie from the default
+        // The first allowed IPs of another identity build the merged table from the default
         // one's, in the same change.
         let first_peer = add_ips_in(&mut table, first, key(), &["10.0.1.0/24", "10.0.2.0/24"]);
         assert_eq!(rebuilds(&table, 1), 1);
@@ -1684,11 +1685,11 @@ mod tests {
         assert_eq!(table.by_destination(ip("fd00::1")), Some(default_peer));
         assert_eq!(table.by_destination(ip("10.0.2.1")), Some(first_peer));
         let c = key();
-        // Networks of a length the merged trie uses go in place.
+        // Networks of a length the merged table uses go in place.
         let second_peer = add_ips_in(&mut table, second, c, &["10.0.1.0/24", "10.0.3.0/24"]);
         assert_eq!(merged(&table), Some(2));
         assert_eq!(table.by_destination(ip("10.0.1.1")), Some(second_peer));
-        // A removal re-fills the merged trie in the same change, in place.
+        // A removal re-fills the merged table in the same change, in place.
         assert_eq!(table.remove(second, &c), Some(second_peer));
         assert_eq!(rebuilds(&table, 2), 2);
         assert_eq!(merged(&table), Some(2));

@@ -623,8 +623,10 @@ impl FlowControl {
     /// call never waits. At once, blocked reads, writes and sends of the flow wake up, and
     /// every data handle of the flow fails from then on with
     /// [`io::ErrorKind::ConnectionAborted`](std::io::ErrorKind::ConnectionAborted)
-    /// ([`UdpFlow::recv`](crate::UdpFlow::recv) returns `None`); bytes and datagrams the
-    /// flow buffered are discarded, never returned.
+    /// ([`UdpFlow::recv`](crate::UdpFlow::recv) returns `None`;
+    /// [`UdpSocket::send`](crate::UdpSocket::send) on an unconnected socket still returns
+    /// `NotConnected` before checking revocation). Bytes and datagrams the flow buffered
+    /// are discarded, never returned.
     ///
     /// Unlike a shutdown or a drop, nothing is sent: no FIN, and unlike
     /// [`TcpConnection::abort`](crate::TcpConnection::abort) no RST either. The peer is not

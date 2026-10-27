@@ -243,7 +243,7 @@ impl Tunn {
         }
 
         // All ephemeral private keys and symmetric session keys are zeroed out after
-        // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
+        // (REJECT_AFTER_TIME * 3), or 540 seconds, if no new keys have been exchanged.
         if now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3 {
             tracing::debug!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
             self.handshake.set_expired();
@@ -251,7 +251,7 @@ impl Tunn {
             return Err(WireGuardError::ConnectionExpired);
         }
 
-        // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
+        // After REKEY_ATTEMPT_TIME (90 seconds) of trying to initiate a new handshake,
         // the retries give up and cease, and clear all existing packets queued
         // up to be sent. If a packet is explicitly queued up to be sent, then
         // this timer is reset.
@@ -269,7 +269,7 @@ impl Tunn {
     /// Whether a handshake initiation is due.
     fn handshake_due(&mut self, now: Duration) -> bool {
         if self.handshake.is_init_sent() {
-            // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
+            // A handshake initiation is retried after REKEY_TIMEOUT (5 seconds) plus jitter,
             // if a response has not been received, where jitter is some random
             // value between 0 and 333 ms.
             let due = now.saturating_sub(self.timers.handshake_init_sent)
@@ -295,9 +295,9 @@ impl Tunn {
         if self.timers.is_initiator() {
             // After sending a packet, if the sender was the original initiator
             // of the handshake and if the current session key is REKEY_AFTER_TIME
-            // ms old, we initiate a new handshake. If the sender was the original
+            // (120 seconds) old, we initiate a new handshake. If the sender was the original
             // responder of the handshake, it does not re-initiate a new handshake
-            // after REKEY_AFTER_TIME ms like the original initiator does.
+            // after REKEY_AFTER_TIME like the original initiator does.
             if session_established < self.timers[TimeLastDataPacketSent]
                 && session_age >= REKEY_AFTER_TIME
             {
@@ -307,7 +307,7 @@ impl Tunn {
 
             // After receiving a packet, if the receiver was the original initiator
             // of the handshake and if the current session key is REJECT_AFTER_TIME
-            // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT ms old, we initiate a new
+            // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT seconds old, we initiate a new
             // handshake.
             if session_established < self.timers[TimeLastDataPacketReceived]
                 && session_age >= REKEY_ON_RECEIVE_TIME
@@ -320,7 +320,7 @@ impl Tunn {
         }
 
         // If we have sent data to a given peer but have not received a packet from that peer
-        // for (KEEPALIVE + REKEY_TIMEOUT) ms since, we initiate a new handshake.
+        // for (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT), or 15 seconds, since, we initiate a new handshake.
         if self
             .timers
             .handshake_due_from
@@ -336,7 +336,7 @@ impl Tunn {
     /// Whether a keepalive is due.
     fn keepalive_due(&mut self, now: Duration) -> bool {
         // If data has been received from a given peer, but we have not sent anything back
-        // for KEEPALIVE ms since, we send an empty packet.
+        // for KEEPALIVE_TIMEOUT (10 seconds) since, we send an empty packet.
         if self
             .timers
             .keepalive_due_from

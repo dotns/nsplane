@@ -8,8 +8,9 @@
 //!
 //! Datagrams are keyed by (source, destination, protocol, identification) for IPv4
 //! (RFC 791) and (source, destination, identification) for IPv6 (RFC 8200). Fragments
-//! may arrive in any order and an identical retransmitted fragment is ignored, but
-//! fragments that overlap with different coverage drop the whole datagram (RFC 5722;
+//! may arrive in any order. After end-consistency checks, a fragment with an already
+//! received byte range is ignored without comparing payload bytes; overlapping ranges
+//! with different coverage drop the whole datagram (RFC 5722;
 //! the same policy applies to IPv4).
 
 use std::collections::HashMap;
@@ -156,7 +157,8 @@ impl Datagram {
         }
     }
 
-    /// Adds `piece`, ignoring an exact duplicate.
+    /// Adds `piece`; after end-consistency checks, ignores an already received range
+    /// without comparing its payload bytes.
     fn insert(&mut self, piece: &Piece<'_>) -> Result<(), Reject> {
         let (start, end) = (piece.start, piece.start + piece.data.len());
         if !piece.more {

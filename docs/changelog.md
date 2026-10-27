@@ -533,3 +533,16 @@ alone (task `20261027-0349-barrier-count-window`), rebased onto `main` at `9e955
 docs only, the freeze lifted, so no exception). `main` fast-forwards to the release head.
 Workspace versions, internal requirements and guide tags were synchronized in the version
 commit.
+
+## 2026-10-27 [fix]
+
+Task `20261027-0537-tk-cleanup`: owner-approved DNS passthrough fixture and source documentation cleanup
+from v0.20.1. Reserve both upstream socket protocols before serving; retry only UDP
+allocation conflicts. Reconciled baseline drift entries with current code and corrected
+comments/rustdoc/README text without runtime changes. Existing historical records are
+preserved. The baseline checkout is untouched; delivery targets a Gitea branch only.
+Verification: deterministic old-fixture AddrInUse failure, normal and forced-allocation-conflict
+passthrough runs each 10/10, one complete `just check` (2,405 tests passed, 34 skipped;
+36 doctests passed, 40 ignored), and warning-denied workspace rustdoc all passed. Local
+review found no introduced issue. The four other-document drift entries remain in tk #184
+outside this comment/README scope.

@@ -275,8 +275,8 @@ impl PacketSource for SlotSource {
     async fn recv(&mut self) -> io::Result<PacketBuf> {
         let mtu = usize::from(self.mtu);
         let mut packet = self.pool.get(mtu + TRANSLATION_SLACK + TAILROOM);
-        // `PacketBuf` exposes only initialised bytes, so the read region is zero-filled
-        // first.
+        // `set_len` zero-fills only never-initialised bytes; reused bytes retain their
+        // contents until the read overwrites them.
         packet.set_len(mtu + 1);
         loop {
             // Created before the check, so a change made after it wakes the wait.

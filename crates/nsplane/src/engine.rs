@@ -67,17 +67,18 @@ const PATH_MTU_REPORTS: usize = 16;
 /// hands the datagrams one drain of the core queues for a transport to its transmit task as
 /// one message (up to [`MAX_BATCH`]; the transmit queue stays bounded in datagrams), and the
 /// transmit task sends what is queued in batches of up to [`MAX_BATCH`]. The core
-/// is never shared. Without crypto workers the data path takes no lock: each peer owns its
-/// tunnel. With crypto workers each peer's tunnel stays behind a mutex, but only the owner
-/// locks it: the owner reserves a local packet's counter or checks a received message's
+/// is never shared. Each peer owns its tunnel; receive replay validation takes a lock
+/// even without crypto workers. With workers each tunnel stays behind a mutex, but only
+/// the owner locks it: the owner reserves a local packet's counter or checks a received message's
 /// session and replay window, and hands the job a seal or open ticket (session key and
 /// counter), so a job never touches the tunnel; the owner commits each open, in order,
 /// when it completes the job. The mutex is therefore uncontended.
 ///
 /// Transports: the engine runs any number of transports, keyed by [`Transport::id`]. Every
 /// transport's received datagrams feed the core through one queue, so a peer's
-/// authenticated traffic may arrive on any of them (the [`PathPolicy`] decides whether its
-/// path follows). A datagram to transmit goes to the transport named by its
+/// authenticated traffic may arrive on any transport permitted by its local identity
+/// (the [`PathPolicy`] decides whether its path follows). A datagram to transmit goes
+/// to the transport named by its
 /// [`Path::transport`]; when none is installed under that id, it is dropped and counted
 /// under [`crate::DROP_NO_TRANSPORT`]. Each transport's tasks are spawned for its concrete
 /// type when it is added, so no datagram goes through a boxed future (unless the transport
@@ -153,7 +154,8 @@ const PATH_MTU_REPORTS: usize = 16;
 /// Suspension: [`EngineHandle::suspend`] pauses the engine without tearing it down. While
 /// suspended, every I/O task waits before its next read or write (one already in progress
 /// may complete), so datagrams that arrive stay in the socket's buffer, and the owner task
-/// polls neither its queues nor the core's timer: no I/O runs and no timer fires. Handle
+/// polls neither its packet queues nor the core's timer. Independently owned transport
+/// tasks, such as link dialing and pings, are not paused by this gate. Handle
 /// calls are still served; the datagrams they cause wait in the transmit queues and the
 /// waiting datagrams (within their bounds) until [`EngineHandle::resume`], which runs the
 /// core's timers once with the current time, so sessions that expired meanwhile expire and
@@ -191,15 +193,17 @@ const PATH_MTU_REPORTS: usize = 16;
 /// packets are encrypted on every worker in parallel (on a multi-threaded runtime). The owner
 /// completes the jobs in the order it handed them out, marking each received datagram's
 /// counter as received only then, so each peer's packets leave in the order they came and a
-/// duplicate opened on two workers at once is still rejected. At most queue capacity packets
-/// are with the workers at a time; while that many are, the owner stops reading local
+/// duplicate opened on two workers at once is still rejected. Queue capacity limits input
+/// admission to the workers; fragmentation can expand an admitted packet into several
+/// jobs and exceed that budget. While the budget is reached, the owner stops reading local
 /// packets and received datagrams, and the received datagrams with the workers count
 /// against the deliver queue's room (see Backpressure). Likewise, the local packets with
 /// the workers count against the room for local packets, so a slow transport holds back
 /// the source instead of dropping their datagrams under [`crate::DROP_TRANSMIT_FULL`].
-/// Before every handle call that reads or changes peers, counters or sessions, the owner
-/// waits for the packets with the workers, so the call sees (and acts after) every packet
-/// read before it, as without workers.
+/// Before `ConfigChange` commands, peer statistics/session/list queries, injections, drop
+/// counter and status queries, unanswered-handshake queries, and identity removal/list
+/// queries, the owner waits for outstanding jobs. Key/ID and transport-counter queries
+/// do not wait for workers.
 ///
 /// Local barrier: [`EngineHandle::local_barrier`] waits until every local packet the source
 /// task took before the call has been routed and filtered or dropped; the source task counts

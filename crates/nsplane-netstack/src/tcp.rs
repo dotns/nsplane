@@ -138,7 +138,7 @@ pub(crate) fn revoked() -> io::Error {
 /// Dropping the connection closes it gracefully (FIN after the buffered bytes) and
 /// discards bytes that arrive afterwards; the socket and its tuple stay with the stack
 /// until the close completes. [`abort`](Self::abort) resets the connection instead and
-/// releases it at once. A connection without traffic in either
+/// releases it after its RST can be dispatched. A connection without traffic in either
 /// direction for 5 minutes is reset the same way: the peer gets an RST.
 /// [`control`](Self::control) revokes it without sending anything; every operation then
 /// fails with [`io::ErrorKind::ConnectionAborted`].
@@ -200,8 +200,10 @@ impl TcpConnection {
 
     /// Waits until the stack has released the connection's socket.
     ///
-    /// After this resolves the connection can no longer emit packets, so state that
-    /// correlates the connection with something outside the stack can be released. The
+    /// After this resolves the socket emits no new packets, but output such as the final
+    /// ACK can still be queued. Before releasing external correlation state, keep receiving
+    /// until [`NetStackSource::tcp_egress_drained`](crate::NetStackSource::tcp_egress_drained)
+    /// is true and finish forwarding packets already taken from the source. The
     /// socket is released once it is closed (or in TIME-WAIT) and every received byte was
     /// read, or after the idle timeout, or when the stack stops.
     pub async fn terminated(&self) {
@@ -210,12 +212,13 @@ impl TcpConnection {
         let _ = terminal.wait_for(|terminal| *terminal).await;
     }
 
-    /// Resets the connection and releases it at once.
+    /// Resets the connection and releases it after its RST can be dispatched.
     ///
     /// The stack sends an RST to the peer instead of the FIN a drop sends, discards the
-    /// bytes not read or not taken yet, and releases the socket within the driver turn
-    /// that observes the abort, without waiting for the peer, TIME-WAIT or the idle
-    /// timeout. After that turn [`NetStackHandle::owns`](crate::NetStackHandle::owns) no
+    /// bytes not read or not taken yet, and releases the socket once the RST can be
+    /// dispatched. Egress backpressure can delay release across driver turns; it does not
+    /// wait for the peer, TIME-WAIT or the idle timeout. After release
+    /// [`NetStackHandle::owns`](crate::NetStackHandle::owns) no
     /// longer reports the connection's tuple, its local port can be connected from again,
     /// and the release [`terminated`](Self::terminated) waits for has happened. A
     /// connection the peer already reset or closed is only released; no RST is sent.

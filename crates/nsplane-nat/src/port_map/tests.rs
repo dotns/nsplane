@@ -1,6 +1,6 @@
-//! Tests of the port map filter, adapted from ns `packet_nat` tests (forward
-//! and reverse NAT, conntrack reuse, checksums) to the `PacketFilter` form.
-//! Every rewritten packet has all its checksums verified by full recompute.
+//! Tests of forward and reverse NAT, conntrack reuse and checksums through
+//! the port map `PacketFilter`. Every rewritten packet has all checksums
+//! verified by full recomputation.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};

@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-10-20
+> Updated: 2026-10-27
 
 ## Usage
 
@@ -77,3 +77,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261026-0836-local-barrier-plaintext-ingress Engine local barrier and validated plaintext ingress**](20261026-0836-local-barrier-plaintext-ingress.md) `P2`
 - [x] [**20261026-0838-first-input-flow-control Netstack flow control from the first input**](20261026-0838-first-input-flow-control.md) `P1`
 - [x] [**20261027-0349-barrier-count-window Local barrier: cover a packet the source is handing out**](20261027-0349-barrier-count-window.md) `P1`
+
+- [x] [**20261027-0537-tk-cleanup DNS fixture and source documentation cleanup**](20261027-0537-tk-cleanup.md) `P2`
