@@ -25,9 +25,10 @@
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
-use nsplane_packet::reassembly::{self, Reassembler, ReassemblyConfig};
+use nsplane_packet::reassembly::{self, FragmentTags, Reassembler, ReassemblyConfig};
 
 use super::{Result, reasons};
 
@@ -175,12 +176,16 @@ impl Reassembly {
         });
     }
 
-    /// Adds the IPv4 fragment `packet` of the datagram `key`, whose payload
-    /// is `len` bytes, at `now` (seconds), opening an entry if there is none.
+    /// Adds the IPv4 fragment `packet` of the datagram `key`, with packet tag
+    /// `tag`, whose payload is `len` bytes, at `now` (seconds), opening an entry
+    /// if there is none. A completed datagram whose fragments carried different
+    /// tags is dropped (`reasons::FRAGMENT_MIXED_TAGS`); otherwise their tag is
+    /// the completing fragment's.
     pub(super) fn observe(
         &mut self,
         key: Key,
         packet: &[u8],
+        tag: Option<NonZeroU64>,
         len: usize,
         now: u64,
     ) -> Result<Outcome> {
@@ -197,7 +202,8 @@ impl Reassembly {
             return Err(reasons::BUDGET_EXCEEDED);
         }
         let (before, pending) = (self.reassembler.stats(), self.reassembler.pending());
-        match self.reassembler.push(packet, self.at(now)) {
+        let (outcome, tags) = self.reassembler.push_tagged(packet, tag, self.at(now));
+        match outcome {
             reassembly::Outcome::Held => {
                 let held = self.held.entry(key).or_insert(Held {
                     created_at: now,
@@ -211,6 +217,10 @@ impl Reassembly {
             reassembly::Outcome::Complete(packet) => {
                 self.remove(&key);
                 self.counters.accepted += 1;
+                // A merge never turns tagged input into an untagged packet.
+                if tags == FragmentTags::Mixed {
+                    return Err(reasons::FRAGMENT_MIXED_TAGS);
+                }
                 Ok(Outcome::Complete(packet))
             }
             reassembly::Outcome::Pass => Err(reasons::MALFORMED_FRAGMENT),
@@ -288,7 +298,7 @@ mod tests {
     }
 
     fn observe(state: &mut Reassembly, packet: &[u8], now: u64) -> Result<Outcome> {
-        state.observe(KEY, packet, packet.len() - 20, now)
+        state.observe(KEY, packet, None, packet.len() - 20, now)
     }
 
     const DATA: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";

@@ -4,6 +4,7 @@
 
 mod nested_lans;
 mod peer6_eam4;
+mod tags;
 mod vectors;
 
 use std::net::{Ipv4Addr, Ipv6Addr};

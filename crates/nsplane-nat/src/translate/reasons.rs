@@ -53,6 +53,10 @@ pub const OVERLAP: &str = "translation fragment overlap";
 pub const EXPIRED: &str = "translation fragment expired";
 /// Reassembly is at its entry or byte limit.
 pub const BUDGET_EXCEEDED: &str = "translation fragment budget exceeded";
+/// The fragments of a reassembled datagram carried different packet tags
+/// ([`PacketBuf::tag`](nsplane_packet::PacketBuf::tag)), or some a tag and others none:
+/// the datagram is dropped rather than passed with no tag.
+pub const FRAGMENT_MIXED_TAGS: &str = "translation fragment mixed tags";
 /// A reassembled datagram would be larger than the translator's MTU once
 /// translated (see [`Translator::set_mtu`](crate::Translator::set_mtu)).
 pub const REASSEMBLED_TOO_BIG: &str = "translation reassembled datagram too big";
