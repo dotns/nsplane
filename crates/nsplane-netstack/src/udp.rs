@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -37,6 +38,8 @@ pub(crate) struct Datagram {
     pub(crate) dst: SocketAddr,
     /// A view into the ingress packet; parsing copies nothing.
     pub(crate) payload: Bytes,
+    /// The packet's tag: its ingress label.
+    pub(crate) label: Option<NonZeroU64>,
 }
 
 /// Extracts the UDP datagram from an IPv4 or IPv6 packet.
@@ -45,16 +48,31 @@ pub(crate) struct Datagram {
 /// IPv6 extension headers are not walked.
 pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
     let (src, dst, payload) = udp_payload(&packet)?;
+    let label = packet.tag();
     let payload = packet.freeze().slice(payload);
-    Some(Datagram { src, dst, payload })
+    Some(Datagram {
+        src,
+        dst,
+        payload,
+        label,
+    })
 }
 
 /// [`parse_udp`], also returning the whole packet the datagram's payload is a view into.
 pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
     let (src, dst, payload) = udp_payload(&packet)?;
+    let label = packet.tag();
     let whole = packet.freeze();
     let payload = whole.slice(payload);
-    Some((Datagram { src, dst, payload }, whole))
+    Some((
+        Datagram {
+            src,
+            dst,
+            payload,
+            label,
+        },
+        whole,
+    ))
 }
 
 /// The source, destination and payload range of an unfragmented UDP datagram.
@@ -285,6 +303,13 @@ impl UdpFlow {
     /// flow and every [`UdpReply`] of it share one control.
     pub fn control(&self) -> FlowControl {
         self.reply.control()
+    }
+
+    /// The ingress label of the flow: the tag the consumer set on its first datagram (see
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label)), or `None` for
+    /// an unlabeled flow.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.reply.flow.label()
     }
 
     /// The state of the flow's lifetime.

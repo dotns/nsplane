@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -176,6 +177,14 @@ impl TcpConnection {
     /// The connection's control, which can revoke it from any task; see [`FlowControl`].
     pub fn control(&self) -> FlowControl {
         FlowControl::new(Arc::clone(&self.flow))
+    }
+
+    /// The ingress label of the connection: the tag the consumer set on its SYN (see
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label)), or `None` for
+    /// an unlabeled connection and for one opened with
+    /// [`connect_tcp`](crate::NetStackHandle::connect_tcp).
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.flow.label()
     }
 
     /// The state of the connection's lifetime.

@@ -182,7 +182,7 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        let flow = FlowState::new(Target::UdpBound(addr), &self.revocations);
+        let flow = FlowState::new(Target::UdpBound(addr), None, &self.revocations);
         self.bound.insert(addr, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_bound(addr);
         Ok(UdpSocket::new(
@@ -248,7 +248,7 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        let flow = FlowState::new(Target::UdpConnected(key), &self.revocations);
+        let flow = FlowState::new(Target::UdpConnected(key), None, &self.revocations);
         self.connected.insert(key, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_flow(local, remote);
         Ok(UdpSocket::new(

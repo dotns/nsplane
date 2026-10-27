@@ -630,7 +630,7 @@ async fn receipt_fails_when_fence_table_is_full() -> TestResult {
             start: 0,
             end: u64::MAX,
         };
-        assert!(source.fences.insert(fence));
+        assert!(source.fences.insert(fence).is_ok());
     }
 
     assert_eq!(retire(&sending.control()).await?, RetirementOutcome::Failed);

@@ -221,6 +221,16 @@ pub struct NetStackConfig {
     /// [`TransparentConfig::admission`] while this field is [`Admission::Immediate`]; a
     /// `Decide` here takes precedence. Default [`Admission::Immediate`].
     pub admission: Admission,
+    /// Most revoked ingress labels the stack remembers at once, see
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label).
+    ///
+    /// While the stack holds a label's tombstone, input with that label is dropped and
+    /// counted in [`label_revoked`](crate::NetStackStats::label_revoked), and it never opens
+    /// a new connection or flow. Beyond this many revoked labels the oldest tombstone is
+    /// forgotten, so a label is remembered for at least the next `max_revoked_labels`
+    /// revocations; a tombstone costs about 16 bytes. 0 keeps none: input sent after the
+    /// revoke then opens new lifetimes again. Default 65536.
+    pub max_revoked_labels: usize,
 }
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
@@ -360,6 +370,7 @@ impl Default for NetStackConfig {
             reassembly: None,
             transparent: None,
             admission: Admission::Immediate,
+            max_revoked_labels: 65_536,
         }
     }
 }
@@ -388,6 +399,7 @@ pub(crate) struct Settings {
     pub(crate) transparent: Option<Box<Transparent>>,
     /// The top-level admission, or the deprecated transparent one.
     pub(crate) admission: Admission,
+    pub(crate) max_revoked_labels: usize,
 }
 
 /// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
@@ -554,6 +566,7 @@ impl Settings {
                 },
                 admission => admission,
             },
+            max_revoked_labels: config.max_revoked_labels,
         }
     }
 
