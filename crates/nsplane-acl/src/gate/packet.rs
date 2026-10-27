@@ -135,12 +135,13 @@ struct Chain {
 /// Hop-by-Hop, Routing and Destination Options by their length, AH by its
 /// own length, and one Fragment header, after which a later fragment holds
 /// no more headers. `None` for a truncated chain, more than
-/// [`MAX_EXTENSION_HEADERS`] headers or a second Fragment header.
+/// [`MAX_EXTENSION_HEADERS`] headers (the Fragment header counts, also in a
+/// later fragment) or a second Fragment header.
 fn walk_v6(packet: &[u8]) -> Option<Chain> {
     let mut protocol = *packet.get(6)?;
     let mut offset = 40;
     let mut fragment = None;
-    for _ in 0..=MAX_EXTENSION_HEADERS {
+    for consumed in 0..=MAX_EXTENSION_HEADERS {
         let length = match protocol {
             0 | 43 | 60 => (usize::from(*packet.get(offset + 1)?) + 1) * 8,
             51 => (usize::from(*packet.get(offset + 1)?) + 2) * 4,
@@ -153,6 +154,9 @@ fn walk_v6(packet: &[u8]) -> Option<Chain> {
                 });
             }
         };
+        if consumed == MAX_EXTENSION_HEADERS {
+            return None;
+        }
         let header = packet.get(offset..offset + length)?;
         if protocol == 44 {
             let field = u16::from_be_bytes([header[2], header[3]]);

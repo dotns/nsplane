@@ -5,6 +5,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.4] - unreleased
+
+Patch release; no public API change.
+
+### Fixed
+- `nsplane-packet` `vnet::segment`: an IPv4 TCP or UDP super-packet whose header carries
+  20 option bytes (IHL 10, the length of an IPv6 header) is segmented as IPv4. It took the
+  IPv6 branch: every segment kept the super-packet's total length, had its identification
+  overwritten, a stale header checksum and invalid transport checksums, so the receiver
+  dropped it. This affects `nsplane-tun` offload reads and `nsplane-ether` packet-socket
+  reads. The IP version now comes from the GSO type (or the first nibble for `GSO_UDP_L4`);
+  `nsplane-tun`'s coalescer, which merges only IPv4 headers without options, uses the
+  version the same way.
+- `nsplane-acl` flow gate: the IPv6 extension-header walk counts a later fragment's Fragment
+  header toward the documented limit of 8 headers. Behaviour change: a later fragment of an
+  admitted datagram carried behind 8 other extension headers (9 in all) is now denied
+  `Malformed` instead of passing as `ValidState`; without an admitted first fragment it is
+  `Malformed` instead of `OrphanFragment`. First fragments and unfragmented packets already
+  obeyed the limit; such a fragment never opened a flow.
+
 ## [0.19.3] - 2026-10-26
 
 Patch release; no public API change.

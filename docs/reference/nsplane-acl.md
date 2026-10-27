@@ -317,7 +317,7 @@ and IPv6 packets.
   `GateReason` has stable names (`as_str`) and drop reasons (`drop_reason`, `flow gate:
   <reason>`).
 - **IPv6.** Hop-by-Hop, Routing, Destination Options and Fragment headers are walked (at
-  most 8, within the payload length; AH is skipped by its own length, ESP and No Next Header
+  most 8, the Fragment header counted, in later fragments too, within the payload length; AH is skipped by its own length, ESP and No Next Header
   carry no ports); a truncated or longer chain, a second Fragment header or a first fragment
   without its whole upper-layer header is `Malformed` as for IPv4, and a packet shorter than
   the 40-byte fixed header passes as unreadable. Fragments are keyed by the 32-bit
@@ -449,7 +449,7 @@ reject invalid input and leave the previous state in effect; `open_pinhole` retu
 - `FlowTracker`: a bounded table of the capacity it is created with.
 - Flow gate: `GateLimits` (defaults 16,384 flows, 2,048 per peer, 4,096 fragments); a full
   table fails closed with `GateReason::StateCapacity` and never evicts a live entry.
-- IPv6 header walk in the gate: at most 8 extension headers.
+- IPv6 header walk in the gate: at most 8 extension headers, the Fragment header included.
 - Gate decision events: `GateEventsConfig::capacity` buffered events and a token bucket of
   `burst` tokens refilled at `rate` per second; events beyond them are dropped and counted
   in `GateCounters::events_dropped`.

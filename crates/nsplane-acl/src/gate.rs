@@ -94,10 +94,11 @@
 //!   Options (60) and Fragment (44) headers are walked, an Authentication
 //!   Header (51) is skipped by its own length so the ports behind it stay
 //!   visible, and ESP (50) and No Next Header (59) are upper layers without
-//!   ports. At most 8 extension headers, all within the payload length; a
-//!   longer or truncated chain, a second Fragment header, a payload length
-//!   beyond the packet, or a first fragment that does not hold the whole
-//!   TCP (20 bytes), UDP or `ICMPv6` (8 bytes) header is malformed. The
+//!   ports. At most 8 extension headers, the Fragment header included (in
+//!   later fragments too), all within the payload length; a longer or
+//!   truncated chain, a second Fragment header, a payload length beyond the
+//!   packet, or a first fragment that does not hold the whole TCP (20
+//!   bytes), UDP or `ICMPv6` (8 bytes) header is malformed. The
 //!   addresses are those of the fixed header, with or without a Routing
 //!   header; a packet shorter than the fixed header (40 bytes, or 20 for
 //!   IPv4) is unreadable and passes.
