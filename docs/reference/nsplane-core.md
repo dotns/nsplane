@@ -8,7 +8,7 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
 
 ## Behavior
 
@@ -87,6 +87,28 @@ the filter chain, so no `PacketFilter` sees it. A stateful filter (`nsplane-acl`
 `AclFilter`) keeps no reply state for an injected packet, so the peer's replies are judged by
 the inbound rules alone, and a translating filter does not translate it; a consumer orders
 its filters with that in mind. Pinned by `nsplane-e2e`'s `inject_filters` tests.
+
+### Validated plaintext
+
+`Core::receive_plaintext(peer, from, packet)` runs a plaintext IP packet attributed to a peer
+through the code a decrypted transport data packet runs after decryption, shared with it:
+the allowed-IP source check (`SOURCE_NOT_ALLOWED`), the peer's inbound destinations
+(`DESTINATION_NOT_ALLOWED`, an owned list or a shared source), the inbound filters in install
+order (`PacketFilter::inbound_from` with `from`) and `Output::Deliver`. So a plaintext packet
+and a decrypted packet of the same peer meet the same verdicts.
+
+- The packet is read as the tunnel reads decrypted data: cut to the length its IP header
+  states. A packet that is not a whole IPv4 or IPv6 packet (version, header, length) has no
+  readable source and is dropped as `SOURCE_NOT_ALLOWED`.
+- A peer that does not exist or was removed is dropped as `UNKNOWN_PLAINTEXT_PEER`, never
+  delivered; peer ids are never reused, so an id of a removed peer never reaches a later one.
+- Nothing is authenticated: no handshake accounting, no `PathPolicy::on_authenticated`, no
+  roaming and no `Event::Authenticated`; the peer's path stays as it is and `from` is only
+  what the filters see, so a filter that answers on the arrival path answers on `from`.
+- A delivered packet counts in the peer's `data_rx`, not in `rx` (no datagram arrived).
+
+Unlike `inject_inbound`, which delivers past every check, this entry is a second way into the
+inbound filter chain; `nsplane`'s `PlaintextIngress` feeds it.
 
 ### Padding
 
@@ -259,7 +281,7 @@ stops reading keeps up to 8 old values until it exits.
 
 Every packet the core drops is counted under a reason from `reasons` (for example
 `NO_ROUTE`, `NO_SESSION`, `UNKNOWN_PEER`, `UNKNOWN_SESSION`, `UNKNOWN_LOCAL_IDENTITY`,
-`DESTINATION_NOT_ALLOWED`) and published as `Event::Dropped`; filters add their own reasons.
+`SOURCE_NOT_ALLOWED`, `DESTINATION_NOT_ALLOWED`, `UNKNOWN_PLAINTEXT_PEER`) and published as `Event::Dropped`; filters add their own reasons.
 The engine reports the counts with `EngineHandle::drop_counters`.
 
 ## See also

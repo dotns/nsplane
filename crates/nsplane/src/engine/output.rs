@@ -19,6 +19,7 @@ use crate::events::{
     DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSPORT_CLOSED,
     DROP_TRANSPORT_SEND_ERROR,
 };
+use crate::io::PacketSink;
 
 /// The sink as the owner task sees it.
 pub(super) struct InlineSink {
@@ -34,6 +35,23 @@ pub(super) struct InlineSink {
     /// Packets the owner task delivers itself at the end of the current drain, oldest
     /// first ([`Owner::deliver_inline`]).
     pub(super) delivered: VecDeque<(PeerId, PacketBuf)>,
+}
+
+impl InlineSink {
+    pub(super) fn new<Snk: PacketSink>(
+        sink: Arc<Snk>,
+        outstanding: Arc<AtomicUsize>,
+        allowed: bool,
+    ) -> Self {
+        Self {
+            try_deliver: Box::new(move |packets| sink.try_send_batch(packets)),
+            outstanding,
+            allowed,
+            closed: false,
+            backoff: Backoff::default(),
+            delivered: VecDeque::with_capacity(MAX_BATCH),
+        }
+    }
 }
 
 /// When the owner task sends and delivers itself.

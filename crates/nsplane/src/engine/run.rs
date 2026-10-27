@@ -13,7 +13,7 @@ use super::command::settles;
 use super::transport::Datagram;
 use super::workers::JobBatch;
 use super::{Owner, now};
-use crate::handle::Command;
+use crate::handle::{Command, Plaintext};
 use crate::transport::PathMtuReport;
 
 /// What woke the owner task.
@@ -30,6 +30,8 @@ enum Wake {
     Flush(TransportId, Option<OwnedSemaphorePermit>),
     /// A crypto worker ran a job.
     Crypto(Option<JobBatch>),
+    /// A packet of the plaintext ingress queue.
+    Plaintext(Option<Plaintext>),
     Timer,
 }
 
@@ -50,7 +52,11 @@ impl Owner {
             // waiting datagrams.
             let droppable = matches!(
                 wake,
-                Wake::Local(_) | Wake::Datagram(_) | Wake::Crypto(_) | Wake::Timer
+                Wake::Local(_)
+                    | Wake::Datagram(_)
+                    | Wake::Plaintext(_)
+                    | Wake::Crypto(_)
+                    | Wake::Timer
             );
             match wake {
                 Wake::Command(None) => break,
@@ -69,7 +75,13 @@ impl Owner {
                 // The owner keeps a sender of both queues, so they never close.
                 Wake::Datagram(None) | Wake::PathMtu(None) => {}
                 Wake::Local(Some(packet)) => self.input_locals(packet),
-                Wake::Local(None) => self.local = None,
+                Wake::Local(None) => {
+                    // No local packet comes any more: every barrier is passed.
+                    self.local = None;
+                    self.pass_barriers();
+                }
+                Wake::Plaintext(Some(packet)) => self.input_plaintext(packet),
+                Wake::Plaintext(None) => self.plaintext = None,
                 Wake::Mtu(Some(mtu)) => {
                     if mtu != self.mtu {
                         self.mtu = mtu;
@@ -164,7 +176,32 @@ impl Owner {
         if !self.sink.closed && !self.poll_deliver_room(cx) {
             return Poll::Pending;
         }
+        if self.plaintext.is_some() {
+            return self.poll_datagrams_and_plaintext(cx);
+        }
         self.datagrams.poll_recv(cx).map(Wake::Datagram)
+    }
+
+    /// Polls the received datagrams and the plaintext ingress queue, alternating which
+    /// comes first.
+    #[cold]
+    fn poll_datagrams_and_plaintext(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
+        let Some(plaintext) = &mut self.plaintext else {
+            return Poll::Pending;
+        };
+        plaintext.first = !plaintext.first;
+        if plaintext.first
+            && let Poll::Ready(packet) = plaintext.packets.poll_recv(cx)
+        {
+            return Poll::Ready(Wake::Plaintext(packet));
+        }
+        if let Poll::Ready(datagram) = self.datagrams.poll_recv(cx) {
+            return Poll::Ready(Wake::Datagram(datagram));
+        }
+        if plaintext.first {
+            return Poll::Pending;
+        }
+        plaintext.packets.poll_recv(cx).map(Wake::Plaintext)
     }
 
     /// Whether the deliver queue has room beyond the received datagrams with the crypto
