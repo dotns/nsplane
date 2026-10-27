@@ -3,7 +3,8 @@
 Design note, no code. Status: for owner review. Plan:
 [20261027-0433-post-freeze-schedule](../20261027-0433-post-freeze-schedule.md) (M3); task:
 [20261027-0433-peer-expiry-signal](../../task/20261027-0433-peer-expiry-signal.md). Ships in
-0.21.0 with release C. All code references are at `main` `ba45ff6` (v0.20.0).
+0.21.0 with release C. All code references are at `main` right after v0.20.0 (the commit that
+added the post-freeze schedule).
 
 ## Starting point: the event exists
 
@@ -52,7 +53,7 @@ So the actual gaps are:
    `SessionExpired` as "peer down" (as the guide does) reads an idle peer as down.
 3. **A peer that was never up goes down.** Path 1 measures from the timer origin when no
    session was ever established. A peer that is added and never contacted emits
-   `SessionExpired` 540 s after its first timer tick. Checked on `ba45ff6` with a scratch
+   `SessionExpired` 540 s after its first timer tick. Checked on that commit with a scratch
    core test (two cores, no traffic): no event at 539 s, `SessionExpired { peer }` at 541 s,
    `peer_has_session` false, nothing more by 1141 s.
 
@@ -169,7 +170,7 @@ publishes FIFO:
 - `Peer` grows by one `u64` and one `bool`. Both go in the cold fields next to `expired` and
   `unanswered_handshakes`, which the data path does not touch. Check: one `slot.sh` A/B of
   `core_pair` / `local_graph` with the implementation, to show no change beyond noise.
-- Sizes on `ba45ff6` (x86_64, scratch test): `Event` 64 bytes, `Output` 96 bytes,
+- Sizes on that commit (x86_64, scratch test): `Event` 64 bytes, `Output` 96 bytes,
   `Path` 36 bytes, `PacketBuf` 56 bytes, `PeerStats` 192 bytes. `SessionExpired` gains one
   byte and stays far below the largest variant. The `Event::PeerStats` variant grows from
   52 to 60 bytes of fields, so `Event` stays at 64 bytes or grows to 72. Either way,
