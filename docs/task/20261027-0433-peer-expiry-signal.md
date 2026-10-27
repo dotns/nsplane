@@ -1,6 +1,6 @@
 # 20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)
 
-- **status**: pending
+- **status**: in progress (design note merged 2026-10-27, owner review of O1-O5 pending)
 - **priority**: P3
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-27 04:33
