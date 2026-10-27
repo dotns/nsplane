@@ -1,6 +1,6 @@
 # ADR: feature freeze at 0.11.x
 
-- **Status**: Accepted
+- **Status**: Superseded by [2026-10-27-normal-maintenance](2026-10-27-normal-maintenance.md)
 - **Date**: 2026-10-08
 - **Review**: none
 
@@ -77,3 +77,5 @@ slot A/B when it touches the data path.
   one breaking change). It ships as 0.20.0, together with the fixes of 0.19.4. Release C of the
   same plan (ingress labels, plaintext egress, send receipts) is in design and needs its own
   exception.
+- 2026-10-27: the owner lifted the freeze ("后续走正常维护，解除冻结，只是提示api兼容性"); see
+  [2026-10-27-normal-maintenance](2026-10-27-normal-maintenance.md).

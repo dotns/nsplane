@@ -502,3 +502,8 @@ is not released separately and its changelog section is folded into 0.20.0. `mai
 to the release head. Workspace versions, internal requirements and guide tags were synchronized
 in the version commit.
 
+## 2026-10-27 [decision]
+
+The owner lifted the 0.11 feature freeze: normal maintenance, with breaking public API changes
+called out in the plan and in the CHANGELOG (ADR `2026-10-27-normal-maintenance`, superseding
+`2026-10-08-feature-freeze-0-11`).
