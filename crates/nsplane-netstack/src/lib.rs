@@ -19,7 +19,11 @@
 //! [`FlowContext`] (the caller's isolation domain and an instance the stack never hands
 //! out twice); the stack never reads it, and a new flow on the same tuple never takes
 //! over a revoked flow's queues, replies or held fragments. Both cover the stack only:
-//! packets already taken from [`NetStackSource`] are outside.
+//! packets already taken from [`NetStackSource`] are outside. With
+//! [`Admission::Decide`] in [`NetStackConfig::admission`], every new connection or flow is
+//! first offered as a [`PendingFlow`], whose [`control`](PendingFlow::control) covers the
+//! lifetime from its first input to its handle; [`FlowControl::delivery`] tells whether the
+//! handle was handed out.
 //! [`owns`](NetStackHandle::owns) tells whether an ingress packet is the stack's
 //! ([`Ownership`]), for a local side that shares one decrypted stream with other consumers.
 //!
@@ -59,7 +63,10 @@ mod udp;
 
 pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentConfig};
 pub use events::{FlowEvent, FlowEventReason, FlowEventsConfig};
-pub use flow::{FlowContext, FlowControl, RetirementOutcome, RetirementReceipt};
+pub use flow::{
+    DeliveryOutcome, DeliveryReceipt, FlowContext, FlowControl, RetirementOutcome,
+    RetirementReceipt, Undelivered,
+};
 pub use nsplane_packet::reassembly::ReassemblyConfig;
 pub use ownership::Ownership;
 pub use pending::{PendingFlow, PendingProtocol};

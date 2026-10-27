@@ -3,7 +3,7 @@
 [中文版](guide.zh-CN.md)
 
 This guide shows how to embed nsplane in an application: which crates to pick, how an engine
-is assembled, and complete code for the common deployments. It describes nsplane 0.19.3.
+is assembled, and complete code for the common deployments. It describes nsplane 0.20.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
 - Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.19.3" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.19.3" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.20.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.20.0" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns
@@ -654,16 +654,13 @@ async fn main() -> anyhow::Result<()> {
     let (c, stack_c, _) = node(key_c, client)?;
     // Server: owns 10.0.0.2 and terminates every address of 192.0.2.0/24, asking the
     // application about each new connection or flow.
-    let server = NetStackConfig {
-        transparent: Some(TransparentConfig {
-            prefixes: vec![("192.0.2.0".parse()?, 24)],
-            admission: Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 },
-            max_connections: Some(4096),
-            events: Some(FlowEventsConfig::default()),
-            ..Default::default()
-        }),
-        ..NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU)
-    };
+    let mut server = NetStackConfig::new(vec![("10.0.0.2".parse()?, 32)], DEFAULT_MTU);
+    let mut transparent = TransparentConfig::default();
+    transparent.prefixes = vec![("192.0.2.0".parse()?, 24)];
+    transparent.max_connections = Some(4096);
+    transparent.events = Some(FlowEventsConfig::default());
+    server.transparent = Some(transparent);
+    server.admission = Admission::Decide { timeout: Duration::from_secs(5), max_pending: 256 };
     let (s, stack_s, outer_s) = node(key_s, server)?;
 
     // The client routes every IPv4 destination to the server.

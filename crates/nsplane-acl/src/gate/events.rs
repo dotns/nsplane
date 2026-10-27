@@ -209,7 +209,8 @@ impl FlowGate {
                 dropped();
                 return;
             }
-            // Every packet the gate decides on has readable addresses.
+            // Only a scoped denial of a packet without readable addresses
+            // has none.
             let Some((protocol, src, dst)) = five_tuple(packet) else {
                 dropped();
                 return;

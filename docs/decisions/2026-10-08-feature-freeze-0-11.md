@@ -69,3 +69,11 @@ slot A/B when it touches the data path.
 - 2026-10-24: tenth exception (owner: "需要同步到完整上游再更新我们的补丁，包括每个 socket 单独调重传超时"):
   the smoltcp fork moves to upstream `main` and `nsplane-netstack` exposes the per-socket TCP
   RTO bounds (plan `20261024-1453-smoltcp-upstream-fixes`).
+- 2026-10-26: eleventh exception (owner decision on plan
+  `20261026-0822-node-gateway-requests`, release B): netstack control of a lifetime from its
+  first input with admission on every stack, scope-qualified flow gate decisions, the engine's
+  local barrier and a validated plaintext ingress, with the recommended answers to O1-O7; five
+  netstack configuration and statistics types become `#[non_exhaustive]` (owner decision, the
+  one breaking change). It ships as 0.20.0, together with the fixes of 0.19.4. Release C of the
+  same plan (ingress labels, plaintext egress, send receipts) is in design and needs its own
+  exception.

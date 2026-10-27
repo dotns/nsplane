@@ -11,7 +11,8 @@ const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 2);
 const DIALED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 
 /// A transparent stack at [`LOCAL`] for every destination, deciding with `timeout` and
-/// `max_pending`, and `max_connections`.
+/// `max_pending` through the deprecated transparent field, and `max_connections`.
+#[allow(deprecated, reason = "the deprecated field is still honoured")]
 fn decide(timeout: Duration, max_pending: usize, max_connections: Option<usize>) -> NetStackConfig {
     NetStackConfig {
         transparent: Some(TransparentConfig {

@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
 use crate::device::TAILROOM;
-use crate::flow::{FlowControl, FlowState};
+use crate::flow::{FlowControl, FlowState, Undelivered};
 use crate::ownership::Registration;
 use crate::tcp::revoked;
 
@@ -285,6 +285,19 @@ impl UdpFlow {
     /// flow and every [`UdpReply`] of it share one control.
     pub fn control(&self) -> FlowControl {
         self.reply.control()
+    }
+
+    /// The state of the flow's lifetime.
+    pub(crate) const fn flow(&self) -> &Arc<FlowState> {
+        &self.reply.flow
+    }
+}
+
+impl Drop for UdpFlow {
+    /// A flow dropped before it was handed out (with the accept queue) ends its lifetime
+    /// undelivered.
+    fn drop(&mut self) {
+        self.reply.flow.undeliver(Undelivered::AcceptQueueGone);
     }
 }
 

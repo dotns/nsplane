@@ -5,6 +5,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-27
+
+Feature release under the eleventh exception to the 0.11 feature freeze: netstack control of a
+lifetime from its first input, scope-qualified flow gate decisions, the engine's local barrier
+and a validated plaintext ingress. Breaking: five netstack configuration and statistics types
+are `#[non_exhaustive]` (see Changed). Also fixes IPv4 GSO segmentation with 20 option bytes and
+the flow gate's IPv6 extension-header limit for later fragments (behaviour change).
+
+### Added
+- `nsplane-acl`: scope-qualified flow gate decisions. `FlowGate::evaluate_inbound_in` and
+  `evaluate_outbound_in` decide a packet for a `ScopeSelection` (one scope or a non-empty set;
+  `ScopeSelection::any_of` refuses an empty set with `EmptySelection`) and return a
+  `ScopedDecision` with the decision, the deciding `ScopeId`, the `RuleId` (the flow's grant
+  for `ValidState` too, `None` for a later fragment) and the policy generation. A packet whose
+  scope is outside the selection, or that binds no scope, is denied with the new
+  `GateReason::OutOfScope` without reading or writing any state; held, ambiguous and
+  malformed packets are enforced denials whatever the scopes' modes. Out-of-scope denials
+  count as enforced denials and emit decision events. The unscoped calls are unchanged.
+- `EngineHandle::local_barrier` waits until every packet the engine took from its
+  `PacketSource` before the call has been routed and passed or been dropped by the outbound
+  filters (or dropped for no route, by the fragmentation stage or by the tunnel's queue),
+  including the packets in the local queue and those the source task holds while it is full,
+  with the fragmentation stage and with crypto workers. A suspended engine passes it after
+  resuming; a stopped one returns `EngineError` and never reports a barrier it did not pass.
+  Packets still in the source itself are not covered. Cost: one atomic add per source read.
+- Validated plaintext ingress: `Core::receive_plaintext` runs a plaintext IP packet
+  attributed to a peer through the post-decryption code of a transport data packet (source
+  check, inbound destinations, `PacketFilter::inbound_from` in install order with the given
+  path, delivery), shared with it, so both meet the same verdicts and drop reasons. Unknown or
+  removed peers are dropped as the new `reasons::UNKNOWN_PLAINTEXT_PEER`; a packet without a
+  readable IPv4 or IPv6 source as `SOURCE_NOT_ALLOWED`. Nothing is authenticated (no
+  handshake accounting, path policy, roaming or `Event::Authenticated`); delivered bytes
+  count in `data_rx`. `EngineBuilder::plaintext_ingress(capacity)` returns a bounded
+  `PlaintextIngress` (`send` waits, `try_send` refuses with `PlaintextRefused`) that the
+  engine polls next to the received datagrams under the deliver-queue backpressure.
+  `inject_inbound` keeps its bypass contract.
+- nsplane-netstack: control of a connection's or flow's lifetime from its first input.
+  Under `Admission::Decide`, `PendingFlow::control` returns the lifetime's `FlowControl`,
+  the same control the `TcpConnection` or `UdpFlow` handed out later carries (a
+  `FlowContext` bound on it stays on the handle). Revoking it before the hand-out retires
+  the lifetime at its stage (held, accepted before the next driver turn, listener socket in
+  SYN-RECEIVED with its queued SYN-ACK, established and waiting for `incoming_tcp`, queued
+  in `incoming_tcp` / `incoming_udp`) and sends nothing; the handle is never returned
+  afterwards and a later SYN or datagram on the tuple is a new lifetime.
+  `RetirementOutcome` keeps its meaning.
+- nsplane-netstack: `FlowControl::delivery` returns a `DeliveryReceipt` (`outcome`,
+  `wait`) with exactly one `DeliveryOutcome` per lifetime: `Delivered` when the stream takes
+  the handle, or `NotDelivered(Undelivered)` with `Rejected`, `TimedOut`,
+  `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`,
+  `AcceptQueueGone`, `FlowLimit`, `Revoked` or `Stopped`. Handles admitted with
+  `Admission::Immediate` and those the application opens report `Delivered`.
+- nsplane-netstack: `NetStackConfig::admission` applies admission to every stack; on a
+  stack without `transparent`, `Decide` holds SYNs and first datagrams to the stack's own
+  addresses and rejections are sourced from them.
+- nsplane-netstack: `NetStackStats::handshake_failed` counts inbound TCP handshakes that
+  ended before the connection was established.
+
+### Changed
+
+#### Breaking
+- nsplane-netstack `NetStackConfig`, `TransparentConfig`, `FlowEventsConfig`,
+  `NetStackStats` and the enum `PendingProtocol` are `#[non_exhaustive]`, so later fields
+  and variants are not breaking again. Other crates can no longer build the structs with a
+  struct expression, also not with `..Default::default()`: start from
+  `NetStackConfig::new` or `Default::default()` and assign the fields (for an expected
+  `NetStackStats`, assign the expected counters on a default value). A `match` on
+  `PendingProtocol` needs a wildcard arm. Reading fields and comparing values is unchanged.
+  `NetStackConfig` gains `admission` and `NetStackStats` gains `handshake_failed` in the same
+  release.
+
+  ```rust
+  // Before
+  let config = NetStackConfig {
+      accept_capacity: 256,
+      transparent: Some(TransparentConfig { prefixes, ..Default::default() }),
+      ..NetStackConfig::new(addresses, mtu)
+  };
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      PendingProtocol::Udp => false,
+  };
+  // After
+  let mut transparent = TransparentConfig::default();
+  transparent.prefixes = prefixes;
+  let mut config = NetStackConfig::new(addresses, mtu);
+  config.accept_capacity = 256;
+  config.transparent = Some(transparent);
+  let tcp = match item.protocol() {
+      PendingProtocol::Tcp => true,
+      _ => false,
+  };
+  ```
+
+#### Other
+- nsplane-netstack: under `Admission::Decide`, `incoming_tcp` and `incoming_udp` skip a
+  handle whose lifetime ended while it was queued, also when the stack stopped; an accepted
+  held datagram opens its flow in the flow table even if a socket bound or connected
+  meanwhile claims its tuple.
+
+### Deprecated
+- nsplane-netstack: `TransparentConfig::admission`, replaced by
+  `NetStackConfig::admission`. A transparent stack honours it while the top-level field is
+  `Admission::Immediate`.
+
+### Fixed
+- `nsplane-packet` `vnet::segment`: an IPv4 TCP or UDP super-packet whose header carries
+  20 option bytes (IHL 10, the length of an IPv6 header) is segmented as IPv4. It took the
+  IPv6 branch: every segment kept the super-packet's total length, had its identification
+  overwritten, a stale header checksum and invalid transport checksums, so the receiver
+  dropped it. This affects `nsplane-tun` offload reads and `nsplane-ether` packet-socket
+  reads. The IP version now comes from the GSO type (or the first nibble for `GSO_UDP_L4`);
+  `nsplane-tun`'s coalescer, which merges only IPv4 headers without options, uses the
+  version the same way.
+- `nsplane-acl` flow gate: the IPv6 extension-header walk counts a later fragment's Fragment
+  header toward the documented limit of 8 headers. Behaviour change: a later fragment of an
+  admitted datagram carried behind 8 other extension headers (9 in all) is now denied
+  `Malformed` instead of passing as `ValidState`; without an admitted first fragment it is
+  `Malformed` instead of `OrphanFragment`. First fragments and unfragmented packets already
+  obeyed the limit; such a fragment never opened a flow.
+
 ## [0.19.3] - 2026-10-26
 
 Patch release; no public API change.

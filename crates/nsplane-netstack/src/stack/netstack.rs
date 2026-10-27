@@ -64,7 +64,8 @@ impl NetStack {
         let (udp_tx, udp_rx) = mpsc::channel(settings.datagram_capacity);
         let (accept_tcp, incoming_tcp) = mpsc::channel(settings.accept_capacity);
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
-        let (pending, incoming_pending) = pending_table(&settings, &notify).unzip();
+        let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
+        let (pending, incoming_pending) = pending_table(&settings, &notify, &revocations).unzip();
         let pending = pending.map(Box::new);
         let (events, flow_events) = event_sink(&settings).unzip();
         let events = events.map(Box::new);
@@ -79,7 +80,6 @@ impl NetStack {
             settings.reassembly.as_ref(),
         ));
         let reassembler = settings.reassembly.clone().map(Reassembler::new);
-        let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
         let fences = Arc::new(Fences::default());
 
         let mut device = VirtualDevice::new(settings.mtu, EGRESS_BACKLOG, Arc::clone(&stats));
@@ -194,7 +194,9 @@ impl NetStackSource {
     /// responsibility: finish forwarding them before retirement. This does not prove
     /// delivery or application completion at the peer.
     ///
-    /// Returns an error for another stack's control, a non-TCP flow, or a revoked flow.
+    /// Returns an error for another stack's control, a non-TCP flow, a revoked flow, or a
+    /// lifetime held under [`Admission::Decide`] that has no connection yet (held,
+    /// mid handshake, or ended before it was established).
     pub fn tcp_egress_drained(&self, control: &crate::FlowControl) -> io::Result<bool> {
         Ok(control
             .tcp_egress_end(&self.revocations)?
@@ -266,14 +268,21 @@ impl PacketSink for NetStackSink {
 fn pending_table(
     settings: &Settings,
     notify: &Arc<Notify>,
+    revocations: &Arc<Revocations>,
 ) -> Option<(Pending, mpsc::Receiver<PendingFlow>)> {
-    match settings.transparent.as_ref()?.admission {
+    match settings.admission {
         Admission::Decide {
             timeout,
             max_pending,
         } => {
             let (offer, incoming) = mpsc::channel(max_pending);
-            let table = Pending::new(timeout, max_pending, offer, Arc::clone(notify));
+            let table = Pending::new(
+                timeout,
+                max_pending,
+                offer,
+                Arc::clone(notify),
+                Arc::clone(revocations),
+            );
             Some((table, incoming))
         }
         Admission::Immediate => None,

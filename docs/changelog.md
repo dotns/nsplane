@@ -421,3 +421,84 @@ Linux musl targets (`msg_iovlen` and the `ioctl` request type differ between gli
 `just cross` runs clippy for `x86_64-unknown-linux-musl`. Also carries the module splits of
 nsplane-core `core.rs` and nsplane-netstack `stack.rs` (pure moves, no API change). Workspace
 versions, internal requirements and guide tags synchronized.
+
+## 2026-10-26 08:34 [decision]
+
+Owner decisions on plan `20261026-0822-node-gateway-requests` (task
+`20261026-0819-node-gateway-requests`): release A (0.19.3, the vnet IPv4 IHL 10 and `walk_v6`
+later-fragment fixes, including the latter's behaviour change) approved as a bug-fix release;
+release B (0.20.0: netstack control from the first input, scoped flow-gate decisions, the local
+barrier and validated plaintext ingress) approved as the eleventh freeze exception with the
+plan's shapes and the recommended answers to O1-O7; release C (0.21.0: netstack ingress labels,
+plaintext egress, send receipts) is designed first as one carrier, the packet tag, in a design
+note for owner and consumer review, and is not implemented.
+
+## 2026-10-26 [fix]
+
+Fix the two defects of release A (0.19.4), plan `20261026-0822-node-gateway-requests`
+(task `20261026-0851-vnet-walk-v6-fixes`), each with its regression test first:
+
+- `vnet::segment` segmented an IPv4 super-packet with IHL 10 as IPv6, because `fix_segment` and
+  `pseudo_sum` chose by header length; they now take the IP version. `nsplane-tun`'s coalescer
+  keeps the version per group for the same choice (unreachable before: it merges only
+  option-less IPv4 headers).
+- The flow gate's `walk_v6` ran nine iterations and returned on a later Fragment header, so a
+  ninth header passed; the ninth extension header of any kind is now malformed.
+
+Slot A/B against `main`, interleaved, slot 1: `vnet/segment_tcpv4_64k` 3.185 vs 3.183 us (mean
+of 3 rounds); `offload/coalesce_tcpv4_48` no regression (B at or below A in all 5 rounds, the
+spread too wide to claim a gain); gate `established/*`, `baseline/pass_gate` and the IPv6 cases
+within the round-to-round noise. A first `walk_v6` that left the loop with `break` and checked
+the next header after it cost `icmp_error/v6` +4 ns (48 to 53 ns, two rounds); the shipped
+version keeps the original loop and adds one bound check per header (48.0 / 48.3 ns against
+48.9 / 47.9 ns).
+
+## 2026-10-27 [decision]
+
+Owner decision on plan `20261026-0822-node-gateway-requests`: `main` moved to `fb67db9` (0.19.3
+released upstream, then the large module split), so release A becomes 0.19.4, and the plan,
+release A and the release B workstreams are rebased onto `fb67db9` as new branches and release
+B is integrated again; the branches go to the Gitea remote only.
+
+## 2026-10-27 [release]
+
+Prepare 0.20.0 (not tagged) on `fb67db9`, release B of plan
+`20261026-0822-node-gateway-requests` under the eleventh freeze exception (ADR
+`2026-10-08-feature-freeze-0-11` amended): scope-qualified flow gate decisions (task
+`20261026-0837-scoped-flowgate`), the engine's local barrier and validated plaintext ingress
+(task `20261026-0836-local-barrier-plaintext-ingress`), netstack control from the first input
+with admission on every stack (task `20261026-0838-first-input-flow-control`), and the fixes of
+release A, 0.19.4 (task `20261026-0851-vnet-walk-v6-fixes`). Each branch was rebased onto
+`fb67db9` first, its changes moved into the modules of the split; merged in the order plan, A,
+W2, W3, W1 on `release/0.20.0-v2`, where the conflicts were the changelogs and the task index
+only. Breaking: `NetStackConfig`, `NetStackStats`, `TransparentConfig`, `FlowEventsConfig` and
+`PendingProtocol` are `#[non_exhaustive]`. The 0.19.4 section of `CHANGELOG.md` stays as
+prepared, unreleased; 0.20.0 lists its fixes under Fixed. Slot A/B of the integrated head
+against `fb67db9` (`docs/performance.md`, "0.20.0 against 0.19.3"): the gate's established paths
++1.2 % / +2.0 % (the scoped check, as on its branch); `core_round_trip/1420` +1.7 % (+20 ns,
+reproducible; 64-byte and batched round trips unchanged), open; `send_stream` and `local_graph`
+within the noise.
+
+## 2026-10-27 [investigation]
+
+`core_round_trip/1420` +20 ns at 0.20.0 against 0.19.3: code placement, not added work. Bisected
+by workstream on a quiet host: the bench binaries of release A, W2 and W1 equal `fb67db9`'s, W3
+alone and every merge before the version commit measure as `fb67db9`, and the cost appears with
+the version commit only; the same source at version 0.20.1 is 1 % faster than 0.19.3, and
+`fb67db9` at version 0.20.0 is unchanged. The version enters every symbol hash and moves the
+code: `objdump` shows the same instructions (526,948, equal function lengths, differences only
+in RIP-relative offsets) and the bench's round-trip routines at another 16-byte offset. No
+change made (`docs/performance.md`, "0.20.0 against 0.19.3"). `perf` and `valgrind` are not
+available on the host, so instruction counts come from the disassembly, not from counters.
+
+## 2026-10-27 [release]
+
+Release 0.20.0 (tag `v0.20.0`) at the owner's request: release B of plan
+`20261026-0822-node-gateway-requests` (netstack control from the first input with admission on
+every stack, scope-qualified flow gate decisions, the engine's local barrier and validated
+plaintext ingress; five netstack types `#[non_exhaustive]`) and release A, whose two fixes (IPv4
+GSO segmentation with IHL 10, the `walk_v6` later-fragment header limit) ship in 0.20.0; 0.19.4
+is not released separately and its changelog section is folded into 0.20.0. `main` fast-forwards
+to the release head. Workspace versions, internal requirements and guide tags were synchronized
+in the version commit.
+

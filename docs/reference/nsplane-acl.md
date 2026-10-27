@@ -9,7 +9,7 @@ a stateful flow gate for bound peers (`gate::FlowGate`, `GateFilter`). Builds on
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `find_flow` (either family), `counters`, `enable_events` / `disable_events`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason`, `GateCounters` (`events_emitted`, `events_dropped`), decision events `GateEventsConfig` (`capacity`, `rate`, `burst`), `GateEvent` (`at`, `peer`, `protocol`, `src`, `dst`, `allow`, `enforced`, `reason`, `rule`), `GateEvents` (`try_recv`, `recv`, `recv_timeout`, `drain`), `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`) |
+| main | `AclEngine` (`install` / `uninstall` / `fail`, `policy_state`, `with_not_installed`, `rules`, `evaluate`, `store_namespace` / `remove_namespace`, `store_grant` / `remove_grant`, `open_pinhole`, `expire_pinholes`, `clear_all`, `generation`, `pinhole_stats`), `AclFilter` (`new`, `with_config`, `with_scope`, `replace_scopes`, `scope_generation`, `stats`), `FlowTracker` | typed rules `Label`, `LabelSet`, `RuleId`, `Rule`, `ProtocolMatch`, `PortSet`, `IcmpTypes`, `RuleSet`; flows `Flow`, `Transport`, `Decision`, `Matched`; states `PolicyState`, `NotInstalled`; `Protocol`, `IpNet`; identity `PeerIdentity` (`local_identity`), `PeerLabelMap` (`set_local_identity`); namespaces `NamespaceId`, `NamespaceKind`, `NamespacePolicy`, `NamespaceMember`, `OutboundRule`, `Grant`, `GrantEnd`; pinholes `PinholeSpec`, `PinholeGuard`, `PinholeId`, `Direction`, `PinholeError`, `PinholeStats`; scopes `AclFilterScope`, `AclFilterScopes`, `AclFilterScopeError`, `OtherProtocolRule`, `OtherProtocol`; stats `AclFilterStats`, `FlowKey`, `FlowStats`; `reasons`; flow gate (`gate` module, IPv4 and IPv6) `FlowGate` (`new`, `with_clock`, `replace`, `generation`, `evaluate_inbound` / `evaluate_outbound`, `evaluate_inbound_in` / `evaluate_outbound_in`, `find_flow` (either family), `counters`, `enable_events` / `disable_events`), `GateFilter` (`new`, `with_acl`, `with_acl_outbound`, `with_divert`, `gate`, `stats`), `GateDivert`, `DivertedPacket`, `GatePolicy`, `GateScope`, `ScopeId`, `GateMode`, `GateBinding` (empty `addresses`: peer-keyed), `GateGrant`, `UnboundRule`, `UnboundAction`, `GateHolds`, `HoldRule`, `GateConfig`, `GateLimits`, `GateTimeouts`, `GateDecision`, `GateReason` (`OutOfScope` for scoped decisions), scoped decisions `ScopeSelection` (`one`, `any_of`), `EmptySelection`, `ScopedDecision` (`decision`, `scope`, `rule`, `generation`), `GateCounters` (`events_emitted`, `events_dropped`), decision events `GateEventsConfig` (`capacity`, `rate`, `burst`), `GateEvent` (`at`, `peer`, `protocol`, `src`, `dst`, `allow`, `enforced`, `reason`, `rule`), `GateEvents` (`try_recv`, `recv`, `recv_timeout`, `drain`), `LiveFlow`, `GateFilterStats`, `GatePolicyError` (`DuplicatePeerBinding`) |
 
 ## Behavior
 
@@ -317,7 +317,7 @@ and IPv6 packets.
   `GateReason` has stable names (`as_str`) and drop reasons (`drop_reason`, `flow gate:
   <reason>`).
 - **IPv6.** Hop-by-Hop, Routing, Destination Options and Fragment headers are walked (at
-  most 8, within the payload length; AH is skipped by its own length, ESP and No Next Header
+  most 8, the Fragment header counted, in later fragments too, within the payload length; AH is skipped by its own length, ESP and No Next Header
   carry no ports); a truncated or longer chain, a second Fragment header or a first fragment
   without its whole upper-layer header is `Malformed` as for IPv4, and a packet shorter than
   the 40-byte fixed header passes as unreadable. Fragments are keyed by the 32-bit
@@ -328,6 +328,42 @@ and IPv6 packets.
 - **Queries.** `find_flow(remote, local, Protocol)` returns the live flow of a five-tuple of
   either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
   mixed-family pair.
+
+#### Scoped decisions
+
+`evaluate_inbound_in(peer, packet, &ScopeSelection)` and `evaluate_outbound_in` decide for a
+caller's selection of scopes: one (`ScopeSelection::one`) or a non-empty set
+(`ScopeSelection::any_of`, order and repeats ignored; an empty set is refused with
+`EmptySelection`). The ids need not be in the policy; a scope the policy does not have never
+decides. The call takes the same steps on the same snapshot, state and counters as
+`evaluate_inbound` / `evaluate_outbound`, with one check once the packet's scope is resolved
+(the binding step) and before any state is read or written. It returns a `ScopedDecision`:
+
+- `decision`: the gate's decision, as in the table below; never `GateDecision::Pass`.
+- `scope`: the deciding scope, when it is in the selection.
+- `rule`: the admitting grant (`Granted`) or the first matching suspended grant
+  (`Suspended`) of a new flow, and the flow's grant for a packet of a live flow
+  (`ValidState`) or an ICMP error quoting one; `None` for a later fragment and every other
+  decision.
+- `generation`: the policy generation the decision was taken under.
+
+| Situation | Scoped decision |
+| --- | --- |
+| The resolved scope is in the selection | the decision of that scope: its mode, its state only (every flow and fragment key carries the scope), with `scope` and `rule` |
+| The resolved scope is outside the selection | `Enforce { allow: false, reason: OutOfScope }`, no state read or written |
+| No scope binds the packet (unbound, also with an `UnboundAction::Pass` rule; an inert gate; another IP version) | `Enforce { allow: false, reason: OutOfScope }`; an unbound first fragment records no pass disposition and a later one does not follow one |
+| A hold matches | `Enforce { allow: false, reason: Held }` |
+| More than one scope binds the packet | `Enforce { allow: false, reason: Ambiguous }`, whatever the scopes' modes |
+| The packet cannot be parsed (or its addresses read) | `Enforce { allow: false, reason: Malformed }`, whatever the scopes' modes |
+
+A scoped call creates, refreshes or migrates no state outside the selection; reclaiming
+expired entries when a limit is reached is the same as for every evaluation. An `OutOfScope`
+denial counts in `GateCounters::enforced_denied` and emits a decision event like any denial
+(a scoped denial of a packet without readable addresses has no event and counts in
+`events_dropped`). `evaluate_inbound`, `evaluate_outbound`, `GateFilter` and `find_flow`
+take no selection: the unscoped calls share the evaluation with the scoped ones, which costs
+them a few untaken branches per packet. A scoped call on an established flow also looks up
+the scope id in the selection and clones the flow's grant id.
 
 #### Decision events
 
@@ -406,7 +442,9 @@ ICMP and outbound grants (`grant_kinds`), ICMP errors, fragments and malformed p
 `ipv6_flows`), peer-keyed bindings (`peer_keyed`), holds and unbound rules
 (`holds_and_unbound`), the state limits,
 validation and the epoch retry (`state_table`), a writer racing packet threads
-(`concurrency`), the filter (`filter`), decision events (`events`), and `model`, which compares the gate on seeded
+(`concurrency`), the filter (`filter`), decision events (`events`), scoped decisions
+(`scoped`: two scopes with the same five-tuple, each scope's state untouched by a call for
+the other, every row of the table), and `model`, which compares the gate on seeded
 random sequences of packets, `replace` calls and clock steps against a reference model of
 the gate (one map, no shards, no lazy expiry) for equal decisions and counters.
 `nsplane-e2e` `flow_gate` runs the filter on one of two engines: grants, suspension,
@@ -437,7 +475,8 @@ peer denied while its inbound flows arrive, and one binding governing both famil
 an enforced denial drops with `GateReason::drop_reason` (`flow gate: <reason>`), counted in
 `GateCounters` and `GateFilterStats`. `RuleSet::new`, `store_namespace` and `store_grant`
 reject invalid input and leave the previous state in effect; `open_pinhole` returns a
-`PinholeError`; `FlowGate::replace` returns a `GatePolicyError`; `replace_scopes` returns an
+`PinholeError`; `FlowGate::replace` returns a `GatePolicyError`; `ScopeSelection::any_of`
+returns `EmptySelection` for an empty set; `replace_scopes` returns an
 `AclFilterScopeError`.
 
 ## Limits and bounds
@@ -449,7 +488,7 @@ reject invalid input and leave the previous state in effect; `open_pinhole` retu
 - `FlowTracker`: a bounded table of the capacity it is created with.
 - Flow gate: `GateLimits` (defaults 16,384 flows, 2,048 per peer, 4,096 fragments); a full
   table fails closed with `GateReason::StateCapacity` and never evicts a live entry.
-- IPv6 header walk in the gate: at most 8 extension headers.
+- IPv6 header walk in the gate: at most 8 extension headers, the Fragment header included.
 - Gate decision events: `GateEventsConfig::capacity` buffered events and a token bucket of
   `burst` tokens refilled at `rate` per second; events beyond them are dropped and counted
   in `GateCounters::events_dropped`.

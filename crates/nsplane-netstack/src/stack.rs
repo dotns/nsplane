@@ -73,15 +73,25 @@ fn stack_gone() -> io::Error {
 /// The queue of a UDP flow or socket, with the flow it belongs to.
 type Inbox<T> = (mpsc::Sender<T>, Arc<FlowState>);
 
+/// A listener socket mid handshake.
+struct Inbound {
+    /// Keeps the tuple visible to `owns` while the handshake runs.
+    registration: Registration,
+    /// The egress position when the socket took the SYN.
+    start: u64,
+    /// The lifetime of a SYN accepted under `Admission::Decide`, its target bound to the
+    /// socket.
+    flow: Option<Arc<FlowState>>,
+}
+
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
     settings: Settings,
     iface: Interface,
     device: VirtualDevice,
     sockets: SocketSet<'static>,
-    /// Listener sockets mid handshake, with the tuple they registered for `owns` and the
-    /// egress position when they took the SYN.
-    inbound: HashMap<SocketHandle, (Registration, u64)>,
+    /// Listener sockets mid handshake.
+    inbound: HashMap<SocketHandle, Inbound>,
     /// port -> the sockets this port has open for inbound connections: those in `Listen`
     /// (free to accept a SYN) plus those in `SynReceived` (claimed by a SYN, mid
     /// handshake). A socket leaves the pool when it is established (promoted to a
@@ -158,6 +168,9 @@ struct Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        if let Some(table) = self.pending.as_mut() {
+            table.stop();
+        }
         self.revocations.close(&mut self.retiring);
         for conn in self.conns.values() {
             conn.release();

@@ -71,7 +71,9 @@ impl NetStackHandle {
     /// Only the first call (on any clone of the handle) gets the connections; every later
     /// call returns a stream that ends immediately. The stream ends when the stack stops.
     /// Connections that arrive while the stream is not consumed are queued up to
-    /// [`NetStackConfig::accept_capacity`], then closed and counted.
+    /// [`NetStackConfig::accept_capacity`], then closed and counted. Taking a connection
+    /// held under [`Admission::Decide`] fixes its delivery; one whose lifetime ended while
+    /// it was queued (revoked, or the stack stopped) is skipped, never returned.
     pub fn incoming_tcp(&self) -> impl Stream<Item = TcpConnection> + Send + Unpin + use<> {
         Incoming(take(&self.incoming_tcp))
     }
@@ -82,17 +84,20 @@ impl NetStackHandle {
     /// connected with [`connect_udp`](Self::connect_udp) are not reported here. Only the first call (on any clone of the handle) gets the flows; every later
     /// call returns a stream that ends immediately. The stream ends when the stack stops.
     /// Flows that arrive while the stream is not consumed are queued up to
-    /// [`NetStackConfig::accept_capacity`], then dropped and counted.
+    /// [`NetStackConfig::accept_capacity`], then dropped and counted. Flows held under
+    /// [`Admission::Decide`] are handed out like connections on
+    /// [`incoming_tcp`](Self::incoming_tcp).
     pub fn incoming_udp(&self) -> impl Stream<Item = UdpFlow> + Send + Unpin + use<> {
         Incoming(take(&self.incoming_udp))
     }
 
     /// New TCP connections and UDP flows held for the application's decision, with
-    /// [`Admission::Decide`] configured in [`NetStackConfig::transparent`].
+    /// [`Admission::Decide`] configured in [`NetStackConfig::admission`].
     ///
     /// Each [`PendingFlow`] is accepted, rejected or dropped (which rejects); an accepted
     /// connection or flow then arrives on [`incoming_tcp`](Self::incoming_tcp) or
-    /// [`incoming_udp`](Self::incoming_udp). Items not taken are queued up to the
+    /// [`incoming_udp`](Self::incoming_udp), unless its lifetime ended before (see
+    /// [`PendingFlow::control`] and [`FlowControl::delivery`](crate::FlowControl::delivery)). Items not taken are queued up to the
     /// `max_pending` of [`Admission::Decide`]; beyond that a new connection or flow is
     /// rejected at once. Only the first call (on any clone of the handle) gets the items;
     /// every later call, and every call without [`Admission::Decide`], returns a stream
@@ -317,12 +322,43 @@ impl NetStackHandle {
 /// A stream over an accept queue, or an empty stream for later callers.
 struct Incoming<T>(Option<mpsc::Receiver<T>>);
 
-impl<T> Stream for Incoming<T> {
+/// An item an [`Incoming`] stream hands out.
+trait HandOut {
+    /// Fixes the delivery of the item's lifetime; whether the stream may return it.
+    fn hand_out(&self) -> bool {
+        true
+    }
+}
+
+impl HandOut for TcpConnection {
+    fn hand_out(&self) -> bool {
+        self.flow().deliver()
+    }
+}
+
+impl HandOut for UdpFlow {
+    fn hand_out(&self) -> bool {
+        self.flow().deliver()
+    }
+}
+
+impl HandOut for PendingFlow {}
+
+impl HandOut for FlowEvent {}
+
+impl<T: HandOut> Stream for Incoming<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0
-            .as_mut()
-            .map_or(Poll::Ready(None), |rx| rx.poll_recv(cx))
+        let Some(rx) = self.0.as_mut() else {
+            return Poll::Ready(None);
+        };
+        loop {
+            match rx.poll_recv(cx) {
+                // Dropped: its lifetime ended while it was queued.
+                Poll::Ready(Some(item)) if !item.hand_out() => {}
+                ready => return ready,
+            }
+        }
     }
 }

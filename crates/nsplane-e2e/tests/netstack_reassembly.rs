@@ -86,9 +86,9 @@ async fn stack_and_raw(
 ) -> TestResult<(StackNode, Node<ChannelTransport>)> {
     let [a, b] = ends();
     let (link_a, link_b) = ChannelTransport::pair(1024, a, b);
-    let node = stack_node(1, a, link_a, |config| NetStackConfig {
-        reassembly,
-        ..config
+    let node = stack_node(1, a, link_a, |mut config| {
+        config.reassembly = reassembly;
+        config
     })?;
     let raw = Node::new(2, b.0, b.1, link_b, Options::default());
     node.handle
@@ -298,13 +298,13 @@ async fn without_reassembly_fragments_are_dropped() -> TestResult {
 async fn oversize_reply_from_the_engine_fragmenter_reassembles() -> TestResult {
     let [a, b] = ends();
     let (link_a, link_b) = ChannelTransport::pair(1024, a, b);
-    let sender = stack_node(1, a, link_a, |config| NetStackConfig {
-        udp_allow_fragmentation: true,
-        ..config
+    let sender = stack_node(1, a, link_a, |mut config| {
+        config.udp_allow_fragmentation = true;
+        config
     })?;
-    let receiver = stack_node(2, b, link_b, |config| NetStackConfig {
-        reassembly: Some(ReassemblyConfig::default()),
-        ..config
+    let receiver = stack_node(2, b, link_b, |mut config| {
+        config.reassembly = Some(ReassemblyConfig::default());
+        config
     })?;
     sender
         .handle

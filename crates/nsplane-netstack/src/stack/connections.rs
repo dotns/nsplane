@@ -1,5 +1,6 @@
 //! Bridging established connections to the application, and their release.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use smoltcp::iface::SocketHandle;
@@ -7,7 +8,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use tokio::sync::watch;
 
-use crate::flow::FlowState;
+use crate::flow::{FlowState, Target};
 use crate::ownership::Registration;
 use crate::tcp::{Progress, Shared, WriteHalf, lock};
 
@@ -185,6 +186,28 @@ fn receive_into(socket: &mut tcp::Socket<'_>, shared: &mut Shared) -> usize {
 }
 
 impl Driver {
+    /// A new delivered connection state for the socket `handle`, and its stream buffers.
+    pub(super) fn tcp_state(
+        &self,
+        handle: SocketHandle,
+        local: SocketAddr,
+        peer: SocketAddr,
+        start: u64,
+    ) -> (Arc<FlowState>, Arc<Mutex<Shared>>) {
+        let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
+        let flow = FlowState::new(
+            Target::Tcp {
+                handle,
+                shared: Arc::clone(&shared),
+                local,
+                peer,
+                start,
+            },
+            &self.revocations,
+        );
+        (flow, shared)
+    }
+
     /// Keeps the bytes of terminal sockets before smoltcp's timers discard the socket.
     pub(super) fn preserve_all(&mut self, now: SmolInstant) {
         for (&handle, conn) in &mut self.conns {

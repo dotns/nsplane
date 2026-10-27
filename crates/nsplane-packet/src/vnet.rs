@@ -202,7 +202,15 @@ pub fn segment(
         let mut buf = pool.get((hlen + chunk.len() + TAILROOM).max(capacity));
         buf.extend_from_slice(&packet[..hlen]);
         buf.extend_from_slice(chunk);
-        fix_segment(buf.as_packet_mut(), ip_len, proto, i, count, i * gso_size);
+        fix_segment(
+            buf.as_packet_mut(),
+            version == 6,
+            ip_len,
+            proto,
+            i,
+            count,
+            i * gso_size,
+        );
         if let Some(next) = push(out, pool, buf, i) {
             return Ok(Some(next));
         }
@@ -221,9 +229,17 @@ fn push(out: &mut PacketBatch, pool: &mut PacketPool, buf: PacketBuf, i: usize) 
 
 /// Rewrites the copied headers of segment `i` of `count`, whose payload starts `offset`
 /// bytes into the super-packet's payload.
-fn fix_segment(seg: &mut [u8], ip_len: usize, proto: u8, i: usize, count: usize, offset: usize) {
+fn fix_segment(
+    seg: &mut [u8],
+    v6: bool,
+    ip_len: usize,
+    proto: u8,
+    i: usize,
+    count: usize,
+    offset: usize,
+) {
     let len = seg.len();
-    if ip_len == IPV6_HDR {
+    if v6 {
         put16(seg, 4, len - IPV6_HDR);
     } else {
         put16(seg, 2, len);
@@ -250,7 +266,7 @@ fn fix_segment(seg: &mut [u8], ip_len: usize, proto: u8, i: usize, count: usize,
     };
     seg[field..field + 2].fill(0);
     let mut csum = !fold(sum_words(
-        pseudo_sum(seg, ip_len, proto, len - ip_len),
+        pseudo_sum(seg, v6, proto, len - ip_len),
         &seg[ip_len..],
     ));
     if csum == 0 && proto == UDP {
@@ -314,12 +330,8 @@ fn l4_protocol(packet: &[u8]) -> Option<u8> {
 }
 
 /// Unfolded sum of the pseudo-header of `packet` for a transport length `l4_len`.
-fn pseudo_sum(packet: &[u8], ip_len: usize, proto: u8, l4_len: usize) -> u64 {
-    let addrs = if ip_len == IPV6_HDR {
-        &packet[8..40]
-    } else {
-        &packet[12..20]
-    };
+fn pseudo_sum(packet: &[u8], v6: bool, proto: u8, l4_len: usize) -> u64 {
+    let addrs = if v6 { &packet[8..40] } else { &packet[12..20] };
     sum_words(u64::from(proto) + l4_len as u64, addrs)
 }
 
@@ -662,6 +674,29 @@ mod tests {
             assert_valid(seg);
             let data = payload(i * 1000, 1000.min(2500 - i * 1000));
             assert_eq!(*seg, build(&s.nth(i, i * 1000), &data));
+        }
+    }
+
+    #[test]
+    fn segments_ipv4_with_twenty_option_bytes() {
+        for proto in [TCP, UDP] {
+            let mut s = spec(false, proto);
+            // 19 NOPs and End of Options List: IHL 10, the length of an IPv6 header.
+            s.ip_options = vec![1; 19];
+            s.ip_options.push(0);
+            assert_eq!(s.ip_len(), 40);
+            let (hdr, packet) = super_packet(&s, 2500, 1000);
+            let segments = run(&hdr, &packet).unwrap();
+            assert_eq!(segments.len(), 3);
+            for (i, seg) in segments.iter().enumerate() {
+                assert_valid(seg);
+                let data = payload(i * 1000, 1000.min(2500 - i * 1000));
+                assert_eq!(
+                    *seg,
+                    build(&s.nth(i, i * 1000), &data),
+                    "proto {proto} segment {i}"
+                );
+            }
         }
     }
 
