@@ -12,6 +12,7 @@ use super::addr::GateAddr;
 use super::config::UnboundAction;
 use super::packet::{PacketMeta, flow_key, related_flow_key};
 use super::policy::{Authorization, BindingKey, CompiledScope};
+use super::scoped::{Scoping, enforced_denial};
 use super::snapshot::Snapshot;
 use super::state::{
     Admission, FlowKey, FlowState, FragmentDisposition, Lookup, Shard, TcpClose, protocol_timeout,
@@ -92,6 +93,17 @@ pub(super) struct PacketInput<'a, A: GateAddr> {
     pub(super) now: OnceCell<Instant>,
     /// Every shard was swept for this packet; a global limit now fails closed.
     pub(super) swept: bool,
+    /// The selection of a scoped evaluation.
+    pub(super) scoping: Option<&'a Scoping<'a>>,
+}
+
+impl<A: GateAddr> PacketInput<'_, A> {
+    /// Report the grant of `flow` to a scoped evaluation.
+    fn found_flow(&self, flow: &FlowState) {
+        if let Some(scoping) = self.scoping {
+            scoping.found_flow(flow);
+        }
+    }
 }
 
 impl FlowGate {
@@ -128,22 +140,24 @@ impl FlowGate {
         packet: &[u8],
         now: Instant,
     ) -> GateDecision {
-        self.evaluate_with(direction, peer, packet, OnceCell::from(now))
+        self.evaluate_with(direction, peer, packet, OnceCell::from(now), None)
     }
 
-    /// Evaluate one packet without recording counters; `now` is read from
-    /// the clock on first use unless already set. The version nibble picks
-    /// the family once; a packet of another version passes.
+    /// Evaluate one packet without recording counters, for `scoping`'s
+    /// selection if given; `now` is read from the clock on first use unless
+    /// already set. The version nibble picks the family once; a packet of
+    /// another version passes.
     pub(super) fn evaluate_with(
         &self,
         direction: PacketDirection,
         peer: PeerId,
         packet: &[u8],
         now: OnceCell<Instant>,
+        scoping: Option<&Scoping<'_>>,
     ) -> GateDecision {
         match packet.first().map(|byte| byte >> 4) {
-            Some(4) => self.evaluate_family::<Ipv4Addr>(direction, peer, packet, now),
-            Some(6) => self.evaluate_family::<Ipv6Addr>(direction, peer, packet, now),
+            Some(4) => self.evaluate_family::<Ipv4Addr>(direction, peer, packet, now, scoping),
+            Some(6) => self.evaluate_family::<Ipv6Addr>(direction, peer, packet, now, scoping),
             _ => GateDecision::Pass,
         }
     }
@@ -155,6 +169,7 @@ impl FlowGate {
         peer: PeerId,
         packet: &[u8],
         now: OnceCell<Instant>,
+        scoping: Option<&Scoping<'_>>,
     ) -> GateDecision {
         let mut input = PacketInput {
             direction,
@@ -163,12 +178,19 @@ impl FlowGate {
             meta: A::parse(packet),
             now,
             swept: false,
+            scoping,
         };
         loop {
-            match self
-                .snapshot
-                .read(|snapshot| self.evaluate_once(snapshot, &input))
-            {
+            if let Some(scoping) = scoping {
+                scoping.reset();
+            }
+            match self.snapshot.read(|snapshot| {
+                let step = self.evaluate_once(snapshot, &input);
+                if let (Some(scoping), Step::Done(_)) = (scoping, &step) {
+                    scoping.taken_under(snapshot.generation);
+                }
+                step
+            }) {
                 Step::Done(decision) => return decision,
                 Step::Retry => {}
                 Step::SweepAll => {
@@ -201,42 +223,28 @@ impl FlowGate {
         input: &PacketInput<'_, A>,
     ) -> Step<GateDecision> {
         if snapshot.inert {
-            return Step::Done(GateDecision::Pass);
+            return Step::Done(if input.scoping.is_some() {
+                enforced_denial(GateReason::OutOfScope)
+            } else {
+                GateDecision::Pass
+            });
         }
         let (direction, peer) = (input.direction, input.peer);
         let Some(meta) = &input.meta else {
-            return Step::Done(malformed_decision::<A>(
-                snapshot,
-                direction,
-                peer,
-                input.packet,
-            ));
+            let decision = malformed_decision::<A>(snapshot, direction, peer, input.packet);
+            return Step::Done(if input.scoping.is_some() && decision != held() {
+                enforced_denial(GateReason::Malformed)
+            } else {
+                decision
+            });
         };
         let (remote, local) = meta.endpoints(direction);
         if snapshot.held(direction, peer, local, remote) {
             return Step::Done(held());
         }
-        let binding = BindingKey { peer, ip: remote };
-        let mut matches = Applicable::of(
-            snapshot
-                .bound(&binding)
-                .filter(|scope| scope.governs(local)),
-        );
-        // Most specific first: the peer-keyed bindings only when no scope
-        // binds the exact pair.
-        let peer_keyed = !matches.any && snapshot.has_peer_keyed();
-        if peer_keyed {
-            matches = Applicable::of(
-                snapshot
-                    .peer_keyed(peer)
-                    .filter(|scope| scope.governs(local)),
-            );
-        }
-        if !matches.any {
-            return self.unbound_decision(snapshot, input, meta, local, remote);
-        }
-        let Some(scope) = matches.single else {
-            return Step::Done(matches.deny(GateReason::Ambiguous));
+        let (scope, peer_keyed) = match self.bound_scope(snapshot, input, meta, local, remote) {
+            Ok(bound) => bound,
+            Err(step) => return step,
         };
         let counts = &self.state.counts;
 
@@ -263,6 +271,7 @@ impl FlowGate {
             PacketDirection::Inbound => local,
             PacketDirection::Outbound => remote,
         };
+        let binding = BindingKey { peer, ip: remote };
         let labels = if peer_keyed {
             &scope.peer_bindings[&peer]
         } else {
@@ -306,6 +315,59 @@ impl FlowGate {
         })
     }
 
+    /// Step 4 for a packet that is neither malformed nor held: the one scope
+    /// binding it and whether through a peer-keyed binding, or the decision
+    /// for a packet binding no scope (or none of the selection) or more than
+    /// one.
+    #[inline]
+    fn bound_scope<'s, A: GateAddr>(
+        &self,
+        snapshot: &'s Snapshot,
+        input: &PacketInput<'_, A>,
+        meta: &PacketMeta<A>,
+        local: A,
+        remote: A,
+    ) -> Result<(&'s CompiledScope, bool), Step<GateDecision>> {
+        let binding = BindingKey {
+            peer: input.peer,
+            ip: remote,
+        };
+        let mut matches = Applicable::of(
+            snapshot
+                .bound(&binding)
+                .filter(|scope| scope.governs(local)),
+        );
+        // Most specific first: the peer-keyed bindings only when no scope
+        // binds the exact pair.
+        let peer_keyed = !matches.any && snapshot.has_peer_keyed();
+        if peer_keyed {
+            matches = Applicable::of(
+                snapshot
+                    .peer_keyed(input.peer)
+                    .filter(|scope| scope.governs(local)),
+            );
+        }
+        if !matches.any {
+            if input.scoping.is_some() {
+                return Err(Step::Done(enforced_denial(GateReason::OutOfScope)));
+            }
+            return Err(self.unbound_decision(snapshot, input, meta, local, remote));
+        }
+        let Some(scope) = matches.single else {
+            return Err(Step::Done(if input.scoping.is_some() {
+                enforced_denial(GateReason::Ambiguous)
+            } else {
+                matches.deny(GateReason::Ambiguous)
+            }));
+        };
+        if let Some(scoping) = input.scoping
+            && !scoping.select(&scope.id)
+        {
+            return Err(Step::Done(enforced_denial(GateReason::OutOfScope)));
+        }
+        Ok((scope, peer_keyed))
+    }
+
     /// The verdict for a later fragment or an ICMP error of a bound packet,
     /// which only ever match existing state.
     fn fragment_or_icmp_error<A: GateAddr>(
@@ -346,16 +408,18 @@ impl FlowGate {
             let Some(mut shard) = self.lock_shard(snapshot, peer) else {
                 return Some(Step::Retry);
             };
-            return Some(Step::Done(
-                if shard
-                    .family()
-                    .touch_flow(&related_key, self.now(input), counts)
-                {
-                    valid_state(scope)
-                } else {
-                    deny(scope, GateReason::ReverseNewFlow)
-                },
-            ));
+            let now = self.now(input);
+            let quoted = shard
+                .family()
+                .with_live_flow(&related_key, now, counts, |flow| {
+                    flow.touch::<A>(related_key.protocol, now, &counts.timeouts);
+                    input.found_flow(flow);
+                });
+            return Some(Step::Done(if quoted == Lookup::Missing {
+                deny(scope, GateReason::ReverseNewFlow)
+            } else {
+                valid_state(scope)
+            }));
         }
         None
     }
@@ -385,6 +449,7 @@ impl FlowGate {
                     return false;
                 }
                 existing.touch::<A>(flow_key.protocol, now, &counts.timeouts);
+                input.found_flow(existing);
                 true
             });
         match touched {

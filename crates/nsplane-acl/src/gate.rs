@@ -86,6 +86,29 @@
 //! [`GateDecision::Observe`] and [`GateMode::Enforce`] gives
 //! [`GateDecision::Enforce`]; holds always give [`GateDecision::Enforce`].
 //!
+//! # Scoped decisions
+//!
+//! [`FlowGate::evaluate_inbound_in`] and [`FlowGate::evaluate_outbound_in`]
+//! take the same steps on the same snapshot, state and counters for a
+//! caller's [`ScopeSelection`], with one check once step 4 has resolved the
+//! packet's scope and before any state is read or written. The
+//! [`ScopedDecision`] names the deciding scope, the grant (for
+//! [`GateReason::ValidState`] too, except for a later fragment) and the
+//! policy generation:
+//!
+//! - the scope is in the selection: the decision of that scope, in its mode,
+//!   from its state only (every flow and fragment key carries the scope);
+//! - the scope is outside the selection, or the packet binds no scope
+//!   (unbound rules included; an inert gate; another IP version):
+//!   [`GateDecision::Enforce`] denial [`GateReason::OutOfScope`], without
+//!   touching any state;
+//! - held, ambiguous or malformed before a scope is resolved: an enforced
+//!   denial with [`GateReason::Held`], [`GateReason::Ambiguous`] or
+//!   [`GateReason::Malformed`], whatever the scopes' modes.
+//!
+//! An out-of-scope denial counts as an enforced denial and emits a decision
+//! event like any denial.
+//!
 //! # IPv6
 //!
 //! IPv6 packets take the same steps, with these rules:
@@ -174,6 +197,7 @@ mod hash;
 mod migrate;
 mod packet;
 mod policy;
+mod scoped;
 mod snapshot;
 mod state;
 #[cfg(test)]
@@ -186,6 +210,7 @@ pub use config::{
 pub use divert::DivertedPacket;
 pub use events::{GateEvent, GateEvents, GateEventsConfig};
 pub use filter::{GateDivert, GateFilter, GateFilterStats};
+pub use scoped::{EmptySelection, ScopeSelection, ScopedDecision};
 
 use addr::GateAddr;
 use events::{EventCounters, EventSink};
@@ -218,6 +243,8 @@ pub enum GateReason {
     Ambiguous,
     /// The packet cannot be parsed.
     Malformed,
+    /// The packet belongs to no scope of the caller's [`ScopeSelection`].
+    OutOfScope,
 }
 
 impl GateReason {
@@ -236,6 +263,7 @@ impl GateReason {
             Self::StateCapacity => "state_capacity",
             Self::Ambiguous => "ambiguous",
             Self::Malformed => "malformed",
+            Self::OutOfScope => "out_of_scope",
         }
     }
 
@@ -254,6 +282,7 @@ impl GateReason {
             Self::StateCapacity => "flow gate: state capacity",
             Self::Ambiguous => "flow gate: ambiguous",
             Self::Malformed => "flow gate: malformed",
+            Self::OutOfScope => "flow gate: out of scope",
         }
     }
 }
@@ -465,7 +494,7 @@ impl FlowGate {
         peer: PeerId,
         packet: &[u8],
     ) -> GateDecision {
-        let decision = self.evaluate_with(direction, peer, packet, OnceCell::new());
+        let decision = self.evaluate_with(direction, peer, packet, OnceCell::new(), None);
         self.record_decision(&decision);
         if self.events_on.load(Ordering::Relaxed) {
             self.emit_event(peer, packet, &decision);

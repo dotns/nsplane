@@ -14,6 +14,9 @@
 //! - `established/gate`: the same packet through `FlowGate::evaluate_inbound`.
 //! - `established/outbound`: the local reply of that flow through
 //!   `FlowGate::evaluate_outbound`.
+//! - `scoped/established`: the same packet through `FlowGate::evaluate_inbound_in` with a
+//!   selection of the flow's scope; `scoped/out_of_scope`: with a selection of another scope
+//!   (an enforced `OutOfScope` denial).
 //! - `new_flow/any_grant`, `new_flow/port_grant`: a SYN with a new source port per packet,
 //!   admitted by a source grant of every protocol to the local address and by a source grant
 //!   of one TCP port (not suspended), each after the two owner grants that do not match. The
@@ -60,11 +63,11 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, criterion_group, criterion_main};
 use nsplane_acl::gate::{
     FlowGate, GateBinding, GateConfig, GateDecision, GateFilter, GateGrant, GateMode, GatePolicy,
-    GateScope,
+    GateReason, GateScope, ScopeSelection,
 };
 use nsplane_acl::{
     AclEngine, AclFilter, Direction, IpNet, Label, LabelSet, PeerLabelMap, PortSet, ProtocolMatch,
-    Rule, RuleSet,
+    Rule, RuleId, RuleSet,
 };
 use nsplane_core::{PacketFilter, Verdict};
 use nsplane_packet::{PacketBuf, PeerId};
@@ -555,6 +558,46 @@ fn bench_gate(c: &mut Criterion) {
     c.bench_function("established/outbound", |b| {
         b.iter(|| {
             established_gate.evaluate_outbound(REMOTE_PEER, std::hint::black_box(reply.as_packet()))
+        });
+    });
+
+    // The same packet for a selection of its scope and of another one.
+    let own = ScopeSelection::one("scope-1".into());
+    assert_eq!(
+        established_gate
+            .evaluate_inbound_in(REMOTE_PEER, ack.as_packet(), &own)
+            .rule
+            .as_ref()
+            .map(RuleId::as_str),
+        Some("owner")
+    );
+    c.bench_function("scoped/established", |b| {
+        b.iter(|| {
+            established_gate.evaluate_inbound_in(
+                REMOTE_PEER,
+                std::hint::black_box(ack.as_packet()),
+                &own,
+            )
+        });
+    });
+    let other = ScopeSelection::one("scope-2".into());
+    assert!(matches!(
+        established_gate
+            .evaluate_inbound_in(REMOTE_PEER, ack.as_packet(), &other)
+            .decision,
+        GateDecision::Enforce {
+            allow: false,
+            reason: GateReason::OutOfScope,
+            ..
+        }
+    ));
+    c.bench_function("scoped/out_of_scope", |b| {
+        b.iter(|| {
+            established_gate.evaluate_inbound_in(
+                REMOTE_PEER,
+                std::hint::black_box(ack.as_packet()),
+                &other,
+            )
         });
     });
 
