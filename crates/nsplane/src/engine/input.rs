@@ -168,19 +168,21 @@ impl Owner {
         }
     }
 
-    /// Runs `first` and the plaintext packets queued behind it through the core's checks of
-    /// decrypted data: at most [`MAX_BATCH`] and, since each may deliver a packet, no more
+    /// Runs `first` and the plaintext packets queued behind it, their receipt markers
+    /// cleared, through the core's checks of decrypted data: at most [`MAX_BATCH`] and, since each may deliver a packet, no more
     /// than the deliver queue has room for beyond the received datagrams with the crypto
     /// workers (but always `first`, read only once there is room).
     pub(super) fn input_plaintext(&mut self, first: Plaintext) {
         let room = MAX_BATCH.min(self.deliver_room());
-        let (peer, from, packet) = first;
+        let (peer, from, mut packet) = first;
+        packet.set_tracked(false);
         self.core.receive_plaintext(peer, from, packet);
         let mut taken = 1;
         while taken < room
             && let Some(plaintext) = &mut self.plaintext
-            && let Ok((peer, from, packet)) = plaintext.packets.try_recv()
+            && let Ok((peer, from, mut packet)) = plaintext.packets.try_recv()
         {
+            packet.set_tracked(false);
             self.core.receive_plaintext(peer, from, packet);
             taken += 1;
         }

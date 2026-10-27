@@ -104,12 +104,14 @@ impl Drop for Reading {
     }
 }
 
-/// Reads batches of local packets into the owner's queue until the source closes.
+/// Reads batches of local packets into the owner's queue until the source closes, clearing
+/// their receipt markers.
 ///
 /// Each poll of a read runs inside [`Reading::enter`] and [`Reading::leave`], so the packets
 /// a read takes are counted before a barrier can read the count. Before each read, hands the transmitted buffers queued in `recycled` to the source
-/// ([`PacketSource::recycle`]) and drops what it leaves. Sets `declined` when the source takes
-/// none of the first buffers, so that later ones go to the core's pool instead.
+/// ([`PacketSource::recycle`]), untagged and unmarked, and drops what it leaves. Sets
+/// `declined` when the source takes none of the first buffers, so that later ones go to the
+/// core's pool instead.
 pub(super) async fn read_source<Src: PacketSource>(
     mut source: Src,
     local: BatchSender<PacketBuf>,
@@ -130,6 +132,11 @@ pub(super) async fn read_source<Src: PacketSource>(
         if !recycled.is_empty() {
             recycled.take_all(&mut bufs);
             recycled.release();
+            // The buffers stop being the packets they carried.
+            for buf in &mut bufs {
+                buf.set_tag(None);
+                buf.set_tracked(false);
+            }
             let given = bufs.len();
             source.recycle(&mut bufs);
             if !std::mem::replace(&mut offered, true) && bufs.len() == given {
@@ -150,7 +157,10 @@ pub(super) async fn read_source<Src: PacketSource>(
             .await
         };
         reading.leave(batch.len());
-        packets.extend(batch.drain());
+        packets.extend(batch.drain().map(|mut packet| {
+            packet.set_tracked(false);
+            packet
+        }));
         if local.send(&mut packets).await.is_err() {
             return;
         }

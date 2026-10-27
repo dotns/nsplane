@@ -110,7 +110,10 @@ impl Owner {
         while let Some(output) = self.core.poll_output() {
             match output {
                 Output::Transmit { path, data } => self.transmit(path, data, droppable),
-                Output::Deliver { from, packet } => self.deliver(from, packet),
+                Output::Deliver { from, mut packet } => {
+                    packet.set_tracked(false);
+                    self.deliver(from, packet);
+                }
                 Output::Event(event) => self.event(event),
             }
         }
