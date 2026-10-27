@@ -34,9 +34,11 @@ handle and the filter APIs.
 
 ## Principles
 
-1. **Sans-I/O core.** `nsplane-core` is a state machine: inputs in, outputs out, no sockets
-   and no clock of its own. A driver owns it; tests run two cores against each other with a
-   fake clock, and embedders may drive it from their own loop.
+1. **Sans-I/O core.** `nsplane-core` is a state machine: inputs in, outputs out, no packet
+   I/O, and timers scheduled from caller-supplied time. Its Noise dependency still reads
+   clocks for timestamps, cookie rotation and RTT measurements. A driver owns it; tests run
+   two cores against each other with simulated timer time, and embedders may drive it from
+   their own loop.
 2. **The engine never changes a path by itself.** `PathPolicy` answers "which path for this
    message" and "an authenticated message arrived on this path: adopt it?". The built-in
    `StandardRoaming` is plain WireGuard roaming.
@@ -151,9 +153,10 @@ Any local side works with any transport:
 
 One owner task holds the `Core` and loops over handle commands, local packets, received
 datagrams and the core's next timeout. Each `PacketSource`, `PacketSink` and `Transport` has
-its own task connected to the owner through a bounded queue. The core is never shared:
-without crypto workers the data path takes no lock, and `EngineHandle` calls are messages to
-the owner task. With `EngineBuilder::crypto_workers(n)` (n of 2 or more) sealing and opening
+its own task connected to the owner through a bounded queue. The core is never shared,
+and `EngineHandle` calls are messages to the owner task. Noise session replay validation
+locks its receiving counter even without crypto workers. With
+`EngineBuilder::crypto_workers(n)` (n of 2 or more) sealing and opening
 move to `n` worker tasks while handshakes, timers and configuration stay on the owner; every
 peer's packets keep their arrival order. The details are in the
 [nsplane reference](reference/nsplane.md).

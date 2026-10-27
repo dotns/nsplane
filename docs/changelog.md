@@ -546,3 +546,12 @@ passthrough runs each 10/10, one complete `just check` (2,405 tests passed, 34 s
 36 doctests passed, 40 ignored), and warning-denied workspace rustdoc all passed. Local
 review found no introduced issue. The four other-document drift entries remain in tk #184
 outside this comment/README scope.
+
+## 2026-10-27 [docs]
+
+The owner expanded task `20261027-0537-tk-cleanup` to the four remaining Markdown
+statements and authorized Gitea main integration without a tag. Corrected architecture
+clock and replay-lock claims, the NAT address-model summary, and appended a dated
+correction to the historical optimization plan's dependency constraint. Original process
+records are preserved. This follow-up changes Markdown only; `just docs` and `just typos`
+passed, and local diff review found no issue.

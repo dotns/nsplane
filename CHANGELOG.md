@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicting UDP bind before serving; independent TCP allocation no longer flakes the tests.
 
 ### Changed
-- Correct source comments, rustdoc and README claims about clocks, socket and flow lifetimes,
-  worker ownership, routing storage, protocol limits, offloads and test coverage. Runtime
-  behavior and public API are unchanged.
+- Correct source comments, rustdoc, README and reference documentation claims about clocks,
+  socket and flow lifetimes, worker ownership, replay locks, routing storage, LAN address
+  mappings, protocol limits, offloads and test coverage. Runtime behavior and public API
+  are unchanged.
 
 ## [0.20.1] - 2026-10-27
 
