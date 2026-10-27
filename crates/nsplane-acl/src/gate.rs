@@ -187,7 +187,6 @@ use crate::net::Protocol;
 use crate::rules::RuleId;
 
 mod addr;
-mod clock;
 mod config;
 mod decisions;
 mod divert;
@@ -411,7 +410,7 @@ impl FlowGate {
     /// [`Instant::now`] elsewhere.
     #[must_use]
     pub fn new(config: GateConfig) -> Arc<Self> {
-        Self::with_clock(config, clock::coarse())
+        Self::with_clock(config, crate::clock::coarse())
     }
 
     /// A gate whose flow and fragment expiry follows `clock` (e.g. a manual

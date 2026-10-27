@@ -2,19 +2,6 @@
 
 use super::*;
 
-/// An engine with `rules` installed whose clock is moved by hand.
-fn clocked_engine(rules: RuleSet) -> (Arc<AclEngine>, Arc<Mutex<Instant>>) {
-    let clock = Arc::new(Mutex::new(Instant::now()));
-    let handle = Arc::clone(&clock);
-    let engine = AclEngine::with_clock(move || *handle.lock().unwrap());
-    engine.install(rules);
-    (Arc::new(engine), clock)
-}
-
-fn advance(clock: &Mutex<Instant>, by: Duration) {
-    *clock.lock().unwrap() += by;
-}
-
 #[test]
 fn bypass_and_fragment_defaults() {
     assert_eq!(FragmentMode::default(), FragmentMode::Outcome);
