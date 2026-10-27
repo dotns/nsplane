@@ -34,6 +34,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nsplane-nat`: the translator's zero-checksum UDP reassembly keeps the tag its fragments
   share and drops a datagram whose fragments carried different tags (or some a tag and others
   none) as the new `reasons::FRAGMENT_MIXED_TAGS`, counted in `TranslatorStats::dropped_out`.
+- Netstack ingress labels (`nsplane-netstack`): the tag of a packet sent into `NetStackSink`
+  is its ingress label, on every stack (with or without `Admission`, ordinary or transparent).
+  A connection takes the label of its bare SYN, a flow from `incoming_udp` that of its first
+  datagram, a lifetime held under `Admission::Decide` that of its held input; `None` is a
+  label of its own. `TcpConnection::ingress_label`, `UdpFlow::ingress_label` and
+  `PendingFlow::ingress_label` return it. Input with another label than its lifetime's (a
+  segment, a retransmitted SYN, a handshake ACK, a datagram, a held lifetime's further input,
+  a datagram reassembled from fragments with different labels) is dropped and counted in the
+  new `NetStackStats::label_mismatch`; an unlabeled ICMP error applies to a labeled
+  connection, one with another label is ignored and counted there too. Connections and
+  sockets the application opens carry no label and are not checked.
+- `NetStackHandle::revoke_label(label) -> RetirementReceipt` retires every lifetime of a
+  label at every stage, handed-out handles included (their control is revoked), drops the
+  label's input still queued in the stack and its incomplete reassembled datagrams, and
+  keeps a tombstone: later input with the label is dropped and counted in the new
+  `NetStackStats::label_revoked` and opens no lifetime. `Failed` when the table of labels
+  with queued input (1024) or the egress fences are full; every lifetime found is still
+  retired and a later call reports `Retired` once the fences fit. The new
+  `NetStackConfig::max_revoked_labels` (default 65 536) bounds the tombstones. After
+  `Retired` the same tuple opens a fresh lifetime with its new label.
+- `send_stream` bench: every case also with the receiver's input labeled (`_labeled`), and
+  the new `netstack_udp_flow_send` / `_1cpu` groups, UDP to flows from `incoming_udp`.
+
+### Changed
+
+- `nsplane-netstack`: a connection or flow revoked while it waits in `incoming_tcp` or
+  `incoming_udp` is skipped by the stream also when it was admitted with
+  `Admission::Immediate` (before, only lifetimes held under `Admission::Decide` were).
 
 ## [0.20.1] - 2026-10-27
 

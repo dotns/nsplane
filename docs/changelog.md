@@ -547,3 +547,21 @@ so variant B (`u32` offsets, 56 bytes) ships; against 0.20.0 it is within the no
 `data_path`, `udp_offload` and `translate`, faster on `local_graph`, +1.7 % on `vnet`, and
 `send_stream` `streams_1` / `flows_{1,4}` are to be re-measured (disturbed runs); measured
 before the rebase, against `v0.20.0`. Not merged, not released.
+
+## 2026-10-27 [implementation]
+
+Release C W5 (task `20261027-0305-netstack-ingress-labels`, plan
+`20261026-0822-node-gateway-requests`) on `feat/netstack-ingress-labels` from W4's
+`feat/packet-tag-carrier` (`dbee734`): netstack ingress labels on every stack (a lifetime
+takes the label of its first input, mismatches dropped and counted in `label_mismatch`,
+unlabeled ICMP errors accepted, mixed-label fragment sets dropped), `TcpConnection`,
+`UdpFlow` and `PendingFlow::ingress_label`, `NetStackHandle::revoke_label` retiring every
+lifetime of a label at every stage with ingress positions, `discard_tagged` and tombstones
+(`label_revoked`, `NetStackConfig::max_revoked_labels`), a revoked lifetime skipped in the
+accept streams under `Immediate` too. Tests first (17 of 19 unit tests failing before), an
+e2e incarnation replacement between two engines, labeled `send_stream` cases and the new
+`netstack_udp_flow_send` group. Labeled within the noise plus 3 % (TCP after a 64-slot cache
+of recent tuples; a per-segment lookup cost +5 %); untagged within the noise except
+`netstack_send_1cpu/streams_1` at the edge (+2.1 % median) and the bimodal
+`netstack_udp_send/flows_4` (open for the integration's quiet re-measure). `cargo
+semver-checks` against `v0.20.1`: no semver update required. Not merged, not released.

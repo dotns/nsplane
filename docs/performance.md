@@ -249,6 +249,69 @@ and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's f
 A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
 tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.
 
+## Netstack ingress labels
+
+`send_stream` with netstack ingress labels (release C, W5), 2026-10-27, slot 0, `BENCH_CPUS`,
+each `slot.sh` invocation started at a 1-minute load below 3 (the shared host rose to 4-9
+during runs), criterion means per round.
+
+Labeled against unlabeled on the same build (head of `feat/netstack-ingress-labels`): the wire
+into the receiving stack sets the label on every packet, so each data segment or datagram is
+checked against its connection's or flow's label; the two cases of a count run back to back,
+three rounds. The bar is the noise plus 3 %.
+
+| Case | Unlabeled | Labeled | Change per round |
+| --- | --- | --- | --- |
+| `netstack_send/streams_1` | 3332 / 3421 / 3329 us | 3353 / 3424 / 3412 us | +0.7 / +0.1 / +2.5 % |
+| `netstack_send/streams_4` | 2090 / 2316 / 2303 us | 2151 / 2125 / 2100 us | +2.9 % (the other two unlabeled runs disturbed, intervals 2.1-2.6 ms) |
+| `netstack_send_1cpu/streams_1` | 3452 / 3469 / 3478 us | 3476 / 3493 / 4599 us | +0.7 / +0.7 % (third labeled run disturbed) |
+| `netstack_send_1cpu/streams_4` | 4179 / 4331 / 4396 us | 4214 / 4287 / 4504 us | +0.8 / -1.0 / +2.5 % |
+| `netstack_udp_flow_send/flows_1` | 572.1 / 580.3 / 602.4 us | 573.3 / 609.8 / 590.7 us | +0.2 / +5.1 / -1.9 % (second labeled run disturbed) |
+| `netstack_udp_flow_send/flows_4` | 480.2 / 484.6 / 552.1 us | 487.3 / 601.7 / 483.4 us | +1.5 % (the other two disturbed) |
+| `netstack_udp_flow_send_1cpu/flows_1` | 493.1 / 436.1 / 439.8 us | 440.5 / 439.8 / 442.9 us | +0.9 / +0.7 % |
+| `netstack_udp_flow_send_1cpu/flows_4` | 448.2 / 440.2 / 441.2 us | 446.2 / 443.0 / 443.8 us | -0.5 / +0.6 / +0.6 % |
+
+Earlier builds of the TCP check, same method: a lookup per segment (`SocketAddr` pair,
+SipHash) cost +5.2 % on `netstack_send/streams_1` (+4.8 % on 1 CPU); a one-entry cache of the
+last tuple +2.9 %, but `streams_4` (four interleaved connections) stayed at +8 to +31 %. The
+shipped check reads the IPv4 tuple as two words and probes a 64-slot cache: 4 ns per check
+in isolation (15 ns per table lookup), against about 340 ns per segment for the whole
+four-thread pipeline. The per-socket alternative of the design note was not needed.
+
+Untagged traffic against `dbee734` (the packet tag carrier), rotated base / build rounds in
+three `slot.sh` invocations (four, three and three rounds), all rounds:
+
+| Case | Rounds (build against base) | Median |
+| --- | --- | --- |
+| `netstack_send/streams_1` | -1.6 .. +2.6 % (7) | +0.8 % |
+| `netstack_send/streams_4` | -53 .. +6.8 % (7; the base swung) | +1.2 % |
+| `netstack_send_1cpu/streams_1` | -15.9, -3.1, +1.6 .. +3.8 % (10) | +2.1 % |
+| `netstack_send_1cpu/streams_4` | -3.0 .. +1.7 % (4) | +1.6 % |
+| `netstack_udp_send/flows_1` | -3.8 .. +2.9 % (4) | -1.1 % |
+| `netstack_udp_send/flows_4` | -50.8 .. +66 % (10) | +16 % |
+| `netstack_udp_send_1cpu/flows_1` | -0.5 .. +11.3 % (10) | +1.4 % |
+| `netstack_udp_send_1cpu/flows_4` | +0.2 .. +2.9 % (4) | +0.8 % |
+
+`netstack_udp_send/flows_4` (four connected sockets of one stack to four bound sockets of the
+other, four runtime threads) is bimodal on the shared host: single runs of either binary land
+near 480 us or between 550 and 940 us with wide intervals, the base's included (one round
+-51 % for the build). The build landed high in more rounds, but a diagnostic build without the
+label field in the connection state (the only change on this path besides one tag read per
+datagram) ran at 937 us in the round where the build ran at 487 us and the base at 479 us.
+Not attributed; to be measured again on a quiet host with the release integration, like the
+packet tag carrier's disturbed `flows_4`. `netstack_send_1cpu/streams_1` sits at +2.1 %
+(median of 10 rounds, 8 of them +1.6 to +3.8 %), against a 2.4 % spread of the base alone
+across the three invocations: at the edge of the noise. A build with the label revoke and
+the TCP check moved out of the driver's hot functions (smaller code, the driver loop below
+the base's size) was not faster.
+
+`data_path`, `local_graph` and `udp_offload` do not link `nsplane-netstack`: their bench
+binaries are byte-identical to the base's. The interleaved runs (two rounds each) measure the
+slot's noise: `data_path` `core_round_trip{,_batch32}/{64,1420}` -1.5 .. +1.0 %;
+`udp_offload` -6.2 .. -0.2 %; `local_graph`, 34 cases, mostly within ±3 % per round, single
+rounds up to -15 % and +35 %.
+
+
 ## Packet tag carrier against 0.20.0
 
 The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,
