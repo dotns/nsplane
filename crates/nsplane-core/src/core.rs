@@ -25,7 +25,7 @@ mod tests;
 mod timers;
 
 use route_cache::{Lookups, RouteCache};
-use send::sealed;
+use send::{not_sent, sealed, token};
 
 /// Interval of the peer timers, as in the device.
 const TICK: Duration = Duration::from_millis(250);
@@ -69,6 +69,8 @@ pub struct Core {
     now: Option<Instant>,
     /// Unanswered handshake initiations of the peers removed so far.
     removed_unanswered_handshakes: u64,
+    /// Some peer is marked for plaintext egress (or was, until the next mark changes).
+    plaintext_egress: bool,
 }
 
 impl fmt::Debug for Core {
@@ -101,6 +103,7 @@ impl Core {
             schedule: None,
             now: None,
             removed_unanswered_handshakes: 0,
+            plaintext_egress: false,
         }
     }
 
@@ -252,21 +255,28 @@ impl Core {
     pub fn complete_job(&mut self, mut job: CryptoJob) {
         let id = job.peer;
         match job.direction {
-            Direction::Seal => match self.peers.peer_mut(id) {
-                Some(peer) => {
-                    let outcome = job.finish(&mut peer.tunnel_mut());
-                    sealed(
+            Direction::Seal { len } => {
+                let Some(peer) = self.peers.peer_mut(id) else {
+                    not_sent(
                         &mut self.outputs,
-                        &mut self.pool,
-                        self.policy.as_ref(),
-                        id,
-                        peer,
-                        job.buf,
-                        outcome,
+                        token(&job.buf),
+                        Some(id),
+                        crate::reasons::NO_ROUTE,
                     );
-                }
-                None => self.pool.put(job.buf),
-            },
+                    return self.pool.put(job.buf);
+                };
+                let outcome = job.finish(&mut peer.tunnel_mut());
+                sealed(
+                    &mut self.outputs,
+                    &mut self.pool,
+                    self.policy.as_ref(),
+                    id,
+                    peer,
+                    job.buf,
+                    outcome,
+                    len,
+                );
+            }
             Direction::Open { path } => {
                 let slot = self.peers.slot(id);
                 let outcome = match slot.and_then(|slot| self.peers.at_mut(slot)) {

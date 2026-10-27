@@ -41,5 +41,5 @@ pub use nsplane_packet::{Ecn, Path, PeerId, TransportId};
 pub use policy::{MessageKind, PathPolicy, Roam, StandardRoaming};
 pub use types::{
     AllowedIp, ConfigChange, CoreConfig, Event, InboundDestinations, Input, LocalIdentityId,
-    LocalIdentityInfo, Output, PeerConfig, PeerStats,
+    LocalIdentityInfo, Output, PeerConfig, PeerStats, TrackedOutcome,
 };

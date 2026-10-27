@@ -42,8 +42,8 @@ pub(crate) fn open(tunnel: &mut Tunn, path: Path, buf: &mut PacketBuf) -> Outcom
 /// Which way a job goes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Direction {
-    /// Seals a local packet.
-    Seal,
+    /// Seals a local packet of `len` plaintext bytes.
+    Seal { len: usize },
     /// Opens a datagram received on this path.
     Open { path: Path },
 }
@@ -112,7 +112,7 @@ impl CryptoJob {
         Self {
             peer,
             buf,
-            direction: Direction::Seal,
+            direction: Direction::Seal { len },
             stage,
         }
     }

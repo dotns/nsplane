@@ -222,6 +222,23 @@ impl Core {
         }
     }
 
+    /// Marks or unmarks `peer` for plaintext egress; returns `false` for an unknown peer.
+    ///
+    /// The local packets routed to a marked peer after this call leave after the outbound
+    /// filters as [`Output::Plaintext`] instead of being sealed. The mark is runtime state
+    /// of the [`PeerId`]: an update of the peer in place keeps it, a peer removed and added
+    /// again gets a new id and starts unmarked.
+    ///
+    /// [`Output::Plaintext`]: crate::Output::Plaintext
+    pub fn set_plaintext_egress(&mut self, peer: PeerId, plaintext: bool) -> bool {
+        let Some(p) = self.peers.peer_mut(peer) else {
+            return false;
+        };
+        p.plaintext_egress = plaintext;
+        self.plaintext_egress = self.peers.iter().any(|(_, p)| p.plaintext_egress);
+        true
+    }
+
     /// Removes the peer of `identity` with `key`, keeping its unanswered handshakes in the
     /// total.
     fn remove_peer(&mut self, identity: LocalIdentityId, key: &x25519::PublicKey) {

@@ -83,7 +83,7 @@ fn pump(cores: &mut [Core; 2], now: Instant) -> usize {
                         delivered += 1;
                         core.recycle(packet);
                     }
-                    Output::Event(_) => {}
+                    _ => {}
                 }
             }
         }

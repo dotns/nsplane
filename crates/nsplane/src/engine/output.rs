@@ -115,6 +115,7 @@ impl Owner {
                     self.deliver(from, packet);
                 }
                 Output::Event(event) => self.event(event),
+                _ => {}
             }
         }
         if std::mem::take(&mut self.inline.queued) {

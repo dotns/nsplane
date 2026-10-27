@@ -93,6 +93,8 @@ pub(crate) struct Peer {
     initiation_outstanding: bool,
     /// Handshake initiations transmitted to this peer that got no response.
     unanswered_handshakes: u64,
+    /// Its routed local packets leave as plaintext instead of being sealed.
+    pub(crate) plaintext_egress: bool,
 }
 
 impl std::fmt::Debug for Peer {
@@ -140,6 +142,7 @@ impl Peer {
             handshakes,
             initiation_outstanding: false,
             unanswered_handshakes: 0,
+            plaintext_egress: false,
         }
     }
 
