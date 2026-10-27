@@ -22,10 +22,15 @@ use super::wire::tcp_reset;
 
 impl Driver {
     /// Answers the bare SYN `packet` of `key` with RST for `max_connections`.
-    pub(super) fn reject_connection_limit(&mut self, key: &pending::Key, packet: &[u8]) {
+    pub(super) fn reject_connection_limit(
+        &mut self,
+        key: &pending::Key,
+        packet: &nsplane_packet::PacketBuf,
+    ) {
         stats::add(&self.stats.rejected_connection_limit, 1);
         self.emit(key, FlowEventReason::ConnectionLimit);
-        if let Some(reset) = tcp_reset(packet) {
+        if let Some(mut reset) = tcp_reset(packet.as_packet()) {
+            reset.set_tag(packet.tag());
             self.push_reply(reset);
         }
     }
@@ -84,13 +89,14 @@ impl Driver {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
                         if flow.undeliver(Undelivered::ConnectionLimit) {
-                            self.reject_connection_limit(&key, syn.as_packet());
+                            self.reject_connection_limit(&key, &syn);
                         }
                         continue;
                     }
                     stats::add(&self.stats.accepted, 1);
                     self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
+                    self.remember_syn_label(&syn);
                     self.device.inject(syn);
                     if let Some(table) = self.pending.as_mut() {
                         table.admit(flow);
@@ -156,22 +162,35 @@ impl Driver {
         local: SocketAddr,
         payload: Bytes,
         packet: Bytes,
+        label: Option<std::num::NonZeroU64>,
     ) {
         let key = pending::Key {
             protocol: PendingProtocol::Udp,
             remote,
             local,
         };
-        if self
+        if let Some(held_label) = self
             .pending
             .as_ref()
-            .is_some_and(|table| table.contains(&key))
+            .and_then(|table| table.lifetime(&key).map(FlowState::ingress_label))
         {
             // A held flow queues its first datagram only.
-            stats::add(&self.stats.udp_queue_full, 1);
+            let counter = if held_label == label {
+                &self.stats.udp_queue_full
+            } else {
+                &self.stats.label_mismatch
+            };
+            stats::add(counter, 1);
             return;
         }
-        self.hold(key, pending::Held::Udp { payload, packet });
+        self.hold(
+            key,
+            pending::Held::Udp {
+                payload,
+                packet,
+                label,
+            },
+        );
     }
 
     /// Counts and reports the new flow from `remote` to `local` admitted in transparent

@@ -153,6 +153,11 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
+    /// The immutable ingress label of this connection's lifetime.
+    pub fn ingress_label(&self) -> Option<std::num::NonZeroU64> {
+        self.flow.ingress_label()
+    }
+
     pub(crate) const fn new(
         shared: Arc<Mutex<Shared>>,
         progress: Arc<Progress>,

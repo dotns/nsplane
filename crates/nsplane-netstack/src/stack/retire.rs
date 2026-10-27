@@ -56,12 +56,13 @@ impl Driver {
     /// Retires the flows revoked since the last turn, see [`retire`](Self::retire).
     pub(super) fn retire_revoked(&mut self) {
         self.revocations.take(&mut self.retiring);
+        self.retiring.reverse();
         // Each flow stays in `retiring` until its outcome is written, so a panic leaves the
         // rest to `Drop`, which reports them unknown.
         while let Some(flow) = self.retiring.last().cloned() {
             #[cfg(test)]
             flow.observed_in(self.turns);
-            let outcome = self.retire(&flow);
+            let outcome = self.retire(&flow, true);
             #[cfg(test)]
             flow.completed_in(self.turns);
             flow.finish(outcome);
@@ -77,8 +78,13 @@ impl Driver {
     /// A lifetime not handed out yet is found at its stage: the pending entry, the
     /// listener socket mid handshake, the connection waiting for `incoming_tcp`, or the
     /// flow entry.
-    fn retire(&mut self, flow: &Arc<FlowState>) -> RetirementOutcome {
+    pub(super) fn retire(
+        &mut self,
+        flow: &Arc<FlowState>,
+        fence_output: bool,
+    ) -> RetirementOutcome {
         let fenced = match flow.target() {
+            Some(Target::Label(label)) => return self.retire_label(*label),
             None => {
                 // Held, or accepted and dropped in `take_decisions`: no output yet.
                 if self
@@ -97,6 +103,7 @@ impl Driver {
                 start,
                 ..
             }) => {
+                let mut removed = false;
                 if self
                     .conns
                     .get(&handle)
@@ -104,6 +111,7 @@ impl Driver {
                 {
                     self.aborting.retain(|&aborting| aborting != handle);
                     self.release_conn(handle);
+                    removed = true;
                 } else if self.inbound.get(&handle).is_some_and(|inbound| {
                     inbound
                         .flow
@@ -111,12 +119,28 @@ impl Driver {
                         .is_some_and(|owner| Arc::ptr_eq(owner, flow))
                 }) {
                     self.release_handshake(handle, local.port());
+                    removed = true;
                     flow.set_end(self.position());
+                }
+                if let Some(index) = self.connecting.iter().position(|connecting| {
+                    connecting
+                        .flow
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, flow))
+                }) {
+                    let connecting = self.connecting.swap_remove(index);
+                    self.sockets.remove(connecting.handle);
+                    removed = true;
+                    let _ = connecting.reply.send(Err(crate::tcp::revoked()));
+                    flow.set_end(self.position());
+                }
+                if removed {
+                    self.device.tcp_labels.remove(&(local, peer));
                 }
                 if !self.waiting.is_empty() {
                     self.waiting.retain(|conn| !Arc::ptr_eq(conn.flow(), flow));
                 }
-                self.purge_tcp(local, peer, start, flow.end())
+                !fence_output || self.purge_tcp(local, peer, start, flow.end())
             }
             Some(Target::UdpFlow(key)) => {
                 if self
@@ -126,7 +150,7 @@ impl Driver {
                 {
                     self.flows.remove(key);
                 }
-                self.purge_udp(flow)
+                !fence_output || self.purge_udp(flow)
             }
             Some(Target::UdpBound(local)) => {
                 if self
@@ -136,7 +160,7 @@ impl Driver {
                 {
                     self.bound.remove(local);
                 }
-                self.purge_udp(flow)
+                !fence_output || self.purge_udp(flow)
             }
             Some(Target::UdpConnected(key)) => {
                 if self
@@ -146,10 +170,10 @@ impl Driver {
                 {
                     self.connected.remove(key);
                 }
-                self.purge_udp(flow)
+                !fence_output || self.purge_udp(flow)
             }
         };
-        let barred = self.bar(flow);
+        let barred = !fence_output || self.bar(flow);
         if fenced && barred {
             RetirementOutcome::Retired
         } else {

@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use nsplane_packet::reassembly::Outcome;
+use nsplane_packet::reassembly::{FragmentTags, Outcome};
 use nsplane_packet::{IpPacket, PacketBuf, protocol};
 use tokio::time::Instant;
 
@@ -68,13 +68,21 @@ impl Driver {
             stats::add(&self.stats.reassembly_overflow, 1);
             return None;
         }
-        let routed = match reassembler.push(packet.as_packet(), now) {
+        let (outcome, tags) = reassembler.push_tagged(packet.as_packet(), packet.tag(), now);
+        let routed = match outcome {
             Outcome::Pass => return Some(packet),
+            Outcome::Complete(_) if tags == FragmentTags::Mixed => None,
             Outcome::Complete(datagram) if self.barred(&datagram, now) => {
                 stats::add(&self.stats.retired, 1);
                 None
             }
-            Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
+            Outcome::Complete(datagram) => {
+                let mut packet = PacketBuf::from_packet(&datagram);
+                if let FragmentTags::Same(label) = tags {
+                    packet.set_tag(label);
+                }
+                Some(packet)
+            }
             Outcome::Held | Outcome::Dropped => None,
         };
         self.count_reassembly();
@@ -147,7 +155,7 @@ impl Driver {
                 };
                 (protocol, key.local, Some(key.remote))
             }
-            (None, None) => return true,
+            (None, None) | (Some(Target::Label(_)), _) => return true,
         };
         let until = Instant::now().into_std() + reassembler.config().timeout;
         self.barriers.push(Barrier {
@@ -166,6 +174,10 @@ impl Driver {
         };
         let now = reassembler.stats();
         let before = std::mem::replace(&mut self.reassembly_counted, now);
+        stats::add(
+            &self.stats.label_mismatch,
+            now.mixed_tags - before.mixed_tags,
+        );
         stats::add(
             &self.stats.reassembled,
             now.reassembled - before.reassembled,

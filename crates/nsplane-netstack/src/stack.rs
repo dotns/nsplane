@@ -38,6 +38,7 @@ mod connections;
 mod fragments;
 mod handle;
 mod ingress;
+mod labels;
 mod listeners;
 mod netstack;
 mod retire;
@@ -45,7 +46,7 @@ mod wire;
 
 pub use self::handle::NetStackHandle;
 pub use self::netstack::{NetStack, NetStackSink, NetStackSource};
-pub(crate) use self::wire::{tcp_reset, tcp_segment};
+pub(crate) use self::wire::{tcp_reset, tcp_segment, tcp_tuple};
 
 /// Most ingress packets taken per driver iteration before smoltcp runs, so one burst
 /// cannot starve the bridge phase.
@@ -86,6 +87,7 @@ struct Inbound {
 
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
+    labels: labels::Labels,
     settings: Settings,
     iface: Interface,
     device: VirtualDevice,
@@ -252,6 +254,10 @@ impl Driver {
             self.preserve_all(now);
         }
         self.release_aborted();
+        // At most the live TCP tuples plus this turn's bounded SYN batch are retained.
+        self.device.tcp_labels.retain(|&(local, remote), label| {
+            label.is_some() && self.owners.has_tcp(local, remote)
+        });
 
         // 5. Egress, then wait for more work.
         self.flush_egress() && self.wait(now).await

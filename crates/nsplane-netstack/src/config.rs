@@ -153,6 +153,9 @@ pub struct NetStackConfig {
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
+    /// Most revoked labels remembered; oldest is evicted at capacity.
+    /// Default 65536; zero is normalized to one. Labels must never be reused.
+    pub max_revoked_labels: usize,
     /// Whether an IPv4 UDP datagram the application sends above the MTU leaves as one
     /// oversize packet with DF clear, for the engine's fragmenter
     /// (`nsplane::EngineBuilder::fragmenter`) to split, instead of failing with
@@ -356,6 +359,7 @@ impl Default for NetStackConfig {
             tcp_min_rto: DEFAULT_RTO,
             tcp_initial_rto: DEFAULT_RTO,
             max_udp_flows: 65_536,
+            max_revoked_labels: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
             transparent: None,
@@ -382,6 +386,7 @@ pub(crate) struct Settings {
     pub(crate) tcp_send_budget: Option<usize>,
     pub(crate) tcp_rto: TcpRto,
     pub(crate) max_udp_flows: usize,
+    pub(crate) max_revoked_labels: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
     /// Boxed, so that it does not grow the driver.
@@ -534,6 +539,7 @@ impl Settings {
             tcp_send_budget: config.tcp_send_budget,
             tcp_rto: TcpRto::new(config.tcp_min_rto, config.tcp_initial_rto),
             max_udp_flows: config.max_udp_flows.max(1),
+            max_revoked_labels: config.max_revoked_labels.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
             transparent: config.transparent.map(|transparent| {

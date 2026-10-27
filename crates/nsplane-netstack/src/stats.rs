@@ -53,7 +53,8 @@ pub struct NetStackStats {
     pub udp_not_accepted: u64,
     /// Packets the stack produced while its egress backlog was full.
     pub egress_full: u64,
-    /// Datagrams reassembled from fragments and handed on as one packet. Always 0 without
+    /// Datagrams completed by reassembly, including ones rejected after completion.
+    /// Always 0 without
     /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
     pub reassembled: u64,
     /// Incomplete datagrams discarded with their fragments after the reassembly timeout.
@@ -73,6 +74,10 @@ pub struct NetStackStats {
     /// family's minimum (576 for IPv4, 1280 for IPv6), or not below the configured MTU
     /// and the connection's current path MTU. Applied messages are not counted.
     pub icmp_ignored: u64,
+    /// Input label mismatches, plus fragment sets when they first become mixed.
+    pub label_mismatch: u64,
+    /// Input dropped because its label was revoked.
+    pub label_revoked: u64,
     /// A gauge, not a counter: the TCP connections and UDP flows held for the
     /// application's decision under [`Admission::Decide`](crate::Admission::Decide) now.
     /// Each leaves it accepted, counted in one of the `rejected_` fields, or revoked
@@ -131,6 +136,8 @@ pub(crate) struct Counters {
     pub(crate) reassembly_timeout: AtomicU64,
     pub(crate) reassembly_overflow: AtomicU64,
     pub(crate) icmp_ignored: AtomicU64,
+    pub(crate) label_mismatch: AtomicU64,
+    pub(crate) label_revoked: AtomicU64,
     pub(crate) pending: AtomicU64,
     pub(crate) accepted: AtomicU64,
     pub(crate) rejected_hook: AtomicU64,
@@ -170,6 +177,8 @@ impl Counters {
             reassembly_timeout: get(&self.reassembly_timeout),
             reassembly_overflow: get(&self.reassembly_overflow),
             icmp_ignored: get(&self.icmp_ignored),
+            label_mismatch: get(&self.label_mismatch),
+            label_revoked: get(&self.label_revoked),
             pending: get(&self.pending),
             accepted: get(&self.accepted),
             rejected_hook: get(&self.rejected_hook),

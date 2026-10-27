@@ -72,6 +72,11 @@ pub struct PendingFlow {
 }
 
 impl PendingFlow {
+    /// The immutable label of the input held for this lifetime.
+    pub fn ingress_label(&self) -> Option<std::num::NonZeroU64> {
+        self.state.ingress_label()
+    }
+
     /// TCP or UDP.
     pub const fn protocol(&self) -> PendingProtocol {
         self.key.protocol
@@ -158,17 +163,30 @@ pub(crate) enum Held {
     /// The bare SYN.
     Tcp(PacketBuf),
     /// The first datagram's payload and the whole packet it is a view into.
-    Udp { payload: Bytes, packet: Bytes },
+    Udp {
+        payload: Bytes,
+        packet: Bytes,
+        label: Option<std::num::NonZeroU64>,
+    },
 }
 
 impl Held {
+    pub(crate) const fn label(&self) -> Option<std::num::NonZeroU64> {
+        match self {
+            Self::Tcp(packet) => packet.tag(),
+            Self::Udp { label, .. } => *label,
+        }
+    }
+
     /// The packet that answers a rejection, sourced from the original destination: a RST
     /// for a SYN, a port unreachable for a datagram.
     pub(crate) fn rejection(&self, mtu: u16) -> Option<PacketBuf> {
-        match self {
+        let mut reply = match self {
             Self::Tcp(syn) => crate::stack::tcp_reset(syn.as_packet()),
             Self::Udp { packet, .. } => port_unreachable(packet, mtu),
-        }
+        }?;
+        reply.set_tag(self.label());
+        Some(reply)
     }
 }
 
@@ -264,6 +282,10 @@ impl Pending {
         self.entries.contains_key(key)
     }
 
+    pub(crate) fn lifetime(&self, key: &Key) -> Option<&FlowState> {
+        self.entries.get(key).map(|entry| entry.state.as_ref())
+    }
+
     /// Holds `held` for `key`, which is not held, until a decision or `now + timeout`,
     /// offering it to the application with the state of a new lifetime.
     pub(crate) fn hold(&mut self, key: Key, held: Held, now: Instant) -> Hold {
@@ -272,7 +294,7 @@ impl Pending {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let state = FlowState::held(key, &self.revocations);
+        let state = FlowState::held(key, held.label(), &self.revocations);
         let item = PendingFlow {
             key,
             id,

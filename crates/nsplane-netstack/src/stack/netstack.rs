@@ -66,7 +66,6 @@ impl NetStack {
         let (accept_udp, incoming_udp) = mpsc::channel(settings.accept_capacity);
         let revocations = Arc::new(Revocations::new(Arc::clone(&notify)));
         let (pending, incoming_pending) = pending_table(&settings, &notify, &revocations).unzip();
-        let pending = pending.map(Box::new);
         let (events, flow_events) = event_sink(&settings).unzip();
         let events = events.map(Box::new);
         let (_, mtu) = watch::channel(settings.mtu);
@@ -90,6 +89,7 @@ impl NetStack {
             allow_fragmentation: settings.udp_allow_fragmentation,
         };
         let driver = Driver {
+            labels: super::labels::Labels::new(settings.max_revoked_labels),
             settings,
             iface,
             device,
@@ -140,13 +140,14 @@ impl NetStack {
                 rx: egress_rx,
                 mtu,
                 received: 0,
-                revocations,
+                revocations: Arc::clone(&revocations),
                 fences,
                 stats: Arc::clone(&stats),
             },
             sink: NetStackSink { tx: ingress_tx },
         };
         let handle = NetStackHandle {
+            revocations,
             commands: commands_tx,
             incoming_tcp: Arc::new(Mutex::new(Some(incoming_tcp))),
             incoming_udp: Arc::new(Mutex::new(Some(incoming_udp))),
@@ -213,7 +214,7 @@ impl NetStackSource {
         }
         if self
             .fences
-            .holds(position, || tcp_tuple(packet.as_packet()))
+            .holds(position, packet.tag(), || tcp_tuple(packet.as_packet()))
         {
             stats::add(&self.stats.retired, 1);
             return false;
@@ -269,7 +270,7 @@ fn pending_table(
     settings: &Settings,
     notify: &Arc<Notify>,
     revocations: &Arc<Revocations>,
-) -> Option<(Pending, mpsc::Receiver<PendingFlow>)> {
+) -> Option<(Box<Pending>, mpsc::Receiver<PendingFlow>)> {
     match settings.admission {
         Admission::Decide {
             timeout,
@@ -283,7 +284,7 @@ fn pending_table(
                 Arc::clone(notify),
                 Arc::clone(revocations),
             );
-            Some((table, incoming))
+            Some((Box::new(table), incoming))
         }
         Admission::Immediate => None,
     }

@@ -113,11 +113,39 @@ impl Driver {
 
     /// Routes one ingress packet, counting the SYNs per destination port in `demand`.
     fn ingest(&mut self, packet: PacketBuf, demand: &mut HashMap<u16, usize>) {
+        if self.labels.ingest(packet.tag()) {
+            return stats::add(&self.stats.label_revoked, 1);
+        }
         let Some(packet) = self.reassemble(packet) else {
             return;
         };
         match classify(packet.as_packet(), &self.settings) {
             Ok(Class::Tcp { dst_port, syn }) => {
+                if (packet.tag().is_some()
+                    || !self.device.tcp_labels.is_empty()
+                    || self.pending.is_some())
+                    && let Some((remote, local)) = tcp_tuple(packet.as_packet())
+                {
+                    let key = pending::Key {
+                        protocol: PendingProtocol::Tcp,
+                        remote,
+                        local,
+                    };
+                    let label = self
+                        .device
+                        .tcp_labels
+                        .get(&(local, remote))
+                        .copied()
+                        .or_else(|| {
+                            self.pending.as_ref().and_then(|table| {
+                                table.lifetime(&key).map(FlowState::ingress_label)
+                            })
+                        })
+                        .or_else(|| self.owners.has_tcp(local, remote).then_some(None));
+                    if label.is_some_and(|label| label != packet.tag()) {
+                        return stats::add(&self.stats.label_mismatch, 1);
+                    }
+                }
                 if syn {
                     if self.accept_full() {
                         // Unanswered, the peer retransmits it once the queue may have room.
@@ -132,6 +160,7 @@ impl Driver {
                         packet
                     };
                     *demand.entry(dst_port).or_insert(0) += 1;
+                    self.remember_syn_label(&packet);
                     return self.device.inject(packet);
                 }
                 self.device.inject(packet);
@@ -141,7 +170,7 @@ impl Driver {
                 Some(datagram) => self.dispatch_udp(datagram, None),
                 None => stats::add(&self.stats.malformed, 1),
             },
-            Ok(Class::Icmp) => self.icmp(packet.as_packet()),
+            Ok(Class::Icmp) => self.icmp(&packet),
             Err(Reject::Malformed) => stats::add(&self.stats.malformed, 1),
             Err(Reject::NoAddress) => stats::add(&self.stats.no_address, 1),
             Err(Reject::Prefix) => {
@@ -150,6 +179,16 @@ impl Driver {
                 self.emit_prefix(packet.as_packet());
             }
             Err(Reject::Unsupported) => stats::add(&self.stats.unsupported, 1),
+        }
+    }
+
+    /// Saves a SYN's label before smoltcp can emit its first reply.
+    pub(super) fn remember_syn_label(&mut self, packet: &PacketBuf) {
+        if let Some((remote, local)) = tcp_tuple(packet.as_packet()) {
+            self.device
+                .tcp_labels
+                .entry((local, remote))
+                .or_insert_with(|| packet.tag());
         }
     }
 
@@ -196,7 +235,7 @@ impl Driver {
             return None;
         }
         if self.at_connection_limit(demand) {
-            self.reject_connection_limit(&key, packet.as_packet());
+            self.reject_connection_limit(&key, &packet);
             return None;
         }
         if self.pending.is_some() {
@@ -238,11 +277,26 @@ impl Driver {
     /// Applies an ICMP Fragmentation Needed or `ICMPv6` Packet Too Big to the connection
     /// whose segment it quotes, or counts it in `icmp_ignored`; any other ICMP message
     /// counts as `unsupported`.
-    fn icmp(&mut self, packet: &[u8]) {
-        match pmtu::parse(packet) {
+    fn icmp(&mut self, packet: &PacketBuf) {
+        match pmtu::parse(packet.as_packet()) {
             Message::Other => stats::add(&self.stats.unsupported, 1),
             Message::Ignored => stats::add(&self.stats.icmp_ignored, 1),
             Message::TooBig(too_big) => {
+                if packet.tag().is_some()
+                    && self
+                        .device
+                        .tcp_labels
+                        .get(&(too_big.local, too_big.remote))
+                        .copied()
+                        .or_else(|| {
+                            self.owners
+                                .has_tcp(too_big.local, too_big.remote)
+                                .then_some(None)
+                        })
+                        .is_some_and(|label| label != packet.tag())
+                {
+                    return stats::add(&self.stats.label_mismatch, 1);
+                }
                 if !self.reduce_mss(&too_big) {
                     stats::add(&self.stats.icmp_ignored, 1);
                 }
@@ -290,10 +344,14 @@ impl Driver {
             src,
             dst,
             mut payload,
+            label,
         } = datagram;
         if !self.connected.is_empty()
-            && let Some((socket, _)) = self.connected.get(&(src, dst))
+            && let Some((socket, state)) = self.connected.get(&(src, dst))
         {
+            if !socket.is_closed() && state.ingress_label() != label {
+                return stats::add(&self.stats.label_mismatch, 1);
+            }
             match socket.try_send((src, payload)) {
                 Ok(()) => return,
                 Err(TrySendError::Full(_)) => {
@@ -326,7 +384,7 @@ impl Driver {
                 }
             }
         }
-        self.dispatch_flow(src, dst, payload, whole);
+        self.dispatch_flow(src, dst, payload, whole, label);
     }
 
     /// Routes a datagram into the flow table, opening a flow for a new tuple, or holding it
@@ -337,12 +395,16 @@ impl Driver {
         local: SocketAddr,
         payload: Bytes,
         whole: Option<Bytes>,
+        label: Option<std::num::NonZeroU64>,
     ) {
         let key = (remote, local);
         // Existing flow: a full queue drops the datagram (normal UDP backpressure); a
         // closed one means the application dropped the flow, so it is replaced by a new
         // flow carrying this datagram.
         let payload = match self.flows.get(&key) {
+            Some((flow, state)) if !flow.is_closed() && state.ingress_label() != label => {
+                return stats::add(&self.stats.label_mismatch, 1);
+            }
             Some((flow, _)) => match flow.try_send(payload) {
                 Ok(()) => return,
                 Err(TrySendError::Full(_)) => {
@@ -358,7 +420,7 @@ impl Driver {
             None => payload,
         };
         if let Some(packet) = whole {
-            return self.hold_udp(remote, local, payload, packet);
+            return self.hold_udp(remote, local, payload, packet, label);
         }
         if self.settings.transparent.is_some() {
             self.admit_udp(remote, local);
@@ -378,7 +440,7 @@ impl Driver {
         let _ = tx.try_send(payload);
         // Registered before the application can see (and drop) the flow.
         let registration = self.owners.udp_flow(local, remote);
-        let state = FlowState::new(Target::UdpFlow(key), &self.revocations);
+        let state = FlowState::labeled(Target::UdpFlow(key), label, &self.revocations);
         let flow = UdpFlow::new(
             registration,
             rx,

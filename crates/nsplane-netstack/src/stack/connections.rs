@@ -195,7 +195,7 @@ impl Driver {
         start: u64,
     ) -> (Arc<FlowState>, Arc<Mutex<Shared>>) {
         let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
-        let flow = FlowState::new(
+        let flow = FlowState::labeled(
             Target::Tcp {
                 handle,
                 shared: Arc::clone(&shared),
@@ -203,6 +203,11 @@ impl Driver {
                 peer,
                 start,
             },
+            self.device
+                .tcp_labels
+                .get(&(local, peer))
+                .copied()
+                .flatten(),
             &self.revocations,
         );
         (flow, shared)

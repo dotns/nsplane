@@ -598,6 +598,37 @@ fn push_tagged_tags_expire_with_their_datagram() {
 }
 
 #[test]
+fn push_tagged_incomplete_mixed_sets_count_once_before_expiry() {
+    let cases = [
+        fragment_v4(&udp_v4(400, 61), 160),
+        fragment_v6(&udp_v6(400, false), 40, 6, 160, 0x61),
+    ];
+    for fragments in cases {
+        let start = Instant::now();
+        let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+        // Start without the first fragment, so even the header is still missing.
+        assert_eq!(
+            reassembler.push_tagged(&fragments[1], tag(1), start),
+            (Outcome::Held, FragmentTags::Same(tag(1)))
+        );
+        for label in [None, tag(2), tag(1)] {
+            assert_eq!(
+                reassembler.push_tagged(&fragments[1], label, start),
+                (Outcome::Held, FragmentTags::Mixed)
+            );
+            assert_eq!(reassembler.stats().mixed_tags, 1);
+        }
+        assert_eq!(reassembler.stats().reassembled, 0);
+        assert_eq!(reassembler.expire(start + Duration::from_secs(30)), 1);
+        assert_eq!(reassembler.stats().mixed_tags, 1);
+        let all = vec![tag(3); fragments.len()];
+        let (_, tags) = reassemble_tagged(&mut reassembler, &fragments, &all);
+        assert_eq!(tags, FragmentTags::Same(tag(3)));
+        assert_eq!(reassembler.stats().mixed_tags, 1);
+    }
+}
+
+#[test]
 fn discard_tagged_drops_the_datagrams_holding_the_tag() {
     let now = Instant::now();
     let mut reassembler = Reassembler::new(ReassemblyConfig::default());
@@ -630,5 +661,5 @@ fn discard_tagged_drops_the_datagrams_holding_the_tag() {
     assert!(matches!(outcome, Outcome::Complete(_)));
     assert_eq!(tags, FragmentTags::Same(None));
     let stats = reassembler.stats();
-    assert_eq!((stats.timeout, stats.overflow, stats.mixed_tags), (0, 0, 0));
+    assert_eq!((stats.timeout, stats.overflow, stats.mixed_tags), (0, 0, 1));
 }

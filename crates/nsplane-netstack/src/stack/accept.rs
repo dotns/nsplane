@@ -23,6 +23,7 @@ use super::{CONNECT_TIMEOUT, Driver, Inbound};
 
 /// A `connect_tcp` waiting for its handshake.
 pub(super) struct Connecting {
+    pub(super) flow: Option<Arc<FlowState>>,
     pub(super) handle: SocketHandle,
     /// Keeps the connect's tuple visible to `owns` while it is in SYN-SENT.
     pub(super) _registration: Registration,
@@ -125,6 +126,7 @@ impl Driver {
     pub(super) fn finish_connects(&mut self, now: SmolInstant) {
         for connecting in std::mem::take(&mut self.connecting) {
             let Connecting {
+                flow,
                 handle,
                 _registration: registration,
                 reply,
@@ -136,7 +138,7 @@ impl Driver {
                 tcp::State::Established | tcp::State::CloseWait => {
                     socket.set_timeout(None);
                     // A caller that gave up drops the connection, which closes it.
-                    let _ = reply.send(Ok(self.adopt(handle, now, start, None)));
+                    let _ = reply.send(Ok(self.adopt(handle, now, start, flow)));
                 }
                 tcp::State::Closed => {
                     self.sockets.remove(handle);
@@ -152,6 +154,7 @@ impl Driver {
                         socket.abort();
                     }
                     self.connecting.push(Connecting {
+                        flow,
                         handle,
                         _registration: registration,
                         reply,
@@ -284,8 +287,18 @@ impl Driver {
                     let flow = self
                         .pending
                         .as_mut()
-                        .and_then(|table| table.take_admitted(local, remote));
-                    if let Some(flow) = &flow {
+                        .and_then(|table| table.take_admitted(local, remote))
+                        .or_else(|| {
+                            self.device
+                                .tcp_labels
+                                .get(&(local, remote))
+                                .copied()
+                                .flatten()
+                                .map(|_| self.tcp_state(handle, local, remote, mark).0)
+                        });
+                    if let Some(flow) = &flow
+                        && flow.target().is_none()
+                    {
                         flow.bind(Target::Tcp {
                             handle,
                             shared: Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer))),

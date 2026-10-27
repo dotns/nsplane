@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
@@ -27,6 +28,7 @@ use crate::config::{Admission, NetStackConfig};
 #[derive(Debug)]
 pub(super) enum Command {
     Connect {
+        label: Option<NonZeroU64>,
         remote: SocketAddr,
         /// The local port, or `None` for an ephemeral one.
         local_port: Option<u16>,
@@ -39,6 +41,7 @@ pub(super) enum Command {
         reply: oneshot::Sender<io::Result<UdpSocket>>,
     },
     ConnectUdp {
+        label: Option<NonZeroU64>,
         local: SocketAddr,
         remote: SocketAddr,
         reply: oneshot::Sender<io::Result<UdpSocket>>,
@@ -51,6 +54,7 @@ pub(super) enum Command {
 /// the stack.
 #[derive(Debug, Clone)]
 pub struct NetStackHandle {
+    pub(super) revocations: Arc<crate::flow::Revocations>,
     pub(super) commands: mpsc::Sender<Command>,
     pub(super) incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     pub(super) incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
@@ -66,6 +70,18 @@ fn take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
 }
 
 impl NetStackHandle {
+    /// Retires every lifetime carrying `label`, including queued input and output.
+    ///
+    /// Each call returns a fresh receipt; retry after `Failed` when the bounded fence
+    /// tables have room. `Unknown` means the driver stopped. The stack remembers at most
+    /// [`NetStackConfig::max_revoked_labels`] labels; never reuse a label even after its
+    /// tombstone is evicted. Packets already returned by the source are outside this proof.
+    pub fn revoke_label(&self, label: NonZeroU64) -> crate::RetirementReceipt {
+        let state =
+            crate::flow::FlowState::new(crate::flow::Target::Label(label), &self.revocations);
+        crate::FlowControl::new(state).revoke()
+    }
+
     /// Inbound TCP connections to any port of the stack's addresses, once established.
     ///
     /// Only the first call (on any clone of the handle) gets the connections; every later
@@ -127,7 +143,7 @@ impl NetStackHandle {
     /// [`io::ErrorKind::TimedOut`] if it does not answer within 20 seconds and
     /// [`io::ErrorKind::BrokenPipe`] once the stack stopped.
     pub async fn connect_tcp(&self, remote: SocketAddr) -> io::Result<TcpConnection> {
-        self.connect(remote, None).await
+        self.connect(remote, None, None).await
     }
 
     /// Opens a TCP connection from the stack's `local_port` to `remote`, like
@@ -138,7 +154,31 @@ impl NetStackHandle {
         local_port: u16,
         remote: SocketAddr,
     ) -> io::Result<TcpConnection> {
-        self.connect(remote, (local_port != 0).then_some(local_port))
+        self.connect(remote, (local_port != 0).then_some(local_port), None)
+            .await
+    }
+
+    /// Opens a TCP connection with `label` fixed before its initial SYN.
+    /// The label is never changed and must match every inbound segment.
+    /// Errors are those of [`connect_tcp`](Self::connect_tcp), plus
+    /// `ConnectionAborted` when the label has a retained revocation tombstone.
+    pub async fn connect_tcp_labeled(
+        &self,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<TcpConnection> {
+        self.connect(remote, None, Some(label)).await
+    }
+
+    /// Like [`connect_tcp_from`](Self::connect_tcp_from), with an immutable label.
+    /// A remembered revoked label fails with `ConnectionAborted`.
+    pub async fn connect_tcp_from_labeled(
+        &self,
+        local_port: u16,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<TcpConnection> {
+        self.connect(remote, (local_port != 0).then_some(local_port), Some(label))
             .await
     }
 
@@ -146,6 +186,7 @@ impl NetStackHandle {
         &self,
         remote: SocketAddr,
         local_port: Option<u16>,
+        label: Option<NonZeroU64>,
     ) -> io::Result<TcpConnection> {
         // An explicit port gives the whole tuple now, so the connect is visible to `owns`
         // before the command reaches the driver.
@@ -155,6 +196,7 @@ impl NetStackHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Connect {
+                label,
                 remote,
                 local_port,
                 registration,
@@ -209,9 +251,46 @@ impl NetStackHandle {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> io::Result<UdpSocket> {
+        self.connect_datagram(local, remote, None).await
+    }
+
+    /// Opens a connected UDP socket with `label` fixed before its first send.
+    /// Errors are those of [`connect_udp`](Self::connect_udp), plus
+    /// `ConnectionAborted` when the label has a retained revocation tombstone.
+    pub async fn connect_udp_labeled(
+        &self,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<UdpSocket> {
+        self.connect_datagram(
+            SocketAddr::new(unspecified(remote.ip()), 0),
+            remote,
+            Some(label),
+        )
+        .await
+    }
+
+    /// Like [`connect_udp_from`](Self::connect_udp_from), with an immutable label.
+    /// A remembered revoked label fails with `ConnectionAborted`.
+    pub async fn connect_udp_from_labeled(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<UdpSocket> {
+        self.connect_datagram(local, remote, Some(label)).await
+    }
+
+    async fn connect_datagram(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        label: Option<NonZeroU64>,
+    ) -> io::Result<UdpSocket> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::ConnectUdp {
+                label,
                 local,
                 remote,
                 reply,
@@ -332,17 +411,21 @@ trait HandOut {
 
 impl HandOut for TcpConnection {
     fn hand_out(&self) -> bool {
-        self.flow().deliver()
+        !self.flow().is_revoked() && self.flow().deliver()
     }
 }
 
 impl HandOut for UdpFlow {
     fn hand_out(&self) -> bool {
-        self.flow().deliver()
+        !self.flow().is_revoked() && self.flow().deliver()
     }
 }
 
-impl HandOut for PendingFlow {}
+impl HandOut for PendingFlow {
+    fn hand_out(&self) -> bool {
+        !self.control().is_revoked()
+    }
+}
 
 impl HandOut for FlowEvent {}
 

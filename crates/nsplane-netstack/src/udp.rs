@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -35,6 +36,7 @@ const DONT_FRAGMENT: u8 = 0x40;
 pub(crate) struct Datagram {
     pub(crate) src: SocketAddr,
     pub(crate) dst: SocketAddr,
+    pub(crate) label: Option<NonZeroU64>,
     /// A view into the ingress packet; parsing copies nothing.
     pub(crate) payload: Bytes,
 }
@@ -44,17 +46,32 @@ pub(crate) struct Datagram {
 /// Returns `None` if the packet is not an unfragmented UDP datagram or is malformed.
 /// IPv6 extension headers are not walked.
 pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
+    let label = packet.tag();
     let (src, dst, payload) = udp_payload(&packet)?;
     let payload = packet.freeze().slice(payload);
-    Some(Datagram { src, dst, payload })
+    Some(Datagram {
+        src,
+        dst,
+        label,
+        payload,
+    })
 }
 
 /// [`parse_udp`], also returning the whole packet the datagram's payload is a view into.
 pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
+    let label = packet.tag();
     let (src, dst, payload) = udp_payload(&packet)?;
     let whole = packet.freeze();
     let payload = whole.slice(payload);
-    Some((Datagram { src, dst, payload }, whole))
+    Some((
+        Datagram {
+            src,
+            dst,
+            label,
+            payload,
+        },
+        whole,
+    ))
 }
 
 /// The source, destination and payload range of an unfragmented UDP datagram.
@@ -183,6 +200,7 @@ impl UdpOut {
         }
         let mut packet =
             build_udp(src, dst, payload).ok_or_else(|| invalid("datagram exceeds the MTU"))?;
+        packet.set_tag(flow.ingress_label());
         if packet.len() > self.mtu {
             if !self.allow_fragmentation || !src.is_ipv4() {
                 return Err(invalid("datagram exceeds the MTU"));
@@ -240,6 +258,11 @@ pub struct UdpFlow {
 }
 
 impl UdpFlow {
+    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.reply.flow.ingress_label()
+    }
+
     pub(crate) const fn new(
         registration: Registration,
         rx: mpsc::Receiver<Bytes>,
@@ -311,6 +334,11 @@ pub struct UdpReply {
 }
 
 impl UdpReply {
+    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.flow.ingress_label()
+    }
+
     pub(crate) const fn new(
         local: SocketAddr,
         peer: SocketAddr,
@@ -374,6 +402,11 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.flow.ingress_label()
+    }
+
     pub(crate) const fn new(
         registration: Registration,
         local: SocketAddr,

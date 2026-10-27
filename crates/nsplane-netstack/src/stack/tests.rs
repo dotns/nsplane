@@ -41,6 +41,7 @@ mod flow_bounds;
 mod flow_context;
 mod flow_control;
 mod half_close;
+mod ingress_labels;
 mod listener_integration;
 mod listener_pool;
 mod ownership;
