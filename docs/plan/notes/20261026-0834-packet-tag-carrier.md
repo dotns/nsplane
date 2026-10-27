@@ -1,11 +1,11 @@
 # Release C: one carrier, the packet tag
 
-Design note, no code. Status: for owner and consumer review. Plan:
+Design note, no code. Status: for owner review. Plan:
 [20261026-0822-node-gateway-requests](../20261026-0822-node-gateway-requests.md) (W4-W6,
 release C, open questions O8-O12); task:
 [20261026-0819-node-gateway-requests](../../task/20261026-0819-node-gateway-requests.md) (R2,
-R4 proposal A, R5 part 2, R6). All code references are at `main` `52eb983` (v0.19.2). The
-review record is at the end.
+R4 proposal A, R5 part 2, R6). Code references are at `52eb983` (v0.19.2) unless they name a
+file of the 0.20.0 module split. The review record is at the end.
 
 ## The carrier
 
@@ -172,13 +172,14 @@ breaking change; see the breaking-change list.
 
 ## Per-packet budget
 
-What an untagged packet pays: 8 more bytes per `PacketBuf` (variant A) in every queue and
-batch it sits in; one word copied at the copy sites above (`layout_for_sealing`'s slow path,
+What an untagged packet pays: 8 more bytes per `PacketBuf` (variant A) in every queue and batch
+it sits in; one word copied at the copy sites above (`layout_for_sealing`'s slow path,
 `split_ipv4`, the translator's slow paths, netstack reassembly); one store per packet at the
-engine's entries (the receipt marker cleared in the batch `read_source` already walks); one
-store per recycled buffer; one compare in `sealed` (data vs. other kinds, already computed).
-The netstack's label checks run only while the stack holds a labeled lifetime or a tombstone
-(a counter), so an unlabeled stack keeps today's path; receipts cost only for tracked packets.
+engine's entries and hand-outs (the receipt marker cleared in the batches `read_source` and the
+delivery already walk); one store per recycled buffer; one compare in `sealed` (data vs. other
+kinds, already computed). The netstack's label checks run only while the stack holds a labeled
+lifetime or a tombstone (a counter), so an unlabeled stack keeps today's path; receipts cost
+only for tracked packets.
 
 Acceptance bar for untagged traffic: within the slot A/B noise against `main` on
 
@@ -285,14 +286,38 @@ above).
 ### R4 proposal A
 
 `PacketFilter::outbound` sees the tag of the packet `read_source` took, through the fragmenter
-(`split_ipv4` copies it) and the translators (they copy it). No trait change. The consumer drops
-packets whose tag names a superseded ownership epoch, and untagged packets where it tags (rule
-of the carrier); with release B's barrier it can use either.
+(`split_ipv4` copies it) and the translators (they copy it). No trait change. The consumer
+stamps each local packet with the ownership epoch under which its destination was chosen, as
+early as its own producers, and its outbound filter drops packets whose tag names a superseded
+epoch, and untagged packets where it tags (rule of the carrier).
+
+Release B's `EngineHandle::local_barrier` is not a substitute for a consumer with queues of its
+own in front of the engine. It covers only what `PacketSource::recv_batch` has returned: packets
+in the consumer's queues carry no position, so the consumer cannot fence them exactly, and
+waiting for the queues to drain may never finish under load. The barrier serves as an interim
+measure from 0.20.0 for a consumer whose source is fenced exactly; the tag covers every queue
+between the stamp and the filter, the consumer's and the engine's. The gateway needs R4 A for
+this reason (review record). The barrier's count window is an open item (below).
 
 ### W6, plaintext egress (R5 part 2)
 
 `Output::Plaintext { to, packet }` moves the filtered packet, tag included, to the
-`PlaintextEgress` receiver. The opt-in is runtime state of the peer (O8).
+`PlaintextEgress` receiver, with the receipt marker cleared. The opt-in is runtime state of the
+peer that follows its `PeerId` (O8, decided):
+
+- A consumer that learns the `PeerId` only by reading the peer back (`add_or_update_peer`
+  returns no id) adds the peer closed (no allowed IPs, or no inbound destinations), reads the
+  `PeerId` back, calls `set_plaintext_egress`, then opens the peer (sets its allowed IPs). A
+  packet routed to the peer before the flag is set is sealed as for any peer; this order keeps
+  that from happening.
+- Packets queued in the tunnel (`Tunn::packet_queue`) before the flag is set were routed for
+  sealing and stay sealed: `Core::flush_queue` seals them once a session exists. The flag
+  applies to packets routed after it is set.
+- A tracked packet (R6) routed to a plaintext-egress peer ends `NotSent` with the new reason
+  `reasons::PLAINTEXT_EGRESS` and is handed to `PlaintextEgress` untracked: nothing was sealed or
+  handed to a transport, so it has no `Sent` result.
+- Such a peer starts no handshake for data, and still answers and starts handshakes for inbound
+  sealed traffic, so it moves between plaintext and sealed egress without a gap.
 
 ### W6, send receipts (R6)
 
@@ -318,9 +343,31 @@ of the carrier); with release B's barrier it can use either.
   meaning for untracked packets. The setter is public because the marker is set in `nsplane`
   and lives in `nsplane-packet`; a hidden setter would be an undocumented semver surface. The
   engine sets it when `TrackedSender` accepts a packet and clears it on every other entry
-  (`read_source`, the inject calls, `PlaintextIngress`), so a mark set elsewhere never produces a
-  result. The core reports drops of tracked packets per packet (an `Output` carrying the tag and
-  the reason), the engine at the transport call.
+  (`read_source`, the inject calls, `PlaintextIngress`) and on every packet it hands out
+  (`Output::Deliver` to the sink, `Output::Plaintext` to `PlaintextEgress`, buffers given back
+  for recycling), so a mark set elsewhere never produces a result and a receiver never reads a
+  stale mark. The core reports drops of tracked packets per packet (an `Output` carrying the tag
+  and the reason), the engine at the transport call.
+- Results: `Sent { peer, bytes }` once the transport call that carried the sealed datagram
+  succeeded; `peer` is the routed `PeerId` and `bytes` the plaintext packet length handed to
+  sealing, without padding or the data message header (what `PeerStats::data_tx` counts).
+  `NotSent { reason }` with the existing reason strings at every drop site a tracked packet can
+  meet: no route, filter drop, handled by a filter, no session (O9), oversize with a fragmenter
+  (O10), `NO_PATH` (the peer has no path and the policy selects none), `ENCAPSULATE_ERROR`
+  (sealing failed), transmit queue full, transport closed, removed or send error, plaintext
+  egress (O8), engine stopped. A consumer that wants to retry keeps its own copy: `SendResult`
+  returns no buffer.
+- No session (O9, decided): `NotSent { no session }` at once, on the inline path and with crypto
+  workers (`handle_locals_deferred`) alike; the handshake starts as for an untracked packet. The
+  consumer may retry once the session is up.
+- Above the MTU (O10, decided): with a fragmenter, a tracked packet it would split is `NotSent
+  { oversize }`, and an IPv6 or DF packet it answers with an ICMP error is `NotSent` with
+  `FRAGMENT_OVERSIZE`. Without a fragmenter (local packets enter the core whatever their size) a
+  tracked packet above the MTU is sealed as an untracked one would be, and its result follows the
+  transport call.
+- `local_barrier` counts packets `TrackedSender` accepts, in the same position as packets taken
+  from the `PacketSource`, at acceptance, so the barrier keeps meaning every local packet the
+  engine took before the call.
 - Clones: `Clone` copies the tag and clears the marker, so a clone is never tracked and the
   original keeps the one result. No nsplane path clones a packet (see the carrier), so inside
   nsplane a tracked packet has one buffer from `TrackedSender` to its result; copy sites that
@@ -336,37 +383,46 @@ of the carrier); with release B's barrier it can use either.
 
 ## Open questions
 
-Decided by the owner on 2026-10-26: O11, O12 and O14, as recommended. Open for the gateway's
-review (started): O8, O9, O10 and O13.
+Decided by the owner: O11, O12 and O14 on 2026-10-26, and O8, O9, O10 and O13 on 2026-10-27
+after the gateway's review, all as recommended. Open for the owner: the barrier's count window
+(O15, below).
 
-- O8 (R5 part 2) Opt-in per peer through `Core::set_plaintext_egress(peer, bool)` and the engine
-  equivalent (recommended: runtime, no `PeerConfig` change, reverts with the call), or a
-  `PeerConfig` field. Across peer changes the runtime flag follows the `PeerId`, like
-  `Core::set_peer_pad_limit` today: `AddOrUpdatePeer` for a known identity and key updates the
-  peer in place and keeps its `PeerId` (`peer_table.rs` `apply`), so the flag stays; a peer
-  removed and added again gets a new `PeerId` (ids are never reused) and starts without it, so
-  the consumer sets it again. Tests: flag kept across an update, absent after remove and re-add,
-  and no packet of the removed peer reaches the egress queue under the new id. Such a peer
-  starts no handshake for data. Recommended: it may still answer and start handshakes for
-  inbound sealed traffic, unchanged, so a peer moves between plaintext and sealed egress without
-  a gap. Open, for the gateway's review.
-- O9 (R6) Without a session. `encapsulate_in_place` / `reserve_in_place` copy the packet into
-  `Tunn::packet_queue` (`VecDeque<Vec<u8>>`, `MAX_QUEUE_DEPTH` 256, silently not queued beyond,
-  cleared by `clear_all` in the timers) and write an initiation into the buffer. Recommended:
-  `NotSent { no session }` at once; the tracked path checks `Tunn::has_session` (public, the same
-  test `encapsulate_in_place` makes) and on `false` formats an initiation with
-  `Tunn::format_handshake_initiation` without queueing the packet, so the handshake starts as for
-  an untracked packet and the packet is never sent after its result. This needs no
+- O8 (R5 part 2) **Decided 2026-10-27 (owner): the runtime opt-in that follows the `PeerId`,
+  with the add-closed, read back, mark, then open order for consumers that learn the `PeerId` by
+  readback; tunnel-queued packets stay sealed as routed; a tracked packet to such a peer is
+  `NotSent` with `PLAINTEXT_EGRESS`** (W6 above). Opt-in per peer through
+  `Core::set_plaintext_egress(peer, bool)` and the engine equivalent (recommended: runtime, no
+  `PeerConfig` change, reverts with the call), or a `PeerConfig` field. Across peer changes the
+  runtime flag follows the `PeerId`, like `Core::set_peer_pad_limit` today: `AddOrUpdatePeer`
+  for a known identity and key updates the peer in place and keeps its `PeerId` (`peer_table.rs`
+  `apply`), so the flag stays; a peer removed and added again gets a new `PeerId` (ids are never
+  reused) and starts without it, so the consumer sets it again. Tests: flag kept across an
+  update, absent after remove and re-add, and no packet of the removed peer reaches the egress
+  queue under the new id. Such a peer starts no handshake for data. Recommended: it may still
+  answer and start handshakes for inbound sealed traffic, unchanged, so a peer moves between
+  plaintext and sealed egress without a gap. The gateway found the runtime flag workable with
+  that order and leaned to a `PeerConfig` field or a call keyed by identity and public key; the
+  owner kept the recommendation.
+- O9 (R6) **Decided 2026-10-27 (owner): `NotSent { no session }` at once; the consumer may
+  retry; the deferred (crypto worker) path is tested too.** Without a session.
+  `encapsulate_in_place` / `reserve_in_place` copy the packet into `Tunn::packet_queue`
+  (`VecDeque<Vec<u8>>`, `MAX_QUEUE_DEPTH` 256, silently not queued beyond, cleared by
+  `clear_all` in the timers) and write an initiation into the buffer. Recommended: `NotSent { no
+  session }` at once; the tracked path checks `Tunn::has_session` (public, the same test
+  `encapsulate_in_place` makes) and on `false` formats an initiation with
+  `Tunn::format_handshake_initiation` without queueing the packet, so the handshake starts as
+  for an untracked packet and the packet is never sent after its result. This needs no
   `nsplane-noise` change. Consequence for the consumer: a tracked packet right after a session
-  expiry fails and the consumer retries once the session is up. The alternative keeps the tag in
-  the queue and reports overflow, `clear_all` and the later flush, which changes
-  `nsplane-noise`'s queue and `Core::flush_queue`. Open, for the gateway's review.
-- O10 (R6) A tracked packet above the MTU: `NotSent { oversize }` (recommended; `split_ipv4`
+  expiry fails and the consumer may retry once the session is up. The alternative keeps the tag
+  in the queue and reports overflow, `clear_all` and the later flush, which changes
+  `nsplane-noise`'s queue and `Core::flush_queue`.
+- O10 (R6) **Decided 2026-10-27 (owner): `NotSent { oversize }` with a fragmenter; without one a
+  tracked packet above the MTU is sealed as usual and its result follows the transport call.**
+  A tracked packet above the MTU: `NotSent { oversize }` (recommended; `split_ipv4`
   copies the tag, so one packet would become several datagrams with one token and the result
   would wait for all of them, through possibly different calls), or one result after the last
   fragment's call (a per-token fragment count in the engine). An IPv6 or DF packet answered with
-  an ICMP error is `NotSent` with `FRAGMENT_OVERSIZE` either way. Open, for the gateway's
-  review.
+  an ICMP error is `NotSent` with `FRAGMENT_OVERSIZE` either way.
 - O11 (C) **Decided 2026-10-26 (owner): the tag on `PacketBuf`, variant A first, B only if A
   is outside the noise.** The tag on `PacketBuf` (recommended: every queue and the filters see
   it with no new item type; untagged traffic pays one word; a consumer's own queue of
@@ -383,14 +439,16 @@ review (started): O8, O9, O10 and O13.
   same carrier) or a barrier with ingress sequence numbers on handles (completion waits on
   handshakes that may never finish; every handle needs the sequence anyway, and the consumer
   maps sequence ranges to its own lifetimes). The node agrees (labels).
-- O13 (R6) How a tracked packet is marked. Recommended: the documented public marker above
-  (`is_tracked` / `set_tracked`, honoured only on the engine's `TrackedSender` path, separate
-  from the tag, cleared by `Clone`, pools, recycling and the engine's other entries).
-  Alternatives: every tagged packet tracked while a `SendResults` receiver exists (costs a
-  result per R4-tagged packet), or a field in the engine's queue items (`Datagram` grows, and
-  the core cannot see it for its own drops). The node's condition (no tag bits, no change for
-  untracked packets) and the planning review's (documented, not hidden) are met. Open, for the
-  gateway's review.
+- O13 (R6) **Decided 2026-10-27 (owner): the documented `is_tracked` / `set_tracked` marker,
+  honoured only on the `TrackedSender` path, cleared on clone, by pools, recycling and the other
+  entries, and on every packet nsplane hands out.** How a tracked packet is marked. Recommended:
+  the documented public marker above (`is_tracked` / `set_tracked`, honoured only on the
+  engine's `TrackedSender` path, separate from the tag, cleared by `Clone`, pools, recycling and
+  the engine's other entries). Alternatives: every tagged packet tracked while a `SendResults`
+  receiver exists (costs a result per R4-tagged packet), or a field in the engine's queue items
+  (`Datagram` grows, and the core cannot see it for its own drops). The node's condition (no tag
+  bits, no change for untracked packets), the planning review's (documented, not hidden) and the
+  gateway's (cleared on hand-out) are met.
 - O14 (R2, new) **Decided 2026-10-26 (owner): a bounded tombstone table per stack,
   `NetStackConfig::max_revoked_labels`, default 65,536.** How long nsplane remembers a revoked
   label. Recommended: a tombstone table per stack (`NetStackConfig::max_revoked_labels`, default
@@ -401,6 +459,15 @@ review (started): O8, O9, O10 and O13.
   (a reused label opens a new lifetime; the consumer contract alone protects). Either way the
   consumer contract stands: labels of revoked lifetimes are never reused, and queued input of a
   label is cancelled before its revoke.
+- O15 (release B, open for the owner) The barrier's count window. `read_source` adds a batch to
+  the barrier's count right after `PacketSource::recv_batch` returns it (`engine/tasks.rs`). A
+  consumer that raises its source fence and calls `local_barrier` from another thread while the
+  source task is between that return and the count gets a position that excludes the packet, so
+  the packet can be routed after the barrier passed. Options: fix it in a 0.20.x patch (take the
+  position from the source task between reads, so the barrier asks the source task instead of
+  reading the counter), or document that the consumer's fence must also wait until the source
+  task is back in `recv_batch`. Recommended: fix in 0.20.x; the documented rule is hard to meet
+  for a consumer whose source task it does not control.
 
 ## Consumers' adoption path
 
@@ -430,18 +497,30 @@ The node, from the release C tag (its provider stack is an ordinary stack; label
    their control and the admission it holds past the stack (its own bridges, reopen paths and
    writes). Labels do not reach past the stack.
 
-The gateway, from the release C tag (pending its review):
+The gateway, from the release C tag (it is on 0.19.1 and skips 0.20.0):
 
-1. Bump as above.
-2. R4: tag local packets with the ownership epoch in its `PacketSource` and check it in its
-   outbound filter, treating untagged packets as not current (optional if release B's barrier
-   already suffices).
-3. R5 part 2: mark the reference peers with `set_plaintext_egress` (again after a peer is
-   removed and re-added), read `PlaintextEgress`; release B's `PlaintextIngress` carries the
-   other direction.
-4. R6: send its echo replies through `TrackedSender` with a tag that packs its token, retry a
-   `NotSent { no session }`, and drop its accounting from `PeerStats::data_tx` deltas and
-   `Event::Dropped`.
+1. Bump, taking release B's breaks with it: `NetStackConfig` is `#[non_exhaustive]` since 0.20.0,
+   so its struct literals with `..Default::default()` (two production sites and a few tests)
+   become a default value with assigned fields. `Output` and `TranslatorStats` do not affect it
+   (it neither drives `Core` nor builds the translator's counters); its `Reassembler::push` calls
+   are unchanged.
+2. R4 (needed: its own bounded queues are in front of the engine, outside the barrier). Stamp
+   each local packet with the membership publication generation under which its destination
+   was chosen (stored so that it is never zero), at the producers, or at least at its merge
+   stage and its source for the TUN side; check it in the outbound membership filter against the
+   generation at which the destination's current owner was published, and drop untagged packets
+   to such destinations.
+3. R5 part 2, only when its measurement-only reference engine is built (no production peer is
+   marked): add each peer closed, read the `PeerId` back, `set_plaintext_egress`, then open the
+   allowed IPs; read `PlaintextEgress`; release B's `PlaintextIngress` carries the other
+   direction, with a real arrival path (`from: Path` is mandatory).
+4. R6, which adds reply billing where there is none today: build the engine with a tracked
+   sender, hand the echo replies to `TrackedSender` with a token in the tag (all 64 bits; no
+   epoch is needed on these packets), keep its own checks before the hand-off, and on
+   `Sent { peer, .. }` with `peer` equal to the probe's bound incarnation record the reply as
+   sent, computing the billed bytes from its own copy; on `NotSent` record nothing and may retry
+   once within its echo timeout.
+5. No netstack labels: its stacks stay unlabeled and keep today's path.
 
 ## Breaking changes and migration
 
@@ -486,10 +565,15 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   opening a lifetime; the same tuple after `Retired` opening a fresh lifetime with a new label,
   for UDP and for TCP.
 - W6: exactly one result per tracked packet under every drop site (no route, filter drop,
-  handled, no session, oversize, transmit full, transport closed, peer removed, send error,
-  engine stopped) and through every copy site, a clone of a tracked packet untracked, a
-  transport failure in the middle of a batch, stop with results outstanding; plaintext egress
-  full, closed, peer removed and re-added.
+  handled, no session inline and with crypto workers, oversize with a fragmenter, `NO_PATH`,
+  `ENCAPSULATE_ERROR`, transmit full, transport closed, peer removed, send error, plaintext
+  egress, engine stopped) and through every copy site; a tracked packet above the MTU without a
+  fragmenter sealed and reported by its transport call; `Sent { bytes }` equal to the plaintext
+  length; a clone of a tracked packet untracked; the marker cleared on `Output::Deliver`,
+  `Output::Plaintext` and recycled buffers; `local_barrier` waiting for packets `TrackedSender`
+  accepted before the call; a transport failure in the middle of a batch; stop with results
+  outstanding; plaintext egress full, closed, peer removed and re-added, the add-closed, mark,
+  open order, and tunnel-queued packets sealed after the flag is set.
 - Benchmarks as in the budget: variant A and B, untagged against `main`, labeled against
   unlabeled.
 
@@ -508,12 +592,16 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
 
 ## Open items for review
 
-- Owner: O8-O10 and O13 after the gateway's review, the labeled-path allowance (proposed 3 %),
-  the twelfth freeze exception and the go-ahead for release C. Decided on 2026-10-26: O11 (with
-  the variant A / B rule), O12 and O14.
-- The gateway: O8-O10 and O13; token = tag with packing; whether release B's barrier makes R4
-  proposal A unnecessary; whether it needs `recv_labeled` on bound sockets (dropped from release
-  C unless it asks: it costs a word per queued bound datagram and the node does not need it).
+- Owner: O15 (the barrier's count window: fix in 0.20.x or document only), the labeled-path
+  allowance (proposed 3 %), the twelfth freeze exception and the go-ahead for implementing
+  release C. The gateway's view on scope: R5 part 2 has no production user yet and is the item
+  that could move to a later release with the least loss if release C must shrink. Decided:
+  O11 (with the variant A / B rule), O12 and O14 on 2026-10-26; O8, O9, O10 and O13 on
+  2026-10-27.
+- The gateway (its own design, not nsplane's): which real arrival path its reference engine
+  passes to `PlaintextIngress` (`from: Path` stays mandatory).
+- `recv_labeled` on bound sockets stays out of release C: neither consumer uses bound netstack
+  sockets.
 
 ## Review record
 
@@ -535,7 +623,25 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   `NetStackConfig::max_revoked_labels`, default 65,536) take the recommended answers. O8, O9,
   O10 and O13 wait for the gateway's review; the twelfth freeze exception and the go-ahead for
   release C are not decided.
-- Gateway review: started, pending.
+- Gateway-side consumer review (of `b900278`): R4 proposal A is needed, not optional: the
+  gateway has bounded queues of its own in front of the engine that the barrier cannot fence,
+  and the tag carries the publication generation a `PeerId` lacks; the barrier is a partial
+  interim from 0.20.0, with a count window between `recv_batch` returning and the count. O8: the
+  runtime flag is workable if the add-closed, read back, mark, open order is documented; it
+  leaned to a `PeerConfig` field or a key-addressed call; tunnel-queued packets and tracked
+  packets to such a peer need defined behaviour. O9 acceptable with an optional retry and a test
+  of the deferred path; O10 acceptable if a tracked packet above the MTU without a fragmenter is
+  sealed as usual; O13 workable if the marker is also cleared on hand-out. Token = tag is fine
+  (no packing needed for echo replies). R6 adds billing where there is none (the gateway reads
+  no `data_tx` or `Event::Dropped`). Missing: `NO_PATH` and `ENCAPSULATE_ERROR` among the drop
+  sites, the meaning of `Sent { bytes }`, whether the barrier counts `TrackedSender` packets.
+  `recv_labeled` and labels are not needed. The adoption path must include release B's
+  `NetStackConfig` break for a consumer that skips 0.20.0. Its statements about nsplane's code
+  were checked at `52eb983` and in the split modules of 0.20.0 and hold.
+- Owner decisions, 2026-10-27: O8, O9, O10 and O13 take the recommended options as refined by
+  the gateway review; R4 proposal A stays in release C; `recv_labeled` stays out. The barrier's
+  count window is open (O15); the twelfth freeze exception and the go-ahead for implementing
+  release C are not decided. Release B shipped as 0.20.0.
 - Changes in this revision: the carrier's `None` rule and the clone statement (checked by
   building without `Clone`); the receipt marker made a documented public property with a clone
   rule and cleared at the engine's other entries; `Mixed` dropped and counted in nsplane-nat too
@@ -545,3 +651,11 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   tuple after `Retired`; a labeled-path bar and the per-socket fallback; `recv_labeled` dropped
   pending the gateway; O8's flag across peer changes; the node's adoption path rewritten; tests
   extended for each.
+- Changes in this revision (gateway review, 2026-10-27): status "for owner review"; R4 proposal A
+  stated as needed, with the barrier's limits for consumers with their own queues; O8, O9, O10
+  and O13 decided, with the add-closed, read back, mark, open order, tunnel-queued packets sealed,
+  `PLAINTEXT_EGRESS` for tracked packets to a plaintext-egress peer, "may retry" and the deferred
+  path, the no-fragmenter rule, and the marker cleared on hand-out; `NO_PATH` and
+  `ENCAPSULATE_ERROR` added to the drop sites; `Sent { bytes }` defined; `local_barrier` counts
+  `TrackedSender` packets at acceptance; the barrier's count window recorded as O15; the gateway
+  adoption path rewritten; tests extended for each.

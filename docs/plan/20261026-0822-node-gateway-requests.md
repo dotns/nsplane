@@ -637,6 +637,14 @@ Owner decisions, 2026-10-26:
      65,536.
    O8, O9, O10 and O13 wait for the gateway's review, which has started; the twelfth freeze
    exception and the go-ahead for release C are not decided.
+6. Release C answers recorded on 2026-10-27, after the gateway's review, as recommended in the
+   design note: O8 (the runtime opt-in that follows the `PeerId`, with the add-closed, read
+   back, mark, open order), O9 (`NotSent { no session }` at once, the consumer may retry), O10
+   (`NotSent { oversize }` with a fragmenter; sealed as usual without one) and O13 (the
+   documented `is_tracked` / `set_tracked` marker, also cleared on hand-out). R4 proposal A stays
+   in release C; `recv_labeled` stays out. Open for the owner: the barrier's count window (O15 in
+   the note); the twelfth freeze exception and the go-ahead for implementing release C are not
+   decided.
 
 Owner decision, 2026-10-27: `main` moved to `fb67db9` (0.19.3 released with a musl build fix,
 then the largest modules split: `nsplane-core` `core.rs`, `nsplane` `engine.rs` and `udp.rs`,
