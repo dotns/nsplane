@@ -142,6 +142,18 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
   `PacketBuf::set_len`, `extend_from_slice` and `PacketPool::get_len` stop there, and
   `PacketBuf::from_shared` and `reserve_front` return `BoundsError` for a range past it. IP
   packets are far below the bound; no source change.
+- `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
+  `NetStackConfig::admission`, which applies to every stack, transparent ones included.
+
+  ```rust
+  // Before
+  let mut transparent = TransparentConfig::default();
+  transparent.admission = Admission::Decide { timeout, max_pending };
+  config.transparent = Some(transparent);
+  // After
+  config.transparent = Some(TransparentConfig::default());
+  config.admission = Admission::Decide { timeout, max_pending };
+  ```
 
 #### Migration
 - Every consumer: bump the nsplane crates together. A consumer that sets no tag, marks no peer
