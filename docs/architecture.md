@@ -158,6 +158,12 @@ Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter
   engine hands them to a bounded `PlaintextEgress`. The mark is runtime state of the `PeerId`
   (kept on an update, gone with the peer); the peer starts no handshake for data and still
   answers and starts handshakes for inbound sealed traffic.
+- A peer's tunnel expiry is reported once per expiry as `Event::SessionExpired { peer, cause }`
+  (`ExpiryCause::SessionAge`: idle for 540 s, not reported for a peer that was not up since it
+  was added or since its last reported expiry; `ExpiryCause::HandshakeTimeout`: initiations
+  unanswered for 90 s) and counted in `PeerStats::expirations`, so events stay best effort
+  while the counter is loss-proof. Expiry runs on the timer path only; the data path does not
+  read it.
 - A flow gate can decide for a caller's selection of scopes (`FlowGate::evaluate_inbound_in`
   / `evaluate_outbound_in`): on the same snapshot and state as the unscoped calls, inside the
   selection the normal decision with its scope, rule and policy generation, outside it an

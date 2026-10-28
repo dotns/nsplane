@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use nsplane::{ChannelTransport, Event, PeerId};
+use nsplane::{ChannelTransport, Event, ExpiryCause, PeerId};
 use nsplane_e2e::{Family, Node, Options, TestResult, channel_pair, introduce, transfer};
 use tokio::time::advance;
 
@@ -35,7 +35,10 @@ fn handshake_completed(event: &Event, peer: PeerId) -> bool {
 
 /// Whether `event` reports the expiry of the sessions with `peer`.
 fn session_expired(event: &Event, peer: PeerId) -> bool {
-    matches!(event, Event::SessionExpired { peer: p } if *p == peer)
+    matches!(
+        event,
+        Event::SessionExpired { peer: p, cause: ExpiryCause::SessionAge } if *p == peer
+    )
 }
 
 /// The datagrams `node` has received from `peer`.

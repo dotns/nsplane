@@ -41,6 +41,7 @@ mod types;
 pub use crate::core::Core;
 pub use filter::{PacketFilter, Verdict};
 pub use job::CryptoJob;
+pub use nsplane_noise::noise::ExpiryCause;
 pub use nsplane_noise::{noise, x25519};
 pub use nsplane_packet::PacketBuf;
 pub use nsplane_packet::{Ecn, Path, PeerId, TransportId};

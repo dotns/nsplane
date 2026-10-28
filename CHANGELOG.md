@@ -10,9 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Feature release: one opaque packet tag carried on `PacketBuf` through the engine, the
 translators and the netstack, netstack ingress labels with label revocation, plaintext egress
 per peer and per-packet send receipts. Approved as the twelfth exception to the 0.11 feature
-freeze, before the freeze was lifted (ADR `2026-10-27-normal-maintenance`). Breaking:
-`nsplane-core` `Output` is `#[non_exhaustive]` with two new variants, and `PacketBuf` packet
-offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
+freeze, before the freeze was lifted (ADR `2026-10-27-normal-maintenance`). With it, a
+peer-level expiry signal: `Event::SessionExpired` carries its cause and `PeerStats` counts the
+expiries. Breaking: `nsplane-core` `Output` is `#[non_exhaustive]` with two new variants,
+`PacketBuf` packet offsets are `u32`, `Event` and `PeerStats` are `#[non_exhaustive]` with new
+fields, and the deprecated `nsplane-wss` stream carrier and `TransparentConfig::admission` are
+removed (see Changed). Consumers that set no tag keep today's paths.
 
 ### Added
 - Packet tag carrier (`nsplane-packet`): `PacketBuf::{tag, set_tag, take_tag}` carry an opaque
@@ -106,6 +109,12 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
 - Benches: `data_path` `core_round_trip_tracked` and `core_plaintext_egress`; `worker_pool`
   `tracked_send` (tracked against untracked packets through an engine) and `engine_one_way`
   (untracked packets one way through an engine).
+- `Event::SessionExpired` carries `cause: ExpiryCause` (`SessionAge`: no handshake for
+  540 s; `HandshakeTimeout`: initiations unanswered for 90 s), also as
+  `nsplane_noise::noise::ExpiryCause` and `Tunn::expiry_cause` (re-exported as
+  `nsplane_core::ExpiryCause` and `nsplane::ExpiryCause`). `PeerStats::expirations` and the
+  `expirations` field of `Event::PeerStats` count the reported expiries per peer, so a
+  subscriber that lagged still learns about them. `PeerStats::new` builds a snapshot.
 
 ### Changed
 
@@ -142,6 +151,45 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
   `PacketBuf::set_len`, `extend_from_slice` and `PacketPool::get_len` stop there, and
   `PacketBuf::from_shared` and `reserve_front` return `BoundsError` for a range past it. IP
   packets are far below the bound; no source change.
+- nsplane-core `Event` and `PeerStats` are `#[non_exhaustive]`, so later variants and fields
+  are not breaking again (re-exported by `nsplane`). A `match` on `Event` needs a wildcard
+  arm. Other crates can no longer build `PeerStats` with a struct expression, also not with
+  `..base`: start from `PeerStats::new(peer, public_key)` or a snapshot and assign the
+  fields. Constructing and matching existing `Event` variants, reading fields and comparing
+  values are unchanged. In the same release, `Event::SessionExpired` gains `cause` and
+  `Event::PeerStats` gains `expirations`, so patterns that name every field need the new
+  field or `..`.
+
+  ```rust
+  // Before
+  match event {
+      Event::SessionExpired { peer } => mark_down(peer),
+      Event::PeerStats { peer, rx, tx, data_rx, data_tx, last_handshake } => {
+          record(peer, rx, tx, data_rx, data_tx, last_handshake)
+      }
+      Event::HandshakeCompleted { peer, .. } => mark_up(peer),
+      Event::Authenticated { .. }
+      | Event::PathAdopted { .. }
+      | Event::Dropped { .. }
+      | Event::Suspended
+      | Event::Resumed
+      | Event::MtuChanged { .. } => {}
+  }
+  let zeroed = PeerStats { rx: 0, tx: 0, ..snapshot };
+  // After
+  match event {
+      Event::SessionExpired { peer, cause: ExpiryCause::HandshakeTimeout } => mark_down(peer),
+      Event::SessionExpired { peer, .. } => mark_idle(peer),
+      Event::PeerStats { peer, rx, tx, data_rx, data_tx, last_handshake, .. } => {
+          record(peer, rx, tx, data_rx, data_tx, last_handshake)
+      }
+      Event::HandshakeCompleted { peer, .. } => mark_up(peer),
+      _ => {}
+  }
+  let mut zeroed = snapshot;
+  zeroed.rx = 0;
+  zeroed.tx = 0;
+  ```
 - `nsplane-wss`: the deprecated WebSocket stream carrier is removed: `WssStreamClient`,
   `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
   `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
@@ -162,18 +210,6 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
   let transport = dialer.into_transport(TransportId::new(2), relay_addr, LinkConfig::default());
   // add `transport` and the relay peer to the engine; open TCP through the local side
   let stream = netstack.connect_tcp(target).await?;
-  ```
-- `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
-  `NetStackConfig::admission`, which applies to every stack, transparent ones included.
-
-  ```rust
-  // Before
-  let mut transparent = TransparentConfig::default();
-  transparent.admission = Admission::Decide { timeout, max_pending };
-  config.transparent = Some(transparent);
-  // After
-  config.transparent = Some(TransparentConfig::default());
-  config.admission = Admission::Decide { timeout, max_pending };
   ```
 - `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
   `NetStackConfig::admission`, which applies to every stack, transparent ones included.
@@ -216,6 +252,11 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
   `NotSent` with `NO_SESSION` may be sent again once the session is up.
 
 #### Other
+- nsplane-core: a peer that never completed a handshake (or none since its last expiry) no
+  longer reports `Event::SessionExpired` when its idle timer runs out (540 s after it was
+  added); its tunnel still expires. Handshakes that go unanswered are still reported
+  (`ExpiryCause::HandshakeTimeout`). A keepalive the timers could not seal (its key at
+  Reject-After-Messages) is not reported as an expiry either.
 - `nsplane-netstack`: a connection or flow revoked while it waits in `incoming_tcp` or
   `incoming_udp` is skipped by the stream also when it was admitted with
   `Admission::Immediate` (before, only lifetimes held under `Admission::Decide` were).
