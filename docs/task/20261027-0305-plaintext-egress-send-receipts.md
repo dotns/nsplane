@@ -1,6 +1,6 @@
 # 20261027-0305-plaintext-egress-send-receipts Plaintext egress and per-packet send receipts (release C, W6)
 
-- **status**: completed (integrated into 0.21.0 on `release/0.21.0`, not released)
+- **status**: completed (released in 0.21.0 on 2026-10-28)
 - **priority**: P1
 - **owner**: w6/plaintext-egress-send-receipts
 - **createdAt**: 2026-10-27 03:05

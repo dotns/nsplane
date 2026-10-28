@@ -694,3 +694,21 @@ handshake watermark instead of an `up` flag, so `core/receive.rs` is unchanged. 
 `rcgen`) and `TransparentConfig::admission`. `cargo semver-checks` against `v0.20.2` lists
 `Output` (as integrated) plus exactly the planned breaks. Two `data_path` A/B invocations
 against `bcb68f1` are within the noise (`docs/performance.md`, "Peer expiry signal").
+
+## 2026-10-28 [release]
+
+Release 0.21.0 (tag `v0.21.0`) at the owner's request: release C of plan
+`20261026-0822-node-gateway-requests` (packet tag carrier, netstack ingress labels with label
+revocation, plaintext egress, per-packet send receipts), M3 of plan
+`20261027-0433-post-freeze-schedule` (peer expiry cause and `expirations`, `Event` and
+`PeerStats` `#[non_exhaustive]`), and the removal of the deprecated `nsplane-wss` stream
+carrier and `TransparentConfig::admission`. The owner accepted the unsealed-keepalive deviation
+of M3 and the `data_path` A/B as noise. Before the tag: the CHANGELOG date set to the release
+date, the normal-maintenance ADR records the removals; `nsplane-wss` keeps tokio's `io-util`
+feature, because `tokio-tungstenite`'s `handshake` feature enables it too, so no gate can show
+the crate's own need (its library code uses no `io-util` API). Gates on the release head:
+`just check` passed; `just cross` ran its Windows line only (passed) and `just test-windows`
+was replaced by a build of the same Windows test binaries (passed), because this host has no
+`cargo-zigbuild`, `zig`, musl target or `wine`; the owner accepted this. `release/0.21.0`
+merged into `main` with a merge commit; plan `20261026-0822-node-gateway-requests` and task
+`20261026-0819-node-gateway-requests` completed.

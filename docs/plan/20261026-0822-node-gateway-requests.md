@@ -1,8 +1,7 @@
 # 20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping
 
-- **status**: implementing (releases A and B released as 0.20.0 on 2026-10-27; release C
-  implemented and integrated as 0.21.0 on `release/0.21.0`, not merged into `main`, not
-  released)
+- **status**: completed (releases A and B released as 0.20.0 on 2026-10-27; release C
+  released as 0.21.0 on 2026-10-28, tag `v0.21.0`)
 - **createdAt**: 2026-10-26 08:22
 - **approvedAt**: 2026-10-26
 - **relatedTask**: 20261026-0819-node-gateway-requests

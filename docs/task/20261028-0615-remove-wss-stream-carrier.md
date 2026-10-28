@@ -1,6 +1,6 @@
 # 20261028-0615-remove-wss-stream-carrier Remove the deprecated WsFrame stream carrier from nsplane-wss
 
-- **status**: completed (on `release/0.21.0` 2026-10-28; ships in 0.21.0, not yet tagged)
+- **status**: completed (released in 0.21.0 on 2026-10-28)
 - **priority**: P2
 - **owner**: pdev (oitcozuh)
 - **createdAt**: 2026-10-28 06:15

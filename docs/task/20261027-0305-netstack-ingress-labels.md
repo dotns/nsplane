@@ -1,6 +1,6 @@
 # 20261027-0305-netstack-ingress-labels Netstack ingress labels and label revocation (release C, W5)
 
-- **status**: completed (integrated into 0.21.0 on `release/0.21.0`, not released)
+- **status**: completed (released in 0.21.0 on 2026-10-28)
 - **priority**: P1
 - **owner**: w5/netstack-ingress-labels
 - **createdAt**: 2026-10-27 03:05
