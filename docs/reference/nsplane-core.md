@@ -127,12 +127,13 @@ its filters with that in mind. Pinned by `nsplane-e2e`'s `inject_filters` tests.
 through the code a decrypted transport data packet runs after decryption, shared with it:
 the allowed-IP source check (`SOURCE_NOT_ALLOWED`), the peer's inbound destinations
 (`DESTINATION_NOT_ALLOWED`, an owned list or a shared source), the inbound filters in install
-order (`PacketFilter::inbound_from` with `from`) and `Output::Deliver`. So a plaintext packet
-and a decrypted packet of the same peer meet the same verdicts.
+order (`PacketFilter::inbound_from` with `from`) and `Output::Deliver`. Valid plaintext and
+decrypted packets of the same peer meet the same address and filter verdicts.
 
-- The packet is read as the tunnel reads decrypted data: cut to the length its IP header
-  states. A packet that is not a whole IPv4 or IPv6 packet (version, header, length) has no
-  readable source and is dropped as `SOURCE_NOT_ALLOWED`.
+- The packet is cut to the length its IP header states. IPv4 requires IHL at least five,
+  header length no greater than total length, and total length within the buffer. IPv6
+  requires its 40-byte header and declared payload within the buffer. A packet failing
+  these version, header or length checks is dropped as `SOURCE_NOT_ALLOWED` before filters.
 - A peer that does not exist or was removed is dropped as `UNKNOWN_PLAINTEXT_PEER`, never
   delivered; peer ids are never reused, so an id of a removed peer never reaches a later one.
 - Nothing is authenticated: no handshake accounting, no `PathPolicy::on_authenticated`, no

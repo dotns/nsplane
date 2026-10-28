@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-10-27
+> Updated: 2026-10-28
 
 ## Usage
 
@@ -88,3 +88,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261028-0615-remove-transparent-admission Remove the deprecated TransparentConfig::admission**](20261028-0615-remove-transparent-admission.md) `P2`
 - [ ] [**20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards**](20261028-0611-expiry-queued-packets-dropped.md) `P3`
 - [ ] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`
+
+- [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `P2`

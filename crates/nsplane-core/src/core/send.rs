@@ -41,10 +41,12 @@ impl Core {
     /// order ([`PacketFilter::inbound_from`] with `from`), then `Output::Deliver`.
     ///
     /// As the tunnel does with decrypted data, the packet is cut to the length its IP header
-    /// states; one that is not a whole IPv4 or IPv6 packet (version, header, length) has no
-    /// readable source and is dropped as [`reasons::SOURCE_NOT_ALLOWED`]. A `peer` that does
-    /// not exist or was removed is dropped as [`reasons::UNKNOWN_PLAINTEXT_PEER`], never
-    /// delivered; peer ids are never reused.
+    /// states. IPv4 requires IHL >= 5 and a header length no greater than the declared total
+    /// length, which must fit in the buffer. IPv6 requires a 40-byte header and its declared
+    /// payload within the buffer. A packet failing these version, header or length checks
+    /// has no readable source and is dropped as [`reasons::SOURCE_NOT_ALLOWED`]. A `peer`
+    /// that does not exist or was removed is dropped as [`reasons::UNKNOWN_PLAINTEXT_PEER`],
+    /// never delivered; peer ids are never reused.
     ///
     /// Nothing about the packet is authenticated: no handshake accounting, no
     /// [`PathPolicy::on_authenticated`], no roaming and no `Event::Authenticated`; the
@@ -568,13 +570,18 @@ fn src_address(packet: &[u8]) -> Option<IpAddr> {
 }
 
 /// The source address of a whole IPv4 or IPv6 packet at the start of `packet` and the length
-/// its header states, read as the tunnel reads decrypted data.
+/// its header states. IPv4 includes its options; IPv6 includes its fixed header and payload.
 fn ip_source(packet: &[u8]) -> Option<(IpAddr, usize)> {
     let (src, len) = match packet.first()? >> 4 {
         4 if packet.len() >= 20 => {
             let src: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
             let len: [u8; 2] = packet.get(2..4)?.try_into().ok()?;
-            (IpAddr::from(src), usize::from(u16::from_be_bytes(len)))
+            let len = usize::from(u16::from_be_bytes(len));
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            if header_len < 20 || header_len > len {
+                return None;
+            }
+            (IpAddr::from(src), len)
         }
         6 if packet.len() >= 40 => {
             let src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;

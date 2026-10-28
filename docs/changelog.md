@@ -712,3 +712,15 @@ was replaced by a build of the same Windows test binaries (passed), because this
 `cargo-zigbuild`, `zig`, musl target or `wine`; the owner accepted this. `release/0.21.0`
 merged into `main` with a merge commit; plan `20261026-0822-node-gateway-requests` and task
 `20261026-0819-node-gateway-requests` completed.
+
+## 2026-10-28 16:38 [progress]
+
+Completed `20261028-1630-plaintext-ipv4-validation` (tk #748/#749): plaintext IPv4 requires a valid IHL
+and total length covering its header before address checks and filters. Added three
+regression tests for malformed bounds, valid options/header-only packets, IPv6 payload
+bounds and padding. RED reproduced zero IHL; all eight plaintext tests passed after the fix.
+Changed Cargo repository metadata and documented the padding limit's 1280-byte
+inner floor. Rustdoc, reference and release notes match. `just check` passed with six build
+jobs: 2,458 tests passed, 34 skipped, and all remaining gates passed. Local diff review found
+no remaining issue. The encrypted tunnel's analogous IPv4 check is tracked as tk #754;
+baseline follow-ups #743/#744 remain for alignment after integration.

@@ -144,7 +144,8 @@ impl Owner {
     }
 
     /// Caps the padding of every peer's data at its inner MTU in `mtus` (the source MTU for a
-    /// peer not listed), so that a packet at that MTU fits the path. Without a table nothing
+    /// peer not listed). A packet at that MTU fits the path only when the outer ceiling can
+    /// carry the 1280-byte inner floor plus encapsulation headers. Without a table nothing
     /// is set and the padding stays as it always was. The table is never dropped once
     /// created, so the limits are never cleared as a whole; they also follow the source MTU.
     fn set_pad_limits(&mut self, mtus: &PeerMtus) {

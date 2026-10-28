@@ -1560,6 +1560,95 @@ mod plaintext {
     }
 
     #[test]
+    fn plaintext_rejects_invalid_ipv4_header_bounds() {
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        for (name, ihl, total, available) in [
+            ("zero IHL", 0, 100u16, 100),
+            ("IHL below five", 4, 100, 100),
+            ("zero total", 5, 0, 100),
+            ("total below minimum header", 5, 19, 100),
+            ("options beyond total", 6, 23, 100),
+            ("options beyond buffer", 15, 60, 59),
+        ] {
+            let mut packet = ip("10.0.0.1", "10.0.0.2", 0);
+            packet.as_packet_mut()[0] = 0x40 | ihl;
+            packet.as_packet_mut()[2..4].copy_from_slice(&total.to_be_bytes());
+            packet.set_len(available);
+            let before = b.peer_stats(a_id).unwrap().data_rx;
+            b.receive_plaintext(a_id, path(1), packet);
+            let (fate, _) = fate(&mut b, &filter);
+            assert_eq!(fate.drops, [reasons::SOURCE_NOT_ALLOWED], "{name}");
+            assert!(fate.seen.is_empty() && fate.delivered.is_empty(), "{name}");
+            assert_eq!(b.peer_stats(a_id).unwrap().data_rx, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn plaintext_accepts_ipv4_options_and_header_only_packets() {
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        let key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        b.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinations {
+                peer: key,
+                destinations: None,
+            }),
+            Instant::now(),
+        );
+        for (ihl, total, available) in [(5, 20u16, 20), (6, 24, 100), (15, 60, 60)] {
+            let mut packet = ip("10.0.0.1", "10.0.0.0", 0);
+            packet.as_packet_mut()[0] = 0x40 | ihl;
+            packet.as_packet_mut()[2..4].copy_from_slice(&total.to_be_bytes());
+            packet.set_len(available);
+            let expected = packet.as_packet()[..usize::from(total)].to_vec();
+            b.receive_plaintext(a_id, path(1), packet);
+            let (fate, _) = fate(&mut b, &filter);
+            assert_eq!(fate.drops, [] as [&str; 0]);
+            assert_eq!(fate.seen, [(a_id, path(1), expected.clone())]);
+            assert_eq!(fate.delivered, [(a_id, expected)]);
+        }
+    }
+
+    #[test]
+    fn plaintext_checks_ipv6_payload_bounds_and_trims_padding() {
+        let filter = Recording::default();
+        let (_, mut b, a_id) = sender_and_receiver(&filter);
+        let key = x25519::PublicKey::from(&x25519::StaticSecret::from([1; 32]));
+        b.handle_input(
+            Input::Config(ConfigChange::SetInboundDestinations {
+                peer: key,
+                destinations: None,
+            }),
+            Instant::now(),
+        );
+        for (payload, available, valid) in [
+            (0u16, 39, false),
+            (61, 100, false),
+            (u16::MAX, 100, false),
+            (0, 40, true),
+            (0, 100, true),
+            (60, 100, true),
+        ] {
+            let mut packet = ip("fd00::1", "fd00::", 0);
+            packet.as_packet_mut()[4..6].copy_from_slice(&payload.to_be_bytes());
+            packet.set_len(available);
+            let bytes = packet.as_packet().to_vec();
+            b.receive_plaintext(a_id, path(1), packet);
+            let (fate, _) = fate(&mut b, &filter);
+            if valid {
+                let expected = bytes[..40 + usize::from(payload)].to_vec();
+                assert_eq!(fate.drops, [] as [&str; 0]);
+                assert_eq!(fate.seen, [(a_id, path(1), expected.clone())]);
+                assert_eq!(fate.delivered, [(a_id, expected)]);
+            } else {
+                assert_eq!(fate.drops, [reasons::SOURCE_NOT_ALLOWED]);
+                assert!(fate.seen.is_empty() && fate.delivered.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn packets_are_read_like_decrypted_data() {
         let filter = Recording::default();
         let (mut a, mut b, a_id) = sender_and_receiver(&filter);
