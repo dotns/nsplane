@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.21.0] - 2026-10-27
+## [0.21.0] - 2026-10-28
 
 Feature release: one opaque packet tag carried on `PacketBuf` through the engine, the
 translators and the netstack, netstack ingress labels with label revocation, plaintext egress
