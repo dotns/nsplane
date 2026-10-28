@@ -29,7 +29,8 @@ impl UapiListener {
     ///
     /// Creates `/var/run/wireguard` if needed and, when the process runs under `sudo`, hands
     /// the directory to the invoking user (`SUDO_UID` / `SUDO_GID`), so the socket can still
-    /// be removed after privileges are dropped. A stale socket is replaced.
+    /// be removed after privileges are dropped. The existing path is removed without
+    /// checking its type or whether a listener is active; see [`Self::bind_path`].
     ///
     /// # Panics
     ///
@@ -39,14 +40,16 @@ impl UapiListener {
         Self::bind_path(socket_path(iface))
     }
 
-    /// Binds a socket at `path`, replacing a stale socket; the directory must exist.
+    /// Binds a socket at `path`; the directory must exist. Attempts to remove any
+    /// existing file or symlink at the path without checking its type or staleness.
+    /// Removal errors are ignored; the subsequent bind determines success.
     ///
     /// # Panics
     ///
     /// Panics when called outside a tokio runtime with I/O enabled.
     pub fn bind_path(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let _ = fs::remove_file(&path); // Attempt to remove the socket if already exists
+        let _ = fs::remove_file(&path); // Remove an existing path without a type or staleness check.
         let listener = UnixListener::bind(&path)?;
         Ok(Self { listener, path })
     }

@@ -58,7 +58,12 @@ for bin in "${EXAMPLES[@]}"; do
 done
 
 docker build -q "${LABELS[@]}" -t "$IMG" scripts/e2e >/dev/null
-docker network create "${LABELS[@]}" "$NET" >/dev/null
+# Docker 28+ drops, in raw PREROUTING, packets to a container address that enter from another
+# bridge; with bridge-nf-call-iptables that includes bridged frames, so the scenarios that route
+# through a container (routers, gateways) lose them. nat-unprotected keeps the routing open on
+# the test networks; older daemons ignore the option.
+NET_OPTS=(-o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected)
+docker network create "${LABELS[@]}" "${NET_OPTS[@]}" "$NET" >/dev/null
 
 # --- helpers: containers ----------------------------------------------------------------
 # Containers are named $PREFIX-$CASE-<name>; `X <name> <cmd>` runs a command in one.
@@ -85,11 +90,14 @@ pub() { X "$1" 'cat /p'; }
 ip_of() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(ctr "$1")"; }
 # ip_on <ctr> <network>: the container's address on one of its networks.
 ip_on() { docker inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$(ctr "$1")"; }
-# case_net <name>: creates an internal network of the current case and prints its name.
+# case_net <name>: creates a network of the current case and prints its name. Not --internal:
+# Docker drops frames with an address outside an internal network's subnet (DOCKER-INTERNAL,
+# bridged frames included), which is all routed traffic; the scenarios set explicit routes
+# through their router instead.
 case_net() {
   local net
   net=$(ctr "$1")
-  docker network create --internal "${LABELS[@]}" --label "nsplane-e2e-ex-case=$CASE" "$net" >/dev/null
+  docker network create "${LABELS[@]}" "${NET_OPTS[@]}" --label "nsplane-e2e-ex-case=$CASE" "$net" >/dev/null
   echo "$net"
 }
 # The containers of the current case: dump their logs and status files, then remove them.
@@ -518,7 +526,7 @@ scenario_native_wg_reverse() {
 # with the relay as the peer endpoint and each other's reflexive address (copied by the
 # harness from --reflexive-out to --peer-candidates) as direct candidate. The direct path
 # goes up first, blocking it falls back to the relay, unblocking returns to direct; echo in
-# every phase. With nat each node sits on its own internal network behind a router doing
+# every phase. With nat each node sits on its own case network behind a router doing
 # MASQUERADE, the relay on the shared network, and the routers block the direct path.
 ladder() {
   local bin=$1 nat=$2
@@ -765,7 +773,7 @@ scenario_acl_gateway() {
 }
 
 # --- scenarios: NAT --------------------------------------------------------------------
-# translate_node t between an IPv4-only client c on t's LAN (an internal network) and a
+# translate_node t between an IPv4-only client c on t's LAN and a
 # kernel WireGuard peer k whose overlay is IPv6 only. t maps k (peer6 fd00:a::2:0, eam6
 # fd00:a::2:1) to eam4 10.200.0.2, its own eam4 10.200.0.1 to eam6 fd00:a::1:1, and the
 # LAN's IPv4 subnet to fd00:1::/96. c routes 10.200.0.2 through t; k sees the requests from
@@ -862,7 +870,7 @@ scenario_port_map() {
 }
 
 # subnet_gateway g between kernel WireGuard client k (IPv6 overlay only, fd00:c::2) and an
-# IPv4 LAN host l on g's LAN (an internal network). g maps fd00:64::/96 to the LAN's subnet
+# IPv4 LAN host l on g's LAN. g maps fd00:64::/96 to the LAN's subnet
 # and SNATs to 10.201.0.1, which l routes back through g. k reaches l's echo and ping as
 # fd00:64::<l's IPv4>; the LAN's broadcast address is refused as an unsafe target.
 scenario_subnet_gateway() {

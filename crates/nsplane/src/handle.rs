@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::engine::{NewTransport, SourceTaken};
 use crate::fragment::FragmentStats;
+use crate::tracked::Receipts;
 use crate::transport::{PathMtuReport, Transport};
 
 /// The description of a peer for [`EngineHandle::add_or_update_peer`].
@@ -146,6 +147,37 @@ impl fmt::Display for PlaintextRefused {
 }
 
 impl Error for PlaintextRefused {}
+
+/// The receiver of the local packets routed to peers marked for plaintext egress; from
+/// [`crate::EngineBuilder::plaintext_egress`].
+///
+/// The engine hands it each such packet after the outbound filters, instead of sealing it,
+/// with the peer it was routed to: the packet as the filters left it, tag included, receipt
+/// marker cleared. Peer ids are never reused, so a packet of a removed peer is never
+/// attributed to a later one. When the queue is full the packet is dropped under
+/// [`crate::DROP_PLAINTEXT_EGRESS_FULL`]; once this receiver is dropped, under
+/// [`crate::DROP_PLAINTEXT_EGRESS_CLOSED`].
+#[derive(Debug)]
+pub struct PlaintextEgress {
+    packets: mpsc::Receiver<(PeerId, PacketBuf)>,
+}
+
+impl PlaintextEgress {
+    pub(crate) const fn new(packets: mpsc::Receiver<(PeerId, PacketBuf)>) -> Self {
+        Self { packets }
+    }
+
+    /// The next packet and the peer it was routed to; waits for one. `None` once the engine
+    /// has stopped and every packet was received.
+    pub async fn recv(&mut self) -> Option<(PeerId, PacketBuf)> {
+        self.packets.recv().await
+    }
+
+    /// The next packet if one is queued.
+    pub fn try_recv(&mut self) -> Option<(PeerId, PacketBuf)> {
+        self.packets.try_recv().ok()
+    }
+}
 
 /// The error of the transport calls of [`EngineHandle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,9 +431,17 @@ pub(crate) enum Command {
     SetLocalSources(LocalIdentityId, Vec<AllowedIp>, oneshot::Sender<bool>),
     LocalIdentities(oneshot::Sender<Vec<LocalIdentity>>),
     PeerIdIn(LocalIdentityId, PublicKey, oneshot::Sender<Option<PeerId>>),
-    /// Replies once the owner has taken this many local packets through routing and the
-    /// outbound filters.
-    LocalBarrier(u64, oneshot::Sender<()>),
+    /// Replies once the owner has taken this many local packets from the source and from
+    /// the tracked sender through routing and the outbound filters.
+    LocalBarrier(LocalPosition, oneshot::Sender<()>),
+    SetPlaintextEgress(PeerId, bool, oneshot::Sender<bool>),
+}
+
+/// How many local packets were taken: from the source and from the tracked sender.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalPosition {
+    pub(crate) source: u64,
+    pub(crate) tracked: u64,
 }
 
 /// A cheap, cloneable handle to a running engine.
@@ -414,6 +454,8 @@ pub struct EngineHandle {
     commands: mpsc::Sender<Command>,
     /// Local packets the source task took from the source so far.
     source_taken: Arc<SourceTaken>,
+    /// The tracked sender's receipts, if built.
+    receipts: Option<Arc<Receipts>>,
 }
 
 impl fmt::Debug for EngineHandle {
@@ -428,10 +470,12 @@ impl EngineHandle {
     pub(crate) const fn new(
         commands: mpsc::Sender<Command>,
         source_taken: Arc<SourceTaken>,
+        receipts: Option<Arc<Receipts>>,
     ) -> Self {
         Self {
             commands,
             source_taken,
+            receipts,
         }
     }
 
@@ -461,8 +505,9 @@ impl EngineHandle {
 
     /// Adds a peer, or updates it in place if its public key is known in its local identity.
     ///
-    /// Peers cannot be added before a private key is set; the core then reports
-    /// `Event::Dropped { reason: "no private key", .. }`.
+    /// A peer needs a private key on its selected local identity; otherwise the core reports
+    /// `Event::Dropped { reason: "no private key", .. }`. A keyed non-default identity
+    /// accepts peers even when the default identity has no key.
     ///
     /// The methods below that name a peer by public key address the peer of the default
     /// local identity. A peer of another identity (`local_identity` set) is removed and given
@@ -602,7 +647,7 @@ impl EngineHandle {
 
     /// Adds a local identity with its own static key, which answers handshakes on every
     /// transport; returns its id, or `None` if an identity of the engine (the default one
-    /// included) already holds the key.
+    /// included) already holds the key or identity ids are exhausted.
     ///
     /// Peers are bound to an identity with [`PeerConfig::local_identity`]; the same remote
     /// key may be a peer of several identities. Ids are never reused.
@@ -729,6 +774,9 @@ impl EngineHandle {
     /// packet. A stateful filter (e.g. `nsplane-acl`'s `AclFilter`) records no reply state for
     /// it, so the peer's replies are judged by the inbound rules alone, and a translating
     /// filter does not translate it.
+    ///
+    /// A packet routed to a peer marked with [`EngineHandle::set_plaintext_egress`] goes to
+    /// the plaintext egress receiver instead of being sealed.
     pub async fn inject_outbound(&self, packet: PacketBuf) -> Result<(), EngineError> {
         self.call(|tx| Command::Inject(Injection::Outbound(packet), tx))
             .await
@@ -940,10 +988,10 @@ impl EngineHandle {
     /// `min(source MTU, min(transport ceiling, mtu - IP header - 8) - 32)`, at least 1280:
     /// with an IPv6 path MTU of 1500, 1420. The engine does not probe for a larger MTU.
     ///
-    /// From the first ceiling or report on, the padding of every peer's data stops at its
-    /// inner MTU, as the kernel pads to the MTU, so a packet at the inner MTU makes an outer
-    /// packet of at most the path MTU (earlier, padding to a multiple of 16 bytes could
-    /// overshoot it by up to 15 bytes).
+    /// Installing a ceiling or lowering a learned path MTU recomputes peers' padding
+    /// limits at their inner MTUs. An ignored first report creates the table but does not
+    /// install padding limits by itself. A packet at its inner MTU fits the path only
+    /// when the outer ceiling can carry the 1280-byte inner floor plus encapsulation headers.
     pub async fn report_path_mtu(&self, path: Path, mtu: u16) -> Result<bool, EngineError> {
         let report = PathMtuReport::new(path, mtu);
         self.call(|tx| Command::ReportPathMtu(report, tx)).await
@@ -1010,9 +1058,10 @@ impl EngineHandle {
         self.call(Command::TotalUnansweredHandshakes).await
     }
 
-    /// Waits until every packet the engine took from its [`crate::PacketSource`] before this
-    /// call has been routed and passed or been dropped by the outbound filters (or dropped
-    /// for no route, by the fragmentation stage or by the tunnel's queue).
+    /// Waits until every packet the engine took from its [`crate::PacketSource`], and every
+    /// packet its [`crate::TrackedSender`] accepted, before this call has been routed and
+    /// passed or been dropped by the outbound filters (or dropped for no route, by the
+    /// fragmentation stage or by the tunnel's queue).
     ///
     /// A packet counts as taken once [`crate::PacketSource::recv_batch`] took it from the
     /// source, also while that read is still in progress: the engine counts what a read
@@ -1032,8 +1081,33 @@ impl EngineHandle {
     /// [`EngineError`] once the engine has stopped before the barrier passed; a stopped
     /// engine never reports a barrier it did not pass.
     pub async fn local_barrier(&self) -> Result<(), EngineError> {
-        let position = self.source_taken.position().await;
+        let position = LocalPosition {
+            source: self.source_taken.position().await,
+            tracked: self.receipts.as_ref().map_or(0, |r| r.accepted()),
+        };
         self.call(|tx| Command::LocalBarrier(position, tx)).await
+    }
+
+    /// Marks or unmarks `peer` for plaintext egress; `Ok(false)` for an unknown peer.
+    ///
+    /// The local packets routed to a marked peer after the call leave after the outbound
+    /// filters through [`PlaintextEgress`] instead of being sealed; packets routed before
+    /// it, and those the peer's tunnel queued behind a handshake, stay sealed. A marked peer
+    /// starts no handshake for data, and still answers handshakes and starts them for
+    /// inbound sealed traffic, so it moves between plaintext and sealed egress without a
+    /// gap. The mark is runtime state of the [`PeerId`]: an update of the peer in place keeps
+    /// it, a peer removed and added again gets a new id and starts unmarked.
+    ///
+    /// [`EngineHandle::add_or_update_peer`] returns no id. To keep a new peer's first
+    /// packets from being sealed, add it closed (without allowed IPs), read its id back with
+    /// [`EngineHandle::peer_id`], mark it, then open it ([`EngineHandle::set_allowed_ips`]).
+    pub async fn set_plaintext_egress(
+        &self,
+        peer: PeerId,
+        plaintext: bool,
+    ) -> Result<bool, EngineError> {
+        self.call(|tx| Command::SetPlaintextEgress(peer, plaintext, tx))
+            .await
     }
 
     /// Stops the engine: every task is stopped and joined before this returns, and

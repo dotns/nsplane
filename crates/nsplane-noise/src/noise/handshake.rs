@@ -541,8 +541,9 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key);
     }
 
-    /// Replaces the preshared key. Handshakes already in flight keep the old key; the next
-    /// handshake uses the new one.
+    /// Replaces the preshared key used when producing or accepting a handshake response,
+    /// including responses to initiations already in flight. Established sessions keep
+    /// their derived keys.
     pub(crate) const fn set_preshared_key(&mut self, preshared_key: Option<[u8; KEY_LEN]>) {
         self.params.preshared_key = preshared_key;
     }

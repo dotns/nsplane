@@ -14,7 +14,13 @@
 //! connected sockets of stack `a`, flows without a context, each to a bound socket of `b`.
 //! An iteration sends `DATAGRAMS` datagrams of `DATAGRAM` bytes in batches of `BATCH` and
 //! ends when the receivers took all of them; a batch fits the receivers' queues, so none
-//! is lost:
+//! is lost. `netstack_udp_flow_send` and `netstack_udp_flow_send_1cpu` send the same load
+//! to flows `b` hands out on `incoming_udp` instead of bound sockets.
+//!
+//! Each case also runs with `b`'s input labeled (`_labeled`): the wire from `a` to `b` sets
+//! the ingress label on every packet, so `b`'s connections and flows are labeled and every
+//! segment and datagram into `b` is checked against its lifetime's label. Unlabeled and
+//! labeled cases of one count run one after the other:
 //!
 //! ```text
 //! cargo bench -p nsplane-netstack --bench send_stream
@@ -22,6 +28,7 @@
 
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -51,26 +58,40 @@ const DATAGRAM: usize = 1200;
 /// First UDP port of the receiving stack, one per flow.
 const UDP_PORT: u16 = 5000;
 
-/// Forwards every packet from `from` to `to`.
-async fn wire(mut from: NetStackSource, to: NetStackSink) {
-    while let Ok(packet) = from.recv().await {
+/// The ingress label of `b`'s input in the labeled cases.
+const LABEL: NonZeroU64 = NonZeroU64::MIN;
+
+/// Forwards every packet from `from` to `to`, with the ingress label `label` if given.
+async fn wire(mut from: NetStackSource, to: NetStackSink, label: Option<NonZeroU64>) {
+    while let Ok(mut packet) = from.recv().await {
+        if label.is_some() {
+            packet.set_tag(label);
+        }
         if to.send(packet, PeerId::new(1)).await.is_err() {
             break;
         }
     }
 }
 
-/// Two stacks, `10.0.0.1` and `10.0.0.2`, wired back to back.
-fn pair() -> (NetStackHandle, NetStackHandle) {
+/// Two stacks, `10.0.0.1` and `10.0.0.2`, wired back to back; `b`'s input carries `label`.
+fn pair(label: Option<NonZeroU64>) -> (NetStackHandle, NetStackHandle) {
     let config =
         |last: u8| NetStackConfig::new(vec![(IpAddr::from([10, 0, 0, last]), 24)], DEFAULT_MTU);
     let (a_stack, a) = NetStack::new(config(1));
     let (b_stack, b) = NetStack::new(config(2));
     let (a_source, a_sink) = a_stack.split();
     let (b_source, b_sink) = b_stack.split();
-    tokio::spawn(wire(a_source, b_sink));
-    tokio::spawn(wire(b_source, a_sink));
+    tokio::spawn(wire(a_source, b_sink, label));
+    tokio::spawn(wire(b_source, a_sink, None));
     (a, b)
+}
+
+/// The cases of one count: unlabeled, then labeled.
+fn cases(name: &str, count: usize) -> [(String, Option<NonZeroU64>); 2] {
+    [
+        (format!("{name}_{count}"), None),
+        (format!("{name}_{count}_labeled"), Some(LABEL)),
+    ]
 }
 
 /// `streams` connections from stack `10.0.0.1` to stack `10.0.0.2`: a sender per
@@ -78,11 +99,12 @@ fn pair() -> (NetStackHandle, NetStackHandle) {
 /// reports every read's length on the returned channel.
 async fn streams(
     streams: usize,
+    label: Option<NonZeroU64>,
 ) -> (
     Vec<mpsc::UnboundedSender<usize>>,
     mpsc::UnboundedReceiver<usize>,
 ) {
-    let (a, b) = pair();
+    let (a, b) = pair(label);
     let mut incoming = b.incoming_tcp();
     let (read_tx, read_rx) = mpsc::unbounded_channel();
     let mut senders = Vec::with_capacity(streams);
@@ -123,11 +145,12 @@ async fn streams(
 /// datagram on the returned channel.
 async fn udp_flows(
     flows: usize,
+    label: Option<NonZeroU64>,
 ) -> (
     Vec<mpsc::UnboundedSender<usize>>,
     mpsc::UnboundedReceiver<()>,
 ) {
-    let (a, b) = pair();
+    let (a, b) = pair(label);
     let (recv_tx, recv_rx) = mpsc::unbounded_channel();
     let mut senders = Vec::with_capacity(flows);
     for port in (UDP_PORT..).take(flows) {
@@ -156,6 +179,50 @@ async fn udp_flows(
     (senders, recv_rx)
 }
 
+/// `flows` UDP flows from stack `10.0.0.1` to stack `10.0.0.2`, like [`udp_flows`], each
+/// received as a flow from `b`'s `incoming_udp`, opened by one datagram before the run.
+async fn incoming_flows(
+    flows: usize,
+    label: Option<NonZeroU64>,
+) -> (
+    Vec<mpsc::UnboundedSender<usize>>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (a, b) = pair(label);
+    let mut incoming = b.incoming_udp();
+    let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+    let mut senders = Vec::with_capacity(flows);
+    for port in (UDP_PORT..).take(flows) {
+        let target = SocketAddr::from(([10, 0, 0, 2], port));
+        let socket = a.connect_udp(target).await.unwrap();
+        socket.send(b"open").await.unwrap();
+        let mut flow = poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx))
+            .await
+            .unwrap();
+        assert_eq!(flow.ingress_label(), label);
+        flow.recv().await.unwrap();
+        let received = recv_tx.clone();
+        tokio::spawn(async move {
+            while flow.recv().await.is_some() {
+                if received.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<usize>();
+        tokio::spawn(async move {
+            let data = vec![0x5a; DATAGRAM];
+            while let Some(count) = rx.recv().await {
+                for _ in 0..count {
+                    socket.send(&data).await.unwrap();
+                }
+            }
+        });
+        senders.push(tx);
+    }
+    (senders, recv_rx)
+}
+
 fn bench_send(c: &mut Criterion) {
     let runtimes = [
         ("netstack_send", tokio::runtime::Builder::new_multi_thread()),
@@ -170,9 +237,12 @@ fn bench_send(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(CHUNK_BYTES as u64));
         group.sample_size(20);
         group.measurement_time(Duration::from_secs(10));
-        for count in [1, 4] {
-            let (senders, mut reads) = runtime.block_on(streams(count));
-            group.bench_function(format!("streams_{count}"), |bench| {
+        for (case, count, label) in [1, 4]
+            .into_iter()
+            .flat_map(|count| cases("streams", count).map(|(case, label)| (case, count, label)))
+        {
+            let (senders, mut reads) = runtime.block_on(streams(count, label));
+            group.bench_function(case, |bench| {
                 bench.iter_custom(|iters| {
                     runtime.block_on(async {
                         let per_stream = CHUNK_BYTES / count * usize::try_from(iters).unwrap();
@@ -194,13 +264,19 @@ fn bench_send(c: &mut Criterion) {
 }
 
 fn bench_udp_send(c: &mut Criterion) {
+    udp_send(c, "netstack_udp_send", false);
+}
+
+fn bench_udp_flow_send(c: &mut Criterion) {
+    udp_send(c, "netstack_udp_flow_send", true);
+}
+
+/// The UDP groups `name` and `name_1cpu`, to bound sockets or to `incoming` flows.
+fn udp_send(c: &mut Criterion, name: &str, incoming: bool) {
     let runtimes = [
+        (name.to_owned(), tokio::runtime::Builder::new_multi_thread()),
         (
-            "netstack_udp_send",
-            tokio::runtime::Builder::new_multi_thread(),
-        ),
-        (
-            "netstack_udp_send_1cpu",
+            format!("{name}_1cpu"),
             tokio::runtime::Builder::new_current_thread(),
         ),
     ];
@@ -210,9 +286,16 @@ fn bench_udp_send(c: &mut Criterion) {
         group.throughput(Throughput::Elements(DATAGRAMS as u64));
         group.sample_size(20);
         group.measurement_time(Duration::from_secs(10));
-        for count in [1, 4] {
-            let (senders, mut received) = runtime.block_on(udp_flows(count));
-            group.bench_function(format!("flows_{count}"), |bench| {
+        for (case, count, label) in [1, 4]
+            .into_iter()
+            .flat_map(|count| cases("flows", count).map(|(case, label)| (case, count, label)))
+        {
+            let (senders, mut received) = if incoming {
+                runtime.block_on(incoming_flows(count, label))
+            } else {
+                runtime.block_on(udp_flows(count, label))
+            };
+            group.bench_function(case, |bench| {
                 bench.iter_custom(|iters| {
                     runtime.block_on(async {
                         let batches = DATAGRAMS / BATCH * usize::try_from(iters).unwrap();
@@ -234,5 +317,5 @@ fn bench_udp_send(c: &mut Criterion) {
     }
 }
 
-criterion::criterion_group!(benches, bench_send, bench_udp_send);
+criterion::criterion_group!(benches, bench_send, bench_udp_send, bench_udp_flow_send);
 criterion::criterion_main!(benches);

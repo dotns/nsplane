@@ -50,8 +50,8 @@ variants cover offload on/off x crypto workers 0/2:
 
 `nsplane-kernel` and `kernel-nsplane` always run the default nsplane-cli configuration.
 nsplane-cli sides keep the UDP port bound at startup (read back with `wg show wg0
-listen-port`) instead of setting `listen-port 51820`: a `listen-port` set over the UAPI binds
-a new socket with offload on, which would undo `WG_NO_OFFLOAD`.
+listen-port`) instead of setting `listen-port 51820`, avoiding a socket rebind. A UAPI
+`listen-port` rebind preserves the CLI's offload setting, including `WG_NO_OFFLOAD`.
 
 wireguard-go is built from upstream source at a pinned tag in the builder image
 `ai-agent/wireguard-go` (`scripts/bench/wireguard-go/Dockerfile`, build arg

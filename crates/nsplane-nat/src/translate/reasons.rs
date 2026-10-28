@@ -49,7 +49,8 @@ pub const TINY_FRAGMENT: &str = "translation tiny fragment";
 pub const MALFORMED_FRAGMENT: &str = "translation malformed fragment";
 /// A fragment overlaps another fragment of the same datagram.
 pub const OVERLAP: &str = "translation fragment overlap";
-/// A datagram being reassembled timed out.
+/// Expired-datagram reason name; no translation path emits it. Reassembly expiry
+/// is recorded in counters instead.
 pub const EXPIRED: &str = "translation fragment expired";
 /// Reassembly is at its entry or byte limit.
 pub const BUDGET_EXCEEDED: &str = "translation fragment budget exceeded";

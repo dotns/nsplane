@@ -22,8 +22,9 @@
 #
 # BENCH_LOCK_DIR (default /tmp) moves the lock files, for tests of this script.
 #
-# Fairness: one A/B per invocation; wait 120 s before taking a slot again. Builds and tests that
-# do not measure time do not take a slot.
+# Caller fairness convention: run one A/B per invocation and wait 120 s before taking
+# a slot again. This script enforces neither rule; it runs the supplied command and
+# releases its locks on exit. Builds and tests that do not measure time do not take a slot.
 set -euo pipefail
 
 if [ $# -eq 0 ]; then

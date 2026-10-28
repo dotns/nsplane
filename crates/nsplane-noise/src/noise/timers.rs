@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 // Some constants, represent time in seconds
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
 pub(super) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
-const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+pub(super) const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+pub(super) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(super) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
@@ -47,6 +47,19 @@ use self::TimerName::{
     TimeCookieReceived, TimeCurrent, TimeLastDataPacketReceived, TimeLastDataPacketSent,
     TimeLastHandshakeStarted, TimeLastPacketReceived, TimeLastPacketSent, TimeSessionEstablished,
 };
+
+/// Why a tunnel expired: which timer gave up on its sessions ([`Tunn::expiry_cause`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExpiryCause {
+    /// No handshake completed for `REJECT_AFTER_TIME * 3` (540 s): the keys were too old to
+    /// keep, typically because no traffic needed a rekey. Not a sign that the peer is
+    /// unreachable.
+    SessionAge,
+    /// Handshake initiations got no response for `REKEY_ATTEMPT_TIME` (90 s): the peer did
+    /// not answer and the retries gave up.
+    HandshakeTimeout,
+}
 
 /// A random delay of 0 to 333 ms added to every handshake retry, so peers that lost their
 /// handshakes at the same time do not retry in lockstep.
@@ -87,6 +100,8 @@ pub(super) struct Timers {
     /// Local index of the session we established as responder that the initiator has not
     /// confirmed with a data message yet.
     unconfirmed_session: Option<usize>,
+    /// Why the tunnel last expired; read only while the handshake is expired.
+    pub(super) expiry_cause: Option<ExpiryCause>,
 }
 
 impl Timers {
@@ -106,6 +121,7 @@ impl Timers {
             should_reset_rr: reset_rr,
             handshakes: 0,
             unconfirmed_session: None,
+            expiry_cause: None,
         }
     }
 
@@ -229,6 +245,13 @@ impl Tunn {
         }
     }
 
+    /// Expires the tunnel for `cause`: discards its sessions, queued packets and timers.
+    fn expire(&mut self, cause: ExpiryCause) {
+        self.handshake.set_expired();
+        self.clear_all();
+        self.timers.expiry_cause = Some(cause);
+    }
+
     /// Expires the connection when keys are too old or handshakes keep failing.
     fn check_expiry(&mut self, now: Duration) -> Result<(), WireGuardError> {
         if self.handshake.is_expired() {
@@ -243,15 +266,14 @@ impl Tunn {
         }
 
         // All ephemeral private keys and symmetric session keys are zeroed out after
-        // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
+        // (REJECT_AFTER_TIME * 3), or 540 seconds, if no new keys have been exchanged.
         if now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3 {
             tracing::debug!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
-            self.handshake.set_expired();
-            self.clear_all();
+            self.expire(ExpiryCause::SessionAge);
             return Err(WireGuardError::ConnectionExpired);
         }
 
-        // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
+        // After REKEY_ATTEMPT_TIME (90 seconds) of trying to initiate a new handshake,
         // the retries give up and cease, and clear all existing packets queued
         // up to be sent. If a packet is explicitly queued up to be sent, then
         // this timer is reset.
@@ -259,8 +281,7 @@ impl Tunn {
             && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= REKEY_ATTEMPT_TIME
         {
             tracing::debug!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-            self.handshake.set_expired();
-            self.clear_all();
+            self.expire(ExpiryCause::HandshakeTimeout);
             return Err(WireGuardError::ConnectionExpired);
         }
         Ok(())
@@ -269,7 +290,7 @@ impl Tunn {
     /// Whether a handshake initiation is due.
     fn handshake_due(&mut self, now: Duration) -> bool {
         if self.handshake.is_init_sent() {
-            // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
+            // A handshake initiation is retried after REKEY_TIMEOUT (5 seconds) plus jitter,
             // if a response has not been received, where jitter is some random
             // value between 0 and 333 ms.
             let due = now.saturating_sub(self.timers.handshake_init_sent)
@@ -295,9 +316,9 @@ impl Tunn {
         if self.timers.is_initiator() {
             // After sending a packet, if the sender was the original initiator
             // of the handshake and if the current session key is REKEY_AFTER_TIME
-            // ms old, we initiate a new handshake. If the sender was the original
+            // (120 seconds) old, we initiate a new handshake. If the sender was the original
             // responder of the handshake, it does not re-initiate a new handshake
-            // after REKEY_AFTER_TIME ms like the original initiator does.
+            // after REKEY_AFTER_TIME like the original initiator does.
             if session_established < self.timers[TimeLastDataPacketSent]
                 && session_age >= REKEY_AFTER_TIME
             {
@@ -307,7 +328,7 @@ impl Tunn {
 
             // After receiving a packet, if the receiver was the original initiator
             // of the handshake and if the current session key is REJECT_AFTER_TIME
-            // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT ms old, we initiate a new
+            // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT seconds old, we initiate a new
             // handshake.
             if session_established < self.timers[TimeLastDataPacketReceived]
                 && session_age >= REKEY_ON_RECEIVE_TIME
@@ -320,7 +341,7 @@ impl Tunn {
         }
 
         // If we have sent data to a given peer but have not received a packet from that peer
-        // for (KEEPALIVE + REKEY_TIMEOUT) ms since, we initiate a new handshake.
+        // for (KEEPALIVE_TIMEOUT + REKEY_TIMEOUT), or 15 seconds, since, we initiate a new handshake.
         if self
             .timers
             .handshake_due_from
@@ -336,7 +357,7 @@ impl Tunn {
     /// Whether a keepalive is due.
     fn keepalive_due(&mut self, now: Duration) -> bool {
         // If data has been received from a given peer, but we have not sent anything back
-        // for KEEPALIVE ms since, we send an empty packet.
+        // for KEEPALIVE_TIMEOUT (10 seconds) since, we send an empty packet.
         if self
             .timers
             .keepalive_due_from

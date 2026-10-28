@@ -48,6 +48,28 @@ impl<K: PacketSink> PacketSink for Nat64LanSink<K> {
             .retain_mut(|(_, packet)| !matches!(self.nat.forward(packet), Nat64Verdict::Drop(_)));
         self.inner.send_batch(packets).await
     }
+
+    /// Like [`send_batch`](Self::send_batch) over `inner`'s `send_batch_spent`:
+    /// the buffers of the dropped packets are appended to `spent` first, in
+    /// order, then `inner` appends its own.
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        // One pass that rotates the queue, keeping the kept packets' order.
+        for _ in 0..packets.len() {
+            let Some((from, mut packet)) = packets.pop_front() else {
+                break;
+            };
+            if matches!(self.nat.forward(&mut packet), Nat64Verdict::Drop(_)) {
+                spent.push(packet);
+            } else {
+                packets.push_back((from, packet));
+            }
+        }
+        self.inner.send_batch_spent(packets, spent).await
+    }
 }
 
 /// A [`PacketSource`] that runs [`Nat64Lan::reverse`] on every local packet

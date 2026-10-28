@@ -1,6 +1,6 @@
-//! `WssDialEvent`s of `WssDialer` and `WssStreamClient`: one event per link or session up
-//! and lost, failed dial, timeout and 401/403 rejection, in order; and the reconnect delay
-//! after a loss, apart from the failure backoff.
+//! `WssDialEvent`s of `WssDialer`: one event per link up and lost, failed dial, timeout and
+//! 401/403 rejection, in order; and the reconnect delay after a loss, apart from the failure
+//! backoff.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -10,8 +10,6 @@ use futures_util::StreamExt as _;
 use nsplane::{LinkConfig, TransportId};
 use nsplane_e2e::{TestResult, WAIT};
 use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpListener, TcpStream};
@@ -210,21 +208,14 @@ fn check_sequence(seen: &Seen, relay: &Relay) -> TestResult {
     Ok(())
 }
 
-/// The event phases both carriers run through: up, lost and up again, two 401s, two 403s,
-/// two dials to a relay that went down and a dial that times out. `dial` makes the carrier
-/// dial (the dialer dials on its own).
-async fn phases<F, D>(relay: &Relay, seen: &Seen, dial: D) -> TestResult
-where
-    D: Fn() -> F,
-    F: Future<Output = ()>,
-{
+/// The event phases the dialer runs through, redialing on its own: up, lost and up again,
+/// two 401s, two 403s, two dials to a relay that went down and a dial that times out.
+async fn phases(relay: &Relay, seen: &Seen) -> TestResult {
     use WssDialEvent::{Connected, DialFailed, Lost, Rejected, TimedOut};
 
-    dial().await;
     seen.until(Connected, 1, WAIT).await?;
     relay.kick();
     seen.until(Lost, 1, WAIT).await?;
-    dial().await;
     seen.until(Connected, 2, WAIT).await?;
 
     relay.set(Mode::Refuse(401));
@@ -237,12 +228,10 @@ where
     ] {
         relay.set(mode);
         for n in 1..=2 {
-            dial().await;
             seen.until(event, n, WAIT).await?;
         }
     }
     relay.set(Mode::Silent);
-    dial().await;
     seen.until(TimedOut, 1, WAIT).await
 }
 
@@ -260,41 +249,12 @@ async fn dialer_sends_one_event_per_occurrence() -> TestResult {
         "192.0.2.1:1000".parse()?,
         LinkConfig::default(),
     );
-    // The dialer redials on its own.
-    phases(&relay, &seen, || std::future::ready(())).await?;
+    phases(&relay, &seen).await?;
     check_sequence(&seen, &relay)?;
     // The counters keep counting across the redial.
     assert_eq!(stats.connects(), 2);
     assert!(stats.rejected_unauthorized() >= 2 && stats.rejected_forbidden() >= 2);
     drop(transport);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-async fn stream_client_sends_one_event_per_occurrence() -> TestResult {
-    let relay = Relay::start().await?;
-    let config = relay
-        .config()
-        .backoff(Duration::from_millis(20), Duration::from_millis(40));
-    let client = WssStreamClient::new(config, WssStreamLimits::default())?;
-    let seen = Seen::record(client.events());
-    phases(&relay, &seen, || {
-        let client = client.clone();
-        async move {
-            let _ = client.connect().await;
-        }
-    })
-    .await?;
-    // Each dial ended before the next began: nothing is in flight.
-    assert_eq!(seen.events(), expected(&relay.log()));
-    let stats = client.stats();
-    assert_eq!(stats.sessions(), 2);
-    assert_eq!(
-        (stats.rejected_unauthorized(), stats.rejected_forbidden()),
-        (2, 2)
-    );
-    assert_eq!(stats.connect_failures(), 7);
     Ok(())
 }
 
@@ -357,30 +317,4 @@ async fn dialer_reconnects_after_the_delay_then_backs_off_from_the_floor() -> Te
     )?;
     drop(transport);
     Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-async fn stream_client_reconnects_after_the_delay_then_backs_off_from_the_floor() -> TestResult {
-    use WssDialEvent::{Connected, Lost};
-
-    let relay = Relay::start().await?;
-    let client = WssStreamClient::new(reconnect_config(&relay), WssStreamLimits::default())?;
-    let seen = Seen::record(client.events());
-    client.connect().await?;
-    relay.kick();
-    seen.until(Lost, 1, WAIT).await?;
-    client.connect().await?;
-    seen.until(Connected, 2, WAIT).await?;
-
-    relay.set(Mode::Drop);
-    relay.kick();
-    seen.until(Lost, 2, WAIT).await?;
-    let mut failures = Vec::new();
-    for _ in 0..3 {
-        assert!(client.connect().await.is_err());
-        failures.push(Instant::now());
-    }
-    assert!(failures[0] - seen.times(Lost)[1] >= RECONNECT);
-    check_waits(seen.times(Lost)[0], seen.times(Connected)[1], &failures)
 }

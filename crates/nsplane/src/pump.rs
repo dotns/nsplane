@@ -367,6 +367,97 @@ mod tests {
         Ok(())
     }
 
+    /// A sink that records the tag and marker of every packet it takes over and appends its
+    /// buffer to `spent`.
+    #[derive(Clone, Default)]
+    struct MarkSink(Recycled);
+
+    impl MarkSink {
+        fn record(&self, packet: &PacketBuf) {
+            if let Ok(mut taken) = self.0.lock() {
+                taken.push((packet.tag(), packet.is_tracked()));
+            }
+        }
+    }
+
+    impl PacketSink for MarkSink {
+        fn send(
+            &self,
+            packet: PacketBuf,
+            _from: PeerId,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            self.record(&packet);
+            std::future::ready(Ok(()))
+        }
+
+        fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            for (_, packet) in packets.drain(..) {
+                self.record(&packet);
+                spent.push(packet);
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn marks(record: &Recycled) -> Vec<(Option<std::num::NonZeroU64>, bool)> {
+        record.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Pumps four tagged, marked packets into `sink`; returns the tags and markers the
+    /// source got back through `recycle`.
+    async fn pump_tagged(
+        sink: impl PacketSink,
+    ) -> Result<Vec<(Option<std::num::NonZeroU64>, bool)>, Box<dyn std::error::Error>> {
+        let recycled = Recycled::default();
+        let source = TaggedSource {
+            left: 4,
+            recycled: Arc::clone(&recycled),
+        };
+        assert_eq!(pump(source, sink, PeerId::new(1)).await?.packets, 4);
+        Ok(marks(&recycled))
+    }
+
+    #[tokio::test]
+    async fn wrapper_sinks_hand_spent_and_dropped_buffers_back_untagged_and_unmarked() -> TestResult
+    {
+        use crate::{AbortSink, MapSink, MapVerdict, Splitter, SwapSink};
+        let tag = std::num::NonZeroU64::new;
+        let unmarked = [(None, false); 4];
+
+        // Kept packets reach the inner sink with their tag and marker; the buffers of the
+        // ones the closure drops are spent with the inner sink's.
+        let taken = Recycled::default();
+        let sink = MapSink::new(MarkSink(Arc::clone(&taken)), |packet: &mut PacketBuf, _| {
+            if packet.tag().is_some_and(|tag| tag.get() % 2 == 0) {
+                MapVerdict::Drop
+            } else {
+                MapVerdict::Keep
+            }
+        });
+        assert_eq!(pump_tagged(sink).await?, unmarked);
+        assert_eq!(marks(&taken), [(tag(3), true), (tag(1), true)]);
+
+        // Packets an aborted sink, an empty swap slot or a splitter's misroute drops.
+        let (sink, abort) = AbortSink::new(MarkSink::default());
+        abort.abort();
+        assert_eq!(pump_tagged(sink).await?, unmarked);
+        assert_eq!(
+            pump_tagged(SwapSink::new(None::<MarkSink>)).await?,
+            unmarked
+        );
+        let taken = Recycled::default();
+        let splitter =
+            Splitter::new(|_, packet| usize::from(packet.tag().is_some_and(|tag| tag.get() > 2)))
+                .sink(MarkSink(Arc::clone(&taken)));
+        assert_eq!(pump_tagged(splitter).await?, unmarked);
+        assert_eq!(marks(&taken), [(tag(2), true), (tag(1), true)]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn default_sink_offers_nothing() -> TestResult {
         let (source, seen_log) = script(&[1, 2], true);

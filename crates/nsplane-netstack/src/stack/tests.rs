@@ -42,6 +42,7 @@ mod flow_context;
 mod flow_control;
 mod half_close;
 mod ingress_labels;
+mod labels;
 mod listener_integration;
 mod listener_pool;
 mod ownership;
@@ -49,6 +50,7 @@ mod pending;
 mod pmtu;
 mod progress;
 mod reassembly;
+mod revoke_label;
 mod rto;
 mod transparent;
 

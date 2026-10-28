@@ -48,43 +48,51 @@ impl Driver {
     }
 
     /// The egress position of the oldest packet possibly still in the egress queue.
-    fn oldest_queued(&self) -> u64 {
+    pub(super) fn oldest_queued(&self) -> u64 {
         let queued = self.egress.max_capacity() - self.egress.capacity();
         self.sent.saturating_sub(queued as u64)
     }
 
     /// Retires the flows revoked since the last turn, see [`retire`](Self::retire).
     pub(super) fn retire_revoked(&mut self) {
-        self.revocations.take(&mut self.retiring);
-        self.retiring.reverse();
+        self.revocations
+            .take(&mut self.retiring, &mut self.labels.revoking);
         // Each flow stays in `retiring` until its outcome is written, so a panic leaves the
         // rest to `Drop`, which reports them unknown.
         while let Some(flow) = self.retiring.last().cloned() {
             #[cfg(test)]
             flow.observed_in(self.turns);
-            let outcome = self.retire(&flow, true);
+            let outcome = self.retire(&flow);
             #[cfg(test)]
             flow.completed_in(self.turns);
             flow.finish(outcome);
             self.retiring.pop();
         }
+        self.retire_labels();
+    }
+
+    /// Removes a revoked flow's state and its output from the stack (see
+    /// [`remove_lifetime`](Self::remove_lifetime)) and bars its fragments the reassembler
+    /// may hold. `Failed` if the fence or the barrier table is full.
+    fn retire(&mut self, flow: &Arc<FlowState>) -> RetirementOutcome {
+        let fenced = self.remove_lifetime(flow).is_ok();
+        let barred = self.bar(flow);
+        if fenced && barred {
+            RetirementOutcome::Retired
+        } else {
+            RetirementOutcome::Failed
+        }
     }
 
     /// Removes a revoked flow's state and its output from the stack: the socket (without
-    /// an RST) or the queue entry, its packets in the backlog, a fence for those already
-    /// in the egress queue, and a barrier for its fragments the reassembler may hold.
-    /// `Failed` if the fence or the barrier table is full.
+    /// an RST) or the queue entry, its packets in the backlog, and a fence for those
+    /// already in the egress queue, returned if the fence table is full.
     ///
     /// A lifetime not handed out yet is found at its stage: the pending entry, the
     /// listener socket mid handshake, the connection waiting for `incoming_tcp`, or the
     /// flow entry.
-    pub(super) fn retire(
-        &mut self,
-        flow: &Arc<FlowState>,
-        fence_output: bool,
-    ) -> RetirementOutcome {
-        let fenced = match flow.target() {
-            Some(Target::Label(label)) => return self.retire_label(*label),
+    pub(super) fn remove_lifetime(&mut self, flow: &Arc<FlowState>) -> Result<(), Fence> {
+        match flow.target() {
             None => {
                 // Held, or accepted and dropped in `take_decisions`: no output yet.
                 if self
@@ -94,7 +102,7 @@ impl Driver {
                 {
                     self.count_pending();
                 }
-                true
+                Ok(())
             }
             Some(&Target::Tcp {
                 handle,
@@ -103,7 +111,6 @@ impl Driver {
                 start,
                 ..
             }) => {
-                let mut removed = false;
                 if self
                     .conns
                     .get(&handle)
@@ -111,15 +118,13 @@ impl Driver {
                 {
                     self.aborting.retain(|&aborting| aborting != handle);
                     self.release_conn(handle);
-                    removed = true;
                 } else if self.inbound.get(&handle).is_some_and(|inbound| {
                     inbound
                         .flow
                         .as_ref()
                         .is_some_and(|owner| Arc::ptr_eq(owner, flow))
                 }) {
-                    self.release_handshake(handle, local.port());
-                    removed = true;
+                    self.release_handshake(handle);
                     flow.set_end(self.position());
                 }
                 if let Some(index) = self.connecting.iter().position(|connecting| {
@@ -130,17 +135,15 @@ impl Driver {
                 }) {
                     let connecting = self.connecting.swap_remove(index);
                     self.sockets.remove(connecting.handle);
-                    removed = true;
+                    self.labels.release((peer, local), handle);
+                    self.device.tcp_labels.remove(&(local, peer));
                     let _ = connecting.reply.send(Err(crate::tcp::revoked()));
                     flow.set_end(self.position());
-                }
-                if removed {
-                    self.device.tcp_labels.remove(&(local, peer));
                 }
                 if !self.waiting.is_empty() {
                     self.waiting.retain(|conn| !Arc::ptr_eq(conn.flow(), flow));
                 }
-                !fence_output || self.purge_tcp(local, peer, start, flow.end())
+                self.purge_tcp(local, peer, start, flow.end())
             }
             Some(Target::UdpFlow(key)) => {
                 if self
@@ -150,7 +153,7 @@ impl Driver {
                 {
                     self.flows.remove(key);
                 }
-                !fence_output || self.purge_udp(flow)
+                self.purge_udp(flow)
             }
             Some(Target::UdpBound(local)) => {
                 if self
@@ -160,7 +163,7 @@ impl Driver {
                 {
                     self.bound.remove(local);
                 }
-                !fence_output || self.purge_udp(flow)
+                self.purge_udp(flow)
             }
             Some(Target::UdpConnected(key)) => {
                 if self
@@ -170,19 +173,13 @@ impl Driver {
                 {
                     self.connected.remove(key);
                 }
-                !fence_output || self.purge_udp(flow)
+                self.purge_udp(flow)
             }
-        };
-        let barred = !fence_output || self.bar(flow);
-        if fenced && barred {
-            RetirementOutcome::Retired
-        } else {
-            RetirementOutcome::Failed
         }
     }
 
     /// Drops the TCP packets from `local` to `peer` at egress positions in `[start, end)`
-    /// from the backlog and fences those possibly in the egress queue; `false` if the
+    /// from the backlog and fences those possibly in the egress queue; the fence if the
     /// fence table is full.
     pub(super) fn purge_tcp(
         &mut self,
@@ -190,7 +187,7 @@ impl Driver {
         peer: SocketAddr,
         start: u64,
         end: u64,
-    ) -> bool {
+    ) -> Result<(), Fence> {
         let sent = self.sent;
         let mut dropped = 0;
         for (position, packet) in (sent..).zip(self.device.tx_queue.iter_mut()) {
@@ -203,18 +200,20 @@ impl Driver {
         }
         stats::add(&self.stats.retired, dropped);
         let (start, end) = (start.max(self.oldest_queued()), end.min(sent));
-        start >= end
-            || self.fences.insert(Fence::Tcp {
-                local,
-                peer,
-                start,
-                end,
-            })
+        if start >= end {
+            return Ok(());
+        }
+        self.fences.insert(Fence::Tcp {
+            local,
+            peer,
+            start,
+            end,
+        })
     }
 
     /// Drops the UDP datagrams of `flow` from the backlog and fences those possibly in the
-    /// egress queue; `false` if the fence table is full.
-    fn purge_udp(&mut self, flow: &Arc<FlowState>) -> bool {
+    /// egress queue; the fence if the fence table is full.
+    fn purge_udp(&mut self, flow: &Arc<FlowState>) -> Result<(), Fence> {
         let (sent, oldest) = (self.sent, self.oldest_queued());
         let tx_queue = &mut self.device.tx_queue;
         let mut dropped = 0;
@@ -235,6 +234,9 @@ impl Driver {
             false
         });
         stats::add(&self.stats.retired, dropped);
-        queued.is_empty() || self.fences.insert(Fence::Udp(queued))
+        if queued.is_empty() {
+            return Ok(());
+        }
+        self.fences.insert(Fence::Udp(queued))
     }
 }

@@ -225,10 +225,9 @@ fn scenario(mode: Mode) -> Trace {
     let mut stats = Vec::new();
     for i in 0..3 {
         for j in (0..3).filter(|&j| j != i) {
-            stats.push(PeerStats {
-                public_key: PublicKey::from([0; 32]),
-                ..net.cores[i].peer_stats(net.peer_id(i, j)).unwrap()
-            });
+            let mut peer = net.cores[i].peer_stats(net.peer_id(i, j)).unwrap();
+            peer.public_key = PublicKey::from([0; 32]);
+            stats.push(peer);
         }
     }
     Trace {

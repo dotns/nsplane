@@ -81,7 +81,7 @@ impl UdpTransport {
     }
 
     /// Runs the non-blocking read `read`. With path MTU discovery on, it reads the
-    /// error queue empty first, and retries a failed read: a queued ICMP error also
+    /// first 64 queued errors at most, and retries a failed read: a queued ICMP error also
     /// fails the next read once with its error code, which is not the engine's.
     fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
         if !self.errors.discovery.load(Ordering::Relaxed) {

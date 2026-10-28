@@ -141,6 +141,13 @@ impl Driver {
                     let _ = reply.send(Ok(self.adopt(handle, now, start, flow)));
                 }
                 tcp::State::Closed => {
+                    if let Some(flow) = &flow {
+                        if let Some(&Target::Tcp { local, peer, .. }) = flow.target() {
+                            self.labels.release((peer, local), handle);
+                            self.device.tcp_labels.remove(&(local, peer));
+                        }
+                        flow.set_end(self.position());
+                    }
                     self.sockets.remove(handle);
                     let error = if now >= started + CONNECT_TIMEOUT {
                         io::Error::new(io::ErrorKind::TimedOut, "TCP handshake timed out")
@@ -197,7 +204,12 @@ impl Driver {
             }
             _ => None,
         });
-        let (flow, shared) = bound.unwrap_or_else(|| self.tcp_state(handle, local, peer, start));
+        let (flow, shared) = bound.unwrap_or_else(|| {
+            let label = self.labels.socket_label((peer, local), handle);
+            let (flow, shared) = self.tcp_state(handle, local, peer, start, label);
+            self.labels.register(&flow);
+            (flow, shared)
+        });
         self.conns.insert(
             handle,
             Conn {
@@ -227,6 +239,8 @@ impl Driver {
     /// ends undelivered.
     pub(super) fn release_inbound(&mut self) {
         let (sockets, stats, end) = (&self.sockets, &self.stats, self.position());
+        let labels = &mut self.labels;
+        let output_labels = &mut self.device.tcp_labels;
         self.inbound.retain(|&handle, inbound| {
             let failed = matches!(
                 sockets.get::<tcp::Socket<'_>>(handle).state(),
@@ -234,6 +248,8 @@ impl Driver {
             );
             if failed {
                 stats::add(&stats.handshake_failed, 1);
+                labels.release(inbound.tuple, handle);
+                output_labels.remove(&(inbound.tuple.1, inbound.tuple.0));
                 if let Some(flow) = &inbound.flow {
                     flow.set_end(end);
                     flow.undeliver(Undelivered::HandshakeFailed);
@@ -243,10 +259,17 @@ impl Driver {
         });
     }
 
-    /// Removes the listener socket `handle` of `port` mid handshake, without an RST: a
-    /// revoked lifetime.
-    pub(super) fn release_handshake(&mut self, handle: SocketHandle, port: u16) {
-        self.inbound.remove(&handle);
+    /// Removes the listener socket `handle` mid handshake, without an RST: a revoked
+    /// lifetime.
+    pub(super) fn release_handshake(&mut self, handle: SocketHandle) {
+        let Some(inbound) = self.inbound.remove(&handle) else {
+            return;
+        };
+        self.labels.release(inbound.tuple, handle);
+        self.device
+            .tcp_labels
+            .remove(&(inbound.tuple.1, inbound.tuple.0));
+        let port = inbound.tuple.1.port();
         if let Some(handles) = self.listeners.get_mut(&port) {
             handles.retain(|&listener| listener != handle);
             if handles.is_empty() {
@@ -287,18 +310,8 @@ impl Driver {
                     let flow = self
                         .pending
                         .as_mut()
-                        .and_then(|table| table.take_admitted(local, remote))
-                        .or_else(|| {
-                            self.device
-                                .tcp_labels
-                                .get(&(local, remote))
-                                .copied()
-                                .flatten()
-                                .map(|_| self.tcp_state(handle, local, remote, mark).0)
-                        });
-                    if let Some(flow) = &flow
-                        && flow.target().is_none()
-                    {
+                        .and_then(|table| table.take_admitted(local, remote));
+                    if let Some(flow) = &flow {
                         flow.bind(Target::Tcp {
                             handle,
                             shared: Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer))),
@@ -308,10 +321,12 @@ impl Driver {
                         });
                     }
                     let registration = self.owners.tcp(local, remote);
+                    self.labels.bind_socket((remote, local), handle);
                     self.inbound.insert(
                         handle,
                         Inbound {
                             registration,
+                            tuple: (remote, local),
                             start: mark,
                             flow,
                         },
@@ -319,6 +334,7 @@ impl Driver {
                 }
             }
         }
+        self.labels.expire_syns(&mut self.device.tcp_labels);
         let Some(refused) = self.pending.as_mut().map(|table| table.take_refused()) else {
             return;
         };
@@ -328,7 +344,9 @@ impl Driver {
             }
             // Revoked during this turn: smoltcp's RST for the SYN goes too.
             if let Some(key) = flow.held_key()
-                && !self.purge_tcp(key.local, key.remote, mark, self.position())
+                && self
+                    .purge_tcp(key.local, key.remote, mark, self.position())
+                    .is_err()
             {
                 flow.finish(RetirementOutcome::Failed);
             }

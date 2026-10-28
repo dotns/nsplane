@@ -124,9 +124,17 @@ fn stub_response(request: &[u8], pad: usize) -> Vec<u8> {
 /// A stub upstream on UDP and TCP of one port; every message it receives is reported on the
 /// channel and answered with [`stub_response`].
 async fn stub_upstream(pad: usize) -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>) {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
+    // TCP and UDP allocate ports independently. Keep the listener while trying UDP,
+    // and retry only allocation conflicts before starting either serving task.
+    let (tcp, udp, addr) = loop {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        match UdpSocket::bind(addr).await {
+            Ok(udp) => break (tcp, udp, addr),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("bind stub UDP socket: {error}"),
+        }
+    };
     let (seen, received) = mpsc::unbounded_channel();
     let udp_seen = seen.clone();
     tokio::spawn(async move {

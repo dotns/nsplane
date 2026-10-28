@@ -1,7 +1,9 @@
 //! Sans-I/O WireGuard engine core for the nsplane data plane.
 //!
-//! The [`Core`] performs no I/O and keeps no clock of its own: datagrams and local packets go
-//! in, datagrams to transmit, decrypted packets to deliver and events come out. Path selection
+//! The [`Core`] performs no packet I/O and schedules timers from caller-supplied time.
+//! The Noise dependency still reads clocks for timestamps, cookies and RTT measurements.
+//! Datagrams and local packets go in; datagrams to transmit, decrypted packets to deliver
+//! and events come out. Path selection
 //! and roaming are delegated to a [`PathPolicy`]; local packet rewriting and interception to
 //! [`PacketFilter`]s.
 //!
@@ -12,6 +14,10 @@
 //! Buffers the driver is done with go back through [`Core::recycle`]. A driver that reads
 //! datagrams or local packets in batches feeds them with [`Core::handle_datagrams`] and
 //! [`Core::handle_locals`], which share the dispatch work across the batch.
+//!
+//! A peer marked with [`Core::set_plaintext_egress`] gets its routed local packets as
+//! `Output::Plaintext` instead of sealed, and a tracked local packet (tagged, with its
+//! receipt marker set) gets one `Output::Tracked` with what became of it.
 //!
 //! A driver that encrypts and decrypts on several threads builds the core with
 //! [`CoreConfig::crypto_jobs`] and feeds inputs with [`Core::handle_input_deferred`] instead:
@@ -35,11 +41,12 @@ mod types;
 pub use crate::core::Core;
 pub use filter::{PacketFilter, Verdict};
 pub use job::CryptoJob;
+pub use nsplane_noise::noise::ExpiryCause;
 pub use nsplane_noise::{noise, x25519};
 pub use nsplane_packet::PacketBuf;
 pub use nsplane_packet::{Ecn, Path, PeerId, TransportId};
 pub use policy::{MessageKind, PathPolicy, Roam, StandardRoaming};
 pub use types::{
     AllowedIp, ConfigChange, CoreConfig, Event, InboundDestinations, Input, LocalIdentityId,
-    LocalIdentityInfo, Output, PeerConfig, PeerStats,
+    LocalIdentityInfo, Output, PeerConfig, PeerStats, TrackedOutcome,
 };

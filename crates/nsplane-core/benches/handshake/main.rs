@@ -103,7 +103,7 @@ fn receive(core: &mut Core, data: PacketBuf) -> Result<PacketBuf, &'static str> 
             Output::Transmit { data, .. } => answer = Ok(data),
             Output::Event(Event::Dropped { reason, .. }) => answer = Err(reason),
             Output::Deliver { packet, .. } => core.recycle(packet),
-            Output::Event(_) => {}
+            _ => {}
         }
     }
     answer

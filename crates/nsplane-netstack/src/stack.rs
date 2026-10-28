@@ -29,6 +29,7 @@ use self::accept::Connecting;
 use self::connections::Conn;
 use self::fragments::Barrier;
 use self::handle::Command;
+use self::labels::Labels;
 use self::listeners::{Pool, prepare_tcp_listeners};
 
 mod accept;
@@ -59,8 +60,6 @@ const EGRESS_BACKLOG: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// Longest the driver sleeps without a timer from smoltcp.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
-/// Minimum spacing between bounded label-registry maintenance passes.
-const LABEL_SWEEP_INTERVAL: SmolDuration = SmolDuration::from_millis(50);
 /// Maximum interval without application payload in either direction of a connection.
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
@@ -80,6 +79,8 @@ type Inbox<T> = (mpsc::Sender<T>, Arc<FlowState>);
 struct Inbound {
     /// Keeps the tuple visible to `owns` while the handshake runs.
     registration: Registration,
+    /// `(remote, local)`.
+    tuple: (SocketAddr, SocketAddr),
     /// The egress position when the socket took the SYN.
     start: u64,
     /// The lifetime of a SYN accepted under `Admission::Decide`, its target bound to the
@@ -89,7 +90,6 @@ struct Inbound {
 
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
-    labels: labels::Labels,
     settings: Settings,
     iface: Interface,
     device: VirtualDevice,
@@ -143,9 +143,9 @@ struct Driver {
     /// The reassembler's counts already added to `stats`.
     reassembly_counted: ReassemblyStats,
     revocations: Arc<Revocations>,
-    next_label_sweep: SmolInstant,
     /// Revoked flows taken in this turn and not retired yet; empty between turns.
     retiring: Vec<Arc<FlowState>>,
+    labels: Labels,
     /// Packets moved from the backlog into the egress queue. The packet at `tx_queue[i]`
     /// has egress position `sent + i`; positions never change, as packets dropped from the
     /// backlog leave an empty placeholder the source discards.
@@ -176,7 +176,8 @@ impl Drop for Driver {
         if let Some(table) = self.pending.as_mut() {
             table.stop();
         }
-        self.revocations.close(&mut self.retiring);
+        self.revocations
+            .close(&mut self.retiring, &mut self.labels.revoking);
         for conn in self.conns.values() {
             conn.release();
         }
@@ -220,10 +221,6 @@ impl Driver {
         // every SYN in the batch up front: sizing it against the current state would leave
         // the 2nd..Nth simultaneous SYN without a socket to land on.
         let now = self.now();
-        if now >= self.next_label_sweep {
-            self.revocations.sweep_labeled();
-            self.next_label_sweep = now + LABEL_SWEEP_INTERVAL;
-        }
         // Before the pool reclaims sockets that left the handshake.
         self.release_inbound();
         let mark = self.position();
@@ -261,10 +258,6 @@ impl Driver {
             self.preserve_all(now);
         }
         self.release_aborted();
-        // At most the live TCP tuples plus this turn's bounded SYN batch are retained.
-        self.device.tcp_labels.retain(|&(local, remote), label| {
-            label.is_some() && self.owners.has_tcp(local, remote)
-        });
 
         // 5. Egress, then wait for more work.
         self.flush_egress() && self.wait(now).await

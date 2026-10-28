@@ -1,7 +1,7 @@
 //! Receiving through `quinn-udp`, with generic receive offload: one read may return a
 //! train of datagrams of one sender, all of one size (the stride) but the last. Without
 //! `quinn-udp` state, `recvmsg` / `sendmsg` with TOS and traffic class control messages.
-//! With path MTU discovery on, every read first reads the error queue empty.
+//! With path MTU discovery on, each read attempt first consumes at most 64 queued errors.
 
 mod pmtu;
 mod recv;

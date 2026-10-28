@@ -46,7 +46,9 @@ pub struct AclFilterConfig {
     /// Maximum number of reply allowances (at least 1). When full, the least
     /// recently seen entry is evicted. Default 4096.
     pub reply_capacity: usize,
-    /// How long a reply allowance lives without traffic. Default 120 s.
+    /// How long a reply allowance lives without traffic, on the engine clock
+    /// ([`AclEngine::with_clock`]); with the default clock it is accurate to
+    /// one scheduler tick (1 to 4 ms) on Linux and Android. Default 120 s.
     pub reply_idle_timeout: Duration,
     /// How inbound non-first IPv4 fragments are gated. Default
     /// [`FragmentMode::Outcome`].
@@ -174,8 +176,8 @@ pub struct AclFilterStats {
     /// Outbound packets to outbound-restricted peers accepted as replies to
     /// accepted inbound flows.
     pub outbound_replies: u64,
-    /// Reply-table entries removed because what they depended on (a grant or
-    /// a pinhole) is gone.
+    /// Flow continuations removed because their grant, pinhole, rule or default-accept
+    /// decision no longer admits them.
     pub reply_revoked: u64,
     /// Pending-dependency entries (the dependency of an inbound flow accepted
     /// through a grant, a pinhole or a dependent allowance) evicted because

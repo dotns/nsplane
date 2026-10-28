@@ -54,5 +54,9 @@ pub trait PacketFilter: Send + Sync + 'static {
     }
 
     /// Local packet routed to `peer`, before it is encrypted. May rewrite it in place.
+    ///
+    /// The filter sees the packet's tag and may set it. The receipt marker is not the
+    /// filter's: after the chain the core restores the tag and the marker of a tracked
+    /// packet and clears a marker set on any other packet.
     fn outbound(&self, peer: PeerId, packet: &mut PacketBuf) -> Verdict;
 }

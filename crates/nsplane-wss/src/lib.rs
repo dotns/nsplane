@@ -1,21 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! WebSocket-over-TLS (WSS) carriers for nsplane.
+//! WebSocket-over-TLS (WSS) carriers for nsplane:
 //!
-//! The dialing carriers share one connection setup ([`WssConfig`]):
-//!
-//! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport),
-//!   below.
-//! - [`WssStreamClient`], the stream carrier (deprecated): TCP streams ([`WssTcpStream`])
-//!   and UDP flows ([`WssUdpFlow`]) to targets behind a WSS server, multiplexed over
-//!   sessions with the `WsFrame` protocol of the [`frame`] module.
-//! - [`WssStreamServer`], the server side of that protocol (deprecated): it dials the relay
-//!   too and relays each opened stream to the backend a [`WssResolver`] picks.
-//!
-//! [`WssServerTransport`] is the server side of [`WssDialer`]'s links: a transport over
-//! the WebSocket sessions the embedder accepts (see [below](#server-transport)).
-//!
-//! The stream carrier is deprecated; a WireGuard peer over [`WssDialer`] replaces it.
+//! - [`WssDialer`], the datagram carrier for [`LinkTransport`](nsplane::LinkTransport): it
+//!   dials the WSS connections a [`WssConfig`] describes (below).
+//! - [`WssServerTransport`], the server side of [`WssDialer`]'s links: a transport over the
+//!   WebSocket sessions the embedder accepts (see [below](#server-transport)).
 //!
 //! [`WssDialer`] is a [`LinkDialer`](nsplane::LinkDialer) for
 //! [`LinkTransport`](nsplane::LinkTransport): each link is one WSS connection, and each
@@ -40,14 +30,12 @@
 //!   link that came up ([`WssConfig::backoff_min`] when unset), and after a failed dial
 //!   [`WssConfig::backoff_min`], doubled after each further failure up to
 //!   [`WssConfig::backoff_max`]. Without a reconnect delay, the wait after a link is the
-//!   first step of that doubling. A [`WssStreamClient`] open waits for that dial unless
-//!   [`WssStreamLimits::open_timeout`] is set; past it the open fails with the last dial
-//!   error while the dial goes on.
+//!   first step of that doubling.
 //! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`], or never
 //!   when it is zero ([`WssConfig::ping_interval(None)`](WssConfig::ping_interval)); the
 //!   receiving half ends the link when no frame at all (pongs included) arrived for
 //!   [`WssConfig::read_idle`].
-//! - **Events**: [`WssDialer::events`] (and [`WssStreamClient::events`]) receive one
+//! - **Events**: [`WssDialer::events`] receives one
 //!   [`WssDialEvent`] per link that came up or was lost, failed dial, dial timeout and
 //!   401/403 rejection, on a broadcast channel of [`WssDialEvent::CAPACITY`] events.
 //! - **Messages**: text messages and binary messages longer than [`MAX_DATAGRAM`] are
@@ -120,75 +108,11 @@
 //! }
 //! # }
 //! ```
-//!
-//! The stream carrier on the same kind of configuration:
-//!
-//! ```no_run
-//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
-//! use nsplane_wss::{WssConfig, WssStreamClient, WssStreamLimits, WssTls};
-//! use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-//!
-//! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
-//! let config = WssConfig::new("wss://gateway.example/client", WssTls::Roots(roots));
-//! let client = WssStreamClient::new(config, WssStreamLimits::default())?;
-//!
-//! let mut stream = client.open_tcp("10.0.0.2:80".parse().unwrap()).await?;
-//! stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
-//! stream.shutdown().await?;
-//! let mut reply = Vec::new();
-//! stream.read_to_end(&mut reply).await?;
-//!
-//! let mut dns = client.open_udp("10.0.0.2:53".parse().unwrap()).await?;
-//! dns.send(b"query").await?;
-//! let answer = dns.recv().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! The server side, on its own configuration:
-//!
-//! ```no_run
-//! # #![allow(deprecated, reason = "an example of the deprecated stream carrier")]
-//! use std::net::SocketAddr;
-//! use std::sync::Arc;
-//!
-//! use nsplane::BoxFuture;
-//! use nsplane_wss::{
-//!     Denied, WssConfig, WssOpen, WssResolver, WssServerLimits, WssStreamServer, WssTls,
-//! };
-//!
-//! /// Serves only port 80, on a local backend.
-//! struct Web;
-//!
-//! impl WssResolver for Web {
-//!     fn resolve(&self, open: WssOpen) -> BoxFuture<'_, Result<SocketAddr, Denied>> {
-//!         let backend = if open.target.port() == 80 {
-//!             Ok(SocketAddr::from(([127, 0, 0, 1], 8080)))
-//!         } else {
-//!             Err(Denied)
-//!         };
-//!         Box::pin(std::future::ready(backend))
-//!     }
-//! }
-//!
-//! # async fn run(roots: rustls::RootCertStore) -> std::io::Result<()> {
-//! let config = WssConfig::new("wss://relay.example/server", WssTls::Roots(roots));
-//! let server = WssStreamServer::new(config, WssServerLimits::default(), Arc::new(Web))?;
-//! let stats = server.stats();
-//! let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-//! // `stop.send(())`, or dropping `stop`, ends the run.
-//! server.run(async { let _ = stopped.await; }).await;
-//! # Ok(())
-//! # }
-//! ```
 
 mod accept;
 mod config;
 mod connect;
 mod dialer;
-pub mod frame;
-mod server;
-mod stream;
 
 pub use accept::{
     WssAcceptor, WssServerConfig, WssServerTransport, WssServerTransportStats, WssSession,
@@ -197,18 +121,9 @@ pub use accept::{
 pub use config::{BearerProvider, WssConfig, WssTls};
 pub use connect::{WssDialError, WssDialEvent};
 pub use dialer::{WssDialer, WssStats};
-#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
-pub use server::{
-    Denied, WssCloseReason, WssOpen, WssResolver, WssServerLimits, WssServerStats, WssStreamEvent,
-    WssStreamEventKind, WssStreamServer,
-};
-#[expect(deprecated, reason = "re-exports of the deprecated stream carrier")]
-pub use stream::{
-    MAX_DATA_PAYLOAD, WssStreamClient, WssStreamLimits, WssStreamStats, WssTcpStream, WssUdpFlow,
-};
 
-/// The longest datagram a message (or a UDP flow's DATA frame) may carry; longer ones are
-/// dropped and counted, or refused on send.
+/// The longest datagram a message may carry; longer ones are dropped and counted, or
+/// refused on send.
 pub const MAX_DATAGRAM: usize = 65_535;
 
 /// The longest WebSocket message or frame read at all; a longer one ends the link or

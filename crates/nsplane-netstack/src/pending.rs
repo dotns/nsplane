@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -72,11 +73,6 @@ pub struct PendingFlow {
 }
 
 impl PendingFlow {
-    /// The immutable label of the input held for this lifetime.
-    pub fn ingress_label(&self) -> Option<std::num::NonZeroU64> {
-        self.state.ingress_label()
-    }
-
     /// TCP or UDP.
     pub const fn protocol(&self) -> PendingProtocol {
         self.key.protocol
@@ -91,6 +87,13 @@ impl PendingFlow {
     /// which the connection or flow keeps as its local address.
     pub const fn local_addr(&self) -> SocketAddr {
         self.key.local
+    }
+
+    /// The ingress label of the held SYN or datagram, which the connection or flow keeps
+    /// (see [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label)); `None`
+    /// for unlabeled input.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.state.label()
     }
 
     /// The control of this connection's or flow's lifetime, from its first input on.
@@ -166,11 +169,13 @@ pub(crate) enum Held {
     Udp {
         payload: Bytes,
         packet: Bytes,
-        label: Option<std::num::NonZeroU64>,
+        label: Option<NonZeroU64>,
     },
 }
 
 impl Held {
+    /// The packet that answers a rejection, sourced from the original destination: a RST
+    /// for a SYN, a port unreachable for a datagram.
     pub(crate) const fn label(&self) -> Option<std::num::NonZeroU64> {
         match self {
             Self::Tcp(packet) => packet.tag(),
@@ -200,8 +205,8 @@ struct Entry {
 /// What [`Pending::hold`] did with a packet.
 #[derive(Debug)]
 pub(crate) enum Hold {
-    /// Held and offered to the application.
-    Held,
+    /// Held and offered to the application, with the state of its lifetime.
+    Held(Arc<FlowState>),
     /// Not held; reject it at once.
     Full(Held),
     /// Not held: the application's stream is gone; reject it at once.
@@ -277,24 +282,27 @@ impl Pending {
         self.entries.len()
     }
 
-    /// Whether `key` is held.
-    pub(crate) fn contains(&self, key: &Key) -> bool {
-        self.entries.contains_key(key)
-    }
-
+    /// The lifetime held for `key`, if `key` is held.
     pub(crate) fn lifetime(&self, key: &Key) -> Option<&FlowState> {
-        self.entries.get(key).map(|entry| entry.state.as_ref())
+        self.entries.get(key).map(|entry| &*entry.state)
     }
 
     /// Holds `held` for `key`, which is not held, until a decision or `now + timeout`,
-    /// offering it to the application with the state of a new lifetime.
-    pub(crate) fn hold(&mut self, key: Key, held: Held, now: Instant) -> Hold {
+    /// offering it to the application with the state of a new lifetime with the ingress
+    /// `label`.
+    pub(crate) fn hold(
+        &mut self,
+        key: Key,
+        held: Held,
+        label: Option<NonZeroU64>,
+        now: Instant,
+    ) -> Hold {
         if self.entries.len() >= self.max {
             return Hold::Full(held);
         }
         let id = self.next_id;
         self.next_id += 1;
-        let state = FlowState::held(key, held.label(), &self.revocations);
+        let state = FlowState::held(key, label, &self.revocations);
         let item = PendingFlow {
             key,
             id,
@@ -315,14 +323,21 @@ impl Pending {
             };
         }
         self.track(&state);
-        self.entries.insert(key, Entry { id, held, state });
+        self.entries.insert(
+            key,
+            Entry {
+                id,
+                held,
+                state: Arc::clone(&state),
+            },
+        );
         if self.deadlines.len() >= self.max.saturating_mul(2) {
             let entries = &self.entries;
             self.deadlines
                 .retain(|(_, key, id)| entries.get(key).is_some_and(|entry| entry.id == *id));
         }
         self.deadlines.push_back((now + self.timeout, key, id));
-        Hold::Held
+        Hold::Held(state)
     }
 
     /// The next decision whose entry is still held, with what it holds and its lifetime;

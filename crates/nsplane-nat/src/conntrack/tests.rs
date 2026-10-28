@@ -1,5 +1,4 @@
-//! Tests of the conntrack table, adapted from ns `conntrack/table/tests.rs`
-//! with a hand-moved clock instead of a background sweeper.
+//! Tests of the conntrack table with a caller-controlled clock.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};

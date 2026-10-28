@@ -21,6 +21,8 @@ enum Wake {
     Command(Option<Command>),
     Datagram(Option<Datagram>),
     Local(Option<PacketBuf>),
+    /// A packet of the tracked sender.
+    Tracked(Option<PacketBuf>),
     Mtu(Option<u16>),
     /// A transport reported a path MTU.
     PathMtu(Option<PathMtuReport>),
@@ -53,6 +55,7 @@ impl Owner {
             let droppable = matches!(
                 wake,
                 Wake::Local(_)
+                    | Wake::Tracked(_)
                     | Wake::Datagram(_)
                     | Wake::Plaintext(_)
                     | Wake::Crypto(_)
@@ -80,6 +83,9 @@ impl Owner {
                     self.local = None;
                     self.pass_barriers();
                 }
+                Wake::Tracked(Some(packet)) => self.input_tracked(packet),
+                // The receipts keep a sender while the owner task runs.
+                Wake::Tracked(None) => self.tracked = None,
                 Wake::Plaintext(Some(packet)) => self.input_plaintext(packet),
                 Wake::Plaintext(None) => self.plaintext = None,
                 Wake::Mtu(Some(mtu)) => {
@@ -101,9 +107,14 @@ impl Owner {
                         && let Some(datagram) = slot.pending.pop_front()
                     {
                         permit.forget();
+                        let tracked = datagram.1.is_tracked();
                         slot.staged.push(datagram);
                         self.staged = true;
                         self.high_water.transmit.record(slot.queued());
+                        // A tracked datagram ends the message that carries it.
+                        if tracked {
+                            self.hand_over();
+                        }
                     }
                     self.move_pending(id);
                 }
@@ -263,14 +274,41 @@ impl Owner {
         Poll::Pending
     }
 
-    /// Polls the source queue, unless there is no room for local packets
-    /// ([`Owner::local_room`]).
+    /// Polls the source queue, and the tracked sender's if built, unless there is no room
+    /// for local packets ([`Owner::local_room`]).
     fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
-        let full = self.local_room() == 0;
-        match &mut self.local {
-            Some(local) if !full => local.poll_recv(cx).map(Wake::Local),
-            _ => Poll::Pending,
+        if self.local_room() == 0 {
+            return Poll::Pending;
         }
+        if self.tracked.is_some() {
+            return self.poll_local_and_tracked(cx);
+        }
+        self.local
+            .as_mut()
+            .map_or(Poll::Pending, |local| local.poll_recv(cx).map(Wake::Local))
+    }
+
+    /// Polls the source queue and the tracked sender's, alternating which comes first.
+    #[cold]
+    fn poll_local_and_tracked(&mut self, cx: &mut Context<'_>) -> Poll<Wake> {
+        let Some(tracked) = &mut self.tracked else {
+            return Poll::Pending;
+        };
+        tracked.first = !tracked.first;
+        if tracked.first
+            && let Poll::Ready(packet) = tracked.packets.poll_recv(cx)
+        {
+            return Poll::Ready(Wake::Tracked(packet));
+        }
+        if let Some(local) = &mut self.local
+            && let Poll::Ready(packet) = local.poll_recv(cx)
+        {
+            return Poll::Ready(Wake::Local(packet));
+        }
+        if tracked.first {
+            return Poll::Pending;
+        }
+        tracked.packets.poll_recv(cx).map(Wake::Tracked)
     }
 
     /// Arms the timer for the core's next timeout or, if earlier, the next expiry of a

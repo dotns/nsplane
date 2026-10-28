@@ -1,14 +1,15 @@
-//! The default clock of the gate: the kernel's coarse monotonic clock on Linux
-//! and Android (one scheduler tick, 1 to 4 ms, of resolution at a fraction of
-//! the cost of [`Instant::now`]), which the second-scale flow and fragment
-//! timeouts do not notice; [`Instant::now`] elsewhere.
+//! The default clock of the flow gate and the engine: the kernel's coarse
+//! monotonic clock on Linux and Android (one scheduler tick, 1 to 4 ms, of
+//! resolution at a fraction of the cost of [`Instant::now`]), which the
+//! second-scale flow, fragment, reply and pinhole timeouts do not notice;
+//! [`Instant::now`] elsewhere.
 
 use std::time::Instant;
 
 /// The coarse clock as an [`Instant`]: the time of the first read plus the
 /// coarse time since, so it advances with the monotonic clock.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(super) fn coarse() -> impl Fn() -> Instant + Send + Sync + 'static {
+pub(crate) fn coarse() -> impl Fn() -> Instant + Send + Sync + 'static {
     use std::time::Duration;
 
     use nix::time::{ClockId, clock_gettime};
@@ -29,7 +30,7 @@ pub(super) fn coarse() -> impl Fn() -> Instant + Send + Sync + 'static {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub(super) fn coarse() -> impl Fn() -> Instant + Send + Sync + 'static {
+pub(crate) fn coarse() -> impl Fn() -> Instant + Send + Sync + 'static {
     Instant::now
 }
 

@@ -15,11 +15,12 @@
 //! transport's ceiling and its learned MTU less the IP (20 for IPv4 and IPv4-mapped, 40 for
 //! IPv6) and UDP (8) headers, and 32 is the transport data message's overhead. A path
 //! without a ceiling leaves the source MTU, and a ceiling never takes the inner MTU below
-//! the IPv6 minimum of 1280. A path MTU of 1500 over IPv6 gives 1420. Once the engine keeps
-//! this state, the padding of every peer's data stops at its inner MTU
-//! ([`Core::set_peer_pad_limit`]), as the kernel pads to the MTU, so a packet at the inner
-//! MTU makes an outer packet of at most the path MTU (earlier, padding to a multiple of 16
-//! bytes could overshoot it by up to 15). Without this state the padding is unchanged.
+//! the IPv6 minimum of 1280. A path MTU of 1500 over IPv6 gives 1420. Installing a ceiling
+//! or lowering a learned MTU recomputes each peer's padding limit at its inner MTU
+//! ([`Core::set_peer_pad_limit`]). An ignored first report creates the table without
+//! installing padding limits by itself. A packet at its inner MTU fits the path only
+//! when the outer ceiling can carry the 1280-byte inner floor plus encapsulation headers.
+//! Without this state the padding is unchanged.
 //!
 //! The inner MTU reaches the local kernel or stack only through the fragmentation stage
 //! ([`EngineBuilder::fragmenter`]: Packet Too Big, Fragmentation Needed and fragments sized

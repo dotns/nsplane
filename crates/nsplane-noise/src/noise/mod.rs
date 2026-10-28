@@ -13,6 +13,7 @@ mod timers;
 mod wire;
 
 pub use session::{OpenTicket, SealTicket};
+pub use timers::ExpiryCause;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -226,6 +227,17 @@ impl Tunn {
     /// Returns whether the tunnel gave up on handshakes and needs to be recreated.
     pub const fn is_expired(&self) -> bool {
         self.handshake.is_expired()
+    }
+
+    /// Why the tunnel expired, while it is expired ([`Tunn::is_expired`]); `None` otherwise.
+    ///
+    /// The next handshake initiation, which leaves the expired state, clears it.
+    pub const fn expiry_cause(&self) -> Option<ExpiryCause> {
+        if self.handshake.is_expired() {
+            self.timers.expiry_cause
+        } else {
+            None
+        }
     }
 
     /// Returns the destination address of an IP packet.
@@ -533,6 +545,12 @@ impl Tunn {
     /// Receives a UDP datagram from the network and parses it.
     /// Returns `TunnResult`.
     ///
+    /// Decrypted IPv4 requires IHL >= 5 and header length <= total length <= buffer length;
+    /// IPv6 requires its 40-byte header plus declared payload to fit. Padding is trimmed.
+    /// Invalid IP bounds return [`WireGuardError::InvalidPacket`] without increasing
+    /// received data bytes or the data-received timer. Authenticated transport timers,
+    /// session confirmation and replay state still advance. Empty plaintext is a keepalive.
+    ///
     /// If the result is of type `TunnResult::WriteToNetwork`, should repeat the call with empty datagram,
     /// until `TunnResult::Done` is returned. If batch processing packets, it is OK to defer until last
     /// packet is processed.
@@ -729,6 +747,7 @@ impl Tunn {
 
         if self.handshake.is_expired() {
             self.timers.clear();
+            self.timers.expiry_cause = None;
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
@@ -749,8 +768,10 @@ impl Tunn {
         }
     }
 
-    /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
-    /// Returns the truncated packet and the source IP as `TunnResult`
+    /// Validates IP header bounds and trims padding to the declared packet length.
+    /// IPv4 requires IHL >= 5 and header length <= total length <= buffer length.
+    /// IPv6 requires its fixed header plus declared payload to fit the buffer.
+    /// Empty plaintext is a keepalive; invalid packets do not count as received data.
     fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => return TunnResult::Done, // This is keepalive, and not an error
@@ -759,7 +780,12 @@ impl Tunn {
                 array_at::<IPV4_IP_SZ>(packet, IPV4_SRC_IP_OFF),
             ) {
                 (Some(len), Some(addr)) => {
-                    (usize::from(u16::from_be_bytes(*len)), IpAddr::from(*addr))
+                    let total_len = usize::from(u16::from_be_bytes(*len));
+                    let header_len = usize::from(packet[0] & 0x0f) * 4;
+                    if header_len < IPV4_MIN_HEADER_SIZE || header_len > total_len {
+                        return TunnResult::Err(WireGuardError::InvalidPacket);
+                    }
+                    (total_len, IpAddr::from(*addr))
                 }
                 _ => return TunnResult::Err(WireGuardError::InvalidPacket),
             },
@@ -880,7 +906,9 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
-    use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
+    use crate::noise::timers::{
+        REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
+    };
 
     use super::*;
     use rand_core::{OsRng, RngCore};
@@ -963,6 +991,113 @@ mod tests {
         let mut packet = Vec::<u8>::with_capacity(header.size(payload.len()));
         header.write(&mut packet, &payload).unwrap();
         packet
+    }
+
+    #[test]
+    fn decapsulated_ipv4_rejects_invalid_header_bounds() {
+        let (mut sender, mut receiver) = create_two_tuns_and_handshake();
+        let mut cases = Vec::new();
+        for ihl in 0..5 {
+            cases.push((ihl, 20_u16));
+        }
+        cases.extend([(5, 0), (5, 19), (6, 20), (15, 59), (5, 65)]);
+        for mode in 0..3 {
+            for &(ihl, total) in &cases {
+                let mut packet = [0_u8; 64];
+                packet[0] = 0x40 | ihl;
+                packet[2..4].copy_from_slice(&total.to_be_bytes());
+                let mut wire = [0_u8; 256];
+                let TunnResult::WriteToNetwork(data) = sender.encapsulate(&packet, &mut wire)
+                else {
+                    panic!("expected encrypted data");
+                };
+                let len = data.len();
+                let mut output = [0_u8; 256];
+                receiver.timers[TimerName::TimeCurrent] = std::time::Duration::from_secs(7);
+                let before = receiver.timers[TimerName::TimeLastDataPacketReceived];
+                let rx_before = receiver.rx_bytes;
+                let result = match mode {
+                    0 => receiver.decapsulate(None, &wire[..len], &mut output),
+                    1 => receiver.decapsulate_in_place(None, &mut wire, len),
+                    _ => {
+                        let ticket = receiver.open_ticket(&wire[..len]).unwrap();
+                        let plain_len = ticket.open(&mut wire[..len]).unwrap();
+                        receiver.commit_open(&ticket, &mut wire[..len], plain_len)
+                    }
+                };
+                assert!(
+                    matches!(result, TunnResult::Err(WireGuardError::InvalidPacket)),
+                    "mode={mode}, IHL={ihl}, total={total}: {result:?}"
+                );
+                assert_eq!(receiver.rx_bytes, rx_before);
+                assert_eq!(
+                    receiver.timers[TimerName::TimeLastDataPacketReceived],
+                    before
+                );
+                assert_eq!(
+                    receiver.timers[TimerName::TimeLastPacketReceived],
+                    receiver.timers[TimerName::TimeCurrent]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decapsulated_ipv4_accepts_options_and_trims_padding() {
+        let (mut receiver, _) = create_two_tuns();
+        for (ihl, total) in [(5, 20_u16), (6, 24), (6, 28), (15, 60)] {
+            let mut packet = [0_u8; 64];
+            packet[0] = 0x40 | ihl;
+            packet[2..4].copy_from_slice(&total.to_be_bytes());
+            packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            // Zero-filled options are End of Option List and padding.
+            let before = receiver.rx_bytes;
+            receiver.timers[TimerName::TimeCurrent] = std::time::Duration::from_secs(7);
+            let TunnResult::WriteToTunnelV4(delivered, src) =
+                receiver.validate_decapsulated_packet(&mut packet)
+            else {
+                panic!("expected IPv4 delivery");
+            };
+            assert_eq!(delivered.len(), usize::from(total));
+            assert_eq!(src, Ipv4Addr::new(192, 0, 2, 1));
+            assert_eq!(receiver.rx_bytes, before + usize::from(total));
+            assert_eq!(
+                receiver.timers[TimerName::TimeLastDataPacketReceived],
+                receiver.timers[TimerName::TimeCurrent]
+            );
+        }
+    }
+
+    #[test]
+    fn decapsulated_keepalive_and_ipv6_bounds_are_unchanged() {
+        let (mut receiver, _) = create_two_tuns();
+        receiver.timers[TimerName::TimeCurrent] = std::time::Duration::from_secs(7);
+        assert!(matches!(
+            receiver.validate_decapsulated_packet(&mut []),
+            TunnResult::Done
+        ));
+        assert_eq!(receiver.rx_bytes, 0);
+        assert_eq!(
+            receiver.timers[TimerName::TimeLastDataPacketReceived],
+            std::time::Duration::ZERO
+        );
+        let mut packet = [0_u8; 48];
+        packet[0] = 0x60;
+        for payload_len in [0_u16, 8] {
+            packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+            let TunnResult::WriteToTunnelV6(delivered, _) =
+                receiver.validate_decapsulated_packet(&mut packet)
+            else {
+                panic!("expected IPv6 delivery");
+            };
+            assert_eq!(delivered.len(), 40 + usize::from(payload_len));
+        }
+        packet[4..6].copy_from_slice(&9_u16.to_be_bytes());
+        assert!(matches!(
+            receiver.validate_decapsulated_packet(&mut packet),
+            TunnResult::Err(WireGuardError::InvalidPacket)
+        ));
+        assert_eq!(receiver.rx_bytes, 88);
     }
 
     fn update_timer_results_in_handshake(tun: &mut Tunn, now: Instant) {
@@ -1767,5 +1902,86 @@ mod tests {
             my_tun.commit_open(&open, &mut theirs[..len], plain_len),
             TunnResult::Err(WireGuardError::NoCurrentSession)
         ));
+    }
+
+    /// Runs the timers of `tun` at `now` and expects the tunnel to expire.
+    fn expect_expiry(tun: &mut Tunn, now: Instant) {
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            tun.update_timers_at(now, &mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert!(tun.is_expired());
+    }
+
+    #[test]
+    fn expiry_cause_is_none_on_a_fresh_tunnel_and_after_a_handshake() {
+        let (my_tun, their_tun) = create_two_tuns();
+        assert_eq!(my_tun.expiry_cause(), None);
+        assert_eq!(their_tun.expiry_cause(), None);
+
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut now = start(&mut [&mut my_tun, &mut their_tun]);
+        advance(
+            &mut now,
+            Duration::from_secs(1),
+            &mut [&mut my_tun, &mut their_tun],
+        );
+        assert_eq!(my_tun.expiry_cause(), None);
+        assert_eq!(their_tun.expiry_cause(), None);
+    }
+
+    #[test]
+    fn an_unanswered_initiation_expires_for_handshake_timeout() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
+        create_handshake_init(&mut my_tun);
+
+        expect_expiry(&mut my_tun, now + REKEY_ATTEMPT_TIME);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+        // The expired state reports the same cause on later ticks.
+        assert!(matches!(
+            my_tun.update_timers_at(now + REKEY_ATTEMPT_TIME * 2, &mut []),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+    }
+
+    #[test]
+    fn a_session_left_alone_expires_for_session_age() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let now = start(&mut [&mut my_tun, &mut their_tun]);
+
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+        expect_expiry(&mut their_tun, now + REJECT_AFTER_TIME * 3);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+        assert_eq!(their_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+    }
+
+    #[test]
+    fn a_tunnel_without_a_session_expires_for_session_age() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
+
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+    }
+
+    #[test]
+    fn a_handshake_initiation_after_the_expiry_clears_the_cause() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let now = start(&mut [&mut my_tun, &mut their_tun]);
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+
+        create_handshake_init(&mut my_tun);
+        assert!(!my_tun.is_expired());
+        assert_eq!(my_tun.expiry_cause(), None);
+
+        // The next expiry reports its own cause.
+        expect_expiry(
+            &mut my_tun,
+            now + REJECT_AFTER_TIME * 3 + REKEY_ATTEMPT_TIME,
+        );
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
     }
 }

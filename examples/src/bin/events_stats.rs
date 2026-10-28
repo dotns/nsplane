@@ -141,16 +141,20 @@ fn describe(event: &Event) -> String {
         Event::PathAdopted { peer, path } => {
             format!("path-adopted peer={} path={}", peer.get(), path.addr)
         }
-        Event::SessionExpired { peer } => format!("session-expired peer={}", peer.get()),
+        Event::SessionExpired { peer, cause } => {
+            format!("session-expired peer={} cause={cause:?}", peer.get())
+        }
         Event::PeerStats {
             peer,
             rx,
             tx,
             data_rx,
             data_tx,
+            expirations,
             last_handshake,
         } => format!(
-            "stats peer={} rx={rx} tx={tx} data_rx={data_rx} data_tx={data_tx} handshake={}",
+            "stats peer={} rx={rx} tx={tx} data_rx={data_rx} data_tx={data_tx} \
+             expirations={expirations} handshake={}",
             peer.get(),
             last_handshake.map_or_else(|| "never".to_owned(), |age| format!("{}s", age.as_secs()))
         ),
@@ -161,6 +165,7 @@ fn describe(event: &Event) -> String {
         Event::Suspended => "suspended".to_owned(),
         Event::Resumed => "resumed".to_owned(),
         Event::MtuChanged { mtu } => format!("mtu-changed mtu={mtu}"),
+        event => format!("{event:?}"),
     }
 }
 

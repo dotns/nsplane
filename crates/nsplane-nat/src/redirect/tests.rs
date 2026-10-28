@@ -1,6 +1,5 @@
-//! Tests of the local-side redirect, adapted from the ns `tun_service`
-//! rewrite tests to in-place rewriting on `PacketBuf`, plus checksums, the
-//! flow lifetime (expiry, eviction, removal) and the re-entrancy rules.
+//! Tests of in-place local-side redirect on `PacketBuf`, checksums, flow
+//! lifetime (expiry, eviction, removal) and re-entrancy rules.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -156,7 +155,7 @@ fn assert_pass(packet: &mut PacketBuf, call: impl Fn(&mut PacketBuf) -> Redirect
     assert_eq!(packet.as_packet(), before.as_slice());
 }
 
-// -- Rewriting (ns `rewrite_inbound_for_netstack` / `rewrite_outbound_from_netstack`). --
+// -- Forward and reverse rewriting. --
 
 #[test]
 fn rewrites_tcp_to_the_endpoint_and_restores_the_service_on_replies() {
@@ -268,7 +267,7 @@ fn asks_again_when_the_endpoint_is_in_use_by_the_same_source() {
 
 #[test]
 fn drops_a_new_flow_when_every_offered_endpoint_is_in_use() {
-    // ns `StackEndpointPoolExhausted`: a pool of one endpoint.
+    // A pool of one endpoint exercises exhaustion.
     let (redirect, calls) = redirect(1);
     forward(&redirect, udp(CLIENT, SERVICE_A));
     let mut packet = udp(CLIENT, SERVICE_B);
@@ -411,7 +410,7 @@ fn decide_may_scan_a_small_pool_with_endpoint_in_use() {
     );
 }
 
-// -- Flow removal (ns `remove_netstack_flow`, `revoke_removed_routes`, `clear_udp_flows`). --
+// -- Flow removal and revocation. --
 
 #[test]
 fn removed_flows_stop_rewriting_and_ask_again() {

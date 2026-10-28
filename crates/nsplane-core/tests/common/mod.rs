@@ -22,12 +22,13 @@
 )]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use nsplane_core::x25519::{PublicKey, StaticSecret};
 use nsplane_core::{
     AllowedIp, ConfigChange, Core, CoreConfig, Ecn, Event, Input, Output, PacketBuf, Path,
-    PeerConfig, PeerId, TransportId,
+    PeerConfig, PeerId, TrackedOutcome, TransportId,
 };
 use nsplane_packet::checksum;
 use rand_core::OsRng;
@@ -67,6 +68,20 @@ pub struct Sent {
     pub data: Vec<u8>,
 }
 
+/// An `Output::Tracked` as logged by [`Net::drain`]: the tag, the peer and the outcome, and
+/// how many datagrams the core had transmitted before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tracked {
+    /// The tag.
+    pub tag: NonZeroU64,
+    /// The peer, if routed.
+    pub peer: Option<PeerId>,
+    /// The outcome.
+    pub outcome: TrackedOutcome,
+    /// `transmits[i].len()` when it was logged.
+    pub transmitted: usize,
+}
+
 /// Inspects every datagram in flight; may rewrite it, re-path it or drop it.
 pub type Interceptor = Box<dyn FnMut(&mut InFlight) -> Fate>;
 
@@ -88,6 +103,12 @@ pub struct Net {
     pub transmits: Vec<Vec<Sent>>,
     /// Datagrams addressed to no core, with their sender.
     pub lost: Vec<InFlight>,
+    /// Local packets each core handed out for plaintext egress, with the peer they were
+    /// routed to.
+    pub plaintext: Vec<Vec<(PeerId, PacketBuf)>>,
+    /// What became of the tracked local packets of each core, in output order; a sealed one
+    /// is followed in `transmits` by its datagram.
+    pub tracked: Vec<Vec<Tracked>>,
     /// Return delivered packets to the delivering core's pool right away, like a driver that
     /// is done with them. Off by default, so tests can inspect `delivered`.
     pub recycle_delivered: bool,
@@ -227,6 +248,8 @@ impl Net {
             events: (0..n).map(|_| Vec::new()).collect(),
             transmits: (0..n).map(|_| Vec::new()).collect(),
             lost: Vec::new(),
+            plaintext: (0..n).map(|_| Vec::new()).collect(),
+            tracked: (0..n).map(|_| Vec::new()).collect(),
             recycle_delivered: false,
             interceptor: None,
         }
@@ -339,6 +362,14 @@ impl Net {
                         }
                     }
                     Output::Event(event) => self.events[i].push(event),
+                    Output::Plaintext { to, packet } => self.plaintext[i].push((to, packet)),
+                    Output::Tracked { tag, peer, outcome } => self.tracked[i].push(Tracked {
+                        tag,
+                        peer,
+                        outcome,
+                        transmitted: self.transmits[i].len(),
+                    }),
+                    other => panic!("unknown output {other:?}"),
                 }
             }
         }
@@ -418,6 +449,8 @@ impl Net {
             self.delivered[i].clear();
             self.events[i].clear();
             self.transmits[i].clear();
+            self.plaintext[i].clear();
+            self.tracked[i].clear();
         }
         self.lost.clear();
     }

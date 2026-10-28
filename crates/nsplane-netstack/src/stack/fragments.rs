@@ -50,8 +50,10 @@ impl Barrier {
 
 impl Driver {
     /// Feeds a packet to an address the stack accepts through the reassembler, if there is one:
-    /// the packet to route (the packet itself or a completed datagram), or `None` while
-    /// its datagram is incomplete or once the fragment is dropped.
+    /// the packet to route (the packet itself or a completed datagram with the label its
+    /// fragments share), or `None` while its datagram is incomplete or once the fragment
+    /// is dropped. A datagram whose fragments carry different labels is dropped and
+    /// counted in `label_mismatch`.
     pub(super) fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return Some(packet);
@@ -68,22 +70,19 @@ impl Driver {
             stats::add(&self.stats.reassembly_overflow, 1);
             return None;
         }
-        let (outcome, tags) = reassembler.push_tagged(packet.as_packet(), packet.tag(), now);
-        let routed = match outcome {
-            Outcome::Pass => return Some(packet),
-            Outcome::Complete(_) if tags == FragmentTags::Mixed => None,
-            Outcome::Complete(datagram) if self.barred(&datagram, now) => {
+        let routed = match reassembler.push_tagged(packet.as_packet(), packet.tag(), now) {
+            (Outcome::Pass, _) => return Some(packet),
+            (Outcome::Complete(datagram), FragmentTags::Same(_)) if self.barred(&datagram, now) => {
                 stats::add(&self.stats.retired, 1);
                 None
             }
-            Outcome::Complete(datagram) => {
+            (Outcome::Complete(datagram), FragmentTags::Same(label)) => {
                 let mut packet = PacketBuf::from_packet(&datagram);
-                if let FragmentTags::Same(label) = tags {
-                    packet.set_tag(label);
-                }
+                packet.set_tag(label);
                 Some(packet)
             }
-            Outcome::Held | Outcome::Dropped => None,
+            // `Mixed`: never handed on untagged or under one of its labels.
+            (Outcome::Complete(_) | Outcome::Held | Outcome::Dropped, _) => None,
         };
         self.count_reassembly();
         routed
@@ -155,7 +154,7 @@ impl Driver {
                 };
                 (protocol, key.local, Some(key.remote))
             }
-            (None, None) | (Some(Target::Label(_)), _) => return true,
+            (None, None) => return true,
         };
         let until = Instant::now().into_std() + reassembler.config().timeout;
         self.barriers.push(Barrier {

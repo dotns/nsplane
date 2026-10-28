@@ -42,7 +42,7 @@ impl Core {
 
     /// Adds a local identity with its own static key that answers handshakes only on
     /// `transports` (none for an empty set); returns its id, or `None` if an identity
-    /// (the default one included) already holds the key.
+    /// (the default one included) already holds the key or identity ids are exhausted.
     ///
     /// Bind peers to it with [`PeerConfig::local_identity`]. A handshake initiation is
     /// dispatched to the identity whose key its mac1 is computed with: an identity is skipped
@@ -143,6 +143,7 @@ impl Core {
             tx: p.tx(),
             data_rx: p.data_rx(),
             data_tx: p.data_tx(),
+            expirations: p.expirations(),
             last_handshake,
         })
     }
@@ -193,7 +194,7 @@ impl Core {
 
     /// The path `peer`'s next transport data message would leave on: the one the policy
     /// selects for [`MessageKind::Data`], or the peer's current path. `None` for an unknown
-    /// peer or one without a path.
+    /// peer, or when neither the policy nor the peer supplies a path.
     pub fn data_path(&self, peer: PeerId) -> Option<Path> {
         let current = self.peers.peer(peer)?.path();
         self.policy.select(peer, MessageKind::Data).or(current)
@@ -220,6 +221,23 @@ impl Core {
         if let Some(p) = self.peers.peer_mut(peer) {
             p.tunnel_mut().set_pad_limit(limit.map(usize::from));
         }
+    }
+
+    /// Marks or unmarks `peer` for plaintext egress; returns `false` for an unknown peer.
+    ///
+    /// The local packets routed to a marked peer after this call leave after the outbound
+    /// filters as [`Output::Plaintext`] instead of being sealed. The mark is runtime state
+    /// of the [`PeerId`]: an update of the peer in place keeps it, a peer removed and added
+    /// again gets a new id and starts unmarked.
+    ///
+    /// [`Output::Plaintext`]: crate::Output::Plaintext
+    pub fn set_plaintext_egress(&mut self, peer: PeerId, plaintext: bool) -> bool {
+        let Some(p) = self.peers.peer_mut(peer) else {
+            return false;
+        };
+        p.plaintext_egress = plaintext;
+        self.plaintext_egress = self.peers.iter().any(|(_, p)| p.plaintext_egress);
+        true
     }
 
     /// Removes the peer of `identity` with `key`, keeping its unanswered handshakes in the

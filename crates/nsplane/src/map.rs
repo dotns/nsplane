@@ -146,6 +146,22 @@ where
         keep
     }
 
+    /// Runs the closure on every packet in `packets`, in order, like `retain_mut` with
+    /// [`MapSink::map`], but appends the buffers of the dropped packets to `spent`. One
+    /// pass that rotates the queue: no allocation beyond `spent`'s growth.
+    fn map_spent(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>, spent: &mut Vec<PacketBuf>) {
+        for _ in 0..packets.len() {
+            let Some((from, mut packet)) = packets.pop_front() else {
+                break;
+            };
+            if self.map(&mut packet, from) {
+                packets.push_back((from, packet));
+            } else {
+                spent.push(packet);
+            }
+        }
+    }
+
     /// An empty copy buffer, a spare one if there is one.
     fn take_copies(&self) -> Copies {
         self.spare
@@ -210,6 +226,30 @@ where
         let kept = packets.len();
         let result = self.inner.send_batch(packets).await;
         // On an error the packet that failed was dropped and the rest are left.
+        let delivered = kept.saturating_sub(packets.len() + usize::from(result.is_err()));
+        copies.report(delivered, after);
+        self.put_copies(copies);
+        result
+    }
+
+    /// Like [`send_batch`](Self::send_batch) over `inner`'s `send_batch_spent`: the buffers
+    /// of the packets the closure dropped are appended to `spent` first, then `inner`
+    /// appends its own. The `after` hook reads its copies, never a buffer in `spent`.
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        self.map_spent(packets, spent);
+        let Some(after) = &self.after else {
+            return self.inner.send_batch_spent(packets, spent).await;
+        };
+        let mut copies = self.take_copies();
+        for (_, packet) in packets.iter() {
+            copies.push(packet.as_packet());
+        }
+        let kept = packets.len();
+        let result = self.inner.send_batch_spent(packets, spent).await;
         let delivered = kept.saturating_sub(packets.len() + usize::from(result.is_err()));
         copies.report(delivered, after);
         self.put_copies(copies);
@@ -328,6 +368,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::io::test_sinks::{SpentSink, bytes};
     use crate::{ChannelSink, ChannelSource};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -706,5 +747,60 @@ mod tests {
         let mut bufs = vec![PacketBuf::from_packet(&[1])];
         source.recycle(&mut bufs);
         assert_eq!(bufs.len(), 1);
+    }
+
+    /// Drops interleaved between kept packets.
+    const INTERLEAVED: [&[u8]; 6] = [&[1, 2], &[0, 9], &[3, 4], &[0, 8], &[0, 7], &[5, 6]];
+
+    #[tokio::test]
+    async fn spent_returns_dropped_and_delivered_buffers_in_order() -> TestResult {
+        let inner = SpentSink::default();
+        let sink = MapSink::new(inner.clone(), rewrite_sink);
+        let mut packets = batch(&INTERLEAVED);
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        let kept = [vec![1, 0xFF], vec![3, 0xFF], vec![5, 0xFF]];
+        assert_eq!(inner.taken(), kept);
+        // The dropped ones first, as mapping runs before the inner sink.
+        let mut expected = vec![vec![0, 9], vec![0, 8], vec![0, 7]];
+        expected.extend(kept);
+        assert_eq!(bytes(&spent), expected);
+        assert_eq!(sink.dropped(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_after_reports_the_delivered_packets() -> TestResult {
+        let inner = SpentSink::default();
+        let reported = Arc::new(Reported::default());
+        let sink = after_sink(inner.clone(), &reported);
+        let mut packets = batch(&INTERLEAVED);
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent).await?;
+        let kept = [vec![1, 0xFF], vec![3, 0xFF], vec![5, 0xFF]];
+        assert_eq!(reported.take(), kept);
+        assert_eq!(inner.taken(), kept);
+        assert_eq!(spent.len(), 6);
+        assert_eq!(sink.dropped(), 3);
+
+        // On an error: the hook runs for the ones before it, the rest stay mapped.
+        let mut packets = batch(&[&[1, 2], &[0, 1], &[SpentSink::FAIL, 1], &[3, 4]]);
+        let mut spent = Vec::new();
+        let err = sink
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(reported.take(), [vec![1, 0xFF]]);
+        assert_eq!(bytes(&spent), [vec![0, 1], vec![1, 0xFF]]);
+        let left: Vec<_> = packets
+            .iter()
+            .map(|(_, p)| p.as_packet().to_vec())
+            .collect();
+        assert_eq!(left, [vec![3, 0xFF]]);
+        assert_eq!(sink.dropped(), 4);
+        Ok(())
     }
 }

@@ -425,7 +425,7 @@ impl UdpTransport {
     ///
     /// On, on Linux and Android, the socket asks for its ICMP errors (`IP_RECVERR` unless
     /// it is IPv6-only, and `IPV6_RECVERR` on an IPv6 socket), and receiving also waits
-    /// for them and reads the socket's error queue empty before reading datagrams: each
+    /// for them and reads at most 64 queued errors before each datagram read attempt: each
     /// ICMP Fragmentation Needed (type 3, code 4) or `ICMPv6` Packet Too Big (type 2,
     /// code 0) about one of the transport's datagrams becomes a
     /// [`PathMtuReport`](crate::PathMtuReport) for the

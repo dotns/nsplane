@@ -99,7 +99,9 @@ pub struct NetStackConfig {
     /// `queue_capacity`, this stack's `ingress_capacity`, both 1024 packets by default)
     /// drops the rest. smoltcp recovers such losses by fast retransmit and New Reno's
     /// retransmission on partial ACKs, but without SACK one hole per round trip, and a lost
-    /// retransmission still waits for a retransmission timeout of at least 1 s. Measured
+    /// retransmission still waits for a retransmission timeout (at least 1 s by default;
+    /// [`tcp_min_rto`](Self::tcp_min_rto) and [`tcp_initial_rto`](Self::tcp_initial_rto)
+    /// can each be configured down to 1 ms). Measured
     /// in-process at the default MTU before the fork had New Reno, 4 MiB (about 3000
     /// segments) dropped packets at the receiving engine's full sink in most runs and moved
     /// 64 MiB at about 50 MB/s instead of 250-450 MB/s; with 8192-packet queues it ran
@@ -153,9 +155,6 @@ pub struct NetStackConfig {
     /// Most UDP flows tracked at once; datagrams opening a flow beyond it are dropped.
     /// Default 65536.
     pub max_udp_flows: usize,
-    /// Most revoked labels remembered; oldest is evicted at capacity.
-    /// Default 65536; zero is normalized to one. Labels must never be reused.
-    pub max_revoked_labels: usize,
     /// Whether an IPv4 UDP datagram the application sends above the MTU leaves as one
     /// oversize packet with DF clear, for the engine's fragmenter
     /// (`nsplane::EngineBuilder::fragmenter`) to split, instead of failing with
@@ -218,12 +217,18 @@ pub struct NetStackConfig {
     /// [`PendingFlow`](crate::PendingFlow) whose [`control`](crate::PendingFlow::control)
     /// covers the lifetime from its first input on. On a stack without `transparent`,
     /// rejections are sourced from the stack's own addresses and there is no connection
-    /// limit beyond the listener pool and the accept queue.
-    ///
-    /// A transparent stack also honours the deprecated
-    /// [`TransparentConfig::admission`] while this field is [`Admission::Immediate`]; a
-    /// `Decide` here takes precedence. Default [`Admission::Immediate`].
+    /// limit beyond the listener pool and the accept queue. Default [`Admission::Immediate`].
     pub admission: Admission,
+    /// Most revoked ingress labels the stack remembers at once, see
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label).
+    ///
+    /// While the stack holds a label's tombstone, input with that label is dropped and
+    /// counted in [`label_revoked`](crate::NetStackStats::label_revoked), and it never opens
+    /// a new connection or flow. Beyond this many revoked labels the oldest tombstone is
+    /// forgotten, so a label is remembered for at least the next `max_revoked_labels`
+    /// revocations; a tombstone costs about 16 bytes. 0 keeps none: input sent after the
+    /// revoke then opens new lifetimes again. Default 65536.
+    pub max_revoked_labels: usize,
 }
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
@@ -254,10 +259,6 @@ pub struct TransparentConfig {
     /// transparent mode, and also in
     /// [`rejected_prefix`](crate::NetStackStats::rejected_prefix).
     pub prefixes: Vec<(IpAddr, u8)>,
-    /// Deprecated: replaced by [`NetStackConfig::admission`], and honoured while that field
-    /// is [`Admission::Immediate`]. Default [`Admission::Immediate`].
-    #[deprecated(note = "use `NetStackConfig::admission`, which applies to every stack")]
-    pub admission: Admission,
     /// Most TCP connections the stack holds at once: accepted, mid handshake or opened
     /// with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until they are released.
     ///
@@ -359,11 +360,11 @@ impl Default for NetStackConfig {
             tcp_min_rto: DEFAULT_RTO,
             tcp_initial_rto: DEFAULT_RTO,
             max_udp_flows: 65_536,
-            max_revoked_labels: 65_536,
             udp_allow_fragmentation: false,
             reassembly: None,
             transparent: None,
             admission: Admission::Immediate,
+            max_revoked_labels: 65_536,
         }
     }
 }
@@ -386,13 +387,12 @@ pub(crate) struct Settings {
     pub(crate) tcp_send_budget: Option<usize>,
     pub(crate) tcp_rto: TcpRto,
     pub(crate) max_udp_flows: usize,
-    pub(crate) max_revoked_labels: usize,
     pub(crate) udp_allow_fragmentation: bool,
     pub(crate) reassembly: Option<ReassemblyConfig>,
     /// Boxed, so that it does not grow the driver.
     pub(crate) transparent: Option<Box<Transparent>>,
-    /// The top-level admission, or the deprecated transparent one.
     pub(crate) admission: Admission,
+    pub(crate) max_revoked_labels: usize,
 }
 
 /// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
@@ -508,14 +508,6 @@ impl Settings {
                 }
             }
         }
-        #[allow(deprecated, reason = "honoured until it is removed")]
-        let admission = match config.admission {
-            Admission::Immediate => config
-                .transparent
-                .as_ref()
-                .map_or(Admission::Immediate, |transparent| transparent.admission),
-            admission => admission,
-        };
         let mtu = config.mtu.max(MIN_MTU);
         let mss = usize::from(mtu) - 40;
         let tcp_buffer = |size: Option<usize>| {
@@ -539,7 +531,6 @@ impl Settings {
             tcp_send_budget: config.tcp_send_budget,
             tcp_rto: TcpRto::new(config.tcp_min_rto, config.tcp_initial_rto),
             max_udp_flows: config.max_udp_flows.max(1),
-            max_revoked_labels: config.max_revoked_labels.max(1),
             udp_allow_fragmentation: config.udp_allow_fragmentation,
             reassembly: config.reassembly,
             transparent: config.transparent.map(|transparent| {
@@ -549,7 +540,7 @@ impl Settings {
                     events: transparent.events,
                 })
             }),
-            admission: match admission {
+            admission: match config.admission {
                 Admission::Decide {
                     timeout,
                     max_pending,
@@ -560,6 +551,7 @@ impl Settings {
                 },
                 admission => admission,
             },
+            max_revoked_labels: config.max_revoked_labels,
         }
     }
 
@@ -675,19 +667,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated, reason = "the deprecated field is still honoured")]
-    fn admission_is_top_level_first_then_transparent() {
+    fn admission_is_normalised() {
         let decide = |timeout| Admission::Decide {
             timeout,
             max_pending: 0,
         };
-        let admission = |top, transparent: Option<Admission>| {
+        let admission = |admission, transparent: Option<TransparentConfig>| {
             Settings::new(NetStackConfig {
-                admission: top,
-                transparent: transparent.map(|admission| TransparentConfig {
-                    admission,
-                    ..TransparentConfig::default()
-                }),
+                transparent,
+                admission,
                 ..NetStackConfig::default()
             })
             .admission
@@ -700,15 +688,15 @@ mod tests {
         assert_eq!(admission(Admission::Immediate, None), Admission::Immediate);
         assert_eq!(admission(decide(second), None), normalised(second));
         assert_eq!(
-            admission(Admission::Immediate, Some(decide(second))),
+            admission(decide(second), Some(TransparentConfig::default())),
             normalised(second)
         );
         assert_eq!(
-            admission(decide(second), Some(decide(Duration::from_secs(2)))),
-            normalised(second)
+            admission(Admission::Immediate, Some(TransparentConfig::default())),
+            Admission::Immediate
         );
         assert_eq!(
-            admission(decide(Duration::MAX), Some(Admission::Immediate)),
+            admission(decide(Duration::MAX), None),
             normalised(MAX_PENDING_TIMEOUT)
         );
     }

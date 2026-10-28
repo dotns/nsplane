@@ -7,19 +7,21 @@
 //! Supported targets: Linux and Android (`/dev/net/tun`, raw IP packets), macOS and iOS
 //! (utun control socket, packets framed by a 4-byte address-family header), and Windows
 //! (a Wintun adapter; a reader thread feeds the source, so there is no fd). On every
-//! other target the crate is empty.
+//! other target only the host callback types are available.
 //!
 //! Offloads (Linux/Android): [`Tun::create`] opens the device with a virtio-net header
 //! (`IFF_VNET_HDR`) and TCP segmentation offload, plus UDP segmentation offload where the
 //! kernel supports it, so one read or write can carry up to 64 KiB of one flow: the
-//! source splits such reads into MTU-sized packets, and the sink coalesces runs of
+//! source splits such reads according to the kernel `gso_size` (the MTU-derived buffer
+//! capacity is an allocation minimum, not a segment limit), and the sink coalesces runs of
 //! packets into super-packets (`writev` of header and pieces, no copy). Kernels without
 //! these features get a plain device. `Tun::create_with` with `TunOptions::offload(false)`
 //! opts out, and `Tun::offload` reports what is in use.
 //!
 //! Windows service TUN: `Tun::create_with` with `TunOptions` verifies `wintun.dll`
-//! against a `WintunPin` (SHA-256, optionally the running driver version) before loading
-//! it, can refuse a live adapter or interface of the same name (`exclusive`), replaces an
+//! against a `WintunPin` SHA-256 digest before loading it and optionally verifies the
+//! running driver version after opening or creating the adapter. It can refuse a live
+//! adapter or interface of the same name (`exclusive`), replaces an
 //! orphaned (non-present) one and sets the interface MTU; refusals are `WintunError`s
 //! inside the `io::Error`.
 //!

@@ -238,9 +238,12 @@
 //! [`AclFilterStats::reply_revoked`]), and other traffic and namespaces are
 //! unaffected.
 //!
-//! **Clock and lazy expiry.** Expiry follows the engine clock: [`Instant::now`]
-//! by default, or the closure given to [`AclEngine::with_clock`] (e.g. paused
-//! tokio time, or a manual clock in tests). Evaluation treats an expired
+//! **Clock and lazy expiry.** Expiry follows the engine clock: by default the
+//! coarse monotonic clock on Linux and Android (accurate to one scheduler
+//! tick, 1 to 4 ms) and [`Instant::now`] elsewhere, or the closure given to
+//! [`AclEngine::with_clock`] (e.g. paused tokio time, or a manual clock in
+//! tests). The same clock ages the reply allowances and allow-only fragment
+//! entries of an [`AclFilter`] on the engine. Evaluation treats an expired
 //! pinhole as absent immediately; the pinhole is removed and counted by the
 //! next engine update, by [`AclEngine::expire_pinholes`], or by the
 //! evaluation that sees it, whichever comes first.
@@ -318,6 +321,7 @@
 //!
 //! [`Instant::now`]: std::time::Instant::now
 
+mod clock;
 #[cfg(test)]
 mod differential;
 pub mod engine;

@@ -57,10 +57,12 @@ impl<W: FrameWrite> Shared<W> {
 ///
 /// Returns the IP side as a [`PacketSource`] (IP packets from the guest) and a
 /// [`PacketSink`] (IP packets for the guest), plus a handle for counters. The reader task
-/// is spawned on the current Tokio runtime and runs until the transport ends, fails, or
-/// the source is dropped. Once the transport is gone the source returns
-/// [`io::ErrorKind::BrokenPipe`] after the queued packets, and the sink returns it on
-/// every call.
+/// is spawned on the current Tokio runtime. Transport EOF or a read failure closes the
+/// port; the source then returns [`io::ErrorKind::BrokenPipe`] after queued packets,
+/// and subsequent sink calls fail with it. A dropped source is detected only when the
+/// reader next queues an IP packet: an idle or control-only transport can keep running.
+/// That exit does not close the sink. A write failure closes the port, but does not
+/// interrupt a pending read.
 ///
 /// # Panics
 ///
@@ -87,7 +89,7 @@ pub fn spawn_port<R: FrameRead, W: FrameWrite>(
     )
 }
 
-/// Reads guest frames until the transport ends or the source is gone.
+/// Reads guest frames until EOF, an I/O failure, or an IP enqueue detects a dropped source.
 async fn read_loop<R: FrameRead, W: FrameWrite>(
     mut reader: R,
     shared: Arc<Shared<W>>,

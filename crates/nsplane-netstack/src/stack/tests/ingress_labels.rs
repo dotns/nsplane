@@ -255,7 +255,8 @@ async fn queued_input_is_fenced_after_tombstone_eviction() -> TestResult {
         let mut flow = timeout(WAIT, next(&mut incoming)).await?.ok_or("flow")?;
         assert_eq!(flow.ingress_label(), fresh);
         assert_eq!(flow.recv().await.unwrap(), b"fresh"[..]);
-        assert_eq!(handle.stats().label_revoked, 1);
+        // Upstream distinguishes queue-fenced input from a retained tombstone.
+        assert_eq!(handle.retired_drops(), 1);
     }
     Ok(())
 }
@@ -598,10 +599,15 @@ async fn full_output_fences_report_failed_without_preserving_live_access() -> Te
     })
     .await?;
     for index in 0..crate::flow::MAX_FENCES {
-        assert!(source.fences.insert(crate::flow::Fence::Label {
-            label: NonZeroU64::new(99 + index as u64).unwrap(),
-            end: 1
-        }));
+        assert!(
+            source
+                .fences
+                .insert(crate::flow::Fence::Label {
+                    label: NonZeroU64::new(99 + index as u64).unwrap(),
+                    end: 1
+                })
+                .is_ok()
+        );
     }
     assert_eq!(
         timeout(WAIT, handle.revoke_label(label).wait()).await?,

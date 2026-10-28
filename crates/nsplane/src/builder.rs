@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use nsplane_core::x25519::StaticSecret;
 use nsplane_core::{CoreConfig, PacketFilter, PathPolicy, StandardRoaming};
-use nsplane_packet::TransportId;
+use nsplane_packet::{PacketBuf, PeerId, TransportId};
 use tokio::sync::mpsc;
 
 use crate::engine::{self, Engine, NewTransport};
 use crate::fragment::{FragmentConfig, Fragmenter};
-use crate::handle::{Plaintext, PlaintextIngress};
+use crate::handle::{Plaintext, PlaintextEgress, PlaintextIngress};
 use crate::io::{PacketSink, PacketSource};
 use crate::path_mtu;
+use crate::tracked::{Receipts, SendResults, TrackedInput, TrackedSender};
 use crate::transport::Transport;
 
 /// Default capacity of the internal packet queues, in packets: 1.5x the high-water mark of a
@@ -66,6 +67,8 @@ pub struct EngineBuilder<Src, Snk> {
     transport_max: BTreeMap<TransportId, u16>,
     path_mtu_expiry: Duration,
     plaintext: Option<mpsc::Receiver<Plaintext>>,
+    plaintext_egress: Option<mpsc::Sender<(PeerId, PacketBuf)>>,
+    tracked: Option<TrackedInput>,
 }
 
 impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
@@ -83,6 +86,8 @@ impl<Src, Snk> fmt::Debug for EngineBuilder<Src, Snk> {
             .field("transport_max", &self.transport_max)
             .field("path_mtu_expiry", &self.path_mtu_expiry)
             .field("plaintext_ingress", &self.plaintext.is_some())
+            .field("plaintext_egress", &self.plaintext_egress.is_some())
+            .field("tracked_sender", &self.tracked.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -106,6 +111,8 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             transport_max: BTreeMap::new(),
             path_mtu_expiry: path_mtu::DEFAULT_EXPIRY,
             plaintext: None,
+            plaintext_egress: None,
+            tracked: None,
         }
     }
 
@@ -232,6 +239,28 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
         (self, PlaintextIngress::new(queue))
     }
 
+    /// A bounded receiver of `capacity` packets (at least 1) for the local packets routed to
+    /// peers marked for plaintext egress ([`crate::EngineHandle::set_plaintext_egress`]);
+    /// see [`PlaintextEgress`]. Without it such packets are dropped under
+    /// [`crate::DROP_PLAINTEXT_EGRESS_CLOSED`]. A second call replaces the first receiver,
+    /// which then receives nothing more.
+    #[must_use]
+    pub fn plaintext_egress(mut self, capacity: usize) -> (Self, PlaintextEgress) {
+        let (queue, packets) = mpsc::channel(capacity.max(1));
+        self.plaintext_egress = Some(queue);
+        (self, PlaintextEgress::new(packets))
+    }
+
+    /// An entry for tracked local packets with at most `capacity` results outstanding (at
+    /// least 1), and the receiver of their results; see [`TrackedSender`]. A second call
+    /// replaces the first entry, whose calls then fail as if the engine had stopped.
+    #[must_use]
+    pub fn tracked_sender(mut self, capacity: usize) -> (Self, TrackedSender, SendResults) {
+        let (sender, results, input) = Receipts::channel(capacity);
+        self.tracked = Some(input);
+        (self, sender, results)
+    }
+
     /// Spawns the engine's tasks and returns the running engine.
     ///
     /// Fails, without spawning anything, with [`BuildError::NoTransport`] when no transport
@@ -275,6 +304,8 @@ impl<Src: PacketSource, Snk: PacketSink> EngineBuilder<Src, Snk> {
             transport_max: self.transport_max,
             path_mtu_expiry: self.path_mtu_expiry,
             plaintext: self.plaintext,
+            plaintext_egress: self.plaintext_egress,
+            tracked: self.tracked,
         }))
     }
 }

@@ -192,6 +192,13 @@ impl<T> BatchQueue<T> {
         self.taken += out.len() - before;
     }
 
+    /// Refuses every later message and frees no slot again, so the senders see the queue
+    /// gone; what is held or queued stays to be taken.
+    pub(super) fn close(&mut self) {
+        self.batches.close();
+        self.permits.close();
+    }
+
     /// Whether no item is held or queued.
     pub(super) fn is_empty(&self) -> bool {
         self.held.is_empty() && self.batches.is_empty()

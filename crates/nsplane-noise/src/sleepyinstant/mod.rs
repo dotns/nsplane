@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
-//! Attempts to provide the same functionality as `std::time::Instant`, except it
-//! uses a timer which accounts for time when the system is asleep
+//! An Instant-like clock using `CLOCK_BOOTTIME` on supported Unix targets.
+//! macOS, iOS, tvOS, FreeBSD and NetBSD use `CLOCK_MONOTONIC`; Windows uses
+//! `std::time::Instant`. Suspend inclusion depends on the selected platform clock.
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]

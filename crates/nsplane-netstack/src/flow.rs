@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use smoltcp::iface::SocketHandle;
 use tokio::sync::Notify;
@@ -17,17 +17,9 @@ use tokio::sync::Notify;
 use crate::pending::Key;
 use crate::tcp::{self, Shared};
 
-#[cfg(test)]
-mod tests;
-
 /// Most fences the egress holds at once, TCP and UDP together; a revoke that needs one
 /// more fails. A fence is dropped once the source took every position it holds back.
 pub(crate) const MAX_FENCES: usize = 1024;
-
-/// Most old label registrations inspected when adding one lifetime.
-const LABEL_SWEEP_BUDGET: usize = 8;
-/// Most label registrations inspected by one driver maintenance pass.
-const IDLE_LABEL_SWEEP_BUDGET: usize = 256;
 
 const PENDING: u8 = 0;
 const RETIRED: u8 = 1;
@@ -167,8 +159,6 @@ impl Undelivered {
 /// Where the driver finds a flow's state.
 #[derive(Debug)]
 pub(crate) enum Target {
-    /// A fresh receipt for one label-wide retirement request.
-    Label(NonZeroU64),
     /// A TCP connection, or the socket of one mid handshake; `start` is the egress
     /// position of the socket's first packet.
     Tcp {
@@ -194,7 +184,6 @@ pub(crate) enum Target {
 /// flow entry. Every other flow is created with its target, already delivered.
 pub(crate) struct FlowState {
     target: OnceLock<Target>,
-    ingress_label: Option<NonZeroU64>,
     /// The tuple of a lifetime held under `Admission::Decide`, by which the driver finds it
     /// before its target is bound.
     held: Option<Key>,
@@ -215,6 +204,9 @@ pub(crate) struct FlowState {
     revocations: Arc<Revocations>,
     /// The caller's label; never read by the stack.
     context: OnceLock<FlowContext>,
+    /// The ingress label of the lifetime's first input: the tag of the SYN or the first
+    /// datagram, or the explicit label of an application-opened lifetime.
+    label: Option<NonZeroU64>,
     #[cfg(test)]
     observed_turn: AtomicU64,
     #[cfg(test)]
@@ -222,13 +214,9 @@ pub(crate) struct FlowState {
 }
 
 impl FlowState {
-    /// The state of a flow created with its target and handed out.
-    pub(crate) fn new(target: Target, revocations: &Arc<Revocations>) -> Arc<Self> {
-        Self::labeled(target, None, revocations)
-    }
-
-    /// Creates a lifetime with its immutable ingress label.
-    pub(crate) fn labeled(
+    /// The state of a flow created with its target and handed out, with the ingress label
+    /// of its first input.
+    pub(crate) fn new(
         target: Target,
         label: Option<NonZeroU64>,
         revocations: &Arc<Revocations>,
@@ -236,11 +224,8 @@ impl FlowState {
         Self::with(OnceLock::from(target), None, true, label, revocations)
     }
 
-    pub(crate) const fn ingress_label(&self) -> Option<NonZeroU64> {
-        self.ingress_label
-    }
-
-    /// The state of the lifetime of `key`, held under `Admission::Decide`.
+    /// The state of the lifetime of `key`, held under `Admission::Decide`, with the ingress
+    /// label of its first input.
     pub(crate) fn held(
         key: Key,
         label: Option<NonZeroU64>,
@@ -249,17 +234,21 @@ impl FlowState {
         Self::with(OnceLock::new(), Some(key), false, label, revocations)
     }
 
+    /// The state behind the receipt of a label's revoke, which no lifetime has.
+    pub(crate) fn receipt(revocations: &Arc<Revocations>) -> Arc<Self> {
+        Self::with(OnceLock::new(), None, true, None, revocations)
+    }
+
     /// A delivered and adopted state, or an undecided one not adopted yet.
     fn with(
         target: OnceLock<Target>,
         held: Option<Key>,
         delivered: bool,
-        ingress_label: Option<NonZeroU64>,
+        label: Option<NonZeroU64>,
         revocations: &Arc<Revocations>,
     ) -> Arc<Self> {
-        let state = Arc::new(Self {
+        Arc::new(Self {
             target,
-            ingress_label,
             held,
             adopted: AtomicBool::new(delivered),
             revoked: AtomicBool::new(false),
@@ -270,15 +259,17 @@ impl FlowState {
             end: AtomicU64::new(u64::MAX),
             revocations: Arc::clone(revocations),
             context: OnceLock::new(),
+            label,
             #[cfg(test)]
             observed_turn: AtomicU64::new(0),
             #[cfg(test)]
             completed_turn: AtomicU64::new(0),
-        });
-        if ingress_label.is_some() {
-            revocations.lock().track_labeled(&state);
-        }
-        state
+        })
+    }
+
+    /// The ingress label of the lifetime's first input.
+    pub(crate) const fn label(&self) -> Option<NonZeroU64> {
+        self.label
     }
 
     /// Where the driver finds the flow, once bound.
@@ -375,10 +366,35 @@ impl FlowState {
         self.end.store(end, Ordering::Relaxed);
     }
 
+    /// Revokes the flow on the handle side; whether this call did (only the first call does
+    /// anything). A lifetime not handed out yet never will be.
+    fn revoke_handles(&self) -> bool {
+        if self.revoked.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        // The driver answers a rejection only if it fixed the delivery first.
+        self.undeliver(Undelivered::Revoked);
+        if let Some(Target::Tcp { shared, .. }) = self.target() {
+            let mut shared = tcp::lock(shared);
+            shared.rx.clear();
+            shared.tx.clear();
+            shared.wake_reader();
+            shared.wake_writer();
+        }
+        self.wake.notify_waiters();
+        true
+    }
+
+    /// Revokes the flow on the handle side for the driver, which retires it at once
+    /// instead of queueing it; whether this call revoked it.
+    pub(crate) fn revoke_in_driver(&self) -> bool {
+        self.revoke_handles()
+    }
+
     /// Revokes the flow on the handle side and queues it for the driver; only the first
-    /// call does anything. A lifetime not handed out yet never will be.
+    /// call does anything.
     fn revoke(self: &Arc<Self>) {
-        if !self.mark_revoked() {
+        if !self.revoke_handles() {
             return;
         }
         let mut queue = self.revocations.lock();
@@ -391,25 +407,6 @@ impl FlowState {
         self.revocations.hint.store(true, Ordering::Relaxed);
         drop(queue);
         self.revocations.driver.notify_one();
-    }
-
-    /// Revokes application access without queuing another driver request.
-    pub(crate) fn mark_revoked(&self) -> bool {
-        // Fix the reason before a receiver observes revocation and drops the handle.
-        // The driver answers a rejection only if it fixed the delivery first.
-        self.undeliver(Undelivered::Revoked);
-        if self.revoked.swap(true, Ordering::SeqCst) {
-            return false;
-        }
-        if let Some(Target::Tcp { shared, .. }) = self.target() {
-            let mut shared = tcp::lock(shared);
-            shared.rx.clear();
-            shared.tx.clear();
-            shared.wake_reader();
-            shared.wake_writer();
-        }
-        self.wake.notify_waiters();
-        true
     }
 
     /// Writes the outcome once and wakes the waiters; later calls change nothing.
@@ -450,17 +447,6 @@ impl FlowState {
     }
 }
 
-impl Drop for FlowState {
-    fn drop(&mut self) {
-        if self.ingress_label.is_some() {
-            // Destruction can run while the registry is locked.
-            self.revocations
-                .label_generation
-                .fetch_add(1, Ordering::Release);
-        }
-    }
-}
-
 impl fmt::Debug for FlowState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlowState")
@@ -479,8 +465,6 @@ pub(crate) struct Revocations {
     queue: Mutex<Queue>,
     /// Set while `queue.pending` may hold flows: the driver's only cost per turn.
     hint: AtomicBool,
-    label_generation: AtomicU64,
-    clean_label_generation: AtomicU64,
     driver: Arc<Notify>,
 }
 
@@ -489,58 +473,8 @@ struct Queue {
     /// The driver stopped: revokes resolve as unknown at once.
     closed: bool,
     pending: Vec<Arc<FlowState>>,
-    /// Weak references keep delivered handles revocable after socket release.
-    labeled: Vec<Weak<FlowState>>,
-    /// The unvisited prefix of this pass; visited and appended entries stay after it.
-    labeled_end: usize,
-    /// Only releases observed before this pass can be acknowledged on completion.
-    labeled_generation: u64,
-}
-
-impl Queue {
-    fn track_labeled(&mut self, flow: &Arc<FlowState>) {
-        if self.closed {
-            return;
-        }
-        // Reserve one inspection for short-lived entries appended during the pass.
-        if self.sweep_labeled(&flow.revocations, LABEL_SWEEP_BUDGET - 1)
-            && let Some(tail) = self.labeled.last_mut()
-            && tail.strong_count() == 0
-        {
-            // An unvisited slot can be reused too: its old entry was just inspected.
-            *tail = Arc::downgrade(flow);
-            return;
-        }
-        self.labeled.push(Arc::downgrade(flow));
-    }
-
-    /// Returns whether this call had a release-triggered pass to advance.
-    fn sweep_labeled(&mut self, registry: &Revocations, budget: usize) -> bool {
-        if self.closed {
-            return false;
-        }
-        if self.labeled_end == 0 {
-            let generation = registry.label_generation.load(Ordering::Acquire);
-            if generation == registry.clean_label_generation.load(Ordering::Relaxed) {
-                return false;
-            }
-            self.labeled_generation = generation;
-            self.labeled_end = self.labeled.len();
-        }
-        for _ in 0..budget.min(self.labeled_end) {
-            self.labeled_end -= 1;
-            if self.labeled[self.labeled_end].strong_count() == 0 {
-                // The tail is already outside the unvisited prefix.
-                self.labeled.swap_remove(self.labeled_end);
-            }
-        }
-        if self.labeled_end == 0 {
-            registry
-                .clean_label_generation
-                .store(self.labeled_generation, Ordering::Release);
-        }
-        true
-    }
+    /// Revoked ingress labels, each with the state behind its receipt.
+    labels: Vec<(NonZeroU64, Arc<FlowState>)>,
 }
 
 impl Revocations {
@@ -548,8 +482,6 @@ impl Revocations {
         Self {
             queue: Mutex::default(),
             hint: AtomicBool::new(false),
-            label_generation: AtomicU64::new(0),
-            clean_label_generation: AtomicU64::new(0),
             driver,
         }
     }
@@ -558,57 +490,51 @@ impl Revocations {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reclaims expired registrations even when no new lifetimes arrive.
-    pub(crate) fn sweep_labeled(&self) {
-        if self.label_generation.load(Ordering::Acquire)
-            == self.clean_label_generation.load(Ordering::Relaxed)
-        {
+    /// Queues the revoke of `label` for the driver, whose outcome `receipt` takes; unknown
+    /// at once once the driver stopped.
+    pub(crate) fn revoke_label(&self, label: NonZeroU64, receipt: Arc<FlowState>) {
+        let mut queue = self.lock();
+        if queue.closed {
+            drop(queue);
+            receipt.finish(RetirementOutcome::Unknown);
             return;
         }
-        let mut queue = self.lock();
-        queue.sweep_labeled(self, IDLE_LABEL_SWEEP_BUDGET);
-        if queue.labeled.is_empty() {
-            queue.labeled = Vec::new();
-            queue.labeled_end = 0;
-        }
+        queue.labels.push((label, receipt));
+        self.hint.store(true, Ordering::Relaxed);
+        drop(queue);
+        self.driver.notify_one();
     }
 
-    pub(crate) fn labeled(&self, label: NonZeroU64) -> Vec<Arc<FlowState>> {
-        let mut queue = self.lock();
-        let generation = self.label_generation.load(Ordering::Acquire);
-        queue.labeled.retain(|flow| flow.strong_count() != 0);
-        if queue.labeled.is_empty() {
-            queue.labeled = Vec::new();
-        }
-        queue.labeled_end = 0;
-        self.clean_label_generation
-            .store(generation, Ordering::Release);
-        queue
-            .labeled
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|flow| flow.ingress_label() == Some(label))
-            .collect()
-    }
-
-    /// Moves the pending revocations into `into`; one load while there are none.
-    pub(crate) fn take(&self, into: &mut Vec<Arc<FlowState>>) {
+    /// Moves the pending revocations of flows into `flows` and of labels into `labels`;
+    /// one load while there are none.
+    pub(crate) fn take(
+        &self,
+        flows: &mut Vec<Arc<FlowState>>,
+        labels: &mut Vec<(NonZeroU64, Arc<FlowState>)>,
+    ) {
         if !self.hint.load(Ordering::Relaxed) {
             return;
         }
         let mut queue = self.lock();
         self.hint.store(false, Ordering::Relaxed);
-        into.append(&mut queue.pending);
+        flows.append(&mut queue.pending);
+        labels.append(&mut queue.labels);
     }
 
-    /// Stops taking revocations: the pending ones and those in `retiring` end unknown.
-    pub(crate) fn close(&self, retiring: &mut Vec<Arc<FlowState>>) {
+    /// Stops taking revocations: the pending ones and those in `retiring` and `revoking`
+    /// end unknown.
+    pub(crate) fn close(
+        &self,
+        retiring: &mut Vec<Arc<FlowState>>,
+        revoking: &mut Vec<(NonZeroU64, Arc<FlowState>)>,
+    ) {
         let mut queue = self.lock();
         queue.closed = true;
-        queue.labeled = Vec::new();
-        queue.labeled_end = 0;
         for flow in queue.pending.drain(..).chain(retiring.drain(..)) {
             flow.finish(RetirementOutcome::Unknown);
+        }
+        for (_, receipt) in queue.labels.drain(..).chain(revoking.drain(..)) {
+            receipt.finish(RetirementOutcome::Unknown);
         }
     }
 }
@@ -619,7 +545,7 @@ impl Revocations {
 /// [`NetStackSource`]: crate::NetStackSource
 #[derive(Debug)]
 pub(crate) enum Fence {
-    /// Output carrying one immutable label before the retirement position.
+    /// Tagged output queued before a label revoke, including stateless replies.
     Label { label: NonZeroU64, end: u64 },
     /// TCP packets from `local` to `peer` at egress positions in `[start, end)`, clipped
     /// to the positions possibly in the egress queue: one per revoked connection, of fixed
@@ -637,7 +563,7 @@ pub(crate) enum Fence {
 
 impl Fence {
     /// Whether every packet the fence holds back is behind `position`.
-    fn passed(&mut self, position: u64) -> bool {
+    pub(crate) fn passed(&mut self, position: u64) -> bool {
         match self {
             Self::Tcp { end, .. } | Self::Label { end, .. } => *end <= position,
             Self::Udp(positions) => {
@@ -658,7 +584,6 @@ impl Fence {
         tag: Option<NonZeroU64>,
     ) -> bool {
         match self {
-            Self::Label { label, end } => position < *end && tag == Some(*label),
             Self::Tcp {
                 local,
                 peer,
@@ -666,6 +591,7 @@ impl Fence {
                 end,
             } => (*start..*end).contains(&position) && tuple == Some((*local, *peer)),
             Self::Udp(positions) => positions.front() == Some(&position),
+            Self::Label { label, end } => position < *end && tag == Some(*label),
         }
     }
 }
@@ -683,8 +609,8 @@ impl Fences {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Adds `fence`; `false` if the table is full.
-    pub(crate) fn insert(&self, fence: Fence) -> bool {
+    /// Adds `fence`, or returns it if the table is full.
+    pub(crate) fn insert(&self, fence: Fence) -> Result<(), Fence> {
         let mut table = self.lock();
         if let Fence::Label { label, end } = &fence && let Some(Fence::Label {
             end: held_end, ..
@@ -692,14 +618,14 @@ impl Fences {
             |held| matches!(held, Fence::Label { label: held_label, .. } if held_label == label),
         ) {
             *held_end = (*held_end).max(*end);
-            return true;
+            return Ok(());
         }
         if table.len() >= MAX_FENCES {
-            return false;
+            return Err(fence);
         }
         table.push(fence);
         self.active.store(true, Ordering::SeqCst);
-        true
+        Ok(())
     }
 
     /// Whether the packet at egress `position` is held back; `tuple` gives the `(src,
@@ -785,8 +711,10 @@ impl FlowControl {
     /// call never waits. At once, blocked reads, writes and sends of the flow wake up, and
     /// every data handle of the flow fails from then on with
     /// [`io::ErrorKind::ConnectionAborted`](std::io::ErrorKind::ConnectionAborted)
-    /// ([`UdpFlow::recv`](crate::UdpFlow::recv) returns `None`); bytes and datagrams the
-    /// flow buffered are discarded, never returned.
+    /// ([`UdpFlow::recv`](crate::UdpFlow::recv) returns `None`;
+    /// [`UdpSocket::send`](crate::UdpSocket::send) on an unconnected socket still returns
+    /// `NotConnected` before checking revocation). Bytes and datagrams the flow buffered
+    /// are discarded, never returned.
     ///
     /// Unlike a shutdown or a drop, nothing is sent: no FIN, and unlike
     /// [`TcpConnection::abort`](crate::TcpConnection::abort) no RST either. The peer is not
@@ -905,13 +833,7 @@ impl fmt::Debug for FlowControl {
     }
 }
 
-/// The receipt of [`FlowControl::revoke`] or [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label).
-/// It reports when and how the stack retired the requested lifetime or label.
-///
-/// Each label-wide call has a fresh outcome, so a failed label retirement can be retried.
-/// Its bounded ingress and egress fences cover queued labeled packets; packets already
-/// returned by the source remain outside the proof. The per-flow rules below apply to
-/// receipts from `FlowControl::revoke`.
+/// The receipt of a [`FlowControl::revoke`]: when and how the stack retired the flow.
 ///
 /// Every clone and every receipt of a later revoke of the same flow share one outcome,
 /// written once by the stack's driver:
@@ -950,6 +872,10 @@ pub struct RetirementReceipt {
 }
 
 impl RetirementReceipt {
+    pub(crate) const fn new(state: Arc<FlowState>) -> Self {
+        Self { state }
+    }
+
     /// The outcome, or `None` while the driver has not retired the flow yet.
     pub fn outcome(&self) -> Option<RetirementOutcome> {
         self.state.outcome()

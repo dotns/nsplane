@@ -131,7 +131,7 @@ impl Inner {
     ) -> Option<Hit> {
         match table.entries.get_mut(&key)? {
             FlowEntry::Allowance(allowance) => {
-                let now = Instant::now();
+                let now = self.engine.now();
                 if now.duration_since(allowance.last_seen) > self.config.reply_idle_timeout {
                     table.entries.remove(&key);
                     bump(&self.counters.reply_expired);
@@ -142,7 +142,7 @@ impl Inner {
                         let origin = *origin;
                         return self.revalidate(table, snapshot, key, origin, now);
                     }
-                    Some(dependency) if !snapshot.is_live(dependency, || self.engine.now()) => {
+                    Some(dependency) if !snapshot.is_live(dependency, || now) => {
                         // The pinhole may only have expired: sweep it.
                         *sweep = matches!(dependency, ReplyDependency::Pinhole(_));
                         table.entries.remove(&key);

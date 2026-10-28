@@ -24,6 +24,7 @@ use crate::events::{DROP_TRANSMIT_FULL, DROP_TRANSPORT_CLOSED};
 use crate::handle::TransportStats;
 #[cfg(doc)]
 use crate::io::{PacketSink, PacketSource};
+use crate::tracked::Receipts;
 use crate::transport::{PathMtuReport, Transport};
 
 /// What a stopped transmit task hands back: its queue and the datagrams of the batch it was
@@ -188,9 +189,19 @@ pub(super) struct SendErrors {
     /// The owner keeps a sender, so the signal never closes; a full signal is already
     /// pending.
     pub(super) signal: mpsc::Sender<()>,
+    /// Where the results of tracked datagrams go, with a tracked sender.
+    pub(super) receipts: Option<Arc<Receipts>>,
 }
 
 impl SendErrors {
+    pub(super) fn new(signal: mpsc::Sender<()>, receipts: Option<Arc<Receipts>>) -> Self {
+        Self {
+            count: Arc::default(),
+            signal,
+            receipts,
+        }
+    }
+
     /// Reports `failed` datagrams.
     fn report(&self, failed: usize) {
         // The signal orders the count before the owner's take.
@@ -247,6 +258,15 @@ impl Traffic {
         self.tx_datagrams
             .fetch_add(done.len() as u64, Ordering::Relaxed);
         self.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Reports the datagram `data`, if tracked, as sent or as not sent for `failure`.
+    pub(super) fn finish_tracked(&self, data: &PacketBuf, failure: Option<&'static str>) {
+        if data.is_tracked()
+            && let Some(receipts) = &self.errors.receipts
+        {
+            receipts.finish(data, failure);
+        }
     }
 
     pub(super) fn stats(&self, id: TransportId) -> TransportStats {
@@ -332,14 +352,17 @@ impl TransportSlot {
 
     /// Sends `batch` on the transport without waiting, counting the datagrams it is done
     /// with and the failed ones as the transmit task does; returns how many it is done
-    /// with. [`io::ErrorKind::BrokenPipe`] marks the transport closed.
-    pub(super) fn send_now(&mut self, batch: &[Datagram]) -> usize {
+    /// with, and whether the call that was done with the last of those failed it.
+    /// [`io::ErrorKind::BrokenPipe`] marks the transport closed.
+    pub(super) fn send_now(&mut self, batch: &[Datagram]) -> (usize, bool) {
         let mut sent = 0;
+        let mut last_failed = false;
         while sent < batch.len() {
             let before = sent;
             let mut failed = 0;
             let Err(e) = (self.try_send)(batch, &mut sent, &mut failed) else {
                 sent = batch.len();
+                last_failed = false;
                 break;
             };
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -353,6 +376,7 @@ impl TransportSlot {
             // at most the datagrams the call was done with count as failed.
             sent = sent.max(before + 1).min(batch.len());
             self.traffic.failed(failed.clamp(1, sent - before));
+            last_failed = true;
             if e.kind() == io::ErrorKind::BrokenPipe {
                 tracing::debug!("Transport closed for sending");
                 self.closed = true;
@@ -361,7 +385,7 @@ impl TransportSlot {
             tracing::debug!(message = "Transport send error", error = ?e);
         }
         self.traffic.sent(&batch[..sent]);
-        sent
+        (sent, last_failed)
     }
 
     /// Stops both tasks and returns every datagram still queued for the transport, oldest

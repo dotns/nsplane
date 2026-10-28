@@ -53,8 +53,7 @@ pub struct NetStackStats {
     pub udp_not_accepted: u64,
     /// Packets the stack produced while its egress backlog was full.
     pub egress_full: u64,
-    /// Datagrams completed by reassembly, including ones rejected after completion.
-    /// Always 0 without
+    /// Datagrams reassembled from fragments and handed on as one packet. Always 0 without
     /// [`NetStackConfig::reassembly`](crate::NetStackConfig::reassembly).
     pub reassembled: u64,
     /// Incomplete datagrams discarded with their fragments after the reassembly timeout.
@@ -74,10 +73,6 @@ pub struct NetStackStats {
     /// family's minimum (576 for IPv4, 1280 for IPv6), or not below the configured MTU
     /// and the connection's current path MTU. Applied messages are not counted.
     pub icmp_ignored: u64,
-    /// Input label mismatches, plus fragment sets when they first become mixed.
-    pub label_mismatch: u64,
-    /// Input dropped because its label was revoked.
-    pub label_revoked: u64,
     /// A gauge, not a counter: the TCP connections and UDP flows held for the
     /// application's decision under [`Admission::Decide`](crate::Admission::Decide) now.
     /// Each leaves it accepted, counted in one of the `rejected_` fields, or revoked
@@ -116,6 +111,24 @@ pub struct NetStackStats {
     /// [`TransparentConfig::events`](crate::TransparentConfig::events), or finding its
     /// channel full or its receiver gone.
     pub events_dropped: u64,
+    /// Ingress input dropped because its ingress label (the [`PacketBuf`] tag) differs
+    /// from the label of the lifetime it belongs to: a TCP segment, a retransmitted SYN or
+    /// a handshake ACK of an accepted connection, a datagram of a UDP flow from
+    /// [`incoming_udp`](crate::NetStackHandle::incoming_udp), the further SYNs and
+    /// datagrams of a lifetime held under [`Admission::Decide`](crate::Admission::Decide),
+    /// a datagram reassembled from fragments with different labels, and an ICMP error
+    /// with a label that quotes a connection of another label (ignored, not applied).
+    ///
+    /// [`PacketBuf`]: nsplane_packet::PacketBuf
+    pub label_mismatch: u64,
+    /// Ingress input dropped because its label was revoked with
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label) and its
+    /// tombstone is still held (see
+    /// [`max_revoked_labels`](crate::NetStackConfig::max_revoked_labels)): input sent after
+    /// the call. Input of the label still queued in the stack at the call is dropped as
+    /// part of the revoke and counted in
+    /// [`retired_drops`](crate::NetStackHandle::retired_drops).
+    pub label_revoked: u64,
 }
 
 /// The live counters behind [`NetStackStats`].
@@ -136,8 +149,6 @@ pub(crate) struct Counters {
     pub(crate) reassembly_timeout: AtomicU64,
     pub(crate) reassembly_overflow: AtomicU64,
     pub(crate) icmp_ignored: AtomicU64,
-    pub(crate) label_mismatch: AtomicU64,
-    pub(crate) label_revoked: AtomicU64,
     pub(crate) pending: AtomicU64,
     pub(crate) accepted: AtomicU64,
     pub(crate) rejected_hook: AtomicU64,
@@ -147,6 +158,8 @@ pub(crate) struct Counters {
     pub(crate) rejected_prefix: AtomicU64,
     pub(crate) events_emitted: AtomicU64,
     pub(crate) events_dropped: AtomicU64,
+    pub(crate) label_mismatch: AtomicU64,
+    pub(crate) label_revoked: AtomicU64,
     /// Behind [`NetStackHandle::retired_drops`](crate::NetStackHandle::retired_drops), not
     /// part of [`NetStackStats`].
     pub(crate) retired: AtomicU64,
@@ -177,8 +190,6 @@ impl Counters {
             reassembly_timeout: get(&self.reassembly_timeout),
             reassembly_overflow: get(&self.reassembly_overflow),
             icmp_ignored: get(&self.icmp_ignored),
-            label_mismatch: get(&self.label_mismatch),
-            label_revoked: get(&self.label_revoked),
             pending: get(&self.pending),
             accepted: get(&self.accepted),
             rejected_hook: get(&self.rejected_hook),
@@ -188,6 +199,8 @@ impl Counters {
             rejected_prefix: get(&self.rejected_prefix),
             events_emitted: get(&self.events_emitted),
             events_dropped: get(&self.events_dropped),
+            label_mismatch: get(&self.label_mismatch),
+            label_revoked: get(&self.label_revoked),
         }
     }
 }

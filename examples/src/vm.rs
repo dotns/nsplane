@@ -285,8 +285,9 @@ impl Acl {
     }
 
     /// Reads the policy file and installs it if its content changed since the last read.
-    /// Returns whether a new policy was installed; a file that cannot be read or parsed
-    /// keeps the previous policy and is reported once.
+    /// Returns whether a new policy was installed. Read or parse failures keep the
+    /// previous policy. Each read failure is logged; invalid content is remembered so
+    /// repeated reads of the same bytes do not report the parse failure again.
     pub async fn reload(&self) -> bool {
         let content = match tokio::fs::read(&self.path).await {
             Ok(content) => content,

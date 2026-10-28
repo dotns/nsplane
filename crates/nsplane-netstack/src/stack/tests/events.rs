@@ -10,8 +10,17 @@ const SYN: u8 = 0x02;
 /// A stack at [`LOCAL`] with `transparent`, its source (kept so the driver runs) and
 /// its sink.
 fn start(transparent: TransparentConfig) -> (NetStackHandle, NetStackSource, NetStackSink) {
+    start_admitting(transparent, Admission::Immediate)
+}
+
+/// [`start`] admitting new connections and flows with `admission`.
+fn start_admitting(
+    transparent: TransparentConfig,
+    admission: Admission,
+) -> (NetStackHandle, NetStackSource, NetStackSink) {
     let (stack, handle) = NetStack::new(NetStackConfig {
         transparent: Some(transparent),
+        admission,
         ..config(LOCAL)
     });
     let (source, sink) = stack.split();
@@ -27,16 +36,17 @@ fn with_events(events: Option<FlowEventsConfig>) -> TransparentConfig {
     }
 }
 
-/// [`with_events`] deciding with `timeout` and `max_pending`.
-#[allow(deprecated, reason = "the deprecated field is still honoured")]
-fn deciding(timeout: Duration, max_pending: usize) -> TransparentConfig {
-    TransparentConfig {
-        admission: Admission::Decide {
-            timeout,
-            max_pending,
-        },
-        ..with_events(Some(FlowEventsConfig::default()))
-    }
+/// [`start`] with [`with_events`] and the default events, deciding with `timeout` and
+/// `max_pending`.
+fn start_deciding(
+    timeout: Duration,
+    max_pending: usize,
+) -> (NetStackHandle, NetStackSource, NetStackSink) {
+    let admission = Admission::Decide {
+        timeout,
+        max_pending,
+    };
+    start_admitting(with_events(Some(FlowEventsConfig::default())), admission)
 }
 
 fn addr(text: &str) -> Result<SocketAddr, Box<dyn Error>> {
@@ -185,7 +195,7 @@ async fn a_connection_limit_rejection_is_emitted() -> TestResult {
 
 #[tokio::test]
 async fn decisions_on_held_connections_and_flows_are_emitted() -> TestResult {
-    let (handle, _source, sink) = start(deciding(WAIT * 5, 1));
+    let (handle, _source, sink) = start_deciding(WAIT * 5, 1);
     let mut events = handle.flow_events();
     let mut pending = handle.incoming_pending();
 
@@ -250,7 +260,7 @@ async fn decisions_on_held_connections_and_flows_are_emitted() -> TestResult {
 
 #[tokio::test]
 async fn a_timeout_is_emitted() -> TestResult {
-    let (handle, _source, sink) = start(deciding(Duration::from_millis(50), 8));
+    let (handle, _source, sink) = start_deciding(Duration::from_millis(50), 8);
     let mut events = handle.flow_events();
     let mut pending = handle.incoming_pending();
     send_syn(&sink, "10.8.0.2:40000", "192.0.2.10:443").await?;

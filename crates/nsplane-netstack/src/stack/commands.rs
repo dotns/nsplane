@@ -141,7 +141,12 @@ impl Driver {
         let local = SocketAddr::new(local, port);
         let flow = label.map(|label| {
             self.device.tcp_labels.insert((local, remote), Some(label));
-            self.tcp_state(handle, local, remote, self.position()).0
+            self.labels.bind_active((remote, local), handle, label);
+            let flow = self
+                .tcp_state(handle, local, remote, self.position(), Some(label))
+                .0;
+            self.labels.register(&flow);
+            flow
         });
         Ok((handle, registration, flow))
     }
@@ -195,7 +200,7 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        let flow = FlowState::new(Target::UdpBound(addr), &self.revocations);
+        let flow = FlowState::new(Target::UdpBound(addr), None, &self.revocations);
         self.bound.insert(addr, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_bound(addr);
         Ok(UdpSocket::new(
@@ -269,7 +274,8 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        let flow = FlowState::labeled(Target::UdpConnected(key), label, &self.revocations);
+        let flow = FlowState::new(Target::UdpConnected(key), label, &self.revocations);
+        self.labels.register(&flow);
         self.connected.insert(key, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_flow(local, remote);
         Ok(UdpSocket::new(

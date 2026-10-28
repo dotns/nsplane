@@ -134,8 +134,9 @@
 //!   quoted fixed header, its extension headers and 8 bytes of its upper
 //!   layer, with addresses mirroring the error's, as for IPv4); echo request
 //!   128 opens a flow keyed by its identifier and echo reply 129 is
-//!   reverse-only. Every other type, Neighbor Discovery and Multicast
-//!   Listener messages included, is an ordinary new flow that needs a grant
+//!   reverse-only. Redirect type 137 is also reverse-only and requires live state.
+//!   The remaining types, including other Neighbor Discovery and Multicast
+//!   Listener messages, are ordinary new flows that need a grant
 //!   ([`ProtocolMatch::Icmp`](crate::ProtocolMatch::Icmp) matches `ICMPv6`
 //!   types).
 //!
@@ -187,7 +188,6 @@ use crate::net::Protocol;
 use crate::rules::RuleId;
 
 mod addr;
-mod clock;
 mod config;
 mod decisions;
 mod divert;
@@ -411,7 +411,7 @@ impl FlowGate {
     /// [`Instant::now`] elsewhere.
     #[must_use]
     pub fn new(config: GateConfig) -> Arc<Self> {
-        Self::with_clock(config, clock::coarse())
+        Self::with_clock(config, crate::clock::coarse())
     }
 
     /// A gate whose flow and fragment expiry follows `clock` (e.g. a manual

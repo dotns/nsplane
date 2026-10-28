@@ -32,5 +32,5 @@ The rest of the bug fix rules stay: regression test, full gate, slot A/B for dat
 - The open follow-ups the freeze left unscheduled (deferred optimizations, NG-6, wrapper
   `send_batch_spent` forwarding, `EngineHandle::recycle`, netstack SACK, release C of plan
   `20261026-0822-node-gateway-requests`, the peer-level expiry signal) can be planned again.
-- The deprecated `WsFrame` stream carrier and `TransparentConfig::admission` may be removed in a
-  later minor release, with a breaking notice.
+- The deprecated `WsFrame` stream carrier and `TransparentConfig::admission` were removed in
+  0.21.0, with a breaking notice and migration examples in the CHANGELOG.

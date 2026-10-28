@@ -1,7 +1,7 @@
 //! RFC 1071 Internet checksum helpers.
 //!
-//! All functions return the final, complemented checksum in host order, ready to be
-//! written big-endian into a header.
+//! Checksum functions return the complemented checksum in host order, ready to be
+//! written big-endian into a header. [`sum_words`] and [`fold`] return uncomplemented sums.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -59,7 +59,8 @@ pub fn internet_checksum(data: &[u8]) -> u16 {
 /// Returns the checksum of an IPv4 header, treating its checksum field (bytes 10..12)
 /// as zero so the result can be written straight into the header.
 ///
-/// A header shorter than 20 bytes is summed as given.
+/// Short headers are accepted; bytes 10 and 11 are excluded when present, including
+/// byte 10 of an 11-byte input.
 pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
     let before = header.get(..IPV4_CHECKSUM.start).unwrap_or(header);
     let after = header.get(IPV4_CHECKSUM.end..).unwrap_or(&[]);

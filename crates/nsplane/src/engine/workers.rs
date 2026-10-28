@@ -30,7 +30,8 @@ pub(super) struct Workers {
     /// The worker the next job goes to.
     next: usize,
     /// Jobs batched or with the workers and not completed yet, in the order they were
-    /// handed out; at most `bound`. A job is here once its worker handed it back.
+    /// handed out. Input admission uses `bound`, but fragmentation can expand an admitted
+    /// packet beyond it. A job is here once its worker handed it back.
     order: VecDeque<Pending>,
     /// The sequence number of the front of `order`.
     first: u64,

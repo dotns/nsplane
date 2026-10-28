@@ -36,9 +36,10 @@ const DONT_FRAGMENT: u8 = 0x40;
 pub(crate) struct Datagram {
     pub(crate) src: SocketAddr,
     pub(crate) dst: SocketAddr,
-    pub(crate) label: Option<NonZeroU64>,
     /// A view into the ingress packet; parsing copies nothing.
     pub(crate) payload: Bytes,
+    /// The packet's tag: its ingress label.
+    pub(crate) label: Option<NonZeroU64>,
 }
 
 /// Extracts the UDP datagram from an IPv4 or IPv6 packet.
@@ -46,29 +47,29 @@ pub(crate) struct Datagram {
 /// Returns `None` if the packet is not an unfragmented UDP datagram or is malformed.
 /// IPv6 extension headers are not walked.
 pub(crate) fn parse_udp(packet: PacketBuf) -> Option<Datagram> {
-    let label = packet.tag();
     let (src, dst, payload) = udp_payload(&packet)?;
+    let label = packet.tag();
     let payload = packet.freeze().slice(payload);
     Some(Datagram {
         src,
         dst,
-        label,
         payload,
+        label,
     })
 }
 
 /// [`parse_udp`], also returning the whole packet the datagram's payload is a view into.
 pub(crate) fn parse_udp_whole(packet: PacketBuf) -> Option<(Datagram, Bytes)> {
-    let label = packet.tag();
     let (src, dst, payload) = udp_payload(&packet)?;
+    let label = packet.tag();
     let whole = packet.freeze();
     let payload = whole.slice(payload);
     Some((
         Datagram {
             src,
             dst,
-            label,
             payload,
+            label,
         },
         whole,
     ))
@@ -200,7 +201,7 @@ impl UdpOut {
         }
         let mut packet =
             build_udp(src, dst, payload).ok_or_else(|| invalid("datagram exceeds the MTU"))?;
-        packet.set_tag(flow.ingress_label());
+        packet.set_tag(flow.label());
         if packet.len() > self.mtu {
             if !self.allow_fragmentation || !src.is_ipv4() {
                 return Err(invalid("datagram exceeds the MTU"));
@@ -258,11 +259,6 @@ pub struct UdpFlow {
 }
 
 impl UdpFlow {
-    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
-    pub fn ingress_label(&self) -> Option<NonZeroU64> {
-        self.reply.flow.ingress_label()
-    }
-
     pub(crate) const fn new(
         registration: Registration,
         rx: mpsc::Receiver<Bytes>,
@@ -310,6 +306,13 @@ impl UdpFlow {
         self.reply.control()
     }
 
+    /// The ingress label of the flow: the tag the consumer set on its first datagram (see
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label)), or `None` for
+    /// an unlabeled flow.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.reply.flow.label()
+    }
+
     /// The state of the flow's lifetime.
     pub(crate) const fn flow(&self) -> &Arc<FlowState> {
         &self.reply.flow
@@ -336,7 +339,7 @@ pub struct UdpReply {
 impl UdpReply {
     /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
     pub fn ingress_label(&self) -> Option<NonZeroU64> {
-        self.flow.ingress_label()
+        self.flow.label()
     }
 
     pub(crate) const fn new(
@@ -385,8 +388,9 @@ impl UdpReply {
 /// unless another socket is bound to the exact address. A connected socket receives only
 /// the datagrams from its remote to its local address, ahead of any socket bound to that
 /// address. Dropping the socket unbinds it. After a revoke through its
-/// [`control`](Self::control) every operation fails with
-/// [`io::ErrorKind::ConnectionAborted`].
+/// [`control`](Self::control), data operations fail with
+/// [`io::ErrorKind::ConnectionAborted`], except [`send`](Self::send) on an unconnected
+/// socket, which checks for a remote first and returns [`io::ErrorKind::NotConnected`].
 #[derive(Debug)]
 pub struct UdpSocket {
     /// Declared before `rx`: the address leaves the ownership table before the driver can
@@ -404,7 +408,7 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
     pub fn ingress_label(&self) -> Option<NonZeroU64> {
-        self.flow.ingress_label()
+        self.flow.label()
     }
 
     pub(crate) const fn new(

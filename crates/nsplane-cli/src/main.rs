@@ -154,7 +154,8 @@ fn adopt_uapi_stream(fd: i32) -> anyhow::Result<tokio::net::UnixStream> {
     Ok(tokio::net::UnixStream::from_std(stream)?)
 }
 
-/// Brings the interface up and runs it until SIGINT or SIGTERM.
+/// Creates or adopts the TUN device and serves packets and UAPI until SIGINT or SIGTERM.
+/// Interface addresses, routes and administrative up state are configured externally.
 async fn serve(args: &Args) -> anyhow::Result<()> {
     let uapi_stream = args
         .uapi_fd

@@ -1,6 +1,5 @@
 //! Upgrades refused with an HTTP response carry a `WssDialError` (status, headers and the
-//! truncated body) in the dial error of `WssDialer` and `WssStreamClient`; a 401 is still
-//! a rejection.
+//! truncated body) in the dial error of `WssDialer`; a 401 is still a rejection.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -9,8 +8,6 @@ use std::time::Duration;
 use nsplane::{LinkDialer as _, LinkState};
 use nsplane_e2e::{TestResult, WAIT};
 use nsplane_wss::{WssConfig, WssDialError, WssDialer, WssTls};
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -131,31 +128,5 @@ async fn unavailable_carries_the_detail() -> TestResult {
         0
     );
     assert_eq!(stats.connect_failures(), 1);
-    Ok(())
-}
-
-/// Every open behind a refused session dial gets the detail, the waiters behind the dial
-/// included.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-async fn stream_opens_carry_the_detail() -> TestResult {
-    let addr = refusing("401 Unauthorized").await?;
-    let client = WssStreamClient::new(config(addr), WssStreamLimits::default())?;
-    let target: SocketAddr = "10.0.0.1:80".parse()?;
-    let opens: Vec<_> = (0..3)
-        .map(|_| {
-            let client = client.clone();
-            tokio::spawn(async move { client.open_tcp(target).await.map(drop) })
-        })
-        .collect();
-    for open in opens {
-        let err = timeout(WAIT, open)
-            .await??
-            .err()
-            .ok_or("the open succeeded")?;
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        check_detail(&err, 401)?;
-    }
-    assert!(client.stats().rejected_unauthorized() >= 1);
     Ok(())
 }

@@ -6,8 +6,8 @@
 use std::mem;
 use std::time::Instant;
 
-use nsplane_noise::noise::TunnResult;
 use nsplane_noise::noise::errors::WireGuardError;
+use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_packet::{Ecn, HEADROOM, Path, PeerId};
 
 use super::send::{Fixed, transmit};
@@ -36,10 +36,17 @@ impl Core {
             match result {
                 TunnResult::Done => peer.expired = false,
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                    peer.initiation_abandoned();
-                    if !mem::replace(&mut peer.expired, true) {
-                        self.outputs
-                            .push_back(Output::Event(Event::SessionExpired { peer: id }));
+                    // Without a cause the tunnel did not expire: a keepalive was not sealed.
+                    if let Some(cause) = peer.with_tunnel(Tunn::expiry_cause) {
+                        if peer.tunnel_expired(cause) {
+                            self.outputs.push_back(Output::Event(Event::SessionExpired {
+                                peer: id,
+                                cause,
+                            }));
+                        }
+                    } else {
+                        peer.expired = false;
+                        tracing::debug!("Keepalive not sealed: connection expired");
                     }
                 }
                 TunnResult::Err(e) => {
@@ -84,6 +91,7 @@ impl Core {
                     tx: p.tx(),
                     data_rx: p.data_rx(),
                     data_tx: p.data_tx(),
+                    expirations: p.expirations(),
                     last_handshake: p.time_since_last_handshake(now),
                 }));
             }

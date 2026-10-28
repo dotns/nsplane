@@ -24,9 +24,11 @@ Every peer has its own IPv6 address on the tunnel, `peer6`, and an EAM `eam4 <->
 local IPv4 address translated to and from the IPv6 side of the mapping. Optionally it also has
 a second EAM `peer6_eam4 <-> peer6` (a local IPv4 address translated to and from `peer6`) and
 a local IPv6 rewrite `local6 <-> peer6` (rewritten, not translated). The node's own EAM is
-`SelfMapping` `eam4 <-> eam6`, and IPv4 LAN prefixes pair with IPv6 /96 prefixes holding the
-IPv4 address in the low 32 bits (`lan4 <-> lan6`), behind this node or behind a peer. `TranslationTable` (built and validated
-by `TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
+`SelfMapping` `eam4 <-> eam6`. IPv4 LAN prefixes pair with IPv6 prefixes (`lan4 <-> lan6`),
+behind this node or behind a peer: a /96 prefix embeds the full IPv4 address, while a
+/(96 + `lan4` length) prefix maps the network bits and copies only the host bits (see
+[LAN prefixes](#lan-prefixes)). `TranslationTable` (built and validated by
+`TranslationTableBuilder`) holds this model immutably; `Translator::store` replaces it
 atomically while traffic flows.
 
 ### LAN prefixes
@@ -138,8 +140,11 @@ allowed IPs contain, so the core could not route them to a peer before a filter 
 `Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
 `reverse` on local packets before the core routes them (the IPv6 result goes to the peer
 owning the original source). Both keep the packet's tag and receipt marker; a reply without
-the 20 bytes of headroom `reverse` grows into is copied once, with both. The clients route the mapped /96 to the gateway (it is in their
-allowed IPs for it), and the gateway's local side routes `snat_source` back to itself. The
+the 20 bytes of headroom `reverse` grows into is copied once, with both.
+`Nat64LanSink::send_batch_spent` appends the buffers of the packets `forward` dropped, in
+order, then forwards to the inner sink's `send_batch_spent`. The clients route the mapped /96
+to the gateway (it is in their allowed IPs for it), and the gateway's local side routes
+`snat_source` back to itself. The
 wrappers make `nsplane-nat` depend on `nsplane`; `nsplane` does not depend on `nsplane-nat`.
 
 ### Redirect

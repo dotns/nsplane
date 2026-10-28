@@ -424,13 +424,14 @@ async fn settings(node: &Node) -> TestResult<(Config, Vec<PeerStats>, Option<Pub
         .peers()
         .await?
         .into_iter()
-        .map(|p| PeerStats {
-            rx: 0,
-            tx: 0,
-            data_rx: 0,
-            data_tx: 0,
-            last_handshake: None,
-            ..p
+        .map(|mut p| {
+            p.rx = 0;
+            p.tx = 0;
+            p.data_rx = 0;
+            p.data_tx = 0;
+            p.expirations = 0;
+            p.last_handshake = None;
+            p
         })
         .collect();
     Ok((

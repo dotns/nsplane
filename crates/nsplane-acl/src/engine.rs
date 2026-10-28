@@ -733,7 +733,7 @@ pub struct AclEngine {
 
 impl Default for AclEngine {
     fn default() -> Self {
-        Self::with_clock(Instant::now)
+        Self::with_clock(crate::clock::coarse())
     }
 }
 
@@ -747,15 +747,19 @@ impl fmt::Debug for AclEngine {
 }
 
 impl AclEngine {
-    /// An engine with nothing installed (denies everything).
+    /// An engine with nothing installed (denies everything). Its clock is the
+    /// coarse monotonic clock on Linux and Android (a resolution of one
+    /// scheduler tick, 1 to 4 ms) and [`Instant::now`] elsewhere.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// An engine with nothing installed whose pinhole expiry follows `clock`
-    /// instead of [`Instant::now`]; e.g. `|| tokio::time::Instant::now().into_std()`
-    /// to follow paused tokio time in tests.
+    /// An engine with nothing installed whose pinhole expiry, and the reply
+    /// allowance and fragment expiry of its [`AclFilter`](crate::AclFilter)s,
+    /// follow `clock` instead of the default coarse clock; e.g.
+    /// `|| tokio::time::Instant::now().into_std()` to follow paused tokio time
+    /// in tests.
     pub fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
         Self {
             snapshot: SnapshotCell::default(),

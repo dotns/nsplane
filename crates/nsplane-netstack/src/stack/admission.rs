@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -25,24 +26,34 @@ impl Driver {
     pub(super) fn reject_connection_limit(
         &mut self,
         key: &pending::Key,
-        packet: &nsplane_packet::PacketBuf,
+        packet: &[u8],
+        label: Option<NonZeroU64>,
     ) {
         stats::add(&self.stats.rejected_connection_limit, 1);
         self.emit(key, FlowEventReason::ConnectionLimit);
-        if let Some(mut reset) = tcp_reset(packet.as_packet()) {
-            reset.set_tag(packet.tag());
+        if let Some(mut reset) = tcp_reset(packet) {
+            reset.set_tag(label);
             self.push_reply(reset);
         }
     }
 
-    /// Holds a new connection or flow for the application's decision, rejecting it at
-    /// once when the table is full or the application's stream is gone.
-    pub(super) fn hold(&mut self, key: pending::Key, held: pending::Held) {
+    /// Holds a new connection or flow with the ingress `label` for the application's
+    /// decision, rejecting it at once when the table is full or the application's stream
+    /// is gone.
+    pub(super) fn hold(
+        &mut self,
+        key: pending::Key,
+        held: pending::Held,
+        label: Option<NonZeroU64>,
+    ) {
         let Some(table) = self.pending.as_mut() else {
             return;
         };
-        match table.hold(key, held, Instant::now()) {
-            Hold::Held => self.count_pending(),
+        match table.hold(key, held, label, Instant::now()) {
+            Hold::Held(state) => {
+                self.labels.register(&state);
+                self.count_pending();
+            }
             Hold::Full(held) => self.reject(&key, &held, FlowEventReason::TableFull),
             Hold::Gone(held) => self.reject(&key, &held, FlowEventReason::Hook),
         }
@@ -89,14 +100,17 @@ impl Driver {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
                         if flow.undeliver(Undelivered::ConnectionLimit) {
-                            self.reject_connection_limit(&key, &syn);
+                            self.reject_connection_limit(&key, syn.as_packet(), syn.tag());
                         }
                         continue;
                     }
                     stats::add(&self.stats.accepted, 1);
                     self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
-                    self.remember_syn_label(&syn);
+                    self.labels.record_syn(syn.as_packet(), syn.tag());
+                    self.device
+                        .tcp_labels
+                        .insert((key.local, key.remote), syn.tag());
                     self.device.inject(syn);
                     if let Some(table) = self.pending.as_mut() {
                         table.admit(flow);
@@ -152,8 +166,8 @@ impl Driver {
         }
     }
 
-    /// Holds the new flow from `remote` to `local` with its first datagram, or drops the
-    /// datagram of a flow already held.
+    /// Holds the new flow from `remote` to `local` with its first datagram and its ingress
+    /// `label`, or drops the datagram of a flow already held.
     #[cold]
     #[inline(never)]
     pub(super) fn hold_udp(
@@ -162,20 +176,16 @@ impl Driver {
         local: SocketAddr,
         payload: Bytes,
         packet: Bytes,
-        label: Option<std::num::NonZeroU64>,
+        label: Option<NonZeroU64>,
     ) {
         let key = pending::Key {
             protocol: PendingProtocol::Udp,
             remote,
             local,
         };
-        if let Some(held_label) = self
-            .pending
-            .as_ref()
-            .and_then(|table| table.lifetime(&key).map(FlowState::ingress_label))
-        {
+        if let Some(held) = self.pending.as_ref().and_then(|table| table.lifetime(&key)) {
             // A held flow queues its first datagram only.
-            let counter = if held_label == label {
+            let counter = if held.label() == label {
                 &self.stats.udp_queue_full
             } else {
                 &self.stats.label_mismatch
@@ -190,6 +200,7 @@ impl Driver {
                 packet,
                 label,
             },
+            label,
         );
     }
 

@@ -11,6 +11,7 @@ use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::events::FlowEvent;
+use crate::flow::{FlowState, RetirementReceipt, Revocations, Undelivered};
 use crate::ownership::{Owners, Ownership, Registration};
 use crate::pending::PendingFlow;
 use crate::stats::{Counters, NetStackStats};
@@ -54,7 +55,6 @@ pub(super) enum Command {
 /// the stack.
 #[derive(Debug, Clone)]
 pub struct NetStackHandle {
-    pub(super) revocations: Arc<crate::flow::Revocations>,
     pub(super) commands: mpsc::Sender<Command>,
     pub(super) incoming_tcp: Arc<Mutex<Option<mpsc::Receiver<TcpConnection>>>>,
     pub(super) incoming_udp: Arc<Mutex<Option<mpsc::Receiver<UdpFlow>>>>,
@@ -62,6 +62,7 @@ pub struct NetStackHandle {
     pub(super) flow_events: Arc<Mutex<Option<mpsc::Receiver<FlowEvent>>>>,
     pub(super) stats: Arc<Counters>,
     pub(super) owners: Arc<Owners>,
+    pub(super) revocations: Arc<Revocations>,
 }
 
 /// Takes the value out of a shared slot, ignoring poisoning.
@@ -70,18 +71,6 @@ fn take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
 }
 
 impl NetStackHandle {
-    /// Retires every lifetime carrying `label`, including queued input and output.
-    ///
-    /// Each call returns a fresh receipt; retry after `Failed` when the bounded fence
-    /// tables have room. `Unknown` means the driver stopped. The stack remembers at most
-    /// [`NetStackConfig::max_revoked_labels`] labels; never reuse a label even after its
-    /// tombstone is evicted. Packets already returned by the source are outside this proof.
-    pub fn revoke_label(&self, label: NonZeroU64) -> crate::RetirementReceipt {
-        let state =
-            crate::flow::FlowState::new(crate::flow::Target::Label(label), &self.revocations);
-        crate::FlowControl::new(state).revoke()
-    }
-
     /// Inbound TCP connections to any port of the stack's addresses, once established.
     ///
     /// Only the first call (on any clone of the handle) gets the connections; every later
@@ -300,6 +289,52 @@ impl NetStackHandle {
         response.await.map_err(|_| stack_gone())?
     }
 
+    /// Revokes every lifetime with the ingress label `label` and returns the receipt.
+    ///
+    /// The tag of a packet sent into [`NetStackSink`] is its ingress label, and a
+    /// connection or flow takes the label of its first input (see
+    /// [`TcpConnection::ingress_label`] and [`UdpFlow::ingress_label`]). The call never
+    /// waits; the driver turn that takes it:
+    ///
+    /// - retires every lifetime with the label at its stage, as [`FlowControl::revoke`]
+    ///   does, and revokes its control: held under [`Admission::Decide`], a listener socket
+    ///   mid handshake, a connection waiting for or queued in `incoming_tcp`, a flow queued
+    ///   in `incoming_udp` (neither is handed out), and handles already handed out (reads
+    ///   fail with [`io::ErrorKind::ConnectionAborted`], [`UdpFlow::recv`] returns `None`);
+    ///   each lifetime's own receipts report its retirement;
+    /// - drops the label's input still in the ingress queue, sent before the call, as the
+    ///   driver takes it (counted in [`retired_drops`](Self::retired_drops));
+    /// - discards the incomplete datagrams the reassembler holds a fragment of the label of;
+    /// - records the label's tombstone: input with the label that reaches the stack later is
+    ///   dropped and counted in [`label_revoked`](NetStackStats::label_revoked) and opens no
+    ///   new lifetime, for at least the next
+    ///   [`max_revoked_labels`](NetStackConfig::max_revoked_labels) revocations.
+    ///
+    /// The receipt reports [`Retired`](crate::RetirementOutcome::Retired) when nothing of
+    /// the label is delivered from then on and no output of its lifetimes leaves the stack;
+    /// [`Failed`](crate::RetirementOutcome::Failed) when a bounded table was full (at most
+    /// 1024 labels with queued input at once, and the egress fences of
+    /// [`RetirementReceipt`]): every lifetime found is still retired, but input or output
+    /// queued before the call may still pass. The call is idempotent: call it again, and a
+    /// later call scans again, records what did not fit and reports `Retired` once it does;
+    /// keep the lifetime's owner withdrawn until then.
+    /// [`Unknown`](crate::RetirementOutcome::Unknown) means the stack stopped.
+    ///
+    /// Labels of revoked lifetimes must not be reused, and input of the label queued on the
+    /// caller's side should be cancelled before the call: the tombstone is a safety net.
+    /// After `Retired`, the same tuple opens a fresh lifetime with its new label. Connections
+    /// and connected UDP sockets opened with a labeled API are covered, including a TCP
+    /// handshake still in progress. Unlabeled application-opened sockets are unaffected.
+    /// Output packets retain the lifetime label from creation, including queued replies.
+    /// The proof boundary of [`FlowControl::revoke`] applies.
+    ///
+    /// [`FlowControl::revoke`]: crate::FlowControl::revoke
+    pub fn revoke_label(&self, label: NonZeroU64) -> RetirementReceipt {
+        let state = FlowState::receipt(&self.revocations);
+        self.revocations.revoke_label(label, Arc::clone(&state));
+        RetirementReceipt::new(state)
+    }
+
     /// The stack's drop counters.
     pub fn stats(&self) -> NetStackStats {
         self.stats.snapshot()
@@ -308,7 +343,8 @@ impl NetStackHandle {
     /// Packets and datagrams the stack discarded because their flow was revoked with
     /// [`FlowControl::revoke`](crate::FlowControl::revoke): queued output removed from the
     /// egress backlog, held back at the [`NetStackSource`], or still waiting in the UDP
-    /// send queue. Counted here and not in [`stats`](Self::stats); bytes and datagrams a
+    /// send queue, plus reassembled ingress datagrams rejected by retirement barriers.
+    /// Counted here and not in [`stats`](Self::stats); bytes and datagrams a
     /// revoked flow had buffered for the application are not counted. Only grows.
     pub fn retired_drops(&self) -> u64 {
         self.stats
@@ -409,15 +445,27 @@ trait HandOut {
     }
 }
 
+/// Fixes the delivery of `flow` unless it ended or was revoked; whether its handle may be
+/// returned. A revoked lifetime is skipped also when it was delivered from the start
+/// (`Admission::Immediate`); its delivery ends revoked before the skipped handle's drop
+/// could end it otherwise.
+fn hand_out(flow: &FlowState) -> bool {
+    if flow.is_revoked() {
+        flow.undeliver(Undelivered::Revoked);
+        return false;
+    }
+    flow.deliver()
+}
+
 impl HandOut for TcpConnection {
     fn hand_out(&self) -> bool {
-        !self.flow().is_revoked() && self.flow().deliver()
+        hand_out(self.flow())
     }
 }
 
 impl HandOut for UdpFlow {
     fn hand_out(&self) -> bool {
-        !self.flow().is_revoked() && self.flow().deliver()
+        hand_out(self.flow())
     }
 }
 

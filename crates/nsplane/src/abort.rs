@@ -82,6 +82,10 @@ impl SinkAbort {
 /// [`PacketSink::try_send_batch`] goes to the inner sink until the abort, and drops and
 /// counts every packet and returns `Ok` after it.
 ///
+/// [`PacketSink::send_batch_spent`] behaves like `send_batch` over the inner sink's
+/// `send_batch_spent`, so the inner sink's spent buffers reach the caller; the packets it
+/// drops on an abort, except the one being delivered, have their buffers appended to `spent`.
+///
 /// An aborted sink returns `Ok`, not [`io::ErrorKind::BrokenPipe`]: behind a [`SwapSink`]
 /// the next generation may already be installed, and a `BrokenPipe` would make the
 /// engine (or a `pump`) take the whole local side for gone. Stopping whatever feeds the
@@ -160,6 +164,23 @@ impl<S: PacketSink> PacketSink for AbortSink<S> {
         Ok(())
     }
 
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        let total = packets.len();
+        if !self.abort.is_aborted()
+            && let Some(result) = self.race(self.inner.send_batch_spent(packets, spent)).await
+        {
+            return result;
+        }
+        let in_flight = usize::from(packets.len() < total);
+        self.count(packets.len() + in_flight);
+        spent.extend(packets.drain(..).map(|(_, packet)| packet));
+        Ok(())
+    }
+
     fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
         if self.abort.is_aborted() {
             self.count(packets.len());
@@ -188,6 +209,7 @@ mod tests {
 
     use super::*;
     use crate::ChannelSink;
+    use crate::io::test_sinks::{SpentSink, bytes};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -279,6 +301,60 @@ mod tests {
         assert_eq!(sink.dropped(), 4);
         assert_eq!(next(&mut rx).await?, 1);
         assert!(rx.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_forwards_the_inner_sinks_buffers() -> TestResult {
+        let inner = SpentSink::default();
+        let (sink, _abort) = AbortSink::new(inner.clone());
+        let mut packets = batch(&[1, 2, 3]);
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[1], [2], [3]]);
+        assert_eq!(inner.taken(), [[1], [2], [3]]);
+
+        // An error from the inner sink comes back unchanged, the rest left.
+        let mut packets = batch(&[4, SpentSink::FAIL, 6]);
+        let mut spent = Vec::new();
+        let err = sink
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(bytes(&spent), [[4]]);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(sink.dropped(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_abort_returns_the_dropped_buffers() -> TestResult {
+        let inner = SpentSink::default();
+        let (sink, abort) = AbortSink::new(inner.clone());
+        let mut packets = batch(&[1, SpentSink::HOLD, 3]);
+        let mut spent = Vec::new();
+        {
+            let mut pending = Box::pin(sink.send_batch_spent(&mut packets, &mut spent));
+            assert!(timeout(PENDING, &mut pending).await.is_err());
+            abort.abort();
+            timeout(WAIT, pending).await??;
+        }
+        assert!(packets.is_empty());
+        // 1 was written; the held packet went with the cancelled call; 3 was left.
+        assert_eq!(bytes(&spent), [[1], [3]]);
+        assert_eq!(sink.dropped(), 2);
+
+        // After the abort every buffer comes back at once.
+        let mut packets = batch(&[4, 5]);
+        let mut spent = Vec::new();
+        sink.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[4], [5]]);
+        assert_eq!(sink.dropped(), 4);
+        assert_eq!(inner.taken(), [[1]]);
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 //! Bridging established connections to the application, and their release.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use smoltcp::iface::SocketHandle;
@@ -186,16 +187,18 @@ fn receive_into(socket: &mut tcp::Socket<'_>, shared: &mut Shared) -> usize {
 }
 
 impl Driver {
-    /// A new delivered connection state for the socket `handle`, and its stream buffers.
+    /// A new delivered connection state for the socket `handle` with the ingress `label`,
+    /// and its stream buffers.
     pub(super) fn tcp_state(
         &self,
         handle: SocketHandle,
         local: SocketAddr,
         peer: SocketAddr,
         start: u64,
+        label: Option<NonZeroU64>,
     ) -> (Arc<FlowState>, Arc<Mutex<Shared>>) {
         let shared = Arc::new(Mutex::new(Shared::new(self.settings.stream_buffer)));
-        let flow = FlowState::labeled(
+        let flow = FlowState::new(
             Target::Tcp {
                 handle,
                 shared: Arc::clone(&shared),
@@ -203,11 +206,7 @@ impl Driver {
                 peer,
                 start,
             },
-            self.device
-                .tcp_labels
-                .get(&(local, peer))
-                .copied()
-                .flatten(),
+            label,
             &self.revocations,
         );
         (flow, shared)
@@ -288,6 +287,10 @@ impl Driver {
     pub(super) fn release_conn(&mut self, handle: SocketHandle) {
         let end = self.position();
         if let Some(conn) = self.conns.remove(&handle) {
+            if let Some(&Target::Tcp { local, peer, .. }) = conn.flow.target() {
+                self.labels.release((peer, local), handle);
+                self.device.tcp_labels.remove(&(local, peer));
+            }
             conn.flow.set_end(end);
             conn.release();
         }

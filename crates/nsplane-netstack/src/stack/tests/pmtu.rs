@@ -52,7 +52,11 @@ fn too_big_quoting(router: IpAddr, dst: IpAddr, quoted: &[u8], mtu: u32) -> Pack
 
 /// [`too_big_quoting`] `packet` to its source with the quote a router sends: the IP header
 /// and 8 bytes (IPv4, RFC 792), or as much as fits a 1280-byte message (IPv6, RFC 4443).
-fn too_big(router: IpAddr, packet: &[u8], mtu: u32) -> Result<PacketBuf, Box<dyn Error>> {
+pub(super) fn too_big(
+    router: IpAddr,
+    packet: &[u8],
+    mtu: u32,
+) -> Result<PacketBuf, Box<dyn Error>> {
     let src = IpPacket::parse(packet)
         .map_err(|_| "not an IP packet")?
         .src();
