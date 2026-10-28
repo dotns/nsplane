@@ -1,6 +1,6 @@
 # nstun - Plan Index
 
-> Updated: 2026-10-27
+> Updated: 2026-10-28
 
 ## Usage
 
@@ -62,3 +62,5 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261026-0822-node-gateway-requests Node and gateway requests at 0.19.2, and two defects: design and release grouping**](20261026-0822-node-gateway-requests.md) `2026-10-26`
 - [x] [**20261027-0537-tk-cleanup DNS fixture and source documentation cleanup**](20261027-0537-tk-cleanup.md) `2026-10-27`
 - [-] [**20261027-0433-post-freeze-schedule Schedule of the follow-ups the 0.11 freeze left open**](20261027-0433-post-freeze-schedule.md) `2026-10-27`
+
+- [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `2026-10-28`
