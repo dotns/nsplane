@@ -313,6 +313,31 @@ packet pays one read of the receipt marker in the core's send path and in the tr
 one store of the marker after the outbound filters, and one `bool` of the core for the
 plaintext egress mark.
 
+## Peer expiry signal
+
+The expiry cause and the `expirations` counter (with `Event` and `PeerStats`
+`#[non_exhaustive]`) against the build without them, 2026-10-28, slot 0, `BENCH_CPUS_A`,
+interleaved base / build, two `slot.sh` invocations, each started at a 1-minute load below 3
+(the shared host rose to 5-10 within both), criterion means per round. The first invocation ran
+all 24 `data_path` cases for three rounds, the second the cases below for five rounds.
+
+| Case | Change per round | Median |
+| --- | --- | --- |
+| `core_round_trip/64` | +1.8 / -0.5 / -6.0; +1.8 / -2.2 / +2.0 / +0.1 / +20.0 % | +1.0 % |
+| `core_round_trip/1420` | +2.3 / -1.3 / +7.1; +2.6 / -4.3 / +4.6 / -2.0 / -0.1 % | +1.1 % |
+| `core_encapsulate/64` | -0.1 / +1.3 / -3.2; +0.5 / -4.4 / -0.8 / -1.0 / -1.1 % | -0.9 % |
+| `core_round_trip_two_identities/64` | +2.8 / +0.5 / +1.8; +3.2 / -5.0 / -2.0 / -1.3 / +0.3 % | +0.4 % |
+| `core_decapsulate_batch32/1420` | +1.8 / +10.3 / +2.3; +1.1 / +7.1 / +0.2 / -1.8 / +13.0 % | +2.1 % |
+| `tunn_round_trip/64` | +4.4 / +0.4 / +0.1; +0.5 / -2.2 / -0.3 / +0.8 / +1.4 % | +0.5 % |
+
+Every case changes in both directions; the values above +5 % come from runs during which the
+load rose to 7-10. The other 18 cases of the first invocation are within -8.5 % to +17.6 %
+with both signs in each, except `device_equivalent_round_trip/1420` (+1.8 / +0.3 / +2.8 %) and
+`core_encapsulate_batch32/1420` (+0.1 / +1.5 / +2.7 %). The data path does not read the expiry
+state: the cause is written once per expiry by the timers and read by `handle_timeout`; the
+core's per-peer record grows from 224 to 240 bytes (two `u64` counters), and the size of the
+tunnel (9952 bytes), `Output` (96 bytes) and `Event` (64 bytes) is unchanged.
+
 ## Packet tag carrier against 0.20.0
 
 The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,

@@ -368,4 +368,6 @@ Implementation notes against this design:
   (`core/receive.rs` is unchanged) and no fifth `bool` in `Peer`.
 - D5: `size_of::<Output>()` stays 96 and `size_of::<Event>()` 64 bytes (both measured on
   `bcb68f1` before the change and pinned by a core unit test); `PeerStats` grows from 192 to
-  200 bytes.
+  200 bytes, the core's `Peer` from 224 to 240, `Tunn` stays 9952 (the cause fits in padding).
+  Two interleaved `data_path` A/B invocations against `bcb68f1` are within the noise (table in
+  `docs/performance.md`, "Peer expiry signal").

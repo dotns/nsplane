@@ -1,6 +1,6 @@
 # 20261028-0615-remove-wss-stream-carrier Remove the deprecated WsFrame stream carrier from nsplane-wss
 
-- **status**: in_progress
+- **status**: completed (on `release/0.21.0` 2026-10-28; ships in 0.21.0, not yet tagged)
 - **priority**: P2
 - **owner**: pdev (oitcozuh)
 - **createdAt**: 2026-10-28 06:15
@@ -33,3 +33,18 @@ module, and everything that exists only for them.
 - **blocks**: (none)
 
 ## Notes
+
+- Removed on `feat/0.21.0-m3-removals`: `src/stream.rs`, `src/server.rs`, `src/frame.rs` with
+  their unit tests, `tests/stream.rs`, and the crate-private `WssConfig::pings`,
+  `Connector::retry_now` and `Connector::lost` that only they used; `thiserror` and the
+  `rcgen` dev-dependency. `WssConfig` keeps every field and method (none was stream-only).
+- `connect.rs` unit tests: `loss_waits_at_least_the_floor` became
+  `without_a_reconnect_delay_a_redial_waits_the_floor`; the backoff test sets the post-success
+  state through `reconnect()`.
+- e2e: `wss_stream_open.rs` deleted (only `open_timeout`, stream-only); the stream-client tests
+  in `wss_dial_error`, `wss_events`, `wss_keepalive` and `wss_ping_off` deleted, each with a
+  `WssDialer` test covering the shared behaviour. Coverage note: the deleted events test
+  checked exact connect-failure counters (7, and 2/2 rejections); the dialer test checks the
+  same event sequence one to one with looser counter bounds.
+- `cargo semver-checks` against v0.20.2 lists exactly the removed items (enum, struct, trait,
+  function, module and constant missing in `nsplane-wss`).

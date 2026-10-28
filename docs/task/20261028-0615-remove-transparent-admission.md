@@ -1,6 +1,6 @@
 # 20261028-0615-remove-transparent-admission Remove the deprecated TransparentConfig::admission
 
-- **status**: in_progress
+- **status**: completed (on `release/0.21.0` 2026-10-28; ships in 0.21.0, not yet tagged)
 - **priority**: P2
 - **owner**: pdev (oitcozuh)
 - **createdAt**: 2026-10-28 06:15
@@ -27,3 +27,10 @@ on 2026-10-28.
 - **blocks**: (none)
 
 ## Notes
+
+- Removed on `feat/0.21.0-m3-removals`: the field, its default, the fallback in
+  `Settings::new`. `admission_is_top_level_first_then_transparent` became
+  `admission_is_normalised` (with and without a transparent config, the 24 h timeout clamp);
+  `stack/tests/pending.rs` and `stack/tests/events.rs` set `NetStackConfig::admission`.
+- `cargo semver-checks` against v0.20.2: `struct_pub_field_missing` for
+  `TransparentConfig::admission`, nothing else in `nsplane-netstack`.

@@ -666,3 +666,31 @@ the noise. At or above the edge of the noise, both arriving with the packet tag 
 `core_round_trip/64` +0.2 % to +5.3 % (median +2.2 %, about 9 ns) with `core_encapsulate/64`
 +1.0 % to +4.5 %, and `netstack_send/streams_1` -0.7 % to +4.0 %; raised with the owner.
 Tables in `docs/performance.md`.
+
+## 2026-10-28 [decision]
+
+Owner decisions for 0.21.0: release C as integrated on `release/0.21.0` (`bcb68f1`, the packet
+tag carrier's untagged cost accepted) ships together with M3 of plan
+`20261027-0433-post-freeze-schedule` and the removal of the deprecated `WsFrame` stream carrier
+and `TransparentConfig::admission`. M3's open questions are answered as recommended: O1 no idle
+(`SessionAge`) expiry for a peer that was never up, O2 one `expirations` counter, O3
+`#[non_exhaustive]` on `Event` and `PeerStats` at enum / struct level only, O4
+`PeerStats::new`, O5 both observations as follow-up tasks after 0.21.0
+(`20261028-0611-expiry-queued-packets-dropped`,
+`20261028-0611-session-age-aborts-fresh-handshake`). Merge into `main`, tag and publication
+wait for a separate word.
+
+## 2026-10-28 [progress]
+
+M3 and the two removals on `feat/0.21.0-m3-removals` from `release/0.21.0` (`bcb68f1`), merged
+back into `release/0.21.0`. `nsplane-noise` `Tunn::expiry_cause` reports `ExpiryCause`
+(`SessionAge`, `HandshakeTimeout`); `nsplane-core` `Event::SessionExpired` carries it,
+`PeerStats::expirations` and `Event::PeerStats::expirations` count the reported expiries, the
+idle expiry of a peer that was not up is not reported, `Event` and `PeerStats` are
+`#[non_exhaustive]` and `PeerStats::new` exists; tests first (noise 4 of 5 and core timer tests
+6 of 14 failing against stubs; an e2e lagging-subscriber test). Deviation: `Peer` keeps a
+handshake watermark instead of an `up` flag, so `core/receive.rs` is unchanged. Removed:
+`nsplane-wss`'s stream carrier (client, server, `frame` module, their tests, `thiserror` and
+`rcgen`) and `TransparentConfig::admission`. `cargo semver-checks` against `v0.20.2` lists
+`Output` (as integrated) plus exactly the planned breaks. Two `data_path` A/B invocations
+against `bcb68f1` are within the noise (`docs/performance.md`, "Peer expiry signal").
