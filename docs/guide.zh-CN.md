@@ -928,9 +928,6 @@ where
 }
 ```
 
-`WssStreamClient` / `WssStreamServer`（多路复用的 TCP/UDP 流）已弃用，请改用经 `WssDialer` 的
-WireGuard peer。
-
 ## 13. 多个本地身份
 
 一个引擎可以在同一组传输上以多个 WireGuard 身份（私钥）应答：

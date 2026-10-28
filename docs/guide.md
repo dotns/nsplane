@@ -975,9 +975,6 @@ where
 }
 ```
 
-`WssStreamClient` / `WssStreamServer` (multiplexed TCP/UDP streams) are deprecated; use a
-WireGuard peer over `WssDialer` instead.
-
 ## 13. Several local identities
 
 One engine can answer as several WireGuard identities (private keys) on the same transports:

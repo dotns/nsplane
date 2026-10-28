@@ -1,6 +1,6 @@
-//! `WssConfig::keepalive` on `WssDialer` links and `WssStreamClient` sessions: pings at
-//! the configured interval, and a relay that stops answering ends the link or session after
-//! the configured read idle, long before the 35 s default.
+//! `WssConfig::keepalive` on `WssDialer` links: pings at the configured interval, and a
+//! relay that stops answering ends the link after the configured read idle, long before the
+//! 35 s default.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -11,8 +11,6 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::{LinkConfig, TransportId};
 use nsplane_e2e::{TestResult, WAIT};
 use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-use nsplane_wss::{WssStreamClient, WssStreamLimits};
 use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
@@ -111,7 +109,7 @@ impl Relay {
 
     /// Checks that the first connection pings every `ping` and stays up past `idle` while
     /// it gets pongs, then freezes it and checks that it ends after `idle`, well before the
-    /// default. `events` are the carrier's.
+    /// default. `events` are the dialer's.
     async fn check(
         &self,
         events: &mut broadcast::Receiver<WssDialEvent>,
@@ -171,16 +169,6 @@ async fn dialer_case(ping: Duration, idle: Duration) -> TestResult {
     Ok(())
 }
 
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-async fn stream_client_case(ping: Duration, idle: Duration) -> TestResult {
-    let relay = Relay::start().await?;
-    let client = WssStreamClient::new(relay.config(ping, idle), WssStreamLimits::default())?;
-    let mut events = client.events();
-    timeout(WAIT, client.connect()).await??;
-    assert_eq!(events.try_recv()?, WssDialEvent::Connected);
-    relay.check(&mut events, ping, idle).await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dialer_pings_and_idles_as_configured() -> TestResult {
     dialer_case(Duration::from_millis(100), Duration::from_millis(600)).await
@@ -189,14 +177,4 @@ async fn dialer_pings_and_idles_as_configured() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dialer_honors_other_keepalive_values() -> TestResult {
     dialer_case(Duration::from_millis(200), Duration::from_millis(1100)).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_client_pings_and_idles_as_configured() -> TestResult {
-    stream_client_case(Duration::from_millis(100), Duration::from_millis(600)).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_client_honors_other_keepalive_values() -> TestResult {
-    stream_client_case(Duration::from_millis(200), Duration::from_millis(1100)).await
 }

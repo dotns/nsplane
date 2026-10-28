@@ -1,7 +1,6 @@
-//! `WssConfig::ping_interval(None)` on `WssDialer` links and `WssStreamClient` sessions:
-//! data flows and no ping is sent while the relay keeps the link alive with its own pings,
-//! and a relay gone silent still ends the link or session after the read idle. With pings
-//! on, the same relay sees them.
+//! `WssConfig::ping_interval(None)` on `WssDialer` links: data flows and no ping is sent
+//! while the relay keeps the link alive with its own pings, and a relay gone silent still
+//! ends the link after the read idle. With pings on, the same relay sees them.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -11,11 +10,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::LinkDialer as _;
 use nsplane_e2e::{TestResult, WAIT};
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-use nsplane_wss::frame::{FrameCommand, WsFrame};
-use nsplane_wss::{WssConfig, WssDialEvent, WssDialer, WssTls};
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-use nsplane_wss::{WssStreamClient, WssStreamLimits};
+use nsplane_wss::{WssConfig, WssDialer, WssTls};
 use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -44,8 +39,8 @@ struct Received {
     binary: usize,
 }
 
-/// A plain WebSocket relay that pings every [`PING`], echoes binary messages (but OPEN
-/// frames) and records what it receives, until frozen.
+/// A plain WebSocket relay that pings every [`PING`], echoes binary messages and records
+/// what it receives, until frozen.
 struct Relay {
     addr: SocketAddr,
     received: Mutex<Received>,
@@ -74,7 +69,6 @@ impl Relay {
         Ok(relay)
     }
 
-    #[expect(deprecated, reason = "tests of the deprecated stream carrier")]
     async fn serve(self: Arc<Self>, tcp: TcpStream) {
         let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
             return;
@@ -95,9 +89,7 @@ impl Relay {
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         lock(&self.received).binary += 1;
-                        let open = WsFrame::decode(&bytes)
-                            .is_ok_and(|frame| matches!(frame.command, FrameCommand::Open { .. }));
-                        (!open).then_some(Message::Binary(bytes))
+                        Some(Message::Binary(bytes))
                     }
                     Some(Ok(_)) => None,
                     _ => return,
@@ -220,39 +212,6 @@ async fn dialer_case(on: bool) -> TestResult {
         .await
 }
 
-#[expect(deprecated, reason = "tests of the deprecated stream carrier")]
-async fn stream_client_case(on: bool) -> TestResult {
-    let relay = Relay::start().await?;
-    let config = relay.config();
-    let config = if on {
-        config
-    } else {
-        config.ping_interval(None)
-    };
-    let client = WssStreamClient::new(config, WssStreamLimits::default())?;
-    let mut events = client.events();
-    timeout(WAIT, client.connect()).await??;
-    assert_eq!(events.try_recv()?, WssDialEvent::Connected);
-
-    let mut flow = timeout(WAIT, client.open_udp("192.0.2.1:53".parse()?)).await??;
-    timeout(WAIT, flow.send(b"over the session")).await??;
-    let echoed = timeout(WAIT, flow.recv()).await??.ok_or("flow ended")?;
-    assert_eq!(&echoed[..], b"over the session");
-    relay.pong().await?;
-    relay.check_pings(on).await;
-    assert!(
-        events.try_recv().is_err(),
-        "the relay's pings keep the session up"
-    );
-
-    relay
-        .check_idle(on, async {
-            assert_eq!(events.recv().await?, WssDialEvent::Lost);
-            Ok(())
-        })
-        .await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dialer_without_pings_keeps_data_and_the_read_idle() -> TestResult {
     dialer_case(false).await
@@ -261,14 +220,4 @@ async fn dialer_without_pings_keeps_data_and_the_read_idle() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dialer_with_pings_still_pings() -> TestResult {
     dialer_case(true).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_client_without_pings_keeps_data_and_the_read_idle() -> TestResult {
-    stream_client_case(false).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_client_with_pings_still_pings() -> TestResult {
-    stream_client_case(true).await
 }

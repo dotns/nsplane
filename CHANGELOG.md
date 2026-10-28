@@ -142,6 +142,39 @@ offsets are `u32` (see Changed). Consumers that set no tag keep today's paths.
   `PacketBuf::set_len`, `extend_from_slice` and `PacketPool::get_len` stop there, and
   `PacketBuf::from_shared` and `reserve_front` return `BoundsError` for a range past it. IP
   packets are far below the bound; no source change.
+- `nsplane-wss`: the deprecated WebSocket stream carrier is removed: `WssStreamClient`,
+  `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
+  `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
+  `Denied`, `WssStreamEvent`, `WssStreamEventKind`, `WssCloseReason` and the `frame` module
+  (the `WsFrame` codec). `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`,
+  `WssDialError`, `WssDialEvent`, `WssStats`, the server transport (`WssServerTransport`,
+  `WssAcceptor`, `WssServerConfig`, `WssSession` and their stats), `MAX_DATAGRAM` and
+  `MAX_MESSAGE` stay. Replacement: a WireGuard peer over `WssDialer` (server side
+  `WssServerTransport`), with TCP and UDP to the targets through the engine, e.g. on an
+  `nsplane-netstack`.
+
+  ```rust
+  // Before
+  let client = WssStreamClient::new(config, WssStreamLimits::default())?;
+  let stream = client.open_tcp(target).await?;
+  // After: the relay is a WireGuard peer reached over WSS
+  let dialer = WssDialer::new(config)?;
+  let transport = dialer.into_transport(TransportId::new(2), relay_addr, LinkConfig::default());
+  // add `transport` and the relay peer to the engine; open TCP through the local side
+  let stream = netstack.connect_tcp(target).await?;
+  ```
+- `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
+  `NetStackConfig::admission`, which applies to every stack, transparent ones included.
+
+  ```rust
+  // Before
+  let mut transparent = TransparentConfig::default();
+  transparent.admission = Admission::Decide { timeout, max_pending };
+  config.transparent = Some(transparent);
+  // After
+  config.transparent = Some(TransparentConfig::default());
+  config.admission = Admission::Decide { timeout, max_pending };
+  ```
 - `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
   `NetStackConfig::admission`, which applies to every stack, transparent ones included.
 
