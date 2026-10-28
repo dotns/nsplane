@@ -29,6 +29,7 @@ use self::accept::Connecting;
 use self::connections::Conn;
 use self::fragments::Barrier;
 use self::handle::Command;
+use self::labels::Labels;
 use self::listeners::{Pool, prepare_tcp_listeners};
 
 mod accept;
@@ -38,6 +39,7 @@ mod connections;
 mod fragments;
 mod handle;
 mod ingress;
+mod labels;
 mod listeners;
 mod netstack;
 mod retire;
@@ -77,6 +79,8 @@ type Inbox<T> = (mpsc::Sender<T>, Arc<FlowState>);
 struct Inbound {
     /// Keeps the tuple visible to `owns` while the handshake runs.
     registration: Registration,
+    /// `(remote, local)`.
+    tuple: (SocketAddr, SocketAddr),
     /// The egress position when the socket took the SYN.
     start: u64,
     /// The lifetime of a SYN accepted under `Admission::Decide`, its target bound to the
@@ -141,6 +145,7 @@ struct Driver {
     revocations: Arc<Revocations>,
     /// Revoked flows taken in this turn and not retired yet; empty between turns.
     retiring: Vec<Arc<FlowState>>,
+    labels: Labels,
     /// Packets moved from the backlog into the egress queue. The packet at `tx_queue[i]`
     /// has egress position `sent + i`; positions never change, as packets dropped from the
     /// backlog leave an empty placeholder the source discards.
@@ -171,7 +176,8 @@ impl Drop for Driver {
         if let Some(table) = self.pending.as_mut() {
             table.stop();
         }
-        self.revocations.close(&mut self.retiring);
+        self.revocations
+            .close(&mut self.retiring, &mut self.labels.revoking);
         for conn in self.conns.values() {
             conn.release();
         }

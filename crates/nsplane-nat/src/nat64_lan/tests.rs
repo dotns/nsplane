@@ -462,6 +462,31 @@ fn reverse_grows_into_headroom_or_copies_once() {
 }
 
 #[test]
+fn reverse_keeps_the_tag_and_the_marker_in_place_and_through_the_copy() {
+    let lan = lan();
+    let snat_port = be16(&forward_udp(&lan), 20);
+    let tag = std::num::NonZeroU64::new(8);
+    let bytes = ipv4_bytes(protocol::UDP, HOST, SNAT, udp(53, snat_port, b"answer"));
+    for headroom in [true, false] {
+        let mut packet = PacketBuf::with_capacity(bytes.len());
+        if !headroom {
+            packet.reserve_front(packet.headroom()).unwrap();
+        }
+        packet.set_len(bytes.len());
+        packet.as_packet_mut().copy_from_slice(&bytes);
+        packet.set_tag(tag);
+        packet.set_tracked(true);
+        assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+        assert_valid6(packet.as_packet());
+        assert_eq!(
+            (packet.tag(), packet.is_tracked()),
+            (tag, true),
+            "{headroom}"
+        );
+    }
+}
+
+#[test]
 fn conntrack_restores_tcp_sequence_and_checksum_without_corruption() {
     let lan = lan();
     let mut request = ipv6(protocol::TCP, tcp(4321, 18084, 0x1234_5678, 0, SYN, &[]));

@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -269,12 +270,17 @@ impl Fragmenter {
             return Action::Reply(peer, fragmentation_needed(bytes, src, dst, ceiling));
         }
 
+        // A tracked packet is never split: its one result could not cover several datagrams.
+        if packet.is_tracked() {
+            return self.drop("tracked IPv4 packet above the ceiling");
+        }
         let header_bytes = &bytes[..header.header_len()];
         let mut payload = payload.to_vec();
         if translated && !fragment && header.protocol() == protocol::UDP {
             fill_udp_checksum(src, dst, &mut payload);
         }
-        let Some(fragments) = split_ipv4(header_bytes, &payload, mtu, translated) else {
+        let Some(fragments) = split_ipv4(header_bytes, &payload, mtu, translated, packet.tag())
+        else {
             return self.drop("IPv4 packet cannot be split under the MTU");
         };
         self.stats.fragmented += 1;
@@ -431,12 +437,14 @@ fn fill_udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &mut [u8]) {
 
 /// Splits the IPv4 packet with `header` (options included) and `payload` into fragments
 /// that fit `mtu`, once translated with an IPv6 Fragment header if `translated`. Keeps the
-/// packet's offset base and MF flag. `None` if the MTU leaves no room for payload.
+/// packet's offset base and MF flag. Every fragment carries the packet's `tag`, none its
+/// receipt marker. `None` if the MTU leaves no room for payload.
 fn split_ipv4(
     header: &[u8],
     payload: &[u8],
     mtu: usize,
     translated: bool,
+    tag: Option<NonZeroU64>,
 ) -> Option<Vec<PacketBuf>> {
     let flags = u16::from_be_bytes([header[6], header[7]]);
     let base = usize::from(flags & OFFSET_MASK) * 8;
@@ -465,6 +473,7 @@ fn split_ipv4(
 
         let total = header.len() + end - offset;
         let mut fragment = PacketBuf::with_capacity(total + FRAGMENT_TAIL);
+        fragment.set_tag(tag);
         fragment.set_len(total);
         let out = fragment.as_packet_mut();
         out[..header.len()].copy_from_slice(header);
@@ -968,6 +977,76 @@ mod tests {
             assert_eq!(p.as_packet(), packet);
         }
         assert_eq!(f.stats(), FragmentStats::default());
+    }
+
+    /// `packet` with tag `value` and the receipt marker set.
+    fn tagged(packet: &[u8], value: u64) -> PacketBuf {
+        let mut buf = PacketBuf::from_packet(packet);
+        buf.set_tag(NonZeroU64::new(value));
+        buf.set_tracked(true);
+        buf
+    }
+
+    #[test]
+    fn every_fragment_carries_the_tag_and_none_the_marker() {
+        for translated in [false, true] {
+            let packet = ipv4(4000, protocol::UDP, 0, &[]);
+            let mut f = fragmenter(translated);
+            // Only an untracked packet is split (see the next test).
+            let mut tagged = tagged(&packet, 9);
+            tagged.set_tracked(false);
+            let action = f.process(tagged, 1420, Instant::now(), |_, _| (Some(PEER), 1420));
+            let Action::Fragments(fragments) = action else {
+                panic!("not split: {action:?}");
+            };
+            assert!(fragments.len() > 2);
+            for fragment in &fragments {
+                assert_eq!(fragment.tag(), NonZeroU64::new(9));
+                assert!(!fragment.is_tracked());
+            }
+        }
+    }
+
+    #[test]
+    fn a_tracked_packet_is_never_split() {
+        for translated in [false, true] {
+            let packet = ipv4(4000, protocol::UDP, 0, &[]);
+            let mut f = fragmenter(translated);
+            let action = f.process(tagged(&packet, 9), 1420, Instant::now(), |_, _| {
+                (Some(PEER), 1420)
+            });
+            assert!(
+                matches!(action, Action::Drop(FRAGMENT_OVERSIZE)),
+                "{action:?}"
+            );
+            assert_eq!((f.stats().fragmented, f.stats().dropped), (0, 1));
+        }
+    }
+
+    #[test]
+    fn sent_packets_keep_the_tag_and_marker_and_replies_carry_neither() {
+        let mut f = fragmenter(false);
+        let packet = ipv4(1000, protocol::UDP, 0, &[]);
+        let Action::Send(sent) = f.process(tagged(&packet, 3), 1420, Instant::now(), |_, _| {
+            (Some(PEER), 1420)
+        }) else {
+            panic!("not sent");
+        };
+        assert_eq!(sent.tag(), NonZeroU64::new(3));
+        assert!(sent.is_tracked());
+
+        for packet in [
+            ipv4(1500, protocol::UDP, DF, &[]),
+            ipv6(1500, protocol::UDP, DST6),
+        ] {
+            let action = f.process(tagged(&packet, 4), 1420, Instant::now(), |_, _| {
+                (Some(PEER), 1420)
+            });
+            let Action::Reply(_, reply) = action else {
+                panic!("no reply: {action:?}");
+            };
+            assert_eq!((reply.tag(), reply.is_tracked()), (None, false));
+        }
     }
 
     #[test]

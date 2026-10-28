@@ -1,5 +1,5 @@
-//! The connection setup shared by the carriers: URL, TLS, request headers and the bearer,
-//! 401/403 classification, the dial backoff and the dial events.
+//! The connection setup of [`WssDialer`](crate::WssDialer): URL, TLS, request headers and
+//! the bearer, 401/403 classification, the dial backoff and the dial events.
 
 use std::fmt;
 use std::io;
@@ -154,9 +154,8 @@ impl fmt::Display for WssDialError {
 
 impl std::error::Error for WssDialError {}
 
-/// One dial or connection of a [`WssDialer`](crate::WssDialer) or a
-/// [`WssStreamClient`](crate::WssStreamClient), as their `events()` receivers see it: one
-/// event per occurrence.
+/// One dial or link of a [`WssDialer`](crate::WssDialer), as its
+/// [`events`](crate::WssDialer::events) receivers see it: one event per occurrence.
 ///
 /// Events go out on a [`broadcast`] channel of [`CAPACITY`](Self::CAPACITY) events; a
 /// receiver that falls further behind loses the oldest ones and sees
@@ -165,9 +164,9 @@ impl std::error::Error for WssDialError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WssDialEvent {
-    /// A link or session came up.
+    /// A link came up.
     Connected,
-    /// A link or session that came up ended: closed, failed, or silent past
+    /// A link that came up ended: closed, failed, or silent past
     /// [`WssConfig::read_idle`].
     Lost,
     /// A dial failed: TCP, TLS, the bearer token, or an upgrade refused with an HTTP status
@@ -205,7 +204,7 @@ pub(crate) fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-/// The dial counters every carrier reports.
+/// The dial counters of a dialer.
 #[derive(Debug, Default)]
 pub(crate) struct DialCounters {
     pub(crate) connect_failures: AtomicU64,
@@ -384,29 +383,15 @@ impl Connector {
             .map_or(Retry::Backoff(self.config.backoff_min), Retry::Reconnect)
     }
 
-    /// Lets the next dial go at once (a dial for more capacity, not after a loss).
-    pub(crate) fn retry_now(&self) {
-        *lock(&self.retry) = Retry::Now;
-    }
-
-    /// Records a lost connection: the next dial waits the reconnect delay, or the backoff
-    /// floor without one, unless it already waits.
-    pub(crate) fn lost(&self) {
-        let mut retry = lock(&self.retry);
-        if matches!(*retry, Retry::Now) {
-            *retry = self.reconnect();
-        }
-    }
-
     /// Waits as the last dial asks, then dials: TCP, TLS (for `wss://`) and the WebSocket
     /// upgrade. A success makes the next dial wait the reconnect delay (or the backoff
     /// floor); a failure doubles the wait, starting from the floor, and a 401 or 403 also
     /// sets [`LinkState::Rejected`]. An upgrade refused with an HTTP response fails with a
-    /// [`WssDialError`] inside. Every failure sends its event; the carriers send
-    /// [`WssDialEvent::Connected`] themselves.
+    /// [`WssDialError`] inside. Every failure sends its event; the dialer sends
+    /// [`WssDialEvent::Connected`] itself.
     ///
     /// Not cancellation safe: dropped before it finishes, the next dial goes at once (the
-    /// wait it took is lost), so the carriers run it to the end in their own task.
+    /// wait it took is lost), so the link transport runs it to the end in its own task.
     pub(crate) async fn connect(&self, counters: &DialCounters) -> io::Result<Ws> {
         let retry = std::mem::take(&mut *lock(&self.retry));
         let (wait, token) = match retry {
@@ -598,26 +583,20 @@ mod tests {
         assert_eq!(next_backoff(None, max * 2, max), max);
     }
 
-    /// A lost connection only raises an immediate retry to the floor; a longer failure
-    /// backoff stays.
+    /// Without a reconnect delay, the dial after a connection that came up waits the
+    /// backoff floor.
     #[test]
-    fn loss_waits_at_least_the_floor() {
+    fn without_a_reconnect_delay_a_redial_waits_the_floor() {
         let connector = Connector::new(WssConfig::new("wss://relay.example/", roots())).unwrap();
-        connector.retry_now();
-        connector.lost();
+        assert!(matches!(*lock(&connector.retry), Retry::Now));
         assert!(
-            matches!(*lock(&connector.retry), Retry::Backoff(wait) if wait == Duration::from_secs(2))
-        );
-        *lock(&connector.retry) = Retry::Backoff(Duration::from_secs(8));
-        connector.lost();
-        assert!(
-            matches!(*lock(&connector.retry), Retry::Backoff(wait) if wait == Duration::from_secs(8))
+            matches!(connector.reconnect(), Retry::Backoff(wait) if wait == Duration::from_secs(2))
         );
     }
 
-    /// A loss after a session came up waits the reconnect delay (when set), and a dial
-    /// failing after it backs off from the floor rather than from that delay; capacity
-    /// dials still go at once. Each failure is one event.
+    /// The dial after a connection that came up waits the reconnect delay (when set), and a
+    /// dial failing after it backs off from the floor rather than from that delay. Each
+    /// failure is one event.
     #[tokio::test]
     async fn reconnect_delay_then_failures_back_off_from_the_floor() {
         let ms = Duration::from_millis;
@@ -637,10 +616,9 @@ mod tests {
             Retry::Reconnect(delay) => format!("reconnect {}", delay.as_millis()),
             Retry::NewToken(_) => "token".to_owned(),
         };
-        connector.lost();
-        assert_eq!(retry(), "reconnect 5");
-        // A further loss keeps the pending wait.
-        connector.lost();
+        assert_eq!(retry(), "now");
+        // What a dial that came up leaves for the next one.
+        *lock(&connector.retry) = connector.reconnect();
         assert_eq!(retry(), "reconnect 5");
 
         let counters = DialCounters::default();
@@ -656,12 +634,6 @@ mod tests {
         );
         assert!(events.try_recv().is_err());
         assert_eq!(get(&counters.connect_failures), 4);
-
-        // A capacity dial goes at once, and a loss then waits the reconnect delay again.
-        connector.retry_now();
-        assert_eq!(retry(), "now");
-        connector.lost();
-        assert_eq!(retry(), "reconnect 5");
     }
 
     fn http(status: u16) -> WsError {

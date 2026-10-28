@@ -1,8 +1,9 @@
 //! The reasons of [`Event::Dropped`](crate::Event::Dropped).
 //!
-//! The core emits the reasons from [`INVALID_PACKET`] to [`UNKNOWN_PLAINTEXT_PEER`]; the driver
+//! The core emits the reasons from [`INVALID_PACKET`] to [`FILTER_HANDLED`]; the driver
 //! (`nsplane`) emits the rest for drops it decides itself. Packet filters may drop with
-//! reasons of their own.
+//! reasons of their own. The same strings are the reasons of tracked local packets that
+//! were not sent ([`Output::Tracked`](crate::Output::Tracked)).
 
 /// A datagram is not a WireGuard message (wrong type or size).
 pub const INVALID_PACKET: &str = "invalid packet";
@@ -28,7 +29,8 @@ pub const INVALID_HANDSHAKE: &str = "invalid handshake";
 pub const UNKNOWN_LOCAL_IDENTITY: &str = "unknown local identity";
 /// A verified handshake message names no configured peer.
 pub const UNKNOWN_PEER: &str = "unknown peer";
-/// A packet for an explicit path (`Core::inject_outbound_on`) found no current session.
+/// A packet for an explicit path (`Core::inject_outbound_on`) or a tracked local packet
+/// found no current session; neither is queued behind a handshake.
 pub const NO_SESSION: &str = "no session";
 /// The peer's tunnel rejected a verified handshake message (bad keys, replayed timestamp,
 /// no matching handshake in flight).
@@ -46,6 +48,15 @@ pub const NO_FREE_PEER_ID: &str = "no free peer id";
 /// A plaintext packet ([`Core::receive_plaintext`](crate::Core::receive_plaintext)) names a
 /// peer that does not exist or was removed.
 pub const UNKNOWN_PLAINTEXT_PEER: &str = "plaintext from unknown peer";
+/// A tracked local packet was handed out for plaintext egress instead of being sealed.
+///
+/// Its peer is marked with [`Core::set_plaintext_egress`](crate::Core::set_plaintext_egress):
+/// the packet leaves untracked as `Output::Plaintext`. Not a drop: no `Event::Dropped`
+/// carries it.
+pub const PLAINTEXT_EGRESS: &str = "plaintext egress";
+/// A tracked local packet was handled by an outbound filter (`Verdict::Handled`). Not a
+/// drop: no `Event::Dropped` carries it.
+pub const FILTER_HANDLED: &str = "handled by filter";
 
 /// Emitted by the driver: a decrypted packet was dropped because the sink queue was full.
 pub const SINK_FULL: &str = "sink full";
@@ -74,3 +85,12 @@ pub const FRAGMENT_NO_ROUTE: &str = "no route for ICMP error";
 /// Emitted by the driver: a local packet above the MTU was dropped by the fragmentation
 /// stage, and no ICMP error was sent because of the error rate limit.
 pub const FRAGMENT_RATE_LIMITED: &str = "ICMP error rate limited";
+/// Emitted by the driver: a local packet routed to a peer marked for plaintext egress was
+/// dropped because the plaintext egress queue was full.
+pub const PLAINTEXT_EGRESS_FULL: &str = "plaintext egress full";
+/// Emitted by the driver: a local packet routed to a peer marked for plaintext egress was
+/// dropped because the plaintext egress receiver is gone, or the engine has none.
+pub const PLAINTEXT_EGRESS_CLOSED: &str = "plaintext egress closed";
+/// Reported by the driver for a tracked local packet: the engine stopped before it was sent.
+/// Not counted as a drop.
+pub const ENGINE_STOPPED: &str = "engine stopped";

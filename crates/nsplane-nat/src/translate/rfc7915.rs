@@ -287,7 +287,7 @@ fn reassemble(
         return Ok(None);
     }
     let len = payload.len();
-    let outcome = state.observe(key, packet.as_packet(), len, now)?;
+    let outcome = state.observe(key, packet.as_packet(), packet.tag(), len, now)?;
     drop(state);
     let Outcome::Complete(mut body) = outcome else {
         return Ok(Some(Done::Pending));
@@ -517,6 +517,9 @@ fn make_room(packet: &mut PacketBuf, len: usize) -> Result<()> {
         let mut grown = PacketBuf::with_capacity(len + TAILROOM);
         grown.set_len(packet.len());
         grown.as_packet_mut().copy_from_slice(packet.as_packet());
+        // The same packet in a larger buffer.
+        grown.set_tag(packet.tag());
+        grown.set_tracked(packet.is_tracked());
         *packet = grown;
     }
     Ok(())

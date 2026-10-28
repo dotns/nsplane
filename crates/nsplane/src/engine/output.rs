@@ -6,7 +6,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nsplane_core::{Event, Output};
+use std::num::NonZeroU64;
+
+use nsplane_core::{Event, Output, TrackedOutcome};
 use nsplane_packet::{MAX_BATCH, PacketBuf, Path, PeerId, TransportId};
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -16,8 +18,8 @@ use super::queue::BatchQueue;
 use super::transport::TransportSlot;
 use super::transport::{Datagram, TryDeliver};
 use crate::events::{
-    DROP_NO_TRANSPORT, DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSPORT_CLOSED,
-    DROP_TRANSPORT_SEND_ERROR,
+    DROP_NO_TRANSPORT, DROP_PLAINTEXT_EGRESS_CLOSED, DROP_PLAINTEXT_EGRESS_FULL, DROP_SINK_CLOSED,
+    DROP_SINK_FULL, DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_SEND_ERROR,
 };
 use crate::io::PacketSink;
 
@@ -110,8 +112,15 @@ impl Owner {
         while let Some(output) = self.core.poll_output() {
             match output {
                 Output::Transmit { path, data } => self.transmit(path, data, droppable),
-                Output::Deliver { from, packet } => self.deliver(from, packet),
+                Output::Deliver { from, mut packet } => {
+                    packet.set_tracked(false);
+                    self.deliver(from, packet);
+                }
                 Output::Event(event) => self.event(event),
+                Output::Tracked { tag, peer, outcome } => self.tracked_outcome(tag, peer, outcome),
+                Output::Plaintext { to, packet } => self.plaintext_egress(to, packet),
+                // The core of this engine has no other outputs.
+                _ => {}
             }
         }
         if std::mem::take(&mut self.inline.queued) {
@@ -153,6 +162,8 @@ impl Owner {
             if let Some(refused) = slot.hand_over() {
                 closed += refused.len();
                 for (_, data) in refused {
+                    slot.traffic
+                        .finish_tracked(&data, Some(DROP_TRANSPORT_CLOSED));
                     self.core.recycle(data);
                 }
             }
@@ -185,14 +196,18 @@ impl Owner {
     /// Sends a datagram on the transport its path names: without crypto workers, the owner
     /// task sends it itself at the end of the drain when no input is waiting and nothing
     /// of that transport is waiting, queued or being sent, and otherwise queues it.
+    ///
+    /// A tracked datagram ends its batch: the owner task's call or the message to the
+    /// transmit task that carries it.
     pub(super) fn transmit(&mut self, path: Path, data: PacketBuf, droppable: bool) {
         if self.inline.send
             && let Some(slot) = self.transports.get_mut(&path.transport)
             && (!slot.inline.is_empty() || (slot.backoff.ready(self.inline.drains) && slot.idle()))
         {
+            let tracked = data.is_tracked();
             slot.inline.push((path, data));
             self.inline.queued = true;
-            if slot.inline.len() >= MAX_BATCH {
+            if tracked || slot.inline.len() >= MAX_BATCH {
                 self.send_inline(path.transport, droppable);
             }
             return;
@@ -207,8 +222,15 @@ impl Owner {
             return;
         };
         let mut batch = std::mem::take(&mut slot.inline);
-        let sent = slot.send_now(&batch);
+        let (sent, last_failed) = slot.send_now(&batch);
         slot.backoff.record(self.inline.drains, sent > 0);
+        // Only the last datagram of a call can be tracked, and the call attributes it.
+        if sent == batch.len()
+            && let Some((_, last)) = batch.last()
+        {
+            let failure = last_failed.then_some(DROP_TRANSPORT_SEND_ERROR);
+            slot.traffic.finish_tracked(last, failure);
+        }
         for (path, data) in batch.drain(sent..) {
             self.queue_datagram(path, data, droppable);
         }
@@ -228,12 +250,17 @@ impl Owner {
                 if !slot.staged.is_empty() {
                     self.staged = true;
                 }
-                // A message carries at most a batch; the transmit task starts on it while the
-                // owner goes on.
-                if slot.staged.len() >= MAX_BATCH
+                // A message carries at most a batch, and ends with a tracked datagram; the
+                // transmit task starts on it while the owner goes on.
+                if (slot.staged.len() >= MAX_BATCH
+                    || slot
+                        .staged
+                        .last()
+                        .is_some_and(|(_, data)| data.is_tracked()))
                     && let Some(refused) = slot.hand_over()
                 {
                     for (_, data) in refused {
+                        self.finish_tracked(&data, DROP_TRANSPORT_CLOSED);
                         self.core.recycle(data);
                         self.dropped(None, DROP_TRANSPORT_CLOSED);
                     }
@@ -243,9 +270,63 @@ impl Owner {
             None => Err((data, DROP_NO_TRANSPORT)),
         };
         if let Err((data, reason)) = result {
+            self.finish_tracked(&data, reason);
             self.core.recycle(data);
             self.dropped(None, reason);
         }
+    }
+
+    /// Reports the datagram `data`, if tracked, as not sent for `reason`.
+    pub(super) fn finish_tracked(&self, data: &PacketBuf, reason: &'static str) {
+        if data.is_tracked()
+            && let Some(receipts) = &self.send_errors.receipts
+        {
+            receipts.finish(data, Some(reason));
+        }
+    }
+
+    /// Reports the tracked packet with `tag` as not sent for `reason`.
+    pub(super) fn not_sent(&self, tag: NonZeroU64, reason: &'static str) {
+        if let Some(receipts) = &self.send_errors.receipts {
+            receipts.not_sent(tag, reason);
+        }
+    }
+
+    /// Records what the core did with a tracked packet.
+    #[cold]
+    fn tracked_outcome(&self, tag: NonZeroU64, peer: Option<PeerId>, outcome: TrackedOutcome) {
+        let Some(receipts) = &self.send_errors.receipts else {
+            return;
+        };
+        match outcome {
+            TrackedOutcome::Sealed { bytes } => receipts.sealed(tag, peer, bytes),
+            TrackedOutcome::NotSent { reason } => receipts.not_sent(tag, reason),
+            // The core of this engine reports no other outcome.
+            _ => {}
+        }
+    }
+
+    /// Hands a packet routed to `to`, a peer marked for plaintext egress, to the plaintext
+    /// egress queue without waiting; drops it when the queue is full or gone.
+    #[cold]
+    fn plaintext_egress(&mut self, to: PeerId, mut packet: PacketBuf) {
+        packet.set_tracked(false);
+        let Some(queue) = &self.plaintext_egress else {
+            self.core.recycle(packet);
+            return self.dropped(Some(to), DROP_PLAINTEXT_EGRESS_CLOSED);
+        };
+        let reason = match queue.try_send((to, packet)) {
+            Ok(()) => return,
+            Err(TrySendError::Full((_, packet))) => {
+                self.core.recycle(packet);
+                DROP_PLAINTEXT_EGRESS_FULL
+            }
+            Err(TrySendError::Closed((_, packet))) => {
+                self.core.recycle(packet);
+                DROP_PLAINTEXT_EGRESS_CLOSED
+            }
+        };
+        self.dropped(Some(to), reason);
     }
 
     /// Moves the waiting datagrams of transport `id` to its transmit queue until it is full,

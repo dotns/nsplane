@@ -50,3 +50,9 @@ pub const DROP_FRAGMENT_NO_ROUTE: &str = nsplane_core::reasons::FRAGMENT_NO_ROUT
 /// A local packet above the MTU was dropped by the fragmentation stage, and no ICMP error
 /// was sent because of the error rate limit.
 pub const DROP_FRAGMENT_RATE_LIMITED: &str = nsplane_core::reasons::FRAGMENT_RATE_LIMITED;
+/// A local packet routed to a peer marked for plaintext egress was dropped because the
+/// [`crate::PlaintextEgress`] queue was full.
+pub const DROP_PLAINTEXT_EGRESS_FULL: &str = nsplane_core::reasons::PLAINTEXT_EGRESS_FULL;
+/// A local packet routed to a peer marked for plaintext egress was dropped because the
+/// [`crate::PlaintextEgress`] receiver is gone, or the engine was built without one.
+pub const DROP_PLAINTEXT_EGRESS_CLOSED: &str = nsplane_core::reasons::PLAINTEXT_EGRESS_CLOSED;

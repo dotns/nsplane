@@ -45,8 +45,10 @@ pub trait PacketSource: Send + 'static {
     /// Hands back buffers the engine no longer needs, so the source can read into them
     /// again instead of allocating.
     ///
-    /// The source may take buffers out of `bufs` up to the bound of its pool and must drop
-    /// the rest; the caller drops whatever it leaves in `bufs`. It never blocks.
+    /// The engine and [`pump`](crate::pump()) hand the buffers over untagged and unmarked
+    /// ([`PacketBuf::tag`], [`PacketBuf::is_tracked`]). The source may take buffers out of
+    /// `bufs` up to the bound of its pool and must drop the rest; the caller drops whatever
+    /// it leaves in `bufs`. It never blocks.
     ///
     /// The default takes nothing.
     fn recycle(&mut self, bufs: &mut Vec<PacketBuf>) {
@@ -103,7 +105,9 @@ pub trait PacketSink: Send + Sync + 'static {
     /// (copied to the OS, say), or one it dropped. Ordering, backpressure and errors follow
     /// [`send_batch`] exactly: on success `packets` is empty; on an error the packet that
     /// failed is dropped and the rest stay in `packets`, in order. `spent` is only appended
-    /// to, never read or cleared, and the caller must tolerate it staying empty.
+    /// to, never read or cleared, and the caller must tolerate it staying empty. A buffer in
+    /// `spent` still carries the tag and the receipt marker of its packet; [`pump`] clears
+    /// both before it recycles the buffer.
     ///
     /// The default calls [`send_batch`] and appends nothing; a sink that is done with the
     /// buffers once it took the packets over, like a TUN device, overrides it. [`pump`]

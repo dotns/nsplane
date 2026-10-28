@@ -132,6 +132,24 @@ mod tests {
     use crate::buf::HEADROOM;
 
     #[test]
+    fn recycled_buffers_come_back_untagged_and_untracked() {
+        let pool = SharedPacketPool::new(4);
+        let mut bufs = Vec::new();
+        for value in 1..=3 {
+            let mut buf = pool.alloc(64);
+            buf.set_tag(std::num::NonZeroU64::new(value));
+            buf.set_tracked(true);
+            bufs.push(buf);
+        }
+        pool.recycle(&mut bufs);
+        assert_eq!(pool.free_len(), 3);
+        for buf in [pool.alloc(16), pool.alloc_from(&[1, 2]), pool.alloc(1500)] {
+            assert_eq!((buf.tag(), buf.is_tracked()), (None, false));
+        }
+        assert_eq!(pool.free_len(), 0);
+    }
+
+    #[test]
     fn alloc_has_headroom_and_tailroom() {
         let pool = SharedPacketPool::new(4);
         for len in [0, 1, 64, 1420] {

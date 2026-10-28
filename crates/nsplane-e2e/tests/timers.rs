@@ -16,8 +16,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use nsplane::{ChannelTransport, Event, Path, PeerId};
-use nsplane_e2e::{Events, Family, Node, Options, TestResult, channel_pair, introduce, transfer};
+use nsplane::{ChannelTransport, Event, ExpiryCause, Path, PeerId};
+use nsplane_e2e::{
+    Events, Family, Node, Options, TestResult, channel_pair, channel_pair_with, introduce, transfer,
+};
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{Instant, advance};
 
 /// The interval of the core's timer tick.
@@ -52,9 +55,12 @@ fn handshake_completed(event: &Event, peer: PeerId) -> bool {
     matches!(event, Event::HandshakeCompleted { peer: p, .. } if *p == peer)
 }
 
-/// Whether `event` reports the expiry of the sessions with `peer`.
+/// Whether `event` reports the idle expiry of the tunnel with `peer`.
 fn session_expired(event: &Event, peer: PeerId) -> bool {
-    matches!(event, Event::SessionExpired { peer: p } if *p == peer)
+    matches!(
+        event,
+        Event::SessionExpired { peer: p, cause: ExpiryCause::SessionAge } if *p == peer
+    )
 }
 
 /// Moves `b`'s path to `a` away, so the next message from `a` is reported as
@@ -192,6 +198,40 @@ async fn idle_sessions_expire_after_three_reject_after_times() -> TestResult {
     run_for(Duration::from_secs(1)).await;
     a_events.expect(|e| session_expired(e, peer_b)).await?;
     b_events.expect(|e| session_expired(e, peer_a)).await?;
+    Ok(())
+}
+
+/// A subscriber that lagged past an expiry learns about it from the peer's counter, in the
+/// snapshot and in the next periodic stats.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_lagging_subscriber_reads_the_expiry_from_the_counter() -> TestResult {
+    let options = Options {
+        stats_interval: Some(Duration::from_secs(1)),
+    };
+    let (mut a, mut b) = channel_pair_with(options, |_, builder| builder.event_capacity(1))?;
+    introduce(&a, &b, None).await?;
+    transfer(&a, &mut b, Family::V4, 64).await?;
+    transfer(&b, &mut a, Family::V4, 64).await?;
+    let peer_b = a.peer_of(&b).await?;
+    let mut events = a.handle.subscribe().await?;
+
+    run_for(SESSION_EXPIRY + Duration::from_secs(2)).await;
+    assert!(matches!(events.try_recv(), Err(TryRecvError::Lagged(_))));
+    let stats = a.handle.peer_stats(peer_b).await?.ok_or("unknown peer")?;
+    assert_eq!(stats.expirations, 1);
+    run_for(Duration::from_secs(1)).await;
+    let mut latest = None;
+    loop {
+        match events.try_recv() {
+            Ok(event) => latest = Some(event),
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        matches!(latest, Some(Event::PeerStats { peer, expirations: 1, .. }) if peer == peer_b),
+        "{latest:?}"
+    );
     Ok(())
 }
 

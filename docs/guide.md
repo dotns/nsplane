@@ -3,7 +3,7 @@
 [中文版](guide.zh-CN.md)
 
 This guide shows how to embed nsplane in an application: which crates to pick, how an engine
-is assembled, and complete code for the common deployments. It describes nsplane 0.20.2.
+is assembled, and complete code for the common deployments. It describes nsplane 0.21.0.
 
 - Signatures and contracts: rustdoc (`cargo doc --workspace --no-deps --open`).
 - Design: [architecture.md](architecture.md); behavior per crate: [reference](reference/);
@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.20.2" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.20.2" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns
@@ -975,9 +975,6 @@ where
 }
 ```
 
-`WssStreamClient` / `WssStreamServer` (multiplexed TCP/UDP streams) are deprecated; use a
-WireGuard peer over `WssDialer` instead.
-
 ## 13. Several local identities
 
 One engine can answer as several WireGuard identities (private keys) on the same transports:
@@ -998,29 +995,39 @@ outbound packets by source address to an identity's peers (per-identity routing)
 ### Events and statistics
 
 ```rust ignore
-use nsplane::Event;
+use nsplane::{Event, ExpiryCause};
 
 let mut events = handle.subscribe().await?;
 tokio::spawn(async move {
     while let Ok(event) = events.recv().await {
         match event {
             Event::HandshakeCompleted { peer, .. } => println!("up {}", peer.get()),
-            Event::SessionExpired { peer, .. } => println!("down {}", peer.get()),
+            Event::SessionExpired { peer, cause: ExpiryCause::HandshakeTimeout } => {
+                println!("down {}", peer.get())
+            }
+            Event::SessionExpired { peer, .. } => println!("idle {}", peer.get()),
             _ => {}
         }
     }
 });
 
 for p in handle.peers().await? {
-    println!("{:?} rx={} tx={} last_handshake={:?}", p.path, p.rx, p.tx, p.last_handshake);
+    println!(
+        "{:?} rx={} tx={} last_handshake={:?} expirations={}",
+        p.path, p.rx, p.tx, p.last_handshake, p.expirations
+    );
 }
 let drops = handle.drop_counters().await?; // reason -> count
 let queues = handle.queue_stats().await?;  // high-water marks
 let status = handle.status().await?;
 ```
 
-A lagging receiver gets `RecvError::Lagged` and continues. Other counters:
-`transport_stats`, `fragment_stats`, `path_mtu_stats`, `peer_mtus`, `unanswered_handshakes`.
+A peer is down when its handshakes go unanswered (`ExpiryCause::HandshakeTimeout`); a
+`SessionAge` expiry only means that no traffic needed new keys for 540 s, and a peer that was
+never up reports none. A lagging receiver gets `RecvError::Lagged` and continues; it learns of
+an expiry it missed from `PeerStats::expirations` (in `peers`, `peer_stats` and the periodic
+`Event::PeerStats`). Other counters: `transport_stats`, `fragment_stats`, `path_mtu_stats`,
+`peer_mtus`, `unanswered_handshakes`.
 
 ### Runtime changes
 

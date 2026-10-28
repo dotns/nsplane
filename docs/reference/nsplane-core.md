@@ -8,7 +8,7 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `set_plaintext_egress`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output` (`Transmit`, `Deliver`, `Event`, `Plaintext`, `Tracked`; non-exhaustive), `TrackedOutcome`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats` (`new`; non-exhaustive), `Event` (non-exhaustive), `ExpiryCause` (`SessionAge`, `HandshakeTimeout`; non-exhaustive), `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
 
 ## Behavior
 
@@ -17,7 +17,9 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 `Core` performs no I/O and keeps no clock of its own. A driver feeds it `Input`s (local
 packets, received datagrams, configuration changes) with `handle_input`, calls
 `handle_timeout` when `poll_timeout` is due, and drains `poll_output`: datagrams to
-transmit, packets to deliver, and events. Packets go through in place: a local packet is
+transmit, packets to deliver, local packets handed out for plaintext egress, the outcomes of
+tracked local packets, and events; `Output` is non-exhaustive, so a driver matches it with a
+wildcard arm. Packets go through in place: a local packet is
 sealed in its own buffer and leaves as the transmit, a datagram is opened in its buffer and
 leaves as the delivery; buffers come back through `recycle`. `handle_datagrams` and
 `handle_locals` take a batch of received datagrams or local packets and behave exactly like
@@ -78,7 +80,38 @@ attempt gives up (`Event::SessionExpired`); a completed handshake answers it. Th
 monotonic and a peer that only responds stays at 0. `Core::total_unanswered_handshakes()` sums
 it over every peer, removed peers included, so a consumer with a peer registry polls one
 number and looks up the peer when it grows (`EngineHandle::unanswered_handshakes` /
-`total_unanswered_handshakes`); `Event` and `PeerStats` are unchanged.
+`total_unanswered_handshakes`).
+
+### Peer expiry
+
+A peer's tunnel expires on two timer paths of `nsplane-noise`, which discard its sessions,
+its queued packets and its timers; the next packet to the peer starts a new handshake:
+
+- `ExpiryCause::SessionAge`: no handshake completed for `REJECT_AFTER_TIME * 3` (540 s), counted
+  from the last completed handshake or, without one, from the peer's first timer tick. The
+  keys are too old to keep, typically because no traffic needed a rekey; it does not mean
+  the peer is unreachable.
+- `ExpiryCause::HandshakeTimeout`: an initiation got no response for `REKEY_ATTEMPT_TIME`
+  (90 s) and the retries gave up: the peer does not answer.
+
+`Core::handle_timeout` reports an expiry as `Event::SessionExpired { peer, cause }` once: the
+tunnel stays expired, and the next expiry is reported only after the peer sent a handshake
+initiation or completed a handshake. An expiry for `SessionAge` is reported only if the core
+reported a completed handshake (`Event::HandshakeCompleted`) for the peer since it was added
+or since its last reported expiry, so a peer that was never up does not go down for being
+idle; `HandshakeTimeout` is always reported. Packets queued for the handshake are discarded
+without `Event::Dropped`.
+
+`PeerStats::expirations` (and the `expirations` field of `Event::PeerStats`) counts the
+reported expiries, monotonic since the peer was added (a peer added again starts at 0), so a
+subscriber that lagged past the event still learns that one happened. Order: per peer, the
+`Event::HandshakeCompleted` events a tick noticed come before that peer's timer result; the
+periodic `Event::PeerStats` of a tick comes after every peer's timer result. Any `PeerStats`
+event or snapshot taken after a `SessionExpired` counts it.
+
+`Event` and `PeerStats` are `#[non_exhaustive]`: a `match` on `Event` needs a wildcard arm, and
+other crates build a `PeerStats` with `PeerStats::new(peer, public_key)` (or take a snapshot)
+and assign its fields.
 
 ### Injected packets
 
@@ -109,6 +142,83 @@ and a decrypted packet of the same peer meet the same verdicts.
 
 Unlike `inject_inbound`, which delivers past every check, this entry is a second way into the
 inbound filter chain; `nsplane`'s `PlaintextIngress` feeds it.
+
+### Packet tags
+
+The core moves the packet tag and the receipt marker of
+[nsplane-packet](nsplane-packet.md#packet-tag-and-receipt-marker) with the `PacketBuf` and
+never interprets them:
+
+- A local packet (`Input::Local`, `handle_locals`, the `_deferred` forms, `inject_outbound`,
+  `inject_outbound_on`) keeps both through routing, the outbound filters (a filter reads the
+  tag and may set it), sealing in place or on a `CryptoJob`, and `Output::Transmit`, whose
+  datagram is the packet's buffer.
+- A packet without headroom for the data header (a slice of a shared buffer) is copied once
+  into a pooled buffer for sealing; the copy takes the tag and the marker.
+- When the tunnel has no session, an untracked packet's bytes are queued in the tunnel and a
+  handshake initiation is written into its buffer: a sealed message other than data carries
+  neither tag nor marker. The queued packets go out untagged once the session is up (new
+  buffers), as do handshake, cookie and keepalive messages. A tracked packet is never queued
+  (see [Tracked packets](#tracked-packets)).
+- Received datagrams are opened in place; transports hand over untagged buffers, an inbound
+  filter may set a tag, and `Output::Deliver` carries it. `inject_inbound` and
+  `receive_plaintext` keep the tag and the marker of the packet they are given.
+- `recycle` and the pool drop both with the buffer.
+
+### Plaintext egress
+
+`Core::set_plaintext_egress(peer, true)` marks a peer for plaintext egress (`false` for an
+unknown peer); `false` unmarks it. The local packets routed to a marked peer after the call
+pass the outbound filters as usual and then leave as `Output::Plaintext { to, packet }`
+instead of being sealed: the packet as the filters left it, its tag kept and its receipt
+marker cleared, `to` the routed `PeerId`.
+
+- The mark is runtime state of the `PeerId`, like `set_peer_pad_limit`: an
+  `AddOrUpdatePeer` for a known identity and key updates the peer in place and keeps it; a
+  peer removed and added again gets a new id (ids are never reused) and starts unmarked.
+- It applies to packets routed after the call. Packets the tunnel queued behind a handshake
+  before it were routed for sealing and stay sealed: they go out once a session exists.
+  `inject_outbound` is routed and follows the mark; `inject_outbound_on` bypasses routing and
+  is sealed.
+- A marked peer starts no handshake for data (its packets never reach the tunnel), and still
+  answers handshakes, starts them for inbound sealed traffic (as the session's initiator,
+  before its keys get too old for the data it receives) and sends keepalives, so a peer
+  moves between plaintext and sealed egress without a gap.
+- A consumer that learns a new peer's `PeerId` only by reading it back adds the peer closed
+  (no allowed IPs), reads the id back, marks it, then opens it (sets its allowed IPs), so no
+  packet is routed to it, and sealed, before the mark.
+- Cost: while no peer is marked, one `bool` of the core per routed local packet; otherwise
+  also the mark of the routed peer.
+
+### Tracked packets
+
+A tracked local packet carries a tag and the receipt marker
+([nsplane-packet](nsplane-packet.md#packet-tag-and-receipt-marker)); the tag is its token.
+The core emits exactly one `Output::Tracked { tag, peer, outcome }` for each tracked packet
+its send path takes (`Input::Local`, `handle_locals`, the `_deferred` forms with
+`complete_job`, `inject_outbound`, `inject_outbound_on`):
+
+- `TrackedOutcome::Sealed { bytes }` right before the `Output::Transmit` of its datagram,
+  which keeps the tag and the marker: `peer` is the routed peer and `bytes` the plaintext
+  length handed to sealing, without padding or the data message header (what the peer's
+  `data_tx` counts).
+- `TrackedOutcome::NotSent { reason }` at every drop site: `NO_ROUTE` (`peer` `None`), a
+  filter's drop reason, `FILTER_HANDLED` (`Verdict::Handled`), `NO_SESSION`, `NO_PATH`,
+  `ENCAPSULATE_ERROR`, `PLAINTEXT_EGRESS` (the packet leaves untracked as
+  `Output::Plaintext`), and `NO_ROUTE` for a job whose peer was removed before it completed.
+- Without a session (the tunnel's `has_session`) a tracked packet is `NotSent` with
+  `NO_SESSION` at once, inline and on crypto jobs alike, and is not queued in the tunnel; the
+  handshake starts as for an untracked packet (one initiation unless one is in progress). The
+  caller may send it again once the session is up.
+- Counters and events are those of an untracked packet at the same site; a tracked packet
+  that is not queued for lack of a session also counts as a `NO_SESSION` drop. A handled
+  packet and one handed out for plaintext egress are not drops.
+- The outbound filters see the token as the tag; what a filter does to the tag or the marker
+  of a tracked packet is undone after the chain, and a marker a filter sets on an untracked
+  packet is cleared, so only the packets that entered tracked report results. A marked
+  packet without a tag is not tracked: its marker is cleared.
+- Cost: the send path reads the marker once per local packet; the rest runs only for
+  tracked packets.
 
 ### Padding
 
@@ -275,6 +385,7 @@ stops reading keeps up to 8 old values until it exits.
 
 | Feature | How to enable | Default | Cost when not enabled |
 |---|---|---|---|
+| Plaintext egress | `Core::set_plaintext_egress(peer, true)` | no peer marked | one `bool` of the core per routed local packet |
 | Inbound destinations | `PeerConfig::inbound_destinations = Some(nets)`, `EngineHandle::set_inbound_destinations`, or a caller-updated `EngineHandle::set_inbound_destination_source` | `None`: unchecked | one `Option` check per decrypted packet; a source adds one `allows` call |
 
 ## Errors and drop reasons
@@ -282,7 +393,10 @@ stops reading keeps up to 8 old values until it exits.
 Every packet the core drops is counted under a reason from `reasons` (for example
 `NO_ROUTE`, `NO_SESSION`, `UNKNOWN_PEER`, `UNKNOWN_SESSION`, `UNKNOWN_LOCAL_IDENTITY`,
 `SOURCE_NOT_ALLOWED`, `DESTINATION_NOT_ALLOWED`, `UNKNOWN_PLAINTEXT_PEER`) and published as `Event::Dropped`; filters add their own reasons.
-The engine reports the counts with `EngineHandle::drop_counters`.
+The engine reports the counts with `EngineHandle::drop_counters`. The same strings are the
+reasons of `TrackedOutcome::NotSent`, plus `FILTER_HANDLED` and `PLAINTEXT_EGRESS`, which are
+not drops; `PLAINTEXT_EGRESS_FULL`, `PLAINTEXT_EGRESS_CLOSED` and `ENGINE_STOPPED` are the
+driver's.
 
 ## See also
 

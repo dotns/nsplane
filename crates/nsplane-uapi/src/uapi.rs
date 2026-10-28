@@ -766,20 +766,10 @@ mod tests {
     #[test]
     fn config_reports_the_handshake_as_unix_time() {
         let now = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_100, 500);
-        let peer = PeerStats {
-            peer: nsplane::PeerId::new(1),
-            public_key: PublicKey::from([1; 32]),
-            local_identity: nsplane::LocalIdentityId::DEFAULT,
-            path: None,
-            allowed_ips: Vec::new(),
-            preshared_key: None,
-            persistent_keepalive: None,
-            rx: 3,
-            tx: 4,
-            data_rx: 0,
-            data_tx: 0,
-            last_handshake: Some(Duration::new(100, 0)),
-        };
+        let mut peer = PeerStats::new(nsplane::PeerId::new(1), PublicKey::from([1; 32]));
+        peer.rx = 3;
+        peer.tx = 4;
+        peer.last_handshake = Some(Duration::new(100, 0));
         let config = write_config(None, None, None, &[peer], now);
         assert!(config.contains("last_handshake_time_sec=1700000000\n"));
         assert!(config.contains("last_handshake_time_nsec=500\n"));

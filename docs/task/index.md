@@ -71,13 +71,20 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-1454-ether-proxy-arp nsplane-ether: answer ARP and NDP for every address of the guest's link but its own**](20261024-1454-ether-proxy-arp.md) `P2`
 - [x] [**20261024-2224-acl-rule-reply-revocation Revoke reply allowances of rule-accepted flows when their authority is gone**](20261024-2224-acl-rule-reply-revocation.md) `P1`
 - [x] [**20261026-1848-split-large-modules Split the largest modules by responsibility and share e2e scenario setup**](20261026-1848-split-large-modules.md) `P3`
-- [-] [**20261026-0819-node-gateway-requests Requests from the node and the gateway at 0.19.2, and two defects**](20261026-0819-node-gateway-requests.md) `P2`
+- [x] [**20261026-0819-node-gateway-requests Requests from the node and the gateway at 0.19.2, and two defects**](20261026-0819-node-gateway-requests.md) `P2`
 - [x] [**20261026-0851-vnet-walk-v6-fixes Fix vnet IPv4 IHL 10 segmentation and the walk_v6 later-fragment header limit**](20261026-0851-vnet-walk-v6-fixes.md) `P1`
 - [x] [**20261026-0837-scoped-flowgate nsplane-acl: scope-qualified flow gate decisions**](20261026-0837-scoped-flowgate.md) `P1`
 - [x] [**20261026-0836-local-barrier-plaintext-ingress Engine local barrier and validated plaintext ingress**](20261026-0836-local-barrier-plaintext-ingress.md) `P2`
 - [x] [**20261026-0838-first-input-flow-control Netstack flow control from the first input**](20261026-0838-first-input-flow-control.md) `P1`
+- [x] [**20261027-0305-packet-tag-carrier Packet tag carrier on PacketBuf (release C, W4)**](20261027-0305-packet-tag-carrier.md) `P1`
+- [x] [**20261027-0305-netstack-ingress-labels Netstack ingress labels and label revocation (release C, W5)**](20261027-0305-netstack-ingress-labels.md) `P1`
+- [x] [**20261027-0305-plaintext-egress-send-receipts Plaintext egress and per-packet send receipts (release C, W6)**](20261027-0305-plaintext-egress-send-receipts.md) `P1`
 - [x] [**20261027-0349-barrier-count-window Local barrier: cover a packet the source is handing out**](20261027-0349-barrier-count-window.md) `P1`
 - [x] [**20261027-0537-tk-cleanup DNS fixture and source documentation cleanup**](20261027-0537-tk-cleanup.md) `P2`
 - [x] [**20261027-0433-sink-spent-forwarding Wrapper sinks forward send_batch_spent**](20261027-0433-sink-spent-forwarding.md) `P2`
 - [x] [**20261027-0433-filter-coarse-clock AclFilter and AclEngine on the coarse clock**](20261027-0433-filter-coarse-clock.md) `P2`
-- [-] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`
+- [x] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`
+- [x] [**20261028-0615-remove-wss-stream-carrier Remove the deprecated WsFrame stream carrier from nsplane-wss**](20261028-0615-remove-wss-stream-carrier.md) `P2`
+- [x] [**20261028-0615-remove-transparent-admission Remove the deprecated TransparentConfig::admission**](20261028-0615-remove-transparent-admission.md) `P2`
+- [ ] [**20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards**](20261028-0611-expiry-queued-packets-dropped.md) `P3`
+- [ ] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`

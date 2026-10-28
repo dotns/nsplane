@@ -11,9 +11,9 @@ input, per-flow revocation, optional reassembly, and an ownership query for loca
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`), `UdpFlow`, `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
-| admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
-| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`; `admission` deprecated, replaced by `NetStackConfig::admission`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `ingress_label`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
+| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
 ## Behavior
 
@@ -350,9 +350,7 @@ reject (RST and ICMP / `ICMPv6` port unreachable observed at the client) and the
 
 `NetStackConfig::admission` decides how a new TCP connection (a bare SYN) or UDP flow (its
 first datagram) is admitted, on every stack: to the stack's own addresses, and on a
-transparent stack to every in-prefix destination too. A transparent stack also honours the
-deprecated `TransparentConfig::admission` while the top-level field is `Immediate`; a
-`Decide` at the top level takes precedence.
+transparent stack to every in-prefix destination too.
 
 - `Admission::Immediate` (default): accepted on arrival.
 - `Admission::Decide { timeout, max_pending }`: the SYN or first datagram is held in a
@@ -501,6 +499,91 @@ The unit tests `src/stack/tests/first_input.rs` cover a revoke at every stage, e
 deciding, and same-tuple lifetimes; `nsplane-e2e`'s `tests/netstack_first_input.rs` revokes
 TCP and UDP lifetimes at each stage between two engines while an accepted one echoes.
 
+### Ingress labels
+
+The tag of a packet sent into `NetStackSink` (`PacketBuf::tag`) is its ingress label. The
+consumer sets it on its side of the sink after its own classification (or in an inbound
+`PacketFilter`), and it moves with the packet through the consumer's queue and the sink
+into the driver. Labels apply to every stack, with or without `Admission` and transparent
+mode.
+
+- **A lifetime takes the label of its first input**: a TCP connection the label of its
+  bare SYN, a UDP flow from `incoming_udp` the label of its first datagram, a lifetime
+  held under `Admission::Decide` the label of the held SYN or datagram.
+  `TcpConnection::ingress_label`, `UdpFlow::ingress_label` and `PendingFlow::ingress_label`
+  return it. `None` is a label of its own, never a wildcard. Connections the application
+  opens (`connect_tcp`) and sockets from `bind_udp` and `connect_udp` have no label and
+  their input is not checked (no `recv_labeled`).
+- **Mismatches are dropped** and counted in `label_mismatch`: a TCP segment, a
+  retransmitted SYN or a handshake ACK of an accepted connection with another label; a
+  datagram of a flow with another label; a further SYN or datagram of a held lifetime with
+  another label (a retransmitted SYN with the same label is absorbed, a datagram
+  with the same label counts in `udp_queue_full`); a datagram reassembled from fragments
+  whose labels differ (`Reassembler::push_tagged` reports `Mixed`; a tag and none differ).
+  A reassembled datagram whose fragments share a label carries it.
+- **ICMP errors**: an unlabeled Fragmentation Needed or Packet Too Big applies to a labeled
+  connection (routers send them, and a consumer cannot attribute them without the quote);
+  one with a label that quotes a connection of another label is ignored and counted in
+  `label_mismatch`.
+- **Where the label lives.** A bare SYN's label is recorded per tuple before it goes into
+  smoltcp; the poll's tracking of listener sockets binds it to the socket that took the SYN
+  (a SYN no socket took is forgotten with that poll), and adoption gives it to the
+  connection's `FlowState`. The tuple's entry stays until the socket is released, and
+  segments are checked against it before they go into smoltcp. A UDP flow's label is on its
+  `FlowState` and compared on the flow lookup each datagram makes anyway.
+- **Cost.** An unlabeled stack (no labeled connection, no tombstone, no queued input of a
+  revoked label) keeps its per-packet path: one tag check per packet and one compare per
+  flow datagram; each inbound connection costs one table entry from its SYN to its
+  release. While a labeled connection exists, each TCP segment pays a read of its
+  addresses and ports and a probe of a 64-slot cache of recent tuples; a miss (the first
+  segment of a connection after the table changed, or a slot shared with another
+  connection) looks the tuple up in the table, which stays keyed with the standard
+  hasher. Measured in
+  [Performance](../performance.md#netstack-ingress-labels).
+
+`NetStackHandle::revoke_label(label)` returns a `RetirementReceipt` and never waits. The
+driver turn that takes the call:
+
+- records the label's tombstone (see below);
+- holds back the label's input still in the ingress queue: every packet sent into the sink
+  before the call (and those after it up to that turn) is dropped as the driver takes it,
+  counted in `retired_drops`; one entry per label in a table of ingress positions;
+- discards the reassembler's incomplete datagrams holding a fragment with the label
+  (`Reassembler::discard_tagged`); later fragments of such a datagram start a new one that
+  cannot complete;
+- retires every lifetime with the label at its stage, as `FlowControl::revoke` does, and
+  revokes its control: the held entry (`Pending`), a listener socket in SYN-RECEIVED (its
+  SYN-ACK dropped or fenced), the connection waiting for `incoming_tcp`, the connection or
+  flow in an accept queue (never handed out, also under `Immediate`), and handles in the
+  application's hands (reads fail with `ConnectionAborted`, `UdpFlow::recv` returns
+  `None`). Each such lifetime's own receipts report its retirement. A lifetime revoked on
+  its own before is left to its own revoke.
+
+| Outcome | Meaning |
+| --- | --- |
+| `Retired` | nothing of the label is delivered from then on, and no output of its lifetimes leaves the stack |
+| `Failed` | a bounded table was full (ingress positions, egress fences). Every lifetime found was still retired and its handles revoked; what failed is a fence, so input or output queued before the call may still pass. The call is idempotent: a later call scans again, records the fences that did not fit and reports `Retired` once they do. Keep the lifetime's owner withdrawn until a call reports `Retired`. |
+| `Unknown` | the stack stopped before, or had stopped |
+
+- **Tombstones.** Input with a revoked label that reaches the driver after the call is
+  dropped and counted in `label_revoked`, and it never opens a new lifetime while the
+  stack holds the label's tombstone. `NetStackConfig::max_revoked_labels` (default 65 536)
+  bounds the tombstones; beyond it the oldest is forgotten. The consumer contract stands:
+  labels of revoked lifetimes are never reused, and the consumer cancels its own queued
+  input of a label before revoking it; the tombstone is a safety net.
+- **The same tuple after `Retired`** opens a fresh lifetime with its new label: a datagram
+  on a retired flow's tuple opens a new flow, a SYN on a retired connection's tuple a new
+  connection through the listener pool (the old connection's segments get the stack's
+  stateless RST, as after any revoke).
+
+The unit tests `src/stack/tests/labels.rs` and `revoke_label.rs` cover every rule on an
+ordinary stack and on a transparent one with `Immediate` and `Decide`, the node's two
+reproduced cases (a partial datagram completed after a listener replacement; queued
+complete input, a new resource and an identical reinstall), each stage of `revoke_label`,
+`Failed` with a full table and a later `Retired`, tombstones and their bound;
+`nsplane-e2e`'s `tests/netstack_ingress_labels.rs` replaces a labeled incarnation between
+two engines while a new connection echoes.
+
 ### Graceful TCP egress drain
 
 `TcpConnection::terminated` reports socket release. The final TCP ACK can still be
@@ -525,7 +608,9 @@ not establish peer application completion or remote cleanup.
   single-stream throughput runs (ignored by default).
 - `benches/send_stream.rs` (`nsplane-netstack`): the sender alone, two stacks back to back in
   process, TCP (`netstack_send`, `netstack_send_1cpu`) and connected UDP
-  (`netstack_udp_send`, `netstack_udp_send_1cpu`).
+  (`netstack_udp_send`, `netstack_udp_send_1cpu`), and UDP to flows from `incoming_udp`
+  (`netstack_udp_flow_send`, `netstack_udp_flow_send_1cpu`); every case also with the
+  receiver's input labeled (`_labeled`).
 
 ## Configuration and defaults
 
@@ -549,6 +634,7 @@ too: a `match` on it outside the crate needs a wildcard arm.
 | Per-flow admission | `NetStackConfig::admission = Admission::Decide { timeout, max_pending }` (every stack), decisions and controls on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none: one `Option` check per bare SYN |
 | TCP connection limit | `TransparentConfig::max_connections = Some(n)` | `None`: listener pool and accept queue only | one `Option` check per bare SYN in transparent mode |
 | Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |
+| Ingress labels | tag packets before `NetStackSink::send` (`PacketBuf::set_tag`); revoke with `NetStackHandle::revoke_label`; `NetStackConfig::max_revoked_labels` bounds the tombstones | unlabeled: every lifetime has the label `None` | one tag check per ingress packet, one compare per flow datagram, one table entry per inbound connection |
 | Connected UDP sockets | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
 
 ## Errors and drop reasons
@@ -558,7 +644,7 @@ and unsupported packets, refused and deferred SYNs, connections and flows not ac
 UDP queues, the flow limit, egress over the backlog, ignored ICMP, reassembly timeouts and
 overflows, failed inbound handshakes (`handshake_failed`), the admission outcome: `accepted`
 and `rejected_hook`, `rejected_timeout`, `rejected_table_full`, and in transparent mode
-`rejected_connection_limit`, `rejected_prefix`); a lifetime held under `Admission::Decide`
+`rejected_connection_limit`, `rejected_prefix`; input with another label than its lifetime's in `label_mismatch`, input of a revoked label in `label_revoked`); a lifetime held under `Admission::Decide`
 also ends with one `DeliveryOutcome` on its `DeliveryReceipt`;
 packets dropped for a revoked flow are counted in `NetStackHandle::retired_drops`. A
 connection rejected under `Admission::Decide` reaches the peer as a RST (`connect_tcp` on a peer
@@ -586,6 +672,11 @@ revoked flow) and `BrokenPipe` (the stack stopped).
 - Flow events: `FlowEventsConfig::capacity` buffered events (0 is taken as 1) and a token
   bucket of `burst` tokens refilled at `rate` per second.
 - Retirement state: the table under [Per-flow control and retirement](#per-flow-control-and-retirement).
+- Ingress labels: one TCP table entry per inbound connection from its SYN to its release;
+  1024 labels with input in the ingress queue at a revoke (a revoke that needs one more
+  reports `Failed`); `max_revoked_labels` tombstones (65 536 by default, about 16 bytes
+  each); egress fences of a `Failed` label revoke kept for its next call until the source
+  passed them.
 
 ## See also
 

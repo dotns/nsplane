@@ -13,6 +13,7 @@ mod timers;
 mod wire;
 
 pub use session::{OpenTicket, SealTicket};
+pub use timers::ExpiryCause;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -226,6 +227,17 @@ impl Tunn {
     /// Returns whether the tunnel gave up on handshakes and needs to be recreated.
     pub const fn is_expired(&self) -> bool {
         self.handshake.is_expired()
+    }
+
+    /// Why the tunnel expired, while it is expired ([`Tunn::is_expired`]); `None` otherwise.
+    ///
+    /// The next handshake initiation, which leaves the expired state, clears it.
+    pub const fn expiry_cause(&self) -> Option<ExpiryCause> {
+        if self.handshake.is_expired() {
+            self.timers.expiry_cause
+        } else {
+            None
+        }
     }
 
     /// Returns the destination address of an IP packet.
@@ -729,6 +741,7 @@ impl Tunn {
 
         if self.handshake.is_expired() {
             self.timers.clear();
+            self.timers.expiry_cause = None;
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
@@ -880,7 +893,9 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
-    use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
+    use crate::noise::timers::{
+        REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
+    };
 
     use super::*;
     use rand_core::{OsRng, RngCore};
@@ -1767,5 +1782,86 @@ mod tests {
             my_tun.commit_open(&open, &mut theirs[..len], plain_len),
             TunnResult::Err(WireGuardError::NoCurrentSession)
         ));
+    }
+
+    /// Runs the timers of `tun` at `now` and expects the tunnel to expire.
+    fn expect_expiry(tun: &mut Tunn, now: Instant) {
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            tun.update_timers_at(now, &mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert!(tun.is_expired());
+    }
+
+    #[test]
+    fn expiry_cause_is_none_on_a_fresh_tunnel_and_after_a_handshake() {
+        let (my_tun, their_tun) = create_two_tuns();
+        assert_eq!(my_tun.expiry_cause(), None);
+        assert_eq!(their_tun.expiry_cause(), None);
+
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut now = start(&mut [&mut my_tun, &mut their_tun]);
+        advance(
+            &mut now,
+            Duration::from_secs(1),
+            &mut [&mut my_tun, &mut their_tun],
+        );
+        assert_eq!(my_tun.expiry_cause(), None);
+        assert_eq!(their_tun.expiry_cause(), None);
+    }
+
+    #[test]
+    fn an_unanswered_initiation_expires_for_handshake_timeout() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
+        create_handshake_init(&mut my_tun);
+
+        expect_expiry(&mut my_tun, now + REKEY_ATTEMPT_TIME);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+        // The expired state reports the same cause on later ticks.
+        assert!(matches!(
+            my_tun.update_timers_at(now + REKEY_ATTEMPT_TIME * 2, &mut []),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+    }
+
+    #[test]
+    fn a_session_left_alone_expires_for_session_age() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let now = start(&mut [&mut my_tun, &mut their_tun]);
+
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+        expect_expiry(&mut their_tun, now + REJECT_AFTER_TIME * 3);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+        assert_eq!(their_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+    }
+
+    #[test]
+    fn a_tunnel_without_a_session_expires_for_session_age() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
+
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+    }
+
+    #[test]
+    fn a_handshake_initiation_after_the_expiry_clears_the_cause() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let now = start(&mut [&mut my_tun, &mut their_tun]);
+        expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
+
+        create_handshake_init(&mut my_tun);
+        assert!(!my_tun.is_expired());
+        assert_eq!(my_tun.expiry_cause(), None);
+
+        // The next expiry reports its own cause.
+        expect_expiry(
+            &mut my_tun,
+            now + REJECT_AFTER_TIME * 3 + REKEY_ATTEMPT_TIME,
+        );
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
     }
 }

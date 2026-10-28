@@ -5,6 +5,262 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-28
+
+Feature release: one opaque packet tag carried on `PacketBuf` through the engine, the
+translators and the netstack, netstack ingress labels with label revocation, plaintext egress
+per peer and per-packet send receipts. Approved as the twelfth exception to the 0.11 feature
+freeze, before the freeze was lifted (ADR `2026-10-27-normal-maintenance`). With it, a
+peer-level expiry signal: `Event::SessionExpired` carries its cause and `PeerStats` counts the
+expiries. Breaking: `nsplane-core` `Output` is `#[non_exhaustive]` with two new variants,
+`PacketBuf` packet offsets are `u32`, `Event` and `PeerStats` are `#[non_exhaustive]` with new
+fields, and the deprecated `nsplane-wss` stream carrier and `TransparentConfig::admission` are
+removed (see Changed). Consumers that set no tag keep today's paths.
+
+### Added
+- Packet tag carrier (`nsplane-packet`): `PacketBuf::{tag, set_tag, take_tag}` carry an opaque
+  `Option<NonZeroU64>` of the caller's that nsplane never interprets and never writes to the
+  wire, and `PacketBuf::{is_tracked, set_tracked}` a receipt marker separate from it. New
+  buffers and every buffer `PacketPool` and `SharedPacketPool` hand out carry neither; `Clone`
+  copies the tag and clears the marker; `into_bytes` and `freeze` drop both. `PacketBuf` stays
+  56 bytes on 64-bit targets (see Changed).
+- nsplane keeps the tag where it moves a packet into another buffer on its way to a
+  transport or a sink: the core's copy of a packet without headroom for sealing and the
+  translators' grown copies (`Translator`, `Nat64Lan::reverse`) take the tag and the marker;
+  each fragment of `nsplane`'s fragmentation stage takes the tag, never the marker. A local
+  packet's tag reaches the outbound filters (which may read or set it) and the transport
+  call's datagram, inline and with crypto workers; an inbound filter's tag reaches the sink.
+  Where a buffer stops being the packet both are cleared: a handshake initiation the tunnel
+  writes into a packet's buffer, and the buffers the engine and `pump` hand to
+  `PacketSource::recycle`. The engine clears the marker on every packet it takes in (source,
+  inject calls, `PlaintextIngress`) and on every packet it delivers. A packet queued in the
+  tunnel while its peer has no session goes out untagged. Cost for untagged traffic: one
+  store per packet at the engine's entries and deliveries and per recycled buffer, one word
+  copied at the copy sites.
+- `Reassembler::push_tagged` records each fragment's tag and reports the completed datagram's
+  `FragmentTags` (`Same(tag)`, no tag included, or `Mixed`), counted in the new
+  `ReassemblyStats::mixed_tags`; `Reassembler::discard_tagged` drops the incomplete datagrams
+  that may hold a fragment with a tag. `push` is `push_tagged` without a tag.
+- `nsplane-nat`: the translator's zero-checksum UDP reassembly keeps the tag its fragments
+  share and drops a datagram whose fragments carried different tags (or some a tag and others
+  none) as the new `reasons::FRAGMENT_MIXED_TAGS`, counted in `TranslatorStats::dropped_out`.
+- Netstack ingress labels (`nsplane-netstack`): the tag of a packet sent into `NetStackSink`
+  is its ingress label, on every stack (with or without `Admission`, ordinary or transparent).
+  A connection takes the label of its bare SYN, a flow from `incoming_udp` that of its first
+  datagram, a lifetime held under `Admission::Decide` that of its held input; `None` is a
+  label of its own. `TcpConnection::ingress_label`, `UdpFlow::ingress_label` and
+  `PendingFlow::ingress_label` return it. Input with another label than its lifetime's (a
+  segment, a retransmitted SYN, a handshake ACK, a datagram, a held lifetime's further input,
+  a datagram reassembled from fragments with different labels) is dropped and counted in the
+  new `NetStackStats::label_mismatch`; an unlabeled ICMP error applies to a labeled
+  connection, one with another label is ignored and counted there too. Connections and
+  sockets the application opens carry no label and are not checked.
+- `NetStackHandle::revoke_label(label) -> RetirementReceipt` retires every lifetime of a
+  label at every stage, handed-out handles included (their control is revoked), drops the
+  label's input still queued in the stack and its incomplete reassembled datagrams, and
+  keeps a tombstone: later input with the label is dropped and counted in the new
+  `NetStackStats::label_revoked` and opens no lifetime. `Failed` when the table of labels
+  with queued input (1024) or the egress fences are full; every lifetime found is still
+  retired and a later call reports `Retired` once the fences fit. The new
+  `NetStackConfig::max_revoked_labels` (default 65 536) bounds the tombstones. After
+  `Retired` the same tuple opens a fresh lifetime with its new label.
+- `send_stream` bench: every case also with the receiver's input labeled (`_labeled`), and
+  the new `netstack_udp_flow_send` / `_1cpu` groups, UDP to flows from `incoming_udp`.
+- Plaintext egress (`nsplane-core`, `nsplane`): `Core::set_plaintext_egress(peer, bool)` and
+  `EngineHandle::set_plaintext_egress` mark a peer whose local packets routed after the call
+  leave after the outbound filters as the new `Output::Plaintext { to, packet }` instead of
+  being sealed, tag kept, receipt marker cleared. The mark is runtime state of the `PeerId`:
+  kept on an update in place, absent after the peer is removed and added again. Packets
+  routed before the mark and those the tunnel queued behind a handshake stay sealed. A
+  marked peer starts no handshake for data, and still answers handshakes and starts them for
+  inbound sealed traffic. The engine hands the packets to the bounded `PlaintextEgress`
+  receiver of `EngineBuilder::plaintext_egress(capacity)`; a full queue drops them under the
+  new `DROP_PLAINTEXT_EGRESS_FULL`, a missing or dropped receiver under
+  `DROP_PLAINTEXT_EGRESS_CLOSED`. Consumers that learn a `PeerId` only by reading it back add
+  the peer closed, read the id, mark it, then open it.
+- Send receipts (`nsplane`): `EngineBuilder::tracked_sender(capacity)` returns a
+  `TrackedSender` and its `SendResults`. `TrackedSender::send` / `try_send` accept a tagged
+  packet (the tag is its token; untagged, outstanding tags and a stopped engine are refused
+  with the packet as `TrackedRefused`), mark it and enter it into the local path next to the
+  source's packets. Each accepted packet gets exactly one `SendResult { tag, outcome }`:
+  `SendOutcome::Sent { peer, bytes }` once the transport call carrying its datagram
+  succeeded (`bytes`: the plaintext length handed to sealing, as `data_tx` counts), or
+  `SendOutcome::NotSent { reason }` at every drop site, with the drop counters' reason (no
+  route, filter drop, handled, no session, oversize with a fragmenter, no path, encapsulate
+  error, no transport, transmit full, transport closed, removed, send error, plaintext
+  egress, engine stopped). Without a session a tracked packet is not sent at once and the
+  handshake starts as for an untracked one; with a fragmenter it is never split; without one
+  a tracked packet above the MTU is sealed as usual. A tracked datagram ends its transmit
+  batch (the owner's call, the message to the transmit task and the transmit task's call), so
+  the call attributes it exactly. At most `capacity` results are outstanding (`send` waits,
+  `try_send` refuses with `Full`), so none is ever dropped; on stop every outstanding packet
+  is reported `ENGINE_STOPPED`. `EngineHandle::local_barrier` also waits for the packets the
+  tracked sender accepted before the call.
+- `nsplane-core`: a tracked local packet (tagged, receipt marker set) gets exactly one
+  `Output::Tracked { tag, peer, outcome }`: `TrackedOutcome::Sealed { bytes }` right before
+  the `Output::Transmit` of its datagram, or `TrackedOutcome::NotSent { reason }` at every
+  drop site of the send path. Without a session it is not queued in the tunnel (reported
+  `NO_SESSION`, counted as a drop) and the handshake starts as for an untracked packet; what
+  an outbound filter does to its tag or marker is undone after the chain, and a marker a
+  filter sets on an untracked packet is cleared.
+- New reasons: `reasons::PLAINTEXT_EGRESS` and `reasons::FILTER_HANDLED` (results of tracked
+  packets, not drops), `reasons::PLAINTEXT_EGRESS_FULL`, `reasons::PLAINTEXT_EGRESS_CLOSED`
+  and `reasons::ENGINE_STOPPED`.
+- Benches: `data_path` `core_round_trip_tracked` and `core_plaintext_egress`; `worker_pool`
+  `tracked_send` (tracked against untracked packets through an engine) and `engine_one_way`
+  (untracked packets one way through an engine).
+- `Event::SessionExpired` carries `cause: ExpiryCause` (`SessionAge`: no handshake for
+  540 s; `HandshakeTimeout`: initiations unanswered for 90 s), also as
+  `nsplane_noise::noise::ExpiryCause` and `Tunn::expiry_cause` (re-exported as
+  `nsplane_core::ExpiryCause` and `nsplane::ExpiryCause`). `PeerStats::expirations` and the
+  `expirations` field of `Event::PeerStats` count the reported expiries per peer, so a
+  subscriber that lagged still learns about them. `PeerStats::new` builds a snapshot.
+
+### Changed
+
+#### Breaking
+- `nsplane-core` `Output` is `#[non_exhaustive]` and gains `Output::Plaintext` (plaintext
+  egress) and `Output::Tracked` (tracked local packets). Code that matches
+  `Core::poll_output` exhaustively (a driver of its own) needs a wildcard arm; it handles
+  `Plaintext` only if it marks peers with `Core::set_plaintext_egress`, and `Tracked` only if
+  it feeds tracked packets. The engine handles both.
+
+  ```rust
+  // Before
+  while let Some(output) = core.poll_output() {
+      match output {
+          Output::Transmit { path, data } => transmit(path, data),
+          Output::Deliver { from, packet } => deliver(from, packet),
+          Output::Event(event) => report(event),
+      }
+  }
+  // After
+  while let Some(output) = core.poll_output() {
+      match output {
+          Output::Transmit { path, data } => transmit(path, data),
+          Output::Deliver { from, packet } => deliver(from, packet),
+          Output::Event(event) => report(event),
+          // Output::Plaintext and Output::Tracked appear only when the driver marks peers
+          // for plaintext egress or feeds tracked packets.
+          _ => {}
+      }
+  }
+  ```
+- `nsplane-packet` `PacketBuf` keeps 56 bytes on 64-bit targets with the tag added: its packet
+  offsets are `u32`, so a packet ends at most `u32::MAX` bytes into its buffer.
+  `PacketBuf::set_len`, `extend_from_slice` and `PacketPool::get_len` stop there, and
+  `PacketBuf::from_shared` and `reserve_front` return `BoundsError` for a range past it. IP
+  packets are far below the bound; no source change.
+- nsplane-core `Event` and `PeerStats` are `#[non_exhaustive]`, so later variants and fields
+  are not breaking again (re-exported by `nsplane`). A `match` on `Event` needs a wildcard
+  arm. Other crates can no longer build `PeerStats` with a struct expression, also not with
+  `..base`: start from `PeerStats::new(peer, public_key)` or a snapshot and assign the
+  fields. Constructing and matching existing `Event` variants, reading fields and comparing
+  values are unchanged. In the same release, `Event::SessionExpired` gains `cause` and
+  `Event::PeerStats` gains `expirations`, so patterns that name every field need the new
+  field or `..`.
+
+  ```rust
+  // Before
+  match event {
+      Event::SessionExpired { peer } => mark_down(peer),
+      Event::PeerStats { peer, rx, tx, data_rx, data_tx, last_handshake } => {
+          record(peer, rx, tx, data_rx, data_tx, last_handshake)
+      }
+      Event::HandshakeCompleted { peer, .. } => mark_up(peer),
+      Event::Authenticated { .. }
+      | Event::PathAdopted { .. }
+      | Event::Dropped { .. }
+      | Event::Suspended
+      | Event::Resumed
+      | Event::MtuChanged { .. } => {}
+  }
+  let zeroed = PeerStats { rx: 0, tx: 0, ..snapshot };
+  // After
+  match event {
+      Event::SessionExpired { peer, cause: ExpiryCause::HandshakeTimeout } => mark_down(peer),
+      Event::SessionExpired { peer, .. } => mark_idle(peer),
+      Event::PeerStats { peer, rx, tx, data_rx, data_tx, last_handshake, .. } => {
+          record(peer, rx, tx, data_rx, data_tx, last_handshake)
+      }
+      Event::HandshakeCompleted { peer, .. } => mark_up(peer),
+      _ => {}
+  }
+  let mut zeroed = snapshot;
+  zeroed.rx = 0;
+  zeroed.tx = 0;
+  ```
+- `nsplane-wss`: the deprecated WebSocket stream carrier is removed: `WssStreamClient`,
+  `WssTcpStream`, `WssUdpFlow`, `WssStreamLimits`, `WssStreamStats`, `MAX_DATA_PAYLOAD`,
+  `WssStreamServer`, `WssServerLimits`, `WssServerStats`, `WssResolver`, `WssOpen`,
+  `Denied`, `WssStreamEvent`, `WssStreamEventKind`, `WssCloseReason` and the `frame` module
+  (the `WsFrame` codec). `WssDialer`, `WssConfig`, `WssTls`, `BearerProvider`,
+  `WssDialError`, `WssDialEvent`, `WssStats`, the server transport (`WssServerTransport`,
+  `WssAcceptor`, `WssServerConfig`, `WssSession` and their stats), `MAX_DATAGRAM` and
+  `MAX_MESSAGE` stay. Replacement: a WireGuard peer over `WssDialer` (server side
+  `WssServerTransport`), with TCP and UDP to the targets through the engine, e.g. on an
+  `nsplane-netstack`.
+
+  ```rust
+  // Before
+  let client = WssStreamClient::new(config, WssStreamLimits::default())?;
+  let stream = client.open_tcp(target).await?;
+  // After: the relay is a WireGuard peer reached over WSS
+  let dialer = WssDialer::new(config)?;
+  let transport = dialer.into_transport(TransportId::new(2), relay_addr, LinkConfig::default());
+  // add `transport` and the relay peer to the engine; open TCP through the local side
+  let stream = netstack.connect_tcp(target).await?;
+  ```
+- `nsplane-netstack`: the deprecated `TransparentConfig::admission` is removed; set
+  `NetStackConfig::admission`, which applies to every stack, transparent ones included.
+
+  ```rust
+  // Before
+  let mut transparent = TransparentConfig::default();
+  transparent.admission = Admission::Decide { timeout, max_pending };
+  config.transparent = Some(transparent);
+  // After
+  config.transparent = Some(TransparentConfig::default());
+  config.admission = Admission::Decide { timeout, max_pending };
+  ```
+
+#### Migration
+- Every consumer: bump the nsplane crates together. A consumer that sets no tag, marks no peer
+  and builds no tracked sender sees no behaviour change; a driver of `Core` adds the wildcard
+  arm above. `TranslatorStats` stays exhaustive: the translator's mixed-tag drop is counted in
+  `dropped_out` under `reasons::FRAGMENT_MIXED_TAGS`. A consumer coming from 0.19.x also takes
+  0.20.0's breaking change (the netstack configuration and statistics structs are
+  `#[non_exhaustive]`).
+- Ownership epochs on local packets: stamp each packet with `PacketBuf::set_tag` where the
+  consumer chooses its destination, as early as its own producers, and drop stale or untagged
+  packets in an outbound `PacketFilter` that reads `PacketBuf::tag`; the tag survives the
+  consumer's own queues, the engine's queues and the fragmentation stage.
+- Netstack ingress labels: set the label on the sink side, after the consumer's own
+  classification and before its queue toward `NetStackSink`, with a fresh label per owner
+  incarnation (an identical reinstall included). Find the owner of an accepted connection or
+  flow by `ingress_label`. To replace or withdraw an owner: cancel its label in the
+  consumer's own queue, call `NetStackHandle::revoke_label`, wait for the receipt, and install
+  the successor only after `Retired`; on `Failed` keep the owner withdrawn and call again.
+  Never reuse a revoked label.
+- Plaintext egress: a consumer that learns a `PeerId` only by reading it back adds the peer
+  closed (no allowed IPs), reads the id back, calls `set_plaintext_egress`, then opens the
+  peer, and reads the packets from the `PlaintextEgress` of
+  `EngineBuilder::plaintext_egress`.
+- Send receipts: build the engine with `EngineBuilder::tracked_sender`, hand tagged packets
+  (the tag is the token, unique while outstanding) to `TrackedSender`, keep a copy if a retry
+  may be needed, and read one `SendResult` per accepted packet from `SendResults`; a packet
+  `NotSent` with `NO_SESSION` may be sent again once the session is up.
+
+#### Other
+- nsplane-core: a peer that never completed a handshake (or none since its last expiry) no
+  longer reports `Event::SessionExpired` when its idle timer runs out (540 s after it was
+  added); its tunnel still expires. Handshakes that go unanswered are still reported
+  (`ExpiryCause::HandshakeTimeout`). A keepalive the timers could not seal (its key at
+  Reject-After-Messages) is not reported as an expiry either.
+- `nsplane-netstack`: a connection or flow revoked while it waits in `incoming_tcp` or
+  `incoming_udp` is skipped by the stream also when it was admitted with
+  `Admission::Immediate` (before, only lifetimes held under `Admission::Decide` were).
+
 ## [0.20.2] - 2026-10-27
 
 Patch release; no public API change. Wrapper sinks return spent buffers and the ACL filter

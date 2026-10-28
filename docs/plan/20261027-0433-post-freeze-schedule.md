@@ -6,7 +6,9 @@
   peer expiry signal in 0.21.0 with `Event` / `PeerStats` made `#[non_exhaustive]`, and this
   plan with BKD issues)
 - **relatedTask**: 20261027-0433-sink-spent-forwarding, 20261027-0433-filter-coarse-clock,
-  20261027-0433-peer-expiry-signal
+  20261027-0433-peer-expiry-signal, 20261028-0615-remove-wss-stream-carrier,
+  20261028-0615-remove-transparent-admission, 20261028-0611-expiry-queued-packets-dropped,
+  20261028-0611-session-age-aborts-fresh-handshake
 
 ## Goal
 
@@ -19,9 +21,10 @@ release, so additive work ships early and breaking changes ship together in one 
 | --- | --- | --- | --- |
 | 0.20.1 | M1: wrapper sinks forward `PacketSink::send_batch_spent` | additive | 20261027-0433-sink-spent-forwarding |
 | 0.20.1 | M2: `AclFilter` reply allowances and `AclEngine` default on the coarse clock | behavior (expiry granularity) | 20261027-0433-filter-coarse-clock |
-| 0.21.0 | M3: peer-level connection expiry signal; `Event` and `PeerStats` `#[non_exhaustive]` | breaking | 20261027-0433-peer-expiry-signal (design now) |
-| 0.21.0 | Release C of plan `20261026-0822-node-gateway-requests` (packet tag carrier) | breaking | that plan; waits for the gateway review (O8, O9, O10, O13) |
-| 0.21.0 | Remove the deprecated `WsFrame` stream carrier and `TransparentConfig::admission` | breaking | with release C |
+| 0.21.0 | M3: peer-level connection expiry signal; `Event` and `PeerStats` `#[non_exhaustive]` | breaking | 20261027-0433-peer-expiry-signal (owner decided O1-O5 2026-10-28; released in 0.21.0) |
+| 0.21.0 | Release C of plan `20261026-0822-node-gateway-requests` (packet tag carrier) | breaking | that plan; released in 0.21.0 |
+| 0.21.0 | Remove the deprecated `WsFrame` stream carrier and `TransparentConfig::admission` | breaking | 20261028-0615-remove-wss-stream-carrier, 20261028-0615-remove-transparent-admission (released in 0.21.0) |
+| after 0.21.0 | M3 follow-ups O5: packets an expiry discards are not reported; the idle expiry can abort a fresh handshake | to decide | 20261028-0611-expiry-queued-packets-dropped, 20261028-0611-session-age-aborts-fresh-handshake |
 | after 0.21.0 | Netstack SACK: a 1-2 day study of netstack against kernel TCP under loss before any fork work; with it the next smoltcp fork round (vectorized `checksum::data`, the advertised window edge) | study | not opened |
 | on request | NG-6 hub measurement support; `EngineHandle::recycle` | additive | not opened: nsgw measures L4 itself; no consumer that does not produce has asked |
 | not pursued | Length without zero-fill in `nsplane-packet` | needs `unsafe` | conflicts with `#![forbid(unsafe_code)]` |

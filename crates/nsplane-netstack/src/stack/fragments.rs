@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use nsplane_packet::reassembly::Outcome;
+use nsplane_packet::reassembly::{FragmentTags, Outcome};
 use nsplane_packet::{IpPacket, PacketBuf, protocol};
 use tokio::time::Instant;
 
@@ -50,8 +50,10 @@ impl Barrier {
 
 impl Driver {
     /// Feeds a packet to an address the stack accepts through the reassembler, if there is one:
-    /// the packet to route (the packet itself or a completed datagram), or `None` while
-    /// its datagram is incomplete or once the fragment is dropped.
+    /// the packet to route (the packet itself or a completed datagram with the label its
+    /// fragments share), or `None` while its datagram is incomplete or once the fragment
+    /// is dropped. A datagram whose fragments carry different labels is dropped and
+    /// counted in `label_mismatch`.
     pub(super) fn reassemble(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
         let Some(reassembler) = self.reassembler.as_mut() else {
             return Some(packet);
@@ -68,14 +70,23 @@ impl Driver {
             stats::add(&self.stats.reassembly_overflow, 1);
             return None;
         }
-        let routed = match reassembler.push(packet.as_packet(), now) {
-            Outcome::Pass => return Some(packet),
-            Outcome::Complete(datagram) if self.barred(&datagram, now) => {
+        let routed = match reassembler.push_tagged(packet.as_packet(), packet.tag(), now) {
+            (Outcome::Pass, _) => return Some(packet),
+            (Outcome::Complete(datagram), FragmentTags::Same(_)) if self.barred(&datagram, now) => {
                 stats::add(&self.stats.retired, 1);
                 None
             }
-            Outcome::Complete(datagram) => Some(PacketBuf::from_packet(&datagram)),
-            Outcome::Held | Outcome::Dropped => None,
+            (Outcome::Complete(datagram), FragmentTags::Same(label)) => {
+                let mut packet = PacketBuf::from_packet(&datagram);
+                packet.set_tag(label);
+                Some(packet)
+            }
+            // `Mixed`: never handed on untagged or under one of its labels.
+            (Outcome::Complete(_), _) => {
+                stats::add(&self.stats.label_mismatch, 1);
+                None
+            }
+            (Outcome::Held | Outcome::Dropped, _) => None,
         };
         self.count_reassembly();
         routed

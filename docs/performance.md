@@ -249,6 +249,217 @@ and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's f
 A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
 tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.
 
+## Netstack ingress labels
+
+`send_stream` with netstack ingress labels on the 0.21.0 build, 2026-10-27 and 2026-10-28, slot
+0, `BENCH_CPUS`, each `slot.sh` invocation started at a 1-minute load below 3, criterion means.
+Labeled against unlabeled on the same build: the wire into the receiving stack sets the label
+on every packet, so each data segment or datagram is checked against its connection's or
+flow's label; the two cases of a count run back to back, the unlabeled one first. The bar is
+the noise plus 3 %. Six invocations (one of three rounds, five of one); the table has the five
+rounds that started below load 3 and ended below load 4.9 (one more ended at 6.0, every case
+of it 0 % to 23 % off).
+
+| Case | Change per round | Median |
+| --- | --- | --- |
+| `netstack_send/streams_1` | +1.4 / (unlabeled run disturbed) / +0.1 / +1.4 / +3.7 % | +1.4 % |
+| `netstack_send/streams_4` | +1.5 / -6.2 / +5.1 / +4.0 / +0.2 % | +1.5 % |
+| `netstack_send_1cpu/streams_1` | +1.0 / +0.3 / +0.8 / +0.5 / +0.7 % | +0.7 % |
+| `netstack_send_1cpu/streams_4` | +0.7 / +4.8 / +9.5 / +1.6 / +0.7 % | +1.6 % |
+| `netstack_udp_flow_send/flows_1` | +0.4 / -2.6 / +5.7 / +2.1 / -0.2 % | +0.4 % |
+| `netstack_udp_flow_send/flows_4` | +1.1 / +1.2 / -0.2 / +2.1 / +0.9 % | +1.1 % |
+| `netstack_udp_flow_send_1cpu/flows_1` | +0.2 / +0.0 / +1.5 / -0.4 / +1.6 % | +0.2 % |
+| `netstack_udp_flow_send_1cpu/flows_4` | -16.2 (unlabeled run disturbed) / +0.2 / -2.3 / -1.3 / +0.2 % | -1.3 % |
+
+Absolute values, unlabeled: `netstack_send/streams_1` 3356-3419 us, `streams_4` 2090-2167 us,
+`netstack_send_1cpu/streams_{1,4}` 3461-3573 / 4217-4316 us,
+`netstack_udp_flow_send/flows_{1,4}` 586-600 / 481-494 us, `_1cpu` 436-447 / 442-453 us. The
+single rounds above +4 % (+4.8 to +9.5 %) come from the two rounds whose load rose from 2.2-2.3
+to 3.9 during the run, the labeled case running second; in the round that ended at the load it
+started with (2.6), every case is within +4.0 %. Every median is within the bar.
+
+Earlier builds of the TCP check, same method: a lookup per segment (`SocketAddr` pair,
+SipHash) cost +5.2 % on `netstack_send/streams_1` (+4.8 % on 1 CPU); a one-entry cache of the
+last tuple +2.9 %, but `streams_4` (four interleaved connections) stayed at +8 to +31 %. The
+shipped check reads the IPv4 tuple as two words and probes a 64-slot cache: 4 ns per check
+in isolation (15 ns per table lookup), against about 340 ns per segment for the whole
+four-thread pipeline. A per-socket check after smoltcp's demultiplexing was not needed.
+
+Unlabeled traffic against 0.20.2 is in [0.21.0 against 0.20.2](#0210-against-0202).
+
+## Plaintext egress and send receipts
+
+The costs of plaintext egress (`set_plaintext_egress`, `PlaintextEgress`) and of tracked packets
+(`TrackedSender`, `SendResults`) on the 0.21.0 build, 2026-10-27, slot 0, each `slot.sh`
+invocation started at a 1-minute load below 3, criterion means per round. `data_path` and
+`tracked_send` ran on `BENCH_CPUS_A`. Untracked traffic and peers without the mark against
+0.20.2 are in [0.21.0 against 0.20.2](#0210-against-0202).
+
+| Case | Without | With | Change per round |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip_tracked/64` against `core_round_trip/64` (every packet tracked: the core reports it sealed before its datagram) | 433.8 / 434.2 / 435.7 ns | 436.5 / 432.5 / 460.0 ns | +0.6 / -0.4 % (third tracked run disturbed, +5.6 %) |
+| `data_path` `core_round_trip_tracked/1420` against `core_round_trip/1420` | 1.256 / 1.268 / 1.245 us | 1.265 / 1.258 / 1.252 us | +0.7 / -0.8 / +0.6 % |
+| `data_path` `core_plaintext_egress/{64,1420}` against `core_encapsulate/{64,1420}` (routing and the filters, then `Output::Plaintext` instead of sealing) | 225.9 / 221.6 / 222.9, 633.7 / 632.6 / 628.0 ns | 31.7 / 30.7 / 31.7, 37.3 / 35.6 / 35.0 ns | the egress path replaces sealing |
+| `worker_pool` `tracked_send/64B`, 256 packets one way through an engine (0 workers, an in-memory link), tracked against untracked | 238.5 us | 242.4 us | +1.7 % |
+| `worker_pool` `tracked_send/1420B` | 467.4 us | 462.7 us | -1.0 % |
+
+`data_path` is one invocation of three rounds (load 2.6-9.3 at the start of the runs).
+`tracked_send` is the quietest of four invocations (load 1.0); in the others the untracked case,
+which runs first, spread from 243 to 333 us at 64 B and 463 to 723 us at 1420 B, so their
+changes (-18 % to +26 %) measure the host. A tracked packet pays the receipt table (a map of
+outstanding tags under a lock, touched when it is accepted, sealed and decided), its result,
+and a transport call of its own: its datagram ends the batch that carries it. An untracked
+packet pays one read of the receipt marker in the core's send path and in the transmit path,
+one store of the marker after the outbound filters, and one `bool` of the core for the
+plaintext egress mark.
+
+## Peer expiry signal
+
+The expiry cause and the `expirations` counter (with `Event` and `PeerStats`
+`#[non_exhaustive]`) against the build without them, 2026-10-28, slot 0, `BENCH_CPUS_A`,
+interleaved base / build, two `slot.sh` invocations, each started at a 1-minute load below 3
+(the shared host rose to 5-10 within both), criterion means per round. The first invocation ran
+all 24 `data_path` cases for three rounds, the second the cases below for five rounds.
+
+| Case | Change per round | Median |
+| --- | --- | --- |
+| `core_round_trip/64` | +1.8 / -0.5 / -6.0; +1.8 / -2.2 / +2.0 / +0.1 / +20.0 % | +1.0 % |
+| `core_round_trip/1420` | +2.3 / -1.3 / +7.1; +2.6 / -4.3 / +4.6 / -2.0 / -0.1 % | +1.1 % |
+| `core_encapsulate/64` | -0.1 / +1.3 / -3.2; +0.5 / -4.4 / -0.8 / -1.0 / -1.1 % | -0.9 % |
+| `core_round_trip_two_identities/64` | +2.8 / +0.5 / +1.8; +3.2 / -5.0 / -2.0 / -1.3 / +0.3 % | +0.4 % |
+| `core_decapsulate_batch32/1420` | +1.8 / +10.3 / +2.3; +1.1 / +7.1 / +0.2 / -1.8 / +13.0 % | +2.1 % |
+| `tunn_round_trip/64` | +4.4 / +0.4 / +0.1; +0.5 / -2.2 / -0.3 / +0.8 / +1.4 % | +0.5 % |
+
+Every case changes in both directions; the values above +5 % come from runs during which the
+load rose to 7-10. The other 18 cases of the first invocation are within -8.5 % to +17.6 %
+with both signs in each, except `device_equivalent_round_trip/1420` (+1.8 / +0.3 / +2.8 %) and
+`core_encapsulate_batch32/1420` (+0.1 / +1.5 / +2.7 %). The data path does not read the expiry
+state: the cause is written once per expiry by the timers and read by `handle_timeout`; the
+core's per-peer record grows from 224 to 240 bytes (two `u64` counters), and the size of the
+tunnel (9952 bytes), `Output` (96 bytes) and `Event` (64 bytes) is unchanged.
+
+## Packet tag carrier against 0.20.0
+
+The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,
+2026-10-27, slot 0, interleaved base / build in one `slot.sh` invocation per bench, each run
+started at a 1-minute load below 3 (the shared host rose to 3-7 during some runs), criterion
+means of the rounds. `data_path`, `local_graph`, `vnet` and `translate` (the eight one-peer
+cases of each direction) ran on `BENCH_CPUS_A`, `send_stream` and `udp_offload` on
+`BENCH_CPUS`. Two layouts were built: A, the tag added to the 56-byte `PacketBuf` (64 bytes),
+and B, `u32` packet offsets (56 bytes); the shipped build is B.
+
+First run, base / A / B in that order per round (`data_path` and `vnet` three rounds, the
+others two):
+
+| Bench / case | 0.20.0 | A (64 B) | B (56 B) |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 424.9 ns | -1.3 % | -1.3 % |
+| `data_path` `core_round_trip_batch32/64` | 13.36 us | -1.1 % | -1.4 % |
+| `data_path` `core_round_trip/1420` | 1.243 us | +0.6 % | -0.5 % |
+| `send_stream` `netstack_send/streams_{1,4}` | 3.221 / 2.053 ms | -2.7 / -2.5 % | +1.7 / +0.4 % |
+| `send_stream` `netstack_udp_send/flows_{1,4}` | 554.6 / 474.5 us | -1.1 / -2.1 % | +1.0 / -0.1 % |
+| `local_graph`, 34 cases | | -1.3 % to +22 % (`splitter/*` +10 to +22 %) | -8.7 % to +8.8 % |
+| `udp_offload`, 4 cases | | -2.1 % to +3.8 % | -8.9 % to +0.5 % |
+| `vnet` `segment_tcpv4_64k` | 3.110 us | +0.5 % | +0.7 % |
+| `translate`, 16 cases | | -7.2 % to +0.7 % | -11.1 % to +3.9 % |
+
+`local_graph` again, its 16 pipe, splitter, map and bare swap cases, four rounds with the order
+rotated: A against 0.20.0 `splitter/*` +6.5 to +8.3 % in every round, `pipe/send_recv_1420`
++3.4 %, `swap_sink/bare_send_*` +2.5 to +4.4 %, the rest -2.5 % to +2.2 %; B -5.5 % to -12.6 %
+in every case. A is outside the noise on the local graph, so B ships.
+
+The shipped build (B, with the bounds at `u32::MAX`) against 0.20.0:
+
+| Bench / case | 0.20.0 | B | Change |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 421.9 ns | 424.2 ns | +0.5 % |
+| `data_path` `core_round_trip_batch32/64` | 13.18 us | 13.23 us | +0.4 % |
+| `data_path` `core_round_trip/1420` | 1.239 us | 1.248 us | +0.8 % |
+| `data_path` `core_round_trip_batch32/1420` | 39.73 us | 39.77 us | +0.1 % |
+| `data_path`, the other 16 cases | | | -4.6 % to +1.7 % |
+| `local_graph`, 34 cases | | | -12.0 % to -1.2 % |
+| `send_stream` `netstack_send/streams_{1,4}` | 3.226 / 2.217 ms | 3.325 / 2.144 ms | +3.1 / -3.3 % |
+| `send_stream` `netstack_send_1cpu/streams_{1,4}` | 3.385 / 4.107 ms | 3.437 / 4.191 ms | +1.5 / +2.1 % |
+| `send_stream` `netstack_udp_send/flows_{1,4}` | 566.4 / 479.3 us | 591.5 / 681.9 us | +4.4 / +42 % (disturbed, below) |
+| `send_stream` `netstack_udp_send_1cpu/flows_{1,4}` | 425.3 / 427.8 us | 429.6 / 428.2 us | +1.0 / +0.1 % |
+| `udp_offload`, 4 cases | | | -2.3 % to +2.1 % |
+| `vnet` `segment_tcpv4_64k` | 3.112 us | 3.170 / 3.167 us | +1.7 % (a third run at 5.2 us disturbed) |
+| `translate`, 16 cases | | | -3.1 % to +4.8 %, both signs per round |
+
+The B runs of `netstack_udp_send/flows_4` had wide intervals ([725, 862] us and [523, 597] us,
+the load rising to 5.2) where the base runs were tight ([476, 488] us, [473, 479] us); the same
+layout before the bounds measured 475.4 / 472.6 us against 473.9 / 475.2 us. Both cases were
+measured again against 0.20.2 on a quieter host, in [0.21.0 against 0.20.2](#0210-against-0202).
+`vnet` segments a 64 KiB packet into 45
+buffers through `set_len` and `extend_from_slice`, where the bound adds a compare: +53 ns per
+packet, about 1 ns per segment.
+
+## 0.21.0 against 0.20.2
+
+The integrated 0.21.0 head (the packet tag carrier, netstack ingress labels, plaintext egress
+and send receipts), untagged traffic and no peer marked, against `v0.20.2` (`af5d41c`),
+2026-10-27 and 2026-10-28, slot 0, interleaved 0.20.2 / 0.21.0 in each `slot.sh` invocation,
+each invocation started at a 1-minute load below 3 (the shared host rose to 4-13 within some
+of them; the load at the start of every run is in the logs), criterion means per round.
+`data_path` and `local_graph` ran on `BENCH_CPUS_A`, `send_stream`, `udp_offload` and
+`worker_pool` on `BENCH_CPUS`. `engine_one_way` is the same bench code built on both trees.
+
+| Bench / case | 0.20.2 | 0.21.0 | Change per round |
+| --- | --- | --- | --- |
+| `data_path` `core_round_trip/64` | 423.4 / 427.0 / 426.5 ns | 433.8 / 434.2 / 435.7 ns | +2.4 / +1.7 / +2.2 % |
+| `data_path` `core_round_trip_batch32/64` | 13.20 / 13.43 / 13.17 us | 13.57 / 13.20 / 14.91 us | +2.8 / -1.7 % (third 0.21.0 run disturbed) |
+| `data_path` `core_round_trip/1420` | 1.243 / 1.241 / 1.239 us | 1.256 / 1.268 / 1.245 us | +1.0 / +2.1 / +0.5 % |
+| `data_path` `core_round_trip_batch32/1420` | 39.84 / 40.22 / 39.82 us | 53.70 / 40.04 / 40.07 us | -0.4 / +0.6 % (first 0.21.0 run disturbed) |
+| `data_path` `core_encapsulate/64` | 217.3 / 216.7 / 215.2 ns | 225.9 / 221.6 / 222.9 ns | +4.0 / +2.3 / +3.6 % |
+| `data_path`, the other 15 cases | | | -3.6 % to +3.6 % in the first round (both runs started below load 3.4), apart from `device_equivalent_round_trip/64` +12.3 % (-1.3 / +0.2 % in the other rounds); the 64-byte round trips with two identities and with 256 flows +0.9 % to +5.1 % in every round |
+| `send_stream` `netstack_send/streams_1` | 3234 / 3270 / 3266 us | 3275 / 3401 / 3383 us | +1.3 / +4.0 / +3.6 % |
+| `send_stream` `netstack_send/streams_4` | 2234 / 2082 / 2105 us | 2112 / 2127 / 2127 us | -5.5 / +2.2 / +1.0 % |
+| `send_stream` `netstack_send_1cpu/streams_1` | 3381 / 3452 / 3498 us | 3466 / 3550 / 3525 us | +2.5 / +2.9 / +0.8 % |
+| `send_stream` `netstack_send_1cpu/streams_4` | 4109 / 4227 / 4184 us | 4183 / 4250 / 4242 us | +1.8 / +0.6 / +1.4 % |
+| `send_stream` `netstack_udp_send/flows_1` | 561.1 / 583.0 / 575.0 us | 559.8 / 576.7 / 575.3 us | -0.2 / -1.1 / +0.0 % |
+| `send_stream` `netstack_udp_send/flows_4` | 479.8 / 488.1 / 481.5 us | 476.9 / 486.4 / 478.8 us | -0.6 / -0.3 / -0.6 % |
+| `send_stream` `netstack_udp_send_1cpu/flows_1` | 423.0 / 434.8 / 431.3 us | 424.9 / 437.4 / 426.6 us | +0.4 / +0.6 / -1.1 % |
+| `send_stream` `netstack_udp_send_1cpu/flows_4` | 427.6 / 437.6 / 436.9 us | 430.2 / 441.3 / 432.4 us | +0.6 / +0.9 / -1.0 % |
+| `local_graph`, 36 cases | | | 29 cases faster in every round, per-case means -14.6 % to -1.0 % (`splitter/*` -11 %, `pipe/send_recv_*` -8 %); `pump/pipe_to_writer{,_spent}_1420` +3.6 / +8.9 % from one round each (+16.7 / +25.8 %, the other rounds -3.1 to +3.9 %), `pump/pipe_to_wrapped_writer_spent_64` +0.3 % |
+| `udp_offload` `udp_loopback/batch_64x1420_*`, 4 cases | | | -10.7 % to +4.8 %, both signs in every case |
+| `worker_pool` `engine_one_way/64B` (256 untracked packets one way through an engine, 0 workers, in-memory link) | 301.9 / 267.2 / 262.6 us | 276.7 / 274.2 / 308.9 us | -8.4 / +2.6 / +17.6 % |
+| `worker_pool` `engine_one_way/1420B` | 549.1 / 507.1 / 503.3 us | 480.3 / 503.3 / 640.0 us | -12.5 / -0.8 / +27.2 % |
+
+`data_path` is one invocation of three rounds (load 2.6-9.3 at the start of the runs; the
+second 0.20.2 round started at 9.3). The `send_stream` rows are the three of nine rounds in
+which both runs started below load 3 (six single-round invocations and a first one of three
+rounds; the load rose to 4-13 in the others, every case of such a run 5 % to 35 % off in
+either direction). `local_graph`, `udp_offload` and `engine_one_way` are one invocation of
+three rounds each (load 1.9-5.1, 1.9-4.5 and 2.8-3.3).
+
+`netstack_udp_send/flows_4` is not bimodal when the host is quiet: in the three clean rounds
+both binaries ran at 477-488 us. Its high values (561-877 us) came in the six disturbed rounds,
+on both binaries (0.20.2: 577, 606, 670, 672, 723, 803 us; 0.21.0: 493, 560, 572, 598, 782,
+877 us), so they measure the host, not the release.
+
+Two costs sit at or above the edge of the noise in these runs, and both come with the packet
+tag carrier's step. `core_round_trip/64` and `core_encapsulate/64` (the single-packet send path) by step, the
+change of the mean against 0.20.2 in the rounds whose four runs started below load 2.3 (one
+`slot.sh` invocation each, `BENCH_CPUS_A`):
+
+| Build | `core_round_trip/64` | `core_encapsulate/64` | `core_round_trip_batch32/64` |
+| --- | --- | --- | --- |
+| the packet tag carrier merged on 0.20.2 | +2.6 / +1.2 % | +2.6 / +1.7 % | +1.7 / -0.0 % |
+| all three merged on 0.20.2 | +3.2 / +0.7 %; +1.0 % | +3.8 / +2.2 %; +2.0 % | +2.4 / -1.5 %; +1.5 % |
+| the core marker fix of the integration, version 0.20.2 | -0.1 % | +1.9 % | +1.5 % |
+| the 0.21.0 head | +4.1 / +0.2 %; +1.7 % | +4.5 / +1.0 %; +1.9 % | +2.5 / -1.3 %; +1.4 % |
+
+(The values after the semicolon are the first round of a three-round invocation, load 1.3-1.6.)
+Over all eight rounds of the 0.21.0 head against 0.20.2, `core_round_trip/64` is +0.2 % to
++5.3 %, about +9 ns in the median; the batched round trip and the 1420-byte cases stay within
+the noise. `netstack_send/streams_1` by step, three single-round invocations started below load 3
+(0.20.2, the tag carrier merged, the ingress labels merged, the 0.21.0 head in that order; the
+head's runs started at load 3.8-3.9 and only the third is undisturbed): the tag carrier +1.8 /
++3.9 / -0.7 %, with the ingress labels +3.4 / +3.9 / +0.7 %, the head -0.3 % in the third
+(`netstack_send_1cpu/streams_1`: +0.7 / +2.1 / -0.7 %, +2.8 / +3.1 / +2.5 %, the head +3.0 %);
+the bench links no engine or core, so plaintext egress and send receipts cannot add to it. The packet tag carrier's own measurement against 0.20.0 gave
++0.5 % and +3.1 % on the same two cases (below).
+
 ## 0.20.0 against 0.19.3
 
 The integrated 0.20.0 head (netstack control from the first input, scoped flow gate
@@ -304,18 +515,18 @@ stay within the noise. Per workstream, each against `52eb983` on its branch befo
 | Build | Code | Version | `/1420` | `/64` |
 | --- | --- | --- | --- | --- |
 | `fb67db9` | 0.19.3 | 0.19.3 | reference | reference |
-| release A, W2, W1 (each alone) | binary identical to `fb67db9` | 0.19.3 | +0.1 % (release A) | -0.3 % |
-| W3 alone, and the integration before the version commit (binary identical to W3) | release B | 0.19.3 | +0.0 % / -0.1 % | -0.6 % |
+| the 0.19.4 fixes, the scoped gate decisions, the first-input control (each alone) | binary identical to `fb67db9` | 0.19.3 | +0.1 % (the 0.19.4 fixes) | -0.3 % |
+| the local barrier and plaintext ingress alone, and the integration before the version commit (binary identical to it) | 0.20.0 | 0.19.3 | +0.0 % / -0.1 % | -0.6 % |
 | `fb67db9` with the version set to 0.20.0 | 0.19.3 | 0.20.0 | -0.0 % | -0.1 % |
-| 0.20.0 head | release B | 0.20.0 | +1.8 % / +0.8 % | -0.4 % / -0.5 % |
-| 0.20.0 head with the version set to 0.20.1 | release B | 0.20.1 | -1.0 % | -0.1 % |
+| 0.20.0 head | 0.20.0 | 0.20.0 | +1.8 % / +0.8 % | -0.4 % / -0.5 % |
+| 0.20.0 head with the version set to 0.20.1 | 0.20.0 | 0.20.1 | -1.0 % | -0.1 % |
 
 Only `nsplane-core`, `nsplane-packet` and `nsplane-noise` reach this bench, so the binaries of
-release A, W2 and W1 equal `fb67db9`'s, and the merges from W3 on up to the version commit equal
-W3's.
+the 0.19.4 fixes, the scoped gate decisions and the first-input control equal `fb67db9`'s, and
+the merges from the local barrier on up to the version commit equal the local barrier's.
 The cost appears with the version change alone, and the same source at 0.20.1 is faster than
 0.19.3. The version is part of every crate's symbol hash, so it moves functions in the binary:
-`objdump` of the W3 and the 0.20.0 builds shows the same instruction count (526,948) with every
+`objdump` of the local barrier and the 0.20.0 builds shows the same instruction count (526,948) with every
 function body of equal length, the 81 bodies that differ differing only in RIP-relative data
 offsets, and the round-trip routines of the bench (the criterion closures the core path is
 inlined into, `encapsulate_batch`, `decapsulate_batch`) starting at another 16-byte offset of a

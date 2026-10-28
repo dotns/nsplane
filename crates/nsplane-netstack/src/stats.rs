@@ -111,6 +111,24 @@ pub struct NetStackStats {
     /// [`TransparentConfig::events`](crate::TransparentConfig::events), or finding its
     /// channel full or its receiver gone.
     pub events_dropped: u64,
+    /// Ingress input dropped because its ingress label (the [`PacketBuf`] tag) differs
+    /// from the label of the lifetime it belongs to: a TCP segment, a retransmitted SYN or
+    /// a handshake ACK of an accepted connection, a datagram of a UDP flow from
+    /// [`incoming_udp`](crate::NetStackHandle::incoming_udp), the further SYNs and
+    /// datagrams of a lifetime held under [`Admission::Decide`](crate::Admission::Decide),
+    /// a datagram reassembled from fragments with different labels, and an ICMP error
+    /// with a label that quotes a connection of another label (ignored, not applied).
+    ///
+    /// [`PacketBuf`]: nsplane_packet::PacketBuf
+    pub label_mismatch: u64,
+    /// Ingress input dropped because its label was revoked with
+    /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label) and its
+    /// tombstone is still held (see
+    /// [`max_revoked_labels`](crate::NetStackConfig::max_revoked_labels)): input sent after
+    /// the call. Input of the label still queued in the stack at the call is dropped as
+    /// part of the revoke and counted in
+    /// [`retired_drops`](crate::NetStackHandle::retired_drops).
+    pub label_revoked: u64,
 }
 
 /// The live counters behind [`NetStackStats`].
@@ -140,6 +158,8 @@ pub(crate) struct Counters {
     pub(crate) rejected_prefix: AtomicU64,
     pub(crate) events_emitted: AtomicU64,
     pub(crate) events_dropped: AtomicU64,
+    pub(crate) label_mismatch: AtomicU64,
+    pub(crate) label_revoked: AtomicU64,
     /// Behind [`NetStackHandle::retired_drops`](crate::NetStackHandle::retired_drops), not
     /// part of [`NetStackStats`].
     pub(crate) retired: AtomicU64,
@@ -179,6 +199,8 @@ impl Counters {
             rejected_prefix: get(&self.rejected_prefix),
             events_emitted: get(&self.events_emitted),
             events_dropped: get(&self.events_dropped),
+            label_mismatch: get(&self.label_mismatch),
+            label_revoked: get(&self.label_revoked),
         }
     }
 }

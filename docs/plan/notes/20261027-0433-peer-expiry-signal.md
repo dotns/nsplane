@@ -1,6 +1,8 @@
 # Peer-level connection expiry signal
 
-Design note, no code. Status: for owner review. Plan:
+Design note. Status: decided by the owner on 2026-10-28 (O1-O5 as recommended, see
+[Owner decisions](#owner-decisions-2026-10-28)); implemented on `feat/0.21.0-m3-removals` for
+0.21.0. Plan:
 [20261027-0433-post-freeze-schedule](../20261027-0433-post-freeze-schedule.md) (M3); task:
 [20261027-0433-peer-expiry-signal](../../task/20261027-0433-peer-expiry-signal.md). Ships in
 0.21.0 with release C. All code references are at `main` right after v0.20.0 (the commit that
@@ -337,3 +339,35 @@ Plus the compile changes of D6. The gate (`just check`, `cargo doc -D warnings`,
   (b) path 1 can abort a handshake that started just before the 540 s mark, because the
   timer measures from the last established session (or the origin), not from the attempt.
   Should either become a task?
+
+## Owner decisions (2026-10-28)
+
+Answered together with the decision to ship 0.21.0 as release C plus M3 and the removal of the
+deprecated `WsFrame` stream carrier and `TransparentConfig::admission`:
+
+- **O1**: suppress the `SessionAge` expiry of a peer that was never up (D2, behaviour change).
+- **O2**: one `expirations` counter (D3), no per-cause split.
+- **O3**: enum-level `#[non_exhaustive]` only, on `Event` and `PeerStats` (D6); no
+  per-variant attribute.
+- **O4**: add `PeerStats::new`.
+- **O5**: both observations become follow-up tasks after 0.21.0, not part of this release:
+  [20261028-0611-expiry-queued-packets-dropped](../../task/20261028-0611-expiry-queued-packets-dropped.md)
+  and
+  [20261028-0611-session-age-aborts-fresh-handshake](../../task/20261028-0611-session-age-aborts-fresh-handshake.md).
+
+Implementation notes against this design:
+
+- A `ConnectionExpired` that the timers return while the tunnel is not expired (a keepalive
+  that could not be sealed, possible only at Reject-After-Messages) is not an expiry: the core
+  neither reports nor counts it and treats it like the other timer errors. Before, it would
+  have been reported as `SessionExpired`.
+- The `Peer` bookkeeping is one method, `Peer::tunnel_expired(cause) -> bool`, called on every
+  expired tick. Instead of D2's `up: bool`, `Peer` keeps `handshakes_at_expiry`, the count of
+  reported handshakes at the last reported expiry (or when the peer was added): the peer is up
+  while its reported count is above it. Same semantics, no store in `Core::authenticated`
+  (`core/receive.rs` is unchanged) and no fifth `bool` in `Peer`.
+- D5: `size_of::<Output>()` stays 96 and `size_of::<Event>()` 64 bytes (both measured on
+  `bcb68f1` before the change and pinned by a core unit test); `PeerStats` grows from 192 to
+  200 bytes, the core's `Peer` from 224 to 240, `Tunn` stays 9952 (the cause fits in padding).
+  Two interleaved `data_path` A/B invocations against `bcb68f1` are within the noise (table in
+  `docs/performance.md`, "Peer expiry signal").

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use nsplane_core::x25519::PublicKey;
 use nsplane_core::{ConfigChange, Event, Input, PeerStats};
-use nsplane_packet::{MAX_BATCH, TransportId};
+use nsplane_packet::{MAX_BATCH, PacketBuf, TransportId};
 use tokio::sync::{mpsc, oneshot};
 
 use super::output::Backoff;
@@ -98,6 +98,9 @@ impl Owner {
             | Command::PathMtuStats(..)) => self.path_mtu_command(command),
             Command::Shutdown(reply) => return ControlFlow::Break(reply),
             Command::LocalBarrier(position, reply) => self.local_barrier(position, reply),
+            Command::SetPlaintextEgress(peer, plaintext, reply) => {
+                let _ = reply.send(self.core.set_plaintext_egress(peer, plaintext));
+            }
             Command::UnansweredHandshakes(peer, reply) => {
                 let _ = reply.send(self.core.unanswered_handshakes(peer));
             }
@@ -272,14 +275,20 @@ impl Owner {
         Ok(())
     }
 
-    /// Hands an injected packet or handshake to the core and sends what it produced.
+    /// Hands an injected packet, its receipt marker cleared, or handshake to the core and
+    /// sends what it produced.
     fn inject(&mut self, injection: Injection) {
         let now = now();
+        let untracked = |mut packet: PacketBuf| {
+            packet.set_tracked(false);
+            packet
+        };
         match injection {
-            Injection::Inbound(peer, packet) => self.core.inject_inbound(peer, packet),
-            Injection::Outbound(packet) => self.core.inject_outbound(packet, now),
+            Injection::Inbound(peer, packet) => self.core.inject_inbound(peer, untracked(packet)),
+            Injection::Outbound(packet) => self.core.inject_outbound(untracked(packet), now),
             Injection::OutboundOn(peer, path, packet) => {
-                self.core.inject_outbound_on(peer, path, packet, now);
+                self.core
+                    .inject_outbound_on(peer, path, untracked(packet), now);
             }
             Injection::Handshake(peer, path) => self.core.force_handshake(peer, path, now),
             Injection::HandshakeOn(peer, path) => self.core.force_handshake_on(peer, path, now),
@@ -294,6 +303,7 @@ impl Owner {
             .remove(&id)
             .ok_or(TransportError::Unknown(id))?;
         for (_, data) in old.stop().await {
+            self.finish_tracked(&data, DROP_TRANSPORT_REMOVED);
             self.core.recycle(data);
             self.dropped(None, DROP_TRANSPORT_REMOVED);
         }
@@ -394,6 +404,10 @@ impl Owner {
         }
         for task in self.tasks.drain(..) {
             task.stop().await;
+        }
+        // Every tracked packet without a result is reported before the shutdown returns.
+        if let Some(receipts) = &self.send_errors.receipts {
+            receipts.stop();
         }
     }
 }

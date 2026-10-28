@@ -10,8 +10,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fate, Net, Sent};
-use nsplane_core::{ConfigChange, Event};
+use common::{Fate, Net, Sent, default_config};
+use nsplane_core::{ConfigChange, CoreConfig, Event, ExpiryCause, PeerId};
 
 const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
@@ -102,7 +102,7 @@ fn handshake_no_resp_rekey_timeout() {
 }
 
 /// The initiator keeps retrying for `REKEY_ATTEMPT_TIME`, then gives up and reports the
-/// expiry once; data afterwards starts a new handshake.
+/// expiry once, also for a peer that was never up; data afterwards starts a new handshake.
 #[test]
 fn handshake_gives_up_after_rekey_attempt_time() {
     let mut net = Net::new(2);
@@ -118,9 +118,13 @@ fn handshake_gives_up_after_rekey_attempt_time() {
     net.run_for(Duration::from_secs(1));
     assert_eq!(
         net.take_events(0),
-        [Event::SessionExpired { peer }],
+        [Event::SessionExpired {
+            peer,
+            cause: ExpiryCause::HandshakeTimeout
+        }],
         "reported once"
     );
+    assert_eq!(expirations(&net, 0, 1), 1);
     net.run_for(Duration::from_secs(30));
     assert_eq!(net.take_transmits(0), Vec::new(), "no more retries");
     assert_eq!(net.take_events(0), Vec::new());
@@ -260,8 +264,8 @@ fn session_expires_after_reject_after_time_x3() {
     assert_eq!(expiries(&net.take_events(0)), 0);
     assert_eq!(expiries(&net.take_events(1)), 0);
     net.run_for(Duration::from_secs(1));
-    assert_eq!(net.take_events(0), [Event::SessionExpired { peer: a_to_b }]);
-    assert_eq!(net.take_events(1), [Event::SessionExpired { peer: b_to_a }]);
+    assert_eq!(net.take_events(0), [session_age(a_to_b)]);
+    assert_eq!(net.take_events(1), [session_age(b_to_a)]);
     net.run_for(Duration::from_secs(60));
     assert_eq!(net.take_events(0), Vec::new(), "reported once");
     assert_eq!(net.take_events(1), Vec::new());
@@ -274,7 +278,135 @@ fn session_expires_after_reject_after_time_x3() {
     // The next expiry is reported again.
     net.clear_logs();
     net.run_for(REJECT_AFTER_TIME * 3 + Duration::from_secs(1));
-    assert_eq!(net.take_events(0), [Event::SessionExpired { peer: a_to_b }]);
+    assert_eq!(net.take_events(0), [session_age(a_to_b)]);
+    assert_eq!(expirations(&net, 0, 1), 2);
+}
+
+/// `Event::SessionExpired` of `peer` for [`ExpiryCause::SessionAge`].
+const fn session_age(peer: PeerId) -> Event {
+    Event::SessionExpired {
+        peer,
+        cause: ExpiryCause::SessionAge,
+    }
+}
+
+/// `PeerStats::expirations` of core `j` as a peer of core `i`.
+fn expirations(net: &Net, i: usize, j: usize) -> u64 {
+    net.cores[i]
+        .peer_stats(net.peer_id(i, j))
+        .unwrap()
+        .expirations
+}
+
+/// A peer that never completed a handshake reports no expiry when its idle timer runs out,
+/// and counts none.
+#[test]
+fn a_never_contacted_peer_reports_no_expiry() {
+    let mut net = Net::new(2);
+    net.clear_logs();
+
+    net.run_for(REJECT_AFTER_TIME * 3 + Duration::from_secs(1));
+    for (i, j) in [(0, 1), (1, 0)] {
+        assert_eq!(net.take_events(i), Vec::new());
+        assert_eq!(expirations(&net, i, j), 0);
+    }
+    net.run_for(Duration::from_secs(600));
+    for (i, j) in [(0, 1), (1, 0)] {
+        assert_eq!(net.take_events(i), Vec::new());
+        assert_eq!(net.take_transmits(i), Vec::new());
+        assert_eq!(expirations(&net, i, j), 0);
+    }
+}
+
+/// A peer that was never up and whose idle expiry was not reported still reports that its
+/// initiations went unanswered, once.
+#[test]
+fn a_never_up_peer_reports_handshake_timeout_after_an_unreported_idle_expiry() {
+    let mut net = Net::new(2);
+    let peer = net.peer_id(0, 1);
+    net.run_for(REJECT_AFTER_TIME * 3 + Duration::from_secs(1));
+    net.clear_logs();
+
+    net.set_interceptor(|_| Fate::Drop);
+    net.ping4(0, 1, b"nobody answers");
+    net.run_for(REKEY_ATTEMPT_TIME.saturating_sub(TICK));
+    assert_eq!(expiries(&net.take_events(0)), 0);
+    net.run_for(Duration::from_secs(1));
+    assert_eq!(
+        net.take_events(0),
+        [Event::SessionExpired {
+            peer,
+            cause: ExpiryCause::HandshakeTimeout
+        }]
+    );
+    net.run_for(Duration::from_secs(30));
+    assert_eq!(net.take_events(0), Vec::new(), "reported once");
+    assert_eq!(expirations(&net, 0, 1), 1);
+}
+
+/// `expirations` equals the number of `Event::SessionExpired` reported, over one expiry of
+/// each cause, and a completed handshake leaves it.
+#[test]
+fn expirations_count_the_reported_expiries() {
+    let mut net = Net::new(2);
+    let peer = net.peer_id(0, 1);
+    net.ping4(0, 1, b"up");
+    net.clear_logs();
+
+    net.run_for(REJECT_AFTER_TIME * 3 + Duration::from_secs(1));
+    assert_eq!(net.take_events(0), [session_age(peer)]);
+    assert_eq!(expirations(&net, 0, 1), 1);
+    assert_eq!(expirations(&net, 1, 0), 1);
+
+    net.set_interceptor(|_| Fate::Drop);
+    net.ping4(0, 1, b"nobody answers");
+    net.run_for(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+    assert_eq!(
+        net.take_events(0),
+        [Event::SessionExpired {
+            peer,
+            cause: ExpiryCause::HandshakeTimeout
+        }]
+    );
+    assert_eq!(expirations(&net, 0, 1), 2);
+    assert_eq!(expirations(&net, 1, 0), 1, "the responder saw nothing");
+
+    net.clear_interceptor();
+    net.ping4(0, 1, b"up again");
+    assert_eq!(handshakes(&net.take_events(0)), 1);
+    assert_eq!(expirations(&net, 0, 1), 2);
+    assert_eq!(expirations(&net, 1, 0), 1);
+}
+
+/// The periodic `Event::PeerStats` of the tick that expires a peer follows its
+/// `Event::SessionExpired` and already counts it; every one counts the expiries before it.
+#[test]
+fn peer_stats_after_an_expiry_count_it() {
+    let mut net = Net::with_configs(2, |i| CoreConfig {
+        stats_interval: Some(TICK),
+        ..default_config(i)
+    });
+    let peer = net.peer_id(0, 1);
+    net.ping4(0, 1, b"up");
+    net.clear_logs();
+
+    net.run_for(REJECT_AFTER_TIME * 3 + Duration::from_secs(1));
+    let events = net.take_events(0);
+    let expired = events.iter().position(|e| *e == session_age(peer)).unwrap();
+    assert!(
+        matches!(events[expired + 1], Event::PeerStats { peer: p, expirations: 1, .. } if p == peer),
+        "{:?}",
+        &events[expired..]
+    );
+    let mut reported = 0;
+    for event in &events {
+        match *event {
+            Event::SessionExpired { .. } => reported += 1,
+            Event::PeerStats { expirations, .. } => assert_eq!(expirations, reported),
+            _ => {}
+        }
+    }
+    assert_eq!(reported, 1);
 }
 
 /// The timers tick every 250 ms; `poll_timeout` moves forward only, and `handle_timeout`

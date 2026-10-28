@@ -1,5 +1,4 @@
-//! The settings of a [`WssDialer`](crate::WssDialer) or a
-//! [`WssStreamClient`](crate::WssStreamClient).
+//! The settings of a [`WssDialer`](crate::WssDialer).
 
 use std::fmt;
 use std::io;
@@ -20,8 +19,7 @@ pub trait BearerProvider: Send + Sync + 'static {
     fn token(&self) -> BoxFuture<'_, io::Result<Option<String>>>;
 }
 
-/// The TLS trust of a [`WssDialer`](crate::WssDialer) or a
-/// [`WssStreamClient`](crate::WssStreamClient).
+/// The TLS trust of a [`WssDialer`](crate::WssDialer).
 ///
 /// No system or web PKI roots are bundled: the caller supplies what to trust, as a root
 /// store or a complete client configuration, for instance with the aws-lc-rs provider:
@@ -52,8 +50,7 @@ pub enum WssTls {
     Config(Arc<ClientConfig>),
 }
 
-/// Where and how a [`WssDialer`](crate::WssDialer) or a
-/// [`WssStreamClient`](crate::WssStreamClient) connects.
+/// Where and how a [`WssDialer`](crate::WssDialer) connects.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WssConfig {
@@ -81,9 +78,8 @@ pub struct WssConfig {
     pub backoff_min: Duration,
     /// The longest wait before a dial. 60 s by default.
     pub backoff_max: Duration,
-    /// The wait before a dial after a link or session that came up (for a
-    /// [`WssDialer`](crate::WssDialer) and a [`WssStreamServer`](crate::WssStreamServer),
-    /// the dial after a successful one); a dial failing after it backs off from
+    /// The wait before a dial after a link that came up (the dial after a successful one);
+    /// a dial failing after it backs off from
     /// [`backoff_min`](Self::backoff_min), doubling from there. `None` (the default) waits
     /// `backoff_min` instead, counted as the first step of the failure backoff, so a dial
     /// failing after it waits twice `backoff_min`.
@@ -201,11 +197,6 @@ impl WssConfig {
             None => Duration::ZERO,
         };
         self
-    }
-
-    /// The keepalive ping timer of [`ping_interval`](Self::ping_interval), started now.
-    pub(crate) fn pings(&self) -> Pings {
-        Pings::new(self.ping_interval)
     }
 
     /// Sets [`connect_timeout`](Self::connect_timeout).

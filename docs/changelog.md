@@ -504,6 +504,27 @@ in the version commit.
 
 ## 2026-10-27 [decision]
 
+Release C of plan `20261026-0822-node-gateway-requests` approved for implementation as the
+twelfth freeze exception (ADR `2026-10-08-feature-freeze-0-11` amended): the packet tag carrier,
+netstack ingress labels, plaintext egress and send receipts, with the answers to O8-O14 recorded
+in the design note, which is now approved. Tasks for W4, W5 and W6 written; W4 goes first.
+Implementation has not started.
+
+## 2026-10-27 [decision]
+
+O15 of the release C design note (plan `20261026-0822-node-gateway-requests`): the
+`local_barrier` count window is fixed in nsplane and released as 0.20.1 on the Gitea remote
+only, implemented and released by the release B barrier's workstream; it is not part of
+release C.
+
+## 2026-10-27 [decision]
+
+Release C's labeled-path acceptance allowance (plan `20261026-0822-node-gateway-requests`, W5):
+the noise plus 3 %; if TCP misses it, the per-socket label checked after smoltcp's
+demultiplexing is measured instead. No owner item of the design note remains open.
+
+## 2026-10-27 [decision]
+
 The owner lifted the 0.11 feature freeze: normal maintenance, with breaking public API changes
 called out in the plan and in the CHANGELOG (ADR `2026-10-27-normal-maintenance`, superseding
 `2026-10-08-feature-freeze-0-11`).
@@ -564,3 +585,130 @@ Prepare 0.20.2 (tag `v0.20.2`) at the owner's request: wrapper sinks (`MapSink`,
 clock read the coarse monotonic clock (task `20261027-0433-filter-coarse-clock`), plus the DNS
 fixture and documentation cleanup merged after 0.20.1. Workspace versions, internal requirements
 and guide tags synchronized.
+
+## 2026-10-27 [implementation]
+
+Release C W4 (task `20261027-0305-packet-tag-carrier`, plan `20261026-0822-node-gateway-requests`)
+on `feat/packet-tag-carrier` from `v0.20.0`, rebased onto `v0.20.1`: `PacketBuf` tag and
+receipt marker, every carrier site of the design note with a test (each copy and clear site
+failing before its change),
+`Reassembler::push_tagged` / `discard_tagged`, the translator's mixed-tag drop as a new reason
+(`TranslatorStats` kept exhaustive: semver-checks additive only). Layout: variant A (64 bytes)
+was outside the noise on `local_graph` (`splitter/*` +6.5 to +8.3 % over four rotated rounds),
+so variant B (`u32` offsets, 56 bytes) ships; against 0.20.0 it is within the noise on
+`data_path`, `udp_offload` and `translate`, faster on `local_graph`, +1.7 % on `vnet`, and
+`send_stream` `streams_1` / `flows_{1,4}` are to be re-measured (disturbed runs); measured
+before the rebase, against `v0.20.0`. Not merged, not released.
+
+## 2026-10-27 [implementation]
+
+Release C W5 (task `20261027-0305-netstack-ingress-labels`, plan
+`20261026-0822-node-gateway-requests`) on `feat/netstack-ingress-labels` from W4's
+`feat/packet-tag-carrier` (`dbee734`): netstack ingress labels on every stack (a lifetime
+takes the label of its first input, mismatches dropped and counted in `label_mismatch`,
+unlabeled ICMP errors accepted, mixed-label fragment sets dropped), `TcpConnection`,
+`UdpFlow` and `PendingFlow::ingress_label`, `NetStackHandle::revoke_label` retiring every
+lifetime of a label at every stage with ingress positions, `discard_tagged` and tombstones
+(`label_revoked`, `NetStackConfig::max_revoked_labels`), a revoked lifetime skipped in the
+accept streams under `Immediate` too. Tests first (17 of 19 unit tests failing before), an
+e2e incarnation replacement between two engines, labeled `send_stream` cases and the new
+`netstack_udp_flow_send` group. Labeled within the noise plus 3 % (TCP after a 64-slot cache
+of recent tuples; a per-segment lookup cost +5 %); untagged within the noise except
+`netstack_send_1cpu/streams_1` at the edge (+2.1 % median) and the bimodal
+`netstack_udp_send/flows_4` (open for the integration's quiet re-measure). `cargo
+semver-checks` against `v0.20.1`: no semver update required. Not merged, not released.
+
+## 2026-10-27 [implementation]
+
+Release C W6 (task `20261027-0305-plaintext-egress-send-receipts`, plan
+`20261026-0822-node-gateway-requests`) on `feat/plaintext-egress-send-receipts` from W5's
+`feat/netstack-ingress-labels` (`25debab`): plaintext egress (`Core::set_plaintext_egress`
+and the engine's, a mark that follows the `PeerId`, `Output::Plaintext`, the bounded
+`PlaintextEgress` with `DROP_PLAINTEXT_EGRESS_FULL` / `_CLOSED`; tunnel-queued packets stay
+sealed, no handshake for data, handshakes for inbound traffic kept) and send receipts
+(`EngineBuilder::tracked_sender`, `TrackedSender` / `SendResults`, token = tag, exactly one
+`SendResult` per accepted packet through `Output::Tracked` from the core and a receipt table
+in the engine; a tracked datagram ends its transmit batch; `NotSent` at every drop site,
+`ENGINE_STOPPED` on stop; the local barrier covers accepted packets). `Output` is
+`#[non_exhaustive]` (the one break; `cargo semver-checks` against `v0.20.1` reports exactly
+`enum_marked_non_exhaustive` on `Output`). Tests first: core 18 of 19 and engine 23 of 28
+failing against API stubs; an e2e between two engines over UDP. Untracked traffic within the
+noise against `25debab` on `data_path`, `local_graph`, `udp_offload` and `send_stream`
+(`netstack_udp_send/flows_4` bimodal on both binaries, left for the integration's quiet
+re-measure); tracked packets cost about +1 % on the core round trip and up to +3 % end to end
+through an engine. Not merged, not released.
+
+## 2026-10-27 [integration]
+
+Release C of plan `20261026-0822-node-gateway-requests` integrated as 0.21.0 on
+`release/0.21.0` from `v0.20.2`, at the owner's request (merge into `main`, tag and
+publication wait for the owner): the plan branch, then W4 (`dbee734`), W5 (`25debab`) and W6
+(`dfd8ef3`) merged with their commits unchanged; conflicts in documents only. With 0.20.2's
+wrapper sinks forwarding `send_batch_spent`, the buffers of the packets they drop reach the
+source through `pump`, which clears the tag and the marker: tested over the four wrappers. The
+review of W6's deviations against the design note kept all of them and fixed one gap: a
+receipt marker an outbound filter set on an untracked packet now gets cleared (O13). The
+CHANGELOG `[0.21.0]` section (with the breaking `Output` and `PacketBuf` items and migration
+notes), the architecture's contracts for the tag, the receipt marker, send results, plaintext
+egress and netstack ingress labels, the freeze ADR's twelfth exception as shipped, and the
+plan and task records are written; versions are 0.21.0.
+
+## 2026-10-28 [measurement]
+
+Quiet re-measure of the 0.21.0 integration against `v0.20.2` on slot 0 (every `slot.sh`
+invocation started at a 1-minute load below 3; the shared host rose to 4-21 between and within
+runs, so `send_stream`, the labeled path and `tracked_send` were repeated as single-round
+invocations). `netstack_udp_send/flows_4` is unchanged and not bimodal on a quiet host (477-488
+us on both binaries in the clean rounds; the high values came on both binaries in disturbed
+rounds). The labeled path is within the noise plus 3 % by median on every case. `local_graph`
+is faster, `udp_offload`, `engine_one_way` and the 1420-byte and batched core cases are within
+the noise. At or above the edge of the noise, both arriving with the packet tag carrier's step:
+`core_round_trip/64` +0.2 % to +5.3 % (median +2.2 %, about 9 ns) with `core_encapsulate/64`
++1.0 % to +4.5 %, and `netstack_send/streams_1` -0.7 % to +4.0 %; raised with the owner.
+Tables in `docs/performance.md`.
+
+## 2026-10-28 [decision]
+
+Owner decisions for 0.21.0: release C as integrated on `release/0.21.0` (`bcb68f1`, the packet
+tag carrier's untagged cost accepted) ships together with M3 of plan
+`20261027-0433-post-freeze-schedule` and the removal of the deprecated `WsFrame` stream carrier
+and `TransparentConfig::admission`. M3's open questions are answered as recommended: O1 no idle
+(`SessionAge`) expiry for a peer that was never up, O2 one `expirations` counter, O3
+`#[non_exhaustive]` on `Event` and `PeerStats` at enum / struct level only, O4
+`PeerStats::new`, O5 both observations as follow-up tasks after 0.21.0
+(`20261028-0611-expiry-queued-packets-dropped`,
+`20261028-0611-session-age-aborts-fresh-handshake`). Merge into `main`, tag and publication
+wait for a separate word.
+
+## 2026-10-28 [progress]
+
+M3 and the two removals on `feat/0.21.0-m3-removals` from `release/0.21.0` (`bcb68f1`), merged
+back into `release/0.21.0`. `nsplane-noise` `Tunn::expiry_cause` reports `ExpiryCause`
+(`SessionAge`, `HandshakeTimeout`); `nsplane-core` `Event::SessionExpired` carries it,
+`PeerStats::expirations` and `Event::PeerStats::expirations` count the reported expiries, the
+idle expiry of a peer that was not up is not reported, `Event` and `PeerStats` are
+`#[non_exhaustive]` and `PeerStats::new` exists; tests first (noise 4 of 5 and core timer tests
+6 of 14 failing against stubs; an e2e lagging-subscriber test). Deviation: `Peer` keeps a
+handshake watermark instead of an `up` flag, so `core/receive.rs` is unchanged. Removed:
+`nsplane-wss`'s stream carrier (client, server, `frame` module, their tests, `thiserror` and
+`rcgen`) and `TransparentConfig::admission`. `cargo semver-checks` against `v0.20.2` lists
+`Output` (as integrated) plus exactly the planned breaks. Two `data_path` A/B invocations
+against `bcb68f1` are within the noise (`docs/performance.md`, "Peer expiry signal").
+
+## 2026-10-28 [release]
+
+Release 0.21.0 (tag `v0.21.0`) at the owner's request: release C of plan
+`20261026-0822-node-gateway-requests` (packet tag carrier, netstack ingress labels with label
+revocation, plaintext egress, per-packet send receipts), M3 of plan
+`20261027-0433-post-freeze-schedule` (peer expiry cause and `expirations`, `Event` and
+`PeerStats` `#[non_exhaustive]`), and the removal of the deprecated `nsplane-wss` stream
+carrier and `TransparentConfig::admission`. The owner accepted the unsealed-keepalive deviation
+of M3 and the `data_path` A/B as noise. Before the tag: the CHANGELOG date set to the release
+date, the normal-maintenance ADR records the removals; `nsplane-wss` keeps tokio's `io-util`
+feature, because `tokio-tungstenite`'s `handshake` feature enables it too, so no gate can show
+the crate's own need (its library code uses no `io-util` API). Gates on the release head:
+`just check` passed; `just cross` ran its Windows line only (passed) and `just test-windows`
+was replaced by a build of the same Windows test binaries (passed), because this host has no
+`cargo-zigbuild`, `zig`, musl target or `wine`; the owner accepted this. `release/0.21.0`
+merged into `main` with a merge commit; plan `20261026-0822-node-gateway-requests` and task
+`20261026-0819-node-gateway-requests` completed.

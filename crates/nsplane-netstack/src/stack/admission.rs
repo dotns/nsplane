@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -30,14 +31,23 @@ impl Driver {
         }
     }
 
-    /// Holds a new connection or flow for the application's decision, rejecting it at
-    /// once when the table is full or the application's stream is gone.
-    pub(super) fn hold(&mut self, key: pending::Key, held: pending::Held) {
+    /// Holds a new connection or flow with the ingress `label` for the application's
+    /// decision, rejecting it at once when the table is full or the application's stream
+    /// is gone.
+    pub(super) fn hold(
+        &mut self,
+        key: pending::Key,
+        held: pending::Held,
+        label: Option<NonZeroU64>,
+    ) {
         let Some(table) = self.pending.as_mut() else {
             return;
         };
-        match table.hold(key, held, Instant::now()) {
-            Hold::Held => self.count_pending(),
+        match table.hold(key, held, label, Instant::now()) {
+            Hold::Held(state) => {
+                self.labels.register(&state);
+                self.count_pending();
+            }
             Hold::Full(held) => self.reject(&key, &held, FlowEventReason::TableFull),
             Hold::Gone(held) => self.reject(&key, &held, FlowEventReason::Hook),
         }
@@ -91,6 +101,7 @@ impl Driver {
                     stats::add(&self.stats.accepted, 1);
                     self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
+                    self.labels.record_syn(syn.as_packet(), syn.tag());
                     self.device.inject(syn);
                     if let Some(table) = self.pending.as_mut() {
                         table.admit(flow);
@@ -146,8 +157,8 @@ impl Driver {
         }
     }
 
-    /// Holds the new flow from `remote` to `local` with its first datagram, or drops the
-    /// datagram of a flow already held.
+    /// Holds the new flow from `remote` to `local` with its first datagram and its ingress
+    /// `label`, or drops the datagram of a flow already held.
     #[cold]
     #[inline(never)]
     pub(super) fn hold_udp(
@@ -156,22 +167,24 @@ impl Driver {
         local: SocketAddr,
         payload: Bytes,
         packet: Bytes,
+        label: Option<NonZeroU64>,
     ) {
         let key = pending::Key {
             protocol: PendingProtocol::Udp,
             remote,
             local,
         };
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|table| table.contains(&key))
-        {
+        if let Some(held) = self.pending.as_ref().and_then(|table| table.lifetime(&key)) {
             // A held flow queues its first datagram only.
-            stats::add(&self.stats.udp_queue_full, 1);
+            let counter = if held.label() == label {
+                &self.stats.udp_queue_full
+            } else {
+                &self.stats.label_mismatch
+            };
+            stats::add(counter, 1);
             return;
         }
-        self.hold(key, pending::Held::Udp { payload, packet });
+        self.hold(key, pending::Held::Udp { payload, packet }, label);
     }
 
     /// Counts and reports the new flow from `remote` to `local` admitted in transparent

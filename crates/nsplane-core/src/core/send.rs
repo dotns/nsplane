@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::mem;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use nsplane_noise::noise::{DATA_HEADER_SZ, Tunn, TunnResult};
@@ -18,7 +19,7 @@ use crate::job::{self, CryptoJob, Outcome};
 use crate::peer::Peer;
 use crate::policy::{MessageKind, PathPolicy, Roam};
 use crate::reasons;
-use crate::types::{Event, Output};
+use crate::types::{Event, Output, TrackedOutcome};
 
 impl Core {
     /// Delivers `packet` as if it came from `peer`, bypassing the inbound filters and the
@@ -75,6 +76,9 @@ impl Core {
     /// state for it, so the peer's replies are judged by the inbound rules alone, and a
     /// translating filter does not translate it.
     ///
+    /// The packet is routed like a local one, so a packet routed to a peer marked with
+    /// [`Core::set_plaintext_egress`] leaves as [`Output::Plaintext`] instead of sealed.
+    ///
     /// [`PacketFilter`]: crate::PacketFilter
     pub fn inject_outbound(&mut self, packet: PacketBuf, now: Instant) {
         self.start_schedule(now);
@@ -101,18 +105,27 @@ impl Core {
         now: Instant,
     ) {
         self.start_schedule(now);
-        let Some(slot) = self.peers.slot(peer) else {
-            return self.pool.put(packet);
-        };
-        let Some(p) = self.peers.at_mut(slot) else {
+        let Some(p) = self
+            .peers
+            .slot(peer)
+            .and_then(|slot| self.peers.at_mut(slot))
+        else {
+            not_sent(&mut self.outputs, token(&packet), None, reasons::NO_ROUTE);
             return self.pool.put(packet);
         };
         if !p.tunnel_mut().has_session() {
+            not_sent(
+                &mut self.outputs,
+                token(&packet),
+                Some(peer),
+                reasons::NO_SESSION,
+            );
             self.pool.put(packet);
             return self.dropped(Some(peer), reasons::NO_SESSION);
         }
         let (mut packet, len) = self.layout_for_sealing(packet);
-        let Some(p) = self.peers.at_mut(slot) else {
+        let Some(p) = self.peers.peer_mut(peer) else {
+            not_sent(&mut self.outputs, token(&packet), None, reasons::NO_ROUTE);
             return self.pool.put(packet);
         };
         let outcome = job::seal(&mut p.tunnel_mut(), &mut packet, len);
@@ -128,6 +141,7 @@ impl Core {
             p,
             packet,
             outcome,
+            len,
         );
     }
 
@@ -137,6 +151,12 @@ impl Core {
             return;
         };
         let Some(peer) = self.peers.at_mut(slot) else {
+            not_sent(
+                &mut self.outputs,
+                token(&packet),
+                Some(id),
+                reasons::NO_ROUTE,
+            );
             return self.pool.put(packet);
         };
         let outcome = job::seal(&mut peer.tunnel_mut(), &mut packet, len);
@@ -148,6 +168,7 @@ impl Core {
             peer,
             packet,
             outcome,
+            len,
         );
     }
 
@@ -155,6 +176,12 @@ impl Core {
     pub(super) fn seal_job(&mut self, packet: PacketBuf) -> Option<CryptoJob> {
         let (id, slot, packet, len) = self.prepare_send(packet, true)?;
         let Some(peer) = self.peers.at_mut(slot) else {
+            not_sent(
+                &mut self.outputs,
+                token(&packet),
+                Some(id),
+                reasons::NO_ROUTE,
+            );
             self.pool.put(packet);
             return None;
         };
@@ -163,11 +190,14 @@ impl Core {
 
     /// Routes a local packet, runs the outbound filters with `filter` and lays the packet out
     /// for sealing in place; returns its peer and the peer's slot, its buffer and its length.
+    /// A packet routed to a peer marked for plaintext egress is handed out instead, and a
+    /// tracked packet to a peer without a session is not sent.
     fn prepare_send(
         &mut self,
         mut packet: PacketBuf,
         filter: bool,
     ) -> Option<(PeerId, usize, PacketBuf, usize)> {
+        let token = tracked_token(&mut packet);
         let route = match Tunn::dst_address(packet.as_packet()) {
             Some(dst) if self.peers.has_sources() => {
                 self.routes
@@ -179,6 +209,7 @@ impl Core {
         let Some((id, slot)) = route else {
             self.pool.put(packet);
             self.dropped(None, reasons::NO_ROUTE);
+            not_sent(&mut self.outputs, token, None, reasons::NO_ROUTE);
             return None;
         };
 
@@ -191,18 +222,99 @@ impl Core {
                     Verdict::Drop { reason } => {
                         self.pool.put(packet);
                         self.dropped(Some(id), reason);
+                        not_sent(&mut self.outputs, token, Some(id), reason);
                         return None;
                     }
                     Verdict::Handled => {
                         self.pool.put(packet);
+                        not_sent(&mut self.outputs, token, Some(id), reasons::FILTER_HANDLED);
                         return None;
                     }
                 }
             }
+            // The tag of a tracked packet is its token: what a filter did to it or to the
+            // marker is undone, and a marker a filter set on an untracked packet is cleared,
+            // so it never yields a result (nor takes one of a tracked packet with its tag).
+            if let Some(token) = token {
+                packet.set_tag(Some(token));
+                packet.set_tracked(true);
+            } else {
+                packet.set_tracked(false);
+            }
+        }
+
+        if self.plaintext_egress && self.peers.at(slot).is_some_and(|p| p.plaintext_egress) {
+            return self.plaintext_egress(id, packet, token);
+        }
+        if let Some(token) = token
+            && self.peers.at(slot).is_some_and(|p| !p.has_session())
+        {
+            return self.no_session(id, packet, token);
         }
 
         let (packet, len) = self.layout_for_sealing(packet);
         Some((id, slot, packet, len))
+    }
+
+    /// Hands out a local packet routed to `id`, a peer marked for plaintext egress, untracked.
+    #[cold]
+    fn plaintext_egress(
+        &mut self,
+        id: PeerId,
+        mut packet: PacketBuf,
+        token: Option<NonZeroU64>,
+    ) -> Option<(PeerId, usize, PacketBuf, usize)> {
+        packet.set_tracked(false);
+        not_sent(
+            &mut self.outputs,
+            token,
+            Some(id),
+            reasons::PLAINTEXT_EGRESS,
+        );
+        self.outputs.push_back(Output::Plaintext { to: id, packet });
+        None
+    }
+
+    /// Drops a tracked local packet to `id`, which has no session, instead of queueing it,
+    /// and starts the handshake that queueing it would start.
+    #[cold]
+    fn no_session(
+        &mut self,
+        id: PeerId,
+        packet: PacketBuf,
+        token: NonZeroU64,
+    ) -> Option<(PeerId, usize, PacketBuf, usize)> {
+        self.pool.put(packet);
+        self.dropped(Some(id), reasons::NO_SESSION);
+        not_sent(
+            &mut self.outputs,
+            Some(token),
+            Some(id),
+            reasons::NO_SESSION,
+        );
+        let peer = self.peers.peer_mut(id)?;
+        let mut buf = self.pool.get_len(BUF_SIZE);
+        let initiation = peer
+            .tunnel_mut()
+            .format_handshake_initiation(&mut buf.with_headroom_mut()[HEADROOM..], false);
+        match initiation {
+            TunnResult::WriteToNetwork(initiation) => {
+                let len = initiation.len();
+                buf.set_len(len);
+                transmit(
+                    &mut self.outputs,
+                    &mut self.pool,
+                    self.policy.as_ref(),
+                    id,
+                    peer,
+                    MessageKind::HandshakeInit,
+                    buf,
+                );
+            }
+            // A handshake is in progress already.
+            _ => self.pool.put(buf),
+        }
+        None
     }
 
     /// Lays a local packet out for sealing in place; returns its buffer and its length.
@@ -213,10 +325,12 @@ impl Core {
         // handshake initiation if the packet is queued instead.
         if packet.reserve_front(DATA_HEADER_SZ).is_err() {
             // E.g. a slice of a shared buffer: copy it behind the data header of a pooled
-            // buffer.
+            // buffer, with its tag and receipt marker.
             let mut copy = self.pool.get((len + TAILROOM).max(HANDSHAKE_INIT_SZ));
             copy.set_len(DATA_HEADER_SZ + len);
             copy.as_packet_mut()[DATA_HEADER_SZ..].copy_from_slice(packet.as_packet());
+            copy.set_tag(packet.tag());
+            copy.set_tracked(packet.is_tracked());
             self.pool.put(mem::replace(&mut packet, copy));
         }
         packet.set_len((DATA_HEADER_SZ + len + TAILROOM).max(HANDSHAKE_INIT_SZ));
@@ -280,7 +394,13 @@ impl PathPolicy for Fixed {
     }
 }
 
-/// Transmits the local packet that peer `id`'s tunnel sealed in `packet` with `outcome`.
+/// Transmits the local packet of `plain_len` bytes that peer `id`'s tunnel sealed in `packet`
+/// with `outcome`. A data message keeps the packet's tag and receipt marker, and a tracked one
+/// is reported sealed right before it; any other message clears both.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of the core it needs, borrowed apart"
+)]
 pub(super) fn sealed(
     outputs: &mut VecDeque<Output>,
     pool: &mut PacketPool,
@@ -289,27 +409,50 @@ pub(super) fn sealed(
     peer: &mut Peer,
     mut packet: PacketBuf,
     outcome: Outcome,
+    plain_len: usize,
 ) {
     let sealed_len = match outcome {
         Outcome::Sealed(len) => len,
-        // Queued behind a handshake in progress.
-        Outcome::Queued => return pool.put(packet),
+        // Queued behind a handshake in progress; a tracked packet never is, the send path
+        // checks for a session first.
+        Outcome::Queued => {
+            not_sent(outputs, token(&packet), Some(id), reasons::NO_SESSION);
+            return pool.put(packet);
+        }
         Outcome::Failed(e) => {
             tracing::debug!(message = "Encapsulate error", error = ?e);
+            let token = token(&packet);
             pool.put(packet);
-            return outputs.push_back(Output::Event(Event::Dropped {
+            outputs.push_back(Output::Event(Event::Dropped {
                 peer: Some(id),
                 reason: reasons::ENCAPSULATE_ERROR,
             }));
+            return not_sent(outputs, token, Some(id), reasons::ENCAPSULATE_ERROR);
         }
         Outcome::Opened { .. } | Outcome::Unexpected => {
             tracing::debug!("Unexpected result from encapsulate");
+            not_sent(
+                outputs,
+                token(&packet),
+                Some(id),
+                reasons::ENCAPSULATE_ERROR,
+            );
             return pool.put(packet);
         }
     };
     packet.set_len(sealed_len);
     let kind = message_kind(packet.as_packet());
-    transmit(outputs, pool, policy, id, peer, kind, packet);
+    let tracked = if kind == MessageKind::Data {
+        token(&packet).map(|token| (token, plain_len))
+    } else {
+        // A handshake initiation written into the buffer of a packet queued behind it: the
+        // buffer is no longer that packet.
+        not_sent(outputs, token(&packet), Some(id), reasons::NO_SESSION);
+        packet.set_tag(None);
+        packet.set_tracked(false);
+        None
+    };
+    transmit_tracked(outputs, pool, policy, id, peer, kind, packet, tracked);
 }
 
 /// Queues `data` for peer `id` on the path the policy selects for `kind`, or on the peer's
@@ -323,11 +466,37 @@ pub(super) fn transmit(
     kind: MessageKind,
     data: PacketBuf,
 ) {
+    transmit_tracked(outputs, pool, policy, id, peer, kind, data, None);
+}
+
+/// [`transmit`], reporting the datagram of a tracked packet (its token and plaintext length)
+/// sealed right before it, or not sent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of the core it needs, borrowed apart"
+)]
+fn transmit_tracked(
+    outputs: &mut VecDeque<Output>,
+    pool: &mut PacketPool,
+    policy: &dyn PathPolicy,
+    id: PeerId,
+    peer: &mut Peer,
+    kind: MessageKind,
+    data: PacketBuf,
+    tracked: Option<(NonZeroU64, usize)>,
+) {
     let current = peer.path();
     if let Some(path) = policy.select(id, kind).or(current) {
         peer.add_tx(data.len() as u64);
         if kind == MessageKind::HandshakeInit {
             peer.initiation_sent();
+        }
+        if let Some((tag, bytes)) = tracked {
+            outputs.push_back(Output::Tracked {
+                tag,
+                peer: Some(id),
+                outcome: TrackedOutcome::Sealed { bytes },
+            });
         }
         outputs.push_back(Output::Transmit { path, data });
     } else {
@@ -336,6 +505,50 @@ pub(super) fn transmit(
             peer: Some(id),
             reason: reasons::NO_PATH,
         }));
+        not_sent(
+            outputs,
+            tracked.map(|(tag, _)| tag),
+            Some(id),
+            reasons::NO_PATH,
+        );
+    }
+}
+
+/// The token of a tracked packet: its tag, if its receipt marker is set.
+pub(super) const fn token(packet: &PacketBuf) -> Option<NonZeroU64> {
+    if packet.is_tracked() {
+        packet.tag()
+    } else {
+        None
+    }
+}
+
+/// The token of a local packet entering the send path; clears the receipt marker of an
+/// untagged packet, which is not tracked.
+const fn tracked_token(packet: &mut PacketBuf) -> Option<NonZeroU64> {
+    if !packet.is_tracked() {
+        return None;
+    }
+    let token = packet.tag();
+    if token.is_none() {
+        packet.set_tracked(false);
+    }
+    token
+}
+
+/// Reports the tracked packet with `token`, if any, as not sent to `peer` for `reason`.
+pub(super) fn not_sent(
+    outputs: &mut VecDeque<Output>,
+    token: Option<NonZeroU64>,
+    peer: Option<PeerId>,
+    reason: &'static str,
+) {
+    if let Some(tag) = token {
+        outputs.push_back(Output::Tracked {
+            tag,
+            peer,
+            outcome: TrackedOutcome::NotSent { reason },
+        });
     }
 }
 
