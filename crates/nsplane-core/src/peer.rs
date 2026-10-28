@@ -1,11 +1,12 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use nsplane_noise::noise::{Tunn, TunnResult};
+use nsplane_noise::noise::{ExpiryCause, Tunn, TunnResult};
 use nsplane_noise::x25519::PublicKey;
 use nsplane_packet::{Path, TransportId};
 
@@ -85,8 +86,13 @@ pub(crate) struct Peer {
     tx: u64,
     /// Decrypted payload bytes delivered from this peer.
     data_rx: u64,
-    /// Whether the core reported the current expiry of the tunnel's sessions.
+    /// Whether the core handled the current expiry of the tunnel (reported or not).
     pub(crate) expired: bool,
+    /// `handshakes` when the core last reported an expiry (or when the peer was added): the
+    /// peer is up while `handshakes` is above it.
+    handshakes_at_expiry: u64,
+    /// Expiries the core reported as `Event::SessionExpired`.
+    expirations: u64,
     /// The tunnel's handshake count when the core last reported completed handshakes.
     handshakes: u64,
     /// Whether a handshake initiation was transmitted and no handshake completed since.
@@ -139,6 +145,8 @@ impl Peer {
             tx: 0,
             data_rx: 0,
             expired: false,
+            handshakes_at_expiry: handshakes,
+            expirations: 0,
             handshakes,
             initiation_outstanding: false,
             unanswered_handshakes: 0,
@@ -289,6 +297,21 @@ impl Peer {
         self.initiation_outstanding = false;
     }
 
+    /// Records that the tunnel is expired for `cause`, on every timer tick while it is; returns
+    /// whether the core reports this expiry. It reports each expiry once, and one for
+    /// [`ExpiryCause::SessionAge`] only if the peer was up (a completed handshake was
+    /// reported since the peer was added or since its last reported expiry).
+    pub(crate) fn tunnel_expired(&mut self, cause: ExpiryCause) -> bool {
+        self.initiation_abandoned();
+        let up = self.handshakes > self.handshakes_at_expiry;
+        if mem::replace(&mut self.expired, true) || (!up && cause == ExpiryCause::SessionAge) {
+            return false;
+        }
+        self.handshakes_at_expiry = self.handshakes;
+        self.expirations = self.expirations.saturating_add(1);
+        true
+    }
+
     /// Records that the tunnel gave up its handshake attempt: the outstanding initiation, if
     /// any, got no response.
     pub(crate) const fn initiation_abandoned(&mut self) {
@@ -296,6 +319,11 @@ impl Peer {
             self.unanswered_handshakes = self.unanswered_handshakes.saturating_add(1);
         }
         self.initiation_outstanding = false;
+    }
+
+    /// Expiries the core reported as `Event::SessionExpired`.
+    pub(crate) const fn expirations(&self) -> u64 {
+        self.expirations
     }
 
     /// Handshake initiations transmitted to this peer that got no response.

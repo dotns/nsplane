@@ -8,7 +8,7 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `set_plaintext_egress`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output` (`Transmit`, `Deliver`, `Event`, `Plaintext`, `Tracked`; non-exhaustive), `TrackedOutcome`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats`, `Event`, `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `set_plaintext_egress`, `peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output` (`Transmit`, `Deliver`, `Event`, `Plaintext`, `Tracked`; non-exhaustive), `TrackedOutcome`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats` (`new`; non-exhaustive), `Event` (non-exhaustive), `ExpiryCause` (`SessionAge`, `HandshakeTimeout`; non-exhaustive), `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
 
 ## Behavior
 
@@ -80,7 +80,38 @@ attempt gives up (`Event::SessionExpired`); a completed handshake answers it. Th
 monotonic and a peer that only responds stays at 0. `Core::total_unanswered_handshakes()` sums
 it over every peer, removed peers included, so a consumer with a peer registry polls one
 number and looks up the peer when it grows (`EngineHandle::unanswered_handshakes` /
-`total_unanswered_handshakes`); `Event` and `PeerStats` are unchanged.
+`total_unanswered_handshakes`).
+
+### Peer expiry
+
+A peer's tunnel expires on two timer paths of `nsplane-noise`, which discard its sessions,
+its queued packets and its timers; the next packet to the peer starts a new handshake:
+
+- `ExpiryCause::SessionAge`: no handshake completed for `REJECT_AFTER_TIME * 3` (540 s), counted
+  from the last completed handshake or, without one, from the peer's first timer tick. The
+  keys are too old to keep, typically because no traffic needed a rekey; it does not mean
+  the peer is unreachable.
+- `ExpiryCause::HandshakeTimeout`: an initiation got no response for `REKEY_ATTEMPT_TIME`
+  (90 s) and the retries gave up: the peer does not answer.
+
+`Core::handle_timeout` reports an expiry as `Event::SessionExpired { peer, cause }` once: the
+tunnel stays expired, and the next expiry is reported only after the peer sent a handshake
+initiation or completed a handshake. An expiry for `SessionAge` is reported only if the core
+reported a completed handshake (`Event::HandshakeCompleted`) for the peer since it was added
+or since its last reported expiry, so a peer that was never up does not go down for being
+idle; `HandshakeTimeout` is always reported. Packets queued for the handshake are discarded
+without `Event::Dropped`.
+
+`PeerStats::expirations` (and the `expirations` field of `Event::PeerStats`) counts the
+reported expiries, monotonic since the peer was added (a peer added again starts at 0), so a
+subscriber that lagged past the event still learns that one happened. Order: per peer, the
+`Event::HandshakeCompleted` events a tick noticed come before that peer's timer result; the
+periodic `Event::PeerStats` of a tick comes after every peer's timer result. Any `PeerStats`
+event or snapshot taken after a `SessionExpired` counts it.
+
+`Event` and `PeerStats` are `#[non_exhaustive]`: a `match` on `Event` needs a wildcard arm, and
+other crates build a `PeerStats` with `PeerStats::new(peer, public_key)` (or take a snapshot)
+and assign its fields.
 
 ### Injected packets
 

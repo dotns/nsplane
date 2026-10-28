@@ -928,9 +928,6 @@ where
 }
 ```
 
-`WssStreamClient` / `WssStreamServer`（多路复用的 TCP/UDP 流）已弃用，请改用经 `WssDialer` 的
-WireGuard peer。
-
 ## 13. 多个本地身份
 
 一个引擎可以在同一组传输上以多个 WireGuard 身份（私钥）应答：
@@ -950,29 +947,38 @@ peer（按身份路由）；`peer_id_in` / `remove_peer_in` 在某个身份内�
 ### 事件与统计
 
 ```rust ignore
-use nsplane::Event;
+use nsplane::{Event, ExpiryCause};
 
 let mut events = handle.subscribe().await?;
 tokio::spawn(async move {
     while let Ok(event) = events.recv().await {
         match event {
             Event::HandshakeCompleted { peer, .. } => println!("up {}", peer.get()),
-            Event::SessionExpired { peer, .. } => println!("down {}", peer.get()),
+            Event::SessionExpired { peer, cause: ExpiryCause::HandshakeTimeout } => {
+                println!("down {}", peer.get())
+            }
+            Event::SessionExpired { peer, .. } => println!("idle {}", peer.get()),
             _ => {}
         }
     }
 });
 
 for p in handle.peers().await? {
-    println!("{:?} rx={} tx={} last_handshake={:?}", p.path, p.rx, p.tx, p.last_handshake);
+    println!(
+        "{:?} rx={} tx={} last_handshake={:?} expirations={}",
+        p.path, p.rx, p.tx, p.last_handshake, p.expirations
+    );
 }
 let drops = handle.drop_counters().await?; // 原因 -> 次数
 let queues = handle.queue_stats().await?;  // 队列高水位
 let status = handle.status().await?;
 ```
 
-接收端落后时会收到 `RecvError::Lagged`，之后可继续接收。其他计数：`transport_stats`、
-`fragment_stats`、`path_mtu_stats`、`peer_mtus`、`unanswered_handshakes`。
+握手无人应答（`ExpiryCause::HandshakeTimeout`）才表示 peer 不可达；`SessionAge` 过期只表示 540 秒内
+没有流量需要新密钥，从未建立过会话的 peer 不报告这种过期。接收端落后时会收到 `RecvError::Lagged`，
+之后可继续接收；错过的过期可从 `PeerStats::expirations`（`peers`、`peer_stats` 和周期性的
+`Event::PeerStats`）得知。其他计数：`transport_stats`、`fragment_stats`、`path_mtu_stats`、
+`peer_mtus`、`unanswered_handshakes`。
 
 ### 运行中修改
 

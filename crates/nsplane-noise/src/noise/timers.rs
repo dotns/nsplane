@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 // Some constants, represent time in seconds
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
 pub(super) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
-const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+pub(super) const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+pub(super) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(super) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
@@ -47,6 +47,19 @@ use self::TimerName::{
     TimeCookieReceived, TimeCurrent, TimeLastDataPacketReceived, TimeLastDataPacketSent,
     TimeLastHandshakeStarted, TimeLastPacketReceived, TimeLastPacketSent, TimeSessionEstablished,
 };
+
+/// Why a tunnel expired: which timer gave up on its sessions ([`Tunn::expiry_cause`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExpiryCause {
+    /// No handshake completed for `REJECT_AFTER_TIME * 3` (540 s): the keys were too old to
+    /// keep, typically because no traffic needed a rekey. Not a sign that the peer is
+    /// unreachable.
+    SessionAge,
+    /// Handshake initiations got no response for `REKEY_ATTEMPT_TIME` (90 s): the peer did
+    /// not answer and the retries gave up.
+    HandshakeTimeout,
+}
 
 /// A random delay of 0 to 333 ms added to every handshake retry, so peers that lost their
 /// handshakes at the same time do not retry in lockstep.
@@ -87,6 +100,8 @@ pub(super) struct Timers {
     /// Local index of the session we established as responder that the initiator has not
     /// confirmed with a data message yet.
     unconfirmed_session: Option<usize>,
+    /// Why the tunnel last expired; read only while the handshake is expired.
+    pub(super) expiry_cause: Option<ExpiryCause>,
 }
 
 impl Timers {
@@ -106,6 +121,7 @@ impl Timers {
             should_reset_rr: reset_rr,
             handshakes: 0,
             unconfirmed_session: None,
+            expiry_cause: None,
         }
     }
 
@@ -229,6 +245,13 @@ impl Tunn {
         }
     }
 
+    /// Expires the tunnel for `cause`: discards its sessions, queued packets and timers.
+    fn expire(&mut self, cause: ExpiryCause) {
+        self.handshake.set_expired();
+        self.clear_all();
+        self.timers.expiry_cause = Some(cause);
+    }
+
     /// Expires the connection when keys are too old or handshakes keep failing.
     fn check_expiry(&mut self, now: Duration) -> Result<(), WireGuardError> {
         if self.handshake.is_expired() {
@@ -246,8 +269,7 @@ impl Tunn {
         // (REJECT_AFTER_TIME * 3), or 540 seconds, if no new keys have been exchanged.
         if now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3 {
             tracing::debug!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
-            self.handshake.set_expired();
-            self.clear_all();
+            self.expire(ExpiryCause::SessionAge);
             return Err(WireGuardError::ConnectionExpired);
         }
 
@@ -259,8 +281,7 @@ impl Tunn {
             && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= REKEY_ATTEMPT_TIME
         {
             tracing::debug!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-            self.handshake.set_expired();
-            self.clear_all();
+            self.expire(ExpiryCause::HandshakeTimeout);
             return Err(WireGuardError::ConnectionExpired);
         }
         Ok(())

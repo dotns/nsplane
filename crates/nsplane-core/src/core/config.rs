@@ -143,6 +143,7 @@ impl Core {
             tx: p.tx(),
             data_rx: p.data_rx(),
             data_tx: p.data_tx(),
+            expirations: p.expirations(),
             last_handshake,
         })
     }

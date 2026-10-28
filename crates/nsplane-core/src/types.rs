@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nsplane_noise::noise::ExpiryCause;
 use nsplane_noise::x25519;
 use nsplane_packet::{PacketBuf, Path, PeerId, TransportId};
 
@@ -386,8 +387,11 @@ pub enum TrackedOutcome {
 /// Events name peers by [`PeerId`]; the peer's identity is resolvable from its `PeerId`
 /// ([`PeerStats::local_identity`], through [`Core::peer_stats`]).
 ///
+/// The enum is non-exhaustive: a `match` on it needs a wildcard arm.
+///
 /// [`Core::peer_stats`]: crate::Core::peer_stats
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A handshake with `peer` completed: a new session was established.
     ///
@@ -444,10 +448,19 @@ pub enum Event {
         /// [`Ecn::NotEct`]: crate::Ecn::NotEct
         path: Path,
     },
-    /// The sessions with `peer` expired.
+    /// The tunnel with `peer` expired: its sessions and queued packets were discarded and the
+    /// next packet to the peer starts a new handshake.
+    ///
+    /// Emitted by the timers once per expiry: again only after the peer sent a handshake
+    /// initiation or completed a handshake since. An expiry for [`ExpiryCause::SessionAge`] is
+    /// emitted only if a handshake completed (an [`Event::HandshakeCompleted`] was emitted)
+    /// since the peer was added or since its previous `SessionExpired`. Counted in
+    /// [`PeerStats::expirations`].
     SessionExpired {
         /// The peer.
         peer: PeerId,
+        /// Why the tunnel expired.
+        cause: ExpiryCause,
     },
     /// Periodic counters of `peer`.
     PeerStats {
@@ -461,6 +474,8 @@ pub enum Event {
         data_rx: u64,
         /// Plaintext payload bytes sealed for the peer.
         data_tx: u64,
+        /// Expiries reported for the peer; see [`PeerStats::expirations`].
+        expirations: u64,
         /// Time since the last completed handshake.
         last_handshake: Option<Duration>,
     },
@@ -487,7 +502,11 @@ pub enum Event {
 }
 
 /// A snapshot of one peer: its configuration and counters.
+///
+/// The struct is non-exhaustive: other crates build one with [`PeerStats::new`] (or take a
+/// snapshot) and assign the fields.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PeerStats {
     /// The peer.
     pub peer: PeerId,
@@ -516,8 +535,35 @@ pub struct PeerStats {
     /// Plaintext payload bytes sealed for the peer: IP packets before encapsulation, after the
     /// outbound filters.
     pub data_tx: u64,
+    /// Expiries of the peer's tunnel the core reported as [`Event::SessionExpired`], any
+    /// cause; monotonic since the peer was added.
+    pub expirations: u64,
     /// Time since the last completed handshake.
     pub last_handshake: Option<Duration>,
+}
+
+impl PeerStats {
+    /// A snapshot of `peer` with key `public_key` and nothing else: default identity, no
+    /// path, no allowed IPs, no preshared key, no keepalive, zero counters, no handshake.
+    /// For tests and consumers that build snapshots; assign the other fields.
+    #[must_use]
+    pub const fn new(peer: PeerId, public_key: x25519::PublicKey) -> Self {
+        Self {
+            peer,
+            public_key,
+            local_identity: LocalIdentityId::DEFAULT,
+            path: None,
+            allowed_ips: Vec::new(),
+            preshared_key: None,
+            persistent_keepalive: None,
+            rx: 0,
+            tx: 0,
+            data_rx: 0,
+            data_tx: 0,
+            expirations: 0,
+            last_handshake: None,
+        }
+    }
 }
 
 impl fmt::Debug for PeerStats {
@@ -534,6 +580,7 @@ impl fmt::Debug for PeerStats {
             .field("tx", &self.tx)
             .field("data_rx", &self.data_rx)
             .field("data_tx", &self.data_tx)
+            .field("expirations", &self.expirations)
             .field("last_handshake", &self.last_handshake)
             .finish()
     }

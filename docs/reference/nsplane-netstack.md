@@ -13,7 +13,7 @@ input, per-flow revocation, optional reassembly, and an ownership query for loca
 |---|---|---|
 | main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `ingress_label`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
-| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`; `admission` deprecated, replaced by `NetStackConfig::admission`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
+| transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
 ## Behavior
 
@@ -350,9 +350,7 @@ reject (RST and ICMP / `ICMPv6` port unreachable observed at the client) and the
 
 `NetStackConfig::admission` decides how a new TCP connection (a bare SYN) or UDP flow (its
 first datagram) is admitted, on every stack: to the stack's own addresses, and on a
-transparent stack to every in-prefix destination too. A transparent stack also honours the
-deprecated `TransparentConfig::admission` while the top-level field is `Immediate`; a
-`Decide` at the top level takes precedence.
+transparent stack to every in-prefix destination too.
 
 - `Admission::Immediate` (default): accepted on arrival.
 - `Admission::Decide { timeout, max_pending }`: the SYN or first datagram is held in a

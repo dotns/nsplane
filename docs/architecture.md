@@ -70,7 +70,7 @@ handle and the filter APIs.
 | `nsplane` | `crates/nsplane/` | Tokio driver: `Engine`, `EngineBuilder`, `EngineHandle`, events, the I/O traits, `UdpTransport`, `LinkTransport`, the fragmentation stage, the crypto worker pool, the local-side graph | [nsplane](reference/nsplane.md) |
 | `nsplane-acl` | `crates/nsplane-acl/` | Label-based accept-only flow ACL (`AclEngine`), the stateful flow gate (`gate::FlowGate`), and the `AclFilter`, `GateFilter` and `FlowTracker` packet filters | [nsplane-acl](reference/nsplane-acl.md) |
 | `nsplane-nat` | `crates/nsplane-nat/` | IPv4/IPv6 translation (`Translator`, `TranslationTable`), service-publishing DNAT/SNAT (`PortMap`, `Conntrack`), NAT64 to a LAN (`Nat64Lan`), `Redirect`, `Masquerade` | [nsplane-nat](reference/nsplane-nat.md) |
-| `nsplane-wss` | `crates/nsplane-wss/` | WebSocket-over-TLS carriers: `WssDialer` for `LinkTransport`, the server transport, the `WsFrame` stream client and terminate leg | [nsplane-wss](reference/nsplane-wss.md) |
+| `nsplane-wss` | `crates/nsplane-wss/` | WebSocket-over-TLS carriers: `WssDialer` for `LinkTransport` and its server side, `WssServerTransport` | [nsplane-wss](reference/nsplane-wss.md) |
 | `nsplane-tun` | `crates/nsplane-tun/` | OS TUN devices and host-managed devices as `PacketSource` / `PacketSink` | [nsplane-tun](reference/nsplane-tun.md) |
 | `nsplane-netstack` | `crates/nsplane-netstack/` | User-space TCP/IP stack on smoltcp as `PacketSource` / `PacketSink`: TCP and UDP endpoints for IPv4 and IPv6 | [nsplane-netstack](reference/nsplane-netstack.md) |
 | `nsplane-ether` | `crates/nsplane-ether/` | Ethernet adapter for one guest as `PacketSource` / `PacketSink`: ARP, IPv6 neighbor discovery and router advertisements, single-lease DHCPv4; stream and TAP frame transports | [nsplane-ether](reference/nsplane-ether.md) |
@@ -158,6 +158,12 @@ Core::poll_timeout / handle_timeout(now): rekey, keepalive, expiry, rate-limiter
   engine hands them to a bounded `PlaintextEgress`. The mark is runtime state of the `PeerId`
   (kept on an update, gone with the peer); the peer starts no handshake for data and still
   answers and starts handshakes for inbound sealed traffic.
+- A peer's tunnel expiry is reported once per expiry as `Event::SessionExpired { peer, cause }`
+  (`ExpiryCause::SessionAge`: idle for 540 s, not reported for a peer that was not up since it
+  was added or since its last reported expiry; `ExpiryCause::HandshakeTimeout`: initiations
+  unanswered for 90 s) and counted in `PeerStats::expirations`, so events stay best effort
+  while the counter is loss-proof. Expiry runs on the timer path only; the data path does not
+  read it.
 - A flow gate can decide for a caller's selection of scopes (`FlowGate::evaluate_inbound_in`
   / `evaluate_outbound_in`): on the same snapshot and state as the unscoped calls, inside the
   selection the normal decision with its scope, rule and policy generation, outside it an

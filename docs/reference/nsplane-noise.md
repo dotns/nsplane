@@ -7,7 +7,7 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`), `noise::rate_limiter::RateLimiter` (`with_budget`, `mac1_matches`), `x25519` keys | `noise::rate_limiter::HandshakeBudget`, `TunnResult`, `noise::errors::WireGuardError` |
+| main | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`, `is_expired` / `expiry_cause`), `noise::rate_limiter::RateLimiter` (`with_budget`, `mac1_matches`), `x25519` keys | `noise::rate_limiter::HandshakeBudget`, `TunnResult`, `noise::errors::WireGuardError`, `noise::ExpiryCause` |
 
 ## Behavior
 
@@ -17,7 +17,11 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
   - `handshake`: Noise_IKpsk2 handshake and cookie handling.
   - `session`: transport-data AEAD and the anti-replay window.
   - `rate_limiter`: mac1/mac2 verification and cookie replies under load.
-  - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry).
+  - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry). The tunnel
+    expires after `REJECT_AFTER_TIME * 3` (540 s) without a new session
+    (`ExpiryCause::SessionAge`) or after `REKEY_ATTEMPT_TIME` (90 s) of unanswered
+    initiations (`ExpiryCause::HandshakeTimeout`); `Tunn::expiry_cause` returns the cause
+    while `Tunn::is_expired`, and the next handshake initiation clears both.
 - `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
   and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
 

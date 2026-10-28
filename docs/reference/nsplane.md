@@ -95,6 +95,10 @@ leaves behind, and the engine's later `send_batch` would map them a second time.
   are shared by all identities; the UAPI and the CLI use the default identity only.
 - Unanswered handshake initiations are counted per peer and in total
   (`EngineHandle::unanswered_handshakes` / `total_unanswered_handshakes`, see nsplane-core).
+- A peer's tunnel expiry is published as `Event::SessionExpired { peer, cause }` and counted
+  in `PeerStats::expirations`, so a lagging subscriber reads it from `peer_stats` or the next
+  periodic `Event::PeerStats` (see [peer expiry](nsplane-core.md#peer-expiry)). `ExpiryCause`
+  is re-exported.
 - Traffic is counted per peer (`PeerStats`: wire bytes and plaintext bytes) and per transport
   (`EngineHandle::transport_stats`: datagrams and bytes each way, failed sends), the latter
   once per batch by whoever moved it (the transport's receive/transmit tasks, or the owner

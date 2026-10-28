@@ -975,9 +975,6 @@ where
 }
 ```
 
-`WssStreamClient` / `WssStreamServer` (multiplexed TCP/UDP streams) are deprecated; use a
-WireGuard peer over `WssDialer` instead.
-
 ## 13. Several local identities
 
 One engine can answer as several WireGuard identities (private keys) on the same transports:
@@ -998,29 +995,39 @@ outbound packets by source address to an identity's peers (per-identity routing)
 ### Events and statistics
 
 ```rust ignore
-use nsplane::Event;
+use nsplane::{Event, ExpiryCause};
 
 let mut events = handle.subscribe().await?;
 tokio::spawn(async move {
     while let Ok(event) = events.recv().await {
         match event {
             Event::HandshakeCompleted { peer, .. } => println!("up {}", peer.get()),
-            Event::SessionExpired { peer, .. } => println!("down {}", peer.get()),
+            Event::SessionExpired { peer, cause: ExpiryCause::HandshakeTimeout } => {
+                println!("down {}", peer.get())
+            }
+            Event::SessionExpired { peer, .. } => println!("idle {}", peer.get()),
             _ => {}
         }
     }
 });
 
 for p in handle.peers().await? {
-    println!("{:?} rx={} tx={} last_handshake={:?}", p.path, p.rx, p.tx, p.last_handshake);
+    println!(
+        "{:?} rx={} tx={} last_handshake={:?} expirations={}",
+        p.path, p.rx, p.tx, p.last_handshake, p.expirations
+    );
 }
 let drops = handle.drop_counters().await?; // reason -> count
 let queues = handle.queue_stats().await?;  // high-water marks
 let status = handle.status().await?;
 ```
 
-A lagging receiver gets `RecvError::Lagged` and continues. Other counters:
-`transport_stats`, `fragment_stats`, `path_mtu_stats`, `peer_mtus`, `unanswered_handshakes`.
+A peer is down when its handshakes go unanswered (`ExpiryCause::HandshakeTimeout`); a
+`SessionAge` expiry only means that no traffic needed new keys for 540 s, and a peer that was
+never up reports none. A lagging receiver gets `RecvError::Lagged` and continues; it learns of
+an expiry it missed from `PeerStats::expirations` (in `peers`, `peer_stats` and the periodic
+`Event::PeerStats`). Other counters: `transport_stats`, `fragment_stats`, `path_mtu_stats`,
+`peer_mtus`, `unanswered_handshakes`.
 
 ### Runtime changes
 

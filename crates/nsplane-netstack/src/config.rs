@@ -217,11 +217,7 @@ pub struct NetStackConfig {
     /// [`PendingFlow`](crate::PendingFlow) whose [`control`](crate::PendingFlow::control)
     /// covers the lifetime from its first input on. On a stack without `transparent`,
     /// rejections are sourced from the stack's own addresses and there is no connection
-    /// limit beyond the listener pool and the accept queue.
-    ///
-    /// A transparent stack also honours the deprecated
-    /// [`TransparentConfig::admission`] while this field is [`Admission::Immediate`]; a
-    /// `Decide` here takes precedence. Default [`Admission::Immediate`].
+    /// limit beyond the listener pool and the accept queue. Default [`Admission::Immediate`].
     pub admission: Admission,
     /// Most revoked ingress labels the stack remembers at once, see
     /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label).
@@ -263,10 +259,6 @@ pub struct TransparentConfig {
     /// transparent mode, and also in
     /// [`rejected_prefix`](crate::NetStackStats::rejected_prefix).
     pub prefixes: Vec<(IpAddr, u8)>,
-    /// Deprecated: replaced by [`NetStackConfig::admission`], and honoured while that field
-    /// is [`Admission::Immediate`]. Default [`Admission::Immediate`].
-    #[deprecated(note = "use `NetStackConfig::admission`, which applies to every stack")]
-    pub admission: Admission,
     /// Most TCP connections the stack holds at once: accepted, mid handshake or opened
     /// with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until they are released.
     ///
@@ -399,7 +391,6 @@ pub(crate) struct Settings {
     pub(crate) reassembly: Option<ReassemblyConfig>,
     /// Boxed, so that it does not grow the driver.
     pub(crate) transparent: Option<Box<Transparent>>,
-    /// The top-level admission, or the deprecated transparent one.
     pub(crate) admission: Admission,
     pub(crate) max_revoked_labels: usize,
 }
@@ -517,14 +508,6 @@ impl Settings {
                 }
             }
         }
-        #[allow(deprecated, reason = "honoured until it is removed")]
-        let admission = match config.admission {
-            Admission::Immediate => config
-                .transparent
-                .as_ref()
-                .map_or(Admission::Immediate, |transparent| transparent.admission),
-            admission => admission,
-        };
         let mtu = config.mtu.max(MIN_MTU);
         let mss = usize::from(mtu) - 40;
         let tcp_buffer = |size: Option<usize>| {
@@ -557,7 +540,7 @@ impl Settings {
                     events: transparent.events,
                 })
             }),
-            admission: match admission {
+            admission: match config.admission {
                 Admission::Decide {
                     timeout,
                     max_pending,
@@ -684,19 +667,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated, reason = "the deprecated field is still honoured")]
-    fn admission_is_top_level_first_then_transparent() {
+    fn admission_is_normalised() {
         let decide = |timeout| Admission::Decide {
             timeout,
             max_pending: 0,
         };
-        let admission = |top, transparent: Option<Admission>| {
+        let admission = |admission, transparent: Option<TransparentConfig>| {
             Settings::new(NetStackConfig {
-                admission: top,
-                transparent: transparent.map(|admission| TransparentConfig {
-                    admission,
-                    ..TransparentConfig::default()
-                }),
+                transparent,
+                admission,
                 ..NetStackConfig::default()
             })
             .admission
@@ -709,15 +688,15 @@ mod tests {
         assert_eq!(admission(Admission::Immediate, None), Admission::Immediate);
         assert_eq!(admission(decide(second), None), normalised(second));
         assert_eq!(
-            admission(Admission::Immediate, Some(decide(second))),
+            admission(decide(second), Some(TransparentConfig::default())),
             normalised(second)
         );
         assert_eq!(
-            admission(decide(second), Some(decide(Duration::from_secs(2)))),
-            normalised(second)
+            admission(Admission::Immediate, Some(TransparentConfig::default())),
+            Admission::Immediate
         );
         assert_eq!(
-            admission(decide(Duration::MAX), Some(Admission::Immediate)),
+            admission(decide(Duration::MAX), None),
             normalised(MAX_PENDING_TIMEOUT)
         );
     }

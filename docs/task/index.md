@@ -83,4 +83,8 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261027-0537-tk-cleanup DNS fixture and source documentation cleanup**](20261027-0537-tk-cleanup.md) `P2`
 - [x] [**20261027-0433-sink-spent-forwarding Wrapper sinks forward send_batch_spent**](20261027-0433-sink-spent-forwarding.md) `P2`
 - [x] [**20261027-0433-filter-coarse-clock AclFilter and AclEngine on the coarse clock**](20261027-0433-filter-coarse-clock.md) `P2`
-- [-] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`
+- [x] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`
+- [x] [**20261028-0615-remove-wss-stream-carrier Remove the deprecated WsFrame stream carrier from nsplane-wss**](20261028-0615-remove-wss-stream-carrier.md) `P2`
+- [x] [**20261028-0615-remove-transparent-admission Remove the deprecated TransparentConfig::admission**](20261028-0615-remove-transparent-admission.md) `P2`
+- [ ] [**20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards**](20261028-0611-expiry-queued-packets-dropped.md) `P3`
+- [ ] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`

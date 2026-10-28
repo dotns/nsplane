@@ -1594,3 +1594,11 @@ mod plaintext {
         }
     }
 }
+
+/// The expiry signal keeps the per-packet output queue's element size.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn output_size_is_unchanged_by_the_expiry_signal() {
+    assert_eq!(size_of::<Output>(), 96);
+    assert_eq!(size_of::<Event>(), 64);
+}

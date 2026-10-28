@@ -54,9 +54,10 @@ fn scenario(crypto_jobs: bool) -> Trace {
     net.run_for(Duration::from_secs(600));
 
     let stats = [(0, 1), (1, 0)]
-        .map(|(i, j)| PeerStats {
-            public_key: PublicKey::from([0; 32]),
-            ..net.cores[i].peer_stats(net.peer_id(i, j)).unwrap()
+        .map(|(i, j)| {
+            let mut stats = net.cores[i].peer_stats(net.peer_id(i, j)).unwrap();
+            stats.public_key = PublicKey::from([0; 32]);
+            stats
         })
         .into();
     Trace {
