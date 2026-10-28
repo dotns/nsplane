@@ -652,3 +652,17 @@ CHANGELOG `[0.21.0]` section (with the breaking `Output` and `PacketBuf` items a
 notes), the architecture's contracts for the tag, the receipt marker, send results, plaintext
 egress and netstack ingress labels, the freeze ADR's twelfth exception as shipped, and the
 plan and task records are written; versions are 0.21.0.
+
+## 2026-10-28 [measurement]
+
+Quiet re-measure of the 0.21.0 integration against `v0.20.2` on slot 0 (every `slot.sh`
+invocation started at a 1-minute load below 3; the shared host rose to 4-21 between and within
+runs, so `send_stream`, the labeled path and `tracked_send` were repeated as single-round
+invocations). `netstack_udp_send/flows_4` is unchanged and not bimodal on a quiet host (477-488
+us on both binaries in the clean rounds; the high values came on both binaries in disturbed
+rounds). The labeled path is within the noise plus 3 % by median on every case. `local_graph`
+is faster, `udp_offload`, `engine_one_way` and the 1420-byte and batched core cases are within
+the noise. At or above the edge of the noise, both arriving with the packet tag carrier's step:
+`core_round_trip/64` +0.2 % to +5.3 % (median +2.2 %, about 9 ns) with `core_encapsulate/64`
++1.0 % to +4.5 %, and `netstack_send/streams_1` -0.7 % to +4.0 %; raised with the owner.
+Tables in `docs/performance.md`.

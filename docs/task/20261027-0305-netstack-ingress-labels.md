@@ -205,3 +205,13 @@ crate (W5's items are additive).
 Integration into 0.21.0 (`release/0.21.0` from `v0.20.2`, 2026-10-27): merged as `25debab`,
 commits unchanged; the only conflict was this file. The performance section's wording was
 cleaned to the writing rules by the integration.
+
+Re-measure, the integration's quiet re-measure against `v0.20.2` (slot 0, every `slot.sh` invocation
+started at a 1-minute load below 3; tables in `docs/performance.md`, "0.21.0 against
+0.20.2"): `netstack_udp_send/flows_4` is not bimodal on a quiet host (both binaries
+477-488 us in the three clean rounds, -0.6 / -0.3 / -0.6 %); the bimodal values came on both
+binaries in disturbed rounds only. Labeled against unlabeled on the 0.21.0 build, five rounds
+started below load 3: medians +1.4 % (`netstack_send/streams_1`), +1.5 % (`streams_4`), +0.7 /
++1.6 % (`_1cpu`), +0.4 / +1.1 % (`netstack_udp_flow_send/flows_{1,4}`), +0.2 / -1.3 %
+(`_1cpu`): within the noise plus 3 %; single rounds up to +9.5 % only where the load rose
+during the pair.

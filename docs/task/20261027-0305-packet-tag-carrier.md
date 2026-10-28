@@ -162,3 +162,15 @@ with the integration: `pump::tests::wrapper_sinks_hand_spent_and_dropped_buffers
 source with neither; fails with `pump`'s clear removed) and a sentence on
 `PacketSink::send_batch_spent` that spent buffers still carry both. The owner accepted variant
 B and the exhaustive `TranslatorStats` with `reasons::FRAGMENT_MIXED_TAGS` (2026-10-27).
+
+Re-measure, the integration's quiet re-measure against `v0.20.2` (slot 0, every `slot.sh` invocation
+started at a 1-minute load below 3; tables in `docs/performance.md`, "0.21.0 against
+0.20.2"): `send_stream` in the three rounds where both runs started below load 3:
+`netstack_udp_send/flows_4` -0.6 / -0.3 / -0.6 % (both binaries 477-488 us; the high values,
+561-877 us, came on both binaries in the six disturbed rounds: host load, not this change),
+`flows_1` -1.1 to +0.0 %, `netstack_send/streams_1` +1.3 / +4.0 / +3.6 %. By step, the tag
+carrier merged on 0.20.2 accounts for `streams_1` (+1.8 / +3.9 / -0.7 %) and for the 64-byte
+single-packet send path (`core_round_trip/64` +2.6 / +1.2 %, `core_encapsulate/64` +2.6 /
++1.7 %); the 0.21.0 head's `core_round_trip/64` is +0.2 % to +5.3 % over eight rounds (median
++2.2 %, about 9 ns). Raised with the owner in the integration report. `local_graph` 29 of 36
+cases faster in every round (-1 % to -15 % per case).

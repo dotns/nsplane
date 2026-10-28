@@ -252,3 +252,14 @@ against the design note (the specification):
 - The remaining deviations (the marker of an untagged packet cleared, jobs of a panicked
   crypto worker reported `ENGINE_STOPPED`, files outside the listed scope, two W4 tests
   adapted to O9 and O10, the extra benches) follow the note or are scope notes; recorded.
+
+Re-measure, the integration's quiet re-measure against `v0.20.2` (slot 0, every `slot.sh` invocation
+started at a 1-minute load below 3; tables in `docs/performance.md`, "0.21.0 against
+0.20.2"): untracked traffic as in the packet tag carrier's record (the 64-byte
+send path's cost comes with the tag carrier's step; the other two merged add +1.2 / +0.5 % on
+`core_encapsulate/64` in the two rounds that measured both steps). `engine_one_way`
+-12.5 % to +27 %, both signs. On the 0.21.0 build: `core_round_trip_tracked` against
+`core_round_trip` +0.6 / -0.4 % (64 B) and +0.7 / -0.8 / +0.6 % (1420 B); plaintext egress 31
+/ 36 ns against 222 / 631 ns of sealing; `tracked_send` +1.7 % (64 B) and -1.0 % (1420 B) in the
+quietest of four invocations (load 1.0), the others -18 % to +26 % with the untracked case
+spreading by a third.
