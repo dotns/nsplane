@@ -64,3 +64,5 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [-] [**20261027-0433-post-freeze-schedule Schedule of the follow-ups the 0.11 freeze left open**](20261027-0433-post-freeze-schedule.md) `2026-10-27`
 
 - [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `2026-10-28`
+
+- [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `2026-10-28`

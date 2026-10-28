@@ -90,3 +90,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [ ] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`
 
 - [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `P2`
+
+- [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `P2`

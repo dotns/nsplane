@@ -724,3 +724,16 @@ inner floor. Rustdoc, reference and release notes match. `just check` passed wit
 jobs: 2,458 tests passed, 34 skipped, and all remaining gates passed. Local diff review found
 no remaining issue. The encrypted tunnel's analogous IPv4 check is tracked as tk #754;
 baseline follow-ups #743/#744 remain for alignment after integration.
+
+## 2026-10-28 16:51 [progress]
+
+Completed `20261028-1644-decapsulated-ipv4-validation` (tk #754): encrypted IPv4
+now requires IHL >= 5 and header length <= declared total length <= buffer.
+RED reproduced delivery of zero-IHL IPv4; GREEN passed all 58 noise tests, including
+all three receive APIs, unchanged data accounting/timers, options and keepalive/IPv6.
+Updated rustdoc, reference and release notes. `just check` passed with six build jobs:
+2,461 tests passed, 34 skipped; all other gates passed. Review found no further issue.
+Receive-path audit confirmed error logging/drop precedes core accounting and events;
+replay/session and authenticated-packet timers retain existing invalid-IP semantics.
+Destination extraction is downstream of validation and the packet parser already checks
+IPv4 bounds. Baseline alignment after integration is noted on existing tk #743.

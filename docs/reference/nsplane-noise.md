@@ -25,6 +25,19 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
 - `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
   and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
 
+## Decrypted IP validation
+
+All receive paths (copying, in-place and `commit_open`) require IPv4 IHL >= 5
+and header length <= declared total length <= available plaintext. IPv4 options are
+accepted. IPv6 requires its fixed 40-byte header plus declared payload to fit the
+plaintext. Delivery trims trailing padding; empty plaintext is a keepalive.
+
+Invalid bounds return `WireGuardError::InvalidPacket` before plaintext `rx_bytes` or
+the data-received timer advances. As for other invalid IP shapes, authentication has
+already advanced replay state, session confirmation and the authenticated-packet timer.
+The engine logs a `Decapsulate error` and reports `DECAPSULATE_ERROR` before wire-byte
+accounting, authenticated-message notifications, filters or delivery.
+
 ## Errors and drop reasons
 
 `TunnResult::Err` carries a `noise::errors::WireGuardError` (invalid message, wrong index,
