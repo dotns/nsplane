@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Encrypted ingress rejects IPv4 packets whose IHL is below five or whose declared total
+  length is smaller than their header, before counting or delivering plaintext data.
 - Plaintext ingress rejects IPv4 packets with IHL below five or a declared total length
   smaller than their header, before source authorization, filters and delivery.
 - The padding-limit comment states the 1280-byte inner MTU floor and its outer-ceiling limit.
