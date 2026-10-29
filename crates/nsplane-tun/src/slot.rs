@@ -10,6 +10,7 @@
 //! on it but was not returned yet is discarded, and the call reads from the next installed
 //! fd instead.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
@@ -343,7 +344,30 @@ impl PacketSink for SlotSink {
     /// [`TunSlot::replace`] or [`TunSlot::clear`] removed it: one waiting for that fd is
     /// done on the next installed one.
     async fn send(&self, packet: PacketBuf, _from: PeerId) -> io::Result<()> {
-        let bytes = packet.as_packet();
+        self.write(packet.as_packet()).await
+    }
+
+    /// Like one [`send`](Self::send) per packet, and appends the buffer of every packet it
+    /// took over to `spent` once its write is done, whether it was written or failed.
+    /// Cancelling drops the packet being written; the ones behind it stay in `packets`.
+    async fn send_batch_spent(
+        &self,
+        packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        spent: &mut Vec<PacketBuf>,
+    ) -> io::Result<()> {
+        while let Some((_, packet)) = packets.pop_front() {
+            let result = self.write(packet.as_packet()).await;
+            spent.push(packet);
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl SlotSink {
+    /// Writes `bytes` as one write to the installed fd, as [`send`](PacketSink::send)
+    /// describes.
+    async fn write(&self, bytes: &[u8]) -> io::Result<()> {
         loop {
             // Created before the check, so a change made after it wakes the wait.
             let changed = self.shared.changed.notified();
@@ -506,6 +530,52 @@ mod tests {
             slot.replace(fd).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    /// Packets of `payloads`, all from peer 0.
+    fn batch(payloads: &[&[u8]]) -> VecDeque<(PeerId, PacketBuf)> {
+        payloads
+            .iter()
+            .map(|payload| (PeerId::new(0), PacketBuf::from_packet(payload)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_batch_spent_returns_written_buffers() {
+        let (slot, _source, sink) = TunSlot::new(100);
+        let (fd, host) = pair();
+        slot.replace(fd).unwrap();
+        let mut packets = batch(&[b"one", b"two", b"three"]);
+        let mut spent = Vec::new();
+        timeout(WAIT, sink.send_batch_spent(&mut packets, &mut spent))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(packets.is_empty());
+        let spent: Vec<&[u8]> = spent.iter().map(PacketBuf::as_packet).collect();
+        assert_eq!(spent, [&b"one"[..], b"two", b"three"]);
+        let mut buf = [0; 16];
+        for expected in [&b"one"[..], b"two", b"three"] {
+            let len = host.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..len], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_batch_spent_after_close_returns_the_failed_buffer() {
+        let (slot, _source, sink) = TunSlot::new(100);
+        slot.close();
+        let mut packets = batch(&[b"one", b"two"]);
+        let mut spent = Vec::new();
+        let err = sink
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(spent.len(), 1);
+        assert_eq!(spent[0].as_packet(), b"one");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].1.as_packet(), b"two");
     }
 
     #[tokio::test]

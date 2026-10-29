@@ -83,16 +83,24 @@ type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 ///   [`SplitterStats::failed`].
 ///
 /// [`PacketSink::send_batch`] calls `send` for each packet in order.
-/// [`PacketSink::send_batch_spent`] does the same, handing each packet to the chosen sink's
-/// `send_batch_spent` as a batch of one, so that sink's spent buffers reach the caller. Each
-/// packet goes to one sink and is never shared: only that sink may append its buffer, and the
-/// splitter appends the buffers of the packets it drops itself (misrouted, or failed because
-/// every sink is gone).
+/// [`PacketSink::send_batch_spent`] hands packets to the chosen sink's `send_batch_spent`, so
+/// that sink's spent buffers reach the caller. A [`Splitter::new`] splitter hands each run of
+/// consecutive packets routed to the same sink over as one batch; to find where a run ends it
+/// routes the packet behind it, so the route closure may run again for packets left in the
+/// batch after an error, when the caller delivers them. A [`Splitter::new_map`] splitter
+/// hands over one packet at a time, so its closure rewrites each packet once, also across
+/// those retries. Errors and cancellation follow `send_batch`: the packets of a run its sink
+/// did not take over stay at the front of the batch, in order. Each packet goes to one sink
+/// and is never shared: only that sink may append its buffer, and the splitter appends the
+/// buffers of the packets it drops itself (misrouted, or failed because every sink is gone).
 ///
 /// [`Splitter::stats`] reads both counters; a delivered packet costs no counter update.
 pub struct Splitter {
     route: Box<RouteFn>,
     routes: Vec<Route>,
+    /// Whether `send_batch_spent` hands runs of packets for one sink over together: only
+    /// for a closure that does not rewrite packets ([`Splitter::new`]).
+    coalesces: bool,
     open: AtomicUsize,
     misrouted: AtomicU64,
     failed: AtomicU64,
@@ -117,7 +125,10 @@ impl Splitter {
     where
         F: Fn(PeerId, &PacketBuf) -> usize + Send + Sync + 'static,
     {
-        Self::new_map(move |from, packet: &mut PacketBuf| route(from, packet))
+        Self {
+            coalesces: true,
+            ..Self::new_map(move |from, packet: &mut PacketBuf| route(from, packet))
+        }
     }
 
     /// Creates a splitter with no sinks whose `route` closure may rewrite each packet in
@@ -155,6 +166,7 @@ impl Splitter {
         Self {
             route: Box::new(route),
             routes: Vec::new(),
+            coalesces: false,
             open: AtomicUsize::new(0),
             misrouted: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -186,6 +198,12 @@ impl Splitter {
             misrouted: self.misrouted(),
             failed: self.failed.load(Ordering::Relaxed),
         }
+    }
+
+    /// The sink index the route closure picks for the packet at `at` in `packets`.
+    fn route_at(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>, at: usize) -> usize {
+        let (from, packet) = &mut packets[at];
+        (self.route)(*from, packet)
     }
 
     /// Counts a packet failed because every sink is gone and returns its error.
@@ -224,26 +242,65 @@ impl PacketSink for Splitter {
         packets: &mut VecDeque<(PeerId, PacketBuf)>,
         spent: &mut Vec<PacketBuf>,
     ) -> io::Result<()> {
-        // The batch of one each packet is handed over in.
-        let mut one = VecDeque::with_capacity(1);
-        while let Some((from, mut packet)) = packets.pop_front() {
+        // The packets handed to one sink together.
+        let mut run = VecDeque::new();
+        // The route of the front packet, if the previous run already took it.
+        let mut next = None;
+        while !packets.is_empty() {
             if self.open.load(Ordering::Acquire) == 0 {
-                spent.push(packet);
+                if let Some((_, packet)) = packets.pop_front() {
+                    spent.push(packet);
+                }
                 return Err(self.all_closed());
             }
-            let Some(route) = self.routes.get((self.route)(from, &mut packet)) else {
-                self.misrouted.fetch_add(1, Ordering::Relaxed);
-                spent.push(packet);
+            let index = next.take().unwrap_or_else(|| self.route_at(packets, 0));
+            let mut len = 1;
+            // A rewriting closure only sees a packet once it is next to be delivered, so a
+            // packet left after an error is not rewritten again by the caller's retry.
+            if self.coalesces {
+                while len < packets.len() {
+                    let other = self.route_at(packets, len);
+                    if other != index {
+                        next = Some(other);
+                        break;
+                    }
+                    len += 1;
+                }
+            }
+            let Some(route) = self.routes.get(index) else {
+                self.misrouted.fetch_add(len as u64, Ordering::Relaxed);
+                spent.extend(packets.drain(..len).map(|(_, packet)| packet));
                 continue;
             };
-            one.push_back((from, packet));
-            // On an error the packet was dropped, so `one` is empty either way.
-            if let Err(err) = route.sink.send_batch_spent_boxed(&mut one, spent).await {
+            run.extend(packets.drain(..len));
+            let run = Run {
+                packets: &mut *packets,
+                run: &mut run,
+            };
+            let result = route.sink.send_batch_spent_boxed(run.run, spent).await;
+            drop(run);
+            if let Err(err) = result {
                 self.failed(route, &err);
                 return Err(err);
             }
         }
         Ok(())
+    }
+}
+
+/// Packets taken from the front of a batch for one sink. Dropped, once the sink returned or
+/// with its call cancelled, it puts the packets the sink did not take over back at the front
+/// of the batch, in order.
+struct Run<'a> {
+    packets: &'a mut VecDeque<(PeerId, PacketBuf)>,
+    run: &'a mut VecDeque<(PeerId, PacketBuf)>,
+}
+
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        while let Some(entry) = self.run.pop_back() {
+            self.packets.push_front(entry);
+        }
     }
 }
 
@@ -576,6 +633,182 @@ mod tests {
         splitter.send_batch_spent(&mut packets, &mut spent).await?;
         assert_eq!(bytes(&spent), [[2], [3], [5]]);
         assert_eq!(b.taken(), [[3], [5]]);
+        Ok(())
+    }
+
+    /// A [`SpentSink`] that also records the length of every `send_batch_spent` batch.
+    #[derive(Clone, Default)]
+    struct Batches {
+        inner: SpentSink,
+        lens: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl Batches {
+        fn lens(&self) -> Vec<usize> {
+            self.lens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl PacketSink for Batches {
+        async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+            self.inner.send(packet, from).await
+        }
+
+        async fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> io::Result<()> {
+            self.lens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packets.len());
+            self.inner.send_batch_spent(packets, spent).await
+        }
+    }
+
+    /// The first byte of each packet left in `packets`, in order.
+    fn left(packets: &VecDeque<(PeerId, PacketBuf)>) -> Vec<u8> {
+        packets
+            .iter()
+            .map(|(_, packet)| packet.as_packet()[0])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spent_hands_runs_to_a_sink_as_one_batch() -> TestResult {
+        let (a, b) = (Batches::default(), Batches::default());
+        let splitter = Splitter::new(by_first_byte).sink(a.clone()).sink(b.clone());
+        let mut packets = batch(&[0, 0, 0, 1, 1, 7, 7, 0]);
+        let mut spent = Vec::new();
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(bytes(&spent), [[0], [0], [0], [1], [1], [7], [7], [0]]);
+        assert_eq!(a.lens(), [3, 1]);
+        assert_eq!(b.lens(), [2]);
+        assert_eq!(a.inner.taken(), [[0], [0], [0], [0]]);
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 2,
+                failed: 0
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_run_error_leaves_the_rest_in_order() -> TestResult {
+        let (a, b) = (Batches::default(), Batches::default());
+        let splitter = Splitter::new(by_parity).sink(a.clone()).sink(b.clone());
+        let mut packets = batch(&[2, 4, SpentSink::FAIL, 6, 3, 8]);
+        let mut spent = Vec::new();
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(bytes(&spent), [[2], [4]]);
+        // The rest of the run, the packet that ended it and the ones behind.
+        assert_eq!(left(&packets), [6, 3, 8]);
+        assert_eq!(splitter.stats().failed, 1);
+
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert_eq!(bytes(&spent), [[2], [4], [6], [3], [8]]);
+        assert_eq!(a.inner.taken(), [[2], [4], [6], [8]]);
+        assert_eq!(b.inner.taken(), [[3]]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_new_routes_again_what_an_error_left() -> TestResult {
+        let calls = Arc::new(AtomicU64::new(0));
+        let splitter = Splitter::new({
+            let calls = Arc::clone(&calls);
+            move |from, packet: &PacketBuf| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                by_parity(from, packet)
+            }
+        })
+        .sink(SpentSink::default())
+        .sink(SpentSink::default());
+        let mut packets = batch(&[2, SpentSink::FAIL, 6, 3]);
+        let mut spent = Vec::new();
+        assert!(
+            splitter
+                .send_batch_spent(&mut packets, &mut spent)
+                .await
+                .is_err()
+        );
+        // The run 2, FAIL, 6 and the 3 that ended it.
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        // 6 and 3 are routed again, once each.
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(bytes(&spent), [[2], [6], [3]]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_new_map_maps_each_packet_once_across_retries() -> TestResult {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (a, b) = (Batches::default(), Batches::default());
+        let splitter = Splitter::new_map({
+            let calls = Arc::clone(&calls);
+            move |from, packet: &mut PacketBuf| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(byte) = packet.as_packet_mut().first_mut() {
+                    *byte = byte.wrapping_add(1);
+                }
+                by_parity(from, packet)
+            }
+        })
+        .sink(a.clone())
+        .sink(b.clone());
+        // Rewritten to 2, 4, FAIL, 6, 8, all for sink 0.
+        let mut packets = batch(&[1, 3, SpentSink::FAIL - 1, 5, 7]);
+        let mut spent = Vec::new();
+        assert!(
+            splitter
+                .send_batch_spent(&mut packets, &mut spent)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(left(&packets), [5, 7]);
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(bytes(&spent), [[2], [4], [6], [8]]);
+        assert_eq!(a.lens(), [1; 5]);
+        assert_eq!(b.lens(), [0_usize; 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_cancel_keeps_the_packets_not_taken_over() -> TestResult {
+        let (a, b) = (SpentSink::default(), SpentSink::default());
+        let splitter = Splitter::new(by_parity).sink(a.clone()).sink(b.clone());
+        let mut packets = batch(&[3, SpentSink::HOLD, 5, 2, 7]);
+        let mut spent = Vec::new();
+        {
+            let mut pending = Box::pin(splitter.send_batch_spent(&mut packets, &mut spent));
+            let pending_for = std::time::Duration::from_millis(50);
+            assert!(
+                tokio::time::timeout(pending_for, &mut pending)
+                    .await
+                    .is_err()
+            );
+        }
+        // The held packet was being delivered and is dropped; the rest stay in order.
+        assert_eq!(left(&packets), [5, 2, 7]);
+        assert_eq!(bytes(&spent), [[3]]);
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert_eq!(bytes(&spent), [[3], [5], [2], [7]]);
+        assert_eq!(b.taken(), [[3], [5], [7]]);
         Ok(())
     }
 
