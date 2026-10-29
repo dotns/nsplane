@@ -100,7 +100,7 @@ pub struct Splitter {
     routes: Vec<Route>,
     /// Whether `send_batch_spent` hands runs of packets for one sink over together: only
     /// for a closure that does not rewrite packets ([`Splitter::new`]).
-    groups: bool,
+    coalesces: bool,
     open: AtomicUsize,
     misrouted: AtomicU64,
     failed: AtomicU64,
@@ -126,7 +126,7 @@ impl Splitter {
         F: Fn(PeerId, &PacketBuf) -> usize + Send + Sync + 'static,
     {
         Self {
-            groups: true,
+            coalesces: true,
             ..Self::new_map(move |from, packet: &mut PacketBuf| route(from, packet))
         }
     }
@@ -166,7 +166,7 @@ impl Splitter {
         Self {
             route: Box::new(route),
             routes: Vec::new(),
-            groups: false,
+            coalesces: false,
             open: AtomicUsize::new(0),
             misrouted: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -257,7 +257,7 @@ impl PacketSink for Splitter {
             let mut len = 1;
             // A rewriting closure only sees a packet once it is next to be delivered, so a
             // packet left after an error is not rewritten again by the caller's retry.
-            if self.groups {
+            if self.coalesces {
                 while len < packets.len() {
                     let other = self.route_at(packets, len);
                     if other != index {
