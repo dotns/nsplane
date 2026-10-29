@@ -677,7 +677,7 @@ approval. Implementation has not started.
 
 Owner decision, 2026-10-27: O15 of the design note, the `local_barrier` count window (a batch
 is counted only after `PacketSource::recv_batch` returned it, so a barrier taken in between can
-exclude it), is fixed in nsplane and released as 0.20.1 on the Gitea remote only. The release B
+exclude it), is fixed in nsplane and released as 0.20.1. The release B
 barrier's workstream (task `20261026-0836-local-barrier-plaintext-ingress`) implements and
 releases it; it is not part of release C.
 
