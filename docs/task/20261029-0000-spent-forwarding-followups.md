@@ -1,6 +1,6 @@
 # 20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks
 
-- **status**: pending
+- **status**: completed (merged 2026-10-29)
 - **priority**: P3
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-10-29 00:00

@@ -92,4 +92,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `P2`
 
 - [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `P2`
-- [ ] [**20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks**](20261029-0000-spent-forwarding-followups.md) `P3`
+- [x] [**20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks**](20261029-0000-spent-forwarding-followups.md) `P3`
