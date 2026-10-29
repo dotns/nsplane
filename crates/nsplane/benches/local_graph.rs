@@ -12,7 +12,10 @@
 //!
 //! The wrapper groups send through a wrapper into roomy pipes and read the packets back,
 //! each with its baseline next to it: `splitter` compares a reading route closure
-//! (`Splitter::new`) with a rewriting one (`Splitter::new_map`) over two sinks; `map_sink`
+//! (`Splitter::new`) with a rewriting one (`Splitter::new_map`) over two sinks, and
+//! `splitter/spent_*` delivers through `send_batch_spent` in batches of 64 into two sinks
+//! that hand the buffers back: alternating packets (`spent_new`, `spent_new_map`) and runs
+//! of 16 packets per sink (`spent_new_runs`); `map_sink`
 //! compares `MapSink::new` with `MapSink::with_after` (a counter as the hook) on `send`
 //! and `send_batch`; `swap_sink` compares the bare pipe with `SwapSink` and with
 //! `SwapSink<AbortSink>` before any abort.
@@ -25,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use criterion::{BatchSize, Criterion, Throughput};
 use nsplane::{
-    AbortSink, MapSink, MapVerdict, PacketBatch, PacketBuf, PacketSink, PacketSource, PeerId,
-    PipeSource, Splitter, SwapSink, pipe, pump,
+    AbortSink, MAX_BATCH, MapSink, MapVerdict, PacketBatch, PacketBuf, PacketSink, PacketSource,
+    PeerId, PipeSource, Splitter, SwapSink, pipe, pump,
 };
 use tokio::sync::watch;
 
@@ -54,6 +57,20 @@ fn split_packets(size: usize) -> Vec<PacketBuf> {
         .map(|index| {
             let mut packet = vec![0x45; size];
             packet[ROUTE_BYTE] = u8::from(index % 2 == 1);
+            PacketBuf::from_packet(&packet)
+        })
+        .collect()
+}
+
+/// Packets per run of one splitter sink in `splitter/spent_new_runs`.
+const RUN: usize = 16;
+
+/// Packets alternating between splitter sink 0 and sink 1 every `run` packets.
+fn run_packets(size: usize, run: usize) -> Vec<PacketBuf> {
+    (0..PACKETS)
+        .map(|index| {
+            let mut packet = vec![0x45; size];
+            packet[ROUTE_BYTE] = u8::from(index / run % 2 == 1);
             PacketBuf::from_packet(&packet)
         })
         .collect()
@@ -288,6 +305,48 @@ fn bench_splitter(c: &mut Criterion) {
                         send_each(&splitter, &mut held).await;
                         refill(&mut source0, &mut held, &mut batch, PACKETS / 2).await;
                         refill(&mut source1, &mut held, &mut batch, PACKETS).await;
+                    });
+                });
+            });
+        }
+        for (name, run, rewrite) in [
+            ("spent_new", 1, false),
+            ("spent_new_runs", RUN, false),
+            ("spent_new_map", 1, true),
+        ] {
+            let writer = || Writer {
+                spent: true,
+                written: watch::channel(0).0,
+            };
+            let splitter = if rewrite {
+                Splitter::new_map(|_peer, packet| {
+                    if let Some(ttl) = packet.as_packet_mut().get_mut(TTL_BYTE) {
+                        *ttl = ttl.wrapping_sub(1);
+                    }
+                    route(packet)
+                })
+            } else {
+                Splitter::new(|_peer, packet| route(packet))
+            };
+            let splitter = splitter.sink(writer()).sink(writer());
+            let mut held = VecDeque::from(run_packets(size, run));
+            let mut queue = VecDeque::with_capacity(MAX_BATCH);
+            let mut spent = Vec::with_capacity(PACKETS);
+            group.bench_function(format!("{name}_{size}"), |bench| {
+                bench.iter(|| {
+                    runtime.block_on(async {
+                        while !held.is_empty() {
+                            let len = held.len().min(MAX_BATCH);
+                            queue.extend(held.drain(..len).map(|packet| (PeerId::new(1), packet)));
+                            splitter
+                                .send_batch_spent(&mut queue, &mut spent)
+                                .await
+                                .unwrap();
+                        }
+                        // Back to front, in order, so `spent` keeps its capacity.
+                        while let Some(packet) = spent.pop() {
+                            held.push_front(packet);
+                        }
                     });
                 });
             });

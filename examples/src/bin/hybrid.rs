@@ -27,6 +27,7 @@
 
 #[cfg(unix)]
 mod unix {
+    use std::collections::VecDeque;
     use std::io;
     use std::process::ExitCode;
     use std::sync::Arc;
@@ -87,6 +88,14 @@ mod unix {
     impl PacketSink for SharedSplitter {
         async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
             self.0.send(packet, from).await
+        }
+
+        async fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> io::Result<()> {
+            self.0.send_batch_spent(packets, spent).await
         }
     }
 
@@ -163,6 +172,26 @@ mod unix {
             assert_eq!(route(&prefixes, &v4([10, 0, 0, 7])), TUN);
             assert_eq!(route(&prefixes, &v4([10, 1, 0, 1])), STACK);
             assert_eq!(route(&prefixes, &PacketBuf::from_packet(&[0x10])), NO_ROUTE);
+        }
+
+        #[tokio::test]
+        async fn shared_splitter_returns_spent_buffers() {
+            let prefixes = [parse_cidr("10.0.0.1/24").unwrap()];
+            let (tun, _tun_rx) = nsplane::ChannelSink::new(4);
+            let (stack, _stack_rx) = nsplane::ChannelSink::new(4);
+            let splitter = Splitter::new(move |_peer, packet| route(&prefixes, packet))
+                .sink(tun)
+                .sink(stack);
+            let sink = SharedSplitter(Arc::new(splitter));
+            // Not IP: the splitter drops it as misrouted and hands its buffer back.
+            let mut packets = VecDeque::from([(PeerId::new(1), PacketBuf::from_packet(&[0x10]))]);
+            let mut spent = Vec::new();
+            sink.send_batch_spent(&mut packets, &mut spent)
+                .await
+                .unwrap();
+            assert!(packets.is_empty());
+            assert_eq!(spent.len(), 1);
+            assert_eq!(spent[0].as_packet(), [0x10]);
         }
     }
 }

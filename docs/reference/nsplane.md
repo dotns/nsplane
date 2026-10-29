@@ -642,9 +642,14 @@ decisions, not packet loops:
   copies); `AbortSink` races the inner `send_batch_spent` and, aborted, appends the buffers
   of the packets it drops except the one being delivered; `SwapSink` forwards to the
   current sink and appends the buffers it drops (empty slot, or left by a replaced sink that
-  failed); `Splitter` hands each packet to the chosen sink's `send_batch_spent` as a batch
-  of one (a packet goes to one sink only) and appends the buffers of misrouted packets and
-  of a packet failed because every sink is gone.
+  failed); `Splitter` hands packets to the chosen sink's `send_batch_spent` (a packet goes
+  to one sink only), and appends the buffers of misrouted packets and of a packet failed
+  because every sink is gone. A `Splitter::new` splitter hands each run of consecutive
+  packets for one sink over as one batch; it routes the packet behind a run to find its
+  end, so its closure may run again for packets left after an error. A `Splitter::new_map`
+  splitter hands over one packet at a time, so each packet is rewritten once, also across
+  retries. On an error or a cancel the packets of a run its sink did not take over stay at
+  the front of the batch, in order.
 
 ```text
 TUN source ─► pump ─► Splitter ─┬─► pipe ─► MergeSource ─► engine A

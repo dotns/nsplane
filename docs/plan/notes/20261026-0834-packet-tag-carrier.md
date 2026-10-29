@@ -459,8 +459,8 @@ is fixed in 0.20.1.
   (a reused label opens a new lifetime; the consumer contract alone protects). Either way the
   consumer contract stands: labels of revoked lifetimes are never reused, and queued input of a
   label is cancelled before its revoke.
-- O15 (release B) **Decided 2026-10-27 (owner): fixed in nsplane and released as 0.20.1 (Gitea
-  only), implemented and released by the release B barrier's workstream; not part of release
+- O15 (release B) **Decided 2026-10-27 (owner): fixed in nsplane and released as 0.20.1,
+  implemented and released by the release B barrier's workstream; not part of release
   C.** The barrier's count window. `read_source` adds a batch to
   the barrier's count right after `PacketSource::recv_batch` returns it (`engine/tasks.rs`). A
   consumer that raises its source fence and calls `local_barrier` from another thread while the
@@ -648,7 +648,7 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   workstreams W4 (packet tag carrier), W5 (netstack ingress labels) and W6 (plaintext egress and
   send receipts). O15 is a release B item outside the approval.
 - Owner decision, 2026-10-27: O15, the barrier's count window, is fixed in nsplane and released as
-  0.20.1 on the Gitea remote only; the release B barrier's workstream implements and releases it.
+  0.20.1; the release B barrier's workstream implements and releases it.
 - Owner decision, 2026-10-27: the labeled-path acceptance allowance is the noise plus 3 %; if TCP
   misses it, the per-socket label checked after smoltcp's demultiplexing is measured instead.
   No owner item of this note remains open.

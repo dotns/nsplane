@@ -105,6 +105,8 @@ on Linux, Android, macOS and iOS.
   (`SlotSource::oversize_drops`), a 0-byte read is `UnexpectedEof`. Each packet is one write
   without header; a short write is `WriteZero`. No offloads; the MTU watch keeps the value
   given to `new`.
+- `SlotSink::send_batch_spent` writes the packets one at a time and appends each buffer once
+  its write is done, written or failed, so a `pump` into the slot recycles them.
 - The caller keeps its own generation numbering, attach and activate ordering and host-claim
   rules.
 

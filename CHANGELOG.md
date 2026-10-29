@@ -5,6 +5,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `Splitter::send_batch_spent` hands each run of consecutive packets for one sink to that
+  sink's `send_batch_spent` as one batch for a `Splitter::new` splitter; the route closure may
+  run again for packets left after an error. A `Splitter::new_map` splitter still hands over
+  one packet at a time, so each packet is rewritten once. `SlotSink` (`nsplane-tun`)
+  overrides `send_batch_spent` and returns the buffer of every packet it wrote, and the
+  `hybrid` example's splitter wrapper forwards `send_batch_spent`.
+
 ### Fixed
 - Encrypted ingress rejects IPv4 packets whose IHL is below five or whose declared total
   length is smaller than their header, before counting or delivering plaintext data.

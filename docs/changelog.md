@@ -458,7 +458,7 @@ version keeps the original loop and adds one bound check per header (48.0 / 48.3
 Owner decision on plan `20261026-0822-node-gateway-requests`: `main` moved to `fb67db9` (0.19.3
 released upstream, then the large module split), so release A becomes 0.19.4, and the plan,
 release A and the release B workstreams are rebased onto `fb67db9` as new branches and release
-B is integrated again; the branches go to the Gitea remote only.
+B is integrated again.
 
 ## 2026-10-27 [release]
 
@@ -513,8 +513,8 @@ Implementation has not started.
 ## 2026-10-27 [decision]
 
 O15 of the release C design note (plan `20261026-0822-node-gateway-requests`): the
-`local_barrier` count window is fixed in nsplane and released as 0.20.1 on the Gitea remote
-only, implemented and released by the release B barrier's workstream; it is not part of
+`local_barrier` count window is fixed in nsplane and released as 0.20.1,
+implemented and released by the release B barrier's workstream; it is not part of
 release C.
 
 ## 2026-10-27 [decision]
@@ -549,7 +549,7 @@ maintenance (ADR `2026-10-27-normal-maintenance`): no freeze exception needed.
 
 ## 2026-10-27 [release]
 
-Release 0.20.1 (tag `v0.20.1`, Gitea only, as the owner decided): the `local_barrier` count fix
+Release 0.20.1 (tag `v0.20.1`, as the owner decided): the `local_barrier` count fix
 alone (task `20261027-0349-barrier-count-window`), rebased onto `main` at `9e955ee` (0.20.0 plus
 docs only, the freeze lifted, so no exception). `main` fast-forwards to the release head.
 Workspace versions, internal requirements and guide tags were synchronized in the version
@@ -561,7 +561,7 @@ Task `20261027-0537-tk-cleanup`: owner-approved DNS passthrough fixture and sour
 from v0.20.1. Reserve both upstream socket protocols before serving; retry only UDP
 allocation conflicts. Reconciled baseline drift entries with current code and corrected
 comments/rustdoc/README text without runtime changes. Existing historical records are
-preserved. The baseline checkout is untouched; delivery targets a Gitea branch only.
+preserved. The baseline checkout is untouched; delivery targets a branch only.
 Verification: deterministic old-fixture AddrInUse failure, normal and forced-allocation-conflict
 passthrough runs each 10/10, one complete `just check` (2,405 tests passed, 34 skipped;
 36 doctests passed, 40 ignored), and warning-denied workspace rustdoc all passed. Local
@@ -571,7 +571,7 @@ outside this comment/README scope.
 ## 2026-10-27 [docs]
 
 The owner expanded task `20261027-0537-tk-cleanup` to the four remaining Markdown
-statements and authorized Gitea main integration without a tag. Corrected architecture
+statements and authorized main integration without a tag. Corrected architecture
 clock and replay-lock claims, the NAT address-model summary, and appended a dated
 correction to the historical optimization plan's dependency constraint. Original process
 records are preserved. This follow-up changes Markdown only; `just docs` and `just typos`
