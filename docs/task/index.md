@@ -48,7 +48,7 @@ Each task is a single line linking to its detail file. All detailed information 
 - [-] [**20261008-0800-consumer-integration ns and nsgw on nsplane 0.11**](20261008-0800-consumer-integration.md) `P1`
 - [x] [**20261011-0101-local-identities Several local identities per engine**](20261011-0101-local-identities.md) `P1`
 - [-] [**20261012-1700-peer-keyed-gate Peer-keyed, address-family-agnostic flow gate**](20261012-1700-peer-keyed-gate.md) `P1`
-- [-] [**20261012-1830-no-arc-swap No arc-swap in the data path or the public API**](20261012-1830-no-arc-swap.md) `P1`
+- [x] [**20261012-1830-no-arc-swap No arc-swap in the data path or the public API**](20261012-1830-no-arc-swap.md) `P1`
 - [x] [**20261013-1300-lan-prefix-mappings Prefix address mappings for LAN prefixes**](20261013-1300-lan-prefix-mappings.md) `P1`
 - [x] [**20261013-1301-per-identity-routing Cryptokey routing per local identity**](20261013-1301-per-identity-routing.md) `P1`
 - [x] [**20261013-1600-perf-residuals Performance residuals left after 0.13/0.14**](20261013-1600-perf-residuals.md) `P2`
@@ -92,3 +92,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `P2`
 
 - [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `P2`
+- [ ] [**20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks**](20261029-0000-spent-forwarding-followups.md) `P3`
