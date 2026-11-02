@@ -512,8 +512,9 @@ mode.
   held under `Admission::Decide` the label of the held SYN or datagram.
   `TcpConnection::ingress_label`, `UdpFlow::ingress_label` and `PendingFlow::ingress_label`
   return it. `None` is a label of its own, never a wildcard. Connections the application
-  opens (`connect_tcp`) and sockets from `bind_udp` and `connect_udp` have no label and
-  their input is not checked (no `recv_labeled`).
+  opens with `connect_tcp` and sockets from `bind_udp` have no label and their input is
+  not checked. Connected UDP compares its label, including `None`, with every datagram.
+  The labeled active APIs below bind a label before the first send (no `recv_labeled`).
 - **Mismatches are dropped** and counted in `label_mismatch`: a TCP segment, a
   retransmitted SYN or a handshake ACK of an accepted connection with another label; a
   datagram of a flow with another label; a further SYN or datagram of a held lifetime with
@@ -583,6 +584,27 @@ complete input, a new resource and an identical reinstall), each stage of `revok
 `Failed` with a full table and a later `Retired`, tombstones and their bound;
 `nsplane-e2e`'s `tests/netstack_ingress_labels.rs` replaces a labeled incarnation between
 two engines while a new connection echoes.
+
+### Active connection and output labels
+
+`connect_tcp_labeled` and `connect_tcp_from_labeled` fix the label before the first SYN.
+`connect_udp_labeled` and `connect_udp_from_labeled` do the same for a connected UDP
+socket before its first send. The label must match subsequent input; a retained
+revocation tombstone refuses a new connect with `ConnectionAborted`.
+`UdpSocket::ingress_label` and `UdpReply::ingress_label` expose the immutable label.
+
+These lifetimes use the same registry and retirement receipts as inbound lifetimes.
+`revoke_label` also cancels a labeled TCP connect still waiting for its handshake.
+TCP segments, UDP sends and admission rejection replies carry the lifetime label when
+created, before entering output queues. Reusing a tuple cannot relabel queued output.
+A bounded label fence also covers queued stateless replies; a full fence table reports
+`Failed`, and a later call retries without reviving data handles. Packets already returned
+by `NetStackSource` remain outside the retirement proof.
+
+The additional behavior tests are `src/stack/tests/ingress_labels.rs` and
+`nsplane-e2e/tests/netstack_labels.rs`. The latter exercises real encrypted engines over
+an in-process channel; it is not a deployment or service acceptance test. Performance
+measurements above describe the released ingress-only implementation, not this extension.
 
 ### Graceful TCP egress drain
 

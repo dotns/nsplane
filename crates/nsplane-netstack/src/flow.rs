@@ -205,7 +205,7 @@ pub(crate) struct FlowState {
     /// The caller's label; never read by the stack.
     context: OnceLock<FlowContext>,
     /// The ingress label of the lifetime's first input: the tag of the SYN or the first
-    /// datagram. `None` for an unlabeled lifetime and for one the application opened.
+    /// datagram, or the explicit label of an application-opened lifetime.
     label: Option<NonZeroU64>,
     #[cfg(test)]
     observed_turn: AtomicU64,
@@ -545,6 +545,8 @@ impl Revocations {
 /// [`NetStackSource`]: crate::NetStackSource
 #[derive(Debug)]
 pub(crate) enum Fence {
+    /// Tagged output queued before a label revoke, including stateless replies.
+    Label { label: NonZeroU64, end: u64 },
     /// TCP packets from `local` to `peer` at egress positions in `[start, end)`, clipped
     /// to the positions possibly in the egress queue: one per revoked connection, of fixed
     /// size.
@@ -563,7 +565,7 @@ impl Fence {
     /// Whether every packet the fence holds back is behind `position`.
     pub(crate) fn passed(&mut self, position: u64) -> bool {
         match self {
-            Self::Tcp { end, .. } => *end <= position,
+            Self::Tcp { end, .. } | Self::Label { end, .. } => *end <= position,
             Self::Udp(positions) => {
                 while positions.front().is_some_and(|&held| held < position) {
                     positions.pop_front();
@@ -575,7 +577,12 @@ impl Fence {
 
     /// Whether the packet at `position`, a TCP packet from and to `tuple` if it is one,
     /// is held back.
-    fn holds(&self, position: u64, tuple: Option<(SocketAddr, SocketAddr)>) -> bool {
+    fn holds(
+        &self,
+        position: u64,
+        tuple: Option<(SocketAddr, SocketAddr)>,
+        tag: Option<NonZeroU64>,
+    ) -> bool {
         match self {
             Self::Tcp {
                 local,
@@ -584,6 +591,7 @@ impl Fence {
                 end,
             } => (*start..*end).contains(&position) && tuple == Some((*local, *peer)),
             Self::Udp(positions) => positions.front() == Some(&position),
+            Self::Label { label, end } => position < *end && tag == Some(*label),
         }
     }
 }
@@ -604,6 +612,14 @@ impl Fences {
     /// Adds `fence`, or returns it if the table is full.
     pub(crate) fn insert(&self, fence: Fence) -> Result<(), Fence> {
         let mut table = self.lock();
+        if let Fence::Label { label, end } = &fence && let Some(Fence::Label {
+            end: held_end, ..
+        }) = table.iter_mut().find(
+            |held| matches!(held, Fence::Label { label: held_label, .. } if held_label == label),
+        ) {
+            *held_end = (*held_end).max(*end);
+            return Ok(());
+        }
         if table.len() >= MAX_FENCES {
             return Err(fence);
         }
@@ -618,6 +634,7 @@ impl Fences {
     pub(crate) fn holds(
         &self,
         position: u64,
+        tag: Option<NonZeroU64>,
         tuple: impl FnOnce() -> Option<(SocketAddr, SocketAddr)>,
     ) -> bool {
         if !self.active.load(Ordering::SeqCst) {
@@ -630,7 +647,7 @@ impl Fences {
             return false;
         }
         let tuple = tuple();
-        table.iter().any(|fence| fence.holds(position, tuple))
+        table.iter().any(|fence| fence.holds(position, tuple, tag))
     }
 }
 

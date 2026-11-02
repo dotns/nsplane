@@ -47,7 +47,7 @@ mod wire;
 
 pub use self::handle::NetStackHandle;
 pub use self::netstack::{NetStack, NetStackSink, NetStackSource};
-pub(crate) use self::wire::{tcp_reset, tcp_segment};
+pub(crate) use self::wire::{tcp_reset, tcp_segment, tcp_tuple};
 
 /// Most ingress packets taken per driver iteration before smoltcp runs, so one burst
 /// cannot starve the bridge phase.

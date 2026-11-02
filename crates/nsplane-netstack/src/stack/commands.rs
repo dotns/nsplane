@@ -53,12 +53,14 @@ impl Driver {
         }
         match command {
             Command::Connect {
+                label,
                 remote,
                 local_port,
                 registration,
                 reply,
-            } => match self.open_connect(remote, local_port, registration) {
-                Ok((handle, registration)) => self.connecting.push(Connecting {
+            } => match self.open_connect(remote, local_port, registration, label) {
+                Ok((handle, registration, flow)) => self.connecting.push(Connecting {
+                    flow,
                     handle,
                     _registration: registration,
                     reply,
@@ -73,11 +75,12 @@ impl Driver {
                 let _ = reply.send(self.bind(local));
             }
             Command::ConnectUdp {
+                label,
                 local,
                 remote,
                 reply,
             } => {
-                let _ = reply.send(self.connect_udp(local, remote));
+                let _ = reply.send(self.connect_udp(local, remote, label));
             }
         }
     }
@@ -89,7 +92,11 @@ impl Driver {
         remote: SocketAddr,
         local_port: Option<u16>,
         registration: Option<Registration>,
-    ) -> io::Result<(SocketHandle, Registration)> {
+        label: Option<std::num::NonZeroU64>,
+    ) -> io::Result<(SocketHandle, Registration, Option<Arc<FlowState>>)> {
+        if label.is_some_and(|label| self.labels.revoked(label)) {
+            return Err(crate::tcp::revoked());
+        }
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -130,7 +137,18 @@ impl Driver {
         // Registered before the driver's next poll emits the SYN.
         let registration =
             registration.unwrap_or_else(|| self.owners.tcp(SocketAddr::new(local, port), remote));
-        Ok((self.sockets.add(socket), registration))
+        let handle = self.sockets.add(socket);
+        let local = SocketAddr::new(local, port);
+        let flow = label.map(|label| {
+            self.device.tcp_labels.insert((local, remote), Some(label));
+            self.labels.bind_active((remote, local), handle, label);
+            let flow = self
+                .tcp_state(handle, local, remote, self.position(), Some(label))
+                .0;
+            self.labels.register(&flow);
+            flow
+        });
+        Ok((handle, registration, flow))
     }
 
     /// The local ports of the stack's TCP connections (open or opening) and listeners.
@@ -197,7 +215,15 @@ impl Driver {
     }
 
     /// Connects a UDP socket, see [`NetStackHandle::connect_udp_from`].
-    fn connect_udp(&mut self, local: SocketAddr, remote: SocketAddr) -> io::Result<UdpSocket> {
+    fn connect_udp(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        label: Option<std::num::NonZeroU64>,
+    ) -> io::Result<UdpSocket> {
+        if label.is_some_and(|label| self.labels.revoked(label)) {
+            return Err(crate::tcp::revoked());
+        }
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -248,7 +274,8 @@ impl Driver {
             ));
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
-        let flow = FlowState::new(Target::UdpConnected(key), None, &self.revocations);
+        let flow = FlowState::new(Target::UdpConnected(key), label, &self.revocations);
+        self.labels.register(&flow);
         self.connected.insert(key, (tx, Arc::clone(&flow)));
         let registration = self.owners.udp_flow(local, remote);
         Ok(UdpSocket::new(

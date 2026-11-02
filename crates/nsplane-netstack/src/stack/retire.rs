@@ -127,6 +127,19 @@ impl Driver {
                     self.release_handshake(handle);
                     flow.set_end(self.position());
                 }
+                if let Some(index) = self.connecting.iter().position(|connecting| {
+                    connecting
+                        .flow
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, flow))
+                }) {
+                    let connecting = self.connecting.swap_remove(index);
+                    self.sockets.remove(connecting.handle);
+                    self.labels.release((peer, local), handle);
+                    self.device.tcp_labels.remove(&(local, peer));
+                    let _ = connecting.reply.send(Err(crate::tcp::revoked()));
+                    flow.set_end(self.position());
+                }
                 if !self.waiting.is_empty() {
                     self.waiting.retain(|conn| !Arc::ptr_eq(conn.flow(), flow));
                 }

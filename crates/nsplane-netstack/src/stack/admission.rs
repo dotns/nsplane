@@ -23,10 +23,16 @@ use super::wire::tcp_reset;
 
 impl Driver {
     /// Answers the bare SYN `packet` of `key` with RST for `max_connections`.
-    pub(super) fn reject_connection_limit(&mut self, key: &pending::Key, packet: &[u8]) {
+    pub(super) fn reject_connection_limit(
+        &mut self,
+        key: &pending::Key,
+        packet: &[u8],
+        label: Option<NonZeroU64>,
+    ) {
         stats::add(&self.stats.rejected_connection_limit, 1);
         self.emit(key, FlowEventReason::ConnectionLimit);
-        if let Some(reset) = tcp_reset(packet) {
+        if let Some(mut reset) = tcp_reset(packet) {
+            reset.set_tag(label);
             self.push_reply(reset);
         }
     }
@@ -94,7 +100,7 @@ impl Driver {
                 pending::Held::Tcp(syn) => {
                     if self.at_connection_limit(demand) {
                         if flow.undeliver(Undelivered::ConnectionLimit) {
-                            self.reject_connection_limit(&key, syn.as_packet());
+                            self.reject_connection_limit(&key, syn.as_packet(), syn.tag());
                         }
                         continue;
                     }
@@ -102,6 +108,9 @@ impl Driver {
                     self.emit(&key, FlowEventReason::Admitted);
                     *demand.entry(key.local.port()).or_insert(0) += 1;
                     self.labels.record_syn(syn.as_packet(), syn.tag());
+                    self.device
+                        .tcp_labels
+                        .insert((key.local, key.remote), syn.tag());
                     self.device.inject(syn);
                     if let Some(table) = self.pending.as_mut() {
                         table.admit(flow);
@@ -184,7 +193,15 @@ impl Driver {
             stats::add(counter, 1);
             return;
         }
-        self.hold(key, pending::Held::Udp { payload, packet }, label);
+        self.hold(
+            key,
+            pending::Held::Udp {
+                payload,
+                packet,
+                label,
+            },
+            label,
+        );
     }
 
     /// Counts and reports the new flow from `remote` to `local` admitted in transparent

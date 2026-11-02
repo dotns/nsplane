@@ -215,3 +215,20 @@ started below load 3: medians +1.4 % (`netstack_send/streams_1`), +1.5 % (`strea
 +1.6 % (`_1cpu`), +0.4 / +1.1 % (`netstack_udp_flow_send/flows_{1,4}`), +0.2 / -1.3 %
 (`_1cpu`): within the noise plus 3 %; single rounds up to +9.5 % only where the load rose
 during the pair.
+
+## Active-lifetime branch integration (2026-10-29)
+
+The released W5 status above describes ingress-only behavior. The consumer-approved
+extension, merged with main `8d5d21055d01` on `feat/packet-lifetime-labels`, keeps active
+TCP, connected UDP and output labels on the upstream lifetime implementation. It retains
+both ingress behavior suites and both encrypted-engine tests. The old private
+`Revocations` registry and its ten implementation-specific tests are replaced by the
+upstream registry and its behavior tests.
+
+Validation on macOS: 211 netstack unit tests, 19 netstack integration tests, 141 packet
+unit tests and six doctests pass. Both encrypted-engine label tests pass, as do targeted
+all-target clippy and formatting. The additional label suite was rerun after fence retry
+coalescing. Queue-fenced input uses upstream `retired_drops`; retained tombstones use
+`label_revoked`. Mixed fragment labels are counted on the first mismatch, including an
+incomplete datagram. These are library tests, not consumer service acceptance, and the
+released performance results above do not establish this extension's performance.

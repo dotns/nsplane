@@ -29,6 +29,7 @@ use crate::config::{Admission, NetStackConfig};
 #[derive(Debug)]
 pub(super) enum Command {
     Connect {
+        label: Option<NonZeroU64>,
         remote: SocketAddr,
         /// The local port, or `None` for an ephemeral one.
         local_port: Option<u16>,
@@ -41,6 +42,7 @@ pub(super) enum Command {
         reply: oneshot::Sender<io::Result<UdpSocket>>,
     },
     ConnectUdp {
+        label: Option<NonZeroU64>,
         local: SocketAddr,
         remote: SocketAddr,
         reply: oneshot::Sender<io::Result<UdpSocket>>,
@@ -130,7 +132,7 @@ impl NetStackHandle {
     /// [`io::ErrorKind::TimedOut`] if it does not answer within 20 seconds and
     /// [`io::ErrorKind::BrokenPipe`] once the stack stopped.
     pub async fn connect_tcp(&self, remote: SocketAddr) -> io::Result<TcpConnection> {
-        self.connect(remote, None).await
+        self.connect(remote, None, None).await
     }
 
     /// Opens a TCP connection from the stack's `local_port` to `remote`, like
@@ -141,7 +143,31 @@ impl NetStackHandle {
         local_port: u16,
         remote: SocketAddr,
     ) -> io::Result<TcpConnection> {
-        self.connect(remote, (local_port != 0).then_some(local_port))
+        self.connect(remote, (local_port != 0).then_some(local_port), None)
+            .await
+    }
+
+    /// Opens a TCP connection with `label` fixed before its initial SYN.
+    /// The label is never changed and must match every inbound segment.
+    /// Errors are those of [`connect_tcp`](Self::connect_tcp), plus
+    /// `ConnectionAborted` when the label has a retained revocation tombstone.
+    pub async fn connect_tcp_labeled(
+        &self,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<TcpConnection> {
+        self.connect(remote, None, Some(label)).await
+    }
+
+    /// Like [`connect_tcp_from`](Self::connect_tcp_from), with an immutable label.
+    /// A remembered revoked label fails with `ConnectionAborted`.
+    pub async fn connect_tcp_from_labeled(
+        &self,
+        local_port: u16,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<TcpConnection> {
+        self.connect(remote, (local_port != 0).then_some(local_port), Some(label))
             .await
     }
 
@@ -149,6 +175,7 @@ impl NetStackHandle {
         &self,
         remote: SocketAddr,
         local_port: Option<u16>,
+        label: Option<NonZeroU64>,
     ) -> io::Result<TcpConnection> {
         // An explicit port gives the whole tuple now, so the connect is visible to `owns`
         // before the command reaches the driver.
@@ -158,6 +185,7 @@ impl NetStackHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Connect {
+                label,
                 remote,
                 local_port,
                 registration,
@@ -212,9 +240,46 @@ impl NetStackHandle {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> io::Result<UdpSocket> {
+        self.connect_datagram(local, remote, None).await
+    }
+
+    /// Opens a connected UDP socket with `label` fixed before its first send.
+    /// Errors are those of [`connect_udp`](Self::connect_udp), plus
+    /// `ConnectionAborted` when the label has a retained revocation tombstone.
+    pub async fn connect_udp_labeled(
+        &self,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<UdpSocket> {
+        self.connect_datagram(
+            SocketAddr::new(unspecified(remote.ip()), 0),
+            remote,
+            Some(label),
+        )
+        .await
+    }
+
+    /// Like [`connect_udp_from`](Self::connect_udp_from), with an immutable label.
+    /// A remembered revoked label fails with `ConnectionAborted`.
+    pub async fn connect_udp_from_labeled(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        label: NonZeroU64,
+    ) -> io::Result<UdpSocket> {
+        self.connect_datagram(local, remote, Some(label)).await
+    }
+
+    async fn connect_datagram(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        label: Option<NonZeroU64>,
+    ) -> io::Result<UdpSocket> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::ConnectUdp {
+                label,
                 local,
                 remote,
                 reply,
@@ -258,8 +323,10 @@ impl NetStackHandle {
     /// Labels of revoked lifetimes must not be reused, and input of the label queued on the
     /// caller's side should be cancelled before the call: the tombstone is a safety net.
     /// After `Retired`, the same tuple opens a fresh lifetime with its new label. Connections
-    /// and sockets the application opened have no label and are never revoked here. The
-    /// proof boundary of [`FlowControl::revoke`] applies.
+    /// and connected UDP sockets opened with a labeled API are covered, including a TCP
+    /// handshake still in progress. Unlabeled application-opened sockets are unaffected.
+    /// Output packets retain the lifetime label from creation, including queued replies.
+    /// The proof boundary of [`FlowControl::revoke`] applies.
     ///
     /// [`FlowControl::revoke`]: crate::FlowControl::revoke
     pub fn revoke_label(&self, label: NonZeroU64) -> RetirementReceipt {
@@ -402,7 +469,11 @@ impl HandOut for UdpFlow {
     }
 }
 
-impl HandOut for PendingFlow {}
+impl HandOut for PendingFlow {
+    fn hand_out(&self) -> bool {
+        !self.control().is_revoked()
+    }
+}
 
 impl HandOut for FlowEvent {}
 

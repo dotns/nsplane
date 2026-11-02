@@ -142,6 +142,9 @@ impl Driver {
                         packet
                     };
                     self.labels.record_syn(packet.as_packet(), label);
+                    if let Some((remote, local)) = super::tcp_tuple(packet.as_packet()) {
+                        self.device.tcp_labels.insert((local, remote), label);
+                    }
                     *demand.entry(dst_port).or_insert(0) += 1;
                     return self.device.inject(packet);
                 }
@@ -207,7 +210,7 @@ impl Driver {
             return None;
         }
         if self.at_connection_limit(demand) {
-            self.reject_connection_limit(&key, packet.as_packet());
+            self.reject_connection_limit(&key, packet.as_packet(), packet.tag());
             return None;
         }
         if self.pending.is_some() {
@@ -314,8 +317,11 @@ impl Driver {
             label,
         } = datagram;
         if !self.connected.is_empty()
-            && let Some((socket, _)) = self.connected.get(&(src, dst))
+            && let Some((socket, state)) = self.connected.get(&(src, dst))
         {
+            if !socket.is_closed() && state.label() != label {
+                return stats::add(&self.stats.label_mismatch, 1);
+            }
             match socket.try_send((src, payload)) {
                 Ok(()) => return,
                 Err(TrySendError::Full(_)) => {

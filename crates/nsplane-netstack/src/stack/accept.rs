@@ -23,6 +23,7 @@ use super::{CONNECT_TIMEOUT, Driver, Inbound};
 
 /// A `connect_tcp` waiting for its handshake.
 pub(super) struct Connecting {
+    pub(super) flow: Option<Arc<FlowState>>,
     pub(super) handle: SocketHandle,
     /// Keeps the connect's tuple visible to `owns` while it is in SYN-SENT.
     pub(super) _registration: Registration,
@@ -125,6 +126,7 @@ impl Driver {
     pub(super) fn finish_connects(&mut self, now: SmolInstant) {
         for connecting in std::mem::take(&mut self.connecting) {
             let Connecting {
+                flow,
                 handle,
                 _registration: registration,
                 reply,
@@ -136,9 +138,16 @@ impl Driver {
                 tcp::State::Established | tcp::State::CloseWait => {
                     socket.set_timeout(None);
                     // A caller that gave up drops the connection, which closes it.
-                    let _ = reply.send(Ok(self.adopt(handle, now, start, None)));
+                    let _ = reply.send(Ok(self.adopt(handle, now, start, flow)));
                 }
                 tcp::State::Closed => {
+                    if let Some(flow) = &flow {
+                        if let Some(&Target::Tcp { local, peer, .. }) = flow.target() {
+                            self.labels.release((peer, local), handle);
+                            self.device.tcp_labels.remove(&(local, peer));
+                        }
+                        flow.set_end(self.position());
+                    }
                     self.sockets.remove(handle);
                     let error = if now >= started + CONNECT_TIMEOUT {
                         io::Error::new(io::ErrorKind::TimedOut, "TCP handshake timed out")
@@ -152,6 +161,7 @@ impl Driver {
                         socket.abort();
                     }
                     self.connecting.push(Connecting {
+                        flow,
                         handle,
                         _registration: registration,
                         reply,
@@ -230,6 +240,7 @@ impl Driver {
     pub(super) fn release_inbound(&mut self) {
         let (sockets, stats, end) = (&self.sockets, &self.stats, self.position());
         let labels = &mut self.labels;
+        let output_labels = &mut self.device.tcp_labels;
         self.inbound.retain(|&handle, inbound| {
             let failed = matches!(
                 sockets.get::<tcp::Socket<'_>>(handle).state(),
@@ -238,6 +249,7 @@ impl Driver {
             if failed {
                 stats::add(&stats.handshake_failed, 1);
                 labels.release(inbound.tuple, handle);
+                output_labels.remove(&(inbound.tuple.1, inbound.tuple.0));
                 if let Some(flow) = &inbound.flow {
                     flow.set_end(end);
                     flow.undeliver(Undelivered::HandshakeFailed);
@@ -254,6 +266,9 @@ impl Driver {
             return;
         };
         self.labels.release(inbound.tuple, handle);
+        self.device
+            .tcp_labels
+            .remove(&(inbound.tuple.1, inbound.tuple.0));
         let port = inbound.tuple.1.port();
         if let Some(handles) = self.listeners.get_mut(&port) {
             handles.retain(|&listener| listener != handle);
@@ -319,7 +334,7 @@ impl Driver {
                 }
             }
         }
-        self.labels.expire_syns();
+        self.labels.expire_syns(&mut self.device.tcp_labels);
         let Some(refused) = self.pending.as_mut().map(|table| table.take_refused()) else {
             return;
         };

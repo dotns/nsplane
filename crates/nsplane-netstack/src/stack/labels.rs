@@ -188,6 +188,15 @@ impl Labels {
         }
     }
 
+    pub(super) fn revoked(&self, label: NonZeroU64) -> bool {
+        self.tombstones.contains(&label)
+    }
+
+    /// Records an application-opened connection before its first SYN leaves.
+    pub(super) fn bind_active(&mut self, tuple: Tuple, socket: SocketHandle, label: NonZeroU64) {
+        self.insert(tuple, Some(label), Some(socket));
+    }
+
     /// Whether unlabeled TCP input must be looked up: some inbound lifetime has a label.
     pub(super) const fn tcp_labeled(&self) -> bool {
         self.tcp_labeled > 0
@@ -264,7 +273,7 @@ impl Labels {
     }
 
     /// Forgets the SYNs of this turn that no listener socket took.
-    pub(super) fn expire_syns(&mut self) {
+    pub(super) fn expire_syns(&mut self, output_labels: &mut crate::device::TcpLabels) {
         for tuple in std::mem::take(&mut self.syns) {
             if self
                 .tcp
@@ -272,6 +281,7 @@ impl Labels {
                 .is_some_and(|entry| entry.socket.is_none())
             {
                 self.remove(&tuple);
+                output_labels.remove(&(tuple.1, tuple.0));
             }
         }
     }
@@ -398,6 +408,32 @@ impl Driver {
             reassembler.discard_tagged(label);
         }
         fenced &= self.retry_fences(label);
+        let mut dropped = 0;
+        for packet in &mut self.device.tx_queue {
+            if packet.tag() == Some(label) {
+                *packet = super::wire::placeholder();
+                dropped += 1;
+            }
+        }
+        stats::add(&self.stats.retired, dropped);
+        if self.egress.capacity() != self.egress.max_capacity()
+            && let Err(fence) = self.fences.insert(Fence::Label {
+                label,
+                end: self.sent,
+            })
+        {
+            if let Some((_, Fence::Label { end, .. })) = self
+                .labels
+                .unfenced
+                .iter_mut()
+                .find(|(held, fence)| *held == label && matches!(fence, Fence::Label { .. }))
+            {
+                *end = (*end).max(self.sent);
+            } else {
+                self.labels.unfenced.push((label, fence));
+            }
+            fenced = false;
+        }
         let lifetimes = self.labels.lifetimes.remove(&label).unwrap_or_default();
         self.labels.registered -= lifetimes.len();
         for flow in lifetimes.iter().filter_map(Weak::upgrade) {

@@ -289,6 +289,7 @@ impl Driver {
         if let Some(conn) = self.conns.remove(&handle) {
             if let Some(&Target::Tcp { local, peer, .. }) = conn.flow.target() {
                 self.labels.release((peer, local), handle);
+                self.device.tcp_labels.remove(&(local, peer));
             }
             conn.flow.set_end(end);
             conn.release();

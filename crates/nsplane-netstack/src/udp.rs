@@ -201,6 +201,7 @@ impl UdpOut {
         }
         let mut packet =
             build_udp(src, dst, payload).ok_or_else(|| invalid("datagram exceeds the MTU"))?;
+        packet.set_tag(flow.label());
         if packet.len() > self.mtu {
             if !self.allow_fragmentation || !src.is_ipv4() {
                 return Err(invalid("datagram exceeds the MTU"));
@@ -336,6 +337,11 @@ pub struct UdpReply {
 }
 
 impl UdpReply {
+    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.flow.label()
+    }
+
     pub(crate) const fn new(
         local: SocketAddr,
         peer: SocketAddr,
@@ -400,6 +406,11 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// The immutable label of this lifetime; `None` is the unlabeled lifetime.
+    pub fn ingress_label(&self) -> Option<NonZeroU64> {
+        self.flow.label()
+    }
+
     pub(crate) const fn new(
         registration: Registration,
         local: SocketAddr,

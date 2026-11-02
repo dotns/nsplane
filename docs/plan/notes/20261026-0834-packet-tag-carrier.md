@@ -168,7 +168,7 @@ breaking change; see the breaking-change list.
 | `dispatch_flow` -> flow table entry and flow queue (`mpsc` of `Bytes`) | | the label is stored with the flow entry and compared on the lookup `dispatch_flow` already makes; the queue item gains nothing |
 | `dispatch_udp` -> connected / bound socket queues (`mpsc` of `(SocketAddr, Bytes)`) | | unchanged: no `recv_labeled` in release C (open item for the gateway) |
 | `icmp` (`pmtu::parse`, `reduce_mss`) | borrow | an unlabeled ICMP error is accepted for a labeled connection; one with another label than the connection it quotes is ignored and counted |
-| egress (`VirtualDevice` tx tokens from the device pool, `UdpReply`, rejections from `pending.rs`) | new | untagged; labeling egress is not requested and not proposed |
+| egress (`VirtualDevice` tx tokens from the device pool, `UdpReply`, rejections from `pending.rs`) | new | released W5: untagged; the approved active-lifetime extension below retains the label at packet creation |
 
 ## Per-packet budget
 
@@ -669,3 +669,14 @@ heading; the reference pages (`nsplane-packet.md`, `nsplane-netstack.md`, `nspla
   `ENCAPSULATE_ERROR` added to the drop sites; `Sent { bytes }` defined; `local_barrier` counts
   `TrackedSender` packets at acceptance; the barrier's count window recorded as O15; the gateway
   adoption path rewritten; tests extended for each.
+
+## Active-lifetime branch integration (2026-10-29)
+
+The consumer-approved extension on `feat/packet-lifetime-labels` adds active TCP and
+connected UDP labels and retains labels on newly created output packets. It is outside
+the released ingress-only W5 scope described above. Integrating main `8d5d21055d01`
+uses its TCP lifetime index, label registry, retirement receipts and fence retry rules;
+it does not retain the branch's older parallel revocation registry. Active connections
+join that registry before their first output. See the
+[netstack reference](../../reference/nsplane-netstack.md#active-connection-and-output-labels)
+and the [W5 task](../../task/20261027-0305-netstack-ingress-labels.md).

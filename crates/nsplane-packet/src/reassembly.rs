@@ -75,8 +75,8 @@ pub struct ReassemblyStats {
     pub overlap: u64,
     /// Fragments dropped as invalid, and datagrams whose fragments disagree on the length.
     pub malformed: u64,
-    /// Datagrams completed by [`Reassembler::push_tagged`] whose fragments carried
-    /// different tags ([`FragmentTags::Mixed`]); they count in `reassembled` too.
+    /// Datagrams whose accepted fragments first carried different tags
+    /// ([`FragmentTags::Mixed`]), counted once even if they never complete.
     pub mixed_tags: u64,
 }
 
@@ -330,10 +330,11 @@ impl Reassembler {
         self.push_tagged(packet, None, now).0
     }
 
-    /// Like [`push`](Self::push), recording `tag` with the fragment: a completed datagram
-    /// reports its fragments' tags, [`FragmentTags::Mixed`] (counted in
-    /// [`ReassemblyStats::mixed_tags`]) if they differ, an exact duplicate included. Every
-    /// other outcome reports `Same(tag)`, the packet's own tag.
+    /// Like [`push`](Self::push), recording `tag` with the fragment: held and completed
+    /// datagrams report their fragments' tags, [`FragmentTags::Mixed`] if they differ,
+    /// an exact duplicate included. The first mismatch per datagram increments
+    /// [`ReassemblyStats::mixed_tags`]. Pass and dropped outcomes report `Same(tag)`,
+    /// the packet's own tag.
     ///
     /// A caller that labels packets by their tag drops a `Mixed` datagram rather than handle
     /// it untagged: a merge never turns tagged input into an untagged packet.
@@ -377,9 +378,13 @@ impl Reassembler {
             }
             return (Outcome::Dropped, own);
         }
-        datagram.tags = datagram.tags.with(tag);
+        let tags = datagram.tags.with(tag);
+        if tags == FragmentTags::Mixed && datagram.tags != FragmentTags::Mixed {
+            self.stats.mixed_tags += 1;
+        }
+        datagram.tags = tags;
         let Some(header_len) = datagram.header.as_ref().map(Vec::len) else {
-            return (Outcome::Held, own);
+            return (Outcome::Held, tags);
         };
         if datagram
             .total
@@ -390,14 +395,10 @@ impl Reassembler {
             return (Outcome::Dropped, own);
         }
         let Some(complete) = datagram.assemble() else {
-            return (Outcome::Held, own);
+            return (Outcome::Held, tags);
         };
-        let tags = datagram.tags;
         self.datagrams.remove(&piece.key);
         self.stats.reassembled += 1;
-        if tags == FragmentTags::Mixed {
-            self.stats.mixed_tags += 1;
-        }
         (Outcome::Complete(complete), tags)
     }
 

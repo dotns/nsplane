@@ -82,11 +82,7 @@ impl Driver {
                 Some(packet)
             }
             // `Mixed`: never handed on untagged or under one of its labels.
-            (Outcome::Complete(_), _) => {
-                stats::add(&self.stats.label_mismatch, 1);
-                None
-            }
-            (Outcome::Held | Outcome::Dropped, _) => None,
+            (Outcome::Complete(_) | Outcome::Held | Outcome::Dropped, _) => None,
         };
         self.count_reassembly();
         routed
@@ -177,6 +173,10 @@ impl Driver {
         };
         let now = reassembler.stats();
         let before = std::mem::replace(&mut self.reassembly_counted, now);
+        stats::add(
+            &self.stats.label_mismatch,
+            now.mixed_tags - before.mixed_tags,
+        );
         stats::add(
             &self.stats.reassembled,
             now.reassembled - before.reassembled,

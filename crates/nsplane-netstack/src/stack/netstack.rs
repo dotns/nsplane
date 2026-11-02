@@ -214,7 +214,7 @@ impl NetStackSource {
         }
         if self
             .fences
-            .holds(position, || tcp_tuple(packet.as_packet()))
+            .holds(position, packet.tag(), || tcp_tuple(packet.as_packet()))
         {
             stats::add(&self.stats.retired, 1);
             return false;

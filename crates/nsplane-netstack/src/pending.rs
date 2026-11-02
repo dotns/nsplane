@@ -166,17 +166,32 @@ pub(crate) enum Held {
     /// The bare SYN.
     Tcp(PacketBuf),
     /// The first datagram's payload and the whole packet it is a view into.
-    Udp { payload: Bytes, packet: Bytes },
+    Udp {
+        payload: Bytes,
+        packet: Bytes,
+        label: Option<NonZeroU64>,
+    },
 }
 
 impl Held {
     /// The packet that answers a rejection, sourced from the original destination: a RST
     /// for a SYN, a port unreachable for a datagram.
-    pub(crate) fn rejection(&self, mtu: u16) -> Option<PacketBuf> {
+    pub(crate) const fn label(&self) -> Option<std::num::NonZeroU64> {
         match self {
+            Self::Tcp(packet) => packet.tag(),
+            Self::Udp { label, .. } => *label,
+        }
+    }
+
+    /// The packet that answers a rejection, sourced from the original destination: a RST
+    /// for a SYN, a port unreachable for a datagram.
+    pub(crate) fn rejection(&self, mtu: u16) -> Option<PacketBuf> {
+        let mut reply = match self {
             Self::Tcp(syn) => crate::stack::tcp_reset(syn.as_packet()),
             Self::Udp { packet, .. } => port_unreachable(packet, mtu),
-        }
+        }?;
+        reply.set_tag(self.label());
+        Some(reply)
     }
 }
 

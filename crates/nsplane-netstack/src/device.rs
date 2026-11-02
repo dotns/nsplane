@@ -1,7 +1,9 @@
 //! The smoltcp device between the driver's queues and the interface.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use nsplane_packet::{PacketBuf, PacketPool};
@@ -9,7 +11,11 @@ use smoltcp::iface::{Interface, PollIngressSingleResult, PollResult, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
+use crate::stack::tcp_tuple;
 use crate::stats::{self, Counters};
+
+/// TCP lifetime labels, indexed by the outbound tuple.
+pub(crate) type TcpLabels = HashMap<(SocketAddr, SocketAddr), Option<NonZeroU64>>;
 
 /// Idle buffers the device keeps for reuse.
 const POOL_SIZE: usize = 256;
@@ -49,6 +55,8 @@ pub(crate) struct VirtualTxToken<'a> {
     mtu: usize,
     pool: &'a RefCell<PacketPool>,
     stats: &'a Counters,
+    labels: &'a TcpLabels,
+    reply_label: Option<NonZeroU64>,
 }
 
 impl TxToken for VirtualTxToken<'_> {
@@ -63,6 +71,15 @@ impl TxToken for VirtualTxToken<'_> {
         );
         packet.set_len(len);
         let result = f(packet.as_packet_mut());
+        // Fix the label before the first output queue, never at dequeue time.
+        let label = if self.labels.is_empty() {
+            self.reply_label
+        } else {
+            tcp_tuple(packet.as_packet())
+                .and_then(|tuple| self.labels.get(&tuple).copied())
+                .unwrap_or(self.reply_label)
+        };
+        packet.set_tag(label);
         if self.queue.len() < self.limit {
             self.queue.push_back(packet);
         } else {
@@ -77,6 +94,7 @@ impl TxToken for VirtualTxToken<'_> {
 
 /// Virtual IP-medium device: ingress packets in, egress packets out.
 pub(crate) struct VirtualDevice {
+    pub(crate) tcp_labels: TcpLabels,
     pub(crate) rx_queue: VecDeque<PacketBuf>,
     pub(crate) tx_queue: VecDeque<PacketBuf>,
     tx_limit: usize,
@@ -89,6 +107,7 @@ impl VirtualDevice {
     /// Creates a device with an `mtu`-byte MTU and an egress backlog of `tx_limit` packets.
     pub(crate) fn new(mtu: u16, tx_limit: usize, stats: Arc<Counters>) -> Self {
         Self {
+            tcp_labels: HashMap::new(),
             rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             tx_limit,
@@ -163,6 +182,7 @@ impl Device for VirtualDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.rx_queue.pop_front()?;
+        let reply_label = packet.tag();
         let rx = VirtualRxToken {
             packet,
             pool: &self.pool,
@@ -173,6 +193,8 @@ impl Device for VirtualDevice {
             mtu: self.mtu,
             pool: &self.pool,
             stats: &self.stats,
+            labels: &self.tcp_labels,
+            reply_label,
         };
         Some((rx, tx))
     }
@@ -184,6 +206,8 @@ impl Device for VirtualDevice {
             mtu: self.mtu,
             pool: &self.pool,
             stats: &self.stats,
+            labels: &self.tcp_labels,
+            reply_label: None,
         })
     }
 
