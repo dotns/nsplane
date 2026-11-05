@@ -93,3 +93,5 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `P2`
 - [x] [**20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks**](20261029-0000-spent-forwarding-followups.md) `P3`
+
+- [x] [**20261105-1253-echo-code-state Enforce Echo code and state correlation**](20261105-1253-echo-code-state.md) `P1`

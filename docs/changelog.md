@@ -737,3 +737,14 @@ Receive-path audit confirmed error logging/drop precedes core accounting and eve
 replay/session and authenticated-packet timers retain existing invalid-IP semantics.
 Destination extraction is downstream of validation and the packet parser already checks
 IPv4 bounds. Baseline alignment after integration is noted on existing tk #743.
+
+## 2026-11-05 [BUG-P1]
+
+Echo requests and replies require code zero before Gate admission or state reuse.
+Echo state accepts only the original request direction and the correlated reverse reply.
+Other ICMP codes, quoted errors, PMTU and TCP/UDP behavior are preserved. Public APIs
+and policy encodings are unchanged.
+
+Prior validation passed all seven focused regressions, all 330 ACL tests and the full
+workspace checks, including 2496 tests with 34 existing ignored tests. The independent
+reference model retains its seeds and test populations with the corrected direction rule.

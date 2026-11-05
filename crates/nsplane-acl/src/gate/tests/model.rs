@@ -1062,6 +1062,13 @@ impl Model {
         if initial_syn && (flow.close.closing() || direction != flow.initiator) {
             return Some(decision(enforce, false, GateReason::ReverseNewFlow, None));
         }
+        if let Kind::Echo(kind, _) = packet.kind {
+            let request = echo(packet.v6(), true);
+            let expected = echo(packet.v6(), direction == flow.initiator);
+            if flow.opened != (Transport::Icmp { icmp_type: request }) || kind != expected {
+                return Some(decision(enforce, false, GateReason::ReverseNewFlow, None));
+            }
+        }
         Self::touch(flow, flow_key.protocol, now);
         if let Fragment::First(id) = packet.fragment
             && !self.remember(

@@ -307,6 +307,12 @@ and IPv6 packets.
   (`GateLimits`, defaults 16,384 flows, 2,048 per peer, 4,096 fragments): a full table
   sweeps expired entries and then fails closed with `StateCapacity`, never evicting a live
   entry.
+- **Echo.** IPv4 types 8/0 and IPv6 types 128/129 require code zero before
+  granting or reusing state; nonzero codes are `Malformed`. State admits the
+  original request in its initiating direction and the exact reply in the reverse
+  direction, with the same identifier. Other types or incorrect directions cannot
+  reuse Echo state (`ReverseNewFlow`); related errors still use the quoted-flow
+  path. Other ICMP codes and PMTU handling retain their existing behavior.
 - **Holds.** Inbound and outbound `HoldRule`s (peers, local and remote prefixes) deny with
   `Held` in every mode before any scope is consulted, malformed packets with readable
   addresses included; `GateHolds::release` exempts exact `(PeerId, address)` pairs from the

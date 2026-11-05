@@ -465,6 +465,7 @@ fn audit_families(gate: &FlowGate) -> (usize, usize) {
 }
 
 mod concurrency;
+mod echo_code;
 mod events;
 mod grant_kinds;
 mod grants_flow;

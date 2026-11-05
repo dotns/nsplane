@@ -109,6 +109,13 @@
 //! An out-of-scope denial counts as an enforced denial and emits a decision
 //! event like any denial.
 //!
+//! Echo requests and replies (IPv4 types 8/0, IPv6 types 128/129) require
+//! code zero; any other code is malformed before state admission or reuse.
+//! Echo state admits only the original request in its initiating direction
+//! and the matching reply in the opposite direction. Other types cannot
+//! reuse it, except related errors through their quoted flow. Other ICMP
+//! codes and error/PMTU handling are unchanged.
+//!
 //! # IPv6
 //!
 //! IPv6 packets take the same steps, with these rules:

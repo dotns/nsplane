@@ -52,13 +52,19 @@ const fn upper_layer(protocol: u8, icmp: u8, payload: &[u8]) -> Option<Upper> {
             None,
             None,
         ),
-        _ if protocol == icmp && payload.len() >= 8 => (
-            None,
-            None,
-            0,
-            Some(payload[0]),
-            Some(u16::from_be_bytes([payload[4], payload[5]])),
-        ),
+        _ if protocol == icmp && payload.len() >= 8 => {
+            // Echo has no nonzero codes; reject before granting or reusing state.
+            if matches!((icmp, payload[0]), (1, 0 | 8) | (58, 128 | 129)) && payload[1] != 0 {
+                return None;
+            }
+            (
+                None,
+                None,
+                0,
+                Some(payload[0]),
+                Some(u16::from_be_bytes([payload[4], payload[5]])),
+            )
+        }
         6 | 17 => return None,
         _ if protocol == icmp => return None,
         _ => (None, None, 0, None, None),
@@ -227,6 +233,20 @@ impl<A: GateAddr> PacketMeta<A> {
             protocol if protocol == A::ICMP => self.icmp_type.is_some_and(A::is_reverse_only_icmp),
             _ => false,
         }
+    }
+
+    /// Echo state admits only the original request or its reverse reply.
+    pub(super) fn matches_echo_state(self, opened: Transport, same_direction: bool) -> bool {
+        if self.protocol != A::ICMP {
+            return true;
+        }
+        let (request, reply) = if A::ICMP == 1 { (8, 0) } else { (128, 129) };
+        let opened_echo = matches!(opened, Transport::Icmp { icmp_type } if icmp_type == request);
+        let packet_echo = self.icmp_type == Some(request) || self.icmp_type == Some(reply);
+        if !opened_echo && !packet_echo {
+            return true;
+        }
+        opened_echo && self.icmp_type == Some(if same_direction { request } else { reply })
     }
 
     pub(super) const fn tcp_terminal(self) -> bool {

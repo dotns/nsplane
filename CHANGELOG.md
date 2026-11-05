@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hybrid` example's splitter wrapper forwards `send_batch_spent`.
 
 ### Fixed
+- `FlowGate` rejects nonzero-code IPv4/IPv6 Echo requests and replies before granting or
+  reusing state. Echo state accepts only the original request direction and the correlated
+  reverse reply; other ICMP error codes and PMTU handling are preserved.
 - Encrypted ingress rejects IPv4 packets whose IHL is below five or whose declared total
   length is smaller than their header, before counting or delivering plaintext data.
 - Plaintext ingress rejects IPv4 packets with IHL below five or a declared total length

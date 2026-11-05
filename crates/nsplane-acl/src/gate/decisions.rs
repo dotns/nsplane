@@ -448,6 +448,10 @@ impl FlowGate {
                 {
                     return false;
                 }
+                if !meta.matches_echo_state(existing.opened, input.direction == existing.initiator)
+                {
+                    return false;
+                }
                 existing.touch::<A>(flow_key.protocol, now, &counts.timeouts);
                 input.found_flow(existing);
                 true
