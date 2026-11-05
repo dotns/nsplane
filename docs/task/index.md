@@ -95,3 +95,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261029-0000-spent-forwarding-followups Spent buffer forwarding: the remaining sinks**](20261029-0000-spent-forwarding-followups.md) `P3`
 
 - [x] [**20261105-1253-echo-code-state Enforce Echo code and state correlation**](20261105-1253-echo-code-state.md) `P1`
+
+- [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `P1`

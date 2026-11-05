@@ -748,3 +748,10 @@ and policy encodings are unchanged.
 Prior validation passed all seven focused regressions, all 330 ACL tests and the full
 workspace checks, including 2496 tests with 34 existing ignored tests. The independent
 reference model retains its seeds and test populations with the corrected direction rule.
+
+## 2026-11-05 [release]
+
+Prepared 0.22.0 workspace versions, internal path requirements, local lockfile package
+versions and release notes. Runtime code, tests, external dependencies, compiler settings
+and guide URLs are unchanged. The versioned revision requires the complete workspace
+checks before publication.

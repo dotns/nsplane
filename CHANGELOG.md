@@ -5,6 +5,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-05
+
 ### Changed
 - `Splitter::send_batch_spent` hands each run of consecutive packets for one sink to that
   sink's `send_batch_spent` as one batch for a `Splitter::new` splitter; the route closure may

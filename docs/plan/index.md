@@ -68,3 +68,5 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261028-1644-decapsulated-ipv4-validation Validate decapsulated IPv4 header bounds**](20261028-1644-decapsulated-ipv4-validation.md) `2026-10-28`
 
 - [x] [**20261105-1253-echo-code-state Enforce Echo code and state correlation**](20261105-1253-echo-code-state.md) `2026-11-05`
+
+- [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `2026-11-05`
