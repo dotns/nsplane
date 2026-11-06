@@ -338,6 +338,58 @@ state: the cause is written once per expiry by the timers and read by `handle_ti
 core's per-peer record grows from 224 to 240 bytes (two `u64` counters), and the size of the
 tunnel (9952 bytes), `Output` (96 bytes) and `Event` (64 bytes) is unchanged.
 
+## Binary size
+
+Stripped `x86_64-unknown-linux-gnu` binaries of commit `b05b03d` (0.21.0), built in the
+`rust:1.99` image with the workspace release profile (`lto = true`, `codegen-units = 1`) and
+the changes each column names. Sizes are in MB (10^6 bytes). The probes are programs that
+start an engine with the listed parts and no CLI parsing or log subscriber.
+
+| Parts | `strip` | `strip`, `aws-lc-sys` at `opt-level = "s"` | `strip`, `opt-level = "s"`, `panic = "abort"` |
+| --- | --- | --- | --- |
+| Engine, UDP, TUN | 1.59 | 1.58 | 1.06 |
+| Engine, UDP, netstack | 1.93 | not measured | 1.27 |
+| Engine, TUN, `WssDialer` | 5.04 | 3.51 | 2.73 |
+
+The probes spend 0.07 MB on aws-lc without `nsplane-wss` and 2.3 MB with it. A rustls
+`CryptoProvider` reduced to ChaCha20-Poly1305, X25519, ECDSA P256 and Ed25519 saves about
+0.07 MB, because the C part stays at 2.2 MB; `aws-lc-sys` at `opt-level = "s"` takes it to
+0.8 MB by building with `OPENSSL_SMALL` and without the AVX512 assembly.
+
+`nsplane-cli` under other build settings, against 3.02 MB for the workspace release profile:
+
+| Settings | Size |
+| --- | --- |
+| `strip = "symbols"` (the base of the rows below) | 2.45 |
+| `tracing/release_max_level_info` | 2.38 |
+| `-z pack-relative-relocs` | 2.37 |
+| `panic = "abort"` | 2.16 |
+| `opt-level = "s"` | 1.88 |
+| `opt-level = "s"`, `panic = "abort"` | 1.65 |
+| `opt-level = "z"`, `panic = "abort"` | 1.58 |
+| `opt-level = "s"`, `panic = "abort"`, `-Zbuild-std` with `optimize_for_size` | 1.40 |
+| `x86_64-unknown-linux-musl`, static | 2.58 |
+
+Speed under the same settings: one `scripts/bench/slot.sh` invocation on slot 0 (load 2.6), two
+interleaved rounds in the `rust:1.99` image, 30 samples. The first rows are
+`cargo bench -p nsplane-core --bench data_path`, `tunn_round_trip`. The others come from a
+single-threaded program over `aws-lc-rs`: sealing 16 KiB buffers, and one key generation with
+one agreement per operation.
+
+| Measure | `opt-level = 3` | `aws-lc-sys` at `"s"` | All at `"s"` |
+| --- | --- | --- | --- |
+| Round trip, 64 bytes | 361.5 ns | 366.1 ns | 365.6 ns |
+| Round trip, 1420 bytes | 1.169 µs | 1.189 µs | 1.169 µs |
+| ChaCha20-Poly1305 | 3.3 GB/s | 3.3 GB/s | not measured |
+| AES-128-GCM | 28.5 GB/s | 6.8 GB/s | not measured |
+| AES-256-GCM | 24.6 GB/s | 6.4 GB/s | not measured |
+| X25519 | 56.1 k/s | 55.9 k/s | not measured |
+| ECDH P256 | 33.9 k/s | 6.1 k/s | not measured |
+
+The round trip spends its time in the aws-lc assembly, so it does not show what
+`opt-level = "s"` costs in the engine and TUN offload paths; `scripts/bench/wg-compare.sh` was
+not run with these settings.
+
 ## Packet tag carrier against 0.20.0
 
 The packet tag and receipt marker on `PacketBuf` (untagged traffic) against `v0.20.0`,
