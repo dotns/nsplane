@@ -91,8 +91,8 @@ nsplane 通过 git 引用。固定 tag 或 commit 以保证构建可复现：
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
 # 按需添加：
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns
@@ -1026,6 +1026,33 @@ wg setconf wg0 /path/to/wg0.conf
 ```
 
 参数见 [README](../README.md#development-cli-linux-and-macos)。
+
+### 二进制体积
+
+Cargo 只在构建最终二进制的 workspace 中应用 profile，所以这些设置要写在产品自己的
+`Cargo.toml` 里，本仓库的 profile 不会传递给产品。产品体积的大头来自 `nsplane-wss`，它会带入
+rustls 和 aws-lc 的完整 C 部分。不用它时，aws-lc 只留下 ChaCha20-Poly1305 相关代码。
+
+```toml
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# 仅在使用 nsplane-wss 时需要。
+[profile.release.package.aws-lc-sys]
+opt-level = "s"
+```
+
+| 设置 | 效果 | 代价 |
+|---|---|---|
+| `strip = "symbols"` | 去掉符号表 | panic backtrace 不再显示函数名 |
+| `aws-lc-sys` 使用 `opt-level = "s"` | 用 `OPENSSL_SMALL` 构建 aws-lc，不含 AVX512 汇编和大型曲线表 | AES-GCM 和 P256 变慢，这两者只有 TLS 使用；ChaCha20-Poly1305 和 X25519 速度不变 |
+| 所有 crate 使用 `opt-level = "s"` | Rust 代码更小 | 发布前先运行 `scripts/bench/wg-compare.sh`：引擎和 TUN 卸载路径会失去内联 |
+| `panic = "abort"` | 去掉 unwind 代码 | panic 会结束进程：加密 worker 不再能扛住 panic 的任务，否则代价只是丢一个包 |
+| 在产品中启用 `tracing` 的 `release_max_level_info` feature | 编译时去掉 `debug!` 和 `trace!` 调用点 | release 构建中不再有这两个级别的日志 |
+
+各项设置的体积和速度见 [performance.md](performance.md#binary-size)。
 
 ## 16. 示例索引
 

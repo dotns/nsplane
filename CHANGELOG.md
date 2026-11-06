@@ -5,7 +5,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.22.0] - 2026-11-05
+## [0.22.0] - 2026-11-06
 
 ### Added
 - `NetStackHandle::{connect_tcp_labeled, connect_tcp_from_labeled, connect_udp_labeled,

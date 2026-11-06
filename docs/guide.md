@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.21.0" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns
@@ -1077,6 +1077,35 @@ wg setconf wg0 /path/to/wg0.conf
 ```
 
 See the [README](../README.md#development-cli-linux-and-macos) for its flags.
+
+### Binary size
+
+Cargo applies a profile only in the workspace that builds the final binary, so these settings
+go in the product's `Cargo.toml`; the profile of this repository does not reach it. Most of a
+product's size comes from `nsplane-wss`, which brings rustls and the full C part of aws-lc.
+Without it the aws-lc part is the ChaCha20-Poly1305 code alone.
+
+```toml
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# With nsplane-wss only.
+[profile.release.package.aws-lc-sys]
+opt-level = "s"
+```
+
+| Setting | Effect | Cost |
+|---|---|---|
+| `strip = "symbols"` | removes the symbol table | panic backtraces lose their function names |
+| `aws-lc-sys` at `opt-level = "s"` | builds aws-lc with `OPENSSL_SMALL`, without AVX512 assembly and the large curve tables | slower AES-GCM and P256, which only TLS uses; ChaCha20-Poly1305 and X25519 keep their speed |
+| `opt-level = "s"` for all crates | smaller Rust code | run `scripts/bench/wg-compare.sh` before shipping it: the engine and TUN offload paths lose inlining |
+| `panic = "abort"` | removes unwinding code | a panic ends the process: a crypto worker no longer survives a panicking job, which otherwise costs one packet |
+| `tracing` feature `release_max_level_info` in the product | removes `debug!` and `trace!` call sites at compile time | those levels are gone from release builds |
+
+The sizes and the speed of each setting are in
+[performance.md](performance.md#binary-size).
 
 ## 16. Examples index
 

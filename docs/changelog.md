@@ -762,3 +762,8 @@ Netstack label review follow-ups for 0.22.0: connected UDP keeps checking its la
 `None`, now pinned by a test and listed as breaking; the device's TCP label table holds labeled
 lifetimes only, so an unlabeled stack skips the output lookup; the release notes list the
 labeled active APIs and the `mixed_tags` semantics.
+
+## 2026-11-06 [release]
+
+Released 0.22.0: the labeled active netstack APIs, the connected UDP label check (breaking),
+`Splitter` runs and `SlotSink` spent buffers, the Echo and IPv4 header validation.
