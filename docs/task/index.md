@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-10-28
+> Updated: 2026-11-06
 
 ## Usage
 
@@ -99,3 +99,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `P1`
 
 - [x] [**20261106-0900-netstack-label-followups Netstack label review follow-ups**](20261106-0900-netstack-label-followups.md) `P2`
+
+- [x] [**20261106-2327-tcp-zero-checksum Accept zero TCP and ICMP checksums**](20261106-2327-tcp-zero-checksum.md) `P0`

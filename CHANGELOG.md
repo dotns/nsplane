@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- NAT accepts valid TCP checksum fields of `0x0000` in both translation directions
+  and ICMP quotations, preventing persistent TCP stalls. Masquerade accepts valid
+  TCP/ICMPv6 zero checksums and preserves zero on rewrite. UDP retains its distinct
+  absent-checksum and zero-to-`0xffff` rules.
+
 ## [0.22.0] - 2026-11-06
 
 ### Added

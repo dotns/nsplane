@@ -440,7 +440,7 @@ fn transport_v4_to_v6(
         put16(segment, at, udp_wire(checksum));
         return Ok(());
     }
-    if old == 0 || (!fragmented && !transport_valid(addrs.v4_len(protocol, segment)?, segment)) {
+    if !fragmented && !transport_valid(addrs.v4_len(protocol, segment)?, segment) {
         return Err(reasons::INVALID_CHECKSUM);
     }
     let new = update_pseudo_header(old, addrs.v4(protocol), addrs.v6(protocol));
@@ -449,7 +449,7 @@ fn transport_v4_to_v6(
 }
 
 /// Checks a TCP or UDP header and moves its checksum from the IPv6 to the
-/// IPv4 pseudo-header. A zero checksum is invalid over IPv6.
+/// IPv4 pseudo-header. A zero UDP checksum is invalid over IPv6.
 fn transport_v6_to_v4(
     segment: &mut [u8],
     protocol: u8,
@@ -458,7 +458,9 @@ fn transport_v6_to_v4(
 ) -> Result<()> {
     let at = checked_transport(segment, protocol, fragmented)?;
     let old = be16(segment, at);
-    if old == 0 || (!fragmented && !transport_valid(addrs.v6_len(protocol, segment)?, segment)) {
+    if (protocol == protocol::UDP && old == 0)
+        || (!fragmented && !transport_valid(addrs.v6_len(protocol, segment)?, segment))
+    {
         return Err(reasons::INVALID_CHECKSUM);
     }
     let new = update_pseudo_header(old, addrs.v6(protocol), addrs.v4(protocol));

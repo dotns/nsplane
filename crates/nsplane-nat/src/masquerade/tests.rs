@@ -118,7 +118,11 @@ fn ipv6(protocol: u8, src: Ipv6Addr, dst: Ipv6Addr, mut segment: Vec<u8>) -> Pac
     let at = checksum_at(protocol);
     segment[at..at + 2].fill(0);
     let checksum = transport_checksum_v6(src, dst, protocol, &segment);
-    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    let checksum = if protocol == protocol::UDP {
+        crate::checksum::udp_wire(checksum)
+    } else {
+        checksum
+    };
     segment[at..at + 2].copy_from_slice(&checksum.to_be_bytes());
     let mut bytes = vec![0x60, 0, 0, 0];
     bytes.extend_from_slice(&u16::try_from(segment.len()).unwrap().to_be_bytes());
@@ -200,7 +204,9 @@ fn reply(forwarded: &PacketBuf) -> PacketBuf {
 /// Asserts that the transport checksum of an IPv6 packet is valid.
 fn assert_valid(packet: &PacketBuf) {
     let bytes = packet.as_packet();
-    assert_ne!(be16(bytes, 40 + checksum_at(bytes[6])), 0);
+    if bytes[6] == protocol::UDP {
+        assert_ne!(be16(bytes, 46), 0);
+    }
     assert_eq!(
         transport_checksum_v6(src(packet), dst(packet), bytes[6], &bytes[40..]),
         0,
@@ -949,4 +955,88 @@ fn concurrent_first_packets_record_one_flow() {
     assert!(tokens.iter().all(|t| *t == FIRST_TOKEN));
     let stats = f.masquerade.stats();
     assert_eq!((stats.flows, stats.created), (1, 1));
+}
+
+/// Adjust the first payload word to make the checksum zero for the given tuple.
+fn zero_for(
+    mut packet: PacketBuf,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    port: u16,
+    reverse: bool,
+) -> PacketBuf {
+    let proto = packet.as_packet()[6];
+    let info = Info::parse(packet.as_packet(), reverse).unwrap();
+    let payload_at = if proto == protocol::TCP { 60 } else { 48 };
+    let mut target = packet.as_packet().to_vec();
+    target[8..24].copy_from_slice(&src.octets());
+    target[24..40].copy_from_slice(&dst.octets());
+    target[info.token_at..info.token_at + 2].copy_from_slice(&port.to_be_bytes());
+    target[info.checksum_at..info.checksum_at + 2].fill(0);
+    target[payload_at..payload_at + 2].fill(0);
+    let word = transport_checksum_v6(src, dst, proto, &target[40..]);
+    let bytes = packet.as_packet_mut();
+    bytes[payload_at..payload_at + 2].copy_from_slice(&word.to_be_bytes());
+    bytes[info.checksum_at..info.checksum_at + 2].fill(0);
+    let checksum = transport_checksum_v6(info.key.src, info.key.dst, proto, &bytes[40..]);
+    let checksum = if proto == protocol::UDP {
+        crate::checksum::udp_wire(checksum)
+    } else {
+        checksum
+    };
+    bytes[info.checksum_at..info.checksum_at + 2].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+fn zero_cases() -> [PacketBuf; 3] {
+    [
+        tcp((HOST, HOST_PORT), (REMOTE, 80), SYN),
+        echo(HOST, REMOTE, ECHO_REQUEST, HOST_PORT),
+        request(REMOTE, HOST_PORT),
+    ]
+}
+
+#[test]
+fn zero_checksum_inputs_are_valid_only_for_tcp_and_icmp() {
+    for first in zero_cases() {
+        let proto = first.as_packet()[6];
+        let at = 40 + checksum_at(proto);
+        let mut first = zero_for(first, HOST, REMOTE, HOST_PORT, false);
+        first.as_packet_mut()[at..at + 2].fill(0);
+        assert_eq!(
+            transport_checksum_v6(HOST, REMOTE, proto, &first.as_packet()[40..]),
+            0
+        );
+        let f = fixture();
+        if proto == protocol::UDP {
+            assert_drop(first, reasons::BAD_CHECKSUM, |p| f.masquerade.forward(p));
+            continue;
+        }
+        assert_drop(corrupt(&first), reasons::BAD_CHECKSUM, |p| {
+            f.masquerade.forward(p)
+        });
+        let forwarded = f.forward(first);
+        let reverse = zero_for(reply(&forwarded), REMOTE, SOURCE, token(&forwarded), true);
+        assert_eq!(be16_at(&reverse, at), 0);
+        assert_drop(corrupt(&reverse), reasons::BAD_CHECKSUM, |p| {
+            f.masquerade.reverse(p)
+        });
+        f.reverse(reverse);
+    }
+}
+
+#[test]
+fn zero_checksum_outputs_are_normalized_only_for_udp() {
+    for first in zero_cases() {
+        let proto = first.as_packet()[6];
+        let at = 40 + checksum_at(proto);
+        let expected = if proto == protocol::UDP { 0xffff } else { 0 };
+        let first = zero_for(first, SOURCE, REMOTE, FIRST_TOKEN, false);
+        let f = fixture();
+        let forwarded = f.forward(first);
+        assert_eq!(be16_at(&forwarded, at), expected);
+        let reverse = zero_for(reply(&forwarded), REMOTE, HOST, HOST_PORT, true);
+        let restored = f.reverse(reverse);
+        assert_eq!(be16_at(&restored, at), expected);
+    }
 }

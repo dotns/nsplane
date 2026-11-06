@@ -279,10 +279,10 @@ fn quoted_transport(
                 return Ok(());
             }
             let checksum = be16(segment, at);
-            if checksum == 0 {
+            if protocol == protocol::UDP && checksum == 0 {
                 // IPv4 UDP without a checksum stays without one; zero is
                 // invalid over IPv6.
-                return if to_v6 && protocol == protocol::UDP {
+                return if to_v6 {
                     Ok(())
                 } else {
                     Err(reasons::INVALID_CHECKSUM)

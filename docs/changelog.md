@@ -767,3 +767,12 @@ labeled active APIs and the `mixed_tags` semantics.
 
 Released 0.22.0: the labeled active netstack APIs, the connected UDP label check (breaking),
 `Splitter` runs and `SlotSink` spent buffers, the Echo and IPv4 header validation.
+
+## 2026-11-06 23:38 [BUG-P1]
+
+Accept valid TCP zero checksum fields in both RFC 7915 translation directions and
+ICMP quotations. Masquerade accepts valid TCP/ICMPv6 zero fields and preserves zero
+when recomputing; UDP keeps its family-specific absent/invalid handling and wire
+normalization. Added zero-input, incremental next-hop, quotation, masquerade and
+real user-space TCP regressions. The complete `just check` gate passed. An unrelated
+DNS fixture port collision was reproduced on the unchanged base and deferred.

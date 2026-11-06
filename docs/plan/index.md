@@ -1,6 +1,6 @@
 # nstun - Plan Index
 
-> Updated: 2026-10-28
+> Updated: 2026-11-06
 
 ## Usage
 
@@ -70,3 +70,5 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261105-1253-echo-code-state Enforce Echo code and state correlation**](20261105-1253-echo-code-state.md) `2026-11-05`
 
 - [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `2026-11-05`
+
+- [x] [**20261106-2327-tcp-zero-checksum Accept zero TCP and ICMP checksums**](20261106-2327-tcp-zero-checksum.md) `2026-11-06`

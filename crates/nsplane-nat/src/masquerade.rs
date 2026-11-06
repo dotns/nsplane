@@ -30,9 +30,9 @@
 //!   their IPv6 payload length, and replies of unknown flows.
 //!
 //! The transport checksum of a rewritten packet is recomputed over the IPv6
-//! pseudo-header (a result of zero is written as `0xffff`). With
+//! pseudo-header (only UDP writes a result of zero as `0xffff`). With
 //! [`MasqueradeConfig::verify_checksums`], a packet that would be rewritten
-//! with an invalid transport checksum (a zero checksum field included) is
+//! with an invalid transport checksum (including a zero UDP checksum field) is
 //! dropped ([`reasons::BAD_CHECKSUM`]); the recomputation would otherwise
 //! launder the corruption. Only such packets are verified: the first packet
 //! of a flow once the decision closure answered [`Some`] (a corrupt one
@@ -726,9 +726,9 @@ impl Info {
         }
     }
 
-    /// Whether the transport checksum of `bytes` is valid and not zero.
+    /// Whether the transport checksum verifies, with zero forbidden only for UDP.
     fn checksum_valid(&self, bytes: &[u8]) -> bool {
-        be16(bytes, self.checksum_at) != 0
+        (self.key.protocol != protocol::UDP || be16(bytes, self.checksum_at) != 0)
             && transport_checksum_v6(
                 self.key.src,
                 self.key.dst,
@@ -746,7 +746,11 @@ impl Info {
         bytes[self.checksum_at..self.checksum_at + 2].fill(0);
         let (src, dst) = (addr(bytes, SRC_ADDR), addr(bytes, DST_ADDR));
         let checksum = transport_checksum_v6(src, dst, self.key.protocol, &bytes[IPV6_HEADER..]);
-        let checksum = if checksum == 0 { 0xffff } else { checksum };
+        let checksum = if self.key.protocol == protocol::UDP {
+            crate::checksum::udp_wire(checksum)
+        } else {
+            checksum
+        };
         bytes[self.checksum_at..self.checksum_at + 2].copy_from_slice(&checksum.to_be_bytes());
     }
 }

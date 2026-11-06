@@ -6,6 +6,7 @@ mod nested_lans;
 mod peer6_eam4;
 mod tags;
 mod vectors;
+mod zero_checksum;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;

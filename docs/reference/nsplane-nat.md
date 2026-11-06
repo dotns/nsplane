@@ -75,7 +75,10 @@ tests (UDP, TCP, ICMP Echo, coexistence with `eam4`); native IPv4 and IPv6 pass 
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
-incrementally. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
+incrementally. TCP checksum fields of `0x0000` are valid when the sum verifies,
+including after an incremental update and inside ICMP quotations. IPv4 UDP zero
+means absent and gets computed for IPv6; IPv6 UDP zero is rejected. Only UDP maps
+a computed zero to `0xffff`. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
 any fragment order: only the first fragment shows the checksum, so later fragments that
 arrive before it are held (at most 256 datagrams and 1 MiB, for 60 s; a fragment after the
 expiry starts a new entry) in an `nsplane_packet::reassembly::Reassembler`, the one the
@@ -182,7 +185,8 @@ now gets `None` or another `route` is dropped and the flow removed (`route_chang
 route fingerprint must stay current). With
 `MasqueradeConfig::recheck_route_on_forward` (default `false`), forward asks the closure for
 every packet of a recorded flow too and drops it the same way (`ROUTE_CHANGED`). The transport checksum is recomputed
-over the IPv6 pseudo-header. Drop reasons (`masquerade::reasons`, counted in
+over the IPv6 pseudo-header. TCP and ICMPv6 accept valid zero fields and preserve
+a computed zero; only UDP rejects a zero field and emits computed zero as `0xffff`. Drop reasons (`masquerade::reasons`, counted in
 `MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
 flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
 `verify_checksums`, an invalid transport checksum). Forward verifies the checksum only for packets it masquerades: for a new flow after the
