@@ -189,6 +189,57 @@ async fn labeled_connected_udp_filters_input_and_is_retired() -> TestResult {
 }
 
 #[tokio::test]
+async fn unlabeled_connected_udp_accepts_only_unlabeled_input() -> TestResult {
+    let (stack, handle) = NetStack::new(config([10, 0, 0, 1].into()));
+    let (_source, sink) = stack.split();
+    let mut socket = handle
+        .connect_udp_from("10.0.0.1:9000".parse()?, "10.0.0.2:5000".parse()?)
+        .await?;
+    assert_eq!(socket.ingress_label(), None);
+    for (label, payload) in [
+        (NonZeroU64::new(41), &b"labeled"[..]),
+        (None, &b"unlabeled"[..]),
+    ] {
+        sink.send(datagram(label, payload), PeerId::new(0)).await?;
+    }
+    assert_eq!(
+        timeout(WAIT, socket.recv_from()).await??.0,
+        b"unlabeled"[..]
+    );
+    assert_eq!(handle.stats().label_mismatch, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlabeled_tcp_output_stays_unlabeled_beside_a_label_on_every_mode() -> TestResult {
+    let label = NonZeroU64::new(41).unwrap();
+    for cfg in modes() {
+        let decide = matches!(cfg.admission, crate::Admission::Decide { .. });
+        let (handle, mut peer) = RawPeer::start(cfg, [10, 0, 0, 2].into(), 31);
+        let mut pending = handle.incoming_pending();
+        let active = handle.clone();
+        let connect = tokio::spawn(async move {
+            active
+                .connect_tcp_labeled("10.0.0.2:7000".parse().unwrap(), label)
+                .await
+        });
+        assert_eq!(timeout(WAIT, peer.source.recv()).await??.tag(), Some(label));
+        syn(&mut peer, None).await?;
+        if decide {
+            timeout(WAIT, next(&mut pending))
+                .await?
+                .ok_or("pending SYN")?
+                .accept();
+        }
+        let reply = timeout(WAIT, peer.source.recv()).await??;
+        assert_eq!(tcp_segment(reply.as_packet()).unwrap()[13] & 0x12, 0x12);
+        assert_eq!(reply.tag(), None);
+        connect.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_tcp_syn_and_retransmission_are_labeled_and_revoke_cancels_connect() -> TestResult {
     use std::future::Future;
     let label = NonZeroU64::new(41).unwrap();

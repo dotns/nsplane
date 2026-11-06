@@ -143,7 +143,7 @@ impl Driver {
                     };
                     self.labels.record_syn(packet.as_packet(), label);
                     if let Some((remote, local)) = super::tcp_tuple(packet.as_packet()) {
-                        self.device.tcp_labels.insert((local, remote), label);
+                        self.device.set_tcp_label((local, remote), label);
                     }
                     *demand.entry(dst_port).or_insert(0) += 1;
                     return self.device.inject(packet);

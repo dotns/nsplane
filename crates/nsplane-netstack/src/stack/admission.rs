@@ -109,8 +109,7 @@ impl Driver {
                     *demand.entry(key.local.port()).or_insert(0) += 1;
                     self.labels.record_syn(syn.as_packet(), syn.tag());
                     self.device
-                        .tcp_labels
-                        .insert((key.local, key.remote), syn.tag());
+                        .set_tcp_label((key.local, key.remote), syn.tag());
                     self.device.inject(syn);
                     if let Some(table) = self.pending.as_mut() {
                         table.admit(flow);

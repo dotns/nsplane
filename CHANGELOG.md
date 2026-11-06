@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.22.0] - 2026-11-05
 
+### Added
+- `NetStackHandle::{connect_tcp_labeled, connect_tcp_from_labeled, connect_udp_labeled,
+  connect_udp_from_labeled}` open a connection or a connected UDP socket with an immutable
+  ingress label, fixed before the first send: every output packet carries the label, input
+  with another label is dropped and counted in `label_mismatch`, and
+  `NetStackHandle::revoke_label` retires the lifetime. A label with a retained revocation
+  tombstone fails with `ConnectionAborted`.
+- `UdpSocket::ingress_label` and `UdpReply::ingress_label` return the lifetime's label.
+
 ### Changed
+
+#### Breaking
+- A connected UDP socket checks the label of its input. A socket from `connect_udp` or
+  `connect_udp_from` has no label, which is a label of its own: a datagram with a tag is
+  dropped and counted in `label_mismatch`, where 0.21.0 delivered it. A consumer that sets no
+  tag sees no change. One that tags a connected socket's input opens the socket with its label.
+
+  ```rust
+  // Before
+  let socket = handle.connect_udp(remote).await?;
+  // After
+  let socket = handle.connect_udp_labeled(remote, label).await?;
+  ```
+
+#### Other
+- `ReassemblyStats::mixed_tags` counts a set of fragments at its first differing tag, also
+  when the datagram never completes, instead of when it completes.
 - `Splitter::send_batch_spent` hands each run of consecutive packets for one sink to that
   sink's `send_batch_spent` as one batch for a `Splitter::new` splitter; the route closure may
   run again for packets left after an error. A `Splitter::new_map` splitter still hands over

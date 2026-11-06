@@ -755,3 +755,10 @@ Prepared 0.22.0 workspace versions, internal path requirements, local lockfile p
 versions and release notes. Runtime code, tests, external dependencies, compiler settings
 and guide URLs are unchanged. The versioned revision requires the complete workspace
 checks before publication.
+
+## 2026-11-06 [progress]
+
+Netstack label review follow-ups for 0.22.0: connected UDP keeps checking its label, including
+`None`, now pinned by a test and listed as breaking; the device's TCP label table holds labeled
+lifetimes only, so an unlabeled stack skips the output lookup; the release notes list the
+labeled active APIs and the `mixed_tags` semantics.

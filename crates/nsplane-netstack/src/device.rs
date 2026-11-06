@@ -14,8 +14,9 @@ use smoltcp::time::Instant;
 use crate::stack::tcp_tuple;
 use crate::stats::{self, Counters};
 
-/// TCP lifetime labels, indexed by the outbound tuple.
-pub(crate) type TcpLabels = HashMap<(SocketAddr, SocketAddr), Option<NonZeroU64>>;
+/// Labels of the labeled TCP lifetimes, indexed by the outbound tuple. Empty on a stack
+/// without one, whose output skips the lookup.
+pub(crate) type TcpLabels = HashMap<(SocketAddr, SocketAddr), NonZeroU64>;
 
 /// Idle buffers the device keeps for reuse.
 const POOL_SIZE: usize = 256;
@@ -77,7 +78,7 @@ impl TxToken for VirtualTxToken<'_> {
         } else {
             tcp_tuple(packet.as_packet())
                 .and_then(|tuple| self.labels.get(&tuple).copied())
-                .unwrap_or(self.reply_label)
+                .or(self.reply_label)
         };
         packet.set_tag(label);
         if self.queue.len() < self.limit {
@@ -115,6 +116,18 @@ impl VirtualDevice {
             pool: RefCell::new(PacketPool::new(POOL_SIZE)),
             stats,
         }
+    }
+
+    /// Sets the output label of the TCP lifetime on `tuple`, outbound order.
+    pub(crate) fn set_tcp_label(
+        &mut self,
+        tuple: (SocketAddr, SocketAddr),
+        label: Option<NonZeroU64>,
+    ) {
+        match label {
+            Some(label) => self.tcp_labels.insert(tuple, label),
+            None => self.tcp_labels.remove(&tuple),
+        };
     }
 
     /// Enqueues a packet for smoltcp to receive.
@@ -350,5 +363,20 @@ mod tests {
         // survives WireGuard encapsulation.
         assert_eq!(caps.max_transmission_unit, 1360);
         assert_eq!(caps.ip_mtu(), 1360);
+    }
+
+    #[test]
+    fn only_labeled_tcp_lifetimes_keep_an_output_entry() {
+        let mut device = VirtualDevice::new(1500, 4, Arc::new(Counters::default()));
+        let tuple = (
+            "10.0.0.1:9000".parse().unwrap(),
+            "10.0.0.2:5000".parse().unwrap(),
+        );
+        device.set_tcp_label(tuple, None);
+        assert!(device.tcp_labels.is_empty());
+        device.set_tcp_label(tuple, NonZeroU64::new(41));
+        assert_eq!(device.tcp_labels[&tuple].get(), 41);
+        device.set_tcp_label(tuple, None);
+        assert!(device.tcp_labels.is_empty());
     }
 }

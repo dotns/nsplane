@@ -230,6 +230,10 @@ impl NetStackHandle {
     /// [`bind_udp`](Self::bind_udp), which keeps every other remote's; the tuple is
     /// [`Ownership::Flow`] for [`owns`](Self::owns) until the socket is dropped.
     ///
+    /// The socket has no ingress label, which is a label of its own: a datagram with a label
+    /// is dropped and counted in `label_mismatch`. If its peer's input carries a label, open
+    /// the socket with [`connect_udp_from_labeled`](Self::connect_udp_from_labeled).
+    ///
     /// Fails with [`io::ErrorKind::InvalidInput`] if `remote` is unspecified or `local` is
     /// of the other family, [`io::ErrorKind::AddrNotAvailable`] if the stack has no address
     /// of the family or `local` is another address, [`io::ErrorKind::AddrInUse`] if a live

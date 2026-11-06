@@ -174,8 +174,7 @@ pub(crate) enum Held {
 }
 
 impl Held {
-    /// The packet that answers a rejection, sourced from the original destination: a RST
-    /// for a SYN, a port unreachable for a datagram.
+    /// The ingress label of the held SYN or datagram.
     pub(crate) const fn label(&self) -> Option<std::num::NonZeroU64> {
         match self {
             Self::Tcp(packet) => packet.tag(),

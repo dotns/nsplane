@@ -140,7 +140,7 @@ impl Driver {
         let handle = self.sockets.add(socket);
         let local = SocketAddr::new(local, port);
         let flow = label.map(|label| {
-            self.device.tcp_labels.insert((local, remote), Some(label));
+            self.device.tcp_labels.insert((local, remote), label);
             self.labels.bind_active((remote, local), handle, label);
             let flow = self
                 .tcp_state(handle, local, remote, self.position(), Some(label))

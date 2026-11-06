@@ -531,7 +531,8 @@ mode.
   (a SYN no socket took is forgotten with that poll), and adoption gives it to the
   connection's `FlowState`. The tuple's entry stays until the socket is released, and
   segments are checked against it before they go into smoltcp. A UDP flow's label is on its
-  `FlowState` and compared on the flow lookup each datagram makes anyway.
+  `FlowState` and compared on the flow lookup each datagram makes anyway. Output looks up
+  only labeled TCP lifetimes: the device's table has no entry for an unlabeled one.
 - **Cost.** An unlabeled stack (no labeled connection, no tombstone, no queued input of a
   revoked label) keeps its per-packet path: one tag check per packet and one compare per
   flow datagram; each inbound connection costs one table entry from its SYN to its
