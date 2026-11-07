@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A retransmitted SYN no longer opens a second socket for one TCP tuple. With packet loss a free
+  listener in a lower slot took the SYN of a handshake in progress, both sockets answered, and
+  the RST of one ended the client's connection, at `Admission::Decide` and `Immediate`. The
+  stack drops such a SYN and the socket's SYN-ACK retransmission completes the handshake.
+- A client that reuses a port against a stale connection gets through. A bare SYN on a
+  synchronized socket now draws a challenge ACK (RFC 5961) instead of nothing or a second
+  socket, so the client's RST ends the stale connection and its next SYN opens a new one.
+
 ## [0.22.0] - 2026-11-06
 
 ### Added

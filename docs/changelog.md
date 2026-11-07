@@ -767,3 +767,9 @@ labeled active APIs and the `mixed_tags` semantics.
 
 Released 0.22.0: the labeled active netstack APIs, the connected UDP label check (breaking),
 `Splitter` runs and `SlotSink` spent buffers, the Echo and IPv4 header validation.
+
+## 2026-11-07 [fix]
+
+A bare SYN for a tuple with a socket no longer reaches a free listener: dropped mid handshake,
+challenged on a synchronized socket. The challenge is four rewritten copies of the SYN, as
+smoltcp ignores a bare SYN there and exposes no sequence numbers; a fork change could replace it.

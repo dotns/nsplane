@@ -99,3 +99,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `P1`
 
 - [x] [**20261106-0900-netstack-label-followups Netstack label review follow-ups**](20261106-0900-netstack-label-followups.md) `P2`
+
+- [x] [**20261107-0553-retransmitted-syn-second-socket Retransmitted SYN opens a second socket for one tuple**](20261107-0553-retransmitted-syn-second-socket.md) `P1`

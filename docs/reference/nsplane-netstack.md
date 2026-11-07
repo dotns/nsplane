@@ -115,6 +115,15 @@ per turn, in order), and egress TCP segments and UDP datagrams keep 32 bytes of 
   retransmissions; the stack's own sockets do not delay ACKs. A lowered minimum applies
   from a connection's first RTT measurement; the initial RTO times the SYN, the SYN-ACK
   and data sent before a round trip was measured.
+- A bare SYN for a tuple a socket holds never reaches a free listener, which would open a
+  second socket for the tuple. Mid handshake it is dropped: the socket's SYN-ACK retransmission
+  completes the handshake, and a client that restarted answers that SYN-ACK with a RST, which
+  ends it. A synchronized socket answers with a challenge ACK (RFC 5961 section 4.2), at most
+  one per second: a client that restarted answers it with a RST the socket accepts, so the
+  stale connection ends, and its next SYN opens a new one; the SYN alone ends nothing. The
+  stack gets the ACK by injecting four copies of the SYN with ACK set, as smoltcp ignores a
+  bare SYN there. A socket in SYN-SENT takes the SYN of a simultaneous open, and a free
+  listener in a lower slot can take it instead.
 ### Oversize UDP
 
 - UDP datagrams are built with DF set over IPv4 and an application payload whose packet
