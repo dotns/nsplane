@@ -5,6 +5,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-07
+
 ### Fixed
 - NAT accepts valid TCP checksum fields of `0x0000` in both translation directions
   and ICMP quotations, preventing persistent TCP stalls. Masquerade accepts valid

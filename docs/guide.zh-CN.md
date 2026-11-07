@@ -91,8 +91,8 @@ nsplane 通过 git 引用。固定 tag 或 commit 以保证构建可复现：
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.0" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.1" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.1" }
 # 按需添加：
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns

@@ -782,3 +782,9 @@ DNS fixture port collision was reproduced on the unchanged base and deferred.
 A bare SYN for a tuple with a socket no longer reaches a free listener: dropped mid handshake,
 challenged on a synchronized socket. The challenge is four rewritten copies of the SYN, as
 smoltcp ignores a bare SYN there and exposes no sequence numbers; a fork change could replace it.
+
+## 2026-11-07 [release]
+
+Released 0.22.1: NAT accepts valid zero TCP and ICMP checksums, and a repeated SYN stays away
+from free listeners, so packet loss no longer resets a client and a client that reuses a port
+gets past a stale connection.
