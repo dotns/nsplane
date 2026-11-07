@@ -1,7 +1,7 @@
 //! A bare SYN for a tuple the stack holds a socket for: a retransmission mid handshake opens
 //! no second socket, and a client that reuses a port gets past a stale connection.
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::first_input::client_reset;
 use super::labels::{
@@ -124,6 +124,43 @@ async fn a_client_reusing_a_port_gets_past_a_stale_connection_over_ipv6() -> Tes
     })
     .await?;
     reuse_port(&mut peer, &mut incoming, server.into(), socket, stale).await
+}
+
+/// The stack closed first, so the tuple is in TIME-WAIT when the client comes back on the port.
+#[tokio::test(start_paused = true)]
+async fn a_client_reusing_a_port_gets_past_time_wait() -> TestResult {
+    const CLIENT_PORT: u16 = 40_220;
+    for kind in KINDS {
+        let (handle, mut peer) = RawPeer::start(stack_config(kind), CLIENT, 73);
+        accept_all(&handle);
+        let mut incoming = handle.incoming_tcp();
+        let (socket, mut old) = connected(&mut peer, &mut incoming, CLIENT_PORT, None).await?;
+        old.shutdown().await?;
+        peer.pump_until(|peer| peer.state(socket) == tcp::State::CloseWait)
+            .await?;
+        peer.sockets
+            .get_mut::<client_tcp::Socket<'_>>(socket)
+            .close();
+        peer.pump_until(|peer| peer.state(socket) == tcp::State::Closed)
+            .await?;
+        peer.sockets.remove(socket);
+
+        let socket = peer.connect(LOCAL, old.local_addr().port(), CLIENT_PORT)?;
+        let conn = timeout(RECOVERY, async {
+            loop {
+                pump_labeled(&mut peer, None).await;
+                if let Some(conn) = try_next(&mut incoming) {
+                    return conn;
+                }
+            }
+        })
+        .await
+        .map_err(|_| "the client should get past TIME-WAIT")?;
+        assert_eq!(conn.peer_addr().port(), CLIENT_PORT, "{kind:?}");
+        peer.pump_until(|peer| peer.state(socket) == tcp::State::Established)
+            .await?;
+    }
+    Ok(())
 }
 
 /// RFC 5961: a SYN inside the receive window is challenged as well, and leaves the
