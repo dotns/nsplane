@@ -776,3 +776,9 @@ when recomputing; UDP keeps its family-specific absent/invalid handling and wire
 normalization. Added zero-input, incremental next-hop, quotation, masquerade and
 real user-space TCP regressions. The complete `just check` gate passed. An unrelated
 DNS fixture port collision was reproduced on the unchanged base and deferred.
+
+## 2026-11-07 [fix]
+
+A bare SYN for a tuple with a socket no longer reaches a free listener: dropped mid handshake,
+challenged on a synchronized socket. The challenge is four rewritten copies of the SYN, as
+smoltcp ignores a bare SYN there and exposes no sequence numbers; a fork change could replace it.

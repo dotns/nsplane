@@ -36,6 +36,49 @@ pub(crate) fn tcp_segment(pkt: &[u8]) -> Option<&[u8]> {
     pkt.get(ihl..)
 }
 
+/// Copies of the bare SYN `syn` with ACK set that make a synchronized smoltcp socket send a
+/// challenge ACK (RFC 5961 section 4.2), which it does not for a bare SYN. A free listener
+/// refuses a segment with ACK.
+///
+/// The socket challenges a segment that acknowledges at or past SND.UNA and lies outside the
+/// receive window; neither is known here. Numbers half the sequence space apart cover both:
+/// one copy meets each condition, and the others change nothing and go unanswered. The
+/// socket's rate limit applies as to any challenge ACK.
+pub(super) fn tcp_challenges(syn: &PacketBuf) -> Option<[PacketBuf; 4]> {
+    const HALF: u32 = 1 << 31;
+    let packet = syn.as_packet();
+    let segment = tcp_segment(packet)?;
+    let start = segment.as_ptr().addr() - packet.as_ptr().addr();
+    let isn = u32::from_be_bytes(*segment.get(4..)?.first_chunk()?);
+    segment.get(..18)?;
+    Some(
+        [(0, 0), (0, HALF), (HALF, 0), (HALF, HALF)]
+            .map(|(seq, ack)| tcp_challenge(syn, start, isn.wrapping_add(seq), ack)),
+    )
+}
+
+/// `syn`, whose TCP header starts at `start`, with ACK set, `seq` and `ack`. The checksum is
+/// updated rather than computed, so that a damaged SYN stays damaged (RFC 1624).
+fn tcp_challenge(syn: &PacketBuf, start: usize, seq: u32, ack: u32) -> PacketBuf {
+    const ACK: u8 = 0x10;
+    let mut challenge = syn.clone();
+    let header = &mut challenge.as_packet_mut()[start..];
+    let (head, sum) = header[4..18].split_at_mut(12);
+    let mut inverse = [0; 10];
+    inverse.copy_from_slice(&head[..10]);
+    for byte in &mut inverse {
+        *byte = !*byte;
+    }
+    head[..4].copy_from_slice(&seq.to_be_bytes());
+    head[4..8].copy_from_slice(&ack.to_be_bytes());
+    head[9] |= ACK;
+    let old = !u16::from_be_bytes([sum[0], sum[1]]);
+    let acc = checksum::sum_words(u64::from(old), &inverse);
+    let acc = checksum::sum_words(acc, &head[..10]);
+    sum.copy_from_slice(&(!checksum::fold(acc)).to_be_bytes());
+    challenge
+}
+
 /// The `(src, dst)` of a TCP packet.
 pub(crate) fn tcp_tuple(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
     let segment = tcp_segment(pkt)?;

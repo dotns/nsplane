@@ -21,7 +21,7 @@ use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self};
 use crate::udp::{self, Datagram, UdpFlow, UdpReply};
 
-use super::wire::{tcp_dst_port, tcp_is_syn, tcp_tuple};
+use super::wire::{tcp_challenges, tcp_dst_port, tcp_is_syn, tcp_tuple};
 use super::{Driver, MAX_INJECT_PER_ITER};
 
 /// How an ingress packet is handled.
@@ -133,6 +133,9 @@ impl Driver {
                         // Unanswered, the peer retransmits it once the queue may have room.
                         return stats::add(&self.stats.syn_deferred, 1);
                     }
+                    let Some(packet) = self.screen_syn(packet) else {
+                        return;
+                    };
                     let packet = if self.settings.transparent.is_some() || self.pending.is_some() {
                         match self.admit_syn(packet, demand) {
                             Some(packet) => packet,
@@ -185,9 +188,44 @@ impl Driver {
         self.dispatch_udp(datagram, Some(whole));
     }
 
+    /// Keeps a bare SYN away from the free listeners when a socket holds its tuple, as
+    /// smoltcp hands a packet to the first socket that accepts it, in slot order; the SYN
+    /// if it goes on. A socket mid handshake answers with its own SYN-ACK retransmission:
+    /// from a client that restarted, the RST to that SYN-ACK ends the handshake. A
+    /// synchronized socket is challenged (see [`tcp_challenges`]), a socket in SYN-SENT
+    /// takes the SYN of a simultaneous open.
+    fn screen_syn(&mut self, packet: PacketBuf) -> Option<PacketBuf> {
+        let Some((remote, local)) = tcp_tuple(packet.as_packet()) else {
+            return Some(packet);
+        };
+        if !self.owners.has_tcp(local, remote) {
+            return Some(packet);
+        }
+        let (local, remote) = (IpEndpoint::from(local), IpEndpoint::from(remote));
+        // Linear in the sockets, but only per SYN of a tuple the stack holds.
+        let state = self
+            .sockets
+            .iter()
+            .filter_map(|(_, socket)| tcp::Socket::downcast(socket))
+            .find(|socket| {
+                socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote)
+            })
+            .map(tcp::Socket::state);
+        match state {
+            None | Some(tcp::State::SynSent) => return Some(packet),
+            Some(tcp::State::SynReceived) => {}
+            Some(_) => {
+                for challenge in tcp_challenges(&packet).into_iter().flatten() {
+                    self.device.inject(challenge);
+                }
+            }
+        }
+        None
+    }
+
     /// Admits a bare SYN in transparent mode or under `Admission::Decide`; the SYN if it
-    /// goes on into smoltcp now. A retransmitted SYN of a handshake in progress passes
-    /// uncounted, and one of a held connection is absorbed; a new connection beyond
+    /// goes on into smoltcp now. A SYN of a tuple still registered passes uncounted, and
+    /// one of a held connection is absorbed; a new connection beyond
     /// `max_connections` is answered with RST. Under `Admission::Decide` a new connection
     /// is held (or, with the table full, answered with RST).
     fn admit_syn(&mut self, packet: PacketBuf, demand: &HashMap<u16, usize>) -> Option<PacketBuf> {

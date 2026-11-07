@@ -170,7 +170,7 @@ pub(super) async fn connected(
 
 /// The client's packets until it answers the stack's SYN-ACK: the SYN it sent with the tag
 /// `label` and its ACK, which is not sent.
-async fn syn_and_ack(
+pub(super) async fn syn_and_ack(
     peer: &mut RawPeer,
     port: u16,
     label: Option<NonZeroU64>,

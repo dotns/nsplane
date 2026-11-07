@@ -203,7 +203,7 @@ fn segment(src: SocketAddr, dst: SocketAddr, flags: u8) -> Result<Vec<u8>, Box<d
 
 /// The RST the client of the IPv4 `syn` sends while the stack's socket is in SYN-RECEIVED:
 /// sequence number ISN + 1, valid checksums.
-fn client_reset(syn: &[u8]) -> Result<PacketBuf, Box<dyn Error>> {
+pub(super) fn client_reset(syn: &[u8]) -> Result<PacketBuf, Box<dyn Error>> {
     let (src, dst) = tcp_tuple(syn).ok_or("not TCP")?;
     let seq = u32::from_be_bytes(syn[24..28].try_into()?).wrapping_add(1);
     let mut pkt = segment(src, dst, RST)?;
