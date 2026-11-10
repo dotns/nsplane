@@ -94,8 +94,8 @@ nsplane is consumed from git. Pin a tag or a commit so builds are reproducible:
 
 ```toml
 [dependencies]
-nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.1" }
-nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.1" }
+nsplane = { git = "https://github.com/dotns/nsplane", tag = "v0.22.2" }
+nsplane-tun = { git = "https://github.com/dotns/nsplane", tag = "v0.22.2" }
 # as needed:
 # nsplane-netstack, nsplane-uapi, nsplane-acl, nsplane-nat, nsplane-wss, nsplane-core,
 # nsplane-ether, nsplane-dns

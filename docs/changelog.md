@@ -788,3 +788,9 @@ smoltcp ignores a bare SYN there and exposes no sequence numbers; a fork change 
 Released 0.22.1: NAT accepts valid zero TCP and ICMP checksums, and a repeated SYN stays away
 from free listeners, so packet loss no longer resets a client and a client that reuses a port
 gets past a stale connection.
+
+## 2026-11-10 [release]
+
+Released 0.22.2: smoltcp fork `v0.14.0-nsplane.8` takes the ACK of an empty segment past a
+closed receive window, so a TCP connection whose two windows are both closed no longer stalls
+for good (seen as a 60 s stall in about 1 of 25 TUN-to-netstack echoes).

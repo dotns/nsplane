@@ -5,6 +5,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-10
+
+### Fixed
+- A user-space TCP connection no longer stalls for good when both receive windows close.
+  A Linux peer fills the window nsplane-netstack rounds up to the window scale, and its
+  acknowledgements then carry a sequence number past the closed window, which the stack
+  dropped together with their acknowledgement and window update. nsplane-netstack depends on
+  smoltcp fork tag `v0.14.0-nsplane.8`, which processes them (RFC 9293 3.10.7.4).
+
 ## [0.22.1] - 2026-11-07
 
 ### Fixed
