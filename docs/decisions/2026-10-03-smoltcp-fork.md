@@ -158,6 +158,16 @@ With `tcp_min_rto` at 20 ms (one invocation against the default, load 0.4): 1 % 
 to 0.106 s, 3 % loss 0.356 s to 0.300 s, `bulk_tcp_with_heavy_loss` 435 ms to 243 ms,
 `parallel_echo_with_loss` 1073 ms to 133 ms; loss-free and bottleneck unchanged.
 
+Tag `v0.14.0-nsplane.8` (tag object `bf491baacb0e3907f362b5e50f871a8c996b2863`, commit
+`9e228d6285a3e87128d62bf810dfed4b752b82aa`, branch `nsplane/upstream-24bda3b`, 2026-11-10) adds
+`9e228d6` on `.7`: a zero-length segment outside a zero receive window has its ACK processed
+when the ACK is in SND.UNA..=SND.NXT (RFC 9293 3.10.7.4), with SND.WND updated by the
+SND.WL1/SND.WL2 rule. A Linux peer fills the window rounded up to the scale (`419f085`), its
+SND.NXT then passes RCV.NXT and its pure ACKs were dropped; with both windows closed the
+connection stalled for good (a TUN-to-netstack 32 MiB echo stalled in 3 of 78 runs, none of 75
+with the fix). The rounding up stays: rounding down moves the advertised edge left again.
+smoltcp's tests: 709 library tests with the default features.
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.

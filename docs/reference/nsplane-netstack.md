@@ -229,7 +229,7 @@ per turn, in order), and egress TCP segments and UDP datagrams keep 32 bytes of 
 
 ### smoltcp fork
 
-smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.7`, ADR
+smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.8`, ADR
 [2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): upstream smoltcp `main`
 at `24bda3b` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
 retransmission timer when the peer's window closes (RFC 6298 5.1) and arms the zero-window
@@ -244,6 +244,9 @@ Recovery when both ends send under loss:
   retransmission point still accepts the acknowledgements.
 - A FIN in flight is left to the retransmission timer; duplicate ACKs do not replace it by a
   fast retransmission.
+- With the receive window closed, the ACK and window of an empty segment past it (the peer
+  sent into a window rounded up to the scale) are still taken, so a connection whose two
+  windows are both closed reopens (RFC 9293 3.10.7.4).
 
 Throughput:
 

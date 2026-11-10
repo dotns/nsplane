@@ -1,6 +1,6 @@
 # 20261110-1215-zero-window-ack-deadlock A zero receive window drops the ACK that would reopen it
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P1
 - **owner**: L3/t570f88i
 - **createdAt**: 2026-11-10 12:15
@@ -25,7 +25,7 @@ Fixing the zero-window ACK path in the smoltcp fork and proving it in nsplane an
 
 ## Dependencies
 
-- **blocked by**: a fork tag `v0.14.0-nsplane.8` for the committed pin
+- **blocked by**: (none)
 - **blocks**: the ns nsplane bump
 
 ## Notes
@@ -45,5 +45,5 @@ ns re-check: mini-ns `a34e0b403` plus `tests/e2e/stall` from `10bfdfdb7`, with n
 patched to this branch and the fork fix, `RUNS=75 STALLS=75 tests/e2e/stall/repro.sh`: runs 75,
 stalls 0 (echo 219-748 ms, median 311 ms). Baseline on the same commit: 3 stalls in 78.
 
-Pending the owner's tag: the pin commit moves `smoltcp` in `crates/nsplane-netstack/Cargo.toml`
-to `tag = "v0.14.0-nsplane.8"` and adds a CHANGELOG entry; then status goes to completed.
+The fork was tagged `v0.14.0-nsplane.8` (`9e228d6`); `nsplane-netstack` pins it, released as
+0.22.2.

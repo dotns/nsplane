@@ -104,4 +104,4 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261107-0553-retransmitted-syn-second-socket Retransmitted SYN opens a second socket for one tuple**](20261107-0553-retransmitted-syn-second-socket.md) `P1`
 
-- [ ] [**20261110-1215-zero-window-ack-deadlock A zero receive window drops the ACK that would reopen it**](20261110-1215-zero-window-ack-deadlock.md) `P1`
+- [x] [**20261110-1215-zero-window-ack-deadlock A zero receive window drops the ACK that would reopen it**](20261110-1215-zero-window-ack-deadlock.md) `P1`
