@@ -54,6 +54,7 @@ mod repeated_syn;
 mod revoke_label;
 mod rto;
 mod transparent;
+mod zero_window;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
