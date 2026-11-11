@@ -184,6 +184,16 @@ impl Tun {
             pool: PacketPool::new(POOL_FREE),
             mtu: receiver,
             _unwatched: unwatched,
+            // A device with a virtio-net header reads through `VnetReader`'s own buffer.
+            spill: vec![
+                0;
+                if self.offload.vnet_hdr {
+                    0
+                } else {
+                    MAX_IP_PACKET
+                }
+            ]
+            .into_boxed_slice(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             vnet: self.offload.vnet_hdr.then(VnetReader::new),
         };
@@ -295,6 +305,10 @@ pub struct TunSource {
     /// The watch's sender when no MTU watcher task owns it, kept alive so receivers
     /// never observe a closed channel.
     _unwatched: Option<watch::Sender<u16>>,
+    /// Where a plain read puts the bytes of a packet past the MTU known when the read
+    /// started: the interface MTU may have been raised since the watcher's last poll.
+    /// Empty for a device with a virtio-net header.
+    spill: Box<[u8]>,
     /// Read state of a device with a virtio-net header.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     vnet: Option<VnetReader>,
@@ -324,6 +338,22 @@ impl TunSource {
         packet.set_len(mtu);
         packet
     }
+
+    /// The packet of a plain read of `len` bytes into `packet` (from
+    /// [`plain_buf`](Self::plain_buf)) and, past its end, the spill buffer. A packet that
+    /// fit is returned in place; a longer one is put together in a buffer with the same
+    /// room behind it.
+    fn plain_packet(&mut self, mut packet: PacketBuf, len: usize) -> PacketBuf {
+        let Some(spilled) = len.checked_sub(packet.len()).filter(|&n| n > 0) else {
+            packet.set_len(len);
+            return packet;
+        };
+        let mut whole = self.pool.get(len + TRANSLATION_SLACK + TAILROOM);
+        whole.extend_from_slice(packet.as_packet());
+        whole.extend_from_slice(&self.spill[..spilled]);
+        self.pool.put(packet);
+        whole
+    }
 }
 
 impl PacketSource for TunSource {
@@ -331,8 +361,11 @@ impl PacketSource for TunSource {
     /// leaving the headroom in front free and room for the MTU plus 28 bytes behind it,
     /// so an IPv4 <-> IPv6 translator can grow a full-size packet in place, plus
     /// [`TAILROOM`], so the grown packet is sealed without reallocating. A packet
-    /// longer than the MTU is truncated by the OS. A zero-length read (end of stream)
-    /// yields [`io::ErrorKind::BrokenPipe`].
+    /// longer than the MTU known when the read started (the interface MTU was raised and
+    /// the watcher has not polled yet) is returned whole, with the same room behind it:
+    /// the read scatters what does not fit into a 65535-byte buffer the source keeps, and
+    /// only such a packet is copied. A zero-length read (end of stream) yields
+    /// [`io::ErrorKind::BrokenPipe`].
     ///
     /// With a virtio-net header ([`Offload::vnet_hdr`]) one read may yield several
     /// packets; they are queued and returned one per call, before the next read.
@@ -348,12 +381,15 @@ impl PacketSource for TunSource {
         let mut packet = self.plain_buf(mtu);
         loop {
             let mut guard = self.fd.readable().await?;
-            match guard.try_io(|fd| sys::read(fd.get_ref().as_fd(), packet.as_packet_mut())) {
+            match guard.try_io(|fd| {
+                sys::read_spill(
+                    fd.get_ref().as_fd(),
+                    packet.as_packet_mut(),
+                    &mut self.spill,
+                )
+            }) {
                 Ok(Ok(0)) => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-                Ok(Ok(len)) => {
-                    packet.set_len(len);
-                    return Ok(packet);
-                }
+                Ok(Ok(len)) => return Ok(self.plain_packet(packet, len)),
                 Ok(Err(e)) => return Err(e),
                 Err(_would_block) => {}
             }
@@ -386,7 +422,7 @@ impl PacketSource for TunSource {
             let mut packet = self.plain_buf(mtu);
             // Clears the readiness if the read would block.
             let read = self.fd.try_io(Interest::READABLE, |fd| {
-                sys::read(fd.as_fd(), packet.as_packet_mut())
+                sys::read_spill(fd.as_fd(), packet.as_packet_mut(), &mut self.spill)
             });
             match read {
                 Ok(0) => {
@@ -394,8 +430,7 @@ impl PacketSource for TunSource {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
                 Ok(len) => {
-                    packet.set_len(len);
-                    let _ = batch.push(packet);
+                    let _ = batch.push(self.plain_packet(packet, len));
                 }
                 Err(e) => {
                     self.pool.put(packet);
@@ -579,6 +614,9 @@ fn check_ip(packet: &[u8]) -> io::Result<()> {
 /// packet translated to IPv6 with a fragment header, so an IPv4 <-> IPv6 translator
 /// can rewrite a full-size packet in place.
 const TRANSLATION_SLACK: usize = 28;
+
+/// The largest IP packet: the size of a plain source's spill buffer.
+const MAX_IP_PACKET: usize = 65535;
 
 /// Bytes one read from a device with a virtio-net header may return: the header and the
 /// largest IP packet.

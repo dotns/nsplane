@@ -53,6 +53,14 @@ the same (up to 64 idle buffers). The Wintun `TunSource` hands them to the reade
 a 64-slot channel and the thread keeps up to 64 idle ones; excess buffers are dropped and
 neither side waits.
 
+A plain (non-offload) `TunSource` reads into an MTU-sized pooled buffer and scatters what
+does not fit (`readv`) into one 65535-byte buffer it keeps for its lifetime. The MTU is polled
+about once a second, so a packet longer than the MTU known at the read (the interface MTU was
+just raised) is returned whole instead of truncated: only such a packet is copied, into a
+pooled buffer sized for it. Memory: 64 KiB per plain source; an offload source reads through
+its own 64 KiB buffer and allocates none. `SlotSource` has no watcher and keeps dropping and
+counting reads longer than its fixed MTU.
+
 `TunSource::recv_batch` keeps reading without waiting after the first packet, until
 `EAGAIN`, a full batch or a split GSO read, so plain packets come in batches; a lone packet
 returns at once.

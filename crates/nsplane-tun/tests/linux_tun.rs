@@ -248,3 +248,49 @@ async fn tun_mtu_change_is_observed_after_a_rename() {
         assert_eq!(*mtu.borrow_and_update(), value);
     }
 }
+
+/// A packet larger than the MTU the source knows (the interface MTU was raised and the
+/// watcher has not polled yet) is read whole.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
+async fn plain_tun_read_after_an_mtu_increase_is_not_truncated() {
+    const RAISED: usize = 9000;
+    let ip = |args: &[&str]| {
+        let status = Command::new("ip").args(args).status().unwrap();
+        assert!(status.success(), "ip {args:?}: {status}");
+    };
+
+    let tun = Tun::create_with("nsplanebig%d", TunOptions::new().offload(false)).unwrap();
+    let name = tun.name().unwrap();
+    assert!(usize::from(tun.mtu()) < RAISED);
+    let local = Ipv4Addr::new(10, 77, 5, 1);
+    let remote = Ipv4Addr::new(10, 77, 5, 2);
+    ip(&["addr", "add", "10.77.5.1/24", "dev", &name]);
+    ip(&["link", "set", &name, "up"]);
+    let (mut source, _sink) = tun.split().unwrap();
+    let socket = UdpSocket::bind(SocketAddr::from((local, 0))).unwrap();
+
+    ip(&["link", "set", "dev", &name, "mtu", &RAISED.to_string()]);
+    // A datagram filling the raised MTU: 20 bytes of IPv4 and 8 of UDP header.
+    socket
+        .send_to(&vec![0x5a; RAISED - 28], SocketAddr::from((remote, 4000)))
+        .unwrap();
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), source.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = packet.as_packet();
+        // Skip unrelated traffic such as IPv6 router solicitations.
+        if bytes[0] >> 4 != 4 || bytes[9] != protocol::UDP {
+            continue;
+        }
+        assert_eq!(bytes.len(), RAISED);
+        let parsed = IpPacket::parse(bytes).unwrap();
+        assert_eq!(parsed.five_tuple().unwrap().dst_port, 4000);
+        assert!(parsed.payload()[8..].iter().all(|&b| b == 0x5a));
+        // Still with room for an IPv4 -> IPv6 translator to grow it in place.
+        assert!(packet.capacity() >= RAISED + 28, "{}", packet.capacity());
+        break;
+    }
+}

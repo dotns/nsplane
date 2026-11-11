@@ -185,6 +185,27 @@ pub(crate) fn read(fd: BorrowedFd<'_>, packet: &mut [u8]) -> io::Result<usize> {
     cvt_len(unsafe { libc::read(fd.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) })
 }
 
+/// Reads one packet into `packet` and, past its end, into `spill` (`readv`); returns its
+/// length (`0` at end of stream).
+pub(crate) fn read_spill(
+    fd: BorrowedFd<'_>,
+    packet: &mut [u8],
+    spill: &mut [u8],
+) -> io::Result<usize> {
+    let iov = [
+        libc::iovec {
+            iov_base: packet.as_mut_ptr().cast(),
+            iov_len: packet.len(),
+        },
+        libc::iovec {
+            iov_base: spill.as_mut_ptr().cast(),
+            iov_len: spill.len(),
+        },
+    ];
+    // SAFETY: both iovecs reference live, writable buffers of the given lengths.
+    cvt_len(unsafe { libc::readv(fd.as_raw_fd(), iov.as_ptr(), 2) })
+}
+
 /// Writes one packet; returns the number of bytes written.
 pub(crate) fn write(fd: BorrowedFd<'_>, packet: &[u8]) -> io::Result<usize> {
     // SAFETY: `packet` is valid for reads of `packet.len()` bytes.

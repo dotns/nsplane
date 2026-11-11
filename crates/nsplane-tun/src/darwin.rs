@@ -151,9 +151,14 @@ pub(crate) fn mtu(name: &str) -> io::Result<u16> {
     u16::try_from(mtu).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Reads one frame, scattering the AF header into a scratch array and the packet
-/// straight into `packet`; returns the packet length (`0` at end of stream).
-pub(crate) fn read(fd: BorrowedFd<'_>, packet: &mut [u8]) -> io::Result<usize> {
+/// Reads one frame, scattering the AF header into a scratch array, the packet straight
+/// into `packet` and what lies past its end into `spill`; returns the packet length (`0`
+/// at end of stream).
+pub(crate) fn read_spill(
+    fd: BorrowedFd<'_>,
+    packet: &mut [u8],
+    spill: &mut [u8],
+) -> io::Result<usize> {
     let mut header = [0u8; 4];
     let iov = [
         iovec {
@@ -164,9 +169,13 @@ pub(crate) fn read(fd: BorrowedFd<'_>, packet: &mut [u8]) -> io::Result<usize> {
             iov_base: packet.as_mut_ptr().cast(),
             iov_len: packet.len(),
         },
+        iovec {
+            iov_base: spill.as_mut_ptr().cast(),
+            iov_len: spill.len(),
+        },
     ];
-    // SAFETY: both iovecs reference live, writable buffers of the given lengths.
-    let n = cvt_len(unsafe { readv(fd.as_raw_fd(), iov.as_ptr(), 2) })?;
+    // SAFETY: the iovecs reference live, writable buffers of the given lengths.
+    let n = cvt_len(unsafe { readv(fd.as_raw_fd(), iov.as_ptr(), 3) })?;
     match n {
         0 => Ok(0),
         n if n <= header.len() => Err(io::Error::new(
