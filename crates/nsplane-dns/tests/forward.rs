@@ -161,6 +161,74 @@ async fn ignores_responses_with_another_id_or_question() {
 }
 
 #[tokio::test]
+async fn raw_forward_ignores_responses_with_another_question() {
+    let (stub, addr) = udp_stub().await;
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        let (len, peer) = stub.recv_from(&mut buf).await.unwrap();
+        let request = &buf[..len];
+        let wrong_question = response(
+            request,
+            None,
+            "other.example",
+            &[Ipv4Addr::new(192, 0, 2, 77)],
+            false,
+        );
+        let right = response(
+            request,
+            None,
+            "Host.Example",
+            &[Ipv4Addr::new(192, 0, 2, 1)],
+            false,
+        );
+        for reply in [wrong_question, right] {
+            stub.send_to(&reply, peer).await.unwrap();
+        }
+    });
+
+    let forwarder = Forwarder::new(config(vec![addr])).unwrap();
+    let message = query("host.example");
+    let raw = forwarder.forward(message.raw()).await.unwrap();
+    assert_eq!(
+        answer_addrs(&Answer::Raw(raw)),
+        vec![Ipv4Addr::new(192, 0, 2, 1)]
+    );
+}
+
+#[tokio::test]
+async fn transaction_ids_do_not_follow_the_count_and_source_port() {
+    const QUERIES: u16 = 16;
+    let (stub, addr) = udp_stub().await;
+    let upstream = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        let mut buf = [0; 512];
+        for _ in 0..QUERIES {
+            let (len, peer) = stub.recv_from(&mut buf).await.unwrap();
+            let request = &buf[..len];
+            seen.push((peer.port(), Packet::parse(request).unwrap().id()));
+            let reply = response(request, None, "host.example", &[], false);
+            stub.send_to(&reply, peer).await.unwrap();
+        }
+        seen
+    });
+
+    let forwarder = Forwarder::new(config(vec![addr])).unwrap();
+    for _ in 0..QUERIES {
+        let answer = forwarder.resolve(&query("host.example"), client()).await;
+        assert!(matches!(answer, Answer::Raw(_)), "answer: {answer:?}");
+    }
+
+    // An ID computed from the query count and the source port is known to anyone who
+    // sees or guesses the port.
+    let seen = upstream.await.unwrap();
+    let predictable = (0..QUERIES)
+        .zip(&seen)
+        .filter(|(count, (port, id))| *id == count.wrapping_mul(0x9e37) ^ port.rotate_left(7))
+        .count();
+    assert!(predictable < seen.len() / 2, "seen: {seen:?}");
+}
+
+#[tokio::test]
 async fn retries_truncated_responses_over_tcp() {
     let (stub, addr) = udp_stub().await;
     let listener = TcpListener::bind(addr).await.unwrap();

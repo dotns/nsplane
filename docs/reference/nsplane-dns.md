@@ -108,12 +108,16 @@ response unacceptable.
 `Forwarder::forward(message)` passes any DNS message byte for byte the same way (attempts,
 fresh transaction ID, TCP retry, counters) and returns the response with the message's ID.
 The message is not decoded: a response is accepted on its transaction ID, `QR` = 1 and the
-message's opcode, without a question comparison. It returns `None` for a message shorter than
-the header or when every attempt fails (`ForwarderStats::failures`).
+message's opcode. When the message's question section is readable and not empty, a response
+that carries questions must carry the same ones (names compared case-insensitively, types and
+classes) and is ignored otherwise. A response without questions, as servers send for messages
+they refuse, and a response whose sections are not readable are not compared; neither is any
+response to a message whose own questions are not readable. It returns `None` for a message
+shorter than the header or when every attempt fails (`ForwarderStats::failures`).
 
-The transaction ID mixes a counter with the socket's port and is not cryptographically random;
-resistance against spoofed responses comes mostly from the random source port of every
-attempt. There is no cache and no policy: every query the forwarder gets is forwarded. To
+The transaction ID of every attempt comes from the system's random number generator, so a
+spoofed response has to guess it together with the random source port of the attempt; an
+attempt fails when the system has no randomness to give. There is no cache and no policy: every query the forwarder gets is forwarded. To
 answer some names locally, put it behind other resolvers, for example
 `StaticRecords::with_fallback(forwarder)`.
 

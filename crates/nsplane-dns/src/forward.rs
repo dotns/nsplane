@@ -2,10 +2,11 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use rand_core::{OsRng, RngCore};
 use simple_dns::{PacketFlag, PacketView, header_buffer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -89,9 +90,9 @@ struct Counters {
 /// (timeout, ICMP refusal, I/O error) the answer is `SERVFAIL`. Any accepted response is
 /// final, whatever its response code.
 ///
-/// The transaction ID mixes a counter with the socket's port and is not cryptographically
-/// random: resistance against spoofed responses comes mostly from the random ephemeral
-/// source port the system picks for every attempt.
+/// The transaction ID of every attempt comes from the system's random number generator, so a
+/// spoofed response has to guess it together with the ephemeral source port the system picks
+/// for the attempt.
 ///
 /// The forwarder has no cache and no policy: it forwards every query it gets. To answer some
 /// names locally, put it behind other resolvers with [`Fallback`](crate::Fallback), for example
@@ -103,7 +104,6 @@ struct Counters {
 #[derive(Debug)]
 pub struct Forwarder {
     config: ForwarderConfig,
-    next_id: AtomicU16,
     counters: Counters,
 }
 
@@ -122,7 +122,6 @@ impl Forwarder {
         }
         Ok(Self {
             config,
-            next_id: AtomicU16::new(0),
             counters: Counters::default(),
         })
     }
@@ -148,9 +147,11 @@ impl Forwarder {
     ///
     /// Attempts, transaction IDs, the TCP retry and the counters work as for queries, but the
     /// message is not decoded: a response is accepted when it has the transaction ID, `QR` = 1
-    /// and the message's opcode. The question is not compared, so spoofing resistance rests on
-    /// the transaction ID and the source port alone. Any accepted response is returned,
-    /// whatever its response code.
+    /// and the message's opcode. When the message's question section is readable and not
+    /// empty, a response that carries questions must also carry the same ones (names compared
+    /// case-insensitively, types and classes); a response without questions, as servers send
+    /// for messages they refuse, or one whose sections are not readable is not compared. Any
+    /// accepted response is returned, whatever its response code.
     ///
     /// `None` when `message` is shorter than the DNS header or every attempt failed (timeout,
     /// ICMP refusal, I/O error); the latter counts in [`ForwarderStats::failures`].
@@ -159,8 +160,11 @@ impl Forwarder {
             return None;
         }
         let opcode = header_buffer::opcode(message).ok()?;
+        let asked = PacketView::parse(message).map_or_else(|_| Vec::new(), |view| questions(&view));
         let matches = |response: &[u8], id: u16| {
-            is_response(response, id) && header_buffer::opcode(response).ok() == Some(opcode)
+            is_response(response, id)
+                && header_buffer::opcode(response).ok() == Some(opcode)
+                && echoes_questions(response, &asked)
         };
         let mut response = self.exchange(message, matches).await?.to_vec();
         response[..2].copy_from_slice(&message[..2]);
@@ -174,7 +178,7 @@ impl Forwarder {
         matches: impl Fn(&[u8], u16) -> bool + Sync,
     ) -> Option<Bytes> {
         let upstreams = &self.config.upstreams;
-        let mut buf = vec![0; MAX_UDP_RESPONSE];
+        let mut buf = Vec::with_capacity(MAX_UDP_RESPONSE);
         for attempt in 0..self.config.attempts {
             let upstream = upstreams[attempt % upstreams.len()];
             match self.attempt(message, upstream, &mut buf, &matches).await {
@@ -197,12 +201,12 @@ impl Forwarder {
         &self,
         message: &[u8],
         upstream: SocketAddr,
-        buf: &mut [u8],
+        buf: &mut Vec<u8>,
         matches: impl Fn(&[u8], u16) -> bool + Sync,
     ) -> Result<Bytes, AttemptError> {
         let socket = UdpSocket::bind(unspecified(upstream)).await?;
         socket.connect(upstream).await?;
-        let id = self.transaction_id(socket.local_addr()?.port());
+        let id = transaction_id()?;
         let mut message = message.to_vec();
         message[..2].copy_from_slice(&id.to_be_bytes());
 
@@ -210,7 +214,8 @@ impl Forwarder {
         let udp = timeout_at(deadline, async {
             socket.send(&message).await?;
             loop {
-                let len = socket.recv(buf).await?;
+                buf.clear();
+                let len = socket.recv_buf(buf).await?;
                 let response = &buf[..len];
                 if matches(response, id) {
                     if header_buffer::has_flags(response, PacketFlag::TRUNCATION).unwrap_or(false) {
@@ -233,11 +238,15 @@ impl Forwarder {
             Err(AttemptError::Failed)
         }
     }
+}
 
-    fn transaction_id(&self, port: u16) -> u16 {
-        let count = self.next_id.fetch_add(1, Ordering::Relaxed);
-        count.wrapping_mul(0x9e37) ^ port.rotate_left(7)
-    }
+/// A transaction ID from the system's random number generator.
+fn transaction_id() -> Result<u16, AttemptError> {
+    let mut id = [0; 2];
+    OsRng
+        .try_fill_bytes(&mut id)
+        .map_err(|_| AttemptError::Failed)?;
+    Ok(u16::from_be_bytes(id))
 }
 
 impl Resolver for Forwarder {
@@ -253,7 +262,7 @@ impl Resolver for Forwarder {
 enum AttemptError {
     /// The upstream did not answer in time.
     Timeout,
-    /// An I/O error, or a TCP response to another query.
+    /// An I/O error, no random transaction ID, or a TCP response to another query.
     Failed,
 }
 
@@ -311,4 +320,30 @@ fn matches_query(response: &[u8], id: u16, query: &Query) -> bool {
     u16::from(question.qtype) == query.record_type().0
         && u16::from(question.qclass) == query.class()
         && normalize_name(&question.qname.to_string()) == query.name()
+}
+
+/// The questions of `view` as (normalized name, type, class).
+fn questions(view: &PacketView<'_>) -> Vec<(String, u16, u16)> {
+    view.questions
+        .iter()
+        .map(|question| {
+            (
+                normalize_name(&question.qname.to_string()),
+                u16::from(question.qtype),
+                u16::from(question.qclass),
+            )
+        })
+        .collect()
+}
+
+/// Whether `response` may answer a message with the questions `asked`: no questions were
+/// read from the message, or the response is not readable, has no questions or has the same.
+fn echoes_questions(response: &[u8], asked: &[(String, u16, u16)]) -> bool {
+    if asked.is_empty() {
+        return true;
+    }
+    let Ok(view) = PacketView::parse(response) else {
+        return true;
+    };
+    view.questions.is_empty() || questions(&view) == asked
 }
