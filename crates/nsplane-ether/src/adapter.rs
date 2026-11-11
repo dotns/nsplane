@@ -4,7 +4,9 @@
 //! the guest, answers ARP, neighbor and router solicitations and `DHCPv4` itself, and hands
 //! back the IP packets meant for the IP side; [`to_guest`](EtherAdapter::to_guest) gives the
 //! ethernet header that carries an IP packet to the guest. The guest MAC is learned from
-//! the source address of the guest's frames.
+//! the source address of the guest's frames. The port carries one guest and its frames are
+//! trusted: a new source MAC is a new guest, which drops what was learned about the old one
+//! and frees the `DHCPv4` lease, so the lease always goes to the current guest MAC.
 //!
 //! # Neighbor proxy
 //!
@@ -265,6 +267,9 @@ impl EtherAdapter {
                 self.guest_mac = Some(mac);
                 self.own_ipv4.clear();
                 self.own_ipv6.clear();
+                if let Some(server) = &mut self.dhcp {
+                    server.release();
+                }
             }
             None => {
                 tracing::debug!(%mac, "guest MAC learned");
@@ -491,7 +496,7 @@ mod tests {
     use nsplane_packet::udp_packet;
 
     use super::*;
-    use crate::ArpOp;
+    use crate::{ArpOp, DhcpMessage, MessageType};
 
     const GW_MAC: MacAddr = MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     const GUEST_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
@@ -707,6 +712,87 @@ mod tests {
         let other = udp4(Ipv4Addr::new(192, 0, 2, 1), dhcp::SERVER_PORT, &discover);
         let frame = eth(GW_MAC, GUEST_MAC, EtherType::IPV4, &other);
         assert_eq!(a.from_guest(&frame, &mut replies), Some(&other[..]));
+    }
+
+    /// A DHCP message of type `kind` from the client at `mac`, as a broadcast frame; a
+    /// REQUEST selects the gateway's offer of the guest address.
+    fn dhcp_frame(mac: MacAddr, kind: MessageType) -> Vec<u8> {
+        let mut message = vec![1, 1, 6, 0, 0, 0, 0, 1, 0, 0, 0x80, 0];
+        message.extend_from_slice(&[0; 16]);
+        message.extend_from_slice(&mac.0);
+        message.extend_from_slice(&[0; 10 + 192]);
+        message.extend_from_slice(&[99, 130, 83, 99, 53, 1, kind.to_u8()]);
+        if kind == MessageType::Request {
+            message.extend_from_slice(&[dhcp::option::REQUESTED_IP, 4]);
+            message.extend_from_slice(&GUEST_IP.octets());
+            message.extend_from_slice(&[dhcp::option::SERVER_ID, 4]);
+            message.extend_from_slice(&GW_IP.octets());
+        }
+        message.push(255);
+        let packet = udp_packet(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, dhcp::CLIENT_PORT)),
+            SocketAddr::from((Ipv4Addr::BROADCAST, dhcp::SERVER_PORT)),
+            &message,
+        )
+        .unwrap();
+        eth(MacAddr::BROADCAST, mac, EtherType::IPV4, packet.as_packet())
+    }
+
+    /// The type, client MAC and assigned address of the DHCP reply in `replies`, if there
+    /// is exactly one.
+    fn dhcp_reply(replies: &mut Vec<Vec<u8>>) -> Option<(MessageType, MacAddr, Ipv4Addr)> {
+        let reply = replies.pop()?;
+        assert_eq!(replies.len(), 0);
+        let frame = Frame::parse(&reply).unwrap();
+        let (_, segment) = Ipv4Header::parse(frame.payload).unwrap();
+        let (_, payload) = UdpHeader::parse(segment).unwrap();
+        let message = DhcpMessage::parse(payload).unwrap();
+        Some((message.message_type, message.chaddr, message.yiaddr))
+    }
+
+    #[test]
+    fn dhcp_lease_follows_the_guest_mac() {
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        a.from_guest(&dhcp_frame(GUEST_MAC, MessageType::Discover), &mut replies);
+        assert_eq!(
+            dhcp_reply(&mut replies),
+            Some((MessageType::Offer, GUEST_MAC, GUEST_IP))
+        );
+        a.from_guest(&dhcp_frame(GUEST_MAC, MessageType::Request), &mut replies);
+        assert_eq!(
+            dhcp_reply(&mut replies),
+            Some((MessageType::Ack, GUEST_MAC, GUEST_IP))
+        );
+
+        // The guest is replaced by one with another MAC, without a release: the new
+        // guest takes the same lease.
+        a.from_guest(&dhcp_frame(OTHER_MAC, MessageType::Discover), &mut replies);
+        assert_eq!(a.guest_mac(), Some(OTHER_MAC));
+        assert_eq!(
+            dhcp_reply(&mut replies),
+            Some((MessageType::Offer, OTHER_MAC, GUEST_IP))
+        );
+        a.from_guest(&dhcp_frame(OTHER_MAC, MessageType::Request), &mut replies);
+        assert_eq!(
+            dhcp_reply(&mut replies),
+            Some((MessageType::Ack, OTHER_MAC, GUEST_IP))
+        );
+
+        // A frame from a stray source does not lock the holder out: its renewal is
+        // acknowledged again.
+        let packet = udp4(Ipv4Addr::new(1, 1, 1, 1), 53, b"q");
+        a.from_guest(
+            &eth(GW_MAC, GUEST_MAC, EtherType::IPV4, &packet),
+            &mut replies,
+        );
+        a.from_guest(&dhcp_frame(OTHER_MAC, MessageType::Request), &mut replies);
+        assert_eq!(
+            dhcp_reply(&mut replies),
+            Some((MessageType::Ack, OTHER_MAC, GUEST_IP))
+        );
+        assert_eq!(a.stats().dhcp_replies, 5);
+        assert_eq!(a.stats().drop_unanswered, 0);
     }
 
     #[test]

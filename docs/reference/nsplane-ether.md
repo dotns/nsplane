@@ -15,7 +15,7 @@ on `nsplane` and `nsplane-packet`.
 | ports | `spawn_port` | `EtherSource` (`PacketSource`), `EtherSink` (`PacketSink`), `EtherHandle` (`stats`, `guest_mac`) |
 | transports | `FrameRead`, `FrameWrite`; `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux); `PacketSocket` (`bind`, `index`, `split`; Linux) | `TapReader`, `TapWriter`, `PacketReader`, `PacketWriter` (Linux), `MAX_FRAME_LEN` |
 | interfaces | `ensure_tap` (Linux) | `TapConfig` (`new`, `owner`, `group`, `name`), `TapInterface` (`name`, `index`, `created`) |
-| protocols | `Frame` (`parse`), `frame::write_header`; `ArpPacket` (`parse`, `write`, `is_gratuitous`), `arp::reply`; `Ndp` (`parse`), `ndp::answer_neighbor_solicitation`, `ndp::answer_router_solicitation`, `ndp::router_advertisement`; `DhcpMessage` (`parse`, `option`, `requested_ip`, `server_id`, `broadcast`), `DhcpServer` (`new`, `handle`, `reply_frame`, `bound`, `config`) | `EtherType`, `FrameError`, `frame::HEADER_LEN`; `ArpOp`, `ArpError`; `NdpMessage`, `NdpError`, `RaConfig`, `ndp::ALL_NODES`; `DhcpConfig` (`new`, `netmask`), `MessageType`, `DhcpError`, `dhcp::option`, `dhcp::SERVER_PORT`, `dhcp::CLIENT_PORT`; `MacAddr` (`link_local`, `ipv6_multicast`, `is_unicast`, `is_multicast`, `is_broadcast`) |
+| protocols | `Frame` (`parse`), `frame::write_header`; `ArpPacket` (`parse`, `write`, `is_gratuitous`), `arp::reply`; `Ndp` (`parse`), `ndp::answer_neighbor_solicitation`, `ndp::answer_router_solicitation`, `ndp::router_advertisement`; `DhcpMessage` (`parse`, `option`, `requested_ip`, `server_id`, `broadcast`), `DhcpServer` (`new`, `handle`, `release`, `reply_frame`, `bound`, `config`) | `EtherType`, `FrameError`, `frame::HEADER_LEN`; `ArpOp`, `ArpError`; `NdpMessage`, `NdpError`, `RaConfig`, `ndp::ALL_NODES`; `DhcpConfig` (`new`, `netmask`), `MessageType`, `DhcpError`, `dhcp::option`, `dhcp::SERVER_PORT`, `dhcp::CLIENT_PORT`; `MacAddr` (`link_local`, `ipv6_multicast`, `is_unicast`, `is_multicast`, `is_broadcast`) |
 
 ## Behavior
 
@@ -43,7 +43,7 @@ A guest frame goes through these steps in order:
 
 Every frame with a unicast source MAC sets the guest MAC; a new source replaces the old one,
 so the adapter follows a guest whose MAC changes, forgetting the guest addresses learned by
-the neighbor proxy. Until a MAC is learned, IP packets for the
+the neighbor proxy and freeing the DHCP lease. Until a MAC is learned, IP packets for the
 guest are dropped (`drop_no_guest_mac`). The first time a MAC is learned and an IPv6 prefix
 is configured, an unsolicited router advertisement to all-nodes (`ff02::1`) is sent.
 
@@ -139,9 +139,17 @@ traffic for the IP side. Without `dhcp`, DHCP traffic goes to the IP side too.
   or unknown message type, an option past the end) and OFFER, ACK and NAK from the guest get
   no reply.
 
-The lease binds to the first client MAC that receives an ACK. While it is bound, another MAC
-gets no offer and a NAK to its requests until the holder releases or declines. The lease
-does not expire on its own: it stays bound across the lease time.
+A `DhcpServer` binds the lease to the first client MAC that receives an ACK. While it is
+bound, another MAC gets no offer and a NAK to its requests until the holder releases or
+declines or `DhcpServer::release` frees the lease. The server has no clock: the lease does
+not expire on its own and stays bound across the lease time.
+
+The adapter frees the lease whenever the guest MAC changes (see
+[Guest MAC learning](#guest-mac-learning)), and a DHCP message is handled after its source
+MAC is learned. In the adapter the lease therefore follows the guest MAC: a guest replaced
+by one with another MAC, without a RELEASE, gets an OFFER and an ACK for the same address.
+The adapter trusts its port to carry one guest; two MACs behind one port can both hold the
+address.
 
 OFFER and ACK carry message type (53), server id (54), lease time (51), renewal time (58,
 half the lease) and rebinding time (59, seven eighths), subnet mask (1, from

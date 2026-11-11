@@ -11,7 +11,11 @@
 //! - INFORM: ACK with the configuration, without lease times.
 //!
 //! The lease binds to the first client MAC that receives an ACK. While it is bound, another
-//! MAC gets no offer and a NAK to its requests, until the holder releases or declines.
+//! MAC gets no offer and a NAK to its requests, until the holder releases or declines or
+//! the owner of the server frees the lease with [`DhcpServer::release`]. The server has no
+//! clock: the lease does not expire on its own. [`EtherAdapter`](crate::EtherAdapter) frees
+//! it whenever the guest MAC changes, so a guest replaced by one with another MAC gets the
+//! address without a restart.
 //!
 //! Offers and ACKs carry message type (53), server id (54), lease time (51), renewal (58,
 //! half the lease) and rebinding (59, seven eighths) times, subnet mask (1), router (3, if
@@ -337,6 +341,11 @@ impl DhcpServer {
     /// The MAC the lease is bound to, if any.
     pub const fn bound(&self) -> Option<MacAddr> {
         self.bound
+    }
+
+    /// Frees the lease, whoever holds it: the holder is gone without a RELEASE.
+    pub const fn release(&mut self) {
+        self.bound = None;
     }
 
     /// Handles the DHCP message `request` (a UDP payload to port 67) from the client at
@@ -720,6 +729,25 @@ mod tests {
         server
             .handle(&select(OTHER_MAC, SERVER_IP, GUEST_IP), OTHER_MAC)
             .unwrap();
+        assert_eq!(server.bound(), Some(OTHER_MAC));
+    }
+
+    #[test]
+    fn release_frees_lease_for_another_mac() {
+        let mut server = server();
+        server
+            .handle(&select(GUEST_MAC, SERVER_IP, GUEST_IP), GUEST_MAC)
+            .unwrap();
+        server.release();
+        assert_eq!(server.bound(), None);
+        assert!(server.handle(&discover(OTHER_MAC), OTHER_MAC).is_some());
+        let ack = server
+            .handle(&select(OTHER_MAC, SERVER_IP, GUEST_IP), OTHER_MAC)
+            .unwrap();
+        assert_eq!(
+            DhcpMessage::parse(&ack).unwrap().message_type,
+            MessageType::Ack
+        );
         assert_eq!(server.bound(), Some(OTHER_MAC));
     }
 
