@@ -5,6 +5,11 @@
 //! field are mapped, the quoted packet is translated in the reverse direction
 //! (its addresses through the same table, its TTL kept) and the checksum is
 //! recomputed (`ICMPv6` covers the IPv6 pseudo-header, ICMP does not).
+//!
+//! The quoted packet ends at its own length: padding after it and an RFC 4884
+//! extension structure (found through the length attribute of the message, so
+//! a truncated quote does not run into it) are left out of the rebuilt
+//! message, which carries no length attribute of its own.
 
 use std::net::Ipv6Addr;
 
@@ -63,7 +68,7 @@ pub(super) fn v4_to_v6(
     let mut out = Vec::with_capacity(body.len() + 28);
     out.extend_from_slice(&[kind, code, 0, 0]);
     out.extend_from_slice(&rest);
-    quoted_v4_to_v6(&body[8..], table, &mut out)?;
+    quoted_v4_to_v6(original_datagram(body, 5, 4), table, &mut out)?;
     let checksum = transport_checksum_v6(src, dst, protocol::ICMPV6, &out);
     put16(&mut out, 2, checksum);
     Ok(Some(out))
@@ -107,7 +112,13 @@ pub(super) fn v6_to_v4(
     let mut out = Vec::with_capacity(body.len());
     out.extend_from_slice(&[kind, code, 0, 0]);
     out.extend_from_slice(&rest);
-    quoted_v6_to_v4(&body[8..], table, &mut out)?;
+    // Only destination unreachable and time exceeded have a length attribute.
+    let quote = if matches!(body[0], 1 | 3) {
+        original_datagram(body, 4, 8)
+    } else {
+        &body[8..]
+    };
+    quoted_v6_to_v4(quote, table, &mut out)?;
     let checksum = internet_checksum(&out);
     put16(&mut out, 2, checksum);
     Ok(Some(out))
@@ -170,6 +181,19 @@ fn error_v6_to_v4(body: &[u8]) -> Result<(u8, u8, [u8; 4])> {
         ),
         _ => return Err(reasons::UNSUPPORTED_ICMP),
     })
+}
+
+/// The original datagram field of the error message `body`: what follows its
+/// 8-byte header, up to the RFC 4884 length attribute (the byte at `at`, in
+/// words of `unit` bytes) when the message has one. An extension structure
+/// follows that length. A length of zero, or one past the message, is no
+/// attribute.
+fn original_datagram(body: &[u8], at: usize, unit: usize) -> &[u8] {
+    let field = &body[8..];
+    match usize::from(body[at]) * unit {
+        0 => field,
+        len => field.get(..len).unwrap_or(field),
+    }
 }
 
 /// Translates the IPv4 packet quoted in an ICMP error and appends it to `out`.

@@ -75,7 +75,12 @@ tests (UDP, TCP, ICMP Echo, coexistence with `eam4`); native IPv4 and IPv6 pass 
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
-incrementally. TCP checksum fields of `0x0000` are valid when the sum verifies,
+incrementally. The packet quoted in an ICMP error ends at its own length: padding after it
+and an RFC 4884 extension structure (an MPLS label stack, say; located through the length
+attribute of the message, so a truncated quote does not run into it) are accepted and left
+out of the translated error, which is a limitation against RFC 7915 section 4.2 (it asks
+for the extension to be carried over). An IPv6 error whose `peer6`/`local6` addresses are
+only rewritten keeps those bytes. TCP checksum fields of `0x0000` are valid when the sum verifies,
 including after an incremental update and inside ICMP quotations. IPv4 UDP zero
 means absent and gets computed for IPv6; IPv6 UDP zero is rejected. Only UDP maps
 a computed zero to `0xffff`. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in

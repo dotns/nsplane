@@ -4,8 +4,9 @@
 //! the IPv4 header checksum, IPv4 options (an unexhausted source route is
 //! refused), legal addresses and the IPv6 extension header chain (a routing
 //! header with segments left is refused; a fragment header ends the chain).
-//! A packet quoted inside an ICMP error may be truncated and is not checked
-//! for legal addresses.
+//! A packet quoted inside an ICMP error may be truncated, or be followed by
+//! bytes that are not part of it (padding, an RFC 4884 extension structure),
+//! and is not checked for legal addresses.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
@@ -55,7 +56,8 @@ pub(super) struct Ipv4 {
 }
 
 impl Ipv4 {
-    /// Parses `bytes`; `quoted` allows a truncated packet quoted in an ICMP error.
+    /// Parses `bytes`; `quoted` allows a packet quoted in an ICMP error:
+    /// truncated, or followed by bytes past its total length.
     pub(super) fn parse(bytes: &[u8], quoted: bool) -> Result<Self> {
         if bytes.len() < 20 || bytes[0] >> 4 != 4 {
             return Err(reasons::MALFORMED);
@@ -65,10 +67,7 @@ impl Ipv4 {
             return Err(reasons::MALFORMED);
         }
         let total_len = usize::from(be16(bytes, 2));
-        if total_len < header_len
-            || (!quoted && total_len != bytes.len())
-            || (quoted && total_len < bytes.len())
-        {
+        if total_len < header_len || (!quoted && total_len != bytes.len()) {
             return Err(reasons::LENGTH_MISMATCH);
         }
         if !checksum::valid(&bytes[..header_len]) {
@@ -169,13 +168,14 @@ pub(super) struct Ipv6 {
 }
 
 impl Ipv6 {
-    /// Parses `bytes`; `quoted` allows a truncated packet quoted in an ICMP error.
+    /// Parses `bytes`; `quoted` allows a packet quoted in an ICMP error:
+    /// truncated, or followed by bytes past its payload length.
     pub(super) fn parse(bytes: &[u8], quoted: bool) -> Result<Self> {
         if bytes.len() < 40 || bytes[0] >> 4 != 6 {
             return Err(reasons::MALFORMED);
         }
         let total_len = 40 + usize::from(be16(bytes, 4));
-        if (!quoted && total_len != bytes.len()) || (quoted && total_len < bytes.len()) {
+        if !quoted && total_len != bytes.len() {
             return Err(reasons::LENGTH_MISMATCH);
         }
         let src = addr6(&bytes[8..24]);
