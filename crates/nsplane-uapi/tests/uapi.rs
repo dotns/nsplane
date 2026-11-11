@@ -414,6 +414,86 @@ async fn serves_requests_over_a_unix_socket() {
     std::fs::remove_dir(&dir).unwrap();
 }
 
+/// Connects to the UAPI socket at `path` and sends one `get=1`: the connection when it is
+/// answered, `None` when the server closed it.
+#[cfg(unix)]
+async fn answered(path: &std::path::Path) -> Option<tokio::net::UnixStream> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    // Writing to a connection the server already closed fails; so does the read below.
+    let _ = stream.write_all(b"get=1\n\n").await;
+    let mut reader = BufReader::new(&mut stream);
+    let mut out = String::new();
+    loop {
+        let mut line = String::new();
+        if !matches!(reader.read_line(&mut line).await, Ok(n) if n > 0) {
+            return None;
+        }
+        let done = line == "\n" && out.contains("errno=0");
+        out.push_str(&line);
+        if done {
+            return Some(stream);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connections_above_the_cap_are_closed() {
+    use std::time::Duration;
+
+    use nsplane_uapi::UapiListener;
+
+    /// The connections `Uapi::serve` serves at a time.
+    const CAP: usize = 64;
+
+    let dir = std::env::temp_dir().join(format!("nsplane-uapi-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("wg-test.sock");
+    let node = Node::new();
+    let listener = UapiListener::bind_path(&path).unwrap();
+    let uapi = node.uapi.clone();
+    let server = tokio::spawn(async move { uapi.serve(listener).await });
+
+    let test = async {
+        let mut held = Vec::new();
+        for n in 0..CAP {
+            held.push(
+                answered(&path)
+                    .await
+                    .unwrap_or_else(|| panic!("connection {n}")),
+            );
+        }
+        for _ in 0..3 {
+            assert!(answered(&path).await.is_none());
+        }
+        // A closed connection frees its place, once the server has noticed.
+        drop(held.pop());
+        loop {
+            if let Some(stream) = answered(&path).await {
+                held.push(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(answered(&path).await.is_none());
+        held
+    };
+    let held = tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .unwrap();
+
+    node.handle.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(held);
+    std::fs::remove_dir(&dir).unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn serves_a_connected_stream() {

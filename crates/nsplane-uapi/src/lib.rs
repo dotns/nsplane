@@ -85,10 +85,14 @@ mod serve {
     /// How long [`Uapi::serve`] waits after a failed accept before it accepts again.
     const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+    /// How many connections [`Uapi::serve`] serves at a time.
+    const MAX_CONNECTIONS: usize = 64;
+
     impl Uapi {
         /// Accepts connections on `listener` and serves each on its own task, request after
         /// request, until the engine shuts down. A failed accept is logged and retried
-        /// after a short pause.
+        /// after a short pause. At most 64 connections are served at a time: one accepted
+        /// beyond that is closed at once, unanswered.
         ///
         /// On return, and when this future is dropped, the connection tasks are aborted and
         /// the listener is closed (on Unix its socket file is removed).
@@ -114,6 +118,14 @@ mod serve {
                     None => return Ok(()),
                     Some(Ok((reader, writer))) => {
                         while connections.try_join_next().is_some() {}
+                        if connections.len() >= MAX_CONNECTIONS {
+                            // Dropping the halves closes the connection.
+                            tracing::debug!(
+                                message = "Closed a UAPI connection over the limit",
+                                limit = MAX_CONNECTIONS
+                            );
+                            continue;
+                        }
                         let uapi = self.clone();
                         connections
                             .spawn(async move { uapi.serve_connection(reader, writer).await });

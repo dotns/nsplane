@@ -49,7 +49,8 @@ them.
 `Uapi::handle_request` serves one request over any async reader and writer. `UapiListener`
 binds `/var/run/wireguard/<iface>.sock` on Unix and the named pipe
 `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<iface>` with the default security
-descriptor on Windows. `Uapi::serve` accepts connections on it; on Unix `serve_stream` serves
+descriptor on Windows. `Uapi::serve` accepts connections on it and serves at most 64 at a
+time: one accepted beyond that is closed at once, unanswered. On Unix `serve_stream` serves
 one already-connected stream.
 
 The Unix socket file has mode `0600` whatever the process umask is, as with wireguard-go:
