@@ -98,13 +98,15 @@ impl HostTunInput {
     ///
     /// The packet is copied once, into a buffer with the engine's headroom: a buffer
     /// recycled to the [`HostTunSource`] when one is idle, else a new one. Packets longer
-    /// than the MTU are queued too and dropped by the [`HostTunSource`].
+    /// than the MTU are queued too and dropped by the [`HostTunSource`]. The room in the
+    /// queue is claimed first, so a refused push neither copies nor takes a buffer.
     pub fn push(&self, packet: &[u8]) -> Result<(), PushError> {
-        let buf = self.free.alloc_from(packet);
-        self.tx.try_send(buf).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => PushError::Full,
-            mpsc::error::TrySendError::Closed(_) => PushError::Closed,
-        })
+        let permit = self.tx.try_reserve().map_err(|e| match e {
+            mpsc::error::TrySendError::Full(()) => PushError::Full,
+            mpsc::error::TrySendError::Closed(()) => PushError::Closed,
+        })?;
+        permit.send(self.free.alloc_from(packet));
+        Ok(())
     }
 }
 
@@ -348,6 +350,25 @@ mod tests {
         assert!(buf.capacity() >= packet.len() + TAILROOM);
         assert!(buf.with_headroom_mut()[..HEADROOM].iter().all(|&b| b == 0));
         assert_eq!(idle(&source), 0);
+        Ok(())
+    }
+
+    /// A push into a full queue fails before it takes or allocates a buffer.
+    #[test]
+    fn push_into_a_full_queue_takes_no_buffer() -> TestResult {
+        let (input, mut source) = side(1500);
+        for _ in 0..16 {
+            input.push(&[0; 100])?;
+        }
+        source.recycle(&mut vec![PacketBuf::with_capacity(1600)]);
+        let allocated = source.free.allocated();
+
+        assert_eq!(input.push(&[0; 100]), Err(PushError::Full));
+        assert_eq!(source.free.allocated(), allocated);
+        assert_eq!(idle(&source), 1);
+
+        drop(source);
+        assert_eq!(input.push(&[0; 100]), Err(PushError::Closed));
         Ok(())
     }
 
