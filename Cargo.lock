@@ -1100,6 +1100,7 @@ version = "0.22.2"
 dependencies = [
  "bytes",
  "futures-core",
+ "libc",
  "nsplane",
  "nsplane-netstack",
  "simple-dns",

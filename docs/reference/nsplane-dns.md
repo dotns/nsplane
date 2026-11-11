@@ -22,7 +22,7 @@ feature builds on `nsplane-netstack`.
 | resolvers: forwarding (`forward`) | `Forwarder` (`new`, `forward`, `config`, `stats`) | `ForwarderConfig` (`new`), `ForwarderError`, `ForwarderStats` |
 | resolvers: policy routing (`policy`) | `PolicyResolver` (`new`, `replace`, `replace_table`, `table`, `matching`, `stats`) | `PolicyTable` (`new`, `with_ttl`, `rules`, `ttl`, `matching`), `Rule` (`new`, `with_types`, `with_clients`, `with_on_nxdomain`), `NameMatch`, `Action`, `NxDomainFallback`, `ResolverSet` (`new`, `with`, `insert`, `contains`, `len`, `is_empty`), `PolicyStats`, `PolicyError`, `DEFAULT_POLICY_TTL`, `MAX_CNAME_CHAIN` |
 | hosts text (`hosts`) | `Hosts` (`parse`, `static_records`, `wildcard_rules`, `rules`, `errors`, `is_empty`) | `HostsError`, `HostsErrorKind` |
-| server (`server`) | `Server` (`new`, `with_passthrough`, `with_passthrough_policy`, `handle`, `serve_udp`, `serve_tcp`, `serve_stream`, `config`, `resolver`, `stats`) | `ServerConfig` (`with_max_in_flight`, `with_udp_payload_size`, `with_resolve_timeout`, `with_tcp_idle_timeout`), `ServerStats`, `Transport`, trait `PassthroughPolicy` (also for closures), `PassthroughRequest`, `PassthroughDecision` |
+| server (`server`) | `Server` (`new`, `with_passthrough`, `with_passthrough_policy`, `handle`, `serve_udp`, `serve_tcp`, `serve_stream`, `config`, `resolver`, `stats`) | `ServerConfig` (`with_max_in_flight`, `with_udp_payload_size`, `with_resolve_timeout`, `with_tcp_idle_timeout`, `with_max_tcp_connections`), `ServerStats`, `Transport`, trait `PassthroughPolicy` (also for closures), `PassthroughRequest`, `PassthroughDecision` |
 | feature `netstack` (`netstack`) | `Server::serve_udp_flow`, `Server::serve_tcp_connection` | |
 
 ## Behavior
@@ -223,6 +223,17 @@ its clones, to `ServerConfig::max_in_flight`:
   `ServerConfig::tcp_idle_timeout` passes without a query or without the client reading the
   response.
 
+`serve_tcp` serves at most `ServerConfig::max_tcp_connections` connections at once, over every
+`serve_tcp` of a server and its clones. A connection accepted above that is closed at once,
+without a response, and counted in `ServerStats::rejected_connections`; closing keeps the
+listen queue draining and tells the client at once, where leaving the connection in the queue
+would hold it until its own timeout. A slot frees when a served connection ends. An accept
+that fails for lack of file descriptors, socket buffers or memory is logged (a warning for the
+first failure of a shortage, debug for the following ones) and retried after 100 ms; errors
+caused by one connection are skipped, and `serve_tcp` returns on any other. `serve_stream` and
+`serve_tcp_connection` serve the one connection they are given and take no part in this
+bound: their caller decides how many run.
+
 ### netstack feature
 
 `Server::serve_udp_flow` answers the datagrams of one `nsplane-netstack` `UdpFlow` through its
@@ -239,6 +250,7 @@ address and port to these functions.
 | `ServerConfig::udp_payload_size` | `DEFAULT_UDP_PAYLOAD_SIZE` (1232) |
 | `ServerConfig::resolve_timeout` | 5 s |
 | `ServerConfig::tcp_idle_timeout` | 10 s |
+| `ServerConfig::max_tcp_connections` | 256 |
 | `FakePoolConfig::ipv4` / `ipv6` | none (at least one required) |
 | `FakePoolConfig::capacity` | `DEFAULT_FAKE_CAPACITY` (65536), bounded by the prefix sizes |
 | `FakePoolConfig::ttl` | `DEFAULT_FAKE_TTL` (60 s) |
@@ -259,7 +271,8 @@ address and port to these functions.
   answered `FORMERR` or `NOTIMP` (or passed through, see Server), or dropped when it is
   shorter than the header or a response. Passed messages count in `ServerStats::passed`,
   `pass_refused` (kept local by the policy) or `pass_failed` (answered `SERVFAIL`). UDP datagrams over the in-flight bound are dropped
-  (`ServerStats::dropped_overload`).
+  (`ServerStats::dropped_overload`). TCP connections `serve_tcp` accepts over the connection
+  bound are closed (`ServerStats::rejected_connections`).
 
 ## Limits and bounds
 
@@ -267,8 +280,8 @@ address and port to these functions.
   `NOTIMP` unless passthrough sends them to a forwarder.
 - Response codes are limited to `ResponseCode` (no extended codes).
 - `RecordData` covers A, AAAA, CNAME, PTR and TXT.
-- At most `max_in_flight` queries resolve at once per server; a `FakePool` holds at most
-  `capacity` bindings.
+- At most `max_in_flight` queries resolve at once per server, and `serve_tcp` serves at most
+  `max_tcp_connections` connections at once; a `FakePool` holds at most `capacity` bindings.
 - A CNAME chain of `PolicyResolver` holds at most `MAX_CNAME_CHAIN` (8) records. Name
   matching has no wildcards inside a label or in the middle of a name.
 

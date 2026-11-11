@@ -39,6 +39,9 @@ const TC_BIT: u8 = 0x02;
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
 
+/// Pause of [`Server::serve_tcp`] after an accept that failed for lack of resources.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 /// The transport a message arrived on; it decides the response size limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -62,6 +65,9 @@ pub struct ServerConfig {
     /// Time a TCP connection may wait for the next query, or for the client to read a
     /// response, before it is closed. Default 10 s.
     pub tcp_idle_timeout: Duration,
+    /// TCP connections [`Server::serve_tcp`] serves at once, over the server and its clones;
+    /// a connection accepted above it is closed at once. Default 256.
+    pub max_tcp_connections: usize,
 }
 
 impl Default for ServerConfig {
@@ -71,6 +77,7 @@ impl Default for ServerConfig {
             udp_payload_size: DEFAULT_UDP_PAYLOAD_SIZE,
             resolve_timeout: Duration::from_secs(5),
             tcp_idle_timeout: Duration::from_secs(10),
+            max_tcp_connections: 256,
         }
     }
 }
@@ -103,6 +110,13 @@ impl ServerConfig {
         self.tcp_idle_timeout = tcp_idle_timeout;
         self
     }
+
+    /// Sets [`max_tcp_connections`](Self::max_tcp_connections).
+    #[must_use]
+    pub const fn with_max_tcp_connections(mut self, max_tcp_connections: usize) -> Self {
+        self.max_tcp_connections = max_tcp_connections;
+        self
+    }
 }
 
 /// A snapshot of [`Server`] counters, cumulative since the server was created.
@@ -129,6 +143,9 @@ pub struct ServerStats {
     /// Passed messages answered `SERVFAIL`: every forwarder attempt failed or
     /// [`ServerConfig::resolve_timeout`] expired.
     pub pass_failed: u64,
+    /// TCP connections [`Server::serve_tcp`] closed on accept because
+    /// [`ServerConfig::max_tcp_connections`] were open.
+    pub rejected_connections: u64,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +159,7 @@ struct Counters {
     passed: AtomicU64,
     pass_refused: AtomicU64,
     pass_failed: AtomicU64,
+    rejected_connections: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -197,7 +215,8 @@ impl fmt::Debug for Policy {
 
 /// A DNS server answering with a [`Resolver`].
 ///
-/// Clones share the resolver, the in-flight bound and the counters. At most
+/// Clones share the resolver, the in-flight bound, the TCP connection bound and the
+/// counters. At most
 /// [`ServerConfig::max_in_flight`] queries are resolved at once by the serve functions: UDP
 /// datagrams above the bound are dropped (clients retry), TCP queries wait. The server answers
 /// what the resolver returns, encoded by [`encode_response`]; it does not rewrite names or
@@ -207,6 +226,7 @@ pub struct Server<R> {
     resolver: Arc<R>,
     config: ServerConfig,
     permits: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
     counters: Arc<Counters>,
     passthrough: Option<Arc<Forwarder>>,
     policy: Option<Policy>,
@@ -218,6 +238,7 @@ impl<R> Clone for Server<R> {
             resolver: Arc::clone(&self.resolver),
             config: self.config,
             permits: Arc::clone(&self.permits),
+            connections: Arc::clone(&self.connections),
             counters: Arc::clone(&self.counters),
             passthrough: self.passthrough.clone(),
             policy: self.policy.clone(),
@@ -232,6 +253,7 @@ impl<R: Resolver> Server<R> {
             resolver: Arc::new(resolver),
             config,
             permits: Arc::new(Semaphore::new(config.max_in_flight)),
+            connections: Arc::new(Semaphore::new(config.max_tcp_connections)),
             counters: Arc::default(),
             passthrough: None,
             policy: None,
@@ -285,6 +307,7 @@ impl<R: Resolver> Server<R> {
             passed: c.passed.load(Ordering::Relaxed),
             pass_refused: c.pass_refused.load(Ordering::Relaxed),
             pass_failed: c.pass_failed.load(Ordering::Relaxed),
+            rejected_connections: c.rejected_connections.load(Ordering::Relaxed),
         }
     }
 
@@ -480,10 +503,21 @@ impl<R: Resolver + 'static> Server<R> {
     /// Accepts connections on `listener` until it fails, serving each with
     /// [`serve_stream`](Self::serve_stream) in its own task. Needs a tokio runtime.
     ///
+    /// At most [`ServerConfig::max_tcp_connections`] connections are served at once, over
+    /// every `serve_tcp` of the server and its clones. A connection accepted above that is
+    /// closed at once and counted in [`ServerStats::rejected_connections`], so the listen
+    /// queue keeps draining and the client learns of the refusal without a timeout.
+    ///
+    /// An accept that fails for lack of resources (file descriptors, buffers, memory) is
+    /// logged and retried after a pause of 100 ms; such a shortage passes when connections
+    /// close.
+    ///
     /// # Errors
     ///
-    /// The first accept error not tied to a single connection.
+    /// The first accept error that is neither tied to a single connection nor a resource
+    /// shortage.
     pub async fn serve_tcp(&self, listener: TcpListener) -> io::Result<()> {
+        let mut exhausted = false;
         loop {
             let (stream, client) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -491,13 +525,31 @@ impl<R: Resolver + 'static> Server<R> {
                     tracing::debug!(%err, "DNS TCP accept error");
                     continue;
                 }
+                Err(err) if is_resource_exhaustion(&err) => {
+                    // One warning per shortage, not one per retry.
+                    if exhausted {
+                        tracing::debug!(%err, "DNS TCP accept out of resources");
+                    } else {
+                        tracing::warn!(%err, "DNS TCP accept out of resources, retrying");
+                    }
+                    exhausted = true;
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
                 Err(err) => return Err(err),
+            };
+            exhausted = false;
+            let Ok(slot) = Arc::clone(&self.connections).try_acquire_owned() else {
+                bump(&self.counters.rejected_connections);
+                tracing::trace!(%client, "DNS TCP connection closed: connection limit");
+                continue;
             };
             let server = self.clone();
             tokio::spawn(async move {
                 if let Err(err) = server.serve_stream(stream, client).await {
                     tracing::debug!(%client, %err, "DNS TCP connection error");
                 }
+                drop(slot);
             });
         }
     }
@@ -584,4 +636,23 @@ fn is_peer_error(err: &io::Error) -> bool {
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::TimedOut
     )
+}
+
+/// Accept errors of a process or system out of file descriptors, socket buffers or memory;
+/// they pass when connections close.
+fn is_resource_exhaustion(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    #[cfg(unix)]
+    let exhausted = matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    );
+    // WSAEMFILE and WSAENOBUFS.
+    #[cfg(windows)]
+    let exhausted = matches!(err.raw_os_error(), Some(10024 | 10055));
+    #[cfg(not(any(unix, windows)))]
+    let exhausted = false;
+    exhausted
 }

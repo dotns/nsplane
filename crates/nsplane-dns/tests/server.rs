@@ -342,6 +342,55 @@ async fn udp_drops_queries_above_the_in_flight_bound() {
     assert_eq!(server.stats().dropped_overload, 1);
 }
 
+/// One query on a new connection; `None` when the server closes it without an answer.
+async fn tcp_try_query(server: SocketAddr, id: u16) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect(server).await.unwrap();
+    let message = query_message(id, "host.test", TYPE::A, None);
+    let len = u16::try_from(message.len()).unwrap();
+    stream.write_all(&len.to_be_bytes()).await.ok()?;
+    stream.write_all(&message).await.ok()?;
+    let mut prefix = [0; 2];
+    tokio::time::timeout(LONG, stream.read_exact(&mut prefix))
+        .await
+        .unwrap()
+        .ok()?;
+    let mut response = vec![0; usize::from(u16::from_be_bytes(prefix))];
+    stream.read_exact(&mut response).await.ok()?;
+    assert_eq!(Packet::parse(&response).unwrap().id(), id);
+    Some(stream)
+}
+
+#[tokio::test]
+async fn tcp_closes_connections_above_the_cap() {
+    let config = ServerConfig::default().with_max_tcp_connections(2);
+    let server = Server::new(records(), config);
+    let tcp = tcp_server(&server).await;
+
+    // Two answered connections hold both slots.
+    let mut first = tcp_try_query(tcp, 51).await.unwrap();
+    let second = tcp_try_query(tcp, 52).await.unwrap();
+
+    // The third is closed without an answer.
+    let mut third = TcpStream::connect(tcp).await.unwrap();
+    let read = tokio::time::timeout(SHORT, third.read(&mut [0; 1])).await;
+    assert!(matches!(read, Ok(Ok(0) | Err(_))), "read: {read:?}");
+    wait_for_stats(&server, |stats| stats.rejected_connections == 1).await;
+
+    // The open ones keep working.
+    tcp_send(&mut first, &query_message(53, "host.test", TYPE::A, None)).await;
+    assert_eq!(Packet::parse(&tcp_recv(&mut first).await).unwrap().id(), 53);
+
+    // Closing one frees its slot.
+    drop(second);
+    let deadline = Instant::now() + LONG;
+    while tcp_try_query(tcp, 54).await.is_none() {
+        assert!(Instant::now() < deadline, "stats: {:?}", server.stats());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tcp_send(&mut first, &query_message(55, "host.test", TYPE::A, None)).await;
+    assert_eq!(Packet::parse(&tcp_recv(&mut first).await).unwrap().id(), 55);
+}
+
 #[tokio::test]
 async fn resolver_timeout_answers_servfail() {
     let config = ServerConfig::default().with_resolve_timeout(Duration::from_millis(100));
