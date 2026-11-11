@@ -68,7 +68,18 @@ returns at once.
 ### Windows service checks
 
 `Tun::create_with(name, options)` adds opt-in checks; `Tun::create` loads `wintun.dll`
-through the loader's search path and opens or creates the adapter. In order:
+without verifying it and opens or creates the adapter.
+
+`wintun.dll` is always loaded by absolute path, never through the DLL search order (current
+directory, `PATH`). Without a pin the path is the file next to the executable
+(`current_exe`), else the one in the system directory (`GetSystemDirectoryW`, usually
+`C:\Windows\System32`), and nothing else; if neither has the file the call fails with
+`NotFound` naming both paths. The file's content is not checked then, so it is trusted as far
+as those two directories are. Pinning (`TunOptions::wintun_pin`) remains the recommended
+mode, above all for a process that runs elevated. The Windows loader still resolves the
+libraries `wintun.dll` itself imports.
+
+In order:
 
 1. The MTU is validated: below 576 is `InvalidInput`.
 2. With `TunOptions::wintun_pin(WintunPin)` the file at the pin's path (default
@@ -152,15 +163,15 @@ callbacks (iOS `NEPacketTunnelFlow`); it is platform-independent and returns a
 
 | Feature | How to enable | Default | Cost when not enabled |
 |---|---|---|---|
-| Windows service TUN checks | `Tun::create_with(name, TunOptions::new().wintun_pin(pin).exclusive(true).mtu(n))` (Windows) | off: `wintun.dll` from the search path, an existing adapter opened, the MTU left as it is | none: `Tun::create` skips every check |
+| Windows service TUN checks | `Tun::create_with(name, TunOptions::new().wintun_pin(pin).exclusive(true).mtu(n))` (Windows) | off: `wintun.dll` unverified from next to the executable, else the system directory, an existing adapter opened, the MTU left as it is | none: `Tun::create` skips every check |
 | TUN segmentation offload | `Tun::create` turns it on; `Tun::create_with(name, TunOptions::new().offload(false))` opts out; `Tun::offload` reports it | on where the kernel supports it (Linux, Android); macOS, iOS and Windows have none | off: one read or write system call per packet |
 
 ## Platform notes
 
 - `unsafe` code lives only in this crate's platform modules (`unix`, `linux`, `darwin` and
   the Wintun loader), each with SAFETY comments.
-- Windows needs `wintun.dll` next to the executable (or on the search path) and an elevated
-  process. The pure Windows logic runs in Linux unit tests and the pin-before-load path under
+- Windows needs `wintun.dll` next to the executable (or in the system directory; the DLL
+  search path is not used) and an elevated process. The pure Windows logic runs in Linux unit tests and the pin-before-load path under
   wine. Adapter creation, the exclusive refusal, orphan replacement, the MTU set and read-back,
   the driver version query and the Wintun buffer recycling have no automated test; they need
   a Windows host.

@@ -20,7 +20,9 @@
 //!
 //! Windows service TUN: `Tun::create_with` with `TunOptions` verifies `wintun.dll`
 //! against a `WintunPin` SHA-256 digest before loading it and optionally verifies the
-//! running driver version after opening or creating the adapter. It can refuse a live
+//! running driver version after opening or creating the adapter. Without a pin the DLL
+//! is not verified and is loaded from next to the executable, else from the system
+//! directory; either way by absolute path, never through the DLL search order. It can refuse a live
 //! adapter or interface of the same name (`exclusive`), replaces an
 //! orphaned (non-present) one and sets the interface MTU; refusals are `WintunError`s
 //! inside the `io::Error`.

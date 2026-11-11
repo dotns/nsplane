@@ -7,14 +7,19 @@
 //! [`Tun::create_with`] adds the service TUN checks of [`TunOptions`]: the
 //! `wintun.dll` pin (verified before the DLL is loaded), an exclusive adapter name and
 //! the interface MTU.
+//!
+//! `wintun.dll` is always loaded by absolute path, never through the DLL search order:
+//! the pinned path, or without a pin the file next to the executable, else the one in
+//! the system directory.
 
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future;
 use std::io;
 use std::iter;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self as sync_mpsc, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
@@ -30,6 +35,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{ADDRESS_FAMILY, AF_INET, AF_INET6};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use wintun_bindings::{Adapter, MAX_RING_CAPACITY, Session};
 
 use crate::wintun::{self, Existing, Plan, WintunError, WintunPin};
@@ -66,6 +72,10 @@ impl fmt::Debug for Tun {
 
 /// Options for [`Tun::create_with`]; [`TunOptions::new`] (or `Default`) gives the
 /// options [`Tun::create`] uses. Every check is off by default and costs nothing then.
+///
+/// Without [`TunOptions::wintun_pin`] the content of `wintun.dll` is not verified: it is
+/// loaded from next to the executable, else from the system directory, and trusted as far
+/// as those two directories are. A process that runs elevated should pin it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TunOptions {
@@ -75,7 +85,8 @@ pub struct TunOptions {
 }
 
 impl TunOptions {
-    /// The default options: `wintun.dll` from the loader's search path, an existing
+    /// The default options: `wintun.dll` from next to the executable, else from the
+    /// system directory (never the DLL search order), unverified; an existing
     /// adapter of the same name opened (an orphaned one, left non-present by a process
     /// that died, is replaced), the MTU left as it is.
     pub const fn new() -> Self {
@@ -135,14 +146,24 @@ impl Tun {
     /// Opens the Wintun adapter `name`, creating it if needed, starts a session and reads
     /// its MTU.
     ///
-    /// `wintun.dll` must sit next to the executable or on the DLL search path; without
-    /// it (or without the driver) this fails with an [`io::Error`].
+    /// `wintun.dll` must sit next to the executable or, failing that, in the system
+    /// directory (`GetSystemDirectoryW`, usually `C:\Windows\System32`). It is loaded by
+    /// that absolute path: the DLL search order (current directory, `PATH`) is never
+    /// used, so a `wintun.dll` found only there is not loaded. If neither place has the
+    /// file this fails with [`io::ErrorKind::NotFound`] naming both; without the driver
+    /// it fails with another [`io::Error`].
+    ///
+    /// The file's content is not verified here. Pinning it
+    /// ([`Tun::create_with`] with [`TunOptions::wintun_pin`]) is the recommended mode for
+    /// a process that runs elevated.
     pub fn create(name: &str) -> io::Result<Self> {
         Self::create_with(name, TunOptions::new())
     }
 
     /// Like [`Tun::create`], with the checks of `options`, in this order: MTU
-    /// validation, the `wintun.dll` pin (hash, then load of that same absolute path),
+    /// validation, the `wintun.dll` pin (hash, then load of that same absolute path;
+    /// without a pin the unverified file next to the executable, else the one in the
+    /// system directory, is loaded by its absolute path),
     /// the adapter (an orphan is replaced; refused if exclusive and live, else opened or
     /// created), the running driver version, the session, the MTU (set, then read back).
     /// On a failure after the adapter step the session and adapter are dropped: a created
@@ -157,24 +178,25 @@ impl Tun {
             mtu,
         } = options;
         let mtu = mtu.map(wintun::validate_mtu).transpose()?;
-        let wintun = match &wintun_pin {
-            #[allow(unsafe_code, reason = "loading the verified Wintun driver library")]
+        let path = match &wintun_pin {
             Some(pin) => {
                 let path = pin.resolved_path()?;
                 wintun::verify(&path, pin.sha256())?;
-                // SAFETY: the bytes at this absolute path were just verified against the
-                // caller's SHA-256 pin of the signed Wintun library (a replacement between
-                // check and load is the documented residual window); loading it runs no
-                // code beyond its DLL initialization, and the returned function table is
-                // only used through the safe wrappers of `wintun-bindings`.
-                unsafe { wintun_bindings::load_from_path(&path) }?
+                path
             }
-            #[allow(unsafe_code, reason = "loading the Wintun driver library")]
-            // SAFETY: `wintun.dll` is the signed Wintun library; loading it runs no code
-            // beyond its DLL initialization, and the returned function table is only used
-            // through the safe wrappers of `wintun-bindings`.
-            None => unsafe { wintun_bindings::load() }?,
+            None => unpinned_path()?,
         };
+        #[allow(unsafe_code, reason = "loading the Wintun driver library")]
+        // SAFETY: loading the library runs its DLL initialization, and the returned
+        // function table is only used through the safe wrappers of `wintun-bindings`.
+        // What is known about the file: `path` is absolute, so the DLL search order
+        // (current directory, `PATH`) plays no part. With a pin its bytes were just
+        // verified against the caller's SHA-256 of the Wintun library (a replacement
+        // between check and load is the documented residual window). Without a pin
+        // nothing verifies the bytes: the caller trusts whatever `wintun.dll` sits next
+        // to the executable or, failing that, in the system directory, which only someone
+        // able to replace the executable or system DLLs can substitute.
+        let wintun = unsafe { wintun_bindings::load_from_path(&path) }?;
         let opened = Adapter::open(&wintun, name).ok();
         let existing = match existing(name, opened.as_ref().map(|adapter| adapter.get_luid())) {
             Ok(existing) => existing,
@@ -264,6 +286,31 @@ impl Tun {
         };
         Ok((source, TunSink { shared }))
     }
+}
+
+/// The system directory (`GetSystemDirectoryW`), usually `C:\Windows\System32`.
+fn system_directory() -> io::Result<PathBuf> {
+    // `MAX_PATH` characters and the terminating NUL.
+    let mut buf = [0u16; 261];
+    let size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    #[allow(unsafe_code, reason = "kernel32 FFI call")]
+    // SAFETY: `buf` is writable for `size` UTF-16 units and outlives the call.
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), size) };
+    match usize::try_from(len) {
+        Ok(0) => Err(io::Error::last_os_error()),
+        // The path with its NUL did not fit: `len` is the size needed, nothing usable
+        // was written.
+        Ok(len) if len < buf.len() => Ok(PathBuf::from(OsString::from_wide(&buf[..len]))),
+        _ => Err(io::Error::other(
+            "the system directory path is longer than MAX_PATH",
+        )),
+    }
+}
+
+/// The absolute path of the `wintun.dll` to load without a pin: next to the executable,
+/// else in the system directory; [`io::ErrorKind::NotFound`] if neither has the file.
+fn unpinned_path() -> io::Result<PathBuf> {
+    wintun::first_existing(&[wintun::beside_exe()?, wintun::in_dir(&system_directory()?)])
 }
 
 /// The LUID of the interface with the alias `name`, if IP Helper knows one. Not-found
@@ -597,6 +644,41 @@ mod tests {
     #[test]
     fn create_without_driver_fails() {
         assert!(Tun::create("nsplane-test").is_err());
+    }
+
+    #[test]
+    fn system_directory_is_absolute() {
+        let dir = system_directory().unwrap();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(dir.is_dir(), "{}", dir.display());
+    }
+
+    /// Without a pin the DLL is looked for next to the executable and in the system
+    /// directory only: one planted in the current directory is not loaded, and the error
+    /// names both places.
+    #[test]
+    fn create_without_a_pin_ignores_the_current_directory() {
+        let dir = std::env::temp_dir().join(format!("nsplane-tun-planted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wintun.dll"), b"not a dll").unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let result = Tun::create("nsplane-test");
+        std::env::set_current_dir(previous).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let e = result.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        let message = e.to_string();
+        let beside_exe = std::env::current_exe()
+            .unwrap()
+            .with_file_name("wintun.dll");
+        assert!(
+            message.contains(&beside_exe.display().to_string()),
+            "{message}"
+        );
+        assert!(message.to_lowercase().contains("system32"), "{message}");
+        assert!(message.contains("wintun.net"), "{message}");
     }
 
     /// A file under the temp directory, removed on drop.

@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+/// The file name of the Wintun library.
+const DLL_NAME: &str = "wintun.dll";
+
 /// The largest `wintun.dll` that is hashed; the released DLLs are well under 1 MiB, so
 /// anything larger is refused without reading it all.
 const MAX_DLL_LEN: u64 = 16 << 20;
@@ -106,11 +109,46 @@ impl WintunPin {
 
     /// The absolute path to verify and load.
     pub(crate) fn resolved_path(&self) -> io::Result<PathBuf> {
-        match &self.path {
-            Some(path) => std::path::absolute(path),
-            None => Ok(std::env::current_exe()?.with_file_name("wintun.dll")),
-        }
+        self.path
+            .as_ref()
+            .map_or_else(beside_exe, std::path::absolute)
     }
+}
+
+/// The absolute path of `wintun.dll` next to the running executable.
+pub(crate) fn beside_exe() -> io::Result<PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name(DLL_NAME))
+}
+
+/// The path of `wintun.dll` in the directory `dir`.
+pub(crate) fn in_dir(dir: &Path) -> PathBuf {
+    dir.join(DLL_NAME)
+}
+
+/// The first of `candidates` that is a file, for loading `wintun.dll` without a pin: the
+/// candidates are absolute paths, so the loader's search order is never used.
+///
+/// If none is a file this fails with [`io::ErrorKind::NotFound`] naming every candidate
+/// and how to install the DLL at the first one.
+pub(crate) fn first_existing(candidates: &[PathBuf]) -> io::Result<PathBuf> {
+    if let Some(path) = candidates.iter().find(|path| path.is_file()) {
+        return Ok(path.clone());
+    }
+    let searched: Vec<String> = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let remedy = candidates
+        .first()
+        .map(|path| format!(": {}", remedy(path, std::env::consts::ARCH)))
+        .unwrap_or_default();
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "wintun.dll not found (looked for {}; the DLL search path is not used){remedy}",
+            searched.join(", ")
+        ),
+    ))
 }
 
 /// The value of one hex digit.
@@ -497,6 +535,51 @@ mod tests {
         let path = pin.resolved_path().unwrap();
         assert!(path.is_absolute());
         assert!(path.ends_with("dir/wintun.dll"));
+    }
+
+    #[test]
+    fn first_existing_takes_candidates_in_order() {
+        let first = TempFile::new("first");
+        let second = TempFile::new("second");
+        let candidates = [first.0.clone(), second.0.clone()];
+        std::fs::write(&second.0, b"abc").unwrap();
+        assert_eq!(first_existing(&candidates).unwrap(), second.0);
+        std::fs::write(&first.0, b"abc").unwrap();
+        assert_eq!(first_existing(&candidates).unwrap(), first.0);
+    }
+
+    #[test]
+    fn first_existing_names_every_candidate_when_none_exists() {
+        let first = TempFile::new("absent-first");
+        let second = TempFile::new("absent-second");
+        // A directory of that name is not the DLL.
+        let dir = std::env::temp_dir();
+        let e = first_existing(&[first.0.clone(), second.0.clone(), dir]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        let message = e.to_string();
+        assert!(
+            message.contains(&first.0.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.0.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("wintun.net"), "{message}");
+    }
+
+    #[test]
+    fn unpinned_candidates_are_named_wintun_dll() {
+        assert_eq!(
+            beside_exe().unwrap(),
+            std::env::current_exe()
+                .unwrap()
+                .with_file_name("wintun.dll")
+        );
+        assert_eq!(
+            in_dir(Path::new("system")),
+            Path::new("system").join("wintun.dll")
+        );
     }
 
     #[test]
