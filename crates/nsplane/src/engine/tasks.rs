@@ -8,6 +8,7 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 
 use nsplane_packet::{MAX_BATCH, PacketBatch, PacketBuf, PeerId};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -210,7 +211,8 @@ pub(super) async fn write_sink<Snk: PacketSink>(
 }
 
 /// Receives batches of datagrams into the owner's queue until the transport closes, counting
-/// them in `traffic`.
+/// them in `traffic`. After an error other than the close it waits before the next receive,
+/// 1 ms doubling up to 64 ms for errors in a row, so an error that stays does not spin.
 pub(super) async fn receive<T: Transport>(
     transport: Arc<T>,
     datagrams: BatchSender<Datagram>,
@@ -219,6 +221,8 @@ pub(super) async fn receive<T: Transport>(
 ) {
     let mut buf = PacketBuf::with_capacity(MAX_DATAGRAM);
     let mut received = VecDeque::with_capacity(MAX_BATCH);
+    // Errors in a row.
+    let mut errors = 0_u32;
     while running(&mut suspended).await {
         let result = transport.recv_batch(&mut buf, &mut received).await;
         if !received.is_empty() {
@@ -232,12 +236,16 @@ pub(super) async fn receive<T: Transport>(
             return;
         }
         match result {
-            Ok(()) => {}
+            Ok(()) => errors = 0,
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Transport closed for receiving");
                 return;
             }
-            Err(e) => tracing::debug!(message = "Transport receive error", error = ?e),
+            Err(e) => {
+                tracing::debug!(message = "Transport receive error", error = ?e);
+                tokio::time::sleep(Duration::from_millis(1 << errors.min(6))).await;
+                errors += 1;
+            }
         }
     }
 }

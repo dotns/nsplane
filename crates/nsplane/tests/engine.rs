@@ -711,6 +711,59 @@ async fn failed_sends_drop_with_a_counted_reason() {
     assert_eq!(a.drops(DROP_TRANSPORT_SEND_ERROR).await, u64::from(SENT));
 }
 
+/// A transport whose receives fail at once while `failing` is set, counted in `receives`.
+struct Deaf {
+    inner: ChannelTransport,
+    failing: Arc<AtomicBool>,
+    receives: Arc<AtomicUsize>,
+}
+
+impl Transport for Deaf {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        if self.failing.load(Ordering::Relaxed) {
+            self.receives.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other("no buffer space"));
+        }
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        self.inner.send(datagram, to).await
+    }
+}
+
+/// A receive error that stays is retried at a bounded rate, not in a busy loop, and the
+/// receive task goes on once it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasting_receive_errors_back_off() {
+    let (ta, tb) = link(64);
+    let failing = Arc::new(AtomicBool::new(true));
+    let receives = Arc::new(AtomicUsize::new(0));
+    let ta = Deaf {
+        inner: ta,
+        failing: Arc::clone(&failing),
+        receives: Arc::clone(&receives),
+    };
+    let tb = Deaf {
+        inner: tb,
+        failing: Arc::default(),
+        receives: Arc::default(),
+    };
+    let (mut a, mut b) = nodes(ta, tb, &Options::default());
+    introduce(&a, &b).await;
+
+    sleep(QUIET).await;
+    let failed = receives.load(Ordering::Relaxed);
+    assert!((2..100).contains(&failed), "{failed} receives failed");
+
+    failing.store(false, Ordering::Relaxed);
+    exchange(&mut a, &mut b).await;
+}
+
 /// A handshake initiation from `initiator` to `responder`.
 fn initiation(initiator: StaticSecret, responder: PublicKey) -> Vec<u8> {
     let mut tunn = Tunn::new(initiator, responder, None, None, 0, None);

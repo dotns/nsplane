@@ -316,6 +316,31 @@ async fn send_recovery_does_not_spin_on_local_errors_or_backpressure() {
     }
 }
 
+/// A read that keeps failing is given up after eight attempts with path MTU discovery on,
+/// and is never retried without it or on backpressure.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn read_recovery_does_not_spin_on_lasting_errors_or_backpressure() {
+    let a = bind(1, "127.0.0.1:0");
+    for discovery in [false, true] {
+        a.set_path_mtu_discovery(discovery).unwrap();
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::WouldBlock] {
+            let mut attempts = 0;
+            let result: io::Result<()> = a.read(|| {
+                attempts += 1;
+                Err(kind.into())
+            });
+            assert_eq!(result.unwrap_err().kind(), kind);
+            let expected = if discovery && kind != io::ErrorKind::WouldBlock {
+                8
+            } else {
+                1
+            };
+            assert_eq!(attempts, expected);
+        }
+    }
+}
+
 /// Builds an ICMP Packet Too Big quoting a UDP datagram. The raw IPv6 socket supplies
 /// the `ICMPv6` checksum; IPv4 carries its own checksum.
 #[cfg(target_os = "linux")]

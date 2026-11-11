@@ -82,16 +82,20 @@ impl UdpTransport {
 
     /// Runs the non-blocking read `read`. With path MTU discovery on, it reads the
     /// first 64 queued errors at most, and retries a failed read: a queued ICMP error also
-    /// fails the next read once with its error code, which is not the engine's.
-    fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    /// fails the next read once with its error code, which is not the engine's. The
+    /// eighth failure in a row is returned, as a send's is: an error that stays is not
+    /// an ICMP error's.
+    pub(in crate::udp) fn read<T>(&self, mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
         if !self.errors.discovery.load(Ordering::Relaxed) {
             return read();
         }
+        let mut retries = 0;
         loop {
             self.errors.drain_errors(&self.socket);
             match read() {
-                Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock && retries < 7 => {
                     tracing::trace!(message = "Read failed on an ICMP error", error = %e);
+                    retries += 1;
                 }
                 result => return result,
             }
