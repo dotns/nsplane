@@ -588,8 +588,12 @@ The splitter awaits
 only the chosen sink, but a waiting sink still holds back the engine's next delivery;
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
 `Splitter::stats` returns a `SplitterStats` snapshot (`#[non_exhaustive]`): `misrouted`, and
-`failed`, packets whose chosen sink returned an error or that found every sink gone; a
-delivered packet updates no counter.
+`failed`, packets whose chosen sink returned an error or was gone, or that found every sink
+gone; a delivered packet updates no counter. A sink that returned `BrokenPipe` is gone for
+good and is not called again. While another sink is open, a packet routed to a gone sink is
+dropped, counted in `failed`, and the call returns `Ok`, so the engine keeps delivering to
+the open sinks; the splitter returns `BrokenPipe`, which the engine takes for the whole
+local side gone, only once every sink is gone.
 
 ### Local-side graph
 
@@ -643,13 +647,14 @@ decisions, not packet loops:
   of the packets it drops except the one being delivered; `SwapSink` forwards to the
   current sink and appends the buffers it drops (empty slot, or left by a replaced sink that
   failed); `Splitter` hands packets to the chosen sink's `send_batch_spent` (a packet goes
-  to one sink only), and appends the buffers of misrouted packets and of a packet failed
-  because every sink is gone. A `Splitter::new` splitter hands each run of consecutive
+  to one sink only), and appends the buffers of misrouted packets, of packets routed to a
+  gone sink and of a packet failed because every sink is gone. A `Splitter::new` splitter hands each run of consecutive
   packets for one sink over as one batch; it routes the packet behind a run to find its
   end, so its closure may run again for packets left after an error. A `Splitter::new_map`
   splitter hands over one packet at a time, so each packet is rewritten once, also across
   retries. On an error or a cancel the packets of a run its sink did not take over stay at
-  the front of the batch, in order.
+  the front of the batch, in order; when a sink goes while another is open, the call goes
+  on, drops the rest of that run and delivers the packets behind it.
 
 ```text
 TUN source ─► pump ─► Splitter ─┬─► pipe ─► MergeSource ─► engine A

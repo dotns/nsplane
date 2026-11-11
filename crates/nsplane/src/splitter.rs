@@ -35,7 +35,8 @@ impl<S: PacketSink> DynSink for S {
     }
 }
 
-/// One routed sink and whether it has returned [`io::ErrorKind::BrokenPipe`].
+/// One routed sink and whether it has returned [`io::ErrorKind::BrokenPipe`]; a gone sink is
+/// not called again.
 struct Route {
     sink: Box<dyn DynSink>,
     gone: AtomicBool,
@@ -74,15 +75,19 @@ type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 /// - An index out of range drops the packet, counts it in [`SplitterStats::misrouted`]
 ///   (also [`Splitter::misrouted`]), and returns `Ok`, so the engine does not take the
 ///   local side for gone.
-/// - An error from the chosen sink is returned for that packet and counted in
-///   [`SplitterStats::failed`].
-/// - When the chosen sink returns [`io::ErrorKind::BrokenPipe`], the sink counts as gone;
-///   later packets routed to a gone sink get the same error from the sink itself. Once
-///   every sink is gone (or none was added), `send` returns [`io::ErrorKind::BrokenPipe`]
-///   for every packet without calling the closure, and counts it in
-///   [`SplitterStats::failed`].
+/// - An error from the chosen sink, other than [`io::ErrorKind::BrokenPipe`], is returned
+///   for that packet and counted in [`SplitterStats::failed`].
+/// - When the chosen sink returns [`io::ErrorKind::BrokenPipe`], the sink counts as gone
+///   for good and is not called again. While another sink is open, that packet and every
+///   later packet routed to a gone sink are dropped, counted in [`SplitterStats::failed`],
+///   and `send` returns `Ok`: to the engine [`io::ErrorKind::BrokenPipe`] means the whole
+///   local side is gone, and it would stop delivering to the open sinks too.
+/// - The [`io::ErrorKind::BrokenPipe`] of the last open sink is returned. Once every sink
+///   is gone (or none was added), `send` returns [`io::ErrorKind::BrokenPipe`] for every
+///   packet without calling the closure, and counts it in [`SplitterStats::failed`].
 ///
-/// [`PacketSink::send_batch`] calls `send` for each packet in order.
+/// [`PacketSink::send_batch`] calls `send` for each packet in order, so a packet dropped
+/// for a gone sink does not end the batch.
 /// [`PacketSink::send_batch_spent`] hands packets to the chosen sink's `send_batch_spent`, so
 /// that sink's spent buffers reach the caller. A [`Splitter::new`] splitter hands each run of
 /// consecutive packets routed to the same sink over as one batch; to find where a run ends it
@@ -90,9 +95,12 @@ type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 /// batch after an error, when the caller delivers them. A [`Splitter::new_map`] splitter
 /// hands over one packet at a time, so its closure rewrites each packet once, also across
 /// those retries. Errors and cancellation follow `send_batch`: the packets of a run its sink
-/// did not take over stay at the front of the batch, in order. Each packet goes to one sink
-/// and is never shared: only that sink may append its buffer, and the splitter appends the
-/// buffers of the packets it drops itself (misrouted, or failed because every sink is gone).
+/// did not take over stay at the front of the batch, in order. When a sink goes while another
+/// is open, the call goes on instead: the rest of its run is routed again and dropped, and
+/// the packets behind are delivered in order. Each packet goes to one sink and is never
+/// shared: only that sink may append its buffer, and the splitter appends the buffers of the
+/// packets it drops itself (misrouted, routed to a gone sink, or failed because every sink
+/// is gone).
 ///
 /// [`Splitter::stats`] reads both counters; a delivered packet costs no counter update.
 pub struct Splitter {
@@ -114,8 +122,9 @@ pub struct SplitterStats {
     /// returned `Ok` for them.
     pub misrouted: u64,
     /// Packets not delivered because the chosen sink returned an error (of any kind,
-    /// [`io::ErrorKind::BrokenPipe`] included) or because every sink was gone; `send`
-    /// returned the error for them.
+    /// [`io::ErrorKind::BrokenPipe`] included), was gone already, or because every sink was
+    /// gone. `send` returned the error for them, except for a packet routed to a gone sink
+    /// while another sink was open, which it dropped with `Ok`.
     pub failed: u64,
 }
 
@@ -213,11 +222,17 @@ impl Splitter {
     }
 
     /// Counts a packet `route` failed with `err`, and the sink as gone on a broken pipe.
-    fn failed(&self, route: &Route, err: &io::Error) {
+    /// Returns whether the caller gets `err`: not for a broken pipe while another sink is
+    /// open, which would tell the caller that the whole local side is gone.
+    fn failed(&self, route: &Route, err: &io::Error) -> bool {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        if err.kind() == io::ErrorKind::BrokenPipe && !route.gone.swap(true, Ordering::AcqRel) {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return true;
+        }
+        if !route.gone.swap(true, Ordering::AcqRel) {
             self.open.fetch_sub(1, Ordering::AcqRel);
         }
+        self.open.load(Ordering::Acquire) == 0
     }
 }
 
@@ -230,11 +245,16 @@ impl PacketSink for Splitter {
             self.misrouted.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        let result = route.sink.send_boxed(packet, from).await;
-        if let Err(err) = &result {
-            self.failed(route, err);
+        if route.gone.load(Ordering::Acquire) {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         }
-        result
+        if let Err(err) = route.sink.send_boxed(packet, from).await
+            && self.failed(route, &err)
+        {
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn send_batch_spent(
@@ -272,6 +292,11 @@ impl PacketSink for Splitter {
                 spent.extend(packets.drain(..len).map(|(_, packet)| packet));
                 continue;
             };
+            if route.gone.load(Ordering::Acquire) {
+                self.failed.fetch_add(len as u64, Ordering::Relaxed);
+                spent.extend(packets.drain(..len).map(|(_, packet)| packet));
+                continue;
+            }
             run.extend(packets.drain(..len));
             let run = Run {
                 packets: &mut *packets,
@@ -280,8 +305,11 @@ impl PacketSink for Splitter {
             let result = route.sink.send_batch_spent_boxed(run.run, spent).await;
             drop(run);
             if let Err(err) = result {
-                self.failed(route, &err);
-                return Err(err);
+                if self.failed(route, &err) {
+                    return Err(err);
+                }
+                // The rest of the run is back at the front of the batch.
+                next = None;
             }
         }
         Ok(())
@@ -379,17 +407,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_pipe_per_sink_then_all() -> TestResult {
+    async fn gone_sink_drops_until_all_are_gone() -> TestResult {
         let (a, a_rx) = ChannelSink::new(4);
-        let (b, b_rx) = ChannelSink::new(4);
+        let (b, mut b_rx) = ChannelSink::new(4);
         let splitter = Splitter::new(by_first_byte).sink(a).sink(b);
 
+        // Sink b is still open: a packet for the gone sink a is dropped, not an error.
         drop(a_rx);
         for _ in 0..2 {
-            let err = send(&splitter, 0).await.err().ok_or("expected an error")?;
-            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            send(&splitter, 0).await?;
         }
+        assert_eq!(splitter.stats().failed, 2);
         send(&splitter, 1).await?;
+        assert_eq!(b_rx.recv().await.ok_or("b closed")?.1.as_packet(), [1]);
         send(&splitter, 7).await?;
         assert_eq!(splitter.misrouted(), 1);
 
@@ -515,7 +545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn map_broken_pipe_per_sink_then_all() -> TestResult {
+    async fn map_gone_sink_drops_until_all_are_gone() -> TestResult {
         let calls = Arc::new(AtomicU64::new(0));
         let (a, a_rx) = ChannelSink::new(4);
         let (b, b_rx) = ChannelSink::new(4);
@@ -532,8 +562,7 @@ mod tests {
         // A packet starting with 0 is routed to b, one starting with 255 to a.
         drop(b_rx);
         for _ in 0..2 {
-            let err = send(&splitter, 0).await.err().ok_or("expected an error")?;
-            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            send(&splitter, 0).await?;
         }
         assert_eq!(splitter.stats().failed, 2);
         drop(a_rx);
@@ -809,6 +838,103 @@ mod tests {
         splitter.send_batch_spent(&mut packets, &mut spent).await?;
         assert_eq!(bytes(&spent), [[3], [5], [2], [7]]);
         assert_eq!(b.taken(), [[3], [5], [7]]);
+        Ok(())
+    }
+
+    /// What the engine's sink task does: `send_batch` until the batch is empty, stopping
+    /// for good at a broken pipe.
+    #[tokio::test]
+    async fn batch_keeps_flowing_to_the_open_sink_after_the_other_is_gone() -> TestResult {
+        let (a, a_rx) = ChannelSink::new(8);
+        let (b, mut b_rx) = ChannelSink::new(8);
+        let splitter = Splitter::new(by_first_byte).sink(a).sink(b);
+
+        drop(a_rx);
+        for _ in 0..2 {
+            let mut packets = batch(&[1, 0, 0, 1, 0, 1]);
+            splitter.send_batch(&mut packets).await?;
+            assert!(packets.is_empty());
+            for _ in 0..3 {
+                assert_eq!(b_rx.recv().await.ok_or("b closed")?.1.as_packet(), [1]);
+            }
+            assert!(b_rx.is_empty());
+        }
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 0,
+                failed: 6
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_drops_the_runs_of_a_gone_sink() -> TestResult {
+        let a = Batches::default();
+        let splitter = Splitter::new(by_parity)
+            .sink(a.clone())
+            .sink(Failing(io::ErrorKind::BrokenPipe));
+        let mut packets = batch(&[2, 3, 5, 4, 1, 7, 6]);
+        let mut spent = Vec::new();
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        // The gone sink dropped 3 itself; the splitter dropped 5, 1 and 7.
+        assert_eq!(bytes(&spent), [[2], [5], [4], [1], [7], [6]]);
+        assert_eq!(a.inner.taken(), [[2], [4], [6]]);
+        assert_eq!(a.lens(), [1, 1, 1]);
+        assert_eq!(
+            splitter.stats(),
+            SplitterStats {
+                misrouted: 0,
+                failed: 4
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_new_map_drops_for_a_gone_sink_mapping_once() -> TestResult {
+        let calls = Arc::new(AtomicU64::new(0));
+        let a = SpentSink::default();
+        let splitter = Splitter::new_map({
+            let calls = Arc::clone(&calls);
+            move |from, packet: &mut PacketBuf| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                increment_then_route(from, packet)
+            }
+        })
+        .sink(Failing(io::ErrorKind::BrokenPipe))
+        .sink(a.clone());
+        // Rewritten to 1, 0, 0, 1: sink 0 is gone from the second packet on.
+        let mut packets = batch(&[0, 255, 255, 0]);
+        let mut spent = Vec::new();
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(bytes(&spent), [[1], [0], [1]]);
+        assert_eq!(a.taken(), [[1], [1]]);
+        assert_eq!(splitter.stats().failed, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spent_last_sink_gone_is_broken_pipe_and_keeps_the_rest() -> TestResult {
+        let splitter = Splitter::new(by_parity)
+            .sink(Failing(io::ErrorKind::BrokenPipe))
+            .sink(Failing(io::ErrorKind::BrokenPipe));
+        let mut packets = batch(&[2, 3, 4, 5]);
+        let mut spent = Vec::new();
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        // 2 was dropped with sink 1 still open, 3 failed as the last sink went.
+        assert_eq!(left(&packets), [4, 5]);
+        assert!(spent.is_empty());
+        assert_eq!(splitter.stats().failed, 2);
         Ok(())
     }
 
