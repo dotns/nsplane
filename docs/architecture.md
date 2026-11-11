@@ -225,11 +225,22 @@ redacts key material.
 
 ## Unsafe code
 
-`unsafe` lives only in `nsplane-tun`'s platform modules (`unix`, `linux`, `darwin`, and
-loading Wintun in `windows`), each with `SAFETY` comments. `nsplane-packet`, `nsplane-core`,
-`nsplane`, `nsplane-acl`, `nsplane-nat`, `nsplane-wss`, `nsplane-netstack`, `nsplane-uapi`,
-`nsplane-cli` and `nsplane-examples` declare `#![forbid(unsafe_code)]`, and `nsplane-noise`
-contains no `unsafe` block. See ADR
+The workspace lint is `unsafe_code = "deny"`: `unsafe` compiles only under an explicit
+`allow(unsafe_code, reason = "...")`, so `rg 'allow\(unsafe_code'` lists all of it. Two
+library crates use it, for system calls that have no safe wrapper fitting the design, each
+block with a `SAFETY` comment:
+
+- `nsplane-tun`: the platform modules `unix`, `linux` and `darwin`, and in `windows` loading
+  Wintun and the IP Helper calls.
+- `nsplane-ether`: the Linux TAP device and packet socket modules (`tap`, `packet`).
+
+The library crates `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-nat`,
+`nsplane-dns`, `nsplane-wss`, `nsplane-netstack` and `nsplane-uapi`, and the library of
+`nsplane-examples`, declare `#![forbid(unsafe_code)]` at the crate root, which no `allow`
+can lift. `nsplane-noise` has no `unsafe` block. Binaries and tests come under the
+workspace lint: where one of them needs a system call directly (adopting an inherited
+descriptor, a resource limit or a socket pair in a test), the statement carries its own
+`allow` with the reason. See ADR
 [2026-10-01-unsafe-code-in-boringtun](decisions/2026-10-01-unsafe-code-in-boringtun.md).
 
 ## Crypto
