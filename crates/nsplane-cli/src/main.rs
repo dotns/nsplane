@@ -245,9 +245,9 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
 /// this fails, as it did when the login name resolved to root: run as root without `sudo`,
 /// pass `--disable-drop-privileges`.
 ///
-/// A root process also replaces its supplementary groups with the target group, so the
-/// groups of root do not outlive the switch. Not on macOS, where `nix` has no `setgroups`:
-/// the supplementary groups are kept there.
+/// A root process also replaces its supplementary GIDs with the target GID, so those of root
+/// do not outlive the switch. Not on macOS, where `nix` has no `setgroups`: the supplementary
+/// GIDs are kept there.
 fn drop_privileges() -> anyhow::Result<()> {
     let id = |name| std::env::var(name).ok()?.parse::<u32>().ok();
     let (uid, gid) = match (id("SUDO_UID"), id("SUDO_GID")) {
