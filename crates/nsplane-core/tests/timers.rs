@@ -161,6 +161,45 @@ fn passive_keepalive_after_received_data() {
     assert_eq!(net.take_delivered(0), Vec::new());
 }
 
+/// With a persistent keepalive, the initiator that gave up starts a new attempt one interval
+/// after the expiry, and reports the expiry of every attempt.
+#[test]
+fn persistent_keepalive_starts_a_new_attempt_after_the_handshake_gave_up() {
+    let mut net = Net::new(2);
+    net.set_interceptor(|_| Fate::Drop);
+    let id = net.peer_id(0, 1);
+    let peer = net.public_key(1);
+    let interval = Duration::from_secs(25);
+    net.configure(
+        0,
+        ConfigChange::SetKeepalive {
+            peer,
+            interval: Some(25),
+        },
+    );
+    let timed_out = Event::SessionExpired {
+        peer: id,
+        cause: ExpiryCause::HandshakeTimeout,
+    };
+
+    net.run_for(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+    assert_eq!(net.take_events(0), std::slice::from_ref(&timed_out));
+    net.take_transmits(0);
+
+    net.run_for(interval.saturating_sub(Duration::from_secs(2)));
+    assert_eq!(net.take_transmits(0), Vec::new(), "silent for the interval");
+
+    net.run_for(REKEY_ATTEMPT_TIME + interval);
+    let retries = inits(&net.take_transmits(0));
+    assert!((15..=18).contains(&retries), "{retries} initiations");
+    assert_eq!(
+        net.take_events(0),
+        [timed_out],
+        "the second attempt expired"
+    );
+    assert_eq!(expirations(&net, 0, 1), 2);
+}
+
 /// A persistent keepalive goes out as soon as it is enabled, then whenever the tunnel was
 /// idle for the interval.
 #[test]

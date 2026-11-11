@@ -85,7 +85,8 @@ number and looks up the peer when it grows (`EngineHandle::unanswered_handshakes
 ### Peer expiry
 
 A peer's tunnel expires on two timer paths of `nsplane-noise`, which discard its sessions,
-its queued packets and its timers; the next packet to the peer starts a new handshake:
+its queued packets and its timers; the next packet to the peer starts a new handshake, and so
+does a persistent keepalive, one interval after the expiry and after every later one:
 
 - `ExpiryCause::SessionAge`: no handshake completed for `REJECT_AFTER_TIME * 3` (540 s), counted
   from the last completed handshake or, without one, from the peer's first timer tick. The

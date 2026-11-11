@@ -1984,4 +1984,77 @@ mod tests {
         );
         assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
     }
+
+    /// Runs the timers of a tunnel whose peer never answers every 250 ms for 1200 s, after
+    /// one handshake initiation at the start. Returns the times of the handshake initiations
+    /// the timers sent and the number of expiries (runs of `ConnectionExpired` ticks).
+    fn run_unanswered(persistent_keepalive: Option<u16>) -> (Vec<Duration>, usize) {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        my_tun.set_persistent_keepalive(persistent_keepalive);
+        let start = Instant::now();
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.update_timers_at(start, &mut dst),
+            TunnResult::Done | TunnResult::WriteToNetwork(_)
+        ));
+        if !my_tun.handshake.is_in_progress() {
+            create_handshake_init(&mut my_tun);
+        }
+
+        let mut initiations = Vec::new();
+        let mut expiries = 0;
+        let mut expired = false;
+        for tick in 1..=4800 {
+            let elapsed = Duration::from_millis(250) * tick;
+            let result = my_tun.update_timers_at(start + elapsed, &mut dst);
+            if is_handshake_init(&result) {
+                initiations.push(elapsed);
+            }
+            let now_expired = matches!(result, TunnResult::Err(WireGuardError::ConnectionExpired));
+            assert!(
+                now_expired || matches!(result, TunnResult::Done | TunnResult::WriteToNetwork(_)),
+                "{result:?}"
+            );
+            if now_expired && !expired {
+                assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+                expiries += 1;
+            }
+            expired = now_expired;
+        }
+        (initiations, expiries)
+    }
+
+    #[test]
+    fn persistent_keepalive_starts_a_new_handshake_cycle_after_each_expiry() {
+        let (initiations, expiries) = run_unanswered(Some(25));
+
+        // Every cycle retries for REKEY_ATTEMPT_TIME, expires, and starts again one keepalive
+        // interval later: 1200 s hold ten whole cycles of 115 s.
+        assert_eq!(expiries, 10);
+        let cycle_starts: Vec<Duration> = initiations
+            .iter()
+            .zip(initiations.iter().skip(1))
+            .filter(|(previous, next)| next.saturating_sub(**previous) >= Duration::from_secs(25))
+            .map(|(_, next)| *next)
+            .collect();
+        assert_eq!(cycle_starts.len(), 10);
+        assert_eq!(
+            cycle_starts.first(),
+            Some(&(REKEY_ATTEMPT_TIME + Duration::from_secs(25)))
+        );
+        assert!(initiations.last() > Some(&Duration::from_secs(1150)));
+        // Each cycle sends at most one initiation per REKEY_TIMEOUT: no per-tick resend.
+        assert!(
+            initiations.len() <= 11 * 18,
+            "{} initiations",
+            initiations.len()
+        );
+    }
+
+    #[test]
+    fn without_persistent_keepalive_an_expired_tunnel_stays_silent() {
+        let (initiations, expiries) = run_unanswered(None);
+        assert_eq!(expiries, 1);
+        assert!(initiations.last() < Some(&REKEY_ATTEMPT_TIME));
+    }
 }

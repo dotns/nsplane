@@ -368,20 +368,23 @@ impl Tunn {
             return true;
         }
 
-        // Persistent KEEPALIVE: sent once when enabled, then whenever the tunnel was silent
-        // in both directions for the interval.
+        if self.persistent_keepalive_due(now) {
+            tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
+            return true;
+        }
+        false
+    }
+
+    /// Whether a persistent keepalive is due: once when enabled, then whenever the tunnel was
+    /// silent in both directions for the interval.
+    fn persistent_keepalive_due(&mut self, now: Duration) -> bool {
         let interval = self.timers.persistent_keepalive;
         if interval == 0 {
             return false;
         }
         let last_traffic = self.timers[TimeLastPacketSent].max(self.timers[TimeLastPacketReceived]);
-        if mem::take(&mut self.timers.persistent_keepalive_pending)
+        mem::take(&mut self.timers.persistent_keepalive_pending)
             || now.saturating_sub(last_traffic) >= Duration::from_secs(u64::from(interval))
-        {
-            tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
-            return true;
-        }
-        false
     }
 
     /// Advances the timers to the crate clock (`std::time::Instant::now()`); see
@@ -407,7 +410,15 @@ impl Tunn {
 
         self.update_session_timers(now);
 
+        let was_expired = self.handshake.is_expired();
         if let Err(e) = self.check_expiry(now) {
+            // A persistent keepalive has no session to go out on once the tunnel expired: it
+            // starts a new handshake attempt instead, one interval after the expiry. The
+            // tick of the expiry itself always reports it.
+            if was_expired && self.persistent_keepalive_due(now) {
+                tracing::debug!("HANDSHAKE(PERSISTENT_KEEPALIVE)");
+                return self.format_handshake_initiation(dst, true);
+            }
             return TunnResult::Err(e);
         }
 
