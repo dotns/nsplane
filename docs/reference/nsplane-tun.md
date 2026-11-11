@@ -121,6 +121,10 @@ on Linux, Android, macOS and iOS.
   (`SlotSource::oversize_drops`), a 0-byte read is `UnexpectedEof`. Each packet is one write
   without header; a short write is `WriteZero`. No offloads; the MTU watch keeps the value
   given to `new`.
+- macOS and iOS: `replace` checks whether the fd is a utun socket (its interface name can be
+  queried). Such an fd frames every packet with a 4-byte address-family header, which the
+  source strips and the sink adds (a packet that is neither IPv4 nor IPv6 is then
+  `InvalidInput`); any other fd is read and written bare, as on Linux and Android.
 - `SlotSink::send_batch_spent` writes the packets one at a time and appends each buffer once
   its write is done, written or failed, so a `pump` into the slot recycles them.
 - The caller keeps its own generation numbering, attach and activate ordering and host-claim

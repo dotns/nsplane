@@ -9,6 +9,11 @@
 //! `replace` or `clear` returned, no syscall runs on the previous fd; a read that completed
 //! on it but was not returned yet is discarded, and the call reads from the next installed
 //! fd instead.
+//!
+//! Framing: a packet is one read or write of the fd, bare. On macOS and iOS a utun socket
+//! frames every packet with a 4-byte address-family header instead, so
+//! [`TunSlot::replace`] checks whether the fd is one and the slot then strips and adds that
+//! header as `Tun` does; any other fd stays bare there too.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -38,8 +43,26 @@ const TRANSLATION_SLACK: usize = 28;
 #[derive(Debug)]
 struct State {
     fd: Option<Arc<AsyncFd<File>>>,
+    /// Whether the installed fd is a utun socket, whose packets carry the 4-byte header.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    utun: bool,
     enabled: bool,
     closed: bool,
+}
+
+impl State {
+    /// Whether the installed fd frames packets with the utun header.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const fn utun(&self) -> bool {
+        self.utun
+    }
+
+    /// Whether the installed fd frames packets with the utun header: never on this target.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[allow(clippy::unused_self, reason = "the same call as on macOS and iOS")]
+    const fn utun(&self) -> bool {
+        false
+    }
 }
 
 /// What the control handle, the source and the sink share.
@@ -77,16 +100,17 @@ impl Shared {
 
     /// Runs `syscall` if the fd of `generation` is still installed and I/O is enabled;
     /// `None` otherwise. The read lock keeps replace and close out until it returns.
+    /// `syscall` is told whether that fd frames packets with the utun header.
     fn io<T>(
         &self,
         generation: u64,
-        syscall: impl FnOnce() -> io::Result<T>,
+        syscall: impl FnOnce(bool) -> io::Result<T>,
     ) -> io::Result<Option<T>> {
         let state = self.read();
         if !state.enabled || self.generation.load(Ordering::Acquire) != generation {
             return Ok(None);
         }
-        let result = syscall().map(Some);
+        let result = syscall(state.utun()).map(Some);
         drop(state);
         result
     }
@@ -138,6 +162,8 @@ impl TunSlot {
         let shared = Arc::new(Shared {
             state: RwLock::new(State {
                 fd: None,
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                utun: false,
                 enabled: true,
                 closed: false,
             }),
@@ -173,6 +199,10 @@ impl TunSlot {
     /// `fd`. It is closed once no I/O uses it any more. Whether I/O is enabled does not
     /// change.
     ///
+    /// macOS and iOS: if `fd` is a utun socket (its interface name can be queried), its
+    /// packets carry a 4-byte address-family header, which the source strips and the sink
+    /// adds; any other fd is read and written bare, as on Linux and Android.
+    ///
     /// Fails with [`io::ErrorKind::BrokenPipe`] after [`close`](Self::close), and with
     /// [`io::ErrorKind::Other`] outside a tokio runtime; `fd` is closed on every error.
     pub fn replace(&self, fd: OwnedFd) -> io::Result<()> {
@@ -180,6 +210,8 @@ impl TunSlot {
             return Err(io::Error::other("TunSlot::replace needs a tokio runtime"));
         }
         set_nonblocking(&fd)?;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let utun = crate::darwin::name(std::os::fd::AsFd::as_fd(&fd)).is_ok();
         let fd = Arc::new(register::<File>(fd)?);
         let shared = self.shared();
         let previous = {
@@ -189,6 +221,10 @@ impl TunSlot {
                 return Err(closed());
             }
             shared.generation.fetch_add(1, Ordering::AcqRel);
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                state.utun = utun;
+            }
             state.fd.replace(fd)
         };
         shared.changed.notify_waiters();
@@ -290,8 +326,9 @@ impl PacketSource for SlotSource {
                 continue;
             };
             let Ok(result) = guard?.try_io(|fd| {
-                self.shared
-                    .io(generation, || read(fd.get_ref(), packet.as_packet_mut()))
+                self.shared.io(generation, |utun| {
+                    read(fd.get_ref(), utun, packet.as_packet_mut())
+                })
             }) else {
                 continue;
             };
@@ -336,7 +373,10 @@ pub struct SlotSink {
 }
 
 impl PacketSink for SlotSink {
-    /// Writes `packet` as one write, without any header or offload. `from` is unused.
+    /// Writes `packet` as one write, without any header or offload (macOS and iOS: behind
+    /// the address-family header chosen from its IP version if the fd is a utun socket; a
+    /// packet that is neither IPv4 nor IPv6 then fails with
+    /// [`io::ErrorKind::InvalidInput`]). `from` is unused.
     ///
     /// A short write fails with [`io::ErrorKind::WriteZero`]. While the slot is empty or
     /// disabled this waits; once it is closed this fails with
@@ -378,9 +418,10 @@ impl SlotSink {
             let Some(guard) = ready_or_changed(fd.writable(), changed).await else {
                 continue;
             };
-            let Ok(result) =
-                guard?.try_io(|fd| self.shared.io(generation, || write(fd.get_ref(), bytes)))
-            else {
+            let Ok(result) = guard?.try_io(|fd| {
+                self.shared
+                    .io(generation, |utun| write(fd.get_ref(), utun, bytes))
+            }) else {
                 continue;
             };
             if let Some(written) = result? {
@@ -410,23 +451,54 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "TUN slot closed")
 }
 
-/// One `read`, retried when interrupted by a signal.
-fn read(mut fd: &File, buf: &mut [u8]) -> io::Result<usize> {
+/// One read of a packet into `buf`, retried when interrupted by a signal; with `utun`
+/// the frame's header is stripped.
+fn read(fd: &File, utun: bool, buf: &mut [u8]) -> io::Result<usize> {
     loop {
-        match fd.read(buf) {
+        match read_once(fd, utun, buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             result => return result,
         }
     }
 }
 
-/// One `write`, retried when interrupted by a signal.
-fn write(mut fd: &File, buf: &[u8]) -> io::Result<usize> {
+/// One write of the packet `buf`, retried when interrupted by a signal; with `utun`
+/// behind the header for its IP version. Returns the packet bytes written.
+fn write(fd: &File, utun: bool, buf: &[u8]) -> io::Result<usize> {
     loop {
-        match fd.write(buf) {
+        match write_once(fd, utun, buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             result => return result,
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_once(mut fd: &File, _utun: bool, buf: &mut [u8]) -> io::Result<usize> {
+    fd.read(buf)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn write_once(mut fd: &File, _utun: bool, buf: &[u8]) -> io::Result<usize> {
+    fd.write(buf)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn read_once(mut fd: &File, utun: bool, buf: &mut [u8]) -> io::Result<usize> {
+    if utun {
+        crate::darwin::read_spill(std::os::fd::AsFd::as_fd(fd), buf, &mut [])
+    } else {
+        fd.read(buf)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn write_once(mut fd: &File, utun: bool, buf: &[u8]) -> io::Result<usize> {
+    if utun {
+        // The count includes the 4-byte header.
+        crate::darwin::write(std::os::fd::AsFd::as_fd(fd), buf).map(|n| n.saturating_sub(4))
+    } else {
+        fd.write(buf)
     }
 }
 

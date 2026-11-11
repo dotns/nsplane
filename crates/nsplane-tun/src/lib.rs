@@ -46,7 +46,8 @@
 //! for a host that replaces the fd while the engine runs (Android `VpnService`).
 //! `TunSlot::replace` fences the previous fd, `disable`/`enable` park I/O, and `close`
 //! ends both sides with `BrokenPipe`. Packets are read and written one at a time, without
-//! header or offloads.
+//! header or offloads; on macOS and iOS an installed utun socket is detected and its 4-byte
+//! address-family header is stripped and added.
 //!
 //! Host callbacks (every target): [`host_tun`] yields a [`HostTunInput`] the host pushes
 //! packets into from any thread, a [`HostTunSource`] the engine reads them from, and a
