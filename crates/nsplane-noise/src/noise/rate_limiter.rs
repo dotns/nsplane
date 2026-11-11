@@ -443,7 +443,7 @@ impl RateLimiter {
 
                 // The cookie proves the address; the address still gets a bounded rate.
                 if !self.budget.admit_cookie_holder(addr.ip()) {
-                    return Err(TunnResult::Err(WireGuardError::UnderLoad));
+                    return Err(Rejection::Err(WireGuardError::UnderLoad));
                 }
             }
         }
