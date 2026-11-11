@@ -33,8 +33,10 @@
 //! MTU: `TunSource`'s `mtu` watch follows the interface MTU. On Linux/Android and
 //! macOS/iOS, `Tun::split` queries the MTU (`SIOCGIFMTU`) and spawns a tokio task that
 //! polls it every `MTU_POLL_INTERVAL` (1 s) and publishes changes; periodic polling
-//! needs neither netlink nor a routing socket. The task ends when the source and every
-//! receiver are dropped, the device fd is closed, or the interface is gone. An adopted
+//! needs neither netlink nor a routing socket. Each poll takes the interface name from the
+//! fd, so a renamed interface stays watched. The task ends when the source and every
+//! receiver are dropped or the device fd is closed, and with a warning in the log when the
+//! interface is gone. An adopted
 //! fd whose interface name cannot be queried (not a TUN device) is not watched: its MTU
 //! stays the value it was adopted with. On Windows the MTU is read once when the
 //! Wintun adapter opens and is not watched.

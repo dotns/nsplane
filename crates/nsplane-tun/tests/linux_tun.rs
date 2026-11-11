@@ -221,3 +221,30 @@ async fn tun_mtu_change_is_observed() {
         .unwrap();
     assert!(closed.is_err());
 }
+
+/// The watcher follows the device, not the name it had at the split.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN, /dev/net/tun and ip"]
+async fn tun_mtu_change_is_observed_after_a_rename() {
+    let ip = |args: &[&str]| {
+        let status = Command::new("ip").args(args).status().unwrap();
+        assert!(status.success(), "ip {args:?}: {status}");
+    };
+
+    let tun = Tun::create("nsplaneren%d").unwrap();
+    let name = tun.name().unwrap();
+    let (source, _sink) = tun.split().unwrap();
+    let mut mtu = source.mtu();
+
+    let renamed = format!("{name}x");
+    ip(&["link", "set", "dev", &name, "name", &renamed]);
+    assert_eq!(source.name().unwrap(), renamed);
+    for value in [1280u16, 1400] {
+        ip(&["link", "set", "dev", &renamed, "mtu", &value.to_string()]);
+        tokio::time::timeout(Duration::from_secs(5), mtu.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*mtu.borrow_and_update(), value);
+    }
+}

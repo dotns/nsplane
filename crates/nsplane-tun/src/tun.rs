@@ -112,7 +112,7 @@ impl Tun {
     pub fn create_with(name: &str, options: TunOptions) -> io::Result<Self> {
         let (fd, offload) = open(name, options.offload)?;
         set_nonblocking(&fd)?;
-        let mtu = sys::mtu(&sys::name(fd.as_fd())?)?;
+        let mtu = interface_mtu(fd.as_fd())?;
         Ok(Self { fd, mtu, offload })
     }
 
@@ -162,22 +162,22 @@ impl Tun {
     ///
     /// If the fd is a real TUN device, the interface MTU is queried now and a small
     /// task polls it every [`MTU_POLL_INTERVAL`], publishing changes on
-    /// [`TunSource`]'s `mtu` watch. The task ends once the source and every receiver of
-    /// that watch are dropped, the device fd is closed, or the query fails (the
-    /// interface is gone). If the name cannot be queried (not a TUN device) nothing is
-    /// spawned and the MTU stays the value given to [`Tun::from_fd`].
+    /// [`TunSource`]'s `mtu` watch. Every poll asks the fd for its interface name
+    /// first, so the task follows the device when the interface is renamed. The task
+    /// ends once the source and every receiver of that watch are dropped or the device
+    /// fd is closed; if the query fails twice in a row (the interface is gone) it logs a
+    /// warning and ends, and the watch keeps the last value. If the name cannot be
+    /// queried (not a TUN device) nothing is spawned and the MTU stays the value given to
+    /// [`Tun::from_fd`].
     pub fn split(self) -> io::Result<(TunSource, TunSink)> {
-        let watched = sys::name(self.fd.as_fd())
-            .and_then(|name| Ok((sys::mtu(&name)?, name)))
-            .ok();
+        let watched = interface_mtu(self.fd.as_fd()).ok();
         let fd = Arc::new(register::<OwnedFd>(self.fd)?);
-        let (sender, receiver) = watch::channel(watched.as_ref().map_or(self.mtu, |w| w.0));
-        let unwatched = match watched {
-            Some((_, name)) => {
-                tokio::spawn(watch_mtu(name, Arc::downgrade(&fd), sender));
-                None
-            }
-            None => Some(sender),
+        let (sender, receiver) = watch::channel(watched.unwrap_or(self.mtu));
+        let unwatched = if watched.is_some() {
+            tokio::spawn(watch_mtu(Arc::downgrade(&fd), sender));
+            None
+        } else {
+            Some(sender)
         };
         let source = TunSource {
             fd: Arc::clone(&fd),
@@ -237,10 +237,17 @@ impl AsFd for Tun {
     }
 }
 
-/// Polls the MTU of interface `name` every [`MTU_POLL_INTERVAL`] and sends it on `mtu`
-/// when it changed. Ends once every receiver is gone, the device fd is closed, or the
-/// query fails.
-async fn watch_mtu(name: String, fd: Weak<AsyncFd<OwnedFd>>, mtu: watch::Sender<u16>) {
+/// The MTU of the interface `fd` is attached to: its current name, from the fd, then
+/// `SIOCGIFMTU` by that name.
+fn interface_mtu(fd: BorrowedFd<'_>) -> io::Result<u16> {
+    sys::mtu(&sys::name(fd)?)
+}
+
+/// Polls the MTU of the interface of the device `fd` every [`MTU_POLL_INTERVAL`] and sends
+/// it on `mtu` when it changed. The interface is looked up from the fd on every poll, so a
+/// rename is followed. Ends once every receiver is gone or the device fd is closed, and
+/// with a warning when the query fails.
+async fn watch_mtu(fd: Weak<AsyncFd<OwnedFd>>, mtu: watch::Sender<u16>) {
     loop {
         // Every receiver gone: nobody observes the MTU any more.
         if tokio::time::timeout(MTU_POLL_INTERVAL, mtu.closed())
@@ -249,12 +256,24 @@ async fn watch_mtu(name: String, fd: Weak<AsyncFd<OwnedFd>>, mtu: watch::Sender<
         {
             return;
         }
-        // Device closed: the name may already belong to another interface.
-        if fd.strong_count() == 0 {
+        // Device closed: nothing to query.
+        let Some(device) = fd.upgrade() else {
             return;
-        }
-        let Ok(current) = sys::mtu(&name) else {
-            return;
+        };
+        let device_fd = device.get_ref().as_fd();
+        // A rename between the name and the MTU query fails the first attempt.
+        let queried = interface_mtu(device_fd).or_else(|_| interface_mtu(device_fd));
+        drop(device);
+        let current = match queried {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    mtu = *mtu.borrow(),
+                    "TUN MTU watcher stopped: the interface MTU cannot be queried any more"
+                );
+                return;
+            }
         };
         mtu.send_if_modified(|value| {
             let changed = *value != current;
@@ -401,8 +420,9 @@ impl PacketSource for TunSource {
 
     /// The device MTU. For a real TUN device it follows the interface MTU: the
     /// watcher started by [`Tun::split`] polls `SIOCGIFMTU` every
-    /// [`MTU_POLL_INTERVAL`], so a change is observed within about that interval. For
-    /// an fd that is not a TUN device it never changes.
+    /// [`MTU_POLL_INTERVAL`], so a change is observed within about that interval, also
+    /// after the interface was renamed. For an fd that is not a TUN device it never
+    /// changes.
     fn mtu(&self) -> watch::Receiver<u16> {
         let mut mtu = self.mtu.clone();
         // Like `Sender::subscribe`: only later changes count as changed.

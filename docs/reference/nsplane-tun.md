@@ -25,6 +25,14 @@ adapter alias on Windows). nsplane does not configure addresses, routes or DNS o
 - Unix: non-blocking fd I/O shared by both.
 - Windows: a Wintun adapter; a reader thread feeds the source, so there is no fd.
 
+### MTU watch
+
+On Unix `Tun::split` starts a task that polls the interface MTU every `MTU_POLL_INTERVAL`
+(1 s) and publishes changes on the `PacketSource::mtu` watch. Each poll takes the interface
+name from the fd (`TUNGETIFF`, `UTUN_OPT_IFNAME`), so a renamed interface stays watched. When
+the query fails twice in a row (the interface is gone) the task logs one warning and ends;
+the watch keeps the last value. An fd that is not a TUN device is not watched.
+
 ### Offload (Linux, Android)
 
 `Tun::create` opens the device with the virtio-net header and turns on TSO and USO where the
