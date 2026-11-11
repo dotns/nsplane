@@ -228,8 +228,9 @@ the client's ID (`ServerStats::passed`); when `resolve_timeout` expires or every
 attempt fails the answer is `SERVFAIL` without a question (`ServerStats::pass_failed`). Over
 UDP a response above the client's limit (its OPT payload size when the message has a readable
 OPT record, else 512 bytes, clamped like `max_udp_response_size`) is replaced by the
-response's header with `TC` = 1 and all section counts zero; the client retries over TCP,
-where the limit is 65535.
+response's header with `TC` = 1 and its question section, without records (the header alone,
+all section counts zero, when the response's questions cannot be read or do not fit the limit);
+the client retries over TCP, where the limit is 65535.
 
 The serve functions bound the queries resolved at once, over all transports of a server and
 its clones, to `ServerConfig::max_in_flight`:

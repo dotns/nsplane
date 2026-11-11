@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use simple_dns::PacketView;
+use simple_dns::{Packet, PacketView};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -160,6 +160,17 @@ struct Counters {
     pass_refused: AtomicU64,
     pass_failed: AtomicU64,
     rejected_connections: AtomicU64,
+}
+
+/// The question count and the question section of `message`, encoded again without name
+/// compression; `None` when the message does not parse.
+fn question_section(message: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let view = PacketView::parse(message).ok()?;
+    let count = u16::try_from(view.questions.len()).ok()?;
+    let mut packet = Packet::new_query(0);
+    packet.questions = view.questions;
+    let encoded = packet.build_bytes_vec().ok()?;
+    Some((count, encoded.get(HEADER_LEN..)?.to_vec()))
 }
 
 fn bump(counter: &AtomicU64) {
@@ -326,7 +337,8 @@ impl<R: Resolver> Server<R> {
     /// it expires or every forwarder attempt fails). Over UDP, a response above the client's
     /// limit (its OPT payload size when the message has a readable OPT record, else 512
     /// bytes, clamped like [`max_udp_response_size`]) is replaced by its header with `TC` = 1
-    /// and all section counts zero.
+    /// and its question section, without records; by the header alone, all section counts
+    /// zero, when its questions cannot be read or do not fit the limit.
     ///
     /// It does not take an in-flight permit; callers bound concurrency themselves.
     pub async fn handle(
@@ -418,10 +430,16 @@ impl<R: Resolver> Server<R> {
         if response.len() <= max_size {
             return Some(response);
         }
-        let mut header = response.slice(..HEADER_LEN).to_vec();
-        header[2] |= TC_BIT;
-        header[4..].fill(0);
-        Some(Bytes::from(header))
+        let mut truncated = response.slice(..HEADER_LEN).to_vec();
+        truncated[2] |= TC_BIT;
+        truncated[4..].fill(0);
+        if let Some((count, questions)) = question_section(&response)
+            && HEADER_LEN + questions.len() <= max_size
+        {
+            truncated[4..6].copy_from_slice(&count.to_be_bytes());
+            truncated.extend_from_slice(&questions);
+        }
+        Some(Bytes::from(truncated))
     }
 
     const fn options(&self) -> EncodeOptions {

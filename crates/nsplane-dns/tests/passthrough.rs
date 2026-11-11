@@ -433,6 +433,73 @@ async fn passed_responses_are_truncated_for_udp() {
     assert_eq!((stats.passed, stats.truncated), (3, 1));
 }
 
+/// A UDP stub upstream answering every message with `respond(message)`.
+async fn udp_upstream(respond: fn(&[u8]) -> Vec<u8>) -> SocketAddr {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = udp.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0; 65535];
+        loop {
+            let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(&respond(&buf[..len]), peer).await.unwrap();
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn truncated_passed_responses_keep_the_question() {
+    // The request (header and question only) with `QR`, plus a 700-byte answer record.
+    let upstream = udp_upstream(|request| {
+        let mut response = request.to_vec();
+        response[2] |= 0x80;
+        response[7] = 1;
+        response.extend_from_slice(b"\x00\xff\x00\x00\x01\x00\x00\x00\x00\x02\xbc");
+        response.resize(response.len() + 700, 0x55);
+        response
+    })
+    .await;
+    let server = server().with_passthrough(forwarder(upstream));
+
+    let request = notify(0x6101, None);
+    let response = handle(&server, &request, Transport::Udp).await;
+    assert_eq!(header_buffer::id(&response).unwrap(), 0x6101);
+    assert!(
+        header_buffer::has_flags(&response, PacketFlag::TRUNCATION | PacketFlag::RESPONSE).unwrap()
+    );
+    assert_eq!(header_buffer::opcode(&response).unwrap(), OPCODE::Notify);
+    // Header counts: one question, no records; then the question as it was sent.
+    assert_eq!(response[4..12], [0, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(response[12..], request[12..]);
+    let parsed = Packet::parse(&response).unwrap();
+    assert_eq!(parsed.questions.len(), 1);
+    assert_eq!(parsed.questions[0].qname.to_string(), "zone.test");
+    assert_eq!(server.stats().truncated, 1);
+}
+
+#[tokio::test]
+async fn truncated_passed_responses_without_a_readable_question_are_a_header() {
+    // One question announced, but its name is not a sequence of labels.
+    let upstream = udp_upstream(|request| {
+        let mut response = request[..12].to_vec();
+        response[2] |= 0x80;
+        response[4..].copy_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+        response.push(0x3f);
+        response.resize(response.len() + 700, 0x55);
+        response
+    })
+    .await;
+    let server = server().with_passthrough(forwarder(upstream));
+
+    let response = handle(&server, &notify(0x6102, None), Transport::Udp).await;
+    assert_eq!(response.len(), 12);
+    assert_eq!(header_buffer::id(&response).unwrap(), 0x6102);
+    assert!(
+        header_buffer::has_flags(&response, PacketFlag::TRUNCATION | PacketFlag::RESPONSE).unwrap()
+    );
+    assert_eq!(response[4..], [0; 8]);
+}
+
 #[tokio::test]
 async fn passed_over_tcp_sockets() {
     let (upstream, mut seen) = stub_upstream(3000).await;
