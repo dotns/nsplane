@@ -10,7 +10,7 @@ use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, Ecn, EngineHandle, LocalIdentityId, Path, Peer, PeerStats, TransportId, UdpTransport,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::key::parse_key;
@@ -21,6 +21,10 @@ const EINVAL: i32 = 22;
 const ENOSPC: i32 = 28;
 const EPROTO: i32 = 71;
 const EADDRINUSE: i32 = 98;
+
+/// The longest request line accepted, without its newline. The longest line of the protocol
+/// is a key in hex after its name, well under 100 bytes.
+const MAX_LINE_LEN: usize = 4096;
 
 /// The id of the UDP transport the UAPI binds; every `endpoint=` path uses it.
 pub const TRANSPORT_ID: TransportId = TransportId::new(0);
@@ -143,6 +147,9 @@ impl Uapi {
     /// Returns whether the connection can serve another request: `false` once `reader` is
     /// at its end, and after an error response, since the rest of a failed request cannot
     /// be parsed reliably.
+    ///
+    /// A request line longer than 4096 bytes fails the read: outside the settings of a
+    /// `set` this is an error without a response, inside them the response is `errno=5`.
     pub async fn handle_request<R, W>(&self, reader: &mut R, writer: &mut W) -> io::Result<bool>
     where
         R: AsyncBufRead + Unpin,
@@ -412,13 +419,23 @@ fn parse_bool(val: &str) -> Result<bool, i32> {
 }
 
 /// Reads one line without its newline; `None` at the end of the input.
+///
+/// A line longer than [`MAX_LINE_LEN`] is an error, and no more of it is read or kept: a
+/// client that never ends its line cannot grow the buffer without limit.
 async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<String>> {
     let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    // One byte past the limit: the newline of a line of the maximum length.
+    let mut limited = reader.take(MAX_LINE_LEN as u64 + 1);
+    if limited.read_line(&mut line).await? == 0 {
         return Ok(None);
     }
     if line.ends_with('\n') {
         line.pop();
+    } else if line.len() > MAX_LINE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UAPI request line too long",
+        ));
     }
     Ok(Some(line))
 }
@@ -749,6 +766,48 @@ mod tests {
         assert_eq!(request(&uapi, &request_body).await, "errno=0\n\n");
         assert_eq!(listed_peers(&uapi).await, [hex::encode(keys[2])]);
         assert_eq!(uapi.handle().peers().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_overlong_line_fails_the_request() {
+        let (uapi, _engine) = uapi_with_default_peers(&[]).await;
+
+        // A line of the maximum length is read; here it is an unknown command and setting.
+        let longest = "x".repeat(MAX_LINE_LEN);
+        assert_eq!(
+            request(&uapi, &format!("{longest}\n\n")).await,
+            "errno=5\n\n"
+        );
+        assert_eq!(
+            request(&uapi, &format!("set=1\n{longest}\n\n")).await,
+            format!("errno={EPROTO}\n\n")
+        );
+
+        // One byte more fails the read, with or without a newline after it, and nothing
+        // is answered: the connection is closed.
+        for request in [
+            format!("{longest}x"),
+            format!("{longest}x\n\n"),
+            format!("get=1\n{longest}x\n\n"),
+        ] {
+            let mut out = Vec::new();
+            let error = uapi
+                .handle_request(&mut request.as_bytes(), &mut out)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(out, b"");
+        }
+
+        // Inside a `set` it is a read error like any other: EIO, and the connection ends.
+        let request = format!("set=1\nfwmark=0\n{longest}x\n\n");
+        let mut out = Vec::new();
+        let more = uapi
+            .handle_request(&mut request.as_bytes(), &mut out)
+            .await
+            .unwrap();
+        assert!(!more);
+        assert_eq!(out, format!("errno={EIO}\n\n").as_bytes());
     }
 
     #[test]

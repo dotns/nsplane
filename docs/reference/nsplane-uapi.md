@@ -28,6 +28,9 @@ link or WebSocket carrier, `with_external_transport` builds a UAPI that never re
 a `listen_port=` or `fwmark=` equal to the reported value is a no-op, any other value fails
 with `EADDRINUSE` (98) and is logged. `get=1` still reports the listen port.
 
+A request line is at most 4096 bytes long. A longer one fails the read: the connection is
+closed, after an `errno=5` answer when the line is a setting of a `set=1` request.
+
 ### Local identities
 
 The UAPI configures the default local identity (`LocalIdentityId::DEFAULT`) and its peers
