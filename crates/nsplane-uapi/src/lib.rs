@@ -74,6 +74,7 @@ mod serve {
     use std::io;
     use std::pin::pin;
     use std::task::Poll;
+    use std::time::Duration;
 
     use tokio::io::{AsyncRead, AsyncWrite, BufReader};
     use tokio::sync::broadcast::error::RecvError;
@@ -81,9 +82,13 @@ mod serve {
 
     use crate::{Uapi, UapiListener};
 
+    /// How long [`Uapi::serve`] waits after a failed accept before it accepts again.
+    const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
     impl Uapi {
         /// Accepts connections on `listener` and serves each on its own task, request after
-        /// request, until the engine shuts down.
+        /// request, until the engine shuts down. A failed accept is logged and retried
+        /// after a short pause.
         ///
         /// On return, and when this future is dropped, the connection tasks are aborted and
         /// the listener is closed (on Unix its socket file is removed).
@@ -115,6 +120,19 @@ mod serve {
                     }
                     Some(Err(e)) => {
                         tracing::warn!(message = "Failed to accept a UAPI connection", error = ?e);
+                        // The error can persist (no free file descriptor, say) and fail the
+                        // next accept at once: pause instead of spinning and flooding the log.
+                        let mut pause = pin!(tokio::time::sleep(ACCEPT_RETRY_DELAY));
+                        let engine_stopped = poll_fn(|cx| {
+                            if stopped.as_mut().poll(cx).is_ready() {
+                                return Poll::Ready(true);
+                            }
+                            pause.as_mut().poll(cx).map(|()| false)
+                        })
+                        .await;
+                        if engine_stopped {
+                            return Ok(());
+                        }
                     }
                 }
             }

@@ -96,3 +96,85 @@ impl Uapi {
         self.serve_connection(reader, writer).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use nsplane::{ChannelSink, ChannelSource, EngineBuilder};
+    use tracing::span;
+
+    use super::*;
+    use crate::udp_transport;
+
+    /// Counts the warnings of this crate.
+    struct CountWarnings(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for CountWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+                && metadata.target().starts_with("nsplane_uapi")
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn enter(&self, _: &span::Id) {}
+
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn failed_accepts_are_retried_after_a_pause() {
+        let (source, _local, _mtu) = ChannelSource::new(16, 1420);
+        let (sink, _delivered) = ChannelSink::new(16);
+        let engine = EngineBuilder::new(source, sink)
+            .transport(udp_transport(0).unwrap())
+            .build()
+            .unwrap();
+        let uapi = Uapi::new(engine.handle());
+
+        // Accepting on a connected socket fails at once (EINVAL), every time, as a
+        // listening one does when the process is out of file descriptors (EMFILE).
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Readable, so that tokio attempts the accept.
+        peer.write_all(b"x").unwrap();
+        let socket = std::os::unix::net::UnixListener::from(OwnedFd::from(socket));
+        socket.set_nonblocking(true).unwrap();
+        let listener = UapiListener {
+            listener: UnixListener::from_std(socket).unwrap(),
+            path: PathBuf::new(),
+        };
+
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(CountWarnings(Arc::clone(&warnings)));
+        let serving = tokio::spawn(async move { uapi.serve(listener).await });
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let logged = warnings.load(Ordering::Relaxed);
+        assert!(
+            (1..=10).contains(&logged),
+            "{logged} failed accepts in 350 ms"
+        );
+
+        // The pause does not delay the reaction to the engine stopping.
+        engine.handle().shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
