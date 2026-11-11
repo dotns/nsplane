@@ -25,12 +25,10 @@
 //! orphaned (non-present) one and sets the interface MTU; refusals are `WintunError`s
 //! inside the `io::Error`.
 //!
-//! Raw fds (Unix): `adopt_fd` and `Tun::from_raw_fd` adopt an fd passed in by number
-//! (a parent process, the CLI's `--tun-fd` and `--uapi-fd`) so that callers need no
-//! `unsafe`. Either call takes ownership: the fd must be one the process inherited or
-//! otherwise owns, nothing else may use or close it afterwards, and it is closed when
-//! the returned value drops. A negative number or one that is not an open fd is
-//! rejected without adopting anything.
+//! Adopted fds (Unix): `Tun::from_fd` takes an `OwnedFd`, so ownership of the fd is
+//! explicit and the crate never closes an fd it was not given. A host that only has an fd
+//! number (a parent process, Android `VpnService`) turns it into an `OwnedFd` itself, at
+//! the one place that knows nothing else in the process uses that number.
 //!
 //! MTU: `TunSource`'s `mtu` watch follows the interface MTU. On Linux/Android and
 //! macOS/iOS, `Tun::split` queries the MTU (`SIOCGIFMTU`) and spawns a tokio task that
@@ -99,13 +97,6 @@ mod wintun;
     target_os = "ios"
 ))]
 pub use tun::{MTU_POLL_INTERVAL, Offload, Tun, TunOptions, TunSink, TunSource};
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-pub use unix::adopt_fd;
 #[cfg(windows)]
 pub use windows::{Tun, TunOptions, TunSink, TunSource};
 // Public on Windows; also re-exported in Linux unit-test builds so the module's public

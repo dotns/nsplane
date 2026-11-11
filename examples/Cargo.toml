@@ -46,7 +46,7 @@ tracing = "0.1.40"
 tracing-subscriber = "0.3.19"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs", "signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 nsplane-tun = { path = "../crates/nsplane-tun", version = "0.22.2" }
 nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.22.2" }
 

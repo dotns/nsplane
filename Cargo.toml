@@ -38,7 +38,7 @@ smallvec = "1.16.2"
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }
 # The TUN crate owns syscall code, so `forbid` is not possible workspace-wide.
-# `nsplane-cli` forbids unsafe code at its crate root; see docs/decisions.
+# `nsplane-cli` allows one block (adopting inherited descriptors); see docs/decisions.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"

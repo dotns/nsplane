@@ -238,9 +238,9 @@ The library crates `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `
 `nsplane-dns`, `nsplane-wss`, `nsplane-netstack` and `nsplane-uapi`, and the library of
 `nsplane-examples`, declare `#![forbid(unsafe_code)]` at the crate root, which no `allow`
 can lift. `nsplane-noise` has no `unsafe` block. Binaries and tests come under the
-workspace lint: where one of them needs a system call directly (adopting an inherited
-descriptor, a resource limit or a socket pair in a test), the statement carries its own
-`allow` with the reason. See ADR
+workspace lint: where one of them needs a system call directly, the statement carries its
+own `allow` with the reason. `nsplane-cli` has one such block, which adopts the descriptors
+passed by number (`--tun-fd`, `--uapi-fd`); the library API takes `OwnedFd` only. See ADR
 [2026-10-01-unsafe-code-in-boringtun](decisions/2026-10-01-unsafe-code-in-boringtun.md).
 
 ## Crypto

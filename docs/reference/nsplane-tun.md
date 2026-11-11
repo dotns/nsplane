@@ -7,13 +7,13 @@ Wintun), plus the fd slot for Android and the callback bridge for iOS. Builds on
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` / `from_raw_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `adopt_fd` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
+| main | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 
 ## Behavior
 
 ### Devices and names
 
-`Tun::create` opens a TUN device, `Tun::from_fd` / `from_raw_fd` (Unix) adopt one, and
+`Tun::create` opens a TUN device, `Tun::from_fd` (Unix) adopts one from an `OwnedFd`, and
 `Tun::split` yields a `TunSource` and a `TunSink` registered with the tokio reactor.
 `Tun::name` and, after the split, `TunSource::name` / `TunSink::name` query the interface
 name from the device (the kernel-assigned one for a `"tun%d"` or `"utun"` pattern, the

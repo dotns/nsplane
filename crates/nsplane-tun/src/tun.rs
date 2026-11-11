@@ -6,7 +6,7 @@ use std::io;
 use std::io::IoSlice;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::mem;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
@@ -27,7 +27,7 @@ use crate::darwin as sys;
 use crate::linux as sys;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::offload::Coalescer;
-use crate::unix::{adopt_fd, register, set_nonblocking};
+use crate::unix::{register, set_nonblocking};
 
 /// Idle buffers kept by a [`TunSource`]'s pool.
 const POOL_FREE: usize = 64;
@@ -134,19 +134,6 @@ impl Tun {
         set_nonblocking(&fd)?;
         let offload = adopted_offload(fd.as_fd());
         Ok(Self { fd, mtu, offload })
-    }
-
-    /// Adopts the TUN fd numbered `fd` (passed in by a parent process, e.g. the CLI's
-    /// `--tun-fd`) through [`adopt_fd`](crate::adopt_fd), then behaves like
-    /// [`Tun::from_fd`]: same framing, same `mtu` handling.
-    ///
-    /// Ownership rules: the call takes ownership of `fd`. It must be an fd the process
-    /// inherited or otherwise owns, and nothing else may use or close it afterwards; it
-    /// is closed when the [`Tun`] (or the halves of [`Tun::split`]) drops, and also if
-    /// this call fails after adoption. A negative number or one that is not an open fd
-    /// fails without adopting anything.
-    pub fn from_raw_fd(fd: RawFd, mtu: u16) -> io::Result<Self> {
-        Self::from_fd(adopt_fd(fd)?, mtu)
     }
 
     /// The created interface name, queried from the fd (Linux/Android `TUNGETIFF`,

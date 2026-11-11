@@ -284,7 +284,7 @@ async fn client(key: StaticSecret, server_key: PublicKey, server: SocketAddr) ->
   `UdpTransport::bind_with_offload(id, addr, false)` 对 GSO/GRO 同理。
 - Linux 上调大 `net.core.rmem_max` / `wmem_max`（如 4194304）以获得完整的 socket 缓冲区。
 - 服务端代码相同：使用固定监听地址（`0.0.0.0:51820`），peer 不设 `path`，端点从握手中学习。
-- `Tun::from_fd` / `from_raw_fd(fd, mtu)` 接管其他进程创建的 TUN fd
+- `Tun::from_fd(fd, mtu)` 接管其他进程创建的 TUN fd（`OwnedFd`）
   （参见 `nsplane-cli --tun-fd` 和 `fd_bridge` 示例）。
 
 ## 7. 移动端与宿主管理的设备

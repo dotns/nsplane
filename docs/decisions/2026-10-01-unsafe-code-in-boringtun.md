@@ -25,6 +25,11 @@ Until 2026-10-02 the TUN devices and the epoll/kqueue event loops lived in
   ffi/jni removed 2026-10-02: the library crate has no `unsafe` left.
 - In `nstun-tun`, the platform modules `unix`, `linux` and `darwin` opt out at module level;
   `windows` allows a single statement (loading the Wintun library).
+- Safe public functions do not take ownership of a descriptor number: the library accepts
+  `OwnedFd` (`Tun::from_fd`). `nsplane-cli` gets descriptor numbers from its invoker
+  (`--tun-fd`, `--uapi-fd`), so it declares `#![deny(unsafe_code)]` and allows one block, in
+  a private helper that runs before the process opens any descriptor and refuses the
+  standard streams, closed numbers and repeated numbers.
 - Every `unsafe` block carries a `// SAFETY:` comment.
 - Where a safe API exists it is preferred: `nix` for `setuid`/`setgid`, `OwnedFd` for fd
   ownership, `socket2` and `std::net` for sockets.
@@ -37,3 +42,5 @@ The `unsafe` surface is confined to the FFI and TUN platform modules and is grep
 ## Status history
 
 - 2026-10-02: updated; the device layer moved to `nstun-tun`.
+- 2026-11-11: updated; `adopt_fd` and `Tun::from_raw_fd` left the public API of the TUN
+  crate, and the conversion from a descriptor number moved into `nsplane-cli`.

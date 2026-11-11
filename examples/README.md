@@ -184,13 +184,14 @@ sudo cargo run -p nsplane-examples --bin subnet_gateway -- --private-key-file a.
 ### fd_bridge
 
 A host bridge as mobile platforms do it. The host creates and configures the TUN; with
-`--mode fd` (default) it clears `FD_CLOEXEC` on the TUN fd and re-executes itself with
-`--child-fd <N>`, and the child adopts the fd (`Tun::from_raw_fd`) and runs the engine; with
+`--mode fd` (default) it re-executes itself with `--child` and the TUN fd as standard input,
+and the child duplicates that fd into an `OwnedFd`, adopts it (`Tun::from_fd`) and runs the
+engine; with
 `--mode channel` the host pumps packets between the TUN and an engine on `ChannelSource` /
 `ChannelSink` and forwards MTU changes. Echo and checks run on the kernel stack. Needs root.
 
 Flags: node, echo and check flags, `--tun-name`, `--address <CIDR>` (repeatable), `--mtu`,
-`--mode <fd|channel>`, `--child-fd <N>` (internal, set by the parent).
+`--mode <fd|channel>`, `--child` (internal, set by the parent).
 
 ```sh
 sudo cargo run -p nsplane-examples --bin fd_bridge -- --mode channel --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --echo-port 7

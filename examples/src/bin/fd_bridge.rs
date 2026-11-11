@@ -3,11 +3,13 @@
 //! The "host" creates and configures the TUN device (like `tun_node`: `ip` on Linux) and
 //! the engine runs on it in one of two modes:
 //!
-//! - `--mode fd` (default): the host clears `FD_CLOEXEC` on the TUN fd and re-executes this
-//!   binary with `--child-fd <N>` and the same flags; the child adopts the inherited fd
-//!   (`nsplane_tun::Tun::from_raw_fd`) and runs the engine and the UAPI. The parent only
-//!   waits for the child, forwards Ctrl-C to it and exits with its status. This models
-//!   Android `VpnService.establish()` / an iOS packet tunnel handing an fd to the extension.
+//! - `--mode fd` (default): the host re-executes this binary with `--child`, the same flags
+//!   and the TUN fd as the child's standard input; the child duplicates the inherited fd
+//!   into an `OwnedFd`, adopts it (`nsplane_tun::Tun::from_fd`) and runs the engine and the
+//!   UAPI. The parent only waits for the child, forwards Ctrl-C to it and exits with its
+//!   status. This models Android `VpnService.establish()` / an iOS packet tunnel handing an
+//!   fd to the extension. Standard input carries the fd so that both sides stay free of
+//!   `unsafe`: a host that only gets an fd number has to build the `OwnedFd` itself.
 //! - `--mode channel`: the host keeps the TUN and pumps packets between it and an engine
 //!   built on [`ChannelSource`] / [`ChannelSink`] (TUN reads -> the source's `mpsc`
 //!   sender; the sink's receiver -> TUN writes), and forwards the TUN's MTU changes through
@@ -16,7 +18,7 @@
 //! Echo (`--echo-port`) and `--check`s run on the host's kernel stack, through the tunnel.
 //! Linux (and macOS) only; needs root (or `CAP_NET_ADMIN`).
 //!
-//! APIs shown: `nix::fcntl` (`F_SETFD`, no `unsafe`), `nsplane_tun::Tun::from_raw_fd`,
+//! APIs shown: `Stdio::from(OwnedFd)`, `try_clone_to_owned`, `nsplane_tun::Tun::from_fd`,
 //! [`ChannelSource::new`], [`ChannelSink::new`], `PacketSource` / `PacketSink` of
 //! `nsplane_tun`, and the shared node assembly.
 //!
@@ -35,7 +37,6 @@ mod unix {
 
     use anyhow::{Context as _, bail};
     use clap::{Parser, ValueEnum};
-    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use nsplane::{ChannelSink, ChannelSource, PacketSink as _, PacketSource as _};
@@ -46,7 +47,8 @@ mod unix {
     };
     use nsplane_examples::status::Status;
     use nsplane_tun::{Tun, TunSink, TunSource};
-    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use std::os::fd::AsFd as _;
+    use std::process::Stdio;
     use tokio::process::Command;
 
     /// Packets queued between the host pumps and the engine, per direction.
@@ -78,16 +80,16 @@ mod unix {
         #[arg(long, value_enum, default_value_t = Mode::Fd)]
         mode: Mode,
 
-        /// Internal (fd mode): the inherited TUN fd; set by the parent when it re-executes
-        /// itself
-        #[arg(long, value_name = "N")]
-        child_fd: Option<i32>,
+        /// Internal (fd mode): the TUN fd is the inherited standard input; set by the parent
+        /// when it re-executes itself
+        #[arg(long)]
+        child: bool,
     }
 
     pub(crate) async fn main(args: Args) -> anyhow::Result<ExitCode> {
         init_logging(&args.node.log)?;
-        if let Some(fd) = args.child_fd {
-            return child(&args, fd).await;
+        if args.child {
+            return child(&args).await;
         }
         let tun = node::create_tun(&args.tun.tun_name, &args.node)?;
         let name = tun.name().unwrap_or_else(|_| args.tun.tun_name.clone());
@@ -100,17 +102,20 @@ mod unix {
 
     /// Fd mode, host side: hands the TUN fd to a re-executed child and waits for it.
     async fn parent(tun: Tun) -> anyhow::Result<ExitCode> {
-        let fd = tun.as_fd();
-        fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).context("cannot clear FD_CLOEXEC")?;
+        // A duplicate of the TUN fd becomes the child's standard input.
+        let fd = tun
+            .as_fd()
+            .try_clone_to_owned()
+            .context("cannot duplicate the TUN fd")?;
         let exe = std::env::current_exe().context("cannot find the own executable")?;
         let mut child = Command::new(exe)
             .args(std::env::args_os().skip(1))
-            .arg("--child-fd")
-            .arg(fd.as_raw_fd().to_string())
+            .arg("--child")
+            .stdin(Stdio::from(fd))
             .spawn()
             .context("cannot start the child")?;
         let pid = child.id().context("the child has no pid")?;
-        tracing::info!(pid, fd = fd.as_raw_fd(), "TUN fd handed to the child");
+        tracing::info!(pid, "TUN fd handed to the child");
         let status = tokio::select! {
             status = child.wait() => status?,
             signal = tokio::signal::ctrl_c() => {
@@ -132,13 +137,17 @@ mod unix {
             .map_or(ExitCode::FAILURE, ExitCode::from))
     }
 
-    /// Fd mode, extension side: adopts the inherited fd and runs the engine on it.
-    async fn child(args: &Args, fd: i32) -> anyhow::Result<ExitCode> {
+    /// Fd mode, extension side: adopts the fd inherited as standard input and runs the
+    /// engine on it.
+    async fn child(args: &Args) -> anyhow::Result<ExitCode> {
         if args.mode != Mode::Fd {
-            bail!("--child-fd is only used in fd mode");
+            bail!("--child is only used in fd mode");
         }
-        let tun = Tun::from_raw_fd(fd, args.tun.mtu)
-            .with_context(|| format!("cannot adopt TUN fd {fd}"))?;
+        let fd = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("cannot duplicate the inherited TUN fd")?;
+        let tun = Tun::from_fd(fd, args.tun.mtu).context("cannot adopt the inherited TUN fd")?;
         let name = tun.name().context("the inherited fd is no TUN device")?;
         let offload = node::offload_mode(tun.offload());
         let (source, sink) = tun.split().context("cannot open the TUN device")?;
@@ -146,7 +155,7 @@ mod unix {
         let handle = node.engine.handle();
         configure_peers(&handle, &args.node.peer).await?;
         let socket = serve_uapi(handle.clone(), &name, node.transports.listen.port())?;
-        tracing::info!(interface = %name, fd, %offload, listen = %node.transports.listen, uapi = %socket, "engine started on the inherited TUN fd");
+        tracing::info!(interface = %name, %offload, listen = %node.transports.listen, uapi = %socket, "engine started on the inherited TUN fd");
         let status = args
             .node
             .status_file

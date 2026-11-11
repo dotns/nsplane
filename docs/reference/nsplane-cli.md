@@ -21,8 +21,15 @@ supported.
 - `--crypto-workers <N>` enables the crypto worker pool for `N` >= 2.
 - `--no-offload` opens the TUN device and binds the UDP socket without segmentation
   offload; a socket rebound over the UAPI keeps the setting.
-- An adopted TUN fd starts with MTU 1420 and then follows the interface MTU; the daemon owns
-  and closes inherited fds, and a closed or invalid fd fails startup.
+- An adopted TUN fd starts with MTU 1420 and then follows the interface MTU.
+- The daemon takes ownership of the `--tun-fd` and `--uapi-fd` descriptors first thing after
+  parsing its arguments, before the logger and the runtime exist, so a number can only name
+  a descriptor the invoker passed. It sets `FD_CLOEXEC` on them and closes them on exit. A
+  number below 3 (the standard streams), a number that is not an open descriptor, the same
+  number for both options, or a `--uapi-fd` that is not a Unix socket fails startup.
+- Turning a descriptor number into an owned descriptor is the one `unsafe` block of the
+  binary (`adopt_fd`); its soundness rests on the invoker passing descriptors that are open
+  and meant for the daemon.
 
 ## Configuration and defaults
 

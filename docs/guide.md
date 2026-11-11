@@ -296,7 +296,7 @@ Notes:
 - On Linux raise `net.core.rmem_max` / `wmem_max` (e.g. 4194304) for full socket buffers.
 - A server is the same code with a fixed listen address (`0.0.0.0:51820`) and peers without
   `path`: their endpoints are learned from handshakes.
-- `Tun::from_fd` / `from_raw_fd(fd, mtu)` adopt a TUN fd created by another process
+- `Tun::from_fd(fd, mtu)` adopts a TUN fd (an `OwnedFd`) created by another process
   (see `nsplane-cli --tun-fd` and the `fd_bridge` example).
 
 ## 7. Mobile and host-managed devices

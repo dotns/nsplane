@@ -227,8 +227,9 @@ wg setconf wg0 /path/to/wg0.conf
 - The UDP socket is bound to an ephemeral port at startup; `wg set <name> listen-port <port>`
   rebinds it.
 - `--tun-fd` and `--uapi-fd` take fds inherited from a parent process (FD_CLOEXEC cleared).
-  The daemon takes ownership of both and closes them on exit; a closed or invalid fd fails
-  startup. An adopted TUN fd starts with MTU 1420 and then follows the interface MTU. The
+  The daemon takes ownership of both at startup, before it opens any fd of its own, sets
+  FD_CLOEXEC on them and closes them on exit. A number below 3 (the standard streams), a
+  closed fd or the same number for both fails startup. An adopted TUN fd starts with MTU 1420 and then follows the interface MTU. The
   interface name stays required: the UAPI socket is named after the adopted device's name
   when it can be queried, else after `<interface_name>`.
 - `--uapi-fd` serves one client connection next to the standard socket, which is still

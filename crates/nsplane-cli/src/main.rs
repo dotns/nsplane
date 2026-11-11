@@ -3,13 +3,14 @@
 
 //! Development and test daemon for Linux and macOS. Products embed the nsplane library.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(not(unix))]
 compile_error!("nsplane-cli is a Linux/macOS development tool; embed the library instead");
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use clap::Parser;
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
 #[cfg(not(target_vendor = "apple"))]
 use nix::unistd::{geteuid, setgroups};
@@ -18,6 +19,7 @@ use nsplane_tun::{Tun, TunOptions};
 use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
 use std::net::Ipv6Addr;
 use std::num::NonZeroUsize;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
@@ -33,14 +35,14 @@ struct Args {
     #[arg(value_parser = check_tun_name)]
     interface_name: String,
 
-    /// Adopt this already-open TUN device fd instead of creating the interface. The
-    /// daemon takes ownership of the fd and closes it on exit
+    /// Adopt this already-open TUN device fd (3 or higher) instead of creating the
+    /// interface. The daemon takes ownership of the fd and closes it on exit
     #[arg(long, env = "WG_TUN_FD")]
     tun_fd: Option<i32>,
 
-    /// Also serve the UAPI on this already-connected Unix stream socket fd, next to the
-    /// standard socket; the daemon keeps running when that connection ends. The daemon
-    /// takes ownership of the fd and closes it on exit
+    /// Also serve the UAPI on this already-connected Unix stream socket fd (3 or higher,
+    /// not the --tun-fd one), next to the standard socket; the daemon keeps running when
+    /// that connection ends. The daemon takes ownership of the fd and closes it on exit
     #[arg(long, env = "WG_UAPI_FD")]
     uapi_fd: Option<i32>,
 
@@ -116,11 +118,75 @@ fn harden_process() {
     }));
 }
 
+/// The descriptors the invoker handed over by number (`--tun-fd`, `--uapi-fd`).
+#[derive(Debug)]
+struct Inherited {
+    tun: Option<OwnedFd>,
+    uapi: Option<OwnedFd>,
+}
+
+impl Inherited {
+    /// Takes ownership of the descriptors numbered `tun_fd` and `uapi_fd`.
+    ///
+    /// `main` calls this once, before the logger, the runtime or anything else opens a
+    /// descriptor: a number the invoker passed can then only name a descriptor the process
+    /// inherited, never one it opened itself. Nothing is adopted when the two numbers are
+    /// the same.
+    fn adopt(tun_fd: Option<i32>, uapi_fd: Option<i32>) -> anyhow::Result<Self> {
+        if let (Some(tun), Some(uapi)) = (tun_fd, uapi_fd)
+            && tun == uapi
+        {
+            bail!("--tun-fd and --uapi-fd are the same descriptor {tun}");
+        }
+        let take = |flag: &str, fd: Option<i32>| {
+            fd.map(|fd| adopt_fd(fd).with_context(|| format!("Invalid {flag} {fd}")))
+                .transpose()
+        };
+        Ok(Self {
+            tun: take("--tun-fd", tun_fd)?,
+            uapi: take("--uapi-fd", uapi_fd)?,
+        })
+    }
+}
+
+/// Takes ownership of the inherited descriptor numbered `fd` and marks it close-on-exec.
+///
+/// Only [`Inherited::adopt`] calls this, once per number. The standard streams (and
+/// negative numbers) are refused; a number that is not an open descriptor fails without
+/// closing anything.
+fn adopt_fd(fd: i32) -> anyhow::Result<OwnedFd> {
+    if fd < 3 {
+        bail!("not an inheritable descriptor: standard streams and negative numbers are refused");
+    }
+    // SAFETY: the invoker hands the open descriptor `fd` to this process by passing its
+    // number, and nothing in the process has used it: the standard library only touches
+    // 0, 1 and 2 before `main`, `fd` is none of those, and `Inherited::adopt` runs before
+    // the process opens any descriptor and never takes the same number twice. The
+    // `OwnedFd` is therefore the sole owner. A number the invoker left closed is caught
+    // below and released without `close`.
+    #[allow(unsafe_code, reason = "adopting a descriptor passed by number")]
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let flags = match fcntl(&owned, FcntlArg::F_GETFD) {
+        Ok(flags) => FdFlag::from_bits_retain(flags),
+        Err(e) => {
+            // Not ours to close: give the number back.
+            let _ = owned.into_raw_fd();
+            return Err(e).context("not an open descriptor");
+        }
+    };
+    fcntl(&owned, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))
+        .context("cannot set FD_CLOEXEC")?;
+    Ok(owned)
+}
+
 #[allow(clippy::print_stderr, reason = "CLI output boundary")]
 fn main() -> ExitCode {
     harden_process();
     let args = Args::parse();
-    match run(&args) {
+    // First thing after parsing, see `Inherited::adopt`.
+    let result =
+        Inherited::adopt(args.tun_fd, args.uapi_fd).and_then(|inherited| run(&args, inherited));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = ?e, "nsplane-cli failed");
@@ -130,7 +196,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> anyhow::Result<()> {
+fn run(args: &Args, inherited: Inherited) -> anyhow::Result<()> {
     let log_level: Level = args.verbosity.parse().context("Invalid verbosity value")?;
     tracing_subscriber::fmt()
         .with_max_level(log_level)
@@ -142,15 +208,15 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("Failed to start the runtime")?;
-    runtime.block_on(serve(args))
+    runtime.block_on(serve(args, inherited))
 }
 
 /// The MTU an adopted TUN fd starts with; a real TUN device's MTU replaces it at once.
 const ADOPTED_TUN_MTU: u16 = 1420;
 
-/// Adopts the connected Unix stream socket `fd` (`--uapi-fd`) for the tokio reactor.
-fn adopt_uapi_stream(fd: i32) -> anyhow::Result<tokio::net::UnixStream> {
-    let stream = UnixStream::from(nsplane_tun::adopt_fd(fd)?);
+/// Registers the connected Unix stream socket `fd` (`--uapi-fd`) with the tokio reactor.
+fn adopt_uapi_stream(fd: OwnedFd) -> anyhow::Result<tokio::net::UnixStream> {
+    let stream = UnixStream::from(fd);
     // Fails for anything that is not a Unix socket.
     stream.local_addr()?;
     stream.set_nonblocking(true)?;
@@ -159,14 +225,20 @@ fn adopt_uapi_stream(fd: i32) -> anyhow::Result<tokio::net::UnixStream> {
 
 /// Creates or adopts the TUN device and serves packets and UAPI until SIGINT or SIGTERM.
 /// Interface addresses, routes and administrative up state are configured externally.
-async fn serve(args: &Args) -> anyhow::Result<()> {
-    let uapi_stream = args
-        .uapi_fd
-        .map(|fd| adopt_uapi_stream(fd).with_context(|| format!("Invalid --uapi-fd {fd}")))
+async fn serve(args: &Args, inherited: Inherited) -> anyhow::Result<()> {
+    let uapi_stream = inherited
+        .uapi
+        .map(|fd| {
+            let number = fd.as_raw_fd();
+            adopt_uapi_stream(fd).with_context(|| format!("Invalid --uapi-fd {number}"))
+        })
         .transpose()?;
-    let tun = match args.tun_fd {
-        Some(fd) => Tun::from_raw_fd(fd, ADOPTED_TUN_MTU)
-            .with_context(|| format!("Invalid --tun-fd {fd}"))?,
+    let tun = match inherited.tun {
+        Some(fd) => {
+            let number = fd.as_raw_fd();
+            Tun::from_fd(fd, ADOPTED_TUN_MTU)
+                .with_context(|| format!("Invalid --tun-fd {number}"))?
+        }
         None => Tun::create_with(
             &args.interface_name,
             TunOptions::new().offload(!args.no_offload),
@@ -275,6 +347,7 @@ fn drop_privileges() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
 
     #[test]
     fn zero_threads_is_rejected() {
@@ -284,5 +357,84 @@ mod tests {
         assert!(parse("1").is_ok());
         // Zero crypto workers is valid: the engine task does the work itself.
         assert!(Args::try_parse_from(["nsplane-cli", "utun7", "--crypto-workers", "0"]).is_ok());
+    }
+
+    /// The close-on-exec flag of `fd`.
+    fn cloexec(fd: &OwnedFd) -> bool {
+        FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD).unwrap()).contains(FdFlag::FD_CLOEXEC)
+    }
+
+    #[test]
+    fn adopts_an_open_descriptor_and_sets_cloexec() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        // As an invoker hands it over: inheritable.
+        fcntl(&a, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        let number = a.into_raw_fd();
+
+        let inherited = Inherited::adopt(None, Some(number)).unwrap();
+        assert!(inherited.tun.is_none());
+        let fd = inherited.uapi.unwrap();
+        assert_eq!(fd.as_raw_fd(), number);
+        assert!(cloexec(&fd));
+
+        // Still the same open socket.
+        UnixStream::from(fd).write_all(b"adopted").unwrap();
+        let mut buf = [0u8; 7];
+        b.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"adopted");
+    }
+
+    #[test]
+    fn adopts_both_descriptors() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (tun, uapi) = (a.into_raw_fd(), b.into_raw_fd());
+        let inherited = Inherited::adopt(Some(tun), Some(uapi)).unwrap();
+        assert_eq!(inherited.tun.unwrap().as_raw_fd(), tun);
+        assert_eq!(inherited.uapi.unwrap().as_raw_fd(), uapi);
+    }
+
+    #[test]
+    fn refuses_standard_streams_and_negative_numbers() {
+        for fd in [i32::MIN, -1, 0, 1, 2] {
+            let err = adopt_fd(fd).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("standard streams"),
+                "{fd}: {err:#}"
+            );
+            let err = Inherited::adopt(Some(fd), None).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("Invalid --tun-fd {fd}")));
+            let err = Inherited::adopt(None, Some(fd)).unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("Invalid --uapi-fd {fd}")));
+        }
+        // Refused, not closed.
+        assert!(fcntl(std::io::stderr(), FcntlArg::F_GETFD).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_closed_number() {
+        // Far above any descriptor limit, so never open.
+        let err = adopt_fd(i32::MAX).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not an open descriptor"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn refuses_the_same_number_twice() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let number = a.as_raw_fd();
+        let err = Inherited::adopt(Some(number), Some(number)).unwrap_err();
+        assert!(format!("{err:#}").contains("same descriptor"), "{err:#}");
+        // Nothing was adopted: `a` still owns its open descriptor.
+        assert!(a.local_addr().is_ok());
+    }
+
+    #[test]
+    fn fd_options_parse_from_flags() {
+        let args = Args::try_parse_from(["nsplane-cli", "--tun-fd", "5", "--uapi-fd", "6", "utun"])
+            .unwrap();
+        assert_eq!((args.tun_fd, args.uapi_fd), (Some(5), Some(6)));
+        assert!(Args::try_parse_from(["nsplane-cli", "--tun-fd", "x", "utun"]).is_err());
     }
 }
