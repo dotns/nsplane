@@ -17,6 +17,7 @@ use nsplane::{EngineBuilder, UdpTransport};
 use nsplane_tun::{Tun, TunOptions};
 use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
 use std::net::Ipv6Addr;
+use std::num::NonZeroUsize;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
@@ -44,8 +45,8 @@ struct Args {
     uapi_fd: Option<i32>,
 
     /// Number of runtime worker threads
-    #[arg(short, long, env = "WG_THREADS", default_value_t = 4)]
-    threads: usize,
+    #[arg(short, long, env = "WG_THREADS", default_value = "4")]
+    threads: NonZeroUsize,
 
     /// Log verbosity
     #[arg(
@@ -137,7 +138,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
+        .worker_threads(args.threads.get())
         .enable_all()
         .build()
         .context("Failed to start the runtime")?;
@@ -269,4 +270,19 @@ fn drop_privileges() -> anyhow::Result<()> {
         anyhow::bail!("Failed to permanently drop privileges");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_threads_is_rejected() {
+        let parse = |threads| Args::try_parse_from(["nsplane-cli", "utun7", "--threads", threads]);
+        // The runtime cannot be built without a worker thread.
+        assert!(parse("0").is_err());
+        assert!(parse("1").is_ok());
+        // Zero crypto workers is valid: the engine task does the work itself.
+        assert!(Args::try_parse_from(["nsplane-cli", "utun7", "--crypto-workers", "0"]).is_ok());
+    }
 }

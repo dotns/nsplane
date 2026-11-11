@@ -26,7 +26,7 @@ supported.
 | Argument | Env var | Default |
 |---|---|---|
 | `<interface_name>` | | required (`utun` or `utunN` on macOS) |
-| `-t`, `--threads` | `WG_THREADS` | 4 |
+| `-t`, `--threads` | `WG_THREADS` | 4 (at least 1) |
 | `-v`, `--verbosity` | `WG_LOG_LEVEL` | `error` (`info`, `debug`, `trace`) |
 | `--disable-drop-privileges` | `WG_SUDO` | off |
 | `--tun-fd <FD>` | `WG_TUN_FD` | create the interface |
