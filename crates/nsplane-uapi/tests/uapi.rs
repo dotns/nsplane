@@ -371,7 +371,7 @@ async fn serves_requests_over_a_unix_socket() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("wg-test.sock");
     // A stale socket file is replaced.
-    std::fs::write(&path, b"").unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
     let node = Node::new();
     let listener = UapiListener::bind_path(&path).unwrap();

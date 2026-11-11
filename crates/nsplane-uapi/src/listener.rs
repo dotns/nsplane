@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -38,8 +38,8 @@ impl UapiListener {
     /// the directory to the invoking user (`SUDO_UID` / `SUDO_GID`), so the socket can still
     /// be removed after privileges are dropped. The socket itself stays with the user that
     /// bound it, with mode `0600`: bound by root, it takes root to connect (`sudo wg`), as
-    /// with wireguard-go. The existing path is removed without
-    /// checking its type or whether a listener is active; see [`Self::bind_path`].
+    /// with wireguard-go. A socket already at the path is replaced without
+    /// checking whether a listener is active; see [`Self::bind_path`].
     ///
     /// # Panics
     ///
@@ -49,9 +49,11 @@ impl UapiListener {
         Self::bind_path(socket_path(iface))
     }
 
-    /// Binds a socket at `path`; the directory must exist. Attempts to remove any
-    /// existing file or symlink at the path without checking its type or staleness.
-    /// Removal errors are ignored; the subsequent bind determines success.
+    /// Binds a socket at `path`; the directory must exist. A socket already at the path is
+    /// removed, without checking whether a listener is still active on it; removal errors
+    /// are ignored, the subsequent bind determines success. Anything else at the path (a
+    /// regular file, a directory, a symlink, whatever it points to) is left alone and
+    /// fails the call with [`io::ErrorKind::AlreadyExists`].
     ///
     /// The socket file gets mode `0600` whatever the process umask is, as wireguard-go
     /// creates it: `get=1` answers with the private key, so only the owner (and root) may
@@ -63,7 +65,20 @@ impl UapiListener {
     /// Panics when called outside a tokio runtime with I/O enabled.
     pub fn bind_path(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let _ = fs::remove_file(&path); // Remove an existing path without a type or staleness check.
+        match fs::symlink_metadata(&path) {
+            // Whether a listener is still active on it is not checked.
+            Ok(existing) if existing.file_type().is_socket() => {
+                let _ = fs::remove_file(&path);
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a socket", path.display()),
+                ));
+            }
+            // Nothing there, or nothing that can be examined: the bind decides.
+            Err(_) => {}
+        }
         let socket = UnixSocket::new_stream()?;
         socket.bind(&path)?;
         // From here on the socket file is removed when this fails.
@@ -187,6 +202,47 @@ mod tests {
         fn enter(&self, _: &span::Id) {}
 
         fn exit(&self, _: &span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_is_replaced() {
+        let dir = dir("stale");
+        let path = dir.join("wg-test.sock");
+        // A listener that went away without removing its socket file.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let listener = UapiListener::bind_path(&path).unwrap();
+        let client = UnixStream::connect(&path).await.unwrap();
+        listener.accept().await.unwrap();
+        drop((client, listener));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_a_socket_is_kept() {
+        let dir = dir("kept");
+        let file = dir.join("file");
+        fs::write(&file, b"keep").unwrap();
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        // A link to a socket is not a socket either.
+        let target = dir.join("target.sock");
+        let _target = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        let socket_link = dir.join("socket-link.sock");
+        std::os::unix::fs::symlink(&target, &socket_link).unwrap();
+        let subdir = dir.join("dir.sock");
+        fs::create_dir(&subdir).unwrap();
+
+        for path in [&file, &link, &socket_link, &subdir] {
+            let error = UapiListener::bind_path(path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{path:?}");
+            assert!(error.to_string().contains("not a socket"), "{error}");
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+        assert_eq!(fs::read_link(&link).unwrap(), file);
+        assert_eq!(fs::read_link(&socket_link).unwrap(), target);
+        assert!(target.exists() && subdir.is_dir());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

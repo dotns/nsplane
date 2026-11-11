@@ -59,6 +59,10 @@ connections, so no client gets in under the mode the umask gave. `UapiListener::
 `/var/run/wireguard` to `SUDO_UID` / `SUDO_GID` so the socket can be removed after a
 privilege drop, but not the socket: one bound by root takes root to connect (`sudo wg`).
 
+A socket already at the path is replaced, whether or not a listener is still active on it.
+Anything else there (a regular file, a directory, a symlink) is left alone and fails the
+bind with `AlreadyExists`.
+
 ## Platform notes
 
 The Windows named-pipe path and security descriptor match wireguard-windows; they are
