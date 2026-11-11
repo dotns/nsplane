@@ -354,13 +354,15 @@ impl Core {
             };
             let len = packet.len();
             buf.set_len(len);
+            // Without a session the tunnel answers with a handshake initiation instead.
+            let kind = message_kind(buf.as_packet());
             transmit(
                 &mut self.outputs,
                 &mut self.pool,
                 self.policy.as_ref(),
                 id,
                 peer,
-                MessageKind::Data,
+                kind,
                 buf,
             );
         }

@@ -741,6 +741,75 @@ fn padding_stops_at_the_peer_pad_limit() {
     }
 }
 
+/// Feeds the datagrams `from` queued to `to`, as arriving on the path `to` has for its peer;
+/// returns their message kinds.
+fn forward(from: &mut Core, to: &mut Core, crypto_jobs: bool) -> Vec<MessageKind> {
+    let sender = to.peers().next().unwrap();
+    let path = to.data_path(sender).unwrap();
+    transmits(from)
+        .into_iter()
+        .map(|data| {
+            let kind = message_kind(data.as_packet());
+            feed(to, Input::Datagram { path, data }, crypto_jobs);
+            kind
+        })
+        .collect()
+}
+
+#[test]
+fn a_responder_sends_its_queued_packets_once_the_session_is_confirmed() {
+    for crypto_jobs in [false, true] {
+        let [mut a, mut b] = core_pair(crypto_jobs);
+        let b_id = a.peers().next().unwrap();
+        let a_id = b.peers().next().unwrap();
+
+        // `a` queues a packet behind its own initiation, which is lost.
+        let packet = local_packet(100);
+        let sent = packet.as_packet().to_vec();
+        feed(&mut a, Input::Local { packet }, crypto_jobs);
+        let lost = transmits(&mut a);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(
+            message_kind(lost[0].as_packet()),
+            MessageKind::HandshakeInit
+        );
+
+        // `b` initiates: `a` answers with the response alone. It may not send in the new
+        // session yet, and it starts no handshake of its own for the queued packet.
+        b.force_handshake(a_id, None, Instant::now());
+        assert_eq!(
+            forward(&mut b, &mut a, crypto_jobs),
+            [MessageKind::HandshakeInit]
+        );
+        assert_eq!(
+            forward(&mut a, &mut b, crypto_jobs),
+            [MessageKind::HandshakeResponse],
+            "crypto_jobs: {crypto_jobs}"
+        );
+
+        // The keepalive of `b` confirms the session: the queued packet leaves in it.
+        assert_eq!(
+            forward(&mut b, &mut a, crypto_jobs),
+            [MessageKind::Keepalive]
+        );
+        assert_eq!(
+            forward(&mut a, &mut b, crypto_jobs),
+            [MessageKind::Data],
+            "crypto_jobs: {crypto_jobs}"
+        );
+        let delivered: Vec<_> = std::iter::from_fn(|| b.poll_output())
+            .filter_map(|output| match output {
+                Output::Deliver { packet, .. } => Some(packet.as_packet().to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, [sent]);
+        // Only the lost initiation went out, and the completed handshake settled it.
+        assert_eq!(a.unanswered_handshakes(b_id), Some(0));
+        assert!(transmits(&mut a).is_empty());
+    }
+}
+
 /// An IPv4 packet of 100 bytes from `src` to `dst`.
 fn packet_between(src: [u8; 4], dst: [u8; 4]) -> PacketBuf {
     let mut buf = local_packet(100);

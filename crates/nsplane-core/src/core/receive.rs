@@ -195,6 +195,11 @@ impl Core {
         {
             self.authenticated(id, path, kind, completed);
         }
+        // The first message in a session this side answered as responder confirms it: only
+        // now may the packets queued for lack of a session leave in it.
+        if completed > 0 {
+            self.flush_queue(id);
+        }
 
         let src = src?;
         let dst = || {
@@ -352,7 +357,12 @@ impl Core {
         let reply_kind = message_kind(reply.as_packet());
         self.authenticated(id, path, kind, completed);
         self.transmit(id, reply_kind, reply);
-        self.flush_queue(id);
+        // A response completed the handshake this side started: its session sends at once.
+        // The session of an answered initiation does not until the initiator confirms it, and
+        // flushing before would start a handshake of this side's own for the queued packets.
+        if kind == MessageKind::HandshakeResponse {
+            self.flush_queue(id);
+        }
     }
 
     /// Records an authenticated message of `kind` from `peer` on `path`: reports the
