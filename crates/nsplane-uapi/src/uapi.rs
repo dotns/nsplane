@@ -26,6 +26,12 @@ const EADDRINUSE: i32 = 98;
 /// is a key in hex after its name, well under 100 bytes.
 const MAX_LINE_LEN: usize = 4096;
 
+/// The most bytes of settings one `set` request may carry, newlines included. A request is
+/// read whole before it is applied, and `wg` sets all peers of an interface in one request:
+/// a peer with a preshared key, an endpoint and a few allowed IPs takes about 400 bytes, so
+/// this is room for some 40 000 such peers.
+const MAX_SET_REQUEST_LEN: usize = 16 * 1024 * 1024;
+
 /// The id of the UDP transport the UAPI binds; every `endpoint=` path uses it.
 pub const TRANSPORT_ID: TransportId = TransportId::new(0);
 
@@ -148,8 +154,13 @@ impl Uapi {
     /// at its end, and after an error response, since the rest of a failed request cannot
     /// be parsed reliably.
     ///
+    /// A `set` request is read up to its empty line before any of it is applied, so a
+    /// client that stalls midway does not delay other requests; its settings are then
+    /// applied in order, and those before a failing one stay applied.
+    ///
     /// A request line longer than 4096 bytes fails the read: outside the settings of a
     /// `set` this is an error without a response, inside them the response is `errno=5`.
+    /// The settings of one `set` are limited to 16 MiB in the same way.
     pub async fn handle_request<R, W>(&self, reader: &mut R, writer: &mut W) -> io::Result<bool>
     where
         R: AsyncBufRead + Unpin,
@@ -172,8 +183,7 @@ impl Uapi {
                 }
             }
             "set=1" => {
-                let mut net = self.net.lock().await;
-                let status = match self.set(reader, &mut net).await {
+                let status = match self.set(reader).await {
                     Ok(()) => 0,
                     Err(errno) => errno,
                 };
@@ -208,16 +218,15 @@ impl Uapi {
     }
 
     /// Reads and applies a `set` request.
-    async fn set<R: AsyncBufRead + Unpin>(
-        &self,
-        reader: &mut R,
-        net: &mut NetState,
-    ) -> Result<(), i32> {
+    ///
+    /// The whole request is read before the network settings are locked: the lock
+    /// serializes the `set` requests and is taken by every `get`, so it must not be held
+    /// while waiting for a client that may stall.
+    async fn set<R: AsyncBufRead + Unpin>(&self, reader: &mut R) -> Result<(), i32> {
+        let settings = read_settings(reader).await.map_err(|_| EIO)?;
+        let net = &mut *self.net.lock().await;
         let mut section: Option<PeerSection> = None;
-        while let Some(line) = read_line(reader).await.map_err(|_| EIO)? {
-            if line.is_empty() {
-                break; // Done
-            }
+        for line in settings.split_terminator('\n') {
             let Some((key, val)) = line.split_once('=') else {
                 return Err(EPROTO);
             };
@@ -438,6 +447,28 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option
         ));
     }
     Ok(Some(line))
+}
+
+/// Reads the settings of a `set` request, up to its empty line or the end of the input:
+/// the lines in order, each ended by a newline.
+///
+/// More than [`MAX_SET_REQUEST_LEN`] bytes of settings are an error.
+async fn read_settings<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<String> {
+    let mut settings = String::new();
+    while let Some(line) = read_line(reader).await? {
+        if line.is_empty() {
+            break; // Done
+        }
+        if settings.len() + line.len() >= MAX_SET_REQUEST_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UAPI set request too long",
+            ));
+        }
+        settings.push_str(&line);
+        settings.push('\n');
+    }
+    Ok(settings)
 }
 
 /// Binds the UAPI's transport: id [`TRANSPORT_ID`] on a dual-stack `[::]:port` (0 picks a
@@ -808,6 +839,77 @@ mod tests {
             .unwrap();
         assert!(!more);
         assert_eq!(out, format!("errno={EIO}\n\n").as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_set_does_not_block_other_requests() {
+        let (uapi, _engine) = uapi_with_default_peers(&[]).await;
+        let (mut client, server) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let uapi = uapi.clone();
+            async move {
+                let (reader, mut writer) = tokio::io::split(server);
+                let mut reader = tokio::io::BufReader::new(reader);
+                uapi.handle_request(&mut reader, &mut writer).await
+            }
+        });
+
+        // The client sends the first line of its request and stalls.
+        client.write_all(b"set=1\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let config = tokio::time::timeout(Duration::from_secs(5), request(&uapi, "get=1\n\n"))
+            .await
+            .expect("get=1 waits for the stalled set=1");
+        assert!(config.ends_with("errno=0\n\n"), "{config}");
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(&uapi, "set=1\nfwmark=0\n\n"),
+        )
+        .await
+        .expect("set=1 waits for the stalled set=1");
+        assert_eq!(other, "errno=0\n\n");
+
+        // The stalled request is still served once it is complete.
+        client.write_all(b"replace_peers=true\n\n").await.unwrap();
+        let mut response = [0; 9];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"errno=0\n\n");
+        assert!(serving.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_set_fails_before_it_is_applied() {
+        let (uapi, _engine) = uapi_with_default_peers(&[]).await;
+        // A valid setting that changes nothing, as long as a line can be.
+        let line = format!("fwmark={:0>width$}\n", 0, width = MAX_LINE_LEN - 7);
+        let lines = MAX_SET_REQUEST_LEN / line.len();
+
+        let fits = format!("set=1\n{}\n", line.repeat(lines));
+        assert_eq!(request(&uapi, &fits).await, "errno=0\n\n");
+
+        // The settings before the limit are not applied.
+        let oversized = format!("set=1\nlisten_port=0\n{}\n", line.repeat(lines));
+        let port = listen_port(&uapi).await;
+        assert_eq!(request(&uapi, &oversized).await, format!("errno={EIO}\n\n"));
+        assert_eq!(listen_port(&uapi).await, port);
+    }
+
+    #[tokio::test]
+    async fn settings_before_a_failing_one_stay_applied() {
+        let (uapi, _engine) = uapi_with_default_peers(&[]).await;
+        let key = PublicKey::from(&StaticSecret::from([2; 32])).to_bytes();
+        let port = listen_port(&uapi).await;
+        let request_body = format!(
+            "set=1\nlisten_port=0\npublic_key={0}\npublic_key={0}\nbogus=1\n\n",
+            hex::encode(key)
+        );
+        assert_eq!(
+            request(&uapi, &request_body).await,
+            format!("errno={EINVAL}\n\n")
+        );
+        // The port and the first peer section were applied before the bad line was met.
+        assert_ne!(listen_port(&uapi).await, port);
+        assert_eq!(listed_peers(&uapi).await, [hex::encode(key)]);
     }
 
     #[test]
