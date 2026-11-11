@@ -16,7 +16,10 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
   and get back a `TunnResult` telling them what to write and where.
   - `handshake`: Noise_IKpsk2 handshake and cookie handling.
   - `session`: transport-data AEAD and the anti-replay window.
-  - `rate_limiter`: mac1/mac2 verification and cookie replies under load.
+  - `rate_limiter`: mac1/mac2 verification and cookie replies under load. A source whose
+    mac2 is valid under load is held to 20 handshakes per second with a burst of 5, per
+    IPv4 address or IPv6 /64 (at most 4096 tracked sources); the excess is dropped as
+    `WireGuardError::UnderLoad`.
   - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry). The tunnel
     expires after `REJECT_AFTER_TIME * 3` (540 s) without a new session
     (`ExpiryCause::SessionAge`) or after `REKEY_ATTEMPT_TIME` (90 s) of unanswered

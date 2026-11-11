@@ -9,8 +9,9 @@ use zerocopy::FromBytes;
 
 use portable_atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::sleepyinstant::Instant;
 
@@ -36,7 +37,31 @@ const GLOBAL_LIMIT_FACTOR: u64 = 10;
 /// treated as being under load.
 const MAX_TRACKED_SOURCES: usize = 4096;
 
+/// What one handshake costs a source that holds a valid cookie under load, in time its
+/// token bucket takes to earn it back: 20 handshakes per second.
+const COOKIE_HOLDER_COST: Duration = Duration::from_millis(50);
+
+/// The most a cookie holder's token bucket holds: a burst of 5 handshakes.
+const COOKIE_HOLDER_BURST: Duration = Duration::from_millis(250);
+
 type Cookie = [u8; COOKIE_SIZE];
+
+/// The token bucket of one source that holds a valid cookie. Tokens are counted in the time
+/// that earns them.
+struct TokenBucket {
+    tokens: Duration,
+    /// When the tokens were last counted, since the budget was created
+    updated: Duration,
+}
+
+/// The token buckets of the sources that sent a valid cookie under load, by IPv4 address or
+/// IPv6 /64. The map hashes with the keyed `SipHash` of `RandomState`.
+#[derive(Default)]
+struct CookieHolders {
+    buckets: HashMap<IpAddr, TokenBucket>,
+    /// When the full buckets were last removed, since the budget was created
+    swept: Duration,
+}
 
 /// Handshake counters that decide when handshakes must carry a valid cookie.
 ///
@@ -54,6 +79,10 @@ pub struct HandshakeBudget {
     /// The time last reset was performed on this budget, on the clock of the caller of
     /// `reset_count_at`; `None` until its first call
     last_reset: Mutex<Option<std::time::Instant>>,
+    /// Creation time, on the crate clock: the time base of the cookie holders' buckets
+    start_time: Instant,
+    /// The sources that passed mac2 under load, each limited by a token bucket
+    cookie_holders: Mutex<CookieHolders>,
 }
 
 impl std::fmt::Debug for HandshakeBudget {
@@ -73,6 +102,8 @@ impl HandshakeBudget {
             count: AtomicU64::new(0),
             per_source: Mutex::new(HashMap::new()),
             last_reset: Mutex::new(None),
+            start_time: Instant::now(),
+            cookie_holders: Mutex::new(CookieHolders::default()),
         }
     }
 
@@ -111,6 +142,57 @@ impl HandshakeBudget {
         let previous = *count;
         *count += 1;
         previous >= self.limit
+    }
+
+    /// Takes a token for a handshake from `src`, which carried a valid cookie under load, at
+    /// the crate clock; see [`HandshakeBudget::admit_cookie_holder_at`].
+    fn admit_cookie_holder(&self, src: IpAddr) -> bool {
+        self.admit_cookie_holder_at(src, Instant::now().duration_since(self.start_time))
+    }
+
+    /// Takes a token for a handshake from `src`, which carried a valid cookie under load,
+    /// `now` after the budget was created; `false` if the source has none left.
+    ///
+    /// A cookie proves the source address, so the address can be held to a rate: 20
+    /// handshakes per second with a burst of 5, per IPv4 address or IPv6 /64, as kernel
+    /// WireGuard does. At most `MAX_TRACKED_SOURCES` sources are tracked; one beyond that is
+    /// refused until buckets fill up again and are removed.
+    fn admit_cookie_holder_at(&self, src: IpAddr, now: Duration) -> bool {
+        let src = match src {
+            IpAddr::V4(_) => src,
+            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from_bits(ip.to_bits() & !u128::from(u64::MAX))),
+        };
+
+        let mut holders = self.cookie_holders.lock();
+        // A bucket left alone for COOKIE_HOLDER_BURST is full, like one never seen.
+        if now.saturating_sub(holders.swept) >= COOKIE_HOLDER_BURST {
+            holders
+                .buckets
+                .retain(|_, bucket| now.saturating_sub(bucket.updated) < COOKIE_HOLDER_BURST);
+            holders.swept = now;
+        }
+
+        let Some(bucket) = holders.buckets.get_mut(&src) else {
+            if holders.buckets.len() >= MAX_TRACKED_SOURCES {
+                return false;
+            }
+            holders.buckets.insert(
+                src,
+                TokenBucket {
+                    tokens: COOKIE_HOLDER_BURST.saturating_sub(COOKIE_HOLDER_COST),
+                    updated: now,
+                },
+            );
+            return true;
+        };
+        let tokens = bucket
+            .tokens
+            .saturating_add(now.saturating_sub(bucket.updated))
+            .min(COOKIE_HOLDER_BURST);
+        bucket.updated = bucket.updated.max(now);
+        let rest = tokens.checked_sub(COOKIE_HOLDER_COST);
+        bucket.tokens = rest.unwrap_or(tokens);
+        rest.is_some()
     }
 }
 
@@ -293,7 +375,13 @@ impl RateLimiter {
         Ok(&mut dst[..COOKIE_REPLY_SZ])
     }
 
-    /// Verify the MAC fields on the datagram, and apply rate limiting if needed
+    /// Verify the MAC fields on the datagram, and apply rate limiting if needed.
+    ///
+    /// Under load a handshake needs a valid mac2, or it is answered with a cookie reply
+    /// (`Err(TunnResult::WriteToNetwork)`). A source that holds a valid cookie is limited to
+    /// 20 handshakes per second with a burst of 5, per IPv4 address or IPv6 /64, across the
+    /// limiters sharing the [`HandshakeBudget`]; the excess fails with
+    /// [`WireGuardError::UnderLoad`].
     pub fn verify_packet<'a, 'b>(
         &self,
         src_addr: Option<SocketAddr>,
@@ -328,6 +416,11 @@ impl RateLimiter {
                         .format_cookie_reply(sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
+                }
+
+                // The cookie proves the address; the address still gets a bounded rate.
+                if !self.budget.admit_cookie_holder(addr.ip()) {
+                    return Err(TunnResult::Err(WireGuardError::UnderLoad));
                 }
             }
         }
@@ -440,6 +533,165 @@ mod tests {
                 .verify_packet(Some(honest_ip), &init, &mut dst)
                 .is_ok()
         );
+    }
+
+    /// An initiator at `addr` that holds a valid cookie of `limiter`, which is under load.
+    fn cookie_holder(limiter: &RateLimiter, public: &PublicKey, addr: SocketAddr) -> Initiator {
+        let mut initiator = Initiator::new(public);
+        let mut dst = [0u8; 256];
+        let init = initiator.handshake_init();
+        let Err(TunnResult::WriteToNetwork(cookie_reply)) =
+            limiter.verify_packet(Some(addr), &init, &mut dst)
+        else {
+            panic!("expected a cookie reply");
+        };
+        let cookie_reply = cookie_reply.to_vec();
+        assert!(matches!(
+            initiator.tunn.decapsulate(None, &cookie_reply, &mut dst),
+            TunnResult::Done
+        ));
+        initiator
+    }
+
+    /// Verifies `count` initiations of `initiator` from `addr` in a row and returns how many
+    /// passed and how long the run took.
+    fn flood(
+        limiter: &RateLimiter,
+        initiator: &mut Initiator,
+        addr: SocketAddr,
+        count: usize,
+    ) -> (usize, std::time::Duration) {
+        let inits: Vec<_> = (0..count).map(|_| initiator.handshake_init()).collect();
+        let mut dst = [0u8; 256];
+        let start = std::time::Instant::now();
+        let mut passed = 0;
+        for (i, init) in inits.iter().enumerate() {
+            match limiter.verify_packet(Some(addr), init, &mut dst) {
+                Ok(_) => passed += 1,
+                Err(TunnResult::Err(WireGuardError::UnderLoad)) => {}
+                other => panic!("initiation {i}: {other:?}"),
+            }
+        }
+        (passed, start.elapsed())
+    }
+
+    /// The most initiations a cookie holder gets through in `elapsed`: the burst, and one
+    /// per token period started.
+    fn cookie_holder_allowance(elapsed: std::time::Duration) -> usize {
+        5 + usize::try_from(elapsed.as_millis() / 50).unwrap() + 1
+    }
+
+    #[test]
+    fn a_cookie_holder_is_limited_to_its_burst_under_load() {
+        let (limiter, public) = responder(0);
+        let flooder_addr = SocketAddr::from(([192, 0, 2, 1], 1000));
+        let other_addr = SocketAddr::from(([192, 0, 2, 2], 1000));
+        let mut flooder = cookie_holder(&limiter, &public, flooder_addr);
+        let mut other = cookie_holder(&limiter, &public, other_addr);
+
+        let (passed, elapsed) = flood(&limiter, &mut flooder, flooder_addr, 100);
+        assert!(passed >= 5, "the burst passes, got {passed}");
+        assert!(
+            passed <= cookie_holder_allowance(elapsed),
+            "{passed} of 100 passed in {elapsed:?}"
+        );
+
+        // Another source address has its own bucket.
+        let init = other.handshake_init();
+        let mut dst = [0u8; 256];
+        assert!(
+            limiter
+                .verify_packet(Some(other_addr), &init, &mut dst)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_cookie_holder_gets_tokens_back_over_time() {
+        let (limiter, public) = responder(0);
+        let addr = SocketAddr::from(([192, 0, 2, 1], 1000));
+        let mut flooder = cookie_holder(&limiter, &public, addr);
+
+        let (_, elapsed) = flood(&limiter, &mut flooder, addr, 100);
+        let (passed, again) = flood(&limiter, &mut flooder, addr, 100);
+        assert!(
+            passed <= cookie_holder_allowance(elapsed + again) - 5,
+            "{passed} of 100 passed with the bucket empty"
+        );
+
+        // Five tokens come back in 250 ms.
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        let (passed, _) = flood(&limiter, &mut flooder, addr, 100);
+        assert!(passed >= 5, "the burst passes again, got {passed}");
+    }
+
+    #[test]
+    fn cookie_holder_bucket_is_a_burst_of_5_refilled_at_20_per_second() {
+        let budget = HandshakeBudget::new(0);
+        let src = IpAddr::from([192, 0, 2, 1]);
+        let other = IpAddr::from([192, 0, 2, 2]);
+        let at = Duration::from_millis;
+        let admitted = |now, count: usize| {
+            (0..count)
+                .filter(|_| budget.admit_cookie_holder_at(src, now))
+                .count()
+        };
+
+        assert_eq!(admitted(at(1000), 100), 5);
+        assert!(budget.admit_cookie_holder_at(other, at(1000)));
+        // One token per 50 ms.
+        assert_eq!(admitted(at(1049), 100), 0);
+        assert_eq!(admitted(at(1050), 100), 1);
+        assert_eq!(admitted(at(1200), 100), 3);
+        // 1000 initiations spread over one second: the burst and 20 more.
+        let budget = HandshakeBudget::new(0);
+        let passed = (0..1000)
+            .filter(|i| budget.admit_cookie_holder_at(src, at(*i)))
+            .count();
+        assert_eq!(passed, 5 + 19);
+        // The bucket never holds more than the burst.
+        assert_eq!(
+            (0..100)
+                .filter(|_| budget.admit_cookie_holder_at(src, at(60_000)))
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn cookie_holders_are_keyed_by_ipv6_prefix_64() {
+        let budget = HandshakeBudget::new(0);
+        let host = |prefix: u16, host: u16| IpAddr::from([0x2001, 0xdb8, 0, prefix, 0, 0, 0, host]);
+        let now = Duration::from_secs(1);
+
+        let passed = (0..100)
+            .filter(|i| budget.admit_cookie_holder_at(host(1, *i), now))
+            .count();
+        assert_eq!(passed, 5);
+        assert!(budget.admit_cookie_holder_at(host(2, 1), now));
+    }
+
+    #[test]
+    fn cookie_holder_table_is_bounded_and_swept() {
+        let budget = HandshakeBudget::new(0);
+        let source = |i: usize| IpAddr::from(u32::try_from(i).unwrap().to_be_bytes());
+        let now = Duration::from_secs(1);
+
+        for i in 0..MAX_TRACKED_SOURCES {
+            assert!(budget.admit_cookie_holder_at(source(i), now));
+        }
+        assert_eq!(
+            budget.cookie_holders.lock().buckets.len(),
+            MAX_TRACKED_SOURCES
+        );
+        // A full table refuses a new source and keeps serving the tracked ones.
+        assert!(!budget.admit_cookie_holder_at(source(MAX_TRACKED_SOURCES), now));
+        assert!(budget.admit_cookie_holder_at(source(0), now));
+
+        // Once the buckets are full again they are removed, and the new source gets in.
+        let later = now + COOKIE_HOLDER_BURST;
+        assert!(budget.admit_cookie_holder_at(source(MAX_TRACKED_SOURCES), later));
+        assert_eq!(budget.cookie_holders.lock().buckets.len(), 1);
     }
 
     fn shared_responders(limit: u64) -> [(RateLimiter, PublicKey); 2] {
