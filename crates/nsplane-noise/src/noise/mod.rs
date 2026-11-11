@@ -1257,6 +1257,25 @@ mod tests {
         assert_eq!(my_tun.packet_queue.len(), 1);
     }
 
+    #[test]
+    fn peer_with_a_low_order_static_key_gets_no_handshake() {
+        let secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let peer_public_key = x25519_dalek::PublicKey::from([0u8; 32]);
+        let mut tun = Tunn::new(secret_key, peer_public_key, None, None, 1, None);
+        let mut dst = vec![0u8; 2048];
+
+        assert!(matches!(
+            tun.format_handshake_initiation(&mut dst, true),
+            TunnResult::Err(WireGuardError::WrongKey)
+        ));
+        let packet = create_ipv4_udp_packet();
+        assert!(matches!(
+            tun.encapsulate(&packet, &mut dst),
+            TunnResult::Err(WireGuardError::WrongKey)
+        ));
+        assert!(!tun.handshake.is_in_progress());
+    }
+
     fn create_ipv4_udp_packet_with_payload(payload: &[u8]) -> Vec<u8> {
         let header =
             etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5).udp(5678, 23);
