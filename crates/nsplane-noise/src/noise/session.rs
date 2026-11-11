@@ -358,17 +358,17 @@ impl Session {
     pub(super) fn new(
         local_index: u32,
         peer_index: u32,
-        receiving_key: [u8; 32],
-        sending_key: [u8; 32],
+        receiving_key: &[u8; 32],
+        sending_key: &[u8; 32],
     ) -> Self {
         Self {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: chacha20_poly1305_key(&receiving_key),
-            sender: chacha20_poly1305_key(&sending_key),
+            receiver: chacha20_poly1305_key(receiving_key),
+            sender: chacha20_poly1305_key(sending_key),
             shared: Arc::new(SharedKeys {
-                receiver: chacha20_poly1305_key(&receiving_key),
-                sender: chacha20_poly1305_key(&sending_key),
+                receiver: chacha20_poly1305_key(receiving_key),
+                sender: chacha20_poly1305_key(sending_key),
             }),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(ReceivingKeyCounterValidator::default()),
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn refuses_to_send_at_reject_after_messages() {
-        let session = Session::new(1, 2, [1; 32], [2; 32]);
+        let session = Session::new(1, 2, &[1; 32], &[2; 32]);
         session
             .sending_key_counter
             .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
@@ -630,9 +630,9 @@ mod tests {
 
     #[test]
     fn tickets_seal_and_open_byte_for_byte_like_the_session() {
-        let inline = Session::new(1, 2, [1; 32], [2; 32]);
-        let split = Session::new(1, 2, [1; 32], [2; 32]);
-        let peer = Session::new(2, 1, [2; 32], [1; 32]);
+        let inline = Session::new(1, 2, &[1; 32], &[2; 32]);
+        let split = Session::new(1, 2, &[1; 32], &[2; 32]);
+        let peer = Session::new(2, 1, &[2; 32], &[1; 32]);
         for (len, pad_limit) in [(0, usize::MAX), (37, usize::MAX), (37, 40), (64, 50)] {
             let mut a = [0u8; 128];
             a[DATA_OFFSET..DATA_OFFSET + len].fill(0xab);
@@ -651,7 +651,7 @@ mod tests {
             let expected = plaintext.to_vec();
             let open = peer.open_ticket(2, counter).unwrap_err();
             assert!(matches!(open, WireGuardError::DuplicateCounter));
-            let other = Session::new(2, 1, [2; 32], [1; 32]);
+            let other = Session::new(2, 1, &[2; 32], &[1; 32]);
             let ticket = other.open_ticket(2, counter).unwrap();
             let plain_len = ticket.open(&mut c[..sealed]).unwrap();
             assert_eq!(c[DATA_OFFSET..DATA_OFFSET + plain_len], expected[..]);
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_ticket_never_takes_a_counter_past_reject_after_messages() {
-        let session = Session::new(1, 2, [1; 32], [2; 32]);
+        let session = Session::new(1, 2, &[1; 32], &[2; 32]);
         session.set_sending_counter(REJECT_AFTER_MESSAGES - 1);
         let ticket = session.reserve(0, 64, 0, usize::MAX).unwrap();
         assert_eq!(ticket.counter(), REJECT_AFTER_MESSAGES - 1);

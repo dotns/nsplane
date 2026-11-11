@@ -19,11 +19,14 @@ use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
 use zerocopy::FromBytes;
+use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
 pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
 const KEY_LEN: usize = 32;
 const TIMESTAMP_LEN: usize = 12;
+/// What a handshake without a preshared key mixes in its place
+const NO_PRESHARED_KEY: [u8; KEY_LEN] = [0; KEY_LEN];
 
 // initiator.chaining_key = HASH(CONSTRUCTION)
 const INITIAL_CHAIN_KEY: [u8; KEY_LEN] = [
@@ -74,21 +77,21 @@ where
 
 #[inline]
 /// RFC 2401 HMAC+Blake2s, not to be confused with *keyed* Blake2s
-pub(crate) fn b2s_hmac(key: &[u8; KEY_LEN], data1: &[u8]) -> [u8; 32] {
+pub(crate) fn b2s_hmac(key: &[u8; KEY_LEN], data1: &[u8]) -> Zeroizing<[u8; 32]> {
     use blake2::digest::Update;
     let mut hmac = hmac_blake2s(key);
     hmac.update(data1);
-    hmac.finalize_fixed().into()
+    Zeroizing::new(hmac.finalize_fixed().into())
 }
 
 #[inline]
 /// Like `b2s_hmac`, but chain data1 and data2 together
-pub(crate) fn b2s_hmac2(key: &[u8; KEY_LEN], data1: &[u8], data2: &[u8]) -> [u8; 32] {
+pub(crate) fn b2s_hmac2(key: &[u8; KEY_LEN], data1: &[u8], data2: &[u8]) -> Zeroizing<[u8; 32]> {
     use blake2::digest::Update;
     let mut hmac = hmac_blake2s(key);
     hmac.update(data1);
     hmac.update(data2);
-    hmac.finalize_fixed().into()
+    Zeroizing::new(hmac.finalize_fixed().into())
 }
 
 #[inline]
@@ -315,7 +318,7 @@ impl std::fmt::Debug for NoiseParams {
 struct HandshakeInitSentState {
     local_index: u32,
     hash: [u8; KEY_LEN],
-    chaining_key: [u8; KEY_LEN],
+    chaining_key: Zeroizing<[u8; KEY_LEN]>,
     ephemeral_private: x25519::ReusableSecret,
     time_sent: Instant,
 }
@@ -341,7 +344,7 @@ enum HandshakeState {
     /// Handshake initiated by peer
     InitReceived {
         hash: [u8; KEY_LEN],
-        chaining_key: [u8; KEY_LEN],
+        chaining_key: Zeroizing<[u8; KEY_LEN]>,
         peer_ephemeral_public: x25519::PublicKey,
         peer_index: u32,
     },
@@ -401,7 +404,7 @@ pub fn parse_handshake_anon(
 ) -> Result<HalfHandshake, WireGuardError> {
     let peer_index = packet.sender_idx;
     // initiator.chaining_key = HASH(CONSTRUCTION)
-    let mut chaining_key = INITIAL_CHAIN_KEY;
+    let mut chaining_key = Zeroizing::new(INITIAL_CHAIN_KEY);
     // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
     let mut hash = INITIAL_CHAIN_HASH;
     hash = b2s_hash(&hash, static_public.as_bytes());
@@ -418,11 +421,11 @@ pub fn parse_handshake_anon(
     // temp = HMAC(initiator.chaining_key, DH(initiator.ephemeral_private, responder.static_public))
     let ephemeral_shared = contributory(static_private.diffie_hellman(&peer_ephemeral_public))
         .ok_or(WireGuardError::InvalidPacket)?;
-    let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+    let temp = b2s_hmac(&chaining_key, ephemeral_shared.as_bytes());
     // initiator.chaining_key = HMAC(temp, 0x1)
     chaining_key = b2s_hmac(&temp, &[0x01]);
     // key = HMAC(temp, initiator.chaining_key || 0x2)
-    let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+    let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
 
     let mut peer_static_public = [0u8; KEY_LEN];
     // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
@@ -438,6 +441,13 @@ pub fn parse_handshake_anon(
         peer_index,
         peer_static_public,
     })
+}
+
+impl Drop for NoiseParams {
+    fn drop(&mut self) {
+        // The x25519 secrets wipe themselves.
+        self.preshared_key.zeroize();
+    }
 }
 
 impl NoiseParams {
@@ -560,7 +570,7 @@ impl Handshake {
         dst: &'a mut [u8],
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         // initiator.chaining_key = HASH(CONSTRUCTION)
-        let mut chaining_key = INITIAL_CHAIN_KEY;
+        let mut chaining_key = Zeroizing::new(INITIAL_CHAIN_KEY);
         // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
         let mut hash = INITIAL_CHAIN_HASH;
         hash = b2s_hash(&hash, self.params.static_public.as_bytes());
@@ -583,11 +593,11 @@ impl Handshake {
                 .diffie_hellman(&peer_ephemeral_public),
         )
         .ok_or(WireGuardError::InvalidPacket)?;
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, ephemeral_shared.as_bytes());
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
 
         let mut peer_static_public_decrypted = [0u8; KEY_LEN];
         // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
@@ -615,7 +625,7 @@ impl Handshake {
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         // msg.encrypted_timestamp = AEAD(key, 0, TAI64N(), initiator.hash)
         let mut timestamp = [0u8; TIMESTAMP_LEN];
         aead_chacha20_open(&mut timestamp, &key, 0, packet.encrypted_timestamp, &hash)?;
@@ -672,7 +682,7 @@ impl Handshake {
                 .diffie_hellman(&unencrypted_ephemeral),
         )
         .ok_or(WireGuardError::InvalidPacket)?;
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, ephemeral_shared.as_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.static_public))
@@ -682,22 +692,20 @@ impl Handshake {
                 .diffie_hellman(&unencrypted_ephemeral),
         )
         .ok_or(WireGuardError::InvalidPacket)?;
-        let temp = b2s_hmac(&chaining_key, &static_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, static_shared.as_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let temp = b2s_hmac(
-            &chaining_key,
-            &self.params.preshared_key.unwrap_or([0u8; 32])[..],
-        );
+        let preshared_key = self.params.preshared_key.as_ref();
+        let temp = b2s_hmac(&chaining_key, preshared_key.unwrap_or(&NO_PRESHARED_KEY));
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
-        let temp2 = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let temp2 = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         // key = HMAC(temp, temp2 || 0x3)
-        let key = b2s_hmac2(&temp, &temp2, &[0x03]);
+        let key = b2s_hmac2(&temp, &temp2[..], &[0x03]);
         // responder.hash = HASH(responder.hash || temp2)
-        hash = b2s_hash(&hash, &temp2);
+        hash = b2s_hash(&hash, &temp2[..]);
         // msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
         aead_chacha20_open(&mut [], &key, 0, packet.encrypted_nothing, &hash)?;
 
@@ -714,7 +722,7 @@ impl Handshake {
         // initiator.receiving_key_counter = 0
         let temp1 = b2s_hmac(&chaining_key, &[]);
         let temp2 = b2s_hmac(&temp1, &[0x01]);
-        let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
+        let temp3 = b2s_hmac2(&temp1, &temp2[..], &[0x02]);
 
         let rtt_time = Instant::now().duration_since(state.time_sent);
         self.last_rtt = Some(u32::try_from(rtt_time.as_millis()).unwrap_or(u32::MAX));
@@ -724,7 +732,7 @@ impl Handshake {
         } else {
             self.state = HandshakeState::None;
         }
-        Ok(Session::new(local_index, peer_index, temp3, temp2))
+        Ok(Session::new(local_index, peer_index, &temp3, &temp2))
     }
 
     pub(super) fn receive_cookie_reply(
@@ -800,7 +808,7 @@ impl Handshake {
         let local_index = self.inc_index();
 
         // initiator.chaining_key = HASH(CONSTRUCTION)
-        let mut chaining_key = INITIAL_CHAIN_KEY;
+        let mut chaining_key = Zeroizing::new(INITIAL_CHAIN_KEY);
         // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
         let mut hash = INITIAL_CHAIN_HASH;
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
@@ -823,11 +831,11 @@ impl Handshake {
         let ephemeral_shared =
             contributory(ephemeral_private.diffie_hellman(&self.params.peer_static_public))
                 .ok_or(WireGuardError::WrongKey)?;
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, ephemeral_shared.as_bytes());
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
         aead_chacha20_seal(
             encrypted_static,
@@ -843,7 +851,7 @@ impl Handshake {
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         // msg.encrypted_timestamp = AEAD(key, 0, TAI64N(), initiator.hash)
         let timestamp = self.stamper.stamp();
         aead_chacha20_seal(encrypted_timestamp, &key, 0, &timestamp, &hash);
@@ -920,29 +928,27 @@ impl Handshake {
         let ephemeral_shared =
             contributory(ephemeral_private.diffie_hellman(&peer_ephemeral_public))
                 .ok_or(WireGuardError::InvalidPacket)?;
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, ephemeral_shared.as_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.static_public))
         let static_shared =
             contributory(ephemeral_private.diffie_hellman(&self.params.peer_static_public))
                 .ok_or(WireGuardError::WrongKey)?;
-        let temp = b2s_hmac(&chaining_key, &static_shared.to_bytes());
+        let temp = b2s_hmac(&chaining_key, static_shared.as_bytes());
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let temp = b2s_hmac(
-            &chaining_key,
-            &self.params.preshared_key.unwrap_or([0u8; 32])[..],
-        );
+        let preshared_key = self.params.preshared_key.as_ref();
+        let temp = b2s_hmac(&chaining_key, preshared_key.unwrap_or(&NO_PRESHARED_KEY));
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
-        let temp2 = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let temp2 = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         // key = HMAC(temp, temp2 || 0x3)
-        let key = b2s_hmac2(&temp, &temp2, &[0x03]);
+        let key = b2s_hmac2(&temp, &temp2[..], &[0x03]);
         // responder.hash = HASH(responder.hash || temp2)
-        hash = b2s_hash(&hash, &temp2);
+        hash = b2s_hash(&hash, &temp2[..]);
         // msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
         aead_chacha20_seal(encrypted_nothing, &key, 0, &[], &hash);
 
@@ -956,11 +962,11 @@ impl Handshake {
         // initiator.receiving_key_counter = 0
         let temp1 = b2s_hmac(&chaining_key, &[]);
         let temp2 = b2s_hmac(&temp1, &[0x01]);
-        let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
+        let temp3 = b2s_hmac2(&temp1, &temp2[..], &[0x02]);
 
         let dst = self.append_mac1_and_mac2(local_index, &mut dst[..HANDSHAKE_RESP_SZ]);
 
-        Ok((dst, Session::new(local_index, peer_index, temp2, temp3)))
+        Ok((dst, Session::new(local_index, peer_index, &temp2, &temp3)))
     }
 }
 
@@ -1048,12 +1054,12 @@ mod tests {
         let mut chaining_key = b2s_hmac(&b2s_hmac(&INITIAL_CHAIN_KEY, &ephemeral), &[0x01]);
         let temp = b2s_hmac(&chaining_key, ephemeral_shared);
         chaining_key = b2s_hmac(&temp, &[0x01]);
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         aead_chacha20_seal(&mut forged.encrypted_static, &key, 0, static_public, &hash);
         hash = b2s_hash(&hash, &forged.encrypted_static);
         let temp = b2s_hmac(&chaining_key, static_shared);
         chaining_key = b2s_hmac(&temp, &[0x01]);
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        let key = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
         let timestamp = TimeStamper::new().stamp();
         aead_chacha20_seal(&mut forged.encrypted_timestamp, &key, 0, &timestamp, &hash);
         forged
@@ -1130,9 +1136,9 @@ mod tests {
             }
             let temp = b2s_hmac(&chaining_key, &[0; KEY_LEN]);
             chaining_key = b2s_hmac(&temp, &[0x01]);
-            let temp2 = b2s_hmac2(&temp, &chaining_key, &[0x02]);
-            let key = b2s_hmac2(&temp, &temp2, &[0x03]);
-            hash = b2s_hash(&hash, &temp2);
+            let temp2 = b2s_hmac2(&temp, &chaining_key[..], &[0x02]);
+            let key = b2s_hmac2(&temp, &temp2[..], &[0x03]);
+            hash = b2s_hash(&hash, &temp2[..]);
             let mut encrypted_nothing = [0u8; 16];
             aead_chacha20_seal(&mut encrypted_nothing, &key, 0, &[], &hash);
 
