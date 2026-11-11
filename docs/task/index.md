@@ -119,3 +119,13 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261111-2035-nat64-lan-checksum NAT64-LAN recomputes transport checksums and hides corruption**](20261111-2035-nat64-lan-checksum.md) `P2`
 
 - [x] [**20261111-2036-ether-dhcp-rebind-and-periodic-ra The DHCP lease outlives its guest and router advertisements are sent once**](20261111-2036-ether-dhcp-rebind-and-periodic-ra.md) `P2`
+
+- [x] [**20261111-2300-raw-fd-adoption-soundness Safe functions took ownership of a descriptor number**](20261111-2300-raw-fd-adoption-soundness.md) `P2`
+
+- [x] [**20261111-2301-noise-hardening Hardening of the Noise state machine**](20261111-2301-noise-hardening.md) `P3`
+
+- [x] [**20261111-2302-peer-listing-quadratic Listing all peers is quadratic in the number of peers**](20261111-2302-peer-listing-quadratic.md) `P3`
+
+- [x] [**20261111-2303-driver-netstack-robustness Driver and netstack robustness items from the audit**](20261111-2303-driver-netstack-robustness.md) `P3`
+
+- [x] [**20261111-2304-uapi-socket-and-jitter UAPI socket hardening, reconnect and router advertisement jitter**](20261111-2304-uapi-socket-and-jitter.md) `P3`

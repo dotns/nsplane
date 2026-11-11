@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-ether: `EtherAdapter::periodic_ra` and `adapter::RA_INTERVAL` (600 s). Ports send the
   router advertisement again every interval; an embedder that drives an `EtherAdapter` without
   `spawn_port` calls `periodic_ra` itself. `DhcpServer::release` frees the lease.
-
+- `Core::all_peer_stats` lists every peer in one pass over the allowed IPs; `EngineHandle::peers`
+  uses it. Listing 20 000 peers takes about 3 ms instead of 3.5 s.
 ### Changed
 - `Splitter` drops a packet routed to a gone sink, counts it in `SplitterStats::failed` and
   returns `Ok` while another sink is open; `BrokenPipe` is returned only once every sink is
@@ -27,6 +28,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request is read in full before it is applied, so an error in it is answered once the request
   is complete and a read error applies nothing.
 - nsplane-cli: `--threads 0` is rejected.
+- `Tunn::set_static_private` derives the public key from the private key and ignores the
+  `static_public` argument; a mismatched pair no longer panics.
+- A peer whose static public key has small order is still accepted by `Tunn::new`, and every
+  handshake with it fails with `WireGuardError::WrongKey`.
+- The tunnel byte counters of `Tunn::stats` saturate instead of overflowing.
+- After a failed `Transport::recv` the engine waits before it calls the transport again, from
+  1 ms doubling to 64 ms while the errors last.
+- nsplane-netstack logs a table at capacity at most once per second per place, with the number
+  of suppressed events.
+- nsplane-uapi: the Unix socket is created with mode 0600, `UapiListener::bind_path` replaces
+  only a socket and fails with `AlreadyExists` for anything else at the path, and at most 64
+  connections are served at a time.
+- nsplane-wss: every reconnect wait, `reconnect_delay` included, is uniform between half the
+  delay and the delay.
+- nsplane-ether: the router advertisement interval of a port is uniform between 450 s and
+  `RA_INTERVAL`.
+- nsplane-cli: `--tun-fd` and `--uapi-fd` are adopted before anything else in the process
+  opens a descriptor, refuse the numbers 0 to 2 and equal numbers, and are set close-on-exec.
+- The `fd_bridge` example hands the TUN descriptor to its child as standard input
+  (`--child` replaces `--child-fd`).
+### Removed
+- `nsplane_tun::adopt_fd` and `Tun::from_raw_fd`: safe functions that took ownership of a
+  descriptor number, which safe code could use to close a descriptor it does not own. Build
+  an `OwnedFd` where the number enters the process and pass it to `Tun::from_fd`.
 
 ### Fixed
 - A persistent keepalive keeps trying after the handshake attempts ran out: every keepalive
@@ -53,7 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS).
 - nsplane-uapi: a failed accept is retried after 100 ms instead of at once, and a stalled
   `set` request no longer blocks other requests.
-
+- A handshake message with a small-order ephemeral key is rejected, and a peer configured with
+  a small-order static public key can no longer be impersonated: every Diffie-Hellman result
+  is checked for all zeros, as kernel WireGuard does.
+- Handshake chaining keys, derived session keys and the preshared key are wiped when dropped,
+  and the debug output of a received initiation no longer prints its chaining key.
+- The Linux UDP transport bounds its read retries under path MTU discovery instead of
+  spinning on a lasting error.
+- nsplane-netstack: a full UDP flow table sweeps for dropped flows only when one was dropped,
+  not for every datagram of a new flow.
 ## [0.22.2] - 2026-11-10
 
 ### Fixed

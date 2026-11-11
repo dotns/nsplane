@@ -804,3 +804,14 @@ gone sink, the DNS TCP cap and forwarder IDs, CLI and UAPI hardening, NAT64-LAN 
 the DHCP rebind and periodic router advertisement (ether). Left open for the owner: `adopt_fd`
 and `Tun::from_raw_fd` are safe functions over `OwnedFd::from_raw_fd` (a fix breaks the API),
 and `SwapSink` still forwards the `BrokenPipe` of its current sink.
+
+## 2026-11-11 [progress]
+
+Second batch from the audit of `857f34f`, five tasks: raw descriptor adoption removed from
+the `nsplane-tun` API (the CLI adopts the numbers itself, first thing in `main`), noise
+hardening (all-zero Diffie-Hellman results, two panics, wiped key material, saturating
+counters), the one-pass peer listing, driver and netstack robustness (bounded UDP read
+retries, a receive backoff in the engine, limited capacity warnings), and the UAPI socket
+mode, path check and connection cap with jitter for the WSS reconnect and the router
+advertisement interval. Not changed after a look: the O(N) local port bookkeeping of outbound
+netstack connections, which follows the state of the smoltcp sockets.
