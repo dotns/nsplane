@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
@@ -19,6 +20,7 @@ use crate::flow::{FlowState, Target};
 use crate::pending::{self, PendingProtocol};
 use crate::pmtu::{self, Message, TooBig};
 use crate::stats::{self};
+use crate::throttle::LogLimit;
 use crate::udp::{self, Datagram, UdpFlow, UdpReply};
 
 use super::wire::{tcp_challenges, tcp_dst_port, tcp_is_syn, tcp_tuple};
@@ -435,15 +437,8 @@ impl Driver {
         if self.settings.transparent.is_some() {
             self.admit_udp(remote, local);
         }
-        // Bound the table: refuse a new flow when it is full of live flows rather than
-        // grow without limit under a spray of distinct tuples.
-        if self.flows.len() >= self.settings.max_udp_flows {
-            self.flows.retain(|_, (flow, _)| !flow.is_closed());
-            if self.flows.len() >= self.settings.max_udp_flows {
-                tracing::warn!(%remote, %local, "UDP flow table at capacity; dropping new flow");
-                stats::add(&self.stats.udp_flow_limit, 1);
-                return;
-            }
+        if !self.flow_room(remote, local) {
+            return;
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
         // The queue is empty, so the first datagram always fits.
@@ -454,6 +449,7 @@ impl Driver {
         let flow = UdpFlow::new(
             registration,
             rx,
+            Arc::clone(&self.flows_dropped.count),
             UdpReply::new(local, remote, self.out.clone(), Arc::clone(&state)),
         );
         if self.accept_udp.try_send(flow).is_ok() {
@@ -463,5 +459,37 @@ impl Driver {
             tracing::debug!(%remote, %local, "incoming_udp full or gone; dropping UDP flow");
             stats::add(&self.stats.udp_not_accepted, 1);
         }
+    }
+
+    /// Whether the flow table has room for a new flow of `remote` to `local`; counts the
+    /// refusal otherwise.
+    ///
+    /// Bounds the table: a new flow is refused when it is full of live flows rather than
+    /// let it grow without limit under a spray of distinct tuples. A full table first
+    /// loses the flows the application dropped, swept only when one was dropped since the
+    /// last sweep, so the spray costs no sweep per datagram.
+    pub(super) fn flow_room(&mut self, remote: SocketAddr, local: SocketAddr) -> bool {
+        static LIMIT: LogLimit = LogLimit::new();
+        if self.flows.len() < self.settings.max_udp_flows {
+            return true;
+        }
+        let dropped = self.flows_dropped.count.load(Ordering::Acquire);
+        if dropped != self.flows_dropped.swept {
+            self.flows_dropped.swept = dropped;
+            self.flows.retain(|_, (flow, _)| !flow.is_closed());
+            if self.flows.len() < self.settings.max_udp_flows {
+                return true;
+            }
+        }
+        if let Some(suppressed) = LIMIT.admit() {
+            tracing::warn!(
+                %remote,
+                %local,
+                suppressed,
+                "UDP flow table at capacity; dropping new flow"
+            );
+        }
+        stats::add(&self.stats.udp_flow_limit, 1);
+        false
     }
 }

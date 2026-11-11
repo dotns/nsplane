@@ -59,6 +59,7 @@ mod pmtu;
 mod stack;
 mod stats;
 mod tcp;
+mod throttle;
 mod udp;
 
 pub use config::{Admission, DEFAULT_MTU, MIN_MTU, NetStackConfig, TransparentConfig};

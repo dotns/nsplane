@@ -131,14 +131,9 @@ impl Driver {
         let (remote, local) = (key.remote, key.local);
         stats::add(&self.stats.accepted, 1);
         self.emit(key, FlowEventReason::Admitted);
-        if self.flows.len() >= self.settings.max_udp_flows {
-            self.flows.retain(|_, (tx, _)| !tx.is_closed());
-            if self.flows.len() >= self.settings.max_udp_flows {
-                tracing::warn!(%remote, %local, "UDP flow table at capacity; dropping new flow");
-                stats::add(&self.stats.udp_flow_limit, 1);
-                flow.undeliver(Undelivered::FlowLimit);
-                return;
-            }
+        if !self.flow_room(remote, local) {
+            flow.undeliver(Undelivered::FlowLimit);
+            return;
         }
         let (tx, rx) = mpsc::channel(self.settings.datagram_capacity);
         // The queue is empty, so the first datagram always fits.
@@ -148,6 +143,7 @@ impl Driver {
         let handle = UdpFlow::new(
             registration,
             rx,
+            Arc::clone(&self.flows_dropped.count),
             UdpReply::new(local, remote, self.out.clone(), Arc::clone(&flow)),
         );
         match self.accept_udp.try_send(handle) {

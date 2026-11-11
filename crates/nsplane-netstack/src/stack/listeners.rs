@@ -6,6 +6,7 @@ use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 
 use crate::config::TcpRto;
+use crate::throttle::LogLimit;
 
 /// Socket pool limits: sockets per port and in total, and each socket's buffer sizes and
 /// RTO bounds.
@@ -118,16 +119,20 @@ pub(super) fn prepare_tcp_listeners(
     for (&port, &want) in demand {
         let free = targets.get(&port).copied().unwrap_or(0);
         if free < want {
+            static LIMIT: LogLimit = LogLimit::new();
             refused += want - free;
-            tracing::warn!(
-                target: "netstack",
-                port,
-                demand = want,
-                free,
-                held = held_per_port.get(&port).copied().unwrap_or(0),
-                total = planned_total,
-                "TCP listener pool at its cap; excess SYNs will be refused"
-            );
+            if let Some(suppressed) = LIMIT.admit() {
+                tracing::warn!(
+                    target: "netstack",
+                    port,
+                    demand = want,
+                    free,
+                    held = held_per_port.get(&port).copied().unwrap_or(0),
+                    total = planned_total,
+                    suppressed,
+                    "TCP listener pool at its cap; excess SYNs will be refused"
+                );
+            }
         }
     }
 
@@ -202,15 +207,19 @@ pub(super) fn ensure_tcp_listeners(
         .min(pool.limit.saturating_sub(total));
     let add = demand.saturating_sub(free).min(headroom);
     if add < demand.saturating_sub(free) {
-        tracing::warn!(
-            target: "netstack",
-            port,
-            demand,
-            free,
-            held,
-            total,
-            "TCP listener pool at its cap; excess SYNs will be refused"
-        );
+        static LIMIT: LogLimit = LogLimit::new();
+        if let Some(suppressed) = LIMIT.admit() {
+            tracing::warn!(
+                target: "netstack",
+                port,
+                demand,
+                free,
+                held,
+                total,
+                suppressed,
+                "TCP listener pool at its cap; excess SYNs will be refused"
+            );
+        }
     }
 
     let handles = listeners.entry(port).or_default();

@@ -28,7 +28,9 @@ use super::commands::random_ephemeral;
 use super::handle::NetStackHandle;
 use super::labels::Labels;
 use super::wire::tcp_tuple;
-use super::{COMMAND_CAPACITY, Driver, EGRESS_BACKLOG, MAX_INJECT_PER_ITER, stack_gone};
+use super::{
+    COMMAND_CAPACITY, Driver, DroppedFlows, EGRESS_BACKLOG, MAX_INJECT_PER_ITER, stack_gone,
+};
 
 /// A user-space TCP/IP stack on smoltcp, seen from the data plane.
 ///
@@ -102,6 +104,7 @@ impl NetStack {
             deferred: Vec::new(),
             connecting: Vec::new(),
             flows: HashMap::new(),
+            flows_dropped: DroppedFlows::default(),
             bound: HashMap::new(),
             connected: HashMap::new(),
             ingress,

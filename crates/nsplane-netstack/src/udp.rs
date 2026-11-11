@@ -10,6 +10,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use nsplane_packet::checksum::{
@@ -255,18 +256,33 @@ pub struct UdpFlow {
     /// see the queue closed and open a new flow for it.
     _registration: Registration,
     rx: mpsc::Receiver<Bytes>,
+    /// Declared after `rx`: the driver sees the queue closed by the time it sees the count.
+    _dropped: Dropped,
     reply: UdpReply,
+}
+
+/// Counts a dropped flow in the driver's count of them, which tells it that its flow table
+/// has a closed flow to sweep.
+#[derive(Debug)]
+struct Dropped(Arc<AtomicU64>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl UdpFlow {
     pub(crate) const fn new(
         registration: Registration,
         rx: mpsc::Receiver<Bytes>,
+        dropped: Arc<AtomicU64>,
         reply: UdpReply,
     ) -> Self {
         Self {
             _registration: registration,
             rx,
+            _dropped: Dropped(dropped),
             reply,
         }
     }

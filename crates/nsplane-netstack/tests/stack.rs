@@ -428,6 +428,36 @@ async fn udp_flow_limit_is_counted() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_dropped_udp_flow_makes_room_at_the_flow_limit() -> TestResult {
+    let (handle, _source, sink) = single(|config| config.max_udp_flows = 1);
+    let mut incoming = handle.incoming_udp();
+    sink.send(udp([10, 0, 0, 2], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+        .await?;
+    let live = next(&mut incoming).await?;
+    // Refused twice while the only flow lives.
+    for refused in 1..=2 {
+        sink.send(udp([10, 0, 0, 3], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+            .await?;
+        counted(&handle, |stats| stats.udp_flow_limit == refused).await?;
+    }
+    drop(live);
+    sink.send(udp([10, 0, 0, 3], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+        .await?;
+    let admitted = next(&mut incoming).await?;
+    assert_eq!(admitted.peer_addr(), addr("10.0.0.3:1")?);
+    // The table is full again, and the next dropped flow makes room again.
+    sink.send(udp([10, 0, 0, 4], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+        .await?;
+    counted(&handle, |stats| stats.udp_flow_limit == 3).await?;
+    drop(admitted);
+    sink.send(udp([10, 0, 0, 4], 1, [10, 0, 0, 1], 53), PeerId::new(1))
+        .await?;
+    assert_eq!(next(&mut incoming).await?.peer_addr(), addr("10.0.0.4:1")?);
+    assert_eq!(handle.stats().udp_flow_limit, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unaccepted_tcp_connections_are_counted() -> TestResult {
     let pair = pair_with(1420, |config| config.accept_capacity = 1)?;
     // `b` never consumes `incoming_tcp`: the first connection waits there, the second

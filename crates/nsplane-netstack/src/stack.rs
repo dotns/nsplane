@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -88,6 +89,16 @@ struct Inbound {
     flow: Option<Arc<FlowState>>,
 }
 
+/// Whether `Driver::flows` may hold flows the application dropped.
+#[derive(Debug, Default)]
+struct DroppedFlows {
+    /// The flows the application dropped so far, counted by each as it is dropped.
+    count: Arc<AtomicU64>,
+    /// `count` as of the last sweep of a full flow table: the table has no closed flow to
+    /// sweep until the count moves.
+    swept: u64,
+}
+
 /// The single task that owns smoltcp and every queue behind the stack.
 struct Driver {
     settings: Settings,
@@ -112,6 +123,7 @@ struct Driver {
     deferred: Vec<Command>,
     connecting: Vec<Connecting>,
     flows: HashMap<(SocketAddr, SocketAddr), Inbox<Bytes>>,
+    flows_dropped: DroppedFlows,
     bound: HashMap<SocketAddr, Inbox<(SocketAddr, Bytes)>>,
     /// Connected UDP sockets by `(remote, local)`; checked before `bound` only while not
     /// empty.
