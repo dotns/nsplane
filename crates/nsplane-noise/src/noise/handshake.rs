@@ -335,7 +335,6 @@ impl std::fmt::Debug for HandshakeInitSentState {
     }
 }
 
-#[derive(Debug)]
 enum HandshakeState {
     /// No handshake in process
     None,
@@ -350,6 +349,28 @@ enum HandshakeState {
     },
     /// Handshake was established too long ago (implies no handshake is in progress)
     Expired,
+}
+
+impl std::fmt::Debug for HandshakeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::InitSent(state) => f.debug_tuple("InitSent").field(state).finish(),
+            Self::InitReceived {
+                hash,
+                chaining_key: _,
+                peer_ephemeral_public,
+                peer_index,
+            } => f
+                .debug_struct("InitReceived")
+                .field("hash", hash)
+                .field("chaining_key", &"<redacted>")
+                .field("peer_ephemeral_public", peer_ephemeral_public)
+                .field("peer_index", peer_index)
+                .finish(),
+            Self::Expired => f.write_str("Expired"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -974,6 +995,19 @@ impl Handshake {
 mod tests {
     use super::*;
 
+    #[test]
+    fn debug_of_a_received_initiation_hides_the_chaining_key() {
+        let state = HandshakeState::InitReceived {
+            hash: [0x11; KEY_LEN],
+            chaining_key: Zeroizing::new([0xAB; KEY_LEN]),
+            peer_ephemeral_public: x25519::PublicKey::from([9; KEY_LEN]),
+            peer_index: 7,
+        };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        // 0xAB prints as 171.
+        assert!(!debug.contains("171"), "{debug}");
+    }
     #[test]
     fn chacha20_seal_rfc7530_test_vector() {
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
