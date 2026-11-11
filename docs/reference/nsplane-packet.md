@@ -82,6 +82,17 @@ an identical retransmitted fragment is ignored, and fragments that overlap with 
 coverage drop the whole datagram (RFC 5722, for both families). `stats` and `pending` report
 the state.
 
+A fragment of a new datagram that finds `max_datagrams` datagrams held takes the place of an
+older incomplete one instead of being dropped, so junk first fragments cannot block reassembly
+for a whole timeout. The discarded datagram is the oldest one of the new fragment's own source
+address if that source holds half of the table or more (`max_datagrams / 2`, at least 1); else
+the oldest of a source holding more than half; else the oldest of all. The share is not a
+field of `ReassemblyConfig` (the struct is exhaustive) and applies only to a full table: one
+source may use every entry while no other needs it. A discarded datagram disappears like an
+expired one (its tags go with it, and its later fragments open a new datagram that expires);
+it is counted in `ReassemblyStats::evicted` and in `overflow`. `max_datagrams: 0` drops every
+fragment (`overflow`).
+
 `push_tagged(packet, tag, now) -> (Outcome, FragmentTags)` records each fragment's packet tag
 (16 bytes per held datagram): a completed datagram reports `FragmentTags::Same(tag)` when every
 fragment, exact duplicates included, carried that tag (or every one none), and

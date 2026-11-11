@@ -4,7 +4,9 @@
 //! not fragments pass through untouched; fragments are held until their datagram is
 //! complete, which then comes back as one valid IP packet. State is bounded in
 //! datagrams and bytes, expires after a timeout, and costs nothing until the first
-//! fragment arrives: there is no allocation before it and no background task.
+//! fragment arrives: there is no allocation before it and no background task. A full
+//! table admits a new datagram by discarding an older incomplete one, taken first from
+//! a source address that holds more than half of the table.
 //!
 //! Datagrams are keyed by (source, destination, protocol, identification) for IPv4
 //! (RFC 791) and (source, destination, identification) for IPv6 (RFC 8200). Fragments
@@ -18,7 +20,7 @@
 //! (no tag counting as a value of its own) or different ones ([`FragmentTags`]).
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
@@ -40,8 +42,13 @@ const MAX_LEN_FIELD: usize = 0xFFFF;
 /// Bounds of a [`Reassembler`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReassemblyConfig {
-    /// Most incomplete datagrams held at once; a fragment of a further datagram is
-    /// dropped and counted as overflow.
+    /// Most incomplete datagrams held at once. A fragment of a further datagram takes the
+    /// place of an older one, which is discarded and counted as
+    /// [evicted](ReassemblyStats::evicted): the oldest datagram of the fragment's own
+    /// source address if that source holds half of the table (at least one entry) or
+    /// more, otherwise the oldest of a source holding more than half, otherwise the
+    /// oldest of all. One source may fill the table while no other needs it. With 0 every
+    /// fragment is dropped and counted as overflow.
     pub max_datagrams: usize,
     /// Time after its first fragment at which an incomplete datagram is discarded.
     pub timeout: Duration,
@@ -69,7 +76,8 @@ pub struct ReassemblyStats {
     pub reassembled: u64,
     /// Incomplete datagrams discarded after the timeout.
     pub timeout: u64,
-    /// Fragments or datagrams dropped at the datagram or byte bound.
+    /// Fragments or datagrams dropped at the datagram or byte bound, evicted datagrams
+    /// included.
     pub overflow: u64,
     /// Datagrams dropped for overlapping fragments.
     pub overlap: u64,
@@ -78,6 +86,9 @@ pub struct ReassemblyStats {
     /// Datagrams whose accepted fragments first carried different tags
     /// ([`FragmentTags::Mixed`]), counted once even if they never complete.
     pub mixed_tags: u64,
+    /// Incomplete datagrams discarded to admit a new one into a full table; each is also
+    /// counted in [`overflow`](Self::overflow).
+    pub evicted: u64,
 }
 
 /// The tags of a datagram's fragments, as [`Reassembler::push_tagged`] reports them.
@@ -141,6 +152,15 @@ enum Key {
     },
 }
 
+impl Key {
+    const fn source(&self) -> IpAddr {
+        match *self {
+            Self::V4 { src, .. } => IpAddr::V4(src),
+            Self::V6 { src, .. } => IpAddr::V6(src),
+        }
+    }
+}
+
 /// One fragment as parsed from a packet.
 struct Piece<'a> {
     key: Key,
@@ -160,6 +180,8 @@ struct Piece<'a> {
 #[derive(Debug)]
 struct Datagram {
     first_seen: Instant,
+    /// Position in the order the datagrams were opened in.
+    opened: u64,
     /// Header from the first fragment, once it arrived.
     header: Option<Vec<u8>>,
     /// See [`Piece::next_header`].
@@ -183,9 +205,10 @@ enum Reject {
 }
 
 impl Datagram {
-    const fn new(now: Instant, tag: Option<NonZeroU64>) -> Self {
+    const fn new(now: Instant, opened: u64, tag: Option<NonZeroU64>) -> Self {
         Self {
             first_seen: now,
+            opened,
             header: None,
             next_header: None,
             data: Vec::new(),
@@ -293,6 +316,8 @@ fn finish_header(
 pub struct Reassembler {
     config: ReassemblyConfig,
     datagrams: HashMap<Key, Datagram>,
+    /// Datagrams opened so far.
+    opened: u64,
     stats: ReassemblyStats,
 }
 
@@ -302,6 +327,7 @@ impl Reassembler {
         Self {
             config,
             datagrams: HashMap::new(),
+            opened: 0,
             stats: ReassemblyStats::default(),
         }
     }
@@ -364,12 +390,15 @@ impl Reassembler {
             && self.datagrams.len() >= self.config.max_datagrams
         {
             self.stats.overflow += 1;
-            return (Outcome::Dropped, own);
+            if !self.evict(piece.key.source()) {
+                return (Outcome::Dropped, own);
+            }
         }
-        let datagram = self
-            .datagrams
-            .entry(piece.key)
-            .or_insert_with(|| Datagram::new(now, tag));
+        let opened = &mut self.opened;
+        let datagram = self.datagrams.entry(piece.key).or_insert_with(|| {
+            *opened += 1;
+            Datagram::new(now, *opened, tag)
+        });
         if let Err(reject) = datagram.insert(&piece) {
             self.datagrams.remove(&piece.key);
             match reject {
@@ -400,6 +429,36 @@ impl Reassembler {
         self.datagrams.remove(&piece.key);
         self.stats.reassembled += 1;
         (Outcome::Complete(complete), tags)
+    }
+
+    /// Discards one incomplete datagram of a full table for a new one from `source`, see
+    /// [`ReassemblyConfig::max_datagrams`]; `false` if none is held.
+    fn evict(&mut self, source: IpAddr) -> bool {
+        let mut held: HashMap<IpAddr, usize> = HashMap::new();
+        for key in self.datagrams.keys() {
+            *held.entry(key.source()).or_default() += 1;
+        }
+        let share = (self.config.max_datagrams / 2).max(1);
+        // At most one source holds more than half of the table.
+        let from = if held.get(&source).is_some_and(|&count| count >= share) {
+            Some(source)
+        } else {
+            held.into_iter()
+                .find(|&(_, count)| count > share)
+                .map(|(source, _)| source)
+        };
+        let oldest = self
+            .datagrams
+            .iter()
+            .filter(|(key, _)| from.is_none_or(|from| key.source() == from))
+            .min_by_key(|(_, datagram)| datagram.opened)
+            .map(|(key, _)| *key);
+        let Some(oldest) = oldest else {
+            return false;
+        };
+        self.datagrams.remove(&oldest);
+        self.stats.evicted += 1;
+        true
     }
 
     /// Discards the incomplete datagrams holding a fragment with `tag`, and those whose

@@ -365,8 +365,17 @@ fn invalid_fragments_are_malformed() {
     assert_eq!(reassembler.pending(), 0);
 }
 
+/// `packet` (unfragmented IPv4) as sent by `src`; the UDP checksum is left as it was.
+fn from_source(mut packet: Vec<u8>, src: Ipv4Addr) -> Vec<u8> {
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[10..12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
 #[test]
-fn max_datagrams_overflow_is_counted() {
+fn full_table_evicts_the_oldest_datagram() {
     let config = ReassemblyConfig {
         max_datagrams: 2,
         ..ReassemblyConfig::default()
@@ -377,15 +386,138 @@ fn max_datagrams_overflow_is_counted() {
     let mut reassembler = Reassembler::new(config);
     assert_eq!(reassembler.push(&fragments[0][0], now), Outcome::Held);
     assert_eq!(reassembler.push(&fragments[1][0], now), Outcome::Held);
-    assert_eq!(reassembler.push(&fragments[2][0], now), Outcome::Dropped);
-    assert_eq!(reassembler.stats().overflow, 1);
-    assert_eq!(reassembler.pending(), 2);
-    // Held datagrams are not evicted and still complete.
-    assert_eq!(
-        reassembler.push(&fragments[0][1], now),
-        Outcome::Complete(packets[0].clone())
-    );
+    // The table is full: the new datagram takes the place of the oldest one.
     assert_eq!(reassembler.push(&fragments[2][0], now), Outcome::Held);
+    let stats = reassembler.stats();
+    assert_eq!((stats.evicted, stats.overflow, stats.timeout), (1, 1, 0));
+    assert_eq!(reassembler.pending(), 2);
+    assert_eq!(
+        reassembler.push(&fragments[1][1], now),
+        Outcome::Complete(packets[1].clone())
+    );
+    assert_eq!(
+        reassembler.push(&fragments[2][1], now),
+        Outcome::Complete(packets[2].clone())
+    );
+    // The evicted datagram is gone like an expired one: its later fragment opens a new entry.
+    assert_eq!(reassembler.push(&fragments[0][1], now), Outcome::Held);
+    assert_eq!(reassembler.pending(), 1);
+    assert_eq!(reassembler.stats().reassembled, 2);
+}
+
+#[test]
+fn full_table_evicts_from_the_source_over_its_share() {
+    let config = ReassemblyConfig {
+        max_datagrams: 4,
+        ..ReassemblyConfig::default()
+    };
+    let quiet = Ipv4Addr::new(192, 0, 2, 20);
+    let late = Ipv4Addr::new(192, 0, 2, 30);
+    let now = Instant::now();
+    let mut reassembler = Reassembler::new(config);
+    // The oldest datagram is the quiet source's; another source then takes the other
+    // three entries, more than half of the table.
+    let kept = from_source(udp_v4(300, 1), quiet);
+    let kept_fragments = fragment_v4(&kept, 160);
+    assert_eq!(reassembler.push(&kept_fragments[0], now), Outcome::Held);
+    let noisy: Vec<_> = (2..=6)
+        .map(|id| fragment_v4(&udp_v4(300, id), 160))
+        .collect();
+    for fragments in &noisy[..3] {
+        assert_eq!(reassembler.push(&fragments[0], now), Outcome::Held);
+    }
+
+    // A third source: the noisy source's oldest datagram goes, not the oldest of all.
+    let other = from_source(udp_v4(300, 7), late);
+    let other_fragments = fragment_v4(&other, 160);
+    assert_eq!(reassembler.push(&other_fragments[0], now), Outcome::Held);
+    assert_eq!(reassembler.stats().evicted, 1);
+    // The noisy source at its share (two of four) replaces its own oldest datagram.
+    assert_eq!(reassembler.push(&noisy[3][0], now), Outcome::Held);
+    assert_eq!(reassembler.push(&noisy[4][0], now), Outcome::Held);
+    assert_eq!(reassembler.stats().evicted, 3);
+    assert_eq!(reassembler.pending(), 4);
+
+    assert_eq!(
+        reassembler.push(&kept_fragments[1], now),
+        Outcome::Complete(kept)
+    );
+    assert_eq!(
+        reassembler.push(&other_fragments[1], now),
+        Outcome::Complete(other)
+    );
+    // Of the noisy source's five datagrams the two newest are left.
+    for fragments in &noisy[3..] {
+        assert!(matches!(
+            reassembler.push(&fragments[1], now),
+            Outcome::Complete(_)
+        ));
+    }
+    assert_eq!(reassembler.pending(), 0);
+    assert_eq!(reassembler.stats().reassembled, 4);
+}
+
+#[test]
+fn one_source_may_fill_the_table() {
+    let config = ReassemblyConfig {
+        max_datagrams: 4,
+        ..ReassemblyConfig::default()
+    };
+    let packets: Vec<_> = (1..=4).map(|id| udp_v4(300, id)).collect();
+    let fragments: Vec<_> = packets.iter().map(|p| fragment_v4(p, 160)).collect();
+    let now = Instant::now();
+    let mut reassembler = Reassembler::new(config);
+    for fragments in &fragments {
+        assert_eq!(reassembler.push(&fragments[0], now), Outcome::Held);
+    }
+    for (fragments, packet) in fragments.iter().zip(&packets) {
+        assert_eq!(
+            reassembler.push(&fragments[1], now),
+            Outcome::Complete(packet.clone())
+        );
+    }
+    assert_eq!(reassembler.stats().evicted, 0);
+}
+
+#[test]
+fn eviction_drops_the_tags_with_the_datagram() {
+    let config = ReassemblyConfig {
+        max_datagrams: 1,
+        ..ReassemblyConfig::default()
+    };
+    let tag = NonZeroU64::new(7).unwrap();
+    let first = fragment_v4(&udp_v4(300, 1), 160);
+    let second = fragment_v4(&udp_v4(300, 2), 160);
+    let now = Instant::now();
+    let mut reassembler = Reassembler::new(config);
+    assert_eq!(
+        reassembler.push_tagged(&first[0], Some(tag), now),
+        (Outcome::Held, FragmentTags::Same(Some(tag)))
+    );
+    assert_eq!(
+        reassembler.push_tagged(&second[0], None, now),
+        (Outcome::Held, FragmentTags::Same(None))
+    );
+    // Nothing with the tag is held any more.
+    assert_eq!(reassembler.discard_tagged(tag), 0);
+    assert_eq!(reassembler.pending(), 1);
+    assert_eq!(reassembler.stats().mixed_tags, 0);
+}
+
+#[test]
+fn zero_max_datagrams_drops_every_fragment() {
+    let config = ReassemblyConfig {
+        max_datagrams: 0,
+        ..ReassemblyConfig::default()
+    };
+    let fragments = fragment_v4(&udp_v4(300, 1), 160);
+    let mut reassembler = Reassembler::new(config);
+    assert_eq!(
+        reassembler.push(&fragments[0], Instant::now()),
+        Outcome::Dropped
+    );
+    let stats = reassembler.stats();
+    assert_eq!((stats.overflow, stats.evicted), (1, 0));
 }
 
 #[test]
