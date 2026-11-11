@@ -391,7 +391,7 @@ impl Tunn {
             if len > 0 {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += len;
+            self.tx_bytes = self.tx_bytes.saturating_add(len);
             return TunnResult::WriteToNetwork(packet);
         }
 
@@ -434,7 +434,7 @@ impl Tunn {
             if len > 0 {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += len;
+            self.tx_bytes = self.tx_bytes.saturating_add(len);
             return Reservation::Seal(ticket);
         }
 
@@ -804,7 +804,7 @@ impl Tunn {
         }
 
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += computed_len;
+        self.rx_bytes = self.rx_bytes.saturating_add(computed_len);
 
         match src_ip_address {
             IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
@@ -889,7 +889,8 @@ impl Tunn {
     ///
     /// The time since the last handshake is measured on the crate clock, like
     /// [`Tunn::time_since_last_handshake`]. The round-trip time is always measured on the
-    /// real clock, whatever clock drives [`Tunn::update_timers_at`].
+    /// real clock, whatever clock drives [`Tunn::update_timers_at`]. The byte counts stop at
+    /// `usize::MAX` instead of wrapping.
     pub fn stats(&self) -> (Option<Duration>, usize, usize, f32, Option<u32>) {
         let time = self.time_since_last_handshake();
         let tx_bytes = self.tx_bytes;
@@ -979,6 +980,33 @@ mod tests {
         parse_keepalive(&mut their_tun, &keepalive);
 
         (my_tun, their_tun)
+    }
+
+    #[test]
+    fn byte_counters_saturate() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        my_tun.tx_bytes = usize::MAX - 1;
+        their_tun.rx_bytes = usize::MAX - 1;
+        let packet = create_ipv4_udp_packet();
+        let mut sealed = vec![0u8; 2048];
+        let mut opened = vec![0u8; 2048];
+
+        let TunnResult::WriteToNetwork(datagram) = my_tun.encapsulate(&packet, &mut sealed) else {
+            panic!("the packet is sealed");
+        };
+        assert!(matches!(
+            their_tun.decapsulate(None, datagram, &mut opened),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+        let mut buf = vec![0u8; 2048];
+        buf[DATA_HEADER_SZ..DATA_HEADER_SZ + packet.len()].copy_from_slice(&packet);
+        assert!(matches!(
+            my_tun.reserve_in_place(&mut buf, packet.len()),
+            Reservation::Seal(_)
+        ));
+
+        assert_eq!(my_tun.stats().1, usize::MAX);
+        assert_eq!(their_tun.stats().2, usize::MAX);
     }
 
     #[test]
