@@ -34,6 +34,10 @@ impl ChannelSource {
     /// Returns the source, the sender that feeds it, and the sender that changes its MTU.
     /// Once every packet sender is dropped and the queue is drained, `recv` returns
     /// [`io::ErrorKind::BrokenPipe`].
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is 0.
     pub fn new(capacity: usize, mtu: u16) -> (Self, mpsc::Sender<PacketBuf>, watch::Sender<u16>) {
         let (tx, rx) = mpsc::channel(capacity);
         let (mtu_tx, mtu_rx) = watch::channel(mtu);
@@ -89,6 +93,10 @@ impl ChannelSink {
     ///
     /// `send` waits while the queue is full and returns [`io::ErrorKind::BrokenPipe`]
     /// once the returned receiver is dropped.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is 0.
     pub fn new(capacity: usize) -> (Self, mpsc::Receiver<(PeerId, PacketBuf)>) {
         let (tx, rx) = mpsc::channel(capacity);
         (Self { tx }, rx)
@@ -122,6 +130,10 @@ impl ChannelTransport {
     ///
     /// Once one end is dropped, the other end's `send` to it and its `recv` (after the
     /// queue drains) return [`io::ErrorKind::BrokenPipe`].
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is 0.
     pub fn pair(
         capacity: usize,
         a: (TransportId, SocketAddr),
