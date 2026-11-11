@@ -1,16 +1,22 @@
 //! Parsing and in-place rewriting of the packets [`Nat64Lan`](super::Nat64Lan)
 //! translates.
 //!
-//! Checksums are recomputed in full after the ports and the TCP
-//! MSS are rewritten; the payload is never copied except for the one-time
-//! reallocation of a reply whose buffer lacks 20 bytes of headroom.
+//! Transport checksums are updated incrementally (RFC 1624) for what the
+//! translation changes: the pseudo-header, the port or echo identifier, the
+//! ICMP type and a clamped TCP MSS. The incoming checksum is not verified and
+//! the payload is not summed, so a corrupted packet leaves with a checksum
+//! that still fails at its receiver. Only a reply without a UDP checksum gets
+//! a full one, as IPv6 requires it. The payload is never copied except for
+//! the one-time reallocation of a reply whose buffer lacks 20 bytes of
+//! headroom.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nsplane_packet::{FiveTuple, PacketBuf, protocol};
 
 use crate::checksum::{
-    internet_checksum, ipv4_header_checksum, transport_checksum_v4, transport_checksum_v6, udp_wire,
+    PseudoHeader, ipv4_header_checksum, transport_checksum_v6, udp_wire, update_pseudo_header,
+    update_u16,
 };
 
 const ICMPV4_ECHO_REPLY: u8 = 0;
@@ -43,6 +49,19 @@ fn put16(bytes: &mut [u8], at: usize, value: u16) {
 
 const fn addr4(bytes: &[u8], at: usize) -> Ipv4Addr {
     Ipv4Addr::new(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3])
+}
+
+/// Writes `value` at the even offset `at` of a segment and returns its
+/// `checksum` updated for the replaced word.
+fn replace16(segment: &mut [u8], at: usize, value: u16, checksum: u16) -> u16 {
+    let checksum = update_u16(checksum, be16(segment, at), value);
+    put16(segment, at, value);
+    checksum
+}
+
+/// The offset of the checksum field of a TCP or UDP header.
+const fn checksum_at(protocol: u8) -> usize {
+    if protocol == protocol::TCP { 16 } else { 6 }
 }
 
 fn addr6(bytes: &[u8], at: usize) -> Ipv6Addr {
@@ -98,8 +117,8 @@ pub(super) fn request(bytes: &[u8]) -> Option<Request> {
 /// The flow tuple of a request after its destination resolved, keyed by the
 /// IPv4 protocol (an echo flow carries its identifier as both ports), and its
 /// TCP flags; `None` for a malformed packet: a payload length that disagrees
-/// with the packet, a truncated transport header, or a payload too large for
-/// IPv4.
+/// with the packet, a truncated transport header, a payload too large for
+/// IPv4, or a UDP datagram without a checksum (invalid over IPv6).
 pub(super) fn request_tuple(bytes: &[u8], request: Request) -> Option<(FiveTuple, u8)> {
     let payload = bytes.len() - 40;
     let minimum = if request.protocol == protocol::TCP {
@@ -110,6 +129,7 @@ pub(super) fn request_tuple(bytes: &[u8], request: Request) -> Option<(FiveTuple
     if usize::from(be16(bytes, 4)) != payload
         || payload < minimum
         || payload + HEADER_DELTA > usize::from(u16::MAX)
+        || (request.protocol == protocol::UDP && be16(bytes, 46) == 0)
     {
         return None;
     }
@@ -151,12 +171,32 @@ pub(super) fn to_ipv4(
     let traffic_class = (bytes[0] << 4) | (bytes[1] >> 4);
     let hop_limit = bytes[7];
     let protocol = translated.protocol;
+    let length = bytes.len() - 40;
+    let old = PseudoHeader::V6 {
+        src: addr6(bytes, 8),
+        dst: addr6(bytes, 24),
+        protocol: bytes[6],
+        len: u32::try_from(length).unwrap_or(u32::MAX),
+    };
     let segment = &mut bytes[40..];
     if protocol == protocol::ICMP {
-        segment[0] = ICMPV4_ECHO_REQUEST;
-        put16(segment, 4, translated.src_port);
+        // ICMPv4 has no pseudo-header.
+        let checksum = update_u16(be16(segment, 2), old.sum(), 0);
+        let kind = u16::from_be_bytes([ICMPV4_ECHO_REQUEST, segment[1]]);
+        let checksum = replace16(segment, 0, kind, checksum);
+        let checksum = replace16(segment, 4, translated.src_port, checksum);
+        put16(segment, 2, checksum);
     } else {
-        put16(segment, 0, translated.src_port);
+        let at = checksum_at(protocol);
+        let new = PseudoHeader::V4 {
+            src,
+            dst,
+            protocol,
+            len: u16::try_from(length).unwrap_or(u16::MAX),
+        };
+        let checksum = update_pseudo_header(be16(segment, at), old, new);
+        let checksum = replace16(segment, 0, translated.src_port, checksum);
+        put16(segment, at, finish(protocol, checksum));
     }
     if let Some(maximum) = max_tcp_mss
         && protocol == protocol::TCP
@@ -178,24 +218,6 @@ pub(super) fn to_ipv4(
     header[16..20].copy_from_slice(&dst.octets());
     let checksum = ipv4_header_checksum(header);
     put16(header, 10, checksum);
-    let segment = &mut bytes[40..];
-    match protocol {
-        protocol::ICMP => {
-            put16(segment, 2, 0);
-            let checksum = internet_checksum(segment);
-            put16(segment, 2, checksum);
-        }
-        protocol::TCP => {
-            put16(segment, 16, 0);
-            let checksum = transport_checksum_v4(src, dst, protocol, segment);
-            put16(segment, 16, checksum);
-        }
-        _ => {
-            put16(segment, 6, 0);
-            let checksum = transport_checksum_v4(src, dst, protocol, segment);
-            put16(segment, 6, udp_wire(checksum));
-        }
-    }
     // The packet holds 40 bytes or more; this cannot fail.
     let _ = packet.advance(HEADER_DELTA);
 }
@@ -258,6 +280,12 @@ pub(super) fn to_ipv6(packet: &mut PacketBuf, original: &FiveTuple, max_tcp_mss:
     let traffic_class = bytes[1];
     let hop_limit = bytes[8];
     let payload = bytes.len() - 20;
+    let old = PseudoHeader::V4 {
+        src: addr4(bytes, 12),
+        dst: addr4(bytes, 16),
+        protocol: original.protocol,
+        len: u16::try_from(payload).unwrap_or(u16::MAX),
+    };
     // The standard headroom holds 32 bytes; this cannot fail.
     let _ = packet.reserve_front(HEADER_DELTA);
     let protocol = ipv6_protocol(original.protocol);
@@ -271,28 +299,38 @@ pub(super) fn to_ipv6(packet: &mut PacketBuf, original: &FiveTuple, max_tcp_mss:
     header[7] = hop_limit;
     header[8..24].copy_from_slice(&src.octets());
     header[24..40].copy_from_slice(&dst.octets());
-    let segment = &mut bytes[40..];
-    let at = match protocol {
-        protocol::ICMPV6 => {
-            segment[0] = ICMPV6_ECHO_REPLY;
-            put16(segment, 4, original.src_port);
-            2
-        }
-        protocol::TCP => {
-            put16(segment, 2, original.src_port);
-            if let Some(maximum) = max_tcp_mss {
-                clamp_tcp_mss(segment, maximum);
-            }
-            16
-        }
-        _ => {
-            put16(segment, 2, original.src_port);
-            6
-        }
+    let new = PseudoHeader::V6 {
+        src,
+        dst,
+        protocol,
+        len: u32::try_from(payload).unwrap_or(u32::MAX),
     };
-    put16(segment, at, 0);
-    let checksum = transport_checksum_v6(src, dst, protocol, segment);
+    let segment = &mut bytes[40..];
+    if protocol == protocol::ICMPV6 {
+        // ICMPv4 has no pseudo-header.
+        let checksum = update_u16(be16(segment, 2), 0, new.sum());
+        let kind = u16::from_be_bytes([ICMPV6_ECHO_REPLY, segment[1]]);
+        let checksum = replace16(segment, 0, kind, checksum);
+        let checksum = replace16(segment, 4, original.src_port, checksum);
+        put16(segment, 2, checksum);
+        return;
+    }
+    let at = checksum_at(protocol);
+    if protocol == protocol::UDP && be16(segment, at) == 0 {
+        // The sender computed no checksum; IPv6 requires one.
+        put16(segment, 2, original.src_port);
+        let checksum = transport_checksum_v6(src, dst, protocol, segment);
+        put16(segment, at, udp_wire(checksum));
+        return;
+    }
+    let checksum = update_pseudo_header(be16(segment, at), old, new);
+    let checksum = replace16(segment, 2, original.src_port, checksum);
     put16(segment, at, finish(protocol, checksum));
+    if let Some(maximum) = max_tcp_mss
+        && protocol == protocol::TCP
+    {
+        clamp_tcp_mss(segment, maximum);
+    }
 }
 
 /// An ICMP Fragmentation Needed quoting a translated packet: the reply tuple
@@ -393,7 +431,7 @@ pub(super) fn packet_too_big(
     packet.as_packet_mut().copy_from_slice(&out);
 }
 
-/// The on-wire form of a computed checksum: UDP never sends zero.
+/// The on-wire form of an updated checksum: UDP never sends zero.
 const fn finish(protocol: u8, checksum: u16) -> u16 {
     if protocol == protocol::UDP {
         udp_wire(checksum)
@@ -403,7 +441,7 @@ const fn finish(protocol: u8, checksum: u16) -> u16 {
 }
 
 /// Lowers the MSS option of a TCP SYN (or SYN-ACK) `segment` to `maximum`
-/// The caller recomputes the checksum.
+/// and updates the checksum of the segment for it.
 fn clamp_tcp_mss(segment: &mut [u8], maximum: u16) {
     if segment.len() < 20 || segment[13] & TCP_SYN == 0 {
         return;
@@ -418,8 +456,18 @@ fn clamp_tcp_mss(segment: &mut [u8], maximum: u16) {
             0 => return,
             1 => option += 1,
             2 if option + 4 <= end && segment[option + 1] == 4 => {
-                if be16(segment, option + 2) > maximum {
+                let old = be16(segment, option + 2);
+                if old > maximum {
                     put16(segment, option + 2, maximum);
+                    // A value at an odd offset lies across two checksum
+                    // words with its bytes swapped.
+                    let (old, new) = if option % 2 == 0 {
+                        (old, maximum)
+                    } else {
+                        (old.swap_bytes(), maximum.swap_bytes())
+                    };
+                    let checksum = update_u16(be16(segment, 16), old, new);
+                    put16(segment, 16, checksum);
                 }
                 return;
             }

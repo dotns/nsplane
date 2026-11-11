@@ -647,6 +647,263 @@ fn replies_of_unknown_flows_and_other_packets_are_not_ours() {
     assert_not_ours(&mut PacketBuf::from_packet(&fragment), |p| lan.reverse(p));
 }
 
+// -- Checksums: updated for what changed, never recomputed over the packet. --
+
+const DATA_LENGTHS: [usize; 6] = [0, 1, 2, 5, 33, 1200];
+
+fn data(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| u8::try_from((i * 31 + 7) % 251).unwrap())
+        .collect()
+}
+
+const fn next_header(protocol: u8) -> u8 {
+    if protocol == protocol::ICMP {
+        protocol::ICMPV6
+    } else {
+        protocol
+    }
+}
+
+/// A request segment of `protocol` (IPv4 numbering) from the client.
+fn request_segment(protocol: u8, data: &[u8]) -> Vec<u8> {
+    match protocol {
+        protocol::TCP => {
+            let mut segment = tcp(4321, 80, 1, 0, SYN, &[]);
+            segment.extend_from_slice(data);
+            segment
+        }
+        protocol::UDP => udp(4321, 53, data),
+        _ => echo(128, 4321, 1, data),
+    }
+}
+
+/// The reply segment of the LAN host to the flow of [`request_segment`].
+fn reply_segment(protocol: u8, snat_port: u16, data: &[u8]) -> Vec<u8> {
+    match protocol {
+        protocol::TCP => {
+            let mut segment = tcp(80, snat_port, 9, 2, SYN_ACK, &[]);
+            segment.extend_from_slice(data);
+            segment
+        }
+        protocol::UDP => udp(53, snat_port, data),
+        _ => echo(0, snat_port, 1, data),
+    }
+}
+
+/// Forwards a valid request of `protocol` and returns the SNAT port (or echo
+/// identifier) of its flow.
+fn open_flow(lan: &Nat64Lan, protocol: u8) -> u16 {
+    let mut request = ipv6(next_header(protocol), request_segment(protocol, b""));
+    assert_eq!(lan.forward(&mut request), Nat64Verdict::Translated);
+    let at = if protocol == protocol::ICMP { 24 } else { 20 };
+    be16(request.as_packet(), at)
+}
+
+/// Whether the transport checksum of an IPv4 packet verifies, by a full
+/// recomputation.
+fn transport_valid4(packet: &[u8]) -> bool {
+    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    if packet[9] == protocol::ICMP {
+        internet_checksum(&packet[20..]) == 0
+    } else {
+        transport_checksum_v4(src, dst, packet[9], &packet[20..]) == 0
+    }
+}
+
+/// Whether the transport checksum of an IPv6 packet verifies, by a full
+/// recomputation.
+fn transport_valid6(packet: &[u8]) -> bool {
+    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+    transport_checksum_v6(src, dst, packet[6], &packet[40..]) == 0
+}
+
+/// The corrupted forms of `packet`: a damaged checksum field (at `field`) and,
+/// with data, a damaged last byte.
+fn corruptions(packet: &[u8], field: usize, has_data: bool) -> Vec<Vec<u8>> {
+    let mut damaged = vec![packet.to_vec()];
+    damaged[0][field] ^= 0x01;
+    if has_data {
+        let mut bytes = packet.to_vec();
+        *bytes.last_mut().unwrap() ^= 0x40;
+        damaged.push(bytes);
+    }
+    damaged
+}
+
+#[test]
+fn valid_checksums_stay_valid_in_both_directions() {
+    for protocol in [protocol::TCP, protocol::UDP, protocol::ICMP] {
+        for len in DATA_LENGTHS {
+            let lan = lan();
+            let data = data(len);
+            let mut request = ipv6(next_header(protocol), request_segment(protocol, &data));
+            assert_eq!(lan.forward(&mut request), Nat64Verdict::Translated);
+            let forwarded = request.as_packet();
+            assert_valid4(forwarded);
+            assert_eq!(&forwarded[forwarded.len() - len..], data.as_slice());
+
+            let snat_port = open_flow(&lan, protocol);
+            let mut packet = reply(protocol, reply_segment(protocol, snat_port, &data));
+            assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+            let restored = packet.as_packet();
+            assert_valid6(restored);
+            assert_eq!(&restored[restored.len() - len..], data.as_slice());
+        }
+    }
+}
+
+#[test]
+fn a_corrupted_request_stays_corrupted_after_translation() {
+    for protocol in [protocol::TCP, protocol::UDP, protocol::ICMP] {
+        for len in DATA_LENGTHS {
+            let segment = request_segment(protocol, &data(len));
+            let intact = ipv6_bytes(next_header(protocol), CLIENT, HOST6, segment);
+            assert!(transport_valid6(&intact));
+            for damaged in corruptions(&intact, 40 + checksum_at(protocol), len > 0) {
+                assert!(!transport_valid6(&damaged));
+                let lan = lan();
+                let mut packet = PacketBuf::from_packet(&damaged);
+                assert_eq!(lan.forward(&mut packet), Nat64Verdict::Translated);
+                let forwarded = packet.as_packet();
+                assert!(valid(&forwarded[..20]), "IPv4 header checksum");
+                assert!(
+                    !transport_valid4(forwarded),
+                    "protocol {protocol} data {len}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_corrupted_reply_stays_corrupted_after_translation() {
+    for protocol in [protocol::TCP, protocol::UDP, protocol::ICMP] {
+        for len in DATA_LENGTHS {
+            let lan = lan();
+            let snat_port = open_flow(&lan, protocol);
+            let segment = reply_segment(protocol, snat_port, &data(len));
+            let intact = ipv4_bytes(protocol, HOST, SNAT, segment);
+            assert!(transport_valid4(&intact));
+            for damaged in corruptions(&intact, 20 + checksum_at(protocol), len > 0) {
+                assert!(!transport_valid4(&damaged));
+                let mut packet = PacketBuf::from_packet(&damaged);
+                assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+                assert!(
+                    !transport_valid6(packet.as_packet()),
+                    "protocol {protocol} data {len}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_reply_without_a_udp_checksum_gets_a_full_one() {
+    for len in DATA_LENGTHS {
+        let lan = lan();
+        let snat_port = open_flow(&lan, protocol::UDP);
+        let mut bytes = ipv4_bytes(protocol::UDP, HOST, SNAT, udp(53, snat_port, &data(len)));
+        bytes[26..28].fill(0);
+        let mut packet = PacketBuf::from_packet(&bytes);
+        assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+        let restored = packet.as_packet();
+        assert_ne!(be16(restored, 46), 0);
+        assert_valid6(restored);
+    }
+}
+
+#[test]
+fn a_request_without_a_udp_checksum_is_dropped() {
+    let lan = lan();
+    let mut bytes = ipv6_bytes(protocol::UDP, CLIENT, HOST6, udp(4321, 53, b"query"));
+    bytes[46..48].fill(0);
+    let mut packet = PacketBuf::from_packet(&bytes);
+    assert_eq!(
+        lan.forward(&mut packet),
+        Nat64Verdict::Drop(reasons::MALFORMED)
+    );
+    assert_eq!(packet.as_packet(), bytes.as_slice());
+    assert_eq!(lan.stats().conntrack.inserted, 0);
+}
+
+/// Two data bytes equal to the checksum of the same segment with zero data
+/// make the checksum compute to zero.
+#[test]
+fn a_computed_zero_is_sent_as_ffff_by_udp_and_as_zero_by_tcp() {
+    for protocol in [protocol::TCP, protocol::UDP] {
+        let wire: u16 = if protocol == protocol::UDP { 0xFFFF } else { 0 };
+        let (at4, at6) = (20 + checksum_at(protocol), 40 + checksum_at(protocol));
+
+        // Forward: the SNAT port of the flow is stable, so the first pass
+        // tells which data cancels the translated checksum.
+        let lan = lan();
+        let mut probe = ipv6(protocol, request_segment(protocol, &[0, 0]));
+        assert_eq!(lan.forward(&mut probe), Nat64Verdict::Translated);
+        let cancel = be16(probe.as_packet(), at4).to_be_bytes();
+        let mut request = ipv6(protocol, request_segment(protocol, &cancel));
+        assert_eq!(lan.forward(&mut request), Nat64Verdict::Translated);
+        assert_eq!(be16(request.as_packet(), at4), wire);
+        assert_valid4(request.as_packet());
+
+        // Reverse, with and (UDP) without a checksum from the LAN host.
+        let snat_port = be16(request.as_packet(), 20);
+        let mut probe = reply(protocol, reply_segment(protocol, snat_port, &[0, 0]));
+        assert_eq!(lan.reverse(&mut probe), Nat64Verdict::Translated);
+        let cancel = be16(probe.as_packet(), at6).to_be_bytes();
+        let mut bytes = ipv4_bytes(
+            protocol,
+            HOST,
+            SNAT,
+            reply_segment(protocol, snat_port, &cancel),
+        );
+        let mut packet = PacketBuf::from_packet(&bytes);
+        assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+        assert_eq!(be16(packet.as_packet(), at6), wire);
+        assert_valid6(packet.as_packet());
+        if protocol == protocol::UDP {
+            bytes[at4..at4 + 2].fill(0);
+            let mut packet = PacketBuf::from_packet(&bytes);
+            assert_eq!(lan.reverse(&mut packet), Nat64Verdict::Translated);
+            assert_eq!(be16(packet.as_packet(), at6), wire);
+            assert_valid6(packet.as_packet());
+        }
+    }
+}
+
+#[test]
+fn a_clamped_mss_at_an_odd_offset_keeps_the_checksum_valid() {
+    let lan = Nat64Lan::new(routes(vec![route()]), config(Some(1360)));
+    // NOP, MSS 1460, end of options: the MSS value starts at an odd offset.
+    let options = [1, 2, 4, 0x05, 0xb4, 0, 0, 0];
+    let mut syn = ipv6(protocol::TCP, tcp(4321, 80, 1, 0, SYN, &options));
+    assert_eq!(lan.forward(&mut syn), Nat64Verdict::Translated);
+    let forwarded = syn.as_packet();
+    assert_eq!(be16(forwarded, 43), 1360);
+    assert_valid4(forwarded);
+    let snat_port = be16(forwarded, 20);
+
+    let mut syn_ack = reply(protocol::TCP, tcp(80, snat_port, 9, 2, SYN_ACK, &options));
+    assert_eq!(lan.reverse(&mut syn_ack), Nat64Verdict::Translated);
+    assert_eq!(be16(syn_ack.as_packet(), 63), 1360);
+    assert_valid6(syn_ack.as_packet());
+
+    // A corrupted SYN stays corrupted through the clamp.
+    let mut bytes = ipv6_bytes(
+        protocol::TCP,
+        CLIENT,
+        HOST6,
+        tcp(4321, 80, 1, 0, SYN, &options),
+    );
+    bytes[56] ^= 0x01;
+    let mut damaged = PacketBuf::from_packet(&bytes);
+    assert_eq!(lan.forward(&mut damaged), Nat64Verdict::Translated);
+    assert_eq!(be16(damaged.as_packet(), 43), 1360);
+    assert!(!transport_valid4(damaged.as_packet()));
+}
+
 // -- Routes replaced through a LanRoutes clone. --
 
 #[test]

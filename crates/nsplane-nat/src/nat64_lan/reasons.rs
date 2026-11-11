@@ -16,6 +16,6 @@ pub const PORT_EXHAUSTED: &str = "nat64 lan ports exhausted";
 /// all (`max_entries` is 0).
 pub const CONNTRACK_FULL: &str = "nat64 lan conntrack full";
 /// A packet to a routed destination is malformed (its length disagrees with
-/// its header, its transport header is truncated) or would not fit an IPv4
-/// packet.
+/// its header, its transport header is truncated, its UDP checksum is
+/// absent) or would not fit an IPv4 packet.
 pub const MALFORMED: &str = "nat64 lan malformed";

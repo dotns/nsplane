@@ -128,7 +128,10 @@ unspecified; other mapped targets are dropped and counted) become IPv4 from the 
 `SnatPorts` and given back when the flow expires, is evicted or is removed
 (`Nat64Lan::remove_flow`, built on `Conntrack::remove` and its removal hook); a saturated
 range drops the packet rather than aliasing a flow. Replies and Fragmentation Needed (as
-Packet Too Big) are translated back; TCP MSS can be clamped. Translated packets
+Packet Too Big) are translated back; TCP MSS can be clamped. Transport checksums are updated
+incrementally for the rewritten fields and not verified, so a corrupted packet stays
+corrupted for its receiver; an IPv4 UDP reply without a checksum gets a full one and an IPv6
+UDP request without one is dropped (`reasons::MALFORMED`). Translated packets
 leave DF clear by default (`Nat64LanConfig::set_df` sets it above 1260 bytes, trading LAN
 fragmentation for a PMTU black hole when the LAN filters ICMP), and a destination that more
 than one route resolves is dropped and counted (`reasons::AMBIGUOUS_ROUTE`), unless

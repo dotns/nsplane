@@ -31,8 +31,11 @@
 //! Packets are rewritten in place: a forwarded packet shrinks by 20 bytes
 //! (its start moves forward inside the buffer) and a reply grows by 20 bytes
 //! into its headroom; a reply whose buffer has less than 20 bytes of headroom
-//! is copied once into a buffer with the standard headroom. Checksums are
-//! recomputed. Translated IPv4 packets leave DF clear unless
+//! is copied once into a buffer with the standard headroom. Transport
+//! checksums are updated incrementally for the rewritten fields and not
+//! verified: a corrupted packet stays corrupted for its receiver. A reply
+//! without a UDP checksum gets a full one; a request without one is invalid
+//! over IPv6 and dropped ([`reasons::MALFORMED`]). Translated IPv4 packets leave DF clear unless
 //! [`Nat64LanConfig::set_df`] is on. The hop limit and TTL are copied: the node forwarding the translated packet decrements
 //! them.
 //!
