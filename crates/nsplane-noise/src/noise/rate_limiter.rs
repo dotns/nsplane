@@ -21,6 +21,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -213,7 +214,7 @@ pub struct RateLimiter {
     /// The key we use to derive the nonce
     nonce_key: [u8; 32],
     /// The key we use to derive the cookie
-    secret_key: [u8; 16],
+    secret_key: Zeroizing<[u8; 16]>,
     start_time: Instant,
     /// A single 64 bit counter (should suffice for many years)
     nonce_ctr: AtomicU64,
@@ -255,8 +256,8 @@ impl RateLimiter {
         public_key: &crate::x25519::PublicKey,
         budget: Arc<HandshakeBudget>,
     ) -> Self {
-        let mut secret_key = [0u8; 16];
-        OsRng.fill_bytes(&mut secret_key);
+        let mut secret_key = Zeroizing::new([0u8; 16]);
+        OsRng.fill_bytes(&mut secret_key[..]);
         Self {
             nonce_key: Self::rand_bytes(),
             secret_key,
@@ -885,7 +886,7 @@ mod tests {
 
         fn limiter(limit: u64) -> RateLimiter {
             let mut limiter = RateLimiter::new(&responder_public(), limit);
-            limiter.secret_key = SECRET_KEY;
+            limiter.secret_key = Zeroizing::new(SECRET_KEY);
             limiter.nonce_key = NONCE_KEY;
             limiter
         }

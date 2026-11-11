@@ -9,13 +9,12 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 use crate::sleepyinstant::Instant;
 use crate::x25519;
-use aead::{Aead, Payload};
+use aead::AeadInPlace;
 use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand_core::OsRng;
-use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use subtle::ConstantTimeEq;
 use zerocopy::FromBytes;
@@ -25,6 +24,8 @@ pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
 pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
 const KEY_LEN: usize = 32;
 const TIMESTAMP_LEN: usize = 12;
+const COOKIE_LEN: usize = 16;
+const COOKIE_TAG_LEN: usize = 16;
 /// What a handshake without a preshared key mixes in its place
 const NO_PRESHARED_KEY: [u8; KEY_LEN] = [0; KEY_LEN];
 
@@ -298,8 +299,9 @@ struct NoiseParams {
     static_shared: Option<x25519::SharedSecret>,
     /// A pre-computation of HASH("mac1----", `peer_static_public`) for this peer
     sending_mac1_key: [u8; KEY_LEN],
-    /// An optional preshared key
-    preshared_key: Option<[u8; KEY_LEN]>,
+    /// The preshared key; all zero without one, which is what such a handshake mixes in. A
+    /// plain array, so that replacing the key overwrites the old one in place.
+    preshared_key: [u8; KEY_LEN],
 }
 
 impl std::fmt::Debug for NoiseParams {
@@ -310,7 +312,10 @@ impl std::fmt::Debug for NoiseParams {
             .field("peer_static_public", &self.peer_static_public)
             .field("static_shared", &"<redacted>")
             .field("sending_mac1_key", &self.sending_mac1_key)
-            .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
+            .field(
+                "preshared_key",
+                &(!bool::from(self.preshared_key.ct_eq(&NO_PRESHARED_KEY))).then_some("<redacted>"),
+            )
             .finish()
     }
 }
@@ -395,7 +400,7 @@ pub struct Handshake {
 struct Cookies {
     last_mac1: Option<[u8; 16]>,
     index: u32,
-    write_cookie: Option<[u8; 16]>,
+    write_cookie: Option<Zeroizing<[u8; COOKIE_LEN]>>,
 }
 
 impl std::fmt::Debug for Cookies {
@@ -403,7 +408,10 @@ impl std::fmt::Debug for Cookies {
         f.debug_struct("Cookies")
             .field("last_mac1", &self.last_mac1)
             .field("index", &self.index)
-            .field("write_cookie", &self.write_cookie.map(|_| "<redacted>"))
+            .field(
+                "write_cookie",
+                &self.write_cookie.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -489,7 +497,7 @@ impl NoiseParams {
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
-            preshared_key,
+            preshared_key: preshared_key.unwrap_or(NO_PRESHARED_KEY),
         }
     }
 
@@ -558,7 +566,7 @@ impl Handshake {
         self.cookies.write_cookie.is_some()
     }
 
-    pub(crate) const fn clear_cookie(&mut self) {
+    pub(crate) fn clear_cookie(&mut self) {
         self.cookies.write_cookie = None;
     }
 
@@ -580,9 +588,12 @@ impl Handshake {
 
     /// Replaces the preshared key used when producing or accepting a handshake response,
     /// including responses to initiations already in flight. Established sessions keep
-    /// their derived keys.
+    /// their derived keys. The new key, or the zeros of no key, overwrite the old key.
     pub(crate) const fn set_preshared_key(&mut self, preshared_key: Option<[u8; KEY_LEN]>) {
-        self.params.preshared_key = preshared_key;
+        self.params.preshared_key = match preshared_key {
+            Some(key) => key,
+            None => NO_PRESHARED_KEY,
+        };
     }
 
     pub(super) fn receive_handshake_initialization<'a>(
@@ -717,8 +728,7 @@ impl Handshake {
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let preshared_key = self.params.preshared_key.as_ref();
-        let temp = b2s_hmac(&chaining_key, preshared_key.unwrap_or(&NO_PRESHARED_KEY));
+        let temp = b2s_hmac(&chaining_key, &self.params.preshared_key);
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
@@ -771,17 +781,19 @@ impl Handshake {
         // msg.encrypted_cookie = XAEAD(HASH(LABEL_COOKIE || responder.static_public), msg.nonce, cookie, last_received_msg.mac1)
         let key = b2s_hash(LABEL_COOKIE, self.params.peer_static_public.as_bytes()); // TODO: pre-compute
 
-        let payload = Payload {
-            aad: &mac1[0..16],
-            msg: packet.encrypted_cookie,
+        let Some((ciphertext, tag)) = packet
+            .encrypted_cookie
+            .split_first_chunk::<COOKIE_LEN>()
+            .filter(|(_, tag)| tag.len() == COOKIE_TAG_LEN)
+        else {
+            return Err(WireGuardError::InvalidPacket);
         };
-        let plaintext = XChaCha20Poly1305::new(&key.into())
-            .decrypt(packet.nonce.into(), payload)
+        // Decrypted in place, in a buffer that is wiped when the cookie is dropped.
+        let mut cookie = Zeroizing::new(*ciphertext);
+        XChaCha20Poly1305::new(&key.into())
+            .decrypt_in_place_detached(packet.nonce.into(), &mac1, &mut cookie[..], tag.into())
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
-        let cookie = plaintext
-            .try_into()
-            .map_err(|_| WireGuardError::InvalidPacket)?;
         self.cookies.write_cookie = Some(cookie);
         Ok(())
     }
@@ -797,9 +809,13 @@ impl Handshake {
         dst[mac1_off..mac2_off].copy_from_slice(&msg_mac1[..]);
 
         //msg.mac2 = MAC(initiator.last_received_cookie, msg[0:offsetof(msg.mac2)])
-        let msg_mac2: [u8; 16] = self.cookies.write_cookie.map_or([0u8; 16], |cookie| {
-            b2s_keyed_mac_16(&cookie, &dst[..mac2_off])
-        });
+        let msg_mac2: [u8; 16] = self
+            .cookies
+            .write_cookie
+            .as_deref()
+            .map_or([0u8; 16], |cookie| {
+                b2s_keyed_mac_16(cookie, &dst[..mac2_off])
+            });
 
         dst[mac2_off..].copy_from_slice(&msg_mac2[..]);
 
@@ -960,8 +976,7 @@ impl Handshake {
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp = HMAC(responder.chaining_key, preshared_key)
-        let preshared_key = self.params.preshared_key.as_ref();
-        let temp = b2s_hmac(&chaining_key, preshared_key.unwrap_or(&NO_PRESHARED_KEY));
+        let temp = b2s_hmac(&chaining_key, &self.params.preshared_key);
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // temp2 = HMAC(temp, responder.chaining_key || 0x2)
