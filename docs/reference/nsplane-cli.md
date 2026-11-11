@@ -14,6 +14,9 @@ an inherited stream with `--uapi-fd`), drops privileges to `SUDO_UID` / `SUDO_GI
 stderr and does not daemonize, so `wg-quick` with `WG_QUICK_USERSPACE_IMPLEMENTATION` is not
 supported.
 
+- The UAPI socket has mode `0600` and belongs to the user the daemon started as. Started
+  with `sudo`, that is root, also after the privilege drop: use `sudo wg`. Started
+  unprivileged (`setcap cap_net_admin+epi`), the same user runs `wg`.
 - `wg set <name> listen-port <port>` rebinds the UDP socket.
 - `--crypto-workers <N>` enables the crypto worker pool for `N` >= 2.
 - `--no-offload` opens the TUN device and binds the UDP socket without segmentation

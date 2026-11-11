@@ -52,6 +52,13 @@ binds `/var/run/wireguard/<iface>.sock` on Unix and the named pipe
 descriptor on Windows. `Uapi::serve` accepts connections on it; on Unix `serve_stream` serves
 one already-connected stream.
 
+The Unix socket file has mode `0600` whatever the process umask is, as with wireguard-go:
+`get=1` answers with the private key, so only the owner of the socket and root can connect.
+The mode is set between `bind` and `listen`, and a socket that does not listen yet refuses
+connections, so no client gets in under the mode the umask gave. `UapiListener::bind` hands
+`/var/run/wireguard` to `SUDO_UID` / `SUDO_GID` so the socket can be removed after a
+privilege drop, but not the socket: one bound by root takes root to connect (`sudo wg`).
+
 ## Platform notes
 
 The Windows named-pipe path and security descriptor match wireguard-windows; they are
