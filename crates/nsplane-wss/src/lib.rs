@@ -30,7 +30,9 @@
 //!   link that came up ([`WssConfig::backoff_min`] when unset), and after a failed dial
 //!   [`WssConfig::backoff_min`], doubled after each further failure up to
 //!   [`WssConfig::backoff_max`]. Without a reconnect delay, the wait after a link is the
-//!   first step of that doubling.
+//!   first step of that doubling. Each wait is jittered: a dial waits a random time
+//!   between half of the delay and the delay, so that dialers that lost their links
+//!   together do not all dial again at the same moment.
 //! - **Keepalive**: the sending half pings every [`WssConfig::ping_interval`], or never
 //!   when it is zero ([`WssConfig::ping_interval(None)`](WssConfig::ping_interval)); the
 //!   receiving half ends the link when no frame at all (pongs included) arrived for

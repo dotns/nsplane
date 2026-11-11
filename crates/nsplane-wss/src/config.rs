@@ -75,6 +75,10 @@ pub struct WssConfig {
     pub bearer: Option<Arc<dyn BearerProvider>>,
     /// The wait before a dial after a link that came up, and after the first failed dial;
     /// it doubles after each further failure. 2 s by default.
+    ///
+    /// Every wait of the backoff, and of [`reconnect_delay`](Self::reconnect_delay), is an
+    /// upper bound: a dial waits a random time between half of it and all of it, so that
+    /// the dialers a server lost together do not come back together.
     pub backoff_min: Duration,
     /// The longest wait before a dial. 60 s by default.
     pub backoff_max: Duration,

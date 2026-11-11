@@ -272,18 +272,18 @@ fn reconnect_config(relay: &Relay) -> WssConfig {
 
 /// After the loss at `lost`: the redial came up at `up`, after the reconnect delay but
 /// before the floor; then, with the relay down, the failures at `failures` waited the
-/// floor, then twice the floor.
+/// floor, then twice the floor. Every wait is jittered down to half of its delay at most.
 fn check_waits(lost: Instant, up: Instant, failures: &[Instant]) -> TestResult {
     let redial = up - lost;
     assert!(
-        redial >= RECONNECT && redial < FLOOR,
+        redial >= RECONNECT / 2 && redial < FLOOR / 2,
         "redial after {redial:?}"
     );
     let [first, second, third] = failures else {
         return Err(format!("{} failures", failures.len()).into());
     };
-    assert!(*second - *first >= FLOOR, "{:?}", *second - *first);
-    assert!(*third - *second >= FLOOR * 2, "{:?}", *third - *second);
+    assert!(*second - *first >= FLOOR / 2, "{:?}", *second - *first);
+    assert!(*third - *second >= FLOOR, "{:?}", *third - *second);
     Ok(())
 }
 
@@ -309,7 +309,7 @@ async fn dialer_reconnects_after_the_delay_then_backs_off_from_the_floor() -> Te
     relay.kick();
     seen.until(DialFailed, 3, WAIT + FLOOR * 3).await?;
     let lost = seen.times(Lost);
-    assert!(seen.times(DialFailed)[0] - lost[1] >= RECONNECT);
+    assert!(seen.times(DialFailed)[0] - lost[1] >= RECONNECT / 2);
     check_waits(
         lost[0],
         seen.times(Connected)[1],

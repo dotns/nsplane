@@ -45,7 +45,10 @@ in `tokio-tungstenite` and `rustls` (aws-lc-rs provider). It is `#![forbid(unsaf
   connector models this as a distinct `Retry::Reconnect` state, so the failure backoff
   restarts at the floor instead of doubling the reconnect delay. Without
   `reconnect_delay` (the default) the wait after a link is `backoff_min` as the first step
-  of the doubling.
+  of the doubling. Each of these waits is jittered: the delay is an upper bound, and a
+  dial waits a random time between half of it and all of it (1 to 2 s, then 2 to 4 s, at
+  most 30 to 60 s by default), so the dialers a restarted server lost together do not
+  come back in waves. The doubling goes by the delay, not by the time waited.
 - Keepalive: a ping every `ping_interval` (10 s); the link ends when no frame at all
   (pongs included) arrived for `read_idle` (35 s). The dialer reads both per dial
   (`WssConfig::keepalive`). A zero `ping_interval` (`WssConfig::ping_interval(None)`)

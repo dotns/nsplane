@@ -1,7 +1,9 @@
 //! The connection setup of [`WssDialer`](crate::WssDialer): URL, TLS, request headers and
 //! the bearer, 401/403 classification, the dial backoff and the dial events.
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -234,6 +236,20 @@ fn next_backoff(wait: Option<Duration>, min: Duration, max: Duration) -> Duratio
         .min(max)
 }
 
+/// `delay` shortened by `random`, uniformly over `delay / 2 ..= delay`.
+fn jitter(delay: Duration, random: u64) -> Duration {
+    let span = (delay / 2).as_nanos() + 1;
+    let cut = u64::try_from(u128::from(random) % span).unwrap_or(u64::MAX);
+    delay.saturating_sub(Duration::from_nanos(cut))
+}
+
+/// The wait of one dial for the configured `delay`: a random one in `delay / 2 ..= delay`,
+/// so that the dialers a server lost together do not come back together.
+fn jittered(delay: Duration) -> Duration {
+    // A hasher of the standard library starts from random keys.
+    jitter(delay, RandomState::new().build_hasher().finish())
+}
+
 /// The detail of an upgrade refused with an HTTP response.
 fn refusal(error: &WsError) -> Option<WssDialError> {
     let WsError::Http(response) = error else {
@@ -386,7 +402,8 @@ impl Connector {
     /// Waits as the last dial asks, then dials: TCP, TLS (for `wss://`) and the WebSocket
     /// upgrade. A success makes the next dial wait the reconnect delay (or the backoff
     /// floor); a failure doubles the wait, starting from the floor, and a 401 or 403 also
-    /// sets [`LinkState::Rejected`]. An upgrade refused with an HTTP response fails with a
+    /// sets [`LinkState::Rejected`]. Each of these waits is a random one between half of
+    /// its delay and the delay; the doubling goes by the delay. An upgrade refused with an HTTP response fails with a
     /// [`WssDialError`] inside. Every failure sends its event; the dialer sends
     /// [`WssDialEvent::Connected`] itself.
     ///
@@ -397,11 +414,11 @@ impl Connector {
         let (wait, token) = match retry {
             Retry::Now => (None, self.token().await),
             Retry::Backoff(wait) => {
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(jittered(wait)).await;
                 (Some(wait), self.token().await)
             }
             Retry::Reconnect(delay) => {
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(jittered(delay)).await;
                 (None, self.token().await)
             }
             Retry::NewToken(refused) => (None, self.token_other_than(refused).await),
@@ -581,6 +598,38 @@ mod tests {
         assert_eq!(next_backoff(Some(Duration::MAX), min, max), max);
         // A floor above the cap is capped.
         assert_eq!(next_backoff(None, max * 2, max), max);
+    }
+
+    /// A wait is spread over its upper half, bounds included, and never above the
+    /// configured delay.
+    #[test]
+    fn jitter_spreads_a_wait_over_its_upper_half() {
+        let delay = Duration::from_secs(2);
+        let half = Duration::from_secs(1);
+        assert_eq!(jitter(delay, 0), delay);
+        assert_eq!(jitter(delay, 1_000_000_000), half);
+        assert_eq!(jitter(delay, 1_000_000_001), delay);
+        assert_eq!(jitter(delay, 250_000_000), Duration::from_millis(1750));
+        for random in [1, 999_999_999, u64::MAX / 3, u64::MAX] {
+            let wait = jitter(delay, random);
+            assert!(half <= wait && wait <= delay, "{wait:?}");
+        }
+        assert_eq!(jitter(Duration::ZERO, u64::MAX), Duration::ZERO);
+        assert_eq!(
+            jitter(Duration::from_nanos(1), u64::MAX),
+            Duration::from_nanos(1)
+        );
+        let wait = jitter(Duration::MAX, u64::MAX);
+        assert!(Duration::MAX / 2 <= wait && wait <= Duration::MAX);
+    }
+
+    /// The waits of a dialer differ from one another, within the bounds.
+    #[test]
+    fn jittered_waits_differ() {
+        let delay = Duration::from_secs(60);
+        let waits: Vec<_> = (0..64).map(|_| jittered(delay)).collect();
+        assert!(waits.iter().all(|wait| (delay / 2..=delay).contains(wait)));
+        assert!(waits.iter().any(|wait| *wait != waits[0]), "{waits:?}");
     }
 
     /// Without a reconnect delay, the dial after a connection that came up waits the
