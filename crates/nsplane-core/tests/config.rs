@@ -298,6 +298,26 @@ fn stats_interval_emits_peer_stats() {
 }
 
 #[test]
+fn peer_path_is_the_stored_path() {
+    let mut net = Net::unpeered(3, common::default_config);
+    net.add_peer(0, 1);
+    let mut pathless = net.peer_config(2);
+    pathless.path = None;
+    net.configure(0, ConfigChange::AddOrUpdatePeer(pathless));
+    let (with_path, without) = (net.peer_id(0, 1), net.peer_id(0, 2));
+
+    assert_eq!(net.cores[0].peer_path(with_path), Some(Some(net.paths[1])));
+    assert_eq!(net.cores[0].peer_path(without), Some(None));
+    for peer in [with_path, without] {
+        let stats = net.cores[0].peer_stats(peer).unwrap();
+        assert_eq!(net.cores[0].peer_path(peer), Some(stats.path));
+    }
+
+    net.configure(0, ConfigChange::RemovePeer(net.public_key(2)));
+    assert_eq!(net.cores[0].peer_path(without), None);
+}
+
+#[test]
 fn force_handshake_on_a_path_sends_an_initiation_there() {
     let mut net = Net::new(2);
     let id = net.peer_id(0, 1);

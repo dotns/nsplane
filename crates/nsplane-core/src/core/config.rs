@@ -126,6 +126,13 @@ impl Core {
         self.peers.peer(peer).map(Peer::has_session)
     }
 
+    /// The stored (current) path of `peer`, the `path` of its [`Core::peer_stats`]: `None`
+    /// for an unknown peer, `Some(None)` for a peer without a path. Reads the peer alone, so
+    /// it also is the cheap test for whether a peer exists.
+    pub fn peer_path(&self, peer: PeerId) -> Option<Option<Path>> {
+        self.peers.peer(peer).map(Peer::path)
+    }
+
     /// Configuration and counters of `peer`; the time since its last handshake is measured
     /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {

@@ -104,7 +104,7 @@ impl Owner {
 
     /// The inner MTU of `peer`; `None` for an unknown peer.
     fn peer_mtu(&mut self, peer: PeerId) -> Option<u16> {
-        self.core.peer_stats(peer)?;
+        self.core.peer_path(peer)?;
         let Some(table) = &mut self.path_mtus.table else {
             return Some(self.mtu);
         };

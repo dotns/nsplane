@@ -8,7 +8,7 @@ packet filter chain. It does no I/O and keeps no clock; `nsplane` drives it. Bui
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `set_plaintext_egress`, `peer_stats` / `all_peer_stats` / `peer_has_session`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output` (`Transmit`, `Deliver`, `Event`, `Plaintext`, `Tracked`; non-exhaustive), `TrackedOutcome`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats` (`new`; non-exhaustive), `Event` (non-exhaustive), `ExpiryCause` (`SessionAge`, `HandshakeTimeout`; non-exhaustive), `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
+| main | `Core` (`handle_input`, `handle_datagrams` / `handle_locals`, the `_deferred` forms and `complete_job`, `handle_timeout` / `poll_timeout`, `poll_output`, `inject_inbound` / `inject_outbound` / `inject_outbound_on`, `receive_plaintext`, `force_handshake` / `force_handshake_on`, `route`, `data_path`, `is_remote_index`, `set_peer_pad_limit`, `set_plaintext_egress`, `peer_stats` / `all_peer_stats` / `peer_has_session` / `peer_path`, `unanswered_handshakes` / `total_unanswered_handshakes`, `recycle`, `add_local_identity` / `add_local_identity_on` / `remove_local_identity` / `local_identities`, `peer_id_in`, `set_local_sources`, `route_from`); traits `PathPolicy` (`select`, `on_authenticated`, `observe_every_message`) and `PacketFilter` (`inbound`, `inbound_from`, `outbound`) | `CoreConfig`, `Input`, `Output` (`Transmit`, `Deliver`, `Event`, `Plaintext`, `Tracked`; non-exhaustive), `TrackedOutcome`, `ConfigChange`, `PeerConfig`, `AllowedIp`, `PeerStats` (`new`; non-exhaustive), `Event` (non-exhaustive), `ExpiryCause` (`SessionAge`, `HandshakeTimeout`; non-exhaustive), `Verdict`, `Roam`, `MessageKind`, `StandardRoaming`, `CryptoJob`, `LocalIdentityId`, `LocalIdentityInfo`, `reasons` |
 
 ## Behavior
 
@@ -225,7 +225,8 @@ its send path takes (`Input::Local`, `handle_locals`, the `_deferred` forms with
 ### Padding
 
 Used by the driver's per-path MTU (see [nsplane](nsplane.md)); unused otherwise: `Core::data_path(peer)` is the path the peer's next data message leaves on (what the policy
-selects for `MessageKind::Data`, else the current path), `Core::is_remote_index(peer, index)`
+selects for `MessageKind::Data`, else the current path), `Core::peer_path(peer)` is the stored
+path alone (`None` for an unknown peer, without building a `PeerStats`), `Core::is_remote_index(peer, index)`
 checks a quoted receiver index against the peer's current session, and
 `Core::set_peer_pad_limit(peer, limit)` caps the padding of the peer's data at `limit` bytes
 of plaintext (`noise::Tunn::set_pad_limit`), as kernel WireGuard pads to the interface MTU: a

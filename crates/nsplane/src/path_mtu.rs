@@ -92,7 +92,7 @@ impl Peers for Core {
     }
 
     fn stored_path(&self, peer: PeerId) -> Option<Path> {
-        self.peer_stats(peer)?.path
+        self.peer_path(peer)?
     }
 
     fn is_remote_index(&self, peer: PeerId, index: u32) -> bool {
