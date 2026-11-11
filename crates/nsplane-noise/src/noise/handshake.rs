@@ -26,6 +26,7 @@ const KEY_LEN: usize = 32;
 const TIMESTAMP_LEN: usize = 12;
 const COOKIE_LEN: usize = 16;
 const COOKIE_TAG_LEN: usize = 16;
+const AEAD_TAG_LEN: usize = 16;
 /// What a handshake without a preshared key mixes in its place
 const NO_PRESHARED_KEY: [u8; KEY_LEN] = [0; KEY_LEN];
 
@@ -198,12 +199,17 @@ fn aead_chacha20_open_inner(
 ) -> Result<(), aws_lc_rs::error::Unspecified> {
     let key = chacha20_poly1305_key(key);
 
-    let mut inner_buffer = data.to_owned();
+    // The largest encrypted handshake field is the static key with its tag.
+    let mut inner_buffer = [0u8; KEY_LEN + AEAD_TAG_LEN];
+    let inner_buffer = inner_buffer
+        .get_mut(..data.len())
+        .ok_or(aws_lc_rs::error::Unspecified)?;
+    inner_buffer.copy_from_slice(data);
 
     let plaintext = key.open_in_place(
         Nonce::assume_unique_for_key(nonce),
         Aad::from(aad),
-        &mut inner_buffer,
+        inner_buffer,
     )?;
 
     buffer.copy_from_slice(plaintext);
@@ -299,6 +305,9 @@ struct NoiseParams {
     static_shared: Option<x25519::SharedSecret>,
     /// A pre-computation of HASH("mac1----", `peer_static_public`) for this peer
     sending_mac1_key: [u8; KEY_LEN],
+    /// A pre-computation of HASH("cookie--", `peer_static_public`): the key of the cookie
+    /// replies this peer sends
+    receiving_cookie_key: [u8; KEY_LEN],
     /// The preshared key; all zero without one, which is what such a handshake mixes in. A
     /// plain array, so that replacing the key overwrites the old one in place.
     preshared_key: [u8; KEY_LEN],
@@ -312,6 +321,7 @@ impl std::fmt::Debug for NoiseParams {
             .field("peer_static_public", &self.peer_static_public)
             .field("static_shared", &"<redacted>")
             .field("sending_mac1_key", &self.sending_mac1_key)
+            .field("receiving_cookie_key", &self.receiving_cookie_key)
             .field(
                 "preshared_key",
                 &(!bool::from(self.preshared_key.ct_eq(&NO_PRESHARED_KEY))).then_some("<redacted>"),
@@ -497,6 +507,7 @@ impl NoiseParams {
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
+            receiving_cookie_key: b2s_hash(LABEL_COOKIE, peer_static_public.as_bytes()),
             preshared_key: preshared_key.unwrap_or(NO_PRESHARED_KEY),
         }
     }
@@ -779,7 +790,7 @@ impl Handshake {
             return Err(WireGuardError::WrongIndex);
         }
         // msg.encrypted_cookie = XAEAD(HASH(LABEL_COOKIE || responder.static_public), msg.nonce, cookie, last_received_msg.mac1)
-        let key = b2s_hash(LABEL_COOKIE, self.params.peer_static_public.as_bytes()); // TODO: pre-compute
+        let key = self.params.receiving_cookie_key;
 
         let Some((ciphertext, tag)) = packet
             .encrypted_cookie
@@ -1252,6 +1263,25 @@ mod tests {
                 Err(WireGuardError::WrongKey)
             ));
         }
+    }
+
+    #[test]
+    fn open_takes_the_static_key_field_and_nothing_longer() {
+        let (key, aad) = ([3u8; KEY_LEN], [5u8; KEY_LEN]);
+
+        let mut sealed = [0u8; KEY_LEN + AEAD_TAG_LEN];
+        aead_chacha20_seal(&mut sealed, &key, 0, &[7; KEY_LEN], &aad);
+        let mut opened = [0u8; KEY_LEN];
+        aead_chacha20_open(&mut opened, &key, 0, &sealed, &aad).expect("the field opens");
+        assert_eq!(opened, [7; KEY_LEN]);
+
+        let mut longer = [0u8; KEY_LEN + 1 + AEAD_TAG_LEN];
+        aead_chacha20_seal(&mut longer, &key, 0, &[7; KEY_LEN + 1], &aad);
+        let mut opened = [0u8; KEY_LEN + 1];
+        assert!(matches!(
+            aead_chacha20_open(&mut opened, &key, 0, &longer, &aad),
+            Err(WireGuardError::InvalidAeadTag)
+        ));
     }
 
     #[test]
