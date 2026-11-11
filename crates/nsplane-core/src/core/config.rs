@@ -130,13 +130,29 @@ impl Core {
     /// up to the `now` of the latest call that passed the time.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
         let p = self.peers.peer(peer)?;
+        Some(self.stats_of(peer, p, self.peers.allowed_ips(peer)))
+    }
+
+    /// [`Core::peer_stats`] of every peer, in id order. Prefer it to one
+    /// [`Core::peer_stats`] call per peer: it reads the allowed IPs of all peers in one pass,
+    /// while each single query scans the allowed IPs of the peer's whole local identity.
+    pub fn all_peer_stats(&self) -> Vec<PeerStats> {
+        self.peers
+            .iter()
+            .zip(self.peers.all_allowed_ips())
+            .map(|((peer, p), allowed_ips)| self.stats_of(peer, p, allowed_ips))
+            .collect()
+    }
+
+    /// The statistics of `peer`, stored as `p`, with its `allowed_ips`.
+    fn stats_of(&self, peer: PeerId, p: &Peer, allowed_ips: Vec<AllowedIp>) -> PeerStats {
         let last_handshake = self.now.and_then(|now| p.time_since_last_handshake(now));
-        Some(PeerStats {
+        PeerStats {
             peer,
             public_key: *p.public_key(),
             local_identity: p.local_identity(),
             path: p.path(),
-            allowed_ips: self.peers.allowed_ips(peer),
+            allowed_ips,
             preshared_key: p.preshared_key().copied(),
             persistent_keepalive: p.persistent_keepalive(),
             rx: p.rx(),
@@ -145,7 +161,7 @@ impl Core {
             data_tx: p.data_tx(),
             expirations: p.expirations(),
             last_handshake,
-        })
+        }
     }
 
     /// Handshake initiations transmitted to `peer` that got no response; `None` for an

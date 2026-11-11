@@ -217,10 +217,7 @@ impl Owner {
 
     /// Every peer's statistics.
     fn peers(&self) -> Vec<PeerStats> {
-        self.core
-            .peers()
-            .filter_map(|peer| self.core.peer_stats(peer))
-            .collect()
+        self.core.all_peer_stats()
     }
 
     /// A snapshot of the engine, counting the failed sends reported so far.

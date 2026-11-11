@@ -413,16 +413,22 @@ impl<D> Table<D> {
         self.dirty = false;
     }
 
-    /// Appends `(value, network address, prefix length)` of every network, in the order of
-    /// the stride-4 tree bitmap the table replaced (`ip_network_table`): a node's prefixes
-    /// (shorter first, then by address) before its children, children by address.
-    fn collect<'a>(&'a self, v6: bool, out: &mut Vec<(&'a D, IpAddr, u8)>) {
+    /// Appends `(value, network address, prefix length)` of every network whose value
+    /// matches `keep`, in the order of the stride-4 tree bitmap the table replaced
+    /// (`ip_network_table`): a node's prefixes (shorter first, then by address) before its
+    /// children, children by address. Only the matching networks are sorted.
+    fn collect<'a>(
+        &'a self,
+        v6: bool,
+        keep: &dyn Fn(&D) -> bool,
+        out: &mut Vec<(&'a D, IpAddr, u8)>,
+    ) {
         let mut entries: Vec<(u128, u8, &D)> = self
             .networks
             .iter()
             .filter_map(|(&(net, len), &slot)| {
                 let value = self.values.get(usize::try_from(slot).ok()?)?.as_ref()?;
-                Some((net, len, value))
+                keep(value).then_some((net, len, value))
             })
             .collect();
         entries.sort_unstable_by(|&(a, a_len, _), &(b, b_len, _)| tree_order(a, a_len, b, b_len));
@@ -541,9 +547,15 @@ impl<D> AllowedIps<D> {
     /// Iterates over `(value, network address, prefix length)`: IPv4 first, each family in
     /// the pre-order of the stride-4 trie the table replaced.
     pub(crate) fn iter(&self) -> Iter<'_, D> {
+        self.iter_where(&|_| true)
+    }
+
+    /// Iterates like [`AllowedIps::iter`] over the entries whose value matches `keep`, in
+    /// the same order, sorting only those.
+    pub(crate) fn iter_where(&self, keep: &dyn Fn(&D) -> bool) -> Iter<'_, D> {
         let mut entries = Vec::new();
-        self.v4.collect(false, &mut entries);
-        self.v6.collect(true, &mut entries);
+        self.v4.collect(false, keep, &mut entries);
+        self.v6.collect(true, keep, &mut entries);
         Iter(entries.into())
     }
 }
@@ -1035,11 +1047,14 @@ mod tests {
                         "{probe}"
                     );
                 }
-                let expected: Vec<_> = trie
+                let mut expected: Vec<_> = trie
                     .iter()
                     .map(|(net, v)| (v, net.network_address(), net.netmask()))
                     .collect();
                 assert_eq!(ours.iter().collect::<Vec<_>>(), expected);
+                let kept: Vec<_> = ours.iter_where(&|v| *v == value).collect();
+                expected.retain(|(v, _, _)| **v == value);
+                assert_eq!(kept, expected);
             }
         }
     }

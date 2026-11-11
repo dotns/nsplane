@@ -457,8 +457,7 @@ impl PeerTable {
         let owned: Vec<(IpAddr, u8)> = match (&self.merged, self.identities.get(i)) {
             (Some(_), Some(owner)) => owner
                 .ips
-                .iter()
-                .filter(|(p, _, _)| **p == peer)
+                .iter_where(&|p| *p == peer)
                 .map(|(_, addr, cidr)| (addr, cidr))
                 .collect(),
             _ => Vec::new(),
@@ -650,10 +649,23 @@ impl PeerTable {
         };
         owner
             .ips
-            .iter()
-            .filter(|(p, _, _)| **p == peer)
+            .iter_where(&|p| *p == peer)
             .map(|(_, addr, cidr)| AllowedIp { addr, cidr })
             .collect()
+    }
+
+    /// The allowed IPs of every peer, at the position of the peer in [`PeerTable::iter`]:
+    /// each list is what [`PeerTable::allowed_ips`] returns, from one pass over the tables.
+    pub(crate) fn all_allowed_ips(&self) -> Vec<Vec<AllowedIp>> {
+        let mut all = vec![Vec::new(); self.peers.len()];
+        for identity in &self.identities {
+            for (&peer, addr, cidr) in identity.ips.iter() {
+                if let Some(ips) = self.slot(peer).and_then(|slot| all.get_mut(slot)) {
+                    ips.push(AllowedIp { addr, cidr });
+                }
+            }
+        }
+        all
     }
 
     /// Replaces the source set of `identity` with `sources`; an empty list clears it. `false`,
@@ -1478,12 +1490,20 @@ mod tests {
         assert!(!table.routes_to(ip("10.0.1.1"), other_peer));
         assert_eq!(table.allowed_ips(default_peer), vec![net("10.0.0.0/24")]);
         assert_eq!(table.allowed_ips(other_peer), vec![net("10.0.0.0/24")]);
+        assert_eq!(
+            table.all_allowed_ips(),
+            vec![vec![net("10.0.0.0/24")], vec![net("10.0.0.0/24")]]
+        );
         // The fallback table: the last insert owns the range.
         assert_eq!(table.by_destination(ip("10.0.0.1")), Some(other_peer));
 
         // Within an identity the last insert still moves a range.
         let third = add_ips_in(&mut table, other, key(), &["10.0.0.0/24"]);
         assert_eq!(table.allowed_ips(other_peer), Vec::new());
+        assert_eq!(
+            table.all_allowed_ips(),
+            vec![vec![net("10.0.0.0/24")], vec![], vec![net("10.0.0.0/24")]]
+        );
         assert!(!table.routes_to(ip("10.0.0.1"), other_peer));
         assert!(table.routes_to(ip("10.0.0.1"), third));
         assert!(table.routes_to(ip("10.0.0.1"), default_peer));

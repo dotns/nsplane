@@ -1825,4 +1825,8 @@ fn allowed_ips_are_listed_in_trie_order_per_peer() {
         listed(8),
         ["8.0.0.0/5", "10.1.0.0/20", "10.1.2.0/25", "fd00::/16"]
     );
+    // The listing of all peers is the single-peer queries, in id order.
+    let each: Vec<_> = core.peers().filter_map(|p| core.peer_stats(p)).collect();
+    assert_eq!(each.len(), 2);
+    assert_eq!(core.all_peer_stats(), each);
 }
