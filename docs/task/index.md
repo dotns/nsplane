@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-11-10
+> Updated: 2026-11-11
 
 ## Usage
 
@@ -105,3 +105,17 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261107-0553-retransmitted-syn-second-socket Retransmitted SYN opens a second socket for one tuple**](20261107-0553-retransmitted-syn-second-socket.md) `P1`
 
 - [x] [**20261110-1215-zero-window-ack-deadlock A zero receive window drops the ACK that would reopen it**](20261110-1215-zero-window-ack-deadlock.md) `P1`
+
+- [x] [**20261111-2030-keepalive-expiry-and-cookie-rate-limit Persistent keepalive ends at the expiry; cookie holders are not rate limited**](20261111-2030-keepalive-expiry-and-cookie-rate-limit.md) `P1`
+
+- [x] [**20261111-2031-responder-queue-flush A responder flushes its queue into a second handshake initiation**](20261111-2031-responder-queue-flush.md) `P2`
+
+- [x] [**20261111-2032-splitter-gone-sink-closes-engine One gone sink of a Splitter closes the engine's whole sink**](20261111-2032-splitter-gone-sink-closes-engine.md) `P2`
+
+- [x] [**20261111-2033-dns-tcp-cap-and-forwarder-ids DNS: TCP connection cap, accept under exhaustion, forwarder IDs**](20261111-2033-dns-tcp-cap-and-forwarder-ids.md) `P2`
+
+- [x] [**20261111-2034-cli-uapi-hardening Hardening defects in the CLI and the UAPI server**](20261111-2034-cli-uapi-hardening.md) `P2`
+
+- [x] [**20261111-2035-nat64-lan-checksum NAT64-LAN recomputes transport checksums and hides corruption**](20261111-2035-nat64-lan-checksum.md) `P2`
+
+- [x] [**20261111-2036-ether-dhcp-rebind-and-periodic-ra The DHCP lease outlives its guest and router advertisements are sent once**](20261111-2036-ether-dhcp-rebind-and-periodic-ra.md) `P2`

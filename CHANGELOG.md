@@ -5,6 +5,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- nsplane-dns: `ServerConfig::max_tcp_connections` (default 256) caps the connections of
+  `Server::serve_tcp`; a connection above the cap is closed at once and counted in
+  `ServerStats::rejected_connections`.
+- nsplane-ether: `EtherAdapter::periodic_ra` and `adapter::RA_INTERVAL` (600 s). Ports send the
+  router advertisement again every interval; an embedder that drives an `EtherAdapter` without
+  `spawn_port` calls `periodic_ra` itself. `DhcpServer::release` frees the lease.
+
+### Changed
+- `Splitter` drops a packet routed to a gone sink, counts it in `SplitterStats::failed` and
+  returns `Ok` while another sink is open; `BrokenPipe` is returned only once every sink is
+  gone. A gone sink is not called again.
+- A peer with a persistent keepalive whose handshake attempts ran out reports
+  `Event::SessionExpired` once per attempt cycle, not once.
+- NAT64-LAN drops an IPv6 UDP packet whose checksum field is zero as malformed, like the
+  RFC 7915 translator.
+- nsplane-ether: the DHCP lease follows the guest MAC the adapter learned; a second MAC behind
+  one port is no longer refused.
+- nsplane-uapi: a request line is limited to 4096 bytes and a `set` request to 16 MiB. A `set`
+  request is read in full before it is applied, so an error in it is answered once the request
+  is complete and a read error applies nothing.
+- nsplane-cli: `--threads 0` is rejected.
+
+### Fixed
+- A persistent keepalive keeps trying after the handshake attempts ran out: every keepalive
+  interval starts a new attempt cycle. An unreachable peer was given up for good until local
+  traffic arrived.
+- A responder no longer answers a handshake initiation with an initiation of its own when it
+  has packets queued. The queue leaves once the first transport message confirms the session,
+  and a flushed handshake message is no longer accounted as data.
+- One gone sink of a `Splitter` no longer closes the engine's local side for the sinks that
+  are still open.
+- Under load a source that holds a valid cookie is limited to 20 handshakes per second with a
+  burst of 5, per IPv4 address or IPv6 /64, as kernel WireGuard does. It was not limited at
+  all.
+- nsplane-dns: `Server::serve_tcp` keeps accepting through descriptor and memory exhaustion
+  instead of returning the error.
+- nsplane-dns: the forwarder draws its transaction IDs from the OS random source, the raw
+  passthrough path compares the question section of a response, and a query no longer zeroes
+  a 64 KiB buffer.
+- NAT64-LAN updates TCP, UDP and ICMP echo checksums incrementally, so a segment corrupted
+  before translation stays detectably corrupted instead of leaving with a valid checksum.
+- nsplane-ether: a guest replaced by one with another MAC gets the DHCP lease, and a guest's
+  IPv6 default router and DNS servers no longer expire 30 minutes after link-up.
+- nsplane-cli drops root's supplementary groups together with the user and group ID (not on
+  macOS).
+- nsplane-uapi: a failed accept is retried after 100 ms instead of at once, and a stalled
+  `set` request no longer blocks other requests.
+
 ## [0.22.2] - 2026-11-10
 
 ### Fixed

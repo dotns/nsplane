@@ -794,3 +794,13 @@ gets past a stale connection.
 Released 0.22.2: smoltcp fork `v0.14.0-nsplane.8` takes the ACK of an empty segment past a
 closed receive window, so a TCP connection whose two windows are both closed no longer stalls
 for good (seen as a 60 s stall in about 1 of 25 TUN-to-netstack echoes).
+
+## 2026-11-11 [progress]
+
+Repository audit of `857f34f` (all non-test code of every crate read; examples sampled). Seven
+fix tasks from it are completed on branch `fix/audit-20261111`: persistent keepalive after an
+expiry and the cookie holder rate limit (noise), the responder queue flush (core), the Splitter
+gone sink, the DNS TCP cap and forwarder IDs, CLI and UAPI hardening, NAT64-LAN checksums, and
+the DHCP rebind and periodic router advertisement (ether). Left open for the owner: `adopt_fd`
+and `Tun::from_raw_fd` are safe functions over `OwnedFd::from_raw_fd` (a fix breaks the API),
+and `SwapSink` still forwards the `BrokenPipe` of its current sink.
