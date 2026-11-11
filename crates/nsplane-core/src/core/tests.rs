@@ -1760,3 +1760,69 @@ fn output_size_is_unchanged_by_the_expiry_signal() {
     assert_eq!(size_of::<Output>(), 96);
     assert_eq!(size_of::<Event>(), 64);
 }
+
+#[test]
+fn allowed_ips_are_listed_in_trie_order_per_peer() {
+    let mut core = Core::new(CoreConfig {
+        private_key: Some(x25519::StaticSecret::from([1; 32])),
+        ..CoreConfig::default()
+    });
+    // Two peers whose networks interleave in both families.
+    add_peer_in(
+        &mut core,
+        LocalIdentityId::DEFAULT,
+        7,
+        &[
+            "fd00::1/128",
+            "10.1.2.3/32",
+            "192.168.0.0/22",
+            "fd00::/64",
+            "10.0.0.0/8",
+            "::/0",
+            "10.1.2.0/24",
+            "9.0.0.0/8",
+            "2001:db8::/32",
+            "10.0.0.0/7",
+            "0.0.0.0/0",
+            "fd00::/8",
+            "10.1.0.0/16",
+            "10.64.0.0/10",
+        ],
+    );
+    add_peer_in(
+        &mut core,
+        LocalIdentityId::DEFAULT,
+        8,
+        &["fd00::/16", "10.1.2.0/25", "10.1.0.0/20", "8.0.0.0/5"],
+    );
+    let listed = |key: u8| -> Vec<String> {
+        let id = core.peer_id(&x25519::PublicKey::from([key; 32])).unwrap();
+        let ips = core.peer_stats(id).unwrap().allowed_ips;
+        ips.iter()
+            .map(|ip| format!("{}/{}", ip.addr, ip.cidr))
+            .collect()
+    };
+    assert_eq!(
+        listed(7),
+        [
+            "0.0.0.0/0",
+            "10.0.0.0/7",
+            "9.0.0.0/8",
+            "10.0.0.0/8",
+            "10.64.0.0/10",
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            "10.1.2.3/32",
+            "192.168.0.0/22",
+            "::/0",
+            "2001:db8::/32",
+            "fd00::/8",
+            "fd00::/64",
+            "fd00::1/128",
+        ]
+    );
+    assert_eq!(
+        listed(8),
+        ["8.0.0.0/5", "10.1.0.0/20", "10.1.2.0/25", "fd00::/16"]
+    );
+}
