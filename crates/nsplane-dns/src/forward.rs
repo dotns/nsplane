@@ -2,7 +2,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,12 +25,15 @@ const MAX_UDP_RESPONSE: usize = 65535;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ForwarderConfig {
-    /// Upstream servers, asked in order. Must not be empty.
+    /// Upstream servers, asked in order from the one that answered last (the first one
+    /// until then). Must not be empty.
     pub upstreams: Vec<SocketAddr>,
     /// Time limit of one attempt (the UDP exchange, then the TCP retry on its own). Default 2 s.
     pub timeout: Duration,
-    /// Attempts per query, rotating through `upstreams` in order. Must be at least 1.
-    /// Default 2.
+    /// Tries per query in total, not per upstream: each try asks the next upstream in
+    /// order, wrapping around. With fewer attempts than upstreams one query does not reach
+    /// all of them; a query whose attempts all failed leaves the next query to start at the
+    /// upstream after the last one it tried. Must be at least 1. Default 2.
     pub attempts: usize,
 }
 
@@ -90,6 +93,10 @@ struct Counters {
 /// (timeout, ICMP refusal, I/O error) the answer is `SERVFAIL`. Any accepted response is
 /// final, whatever its response code.
 ///
+/// The rotation of a query starts at the upstream that answered last, so an upstream that
+/// stopped answering costs one query its timeout, not every query; the forwarder stays with
+/// the upstream that answers and returns to an earlier one only when that one fails too.
+///
 /// The transaction ID of every attempt comes from the system's random number generator, so a
 /// spoofed response has to guess it together with the ephemeral source port the system picks
 /// for the attempt.
@@ -104,6 +111,8 @@ struct Counters {
 #[derive(Debug)]
 pub struct Forwarder {
     config: ForwarderConfig,
+    /// Index of the upstream the next query asks first.
+    first: AtomicUsize,
     counters: Counters,
 }
 
@@ -122,6 +131,7 @@ impl Forwarder {
         }
         Ok(Self {
             config,
+            first: AtomicUsize::new(0),
             counters: Counters::default(),
         })
     }
@@ -179,10 +189,13 @@ impl Forwarder {
     ) -> Option<Bytes> {
         let upstreams = &self.config.upstreams;
         let mut buf = Vec::with_capacity(MAX_UDP_RESPONSE);
+        let first = self.first.load(Ordering::Relaxed);
         for attempt in 0..self.config.attempts {
-            let upstream = upstreams[attempt % upstreams.len()];
+            let index = first.wrapping_add(attempt) % upstreams.len();
+            let upstream = upstreams[index];
             match self.attempt(message, upstream, &mut buf, &matches).await {
                 Ok(response) => {
+                    self.first.store(index, Ordering::Relaxed);
                     self.counters.forwarded.fetch_add(1, Ordering::Relaxed);
                     return Some(response);
                 }
@@ -192,6 +205,9 @@ impl Forwarder {
                 Err(AttemptError::Failed) => {}
             }
         }
+        // Later upstreams get their turn even with fewer attempts than upstreams.
+        let next = first.wrapping_add(self.config.attempts) % upstreams.len();
+        self.first.store(next, Ordering::Relaxed);
         self.counters.failures.fetch_add(1, Ordering::Relaxed);
         None
     }

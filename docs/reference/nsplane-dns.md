@@ -113,9 +113,14 @@ Each attempt sends the client's query under a fresh transaction ID from a new ep
 socket connected to the upstream. Only a response with that ID and the query's question (name
 compared case-insensitively, type and class) is accepted; other datagrams are ignored until
 the attempt times out. A truncated response (`TC` = 1) is retried over TCP to the same
-upstream. Attempts rotate through `ForwarderConfig::upstreams` in order, starting with the
-first for every query; when all attempts fail (timeout, ICMP refusal, I/O error) the answer is
-`SERVFAIL`. Any accepted response is final, whatever its response code. Responses are read
+upstream. Attempts rotate through `ForwarderConfig::upstreams` in order; when all attempts fail
+(timeout, ICMP refusal, I/O error) the answer is `SERVFAIL`. Any accepted response is final,
+whatever its response code. `ForwarderConfig::attempts` counts the tries of one query in total,
+not per upstream. A query starts at the upstream that answered last (the first one until then),
+so an upstream that stopped answering costs one query its timeout and is then skipped; the
+forwarder stays with the upstream that answers and comes back to an earlier one only when that
+one fails as well. A query whose attempts all failed leaves the next query to start after the
+last upstream it tried, so with fewer attempts than upstreams the later ones are still reached. Responses are read
 with the same lenient view as queries, so records the codec does not parse do not make a
 response unacceptable.
 
@@ -274,7 +279,7 @@ address and port to these functions.
 | `FakePoolConfig::ttl` | `DEFAULT_FAKE_TTL` (60 s) |
 | `FakePool::with_client_limit` | half of the capacity, rounded up |
 | `ForwarderConfig::timeout` | 2 s per attempt (the UDP exchange; the TCP retry has its own) |
-| `ForwarderConfig::attempts` | 2 |
+| `ForwarderConfig::attempts` | 2 (tries per query in total, not per upstream) |
 | `PolicyTable::with_ttl` | `DEFAULT_POLICY_TTL` (60 s) |
 
 ## Errors and drop reasons

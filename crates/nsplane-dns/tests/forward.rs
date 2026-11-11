@@ -283,6 +283,107 @@ async fn rotates_to_the_next_upstream_after_a_timeout() {
     assert_eq!((stats.forwarded, stats.timeouts, stats.failures), (1, 1, 0));
 }
 
+/// An upstream that answers every query for `host.example` with `addr`.
+async fn answering_stub(addr: Ipv4Addr) -> SocketAddr {
+    let (stub, stub_addr) = udp_stub().await;
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (len, peer) = stub.recv_from(&mut buf).await.unwrap();
+            let reply = response(&buf[..len], None, "host.example", &[addr], false);
+            stub.send_to(&reply, peer).await.unwrap();
+        }
+    });
+    stub_addr
+}
+
+#[tokio::test]
+async fn starts_with_the_upstream_that_answered_last() {
+    let (_silent, silent_addr) = udp_stub().await;
+    let live = Ipv4Addr::new(192, 0, 2, 2);
+    let live_addr = answering_stub(live).await;
+
+    let forwarder = Forwarder::new(config(vec![silent_addr, live_addr])).unwrap();
+    let query = query("host.example");
+    let answer = forwarder.resolve(&query, client()).await;
+    assert_eq!(answer_addrs(&answer), vec![live]);
+    assert_eq!(forwarder.stats().timeouts, 1);
+
+    // The silent upstream is not asked again: no further attempt times out.
+    for _ in 0..3 {
+        let answer = forwarder.resolve(&query, client()).await;
+        assert_eq!(answer_addrs(&answer), vec![live]);
+    }
+    let raw = forwarder.forward(query.raw()).await.unwrap();
+    assert_eq!(answer_addrs(&Answer::Raw(raw)), vec![live]);
+    let stats = forwarder.stats();
+    assert_eq!((stats.forwarded, stats.timeouts, stats.failures), (5, 1, 0));
+}
+
+#[tokio::test]
+async fn returns_to_an_earlier_upstream_when_the_last_one_stops_answering() {
+    let (first, second) = (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2));
+    // The first upstream misses one query and answers from then on; the second answers
+    // one query and then no more.
+    let (late, late_addr) = udp_stub().await;
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        late.recv_from(&mut buf).await.unwrap();
+        loop {
+            let (len, peer) = late.recv_from(&mut buf).await.unwrap();
+            let reply = response(&buf[..len], None, "host.example", &[first], false);
+            late.send_to(&reply, peer).await.unwrap();
+        }
+    });
+    let (once, once_addr) = udp_stub().await;
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        let (len, peer) = once.recv_from(&mut buf).await.unwrap();
+        let reply = response(&buf[..len], None, "host.example", &[second], false);
+        once.send_to(&reply, peer).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let forwarder = Forwarder::new(config(vec![late_addr, once_addr])).unwrap();
+    let query = query("host.example");
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(answer_addrs(&forwarder.resolve(&query, client()).await));
+    }
+    assert_eq!(answers, [vec![second], vec![first], vec![first]]);
+    let stats = forwarder.stats();
+    assert_eq!((stats.forwarded, stats.timeouts, stats.failures), (3, 2, 0));
+}
+
+#[tokio::test]
+async fn fewer_attempts_than_upstreams_reach_the_later_ones() {
+    let (_silent_a, silent_a) = udp_stub().await;
+    let (_silent_b, silent_b) = udp_stub().await;
+    let live = Ipv4Addr::new(192, 0, 2, 3);
+    let live_addr = answering_stub(live).await;
+
+    let mut config = config(vec![silent_a, silent_b, live_addr]);
+    config.timeout = Duration::from_millis(100);
+    let forwarder = Forwarder::new(config).unwrap();
+    let query = query("host.example");
+    // Two attempts: the two silent upstreams.
+    assert_eq!(
+        forwarder.resolve(&query, client()).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    // The next query goes on where the failed one stopped.
+    assert_eq!(
+        answer_addrs(&forwarder.resolve(&query, client()).await),
+        vec![live]
+    );
+    assert_eq!(
+        answer_addrs(&forwarder.resolve(&query, client()).await),
+        vec![live]
+    );
+    let stats = forwarder.stats();
+    assert_eq!((stats.forwarded, stats.timeouts, stats.failures), (2, 2, 1));
+}
+
 #[tokio::test]
 async fn answers_servfail_when_every_attempt_fails() {
     let (_silent, silent_addr) = udp_stub().await;
