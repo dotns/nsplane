@@ -3,7 +3,9 @@
 //! [`EtherAdapter`] is sans-I/O. [`from_guest`](EtherAdapter::from_guest) takes a frame from
 //! the guest, answers ARP, neighbor and router solicitations and `DHCPv4` itself, and hands
 //! back the IP packets meant for the IP side; [`to_guest`](EtherAdapter::to_guest) gives the
-//! ethernet header that carries an IP packet to the guest. The guest MAC is learned from
+//! ethernet header that carries an IP packet to the guest;
+//! [`periodic_ra`](EtherAdapter::periodic_ra) gives the router advertisement the caller
+//! repeats every [`RA_INTERVAL`]. The guest MAC is learned from
 //! the source address of the guest's frames. The port carries one guest and its frames are
 //! trusted: a new source MAC is a new guest, which drops what was learned about the old one
 //! and frees the `DHCPv4` lease, so the lease always goes to the current guest MAC.
@@ -32,6 +34,7 @@
 //! address detection; the proxy exclusion applies only to other targets.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use nsplane_packet::{Ipv4Header, Ipv6Header, UdpHeader, protocol};
 
@@ -47,6 +50,11 @@ const IPV6_HEADER_LEN: usize = 40;
 
 /// Most learned guest addresses kept per family; the oldest is forgotten first.
 pub const OWN_ADDRESSES: usize = 16;
+
+/// Interval of the unsolicited router advertisements (see
+/// [`EtherAdapter::periodic_ra`]): a third of the advertised router lifetime, the
+/// `MaxRtrAdvInterval` of RFC 4861 for that lifetime.
+pub const RA_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Configuration of the gateway the adapter stands in for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +154,8 @@ pub struct EtherAdapter {
     /// Learned guest IPv6 addresses, oldest first.
     own_ipv6: Vec<Ipv6Addr>,
     guest_mac: Option<MacAddr>,
+    /// Whether a router advertisement was sent: the guest may hold what it carried.
+    advertised: bool,
     stats: EtherStats,
 }
 
@@ -169,6 +179,7 @@ impl EtherAdapter {
             own_ipv4: Vec::new(),
             own_ipv6: Vec::new(),
             guest_mac: None,
+            advertised: false,
             stats: EtherStats::default(),
         }
     }
@@ -193,7 +204,7 @@ impl EtherAdapter {
     ///
     /// Every frame with a unicast source teaches the guest MAC; when it is learned for the
     /// first time and a prefix is configured, an unsolicited router advertisement to
-    /// all-nodes is appended to `replies`. With the neighbor proxy on, the frame may also
+    /// all-nodes is appended to `replies`; [`periodic_ra`](Self::periodic_ra) repeats it. With the neighbor proxy on, the frame may also
     /// teach a guest address (see [Neighbor proxy](self#neighbor-proxy)).
     pub fn from_guest<'a>(
         &mut self,
@@ -253,6 +264,28 @@ impl EtherAdapter {
         Some(header)
     }
 
+    /// The unsolicited router advertisement to all-nodes that is due every [`RA_INTERVAL`].
+    ///
+    /// A host stops soliciting once it has a router advertisement, and what the
+    /// advertisement carried (the default router, the DNS servers) expires with the router
+    /// lifetime unless it is advertised again. The adapter has no clock: whoever drives it
+    /// calls this every [`RA_INTERVAL`] and sends the frame it returns, as
+    /// [`spawn_port`](crate::spawn_port) does. A guest that uses IPv6 loses its default
+    /// route after the router lifetime otherwise.
+    ///
+    /// Returns `None` while there is nothing to refresh: no router advertisement was sent,
+    /// because no guest MAC is learned, or because no prefix is configured and the guest
+    /// has not solicited one.
+    pub fn periodic_ra(&mut self) -> Option<Vec<u8>> {
+        if !self.advertised {
+            return None;
+        }
+        let ra = self.unsolicited_ra();
+        self.stats.frames_out += 1;
+        self.stats.nd_replies += 1;
+        Some(ra)
+    }
+
     /// Counts an IP packet from the guest that the IP side had no room for.
     pub const fn count_backlog_drop(&mut self) {
         self.stats.drop_backlog += 1;
@@ -275,18 +308,23 @@ impl EtherAdapter {
                 tracing::debug!(%mac, "guest MAC learned");
                 self.guest_mac = Some(mac);
                 if self.ra.prefix.is_some() {
-                    let all_nodes = MacAddr::ipv6_multicast(ndp::ALL_NODES);
-                    let ra = ndp::router_advertisement(
-                        &self.ra,
-                        self.gateway_mac,
-                        ndp::ALL_NODES,
-                        all_nodes,
-                    );
+                    let ra = self.unsolicited_ra();
                     self.reply(ra, replies);
                     self.stats.nd_replies += 1;
                 }
             }
         }
+    }
+
+    /// A router advertisement to all-nodes.
+    fn unsolicited_ra(&mut self) -> Vec<u8> {
+        self.advertised = true;
+        ndp::router_advertisement(
+            &self.ra,
+            self.gateway_mac,
+            ndp::ALL_NODES,
+            MacAddr::ipv6_multicast(ndp::ALL_NODES),
+        )
     }
 
     fn arp(&mut self, frame: &Frame<'_>, replies: &mut Vec<Vec<u8>>) {
@@ -397,6 +435,7 @@ impl EtherAdapter {
                 self.neighbor_solicitation(&ndp, target, frame.src)
             }
             NdpMessage::RouterSolicitation { .. } => {
+                self.advertised = true;
                 ndp::answer_router_solicitation(&ndp, frame.src, self.gateway_mac, &self.ra)
             }
             NdpMessage::NeighborAdvertisement { target, .. } => {
@@ -646,6 +685,55 @@ mod tests {
         let mut replies = Vec::new();
         a.from_guest(&frame, &mut replies);
         assert_eq!(replies.len(), 0);
+    }
+
+    #[test]
+    fn periodic_ra_repeats_the_unsolicited_one() {
+        let mut a = adapter(Some(prefix()));
+        let mut replies = Vec::new();
+        // No guest to advertise to.
+        assert_eq!(a.periodic_ra(), None);
+        let packet = udp4(Ipv4Addr::new(1, 1, 1, 1), 53, b"q");
+        let frame = eth(GW_MAC, GUEST_MAC, EtherType::IPV4, &packet);
+        a.from_guest(&frame, &mut replies);
+        assert_eq!(replies.len(), 1);
+        for _ in 0..3 {
+            assert_eq!(a.periodic_ra().as_ref(), replies.first());
+        }
+        let stats = a.stats();
+        assert_eq!((stats.nd_replies, stats.frames_out), (4, 4));
+    }
+
+    #[test]
+    fn periodic_ra_needs_an_earlier_advertisement() {
+        // Without a prefix nothing is advertised unsolicited, so nothing expires.
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        let packet = udp4(Ipv4Addr::new(1, 1, 1, 1), 53, b"q");
+        let frame = eth(GW_MAC, GUEST_MAC, EtherType::IPV4, &packet);
+        a.from_guest(&frame, &mut replies);
+        assert_eq!(a.periodic_ra(), None);
+        assert_eq!(a.stats().nd_replies, 0);
+
+        // A solicited advertisement made the gateway the guest's default router.
+        let solicitation = vec![133, 0, 0, 0, 0, 0, 0, 0];
+        let all_routers = v6("ff02::2");
+        a.from_guest(
+            &icmpv6(GUEST_MAC.link_local(), all_routers, solicitation),
+            &mut replies,
+        );
+        assert_eq!(replies.len(), 1);
+        let ra = Frame::parse(&replies[0]).unwrap();
+        assert_eq!(ra.dst, GUEST_MAC);
+        let periodic = a.periodic_ra().unwrap();
+        let frame = Frame::parse(&periodic).unwrap();
+        assert_eq!(frame.dst, MacAddr::ipv6_multicast(ndp::ALL_NODES));
+        // The same advertisement, to all-nodes: only the destination and checksum differ.
+        let (ip, icmp) = Ipv6Header::parse(frame.payload).unwrap();
+        assert_eq!(ip.dst(), ndp::ALL_NODES);
+        let (_, solicited) = Ipv6Header::parse(ra.payload).unwrap();
+        assert_eq!((icmp[0], &icmp[4..]), (134, &solicited[4..]));
+        assert_eq!(a.stats().nd_replies, 2);
     }
 
     #[test]

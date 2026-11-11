@@ -5,18 +5,22 @@
 //! advertisements, DHCP) to the transport itself, and queues the IP packets for
 //! [`EtherSource`]. The queue is bounded and lossy: when the IP side does not keep up, new
 //! packets are dropped and counted in [`EtherStats::drop_backlog`], so local replies keep
-//! flowing whether or not the IP side reads. [`EtherSink`] frames IP packets for the guest
-//! and writes them to the same transport.
+//! flowing whether or not the IP side reads. Every [`RA_INTERVAL`] the task also writes the
+//! adapter's unsolicited router advertisement ([`EtherAdapter::periodic_ra`]), so the
+//! guest's default router and DNS servers do not expire. [`EtherSink`] frames IP packets
+//! for the guest and writes them to the same transport.
 
 use std::io;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nsplane::{PacketBuf, PacketSink, PacketSource, PeerId, SharedPacketPool};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::time::{Instant, timeout_at};
 
 use crate::MacAddr;
-use crate::adapter::{EtherAdapter, EtherConfig, EtherStats};
+use crate::adapter::{EtherAdapter, EtherConfig, EtherStats, RA_INTERVAL};
 use crate::frame::HEADER_LEN;
 use crate::transport::{FrameRead, FrameWrite, MAX_FRAME_LEN};
 
@@ -57,7 +61,8 @@ impl<W: FrameWrite> Shared<W> {
 ///
 /// Returns the IP side as a [`PacketSource`] (IP packets from the guest) and a
 /// [`PacketSink`] (IP packets for the guest), plus a handle for counters. The reader task
-/// is spawned on the current Tokio runtime. Transport EOF or a read failure closes the
+/// is spawned on the current Tokio runtime; it also repeats the router advertisement
+/// every [`RA_INTERVAL`] for as long as it runs. Transport EOF or a read failure closes the
 /// port; the source then returns [`io::ErrorKind::BrokenPipe`] after queued packets,
 /// and subsequent sink calls fail with it. A dropped source is detected only when the
 /// reader next queues an IP packet: an idle or control-only transport can keep running.
@@ -89,7 +94,8 @@ pub fn spawn_port<R: FrameRead, W: FrameWrite>(
     )
 }
 
-/// Reads guest frames until EOF, an I/O failure, or an IP enqueue detects a dropped source.
+/// Reads guest frames until EOF, an I/O failure, or an IP enqueue detects a dropped source,
+/// and writes the periodic router advertisement meanwhile.
 async fn read_loop<R: FrameRead, W: FrameWrite>(
     mut reader: R,
     shared: Arc<Shared<W>>,
@@ -98,8 +104,25 @@ async fn read_loop<R: FrameRead, W: FrameWrite>(
 ) {
     let mut buf = vec![0; MAX_FRAME_LEN];
     let mut replies = Vec::new();
+    let mut next_ra = Instant::now() + RA_INTERVAL;
     loop {
-        let len = match reader.read_frame(&mut buf).await {
+        let read = {
+            // The read is not cancellation safe: it stays pending across advertisements.
+            let mut read = pin!(reader.read_frame(&mut buf));
+            loop {
+                if let Ok(read) = timeout_at(next_ra, read.as_mut()).await {
+                    break read;
+                }
+                next_ra += RA_INTERVAL;
+                let ra = shared.adapter().periodic_ra();
+                if let Some(ra) = ra
+                    && shared.write(&ra).await.is_err()
+                {
+                    return;
+                }
+            }
+        };
+        let len = match read {
             Ok(Some(len)) => len,
             Ok(None) => {
                 tracing::debug!("ethernet transport closed");
@@ -205,4 +228,108 @@ impl EtherHandle {
 /// Locks `adapter`; it is never left inconsistent, so a poisoned lock is taken over.
 fn lock(adapter: &Mutex<EtherAdapter>) -> MutexGuard<'_, EtherAdapter> {
     adapter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv6Addr;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+    use tokio::time::{Instant, timeout};
+
+    use super::*;
+    use crate::adapter::RA_INTERVAL;
+    use crate::frame::{self, EtherType, Frame};
+    use crate::ndp;
+
+    const GW_MAC: MacAddr = MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    const GUEST_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+
+    /// The guest's frames, from a channel.
+    struct Reader(UnboundedReceiver<Vec<u8>>);
+
+    impl FrameRead for Reader {
+        async fn read_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+            let Some(frame) = self.0.recv().await else {
+                return Ok(None);
+            };
+            buf[..frame.len()].copy_from_slice(&frame);
+            Ok(Some(frame.len()))
+        }
+    }
+
+    /// The frames for the guest, into a channel.
+    struct Writer(UnboundedSender<Vec<u8>>);
+
+    impl FrameWrite for Writer {
+        fn write_frame(&mut self, frame: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
+            let sent = self.0.send(frame.to_vec());
+            std::future::ready(sent.map_err(|_| io::ErrorKind::BrokenPipe.into()))
+        }
+    }
+
+    /// A frame from the guest that the adapter drops after learning its MAC.
+    fn guest_frame() -> Vec<u8> {
+        let mut out = vec![0; HEADER_LEN + 46];
+        frame::write_header(&mut out, GW_MAC, GUEST_MAC, EtherType(0x88cc)).unwrap();
+        out
+    }
+
+    /// Whether `frame` is a router advertisement to all-nodes.
+    fn is_unsolicited_ra(frame: &[u8]) -> bool {
+        let frame = Frame::parse(frame).unwrap();
+        frame.dst == MacAddr::ipv6_multicast(ndp::ALL_NODES)
+            && frame.ethertype == EtherType::IPV6
+            && frame.payload.get(40) == Some(&134)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn router_advertisements_repeat_once_the_guest_is_known() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, mut guest_rx) = unbounded_channel();
+        let config = EtherConfig {
+            ipv6_prefix: Some(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0)),
+            ..EtherConfig::new(GW_MAC)
+        };
+        let (_source, _sink, handle) = spawn_port(Reader(reader), Writer(writer), config);
+
+        // Nothing is advertised before a guest MAC is learned.
+        let quiet = timeout(RA_INTERVAL * 7 / 2, guest_rx.recv()).await;
+        assert!(quiet.is_err());
+
+        guest_tx.send(guest_frame()).unwrap();
+        let first = guest_rx.recv().await.unwrap();
+        assert!(is_unsolicited_ra(&first));
+        let learned = Instant::now();
+
+        // The first repeat is due within the interval, the following ones every interval.
+        let mut last = learned;
+        for n in 1..=4 {
+            let ra = timeout(RA_INTERVAL * 2, guest_rx.recv()).await.unwrap();
+            assert_eq!(ra, Some(first.clone()));
+            let now = Instant::now();
+            if n == 1 {
+                assert!(now - last <= RA_INTERVAL);
+            } else {
+                assert_eq!(now - last, RA_INTERVAL);
+            }
+            last = now;
+        }
+        // Past the router lifetime of the first advertisement.
+        assert!(last - learned > RA_INTERVAL * 3);
+        assert_eq!(handle.stats().nd_replies, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_router_advertisements_without_ipv6() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, mut guest_rx) = unbounded_channel();
+        let (_source, _sink, handle) =
+            spawn_port(Reader(reader), Writer(writer), EtherConfig::new(GW_MAC));
+        guest_tx.send(guest_frame()).unwrap();
+        let quiet = timeout(RA_INTERVAL * 4, guest_rx.recv()).await;
+        assert!(quiet.is_err());
+        assert_eq!(handle.guest_mac(), Some(GUEST_MAC));
+        assert_eq!(handle.stats().frames_out, 0);
+    }
 }
