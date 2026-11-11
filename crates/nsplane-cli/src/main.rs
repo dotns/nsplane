@@ -11,6 +11,8 @@ compile_error!("nsplane-cli is a Linux/macOS development tool; embed the library
 use anyhow::Context as _;
 use clap::Parser;
 use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
+#[cfg(not(target_vendor = "apple"))]
+use nix::unistd::{geteuid, setgroups};
 use nsplane::{EngineBuilder, UdpTransport};
 use nsplane_tun::{Tun, TunOptions};
 use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
@@ -241,6 +243,10 @@ async fn serve(args: &Args) -> anyhow::Result<()> {
 /// and group IDs. For a plain root process those are 0, so regaining root still succeeds and
 /// this fails, as it did when the login name resolved to root: run as root without `sudo`,
 /// pass `--disable-drop-privileges`.
+///
+/// A root process also replaces its supplementary groups with the target group, so the
+/// groups of root do not outlive the switch. Not on macOS, where `nix` has no `setgroups`:
+/// the supplementary groups are kept there.
 fn drop_privileges() -> anyhow::Result<()> {
     let id = |name| std::env::var(name).ok()?.parse::<u32>().ok();
     let (uid, gid) = match (id("SUDO_UID"), id("SUDO_GID")) {
@@ -248,6 +254,12 @@ fn drop_privileges() -> anyhow::Result<()> {
         _ => (getuid(), getgid()),
     };
 
+    // Supplementary groups before the IDs: only root may change them, and neither setgid
+    // nor setuid drops them.
+    #[cfg(not(target_vendor = "apple"))]
+    if geteuid().is_root() {
+        setgroups(&[gid]).context("setgroups")?;
+    }
     // Group first: once the user ID is dropped, changing the group is no longer allowed.
     setgid(gid).context("setgid")?;
     setuid(uid).context("setuid")?;
