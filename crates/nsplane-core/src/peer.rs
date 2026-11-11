@@ -264,7 +264,7 @@ impl Peer {
 
     /// Plaintext payload bytes sealed for this peer, as counted by the tunnel.
     pub(crate) fn data_tx(&self) -> u64 {
-        self.with_tunnel(|t| t.stats().1 as u64)
+        self.with_tunnel(|t| t.tx_bytes() as u64)
     }
 
     /// Handshakes the tunnel completed since the last call; the core reports each of them.

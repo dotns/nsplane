@@ -7,7 +7,7 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`, `is_expired` / `expiry_cause`), `noise::rate_limiter::RateLimiter` (`with_budget`, `mac1_matches`), `x25519` keys | `noise::rate_limiter::HandshakeBudget`, `TunnResult`, `noise::errors::WireGuardError`, `noise::ExpiryCause` |
+| main | `noise::Tunn` (handshake, sessions, timers; `encapsulate_in_place` / `decapsulate_in_place`, `set_pad_limit`, `remote_index`, `is_expired` / `expiry_cause`, `stats`, `tx_bytes` / `last_handshake_rtt`), `noise::rate_limiter::RateLimiter` (`with_budget`, `mac1_matches`), `x25519` keys | `noise::rate_limiter::HandshakeBudget`, `TunnResult`, `noise::errors::WireGuardError`, `noise::ExpiryCause` |
 
 ## Behavior
 
@@ -27,6 +27,10 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
     while `Tunn::is_expired`, and the next handshake initiation clears both. With a
     persistent keepalive the timers send that initiation one interval after the expiry, so
     an unanswered peer is tried again in cycles for as long as the keepalive is set.
+- `Tunn::stats` returns the time since the last handshake, the data bytes sent and received,
+  the estimated packet loss and the round-trip time of the last handshake this side initiated.
+  It computes all of them, the loss estimate under the receive locks of every session;
+  `Tunn::tx_bytes` and `Tunn::last_handshake_rtt` read one field each and nothing else.
 - `noise::wire`: `zerocopy` views of the four message layouts. Transport data is sealed
   and opened in place (`Tunn::encapsulate_in_place` / `decapsulate_in_place`).
 

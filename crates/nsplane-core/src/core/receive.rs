@@ -378,7 +378,7 @@ impl Core {
             peer.initiation_answered();
             peer.forget_reported_from();
             let rtt = (kind == MessageKind::HandshakeResponse)
-                .then(|| peer.tunnel_mut().stats().4)
+                .then(|| peer.with_tunnel(Tunn::last_handshake_rtt))
                 .flatten()
                 .map(|ms| Duration::from_millis(u64::from(ms)));
             handshakes_completed(&mut self.outputs, id, completed, Some(path), rtt);

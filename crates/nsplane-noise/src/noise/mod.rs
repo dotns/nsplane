@@ -900,6 +900,17 @@ impl Tunn {
 
         (time, tx_bytes, rx_bytes, loss, rtt)
     }
+
+    /// Data bytes sent: the second field of [`Tunn::stats`], without computing the others.
+    pub const fn tx_bytes(&self) -> usize {
+        self.tx_bytes
+    }
+
+    /// Round-trip time of the last handshake we initiated, in milliseconds: the last field of
+    /// [`Tunn::stats`], without computing the others.
+    pub const fn last_handshake_rtt(&self) -> Option<u32> {
+        self.handshake.last_rtt
+    }
 }
 
 #[cfg(test)]
@@ -1007,6 +1018,25 @@ mod tests {
 
         assert_eq!(my_tun.stats().1, usize::MAX);
         assert_eq!(their_tun.stats().2, usize::MAX);
+    }
+
+    #[test]
+    fn single_counters_match_the_stats() {
+        let (mut my_tun, their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+        let mut sealed = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.encapsulate(&packet, &mut sealed),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        let (_, tx_bytes, _, _, rtt) = my_tun.stats();
+        assert!(tx_bytes > 0);
+        assert_eq!(my_tun.tx_bytes(), tx_bytes);
+        assert!(rtt.is_some());
+        assert_eq!(my_tun.last_handshake_rtt(), rtt);
+        // The responder initiated no handshake.
+        assert_eq!(their_tun.last_handshake_rtt(), None);
     }
 
     #[test]
