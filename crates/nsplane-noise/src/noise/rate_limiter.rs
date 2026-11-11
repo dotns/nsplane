@@ -158,8 +158,9 @@ impl HandshakeBudget {
     /// WireGuard does. At most `MAX_TRACKED_SOURCES` sources are tracked; one beyond that is
     /// refused until buckets fill up again and are removed.
     fn admit_cookie_holder_at(&self, src: IpAddr, now: Duration) -> bool {
-        let src = match src {
-            IpAddr::V4(_) => src,
+        // An IPv4-mapped address is its IPv4 source, not a member of one shared /64.
+        let src = match src.to_canonical() {
+            src @ IpAddr::V4(_) => src,
             IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from_bits(ip.to_bits() & !u128::from(u64::MAX))),
         };
 
@@ -669,6 +670,22 @@ mod tests {
             .count();
         assert_eq!(passed, 5);
         assert!(budget.admit_cookie_holder_at(host(2, 1), now));
+    }
+
+    #[test]
+    fn ipv4_mapped_cookie_holders_are_keyed_by_their_ipv4_address() {
+        let budget = HandshakeBudget::new(0);
+        let mapped =
+            |host: u8| IpAddr::V6(std::net::Ipv4Addr::new(192, 0, 2, host).to_ipv6_mapped());
+        let now = Duration::from_secs(1);
+
+        let passed = (0..100)
+            .filter(|_| budget.admit_cookie_holder_at(mapped(1), now))
+            .count();
+        assert_eq!(passed, 5);
+        assert!(budget.admit_cookie_holder_at(mapped(2), now));
+        // The plain IPv4 form of the first source shares its empty bucket.
+        assert!(!budget.admit_cookie_holder_at(IpAddr::from([192, 0, 2, 1]), now));
     }
 
     #[test]
