@@ -27,9 +27,9 @@ IP packet the frame carries when it is for the IP side, cut to the length its IP
 states (ethernet padding removed). `to_guest` returns the 14-byte ethernet header that
 carries an IP packet to the guest: destination the learned guest MAC, source
 `EtherConfig::gateway_mac`, `EtherType` from the IP version nibble. `periodic_ra` returns
-the unsolicited router advertisement to send every `RA_INTERVAL` (see
+the unsolicited router advertisement to send at least every `RA_INTERVAL` (see
 [Periodic router advertisements](#periodic-router-advertisements)); the adapter has no
-clock, so a caller that drives it without `spawn_port` has to call it on that interval.
+clock, so a caller that drives it without `spawn_port` has to call it that often.
 
 A guest frame goes through these steps in order:
 
@@ -102,9 +102,10 @@ has sent a router advertisement (the unsolicited one when the guest MAC is first
 with a prefix configured, or the answer to a router solicitation),
 `EtherAdapter::periodic_ra` returns the same advertisement addressed to all-nodes; before
 that it returns `None`, so a guest that has no prefix and never solicits gets none. The
-reader task of `spawn_port` calls it every `RA_INTERVAL` (600 s, a third of the router
-lifetime) and writes the frame to the transport. The interval runs from the start of the
-port, not from the last advertisement, and is not randomized. A caller that drives an
+reader task of `spawn_port` calls it at random intervals of 450 to 600 s (between three
+quarters of `RA_INTERVAL` and `RA_INTERVAL`, a third of the router lifetime; RFC 4861 6.2.4
+asks for a random interval) and writes the frame to the transport. The intervals run from
+the start of the port, not from the last solicited advertisement. A caller that drives an
 `EtherAdapter` directly has to do the same, or an IPv6 guest loses its default route 1800 s
 after its last solicitation.
 
@@ -194,7 +195,7 @@ returns an `EtherSource` (IP packets from the guest), an `EtherSink` (IP packets
 guest) and an `EtherHandle` (counters and the learned guest MAC).
 
 - The reader task reads one frame at a time, runs it through the adapter, writes the local
-  replies to the transport itself and queues the IP packet for the source. Every
+  replies to the transport itself and queues the IP packet for the source. At least every
   `RA_INTERVAL` it also writes the
   [periodic router advertisement](#periodic-router-advertisements), until it ends. The queue holds
   256 packets and is lossy: when the IP side falls behind, new packets are dropped and
@@ -337,7 +338,7 @@ kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kv
 | DHCP router, DNS servers, MTU option | `DhcpConfig::router`, `dns`, `mtu` | none of them sent |
 | DHCP lease time | `DhcpConfig::lease_secs` | 86 400 s (renewal 43 200 s, rebinding 75 600 s) |
 | Router lifetime and RDNSS lifetime | fixed | 1800 s |
-| Unsolicited router advertisement interval | fixed (`adapter::RA_INTERVAL`) | 600 s |
+| Unsolicited router advertisement interval | fixed (at most `adapter::RA_INTERVAL`) | random, 450 to 600 s |
 | Prefix valid / preferred lifetime | fixed | 30 days / 7 days |
 
 ## Errors and drop reasons

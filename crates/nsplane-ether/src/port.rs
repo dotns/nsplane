@@ -5,15 +5,19 @@
 //! advertisements, DHCP) to the transport itself, and queues the IP packets for
 //! [`EtherSource`]. The queue is bounded and lossy: when the IP side does not keep up, new
 //! packets are dropped and counted in [`EtherStats::drop_backlog`], so local replies keep
-//! flowing whether or not the IP side reads. Every [`RA_INTERVAL`] the task also writes the
+//! flowing whether or not the IP side reads. At random intervals of at most [`RA_INTERVAL`]
+//! (and at least three quarters of it) the task also writes the
 //! adapter's unsolicited router advertisement ([`EtherAdapter::periodic_ra`]), so the
 //! guest's default router and DNS servers do not expire. [`EtherSink`] frames IP packets
 //! for the guest and writes them to the same transport.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::io;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use nsplane::{PacketBuf, PacketSink, PacketSource, PeerId, SharedPacketPool};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
@@ -62,7 +66,7 @@ impl<W: FrameWrite> Shared<W> {
 /// Returns the IP side as a [`PacketSource`] (IP packets from the guest) and a
 /// [`PacketSink`] (IP packets for the guest), plus a handle for counters. The reader task
 /// is spawned on the current Tokio runtime; it also repeats the router advertisement
-/// every [`RA_INTERVAL`] for as long as it runs. Transport EOF or a read failure closes the
+/// at random intervals of at most [`RA_INTERVAL`] for as long as it runs. Transport EOF or a read failure closes the
 /// port; the source then returns [`io::ErrorKind::BrokenPipe`] after queued packets,
 /// and subsequent sink calls fail with it. A dropped source is detected only when the
 /// reader next queues an IP packet: an idle or control-only transport can keep running.
@@ -94,6 +98,21 @@ pub fn spawn_port<R: FrameRead, W: FrameWrite>(
     )
 }
 
+/// The wait before a periodic router advertisement: [`RA_INTERVAL`] shortened by `random`,
+/// uniformly over its last quarter. RFC 4861 6.2.4 asks for a random interval, so that the
+/// routers of a link do not advertise in step.
+fn ra_wait(random: u64) -> Duration {
+    let span = (RA_INTERVAL / 4).as_nanos() + 1;
+    let cut = u64::try_from(u128::from(random) % span).unwrap_or(0);
+    RA_INTERVAL.saturating_sub(Duration::from_nanos(cut))
+}
+
+/// A random [`ra_wait`].
+fn random_ra_wait() -> Duration {
+    // A hasher of the standard library starts from random keys.
+    ra_wait(RandomState::new().build_hasher().finish())
+}
+
 /// Reads guest frames until EOF, an I/O failure, or an IP enqueue detects a dropped source,
 /// and writes the periodic router advertisement meanwhile.
 async fn read_loop<R: FrameRead, W: FrameWrite>(
@@ -104,7 +123,7 @@ async fn read_loop<R: FrameRead, W: FrameWrite>(
 ) {
     let mut buf = vec![0; MAX_FRAME_LEN];
     let mut replies = Vec::new();
-    let mut next_ra = Instant::now() + RA_INTERVAL;
+    let mut next_ra = Instant::now() + random_ra_wait();
     loop {
         let read = {
             // The read is not cancellation safe: it stays pending across advertisements.
@@ -113,7 +132,7 @@ async fn read_loop<R: FrameRead, W: FrameWrite>(
                 if let Ok(read) = timeout_at(next_ra, read.as_mut()).await {
                     break read;
                 }
-                next_ra += RA_INTERVAL;
+                next_ra += random_ra_wait();
                 let ra = shared.adapter().periodic_ra();
                 if let Some(ra) = ra
                     && shared.write(&ra).await.is_err()
@@ -302,22 +321,39 @@ mod tests {
         assert!(is_unsolicited_ra(&first));
         let learned = Instant::now();
 
-        // The first repeat is due within the interval, the following ones every interval.
+        // The first repeat is due within the interval, the following ones after a random
+        // wait in its last quarter.
         let mut last = learned;
-        for n in 1..=4 {
+        let mut waits = Vec::new();
+        for n in 1..=6 {
             let ra = timeout(RA_INTERVAL * 2, guest_rx.recv()).await.unwrap();
             assert_eq!(ra, Some(first.clone()));
             let now = Instant::now();
-            if n == 1 {
-                assert!(now - last <= RA_INTERVAL);
-            } else {
-                assert_eq!(now - last, RA_INTERVAL);
+            let wait = now - last;
+            assert!(wait <= RA_INTERVAL, "{wait:?}");
+            if n > 1 {
+                assert!(wait >= RA_INTERVAL * 3 / 4, "{wait:?}");
+                waits.push(wait);
             }
             last = now;
         }
+        assert!(waits.iter().any(|wait| *wait != waits[0]), "{waits:?}");
         // Past the router lifetime of the first advertisement.
         assert!(last - learned > RA_INTERVAL * 3);
-        assert_eq!(handle.stats().nd_replies, 5);
+        assert_eq!(handle.stats().nd_replies, 7);
+    }
+
+    #[test]
+    fn the_wait_is_in_the_last_quarter_of_the_interval() {
+        let shortest = RA_INTERVAL * 3 / 4;
+        assert_eq!(ra_wait(0), RA_INTERVAL);
+        assert_eq!(ra_wait(150_000_000_000), shortest);
+        assert_eq!(ra_wait(150_000_000_001), RA_INTERVAL);
+        assert_eq!(ra_wait(60_000_000_000), Duration::from_secs(540));
+        for random in [1, 149_999_999_999, u64::MAX / 3, u64::MAX] {
+            let wait = ra_wait(random);
+            assert!(shortest <= wait && wait <= RA_INTERVAL, "{wait:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -5,7 +5,7 @@
 //! back the IP packets meant for the IP side; [`to_guest`](EtherAdapter::to_guest) gives the
 //! ethernet header that carries an IP packet to the guest;
 //! [`periodic_ra`](EtherAdapter::periodic_ra) gives the router advertisement the caller
-//! repeats every [`RA_INTERVAL`]. The guest MAC is learned from
+//! repeats at least every [`RA_INTERVAL`]. The guest MAC is learned from
 //! the source address of the guest's frames. The port carries one guest and its frames are
 //! trusted: a new source MAC is a new guest, which drops what was learned about the old one
 //! and frees the `DHCPv4` lease, so the lease always goes to the current guest MAC.
@@ -51,9 +51,12 @@ const IPV6_HEADER_LEN: usize = 40;
 /// Most learned guest addresses kept per family; the oldest is forgotten first.
 pub const OWN_ADDRESSES: usize = 16;
 
-/// Interval of the unsolicited router advertisements (see
+/// Longest interval between unsolicited router advertisements (see
 /// [`EtherAdapter::periodic_ra`]): a third of the advertised router lifetime, the
 /// `MaxRtrAdvInterval` of RFC 4861 for that lifetime.
+///
+/// [`spawn_port`](crate::spawn_port) waits a random time between three quarters of it and
+/// all of it before each one.
 pub const RA_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Configuration of the gateway the adapter stands in for.
@@ -264,13 +267,14 @@ impl EtherAdapter {
         Some(header)
     }
 
-    /// The unsolicited router advertisement to all-nodes that is due every [`RA_INTERVAL`].
+    /// The unsolicited router advertisement to all-nodes that is due at least every
+    /// [`RA_INTERVAL`].
     ///
     /// A host stops soliciting once it has a router advertisement, and what the
     /// advertisement carried (the default router, the DNS servers) expires with the router
     /// lifetime unless it is advertised again. The adapter has no clock: whoever drives it
-    /// calls this every [`RA_INTERVAL`] and sends the frame it returns, as
-    /// [`spawn_port`](crate::spawn_port) does. A guest that uses IPv6 loses its default
+    /// calls this at least every [`RA_INTERVAL`] and sends the frame it returns, as
+    /// [`spawn_port`](crate::spawn_port) does, at random intervals. A guest that uses IPv6 loses its default
     /// route after the router lifetime otherwise.
     ///
     /// Returns `None` while there is nothing to refresh: no router advertisement was sent,
