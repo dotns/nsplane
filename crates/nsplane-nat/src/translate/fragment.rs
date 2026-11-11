@@ -180,7 +180,9 @@ impl Reassembly {
     /// `tag`, whose payload is `len` bytes, at `now` (seconds), opening an entry
     /// if there is none. A completed datagram whose fragments carried different
     /// tags is dropped (`reasons::FRAGMENT_MIXED_TAGS`); otherwise their tag is
-    /// the completing fragment's.
+    /// the completing fragment's. The caller runs [`cleanup`](Self::cleanup)
+    /// for `now` first, as it needs the expired entries and markers gone
+    /// before it decides to hold the fragment.
     pub(super) fn observe(
         &mut self,
         key: Key,
@@ -189,7 +191,6 @@ impl Reassembly {
         len: usize,
         now: u64,
     ) -> Result<Outcome> {
-        self.cleanup(now);
         if len == 0 {
             return Err(reasons::MALFORMED_FRAGMENT);
         }
