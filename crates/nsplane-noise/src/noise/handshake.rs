@@ -462,21 +462,14 @@ impl NoiseParams {
         }
     }
 
-    /// Set a new private key
-    fn set_static_private(
-        &mut self,
-        static_private: x25519::StaticSecret,
-        static_public: x25519::PublicKey,
-    ) {
-        // Check that the public key indeed matches the private key
-        let check_key = x25519::PublicKey::from(&static_private);
-        assert_eq!(check_key.as_bytes(), static_public.as_bytes());
-
+    /// Set a new private key; returns its public key
+    fn set_static_private(&mut self, static_private: x25519::StaticSecret) -> x25519::PublicKey {
+        self.static_public = x25519::PublicKey::from(&static_private);
         self.static_private = static_private;
-        self.static_public = static_public;
 
         self.static_shared =
             contributory(self.static_private.diffie_hellman(&self.peer_static_public));
+        self.static_public
     }
 
     /// The shared key of the static keys, unless the peer's key has small order
@@ -546,12 +539,12 @@ impl Handshake {
         self.next_index
     }
 
+    /// Sets a new private key; returns its public key.
     pub(crate) fn set_static_private(
         &mut self,
         private_key: x25519::StaticSecret,
-        public_key: x25519::PublicKey,
-    ) {
-        self.params.set_static_private(private_key, public_key);
+    ) -> x25519::PublicKey {
+        self.params.set_static_private(private_key)
     }
 
     /// Replaces the preshared key used when producing or accepting a handshake response,
@@ -1196,8 +1189,8 @@ mod tests {
             assert!(!handshake.is_in_progress());
 
             // A new private key does not change that.
-            let (private, public) = key_pair();
-            handshake.set_static_private(private, public);
+            let (private, _) = key_pair();
+            handshake.set_static_private(private);
             let mut dst = [0u8; HANDSHAKE_INIT_SZ];
             assert!(matches!(
                 handshake.format_handshake_initiation(&mut dst),

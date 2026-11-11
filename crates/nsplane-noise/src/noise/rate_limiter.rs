@@ -232,6 +232,14 @@ impl std::fmt::Debug for RateLimiter {
     }
 }
 
+/// How [`RateLimiter::verify`] turns a datagram down.
+pub(super) enum Rejection<'a> {
+    /// The datagram is dropped.
+    Err(WireGuardError),
+    /// The sender gets this cookie reply.
+    Cookie(&'a mut [u8]),
+}
+
 impl RateLimiter {
     /// Creates a rate limiter for our `public_key` that allows `limit` handshakes per second.
     pub fn new(public_key: &crate::x25519::PublicKey, limit: u64) -> Self {
@@ -389,7 +397,21 @@ impl RateLimiter {
         src: &'a [u8],
         dst: &'b mut [u8],
     ) -> Result<Packet<'a>, TunnResult<'b>> {
-        let packet = Tunn::parse_incoming_packet(src)?;
+        self.verify(src_addr, src, dst)
+            .map_err(|rejection| match rejection {
+                Rejection::Err(e) => TunnResult::Err(e),
+                Rejection::Cookie(reply) => TunnResult::WriteToNetwork(reply),
+            })
+    }
+
+    /// [`RateLimiter::verify_packet`] with the two ways it turns a datagram down as a type.
+    pub(super) fn verify<'a, 'b>(
+        &self,
+        src_addr: Option<SocketAddr>,
+        src: &'a [u8],
+        dst: &'b mut [u8],
+    ) -> Result<Packet<'a>, Rejection<'b>> {
+        let packet = Tunn::parse_incoming_packet(src).map_err(Rejection::Err)?;
 
         // Verify and rate limit handshake messages only
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
@@ -400,12 +422,12 @@ impl RateLimiter {
 
             let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
             if !bool::from(computed_mac1[..].ct_eq(mac1)) {
-                return Err(TunnResult::Err(WireGuardError::InvalidMac));
+                return Err(Rejection::Err(WireGuardError::InvalidMac));
             }
 
             if self.budget.is_under_load(src_addr.map(|a| a.ip())) {
                 let Some(addr) = src_addr else {
-                    return Err(TunnResult::Err(WireGuardError::UnderLoad));
+                    return Err(Rejection::Err(WireGuardError::UnderLoad));
                 };
 
                 // Only given an address can we validate mac2
@@ -415,8 +437,8 @@ impl RateLimiter {
                 if !bool::from(computed_mac2[..].ct_eq(mac2)) {
                     let cookie_packet = self
                         .format_cookie_reply(sender_idx, cookie, mac1, dst)
-                        .map_err(TunnResult::Err)?;
-                    return Err(TunnResult::WriteToNetwork(cookie_packet));
+                        .map_err(Rejection::Err)?;
+                    return Err(Rejection::Cookie(cookie_packet));
                 }
 
                 // The cookie proves the address; the address still gets a bounded rate.

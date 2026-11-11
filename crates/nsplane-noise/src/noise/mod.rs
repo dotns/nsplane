@@ -17,7 +17,7 @@ pub use timers::ExpiryCause;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
-use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::rate_limiter::{RateLimiter, Rejection};
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
@@ -288,18 +288,19 @@ impl Tunn {
     }
 
     /// Update the private key and clear existing sessions
+    ///
+    /// The public key is derived from `static_private`; the one passed is not used.
     pub fn set_static_private(
         &mut self,
         static_private: x25519::StaticSecret,
-        static_public: x25519::PublicKey,
+        _static_public: x25519::PublicKey,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) {
+        let static_public = self.handshake.set_static_private(static_private);
         self.timers.should_reset_rr = rate_limiter.is_none();
         self.rate_limiter = rate_limiter.unwrap_or_else(|| {
             Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
         });
-        self.handshake
-            .set_static_private(static_private, static_public);
         for s in &mut self.sessions {
             *s = None;
         }
@@ -566,20 +567,16 @@ impl Tunn {
         }
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
-        {
+        let packet = match self.rate_limiter.verify(src_addr, datagram, &mut cookie) {
             Ok(packet) => packet,
-            Err(TunnResult::WriteToNetwork(cookie)) => {
+            Err(Rejection::Cookie(cookie)) => {
                 let Some(reply) = dst.get_mut(..cookie.len()) else {
                     return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
                 };
                 reply.copy_from_slice(cookie);
                 return TunnResult::WriteToNetwork(reply);
             }
-            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
-            _ => unreachable!(),
+            Err(Rejection::Err(e)) => return TunnResult::Err(e),
         };
 
         self.handle_verified_packet(packet, dst)
@@ -982,6 +979,26 @@ mod tests {
         parse_keepalive(&mut their_tun, &keepalive);
 
         (my_tun, their_tun)
+    }
+
+    #[test]
+    fn set_static_private_derives_the_public_key() {
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let old_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let new_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let new_public_key = x25519_dalek::PublicKey::from(&new_secret_key);
+        let mut my_tun = Tunn::new(old_secret_key, their_public_key, None, None, 1, None);
+        let mut their_tun = Tunn::new(their_secret_key, new_public_key, None, None, 2, None);
+
+        // A public key that does not belong to the private key is not used.
+        let unrelated = x25519_dalek::PublicKey::from([9u8; 32]);
+        my_tun.set_static_private(new_secret_key, unrelated, None);
+
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        parse_handshake_resp(&mut my_tun, &resp);
+        assert_eq!(my_tun.handshake_count(), 1);
     }
 
     fn create_ipv4_udp_packet() -> Vec<u8> {
