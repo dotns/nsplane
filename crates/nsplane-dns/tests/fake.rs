@@ -113,7 +113,9 @@ async fn allocates_sequentially_from_both_families() {
 
 #[tokio::test(start_paused = true)]
 async fn skips_network_and_broadcast() {
-    let pool = FakePool::new(config(Some(30), None)).unwrap();
+    let pool = FakePool::new(config(Some(30), None))
+        .unwrap()
+        .with_client_limit(2);
     assert_eq!(pool.capacity(), 2);
     assert_eq!(a_addr(&pool, "a").await, Ipv4Addr::new(198, 18, 0, 1));
     assert_eq!(a_addr(&pool, "b").await, Ipv4Addr::new(198, 18, 0, 2));
@@ -189,7 +191,9 @@ async fn reverse_lookup() {
 
 #[tokio::test(start_paused = true)]
 async fn reuses_least_recently_used_expired_binding() {
-    let pool = FakePool::new(config(Some(30), Some(64))).unwrap();
+    let pool = FakePool::new(config(Some(30), Some(64)))
+        .unwrap()
+        .with_client_limit(2);
     assert_eq!(a_addr(&pool, "old").await, Ipv4Addr::new(198, 18, 0, 1));
     tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(a_addr(&pool, "newer").await, Ipv4Addr::new(198, 18, 0, 2));
@@ -231,7 +235,9 @@ async fn reuses_least_recently_used_expired_binding() {
 
 #[tokio::test(start_paused = true)]
 async fn exhausted_until_ttl_expires() {
-    let pool = FakePool::new(config(Some(30), None)).unwrap();
+    let pool = FakePool::new(config(Some(30), None))
+        .unwrap()
+        .with_client_limit(2);
     a(&pool, "a").await;
     a(&pool, "b").await;
     assert_eq!(a(&pool, "c").await, Answer::Code(ResponseCode::ServFail));
@@ -256,7 +262,8 @@ async fn ttl_from_config_and_refresh_on_use() {
         ttl: Duration::from_secs(30),
         ..config(Some(30), None)
     })
-    .unwrap();
+    .unwrap()
+    .with_client_limit(2);
     assert_eq!(
         a(&pool, "a").await,
         Answer::Records(vec![Record::a("a", 30, Ipv4Addr::new(198, 18, 0, 1))])
@@ -273,10 +280,9 @@ async fn ttl_from_config_and_refresh_on_use() {
     // `a` and `c` are both in use now.
     assert_eq!(a(&pool, "d").await, Answer::Code(ResponseCode::ServFail));
 
-    // Reverse and forward inspection do not refresh `a`; `c` is used again.
+    // Forward inspection does not refresh `a`; `c` is used again.
     tokio::time::advance(Duration::from_secs(20)).await;
     a(&pool, "c").await;
-    pool.lookup(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)));
     pool.lookup_name("a");
     tokio::time::advance(Duration::from_secs(15)).await;
     assert_eq!(a_addr(&pool, "d").await, Ipv4Addr::new(198, 18, 0, 1));
@@ -376,4 +382,147 @@ fn pool_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<FakePool>();
     assert_send_sync::<FakePool<StaticRecords>>();
+}
+
+fn client_at(host: u8) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, host], 40000))
+}
+
+async fn a_from(pool: &impl Resolver, name: &str, host: u8) -> Answer {
+    pool.resolve(&query(name, TYPE::A), client_at(host)).await
+}
+
+fn record(name: &str, host: u8) -> Answer {
+    Answer::Records(vec![Record::a(name, 60, Ipv4Addr::new(198, 18, 0, host))])
+}
+
+fn sized(capacity: usize) -> FakePool {
+    FakePool::new(FakePoolConfig {
+        capacity,
+        ..config(Some(24), None)
+    })
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_client_takes_at_most_half_of_the_pool() {
+    let pool = sized(4);
+    assert_eq!(a_from(&pool, "x1", 1).await, record("x1", 1));
+    assert_eq!(a_from(&pool, "x2", 1).await, record("x2", 2));
+    // The third name of one client is refused while its two bindings are in use; a
+    // different source port is the same client.
+    assert_eq!(
+        a_from(&pool, "x3", 1).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    let other_port = SocketAddr::from(([10, 0, 0, 1], 40001));
+    assert_eq!(
+        pool.resolve(&query("x4", TYPE::A), other_port).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    assert_eq!(pool.lookup_name("x3"), None);
+    // Its bound names still answer, and the rest of the pool serves another client.
+    assert_eq!(a_from(&pool, "x1", 1).await, record("x1", 1));
+    assert_eq!(a_from(&pool, "y1", 2).await, record("y1", 3));
+    // A name another client bound is shared: it does not count for the one asking.
+    assert_eq!(a_from(&pool, "x2", 2).await, record("x2", 2));
+    assert_eq!(a_from(&pool, "y1", 1).await, record("y1", 3));
+    assert_eq!(a_from(&pool, "y2", 2).await, record("y2", 4));
+    assert_eq!(pool.stats().exhausted, 0);
+    assert_eq!(pool.len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_binding_in_use_by_lookup_is_not_the_one_reused() {
+    let pool = sized(2);
+    assert_eq!(a_from(&pool, "busy", 1).await, record("busy", 1));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(a_from(&pool, "idle", 2).await, record("idle", 2));
+    let busy = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+
+    // Connections to `busy` keep being opened after its DNS TTL; `idle` is not used.
+    for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(pool.lookup(busy), Some("busy".to_owned()));
+    }
+    assert_eq!(a_from(&pool, "new", 3).await, record("new", 2));
+    assert!(pool.lookup_name("busy").is_some());
+    assert_eq!(pool.lookup_name("idle"), None);
+
+    // Once `busy` is no longer looked up, its address is reused after the TTL.
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert_eq!(
+        a_from(&pool, "late", 2).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(a_from(&pool, "late", 2).await, record("late", 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_limit_is_configurable_and_counted() {
+    assert_eq!(sized(4).client_limit(), 2);
+    assert_eq!(sized(5).client_limit(), 3);
+    assert_eq!(sized(1).client_limit(), 1);
+    assert_eq!(sized(4).with_client_limit(0).client_limit(), 1);
+    assert_eq!(
+        FakePool::new(config(Some(15), None))
+            .unwrap()
+            .client_limit(),
+        32768
+    );
+
+    // The limit survives `with_fallback`; at 1 a client replaces its own binding.
+    let pool = sized(4)
+        .with_client_limit(1)
+        .with_fallback(StaticRecords::new());
+    assert_eq!(pool.client_limit(), 1);
+    assert_eq!(a_from(&pool, "x1", 1).await, record("x1", 1));
+    assert_eq!(
+        a_from(&pool, "x2", 1).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    assert_eq!(a_from(&pool, "y1", 2).await, record("y1", 2));
+    assert_eq!(pool.client_limited(), 1);
+
+    // After the TTL the client's own address goes to its new name, though the pool has
+    // never used addresses left; the other client's binding stays.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(a_from(&pool, "x2", 1).await, record("x2", 1));
+    assert_eq!(pool.lookup_name("x1"), None);
+    assert_eq!(
+        pool.lookup_name("y1").unwrap().0,
+        Some(Ipv4Addr::new(198, 18, 0, 2))
+    );
+    assert_eq!(
+        pool.stats(),
+        FakePoolStats {
+            allocated: 2,
+            reused: 1,
+            exhausted: 0
+        }
+    );
+    assert_eq!(pool.client_limited(), 1);
+
+    // The whole pool for one client.
+    let pool = sized(3).with_client_limit(3);
+    for (name, host) in [("a", 1), ("b", 2), ("c", 3)] {
+        assert_eq!(a_from(&pool, name, 1).await, record(name, host));
+    }
+    assert_eq!(
+        a_from(&pool, "d", 1).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
+    assert_eq!((pool.client_limited(), pool.stats().exhausted), (0, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_ipv4_mapped_client_is_its_ipv4_address() {
+    let pool = sized(2);
+    assert_eq!(a_from(&pool, "x1", 1).await, record("x1", 1));
+    let mapped = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped().into(), 40000);
+    assert_eq!(
+        pool.resolve(&query("x2", TYPE::A), mapped).await,
+        Answer::Code(ResponseCode::ServFail)
+    );
 }

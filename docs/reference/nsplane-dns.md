@@ -18,7 +18,7 @@ feature builds on `nsplane-netstack`.
 | messages and codec (`message`) | `Query::decode` (`id`, `name`, `record_type`, `class`, `recursion_desired`, `udp_payload_size`, `raw`), `encode_response`, `encode_error`, `max_udp_response_size`, `normalize_name` | `Record` (`new`, `a`, `aaaa`, `cname`, `ptr`, `txt`, `record_type`), `RecordData`, `RecordType`, `ResponseCode` (`value`), `Answer`, `DecodeError` (`id`, `response_code`), `EncodeOptions`, `DEFAULT_UDP_PAYLOAD_SIZE`, `MIN_UDP_RESPONSE_SIZE`, `CLASS_IN` |
 | resolvers: composition (`resolver`) | trait `Resolver` (also for `Arc<R>` and `&R`), `Fallback` (`new`) | |
 | resolvers: static records (`records`) | `StaticRecords` (`new`, `insert`, `FromIterator<Record>`, `lookup`, `with_fallback`, `len`, `is_empty`) | |
-| resolvers: fake addresses (`fake`) | `FakePool` (`new`, `with_fallback`, `lookup`, `lookup_name`, `capacity`, `len`, `is_empty`, `stats`) | `FakePoolConfig`, `FakePoolConfigError`, `FakePoolStats`, `NoData`, `DEFAULT_FAKE_CAPACITY`, `DEFAULT_FAKE_TTL` |
+| resolvers: fake addresses (`fake`) | `FakePool` (`new`, `with_fallback`, `with_client_limit`, `lookup`, `lookup_name`, `capacity`, `client_limit`, `client_limited`, `len`, `is_empty`, `stats`) | `FakePoolConfig`, `FakePoolConfigError`, `FakePoolStats`, `NoData`, `DEFAULT_FAKE_CAPACITY`, `DEFAULT_FAKE_TTL` |
 | resolvers: forwarding (`forward`) | `Forwarder` (`new`, `forward`, `config`, `stats`) | `ForwarderConfig` (`new`), `ForwarderError`, `ForwarderStats` |
 | resolvers: policy routing (`policy`) | `PolicyResolver` (`new`, `replace`, `replace_table`, `table`, `matching`, `stats`) | `PolicyTable` (`new`, `with_ttl`, `rules`, `ttl`, `matching`), `Rule` (`new`, `with_types`, `with_clients`, `with_on_nxdomain`), `NameMatch`, `Action`, `NxDomainFallback`, `ResolverSet` (`new`, `with`, `insert`, `contains`, `len`, `is_empty`), `PolicyStats`, `PolicyError`, `DEFAULT_POLICY_TTL`, `MAX_CNAME_CHAIN` |
 | hosts text (`hosts`) | `Hosts` (`parse`, `static_records`, `wildcard_rules`, `rules`, `errors`, `is_empty`) | `HostsError`, `HostsErrorKind` |
@@ -82,13 +82,27 @@ sequentially, skipping the network address (and, for IPv4 prefixes shorter than 
 broadcast address). The answer is one record with TTL `FakePoolConfig::ttl`; a family without
 a prefix answers `NODATA`.
 
-Every answer refreshes the binding's last use. When no fresh index is left (capacity or prefix
+Every answer and every `lookup` refreshes the binding's last use. When no fresh index is left (capacity or prefix
 exhausted), the least recently used binding unused for at least `ttl` is evicted and its
 addresses go to the new name (`FakePoolStats::reused`). A binding is never evicted earlier: while
 every binding is within its TTL the pool answers `SERVFAIL` (`FakePoolStats::exhausted`).
 
-`lookup(addr)` maps an address of either family back to its name and `lookup_name(name)`
-returns a name's addresses; neither allocates nor refreshes. Queries of other types or classes
+A binding belongs to the client address whose query created it (the IP of the resolver's
+`client`, any port; an IPv4-mapped address is its IPv4 address). A name that another client
+asks for later is shared: it stays with its first client and counts for no one else. One client
+holds at most `client_limit()` bindings: half of the capacity, rounded up, unless
+`with_client_limit(n)` sets another bound (`FakePoolConfig` is an exhaustive struct, so the
+bound is not one of its fields). At the limit a new name takes the client's own least recently
+used binding if that one is unused for at least `ttl` (`FakePoolStats::reused`), and is answered
+`SERVFAIL` otherwise, counted by `client_limited()` (`FakePoolStats` is exhaustive too). One
+client asking for many names therefore leaves half of the pool to the others. A pool with a
+single client that needs more than half of it within one `ttl` sets
+`with_client_limit(usize::MAX)`: a limit of the capacity or more is none.
+
+`lookup(addr)` maps an address of either family back to its name and refreshes the binding, so
+an address that connections keep being opened to is not handed to another name once its DNS
+TTL has passed; call it on the data path only. `lookup_name(name)` returns a name's addresses
+and neither allocates nor refreshes. Queries of other types or classes
 go to the pool's fallback: `NoData` (answers `NODATA`) by default, any resolver with
 `with_fallback`, which replaces that fallback instead of chaining on `NXDOMAIN`.
 
@@ -258,6 +272,7 @@ address and port to these functions.
 | `FakePoolConfig::ipv4` / `ipv6` | none (at least one required) |
 | `FakePoolConfig::capacity` | `DEFAULT_FAKE_CAPACITY` (65536), bounded by the prefix sizes |
 | `FakePoolConfig::ttl` | `DEFAULT_FAKE_TTL` (60 s) |
+| `FakePool::with_client_limit` | half of the capacity, rounded up |
 | `ForwarderConfig::timeout` | 2 s per attempt (the UDP exchange; the TCP retry has its own) |
 | `ForwarderConfig::attempts` | 2 |
 | `PolicyTable::with_ttl` | `DEFAULT_POLICY_TTL` (60 s) |
@@ -285,7 +300,8 @@ address and port to these functions.
 - Response codes are limited to `ResponseCode` (no extended codes).
 - `RecordData` covers A, AAAA, CNAME, PTR and TXT.
 - At most `max_in_flight` queries resolve at once per server, and `serve_tcp` serves at most
-  `max_tcp_connections` connections at once; a `FakePool` holds at most `capacity` bindings.
+  `max_tcp_connections` connections at once; a `FakePool` holds at most `capacity` bindings, at most `client_limit()` of them per client
+  address.
 - A CNAME chain of `PolicyResolver` holds at most `MAX_CNAME_CHAIN` (8) records. Name
   matching has no wildcards inside a label or in the middle of a name.
 

@@ -1,6 +1,6 @@
 //! [`FakePool`]: answers A / AAAA with addresses handed out from configured prefixes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -90,11 +90,20 @@ impl Resolver for NoData {
 /// handed out sequentially, skipping the network address (and for IPv4 the broadcast address
 /// below /31). Names match normalized (case-insensitive, no trailing dot).
 ///
-/// Every answer refreshes the binding's last use. When no fresh index is left (capacity or
-/// prefix exhausted), the least recently used binding unused for at least
-/// [`ttl`](FakePoolConfig::ttl) is evicted and its addresses go to the new name. A binding is
-/// never evicted earlier, so the pool answers `SERVFAIL` instead while every binding is in
-/// use.
+/// Every answer and every [`lookup`](Self::lookup) refreshes the binding's last use. When no
+/// fresh index is left (capacity or prefix exhausted), the least recently used binding unused
+/// for at least [`ttl`](FakePoolConfig::ttl) is evicted and its addresses go to the new name. A
+/// binding is never evicted earlier, so the pool answers `SERVFAIL` instead while every binding
+/// is in use.
+///
+/// A binding belongs to the client address (the IP of the resolver's `client`, any port)
+/// whose query created it; a name another client asks for later is shared and stays with its
+/// first client. One client holds at most [`client_limit`](Self::client_limit) bindings, half
+/// of the capacity unless [`with_client_limit`](Self::with_client_limit) sets another bound
+/// (the capacity or more for none): at the limit a new name takes the client's own least recently used binding if that one is
+/// unused for at least `ttl`, and is answered `SERVFAIL` otherwise
+/// ([`client_limited`](Self::client_limited)), so one client asking for many names cannot
+/// take the pool from the others.
 ///
 /// Class IN A queries get one A record with TTL `ttl`, AAAA likewise; a family without a
 /// prefix answers `NODATA`. Every other query goes to `F`: [`NoData`] by default, another
@@ -108,6 +117,7 @@ pub struct FakePool<F = NoData> {
     capacity: usize,
     /// `capacity` as the highest host index.
     slots: u64,
+    client_limit: usize,
     state: Mutex<State>,
     other: F,
 }
@@ -120,16 +130,58 @@ struct State {
     bindings: HashMap<u64, Binding>,
     /// (last use, sequence) -> host index, oldest first.
     lru: BTreeMap<(Instant, u64), u64>,
+    /// Client address -> the `lru` keys of the bindings it created, oldest first.
+    owned: HashMap<IpAddr, BTreeSet<(Instant, u64)>>,
     /// Next never used host index.
     next_index: u64,
     seq: u64,
     stats: FakePoolStats,
+    /// Queries answered `SERVFAIL` at the client limit.
+    client_limited: u64,
 }
 
 #[derive(Debug)]
 struct Binding {
     name: String,
     key: (Instant, u64),
+    /// The client whose query created the binding.
+    owner: IpAddr,
+}
+
+impl State {
+    /// Moves the binding at `index` to `key`, its new last use.
+    fn touch(&mut self, index: u64, key: (Instant, u64)) {
+        let Some(binding) = self.bindings.get_mut(&index) else {
+            return;
+        };
+        self.lru.remove(&binding.key);
+        if let Some(owned) = self.owned.get_mut(&binding.owner) {
+            owned.remove(&binding.key);
+            owned.insert(key);
+        }
+        binding.key = key;
+        self.lru.insert(key, index);
+    }
+
+    /// Evicts the binding last used at `key` if it is unused for at least `ttl` at `now`:
+    /// its host index, free for a new name.
+    fn release(&mut self, key: (Instant, u64), now: Instant, ttl: Duration) -> Option<u64> {
+        if now.saturating_duration_since(key.0) < ttl {
+            return None;
+        }
+        let index = self.lru.remove(&key)?;
+        if let Some(old) = self.bindings.remove(&index) {
+            self.names.remove(&old.name);
+            if let Some(owned) = self.owned.get_mut(&old.owner) {
+                owned.remove(&key);
+                if owned.is_empty() {
+                    self.owned.remove(&old.owner);
+                }
+            }
+        }
+        self.stats.reused += 1;
+        Some(index)
+    }
 }
 
 impl FakePool {
@@ -156,6 +208,7 @@ impl FakePool {
             // `usable` is at most `config.capacity`.
             capacity: usize::try_from(usable).unwrap_or(config.capacity),
             slots: usable,
+            client_limit: usize::try_from(usable.div_ceil(2)).unwrap_or(config.capacity),
             state: Mutex::new(State {
                 next_index: 1,
                 ..State::default()
@@ -176,9 +229,30 @@ impl<F> FakePool<F> {
             record_ttl: self.record_ttl,
             capacity: self.capacity,
             slots: self.slots,
+            client_limit: self.client_limit,
             state: self.state,
             other: fallback,
         }
+    }
+
+    /// Sets the most bindings one client address holds, at least 1; the default is half of
+    /// the [capacity](Self::capacity), rounded up. A limit of the capacity or more lets one
+    /// client take the whole pool, as a pool with a single client may want.
+    #[must_use]
+    pub fn with_client_limit(mut self, limit: usize) -> Self {
+        self.client_limit = limit.max(1);
+        self
+    }
+
+    /// Most bindings one client address holds, see [`with_client_limit`](Self::with_client_limit).
+    pub const fn client_limit(&self) -> usize {
+        self.client_limit
+    }
+
+    /// Queries answered `SERVFAIL` since the pool was created because their client held
+    /// [`client_limit`](Self::client_limit) bindings, all within their TTL.
+    pub fn client_limited(&self) -> u64 {
+        self.lock().client_limited
     }
 
     /// Maximum number of bindings: the configured capacity bounded by the prefix sizes.
@@ -201,7 +275,8 @@ impl<F> FakePool<F> {
         self.lock().stats
     }
 
-    /// The name bound to `addr`, in either family. Does not refresh the binding.
+    /// The name bound to `addr`, in either family. Refreshes the binding's last use like an
+    /// answer does: an address that connections keep being opened to stays with its name.
     pub fn lookup(&self, addr: IpAddr) -> Option<String> {
         let index = match addr {
             IpAddr::V4(addr) => {
@@ -218,7 +293,12 @@ impl<F> FakePool<F> {
                 host_index(u128::from(addr), u128::from(net), len, 128)?
             }
         };
-        self.lock().bindings.get(&index).map(|b| b.name.clone())
+        let now = Instant::now();
+        let mut state = self.lock();
+        state.seq += 1;
+        let key = (now, state.seq);
+        state.touch(index, key);
+        state.bindings.get(&index).map(|b| b.name.clone())
     }
 
     /// The addresses bound to `name`, one per configured family, without allocating or
@@ -229,13 +309,13 @@ impl<F> FakePool<F> {
     }
 
     /// The answer to an A or AAAA query of class IN, allocating or refreshing the binding.
-    fn answer(&self, query: &Query) -> Answer {
+    fn answer(&self, query: &Query, client: IpAddr) -> Answer {
         let name = query.name();
         let wants_v4 = query.record_type() == RecordType::A;
         if (wants_v4 && self.ipv4.is_none()) || (!wants_v4 && self.ipv6.is_none()) {
             return Answer::Records(Vec::new());
         }
-        let Some(index) = self.bind(name) else {
+        let Some(index) = self.bind(name, client) else {
             return Answer::Code(ResponseCode::ServFail);
         };
         let record = if wants_v4 {
@@ -248,8 +328,9 @@ impl<F> FakePool<F> {
         Answer::Records(record.into_iter().collect())
     }
 
-    /// The host index bound to `name`, refreshed, or a new binding; `None` when exhausted.
-    fn bind(&self, name: &str) -> Option<u64> {
+    /// The host index bound to `name`, refreshed, or a new binding of `client`; `None` when
+    /// the pool is exhausted or the client at its limit.
+    fn bind(&self, name: &str, client: IpAddr) -> Option<u64> {
         let now = Instant::now();
         let mut state = self.lock();
         let state = &mut *state;
@@ -257,29 +338,33 @@ impl<F> FakePool<F> {
         let key = (now, state.seq);
 
         if let Some(&index) = state.names.get(name) {
-            if let Some(binding) = state.bindings.get_mut(&index) {
-                state.lru.remove(&binding.key);
-                binding.key = key;
-                state.lru.insert(key, index);
-            }
+            state.touch(index, key);
             return Some(index);
         }
 
-        let index = if state.next_index <= self.slots {
+        // The client's least recently used binding, once it holds as many as it may; a
+        // limit of the whole pool is none.
+        let own = state
+            .owned
+            .get(&client)
+            .filter(|owned| self.client_limit < self.capacity && owned.len() >= self.client_limit)
+            .and_then(|owned| owned.first().copied());
+        let index = if let Some(own) = own {
+            let Some(index) = state.release(own, now, self.ttl) else {
+                state.client_limited += 1;
+                return None;
+            };
+            index
+        } else if state.next_index <= self.slots {
             state.next_index += 1;
             state.stats.allocated += 1;
             state.next_index - 1
         } else {
-            let (&oldest, &index) = state.lru.first_key_value()?;
-            if now.saturating_duration_since(oldest.0) < self.ttl {
+            let oldest = state.lru.first_key_value().map(|(&oldest, _)| oldest)?;
+            let Some(index) = state.release(oldest, now, self.ttl) else {
                 state.stats.exhausted += 1;
                 return None;
-            }
-            state.lru.remove(&oldest);
-            if let Some(old) = state.bindings.remove(&index) {
-                state.names.remove(&old.name);
-            }
-            state.stats.reused += 1;
+            };
             index
         };
         state.names.insert(name.to_owned(), index);
@@ -288,9 +373,11 @@ impl<F> FakePool<F> {
             Binding {
                 name: name.to_owned(),
                 key,
+                owner: client,
             },
         );
         state.lru.insert(key, index);
+        state.owned.entry(client).or_default().insert(key);
         Some(index)
     }
 
@@ -315,7 +402,7 @@ impl<F: Resolver> Resolver for FakePool<F> {
     async fn resolve(&self, query: &Query, client: SocketAddr) -> Answer {
         let ty = query.record_type();
         if query.class() == CLASS_IN && (ty == RecordType::A || ty == RecordType::AAAA) {
-            self.answer(query)
+            self.answer(query, client.ip().to_canonical())
         } else {
             self.other.resolve(query, client).await
         }
