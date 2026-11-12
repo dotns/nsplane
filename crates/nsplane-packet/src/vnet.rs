@@ -291,6 +291,9 @@ fn ip_header_len(packet: &[u8], version: u8, proto: u8) -> Result<usize, Offload
         }
         return Ok(IPV6_HDR);
     }
+    if version != 4 {
+        return Err(OffloadError::BadHeaders);
+    }
     let ihl = usize::from(first & 0x0F) * 4;
     if packet.len() < IPV4_HDR.max(ihl) {
         return Err(OffloadError::Truncated);
@@ -922,6 +925,21 @@ mod tests {
             ..csum
         };
         assert_eq!(err(&ecn_none, &packet), OffloadError::UnsupportedGso);
+    }
+
+    #[test]
+    fn udp_super_packet_of_another_ip_version_is_rejected() {
+        // GSO_UDP_L4 takes the IP version from the packet: a version nibble that is
+        // neither 4 nor 6 must not be segmented as IPv4.
+        let (hdr, mut packet) = super_packet(&spec(false, UDP), 30, 10);
+        for version in [0, 1, 5, 7, 12, 15] {
+            packet[0] = (version << 4) | 5;
+            assert_eq!(
+                run(&hdr, &packet),
+                Err(OffloadError::BadHeaders),
+                "version {version}"
+            );
+        }
     }
 
     #[test]
