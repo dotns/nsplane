@@ -1,6 +1,6 @@
 //! The default network-side transport: one tokio UDP socket driven through `quinn-udp`,
 //! with segmentation offload, and an optional side channel for datagrams that are not the
-//! engine's on the same socket.
+//! engine's on the same socket. On Windows `[::]:port` takes two sockets.
 
 mod send;
 mod side;
@@ -14,7 +14,9 @@ mod tests;
 mod windows;
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(not(windows))]
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -30,7 +32,11 @@ use self::send::run_len;
 use self::send::write_io;
 use self::side::{Side, SideCounters};
 pub use self::side::{SideDatagram, SideSender, SideStats};
-use self::socket::{bind_dual_stack, bind_socket, set_up, target, unmap};
+#[cfg(not(windows))]
+use self::socket::bind_dual_stack;
+#[cfg(windows)]
+use self::socket::{bind_pair, ipv4_destination};
+use self::socket::{bind_socket, set_up, target, unmap};
 use crate::transport::Transport;
 
 /// The most bytes one send carries: the largest IPv4 UDP payload, so also the limit of a
@@ -100,6 +106,19 @@ impl SocketErrors {
 /// [`Path::addr`] as plain IPv4 addresses, and IPv4 destinations are sent to as
 /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`). On an IPv4 socket, sending to an IPv6
 /// address fails with [`io::ErrorKind::InvalidInput`].
+///
+/// On Windows a transport bound to `[::]:port` is two sockets on that port instead, an
+/// IPv6-only one and an IPv4 one: a dual-stack socket there does not own the IPv4 side of
+/// its port, so another socket could bind `0.0.0.0:port` and would then get every IPv4
+/// datagram to it. Nothing else changes for callers: [`local_addr`](Self::local_addr)
+/// reports `[::]:port`, IPv4 peers are reported as plain IPv4 addresses, and IPv4
+/// destinations, IPv4-mapped ones included, leave the IPv4 socket. Receiving takes the
+/// two sockets in turn while both hold datagrams, so the order of arrival is kept within
+/// an address family and not across the two. Each socket is set up and sized on its own:
+/// the buffer setters size both and the getters report the IPv6 socket. A process of the
+/// same user can still bind one local address of the port (`127.0.0.1:port`, say) and
+/// then gets the datagrams to that address; only `SO_EXCLUSIVEADDRUSE` would refuse it,
+/// and it has no safe setter. Another, standard user is refused every bind of the port.
 ///
 /// Whether the transport may use segmentation offload is chosen when binding:
 /// [`bind`](Self::bind) binds with offload, [`bind_with_offload`](Self::bind_with_offload)
@@ -212,6 +231,10 @@ pub struct UdpTransport {
     offload: AtomicBool,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rx: std::sync::Mutex<linux::Rx>,
+    /// The IPv4 socket of a transport bound to `[::]:port`, whose `socket` is then
+    /// IPv6-only.
+    #[cfg(windows)]
+    v4: Option<windows::V4>,
     side: Option<Side>,
     /// Error queue and PMTU reports shared with the side senders.
     errors: Arc<SocketErrors>,
@@ -231,6 +254,11 @@ impl UdpTransport {
     /// (`IPV6_V6ONLY` off). If IPv6 is unavailable on the host, it binds `0.0.0.0:port`
     /// instead and serves IPv4 only; [`local_addr`](Self::local_addr) tells which. Any
     /// other address is bound exactly.
+    ///
+    /// On Windows `[::]:port` binds an IPv6-only socket and an IPv4 socket on the same
+    /// port (see the [type documentation](Self)), for port 0 one the OS chose that is
+    /// free for both. If either cannot have the port because it is in use, the bind fails
+    /// with [`io::ErrorKind::AddrInUse`] and nothing stays bound.
     ///
     /// The socket buffers get what the kernel grants of the request (see the
     /// [type documentation](Self)); a failure to size them is logged and does not fail
@@ -253,6 +281,7 @@ impl UdpTransport {
     ///
     /// Panics when called outside a tokio runtime with I/O enabled.
     pub fn bind_with_offload(id: TransportId, addr: SocketAddr, offload: bool) -> io::Result<Self> {
+        #[cfg(not(windows))]
         let socket = match addr {
             SocketAddr::V6(v6) if v6.ip().is_unspecified() => match bind_dual_stack(addr) {
                 Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
@@ -262,23 +291,17 @@ impl UdpTransport {
             },
             _ => bind_socket(addr)?,
         };
-        socket.set_nonblocking(true)?;
-        // Before `quinn-udp` sets the socket up: on Apple platforms it caches `SO_SNDBUF`.
-        for (option, result) in [
-            (
-                "SO_RCVBUF",
-                socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER),
-            ),
-            (
-                "SO_SNDBUF",
-                socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER),
-            ),
-        ] {
-            if let Err(e) = result {
-                tracing::debug!(message = "Default socket buffer not set", option, error = ?e);
-            }
-        }
-        let socket = UdpSocket::from_std(socket.into())?;
+        #[cfg(windows)]
+        let (socket, v4) = match addr {
+            SocketAddr::V6(v6) if v6.ip().is_unspecified() => bind_pair(addr.port())?,
+            _ => (bind_socket(addr)?, None),
+        };
+        let socket = Self::prepare(socket)?;
+        #[cfg(windows)]
+        let v4 = match v4 {
+            Some(v4) => Some(windows::V4::new(Self::prepare(v4)?, offload)),
+            None => None,
+        };
         let local = socket.local_addr()?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let state = if offload {
@@ -297,12 +320,36 @@ impl UdpTransport {
             offload: AtomicBool::new(offload),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rx: std::sync::Mutex::default(),
+            #[cfg(windows)]
+            v4,
             side: None,
             errors: Arc::new(SocketErrors::new(id)),
             train: std::sync::Mutex::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             no_mmsg: AtomicBool::new(false),
         })
+    }
+
+    /// Makes a bound `socket` non-blocking, requests the default socket buffers and hands
+    /// it to tokio.
+    fn prepare(socket: socket2::Socket) -> io::Result<UdpSocket> {
+        socket.set_nonblocking(true)?;
+        // Before `quinn-udp` sets the socket up: on Apple platforms it caches `SO_SNDBUF`.
+        for (option, result) in [
+            (
+                "SO_RCVBUF",
+                socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+            (
+                "SO_SNDBUF",
+                socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER),
+            ),
+        ] {
+            if let Err(e) = result {
+                tracing::debug!(message = "Default socket buffer not set", option, error = ?e);
+            }
+        }
+        UdpSocket::from_std(socket.into())
     }
 
     /// Attaches a side channel: every received datagram for which `classify` returns true
@@ -328,6 +375,8 @@ impl UdpTransport {
         let counters = Arc::new(SideCounters::default());
         let sender = SideSender {
             socket: Arc::clone(&self.socket),
+            #[cfg(windows)]
+            v4: self.v4.as_ref().map(|v4| Arc::clone(&v4.socket)),
             local: self.local,
             counters: Arc::clone(&counters),
             errors: Arc::clone(&self.errors),
@@ -355,6 +404,10 @@ impl UdpTransport {
     /// the [type documentation](Self)). [`recv_buffer_size`](Self::recv_buffer_size) tells
     /// what it granted.
     pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(v4) = &self.v4 {
+            socket2::SockRef::from(&v4.socket).set_recv_buffer_size(bytes)?;
+        }
         socket2::SockRef::from(&self.socket).set_recv_buffer_size(bytes)
     }
 
@@ -362,6 +415,10 @@ impl UdpTransport {
     /// [type documentation](Self)). [`send_buffer_size`](Self::send_buffer_size) tells what
     /// it granted.
     pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(v4) = &self.v4 {
+            v4.set_send_buffer_size(bytes)?;
+        }
         // Through `quinn-udp`, which caches the size on Apple platforms.
         let Some(state) = &self.state else {
             return socket2::SockRef::from(&self.socket).set_send_buffer_size(bytes);
@@ -489,8 +546,28 @@ impl UdpTransport {
     }
 
     /// Maps `addr` to the socket's address family.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn target(&self, addr: SocketAddr) -> io::Result<SocketAddr> {
         target(self.local, addr)
+    }
+
+    /// The socket that sends to `addr`, with `addr` mapped to its address family.
+    fn out(&self, addr: SocketAddr) -> io::Result<Out<'_>> {
+        #[cfg(windows)]
+        if let Some(v4) = &self.v4
+            && let Some(destination) = ipv4_destination(addr)
+        {
+            return Ok(Out {
+                socket: &v4.socket,
+                state: v4.state.as_ref(),
+                destination,
+            });
+        }
+        Ok(Out {
+            socket: &self.socket,
+            state: self.state.as_ref(),
+            destination: target(self.local, addr)?,
+        })
     }
 
     /// Whether the side channel took the datagram `datagram` from `from` (unmapped).
@@ -508,6 +585,16 @@ impl UdpTransport {
             ecn,
         }
     }
+}
+
+/// A socket of the transport to send on: its one socket, or on Windows, for a transport
+/// bound to `[::]:port`, the one of the destination's address family.
+struct Out<'a> {
+    socket: &'a UdpSocket,
+    /// As [`UdpTransport::state`], of this socket.
+    state: Option<&'a UdpSocketState>,
+    /// The destination in the socket's address family.
+    destination: SocketAddr,
 }
 
 impl Transport for UdpTransport {
@@ -556,8 +643,12 @@ impl Transport for UdpTransport {
                 result.inspect_err(|_| *failed += 1)?;
                 continue;
             }
-            let run = run_len(&datagrams[*sent..], self.max_segments());
-            let result = match &self.state {
+            // A destination no socket sends to fails in the send, as a run of the socket.
+            let state = self
+                .out(to.addr)
+                .map_or(self.state.as_ref(), |out| out.state);
+            let run = run_len(&datagrams[*sent..], self.segments(state));
+            let result = match state {
                 Some(state) if run > 1 => {
                     self.send_run(state, &datagrams[*sent..*sent + run], to)
                         .await
@@ -600,8 +691,12 @@ impl Transport for UdpTransport {
                 result.inspect_err(|_| *failed += 1)?;
                 continue;
             }
-            let run = run_len(&datagrams[*sent..], self.max_segments());
-            let result = match &self.state {
+            // A destination no socket sends to fails in the send, as a run of the socket.
+            let state = self
+                .out(to.addr)
+                .map_or(self.state.as_ref(), |out| out.state);
+            let run = run_len(&datagrams[*sent..], self.segments(state));
+            let result = match state {
                 Some(state) if run > 1 => {
                     self.try_send_run(state, &datagrams[*sent..*sent + run], to)
                 }
@@ -653,11 +748,23 @@ impl UdpTransport {
 
     /// Sends one datagram with plain `send_to`, without an ECN mark.
     async fn send_to(&self, datagram: &[u8], to: SocketAddr, _ecn: Ecn) -> io::Result<()> {
-        self.socket.send_to(datagram, to).await.map(drop)
+        self.socket_to(to).send_to(datagram, to).await.map(drop)
     }
 
     /// [`UdpTransport::send_to`] without waiting.
     fn try_send_to(&self, datagram: &[u8], to: SocketAddr, _ecn: Ecn) -> io::Result<()> {
-        self.socket.try_send_to(datagram, to).map(drop)
+        self.socket_to(to).try_send_to(datagram, to).map(drop)
+    }
+
+    /// The socket that sends to `destination`, an address [`UdpTransport::out`] mapped.
+    fn socket_to(&self, destination: SocketAddr) -> &UdpSocket {
+        #[cfg(windows)]
+        if let Some(v4) = &self.v4
+            && destination.is_ipv4()
+        {
+            return &v4.socket;
+        }
+        let _ = destination;
+        &self.socket
     }
 }

@@ -17,8 +17,14 @@ use super::{MAX_SEND, SocketErrors, UdpTransport};
 
 impl UdpTransport {
     /// The most datagrams one send may carry right now.
+    #[cfg(test)]
     pub(super) fn max_segments(&self) -> usize {
-        match &self.state {
+        self.segments(self.state.as_ref())
+    }
+
+    /// The most datagrams one send on the socket with `state` may carry right now.
+    pub(super) fn segments(&self, state: Option<&UdpSocketState>) -> usize {
+        match state {
             Some(state) if self.offload() => state.max_gso_segments(),
             _ => 1,
         }
@@ -32,20 +38,20 @@ impl UdpTransport {
         segment_size: Option<usize>,
         to: &Path,
     ) -> io::Result<()> {
-        let destination = self.target(to.addr)?;
-        let Some(state) = &self.state else {
+        let out = self.out(to.addr)?;
+        let Some(state) = out.state else {
             // Without `quinn-udp` state nothing is segmented.
-            return self.send_to(contents, destination, to.ecn).await;
+            return self.send_to(contents, out.destination, to.ecn).await;
         };
         let transmit = Transmit {
-            destination,
+            destination: out.destination,
             ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
             contents,
             segment_size,
             src_ip: None,
         };
-        write_io(&self.socket, &self.errors, || {
-            state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+        write_io(out.socket, &self.errors, || {
+            state.try_send(UdpSockRef::from(out.socket), &transmit)
         })
         .await
     }
@@ -58,35 +64,36 @@ impl UdpTransport {
         segment_size: Option<usize>,
         to: &Path,
     ) -> io::Result<()> {
-        let destination = self.target(to.addr)?;
-        let Some(state) = &self.state else {
-            return self.try_send_to(contents, destination, to.ecn);
+        let out = self.out(to.addr)?;
+        let Some(state) = out.state else {
+            return self.try_send_to(contents, out.destination, to.ecn);
         };
         let transmit = Transmit {
-            destination,
+            destination: out.destination,
             ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
             contents,
             segment_size,
             src_ip: None,
         };
-        self.socket.try_io(Interest::WRITABLE, || {
-            self.errors.write(&self.socket, || {
-                state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+        out.socket.try_io(Interest::WRITABLE, || {
+            self.errors.write(out.socket, || {
+                state.try_send(UdpSockRef::from(out.socket), &transmit)
             })
         })
     }
 
     /// Sends `run`, two or more datagrams to `to` that [`run_len`] put into one run, as
-    /// one segmented send (see [`UdpTransport::send_run_now`]).
+    /// one segmented send (see [`UdpTransport::send_run_now`]); `state` is that of the
+    /// socket that sends to `to`.
     pub(super) async fn send_run(
         &self,
         state: &UdpSocketState,
         run: &[(Path, PacketBuf)],
         to: &Path,
     ) -> io::Result<()> {
-        let destination = self.target(to.addr)?;
-        write_io(&self.socket, &self.errors, || {
-            self.send_run_now(state, run, destination, to.ecn)
+        let out = self.out(to.addr)?;
+        write_io(out.socket, &self.errors, || {
+            self.send_run_now(out.socket, state, run, out.destination, to.ecn)
         })
         .await
     }
@@ -99,15 +106,16 @@ impl UdpTransport {
         run: &[(Path, PacketBuf)],
         to: &Path,
     ) -> io::Result<()> {
-        let destination = self.target(to.addr)?;
-        self.socket.try_io(Interest::WRITABLE, || {
-            self.errors.write(&self.socket, || {
-                self.send_run_now(state, run, destination, to.ecn)
+        let out = self.out(to.addr)?;
+        out.socket.try_io(Interest::WRITABLE, || {
+            self.errors.write(out.socket, || {
+                self.send_run_now(out.socket, state, run, out.destination, to.ecn)
             })
         })
     }
 
-    /// One non-blocking segmented send of `run` to `destination`, marked with `ecn`. On
+    /// One non-blocking segmented send of `run` on `socket` to `destination`, marked with
+    /// `ecn`. On
     /// Linux and Android it goes out straight from the datagrams' buffers (one `iovec`
     /// each); the transport's train buffer takes a copy for `quinn-udp` elsewhere, for a
     /// run of more than [`linux::IOVS`] datagrams, and when that send fails with `EIO` or
@@ -115,6 +123,7 @@ impl UdpTransport {
     /// it does for its own sends.
     fn send_run_now(
         &self,
+        socket: &UdpSocket,
         state: &UdpSocketState,
         run: &[(Path, PacketBuf)],
         destination: SocketAddr,
@@ -142,7 +151,7 @@ impl UdpTransport {
             segment_size: run.first().map(|(_, datagram)| datagram.len()),
             src_ip: None,
         };
-        state.try_send(UdpSockRef::from(&*self.socket), &transmit)
+        state.try_send(UdpSockRef::from(socket), &transmit)
     }
 }
 

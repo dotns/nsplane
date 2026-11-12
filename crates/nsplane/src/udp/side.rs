@@ -51,6 +51,9 @@ pub struct SideStats {
 #[derive(Debug, Clone)]
 pub struct SideSender {
     pub(super) socket: Arc<UdpSocket>,
+    /// The transport's IPv4 socket, where it has two.
+    #[cfg(windows)]
+    pub(super) v4: Option<Arc<UdpSocket>>,
     pub(super) local: SocketAddr,
     pub(super) counters: Arc<SideCounters>,
     /// The transport's error queue and PMTU reports.
@@ -67,10 +70,11 @@ impl SideSender {
     pub fn send_to(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
         // Straight to the non-blocking socket: tokio's `try_send_to` also fails while it
         // has not seen the socket writable yet.
-        let to = target(self.local, to)?.into();
+        let (socket, to) = self.out(to)?;
+        let to = to.into();
         self.errors
-            .write(&self.socket, || {
-                socket2::SockRef::from(&*self.socket).send_to(datagram, &to)
+            .write(socket, || {
+                socket2::SockRef::from(socket).send_to(datagram, &to)
             })
             .map(drop)
     }
@@ -87,12 +91,24 @@ impl SideSender {
     /// writable each waiter tries its datagram; the engine's sends and this one go out in
     /// whatever order they reach the socket, and the ones that do not fit wait again.
     pub async fn send_to_async(&self, datagram: &[u8], to: SocketAddr) -> io::Result<()> {
-        let to = target(self.local, to)?.into();
-        write_io(&self.socket, &self.errors, || {
-            socket2::SockRef::from(&*self.socket).send_to(datagram, &to)
+        let (socket, to) = self.out(to)?;
+        let to = to.into();
+        write_io(socket, &self.errors, || {
+            socket2::SockRef::from(socket).send_to(datagram, &to)
         })
         .await
         .map(drop)
+    }
+
+    /// The socket that sends to `to`, with `to` mapped to its address family.
+    fn out(&self, to: SocketAddr) -> io::Result<(&UdpSocket, SocketAddr)> {
+        #[cfg(windows)]
+        if let Some(v4) = &self.v4
+            && let Some(to) = super::socket::ipv4_destination(to)
+        {
+            return Ok((v4, to));
+        }
+        Ok((&self.socket, target(self.local, to)?))
     }
 
     /// The transport's bound address.

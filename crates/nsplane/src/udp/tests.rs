@@ -2,6 +2,7 @@ use super::*;
 use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -144,6 +145,167 @@ async fn dual_stack_unmaps_ipv4_peers() {
         roundtrip(&dual, seen_as(&dual, "127.0.0.1"), &v4, v4.local_addr()).await;
         roundtrip(&v6, v6.local_addr(), &dual, seen_as(&dual, "::1")).await;
         roundtrip(&dual, seen_as(&dual, "::1"), &v6, v6.local_addr()).await;
+    }
+}
+
+/// A transport on `[::]:port` owns the port for IPv4 too: nobody else binds its IPv4 side
+/// while the transport lives.
+#[tokio::test]
+async fn unspecified_bind_owns_the_ipv4_port() {
+    for offload in OFFLOAD {
+        let dual = bind_with(1, "[::]:0", offload);
+        let port = dual.local_addr().port();
+        let err = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+}
+
+/// A port whose IPv4 side is taken is in use for `[::]:port`, and the failed bind leaves
+/// nothing bound.
+#[tokio::test]
+async fn unspecified_bind_fails_on_a_port_taken_for_ipv4() {
+    for offload in OFFLOAD {
+        let listener = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = (Ipv6Addr::UNSPECIFIED, port).into();
+        let err = UdpTransport::bind_with_offload(TransportId::new(1), addr, offload).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+    }
+}
+
+/// An IPv4-mapped destination leaves a transport on `[::]:port` as IPv4, as the plain
+/// IPv4 address does.
+#[tokio::test]
+async fn dual_stack_sends_to_mapped_destinations() {
+    for offload in OFFLOAD {
+        let dual = bind_with(1, "[::]:0", offload);
+        let v4 = bind_with(2, "127.0.0.1:0", offload);
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{}", v4.local_addr().port())
+            .parse()
+            .unwrap();
+        dual.send(DATAGRAM, &path_to(mapped, Ecn::NotEct))
+            .await
+            .unwrap();
+        let (buf, path) = recv(&v4, 1500).await;
+        assert_eq!(buf.as_packet(), DATAGRAM);
+        assert_eq!(path.addr, seen_as(&dual, "127.0.0.1"));
+
+        let batch = batch(mapped, Ecn::NotEct, &train(1200, 3));
+        send_all(&dual, &batch).await;
+        let received: Vec<_> = recv_batches(&v4, batch.len())
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        check(
+            &received,
+            &train(1200, 3),
+            seen_as(&dual, "127.0.0.1"),
+            Ecn::NotEct,
+        );
+    }
+}
+
+/// A transport on `[::]:port` serves IPv4 and IPv6 senders at once: a backlog of one
+/// family does not keep the datagrams of the other waiting behind it, and one batch
+/// sends to both.
+#[tokio::test]
+async fn dual_stack_serves_both_families_at_once() {
+    const BACKLOG: usize = 64;
+    for offload in OFFLOAD {
+        let dual = bind_with(1, "[::]:0", offload);
+        let v4 = bind_with(2, "127.0.0.1:0", offload);
+        let v6 = bind_with(3, "[::1]:0", offload);
+        for (busy, busy_ip, other, other_ip) in [
+            (&v4, "127.0.0.1", &v6, "::1"),
+            (&v6, "::1", &v4, "127.0.0.1"),
+        ] {
+            for _ in 0..BACKLOG {
+                busy.send(b"backlog", &path_to(seen_as(&dual, busy_ip), Ecn::NotEct))
+                    .await
+                    .unwrap();
+            }
+            other
+                .send(DATAGRAM, &path_to(seen_as(&dual, other_ip), Ecn::NotEct))
+                .await
+                .unwrap();
+            // Loopback delivers before `send` returns: all of them are queued.
+            let mut before = None;
+            let mut backlog = 0;
+            while backlog < BACKLOG || before.is_none() {
+                let (buf, path) = recv(&dual, 1500).await;
+                if buf.as_packet() == DATAGRAM {
+                    assert_eq!(path.addr, other.local_addr());
+                    before = Some(backlog);
+                } else {
+                    assert_eq!(path.addr, busy.local_addr());
+                    backlog += 1;
+                }
+            }
+            // Arrival order across families is not kept by two sockets; the single
+            // datagram must not wait for the whole backlog of the other family there.
+            if cfg!(windows) {
+                assert!(before < Some(BACKLOG / 2), "served after {before:?}");
+            }
+        }
+
+        let mut both = batch(v4.local_addr(), Ecn::NotEct, &train(1200, 2));
+        both.extend(batch(v6.local_addr(), Ecn::NotEct, &train(1200, 2)));
+        send_all(&dual, &both).await;
+        for (to, ip) in [(&v4, "127.0.0.1"), (&v6, "::1")] {
+            let received: Vec<_> = recv_batches(to, 3).await.into_iter().flatten().collect();
+            check(&received, &train(1200, 2), seen_as(&dual, ip), Ecn::NotEct);
+        }
+    }
+}
+
+/// The two sockets that stand for `[::]:port` on Windows: both on one port, also when the
+/// OS chooses it, and nothing bound when the IPv4 side of the port is taken.
+#[test]
+fn pair_binds_both_families_on_one_port() {
+    let port_of = |socket: &Socket| socket.local_addr().unwrap().as_socket().unwrap().port();
+    let (v6, v4) = socket::bind_pair(0).unwrap();
+    let v4 = v4.unwrap();
+    assert!(v6.only_v6().unwrap());
+    assert_eq!(
+        v6.local_addr().unwrap().as_socket().unwrap().ip(),
+        Ipv6Addr::UNSPECIFIED
+    );
+    assert_eq!(
+        v4.local_addr().unwrap().as_socket().unwrap().ip(),
+        Ipv4Addr::UNSPECIFIED
+    );
+    let port = port_of(&v6);
+    assert_ne!(port, 0);
+    assert_eq!(port_of(&v4), port);
+    drop((v6, v4));
+    let (v6, v4) = socket::bind_pair(port).unwrap();
+    assert_eq!((port_of(&v6), port_of(&v4.unwrap())), (port, port));
+    drop(v6);
+
+    let listener = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let err = socket::bind_pair(port).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+    let v6_listener = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    v6_listener.set_only_v6(true).unwrap();
+    let any: SocketAddr = (Ipv6Addr::UNSPECIFIED, 0).into();
+    v6_listener.bind(&any.into()).unwrap();
+    let err = socket::bind_pair(port_of(&v6_listener)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+}
+
+/// Of the two sockets, the IPv4 one sends to IPv4 and IPv4-mapped addresses, unmapped.
+#[test]
+fn pair_sends_ipv4_and_mapped_destinations_on_the_ipv4_socket() {
+    let v4: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+    for addr in ["192.0.2.1:51820", "[::ffff:192.0.2.1]:51820"] {
+        assert_eq!(socket::ipv4_destination(addr.parse().unwrap()), Some(v4));
+    }
+    for addr in ["[2001:db8::1]:51820", "[::1]:51820", "[::]:51820"] {
+        assert_eq!(socket::ipv4_destination(addr.parse().unwrap()), None);
     }
 }
 

@@ -1,6 +1,8 @@
 //! Creating and setting up the socket, and the address mapping of dual-stack sockets.
 
 use std::io;
+#[cfg(any(windows, test))]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::net::{SocketAddr, SocketAddrV6};
 
 use quinn_udp::{UdpSockRef, UdpSocketState};
@@ -22,11 +24,69 @@ pub(super) fn target(local: SocketAddr, addr: SocketAddr) -> io::Result<SocketAd
 }
 
 /// Creates a dual-stack IPv6 socket bound to `addr`.
+#[cfg(not(windows))]
 pub(super) fn bind_dual_stack(addr: SocketAddr) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
     socket.bind(&addr.into())?;
     Ok(socket)
+}
+
+/// Binds the two sockets that stand for `[::]:port` where a dual-stack socket does not own
+/// the IPv4 side of its port (Windows): an IPv6-only socket and, on the same port, an
+/// IPv4 one. For port 0 a port the OS chose for IPv6 that is taken for IPv4 is given up
+/// for another one. If the IPv6 socket cannot be had for another reason than a port in
+/// use, `0.0.0.0:port` is bound alone. A failure leaves nothing bound.
+#[cfg(any(windows, test))]
+pub(super) fn bind_pair(port: u16) -> io::Result<(Socket, Option<Socket>)> {
+    let mut tries = 0;
+    loop {
+        let v6 = match bind_v6_only(port) {
+            Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
+                return Ok((bind_socket((Ipv4Addr::UNSPECIFIED, port).into())?, None));
+            }
+            bound => bound?,
+        };
+        let chosen = v6
+            .local_addr()?
+            .as_socket()
+            .map_or(port, |addr| addr.port());
+        match bind_socket((Ipv4Addr::UNSPECIFIED, chosen).into()) {
+            Ok(v4) => return Ok((v6, Some(v4))),
+            Err(e)
+                if port == 0
+                    && tries < PAIR_TRIES
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                tries += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How many more ephemeral ports [`bind_pair`] tries after one that is taken for IPv4.
+#[cfg(any(windows, test))]
+const PAIR_TRIES: usize = 16;
+
+/// Creates an IPv6-only socket bound to `[::]:port`.
+#[cfg(any(windows, test))]
+fn bind_v6_only(port: u16) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    Ok(socket)
+}
+
+/// The address the IPv4 socket of a [`bind_pair`] sends `addr` to: an IPv4 address as it
+/// is and an IPv4-mapped IPv6 address unmapped; `None` for the addresses its IPv6-only
+/// socket sends to.
+#[cfg(any(windows, test))]
+pub(super) fn ipv4_destination(addr: SocketAddr) -> Option<SocketAddr> {
+    Some(unmap(addr)).filter(SocketAddr::is_ipv4)
 }
 
 /// Creates a UDP socket bound to exactly `addr`.

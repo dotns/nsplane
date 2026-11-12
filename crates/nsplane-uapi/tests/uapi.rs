@@ -158,6 +158,19 @@ async fn listen_port_rebinds_the_transport() {
     );
 }
 
+/// A port taken by an IPv4 listener alone is in use as well.
+#[tokio::test]
+async fn listen_port_taken_for_ipv4_is_reported() {
+    let node = Node::new();
+    let taken = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    assert_eq!(
+        node.request(&format!("set=1\nlisten_port={port}\n\n"))
+            .await,
+        "errno=98\n\n"
+    );
+}
+
 #[tokio::test]
 async fn settings_do_not_leak_into_the_next_peer_section() {
     let node = Node::new();

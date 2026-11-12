@@ -413,6 +413,37 @@ of one datagram each (a peer that sends no trains, e.g. kernel WireGuard) `recv_
 reads up to 16 datagrams per `recvmmsg` until a train arrives. With offload off, runs to one
 address and ECN mark go out with `sendmmsg` and `recv_batch` reads up to 16 datagrams per
 `recvmmsg`: batching, not offload, as every datagram stays its own message.
+
+On Windows a dual-stack socket on `[::]:port` does not own the IPv4 side of its port: a plain
+bind of `0.0.0.0:port` by anyone still succeeds, and that socket then gets every IPv4 datagram
+to the port, whichever was bound first. So there `UdpTransport::bind` of `[::]:port` binds two
+sockets on the port, an IPv6-only one and an IPv4 one (for port 0 the port the OS chose for
+IPv6, or after up to 16 more tries one that is also free for IPv4). If the IPv4 side of the
+port is taken the bind fails with `AddrInUse`, nothing stays bound, and `nsplane-uapi` answers
+`listen_port=` with errno 98; while the transport lives a plain bind of `0.0.0.0:port` or
+`[::]:port` fails with `WSAEADDRINUSE`. The API is the same: `local_addr` reports `[::]:port`,
+IPv4 peers are reported as plain IPv4 addresses, IPv4 and IPv4-mapped destinations leave the
+IPv4 socket (also from a `SideSender`), the buffer setters size both sockets (4 MiB requested
+for each by default) and the getters report the IPv6 one. Receiving takes the two sockets in
+turn while both hold datagrams: the order of arrival is kept within an address family, not
+across the two, and neither family waits behind a backlog of the other. Other platforms keep
+the one dual-stack socket, and where IPv6 is unavailable the fallback to one `0.0.0.0:port`
+socket is unchanged.
+
+What two sockets do not prevent, measured on Windows 11 (build 26100) against a transport on
+`[::]:port`, with the second socket bound by .NET with and without `SO_REUSEADDR`:
+
+| second socket binds | same user (elevated administrator, as the transport) | another, standard user |
+| --- | --- | --- |
+| `0.0.0.0:port` or `[::]:port` | refused: `WSAEADDRINUSE`, with `SO_REUSEADDR` `WSAEACCES` | refused: `WSAEADDRINUSE`, with `SO_REUSEADDR` `WSAEACCES` |
+| `127.0.0.1:port` or `[::1]:port` | bound, with or without `SO_REUSEADDR`: it then got 4 of 4 datagrams sent to that address, the transport none | refused: `WSAEACCES`, with or without `SO_REUSEADDR` |
+
+So `SO_REUSEADDR` opens nothing here, and another user cannot take any of the port. A process
+of the transport's own user can still bind one local address of the port and take the
+datagrams to that address; only `SO_EXCLUSIVEADDRUSE` on the transport's sockets refuses that
+bind, and `socket2` has no safe setter for it (`nsplane` forbids unsafe code). A transport on
+`0.0.0.0:port` measured the same for the IPv4 binds. Not measured: an administrator binding
+against a standard user's transport, and service accounts.
 ### In-memory channels
 
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests
