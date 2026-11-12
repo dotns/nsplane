@@ -636,10 +636,13 @@ mod tests {
         let addr = SocketAddr::from(([192, 0, 2, 1], 1000));
         let mut flooder = cookie_holder(&limiter, &public, addr);
 
-        let (_, elapsed) = flood(&limiter, &mut flooder, addr, 100);
-        let (passed, again) = flood(&limiter, &mut flooder, addr, 100);
+        // The clock covers both floods and the time between them, in which the second set
+        // of initiations is built: the bucket refills then too.
+        let start = std::time::Instant::now();
+        flood(&limiter, &mut flooder, addr, 100);
+        let (passed, _) = flood(&limiter, &mut flooder, addr, 100);
         assert!(
-            passed <= cookie_holder_allowance(elapsed + again) - 5,
+            passed <= cookie_holder_allowance(start.elapsed()) - 5,
             "{passed} of 100 passed with the bucket empty"
         );
 
