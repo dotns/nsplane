@@ -376,3 +376,27 @@ fn unknown_records_in_the_additional_section_are_skipped() {
     assert_eq!(packet.questions[0].qname.to_string(), "Host.Example");
     assert_eq!(packet.opt().unwrap().udp_packet_size, 1232);
 }
+
+#[test]
+fn the_reserved_header_bit_is_ignored_and_answered_with_zero() {
+    let mut message = query_message(9, "a.example", TYPE::A, true, None);
+    message[3] |= 0x40;
+    let query = Query::decode(&message).unwrap();
+    assert_eq!((query.id(), query.name()), (9, "a.example"));
+
+    let records = Answer::Records(vec![Record::a("a.example", 60, Ipv4Addr::LOCALHOST)]);
+    for answer in [records, Answer::Code(ResponseCode::NxDomain)] {
+        let bytes = encode_response(&query, &answer, 512, options());
+        assert_eq!(bytes[3] & 0x40, 0);
+        assert_eq!(Packet::parse(&bytes).unwrap().id(), 9);
+    }
+
+    // A response obtained elsewhere is passed on without the bit.
+    let code = Answer::Code(ResponseCode::NoError);
+    let mut raw = encode_response(&query, &code, 512, options()).to_vec();
+    raw[3] |= 0x40;
+    let answer = Answer::Raw(Bytes::from(raw.clone()));
+    let passed = encode_response(&query, &answer, 512, options());
+    raw[3] &= !0x40;
+    assert_eq!(passed, raw);
+}

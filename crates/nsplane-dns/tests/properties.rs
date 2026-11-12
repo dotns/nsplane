@@ -28,7 +28,8 @@ const QR: u16 = 0x8000;
 const TC: u16 = 0x0200;
 const RD: u16 = 0x0100;
 const RA: u16 = 0x0080;
-/// The reserved bit: the codec refuses a message that sets it.
+/// The reserved bit: ignored in a message received, zero in every message sent. (The codec
+/// refused a message that set it, so no generated query set it.)
 const Z: u16 = 0x0040;
 const OPCODE: u16 = 0x7800;
 /// The server's default EDNS payload size.
@@ -206,8 +207,8 @@ fn question(rng: &mut Rng) -> Question {
 fn query(rng: &mut Rng) -> Message {
     let extra = if rng.chance(20) { 1 + rng.below(2) } else { 0 };
     let flags = if rng.chance(5) {
-        // A client may set anything but QR and the opcode.
-        rng.u16() & !(QR | OPCODE | Z)
+        // A client may set anything but QR and the opcode, the reserved bit included.
+        rng.u16() & !(QR | OPCODE)
     } else {
         rng.pick(&[0, RD, RD, RD | 0x0020, 0x0010])
     };
@@ -449,7 +450,7 @@ fn assert_built_reply<'a>(response: &'a [u8], message: &Message, bytes: &[u8]) -
         .unwrap_or_else(|err| panic!("reply {response:02x?} to {bytes:02x?}: {err}"));
     let flags = flags_of(response);
     assert_eq!(packet.id(), message.id);
-    assert_eq!(flags & (QR | OPCODE | RA), QR | RA);
+    assert_eq!(flags & (QR | OPCODE | RA | Z), QR | RA);
     assert_eq!(flags & RD, message.flags & RD);
     let question_end = HEADER + message.question_section().len();
     assert_eq!(read16(response, 4), 1);
@@ -561,7 +562,10 @@ fn a_response_echoes_the_query_and_fits_the_limit() {
                 assert!(response.len() <= max_size);
                 if (HEADER..=max_size).contains(&len) {
                     assert_eq!(read16(&response, 0), message.id);
-                    assert_eq!(response[2..], raw[2..]);
+                    // Passed as it is, but for the ID and the reserved bit.
+                    assert_eq!(response[2], raw[2]);
+                    assert_eq!(u16::from(response[3]), u16::from(raw[3]) & !Z);
+                    assert_eq!(response[4..], raw[4..]);
                     raw_passed += 1;
                 } else {
                     let packet = assert_built_reply(&response, &message, &bytes);
@@ -690,6 +694,8 @@ async fn a_passed_response_arrives_whole_or_cut_to_its_questions() {
             let mut response = script.lock().unwrap().clone();
             response[..2].copy_from_slice(&buf[..2]);
             assert!(len >= HEADER);
+            // Whatever the client set, the reserved bit is not passed on.
+            assert_eq!(flags_of(&buf) & Z, 0);
             socket.send_to(&response, peer).await.unwrap();
         }
     });
@@ -705,8 +711,12 @@ async fn a_passed_response_arrives_whole_or_cut_to_its_questions() {
         let message = other_message(&mut rng);
         let bytes = message.encode();
         let pad = rng.pick(&[0, 100, 300, 480, 700, 1100, 1300, 3000]);
-        let response = upstream_response(&message, pad);
+        // The upstream echoes the flags, the reserved bit too when the client set it; the
+        // response reaches the client without that bit. (No message here had the bit while
+        // the codec refused it, in a query and in an upstream response alike.)
+        let mut response = upstream_response(&message, pad);
         expected.lock().unwrap().clone_from(&response);
+        response[3] &= 0xbf;
         let transport = rng.pick(&[Transport::Udp, Transport::Udp, Transport::Tcp]);
         let got = server.handle(&bytes, client(), transport).await.unwrap();
 

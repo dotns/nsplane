@@ -10,6 +10,8 @@ published.
   crate removed, unknown QTYPEs accepted, `PacketView` added.
 - In this repository, `Cargo.toml` gains `publish = false` and `rust-version` (the workspace
   MSRV, checked by `just msrv`), and `repository` points at upstream.
+- Changed here since the import: the reserved Z bit of a header is ignored when parsing
+  instead of failing the message (it is still never written).
 - License: MIT (`LICENSE`), unchanged.
 
 Upstream changes are reviewed by hand and applied as ordinary commits; the upstream history

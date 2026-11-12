@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::message::{Answer, Query, ResponseCode, name_text};
+use crate::message::{Answer, Query, ResponseCode, Z_BIT, name_text};
 
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
@@ -153,7 +153,8 @@ impl Forwarder {
     }
 
     /// Passes the DNS message `message` to the upstreams byte for byte and returns the
-    /// response, with the message's ID.
+    /// response, with the message's ID. The reserved header bit (Z) alone is cleared, in what
+    /// is sent and in what is returned.
     ///
     /// Attempts, transaction IDs, the TCP retry and the counters work as for queries, but the
     /// message is not decoded: a response is accepted when it has the transaction ID, `QR` = 1
@@ -178,6 +179,7 @@ impl Forwarder {
         };
         let mut response = self.exchange(message, matches).await?.to_vec();
         response[..2].copy_from_slice(&message[..2]);
+        response[3] &= !Z_BIT;
         Some(Bytes::from(response))
     }
 
@@ -225,6 +227,7 @@ impl Forwarder {
         let id = transaction_id()?;
         let mut message = message.to_vec();
         message[..2].copy_from_slice(&id.to_be_bytes());
+        message[3] &= !Z_BIT;
 
         let deadline = Instant::now() + self.config.timeout;
         let udp = timeout_at(deadline, async {

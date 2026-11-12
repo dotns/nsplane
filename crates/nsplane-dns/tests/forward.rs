@@ -12,6 +12,7 @@ use simple_dns::rdata::{A, RData};
 use simple_dns::{CLASS, Name, Packet, PacketFlag, Question, ResourceRecord, TYPE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
 
 fn query(name: &str) -> Query {
     let mut packet = Packet::new_query(0x1234);
@@ -399,6 +400,61 @@ async fn answers_servfail_when_every_attempt_fails() {
     let stats = forwarder.stats();
     assert_eq!((stats.forwarded, stats.failures), (0, 1));
     assert!(stats.timeouts >= 2);
+}
+
+/// An upstream that answers every request with `192.0.2.1` and the reserved header bit
+/// set, and reports the second flags byte of each request it saw.
+async fn reserved_bit_stub() -> (SocketAddr, mpsc::UnboundedReceiver<u8>) {
+    let (stub, addr) = udp_stub().await;
+    let (seen, requests) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (len, peer) = stub.recv_from(&mut buf).await.unwrap();
+            let _ = seen.send(buf[3]);
+            let mut clean = buf[..len].to_vec();
+            clean[3] &= !0x40;
+            let addrs = [Ipv4Addr::new(192, 0, 2, 1)];
+            let mut reply = response(&clean, None, "host.example", &addrs, false);
+            reply[3] |= 0x40;
+            stub.send_to(&reply, peer).await.unwrap();
+        }
+    });
+    (addr, requests)
+}
+
+#[tokio::test]
+async fn an_upstream_response_with_the_reserved_bit_is_accepted() {
+    let (addr, _requests) = reserved_bit_stub().await;
+    let forwarder = Forwarder::new(config(vec![addr])).unwrap();
+    let query = query("host.example");
+    let answer = forwarder.resolve(&query, client()).await;
+    assert_eq!(answer_addrs(&answer), vec![Ipv4Addr::new(192, 0, 2, 1)]);
+    assert_eq!(forwarder.stats().timeouts, 0);
+
+    // A message passed as it is comes back without the bit.
+    let raw = forwarder.forward(query.raw()).await.unwrap();
+    assert_eq!(raw[3] & 0x40, 0);
+    assert_eq!(
+        answer_addrs(&Answer::Raw(raw)),
+        vec![Ipv4Addr::new(192, 0, 2, 1)]
+    );
+}
+
+#[tokio::test]
+async fn the_reserved_bit_of_a_client_is_not_sent_upstream() {
+    let (addr, mut requests) = reserved_bit_stub().await;
+    let forwarder = Forwarder::new(config(vec![addr])).unwrap();
+    let mut message = query("host.example").raw().to_vec();
+    message[3] |= 0x40;
+
+    assert!(forwarder.forward(&message).await.is_some());
+    assert_eq!(requests.recv().await.unwrap() & 0x40, 0);
+
+    let query = Query::decode(&message).unwrap();
+    let answer = forwarder.resolve(&query, client()).await;
+    assert_eq!(answer_addrs(&answer), vec![Ipv4Addr::new(192, 0, 2, 1)]);
+    assert_eq!(requests.recv().await.unwrap() & 0x40, 0);
 }
 
 #[test]

@@ -17,6 +17,10 @@ use simple_dns::{
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
 
+/// The reserved Z bit, in the second flags byte of the header: zero in every message sent
+/// (RFC 1035 section 4.1.1), ignored in a message received.
+pub(crate) const Z_BIT: u8 = 0x40;
+
 /// Longest label, in octets.
 const MAX_LABEL_LEN: usize = 63;
 
@@ -227,8 +231,8 @@ pub enum Answer {
     Records(Vec<Record>),
     /// No answer records, with this response code.
     Code(ResponseCode),
-    /// A complete DNS response obtained elsewhere, passed through with only its ID replaced
-    /// by the query's.
+    /// A complete DNS response obtained elsewhere, passed through with its ID replaced by the
+    /// query's and the reserved header bit (Z) cleared.
     Raw(Bytes),
 }
 
@@ -511,7 +515,7 @@ pub(crate) fn udp_response_limit(client: Option<u16>, options: EncodeOptions) ->
 /// The response echoes the ID, `RD` and the question as the client sent it, and sets `QR`
 /// and `RA`. [`Answer::Records`] and [`Answer::Code`] are local answers (`AA` = 1); an EDNS
 /// query gets an OPT record advertising `options.udp_payload_size`. [`Answer::Raw`] is
-/// passed through with the ID replaced. A response longer than `max_size` is replaced by a
+/// passed through with the ID replaced and the reserved Z bit cleared. A response longer than `max_size` is replaced by a
 /// truncated one (`TC` = 1): the header, the question and the OPT record, no answers, so it
 /// fits any `max_size` of at least 512. Records that cannot be encoded (a label over 63
 /// octets, a name over 255, a TXT string over 255 bytes) give `SERVFAIL`.
@@ -529,6 +533,7 @@ pub fn encode_response(
         Answer::Raw(raw) => (raw.len() >= HEADER_LEN).then(|| {
             let mut out = raw.to_vec();
             out[..2].copy_from_slice(&query.id.to_be_bytes());
+            out[3] &= !Z_BIT;
             out
         }),
     };

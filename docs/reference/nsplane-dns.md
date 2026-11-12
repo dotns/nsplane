@@ -48,6 +48,14 @@ question or OPT record that does not parse, a record cut off) or zero or several
 than the header or a response. `encode_error(id, code)` answers the former without a
 question.
 
+The reserved header bit (Z, RFC 1035 section 4.1.1: zero in every query and response) is
+ignored in a message received, a query and an upstream response alike, as common resolvers
+do, and is zero in everything sent: a built response never has it, and a query sent
+upstream, an `Answer::Raw` and a message or response passed by `Forwarder::forward` have it
+cleared, the one change to passed bytes besides the ID. Up to 0.22.2 a message with the bit
+did not parse: a query got `FORMERR`, and an upstream response was ignored until the attempt
+timed out, which broke resolution through an upstream that sets it.
+
 `encode_response` echoes the ID, `RD` and the question as the client sent it (its case
 included), sets `QR` and `RA`, and sets `AA` for local answers (`Answer::Records`,
 `Answer::Code`). `Answer::Records` with an empty list is `NODATA`. When the query carried an

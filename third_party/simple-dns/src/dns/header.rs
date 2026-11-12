@@ -4,7 +4,6 @@ use super::{PacketFlag, OPCODE, RCODE};
 
 pub(crate) mod masks {
     pub const OPCODE_MASK: u16 = 0b0111_1000_0000_0000;
-    pub const RESERVED_MASK: u16 = 0b0000_0000_0100_0000;
     pub const RESPONSE_CODE_MASK: u16 = 0b0000_0000_0000_1111;
 }
 /// Contains general information about the packet
@@ -76,10 +75,10 @@ impl<'a> Header<'a> {
     pub fn parse(data: &mut BytesBuffer) -> crate::Result<Self> {
         let id = data.get_u16()?;
         let flags = data.get_u16()?;
-        if flags & masks::RESERVED_MASK != 0 {
-            return Err(crate::SimpleDnsError::InvalidHeaderData);
-        }
 
+        // The reserved Z bit must be zero when sent (RFC 1035 section 4.1.1). It is ignored
+        // when received, as resolvers do: `from_bits_truncate` drops it, so it is never
+        // written back.
         let header = Self {
             id,
             opcode: ((flags & masks::OPCODE_MASK) >> masks::OPCODE_MASK.trailing_zeros()).into(),
@@ -186,6 +185,21 @@ mod tests {
         assert_eq!(2, header_buffer::answers(&buffer[..]).unwrap());
         assert_eq!(2, header_buffer::name_servers(&buffer[..]).unwrap());
         assert_eq!(2, header_buffer::questions(&buffer[..]).unwrap());
+    }
+
+    #[test]
+    fn reserved_bit_is_ignored_on_parse_and_written_as_zero() {
+        let buffer = b"\xff\xff\x03\x40\x00\x00\x00\x00\x00\x00\x00\x00";
+        let header = Header::parse(&mut buffer[..].into()).unwrap();
+        assert!(header.has_flags(PacketFlag::TRUNCATION | PacketFlag::RECURSION_DESIRED));
+        assert_eq!(RCODE::NoError, header.response_code);
+
+        let mut buf = vec![];
+        header.write_to(&mut buf, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            b"\xff\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            &buf[..]
+        );
     }
 
     #[test]
