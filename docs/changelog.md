@@ -846,3 +846,9 @@ GIDs kept on macOS: by the owner's decision the new crate `nsplane-sys` holds th
 behind safe functions (`20261112-0202-sys-wrapper-crate`). The observations of the property
 tests were settled in `20261112-0201-property-test-followups`: six defects fixed, among them
 a DNS policy bypass through a dot inside a label, two kept as deliberate.
+
+## 2026-11-12 [release]
+
+Released 0.23.0: the fixes of the audit of `857f34f` in four batches, the new crate
+`nsplane-sys`, and the first runs of the tests on real Windows 11 and macOS hosts. Breaking:
+`nsplane_tun::adopt_fd` and `Tun::from_raw_fd` are removed.

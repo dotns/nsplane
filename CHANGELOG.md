@@ -5,6 +5,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-12
+
 ### Added
 - nsplane-dns: `ServerConfig::max_tcp_connections` (default 256) caps the connections of
   `Server::serve_tcp`; a connection above the cap is closed at once and counted in
