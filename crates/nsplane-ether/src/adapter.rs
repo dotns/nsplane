@@ -36,6 +36,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+use nsplane_packet::checksum::internet_checksum;
 use nsplane_packet::{Ipv4Header, Ipv6Header, UdpHeader, protocol};
 
 use crate::frame::{self, EtherType, Frame, HEADER_LEN};
@@ -47,6 +48,9 @@ pub const DEFAULT_MTU: u16 = 1500;
 
 /// Length of the IPv6 fixed header.
 const IPV6_HEADER_LEN: usize = 40;
+
+/// Length of the UDP header.
+const UDP_HEADER_LEN: usize = 8;
 
 /// Most learned guest addresses kept per family; the oldest is forgotten first.
 pub const OWN_ADDRESSES: usize = 16;
@@ -395,9 +399,24 @@ impl EtherAdapter {
             && !header.more_fragments()
             && header.fragment_offset() == 0
             && (header.dst() == Ipv4Addr::BROADCAST || header.dst() == server.config().server_ip)
-            && let Ok((udp, message)) = UdpHeader::parse(payload)
+            && let Ok((udp, datagram)) = UdpHeader::parse(payload)
             && udp.dst_port() == dhcp::SERVER_PORT
         {
+            // The adapter is the host this datagram is for, so it checks what a receiving
+            // host must: the IPv4 header checksum, which no offload leaves for later, and
+            // a UDP length within the packet, where the message ends. The UDP checksum is
+            // left alone: a guest with checksum offload may send it partial.
+            let sound = frame
+                .payload
+                .get(..header.header_len())
+                .is_some_and(|bytes| internet_checksum(bytes) == 0);
+            let message = usize::from(udp.len())
+                .checked_sub(UDP_HEADER_LEN)
+                .and_then(|len| datagram.get(..len));
+            let Some(message) = message.filter(|_| sound) else {
+                self.stats.drop_malformed += 1;
+                return None;
+            };
             match server
                 .handle(message, frame.src)
                 .and_then(|reply| server.reply_frame(&reply, self.gateway_mac))
@@ -885,6 +904,43 @@ mod tests {
         );
         assert_eq!(a.stats().dhcp_replies, 5);
         assert_eq!(a.stats().drop_unanswered, 0);
+    }
+
+    #[test]
+    fn dhcp_needs_a_sound_ip_header_and_udp_length() {
+        let mut a = adapter(None);
+        let mut replies = Vec::new();
+        let good = dhcp_frame(GUEST_MAC, MessageType::Discover);
+        // The frame is 14 bytes of Ethernet, 20 of IPv4 and 8 of UDP before the message.
+        let udp_len = u16::from_be_bytes([good[38], good[39]]);
+        assert_eq!(usize::from(udp_len), good.len() - 34);
+        let with_udp_len = |len: u16| {
+            let mut frame = good.clone();
+            frame[38..40].copy_from_slice(&len.to_be_bytes());
+            frame
+        };
+        let mut bad_header = good.clone();
+        bad_header[24] ^= 0x10;
+        let malformed = [bad_header, with_udp_len(udp_len + 1), with_udp_len(7)];
+        for frame in &malformed {
+            assert_eq!(a.from_guest(frame, &mut replies), None);
+            assert_eq!(replies.len(), 0, "{frame:02x?}");
+        }
+        assert_eq!(a.stats().drop_malformed, 3);
+
+        // The message ends where the UDP length says: cut before its options, it is no
+        // DHCP message, whatever follows in the IP payload.
+        assert_eq!(a.from_guest(&with_udp_len(8 + 236), &mut replies), None);
+        assert_eq!(replies.len(), 0);
+        assert_eq!(a.stats().drop_unanswered, 1);
+
+        // The UDP checksum is not checked: an offloading guest may leave it partial.
+        let mut partial = good.clone();
+        partial[40] ^= 0xff;
+        a.from_guest(&partial, &mut replies);
+        a.from_guest(&good, &mut replies);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(a.stats().dhcp_replies, 2);
     }
 
     #[test]

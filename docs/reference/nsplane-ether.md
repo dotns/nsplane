@@ -147,6 +147,13 @@ With `EtherConfig::dhcp` set, an unfragmented IPv4 UDP datagram to port 67 sent 
 exactly one address, `DhcpConfig::guest_ip`; port 67 to any other address is ordinary
 traffic for the IP side. Without `dhcp`, DHCP traffic goes to the IP side too.
 
+The adapter is the receiving host of such a datagram, so it checks the IPv4 header checksum
+and the UDP length before the server sees the message: a wrong header checksum, or a UDP
+length below 8 or beyond the IP payload, drops the frame as `drop_malformed`, and the message
+ends where the UDP length says. The UDP checksum is not checked: the adapter is handed bare
+frames, and a guest with checksum offload may send that checksum partial on a transport that
+does not complete it (the header checksum is never offloaded).
+
 - DISCOVER: OFFER of the guest address.
 - REQUEST naming this server, or naming no server with the guest address as requested
   address (option 50) or `ciaddr` (init-reboot, renewing, rebinding): ACK. A request for
@@ -186,7 +193,9 @@ change, no checksum check), cut to their IP header's length; a packet shorter th
 header states is dropped as `drop_malformed`. In the other direction `to_guest` frames any
 packet whose first nibble is 4 or 6 and drops anything else as `drop_bad_ip`. The MTU is
 advertised (router advertisements, `EtherSource`'s MTU) and not enforced: a packet in either
-direction is passed whatever its size, up to `MAX_FRAME_LEN`.
+direction is passed whatever its size, up to `MAX_FRAME_LEN`. No checksum of a passed packet
+is checked because the adapter is a link for it, not its receiver: whoever receives or routes
+the packet on the IP side verifies it, as it would behind any other link.
 
 ### Ports
 
@@ -385,7 +394,7 @@ Everything the adapter discards is counted in `EtherStats` (from `EtherAdapter::
 
 | Counter | Dropped |
 |---|---|
-| `drop_malformed` | bad ethernet header (truncated, 802.3 length, VLAN tag), multicast source MAC, malformed ARP, IP shorter than its header states, neighbor discovery failing validation |
+| `drop_malformed` | bad ethernet header (truncated, 802.3 length, VLAN tag), multicast source MAC, malformed ARP, IP shorter than its header states, neighbor discovery failing validation, a datagram for the DHCP server with a wrong IPv4 header checksum or UDP length |
 | `drop_not_for_gateway` | guest frame to another unicast MAC |
 | `drop_unsupported` | guest frame that is neither ARP, IPv4 nor IPv6 |
 | `drop_unanswered` | ARP, neighbor discovery or DHCP message consumed without a reply |

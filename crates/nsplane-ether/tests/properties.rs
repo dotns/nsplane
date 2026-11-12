@@ -1002,7 +1002,7 @@ fn assert_reply(reply: &[u8], lease: bool) {
 #[test]
 fn the_adapter_accounts_for_every_frame_and_passes_only_whole_ip_packets() {
     let mut rng = Rng(0x5eed_e707);
-    let (mut passed, mut answered) = (0, 0);
+    let (mut passed, mut answered, mut answered_dhcp) = (0, 0, 0);
     for round in 0..40 {
         let prefix = (round % 2 == 0).then_some(PREFIX);
         let config = EtherConfig {
@@ -1056,6 +1056,19 @@ fn the_adapter_accounts_for_every_frame_and_passes_only_whole_ip_packets() {
             }
             for reply in &replies {
                 assert_reply(reply, config.dhcp.is_some());
+                // The model used to let any datagram to port 67 be answered. The adapter
+                // is the receiving host of a DHCP datagram, so a reply now also says the
+                // request had a correct IPv4 header checksum and a UDP length that ends
+                // inside the packet, with a whole DHCP message before that end.
+                if Frame::parse(reply).unwrap().ethertype == EtherType::IPV4 {
+                    let request = &bytes[HEADER_LEN..];
+                    let header_len = usize::from(request[0] & 0x0f) * 4;
+                    assert_eq!(internet_checksum(&request[..header_len]), 0);
+                    let datagram = &request[header_len..usize::from(read16(request, 2))];
+                    let message = &datagram[8..usize::from(read16(datagram, 4))];
+                    assert!(dhcp_valid(message), "{bytes:02x?}");
+                    answered_dhcp += 1;
+                }
             }
             sent_replies += u64::try_from(replies.len()).unwrap();
             answered += replies.len();
@@ -1090,4 +1103,5 @@ fn the_adapter_accounts_for_every_frame_and_passes_only_whole_ip_packets() {
         }
     }
     assert!(passed > 1_500 && answered > 1_500, "{passed} {answered}");
+    assert!(answered_dhcp > 200, "{answered_dhcp}");
 }
