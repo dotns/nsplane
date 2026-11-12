@@ -74,7 +74,9 @@
 //! and bytes, and expire after 60 seconds, which
 //! [`TranslatorStats::fragment_budget_drops`] and
 //! [`TranslatorStats::fragment_timeouts`] count. Other fragments, and IPv6
-//! fragments, are translated one by one. The bounds (256 datagrams, 1 MiB,
+//! fragments, are translated one by one; an IPv6 atomic fragment (offset 0, no
+//! M flag: a whole datagram, RFC 6946) has its TCP or UDP checksum and UDP
+//! length verified like an unfragmented packet. The bounds (256 datagrams, 1 MiB,
 //! 60 seconds), the markers and the other drop reasons are those of 0.9.0;
 //! duplicates differ in three ways. An exact duplicate of a held fragment
 //! counts in [`TranslatorStats::fragments_held`] and in the byte budget. A

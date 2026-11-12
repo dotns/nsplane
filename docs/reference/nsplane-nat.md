@@ -75,7 +75,8 @@ tests (UDP, TCP, ICMP Echo, coexistence with `eam4`); native IPv4 and IPv6 pass 
 local-view address are dropped. TTL/hop limit, ICMP/ICMPv6 (echo and errors, including the
 quoted packet and the MTU of Fragmentation Needed / Packet Too Big) and fragments (with an
 IPv6 Fragment header) are translated; TCP/UDP checksums are verified and updated
-incrementally. The packet quoted in an ICMP error ends at its own length: padding after it
+incrementally, also in an IPv6 atomic fragment (offset 0, no M flag), which carries a whole
+datagram. The packet quoted in an ICMP error ends at its own length: padding after it
 and an RFC 4884 extension structure (an MPLS label stack, say; located through the length
 attribute of the message, so a truncated quote does not run into it) are accepted and left
 out of the translated error, which is a limitation against RFC 7915 section 4.2 (it asks

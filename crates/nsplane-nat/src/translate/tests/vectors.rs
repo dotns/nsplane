@@ -518,6 +518,40 @@ fn fragment_fields_convert_in_both_directions() {
 }
 
 #[test]
+fn an_atomic_ipv6_fragment_is_checked_as_the_whole_datagram_it_is() {
+    // A fragment header with offset 0 and no M flag (RFC 6946) carries a whole
+    // datagram and becomes an unfragmented IPv4 packet.
+    let mut extension = vec![44, protocol::UDP, 0, 0, 0];
+    extension.extend_from_slice(&0xabcd_u32.to_be_bytes());
+    let udp = udp_in(b"atomic");
+    let v4 = in_ok(&inbound6(protocol::UDP, 64, 0, &extension, &udp));
+    check_v4(&v4);
+    assert_eq!(u16::from_be_bytes([v4[6], v4[7]]) & 0x3fff, 0);
+
+    let mut corrupt = udp.clone();
+    corrupt[10] ^= 1;
+    assert_eq!(
+        in_drop(&inbound6(protocol::UDP, 64, 0, &extension, &corrupt)),
+        reasons::INVALID_CHECKSUM
+    );
+    let mut short = udp;
+    short[5] += 1;
+    assert_eq!(
+        in_drop(&inbound6(protocol::UDP, 64, 0, &extension, &short)),
+        reasons::LENGTH_MISMATCH
+    );
+
+    extension[1] = protocol::TCP;
+    let mut tcp = tcp6(peer_eam6(), self_eam6(), b"atomic");
+    check_v4(&in_ok(&inbound6(protocol::TCP, 64, 0, &extension, &tcp)));
+    tcp[20] ^= 1;
+    assert_eq!(
+        in_drop(&inbound6(protocol::TCP, 64, 0, &extension, &tcp)),
+        reasons::INVALID_CHECKSUM
+    );
+}
+
+#[test]
 fn fragmented_icmp_and_bad_fragments_are_dropped() {
     let hdr = Hdr4 {
         fragment: 0x2000,

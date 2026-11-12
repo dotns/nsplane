@@ -340,7 +340,11 @@ pub(super) fn v6_to_v4(
     let payload = &mut packet.as_packet_mut()[v6.payload.clone()];
     let body = match v6.protocol {
         protocol::TCP | protocol::UDP if v6.has_transport_header() => {
-            transport_v6_to_v4(payload, v6.protocol, addrs, v6.fragment.is_some())?;
+            // An atomic fragment (RFC 6946) carries the whole datagram.
+            let fragmented = v6
+                .fragment
+                .is_some_and(|fragment| fragment.more || fragment.offset != 0);
+            transport_v6_to_v4(payload, v6.protocol, addrs, fragmented)?;
             None
         }
         protocol::TCP | protocol::UDP => None,
