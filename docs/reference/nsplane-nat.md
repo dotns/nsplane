@@ -84,7 +84,16 @@ for the extension to be carried over). An IPv6 error whose `peer6`/`local6` addr
 only rewritten keeps those bytes. The upper layer of a quoted packet is translated as far as
 the quote holds it: a TCP or UDP checksum once the quote reaches the end of that field, the
 type of an echo message from its first byte on (a header cut below four bytes kept the type
-of the other family up to 0.22.2) and its checksum from four bytes on. TCP checksum fields of `0x0000` are valid when the sum verifies,
+of the other family up to 0.22.2) and its checksum from four bytes on. A quoted IPv4 UDP
+datagram without a checksum keeps the zero in the IPv6 quote, on purpose: a quote is usually
+cut short, so no checksum can be computed over it, the host that gets the error matches the
+quote to a socket by its addresses and ports and verifies no checksum in it, and a datagram
+that reached the quoting host through this translator never carries a zero. A quote of any
+other protocol is carried with its addresses translated. ESP and No Next Header behind a
+Fragment header are read as the fragmented protocol, and a packet of them is then refused
+like an unfragmented one (`reasons::UNSUPPORTED_PROTOCOL`); they pass only where any
+protocol does, in a quote and in a `peer6`/`local6` address rewrite, whereas the same two
+right in an extension chain, quoted or not, are refused by the chain walk. TCP checksum fields of `0x0000` are valid when the sum verifies,
 including after an incremental update and inside ICMP quotations. IPv4 UDP zero
 means absent and gets computed for IPv6; IPv6 UDP zero is rejected. Only UDP maps
 a computed zero to `0xffff`. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in
