@@ -23,7 +23,13 @@
 //!   and fragments of both families together (one budget per peer). One
 //!   peer holds at most half of the fragment table unless
 //!   [`FlowGate::set_fragments_per_peer`] says otherwise, so a peer sending
-//!   first fragments cannot take the slots of the others.
+//!   first fragments cannot take the slots of the others. Expired entries
+//!   are reclaimed when they are looked up and, at a limit, by a sweep of
+//!   the peer's shard (a per-peer limit) or of every shard (a limit of the
+//!   whole table). After a sweep that reclaimed nothing, the next sweep of
+//!   the same kind waits 100 ms, so refused packets do not each walk the
+//!   state; an expired entry thus makes room at a limit at most 100 ms
+//!   after its expiry.
 //! - **Holds** ([`GateHolds`]): packets held fail closed in every mode before
 //!   any scope is consulted.
 //! - **Unbound rules** ([`UnboundRule`]): what happens to inbound packets of

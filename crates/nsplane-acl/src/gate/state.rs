@@ -3,6 +3,12 @@
 //! Expiry is lazy: an expired entry is dropped when it is looked up, and a
 //! shard (or every shard) is swept only when a limit would be hit, so a
 //! capacity verdict is reached only after expired entries were reclaimed.
+//!
+//! Sweeps are paced, so packets refused at a limit do not each walk the
+//! state: after a sweep that reclaimed nothing, the next sweep of the same
+//! kind (that shard's, or every shard's) waits [`SWEEP_PAUSE`]. An entry
+//! that expires therefore makes room at a limit at most [`SWEEP_PAUSE`]
+//! after its expiry.
 
 use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -18,6 +24,10 @@ use super::config::{GateConfig, GateTimeouts};
 use super::hash::FastMap;
 use super::policy::Slot;
 use crate::rules::{RuleId, Transport};
+
+/// How long a sweep that reclaimed nothing keeps the next one of the same
+/// kind (one shard's, or every shard's) from running.
+pub(super) const SWEEP_PAUSE: Duration = Duration::from_millis(100);
 
 /// Number of state shards.
 pub(super) const SHARD_COUNT: usize = 64;
@@ -173,6 +183,29 @@ pub(super) enum Admission {
     SweepAll,
 }
 
+/// Paces the sweeps of one shard or of every shard.
+#[derive(Debug, Default)]
+pub(super) struct SweepPace {
+    /// When the last sweep ran, if it reclaimed nothing.
+    idle_at: Option<Instant>,
+}
+
+impl SweepPace {
+    /// Whether a sweep may run at `now`: not within [`SWEEP_PAUSE`] after
+    /// one that reclaimed nothing.
+    fn due(&self, now: Instant) -> bool {
+        !self.idle_at.is_some_and(|idle_at| {
+            now.checked_duration_since(idle_at)
+                .is_some_and(|since| since < SWEEP_PAUSE)
+        })
+    }
+
+    /// Record a sweep at `now` that reclaimed `freed` entries.
+    fn ran(&mut self, now: Instant, freed: usize) {
+        self.idle_at = (freed == 0).then_some(now);
+    }
+}
+
 /// Global entry counts, the configured limits and the timeouts.
 #[derive(Debug)]
 pub(super) struct Counts {
@@ -240,6 +273,8 @@ pub(super) struct Shard {
     pub(super) fragments6: FastMap<FragmentKey<Ipv6Addr>, FragmentState>,
     pub(super) peer_flows: FastMap<PeerId, usize>,
     pub(super) peer_fragments: FastMap<PeerId, usize>,
+    /// Paces the sweeps a per-peer limit asks of this shard.
+    sweep_pace: SweepPace,
 }
 
 impl Shard {
@@ -249,10 +284,18 @@ impl Shard {
         A::shard(self)
     }
 
-    /// Remove every expired entry of this shard.
-    pub(super) fn sweep(&mut self, now: Instant, counts: &Counts) {
-        self.family::<Ipv4Addr>().sweep(now, counts);
-        self.family::<Ipv6Addr>().sweep(now, counts);
+    /// Remove every expired entry of this shard; returns how many.
+    pub(super) fn sweep(&mut self, now: Instant, counts: &Counts) -> usize {
+        self.family::<Ipv4Addr>().sweep(now, counts) + self.family::<Ipv6Addr>().sweep(now, counts)
+    }
+
+    /// [`sweep`](Self::sweep) for a per-peer limit, unless the last such
+    /// sweep reclaimed nothing less than [`SWEEP_PAUSE`] ago.
+    fn sweep_at_limit(&mut self, now: Instant, counts: &Counts) {
+        if self.sweep_pace.due(now) {
+            let freed = self.sweep(now, counts);
+            self.sweep_pace.ran(now, freed);
+        }
     }
 
     /// Insert a new flow and, for a first fragment, its fragment authority,
@@ -297,7 +340,7 @@ impl Shard {
             None => false,
         };
         if new_flow && family.peer_flow_count(key.peer) >= counts.peer_limit {
-            self.sweep(now, counts);
+            self.sweep_at_limit(now, counts);
             if self.family::<A>().peer_flow_count(key.peer) >= counts.peer_limit {
                 return Admission::Full;
             }
@@ -344,7 +387,7 @@ impl Shard {
         if self.peer_fragment_count(peer) < limit {
             return true;
         }
-        self.sweep(now, counts);
+        self.sweep_at_limit(now, counts);
         if self.peer_fragment_count(peer) < limit {
             return true;
         }
@@ -472,10 +515,12 @@ impl<A: GateAddr> FamilyShard<'_, A> {
         Some(state.disposition)
     }
 
-    /// Remove every expired entry of this family.
-    fn sweep(&mut self, now: Instant, counts: &Counts) {
+    /// Remove every expired entry of this family; returns how many.
+    fn sweep(&mut self, now: Instant, counts: &Counts) -> usize {
+        let before = self.flows.len() + self.fragments.len();
         self.retain_flows(counts, |_, state| state.expires_at > now);
         self.retain_fragments(counts, |_, state| state.expires_at > now);
+        before - (self.flows.len() + self.fragments.len())
     }
 
     pub(super) fn retain_flows(
@@ -535,6 +580,9 @@ fn forget_peer_entry(counts: &mut FastMap<PeerId, usize>, peer: PeerId) {
 pub(super) struct StateTable {
     shards: Box<[Mutex<Shard>]>,
     pub(super) counts: Counts,
+    /// Paces [`sweep_all`](Self::sweep_all); held for the whole sweep, so
+    /// concurrent callers wait for one sweep instead of each running one.
+    sweep_pace: Mutex<SweepPace>,
 }
 
 impl StateTable {
@@ -553,6 +601,7 @@ impl StateTable {
                 peer_fragment_refusals: AtomicU64::new(0),
                 timeouts: config.timeouts,
             },
+            sweep_pace: Mutex::default(),
         }
     }
 
@@ -572,11 +621,22 @@ impl StateTable {
             .collect()
     }
 
-    /// Reclaim every expired entry. The caller holds no shard lock.
+    /// Reclaim every expired entry, unless the last such sweep reclaimed
+    /// nothing less than [`SWEEP_PAUSE`] ago. The caller holds no shard
+    /// lock.
     pub(super) fn sweep_all(&self, now: Instant) {
-        for mut shard in self.lock_all() {
-            shard.sweep(now, &self.counts);
+        let mut pace = self
+            .sweep_pace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !pace.due(now) {
+            return;
         }
+        let mut freed = 0;
+        for mut shard in self.lock_all() {
+            freed += shard.sweep(now, &self.counts);
+        }
+        pace.ran(now, freed);
     }
 }
 

@@ -141,6 +141,119 @@ fn the_fragment_limit_sweeps_every_shard_before_failing_closed() {
     assert_eq!(audit(&gate), (2, 1));
 }
 
+/// Just under the pause after a sweep that reclaimed nothing.
+const WITHIN_PAUSE: Duration = Duration::from_millis(40);
+
+#[test]
+fn a_sweep_of_a_shard_that_freed_nothing_is_not_repeated_at_once() {
+    let gate = limited(16, 1, 16);
+    gate.replace(policy(vec![open_scope(GateMode::Enforce)]))
+        .unwrap();
+    let start = Instant::now();
+    let inbound = |port, at| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            PEER,
+            &udp(REMOTE, LOCAL, port, 53),
+            at,
+        )
+    };
+    assert_eq!(inbound(40_000, start), granted("in"));
+    let expiry = start + timeouts().udp;
+    let idle_sweep = start + timeouts().udp.saturating_sub(WITHIN_PAUSE);
+    assert_eq!(
+        inbound(40_001, idle_sweep),
+        denied(GateReason::StateCapacity),
+        "this sweep reclaims nothing"
+    );
+    assert_eq!(
+        inbound(40_001, expiry + WITHIN_PAUSE),
+        denied(GateReason::StateCapacity),
+        "no second sweep within the pause, although the flow has expired"
+    );
+    assert_eq!(audit(&gate), (1, 0));
+    assert_eq!(
+        inbound(40_001, idle_sweep + state::SWEEP_PAUSE),
+        granted("in"),
+        "the expired flow makes room once the pause is over"
+    );
+    // The pause starts over with each sweep that reclaims nothing.
+    let second = idle_sweep + state::SWEEP_PAUSE;
+    assert_eq!(
+        inbound(40_002, second + timeouts().udp.saturating_sub(WITHIN_PAUSE)),
+        denied(GateReason::StateCapacity)
+    );
+    assert_eq!(
+        inbound(40_002, second + timeouts().udp + WITHIN_PAUSE),
+        denied(GateReason::StateCapacity)
+    );
+    assert_eq!(audit(&gate), (1, 0));
+}
+
+#[test]
+fn a_sweep_of_every_shard_that_freed_nothing_is_not_repeated_at_once() {
+    let peer_2 = peer_in_other_shard();
+    let gate = limited(1, 16, 16);
+    gate.replace(two_peer_policy(peer_2)).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            PEER,
+            &udp(REMOTE, LOCAL, 40_000, 53),
+            start,
+        ),
+        granted("in")
+    );
+    let other = |at| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            peer_2,
+            &udp(REMOTE_2, LOCAL, 40_000, 53),
+            at,
+        )
+    };
+    let expiry = start + timeouts().udp;
+    let idle_sweep = start + timeouts().udp.saturating_sub(WITHIN_PAUSE);
+    assert_eq!(other(idle_sweep), denied(GateReason::StateCapacity));
+    assert_eq!(
+        other(expiry + WITHIN_PAUSE),
+        denied(GateReason::StateCapacity),
+        "no second sweep within the pause, although the flow has expired"
+    );
+    assert_eq!(audit(&gate), (1, 0));
+    assert_eq!(
+        other(idle_sweep + state::SWEEP_PAUSE),
+        granted("in"),
+        "the expired flow of the other shard makes room once the pause is over"
+    );
+    assert_eq!(audit(&gate), (1, 0));
+}
+
+#[test]
+fn a_sweep_that_freed_something_does_not_hold_the_next_one_back() {
+    let gate = limited(16, 1, 16);
+    gate.replace(policy(vec![open_scope(GateMode::Enforce)]))
+        .unwrap();
+    let start = Instant::now();
+    let inbound = |port, at| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            PEER,
+            &udp(REMOTE, LOCAL, port, 53),
+            at,
+        )
+    };
+    let mut at = start;
+    assert_eq!(inbound(40_000, at), granted("in"));
+    for port in 40_001..40_004 {
+        // Each sweep reclaims the previous flow the instant it has expired.
+        at += timeouts().udp;
+        assert_eq!(inbound(port, at), granted("in"));
+        assert_eq!(audit(&gate), (1, 0));
+    }
+}
+
 #[test]
 fn one_peer_holds_at_most_its_share_of_the_fragment_table() {
     let peer_2 = peer_in_other_shard();

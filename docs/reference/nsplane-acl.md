@@ -313,6 +313,12 @@ and IPv6 packets.
   (`fragments_per_peer()` reads it; a value of at least `GateLimits::fragments` leaves only
   the limit of the whole table, as in earlier releases; lowering it drops nothing), and
   `fragments_per_peer_denied()` counts the first fragments it refused, in every mode.
+  Expired entries are reclaimed when they are looked up and, at a limit, by a sweep: of the
+  peer's shard for a per-peer limit, of all 64 shards for a limit of the whole table. A sweep
+  that reclaimed nothing is not repeated for 100 ms (per shard, and separately for the sweep
+  of all shards), so a peer held at a limit costs one sweep per 100 ms instead of one per
+  refused packet. The bound that follows: an entry that expires makes room at a limit at most
+  100 ms after its expiry (at once when no fruitless sweep ran in the 100 ms before).
 - **Echo.** IPv4 types 8/0 and IPv6 types 128/129 require code zero before
   granting or reusing state; nonzero codes are `Malformed`. State admits the
   original request in its initiating direction and the exact reply in the reverse
