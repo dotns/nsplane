@@ -484,3 +484,41 @@ async fn queued_datagrams_are_written_together() {
     let stats = session.stats();
     assert_eq!((stats.tx(), stats.tx_bytes()), (101, 120_005));
 }
+
+/// A session that floods a full inbound queue takes turns with the others for its room: a
+/// datagram of another session waits for fewer than two queues of the flood, however long
+/// the flood is.
+#[tokio::test]
+async fn a_flooding_session_takes_turns() {
+    let (transport, acceptor) = server(WssServerConfig::default().inbound_queue(8));
+    let (flood, mut flood_client) = session(&acceptor).await;
+    let (quiet, mut quiet_client) = session(&acceptor).await;
+    for _ in 0..500 {
+        flood_client
+            .feed(Message::binary(&b"flood"[..]))
+            .await
+            .unwrap();
+    }
+    flood_client.flush().await.unwrap();
+    // The flood fills the queue and its reader waits for room.
+    let stats = flood.stats();
+    until(|| stats.rx() == 8).await;
+    quiet_client
+        .send(Message::binary(&b"quiet"[..]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut before = 0;
+    loop {
+        let (addr, datagram) = recv(&transport).await;
+        if addr == quiet.addr() {
+            assert_eq!(datagram, b"quiet");
+            break;
+        }
+        before += 1;
+    }
+    // The 8 queued, the one the flood's reader was waiting with, and what that reader adds
+    // to the emptied queue before the other reader runs with the room it was given.
+    assert!(before < 16, "{before}");
+}

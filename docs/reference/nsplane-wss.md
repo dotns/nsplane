@@ -122,7 +122,15 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
   datagrams, never waiting for more), feeds it and flushes once: a datagram alone leaves
   at once, a burst shares its writes, the order is the queue's. Inbound: one shared
   bounded channel (`inbound_queue`, 1024) feeds `recv`; a session's reader waits for
-  room, so a slow engine pushes back per session onto TCP. Batch methods are the trait defaults.
+  room, so a slow engine pushes back per session onto TCP and nothing received is
+  dropped. Batch methods are the trait defaults.
+- **Fairness.** The room of a full inbound queue goes to the waiting readers in the order
+  they asked (the channel's semaphore is first in, first out), one datagram each, and a
+  reader asks again only after its datagram is in. A session that floods therefore cannot
+  shut the others out: a datagram of another session waits for what was queued when it
+  arrived and for what the flooding reader adds in the one turn it runs first, together
+  at most about two queues of datagrams. Dropping at a full queue instead would let the
+  flooding session, which is always first at freed room, starve the others.
 - **Lifecycle.** A close frame or end of stream (peer close), a read or write error, no
   frame for `read_idle` (35 s; pongs count) or `WssSession::close` / dropping the transport
   (local close) ends a session; except after an error it then tries a close frame for at
@@ -139,7 +147,8 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
 - **Tests.** `crates/nsplane-wss/src/accept/tests.rs`: a `WssDialer` link against the
   transport over loopback `ws://`, and sessions over in-memory streams (distinct
   addresses, sends to closed sessions, queue full, read idle and pings, dropped messages,
-  queued datagrams written together, the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
+  queued datagrams written together, a flooding
+  session taking turns, the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
   `WssDialer`s against one engine on the transport: several nodes on distinct session
   addresses, a server-side close and redial moving the endpoint, the transport next to a
   `UdpTransport`, no endpoint takeover by garbage or an unknown key on another session,

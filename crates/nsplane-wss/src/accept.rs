@@ -330,8 +330,10 @@ fn session_addr(n: u64) -> SocketAddr {
 ///   takes what is queued (at most 64 datagrams, never waiting for more) and flushes once,
 ///   so a datagram alone leaves at once and a burst shares its writes; the order is the
 ///   queue's. Received datagrams of all sessions share a queue of
-///   [`WssServerConfig::inbound_queue`];
-///   while it is full the sessions' readers wait, pushing back on their TCP connections.
+///   [`WssServerConfig::inbound_queue`]; nothing received is dropped: while it is full the
+///   sessions' readers wait, pushing back on their TCP connections, and get its room in
+///   the order they asked, one datagram each. A session that floods therefore delays the
+///   others by at most about two queues of its datagrams, and cannot shut them out.
 /// - **Messages**: text messages and binary ones longer than [`MAX_DATAGRAM`] are dropped
 ///   and counted, as is a datagram longer than [`MAX_DATAGRAM`] sent (the send succeeds).
 ///   A close frame, the end of the stream, an error, or no frame for
