@@ -138,7 +138,10 @@ impl Driver {
                     let Some(packet) = self.screen_syn(packet) else {
                         return;
                     };
-                    let packet = if self.settings.transparent.is_some() || self.pending.is_some() {
+                    let packet = if self.settings.transparent.is_some()
+                        || self.pending.is_some()
+                        || self.settings.max_connections.is_some()
+                    {
                         match self.admit_syn(packet, demand) {
                             Some(packet) => packet,
                             None => return,
@@ -225,8 +228,8 @@ impl Driver {
         None
     }
 
-    /// Admits a bare SYN in transparent mode or under `Admission::Decide`; the SYN if it
-    /// goes on into smoltcp now. A SYN of a tuple still registered passes uncounted, and
+    /// Admits a bare SYN in transparent mode, under `Admission::Decide` or with
+    /// `max_connections`; the SYN if it goes on into smoltcp now. A SYN of a tuple still registered passes uncounted, and
     /// one of a held connection is absorbed; a new connection beyond
     /// `max_connections` is answered with RST. Under `Admission::Decide` a new connection
     /// is held (or, with the table full, answered with RST).
@@ -258,20 +261,17 @@ impl Driver {
             self.hold(key, pending::Held::Tcp(packet), label);
             return None;
         }
-        stats::add(&self.stats.accepted, 1);
-        self.emit(&key, FlowEventReason::Admitted);
+        if self.settings.transparent.is_some() {
+            stats::add(&self.stats.accepted, 1);
+            self.emit(&key, FlowEventReason::Admitted);
+        }
         Some(packet)
     }
 
     /// Whether the stack holds `max_connections` TCP connections, counting the connections
     /// held, the handshakes in progress and the SYNs of this batch in `demand`.
     pub(super) fn at_connection_limit(&self, demand: &HashMap<u16, usize>) -> bool {
-        let Some(limit) = self
-            .settings
-            .transparent
-            .as_ref()
-            .and_then(|transparent| transparent.max_connections)
-        else {
+        let Some(limit) = self.settings.max_connections else {
             return false;
         };
         let held = self.conns.len()

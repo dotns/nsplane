@@ -65,8 +65,9 @@ pub enum FlowEventReason {
     /// The pending table was full; see
     /// [`rejected_table_full`](crate::NetStackStats::rejected_table_full).
     TableFull,
-    /// The stack held
-    /// [`max_connections`](crate::TransparentConfig::max_connections) TCP connections;
+    /// The stack held its limit of TCP connections
+    /// ([`NetStackConfig::max_connections`](crate::NetStackConfig::max_connections) or
+    /// [`TransparentConfig::max_connections`](crate::TransparentConfig::max_connections));
     /// see [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit).
     ConnectionLimit,
     /// The destination is outside

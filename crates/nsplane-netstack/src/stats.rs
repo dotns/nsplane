@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// [`NetStackConfig::transparent`](crate::NetStackConfig::transparent) and
 /// [`Admission::Decide`](crate::Admission::Decide): on a stack with neither they are
 /// always 0, and without `transparent` only `pending`, `accepted`, `rejected_hook`,
-/// `rejected_timeout` and `rejected_table_full` count. [`events_emitted`](Self::events_emitted) and
+/// `rejected_timeout` and `rejected_table_full` count. The exception is
+/// [`rejected_connection_limit`](Self::rejected_connection_limit), which counts on every
+/// stack with [`NetStackConfig::max_connections`](crate::NetStackConfig::max_connections). [`events_emitted`](Self::events_emitted) and
 /// [`events_dropped`](Self::events_dropped) count admission events, not packets. Counters
 /// only grow, except the gauge [`pending`](Self::pending).
 ///
@@ -96,6 +98,7 @@ pub struct NetStackStats {
     /// [`Admission::Decide`](crate::Admission::Decide) was full.
     pub rejected_table_full: u64,
     /// Bare SYNs answered with RST because the stack held
+    /// [`NetStackConfig::max_connections`](crate::NetStackConfig::max_connections) or
     /// [`TransparentConfig::max_connections`](crate::TransparentConfig::max_connections)
     /// TCP connections.
     pub rejected_connection_limit: u64,

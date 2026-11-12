@@ -84,7 +84,9 @@ pub struct NetStackConfig {
     /// application. Default 64 KiB.
     pub stream_buffer: usize,
     /// Most TCP sockets held open for inbound handshakes, per destination port and in
-    /// total; SYNs beyond it are refused with RST. Default 32.
+    /// total; SYNs beyond it are refused with RST. A socket is created for a SYN when it
+    /// arrives and leaves the pool once its connection is established, so the pool holds
+    /// no socket (and no buffer) while no handshake runs. Default 32.
     pub listener_pool: usize,
     /// Receive buffer of each TCP socket in bytes: the window a peer may fill.
     ///
@@ -216,8 +218,8 @@ pub struct NetStackConfig {
     /// Under [`Admission::Decide`] each new connection or flow is offered as a
     /// [`PendingFlow`](crate::PendingFlow) whose [`control`](crate::PendingFlow::control)
     /// covers the lifetime from its first input on. On a stack without `transparent`,
-    /// rejections are sourced from the stack's own addresses and there is no connection
-    /// limit beyond the listener pool and the accept queue. Default [`Admission::Immediate`].
+    /// rejections are sourced from the stack's own addresses. Default
+    /// [`Admission::Immediate`].
     pub admission: Admission,
     /// Most revoked ingress labels the stack remembers at once, see
     /// [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label).
@@ -229,6 +231,32 @@ pub struct NetStackConfig {
     /// revocations; a tombstone costs about 16 bytes. 0 keeps none: input sent after the
     /// revoke then opens new lifetimes again. Default 65536.
     pub max_revoked_labels: usize,
+    /// Most TCP connections the stack holds at once, on every stack: accepted, mid
+    /// handshake or opened with [`connect_tcp`](crate::NetStackHandle::connect_tcp), until
+    /// they are released.
+    ///
+    /// At the limit, a bare SYN of a new connection is answered with a RST and counted in
+    /// [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit); a
+    /// retransmitted SYN of a handshake in progress is not a new connection, and
+    /// `connect_tcp` is never refused for it. Under [`Admission::Decide`] the limit is
+    /// checked when the SYN arrives and again when the connection is accepted. With
+    /// [`TransparentConfig::max_connections`] set as well, the lower of the two applies.
+    ///
+    /// The limit is what bounds the stack's TCP memory. Each connection has a receive and
+    /// a send socket buffer ([`tcp_rx_buffer`](Self::tcp_rx_buffer),
+    /// [`tcp_tx_buffer`](Self::tcp_tx_buffer): about 690 KiB each at the defaults) and two
+    /// stream buffers of up to [`stream_buffer`](Self::stream_buffer) bytes (64 KiB each
+    /// by default), so up to about 1.5 MiB at the defaults. The socket buffers are
+    /// allocated zeroed when the SYN arrives or `connect_tcp` is called; with an allocator
+    /// that maps such blocks on demand (glibc, musl) a connection is resident only as far
+    /// as bytes went through it: about 11 KiB while idle, measured with 1000 idle
+    /// connections, and the full size once a direction carried a buffer's worth without
+    /// the buffer running empty. Size the limit for the full size:
+    /// `max_connections * (tcp_rx_buffer + tcp_tx_buffer + 2 * stream_buffer)`.
+    ///
+    /// Default `None`: no limit beyond the [`listener_pool`](Self::listener_pool) and the
+    /// accept queue.
+    pub max_connections: Option<usize>,
 }
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
@@ -265,9 +293,9 @@ pub struct TransparentConfig {
     /// At the limit, a bare SYN of a new connection is answered with a RST sourced from
     /// its original destination and counted in
     /// [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit). A
-    /// retransmitted SYN of a handshake in progress is not a new connection. Default
-    /// `None`: no limit beyond the [`listener_pool`](NetStackConfig::listener_pool) and
-    /// the accept queue.
+    /// retransmitted SYN of a handshake in progress is not a new connection. With
+    /// [`NetStackConfig::max_connections`] set as well, the lower of the two applies.
+    /// Default `None`: no limit of its own.
     pub max_connections: Option<usize>,
     /// Admission events: a [`FlowEvent`](crate::FlowEvent) for each connection or flow
     /// admitted or rejected and each packet rejected for its prefix, on
@@ -316,8 +344,9 @@ pub enum Admission {
     ///   held, its further datagrams are dropped and counted in
     ///   [`udp_queue_full`](crate::NetStackStats::udp_queue_full): a held flow queues its
     ///   first datagram only.
-    /// - On a transparent stack, [`TransparentConfig::max_connections`] is checked when the
-    ///   SYN arrives and again when the connection is accepted.
+    /// - [`NetStackConfig::max_connections`] and, on a transparent stack,
+    ///   [`TransparentConfig::max_connections`] are checked when the SYN arrives and again
+    ///   when the connection is accepted.
     ///
     /// An entry costs the held packet and a few words; expiry rides on the driver's
     /// timer, with no task per entry. A `max_pending` of 0 is taken as 1, and a `timeout`
@@ -365,6 +394,7 @@ impl Default for NetStackConfig {
             transparent: None,
             admission: Admission::Immediate,
             max_revoked_labels: 65_536,
+            max_connections: None,
         }
     }
 }
@@ -393,6 +423,9 @@ pub(crate) struct Settings {
     pub(crate) transparent: Option<Box<Transparent>>,
     pub(crate) admission: Admission,
     pub(crate) max_revoked_labels: usize,
+    /// The lower of [`NetStackConfig::max_connections`] and
+    /// [`TransparentConfig::max_connections`].
+    pub(crate) max_connections: Option<usize>,
 }
 
 /// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
@@ -422,7 +455,6 @@ impl TcpRto {
 #[derive(Debug, Clone)]
 pub(crate) struct Transparent {
     pub(crate) prefixes: Prefixes,
-    pub(crate) max_connections: Option<usize>,
     pub(crate) events: Option<FlowEventsConfig>,
 }
 
@@ -508,6 +540,13 @@ impl Settings {
                 }
             }
         }
+        let max_connections = config
+            .transparent
+            .as_ref()
+            .and_then(|transparent| transparent.max_connections)
+            .into_iter()
+            .chain(config.max_connections)
+            .min();
         let mtu = config.mtu.max(MIN_MTU);
         let mss = usize::from(mtu) - 40;
         let tcp_buffer = |size: Option<usize>| {
@@ -536,7 +575,6 @@ impl Settings {
             transparent: config.transparent.map(|transparent| {
                 Box::new(Transparent {
                     prefixes: Prefixes::new(transparent.prefixes),
-                    max_connections: transparent.max_connections,
                     events: transparent.events,
                 })
             }),
@@ -552,6 +590,7 @@ impl Settings {
                 admission => admission,
             },
             max_revoked_labels: config.max_revoked_labels,
+            max_connections,
         }
     }
 

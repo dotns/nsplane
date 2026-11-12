@@ -36,6 +36,7 @@ mod abort;
 mod basic_udp;
 mod buffers;
 mod connected_udp;
+mod connection_limit;
 mod events;
 mod first_input;
 mod flow_bounds;

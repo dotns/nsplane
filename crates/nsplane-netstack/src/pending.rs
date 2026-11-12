@@ -109,6 +109,7 @@ impl PendingFlow {
     }
 
     /// Admits the connection or flow. With
+    /// [`NetStackConfig::max_connections`](crate::NetStackConfig::max_connections) or
     /// [`TransparentConfig::max_connections`](crate::TransparentConfig::max_connections)
     /// reached at that point, a TCP connection is answered with a RST instead and counted
     /// in [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit).

@@ -11,7 +11,7 @@ input, per-flow revocation, optional reassembly, and an ownership query for loca
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`, `max_connections`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `ingress_label`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
 | transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
@@ -115,6 +115,31 @@ stack with none of these sets no timer and takes no turn until it is woken.
   hold loses its tail when the peer sends it at once (see the field docs and
   [Performance](../performance.md#socket-buffers)). SYNs refused for a full listener pool
   (sized by `NetStackConfig::listener_pool`) are counted in `NetStackStats::syn_refused`.
+- `NetStackConfig::max_connections` (default `None`) bounds the TCP connections of any
+  stack: accepted, mid handshake or opened with `connect_tcp`, until released. At the limit
+  the bare SYN of a new connection is answered with a RST and counted in
+  `rejected_connection_limit`; a retransmitted SYN of a handshake in progress passes, and
+  `connect_tcp` is not refused. Under `Admission::Decide` the limit is checked when the SYN
+  arrives and again at the accept. With `TransparentConfig::max_connections` set too, the
+  lower one applies. Without either, the connections are bounded only by what the peers
+  open: the listener pool bounds handshakes, the accept queue connections not taken yet.
+- Memory per TCP connection: a receive and a send socket buffer (`tcp_rx_buffer`,
+  `tcp_tx_buffer`: `(mtu - 40) * 512` bytes each, 706 560 at MTU 1420) and two stream
+  buffers that grow on demand up to `stream_buffer` (64 KiB), about 1.5 MiB at the defaults.
+  The socket buffers are allocated zeroed (`vec![0; n]`) when the SYN arrives or
+  `connect_tcp` is called; glibc and musl map blocks of this size on demand, so a
+  connection is resident only as far as bytes went through it. Measured in process with
+  two stacks back to back (glibc, release build): 1000 idle connections add about 11 KiB of
+  resident memory per connection end with the default buffers (20 KiB with 64 KiB buffers,
+  which the allocator serves from its heap), and one direction that carried 1 MiB adds its
+  two buffers in full. smoltcp's ring buffer starts over at offset 0 whenever it runs
+  empty, so request/response traffic touches only the front of a buffer; a bulk transfer
+  wraps through all of it. Size `max_connections` for the full size:
+  `max_connections * (tcp_rx_buffer + tcp_tx_buffer + 2 * stream_buffer)`.
+- Listener sockets cost nothing while no handshake runs: each turn sizes the pool to the
+  SYNs of its batch, a socket and its buffers are created for a SYN in the turn that takes
+  it, and a socket left in `Listen` is removed by the next turn. A stack with listening
+  applications and no connection holds no smoltcp socket.
 - `NetStackConfig::tcp_send_budget` (default `None`) bounds the bytes all TCP connections
   of the stack hold in their send buffers together, split evenly between the connections
   with data to send (each at least one IPv4 MSS, at most its `tcp_tx_buffer`). Without it
@@ -333,7 +358,9 @@ own `addresses`.
 #### Connection limit and counters
 
 `TransparentConfig::max_connections` bounds the TCP connections the stack holds at once
-(accepted, mid handshake, or opened with `connect_tcp`, until released). At the limit, the
+(accepted, mid handshake, or opened with `connect_tcp`, until released), like
+`NetStackConfig::max_connections`, which applies to every stack; with both set the lower
+one applies. At the limit, the
 bare SYN of a new connection is answered with a RST from its original destination and
 counted in `rejected_connection_limit`; a retransmitted SYN of a handshake in progress is not
 a new connection. Under `Admission::Decide` the limit is checked when the SYN arrives and
@@ -688,7 +715,7 @@ too: a `match` on it outside the crate needs a wildcard arm.
 | Later-fragment ownership | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
 | Transparent termination | `NetStackConfig::transparent = Some(transparent)` with `transparent.prefixes` assigned on `TransparentConfig::default()` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
 | Per-flow admission | `NetStackConfig::admission = Admission::Decide { timeout, max_pending }` (every stack), decisions and controls on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none: one `Option` check per bare SYN |
-| TCP connection limit | `TransparentConfig::max_connections = Some(n)` | `None`: listener pool and accept queue only | one `Option` check per bare SYN in transparent mode |
+| TCP connection limit | `NetStackConfig::max_connections = Some(n)` on any stack, `TransparentConfig::max_connections = Some(n)` in transparent mode; the lower one applies | `None`: listener pool and accept queue only | one `Option` check per bare SYN |
 | Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |
 | Ingress labels | tag packets before `NetStackSink::send` (`PacketBuf::set_tag`); revoke with `NetStackHandle::revoke_label`; `NetStackConfig::max_revoked_labels` bounds the tombstones | unlabeled: every lifetime has the label `None` | one tag check per ingress packet, one compare per flow datagram, one table entry per inbound connection |
 | Connected UDP sockets | `NetStackHandle::connect_udp(remote)` / `connect_udp_from(local, remote)` | not used: `bind_udp` sockets take any remote | one `HashMap::is_empty` per UDP datagram |
@@ -699,8 +726,8 @@ Everything the stack discards is counted per reason in `NetStackStats` (malforme
 and unsupported packets, refused and deferred SYNs, connections and flows not accepted, full
 UDP queues, the flow limit, egress over the backlog, ignored ICMP, reassembly timeouts and
 overflows, failed inbound handshakes (`handshake_failed`), the admission outcome: `accepted`
-and `rejected_hook`, `rejected_timeout`, `rejected_table_full`, and in transparent mode
-`rejected_connection_limit`, `rejected_prefix`; input with another label than its lifetime's in `label_mismatch`, input of a revoked label in `label_revoked`); a lifetime held under `Admission::Decide`
+and `rejected_hook`, `rejected_timeout`, `rejected_table_full`, with a connection limit
+`rejected_connection_limit`, and in transparent mode `rejected_prefix`; input with another label than its lifetime's in `label_mismatch`, input of a revoked label in `label_revoked`); a lifetime held under `Admission::Decide`
 also ends with one `DeliveryOutcome` on its `DeliveryReceipt`;
 packets dropped for a revoked flow are counted in `NetStackHandle::retired_drops`. A
 connection rejected under `Admission::Decide` reaches the peer as a RST (`connect_tcp` on a peer
@@ -723,8 +750,10 @@ revoked flow) and `BrokenPipe` (the stack stopped).
   for at most `timeout` (at most one day); a held flow queues one datagram. Lifetimes with
   an open delivery: at most twice those the pending table, listener pool, waiting
   connections and accept queues hold.
-- TCP connections in transparent mode: `TransparentConfig::max_connections`, otherwise the
-  listener pool and the accept queue.
+- TCP connections: `NetStackConfig::max_connections` and, in transparent mode,
+  `TransparentConfig::max_connections`; without them the listener pool and the accept queue
+  only. Each connection holds up to `tcp_rx_buffer + tcp_tx_buffer + 2 * stream_buffer`
+  bytes (about 1.5 MiB at the defaults).
 - Flow events: `FlowEventsConfig::capacity` buffered events (0 is taken as 1) and a token
   bucket of `burst` tokens refilled at `rate` per second.
 - Retirement state: the table under [Per-flow control and retirement](#per-flow-control-and-retirement).

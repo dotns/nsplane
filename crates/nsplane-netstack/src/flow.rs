@@ -109,6 +109,7 @@ pub enum Undelivered {
     /// No decision within the [`Admission::Decide`](crate::Admission::Decide) timeout; see
     /// [`rejected_timeout`](crate::NetStackStats::rejected_timeout).
     TimedOut,
+    /// [`NetStackConfig::max_connections`](crate::NetStackConfig::max_connections) or
     /// [`TransparentConfig::max_connections`](crate::TransparentConfig::max_connections)
     /// was reached at the accept; see
     /// [`rejected_connection_limit`](crate::NetStackStats::rejected_connection_limit).
