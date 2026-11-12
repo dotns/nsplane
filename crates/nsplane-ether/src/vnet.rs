@@ -372,3 +372,6 @@ pub(crate) mod tests {
         assert_eq!(run(&v6, &frame), Err(OffloadError::BadHeaders));
     }
 }
+
+#[cfg(test)]
+mod property_tests;
