@@ -559,6 +559,13 @@ impl FlowGate {
     /// The live flow between `remote` and `local` of `protocol`, refreshed,
     /// preferring an enforced one; `None` when `remote` and `local` are of
     /// different address families.
+    ///
+    /// The peer is not part of the question, so there is no key to look up:
+    /// the call walks every flow of the family, O(flows) (some 10 to 20
+    /// microseconds for a full default table). It locks one state shard at a
+    /// time, so packets of the other shards are evaluated meanwhile, and
+    /// starts over when a [`replace`](Self::replace) lands in between. Meant
+    /// for a decision per connection, not per packet.
     #[must_use]
     pub fn find_flow(
         &self,
@@ -593,40 +600,47 @@ impl FlowGate {
         protocol: u8,
     ) -> Option<LiveFlow> {
         let now = (self.clock)();
-        // With every shard held no writer can publish, so the snapshot and
-        // the state are consistent.
-        let mut shards = self.state.lock_all();
-        self.snapshot.read(|snapshot| {
-            let counts = &self.state.counts;
-            let mut found: Option<LiveFlow> = None;
-            for shard in &mut shards {
-                shard.family::<A>().retain_flows(counts, |key, flow| {
-                    if key.remote_ip != remote_ip
-                        || key.local_ip != local_ip
-                        || key.remote_port != remote_port
-                        || key.local_port != local_port
-                        || key.protocol != protocol
-                    {
-                        return true;
+        let counts = &self.state.counts;
+        loop {
+            // `None`: a writer migrated the state since the snapshot was
+            // loaded; look again under the new one.
+            let found = self.snapshot.read(|snapshot| {
+                let mut found: Option<LiveFlow> = None;
+                for mut shard in self.state.each() {
+                    if shard.epoch != snapshot.generation {
+                        return None;
                     }
-                    if flow.expires_at <= now {
-                        return false;
-                    }
-                    flow.touch::<A>(key.protocol, now, &counts.timeouts);
-                    if found.as_ref().is_none_or(|live| !live.enforced)
-                        && let Some(scope) = snapshot.scope_of_slot(key.slot)
-                    {
-                        found = Some(LiveFlow {
-                            scope: scope.id.clone(),
-                            rule: flow.rule.clone(),
-                            enforced: flow.enforced,
-                        });
-                    }
-                    true
-                });
+                    shard.family::<A>().retain_flows(counts, |key, flow| {
+                        if key.remote_ip != remote_ip
+                            || key.local_ip != local_ip
+                            || key.remote_port != remote_port
+                            || key.local_port != local_port
+                            || key.protocol != protocol
+                        {
+                            return true;
+                        }
+                        if flow.expires_at <= now {
+                            return false;
+                        }
+                        flow.touch::<A>(key.protocol, now, &counts.timeouts);
+                        if found.as_ref().is_none_or(|live| !live.enforced)
+                            && let Some(scope) = snapshot.scope_of_slot(key.slot)
+                        {
+                            found = Some(LiveFlow {
+                                scope: scope.id.clone(),
+                                rule: flow.rule.clone(),
+                                enforced: flow.enforced,
+                            });
+                        }
+                        true
+                    });
+                }
+                Some(found)
+            });
+            if let Some(found) = found {
+                return found;
             }
-            found
-        })
+        }
     }
 
     /// Set how many remembered first fragments one peer may hold at a time,

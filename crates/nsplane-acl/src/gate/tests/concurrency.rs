@@ -201,3 +201,37 @@ fn scenarios_run_concurrently_against_separate_gates() {
         }
     });
 }
+
+#[test]
+fn find_flow_holds_one_shard_at_a_time() {
+    let gate = gate_with(policy(vec![open_scope(GateMode::Enforce)]));
+    let packet = udp(REMOTE, LOCAL, 40_000, 53);
+    assert_eq!(gate.evaluate_inbound(PEER, &packet), granted("in"));
+    // A shard the lookup reaches after the one holding the flow.
+    let later = (0..u32::MAX)
+        .map(PeerId::new)
+        .find(|peer| state::shard_index(*peer) > state::shard_index(PEER))
+        .unwrap();
+    let held = gate.state.lock(later);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let finder = scope.spawn(|| {
+            gate.find_flow(
+                SocketAddr::new(REMOTE.into(), 40_000),
+                SocketAddr::new(LOCAL.into(), 53),
+                Protocol::Udp,
+            )
+        });
+        // Time for the lookup to arrive at the held shard.
+        thread::sleep(Duration::from_millis(200));
+        scope.spawn(|| sender.send(gate.evaluate_inbound(PEER, &packet)));
+        let decision = receiver.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert_eq!(
+            decision,
+            Ok(valid()),
+            "the lookup waiting for one shard holds up no packet of another"
+        );
+        assert!(finder.join().unwrap().is_some());
+    });
+}

@@ -345,7 +345,11 @@ and IPv6 packets.
   Each shard keeps one flow and fragment map per family under one budget.
 - **Queries.** `find_flow(remote, local, Protocol)` returns the live flow of a five-tuple of
   either family (`LiveFlow`: scope, grant id, enforced) and refreshes it; `None` for a
-  mixed-family pair.
+  mixed-family pair. The peer is not part of the
+  question, so the call walks every flow of the family (O(flows), 10 to 20 microseconds for
+  a full default table), one shard lock at a time: packets of the other shards are evaluated
+  meanwhile, and the walk starts over when a `replace` lands in between. It is meant for one
+  decision per connection, not per packet.
 
 #### Scoped decisions
 

@@ -612,6 +612,14 @@ impl StateTable {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Every shard in index order, each locked only while the iterator's
+    /// item is alive.
+    pub(super) fn each(&self) -> impl Iterator<Item = MutexGuard<'_, Shard>> {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Lock every shard in index order (the only order any thread uses when
     /// holding more than one shard).
     pub(super) fn lock_all(&self) -> Vec<MutexGuard<'_, Shard>> {
