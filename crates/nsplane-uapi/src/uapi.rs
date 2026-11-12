@@ -939,3 +939,6 @@ mod tests {
         assert!(config.contains("persistent_keepalive_interval=0\n"));
     }
 }
+
+#[cfg(test)]
+mod property_tests;
