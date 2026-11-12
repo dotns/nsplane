@@ -1,79 +1,13 @@
 //! [`LruMap`]: a hash map that keeps its entries in recency order, so the
-//! filter's bounded tables evict their least recently seen entry in O(1), and
-//! [`FlowHash`], the hasher of those tables.
+//! filter's bounded tables evict their least recently seen entry in O(1).
+//! Its keys come from traffic, so it is hashed with the keyed
+//! [`KeyedState`], like the other maps of the filter and the engine that
+//! packets look up.
 
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::Hash;
 
-/// The hasher of the filter's tables: a multiply-rotate hash over 64-bit
-/// words with a random seed per table, several times faster than `SipHash`
-/// on a five-tuple. Not cryptographic; the seed keeps remote peers from
-/// choosing colliding tuples.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FlowHash(u64);
-
-impl Default for FlowHash {
-    fn default() -> Self {
-        Self(RandomState::new().hash_one(0_u8))
-    }
-}
-
-impl BuildHasher for FlowHash {
-    type Hasher = FlowHasher;
-
-    fn build_hasher(&self) -> FlowHasher {
-        FlowHasher(self.0)
-    }
-}
-
-pub(crate) struct FlowHasher(u64);
-
-impl FlowHasher {
-    const fn mix(&mut self, word: u64) {
-        self.0 = (self.0 ^ word)
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(29);
-    }
-}
-
-impl Hasher for FlowHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let (words, rest) = bytes.as_chunks::<8>();
-        for word in words {
-            self.mix(u64::from_le_bytes(*word));
-        }
-        let mut word = [0; 8];
-        word[..rest.len()].copy_from_slice(rest);
-        self.mix(u64::from_le_bytes(word));
-    }
-
-    fn write_u8(&mut self, n: u8) {
-        self.mix(n.into());
-    }
-
-    fn write_u16(&mut self, n: u16) {
-        self.mix(n.into());
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.mix(n.into());
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.mix(n);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.mix(n as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        // Spread the high bits the multiplication produced to the low ones
-        // the table indexes with.
-        self.0 ^ (self.0 >> 32)
-    }
-}
+use nsplane_packet::hash::KeyedState;
 
 /// No slot.
 const NIL: usize = usize::MAX;
@@ -91,7 +25,7 @@ struct Node<K, V> {
 /// inserted or [touched](Self::touch) one, kept in a slab of slots.
 #[derive(Debug)]
 pub(crate) struct LruMap<K, V> {
-    index: HashMap<K, usize, FlowHash>,
+    index: HashMap<K, usize, KeyedState>,
     slots: Vec<Option<Node<K, V>>>,
     free: Vec<usize>,
     /// The least and the most recent slots.
@@ -256,7 +190,51 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::net::Ipv6Addr;
+
+    use std::hash::BuildHasher;
+
     use super::*;
+
+    /// The hasher of the tables.
+    type TableHash = KeyedState;
+
+    /// The tables' former multiply-rotate hasher
+    /// (`state = rotl((state ^ word) * odd, 29)`) cancelled a flip of bit 63
+    /// of one word with a flip of bit 28 of the next, whatever its seed: the
+    /// product carried the first flip in bit 63 alone and the rotation moved
+    /// it to bit 28. The same held for the top `n` bits against bits
+    /// `29 - n..=28`, which gave sets of `2^n` keys with one hash.
+    #[test]
+    fn the_table_hasher_has_no_seed_independent_collisions() {
+        for seed in 0..16_u64 {
+            let hash = TableHash::default();
+            for index in 0..64_u64 {
+                let (first, second) = (index.wrapping_mul(0x0123_4567_89ab_cdef) ^ seed, !index);
+                assert_ne!(
+                    hash.hash_one((first, second)),
+                    hash.hash_one((first ^ (1 << 63), second ^ (1 << 28))),
+                    "words {first:#x}, {second:#x}"
+                );
+            }
+            // The same two bits of an IPv6 address: bit 7 of octet 7 and
+            // bit 4 of octet 11.
+            let address = Ipv6Addr::new(0xfd00, 1, 2, 3, 4, 5, 6, 7);
+            let mut octets = address.octets();
+            octets[7] ^= 0x80;
+            octets[11] ^= 0x10;
+            assert_ne!(
+                hash.hash_one(address),
+                hash.hash_one(Ipv6Addr::from(octets))
+            );
+            // The top four bits of one word against bits 25..=28 of the next.
+            let hashes: HashSet<u64> = (0..256_u64)
+                .map(|bits| hash.hash_one(((bits >> 4) << 60, (bits & 0xf) << 25)))
+                .collect();
+            assert_eq!(hashes.len(), 256);
+        }
+    }
 
     fn keys(map: &mut LruMap<u32, u32>) -> Vec<u32> {
         let mut out = Vec::new();

@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nsplane_core::LocalIdentityId;
+use nsplane_packet::hash::KeyedState;
 use nsplane_packet::{FiveTuple, PeerId};
 
 use super::identity::PeerIdentity;
 use super::outcome::Outcome;
 use super::replies::is_pending;
 use crate::engine::{Membership, ReplyDependency, Snapshot};
-use crate::lru::{FlowHash, LruMap};
+use crate::lru::LruMap;
 use crate::rules::LabelSet;
 
 #[cfg(doc)]
@@ -88,7 +89,7 @@ pub(super) struct FlowTable {
     /// How many of `entries` are cached verdicts.
     pub(super) verdicts: usize,
     pub(super) pending: LruMap<FiveTuple, ReplyEntry>,
-    pub(super) peers: HashMap<PeerId, Arc<PeerInfo>, FlowHash>,
+    pub(super) peers: HashMap<PeerId, Arc<PeerInfo>, KeyedState>,
     pub(super) sources: LruMap<(PeerId, IpAddr), Arc<PeerInfo>>,
 }
 

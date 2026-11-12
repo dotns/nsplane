@@ -507,7 +507,11 @@ returns `EmptySelection` for an empty set; `replace_scopes` returns an
   verdicts are flushed first when the table is full.
 - `FragmentMode::AllowOnly { ttl, capacity }`: a full table drops expired entries and then
   records nothing.
-- `FlowTracker`: a bounded table of the capacity it is created with.
+- `FlowTracker`: a bounded table of the capacity it is created with; a new flow on a full
+  table evicts the least recently seen one in constant time.
+- Hashing: the tables packets look up (the filter's verdict, reply, fragment and source
+  tables, the engine's host index, the tracker's and the gate's state) use the keyed
+  `nsplane_packet::hash::KeyedState`, keyed per table.
 - Flow gate: `GateLimits` (defaults 16,384 flows, 2,048 per peer, 4,096 fragments); a full
   table fails closed with `GateReason::StateCapacity` and never evicts a live entry. One peer
   holds at most half of the fragment table (`FlowGate::set_fragments_per_peer`).

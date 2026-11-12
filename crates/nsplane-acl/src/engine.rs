@@ -10,9 +10,9 @@ use std::time::Instant;
 
 use nsplane_core::cell::SnapshotCell;
 use nsplane_packet::PeerId;
+use nsplane_packet::hash::KeyedState;
 use tracing::{debug, warn};
 
-use crate::lru::FlowHash;
 use crate::{
     Error,
     namespace::{Grant, GrantEnd, NamespaceId, NamespaceKind, NamespacePolicy},
@@ -269,7 +269,7 @@ pub(crate) struct Snapshot {
     /// Member label -> its namespaces (derived from `namespaces`).
     memberships: HashMap<Label, Arc<Membership>>,
     /// Member host addresses (`/32`, `/128`) with their member label (derived).
-    hosts: HashMap<IpAddr, Label, FlowHash>,
+    hosts: HashMap<IpAddr, Label, KeyedState>,
     /// The other member addresses with their member label, longest prefix
     /// first (derived).
     addresses: Vec<(IpNet, Label)>,

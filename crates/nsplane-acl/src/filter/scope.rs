@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use nsplane_core::LocalIdentityId;
+use nsplane_packet::hash::KeyedState;
 use nsplane_packet::{IpPacket, PeerId};
 
 use super::Inner;
 use super::packet::{EchoType, echo_type, is_icmp, source_in};
 use crate::engine::Snapshot;
-use crate::lru::FlowHash;
 use crate::net::IpNet;
 use thiserror::Error;
 
@@ -219,7 +219,7 @@ pub(super) struct ScopeSet {
     /// 0 for the scope given at build, then increased by every replace.
     pub(super) generation: u64,
     pub(super) default: AclFilterScope,
-    pub(super) by_identity: HashMap<LocalIdentityId, AclFilterScope, FlowHash>,
+    pub(super) by_identity: HashMap<LocalIdentityId, AclFilterScope, KeyedState>,
 }
 
 impl ScopeSet {
@@ -228,7 +228,7 @@ impl ScopeSet {
         scopes: AclFilterScopes,
     ) -> Result<Self, AclFilterScopeError> {
         let mut by_identity =
-            HashMap::with_capacity_and_hasher(scopes.identities.len(), FlowHash::default());
+            HashMap::with_capacity_and_hasher(scopes.identities.len(), KeyedState::default());
         for (id, scope) in scopes.identities {
             if by_identity.insert(id, scope).is_some() {
                 return Err(AclFilterScopeError::DuplicateIdentity(id));
