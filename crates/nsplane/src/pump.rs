@@ -44,7 +44,11 @@ fn ended(result: io::Result<()>) -> io::Result<bool> {
 ///
 /// Each round takes one [`PacketSource::recv_batch`] and hands it to
 /// [`PacketSink::send_batch_spent`]; the batch and the delivery queue are allocated once. It
-/// awaits the sink while it applies backpressure and never drops a packet.
+/// awaits the sink while it applies backpressure and never drops a packet itself, with one
+/// exception: the sink is not trusted to keep the batch contract. A batch is offered until it
+/// is empty, and when a call reports it delivered and took no packet out of it, the front
+/// packet is dropped (logged at warn the first time, not counted in [`PumpStats`]), so a
+/// sink that leaves packets neither stalls the ones behind them nor makes the batch grow.
 ///
 /// The buffers the sink appends to `spent` go to [`PacketSource::recycle`], untagged and
 /// unmarked, before the next `recv_batch`, so a source with a pool (a [`pipe`](crate::pipe) whose producers
@@ -71,11 +75,14 @@ pub async fn pump(
     let mut spent = Vec::new();
     // Whether spent buffers are still collected, and whether the source took any yet.
     let (mut recycling, mut recycled) = (true, false);
+    // Whether the sink was already reported for leaving a packet.
+    let mut stuck = false;
     loop {
         let received = source.recv_batch(&mut batch).await;
         packets.extend(batch.drain().map(|packet| (from, packet)));
         let mut sent = Ok(());
-        if !packets.is_empty() {
+        // Until the batch is empty: nothing is left to pile up behind the next read.
+        while sent.is_ok() && !packets.is_empty() {
             let queued = packets.len();
             sent = if recycling {
                 sink.send_batch_spent(&mut packets, &mut spent).await
@@ -87,6 +94,14 @@ pub async fn pump(
             stats.packets += taken as u64;
             if sent.is_ok() {
                 stats.batches += 1;
+                // The sink is not trusted to keep the batch contract: a call that reported
+                // the batch delivered and took nothing loses the front packet.
+                if packets.len() >= queued {
+                    packets.pop_front();
+                    if !std::mem::replace(&mut stuck, true) {
+                        tracing::warn!("Packet sink left a packet it reported delivered");
+                    }
+                }
             }
         }
         if !spent.is_empty() {
@@ -562,6 +577,65 @@ mod tests {
             .err()
             .ok_or("expected an error")?;
         assert_eq!(err.kind(), io::ErrorKind::Other);
+        Ok(())
+    }
+
+    /// A sink that reports a batch delivered and leaves the packets from the first one with
+    /// the byte [`Careless::KEPT`] on in it. Records what it took and the longest batch it
+    /// was offered.
+    #[derive(Clone, Default)]
+    struct Careless {
+        taken: Arc<Mutex<Vec<u8>>>,
+        longest: Arc<Mutex<usize>>,
+    }
+
+    impl Careless {
+        const KEPT: u8 = 0xCC;
+    }
+
+    impl PacketSink for Careless {
+        fn send(
+            &self,
+            _packet: PacketBuf,
+            _from: PeerId,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            std::future::ready(Err(io::ErrorKind::Unsupported.into()))
+        }
+
+        fn send_batch(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+        ) -> impl Future<Output = io::Result<()>> + Send {
+            if let Ok(mut longest) = self.longest.lock() {
+                *longest = (*longest).max(packets.len());
+            }
+            while let Some((_, packet)) = packets.front() {
+                let byte = packet.as_packet()[0];
+                if byte == Self::KEPT {
+                    break;
+                }
+                if let Ok(mut taken) = self.taken.lock() {
+                    taken.push(byte);
+                }
+                packets.pop_front();
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A sink that reports a batch delivered and leaves packets in it loses those packets
+    /// only: the ones behind are delivered and the batch does not grow.
+    #[tokio::test]
+    async fn sink_that_keeps_packets_loses_them_only() -> TestResult {
+        let kept = Careless::KEPT;
+        let (source, _seen) = script(&[1, kept, 2, kept, kept, 3], true);
+        let sink = Careless::default();
+        let stats = timeout(WAIT, pump(source, sink.clone(), PeerId::new(1))).await??;
+        let taken = sink.taken.lock().map(|t| t.clone()).unwrap_or_default();
+        assert_eq!(taken, [1, 2, 3]);
+        assert_eq!(stats.packets, 3);
+        let longest = sink.longest.lock().map(|l| *l).unwrap_or_default();
+        assert_eq!(longest, 1);
         Ok(())
     }
 

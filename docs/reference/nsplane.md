@@ -632,7 +632,11 @@ decisions, not packet loops:
   `recv_batch` and one `send_batch` per round, and awaits the sink's backpressure instead of
   dropping. It ends with `Ok(PumpStats { packets, batches })` once either side returns
   `BrokenPipe` and returns any other error. Cancelled while it waits for the source it
-  loses nothing; while it waits for the sink, at most the batch in flight.
+  loses nothing; while it waits for the sink, at most the batch in flight. Like the engine,
+  it does not trust the sink to keep the batch contract: a batch is offered until it is
+  empty, and a call that reports it delivered and takes nothing out of it loses the front
+  packet (logged at warn the first time; `PumpStats::packets` counts only what the sink
+  took), so the packets behind it are delivered and the batch stays at one read.
   Sink-side return: `pump` delivers with `PacketSink::send_batch_spent(&self,
   packets: &mut VecDeque<(PeerId, PacketBuf)>, spent: &mut Vec<PacketBuf>)`, a default
   method that delivers like `send_batch` and appends the buffers the sink no longer
