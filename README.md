@@ -33,6 +33,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details, and the usage guide
 | `crates/nsplane-ether/` | `nsplane-ether` | Ethernet adapter for one guest: ethernet frames to IP packets as a packet source and sink, with ARP, IPv6 neighbor discovery and router advertisements, and a single-lease DHCPv4 server; length-prefixed stream and Linux TAP transports |
 | `crates/nsplane-dns/` | `nsplane-dns` | DNS serving: wire codec (`simple-dns`, kept in [`third_party/simple-dns`](third_party/simple-dns/UPSTREAM.md)), async `Resolver` trait, static records, a fake-address pool with reverse lookup, an upstream forwarder, and a UDP/TCP `Server` on sockets or `nsplane-netstack` flows (feature `netstack`) |
 | `crates/nsplane-uapi/`   | `nsplane-uapi`   | The `wg` configuration protocol (UAPI) over an engine; Unix socket and Windows named-pipe listeners |
+| `crates/nsplane-sys/`    | `nsplane-sys`    | Safe wrappers over the OS calls no safe dependency provides (`SO_EXCLUSIVEADDRUSE` on Windows, `setgroups` on Apple platforms); used by `nsplane` and `nsplane-cli` |
 | `crates/nsplane-cli/`    | `nsplane-cli`    | Development and test daemon for Linux and macOS, configured through `wg`; products embed the library |
 | `crates/nsplane-e2e/`    | `nsplane-e2e`    | End-to-end tests: engines against each other and against kernel WireGuard |
 | `examples/`              | `nsplane-examples` | Runnable examples (not published); see [examples/README.md](examples/README.md) |

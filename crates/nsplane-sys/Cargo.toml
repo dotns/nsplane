@@ -1,0 +1,27 @@
+[package]
+name = "nsplane-sys"
+description = "Safe wrappers over the OS calls the nsplane crates need and no safe dependency provides"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# JUSTIFICATION: declares setgroups(2), which nix leaves out on Apple targets.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# JUSTIFICATION: declares setsockopt and SO_EXCLUSIVEADDRUSE, for which socket2 has no
+# setter; the same version tokio, socket2 and quinn-udp already pull in.
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+socket2 = "0.6.5"

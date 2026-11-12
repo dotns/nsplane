@@ -47,11 +47,11 @@ docs:
 cross:
     cargo-zigbuild clippy --workspace --all-targets --all-features --target aarch64-apple-darwin
     cargo-zigbuild clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-musl
-    cargo hack clippy -p nsplane-noise -p nsplane -p nsplane-tun -p nsplane-uapi -p nsplane-ether -p nsplane-dns --each-feature --all-targets --target x86_64-pc-windows-gnu
+    cargo hack clippy -p nsplane-noise -p nsplane-sys -p nsplane -p nsplane-tun -p nsplane-uapi -p nsplane-ether -p nsplane-dns --each-feature --all-targets --target x86_64-pc-windows-gnu
 
 # Windows unit tests under wine (no Wintun driver: the device itself cannot start).
 test-windows:
-    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test -p nsplane-noise -p nsplane -p nsplane-tun -p nsplane-uapi -p nsplane-ether -p nsplane-dns --all-features --target x86_64-pc-windows-gnu --locked
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test -p nsplane-noise -p nsplane-sys -p nsplane -p nsplane-tun -p nsplane-uapi -p nsplane-ether -p nsplane-dns --all-features --target x86_64-pc-windows-gnu --locked
 
 # Interop against kernel WireGuard in two containers (needs docker and the wireguard module).
 e2e:

@@ -4,6 +4,7 @@ members = [
     "crates/nsplane-noise",
     "crates/nsplane-cli",
     "crates/nsplane-packet",
+    "crates/nsplane-sys",
     "crates/nsplane-core",
     "crates/nsplane",
     "crates/nsplane-netstack",
@@ -38,6 +39,7 @@ smallvec = "1.16.2"
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -2 }
 # The TUN crate owns syscall code, so `forbid` is not possible workspace-wide.
+# `nsplane-sys` holds the calls the crates that forbid `unsafe` need, behind safe functions.
 # `nsplane-cli` allows one block (adopting inherited descriptors); see docs/decisions.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

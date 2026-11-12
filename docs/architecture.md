@@ -76,6 +76,7 @@ handle and the filter APIs.
 | `nsplane-ether` | `crates/nsplane-ether/` | Ethernet adapter for one guest as `PacketSource` / `PacketSink`: ARP, IPv6 neighbor discovery and router advertisements, single-lease DHCPv4; stream and TAP frame transports | [nsplane-ether](reference/nsplane-ether.md) |
 | `nsplane-dns` | `crates/nsplane-dns/` | DNS serving: wire codec, async `Resolver` trait, `StaticRecords`, `FakePool`, `Forwarder`, and a UDP/TCP `Server` on sockets or netstack flows (feature `netstack`) | [nsplane-dns](reference/nsplane-dns.md) |
 | `nsplane-uapi` | `crates/nsplane-uapi/` | The `wg` UAPI over an `EngineHandle`; Unix socket listener | [nsplane-uapi](reference/nsplane-uapi.md) |
+| `nsplane-sys` | `crates/nsplane-sys/` | Safe wrappers over the OS calls no safe dependency provides: `SO_EXCLUSIVEADDRUSE` (Windows), `setgroups` (Apple platforms) | [nsplane-sys](reference/nsplane-sys.md) |
 | `nsplane-cli` | `crates/nsplane-cli/` | Linux/macOS development daemon: TUN + engine + UAPI | [nsplane-cli](reference/nsplane-cli.md) |
 | `nsplane-e2e` | `crates/nsplane-e2e/` | Not published: library-level end-to-end tests | |
 | `nsplane-examples` | `examples/` | Not published: runnable example binaries on the public APIs and their shared node code, including a single-port relay with UDP and WSS client transports | [examples](../examples/README.md) |
@@ -88,6 +89,7 @@ nsplane-core, nsplane-packet ─► nsplane-acl, nsplane-nat
 nsplane ─► nsplane-nat
 nsplane ─► nsplane-wss
 nsplane-netstack (optional) ─► nsplane-dns
+nsplane-sys ─► nsplane (Windows), nsplane-cli (macOS)
 ```
 
 Dependencies point downward only. `nsplane-core` is the only crate that depends on
@@ -226,13 +228,19 @@ redacts key material.
 ## Unsafe code
 
 The workspace lint is `unsafe_code = "deny"`: `unsafe` compiles only under an explicit
-`allow(unsafe_code, reason = "...")`, so `rg 'allow\(unsafe_code'` lists all of it. Two
+`allow(unsafe_code, reason = "...")`, so `rg 'allow\(unsafe_code'` lists all of it. Three
 library crates use it, for system calls that have no safe wrapper fitting the design, each
 block with a `SAFETY` comment:
 
 - `nsplane-tun`: the platform modules `unix`, `linux` and `darwin`, and in `windows` loading
   Wintun and the IP Helper calls.
 - `nsplane-ether`: the Linux TAP device and packet socket modules (`tap`, `packet`).
+- `nsplane-sys`: the crate that exists to hold such calls for the crates that forbid
+  `unsafe` code. Each of its functions is one FFI call behind a safe signature whose
+  soundness does not depend on the caller: `SO_EXCLUSIVEADDRUSE` for the sockets `nsplane`
+  binds on Windows, and `setgroups` for the privilege drop of `nsplane-cli` on macOS. A
+  call that a crate without `unsafe` needs and no safe dependency provides goes there, not
+  into that crate.
 
 The library crates `nsplane-packet`, `nsplane-core`, `nsplane`, `nsplane-acl`, `nsplane-nat`,
 `nsplane-dns`, `nsplane-wss`, `nsplane-netstack` and `nsplane-uapi`, and the library of

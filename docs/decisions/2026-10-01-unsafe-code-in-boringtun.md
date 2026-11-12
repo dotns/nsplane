@@ -30,6 +30,14 @@ Until 2026-10-02 the TUN devices and the epoll/kqueue event loops lived in
   (`--tun-fd`, `--uapi-fd`), so it declares `#![deny(unsafe_code)]` and allows one block, in
   a private helper that runs before the process opens any descriptor and refuses the
   standard streams, closed numbers and repeated numbers.
+- A crate that forbids `unsafe` code and needs an OS call no safe dependency provides does
+  not open up: the call goes into `nsplane-sys`, a crate that exists for this, as a safe
+  function that takes typed handles and slices (never descriptor numbers or pointers) and
+  whose soundness does not depend on the caller. It holds one `unsafe` block per call and
+  nothing else: `SO_EXCLUSIVEADDRUSE` for the UDP sockets of `nsplane` on Windows and
+  `setgroups` for the privilege drop of `nsplane-cli` on macOS. Platform layers that are
+  `unsafe` throughout (`nsplane-tun`, the TAP and packet socket modules of
+  `nsplane-ether`) stay where they are.
 - Every `unsafe` block carries a `// SAFETY:` comment.
 - Where a safe API exists it is preferred: `nix` for `setuid`/`setgid`, `OwnedFd` for fd
   ownership, `socket2` and `std::net` for sockets.
@@ -44,3 +52,6 @@ The `unsafe` surface is confined to the FFI and TUN platform modules and is grep
 - 2026-10-02: updated; the device layer moved to `nstun-tun`.
 - 2026-11-11: updated; `adopt_fd` and `Tun::from_raw_fd` left the public API of the TUN
   crate, and the conversion from a descriptor number moved into `nsplane-cli`.
+- 2026-11-12: updated; the owner allowed one dedicated crate for `unsafe` calls behind safe
+  functions, `nsplane-sys`, which closed two gaps left open for want of a safe call
+  (`SO_EXCLUSIVEADDRUSE` on Windows, `setgroups` on macOS).
