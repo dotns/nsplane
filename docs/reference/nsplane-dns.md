@@ -31,7 +31,15 @@ feature builds on `nsplane-netstack`.
 
 `Query::decode` accepts a query (`QR` = 0) with opcode `QUERY` and exactly one question. The
 question name is normalized (ASCII-lowercase, no trailing dot) for matching; `raw` keeps the
-received bytes for forwarding. Only the header, the question and the EDNS OPT record (whose
+received bytes for forwarding. A name need not be a host name (RFC 2181 section 11 allows any
+octets in a label): `Query::name` and `normalize_name` write an octet of a label that is not
+a printable ASCII character, or is a dot or a backslash, as a `\DDD` decimal escape, so
+every name has one text of its own and a `.` in it always separates two labels
+(`a\046b.test` is the labels `a.b` and `test`, not `a.b.test`). Up to 0.22.2 such an octet
+was written as it is, lossily when it was no UTF-8, so different names could share a text,
+and with it a fake address, a static record or an exact, suffix or wildcard rule.
+`normalize_name` reads `\DDD`, and a backslash in front of anything else as that character
+(`\.`), so a name in either spelling lands on the same key. Only the header, the question and the EDNS OPT record (whose
 UDP payload size `udp_payload_size` reports) are decoded: records in the answer, authority
 and additional sections are skipped by their length, so records of unknown types or classes
 and RDATA the codec does not parse do not fail the query. A message that does not decode
@@ -45,8 +53,12 @@ included), sets `QR` and `RA`, and sets `AA` for local answers (`Answer::Records
 `Answer::Code`). `Answer::Records` with an empty list is `NODATA`. When the query carried an
 OPT record, the response carries one advertising `EncodeOptions::udp_payload_size`
 (`DEFAULT_UDP_PAYLOAD_SIZE`, 1232, by default); a query without one gets none. `Answer::Raw`
-is passed through with only the ID replaced. Records that do not encode (a name that is not a
-host name, a TXT string over 255 bytes) give `SERVFAIL`.
+is passed through with only the ID replaced. A record name (owner, CNAME or PTR target) is
+text as `normalize_name` reads it, with any octets in its labels, so a record under the name
+of the query always encodes and reaches the client; up to 0.22.2 only host names encoded, and
+the answer to a name such as `foo-.test`, `a b.test` or `*.test` became `SERVFAIL` after a
+`FakePool` had spent a binding on it. Records that do not encode (a label over 63 octets, a
+name over 255, a TXT string over 255 bytes) give `SERVFAIL`.
 
 ### Truncation
 
@@ -101,7 +113,8 @@ single client that needs more than half of it within one `ttl` sets
 
 `lookup(addr)` maps an address of either family back to its name and refreshes the binding, so
 an address that connections keep being opened to is not handed to another name once its DNS
-TTL has passed; call it on the data path only. `lookup_name(name)` returns a name's addresses
+TTL has passed; call it on the data path only. The name is the normalized text of the query
+name, escapes included for a name that is no host name. `lookup_name(name)` returns a name's addresses
 and neither allocates nor refreshes. Queries of other types or classes
 go to the pool's fallback: `NoData` (answers `NODATA`) by default, any resolver with
 `with_fallback`, which replaces that fallback instead of chaining on `NXDOMAIN`.
@@ -185,6 +198,8 @@ answers, or the target's response code with the chain. The chain stops with the 
 collected so far when a target repeats a name of the chain, at `MAX_CNAME_CHAIN` (8)
 records, or when no rule applies to a target.
 
+Rule names are host names (labels of letters, digits, `-` and `_`); a query name is matched
+label by label, so a label with a dot in it never matches a rule spelled with that dot.
 `PolicyTable::new` rejects empty or invalid names, wildcards not of the form `*.name`,
 invalid CNAME targets (also CNAME / PTR data in `Records`) and prefix lengths over the
 address width. Installing (`new`, `replace` with a new resolver set, `replace_table` with the

@@ -95,15 +95,32 @@ impl Question {
         out.extend_from_slice(&self.qclass.to_be_bytes());
     }
 
-    /// The name as the client wrote it, labels joined by dots.
+    /// The name as the client wrote it, in text form.
     fn name(&self) -> String {
-        let labels: Vec<&str> = self
-            .labels
-            .iter()
-            .map(|label| std::str::from_utf8(label).unwrap())
-            .collect();
-        labels.join(".")
+        name_text(self.labels.iter().map(Vec::as_slice))
     }
+}
+
+/// The text form of a name, in the letter case of its labels: the labels joined by dots, an
+/// octet that is not a printable ASCII character, a dot or a backslash as `\DDD`.
+///
+/// The model was the labels joined as they are, while the generator kept to letters, digits
+/// and hyphens: a label with a dot in it then read like two labels, and a name outside host
+/// name syntax could not be the owner of an answer. The codec gives every name a text of its
+/// own now, and this is that text, written a second time.
+fn name_text<'a>(labels: impl Iterator<Item = &'a [u8]>) -> String {
+    let labels: Vec<String> = labels
+        .map(|label| {
+            label
+                .iter()
+                .map(|&octet| match octet {
+                    0x21..=0x7e if octet != b'.' && octet != b'\\' => char::from(octet).to_string(),
+                    _ => format!("\\{octet:03}"),
+                })
+                .collect()
+        })
+        .collect();
+    labels.join(".")
 }
 
 /// A DNS message: questions, answer records of `(type, RDATA)` owned by the root name, and
@@ -158,6 +175,16 @@ impl Message {
 fn label(rng: &mut Rng) -> Vec<u8> {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
     let len = if rng.chance(5) { 63 } else { 1 + rng.below(12) };
+    if rng.chance(15) {
+        // Any octets (RFC 2181 section 11), with the ones a text form has to mind.
+        return (0..len)
+            .map(|_| match rng.below(4) {
+                0 => rng.pick(b".\\ *-_"),
+                1 => rng.byte(),
+                _ => rng.pick(CHARS),
+            })
+            .collect();
+    }
     (0..len).map(|_| rng.pick(CHARS)).collect()
 }
 
@@ -359,18 +386,11 @@ fn decode_reads_what_the_header_and_the_question_say() {
     assert!(seen[1..].iter().all(|&count| count > 300), "{seen:?}");
 }
 
-/// A name the codec encodes as a record owner: its labels neither start nor end with a
-/// hyphen.
+/// A name the codec encodes as a record owner: any labels, in text form. (It took host
+/// name labels only, so the labels here used to start and end with a letter.)
 fn record_name(rng: &mut Rng) -> String {
-    let labels: Vec<String> = (0..=rng.below(2))
-        .map(|_| {
-            let mut label = label(rng);
-            label[0] = b'x';
-            *label.last_mut().unwrap() = b'x';
-            String::from_utf8(label).unwrap()
-        })
-        .collect();
-    labels.join(".")
+    let labels: Vec<Vec<u8>> = (0..=rng.below(2)).map(|_| label(rng)).collect();
+    name_text(labels.iter().map(Vec::as_slice))
 }
 
 /// A record the codec encodes, with a lower and an upper bound of its encoded size: the
@@ -443,7 +463,7 @@ fn assert_built_reply<'a>(response: &'a [u8], message: &Message, bytes: &[u8]) -
 
 fn assert_records_arrived(packet: &Packet<'_>, records: &[Record]) {
     for (got, sent) in packet.answers.iter().zip(records) {
-        assert_eq!(got.name.to_string(), sent.name);
+        assert_eq!(name_text(got.name.as_bytes()), sent.name);
         assert_eq!(got.ttl, sent.ttl);
         match (&got.rdata, &sent.data) {
             (RData::A(a), RecordData::A(addr)) => {
@@ -453,7 +473,7 @@ fn assert_records_arrived(packet: &Packet<'_>, records: &[Record]) {
                 assert_eq!(Ipv6Addr::from(a.address), *addr);
             }
             (RData::CNAME(c), RecordData::Cname(target)) => {
-                assert_eq!(c.0.to_string(), *target);
+                assert_eq!(name_text(c.0.as_bytes()), *target);
             }
             (RData::TXT(_), RecordData::Txt(_)) => {}
             other => panic!("record changed: {other:?}"),
@@ -876,6 +896,27 @@ struct Bound {
     last_use: Instant,
 }
 
+/// The names the pool is asked for; every third one is no host name.
+///
+/// They were all host names, and the pool's answer was never encoded: a binding went to a
+/// name whose answer the codec then turned into SERVFAIL, unseen here. A binding is spent
+/// on an answer that reaches the client, which [`assert_reaches_the_client`] holds.
+fn fake_names() -> Vec<String> {
+    (0..16)
+        .map(|i| match i % 3 {
+            0 => format!("-host{i}-.*.test"),
+            _ => format!("host{i}.fake.test"),
+        })
+        .collect()
+}
+
+/// Asserts that the pool's answer `records` to `query` encodes as one answer record.
+fn assert_reaches_the_client(query: &Query, records: &[Record]) {
+    let answer = Answer::Records(records.to_vec());
+    let response = encode_response(query, &answer, 512, EncodeOptions::default());
+    assert_eq!((rcode_of(&response), read16(&response, 6)), (0, 1));
+}
+
 /// Asserts that every bound name has one address of its own in both families, the one it
 /// was answered with, and that a name answered within the TTL is still bound.
 fn assert_bindings_hold(pool: &FakePool, names: &[String], known: &HashMap<String, Bound>) {
@@ -918,7 +959,7 @@ async fn a_fake_address_stays_with_its_name_while_it_may_be_cached() {
         if round % 2 == 0 {
             pool = pool.with_client_limit(1 + rng.below(capacity));
         }
-        let names: Vec<String> = (0..16).map(|i| format!("host{i}.fake.test")).collect();
+        let names = fake_names();
         let mut known: HashMap<String, Bound> = HashMap::new();
         let (mut created, mut failed) = (0_u64, 0_u64);
 
@@ -941,6 +982,7 @@ async fn a_fake_address_stays_with_its_name_while_it_may_be_cached() {
                                 panic!("{records:?}");
                             };
                             assert_eq!((record.name.as_str(), record.ttl), (name.as_str(), 60));
+                            assert_reaches_the_client(&query, &records);
                             let index = match record.data {
                                 RecordData::A(addr) if v4 => u32::from(addr) - u32::from(NET4),
                                 RecordData::Aaaa(addr) if !v4 => {

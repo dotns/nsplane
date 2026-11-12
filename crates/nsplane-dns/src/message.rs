@@ -10,11 +10,18 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use bytes::Bytes;
 use simple_dns::rdata::{A, AAAA, CNAME, OPT, PTR, RData, TXT};
 use simple_dns::{
-    CLASS, Name, OPCODE, Packet, PacketFlag, PacketView, RCODE, ResourceRecord, header_buffer,
+    CLASS, Label, Name, OPCODE, Packet, PacketFlag, PacketView, RCODE, ResourceRecord,
+    header_buffer,
 };
 
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
+
+/// Longest label, in octets.
+const MAX_LABEL_LEN: usize = 63;
+
+/// Longest name on the wire, with its length octets and the root label.
+const MAX_NAME_LEN: usize = 255;
 
 /// Largest UDP response without EDNS (RFC 1035).
 pub const MIN_UDP_RESPONSE_SIZE: usize = 512;
@@ -155,9 +162,13 @@ impl RecordData {
 
 /// An answer record of class IN.
 ///
-/// Names (the owner and the CNAME / PTR targets) are host names: labels of letters, digits,
-/// `-` and `_`, separated by dots. A response whose records cannot be encoded is answered
-/// with `SERVFAIL`.
+/// Names (the owner and the CNAME / PTR targets) are labels separated by dots, with or
+/// without a trailing dot. A label holds any octets (RFC 2181 section 11): one that is not a
+/// printable ASCII character, a dot or a backslash inside a label is written as
+/// [`normalize_name`] reads it (`\DDD`, `\.`, `\\`), which is how [`Query::name`] gives a
+/// name, so a record under the query's name always encodes. A response with a record that
+/// cannot be encoded (a label over 63 octets, a name over 255 on the wire, a TXT string over
+/// 255 bytes) is answered with `SERVFAIL`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Record {
     /// Owner name.
@@ -267,7 +278,7 @@ impl Query {
         };
         Ok(Self {
             id,
-            name: normalize_name(&question.qname.to_string()),
+            name: name_text(&question.qname),
             record_type: RecordType(question.qtype.into()),
             class: question.qclass.into(),
             recursion_desired: packet.has_flags(PacketFlag::RECURSION_DESIRED),
@@ -281,7 +292,11 @@ impl Query {
         self.id
     }
 
-    /// The question name, ASCII-lowercase and without a trailing dot (the root is `""`).
+    /// The question name, normalized ([`normalize_name`]): ASCII-lowercase and without a
+    /// trailing dot (the root is `""`). A name need not be a host name: an octet of a label
+    /// that is not a printable ASCII character, or is a dot or a backslash, reads `\DDD`
+    /// (`a\046b.test` is the two labels `a.b` and `test`), so every name has one text of
+    /// its own and a `.` in it is always a label boundary.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -313,8 +328,92 @@ impl Query {
 }
 
 /// Normalizes a domain name for comparison: ASCII-lowercase, one trailing dot removed.
+///
+/// A label octet that is not a printable ASCII character, or is a dot or a backslash, is
+/// written as a `\DDD` decimal escape (RFC 1035 section 5.1); a host name has none and is
+/// its own lowercase form. In `name`, a backslash followed by three digits up
+/// to 255 stands for that octet and a backslash in front of anything else for what follows
+/// it (`\.` is a dot inside a label). A dot in the result therefore always separates two
+/// labels, and two different names never normalize to the same text. [`Query::name`] is in
+/// this form.
 pub fn normalize_name(name: &str) -> String {
-    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+    let mut out = String::with_capacity(name.len());
+    for token in Tokens(name.as_bytes()) {
+        match token {
+            Token::Dot => out.push('.'),
+            Token::Octet(octet) => push_octet(&mut out, octet),
+        }
+    }
+    // An escaped dot is not a `.` here.
+    if out.ends_with('.') {
+        out.pop();
+    }
+    out
+}
+
+/// The normalized text ([`normalize_name`]) of a name read from a message.
+pub(crate) fn name_text(name: &Name<'_>) -> String {
+    let mut out = String::new();
+    for (index, label) in name.as_bytes().enumerate() {
+        if index > 0 {
+            out.push('.');
+        }
+        for &octet in label {
+            push_octet(&mut out, octet);
+        }
+    }
+    out
+}
+
+/// Appends a label octet in normalized form.
+fn push_octet(out: &mut String, octet: u8) {
+    if octet.is_ascii_graphic() && octet != b'.' && octet != b'\\' {
+        out.push(char::from(octet.to_ascii_lowercase()));
+    } else {
+        out.push('\\');
+        for digit in [octet / 100, octet / 10 % 10, octet % 10] {
+            out.push(char::from(b'0' + digit));
+        }
+    }
+}
+
+/// A piece of a name in text form.
+enum Token {
+    /// A label separator.
+    Dot,
+    /// An octet of a label, written plainly or as an escape.
+    Octet(u8),
+}
+
+/// The pieces of a name in text form, escapes resolved.
+struct Tokens<'a>(&'a [u8]);
+
+impl Iterator for Tokens<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        let (&first, rest) = self.0.split_first()?;
+        let (token, rest) = match (first, rest) {
+            (b'.', _) => (Token::Dot, rest),
+            // Three digits that are no octet are not an escape: the first one is taken alone.
+            (b'\\', [escaped, after @ ..]) => decimal_octet(rest)
+                .map_or((Token::Octet(*escaped), after), |octet| {
+                    (Token::Octet(octet), &rest[3..])
+                }),
+            (octet, _) => (Token::Octet(octet), rest),
+        };
+        self.0 = rest;
+        Some(token)
+    }
+}
+
+/// The octet written as three decimal digits at the front of `text`.
+fn decimal_octet(text: &[u8]) -> Option<u8> {
+    let digits = text.get(..3)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// Why a message is not a query this codec answers.
@@ -414,8 +513,8 @@ pub(crate) fn udp_response_limit(client: Option<u16>, options: EncodeOptions) ->
 /// query gets an OPT record advertising `options.udp_payload_size`. [`Answer::Raw`] is
 /// passed through with the ID replaced. A response longer than `max_size` is replaced by a
 /// truncated one (`TC` = 1): the header, the question and the OPT record, no answers, so it
-/// fits any `max_size` of at least 512. Records that cannot be encoded (an invalid name, a
-/// TXT string over 255 bytes) give `SERVFAIL`.
+/// fits any `max_size` of at least 512. Records that cannot be encoded (a label over 63
+/// octets, a name over 255, a TXT string over 255 bytes) give `SERVFAIL`.
 pub fn encode_response(
     query: &Query,
     answer: &Answer,
@@ -493,8 +592,8 @@ fn resource_record(record: &Record) -> Option<ResourceRecord<'_>> {
     let rdata = match &record.data {
         RecordData::A(addr) => RData::A(A::from(*addr)),
         RecordData::Aaaa(addr) => RData::AAAA(AAAA::from(*addr)),
-        RecordData::Cname(target) => RData::CNAME(CNAME(host_name(target)?)),
-        RecordData::Ptr(target) => RData::PTR(PTR(host_name(target)?)),
+        RecordData::Cname(target) => RData::CNAME(CNAME(wire_name(target)?)),
+        RecordData::Ptr(target) => RData::PTR(PTR(wire_name(target)?)),
         RecordData::Txt(strings) => {
             let mut txt = TXT::new();
             for s in strings {
@@ -504,13 +603,32 @@ fn resource_record(record: &Record) -> Option<ResourceRecord<'_>> {
         }
     };
     Some(ResourceRecord::new(
-        host_name(&record.name)?,
+        wire_name(&record.name)?,
         CLASS::IN,
         record.ttl,
         rdata,
     ))
 }
 
-fn host_name(name: &str) -> Option<Name<'_>> {
-    Name::new(name.strip_suffix('.').unwrap_or(name)).ok()
+/// The name written as `name`, read as [`normalize_name`] reads it but with its case kept:
+/// any octets in its labels (RFC 2181 section 11), empty labels skipped. `None` for a label
+/// over 63 octets or a name over 255 octets on the wire.
+pub(crate) fn wire_name(name: &str) -> Option<Name<'static>> {
+    let mut labels = Vec::new();
+    let mut label = Vec::new();
+    let mut len = 1;
+    for token in Tokens(name.as_bytes()).chain([Token::Dot]) {
+        match token {
+            Token::Octet(octet) => label.push(octet),
+            Token::Dot if label.is_empty() => {}
+            Token::Dot => {
+                if label.len() > MAX_LABEL_LEN {
+                    return None;
+                }
+                len += 1 + label.len();
+                labels.push(Label::new_unchecked(std::mem::take(&mut label)));
+            }
+        }
+    }
+    (len <= MAX_NAME_LEN).then(|| Name::new_with_labels(&labels))
 }

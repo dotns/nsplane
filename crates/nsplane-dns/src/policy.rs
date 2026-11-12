@@ -53,11 +53,11 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use bytes::Bytes;
 use simple_dns::rdata::{CNAME, RData};
-use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+use simple_dns::{CLASS, Packet, ResourceRecord};
 
 use crate::message::{
     Answer, EncodeOptions, Query, Record, RecordData, RecordType, ResponseCode, encode_response,
-    normalize_name,
+    normalize_name, wire_name,
 };
 use crate::resolver::Resolver;
 
@@ -772,10 +772,10 @@ fn spliced(query: &Query, chain: &[Record], raw: &[u8]) -> Option<Bytes> {
             return None;
         };
         answers.push(ResourceRecord::new(
-            Name::new(&record.name).ok()?,
+            wire_name(&record.name)?,
             CLASS::IN,
             record.ttl,
-            RData::CNAME(CNAME(Name::new(target).ok()?)),
+            RData::CNAME(CNAME(wire_name(target)?)),
         ));
     }
     answers.append(&mut response.answers);

@@ -49,7 +49,7 @@ fn question(rng: &mut Rng) -> Question {
     let labels = (0..=rng.below(4))
         .map(|_| {
             (0..=rng.below(10))
-                .map(|_| rng.pick(b"abcxyz019"))
+                .map(|_| rng.pick(b"abcxyz019\xff"))
                 .collect()
         })
         .collect();
@@ -114,7 +114,24 @@ fn recased(rng: &mut Rng, question: &Question) -> Question {
 /// A question that differs from `question` in its name, type or class.
 fn different(rng: &mut Rng, question: &Question) -> Question {
     let mut other = question.clone();
-    match rng.below(5) {
+    match rng.below(7) {
+        // Two names that read the same once written carelessly: two labels and one label
+        // with a dot in it, and two octets that are no UTF-8. They were taken for the
+        // same question while names were compared as lossy text.
+        5 if other.0.len() > 1 => {
+            let second = other.0.remove(1);
+            other.0[0].push(b'.');
+            other.0[0].extend(second);
+        }
+        5 | 6 => {
+            let label = rng.below(other.0.len());
+            let at = rng.below(other.0[label].len());
+            other.0[label][at] = if other.0[label][at] == 0xff {
+                0xfe
+            } else {
+                0xff
+            };
+        }
         0 => other.1 ^= 1 << rng.below(8),
         1 => other.2 = if other.2 == 1 { 3 } else { 1 },
         2 => {
@@ -135,17 +152,23 @@ fn different(rng: &mut Rng, question: &Question) -> Question {
     other
 }
 
+/// The question as the forwarder keeps it: the name in lowercase text, an octet outside
+/// printable ASCII as `\DDD` (the generator makes no dot or backslash to ask for).
 fn key(question: &Question) -> (String, u16, u16) {
-    let labels: Vec<&str> = question
+    let labels: Vec<String> = question
         .0
         .iter()
-        .map(|label| std::str::from_utf8(label).unwrap())
+        .map(|label| {
+            label
+                .iter()
+                .map(|&octet| match octet {
+                    0x21..=0x7e => char::from(octet.to_ascii_lowercase()).to_string(),
+                    _ => format!("\\{octet:03}"),
+                })
+                .collect()
+        })
         .collect();
-    (
-        labels.join(".").to_ascii_lowercase(),
-        question.1,
-        question.2,
-    )
+    (labels.join("."), question.1, question.2)
 }
 
 #[test]

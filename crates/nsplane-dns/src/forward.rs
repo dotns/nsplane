@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::message::{Answer, Query, ResponseCode, normalize_name};
+use crate::message::{Answer, Query, ResponseCode, name_text};
 
 /// Length of the fixed DNS header.
 const HEADER_LEN: usize = 12;
@@ -335,7 +335,7 @@ fn matches_query(response: &[u8], id: u16, query: &Query) -> bool {
     };
     u16::from(question.qtype) == query.record_type().0
         && u16::from(question.qclass) == query.class()
-        && normalize_name(&question.qname.to_string()) == query.name()
+        && name_text(&question.qname) == query.name()
 }
 
 /// The questions of `view` as (normalized name, type, class).
@@ -344,7 +344,7 @@ fn questions(view: &PacketView<'_>) -> Vec<(String, u16, u16)> {
         .iter()
         .map(|question| {
             (
-                normalize_name(&question.qname.to_string()),
+                name_text(&question.qname),
                 u16::from(question.qtype),
                 u16::from(question.qclass),
             )
