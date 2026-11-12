@@ -914,6 +914,9 @@ impl Tunn {
 }
 
 #[cfg(test)]
+mod property_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::noise::timers::{
         REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
