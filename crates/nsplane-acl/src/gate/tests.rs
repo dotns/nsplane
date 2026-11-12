@@ -489,5 +489,6 @@ mod ipv6_packets;
 mod model;
 mod packets_fragments;
 mod peer_keyed;
+mod properties;
 mod scoped;
 mod state_table;

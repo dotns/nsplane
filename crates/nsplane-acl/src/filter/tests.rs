@@ -33,6 +33,7 @@ mod namespaces;
 mod other_protocols;
 mod pinholes;
 mod policy_states;
+mod properties;
 mod replies;
 mod scopes;
 
