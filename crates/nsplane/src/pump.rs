@@ -445,10 +445,8 @@ mod tests {
         let (sink, abort) = AbortSink::new(MarkSink::default());
         abort.abort();
         assert_eq!(pump_tagged(sink).await?, unmarked);
-        assert_eq!(
-            pump_tagged(SwapSink::new(None::<MarkSink>)).await?,
-            unmarked
-        );
+        let swap = SwapSink::new(None::<MarkSink>);
+        assert_eq!(pump_tagged(swap.clone()).await?, unmarked);
         let taken = Recycled::default();
         let splitter =
             Splitter::new(|_, packet| usize::from(packet.tag().is_some_and(|tag| tag.get() > 2)))

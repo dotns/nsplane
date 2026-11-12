@@ -645,8 +645,8 @@ decisions, not packet loops:
   packets its closure dropped, in order, then the inner sink's (its `after` hook reads its
   copies); `AbortSink` races the inner `send_batch_spent` and, aborted, appends the buffers
   of the packets it drops except the one being delivered; `SwapSink` forwards to the
-  current sink and appends the buffers it drops (empty slot, or left by a replaced sink that
-  failed); `Splitter` hands packets to the chosen sink's `send_batch_spent` (a packet goes
+  current sink and appends the buffers it drops (empty slot, gone sink, or left by a replaced
+  sink that failed); `Splitter` hands packets to the chosen sink's `send_batch_spent` (a packet goes
   to one sink only), and appends the buffers of misrouted packets, of packets routed to a
   gone sink and of a packet failed because every sink is gone. A `Splitter::new` splitter hands each run of consecutive
   packets for one sink over as one batch; it routes the packet behind a run to find its
@@ -689,8 +689,14 @@ Four wrappers cover the per-packet glue left after that:
   on the sink it started on, and `replace` does not wait for it; that is why
   `replace(Option<S>)` returns the old sink as `Option<Arc<S>>`, dropped once the last call
   holding it is done. An error from a sink replaced while the call was in flight is counted
-  as dropped and returns `Ok`, so the engine does not take the local side for gone; an error
-  from the current sink is returned unchanged.
+  as dropped and returns `Ok`, so the engine does not take the local side for gone. A
+  `BrokenPipe` from the current sink means that sink is gone, not the local side: it is not
+  called again, the failed packet, the rest of the batch and every later packet are dropped,
+  counted in `dropped()` and `Ok`, and the next `replace` (which still returns the gone
+  sink) resumes delivery. Any other error from the current sink is returned unchanged. A
+  `SwapSink` returns `BrokenPipe` itself only once it is the last clone, so nobody can
+  `replace` any more, and its slot is empty or its sink gone: keep a clone for as long as
+  the local side may come back (a lone `SwapSink::new(None)` is closed from the start).
 - `AbortSink::new(sink)` returns the wrapped sink and a `SinkAbort` handle. Until the abort,
   each call races the inner call against it (one atomic load more when the call does not
   wait); `SinkAbort::abort` drops a pending inner `send` or `send_batch`, so nothing it

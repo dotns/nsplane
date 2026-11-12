@@ -19,7 +19,8 @@ use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
     DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED,
     DROP_TRANSPORT_SEND_ERROR, Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event,
-    PacketBuf, PacketSource, Path, Peer, PeerId, Transport, TransportError, TransportId,
+    PacketBuf, PacketSink, PacketSource, Path, Peer, PeerId, SwapSink, Transport, TransportError,
+    TransportId,
 };
 use nsplane_core::noise::{Tunn, TunnResult};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -2221,4 +2222,74 @@ async fn default_key_held_by_another_identity_is_ignored() {
     assert_eq!(a.handle.public_key().await.unwrap(), Some(a.public()));
     let kept = a.handle.private_key().await.unwrap().unwrap();
     assert_eq!(PublicKey::from(&kept), a.public());
+}
+
+/// The node `b` of [`nodes`], delivering to `sink`; `delivered` is the test end of it.
+fn node_b<T: Transport, Snk: PacketSink>(
+    transport: T,
+    sink: Snk,
+    delivered: mpsc::Receiver<(PeerId, PacketBuf)>,
+) -> Node {
+    let (source, local, mtu) = ChannelSource::new(4, 1420);
+    let engine = EngineBuilder::new(source, sink)
+        .transport(transport)
+        .private_key(secret(2))
+        .build()
+        .unwrap();
+    Node {
+        handle: engine.handle(),
+        engine,
+        local,
+        delivered,
+        _mtu: mtu,
+        secret: secret(2),
+        ip: IP_B,
+        addr: addr_b(),
+        transport: TransportId::new(2),
+    }
+}
+
+/// The node `a` of [`nodes`] and a node `b` delivering to what `sink` makes of its channel
+/// sink.
+fn nodes_with_sink<Snk: PacketSink>(sink: impl FnOnce(ChannelSink) -> Snk) -> (Node, Node) {
+    let (ta, tb) = link(64);
+    let a = node(
+        1,
+        IP_A,
+        addr_a(),
+        TransportId::new(1),
+        ta,
+        &Options::default(),
+    );
+    let (inner, delivered) = ChannelSink::new(64);
+    (a, node_b(tb, sink(inner), delivered))
+}
+
+/// A swap sink whose sink goes on its own keeps the engine's sink side open: packets are
+/// dropped and counted by it, and the next sink installed gets the deliveries.
+#[tokio::test]
+async fn swap_sink_delivers_again_after_its_sink_is_gone() {
+    let mut handle = None;
+    let (mut a, mut b) = nodes_with_sink(|first| {
+        let swap = SwapSink::new(Some(first));
+        handle = Some(swap.clone());
+        swap
+    });
+    let swap = handle.unwrap();
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    drop(std::mem::replace(&mut b.delivered, mpsc::channel(1).1));
+    for i in 0..3 {
+        a.send(IP_B, &[i]).await;
+    }
+    eventually(|| async { swap.dropped() == 3 }).await;
+    assert_eq!(b.drops(DROP_SINK_CLOSED).await, 0);
+
+    let (second, delivered) = ChannelSink::new(64);
+    assert!(swap.replace(Some(second)).is_some());
+    b.delivered = delivered;
+    exchange(&mut a, &mut b).await;
+    assert_eq!(swap.dropped(), 3);
+    assert_eq!(b.drops(DROP_SINK_CLOSED).await, 0);
 }

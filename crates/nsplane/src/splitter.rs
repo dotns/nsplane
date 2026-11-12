@@ -385,6 +385,36 @@ mod tests {
         Ok(())
     }
 
+    /// A swap sink whose generation is gone is not a gone sink of the splitter: it
+    /// delivers again once it is replaced.
+    #[tokio::test]
+    async fn nested_swap_sink_recovers_after_its_sink_is_gone() -> TestResult {
+        let (first, first_rx) = ChannelSink::new(4);
+        let swap = crate::SwapSink::new(Some(first));
+        let (b, mut b_rx) = ChannelSink::new(4);
+        let splitter = Splitter::new(by_first_byte).sink(swap.clone()).sink(b);
+
+        drop(first_rx);
+        send(&splitter, 0).await?;
+        let mut packets: VecDeque<_> = [0, 1, 0]
+            .map(|byte| (PeerId::new(9), PacketBuf::from_packet(&[byte])))
+            .into();
+        let mut spent = Vec::new();
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert!(packets.is_empty());
+        assert_eq!(swap.dropped(), 3);
+        assert_eq!(splitter.stats(), SplitterStats::default());
+        assert_eq!(b_rx.recv().await.ok_or("b closed")?.1.as_packet(), [1]);
+
+        let (second, mut second_rx) = ChannelSink::new(4);
+        swap.replace(Some(second));
+        send(&splitter, 0).await?;
+        let (peer, packet) = second_rx.recv().await.ok_or("second closed")?;
+        assert_eq!((peer, packet.as_packet()), (PeerId::new(0), &[0][..]));
+        assert_eq!(splitter.stats(), SplitterStats::default());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn out_of_range_is_counted() -> TestResult {
         let (a, mut a_rx) = ChannelSink::new(4);

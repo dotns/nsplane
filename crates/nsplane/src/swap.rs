@@ -14,14 +14,22 @@ use crate::io::PacketSink;
 
 /// The state the clones of a [`SwapSink`] share.
 struct SwapState<S> {
-    current: RwLock<Option<Arc<S>>>,
+    current: RwLock<Slot<S>>,
     dropped: AtomicU64,
+}
+
+/// The slot of a [`SwapSink`].
+struct Slot<S> {
+    sink: Option<Arc<S>>,
+    /// `sink` returned [`io::ErrorKind::BrokenPipe`]: it is not called again.
+    gone: bool,
 }
 
 /// A [`PacketSink`] whose inner sink can be replaced, or removed, while the engine runs.
 ///
 /// Clones share the inner sink and the drop counter: the engine owns one, the embedder
-/// keeps another to call [`SwapSink::replace`] on.
+/// keeps another to call [`SwapSink::replace`] on. While the embedder keeps one, the engine
+/// never takes the local side for gone, whatever happens to the inner sink.
 ///
 /// An embedder that rebuilds the local side per generation (a new TUN writer, a new
 /// encrypt sender) gives the engine a [`SwapSink`] and installs each generation's sink in
@@ -60,16 +68,25 @@ struct SwapState<S> {
 /// - An error from a sink that was replaced while the call was in flight drops the failed
 ///   packet (and, for a batch, the ones left in `packets`), counts them in
 ///   [`SwapSink::dropped`] and returns `Ok`, so the engine does not take the local side
-///   for gone. An error from the current sink is returned unchanged.
+///   for gone.
+/// - An [`io::ErrorKind::BrokenPipe`] from the current sink means that this sink is gone,
+///   not the local side: it is not called again, the failed packet (and the ones left in
+///   `packets`) and every later packet are dropped and counted as for an empty slot, and
+///   the calls return `Ok`. The next [`SwapSink::replace`] resumes delivery.
+/// - Any other error from the current sink is returned unchanged.
+/// - Once the value called is the last clone, nobody can call [`SwapSink::replace`] any
+///   more: with the slot empty or its sink gone, the local side is gone for good and every
+///   call returns [`io::ErrorKind::BrokenPipe`] (the failed packet is dropped and counted,
+///   the rest of a batch stays in `packets`). Every other clone counts, whoever holds it.
 ///
 /// [`PacketSink::send_batch_spent`] behaves like `send_batch` over the sink's
 /// `send_batch_spent`, so that sink's spent buffers reach the caller; the packets it drops
-/// (the slot is empty, or they were left by a replaced sink that failed) have their
-/// buffers appended to `spent`.
+/// (the slot is empty or its sink gone, or they were left by a replaced sink that failed)
+/// have their buffers appended to `spent`.
 ///
 /// [`PacketSink::try_send_batch`] goes to the current sink, which returns
-/// [`io::ErrorKind::WouldBlock`] when it would wait; while the slot is empty it drops and
-/// counts every packet and returns `Ok`.
+/// [`io::ErrorKind::WouldBlock`] when it would wait; an empty slot and an
+/// [`io::ErrorKind::BrokenPipe`] are handled as above.
 ///
 /// Each call takes a read lock only to clone the current sink's [`Arc`]; a delivered
 /// packet costs no counter update.
@@ -82,7 +99,10 @@ impl<S: PacketSink> SwapSink<S> {
     pub fn new(sink: Option<S>) -> Self {
         Self {
             state: Arc::new(SwapState {
-                current: RwLock::new(sink.map(Arc::new)),
+                current: RwLock::new(Slot {
+                    sink: sink.map(Arc::new),
+                    gone: false,
+                }),
                 dropped: AtomicU64::new(0),
             }),
         }
@@ -100,22 +120,44 @@ impl<S: PacketSink> SwapSink<S> {
             .current
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        std::mem::replace(&mut *current, sink)
+        current.gone = false;
+        std::mem::replace(&mut current.sink, sink)
     }
 
-    /// Packets dropped so far, because the slot was empty or because the sink they were
-    /// handed to failed after it was replaced.
+    /// Packets dropped so far, because the slot was empty, its sink was gone, or the sink
+    /// they were handed to failed after it was replaced.
     pub fn dropped(&self) -> u64 {
         self.state.dropped.load(Ordering::Relaxed)
     }
 
-    /// The current sink, if any.
-    fn current(&self) -> Option<Arc<S>> {
-        self.state
-            .current
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// Whether another clone exists, which may still call [`SwapSink::replace`].
+    fn replaceable(&self) -> bool {
+        Arc::strong_count(&self.state) > 1
+    }
+
+    /// The current sink; `None` while the slot is empty or its sink is gone. Once that is
+    /// for good (no other clone is left), [`io::ErrorKind::BrokenPipe`].
+    fn current(&self) -> io::Result<Option<Arc<S>>> {
+        {
+            let current = self
+                .state
+                .current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !current.gone
+                && let Some(sink) = &current.sink
+            {
+                return Ok(Some(Arc::clone(sink)));
+            }
+        }
+        if self.replaceable() {
+            Ok(None)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "swap sink closed",
+            ))
+        }
     }
 
     /// Whether `sink` is still the current sink.
@@ -124,8 +166,39 @@ impl<S: PacketSink> SwapSink<S> {
             .current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .sink
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, sink))
+    }
+
+    /// Whether `err`, which `sink` returned, is absorbed (what it failed and left is
+    /// dropped and the call returns `Ok`): `sink` was replaced, or it is the current sink
+    /// reporting itself gone, which marks the slot, while another clone can replace it.
+    fn absorbs(&self, sink: &Arc<S>, err: &io::Error) -> bool {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return !self.is_current(sink);
+        }
+        {
+            let mut current = self
+                .state
+                .current
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !current
+                .sink
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, sink))
+            {
+                return true;
+            }
+            current.gone = true;
+        }
+        self.replaceable()
+    }
+
+    /// Counts one dropped packet.
+    fn drop_one(&self) {
+        self.state.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Drops every packet in `packets` and counts them, plus `failed` more.
@@ -160,13 +233,13 @@ impl<S> Clone for SwapSink<S> {
 
 impl<S: PacketSink> PacketSink for SwapSink<S> {
     async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
-        let Some(sink) = self.current() else {
-            self.state.dropped.fetch_add(1, Ordering::Relaxed);
+        let Some(sink) = self.current().inspect_err(|_| self.drop_one())? else {
+            self.drop_one();
             return Ok(());
         };
         match sink.send(packet, from).await {
-            Err(_) if !self.is_current(&sink) => {
-                self.state.dropped.fetch_add(1, Ordering::Relaxed);
+            Err(e) if self.absorbs(&sink, &e) => {
+                self.drop_one();
                 Ok(())
             }
             result => result,
@@ -174,12 +247,17 @@ impl<S: PacketSink> PacketSink for SwapSink<S> {
     }
 
     async fn send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
-        let Some(sink) = self.current() else {
+        let current = self.current().inspect_err(|_| {
+            if packets.pop_front().is_some() {
+                self.drop_one();
+            }
+        });
+        let Some(sink) = current? else {
             self.drop_all(packets, 0);
             return Ok(());
         };
         match sink.send_batch(packets).await {
-            Err(_) if !self.is_current(&sink) => {
+            Err(e) if self.absorbs(&sink, &e) => {
                 self.drop_all(packets, 1);
                 Ok(())
             }
@@ -192,12 +270,18 @@ impl<S: PacketSink> PacketSink for SwapSink<S> {
         packets: &mut VecDeque<(PeerId, PacketBuf)>,
         spent: &mut Vec<PacketBuf>,
     ) -> io::Result<()> {
-        let Some(sink) = self.current() else {
+        let current = self.current().inspect_err(|_| {
+            if let Some((_, packet)) = packets.pop_front() {
+                self.drop_one();
+                spent.push(packet);
+            }
+        });
+        let Some(sink) = current? else {
             self.drop_all_spent(packets, spent, 0);
             return Ok(());
         };
         match sink.send_batch_spent(packets, spent).await {
-            Err(_) if !self.is_current(&sink) => {
+            Err(e) if self.absorbs(&sink, &e) => {
                 self.drop_all_spent(packets, spent, 1);
                 Ok(())
             }
@@ -206,25 +290,35 @@ impl<S: PacketSink> PacketSink for SwapSink<S> {
     }
 
     fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
-        let Some(sink) = self.current() else {
+        let current = self.current().inspect_err(|_| {
+            if packets.pop_front().is_some() {
+                self.drop_one();
+            }
+        });
+        let Some(sink) = current? else {
             self.drop_all(packets, 0);
             return Ok(());
         };
-        sink.try_send_batch(packets)
+        match sink.try_send_batch(packets) {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe && self.absorbs(&sink, &e) => {
+                self.drop_all(packets, 1);
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 
 impl<S: fmt::Debug> fmt::Debug for SwapSink<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let current = self
+            .state
+            .current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         f.debug_struct("SwapSink")
-            .field(
-                "current",
-                &*self
-                    .state
-                    .current
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner),
-            )
+            .field("current", &current.sink)
+            .field("gone", &current.gone)
             .field("dropped", &self.state.dropped.load(Ordering::Relaxed))
             .finish()
     }
@@ -273,6 +367,7 @@ mod tests {
     #[tokio::test]
     async fn swap_empty_drops_and_counts() -> TestResult {
         let swap = SwapSink::<ChannelSink>::new(None);
+        let _handle = swap.clone();
         swap.send(packet(1), PeerId::new(1)).await?;
         let mut packets = batch(&[2, 3]);
         swap.send_batch(&mut packets).await?;
@@ -289,6 +384,7 @@ mod tests {
         let (first, mut first_rx) = ChannelSink::new(4);
         let (second, mut second_rx) = ChannelSink::new(4);
         let swap = SwapSink::new(Some(first));
+        let _handle = swap.clone();
         swap.send(packet(1), PeerId::new(1)).await?;
 
         let old = swap.replace(Some(second)).ok_or("no old sink")?;
@@ -357,31 +453,208 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn swap_error_from_current_sink_propagates() -> TestResult {
-        let (sink, rx) = ChannelSink::new(4);
-        let swap = SwapSink::new(Some(sink));
-        drop(rx);
+    /// A sink that is gone: every call is counted and returns `BrokenPipe`.
+    #[derive(Debug, Default)]
+    struct Dead(std::sync::atomic::AtomicUsize);
 
+    impl Dead {
+        fn calls(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        fn call(&self) -> io::Error {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            io::ErrorKind::BrokenPipe.into()
+        }
+    }
+
+    /// A [`Dead`] sink, or a live one.
+    #[derive(Debug)]
+    enum Generation {
+        Dead(Dead),
+        Live(SpentSink),
+    }
+
+    impl PacketSink for Generation {
+        async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+            match self {
+                Self::Dead(dead) => Err(dead.call()),
+                Self::Live(sink) => sink.send(packet, from).await,
+            }
+        }
+
+        async fn send_batch_spent(
+            &self,
+            packets: &mut VecDeque<(PeerId, PacketBuf)>,
+            spent: &mut Vec<PacketBuf>,
+        ) -> io::Result<()> {
+            match self {
+                Self::Dead(dead) => {
+                    packets.pop_front();
+                    Err(dead.call())
+                }
+                Self::Live(sink) => sink.send_batch_spent(packets, spent).await,
+            }
+        }
+
+        fn try_send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
+            match self {
+                Self::Dead(dead) => {
+                    packets.pop_front();
+                    Err(dead.call())
+                }
+                Self::Live(_) => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    fn calls(sink: Option<&Arc<Generation>>) -> Option<usize> {
+        match sink.map(|sink| &**sink) {
+            Some(Generation::Dead(dead)) => Some(dead.calls()),
+            _ => None,
+        }
+    }
+
+    fn broken<T: fmt::Debug>(result: io::Result<T>) -> Result<(), String> {
+        match result {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            other => Err(format!("expected BrokenPipe, got {other:?}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn swap_gone_current_sink_drops_until_replaced() -> TestResult {
+        // Each form is the first to find the sink gone, and calls it once.
+        for form in 0..4 {
+            let swap = SwapSink::new(Some(Generation::Dead(Dead::default())));
+            let handle = swap.clone();
+            let mut packets = batch(&[1, 2, 3]);
+            let mut spent = Vec::new();
+            match form {
+                0 => swap.send(packet(1), PeerId::new(1)).await?,
+                1 => swap.send_batch(&mut packets).await?,
+                2 => swap.send_batch_spent(&mut packets, &mut spent).await?,
+                _ => swap.try_send_batch(&mut packets)?,
+            }
+            assert!(form == 0 || packets.is_empty());
+            // The failed packet is the sink's; the ones it left are spent.
+            assert_eq!(spent.len(), if form == 2 { 2 } else { 0 });
+            assert_eq!(swap.dropped(), if form == 0 { 1 } else { 3 });
+
+            // The gone sink is not called again.
+            let before = swap.dropped();
+            swap.send(packet(4), PeerId::new(4)).await?;
+            let mut packets = batch(&[5, 6]);
+            swap.send_batch(&mut packets).await?;
+            assert!(packets.is_empty());
+            let mut packets = batch(&[7]);
+            let mut spent = Vec::new();
+            swap.send_batch_spent(&mut packets, &mut spent).await?;
+            assert_eq!(bytes(&spent), [[7]]);
+            let mut packets = batch(&[8, 9]);
+            swap.try_send_batch(&mut packets)?;
+            assert!(packets.is_empty());
+            assert_eq!(swap.dropped(), before + 6);
+
+            // `replace` hands the gone sink back and resumes delivery.
+            let live = SpentSink::default();
+            let old = handle.replace(Some(Generation::Live(live.clone())));
+            assert_eq!(calls(old.as_ref()), Some(1));
+            swap.send(packet(10), PeerId::new(10)).await?;
+            swap.send_batch(&mut batch(&[11])).await?;
+            assert_eq!(live.taken(), [[10], [11]]);
+            assert_eq!(swap.dropped(), before + 6);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swap_last_clone_with_a_gone_sink_is_closed() -> TestResult {
+        let swap = SwapSink::new(Some(Generation::Dead(Dead::default())));
+        let handle = swap.clone();
+        swap.send(packet(1), PeerId::new(1)).await?;
+        drop(handle);
+
+        // Nobody can replace the gone sink any more.
+        broken(swap.send(packet(2), PeerId::new(2)).await)?;
+        let mut packets = batch(&[3, 4]);
+        broken(swap.send_batch(&mut packets).await)?;
+        assert_eq!(packets.len(), 1);
+        let mut packets = batch(&[5, 6]);
+        let mut spent = Vec::new();
+        broken(swap.send_batch_spent(&mut packets, &mut spent).await)?;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(bytes(&spent), [[5]]);
+        let mut packets = batch(&[7, 8]);
+        broken(swap.try_send_batch(&mut packets))?;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(swap.dropped(), 5);
+        assert_eq!(calls(swap.replace(None).as_ref()), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swap_last_clone_finds_its_sink_gone() -> TestResult {
+        // The sink's own error comes back: it dropped the failed packet.
+        let swap = SwapSink::new(Some(Generation::Dead(Dead::default())));
+        broken(swap.send(packet(1), PeerId::new(1)).await)?;
+        assert_eq!(swap.dropped(), 0);
+        let swap = SwapSink::new(Some(Generation::Dead(Dead::default())));
+        let mut packets = batch(&[1, 2, 3]);
+        broken(swap.send_batch(&mut packets).await)?;
+        assert_eq!(packets.len(), 2);
+        let swap = SwapSink::new(Some(Generation::Dead(Dead::default())));
+        let mut packets = batch(&[1, 2, 3]);
+        broken(swap.try_send_batch(&mut packets))?;
+        assert_eq!(packets.len(), 2);
+        assert_eq!(swap.dropped(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swap_last_clone_with_an_empty_slot_is_closed() -> TestResult {
+        let swap = SwapSink::<ChannelSink>::new(None);
+        broken(swap.send(packet(1), PeerId::new(1)).await)?;
+        let mut packets = batch(&[2, 3]);
+        broken(swap.send_batch(&mut packets).await)?;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(swap.dropped(), 2);
+
+        // A clone can fill the slot again.
+        let handle = swap.clone();
+        swap.send(packet(4), PeerId::new(4)).await?;
+        let (sink, mut rx) = ChannelSink::new(4);
+        handle.replace(Some(sink));
+        drop(handle);
+        swap.send(packet(5), PeerId::new(5)).await?;
+        assert_eq!(next(&mut rx).await?, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swap_other_error_from_current_sink_propagates() -> TestResult {
+        let swap = SwapSink::new(Some(SpentSink::default()));
+        let _handle = swap.clone();
         let err = swap
-            .send(packet(1), PeerId::new(1))
+            .send(packet(SpentSink::FAIL), PeerId::new(1))
             .await
             .err()
             .ok_or("expected an error")?;
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
-        let mut packets = batch(&[2, 3]);
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let mut packets = batch(&[SpentSink::FAIL, 3]);
         let err = swap
             .send_batch(&mut packets)
             .await
             .err()
             .ok_or("expected an error")?;
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(packets.len(), 1);
         let err = swap
             .try_send_batch(&mut packets)
             .err()
             .ok_or("expected an error")?;
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(packets.len(), 1);
         assert_eq!(swap.dropped(), 0);
         Ok(())
     }
@@ -406,6 +679,7 @@ mod tests {
     #[tokio::test]
     async fn spent_empty_slot_returns_the_dropped_buffers() -> TestResult {
         let swap = SwapSink::<SpentSink>::new(None);
+        let _handle = swap.clone();
         let mut packets = batch(&[1, 2]);
         let mut spent = Vec::new();
         swap.send_batch_spent(&mut packets, &mut spent).await?;
