@@ -59,7 +59,8 @@ const MAX_INJECT_PER_ITER: usize = 256;
 const EGRESS_BACKLOG: usize = 256;
 /// Commands (`connect_tcp`, `bind_udp`, `connect_udp`) queued for the driver.
 const COMMAND_CAPACITY: usize = 64;
-/// Longest the driver sleeps without a timer from smoltcp.
+/// Longest the driver sleeps without a timer from smoltcp while something in the stack
+/// waits for time to pass (see [`Driver::timed`]).
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
 /// Longest a connection goes without a bridge pass while the driver runs: a pass over every
 /// connection follows the last one after this long, for the timeouts of connections
@@ -221,6 +222,7 @@ impl Driver {
         #[cfg(test)]
         {
             self.turns += 1;
+            stats::add(&self.stats.turns, 1);
         }
         // 0. Retire revoked flows before anything of theirs can move.
         self.retire_revoked();
@@ -305,29 +307,55 @@ impl Driver {
         true
     }
 
-    /// Waits for ingress, a request, application I/O, egress room or a smoltcp timer;
-    /// `false` once the stack must stop.
+    /// Whether something in the stack waits for time to pass without a wake-up of its
+    /// own, so the driver keeps its periodic turn: a TCP socket (the idle timeout and the
+    /// release of connections, a `connect_tcp` its caller gave up, a handshake that ended,
+    /// listener sockets to reclaim), the reassembler (fragments and discard records
+    /// expire at the start of a turn), UDP marks to prune once the source took their
+    /// datagrams, or an egress backlog. Without any of them every piece of work arrives
+    /// through a queue or a notification `wait` listens on.
+    fn timed(&self) -> bool {
+        self.sockets.iter().next().is_some()
+            || self.reassembler.is_some()
+            || !self.marks.is_empty()
+            || !self.device.tx_queue.is_empty()
+    }
+
+    /// Waits for ingress, a request, application I/O, egress room or a timer: smoltcp's,
+    /// at most [`MAX_POLL_DELAY`] ahead, and none at all on a stack with nothing
+    /// [`timed`](Self::timed); `false` once the stack must stop.
     async fn wait(&mut self, now: SmolInstant) -> bool {
         let tx_full = self.device.tx_full();
-        let mut delay = if tx_full {
-            MAX_POLL_DELAY
+        let mut delay = if !self.timed() {
+            None
+        } else if tx_full {
+            Some(MAX_POLL_DELAY)
         } else {
-            self.iface
-                .poll_delay(now, &self.sockets)
-                .map_or(MAX_POLL_DELAY, |delay| {
-                    Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
-                })
+            Some(
+                self.iface
+                    .poll_delay(now, &self.sockets)
+                    .map_or(MAX_POLL_DELAY, |delay| {
+                        Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
+                    }),
+            )
         };
         if !self.conns.is_empty() {
-            delay = delay.min(self.full_pass_due(now));
+            delay = delay.map(|delay| delay.min(self.full_pass_due(now)));
         }
         if let Some(deadline) = self.pending.as_deref_mut().and_then(Pending::next_deadline) {
-            delay = delay.min(deadline.saturating_duration_since(Instant::now()));
+            let pending = deadline.saturating_duration_since(Instant::now());
+            delay = Some(delay.map_or(pending, |delay| delay.min(pending)));
         }
-        if delay.is_zero() {
+        if delay.is_some_and(|delay| delay.is_zero()) {
             tokio::task::yield_now().await;
             return true;
         }
+        let timer = async {
+            match delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending().await,
+            }
+        };
         let backlog = !self.device.tx_queue.is_empty();
         let waiting = !self.waiting.is_empty();
         let has_commands = self.commands.is_some();
@@ -372,7 +400,7 @@ impl Driver {
                 }
                 Err(_) => return false,
             },
-            () = tokio::time::sleep(delay) => return true,
+            () = timer => return true,
         };
         match command {
             Some(command) => self.command(command),

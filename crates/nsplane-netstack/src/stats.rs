@@ -163,6 +163,9 @@ pub(crate) struct Counters {
     /// Behind [`NetStackHandle::retired_drops`](crate::NetStackHandle::retired_drops), not
     /// part of [`NetStackStats`].
     pub(crate) retired: AtomicU64,
+    /// Driver turns taken.
+    #[cfg(test)]
+    pub(crate) turns: AtomicU64,
 }
 
 /// Adds `n` to `counter`.

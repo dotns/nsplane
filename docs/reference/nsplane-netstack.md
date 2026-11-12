@@ -48,6 +48,13 @@ no connection without a signal has anything to bridge. smoltcp itself stays line
 sockets: it offers each ingress packet to the sockets in slot order and walks all of them in
 each egress turn and for its next timer.
 
+Between turns the driver waits for an ingress packet, a handle call, a signal of a
+connection, a UDP send, room in the egress or accept queue, or a timer. The timer is smoltcp's
+next one, at most 50 ms ahead (`MAX_POLL_DELAY`), while something in the stack waits for time
+to pass without a wake-up of its own: a TCP socket (a connection, a `connect_tcp`, a handshake
+or a listener socket to reclaim), the reassembler, a UDP mark to prune or an egress backlog. A
+stack with none of these sets no timer and takes no turn until it is woken.
+
 ### Queues, ports and counters
 
 - Every queue is bounded (ingress, egress, accept and datagram capacities in
@@ -214,9 +221,9 @@ each egress turn and for its next timer.
   (none is created without it). Before `classify`, every ingress packet to a stack address
   is pushed into it: a non-fragment passes unchanged, a fragment is held, and a completed
   datagram continues through the normal ingress as one packet (UDP dispatch, or smoltcp for
-  TCP). Expiry runs at the start of each driver turn, which the driver's existing timer
-  (at most `MAX_POLL_DELAY`, 50 ms) already wakes, and is a single emptiness check while no
-  datagram is held. The reassembler's counts are added to `NetStackStats` after each push
+  TCP). Expiry runs at the start of each driver turn, which the driver's timer (at most
+  `MAX_POLL_DELAY`, 50 ms, kept on every stack with a reassembler) wakes, and is a single
+  emptiness check while no datagram is held. The reassembler's counts are added to `NetStackStats` after each push
   or expiry: `reassembled`, `reassembly_timeout`, `reassembly_overflow`, and overlapping or
   invalid fragments as `malformed`. Without it, fragments count as `unsupported`.
 - `NetStackHandle::discard_fragments(src, dst, protocol, id)` is for a local side that
