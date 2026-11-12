@@ -95,7 +95,11 @@ type RouteFn = dyn Fn(PeerId, &mut PacketBuf) -> usize + Send + Sync;
 /// batch after an error, when the caller delivers them. A [`Splitter::new_map`] splitter
 /// hands over one packet at a time, so its closure rewrites each packet once, also across
 /// those retries. Errors and cancellation follow `send_batch`: the packets of a run its sink
-/// did not take over stay at the front of the batch, in order. When a sink goes while another
+/// did not take over stay at the front of the batch, in order. The sinks are not trusted to
+/// keep that contract: when a sink took nothing out of its run, the front packet of the run is
+/// dropped and its buffer appended to `spent`. After an error that is the packet that failed;
+/// after an `Ok` it is counted in [`SplitterStats::failed`] and the rest of the run is routed
+/// again. When a sink goes while another
 /// is open, the call goes on instead: the rest of its run is routed again and dropped, and
 /// the packets behind are delivered in order. Each packet goes to one sink and is never
 /// shared: only that sink may append its buffer, and the splitter appends the buffers of the
@@ -124,7 +128,9 @@ pub struct SplitterStats {
     /// Packets not delivered because the chosen sink returned an error (of any kind,
     /// [`io::ErrorKind::BrokenPipe`] included), was gone already, or because every sink was
     /// gone. `send` returned the error for them, except for a packet routed to a gone sink
-    /// while another sink was open, which it dropped with `Ok`.
+    /// while another sink was open, which it dropped with `Ok`. Also the packets
+    /// `send_batch_spent` dropped because the chosen sink reported its run delivered and
+    /// took none of it.
     pub failed: u64,
 }
 
@@ -303,13 +309,27 @@ impl PacketSink for Splitter {
                 run: &mut run,
             };
             let result = route.sink.send_batch_spent_boxed(run.run, spent).await;
-            drop(run);
-            if let Err(err) = result {
-                if self.failed(route, &err) {
-                    return Err(err);
+            let left = run.run.len();
+            // The sink is not trusted to keep the batch contract: when it took nothing out
+            // of its run, the front packet is dropped, so every call makes progress. After
+            // an error that is the packet that failed, counted below.
+            if left == len
+                && let Some((_, packet)) = run.run.pop_front()
+            {
+                if result.is_ok() {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
                 }
+                spent.push(packet);
+            }
+            drop(run);
+            if left > 0 {
                 // The rest of the run is back at the front of the batch.
                 next = None;
+            }
+            if let Err(err) = result
+                && self.failed(route, &err)
+            {
+                return Err(err);
             }
         }
         Ok(())
@@ -514,6 +534,132 @@ mod tests {
                 failed: 3
             }
         );
+        Ok(())
+    }
+
+    /// A sink that breaks the batch contract for a packet whose second byte is
+    /// [`Careless::KEPT`]: it leaves the packet and the ones behind it in the batch and
+    /// returns `result`. It takes the packets before it over into `inner`.
+    struct Careless {
+        inner: SpentSink,
+        result: fn() -> io::Result<()>,
+    }
+
+    impl Careless {
+        const KEPT: u8 = 0xCC;
+    }
+
+    impl PacketSink for Careless {
+        async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+            self.inner.send(packet, from).await
+        }
+
+        async fn send_batch(&self, packets: &mut VecDeque<(PeerId, PacketBuf)>) -> io::Result<()> {
+            // Lets the timeout of a test fire while the splitter calls again and again.
+            tokio::task::yield_now().await;
+            while let Some((from, packet)) = packets.pop_front() {
+                if packet.as_packet().get(1) == Some(&Self::KEPT) {
+                    packets.push_front((from, packet));
+                    return (self.result)();
+                }
+                self.inner.send(packet, from).await?;
+            }
+            Ok(())
+        }
+    }
+
+    fn batch_of(packets: &[&[u8]]) -> VecDeque<(PeerId, PacketBuf)> {
+        packets
+            .iter()
+            .map(|bytes| (PeerId::new(9), PacketBuf::from_packet(bytes)))
+            .collect()
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A sink that reports its run delivered and leaves packets in it loses the front one
+    /// of those; the splitter does not hand the same run over forever.
+    #[tokio::test]
+    async fn sink_that_leaves_its_run_loses_the_front_packet() -> TestResult {
+        for map in [false, true] {
+            let a = SpentSink::default();
+            let careless = Careless {
+                inner: a.clone(),
+                result: || Ok(()),
+            };
+            let splitter = if map {
+                Splitter::new_map(|from, packet: &mut PacketBuf| by_first_byte(from, packet))
+            } else {
+                Splitter::new(by_first_byte)
+            }
+            .sink(careless);
+            let kept = Careless::KEPT;
+            let mut packets = batch_of(&[&[0, 1], &[0, kept], &[0, 2], &[0, kept]]);
+            let mut spent = Vec::new();
+            tokio::time::timeout(WAIT, splitter.send_batch_spent(&mut packets, &mut spent))
+                .await??;
+            assert!(packets.is_empty());
+            assert_eq!(a.taken(), [[0, 1], [0, 2]]);
+            assert_eq!(bytes(&spent), [[0, kept], [0, kept]]);
+            assert_eq!(splitter.stats().failed, 2);
+        }
+        Ok(())
+    }
+
+    /// The packets a sink left behind an `Ok` are routed again: they do not go to the sink
+    /// of the packet behind their run.
+    #[tokio::test]
+    async fn packets_a_sink_left_do_not_reach_the_next_sink() -> TestResult {
+        let (a, b) = (SpentSink::default(), SpentSink::default());
+        let careless = Careless {
+            inner: a.clone(),
+            result: || Ok(()),
+        };
+        let splitter = Splitter::new(by_first_byte).sink(careless).sink(b.clone());
+        let mut packets = batch_of(&[&[0, Careless::KEPT], &[0, 2], &[1, 3]]);
+        let mut spent = Vec::new();
+        tokio::time::timeout(WAIT, splitter.send_batch_spent(&mut packets, &mut spent)).await??;
+        assert!(packets.is_empty());
+        assert_eq!(a.taken(), [[0, 2]]);
+        assert_eq!(b.taken(), [[1, 3]]);
+        assert_eq!(splitter.stats().failed, 1);
+        Ok(())
+    }
+
+    /// The splitter keeps the batch contract when its sink does not: the packet a sink
+    /// failed and left is dropped, counted once, and the rest stay.
+    #[tokio::test]
+    async fn packet_a_sink_failed_and_left_is_dropped() -> TestResult {
+        let a = SpentSink::default();
+        let careless = Careless {
+            inner: a.clone(),
+            result: || Err(io::Error::other("refused")),
+        };
+        let splitter = Splitter::new(by_first_byte).sink(careless);
+        let mut packets = batch_of(&[&[0, 1], &[0, Careless::KEPT], &[0, 2]]);
+        let mut spent = Vec::new();
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].1.as_packet(), [0, Careless::KEPT]);
+
+        // The run now starts with the packet the sink leaves.
+        let err = splitter
+            .send_batch_spent(&mut packets, &mut spent)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].1.as_packet(), [0, 2]);
+        assert_eq!(bytes(&spent), [[0, Careless::KEPT]]);
+        assert_eq!(splitter.stats().failed, 2);
+        splitter.send_batch_spent(&mut packets, &mut spent).await?;
+        assert_eq!(a.taken(), [[0, 1], [0, 2]]);
         Ok(())
     }
 

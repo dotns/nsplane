@@ -594,7 +594,11 @@ only the chosen sink, but a waiting sink still holds back the engine's next deli
 packets routed to an index out of range are dropped and counted (`Splitter::misrouted`).
 `Splitter::stats` returns a `SplitterStats` snapshot (`#[non_exhaustive]`): `misrouted`, and
 `failed`, packets whose chosen sink returned an error or was gone, or that found every sink
-gone; a delivered packet updates no counter. A sink that returned `BrokenPipe` is gone for
+gone; a delivered packet updates no counter. The sinks are not trusted to keep the batch
+contract: when a sink takes nothing out of the run `send_batch_spent` hands it, the front
+packet of the run is dropped (after an error it is the packet that failed; after an `Ok` it
+is counted in `failed` and the rest of the run is routed again), so a sink that leaves its
+packets cannot make the splitter hand them over forever. A sink that returned `BrokenPipe` is gone for
 good and is not called again. While another sink is open, a packet routed to a gone sink is
 dropped, counted in `failed`, and the call returns `Ok`, so the engine keeps delivering to
 the open sinks; the splitter returns `BrokenPipe`, which the engine takes for the whole
