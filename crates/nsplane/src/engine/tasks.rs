@@ -216,6 +216,11 @@ pub(super) async fn read_source<Src: PacketSource>(
 /// Delivers decrypted packets to the sink in batches of what is queued, until it closes.
 /// After an error other than the close it waits before the next delivery
 /// ([`ErrorBackoff`]).
+///
+/// The sink is not trusted to keep the batch contract: when a call that did not close took
+/// no packet out of the batch (an error that left the failed packet in it, or an `Ok` that
+/// left packets), the front packet is dropped, so every call makes progress and the queue
+/// behind it is not stalled.
 pub(super) async fn write_sink<Snk: PacketSink>(
     sink: Arc<Snk>,
     mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>,
@@ -224,6 +229,8 @@ pub(super) async fn write_sink<Snk: PacketSink>(
 ) {
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
     let mut backoff = ErrorBackoff::default();
+    // Whether the sink was already reported for leaving a packet.
+    let mut stuck = false;
     while let Some(first) = deliver.recv().await {
         packets.push_back(first);
         while packets.len() < MAX_BATCH {
@@ -235,15 +242,22 @@ pub(super) async fn write_sink<Snk: PacketSink>(
             return;
         }
         while !packets.is_empty() {
-            match sink.send_batch(&mut packets).await {
-                Ok(()) => {
-                    backoff.reset();
-                    break;
+            let offered = packets.len();
+            let result = sink.send_batch(&mut packets).await;
+            if let Err(e) = &result
+                && e.kind() == io::ErrorKind::BrokenPipe
+            {
+                tracing::debug!("Packet sink closed");
+                return;
+            }
+            if packets.len() >= offered {
+                packets.pop_front();
+                if !std::mem::replace(&mut stuck, true) {
+                    tracing::warn!("Packet sink left a packet it failed or reported delivered");
                 }
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                    tracing::debug!("Packet sink closed");
-                    return;
-                }
+            }
+            match result {
+                Ok(()) => backoff.reset(),
                 Err(e) => {
                     backoff.log("Packet sink error", &e);
                     backoff.wait().await;

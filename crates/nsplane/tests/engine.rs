@@ -2397,3 +2397,97 @@ async fn lasting_sink_errors_back_off() {
     }
     assert!(delivered > 0 && delivered < PACKETS);
 }
+
+/// A payload [`Careless`] fails without dropping its packet.
+const KEPT_FAILED: &[u8] = b"kept and failed";
+/// A payload [`Careless`] leaves in the batch it reports delivered.
+const KEPT_DELIVERED: &[u8] = b"kept and delivered";
+
+/// A sink that breaks the batch contract for the packets with the payloads above; with
+/// `inline`, in `try_send_batch`.
+struct Careless {
+    inner: ChannelSink,
+    inline: bool,
+}
+
+fn carries(packets: &std::collections::VecDeque<(PeerId, PacketBuf)>, payload: &[u8]) -> bool {
+    packets
+        .front()
+        .is_some_and(|(_, packet)| packet.as_packet().ends_with(payload))
+}
+
+impl PacketSink for Careless {
+    async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+        self.inner.send(packet, from).await
+    }
+
+    async fn send_batch(
+        &self,
+        packets: &mut std::collections::VecDeque<(PeerId, PacketBuf)>,
+    ) -> io::Result<()> {
+        loop {
+            if carries(packets, KEPT_FAILED) {
+                return Err(io::Error::other("refused"));
+            }
+            if carries(packets, KEPT_DELIVERED) {
+                return Ok(());
+            }
+            let Some((from, packet)) = packets.pop_front() else {
+                return Ok(());
+            };
+            self.inner.send(packet, from).await?;
+        }
+    }
+
+    fn try_send_batch(
+        &self,
+        packets: &mut std::collections::VecDeque<(PeerId, PacketBuf)>,
+    ) -> io::Result<()> {
+        if self.inline && carries(packets, KEPT_FAILED) {
+            return Err(io::Error::other("refused"));
+        }
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+}
+
+/// A sink that fails a packet without dropping it, or reports a batch delivered and
+/// leaves packets in it, loses those packets only: the sink task goes on with the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_that_keeps_packets_does_not_stall_the_sink_task() {
+    let (mut a, mut b) = nodes_with_sink(|inner| Careless {
+        inner,
+        inline: false,
+    });
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    for payload in [
+        KEPT_FAILED,
+        b"first",
+        KEPT_DELIVERED,
+        KEPT_DELIVERED,
+        b"second",
+    ] {
+        a.send(IP_B, payload).await;
+    }
+    assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"first"));
+    assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"second"));
+    exchange(&mut a, &mut b).await;
+}
+
+/// A sink that fails a packet in `try_send_batch` without dropping it does not hang the
+/// owner task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_that_keeps_a_failed_packet_inline_does_not_hang_the_engine() {
+    let (mut a, mut b) = nodes_with_sink(|inner| Careless {
+        inner,
+        inline: true,
+    });
+    introduce(&a, &b).await;
+
+    a.send(IP_B, KEPT_FAILED).await;
+    a.send(IP_B, b"after").await;
+    assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"after"));
+    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+    exchange(&mut a, &mut b).await;
+}

@@ -361,11 +361,13 @@ impl Owner {
     }
 
     /// Hands the packets collected for the sink to it without waiting and queues the rest,
-    /// in order.
+    /// in order. A sink that fails a packet and leaves it in the batch, against the batch
+    /// contract, loses that packet, so the loop ends.
     fn deliver_inline(&mut self) {
         let mut packets = std::mem::take(&mut self.sink.delivered);
         let offered = packets.len();
         while !packets.is_empty() {
+            let before = packets.len();
             match (self.sink.try_deliver)(&mut packets) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -374,7 +376,14 @@ impl Owner {
                     self.sink.closed = true;
                     break;
                 }
-                Err(e) => tracing::warn!(message = "Packet sink error", error = ?e),
+                Err(e) => {
+                    tracing::warn!(message = "Packet sink error", error = ?e);
+                    if packets.len() >= before
+                        && let Some((_, packet)) = packets.pop_front()
+                    {
+                        self.core.recycle(packet);
+                    }
+                }
             }
         }
         self.sink
