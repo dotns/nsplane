@@ -27,6 +27,11 @@ const ICMPV6_PACKET_TOO_BIG: u8 = 2;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const TCP_SYN: u8 = 0x02;
+/// IPv6 next header values of the extension headers.
+const HOP_BY_HOP: u8 = 0;
+const ROUTING: u8 = 43;
+const FRAGMENT: u8 = 44;
+const DESTINATION_OPTIONS: u8 = 60;
 
 /// The header size difference between IPv6 and IPv4.
 const HEADER_DELTA: usize = 20;
@@ -97,7 +102,8 @@ pub(super) struct Request {
 }
 
 /// The shape check of a request: an IPv6 TCP or UDP packet or an `ICMPv6`
-/// echo request without extension headers. Everything else is not ours.
+/// echo request without extension headers. Everything else is not ours,
+/// or [`untranslatable`].
 pub(super) fn request(bytes: &[u8]) -> Option<Request> {
     if bytes.len() < 40 || bytes[0] >> 4 != 6 {
         return None;
@@ -112,6 +118,28 @@ pub(super) fn request(bytes: &[u8]) -> Option<Request> {
         protocol,
         dst: addr6(bytes, 24),
     })
+}
+
+/// The drop reason and the destination of an IPv6 packet that starts with an
+/// extension header: not a [`request`], and not translated if it is
+/// addressed to a route.
+pub(super) fn untranslatable(bytes: &[u8]) -> Option<(&'static str, Ipv6Addr)> {
+    if bytes.len() < 40 || bytes[0] >> 4 != 6 {
+        return None;
+    }
+    let reason = match bytes[6] {
+        FRAGMENT => super::reasons::FRAGMENT,
+        HOP_BY_HOP | ROUTING | DESTINATION_OPTIONS => super::reasons::EXTENSION_HEADER,
+        _ => return None,
+    };
+    Some((reason, addr6(bytes, 24)))
+}
+
+/// The source and destination of an IPv4 fragment (MF set or a non-zero
+/// offset).
+pub(super) fn fragment(bytes: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    (bytes.len() >= 20 && bytes[0] >> 4 == 4 && !unfragmented(be16(bytes, 6)))
+        .then(|| (addr4(bytes, 12), addr4(bytes, 16)))
 }
 
 /// The flow tuple of a request after its destination resolved, keyed by the

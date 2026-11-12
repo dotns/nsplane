@@ -15,6 +15,16 @@ pub const PORT_EXHAUSTED: &str = "nat64 lan ports exhausted";
 /// A new flow could not be recorded: the conntrack table holds no flows at
 /// all (`max_entries` is 0).
 pub const CONNTRACK_FULL: &str = "nat64 lan conntrack full";
+/// A fragment, which the translator does not translate.
+///
+/// It is an IPv6 packet with a Fragment header to an address of a route's
+/// `mapped` prefix, or an IPv4 fragment from a route's `real` prefix to its
+/// `snat_source`. Fragments are not reassembled, and a later fragment
+/// carries no ports to find its flow by.
+pub const FRAGMENT: &str = "nat64 lan fragment";
+/// An IPv6 packet to an address of a route's `mapped` prefix starts with a
+/// hop-by-hop options, routing or destination options header.
+pub const EXTENSION_HEADER: &str = "nat64 lan extension header";
 /// A packet to a routed destination is malformed (its length disagrees with
 /// its header, its transport header is truncated, its UDP checksum is
 /// absent) or would not fit an IPv4 packet.

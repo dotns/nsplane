@@ -148,6 +148,20 @@ routes gate every forward packet; a flow keeps its SNAT address across a route r
 caller revokes the flows of a removed route with `remove_flow`. Unlike the filters above it sits
 on the **local side**: the LAN's replies are addressed to `snat_source`, which no peer's
 allowed IPs contain, so the core could not route them to a peer before a filter ran.
+**Limitation: fragments and IPv6 extension headers are not translated.** `Nat64Lan` works on
+one packet at a time and finds a flow by its ports, which a later fragment does not carry;
+translating them needs reassembly, and a reassembled LAN reply above the tunnel MTU would have
+to leave as several IPv6 fragments, which `reverse` and `Nat64LanSource` (one packet in, at
+most one out) cannot emit. Such packets are dropped and counted rather than passed
+untranslated (`NotOurs`) to a side that could not deliver them: an IPv6 packet to an address of a
+`mapped` prefix that starts with a Fragment header (`reasons::FRAGMENT`) or a hop-by-hop
+options, routing or destination options header (`reasons::EXTENSION_HEADER`), and an IPv4
+fragment from a route's `real` prefix to its `snat_source` (`reasons::FRAGMENT`), counted by
+`Nat64Lan::fragment_drops` and `Nat64Lan::extension_header_drops` (accessors, because
+`Nat64LanStats` cannot take a field without breaking its users). A datagram that either side
+fragments is therefore lost: LAN hosts must keep UDP replies within the path MTU (the TCP MSS
+clamp and Packet Too Big cover TCP). The `Translator` differs: it translates fragments and
+skips those extension headers.
 `Nat64LanSink` runs `forward` on the packets the engine delivers and `Nat64LanSource` runs
 `reverse` on local packets before the core routes them (the IPv6 result goes to the peer
 owning the original source). Both keep the packet's tag and receipt marker; a reply without
@@ -254,7 +268,7 @@ Each filter drops with its own reasons (`nsplane_nat::reasons`, `nat64_lan::reas
 - `Masquerade`: a bounded table that refuses new flows when full, and at most
   `max_flows_per_source` flows per inside source address (half the table by default).
 - `Nat64Lan`: one SNAT port or Echo identifier per flow from `SnatPorts`; a saturated range
-  drops the packet.
+  drops the packet. No fragments and no IPv6 extension headers: they are dropped.
 
 ## See also
 

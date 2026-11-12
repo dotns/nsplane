@@ -94,6 +94,16 @@ impl LanRoute {
     }
 }
 
+impl LanRoute {
+    /// Whether a packet from `src` to `dst` is a LAN host of `real` answering
+    /// `snat_source`.
+    pub(super) fn answers(&self, src: Ipv4Addr, dst: Ipv4Addr) -> bool {
+        let (real, len) = self.real;
+        let mask = mask4(len);
+        dst == self.snat_source && u32::from(src) & mask == u32::from(real) & mask
+    }
+}
+
 /// The netmask of an IPv4 prefix of `len` bits (all ones past 32).
 fn mask4(len: u8) -> u32 {
     u32::MAX

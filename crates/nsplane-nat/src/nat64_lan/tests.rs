@@ -1,6 +1,8 @@
 //! Tests of in-place NAT64-to-LAN translation on `PacketBuf`, flow lifetime
 //! (port reservation, expiry, eviction, removal) and route replacement.
 
+mod untranslatable;
+
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
@@ -302,9 +304,12 @@ fn forward_moves_the_start_inside_the_buffer() {
 #[test]
 fn rejects_extensions_and_unauthorized_ipv6_packets() {
     let lan = lan();
-    // A fragment header (and any other extension header) is not ours.
+    // A fragment header (and any other extension header) is not translated.
     let mut fragment = ipv6(44, vec![protocol::UDP, 0, 0, 0, 0, 0, 0, 1]);
-    assert_not_ours(&mut fragment, |p| lan.forward(p));
+    assert_eq!(
+        lan.forward(&mut fragment),
+        Nat64Verdict::Drop(reasons::FRAGMENT)
+    );
     // Another /96.
     let other = Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 8, 0xc0a8, 0x0701);
     let mut elsewhere =
@@ -315,7 +320,7 @@ fn rejects_extensions_and_unauthorized_ipv6_packets() {
     assert_not_ours(&mut gre, |p| lan.forward(p));
     let mut v4 = reply(protocol::UDP, udp(53, 1, b""));
     assert_not_ours(&mut v4, |p| lan.forward(p));
-    assert_eq!(lan.stats().not_ours, 4);
+    assert_eq!(lan.stats().not_ours, 3);
     assert_eq!(lan.stats().conntrack.entries, 0);
 }
 
@@ -644,7 +649,10 @@ fn replies_of_unknown_flows_and_other_packets_are_not_ours() {
     assert_not_ours(&mut ipv6_packet, |p| lan.reverse(p));
     let mut fragment = ipv4_bytes(protocol::UDP, HOST, SNAT, udp(53, snat_port, b""));
     fragment[6] = 0x20;
-    assert_not_ours(&mut PacketBuf::from_packet(&fragment), |p| lan.reverse(p));
+    assert_eq!(
+        lan.reverse(&mut PacketBuf::from_packet(&fragment)),
+        Nat64Verdict::Drop(reasons::FRAGMENT)
+    );
 }
 
 // -- Checksums: updated for what changed, never recomputed over the packet. --

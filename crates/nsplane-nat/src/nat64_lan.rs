@@ -23,10 +23,19 @@
 //!   next-hop MTU plus 20 (at least 1280).
 //! - **TCP MSS clamp** ([`Nat64LanConfig::max_tcp_mss`]): the MSS option of
 //!   SYN packets is lowered in both directions.
-//! - Everything else (other protocols and ICMP types, IPv6 extension headers
-//!   and fragments, IPv4 options and fragments, destinations outside every
-//!   route, replies of unknown flows) is not ours ([`Nat64Verdict::NotOurs`])
-//!   and left unchanged.
+//! - **Fragments and extension headers** are not translated, and are dropped
+//!   rather than passed on untranslated: an IPv6 packet to an address of a
+//!   route's `mapped` prefix whose first next header is a Fragment header
+//!   ([`reasons::FRAGMENT`]) or a hop-by-hop options, routing or destination
+//!   options header ([`reasons::EXTENSION_HEADER`]), and an IPv4 fragment
+//!   from a route's `real` prefix to its `snat_source`
+//!   ([`reasons::FRAGMENT`]). [`Nat64Lan::fragment_drops`] and
+//!   [`Nat64Lan::extension_header_drops`] count them. So a datagram either
+//!   side fragments is lost: a LAN host must keep its replies within the
+//!   path MTU. See [Fragments](#fragments).
+//! - Everything else (other protocols and ICMP types, IPv4 options, other
+//!   fragments, destinations outside every route, replies of unknown flows)
+//!   is not ours ([`Nat64Verdict::NotOurs`]) and left unchanged.
 //!
 //! Packets are rewritten in place: a forwarded packet shrinks by 20 bytes
 //! (its start moves forward inside the buffer) and a reply grows by 20 bytes
@@ -71,6 +80,19 @@
 //! Routes are replaced through the caller's [`LanRoutes`]; flows expire when
 //! idle, not only through [`Nat64Lan::remove_flow`]; DF can be turned on
 //! with [`Nat64LanConfig::set_df`].
+//!
+//! # Fragments
+//!
+//! The translator works on one packet at a time, in place, and finds a flow
+//! by its ports. A fragment after the first has no ports, so translating
+//! fragments needs reassembly (or per-datagram state), and a reassembled
+//! reply larger than the tunnel MTU would have to leave as several IPv6
+//! fragments, which [`Nat64Lan::reverse`] and [`Nat64LanSource`] (one packet
+//! in, at most one out) cannot emit. Such packets are therefore dropped
+//! and counted instead of reaching the other side untranslated, where an
+//! IPv4 fragment to `snat_source` has no route and an IPv6 packet to a
+//! mapped address has no host. The stateless [`Translator`](crate::Translator)
+//! does translate fragments, and skips the extension headers dropped here.
 //!
 //! # Placement
 //!
@@ -209,6 +231,8 @@ struct Counters {
     port_exhausted: AtomicU64,
     other_drops: AtomicU64,
     not_ours: AtomicU64,
+    fragment: AtomicU64,
+    extension_header: AtomicU64,
 }
 
 /// The routes of a [`Nat64Lan`], shared with the caller: clones share the
@@ -258,6 +282,8 @@ impl fmt::Debug for Nat64Lan {
             .field("routes", &self.routes.load())
             .field("config", &self.config)
             .field("stats", &self.stats())
+            .field("fragment_drops", &self.fragment_drops())
+            .field("extension_header_drops", &self.extension_header_drops())
             .finish_non_exhaustive()
     }
 }
@@ -319,6 +345,20 @@ impl Nat64Lan {
         }
     }
 
+    /// Packets dropped with [`reasons::FRAGMENT`], in either direction. It
+    /// is not a field of [`Nat64LanStats`], which cannot grow without
+    /// breaking its users.
+    pub fn fragment_drops(&self) -> u64 {
+        self.counters.fragment.load(Ordering::Relaxed)
+    }
+
+    /// Packets dropped with [`reasons::EXTENSION_HEADER`]; like
+    /// [`fragment_drops`](Self::fragment_drops), not a field of
+    /// [`Nat64LanStats`].
+    pub fn extension_header_drops(&self) -> u64 {
+        self.counters.extension_header.load(Ordering::Relaxed)
+    }
+
     /// Translates an IPv6 packet to a routed LAN host to IPv4, in place; see
     /// the [module docs](self).
     pub fn forward(&self, packet: &mut PacketBuf) -> Nat64Verdict {
@@ -342,7 +382,12 @@ impl Nat64Lan {
             Some((error, original))
         });
         let Some((error, original)) = found else {
-            return self.count(Ok(false), &self.counters.packet_too_big);
+            let result = if self.lan_fragment(bytes) {
+                Err(reasons::FRAGMENT)
+            } else {
+                Ok(false)
+            };
+            return self.count(result, &self.counters.packet_too_big);
         };
         packet::packet_too_big(packet, &original, &error);
         self.count(Ok(true), &self.counters.packet_too_big)
@@ -380,6 +425,8 @@ impl Nat64Lan {
                     reasons::UNSAFE_TARGET => &c.unsafe_target,
                     reasons::AMBIGUOUS_ROUTE => &c.ambiguous_route,
                     reasons::PORT_EXHAUSTED => &c.port_exhausted,
+                    reasons::FRAGMENT => &c.fragment,
+                    reasons::EXTENSION_HEADER => &c.extension_header,
                     _ => &c.other_drops,
                 };
                 (counter, Nat64Verdict::Drop(reason))
@@ -392,6 +439,14 @@ impl Nat64Lan {
     fn forward_inner(&self, packet: &mut PacketBuf) -> Result<bool, &'static str> {
         let bytes = packet.as_packet();
         let Some(request) = packet::request(bytes) else {
+            if let Some((reason, dst)) = packet::untranslatable(bytes)
+                && self
+                    .routes
+                    .0
+                    .read(|routes| routes.iter().any(|route| route.maps(dst)))
+            {
+                return Err(reason);
+            }
             return Ok(false);
         };
         let Some((snat_source, target)) = self.routes.0.read(|routes| {
@@ -477,6 +532,16 @@ impl Nat64Lan {
             }
         }
         Err(reasons::PORT_EXHAUSTED)
+    }
+
+    /// Whether `bytes` is an IPv4 fragment from a route's `real` prefix to
+    /// its `snat_source`: a piece of a LAN reply.
+    fn lan_fragment(&self, bytes: &[u8]) -> bool {
+        packet::fragment(bytes).is_some_and(|(src, dst)| {
+            self.routes
+                .0
+                .read(|routes| routes.iter().any(|route| route.answers(src, dst)))
+        })
     }
 
     /// The original tuple of the flow a LAN packet with `reply` answers.
