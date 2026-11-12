@@ -7,7 +7,7 @@ Wintun), plus the fd slot for Android and the callback bridge for iOS. Builds on
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`), `Offload`, `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
+| main | `Tun` (`create`, `create_with` (on Windows with the service TUN checks), `from_fd` on Unix, `split`, `offload`, `mtu`, `name`), `TunSlot` (`new`, `replace`, `clear`, `disable`, `enable`, `close`; Linux, Android, macOS, iOS), `host_tun` | `TunOptions` (Windows: `wintun_pin`, `exclusive`, `mtu`), `WintunPin` and `WintunError` (Windows), `TunSource` (`name`; `recycle`, on Windows too), `TunSink` (`name`; Windows: `ring_full_drops`), `Offload` (Unix), `MTU_POLL_INTERVAL`; `SlotSource` (`oversize_drops`, `recycle`), `SlotSink`; `HostTunInput` (`push`), `HostTunSource` (`set_mtu`, `oversize_drops`, `recycle`), `HostTunSink`, `PushError`, `HOST_TUN_DEFAULT_CAPACITY` |
 
 ## Behavior
 
@@ -32,6 +32,20 @@ On Unix `Tun::split` starts a task that polls the interface MTU every `MTU_POLL_
 name from the fd (`TUNGETIFF`, `UTUN_OPT_IFNAME`), so a renamed interface stays watched. When
 the query fails twice in a row (the interface is gone) the task logs one warning and ends;
 the watch keeps the last value. An fd that is not a TUN device is not watched.
+
+On Windows `Tun::split` starts a thread (`nsplane-tun-mtu`) that reads the IPv4 interface MTU
+(`GetIpInterfaceEntry`) at the same interval; while the interface has no IPv4 row the value
+stays, and a failed query ends the watching with one warning. The thread is joined when the
+last half is dropped.
+
+### Wintun send ring
+
+The Wintun `TunSink` copies each packet into the send ring without waiting. When the ring is
+full (the OS is not draining it) the packet is dropped, counted in
+`TunSink::ring_full_drops` and the first drop is logged at `warn`; `send` returns `Ok`. The
+`PacketSink` contract reserves `WouldBlock` for `try_send_batch`, and the engine logs every
+other error from `send` at `warn` per packet, so a full ring is a tail drop with a counter
+instead.
 
 ### Offload (Linux, Android)
 
@@ -173,8 +187,9 @@ callbacks (iOS `NEPacketTunnelFlow`); it is platform-independent and returns a
 - Windows needs `wintun.dll` next to the executable (or in the system directory; the DLL
   search path is not used) and an elevated process. The pure Windows logic runs in Linux unit tests and the pin-before-load path under
   wine. Adapter creation, the exclusive refusal, orphan replacement, the MTU set and read-back,
-  the driver version query and the Wintun buffer recycling have no automated test; they need
-  a Windows host.
+  the driver version query, the Wintun buffer recycling, loading an unpinned `wintun.dll`
+  that exists, the MTU watcher against a real adapter and the full send ring have no
+  automated test; they need a Windows host.
 
 ## See also
 

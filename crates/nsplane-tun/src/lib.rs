@@ -40,8 +40,9 @@
 //! receiver are dropped or the device fd is closed, and with a warning in the log when the
 //! interface is gone. An adopted
 //! fd whose interface name cannot be queried (not a TUN device) is not watched: its MTU
-//! stays the value it was adopted with. On Windows the MTU is read once when the
-//! Wintun adapter opens and is not watched.
+//! stays the value it was adopted with. On Windows `Tun::split` starts a thread that polls
+//! the IPv4 interface MTU of the Wintun adapter (`GetIpInterfaceEntry`) at the same
+//! interval.
 //!
 //! Hot-swappable fd (Linux, Android, macOS, iOS): `TunSlot::new` yields a control
 //! handle, a `SlotSource` and a `SlotSink` that do I/O on whichever fd is installed,
@@ -103,7 +104,7 @@ mod wintun;
 ))]
 pub use tun::{MTU_POLL_INTERVAL, Offload, Tun, TunOptions, TunSink, TunSource};
 #[cfg(windows)]
-pub use windows::{Tun, TunOptions, TunSink, TunSource};
+pub use windows::{MTU_POLL_INTERVAL, Tun, TunOptions, TunSink, TunSource};
 // Public on Windows; also re-exported in Linux unit-test builds so the module's public
 // items stay reachable there.
 #[cfg(any(windows, test))]

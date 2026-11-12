@@ -2,7 +2,8 @@
 //!
 //! Wintun's session API is blocking, so [`Tun::split`] moves receiving onto a dedicated
 //! thread that hands packets to the async [`TunSource`] through a bounded channel.
-//! Sending uses Wintun's non-blocking allocate-and-send path directly.
+//! Sending uses Wintun's non-blocking allocate-and-send path directly. A second thread
+//! polls the interface MTU every [`MTU_POLL_INTERVAL`] for the source's `mtu` watch.
 //!
 //! [`Tun::create_with`] adds the service TUN checks of [`TunOptions`]: the
 //! `wintun.dll` pin (verified before the DLL is loaded), an exclusive adapter name and
@@ -21,8 +22,12 @@ use std::iter;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self as sync_mpsc, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{
+    self as sync_mpsc, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError,
+};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use nsplane::{PacketBuf, PacketPool, PacketSink, PacketSource, PeerId, TAILROOM};
 use tokio::sync::{mpsc, watch};
@@ -49,6 +54,9 @@ const TRANSLATION_SLACK: usize = 28;
 
 /// Packets queued between the reader thread and the [`TunSource`].
 const QUEUE_DEPTH: usize = 64;
+
+/// How often the MTU watcher started by [`Tun::split`] queries the interface MTU.
+pub const MTU_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `ERROR_HANDLE_EOF`: the Wintun session is ending.
 const ERROR_HANDLE_EOF: i32 = 38;
@@ -262,22 +270,44 @@ impl Tun {
         self.mtu
     }
 
-    /// Spawns the reader thread (`nsplane-tun-rx`) and splits the session into source and
-    /// sink halves.
+    /// Spawns the reader thread (`nsplane-tun-rx`) and the MTU watcher thread
+    /// (`nsplane-tun-mtu`) and splits the session into source and sink halves.
     ///
-    /// Dropping the last half shuts the session down and joins the reader thread.
+    /// The watcher reads the IPv4 interface MTU (`GetIpInterfaceEntry`) every
+    /// [`MTU_POLL_INTERVAL`] and publishes changes on [`TunSource`]'s `mtu` watch; while
+    /// the interface has no IPv4 row the value stays. If the query fails it logs a
+    /// warning and ends, and the watch keeps the last value.
+    ///
+    /// Dropping the last half shuts the session down and joins both threads.
     pub fn split(self) -> io::Result<(TunSource, TunSink)> {
         let (tx, packets) = mpsc::channel(QUEUE_DEPTH);
         let (recycled, free) = sync_mpsc::sync_channel(POOL_FREE);
+        let (mtu, _) = watch::channel(self.mtu);
+        let (stop, stopped) = sync_mpsc::channel();
+        let luid = self.session.get_adapter().get_luid();
+        let watched = mtu.clone();
+        let watcher = thread::Builder::new()
+            .name("nsplane-tun-mtu".to_owned())
+            .spawn(move || {
+                watch_mtu(&stopped, MTU_POLL_INTERVAL, &watched, || {
+                    ip_interface_mtu(luid, AF_INET)
+                });
+            })?;
         let session = Arc::clone(&self.session);
         let reader = thread::Builder::new()
             .name("nsplane-tun-rx".to_owned())
-            .spawn(move || read_loop(&session, &tx, &free))?;
-        let shared = Arc::new(Shared {
+            .spawn(move || read_loop(&session, &tx, &free));
+        // Created before the reader is checked, so a watcher already running is stopped
+        // and joined if the reader could not be spawned.
+        let mut shared = Shared {
             session: self.session,
-            reader: Some(reader),
-        });
-        let (mtu, _) = watch::channel(self.mtu);
+            reader: None,
+            stop: Some(stop),
+            watcher: Some(watcher),
+            ring_full_drops: AtomicU64::new(0),
+        };
+        shared.reader = Some(reader?);
+        let shared = Arc::new(shared);
         let source = TunSource {
             packets,
             recycled,
@@ -435,6 +465,39 @@ fn set_mtu(name: &str, luid: NET_LUID_LH, mtu: u16) -> io::Result<u16> {
     Ok(wintun::check_mtu(mtu, read_ipv4, read_ipv6)?)
 }
 
+/// Queries the interface MTU with `query` every `interval` and sends it on `mtu` when it
+/// changed, until `stop` is signalled or its sender is dropped. `None` from `query` (the
+/// interface has no row for the family) keeps the value; an error ends the watching with
+/// a warning.
+fn watch_mtu(
+    stop: &Receiver<()>,
+    interval: Duration,
+    mtu: &watch::Sender<u16>,
+    mut query: impl FnMut() -> io::Result<Option<u32>>,
+) {
+    while matches!(stop.recv_timeout(interval), Err(RecvTimeoutError::Timeout)) {
+        match query() {
+            Ok(Some(current)) => {
+                let current = u16::try_from(current).unwrap_or(u16::MAX);
+                mtu.send_if_modified(|value| {
+                    let changed = *value != current;
+                    *value = current;
+                    changed
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    mtu = *mtu.borrow(),
+                    "Wintun MTU watcher stopped: the interface MTU cannot be queried any more"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Receives packets until the session shuts down or the [`TunSource`] is gone, reading
 /// them into the buffers recycled through `free` when there are any.
 fn read_loop(
@@ -478,10 +541,15 @@ fn hand_back(free: &SyncSender<PacketBuf>, bufs: &mut Vec<PacketBuf>) {
     }
 }
 
-/// The session and reader thread shared by both halves.
+/// The session and the threads shared by both halves.
 struct Shared {
     session: Arc<Session>,
     reader: Option<JoinHandle<()>>,
+    /// Dropped to stop the MTU watcher thread.
+    stop: Option<Sender<()>>,
+    watcher: Option<JoinHandle<()>>,
+    /// Packets the sink dropped because the Wintun send ring was full.
+    ring_full_drops: AtomicU64,
 }
 
 impl fmt::Debug for Shared {
@@ -491,13 +559,17 @@ impl fmt::Debug for Shared {
 }
 
 impl Drop for Shared {
-    /// Wakes the reader thread out of its blocking receive and waits for it to exit.
-    /// The [`TunSource`]'s channel receiver is already gone here, so the thread cannot
-    /// be stuck on a full channel.
+    /// Wakes the reader thread out of its blocking receive and the MTU watcher out of
+    /// its wait, and waits for both to exit. The [`TunSource`]'s channel receiver is
+    /// already gone here, so the reader thread cannot be stuck on a full channel.
     fn drop(&mut self) {
         let _ = self.session.shutdown();
+        drop(self.stop.take());
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
         }
     }
 }
@@ -509,8 +581,8 @@ pub struct TunSource {
     packets: mpsc::Receiver<PacketBuf>,
     /// Buffers handed back to the reader thread's pool.
     recycled: SyncSender<PacketBuf>,
-    /// Kept alive so receivers never observe a closed channel; the adapter MTU is not
-    /// watched on Windows, so the value never changes.
+    /// Kept alive so receivers never observe a closed channel, also once the MTU watcher
+    /// thread, which holds a clone, has ended.
     mtu: watch::Sender<u16>,
     shared: Arc<Shared>,
 }
@@ -542,8 +614,9 @@ impl PacketSource for TunSource {
         hand_back(&self.recycled, bufs);
     }
 
-    /// The adapter MTU read at [`Tun::create`]. It is not watched on Windows (that
-    /// would need IP Helper notifications), so it never changes.
+    /// The adapter MTU. It follows the IPv4 interface MTU: the watcher thread started
+    /// by [`Tun::split`] polls it every [`MTU_POLL_INTERVAL`], so a change is observed
+    /// within about that interval.
     fn mtu(&self) -> watch::Receiver<u16> {
         self.mtu.subscribe()
     }
@@ -561,9 +634,13 @@ impl PacketSink for TunSink {
     /// peers.
     ///
     /// A packet that is neither IPv4 nor IPv6 is dropped with
-    /// [`io::ErrorKind::InvalidInput`]. When the send ring is full the packet is dropped
-    /// with [`io::ErrorKind::WouldBlock`]; once the session is ending it is dropped
-    /// with [`io::ErrorKind::BrokenPipe`].
+    /// [`io::ErrorKind::InvalidInput`]; once the session is ending it is dropped with
+    /// [`io::ErrorKind::BrokenPipe`].
+    ///
+    /// When the send ring is full (the OS is not draining it) the packet is dropped and
+    /// counted in [`TunSink::ring_full_drops`], the first one with a warning in the log,
+    /// and the call succeeds: the ring gives no way to wait for room, and an error here
+    /// would be logged by the engine for every packet of the burst.
     fn send(
         &self,
         packet: PacketBuf,
@@ -606,6 +683,12 @@ impl TunSink {
         Ok(self.shared.session.get_adapter().get_name()?)
     }
 
+    /// How many packets this device's sink dropped because the Wintun send ring was
+    /// full.
+    pub fn ring_full_drops(&self) -> u64 {
+        self.shared.ring_full_drops.load(Ordering::Relaxed)
+    }
+
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
         if !matches!(bytes.first().map(|b| b >> 4), Some(4 | 6)) {
             return Err(io::Error::new(
@@ -616,23 +699,29 @@ impl TunSink {
         let len = u16::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "packet too long"))?;
         let session = &self.shared.session;
-        let mut slot = session
-            .allocate_send_packet(len)
-            .map_err(|e| send_error(e.into()))?;
+        let mut slot = match session.allocate_send_packet(len) {
+            Ok(slot) => slot,
+            Err(e) => return send_failed(&self.shared.ring_full_drops, e.into()),
+        };
         slot.bytes_mut().copy_from_slice(bytes);
         session.send_packet(slot);
         Ok(())
     }
 }
 
-/// Maps the Win32 errors of `WintunAllocateSendPacket` to the sink contract.
-fn send_error(e: io::Error) -> io::Error {
+/// Maps a Win32 error of `WintunAllocateSendPacket` to the sink contract: a full send
+/// ring is a drop counted in `ring_full_drops`, not an error (the first one is logged);
+/// a session that is ending is [`io::ErrorKind::BrokenPipe`].
+fn send_failed(ring_full_drops: &AtomicU64, e: io::Error) -> io::Result<()> {
     match e.raw_os_error() {
         Some(ERROR_BUFFER_OVERFLOW) => {
-            io::Error::new(io::ErrorKind::WouldBlock, "Wintun send ring is full")
+            if ring_full_drops.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!("dropping a packet: the Wintun send ring is full");
+            }
+            Ok(())
         }
-        Some(ERROR_HANDLE_EOF) => io::Error::from(io::ErrorKind::BrokenPipe),
-        _ => e,
+        Some(ERROR_HANDLE_EOF) => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        _ => Err(e),
     }
 }
 
@@ -827,11 +916,71 @@ mod tests {
 
     #[test]
     fn send_errors_map_to_sink_contract() {
-        let full = send_error(io::Error::from_raw_os_error(ERROR_BUFFER_OVERFLOW));
-        assert_eq!(full.kind(), io::ErrorKind::WouldBlock);
-        let eof = send_error(io::Error::from_raw_os_error(ERROR_HANDLE_EOF));
-        assert_eq!(eof.kind(), io::ErrorKind::BrokenPipe);
-        let other = send_error(io::Error::from_raw_os_error(5));
-        assert_eq!(other.raw_os_error(), Some(5));
+        let drops = AtomicU64::new(0);
+        let eof = send_failed(&drops, io::Error::from_raw_os_error(ERROR_HANDLE_EOF));
+        assert_eq!(eof.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let other = send_failed(&drops, io::Error::from_raw_os_error(5));
+        assert_eq!(other.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// A full send ring is a counted drop, not an error the engine logs per packet.
+    #[test]
+    fn a_full_send_ring_is_a_counted_drop() {
+        let drops = AtomicU64::new(0);
+        for _ in 0..3 {
+            send_failed(&drops, io::Error::from_raw_os_error(ERROR_BUFFER_OVERFLOW)).unwrap();
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    const POLL: Duration = Duration::from_millis(5);
+
+    #[test]
+    fn mtu_watcher_publishes_changes_until_stopped() {
+        let (mtu, mut observed) = watch::channel(1500u16);
+        let (stop, stopped) = sync_mpsc::channel();
+        let (polled, polls) = sync_mpsc::channel();
+        // No row, the same value, a change, a value past `u16`, then the stop.
+        let mut answers = [None, Some(1500), Some(1280), Some(70_000)].into_iter();
+        let mut stop = Some(stop);
+        let mut seen = Vec::new();
+        watch_mtu(&stopped, POLL, &mtu, || {
+            if observed.has_changed().unwrap() {
+                seen.push(*observed.borrow_and_update());
+            }
+            polled.send(()).unwrap();
+            let Some(answer) = answers.next() else {
+                drop(stop.take());
+                return Ok(None);
+            };
+            Ok(answer)
+        });
+        assert_eq!(polls.try_iter().count(), 5);
+        assert_eq!(seen, [1280, u16::MAX]);
+        assert_eq!(*mtu.borrow(), u16::MAX);
+    }
+
+    #[test]
+    fn mtu_watcher_stops_on_a_query_error_and_keeps_the_value() {
+        let (mtu, observed) = watch::channel(1420u16);
+        let (_stop, stopped) = sync_mpsc::channel();
+        let mut polls = 0;
+        watch_mtu(&stopped, POLL, &mtu, || {
+            polls += 1;
+            Err(io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(polls, 1);
+        assert_eq!(*observed.borrow(), 1420);
+    }
+
+    #[test]
+    fn mtu_watcher_stops_at_once_when_signalled() {
+        let (mtu, _observed) = watch::channel(1420u16);
+        let (stop, stopped) = sync_mpsc::channel();
+        stop.send(()).unwrap();
+        watch_mtu(&stopped, Duration::from_secs(60), &mtu, || {
+            panic!("polled after the stop")
+        });
     }
 }
