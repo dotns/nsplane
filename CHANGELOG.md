@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-tun: `TunSink::ring_full_drops` and `MTU_POLL_INTERVAL` on Windows.
 - nsplane-ether: `FrameRead::is_transient` and `FrameWrite::is_transient` (default: fatal),
   `TransportErrors` and `EtherHandle::transport_errors`.
+- nsplane-packet: `ExtensionWalker`, `ExtensionHeader` and `Ipv6Fragment` step over a chain of
+  IPv6 extension headers, with the header numbers as constants in `protocol`. The flow gate
+  and the netstack fragment ownership check use it.
 ### Changed
 - `Splitter` drops a packet routed to a gone sink, counts it in `SplitterStats::failed` and
   returns `Ok` while another sink is open; `BrokenPipe` is returned only once every sink is
@@ -110,6 +113,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-uapi: replacing all peers removes them from the newest down.
 - The relay example's WSS server serves at most 256 connections, closes one after 35 s without
   a valid frame and bounds a send by 10 s.
+- `UdpTransport` on Windows binds `[::]:port` as an IPv6-only socket and an IPv4 socket on
+  the same port, so nothing else can bind `0.0.0.0:port` and take the IPv4 datagrams. A
+  port whose IPv4 side is taken fails with `AddrInUse` (UAPI `listen_port=`: errno 98).
+  Arrival order is kept within an address family, not across the two.
+- `pump` offers a batch until it is empty, and a sink that reports a batch delivered and
+  takes nothing loses the front packet.
+- `Splitter::send_batch_spent`: a sink that takes nothing out of its run loses the front
+  packet, counted in `SplitterStats::failed`.
+- nsplane-nat: an IPv6 atomic fragment with a wrong TCP or UDP checksum or UDP length is
+  dropped instead of translated.
 ### Removed
 - `nsplane_tun::adopt_fd` and `Tun::from_raw_fd`: safe functions that took ownership of a
   descriptor number, which safe code could use to close a descriptor it does not own. Build
@@ -167,6 +180,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-tun on Windows: the interface MTU is polled, so a change reaches the engine.
 - nsplane-ether: an interface name of 16 bytes or more is refused instead of sent without its
   terminator or panicking.
+- `Splitter::send_batch_spent` no longer loops on a sink that takes nothing, and no longer
+  routes the packets one sink left to the next sink.
+- `pump` no longer keeps and grows a batch its sink left, with the packets behind the first
+  one never delivered.
+- nsplane-packet: a `GSO_UDP_L4` super-packet whose IP version is neither 4 nor 6 is refused
+  instead of segmented as IPv4.
 
 ## [0.22.2] - 2026-11-10
 

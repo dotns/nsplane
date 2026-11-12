@@ -829,3 +829,16 @@ errors on ethernet ports, and wiped keys, cheap accessors and a per-peer allowed
 fairness of the shared WSS inbound queue, `SnapshotCell` retention, the timer tick (under
 1 ms at 20 000 idle peers). Left open: NAT64-LAN fragment translation, the linear socket walk
 of the smoltcp fork per packet, and oldest-first bulk peer removal.
+
+## 2026-11-12 [progress]
+
+Fourth batch from the audit of `857f34f`, with the first runs on real Windows and macOS
+hosts: one IPv6 extension header walker in `nsplane-packet` (used by the flow gate and the
+netstack ownership check; the NAT and reassembly walks stay, for speed and for their
+two-byte read), property tests for the parsers of seven crates (two defects found and
+fixed: a UDP super-packet of another IP version, an unchecked IPv6 atomic fragment), the
+batch contract in `pump` and `Splitter`, and two sockets for `[::]` on Windows. Tests for a
+real Wintun adapter and a real utun interface were added and run on the hosts. Left open:
+a same-user bind of a specific local address on Windows and the supplementary GIDs kept on
+macOS (both need `unsafe`), a send marked CE failing on Windows, and the observations of
+the property tests recorded in `20261112-0102-parser-property-tests`.

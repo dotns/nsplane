@@ -147,3 +147,11 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261112-0008-ether-port-errors Transient transport errors no longer close an ethernet port**](20261112-0008-ether-port-errors.md) `P3`
 
 - [x] [**20261112-0009-noise-core-leftovers Leftovers of the audit in the Noise state machine and the core**](20261112-0009-noise-core-leftovers.md) `P3`
+
+- [x] [**20261112-0101-ipv6-extension-walker One shared walker for the IPv6 extension header chain**](20261112-0101-ipv6-extension-walker.md) `P3`
+
+- [x] [**20261112-0102-parser-property-tests Property tests for the parsers that take untrusted bytes**](20261112-0102-parser-property-tests.md) `P3`
+
+- [x] [**20261112-0103-sink-contract-outside-the-engine The sink batch contract outside the engine, and the macOS privilege drop**](20261112-0103-sink-contract-outside-the-engine.md) `P3`
+
+- [x] [**20261112-0104-windows-udp-port-ownership A transport on `[::]:port` does not own the IPv4 side of its port on Windows**](20261112-0104-windows-udp-port-ownership.md) `P3`
