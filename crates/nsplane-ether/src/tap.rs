@@ -11,10 +11,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use libc::{
-    AF_INET, AF_NETLINK, EBUSY, EIO, F_GETFL, F_SETFL, IFF_NO_PI, IFF_NOARP, IFF_TAP, IFF_UP,
-    IFF_VNET_HDR, IFNAMSIZ, NETLINK_ROUTE, O_NONBLOCK, RTM_DELLINK, SIOCGIFFLAGS, SIOCSIFFLAGS,
-    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW, TUNSETGROUP, TUNSETIFF, TUNSETOWNER, TUNSETPERSIST, c_int,
-    c_short, c_ulong,
+    AF_INET, AF_NETLINK, EAGAIN, EBUSY, EINTR, EIO, ENETDOWN, ENOBUFS, ENOMEM, F_GETFL, F_SETFL,
+    IFF_NO_PI, IFF_NOARP, IFF_TAP, IFF_UP, IFF_VNET_HDR, IFNAMSIZ, NETLINK_ROUTE, O_NONBLOCK,
+    RTM_DELLINK, SIOCGIFFLAGS, SIOCSIFFLAGS, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_RAW, TUNSETGROUP,
+    TUNSETIFF, TUNSETOWNER, TUNSETPERSIST, c_int, c_short, c_ulong,
 };
 use tokio::io::unix::AsyncFd;
 
@@ -121,6 +121,12 @@ impl FrameRead for TapReader {
             }
         }
     }
+
+    /// `EINTR`, `EAGAIN`, `ENOBUFS`, `ENOMEM` and `ENETDOWN` are transient: the device is
+    /// still attached and a later read can succeed.
+    fn is_transient(&self, err: &io::Error) -> bool {
+        transient_errno(err)
+    }
 }
 
 /// Writes frames to a [`TapDevice`].
@@ -142,6 +148,23 @@ impl FrameWrite for TapWriter {
             }
         }
     }
+
+    /// `EINTR`, `EAGAIN`, `ENOBUFS`, `ENOMEM` and `ENETDOWN` are transient: the kernel did
+    /// not take the frame, and the device is still attached.
+    fn is_transient(&self, err: &io::Error) -> bool {
+        transient_errno(err)
+    }
+}
+
+/// Whether `err` is an error of a frame device or socket that a later call can get over: the
+/// call was interrupted or would block, the kernel was out of buffers or memory, or the
+/// link is down.
+pub(crate) fn transient_errno(err: &io::Error) -> bool {
+    // `EAGAIN` and `EWOULDBLOCK` are one value on Linux.
+    matches!(
+        err.raw_os_error(),
+        Some(EINTR | EAGAIN | ENOBUFS | ENOMEM | ENETDOWN)
+    )
 }
 
 /// `IFF_TUN_EXCL` from `<linux/if_tun.h>`: `TUNSETIFF` fails with `EBUSY` instead of
@@ -501,6 +524,27 @@ pub(crate) mod tests {
         tun_attach(name, IFF_TAP | IFF_NO_PI | IFF_VNET_HDR).unwrap()
     }
 
+    /// Sets or clears `IFF_UP` on the interface `name`.
+    pub(crate) fn set_link(name: &str, up: bool) {
+        let sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0).unwrap();
+        let mut ifr = IfReq::new(name, 0).unwrap();
+        #[allow(unsafe_code, reason = "SIOCGIFFLAGS ioctl")]
+        // SAFETY: SIOCGIFFLAGS writes the flags into the `ifreq` that lives for the
+        // duration of the call; `IfReq` matches the kernel's 40-byte layout.
+        let ret = unsafe { libc::ioctl(sock.as_raw_fd(), request(SIOCGIFFLAGS), &raw mut ifr) };
+        assert_eq!(ret, 0);
+        let bit = c_short::try_from(IFF_UP).unwrap();
+        if up {
+            ifr.flags |= bit;
+        } else {
+            ifr.flags &= !bit;
+        }
+        #[allow(unsafe_code, reason = "SIOCSIFFLAGS ioctl")]
+        // SAFETY: SIOCSIFFLAGS reads the `ifreq` that lives for the duration of the call.
+        let ret = unsafe { libc::ioctl(sock.as_raw_fd(), request(SIOCSIFFLAGS), &raw mut ifr) };
+        assert_eq!(ret, 0);
+    }
+
     fn sys(name: &str, file: &str) -> String {
         fs::read_to_string(format!("/sys/class/net/{name}/{file}"))
             .unwrap()
@@ -629,5 +673,28 @@ pub(crate) mod tests {
     fn rejects_bad_names() {
         let err = TapDevice::open("an-interface-name-too-long").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn classifies_transient_errors() {
+        for errno in [EINTR, EAGAIN, libc::EWOULDBLOCK, ENOBUFS, ENOMEM, ENETDOWN] {
+            assert!(
+                transient_errno(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        for errno in [
+            libc::EBADFD,
+            libc::EBADF,
+            libc::EFAULT,
+            libc::EINVAL,
+            libc::ENODEV,
+        ] {
+            assert!(
+                !transient_errno(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        assert!(!transient_errno(&io::ErrorKind::UnexpectedEof.into()));
     }
 }

@@ -12,8 +12,8 @@ on `nsplane` and `nsplane-packet`.
 | Part | Entry points | Supporting types |
 |---|---|---|
 | adapter | `EtherAdapter` (`new`, `from_guest`, `to_guest`, `periodic_ra`, `guest_mac`, `stats`, `count_backlog_drop`), `EtherConfig` (`new`) | `EtherStats`, `DEFAULT_MTU`, `adapter::OWN_ADDRESSES`, `adapter::RA_INTERVAL` |
-| ports | `spawn_port` | `EtherSource` (`PacketSource`), `EtherSink` (`PacketSink`), `EtherHandle` (`stats`, `guest_mac`) |
-| transports | `FrameRead`, `FrameWrite`; `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux); `PacketSocket` (`bind`, `index`, `split`; Linux) | `TapReader`, `TapWriter`, `PacketReader`, `PacketWriter` (Linux), `MAX_FRAME_LEN` |
+| ports | `spawn_port` | `EtherSource` (`PacketSource`), `EtherSink` (`PacketSink`), `EtherHandle` (`stats`, `guest_mac`, `transport_errors`), `TransportErrors` |
+| transports | `FrameRead` (`read_frame`, `is_transient`), `FrameWrite` (`write_frame`, `is_transient`); `stream::FramedReader`, `stream::FramedWriter` (`new`, `into_inner`), `stream::unix` (Unix); `TapDevice` (`open`, `from_fd`, `split`; Linux); `PacketSocket` (`bind`, `index`, `split`; Linux) | `TapReader`, `TapWriter`, `PacketReader`, `PacketWriter` (Linux), `MAX_FRAME_LEN` |
 | interfaces | `ensure_tap` (Linux) | `TapConfig` (`new`, `owner`, `group`, `name`), `TapInterface` (`name`, `index`, `created`) |
 | protocols | `Frame` (`parse`), `frame::write_header`; `ArpPacket` (`parse`, `write`, `is_gratuitous`), `arp::reply`; `Ndp` (`parse`), `ndp::answer_neighbor_solicitation`, `ndp::answer_router_solicitation`, `ndp::router_advertisement`; `DhcpMessage` (`parse`, `option`, `requested_ip`, `server_id`, `broadcast`), `DhcpServer` (`new`, `handle`, `release`, `reply_frame`, `bound`, `config`) | `EtherType`, `FrameError`, `frame::HEADER_LEN`; `ArpOp`, `ArpError`; `NdpMessage`, `NdpError`, `RaConfig`, `ndp::ALL_NODES`; `DhcpConfig` (`new`, `netmask`), `MessageType`, `DhcpError`, `dhcp::option`, `dhcp::SERVER_PORT`, `dhcp::CLIENT_PORT`; `MacAddr` (`link_local`, `ipv6_multicast`, `is_unicast`, `is_multicast`, `is_broadcast`) |
 
@@ -209,8 +209,9 @@ guest) and an `EtherHandle` (counters and the learned guest MAC).
   the transport applies backpressure. Replies and sink writes share one writer behind an
   async mutex, so frames never interleave. A packet that cannot be framed (no guest MAC yet,
   not IPv4 or IPv6) is dropped, counted and reported as sent.
-- The task ends when the transport reaches its end, a read or write fails, or the source is
-  dropped. From then on the source returns `BrokenPipe` after the queued packets and the sink
+- The task ends when the transport reaches its end, a read or write fails with an error that
+  is not transient (see [Transport errors](#transport-errors)), or the source is dropped.
+  From then on the source returns `BrokenPipe` after the queued packets and the sink
   returns `BrokenPipe` on every call.
 
 To attach a guest to a user-space stack, pass the source and sink where the stack's peer
@@ -219,7 +220,8 @@ forward between `EtherSource` / `EtherSink` and `NetStack::split`'s sink and sou
 
 ### Transports
 
-`FrameRead` and `FrameWrite` move whole ethernet frames; an error ends the transport and
+`FrameRead` and `FrameWrite` move whole ethernet frames; an error ends the transport
+unless the transport calls it transient (see [Transport errors](#transport-errors)), and
 neither future is cancellation safe. Three implementations:
 
 - Framed byte stream (`stream`): every frame is a 4-byte big-endian length followed by the
@@ -230,7 +232,7 @@ neither future is cancellation safe. Three implementations:
   before a prefix is the clean end; end of stream inside a prefix or a frame is
   `UnexpectedEof`, a zero length or one above `MAX_FRAME_LEN` is `InvalidData`. The writer
   sends prefix and frame in one write and flushes; an empty or oversized frame is
-  `InvalidInput` and nothing is written.
+  `InvalidInput` and nothing is written. Every error of the stream is fatal.
 - TAP device (`TapDevice`, Linux): `open(name)` attaches `/dev/net/tun` to the TAP
   interface `name` with `IFF_TAP | IFF_NO_PI`, creating it if missing (`""` or a `%d`
   pattern lets the kernel pick the name; longer than 15 bytes or containing NUL is
@@ -238,7 +240,8 @@ neither future is cancellation safe. Three implementations:
   that reads and writes one frame per call) and switches it to non-blocking mode. Every
   `read(2)` and `write(2)` is one frame; a read of zero bytes ends the transport. While the
   interface is down the kernel refuses writes with `EIO`; that frame is dropped and the
-  transport stays open. Interface addresses and link state are left to the caller.
+  transport stays open, and reads wait. Interface addresses and link state are left to the
+  caller.
 - Packet socket (`PacketSocket`, Linux): for a guest whose host-side TAP another process
   holds, as a virtual machine monitor such as Firecracker does. `bind(ifname)` opens an
   `AF_PACKET` / `SOCK_RAW` socket for every protocol (`ETH_P_ALL`) with a virtio-net header
@@ -262,6 +265,37 @@ neither future is cancellation safe. Three implementations:
     is down or gone, no buffer space, the frame exceeds the interface MTU) drop that frame
     and keep the transport open; while no process holds the TAP the kernel drops the frames
     without an error.
+
+### Transport errors
+
+A port does not have to be started again because its link went down and came back. Each
+transport classifies its own errors with `FrameRead::is_transient` and
+`FrameWrite::is_transient`; the default, for a transport that does not override them, is
+that every error is fatal.
+
+| Transport | Transient | Fatal |
+|---|---|---|
+| Framed byte stream | none | every error: after a failed read or a partial write the next frame boundary is unknown, so the stream cannot be used again |
+| TAP device, read and write | `EINTR`, `EAGAIN`, `ENOBUFS`, `ENOMEM`, `ENETDOWN` | everything else, such as `EBADFD` once the interface is deleted |
+| Packet socket, read | `EINTR`, `EAGAIN`, `ENOBUFS`, `ENOMEM`; `ENETDOWN` while the interface exists (the reader itself waits for the link in that case) | `ENETDOWN` once the interface is deleted, since the socket stays bound to the index that is gone; everything else |
+| Packet socket, write | `EINTR`, `EAGAIN`, `ENOMEM` (`ENETDOWN`, `ENXIO`, `ENOBUFS` and `EMSGSIZE` are handled by the writer itself, which drops the frame) | everything else |
+
+What `spawn_port` does with the answer:
+
+- A transient read error is counted, and the read is tried again after a wait of 10 ms that
+  doubles with every further error up to 1 s and starts over once a frame is read. The
+  periodic router advertisement may be late by that wait.
+- A transient write error is counted and that frame is dropped, as a wire would lose it;
+  `EtherSink::send` reports it as sent. The write is not repeated: replies and sink writes
+  share one writer, and a wait would hold back every frame behind it.
+- A fatal error closes the port: the source returns `BrokenPipe` after the queued packets
+  and the sink on every call.
+- Transient errors are logged at warn level, at most one line per second and direction
+  with the running total, and counted in `TransportErrors` (`read`, `write`) from
+  `EtherHandle::transport_errors`.
+
+A custom transport overrides `is_transient` only for errors after which the same call can
+be made again: no part of a frame consumed or written.
 
 ### TAP interfaces
 
@@ -299,9 +333,9 @@ TAP device needs `CAP_NET_ADMIN`, so that test is ignored by default. The offloa
 of the packet socket is tested on crafted frames (partial checksums, GSO frames beyond one
 batch, malformed headers). The tests of `ensure_tap` and `PacketSocket` on real interfaces
 (creation, owner, flags and IPv6 settings, deletion while attached, an existing interface
-left in place, frames in both directions, GSO and partial-checksum frames through the
-kernel) need `CAP_NET_ADMIN`, `CAP_NET_RAW` and `/dev/net/tun` and return early without
-them.
+left in place, frames in both directions, the link set down and up under the socket, GSO
+and partial-checksum frames through the kernel) need `CAP_NET_ADMIN`, `CAP_NET_RAW` and
+`/dev/net/tun` and return early without them.
 
 [`scripts/vm-guest.sh`](../../crates/nsplane-ether/scripts/vm-guest.sh) checks the adapter
 against a real Linux guest. It builds the
@@ -340,6 +374,8 @@ kernel are downloaded once and verified by SHA-256. It needs docker and `/dev/kv
 | Router lifetime and RDNSS lifetime | fixed | 1800 s |
 | Unsolicited router advertisement interval | fixed (at most `adapter::RA_INTERVAL`) | random, 450 to 600 s |
 | Prefix valid / preferred lifetime | fixed | 30 days / 7 days |
+| Wait after a transient transport read error | fixed | 10 ms, doubling to 1 s |
+| Log lines about transient transport errors | fixed | at most one per second and direction |
 
 ## Errors and drop reasons
 
@@ -359,7 +395,8 @@ Everything the adapter discards is counted in `EtherStats` (from `EtherAdapter::
 
 The protocol parsers return `FrameError`, `ArpError`, `NdpError` and `DhcpError`; none
 panics on truncated or malformed input. `EtherSource` and `EtherSink` return `BrokenPipe`
-once the transport is gone.
+once the transport is gone. Transient transport errors do not close the port; they are
+counted in `TransportErrors` (see [Transport errors](#transport-errors)).
 
 ## Limits and bounds
 

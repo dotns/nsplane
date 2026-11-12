@@ -10,18 +10,34 @@
 //! adapter's unsolicited router advertisement ([`EtherAdapter::periodic_ra`]), so the
 //! guest's default router and DNS servers do not expire. [`EtherSink`] frames IP packets
 //! for the guest and writes them to the same transport.
+//!
+//! # Transport errors
+//!
+//! The transport says which of its errors are transient
+//! ([`FrameRead::is_transient`], [`FrameWrite::is_transient`]; none by default):
+//!
+//! - A transient read error is counted and the read is tried again after a wait that starts
+//!   at 10 ms, doubles with every further error up to 1 s, and starts over once a frame is
+//!   read.
+//! - A transient write error is counted and the frame is dropped, as a wire would lose it;
+//!   [`EtherSink`] reports it as delivered. The write is not repeated: the writer is shared
+//!   and a wait would hold back every frame behind it.
+//! - Any other error closes the port.
+//!
+//! Transient errors are logged at most once per second and direction, and counted in
+//! [`TransportErrors`] ([`EtherHandle::transport_errors`]).
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::io;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use nsplane::{PacketBuf, PacketSink, PacketSource, PeerId, SharedPacketPool};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::MacAddr;
 use crate::adapter::{EtherAdapter, EtherConfig, EtherStats, RA_INTERVAL};
@@ -34,12 +50,65 @@ const QUEUE_LEN: usize = 256;
 /// Idle buffers [`EtherSource::recycle`] keeps for the reader task to reuse.
 const POOL_LEN: usize = 256;
 
+/// First wait after a transient read error; it doubles with every further one.
+const READ_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Longest wait after a transient read error.
+const READ_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Shortest time between two log lines about transient errors of one direction.
+const LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Transient transport errors of a port since it started. See
+/// [`EtherHandle::transport_errors`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TransportErrors {
+    /// Transient read errors; each was followed by another read.
+    pub read: u64,
+    /// Transient write errors; each lost one frame for the guest.
+    pub write: u64,
+}
+
+/// The counters behind [`TransportErrors`].
+#[derive(Debug, Default)]
+struct ErrorCounters {
+    read: AtomicU64,
+    write: AtomicU64,
+}
+
+/// Lets one log line through per [`LOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct LogLimit {
+    next: Option<Instant>,
+}
+
+impl LogLimit {
+    /// Whether to log now.
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        if self.next.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.next = Some(now + LOG_INTERVAL);
+        true
+    }
+}
+
+/// The transport writer with the log limit of its transient errors.
+#[derive(Debug)]
+struct Writer<W> {
+    io: W,
+    log: LogLimit,
+}
+
 /// State shared by the reader task, the sink and the handle.
 #[derive(Debug)]
 struct Shared<W> {
     adapter: Arc<Mutex<EtherAdapter>>,
-    writer: AsyncMutex<W>,
+    writer: AsyncMutex<Writer<W>>,
     closed: AtomicBool,
+    errors: Arc<ErrorCounters>,
 }
 
 impl<W: FrameWrite> Shared<W> {
@@ -47,17 +116,26 @@ impl<W: FrameWrite> Shared<W> {
         lock(&self.adapter)
     }
 
-    /// Writes `frame`; a failure closes the port.
+    /// Writes `frame`. A transient failure drops the frame and counts it; any other
+    /// failure closes the port.
     async fn write(&self, frame: &[u8]) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        let result = self.writer.lock().await.write_frame(frame).await;
-        result.map_err(|err| {
-            tracing::debug!("ethernet transport write failed: {err}");
-            self.closed.store(true, Ordering::Release);
-            io::Error::new(io::ErrorKind::BrokenPipe, err)
-        })
+        let mut writer = self.writer.lock().await;
+        let Err(err) = writer.io.write_frame(frame).await else {
+            return Ok(());
+        };
+        if writer.io.is_transient(&err) {
+            let total = self.errors.write.fetch_add(1, Ordering::Relaxed) + 1;
+            if writer.log.allow() {
+                tracing::warn!(total, "dropping a frame for the guest: {err}");
+            }
+            return Ok(());
+        }
+        tracing::debug!("ethernet transport write failed: {err}");
+        self.closed.store(true, Ordering::Release);
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, err))
     }
 }
 
@@ -71,7 +149,8 @@ impl<W: FrameWrite> Shared<W> {
 /// and subsequent sink calls fail with it. A dropped source is detected only when the
 /// reader next queues an IP packet: an idle or control-only transport can keep running.
 /// That exit does not close the sink. A write failure closes the port, but does not
-/// interrupt a pending read.
+/// interrupt a pending read. An error the transport calls transient does not close the
+/// port (see [Transport errors](self#transport-errors)).
 ///
 /// # Panics
 ///
@@ -83,10 +162,15 @@ pub fn spawn_port<R: FrameRead, W: FrameWrite>(
 ) -> (EtherSource, EtherSink<W>, EtherHandle) {
     let (mtu, _) = watch::channel(config.mtu);
     let adapter = Arc::new(Mutex::new(EtherAdapter::new(config)));
+    let errors = Arc::new(ErrorCounters::default());
     let shared = Arc::new(Shared {
         adapter: Arc::clone(&adapter),
-        writer: AsyncMutex::new(writer),
+        writer: AsyncMutex::new(Writer {
+            io: writer,
+            log: LogLimit::default(),
+        }),
         closed: AtomicBool::new(false),
+        errors: Arc::clone(&errors),
     });
     let pool = SharedPacketPool::new(POOL_LEN);
     let (tx, rx) = mpsc::channel(QUEUE_LEN);
@@ -94,7 +178,7 @@ pub fn spawn_port<R: FrameRead, W: FrameWrite>(
     (
         EtherSource { rx, pool, mtu },
         EtherSink { shared },
-        EtherHandle { adapter },
+        EtherHandle { adapter, errors },
     )
 }
 
@@ -113,8 +197,9 @@ fn random_ra_wait() -> Duration {
     ra_wait(RandomState::new().build_hasher().finish())
 }
 
-/// Reads guest frames until EOF, an I/O failure, or an IP enqueue detects a dropped source,
-/// and writes the periodic router advertisement meanwhile.
+/// Reads guest frames until EOF, a fatal I/O failure, or an IP enqueue detects a dropped
+/// source, and writes the periodic router advertisement meanwhile. A transient read
+/// failure is counted and the read tried again after a wait.
 async fn read_loop<R: FrameRead, W: FrameWrite>(
     mut reader: R,
     shared: Arc<Shared<W>>,
@@ -124,6 +209,8 @@ async fn read_loop<R: FrameRead, W: FrameWrite>(
     let mut buf = vec![0; MAX_FRAME_LEN];
     let mut replies = Vec::new();
     let mut next_ra = Instant::now() + random_ra_wait();
+    let mut backoff = READ_BACKOFF;
+    let mut log = LogLimit::default();
     loop {
         let read = {
             // The read is not cancellation safe: it stays pending across advertisements.
@@ -147,11 +234,21 @@ async fn read_loop<R: FrameRead, W: FrameWrite>(
                 tracing::debug!("ethernet transport closed");
                 break;
             }
+            Err(err) if reader.is_transient(&err) => {
+                let total = shared.errors.read.fetch_add(1, Ordering::Relaxed) + 1;
+                if log.allow() {
+                    tracing::warn!(total, "ethernet transport read failed, retrying: {err}");
+                }
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(READ_BACKOFF_MAX);
+                continue;
+            }
             Err(err) => {
                 tracing::debug!("ethernet transport read failed: {err}");
                 break;
             }
         };
+        backoff = READ_BACKOFF;
         let frame = buf.get(..len).unwrap_or_default();
         let packet = shared.adapter().from_guest(frame, &mut replies);
         if let Some(packet) = packet {
@@ -230,6 +327,7 @@ impl<W: FrameWrite> PacketSink for EtherSink<W> {
 #[derive(Debug, Clone)]
 pub struct EtherHandle {
     adapter: Arc<Mutex<EtherAdapter>>,
+    errors: Arc<ErrorCounters>,
 }
 
 impl EtherHandle {
@@ -242,6 +340,15 @@ impl EtherHandle {
     pub fn guest_mac(&self) -> Option<MacAddr> {
         lock(&self.adapter).guest_mac()
     }
+
+    /// The transient transport errors the port got over
+    /// (see [Transport errors](self#transport-errors)).
+    pub fn transport_errors(&self) -> TransportErrors {
+        TransportErrors {
+            read: self.errors.read.load(Ordering::Relaxed),
+            write: self.errors.write.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Locks `adapter`; it is never left inconsistent, so a poisoned lock is taken over.
@@ -251,8 +358,10 @@ fn lock(adapter: &Mutex<EtherAdapter>) -> MutexGuard<'_, EtherAdapter> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::Ipv6Addr;
 
+    use nsplane::PeerId;
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
     use tokio::time::{Instant, timeout};
 
@@ -264,16 +373,22 @@ mod tests {
     const GW_MAC: MacAddr = MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     const GUEST_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
 
-    /// The guest's frames, from a channel.
-    struct Reader(UnboundedReceiver<Vec<u8>>);
+    /// The guest's frames or read errors, from a channel. An
+    /// [`Interrupted`](io::ErrorKind::Interrupted) error is transient.
+    struct Reader(UnboundedReceiver<io::Result<Vec<u8>>>);
 
     impl FrameRead for Reader {
         async fn read_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
             let Some(frame) = self.0.recv().await else {
                 return Ok(None);
             };
+            let frame = frame?;
             buf[..frame.len()].copy_from_slice(&frame);
             Ok(Some(frame.len()))
+        }
+
+        fn is_transient(&self, err: &io::Error) -> bool {
+            err.kind() == io::ErrorKind::Interrupted
         }
     }
 
@@ -285,6 +400,160 @@ mod tests {
             let sent = self.0.send(frame.to_vec());
             std::future::ready(sent.map_err(|_| io::ErrorKind::BrokenPipe.into()))
         }
+    }
+
+    /// Fails each write with the next queued error, if any, before writing to the channel.
+    /// An [`Interrupted`](io::ErrorKind::Interrupted) error is transient.
+    struct FailingWriter {
+        errors: VecDeque<io::ErrorKind>,
+        inner: Writer,
+    }
+
+    impl FrameWrite for FailingWriter {
+        fn write_frame(&mut self, frame: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
+            let result = match self.errors.pop_front() {
+                Some(kind) => Err(kind.into()),
+                None => (self.inner.0.send(frame.to_vec()))
+                    .map_err(|_| io::ErrorKind::BrokenPipe.into()),
+            };
+            std::future::ready(result)
+        }
+
+        fn is_transient(&self, err: &io::Error) -> bool {
+            err.kind() == io::ErrorKind::Interrupted
+        }
+    }
+
+    /// A configuration that advertises a prefix, so a learned guest MAC shows as a frame.
+    fn ipv6_config() -> EtherConfig {
+        EtherConfig {
+            ipv6_prefix: Some(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0)),
+            ..EtherConfig::new(GW_MAC)
+        }
+    }
+
+    /// A minimal IPv4 packet for the sink.
+    fn ip_packet() -> PacketBuf {
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        PacketBuf::from_packet(&packet)
+    }
+
+    fn interrupted() -> io::Result<Vec<u8>> {
+        Err(io::ErrorKind::Interrupted.into())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_read_error_is_retried() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, mut guest_rx) = unbounded_channel();
+        let (_source, sink, handle) = spawn_port(Reader(reader), Writer(writer), ipv6_config());
+        let start = Instant::now();
+        for _ in 0..3 {
+            guest_tx.send(interrupted()).unwrap();
+        }
+        guest_tx.send(Ok(guest_frame())).unwrap();
+
+        // The frame behind the errors is read: the guest gets its router advertisement.
+        let ra = timeout(Duration::from_secs(5), guest_rx.recv()).await;
+        assert!(is_unsolicited_ra(&ra.unwrap().unwrap()));
+        assert_eq!(handle.guest_mac(), Some(GUEST_MAC));
+        assert_eq!(handle.transport_errors().read, 3);
+        assert_eq!(handle.transport_errors().write, 0);
+        // Each retry waited, twice as long as the one before.
+        assert_eq!(start.elapsed(), READ_BACKOFF * 7);
+        // The port is open.
+        sink.send(ip_packet(), PeerId::new(1)).await.unwrap();
+        assert_eq!(guest_rx.recv().await.unwrap().len(), HEADER_LEN + 20);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_read_backoff_is_bounded_and_restarts_after_a_frame() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, mut guest_rx) = unbounded_channel();
+        let (_source, _sink, handle) = spawn_port(Reader(reader), Writer(writer), ipv6_config());
+        let start = Instant::now();
+        for _ in 0..20 {
+            guest_tx.send(interrupted()).unwrap();
+        }
+        guest_tx.send(Ok(guest_frame())).unwrap();
+        let ra = timeout(Duration::from_secs(60), guest_rx.recv()).await;
+        ra.unwrap().unwrap();
+        // 10, 20, ... 640 ms, then 1 s each.
+        assert_eq!(start.elapsed(), READ_BACKOFF * 127 + READ_BACKOFF_MAX * 13);
+
+        // A frame was read: the next error waits the shortest time again.
+        let start = Instant::now();
+        guest_tx.send(interrupted()).unwrap();
+        guest_tx.send(Ok(Vec::new())).unwrap();
+        while handle.stats().frames_in < 2 && start.elapsed() < READ_BACKOFF_MAX {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(start.elapsed() <= READ_BACKOFF + Duration::from_millis(1));
+        assert_eq!(handle.transport_errors().read, 21);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_read_error_closes_the_port() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, _guest_rx) = unbounded_channel();
+        let (mut source, sink, handle) =
+            spawn_port(Reader(reader), Writer(writer), EtherConfig::new(GW_MAC));
+        guest_tx.send(Ok(guest_frame())).unwrap();
+        guest_tx
+            .send(Err(io::ErrorKind::InvalidData.into()))
+            .unwrap();
+        // Nothing after the error is read.
+        guest_tx.send(Ok(guest_frame())).unwrap();
+
+        let err = source.recv().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let err = sink.send(ip_packet(), PeerId::new(1)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(handle.stats().frames_in, 1);
+        assert_eq!(handle.transport_errors(), TransportErrors::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_write_error_drops_the_frame_and_a_fatal_one_closes_the_port() {
+        let (guest_tx, reader) = unbounded_channel();
+        let (writer, mut guest_rx) = unbounded_channel();
+        let writer = FailingWriter {
+            errors: [io::ErrorKind::Interrupted].into(),
+            inner: Writer(writer),
+        };
+        let (_source, sink, handle) = spawn_port(Reader(reader), writer, EtherConfig::new(GW_MAC));
+        guest_tx.send(Ok(guest_frame())).unwrap();
+        while handle.guest_mac().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The refused frame is lost, as on a wire; the sink reports it delivered.
+        sink.send(ip_packet(), PeerId::new(1)).await.unwrap();
+        assert_eq!(handle.transport_errors().write, 1);
+        sink.send(ip_packet(), PeerId::new(1)).await.unwrap();
+        assert_eq!(guest_rx.recv().await.unwrap().len(), HEADER_LEN + 20);
+        assert!(guest_rx.try_recv().is_err());
+
+        // The channel is gone: a fatal error.
+        drop(guest_rx);
+        let err = sink.send(ip_packet(), PeerId::new(1)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let err = sink.send(ip_packet(), PeerId::new(1)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(handle.transport_errors().write, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_log_limit_passes_once_per_interval() {
+        let mut limit = LogLimit::default();
+        assert!(limit.allow());
+        assert!(!limit.allow());
+        tokio::time::sleep(LOG_INTERVAL * 999 / 1000).await;
+        assert!(!limit.allow());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(limit.allow());
+        assert!(!limit.allow());
     }
 
     /// A frame from the guest that the adapter drops after learning its MAC.
@@ -316,7 +585,7 @@ mod tests {
         let quiet = timeout(RA_INTERVAL * 7 / 2, guest_rx.recv()).await;
         assert!(quiet.is_err());
 
-        guest_tx.send(guest_frame()).unwrap();
+        guest_tx.send(Ok(guest_frame())).unwrap();
         let first = guest_rx.recv().await.unwrap();
         assert!(is_unsolicited_ra(&first));
         let learned = Instant::now();
@@ -362,7 +631,7 @@ mod tests {
         let (writer, mut guest_rx) = unbounded_channel();
         let (_source, _sink, handle) =
             spawn_port(Reader(reader), Writer(writer), EtherConfig::new(GW_MAC));
-        guest_tx.send(guest_frame()).unwrap();
+        guest_tx.send(Ok(guest_frame())).unwrap();
         let quiet = timeout(RA_INTERVAL * 4, guest_rx.recv()).await;
         assert!(quiet.is_err());
         assert_eq!(handle.guest_mac(), Some(GUEST_MAC));

@@ -21,7 +21,7 @@ use libc::{
 use nsplane_packet::vnet::VirtioNetHdr;
 use tokio::io::unix::AsyncFd;
 
-use crate::tap::{if_index, socket};
+use crate::tap::{if_index, socket, transient_errno};
 use crate::transport::{FrameRead, FrameWrite};
 use crate::vnet::{self, Segments};
 
@@ -165,6 +165,14 @@ impl FrameRead for PacketReader {
             }
         }
     }
+
+    /// `EINTR`, `EAGAIN`, `ENOBUFS` and `ENOMEM` are transient, and so is `ENETDOWN` while
+    /// the interface exists; `ENETDOWN` of a deleted interface is fatal, since the socket
+    /// stays bound to the index that is gone.
+    fn is_transient(&self, err: &io::Error) -> bool {
+        transient_errno(err)
+            && (err.raw_os_error() != Some(ENETDOWN) || interface_exists(self.index))
+    }
 }
 
 /// Writes frames to the guest through a [`PacketSocket`].
@@ -196,6 +204,12 @@ impl FrameWrite for PacketWriter {
                 Err(_would_block) => {}
             }
         }
+    }
+
+    /// `EINTR`, `EAGAIN` and `ENOMEM` are transient: the kernel did not take the frame and
+    /// the socket is intact. (`ENETDOWN` and `ENOBUFS` never reach the caller.)
+    fn is_transient(&self, err: &io::Error) -> bool {
+        transient_errno(err)
     }
 }
 
@@ -283,7 +297,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::tap::tests::{attach_vnet, net_caps};
+    use crate::tap::tests::{attach_vnet, net_caps, set_link};
     use crate::tap::{TapConfig, TapDevice, ensure_tap};
     use crate::transport::MAX_FRAME_LEN;
     use crate::vnet::tests::{assert_valid, tcp4_gso_frame, udp6_partial_frame};
@@ -402,6 +416,47 @@ mod tests {
         for _ in 0..3 {
             writer.write_frame(&frame(GW, 1, b"nobody")).await.unwrap();
         }
+    }
+
+    /// The interface is set down and up again under the bound socket: the reader carries
+    /// on with the frames sent afterwards. `ENETDOWN` is transient only while the interface
+    /// exists.
+    #[tokio::test]
+    async fn reads_on_after_the_interface_went_down_and_up() {
+        if !net_caps() {
+            return;
+        }
+        let tap = ensure_tap(&TapConfig::new("nsafp-p4")).unwrap();
+        let (_guest_rx, mut guest_tx) = TapDevice::open(tap.name()).unwrap().split();
+        let (mut reader, _writer) = PacketSocket::bind(tap.name()).unwrap().split();
+        let before = frame(GW, 1, b"before");
+        guest_tx.write_frame(&before).await.unwrap();
+        assert_eq!(read(&mut reader).await, before);
+
+        set_link(tap.name(), false);
+        // The socket now holds `ENETDOWN`; the reader waits instead of failing.
+        let mut buf = vec![0; MAX_FRAME_LEN];
+        let down = timeout(Duration::from_millis(200), reader.read_frame(&mut buf)).await;
+        assert!(down.is_err());
+        let net_down = io::Error::from_raw_os_error(ENETDOWN);
+        assert!(reader.is_transient(&net_down));
+        set_link(tap.name(), true);
+
+        let after = frame(GW, 1, b"after");
+        let mut got = None;
+        for _ in 0..50 {
+            guest_tx.write_frame(&after).await.unwrap();
+            let read = reader.read_frame(&mut buf);
+            if let Ok(len) = timeout(Duration::from_millis(100), read).await {
+                got = Some(buf[..len.unwrap().unwrap()].to_vec());
+                break;
+            }
+        }
+        assert_eq!(got.as_deref(), Some(&after[..]));
+
+        drop(tap);
+        assert!(!reader.is_transient(&net_down));
+        assert!(reader.is_transient(&io::Error::from_raw_os_error(libc::EINTR)));
     }
 
     #[tokio::test]

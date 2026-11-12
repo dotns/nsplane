@@ -59,7 +59,7 @@ pub use mac::MacAddr;
 pub use ndp::{Ndp, NdpError, NdpMessage, RaConfig};
 #[cfg(target_os = "linux")]
 pub use packet::{PacketReader, PacketSocket, PacketWriter};
-pub use port::{EtherHandle, EtherSink, EtherSource, spawn_port};
+pub use port::{EtherHandle, EtherSink, EtherSource, TransportErrors, spawn_port};
 #[cfg(target_os = "linux")]
 pub use tap::{TapConfig, TapDevice, TapInterface, TapReader, TapWriter, ensure_tap};
 pub use transport::{FrameRead, FrameWrite, MAX_FRAME_LEN};
