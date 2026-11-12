@@ -14,6 +14,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spawn_port` calls `periodic_ra` itself. `DhcpServer::release` frees the lease.
 - `Core::all_peer_stats` lists every peer in one pass over the allowed IPs; `EngineHandle::peers`
   uses it. Listing 20 000 peers takes about 3 ms instead of 3.5 s.
+- `DROP_SINK_ERROR`: a decrypted packet dropped because the sink failed it, or reported it
+  delivered, and left it in the batch.
+- `LinkSender::send_batch` (with a default that sends one by one) and
+  `LinkTransport::SEND_BATCH` (64): a link sends the datagrams already queued in one call.
+- `Tunn::tx_bytes`, `Tunn::last_handshake_rtt` and `Core::peer_path` read one value without
+  computing the whole statistics.
+- nsplane-acl: `FlowGate::set_fragments_per_peer`, `fragments_per_peer` and
+  `fragments_per_peer_denied`.
+- nsplane-nat: `Masquerade::with_max_flows_per_source`, `max_flows_per_source` and
+  `source_quota_drops` with the drop reason `masquerade::reasons::SOURCE_QUOTA`;
+  `Nat64Lan::fragment_drops` and `extension_header_drops` with
+  `nat64_lan::reasons::{FRAGMENT, EXTENSION_HEADER}`.
+- nsplane-packet: `ReassemblyStats::evicted`.
+- nsplane-dns: `FakePool::with_client_limit`, `client_limit` and `client_limited`.
+- nsplane-netstack: `NetStackConfig::max_connections` limits the TCP connections of any stack,
+  and `NetStackConfig::listener_pool_per_source` with `NetStackStats::syn_refused_source`
+  bounds one source's share of the listener pool. Both are off by default.
+- nsplane-wss: `WssSession::is_closed`.
+- nsplane-tun: `TunSink::ring_full_drops` and `MTU_POLL_INTERVAL` on Windows.
+- nsplane-ether: `FrameRead::is_transient` and `FrameWrite::is_transient` (default: fatal),
+  `TransportErrors` and `EtherHandle::transport_errors`.
 ### Changed
 - `Splitter` drops a packet routed to a gone sink, counts it in `SplitterStats::failed` and
   returns `Ok` while another sink is open; `BrokenPipe` is returned only once every sink is
@@ -48,6 +69,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens a descriptor, refuse the numbers 0 to 2 and equal numbers, and are set close-on-exec.
 - The `fd_bridge` example hands the TUN descriptor to its child as standard input
   (`--child` replaces `--child-fd`).
+- `SwapSink` no longer returns the `BrokenPipe` of its current sink while another clone
+  exists: it drops and counts the packets and delivers again after `replace`. A `SwapSink`
+  that is the last clone with an empty or gone slot returns `BrokenPipe`; alone with an empty
+  slot it used to drop packets and return `Ok`. Keep a clone for as long as the local side
+  may come back.
+- After a source or sink error other than `BrokenPipe` the engine waits before the next call,
+  from 1 ms doubling to 64 ms, and logs only the first error in a row at warn.
+- A link write error loses the batch being written (up to 64 datagrams), not one datagram.
+- nsplane-acl: one peer holds at most half of `GateLimits::fragments` (2048 by default);
+  `set_fragments_per_peer(usize::MAX)` restores the old behaviour. At a state limit a sweep
+  that freed nothing is not repeated for 100 ms, so an entry may count up to 100 ms past its
+  expiry. `FlowGate::find_flow` locks one shard at a time and is no longer one view across
+  the shards.
+- nsplane-nat: one inside source holds at most half of the masquerade flow table by default
+  (2048 of 4096); a deployment with one host that needs more calls
+  `with_max_flows_per_source`. A TCP flow that saw FIN or RST expires after 30 s idle.
+- nsplane-nat: NAT64-LAN drops fragments and IPv6 packets with extension headers addressed to
+  a route (`FRAGMENT`, `EXTENSION_HEADER`) instead of returning `NotOurs`.
+- nsplane-packet: a full reassembly table evicts its oldest datagram for a new one instead of
+  refusing every new datagram.
+- nsplane-dns: one client holds at most half of a `FakePool` by default, a lookup refreshes the
+  binding's place in the eviction order, and the forwarder starts at the upstream that
+  answered last.
+- nsplane-netstack: a driver turn bridges only the connections that were signalled, with a pass
+  over all of them every 50 ms, and a stack with nothing timed sets no timer. smoltcp's `async`
+  feature is enabled.
+- nsplane-netstack: an inbound handshake whose peer went silent is reset after 60 s and
+  counted in `handshake_failed`.
+- nsplane-wss: both ends write the queued datagrams with one flush. A server session's read
+  idle time is refreshed only by a datagram of a valid size, a ping or a pong.
+- nsplane-tun on Windows: without `TunOptions::wintun_pin`, `wintun.dll` is loaded by absolute
+  path from the executable's directory or the system directory only; a copy reachable only
+  through `PATH` or the current directory is `NotFound`. A full send ring drops the packet,
+  counts it and returns `Ok`.
+- nsplane-tun: `TunSlot` adds and strips the 4-byte header of a utun socket installed in it.
+- nsplane-ether: a port stays open across transient transport errors (`EINTR`, `EAGAIN`,
+  `ENOBUFS`, `ENOMEM`, `ENETDOWN`). A read is retried after 10 ms doubling to 1 s, a write
+  drops its frame.
+- nsplane-uapi: replacing all peers removes them from the newest down.
+- The relay example's WSS server serves at most 256 connections, closes one after 35 s without
+  a valid frame and bounds a send by 10 s.
 ### Removed
 - `nsplane_tun::adopt_fd` and `Tun::from_raw_fd`: safe functions that took ownership of a
   descriptor number, which safe code could use to close a descriptor it does not own. Build
@@ -87,6 +149,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spinning on a lasting error.
 - nsplane-netstack: a full UDP flow table sweeps for dropped flows only when one was dropped,
   not for every datagram of a new flow.
+- A sink that fails a packet, or reports it delivered, and leaves it in the batch no longer
+  stalls the sink task or hangs the engine: the packet is dropped (`DROP_SINK_ERROR`).
+- A lasting source or sink error no longer spins the engine's tasks.
+- Removing or reconfiguring a peer and a single `Core::peer_stats` no longer scan every
+  network of the identity: the allowed IPs of each peer are indexed.
+- A replaced preshared key and the cookie secrets are wiped.
+- nsplane-acl: a full flow table or a full peer quota no longer costs a sweep per refused
+  packet, `FlowTracker` evicts in constant time, and the filter's tables use the keyed hasher
+  (the old one had collisions that did not depend on its seed).
+- nsplane-nat: a full masquerade table no longer scans every flow per refused packet, and an
+  ICMP error with padding or an RFC 4884 extension after the quoted packet is translated
+  instead of dropped (the extension is not carried over).
+- nsplane-dns: a truncated passthrough response keeps its question.
+- nsplane-tun: the MTU watcher follows a renamed interface, a packet longer than the known MTU
+  is read whole on a plain device, and a host push claims queue room before it takes a buffer.
+- nsplane-tun on Windows: the interface MTU is polled, so a change reaches the engine.
+- nsplane-ether: an interface name of 16 bytes or more is refused instead of sent without its
+  terminator or panicking.
+
 ## [0.22.2] - 2026-11-10
 
 ### Fixed

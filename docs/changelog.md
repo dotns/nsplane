@@ -815,3 +815,17 @@ retries, a receive backoff in the engine, limited capacity warnings), and the UA
 mode, path check and connection cap with jitter for the WSS reconnect and the router
 advertisement interval. Not changed after a look: the O(N) local port bookkeeping of outbound
 netstack connections, which follows the state of the smoltcp sockets.
+
+## 2026-11-12 [progress]
+
+Third batch from the audit of `857f34f`, nine tasks for the remaining P3 items: per-peer and
+per-source shares with paced sweeps (acl, nat, the DNS fake pool, the reassembly table),
+netstack scaling (signalled connections only per driver turn, no idle timer, connection and
+listener limits), WSS write batching and idle sessions, `SwapSink` recovery with a backoff
+and a batch contract check in the engine (`DROP_SINK_ERROR`), TUN robustness (Wintun loading
+by absolute path, MTU watching, read sizing, utun framing in `TunSlot`), transient transport
+errors on ethernet ports, and wiped keys, cheap accessors and a per-peer allowed IP index
+(noise, core). Reviewed without a change: DHCP against RFC 2131, NDP against RFC 4861, the
+fairness of the shared WSS inbound queue, `SnapshotCell` retention, the timer tick (under
+1 ms at 20 000 idle peers). Left open: NAT64-LAN fragment translation, the linear socket walk
+of the smoltcp fork per packet, and oldest-first bulk peer removal.

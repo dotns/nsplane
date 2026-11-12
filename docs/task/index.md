@@ -129,3 +129,21 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261111-2303-driver-netstack-robustness Driver and netstack robustness items from the audit**](20261111-2303-driver-netstack-robustness.md) `P3`
 
 - [x] [**20261111-2304-uapi-socket-and-jitter UAPI socket hardening, reconnect and router advertisement jitter**](20261111-2304-uapi-socket-and-jitter.md) `P3`
+
+- [x] [**20261112-0001-acl-fairness-and-scans Fairness between peers and full-table scans in nsplane-acl**](20261112-0001-acl-fairness-and-scans.md) `P3`
+
+- [x] [**20261112-0002-nat-quotas-and-fragments Masquerade quota, ICMP quotes with trailing bytes, NAT64-LAN fragments**](20261112-0002-nat-quotas-and-fragments.md) `P3`
+
+- [x] [**20261112-0003-reassembly-and-dns-pools Reassembly table and DNS pool fairness**](20261112-0003-reassembly-and-dns-pools.md) `P3`
+
+- [x] [**20261112-0004-netstack-scaling Netstack scaling and resource items from the audit**](20261112-0004-netstack-scaling.md) `P3`
+
+- [x] [**20261112-0005-wss-batching-and-fairness WSS write batching, session fairness and idle sessions**](20261112-0005-wss-batching-and-fairness.md) `P3`
+
+- [x] [**20261112-0006-driver-sink-recovery Sink recovery and local I/O robustness in the driver**](20261112-0006-driver-sink-recovery.md) `P3`
+
+- [x] [**20261112-0007-tun-robustness TUN robustness: DLL loading, MTU watching, read sizing, slot framing**](20261112-0007-tun-robustness.md) `P3`
+
+- [x] [**20261112-0008-ether-port-errors Transient transport errors no longer close an ethernet port**](20261112-0008-ether-port-errors.md) `P3`
+
+- [x] [**20261112-0009-noise-core-leftovers Leftovers of the audit in the Noise state machine and the core**](20261112-0009-noise-core-leftovers.md) `P3`
