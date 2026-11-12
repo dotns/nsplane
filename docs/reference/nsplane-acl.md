@@ -300,7 +300,9 @@ and IPv6 packets.
   `RuleId` is reported (`GateReason::Granted`); only suspended matches give `Suspended`,
   none `NoGrant`. Grants never admit a reply-only packet.
 - **State.** An admitted flow creates state that admits its replies, later fragments and ICMP
-  errors (matched through the quoted header): idle timeouts (`GateTimeouts`, defaults TCP
+  errors (matched through the quoted header, read within the error's own length: bytes a
+  buffer holds behind the packet are no quote, and an error without a whole one is
+  `Malformed`): idle timeouts (`GateTimeouts`, defaults TCP
   2 h, half-closed 5 min, closed 30 s, UDP 2 min, ICMP 30 s, other 60 s, fragments 30 s). A
   reply-only packet without state is `ReverseNewFlow`, as is a new SYN on a closing flow or
   from the responder; a later fragment without its first is `OrphanFragment`. Limits

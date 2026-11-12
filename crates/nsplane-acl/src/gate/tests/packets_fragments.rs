@@ -45,6 +45,32 @@ pub(super) fn a_related_icmp_error_needs_the_quoted_flow() {
 }
 
 #[test]
+fn an_icmp_error_quote_ends_with_the_packet_not_the_buffer() {
+    let gate = gate_with(policy(vec![open_scope(GateMode::Enforce)]));
+    let original = udp(LOCAL, REMOTE, 50_000, 53);
+    assert_eq!(gate.evaluate_outbound(PEER, &original), granted("out"));
+    let error = icmp_error(REMOTE, LOCAL, &original);
+    assert_eq!(error.len(), 56);
+
+    // Bytes behind the packet's total length are not part of it.
+    let mut padded = error.clone();
+    padded.extend_from_slice(&[0xff; 9]);
+    assert_eq!(gate.evaluate_inbound(PEER, &padded), valid());
+
+    // A total length that ends before the quote, or inside it, leaves no quote to read,
+    // whatever the buffer holds behind it.
+    for total in [28_u16, 48, 55] {
+        let mut cut = error.clone();
+        cut[2..4].copy_from_slice(&total.to_be_bytes());
+        assert_eq!(
+            gate.evaluate_inbound(PEER, &cut),
+            denied(GateReason::Malformed),
+            "total length {total}"
+        );
+    }
+}
+
+#[test]
 pub(super) fn later_fragments_need_an_admitted_first_fragment() {
     let gate = gate_with(policy(vec![open_scope(GateMode::Enforce)]));
     let id = 0x1234;

@@ -368,8 +368,11 @@ const fn quoted_ports(protocol: u8, icmp: u8, payload: &[u8]) -> (u16, u16) {
 }
 
 /// The quote of an `ICMPv4` error: the quoted IPv4 header and 8 bytes of
-/// its upper layer.
+/// its upper layer. The quote ends with the packet's total length: a
+/// buffer may hold bytes behind it.
 pub(super) fn quote_v4(packet: &[u8]) -> Option<Quote<Ipv4Addr>> {
+    let end = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+    let packet = packet.get(..end)?;
     let outer_ihl = usize::from(*packet.first()? & 0x0f) * 4;
     let outer_source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let outer_destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);

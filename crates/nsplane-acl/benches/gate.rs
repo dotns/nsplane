@@ -26,6 +26,7 @@
 //!   `baseline/pass_filter`: through `GateFilter` whose gate has no policy, so the packet goes
 //!   on to the `AclFilter`; `baseline/pass_gate`: through `FlowGate::evaluate_inbound` of that
 //!   gate alone.
+//! - `icmp_error/v4`: an ICMP destination-unreachable error quoting an outbound UDP flow.
 //! - `contention/{1ms,10ms}`: `established/filter` while a thread replaces the policy every 1
 //!   or 10 ms, toggling a grant for an unrelated source in the same scope (a changed scope,
 //!   whose flows are re-authorized).
@@ -97,6 +98,18 @@ fn tcp(src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, flags: u8) ->
     bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
     bytes.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
     PacketBuf::from_packet(&bytes)
+}
+
+/// An IPv4 packet without options, of `protocol` carrying `payload`.
+fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    let total = u16::try_from(20 + payload.len()).unwrap_or(u16::MAX);
+    let mut bytes = vec![0x45, 0];
+    bytes.extend_from_slice(&total.to_be_bytes());
+    bytes.extend_from_slice(&[0, 0, 0x40, 0, 64, protocol, 0, 0]);
+    bytes.extend_from_slice(&src.octets());
+    bytes.extend_from_slice(&dst.octets());
+    bytes.extend_from_slice(payload);
+    bytes
 }
 
 /// An IPv6 packet whose `extensions` Destination Options headers (8 bytes each) precede the
@@ -410,6 +423,20 @@ fn bench_allowed(
     });
 }
 
+/// An ICMP error quoting an outbound UDP flow.
+fn bench_icmp_error(c: &mut Criterion) {
+    let errors = frozen_gate(policy(true, grants(&[])));
+    let original = ipv4(LOCAL, REMOTE, 17, &udp_payload(50000, 53));
+    assert!(matches!(
+        errors.evaluate_outbound(REMOTE_PEER, &original),
+        GateDecision::Enforce { allow: true, .. }
+    ));
+    let mut unreachable = vec![3, 0, 0, 0, 0, 0, 0, 0];
+    unreachable.extend_from_slice(&original[..28]);
+    let error = PacketBuf::from_packet(&ipv4(REMOTE, LOCAL, 1, &unreachable));
+    bench_allowed(c, "icmp_error/v4", &errors, true, &error);
+}
+
 /// The IPv6 benches.
 fn bench_ipv6(c: &mut Criterion) {
     let established = gate(dual_stack(policy(true, grants(&[]))));
@@ -630,6 +657,8 @@ fn bench_gate(c: &mut Criterion) {
         GateDecision::Enforce { allow: true, .. }
     ));
     bench_new_flows(c, "new_flow/port_grant", port_grant, PORT);
+
+    bench_icmp_error(c);
 
     bench_baselines(c, &syn, &ack);
 
