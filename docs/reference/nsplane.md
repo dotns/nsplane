@@ -440,20 +440,31 @@ taken one fails with `AddrInUse`; for port 0 a port free for IPv4 is chosen. The
 is closed before the dual-stack bind, so a bind of the IPv4 port by someone else in between
 is not seen.
 
-What two sockets do not prevent, measured on Windows 11 (build 26100) against a transport on
-`[::]:port`, with the second socket bound by .NET with and without `SO_REUSEADDR`:
+Every socket a `UdpTransport` binds on Windows has `SO_EXCLUSIVEADDRUSE` set before the
+bind (through `nsplane-sys`). Without the option a process of the transport's own user binds
+one local address of the port (`127.0.0.1:port`, `[::1]:port`) next to a socket on the
+wildcard address, and then gets the datagrams sent to that address instead of the transport.
+With it, measured on Windows 11 (build 26100) in the transport's own process, next to a
+transport on `[::]:port` (both families) or on `0.0.0.0:port` (IPv4):
 
-| second socket binds | same user (elevated administrator, as the transport) | another, standard user |
-| --- | --- | --- |
-| `0.0.0.0:port` or `[::]:port` | refused: `WSAEADDRINUSE`, with `SO_REUSEADDR` `WSAEACCES` | refused: `WSAEADDRINUSE`, with `SO_REUSEADDR` `WSAEACCES` |
-| `127.0.0.1:port` or `[::1]:port` | bound, with or without `SO_REUSEADDR`: it then got 4 of 4 datagrams sent to that address, the transport none | refused: `WSAEACCES`, with or without `SO_REUSEADDR` |
+| second socket binds | plain | with `SO_REUSEADDR` | with `SO_EXCLUSIVEADDRUSE` |
+| --- | --- | --- | --- |
+| `0.0.0.0:port` or `[::]:port` | refused: `WSAEADDRINUSE` | refused: `WSAEACCES` | refused: `WSAEADDRINUSE` |
+| `127.0.0.1:port` or `[::1]:port` | refused: `WSAEACCES` | refused: `WSAEACCES` | refused: `WSAEACCES` |
 
-So `SO_REUSEADDR` opens nothing here, and another user cannot take any of the port. A process
-of the transport's own user can still bind one local address of the port and take the
-datagrams to that address; only `SO_EXCLUSIVEADDRUSE` on the transport's sockets refuses that
-bind, and `socket2` has no safe setter for it (`nsplane` forbids unsafe code). A transport on
-`0.0.0.0:port` measured the same for the IPv4 binds. Not measured: an administrator binding
-against a standard user's transport, and service accounts.
+The other way round, a transport does not bind a wildcard address of a port on which another
+socket holds the wildcard address or one local address of that family, whatever options that
+socket has: the bind fails with `AddrInUse` and nothing stays bound. So two transports do not
+share a port either: after one on `[::]:port`, a transport on `127.0.0.1:port` fails with
+`PermissionDenied` (`WSAEACCES`), and after one on `127.0.0.1:port`, a transport on
+`[::]:port` fails with `AddrInUse`.
+
+A transport bound to one exact address owns that address of the port only: a plain bind of
+the wildcard address of the port by another socket succeeds next to it, as it does next to a
+socket without the option, and a second bind of the exact address fails. Not measured with
+the option: binds by another user (without it a standard user was refused every bind of the
+port), and service accounts.
+
 ### In-memory channels
 
 `ChannelSource`, `ChannelSink` and `ChannelTransport` are in-memory implementations for tests

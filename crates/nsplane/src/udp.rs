@@ -115,10 +115,14 @@ impl SocketErrors {
 /// destinations, IPv4-mapped ones included, leave the IPv4 socket. Receiving takes the
 /// two sockets in turn while both hold datagrams, so the order of arrival is kept within
 /// an address family and not across the two. Each socket is set up and sized on its own:
-/// the buffer setters size both and the getters report the IPv6 socket. A process of the
-/// same user can still bind one local address of the port (`127.0.0.1:port`, say) and
-/// then gets the datagrams to that address; only `SO_EXCLUSIVEADDRUSE` would refuse it,
-/// and it has no safe setter. Another, standard user is refused every bind of the port.
+/// the buffer setters size both and the getters report the IPv6 socket.
+///
+/// Every socket the transport binds on Windows has `SO_EXCLUSIVEADDRUSE` set. Without it
+/// a process of the same user binds one local address of the port (`127.0.0.1:port`, say)
+/// next to a socket on the wildcard address and then gets the datagrams to that address.
+/// With it, no other socket binds the wildcard address or a local address of the port
+/// while a transport on a wildcard address lives, and such a transport fails to bind with
+/// [`io::ErrorKind::AddrInUse`] while another socket holds any address of the port.
 ///
 /// Whether the transport may use segmentation offload is chosen when binding:
 /// [`bind`](Self::bind) binds with offload, [`bind_with_offload`](Self::bind_with_offload)

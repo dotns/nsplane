@@ -115,11 +115,14 @@ pub(super) fn bind_pair(port: u16) -> io::Result<(Socket, Option<Socket>)> {
 #[cfg(any(windows, test, not(any(target_os = "linux", target_os = "android"))))]
 const PAIR_TRIES: usize = 16;
 
-/// Creates an IPv6-only socket bound to `[::]:port`.
+/// Creates an IPv6-only socket bound to `[::]:port`, on Windows for its exclusive use as
+/// [`bind_socket`] does.
 #[cfg(any(windows, test))]
 fn bind_v6_only(port: u16) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(true)?;
+    #[cfg(windows)]
+    nsplane_sys::set_exclusive_address_use(&socket, true)?;
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     Ok(socket)
 }
@@ -133,8 +136,14 @@ pub(super) fn ipv4_destination(addr: SocketAddr) -> Option<SocketAddr> {
 }
 
 /// Creates a UDP socket bound to exactly `addr`.
+///
+/// On Windows the socket gets `SO_EXCLUSIVEADDRUSE` first: next to a plain socket on a
+/// wildcard address anyone of the same user binds one local address of the port and takes
+/// the datagrams sent to it. Other platforms refuse that bind without an option.
 pub(super) fn bind_socket(addr: SocketAddr) -> io::Result<Socket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    #[cfg(windows)]
+    nsplane_sys::set_exclusive_address_use(&socket, true)?;
     socket.bind(&addr.into())?;
     Ok(socket)
 }

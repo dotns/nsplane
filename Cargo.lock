@@ -1046,6 +1046,7 @@ dependencies = [
  "nix",
  "nsplane-core",
  "nsplane-packet",
+ "nsplane-sys",
  "quinn-udp",
  "socket2",
  "tokio",

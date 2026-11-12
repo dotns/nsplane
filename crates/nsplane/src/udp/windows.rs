@@ -3,10 +3,10 @@
 //!
 //! A dual-stack socket on `[::]:port` does not own the IPv4 side of its port on Windows:
 //! anyone may still bind `0.0.0.0:port`, and that socket then gets every IPv4 datagram to
-//! the port. `SO_EXCLUSIVEADDRUSE` would refuse that bind, but it has no safe setter. So
-//! the transport binds an IPv6-only socket and an IPv4 socket on the same port instead
-//! ([`bind_pair`](super::socket::bind_pair)), receives on both and sends on the one of the
-//! destination's address family.
+//! the port. So the transport binds an IPv6-only socket and an IPv4 socket on the same port
+//! instead ([`bind_pair`](super::socket::bind_pair)), receives on both and sends on the one
+//! of the destination's address family. Each has `SO_EXCLUSIVEADDRUSE` set, which keeps
+//! every local address of the port in its address family from other sockets.
 
 use std::future::{Future, poll_fn};
 use std::io;

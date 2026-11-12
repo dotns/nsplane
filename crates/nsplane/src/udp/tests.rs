@@ -2,7 +2,7 @@ use super::*;
 use nsplane_packet::{Ecn, HEADROOM, MAX_BATCH};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -171,6 +171,40 @@ async fn unspecified_bind_fails_on_a_port_taken_for_ipv4() {
         let err = UdpTransport::bind_with_offload(TransportId::new(1), addr, offload).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+    }
+}
+
+/// A transport on a wildcard address owns every local address of its port: a plain bind of
+/// the loopback address on that port, which would take the datagrams sent to it, fails.
+#[tokio::test]
+async fn wildcard_bind_owns_the_local_addresses_of_the_port() {
+    for offload in OFFLOAD {
+        let dual = bind_with(1, "[::]:0", offload);
+        let port = dual.local_addr().port();
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap_err();
+        std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).unwrap_err();
+
+        let v4 = bind_with(2, "0.0.0.0:0", offload);
+        let port = v4.local_addr().port();
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap_err();
+    }
+}
+
+/// A port one of whose local addresses another socket holds is in use for `[::]:port`.
+#[tokio::test]
+async fn unspecified_bind_fails_on_a_port_with_a_taken_local_address() {
+    for offload in OFFLOAD {
+        for holder in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            let listener = std::net::UdpSocket::bind((holder, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let addr = (Ipv6Addr::UNSPECIFIED, port).into();
+            let err =
+                UdpTransport::bind_with_offload(TransportId::new(1), addr, offload).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{holder}");
+        }
     }
 }
 
