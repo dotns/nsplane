@@ -52,4 +52,4 @@ nsplane-uapi = { path = "../crates/nsplane-uapi", version = "0.22.2" }
 
 [dev-dependencies]
 nsplane-noise = { path = "../crates/nsplane-noise", version = "0.22.2" }
-tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "test-util", "time"] }

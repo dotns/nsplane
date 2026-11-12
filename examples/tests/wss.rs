@@ -15,16 +15,19 @@ use nsplane_examples::relay::messages::build_register_source;
 use nsplane_examples::relay::router::{MachinePin, Router, Source, TargetConfig, machine_id};
 use nsplane_examples::relay::server::RelayServerTransport;
 use nsplane_examples::relay::wss::client::{WssConfig, WssTransport};
-use nsplane_examples::relay::wss::server::{WsHub, bind};
+use nsplane_examples::relay::wss::server::{IDLE_TIMEOUT, MAX_CONNECTIONS, WsHub, bind};
 use nsplane_examples::relay::wss::{DEFAULT_NAME, ServerCert, client_tls};
 use nsplane_noise::noise::{Tunn, TunnResult};
 use nsplane_noise::x25519::{PublicKey, StaticSecret};
 use serde_json::Value;
+use tokio::io::AsyncReadExt as _;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -374,6 +377,85 @@ async fn the_client_reconnects_after_the_relay_restarts() -> TestResult {
     assert_eq!(server.engine_recv().await?.0, queued);
     round_trip(&mut server, &client).await?;
     assert_eq!((stats.tx(), stats.rx(), stats.drops()), (3, 2, 0));
+    server.stop().await;
+    Ok(())
+}
+
+/// A WebSocket connection to the relay's listener.
+async fn ws_connect(
+    server: &Server,
+    cert: &ServerCert,
+) -> TestResult<WebSocketStream<TlsStream<TcpStream>>> {
+    let tcp = TcpStream::connect(server.wss).await?;
+    let tls = TlsConnector::from(client_tls(cert.pem.as_bytes())?)
+        .connect(DEFAULT_NAME.try_into()?, tcp)
+        .await?;
+    let url = format!("wss://{DEFAULT_NAME}:{}/", server.wss.port());
+    Ok(tokio_tungstenite::client_async(url, tls).await?.0)
+}
+
+/// Moves the clock of the relay's timers forward by two thirds of the idle timeout.
+async fn pass_most_of_the_idle_timeout() {
+    tokio::time::pause();
+    tokio::time::advance(IDLE_TIMEOUT * 2 / 3).await;
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn a_connection_without_valid_frames_is_closed() -> TestResult {
+    let cert = cert()?;
+    let server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
+    let mut ws = ws_connect(&server, &cert).await?;
+    until("the connection", || server.status("connections") == 1).await?;
+
+    // A ping is a valid frame: it restarts the timeout.
+    pass_most_of_the_idle_timeout().await;
+    ws.send(Message::Ping(b"ping".to_vec().into())).await?;
+    let pong = timeout(WAIT, ws.next()).await?.ok_or("closed")??;
+    assert_eq!(pong, Message::Pong(b"ping".to_vec().into()));
+
+    // Text and invalid datagrams are not: the connection is still open for them, and
+    // closes at the timeout after the ping.
+    pass_most_of_the_idle_timeout().await;
+    ws.send(Message::text("hello")).await?;
+    ws.send(Message::binary(vec![9u8; 3])).await?;
+    until("the drops", || {
+        server.status("dropped_text") + server.status("dropped_invalid") == 2
+    })
+    .await?;
+    assert_eq!(server.status("closed_idle"), 0);
+    pass_most_of_the_idle_timeout().await;
+    let end = timeout(WAIT, ws.next()).await?;
+    assert!(matches!(end, Some(Ok(Message::Close(_))) | None), "{end:?}");
+    until("the close", || server.status("connections") == 0).await?;
+    assert_eq!(server.status("closed_idle"), 1);
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn connections_over_the_cap_are_closed() -> TestResult {
+    let cert = cert()?;
+    let server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
+    // Connections in their handshakes count.
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        held.push(TcpStream::connect(server.wss).await?);
+    }
+    let mut refused = TcpStream::connect(server.wss).await?;
+    let read = timeout(WAIT, refused.read(&mut [0u8; 1])).await?;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert_eq!(server.status("refused"), 1);
+
+    // Room again once they are gone.
+    drop(held);
+    until("the failed handshakes", || {
+        server.status("handshake_failures") == MAX_CONNECTIONS as u64
+    })
+    .await?;
+    let _ws = ws_connect(&server, &cert).await?;
+    until("the connection", || server.status("connections") == 1).await?;
+    assert_eq!(server.status("refused"), 1);
     server.stop().await;
     Ok(())
 }

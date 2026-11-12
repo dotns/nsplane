@@ -264,7 +264,12 @@ to each other and reach the own engine. The certificate is self-signed at start 
 `--wss-name` (default `relay.example`) plus the listen address as an IP name, and written to
 `--wss-cert-out <PATH>` for clients to pin. Text, oversized (> 65535 bytes) and non-WireGuard,
 non-control messages are dropped and counted; pings are answered; a closed connection's
-learned sources and routes are forgotten. A WSS connection shows up as `ws:<id>` in
+learned sources and routes are forgotten. The listener's limits are constants of
+`examples/src/relay/wss/server.rs`: at most 256 connections at once, handshakes included
+(`MAX_CONNECTIONS`; further ones are accepted and closed, and each takes a file
+descriptor), a connection without a valid frame (a datagram the router takes, a ping or a
+pong) for 35 s is closed (`IDLE_TIMEOUT`; the clients ping every 10 s), and so is one
+that does not take a message within 10 s (`SEND_TIMEOUT`). A WSS connection shows up as `ws:<id>` in
 `routes[]` and `targets[].source`.
 
 ```sh
@@ -275,7 +280,7 @@ cargo run -p nsplane-examples --bin relay_server -- --private-key-file r.key --l
 | JSON path | Meaning |
 |---|---|
 | `.extra.wss.connections` | open WSS connections |
-| `.extra.wss.{accepted,handshake_failures,closed}` | connections accepted, failed TLS/WebSocket handshakes, closed |
+| `.extra.wss.{accepted,refused,handshake_failures,closed,closed_idle}` | connections accepted, closed at the connection cap, failed TLS/WebSocket handshakes, closed, closed of those by the idle timeout |
 | `.extra.wss.{rx,tx,pings}` | datagrams received / sent over WSS, pings answered |
 | `.extra.wss.dropped_{text,oversized,invalid,queue_full,closed}` | drops by reason |
 
