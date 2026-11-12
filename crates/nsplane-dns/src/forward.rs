@@ -363,3 +363,6 @@ fn echoes_questions(response: &[u8], asked: &[(String, u16, u16)]) -> bool {
     };
     view.questions.is_empty() || questions(&view) == asked
 }
+
+#[cfg(test)]
+mod property_tests;
