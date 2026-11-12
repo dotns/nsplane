@@ -43,6 +43,7 @@ mod flow_bounds;
 mod flow_context;
 mod flow_control;
 mod half_close;
+mod half_open;
 mod idle;
 mod ingress_labels;
 mod labels;

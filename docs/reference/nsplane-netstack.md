@@ -136,6 +136,11 @@ stack with none of these sets no timer and takes no turn until it is woken.
   empty, so request/response traffic touches only the front of a buffer; a bulk transfer
   wraps through all of it. Size `max_connections` for the full size:
   `max_connections * (tcp_rx_buffer + tcp_tx_buffer + 2 * stream_buffer)`.
+- An inbound handshake whose peer sends nothing for 60 s after its SYN
+  (`HANDSHAKE_TIMEOUT`) is reset: the socket leaves SYN-RECEIVED with a RST, returns to the
+  listener pool and is counted in `handshake_failed`. smoltcp retransmits a SYN-ACK without
+  an end, so a peer that went away after its SYN would hold one of the pool's sockets for
+  good. The timeout is lifted when the connection is established.
 - Listener sockets cost nothing while no handshake runs: each turn sizes the pool to the
   SYNs of its batch, a socket and its buffers are created for a SYN in the turn that takes
   it, and a socket left in `Listen` is removed by the next turn. A stack with listening

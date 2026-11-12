@@ -44,8 +44,9 @@ pub struct NetStackStats {
     /// `NetStackConfig::accept_backpressure`; the peer retransmits them.
     pub syn_deferred: u64,
     /// Inbound TCP handshakes that ended before the connection was established: the
-    /// peer reset the socket in SYN-RECEIVED, or the connection closed before the stack
-    /// took it.
+    /// peer reset the socket in SYN-RECEIVED, sent nothing for 60 s after its SYN (the
+    /// stack then resets the handshake), or the connection closed before the stack took
+    /// it.
     pub handshake_failed: u64,
     /// Datagrams dropped because their UDP flow or bound socket queue was full.
     pub udp_queue_full: u64,

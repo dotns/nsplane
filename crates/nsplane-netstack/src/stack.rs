@@ -71,6 +71,11 @@ const FULL_PASS_INTERVAL: Duration = MAX_POLL_DELAY;
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(20);
+/// How long an inbound handshake may go without a segment from the peer before its socket
+/// is reset and returns to the listener pool. A peer that sent a SYN and went away would
+/// hold the socket for good otherwise: smoltcp retransmits the SYN-ACK without an end.
+/// About what Linux gives a SYN-ACK (five retransmissions, 63 s).
+const HANDSHAKE_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
 /// First ephemeral port for `connect_tcp`, `bind_udp` and `connect_udp` on port 0
 /// (RFC 6335).
 const EPHEMERAL_START: u16 = 49_152;

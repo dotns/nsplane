@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 
+use super::HANDSHAKE_TIMEOUT;
 use crate::config::TcpRto;
 use crate::throttle::LogLimit;
 
@@ -226,6 +227,8 @@ pub(super) fn ensure_tcp_listeners(
     for _ in 0..add {
         let mut socket = new_tcp_socket(pool.rx_buffer, pool.tx_buffer, pool.rto);
         let _ = socket.listen(port);
+        // Counts from the SYN the socket takes; lifted when its connection is handed out.
+        socket.set_timeout(Some(HANDSHAKE_TIMEOUT));
         handles.push(sockets.add(socket));
     }
 }

@@ -63,6 +63,10 @@ impl Driver {
                 .inbound
                 .remove(&handle)
                 .map_or((0, None), |inbound| (inbound.start, inbound.flow));
+            // The handshake timeout of the listener socket.
+            self.sockets
+                .get_mut::<tcp::Socket<'_>>(handle)
+                .set_timeout(None);
             let connection = self.adopt(handle, now, start, lifetime);
             tracing::debug!(
                 target: "netstack",
