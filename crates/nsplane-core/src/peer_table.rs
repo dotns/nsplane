@@ -159,7 +159,7 @@ impl PeerTable {
                 key: None,
                 transports: None,
                 peers: 0,
-                ips: AllowedIps::new(),
+                ips: AllowedIps::indexed(),
             }],
             next_identity: 1,
             budget: Arc::new(HandshakeBudget::new(handshake_rate_limit)),
@@ -249,7 +249,7 @@ impl PeerTable {
             key,
             transports,
             peers: 0,
-            ips: AllowedIps::new(),
+            ips: AllowedIps::indexed(),
         });
         Some(id)
     }
@@ -457,13 +457,13 @@ impl PeerTable {
         let owned: Vec<(IpAddr, u8)> = match (&self.merged, self.identities.get(i)) {
             (Some(_), Some(owner)) => owner
                 .ips
-                .iter_where(&|p| *p == peer)
+                .iter_value(&peer)
                 .map(|(_, addr, cidr)| (addr, cidr))
                 .collect(),
             _ => Vec::new(),
         };
         if let Some(owner) = self.identities.get_mut(i) {
-            owner.ips.remove(&|p: &PeerId| *p == peer);
+            owner.ips.remove_value(&peer);
         }
         let Some(merged) = &mut self.merged else {
             return;
@@ -649,7 +649,7 @@ impl PeerTable {
         };
         owner
             .ips
-            .iter_where(&|p| *p == peer)
+            .iter_value(&peer)
             .map(|(_, addr, cidr)| AllowedIp { addr, cidr })
             .collect()
     }

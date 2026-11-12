@@ -140,9 +140,8 @@ impl Core {
         Some(self.stats_of(peer, p, self.peers.allowed_ips(peer)))
     }
 
-    /// [`Core::peer_stats`] of every peer, in id order. Prefer it to one
-    /// [`Core::peer_stats`] call per peer: it reads the allowed IPs of all peers in one pass,
-    /// while each single query scans the allowed IPs of the peer's whole local identity.
+    /// [`Core::peer_stats`] of every peer, in id order: it reads the allowed IPs of all peers
+    /// in one pass, where a [`Core::peer_stats`] call per peer looks each peer up.
     pub fn all_peer_stats(&self) -> Vec<PeerStats> {
         self.peers
             .iter()

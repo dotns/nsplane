@@ -8,7 +8,8 @@
 //! a 10 k table, each its own change (`insert_remove`; `insert_remove_new_len` with a /1, a
 //! prefix length the table does not use yet), removing one value's entries from a 10 k table
 //! with `remove` (`remove_value`), and emptying a 10 k table of 1 k values (10 networks each)
-//! one value per change (`remove_peer_per_change`). A change ends with `commit`, see
+//! one value per change, from a table that indexes the networks by value as the peer table
+//! does (`remove_peer_per_change`). A change ends with `commit`, see
 //! [`Commit`].
 //!
 //! Tables come from a fixed-seed generator: prefixes of mixed length (IPv4 /8../32, IPv6
@@ -251,18 +252,19 @@ fn find(c: &mut Criterion) {
         group.bench_function(format!("remove_peer_per_change/{}/10k", family.id()), |b| {
             b.iter_batched(
                 || {
-                    let mut table = AllowedIps::new();
+                    let mut table = AllowedIps::indexed();
                     for (i, &(net, len)) in prefixes.iter().enumerate() {
                         let peer = u32::try_from(i / PEER_NETWORKS).unwrap_or(u32::MAX);
                         table.insert(family.addr(net), len, peer);
                     }
                     table.commit();
+                    assert!(table.iter_value(&0).count() <= PEER_NETWORKS);
                     table
                 },
                 |mut table| {
                     for peer in 0..WRITE_SIZE / PEER_NETWORKS {
                         let peer = u32::try_from(peer).unwrap_or(u32::MAX);
-                        table.remove(&|&v| v == black_box(peer));
+                        table.remove_value(black_box(&peer));
                         table.commit();
                     }
                     assert!(table.is_empty());

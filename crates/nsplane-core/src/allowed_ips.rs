@@ -1,7 +1,8 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nsplane_packet::hash::KeyedState;
@@ -22,6 +23,10 @@ use nsplane_packet::hash::KeyedState;
 /// only change its networks. A configuration change that ends in one commit costs at most one
 /// rebuild per family. Lookups stay exact on a dirty family, probing every prefix length of
 /// the networks, longest first.
+///
+/// A table made by [`AllowedIps::indexed`] also keeps the networks of each value, so that
+/// [`AllowedIps::remove_value`] and [`AllowedIps::iter_value`] cost the networks of that value
+/// instead of a scan of the table.
 pub(crate) struct AllowedIps<D> {
     v4: Table<D>,
     v6: Table<D>,
@@ -70,6 +75,48 @@ struct Table<D> {
     free: Vec<u32>,
     /// Whether the lengths in use changed since the last rebuild, so `levels` are out of date.
     dirty: bool,
+    /// In an indexed table, the networks of each value that has some: what a scan of
+    /// `networks` for the value finds, in the same order.
+    index: Option<HashMap<D, Networks>>,
+}
+
+/// The networks of one value in the index of a family. A single network is held in place:
+/// most peers have one per family, and a set each would cost an allocation per peer.
+enum Networks {
+    One((u128, u8)),
+    Many(BTreeSet<(u128, u8)>),
+}
+
+impl Networks {
+    fn insert(&mut self, network: (u128, u8)) {
+        match self {
+            Self::One(one) if *one == network => {}
+            Self::One(one) => *self = Self::Many(BTreeSet::from([*one, network])),
+            Self::Many(networks) => {
+                networks.insert(network);
+            }
+        }
+    }
+
+    /// Removes `network`; whether none is left.
+    fn remove(&mut self, network: (u128, u8)) -> bool {
+        match self {
+            Self::One(one) => *one == network,
+            Self::Many(networks) => {
+                networks.remove(&network);
+                networks.is_empty()
+            }
+        }
+    }
+
+    /// The networks, ascending.
+    fn iter(&self) -> impl Iterator<Item = (u128, u8)> + '_ {
+        let (one, many) = match self {
+            Self::One(one) => (Some(*one), None),
+            Self::Many(networks) => (None, Some(networks)),
+        };
+        one.into_iter().chain(many.into_iter().flatten().copied())
+    }
 }
 
 /// The left-aligned network bits of a prefix of `len` bits.
@@ -117,7 +164,7 @@ fn path(count: usize, target: usize) -> impl Iterator<Item = usize> {
     .filter(move |&mid| mid < target)
 }
 
-impl<D> Table<D> {
+impl<D: Copy + Eq + Hash> Table<D> {
     const fn new() -> Self {
         Self {
             levels: Vec::new(),
@@ -125,6 +172,36 @@ impl<D> Table<D> {
             values: Vec::new(),
             free: Vec::new(),
             dirty: false,
+            index: None,
+        }
+    }
+
+    /// An empty table that indexes the networks by value if `indexed`.
+    fn empty(indexed: bool) -> Self {
+        Self {
+            index: indexed.then(HashMap::new),
+            ..Self::new()
+        }
+    }
+
+    /// Records in the index that `value` holds `network`.
+    fn index_insert(&mut self, value: D, network: (u128, u8)) {
+        if let Some(index) = &mut self.index {
+            if let Some(networks) = index.get_mut(&value) {
+                networks.insert(network);
+            } else {
+                index.insert(value, Networks::One(network));
+            }
+        }
+    }
+
+    /// Records in the index that `value` no longer holds `network`.
+    fn index_remove(&mut self, value: &D, network: (u128, u8)) {
+        if let Some(index) = &mut self.index
+            && let Some(networks) = index.get_mut(value)
+            && networks.remove(network)
+        {
+            index.remove(value);
         }
     }
 
@@ -184,7 +261,14 @@ impl<D> Table<D> {
         let net = bits & mask(len);
         if let Some(&slot) = self.networks.get(&(net, len)) {
             // A new value for a known network: the levels stay valid.
-            return self.value_mut(slot)?.replace(data);
+            let old = self.value_mut(slot)?.replace(data);
+            if old != Some(data) {
+                if let Some(old) = &old {
+                    self.index_remove(old, (net, len));
+                }
+                self.index_insert(data, (net, len));
+            }
+            return old;
         }
         let slot = if let Some(slot) = self.free.pop() {
             *self.value_mut(slot)? = Some(data);
@@ -195,6 +279,7 @@ impl<D> Table<D> {
             slot
         };
         self.networks.insert((net, len), slot);
+        self.index_insert(data, (net, len));
         if !self.dirty {
             match self.level(len) {
                 Some(t) => self.place(net, t, slot),
@@ -241,7 +326,11 @@ impl<D> Table<D> {
         if !self.dirty {
             self.unplace(net, len, slot);
         }
-        self.value_mut(slot)?.take()
+        let value = self.value_mut(slot)?.take();
+        if let Some(value) = &value {
+            self.index_remove(value, (net, len));
+        }
+        value
     }
 
     /// Takes network `net/len`, stored in `slot` and already out of the networks, out of the
@@ -331,6 +420,20 @@ impl<D> Table<D> {
             })
             .map(|(&key, _)| key)
             .collect();
+        self.remove_networks(removed);
+    }
+
+    /// Removes every network of `value`: those the index lists, or by a scan without one.
+    fn remove_value(&mut self, value: &D) {
+        let Some(index) = &mut self.index else {
+            return self.remove(&|v| v == value);
+        };
+        let removed = index.remove(value);
+        self.remove_networks(removed.iter().flat_map(Networks::iter).collect());
+    }
+
+    /// Removes the networks `removed`, which the table holds.
+    fn remove_networks(&mut self, removed: Vec<(u128, u8)>) {
         if !self.dirty {
             // In place, unless the networks are the last of a length.
             let mut counts = [0_usize; 129];
@@ -423,7 +526,7 @@ impl<D> Table<D> {
         keep: &dyn Fn(&D) -> bool,
         out: &mut Vec<(&'a D, IpAddr, u8)>,
     ) {
-        let mut entries: Vec<(u128, u8, &D)> = self
+        let entries = self
             .networks
             .iter()
             .filter_map(|(&(net, len), &slot)| {
@@ -431,6 +534,30 @@ impl<D> Table<D> {
                 keep(value).then_some((net, len, value))
             })
             .collect();
+        Self::append_sorted(v6, entries, out);
+    }
+
+    /// [`Table::collect`] for the networks of `value`: those the index lists, or by a scan
+    /// without one.
+    fn collect_value<'a>(&'a self, v6: bool, value: &D, out: &mut Vec<(&'a D, IpAddr, u8)>) {
+        let Some(index) = &self.index else {
+            return self.collect(v6, &|v| v == value, out);
+        };
+        let entries = index
+            .get(value)
+            .into_iter()
+            .flat_map(Networks::iter)
+            .filter_map(|(net, len)| Some((net, len, self.get(net, len)?)))
+            .collect();
+        Self::append_sorted(v6, entries, out);
+    }
+
+    /// Appends `entries` to `out` in the order of [`Table::collect`].
+    fn append_sorted<'a>(
+        v6: bool,
+        mut entries: Vec<(u128, u8, &'a D)>,
+        out: &mut Vec<(&'a D, IpAddr, u8)>,
+    ) {
         entries.sort_unstable_by(|&(a, a_len, _), &(b, b_len, _)| tree_order(a, a_len, b, b_len));
         out.extend(
             entries
@@ -452,18 +579,29 @@ fn tree_order(a: u128, a_len: u8, b: u128, b_len: u8) -> std::cmp::Ordering {
         .then(a.cmp(&b))
 }
 
-impl<D> Default for AllowedIps<D> {
+impl<D: Copy + Eq + Hash> Default for AllowedIps<D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D> AllowedIps<D> {
+impl<D: Copy + Eq + Hash> AllowedIps<D> {
     /// Creates an empty table.
     pub(crate) const fn new() -> Self {
         Self {
             v4: Table::new(),
             v6: Table::new(),
+            rebuilds: 0,
+        }
+    }
+
+    /// Creates an empty table that also keeps the networks of each value: for a table with
+    /// many values of few networks each, like the peers of an identity. The index costs
+    /// memory per value and a set operation per write.
+    pub(crate) fn indexed() -> Self {
+        Self {
+            v4: Table::empty(true),
+            v6: Table::empty(true),
             rebuilds: 0,
         }
     }
@@ -487,8 +625,9 @@ impl<D> AllowedIps<D> {
 
     /// Removes all entries; nothing is left to rebuild.
     pub(crate) fn clear(&mut self) {
-        self.v4 = Table::new();
-        self.v6 = Table::new();
+        for table in [&mut self.v4, &mut self.v6] {
+            *table = Table::empty(table.index.is_some());
+        }
     }
 
     /// Inserts `data` for `key/cidr` and returns the value previously stored for that network.
@@ -526,10 +665,17 @@ impl<D> AllowedIps<D> {
         }
     }
 
-    /// Removes every entry whose value matches `predicate`.
+    /// Removes every entry whose value matches `predicate`, by a scan of the table.
     pub(crate) fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
         self.v4.remove(predicate);
         self.v6.remove(predicate);
+    }
+
+    /// Removes every entry with `value`, like [`AllowedIps::remove`]; an indexed table visits
+    /// the networks of `value` only.
+    pub(crate) fn remove_value(&mut self, value: &D) {
+        self.v4.remove_value(value);
+        self.v6.remove_value(value);
     }
 
     /// Rebuilds each dirty family, once, and returns [`rebuilds`](Self::rebuilds). The end of
@@ -558,6 +704,15 @@ impl<D> AllowedIps<D> {
         self.v6.collect(true, keep, &mut entries);
         Iter(entries.into())
     }
+
+    /// Iterates like [`AllowedIps::iter_where`] over the entries with `value`; an indexed
+    /// table visits the networks of `value` only.
+    pub(crate) fn iter_value(&self, value: &D) -> Iter<'_, D> {
+        let mut entries = Vec::new();
+        self.v4.collect_value(false, value, &mut entries);
+        self.v6.collect_value(true, value, &mut entries);
+        Iter(entries.into())
+    }
 }
 
 /// Iterator over the entries of an [`AllowedIps`] table.
@@ -571,7 +726,7 @@ impl<D> std::fmt::Debug for Iter<'_, D> {
     }
 }
 
-impl<D> std::fmt::Debug for AllowedIps<D> {
+impl<D: Copy + Eq + Hash> std::fmt::Debug for AllowedIps<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list()
             .entries(self.iter().map(|(_, ip, cidr)| format!("{ip}/{cidr}")))
@@ -945,11 +1100,34 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one random walk checks every operation against the reference"
+    )]
     fn matches_the_trie_on_random_tables() {
         use super::*;
         use ip_network::IpNetwork;
         use ip_network_table::IpNetworkTable;
         use std::collections::BTreeSet;
+
+        /// Checks that the index of `table` holds what a scan of its networks finds for
+        /// every value, and that a table that is not `indexed` has none.
+        fn assert_index_matches_a_scan(table: &AllowedIps<u8>, indexed: bool) {
+            for table in [&table.v4, &table.v6] {
+                let mut scanned: HashMap<u8, BTreeSet<(u128, u8)>> = HashMap::new();
+                for (&network, &slot) in &table.networks {
+                    let value = table.values[usize::try_from(slot).unwrap()].unwrap();
+                    scanned.entry(value).or_default().insert(network);
+                }
+                let index = table.index.as_ref().map(|index| {
+                    let networks = |(&value, networks): (&u8, &Networks)| {
+                        (value, networks.iter().collect::<BTreeSet<_>>())
+                    };
+                    index.iter().map(networks).collect::<HashMap<_, _>>()
+                });
+                assert_eq!(index, indexed.then_some(scanned));
+            }
+        }
 
         // splitmix64 with a fixed seed: every run checks the same tables.
         let mut state = 0x6e73_706c_616e_6532_u64;
@@ -976,7 +1154,13 @@ mod tests {
             lengths
         };
         for round in 0..300 {
-            let mut ours: AllowedIps<u8> = AllowedIps::new();
+            // Half of the rounds keep the index of the networks of each value.
+            let indexed = round % 4 < 2;
+            let mut ours: AllowedIps<u8> = if indexed {
+                AllowedIps::indexed()
+            } else {
+                AllowedIps::new()
+            };
             let mut trie: IpNetworkTable<u8> = IpNetworkTable::new();
             // A few base addresses per family, so networks nest and overlap.
             let bases: Vec<u128> = (0..4)
@@ -1013,7 +1197,12 @@ mod tests {
                     0..=8 => assert_eq!(ours.insert(addr, len, value), trie.insert(net, value)),
                     9..=12 => assert_eq!(ours.remove_network(addr, len), trie.remove(net)),
                     13 => {
-                        ours.remove(&|v| *v == value);
+                        // By value, through the index where the table has one, or by a
+                        // predicate, which scans.
+                        match value % 2 {
+                            0 => ours.remove_value(&value),
+                            _ => ours.remove(&|v| *v == value),
+                        }
                         trie.retain(|_, v| *v != value);
                     }
                     14 if next() % 32 == 0 => {
@@ -1055,6 +1244,8 @@ mod tests {
                 let kept: Vec<_> = ours.iter_where(&|v| *v == value).collect();
                 expected.retain(|(v, _, _)| **v == value);
                 assert_eq!(kept, expected);
+                assert_eq!(ours.iter_value(&value).collect::<Vec<_>>(), expected);
+                assert_index_matches_a_scan(&ours, indexed);
             }
         }
     }
