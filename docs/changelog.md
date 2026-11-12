@@ -840,5 +840,8 @@ fixed: a UDP super-packet of another IP version, an unchecked IPv6 atomic fragme
 batch contract in `pump` and `Splitter`, and two sockets for `[::]` on Windows. Tests for a
 real Wintun adapter and a real utun interface were added and run on the hosts. Left open:
 a same-user bind of a specific local address on Windows and the supplementary GIDs kept on
-macOS (both need `unsafe`), a send marked CE failing on Windows, and the observations of
-the property tests recorded in `20261112-0102-parser-property-tests`.
+macOS (both need `unsafe`). Found on the hosts and fixed: a send marked CE fails on Windows
+(sent as ECT(0)), and macOS binds `[::]:port` while another socket holds the IPv4 port (now
+probed first). The observations of the property tests were settled in
+`20261112-0201-property-test-followups`: six defects fixed, among them a DNS policy bypass
+through a dot inside a label, two kept as deliberate.

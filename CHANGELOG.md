@@ -125,6 +125,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packet, counted in `SplitterStats::failed`.
 - nsplane-nat: an IPv6 atomic fragment with a wrong TCP or UDP checksum or UDP length is
   dropped instead of translated.
+- nsplane-dns: `Query::name`, `normalize_name` and `FakePool::lookup` return a canonical name
+  text: lowercase, no trailing dot, and `\DDD` for every octet that is not printable ASCII
+  and for a dot or a backslash inside a label (a space is `\032`).
+- nsplane-uapi: a `set=1` request with a malformed `public_key=` line applies the complete
+  peer section before that line, then fails with `EINVAL`.
+- nsplane-ether: the DHCP server drops a datagram with a wrong IPv4 header checksum or a UDP
+  length outside the packet (`drop_malformed`) and reads the message up to the UDP length.
 ### Removed
 - `nsplane_tun::adopt_fd` and `Tun::from_raw_fd`: safe functions that took ownership of a
   descriptor number, which safe code could use to close a descriptor it does not own. Build
@@ -190,6 +197,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of segmented as IPv4.
 - `UdpTransport` on Windows sends a datagram marked CE as ECT(0); the send failed with
   `WSAEINVAL` and the datagram was lost.
+- nsplane-dns: a label with a dot inside it no longer matches a policy rule for the dotted
+  name, and a name outside host-name syntax is answered under its own name instead of with
+  SERVFAIL after a `FakePool` binding was spent on it.
+- nsplane-dns: a message with the reserved Z header bit set is no longer refused (a query got
+  FORMERR, an upstream response was dropped); the bit is ignored and never sent.
+- nsplane-nat: an ICMP error whose quote holds fewer than four bytes of an echo header has the
+  quoted echo type translated.
+- nsplane-acl: an ICMPv4 error is matched to a flow only through a quote inside its own total
+  length; bytes a buffer holds behind the packet no longer count.
 
 ## [0.22.2] - 2026-11-10
 

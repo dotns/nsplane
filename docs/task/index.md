@@ -155,3 +155,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261112-0103-sink-contract-outside-the-engine The sink batch contract outside the engine, and the macOS privilege drop**](20261112-0103-sink-contract-outside-the-engine.md) `P3`
 
 - [x] [**20261112-0104-windows-udp-port-ownership A transport on `[::]:port` does not own the IPv4 side of its port on Windows**](20261112-0104-windows-udp-port-ownership.md) `P3`
+
+- [x] [**20261112-0201-property-test-followups Follow-ups of the parser and codec property tests**](20261112-0201-property-test-followups.md) `P3`
