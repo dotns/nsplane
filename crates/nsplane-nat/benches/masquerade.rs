@@ -6,6 +6,9 @@
 //!   recomputed.
 //! - `new_flow`: `forward` of a request that opens a new flow every time (the
 //!   source port changes); old flows expire, so the table stays bounded.
+//! - `refused_at_capacity`: `forward` of a request that would open a flow
+//!   while the default table (4096 flows) is full of flows that cannot expire
+//!   yet, each from a host of its own; the request is dropped.
 
 use std::hint::black_box;
 use std::net::Ipv6Addr;
@@ -100,5 +103,27 @@ fn new_flow(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, established, new_flow);
+fn refused_at_capacity(c: &mut Criterion) {
+    let config = MasqueradeConfig::default();
+    let flows = u16::try_from(config.max_flows).unwrap_or(u16::MAX);
+    let masquerade = Masquerade::new(decide(), config);
+    let host = |index: u16| Ipv6Addr::new(0xfd00, 0xaa, 0, 0, 0, 0, 1, index);
+    for index in 0..flows {
+        let mut packet = PacketBuf::from_packet(&udp((host(index), 10_000), (REMOTE, 53), 64));
+        assert_eq!(
+            masquerade.forward(&mut packet),
+            MasqueradeVerdict::Rewritten
+        );
+    }
+    let mut packet = PacketBuf::from_packet(&udp((host(flows), 10_000), (REMOTE, 53), 64));
+    c.bench_function("refused_at_capacity", |b| {
+        b.iter(|| {
+            let verdict = masquerade.forward(black_box(&mut packet));
+            assert!(matches!(verdict, MasqueradeVerdict::Drop(_)));
+            verdict
+        });
+    });
+}
+
+criterion_group!(benches, established, new_flow, refused_at_capacity);
 criterion_main!(benches);

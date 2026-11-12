@@ -197,11 +197,21 @@ over the IPv6 pseudo-header. TCP and ICMPv6 accept valid zero fields and preserv
 a computed zero; only UDP rejects a zero field and emits computed zero as `0xffff`. Drop reasons (`masquerade::reasons`, counted in
 `MasqueradeStats`): `tcp_not_syn` (with `tcp_new_flow_requires_syn`, only a SYN opens a TCP
 flow), `capacity`, `route_changed`, `tokens_exhausted` and `bad_checksum` (with
-`verify_checksums`, an invalid transport checksum). Forward verifies the checksum only for packets it masquerades: for a new flow after the
+`verify_checksums`, an invalid transport checksum), plus `source_quota` (below). Forward verifies the checksum only for packets it masquerades: for a new flow after the
 closure returned `Some` (a corrupt first packet records no flow), for a recorded flow before
 the route recheck; a packet that passes unchanged is never dropped for its checksum. Flows live in a dedicated table instead of a `Conntrack`: a full masquerade table
 refuses new flows, while a `Conntrack` evicts its least
-recently seen flow. Expiry is lazy, per protocol. IPv4, extension headers, fragments, other
+recently seen flow. One inside source address (a LAN host, before the rewrite) may hold at
+most `Masquerade::max_flows_per_source` flows: half of `max_flows` by default (2048 of 4096),
+set with `Masquerade::with_max_flows_per_source` (pass `max_flows` to lift it for a single
+inside host that needs the whole table). A new flow beyond it is dropped with `source_quota`
+and counted by `Masquerade::source_quota_drops`, an accessor because `MasqueradeStats` cannot
+take a field without breaking its users; the table's own bound is checked first. Expiry is
+lazy, per protocol; the table keeps a lower bound of its first expiry, so a new flow that
+meets a full table (or a full quota) scans it only when a flow may have expired instead of
+once per packet. A TCP flow that saw a FIN or RST in either direction, on a packet that passed
+the checksum verification, idles out after 30 s (or `tcp_timeout` if shorter) instead of
+`tcp_timeout`, until a SYN from the LAN host reuses it; the 30 s are not configurable. IPv4, extension headers, fragments, other
 protocols and replies of unknown flows pass unchanged. A local side that answers pings
 itself can recognize a forwarded `ICMPv6` Echo request with the read-only
 `nsplane_packet::icmp::is_echo_request` and turn it into its reply with
@@ -229,6 +239,7 @@ fragmented to fit the MTU after translation.
 | Local-side redirect (DNAT) | call `Redirect::forward` / `Redirect::reverse` on the local path | not used | none |
 | Redirect endpoint tries / pool scan | `Redirect::with_endpoint_tries(n)`; `Redirect::endpoint_in_use` from the decision closure | 32 tries, no scan | none: the same loop with another bound; `endpoint_in_use` runs only when called |
 | Local-side masquerade (IPv6 source NAPT) | call `Masquerade::forward` / `Masquerade::reverse` on the local path | not used | none: a plain type, only called if the embedder wires it |
+| Masquerade flows per inside source | `Masquerade::with_max_flows_per_source(n)` | half of `max_flows`, rounded up (2048) | one small map entry per inside source with a live flow |
 
 ## Errors and drop reasons
 
@@ -240,7 +251,8 @@ Each filter drops with its own reasons (`nsplane_nat::reasons`, `nat64_lan::reas
 
 - Translator fragment state: at most 256 datagrams and 1 MiB, for 60 s.
 - `Conntrack`: bounded by `ConntrackConfig`; the least recently seen flow is evicted.
-- `Masquerade`: a bounded table that refuses new flows when full.
+- `Masquerade`: a bounded table that refuses new flows when full, and at most
+  `max_flows_per_source` flows per inside source address (half the table by default).
 - `Nat64Lan`: one SNAT port or Echo identifier per flow from `SnatPorts`; a saturated range
   drops the packet.
 

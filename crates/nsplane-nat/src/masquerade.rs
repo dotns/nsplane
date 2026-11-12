@@ -52,14 +52,27 @@
 //!
 //! - **Idle timeouts** per protocol (TCP, UDP, `ICMPv6`); every hit in either
 //!   direction refreshes a flow. Expiry is lazy: an expired flow goes when a
-//!   packet finds it, when its token is needed, when the table is full and
-//!   by [`Masquerade::len`]; no packet sweeps the whole table.
+//!   packet finds it, when its token is needed, when the table or its
+//!   source's share of it is full and by [`Masquerade::len`]. The table
+//!   keeps the earliest time any of its flows can expire, so a new flow that
+//!   finds the table full scans it only when a flow may have expired, not
+//!   once per packet.
 //! - **Bounded**: a new flow when [`MasqueradeConfig::max_flows`] flows are
 //!   live is dropped ([`reasons::CAPACITY`]); no flow is evicted.
+//! - **Per-source quota**: the flows of one inside source address (the LAN
+//!   host, before the rewrite) are limited to
+//!   [`Masquerade::max_flows_per_source`], half of `max_flows` (rounded up)
+//!   unless [`Masquerade::with_max_flows_per_source`] says otherwise, so one
+//!   host cannot fill the table and lock the others out. A new flow beyond
+//!   it is dropped ([`reasons::SOURCE_QUOTA`]), counted by
+//!   [`Masquerade::source_quota_drops`].
 //! - **TCP**: with [`MasqueradeConfig::tcp_new_flow_requires_syn`], only a
 //!   SYN (SYN set, ACK clear) opens a flow; another TCP packet the closure
 //!   would masquerade without a flow is dropped ([`reasons::TCP_NOT_SYN`]).
-//!   TCP flows keep no state beyond their idle time.
+//!   A TCP flow that saw a FIN or RST in either direction (on a packet that
+//!   passed the checksum verification) is closing: its idle timeout is 30 s,
+//!   or [`MasqueradeConfig::tcp_timeout`] if that is shorter, until a SYN
+//!   from the LAN host reuses the flow. No other TCP state is kept.
 //! - By default, the forward direction does not ask the decision
 //!   closure again for a recorded flow; a changed route is noticed on the
 //!   next reply. With [`MasqueradeConfig::recheck_route_on_forward`], every
@@ -79,7 +92,9 @@
 //! counted in [`MasqueradeStats`]: [`reasons::TCP_NOT_SYN`],
 //! [`reasons::CAPACITY`], [`reasons::ROUTE_CHANGED`],
 //! [`reasons::TOKENS_EXHAUSTED`] and [`reasons::BAD_CHECKSUM`];
-//! `bad_checksum` is the one the contract did not list. The
+//! `bad_checksum` is the one the contract did not list.
+//! [`reasons::SOURCE_QUOTA`] has a counter of its own,
+//! [`Masquerade::source_quota_drops`]. The
 //! new source is an [`Ipv6Addr`], so the closure cannot answer a source the
 //! masquerade could not write.
 //!
@@ -98,6 +113,7 @@ pub mod reasons;
 mod tests;
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::RangeInclusive;
@@ -118,8 +134,12 @@ const DST_ADDR: usize = 24;
 const ECHO_REQUEST: u8 = 128;
 const ECHO_REPLY: u8 = 129;
 /// TCP flag bits as found in byte 13 of the TCP header.
+const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
 const TCP_ACK: u8 = 0x10;
+/// Longest idle timeout of a TCP flow that saw a FIN or RST.
+const TCP_CLOSING_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The decision closure of a [`Masquerade`].
 type Decide = Box<dyn Fn(&FiveTuple) -> Option<MasqueradeDecision> + Send + Sync>;
@@ -147,7 +167,8 @@ pub struct MasqueradeConfig {
     /// Maximum number of live flows; a new flow beyond it is dropped with
     /// [`reasons::CAPACITY`]. Default 4096.
     pub max_flows: usize,
-    /// Idle timeout of a TCP flow. Default 5 min.
+    /// Idle timeout of a TCP flow; a flow that saw a FIN or RST has at most
+    /// 30 s. Default 5 min.
     pub tcp_timeout: Duration,
     /// Idle timeout of a UDP flow. Default 2 min.
     pub udp_timeout: Duration,
@@ -248,6 +269,7 @@ struct Counters {
     route_changed: AtomicU64,
     tokens_exhausted: AtomicU64,
     bad_checksum: AtomicU64,
+    source_quota: AtomicU64,
 }
 
 /// A flow key: a packet's protocol, addresses and ports (an Echo identifier
@@ -283,6 +305,8 @@ struct Flow {
     token: u16,
     route: u64,
     last_seen: Instant,
+    /// Whether a TCP flow saw a FIN or RST.
+    closing: bool,
 }
 
 /// The flow table, behind the [`Masquerade`]'s mutex.
@@ -292,6 +316,11 @@ struct Table {
     flows: HashMap<Key, Flow>,
     /// Forward keys by the key of the replies.
     replies: HashMap<Key, Key>,
+    /// The number of flows of each inside source address.
+    per_source: HashMap<Ipv6Addr, usize>,
+    /// A lower bound of the time the first flow expires: no flow is expired
+    /// before it. `None` while no flow can expire at all.
+    first_expiry: Option<Instant>,
     /// The next token tried.
     next_token: u16,
     created: u64,
@@ -303,20 +332,69 @@ impl Table {
         Self {
             flows: HashMap::new(),
             replies: HashMap::new(),
+            per_source: HashMap::new(),
+            first_expiry: None,
             next_token: *config.ports.start(),
             created: 0,
             expired: 0,
         }
     }
 
+    /// The idle timeout of `flow`.
+    fn timeout(flow: &Flow, config: &MasqueradeConfig) -> Duration {
+        let timeout = config.timeout(flow.tuple.protocol);
+        if flow.closing {
+            timeout.min(TCP_CLOSING_TIMEOUT)
+        } else {
+            timeout
+        }
+    }
+
     fn is_expired(flow: &Flow, now: Instant, config: &MasqueradeConfig) -> bool {
-        now.saturating_duration_since(flow.last_seen) >= config.timeout(flow.tuple.protocol)
+        now.saturating_duration_since(flow.last_seen) >= Self::timeout(flow, config)
+    }
+
+    /// Whether a flow may be expired at `now`.
+    fn may_expire(&self, now: Instant) -> bool {
+        self.first_expiry.is_some_and(|first| now >= first)
+    }
+
+    /// Lowers [`first_expiry`](Self::first_expiry) to the expiry of `flow`.
+    fn expires(&mut self, flow: &Flow, config: &MasqueradeConfig) {
+        if let Some(expiry) = flow.last_seen.checked_add(Self::timeout(flow, config)) {
+            self.first_expiry = Some(self.first_expiry.map_or(expiry, |first| first.min(expiry)));
+        }
+    }
+
+    /// The number of flows of the inside source address `source`.
+    fn source_flows(&self, source: Ipv6Addr) -> usize {
+        self.per_source.get(&source).copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, key: Key, flow: Flow, config: &MasqueradeConfig) {
+        self.replies.insert(key.reply(flow.source, flow.token), key);
+        self.expires(&flow, config);
+        if self.flows.insert(key, flow).is_none() {
+            *self.per_source.entry(key.src).or_insert(0) += 1;
+        }
+        self.created += 1;
     }
 
     fn remove(&mut self, key: &Key) -> Option<Flow> {
         let flow = self.flows.remove(key)?;
         self.replies.remove(&key.reply(flow.source, flow.token));
+        release_source(&mut self.per_source, key.src);
         Some(flow)
+    }
+
+    /// Marks the TCP flow of forward key `key` as closing, or as open again.
+    fn set_closing(&mut self, key: &Key, closing: bool, config: &MasqueradeConfig) {
+        let Some(flow) = self.flows.get_mut(key) else {
+            return;
+        };
+        flow.closing = closing;
+        let flow = *flow;
+        self.expires(&flow, config);
     }
 
     /// The live flow of forward key `key`, refreshed; an expired one is
@@ -332,11 +410,26 @@ impl Table {
         Some(*flow)
     }
 
-    /// Removes every expired flow.
+    /// Removes every expired flow; scans the table only when one may be
+    /// expired.
     fn expire_all(&mut self, now: Instant, config: &MasqueradeConfig) {
+        if !self.may_expire(now) {
+            return;
+        }
         let before = self.flows.len();
-        self.flows
-            .retain(|_, flow| !Self::is_expired(flow, now, config));
+        let per_source = &mut self.per_source;
+        let mut first_expiry: Option<Instant> = None;
+        self.flows.retain(|key, flow| {
+            if Self::is_expired(flow, now, config) {
+                release_source(per_source, key.src);
+                return false;
+            }
+            if let Some(expiry) = flow.last_seen.checked_add(Self::timeout(flow, config)) {
+                first_expiry = Some(first_expiry.map_or(expiry, |first| first.min(expiry)));
+            }
+            true
+        });
+        self.first_expiry = first_expiry;
         if self.flows.len() != before {
             let flows = &self.flows;
             self.replies.retain(|_, key| flows.contains_key(key));
@@ -378,9 +471,23 @@ impl Table {
     }
 }
 
+/// Forgets one flow of the inside source address `source`.
+fn release_source(per_source: &mut HashMap<Ipv6Addr, usize>, source: Ipv6Addr) {
+    if let Entry::Occupied(mut flows) = per_source.entry(source) {
+        if *flows.get() > 1 {
+            *flows.get_mut() -= 1;
+        } else {
+            flows.remove();
+        }
+    }
+}
+
 /// Local-side IPv6 source NAPT; see the [module docs](self).
 pub struct Masquerade {
     config: MasqueradeConfig,
+    /// Most flows of one inside source address; see
+    /// [`Masquerade::with_max_flows_per_source`].
+    max_flows_per_source: usize,
     decide: Decide,
     table: Mutex<Table>,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
@@ -391,7 +498,9 @@ impl fmt::Debug for Masquerade {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Masquerade")
             .field("config", &self.config)
+            .field("max_flows_per_source", &self.max_flows_per_source)
             .field("stats", &self.stats())
+            .field("source_quota_drops", &self.source_quota_drops())
             .finish_non_exhaustive()
     }
 }
@@ -420,6 +529,7 @@ impl Masquerade {
     ) -> Self {
         Self {
             table: Mutex::new(Table::new(&config)),
+            max_flows_per_source: config.max_flows.div_ceil(2),
             config,
             decide: Box::new(decide),
             clock: Box::new(clock),
@@ -427,9 +537,35 @@ impl Masquerade {
         }
     }
 
+    /// Limits the live flows of one inside source address (a LAN host, as
+    /// the source of its packets before the rewrite) to `flows`; a new flow
+    /// beyond it is dropped with [`reasons::SOURCE_QUOTA`].
+    ///
+    /// The default is half of [`MasqueradeConfig::max_flows`], rounded up, so
+    /// that one host cannot use the whole table. A deployment with a single
+    /// inside host that needs more can pass `max_flows` here, which leaves
+    /// the table's bound as the only one.
+    #[must_use]
+    pub const fn with_max_flows_per_source(mut self, flows: usize) -> Self {
+        self.max_flows_per_source = flows;
+        self
+    }
+
     /// The masquerade's settings.
     pub const fn config(&self) -> &MasqueradeConfig {
         &self.config
+    }
+
+    /// The most live flows one inside source address may have; see
+    /// [`with_max_flows_per_source`](Self::with_max_flows_per_source).
+    pub const fn max_flows_per_source(&self) -> usize {
+        self.max_flows_per_source
+    }
+
+    /// Packets dropped with [`reasons::SOURCE_QUOTA`]. It is not a field of
+    /// [`MasqueradeStats`], which cannot grow without breaking its users.
+    pub fn source_quota_drops(&self) -> u64 {
+        self.counters.source_quota.load(Ordering::Relaxed)
     }
 
     /// The number of live flows; removes the expired ones first.
@@ -502,6 +638,7 @@ impl Masquerade {
                     reasons::CAPACITY => &c.capacity,
                     reasons::ROUTE_CHANGED => &c.route_changed,
                     reasons::TOKENS_EXHAUSTED => &c.tokens_exhausted,
+                    reasons::SOURCE_QUOTA => &c.source_quota,
                     _ => &c.bad_checksum,
                 };
                 (counter, MasqueradeVerdict::Drop(reason))
@@ -522,6 +659,11 @@ impl Masquerade {
                 self.verify_checksum(&info, packet.as_packet())?;
                 if self.config.recheck_route_on_forward {
                     self.recheck_route(&info.key, &flow)?;
+                }
+                // A SYN from the LAN host reuses a closing flow.
+                if info.closes || (info.syn && flow.closing) {
+                    self.lock()
+                        .set_closing(&info.key, info.closes, &self.config);
                 }
                 (flow.source, flow.token)
             }
@@ -549,6 +691,9 @@ impl Masquerade {
         };
         self.verify_checksum(&info, packet.as_packet())?;
         self.recheck_route(&key, &flow)?;
+        if info.closes {
+            self.lock().set_closing(&key, true, &self.config);
+        }
         info.rewrite(packet.as_packet_mut(), DST_ADDR, key.src, key.src_port);
         Ok(true)
     }
@@ -611,21 +756,22 @@ impl Masquerade {
                 return Err(reasons::CAPACITY);
             }
         }
+        if table.source_flows(info.key.src) >= self.max_flows_per_source {
+            table.expire_all(now, config);
+            if table.source_flows(info.key.src) >= self.max_flows_per_source {
+                return Err(reasons::SOURCE_QUOTA);
+            }
+        }
         let token = table.allocate(&info.key, source, now, config)?;
-        table
-            .replies
-            .insert(info.key.reply(source, token), info.key);
-        table.flows.insert(
-            info.key,
-            Flow {
-                tuple,
-                source,
-                token,
-                route: decision.route,
-                last_seen: now,
-            },
-        );
-        table.created += 1;
+        let flow = Flow {
+            tuple,
+            source,
+            token,
+            route: decision.route,
+            last_seen: now,
+            closing: info.closes,
+        };
+        table.insert(info.key, flow, config);
         Ok(Some((source, token)))
     }
 
@@ -644,6 +790,8 @@ struct Info {
     checksum_at: usize,
     /// Whether a TCP packet has SYN set and ACK clear.
     syn: bool,
+    /// Whether a TCP packet has FIN or RST set.
+    closes: bool,
 }
 
 impl Info {
@@ -663,21 +811,24 @@ impl Info {
         let dst = addr(bytes, DST_ADDR);
         let l4 = IPV6_HEADER;
         let protocol = bytes[6];
-        let (src_port, dst_port, checksum_at, syn) = match protocol {
+        let (src_port, dst_port, checksum_at, flags) = match protocol {
             protocol::TCP => {
                 let header_len = usize::from(*bytes.get(l4 + 12)? >> 4) * 4;
                 if header_len < 20 || header_len > payload_len {
                     return None;
                 }
-                let flags = bytes[l4 + 13];
-                let syn = flags & (TCP_SYN | TCP_ACK) == TCP_SYN;
-                (be16(bytes, l4), be16(bytes, l4 + 2), l4 + 16, syn)
+                (
+                    be16(bytes, l4),
+                    be16(bytes, l4 + 2),
+                    l4 + 16,
+                    bytes[l4 + 13],
+                )
             }
             protocol::UDP => {
                 if usize::from(be16(bytes, l4 + 4)) != payload_len {
                     return None;
                 }
-                (be16(bytes, l4), be16(bytes, l4 + 2), l4 + 6, false)
+                (be16(bytes, l4), be16(bytes, l4 + 2), l4 + 6, 0)
             }
             protocol::ICMPV6 => {
                 let expected = if reply { ECHO_REPLY } else { ECHO_REQUEST };
@@ -686,7 +837,7 @@ impl Info {
                 }
                 let id = be16(bytes, l4 + 4);
                 let ports = if reply { (0, id) } else { (id, 0) };
-                (ports.0, ports.1, l4 + 2, false)
+                (ports.0, ports.1, l4 + 2, 0)
             }
             _ => return None,
         };
@@ -705,7 +856,8 @@ impl Info {
             },
             token_at,
             checksum_at,
-            syn,
+            syn: flags & (TCP_SYN | TCP_ACK) == TCP_SYN,
+            closes: flags & (TCP_FIN | TCP_RST) != 0,
         })
     }
 

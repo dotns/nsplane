@@ -7,6 +7,10 @@ pub const TCP_NOT_SYN: &str = "tcp_not_syn";
 /// [`MasqueradeConfig::max_flows`](crate::MasqueradeConfig::max_flows) live
 /// flows. No flow is evicted.
 pub const CAPACITY: &str = "capacity";
+/// A new flow could not be recorded: its inside source address already has
+/// [`Masquerade::max_flows_per_source`](crate::Masquerade::max_flows_per_source)
+/// live flows. No flow is evicted.
+pub const SOURCE_QUOTA: &str = "source_quota";
 /// The decision closure no longer answers a reply's flow with the route the
 /// flow was recorded with (or answers `None`); the flow was removed.
 ///

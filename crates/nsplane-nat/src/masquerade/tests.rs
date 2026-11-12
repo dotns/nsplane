@@ -3,6 +3,8 @@
 //! admission, token wrap and capacity. These test the local implementation;
 //! the `parity_*` names do not establish equivalence with another implementation.
 
+mod quota;
+
 use std::net::Ipv4Addr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Barrier, OnceLock, Weak};
