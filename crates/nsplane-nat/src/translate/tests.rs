@@ -2,6 +2,7 @@
 //! translation tests and RFC 7915 vectors. Every translated
 //! packet's checksums are verified by a full recompute.
 
+mod extension_chain;
 mod icmp_extensions;
 mod nested_lans;
 mod peer6_eam4;

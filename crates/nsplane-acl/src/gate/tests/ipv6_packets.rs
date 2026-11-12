@@ -171,6 +171,142 @@ fn a_truncated_or_overlong_chain_is_malformed() {
 }
 
 #[test]
+fn authentication_headers_are_skipped_by_their_own_length() {
+    let gate = web_gate();
+    // The length counts 4-byte units beyond the first two: a field of 0 is
+    // 8 bytes, 255 is 1028 bytes.
+    for (port, field) in (40_000..).zip([0_u8, 2, 255]) {
+        let mut header = vec![0_u8; (usize::from(field) + 2) * 4];
+        header[1] = field;
+        assert_eq!(
+            gate.evaluate_inbound(PEER, &syn_with(&[(51, header)], port, 443)),
+            granted("web"),
+            "length field {field}"
+        );
+    }
+    let mut overlong = syn_with(&[ah()], 40_010, 443);
+    overlong[41] = 9;
+    assert_eq!(
+        gate.evaluate_inbound(PEER, &overlong),
+        denied(GateReason::Malformed)
+    );
+}
+
+#[test]
+fn the_longest_options_header_is_walked() {
+    let gate = web_gate();
+    for (port, kind) in (40_000..).zip([0, 43, 60]) {
+        let mut header = vec![0_u8; 2048];
+        header[1] = 255;
+        assert_eq!(
+            gate.evaluate_inbound(PEER, &syn_with(&[(kind, header)], port, 443)),
+            granted("web"),
+            "kind {kind}"
+        );
+    }
+}
+
+#[test]
+fn a_chain_cut_inside_a_header_is_malformed() {
+    let gate = web_gate();
+    // The payload ends after `kept` bytes of the single extension header.
+    for (name, chain, kept) in [
+        ("Fragment header", vec![fragment6(1, 0, false)], 7),
+        ("later fragment's header", vec![fragment6(1, 2, true)], 7),
+        ("Fragment header, no bytes", vec![fragment6(1, 0, false)], 0),
+        ("options length byte", vec![options(60, 1)], 1),
+        ("options header", vec![options(43, 2)], 15),
+        ("options header, no bytes", vec![options(0, 1)], 0),
+        ("AH length byte", vec![ah()], 1),
+        ("AH", vec![ah()], 15),
+    ] {
+        let mut packet = syn_with(&chain, 40_000, 443);
+        packet.truncate(40 + kept);
+        packet[4..6].copy_from_slice(&u16::try_from(kept).unwrap().to_be_bytes());
+        assert_eq!(
+            gate.evaluate_inbound(PEER, &packet),
+            denied(GateReason::Malformed),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn nothing_is_walked_behind_a_later_fragment() {
+    let gate = gate_with(policy(vec![open_scope6(GateMode::Enforce)]));
+    // The next header names an extension header and the data is too short
+    // for one: a later fragment's data is not a chain.
+    for next in [0, 43, 44, 51, 60] {
+        assert_eq!(
+            gate.evaluate_inbound(
+                PEER,
+                &ipv6_with(REMOTE6, LOCAL6, &[fragment6(5, 2, true)], next, &[0xff])
+            ),
+            denied(GateReason::OrphanFragment),
+            "next header {next}"
+        );
+    }
+    // Behind a first fragment the chain goes on.
+    let mut cut = ipv6_with(
+        REMOTE6,
+        LOCAL6,
+        &[fragment6(6, 0, true), options(60, 1)],
+        17,
+        &udp_header(40_000, 53),
+    );
+    cut[49] = 4;
+    assert_eq!(
+        gate.evaluate_inbound(PEER, &cut),
+        denied(GateReason::Malformed)
+    );
+}
+
+#[test]
+fn an_unknown_next_header_ends_the_chain_as_the_upper_layer() {
+    let experimental = || {
+        gate_with(policy(vec![scope6(
+            "scope-1",
+            GateMode::Enforce,
+            vec![grant(
+                "experimental",
+                Direction::Inbound,
+                &["remote"],
+                Vec::new(),
+                vec![ProtocolMatch::Ip(253)],
+            )],
+        )]))
+    };
+    for (name, packet) in [
+        ("first", ipv6(REMOTE6, LOCAL6, 253, &[])),
+        (
+            "at the end of the payload",
+            ipv6_with(REMOTE6, LOCAL6, &[options(0, 1), ah()], 253, &[]),
+        ),
+        (
+            "with bytes that look like a chain",
+            ipv6_with(REMOTE6, LOCAL6, &[options(60, 1)], 253, &[0, 9, 0, 0]),
+        ),
+    ] {
+        assert_eq!(
+            experimental().evaluate_inbound(PEER, &packet),
+            granted("experimental"),
+            "{name}"
+        );
+    }
+    // Mobility (135), HIP (139) and Shim6 (140) are not walked either.
+    for next in [135, 139, 140] {
+        assert_eq!(
+            experimental().evaluate_inbound(
+                PEER,
+                &ipv6_with(REMOTE6, LOCAL6, &[], next, &[253, 0, 0, 0, 0, 0, 0, 0])
+            ),
+            denied(GateReason::NoGrant),
+            "next header {next}"
+        );
+    }
+}
+
+#[test]
 fn a_second_fragment_header_is_malformed() {
     let gate = web_gate();
     for chain in [

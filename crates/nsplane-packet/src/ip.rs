@@ -21,6 +21,20 @@ pub mod protocol {
     pub const UDP: u8 = 17;
     /// Internet Control Message Protocol for IPv6.
     pub const ICMPV6: u8 = 58;
+    /// IPv6 Hop-by-Hop Options extension header.
+    pub const IPV6_HOP_BY_HOP: u8 = 0;
+    /// IPv6 Routing extension header.
+    pub const IPV6_ROUTING: u8 = 43;
+    /// IPv6 Fragment extension header.
+    pub const IPV6_FRAGMENT: u8 = 44;
+    /// Encapsulating Security Payload.
+    pub const ESP: u8 = 50;
+    /// Authentication Header.
+    pub const AH: u8 = 51;
+    /// IPv6 No Next Header.
+    pub const IPV6_NO_NEXT_HEADER: u8 = 59;
+    /// IPv6 Destination Options extension header.
+    pub const IPV6_DESTINATION_OPTIONS: u8 = 60;
 }
 
 /// Why a header failed to parse.

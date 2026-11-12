@@ -8,6 +8,7 @@
 mod buf;
 pub mod build;
 pub mod checksum;
+mod extension;
 pub mod hash;
 pub mod icmp;
 mod ip;
@@ -18,6 +19,7 @@ pub mod vnet;
 
 pub use buf::{BoundsError, HEADROOM, MAX_BATCH, PacketBatch, PacketBuf, PacketPool, TAILROOM};
 pub use build::{UdpBuildError, udp_packet, write_udp};
+pub use extension::{ExtensionHeader, ExtensionWalker, Ipv6Fragment};
 pub use ip::{
     FiveTuple, Fragment, IcmpHeader, IpPacket, Ipv4Header, Ipv6Header, Malformed, TcpHeader,
     UdpHeader, protocol,

@@ -7,7 +7,7 @@ crate shares (`PeerId`, `TransportId`, `Path`, `Ecn`). No I/O.
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds; `tag` / `set_tag` / `take_tag`, `is_tracked` / `set_tracked`), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `push_tagged`, `discard_tagged`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome, FragmentTags}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; `vnet::VirtioNetHdr` (`parse`, `encode`), `vnet::segment`, `vnet::OffloadError`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
+| main | `PacketBuf` (headroom, `advance` / `reserve_front`, `from_shared`, fallible bounds; `tag` / `set_tag` / `take_tag`, `is_tracked` / `set_tracked`), `PacketPool`, `SharedPacketPool` (`new`, `alloc`, `alloc_from`, `recycle`, `free_len`, `allocated`), `PacketBatch`, `IpPacket`, `reassembly::Reassembler` (`push`, `push_tagged`, `discard_tagged`, `expire`, `stats`, `pending`), `build::udp_packet` / `build::write_udp`, `icmp::echo_reply_in_place`, `icmp::is_echo_request` | `reassembly::{ReassemblyConfig, ReassemblyStats, Outcome, FragmentTags}`; `Path`, `TransportId`, `PeerId`, `Ecn`; header views `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`, `IcmpHeader`, `Fragment`, `FiveTuple`; `ExtensionWalker` (`new`, `step`, `next_header`, `offset`, `at_extension`), `ExtensionHeader`, `Ipv6Fragment`; `checksum` (`sum_words`, `fold`), `hash::KeyedState` / `hash::KeyedHasher`, `protocol`; `vnet::VirtioNetHdr` (`parse`, `encode`), `vnet::segment`, `vnet::OffloadError`; errors `Malformed`, `BoundsError`, `UdpBuildError`; `HEADROOM`, `MAX_BATCH` |
 
 ## Behavior
 
@@ -69,6 +69,49 @@ any thread; clones share the list. No `unsafe`.
 payload without copying; `Ipv4Header`, `Ipv6Header`, `TcpHeader`, `UdpHeader`,
 `IcmpHeader` and `Fragment` are typed views, `FiveTuple` the flow key. A packet that does not
 parse is `Malformed`.
+
+### IPv6 extension headers
+
+`IpPacket` reads the fixed header only: for IPv6 `protocol()` is the first next header,
+`fragment()` is `None` and `five_tuple()` takes its ports from the first bytes of the payload.
+`ExtensionWalker` walks the chain behind it; the ACL flow gate and the netstack's fragment
+ownership use it.
+
+`ExtensionWalker::new(bytes, next_header, offset)` starts at the header named by `next_header`
+at `offset` of `bytes` (a whole packet: the fixed header's next header and 40; a payload: 0).
+`step()` moves past one header and returns it as an `ExtensionHeader` (`kind`, `offset`,
+`bytes`, `fragment`):
+
+| Next header | Length |
+|---|---|
+| Hop-by-Hop Options (0), Routing (43), Destination Options (60) | (length field + 1) * 8 bytes |
+| Authentication Header (51) | (length field + 2) * 4 bytes |
+| Fragment (44) | 8 bytes; `ExtensionHeader::fragment` gives `Ipv6Fragment { id, offset, more }`, the offset in bytes |
+| anything else, ESP (50) and No Next Header (59) included | not a header: `step` returns `Ok(None)` and stays; `next_header()` is the upper-layer protocol, `offset()` where it starts |
+
+A header that does not lie whole within `bytes` is `Err(Malformed::Truncated)` and the cursor
+stays on it. The bytes of the upper layer are never read. `protocol` names the values
+(`IPV6_HOP_BY_HOP`, `IPV6_ROUTING`, `IPV6_FRAGMENT`, `ESP`, `AH`, `IPV6_NO_NEXT_HEADER`,
+`IPV6_DESTINATION_OPTIONS`).
+
+The walker holds no policy and no limit; a caller decides between steps:
+
+- a bound on the number of headers is the caller's count of its steps;
+- a kind the caller refuses, or treats as the upper layer, is tested with `next_header()`
+  before stepping (`at_extension()` tells whether `step` would move);
+- the chain ends where `bytes` ends, so a caller cuts `bytes` at the payload length first if
+  bytes behind it must not count;
+- after a Fragment header with a non-zero offset the following bytes are data from the middle
+  of the datagram, not a chain: the caller stops, and `next_header()` names what the first
+  fragment carries. Reserved Fragment bits and a second Fragment header are not refused.
+
+It borrows the packet, allocates nothing and is `Copy`.
+
+Two walks do not use it. The reassembler keeps its own loop over the options headers in front
+of a Fragment header: it reads only the first two bytes of each, so a header running past the
+payload is not a fragment (`Outcome::Pass`) unless it announces a Fragment header
+(`Outcome::Dropped`, `malformed`). The RFC 7915 translator of `nsplane-nat` keeps its strict
+parser's walk, whose refusals come in a fixed order.
 
 ### Reassembly
 

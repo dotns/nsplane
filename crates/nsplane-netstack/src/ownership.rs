@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nsplane_packet::reassembly::ReassemblyConfig;
-use nsplane_packet::{IcmpHeader, IpPacket, UdpHeader, protocol};
+use nsplane_packet::{ExtensionWalker, IcmpHeader, IpPacket, UdpHeader, protocol};
 
 use crate::config::Prefixes;
 use crate::stack::tcp_segment;
@@ -441,13 +441,6 @@ impl Owners {
 const SYN: u8 = 0x02;
 const ACK: u8 = 0x10;
 
-/// IPv6 next-header values of the extension headers that may precede a Fragment header,
-/// and of the Fragment header.
-const HOP_BY_HOP: u8 = 0;
-const ROUTING: u8 = 43;
-const DESTINATION_OPTIONS: u8 = 60;
-const FRAGMENT: u8 = 44;
-
 /// For an IPv4 fragment or an IPv6 packet with a Fragment header: the fragmented
 /// protocol, the identification and, for the first fragment, the bytes the transport
 /// header starts in.
@@ -463,25 +456,26 @@ fn fragment_transport<'a>(ip: &IpPacket<'a>) -> Option<(u8, u32, Option<&'a [u8]
             ))
         }
         IpPacket::V6 { .. } => {
-            let mut next = ip.protocol();
-            let mut at = 0;
-            while matches!(next, HOP_BY_HOP | ROUTING | DESTINATION_OPTIONS) {
-                let (&following, &len) = (payload.get(at)?, payload.get(at + 1)?);
-                next = following;
-                at += (usize::from(len) + 1) * 8;
+            let mut walker = ExtensionWalker::new(payload, ip.protocol(), 0);
+            while matches!(
+                walker.next_header(),
+                protocol::IPV6_HOP_BY_HOP
+                    | protocol::IPV6_ROUTING
+                    | protocol::IPV6_DESTINATION_OPTIONS
+            ) {
+                walker.step().ok()?;
             }
-            if next != FRAGMENT {
+            if walker.next_header() != protocol::IPV6_FRAGMENT {
                 return None;
             }
-            let &[inner, _, offset_hi, offset_lo, id0, id1, id2, id3] = payload.get(at..at + 8)?
-            else {
-                return None;
-            };
-            let first = u16::from_be_bytes([offset_hi, offset_lo]) >> 3 == 0;
+            let fragment = walker.step().ok()??.fragment()?;
             Some((
-                inner,
-                u32::from_be_bytes([id0, id1, id2, id3]),
-                first.then(|| payload.get(at + 8..)).flatten(),
+                walker.next_header(),
+                fragment.id,
+                fragment
+                    .is_first()
+                    .then(|| payload.get(walker.offset()..))
+                    .flatten(),
             ))
         }
     }
@@ -547,4 +541,137 @@ pub(crate) fn quoted_tuple(quoted: &[u8]) -> Option<(u8, SocketAddr, SocketAddr,
         SocketAddr::new(dst, dst_port),
         transport,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOP_BY_HOP: u8 = protocol::IPV6_HOP_BY_HOP;
+    const ROUTING: u8 = protocol::IPV6_ROUTING;
+    const DESTINATION_OPTIONS: u8 = protocol::IPV6_DESTINATION_OPTIONS;
+    const FRAGMENT: u8 = protocol::IPV6_FRAGMENT;
+
+    /// An IPv6 packet whose first next header is `next` and whose payload is `payload`.
+    fn v6(next: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x60, 0, 0, 0];
+        packet.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        packet.extend_from_slice(&[next, 64]);
+        packet.extend_from_slice(&[0xfd; 32]);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    /// A Hop-by-Hop, Routing or Destination Options header of `units` 8-byte units
+    /// followed by `next`.
+    fn options(next: u8, units: u8) -> Vec<u8> {
+        let mut header = vec![0_u8; usize::from(units) * 8];
+        header[..2].copy_from_slice(&[next, units - 1]);
+        header
+    }
+
+    /// A Fragment header followed by `inner`, at 8-byte unit `offset` of its datagram.
+    fn fragment(inner: u8, offset: u16, id: u32) -> Vec<u8> {
+        let mut header = vec![inner, 0];
+        header.extend_from_slice(&((offset << 3) | 1).to_be_bytes());
+        header.extend_from_slice(&id.to_be_bytes());
+        header
+    }
+
+    /// [`fragment_transport`] of `packet`, the transport bytes owned.
+    fn found(packet: &[u8]) -> Option<(u8, u32, Option<Vec<u8>>)> {
+        let ip = IpPacket::parse(packet).unwrap();
+        fragment_transport(&ip)
+            .map(|(proto, id, transport)| (proto, id, transport.map(<[u8]>::to_vec)))
+    }
+
+    #[test]
+    fn the_ipv6_fragment_header_is_found_behind_options_headers() {
+        let data = [7_u8; 8];
+        let chains = [
+            Vec::new(),
+            vec![options(FRAGMENT, 1)],
+            vec![options(ROUTING, 255), options(FRAGMENT, 2)],
+            vec![
+                options(DESTINATION_OPTIONS, 1),
+                options(ROUTING, 2),
+                options(FRAGMENT, 1),
+            ],
+            vec![options(DESTINATION_OPTIONS, 1); 99]
+                .into_iter()
+                .chain([options(FRAGMENT, 1)])
+                .collect(),
+        ];
+        for chain in chains {
+            let first = if chain.is_empty() {
+                FRAGMENT
+            } else {
+                HOP_BY_HOP
+            };
+            for (offset, transport) in [(0, Some(data.to_vec())), (3, None)] {
+                let mut payload = chain.concat();
+                payload.extend_from_slice(&fragment(protocol::UDP, offset, 0x0102_0304));
+                payload.extend_from_slice(&data);
+                assert_eq!(
+                    found(&v6(first, &payload)),
+                    Some((protocol::UDP, 0x0102_0304, transport)),
+                    "{} headers, offset {offset}",
+                    chain.len()
+                );
+            }
+        }
+        // A first fragment without data has empty transport bytes.
+        assert_eq!(
+            found(&v6(FRAGMENT, &fragment(protocol::TCP, 0, 9))),
+            Some((protocol::TCP, 9, Some(Vec::new())))
+        );
+    }
+
+    #[test]
+    fn ipv6_chains_without_a_whole_fragment_header_are_not_fragments() {
+        let header = fragment(protocol::UDP, 0, 5);
+        let behind = |options: Vec<u8>| [options, header.clone(), vec![0; 8]].concat();
+        // An options header whose length runs past the payload.
+        let overlong = |next: u8| {
+            let mut options = options(next, 1);
+            options[1] = 9;
+            options
+        };
+        for (name, packet) in [
+            ("no extension header", v6(protocol::UDP, &[0; 8])),
+            (
+                "options before UDP",
+                v6(HOP_BY_HOP, &behind(options(protocol::UDP, 1))),
+            ),
+            (
+                "an Authentication Header is not walked",
+                v6(51, &behind(vec![FRAGMENT, 0, 0, 0, 0, 0, 0, 0])),
+            ),
+            ("an empty payload", v6(HOP_BY_HOP, &[])),
+            ("one byte of an options header", v6(ROUTING, &[FRAGMENT])),
+            ("no Fragment header", v6(FRAGMENT, &[])),
+            ("a cut Fragment header", v6(FRAGMENT, &header[..7])),
+            (
+                "a cut Fragment header behind options",
+                v6(
+                    HOP_BY_HOP,
+                    &[options(FRAGMENT, 2), header[..4].to_vec()].concat(),
+                ),
+            ),
+            (
+                "an overlong options header before UDP",
+                v6(HOP_BY_HOP, &behind(overlong(protocol::UDP))),
+            ),
+            (
+                "an overlong options header before another",
+                v6(DESTINATION_OPTIONS, &behind(overlong(ROUTING))),
+            ),
+            (
+                "an overlong options header before a Fragment header",
+                v6(HOP_BY_HOP, &behind(overlong(FRAGMENT))),
+            ),
+        ] {
+            assert_eq!(found(&packet), None, "{name}");
+        }
+    }
 }

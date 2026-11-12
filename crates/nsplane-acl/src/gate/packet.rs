@@ -2,7 +2,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use nsplane_packet::PeerId;
+use nsplane_packet::{ExtensionWalker, PeerId, protocol};
 
 use super::PacketDirection;
 use super::addr::{GateAddr, address_at};
@@ -143,43 +143,44 @@ struct Chain {
 /// no more headers. `None` for a truncated chain, more than
 /// [`MAX_EXTENSION_HEADERS`] headers (the Fragment header counts, also in a
 /// later fragment) or a second Fragment header.
+#[inline]
 fn walk_v6(packet: &[u8]) -> Option<Chain> {
-    let mut protocol = *packet.get(6)?;
-    let mut offset = 40;
+    let walker = ExtensionWalker::new(packet, *packet.get(6)?, 40);
+    if walker.at_extension() {
+        return walk_chain(walker);
+    }
+    Some(Chain {
+        protocol: walker.next_header(),
+        offset: walker.offset(),
+        fragment: None,
+    })
+}
+
+/// [`walk_v6`] from the first extension header on.
+fn walk_chain(mut walker: ExtensionWalker<'_>) -> Option<Chain> {
     let mut fragment = None;
     for consumed in 0..=MAX_EXTENSION_HEADERS {
-        let length = match protocol {
-            0 | 43 | 60 => (usize::from(*packet.get(offset + 1)?) + 1) * 8,
-            51 => (usize::from(*packet.get(offset + 1)?) + 2) * 4,
-            44 if fragment.is_none() => 8,
-            _ => {
-                return (protocol != 44).then_some(Chain {
-                    protocol,
-                    offset,
-                    fragment,
-                });
-            }
+        if fragment.is_some() && walker.next_header() == protocol::IPV6_FRAGMENT {
+            return None;
+        }
+        let Some(header) = walker.step().ok()? else {
+            break;
         };
         if consumed == MAX_EXTENSION_HEADERS {
             return None;
         }
-        let header = packet.get(offset..offset + length)?;
-        if protocol == 44 {
-            let field = u16::from_be_bytes([header[2], header[3]]);
-            let identification = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-            fragment = Some((identification, field >> 3, field & 1 != 0));
-        }
-        protocol = header[0];
-        offset += length;
-        if fragment.is_some_and(|(_, units, _)| units != 0) {
-            return Some(Chain {
-                protocol,
-                offset,
-                fragment,
-            });
+        if let Some(found) = header.fragment() {
+            fragment = Some((found.id, found.offset >> 3, found.more));
+            if !found.is_first() {
+                break;
+            }
         }
     }
-    None
+    Some(Chain {
+        protocol: walker.next_header(),
+        offset: walker.offset(),
+        fragment,
+    })
 }
 
 /// Parse an IPv6 packet.

@@ -795,3 +795,142 @@ fn discard_tagged_drops_the_datagrams_holding_the_tag() {
     let stats = reassembler.stats();
     assert_eq!((stats.timeout, stats.overflow, stats.mixed_tags), (0, 0, 1));
 }
+
+/// An IPv6 packet whose first next header is `next` and whose payload is `payload`.
+fn v6_raw(next: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0x60, 0, 0, 0];
+    packet.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    packet.extend_from_slice(&[next, 64]);
+    packet.extend_from_slice(&V6_SRC.octets());
+    packet.extend_from_slice(&V6_DST.octets());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// A Hop-by-Hop, Routing or Destination Options header of `units` 8-byte units followed
+/// by `next`.
+fn options_header(next: u8, units: u8) -> Vec<u8> {
+    let mut header = vec![0_u8; usize::from(units) * 8];
+    header[..2].copy_from_slice(&[next, units - 1]);
+    header
+}
+
+/// A Fragment header followed by `inner`, at byte `offset` of its datagram.
+fn fragment_header(inner: u8, offset: u16, more: bool, id: u32) -> Vec<u8> {
+    let mut header = vec![inner, 0];
+    header.extend_from_slice(&(offset | u16::from(more)).to_be_bytes());
+    header.extend_from_slice(&id.to_be_bytes());
+    header
+}
+
+#[test]
+fn ipv6_fragment_header_behind_a_chain_of_options_headers() {
+    // Hop-by-Hop (8 bytes), Routing (16), Destination Options (24), Fragment.
+    let chain = [
+        options_header(ROUTING, 1),
+        options_header(DESTINATION_OPTIONS, 2),
+        options_header(FRAGMENT, 3),
+    ]
+    .concat();
+    let fragments: Vec<Vec<u8>> = [(0, true, [1_u8; 8]), (8, false, [2; 8])]
+        .into_iter()
+        .map(|(offset, more, data)| {
+            let mut payload = chain.clone();
+            payload.extend_from_slice(&fragment_header(protocol::UDP, offset, more, 77));
+            payload.extend_from_slice(&data);
+            v6_raw(HOP_BY_HOP, &payload)
+        })
+        .collect();
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    for order in [[0, 1], [1, 0]] {
+        let packet = reassemble(&mut reassembler, &fragments, &order);
+        let mut expected = options_header(ROUTING, 1);
+        expected.extend_from_slice(&options_header(DESTINATION_OPTIONS, 2));
+        expected.extend_from_slice(&options_header(protocol::UDP, 3));
+        expected.extend_from_slice(&[1; 8]);
+        expected.extend_from_slice(&[2; 8]);
+        assert_eq!(packet, v6_raw(HOP_BY_HOP, &expected), "order {order:?}");
+    }
+}
+
+#[test]
+fn ipv6_chains_that_do_not_reach_a_whole_fragment_header() {
+    let fragment = fragment_header(protocol::UDP, 0, true, 5);
+    let behind = |header: Vec<u8>| [header, fragment.clone(), vec![0; 8]].concat();
+    // An options header whose length runs past the payload.
+    let overlong = |next: u8| {
+        let mut header = options_header(next, 1);
+        header[1] = 9;
+        header
+    };
+    let now = Instant::now();
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    for (name, packet) in [
+        (
+            "an Authentication Header is not walked",
+            v6_raw(51, &behind(vec![FRAGMENT, 0, 0, 0, 0, 0, 0, 0])),
+        ),
+        ("an empty payload", v6_raw(HOP_BY_HOP, &[])),
+        (
+            "one byte of an options header",
+            v6_raw(ROUTING, &[FRAGMENT]),
+        ),
+        (
+            "an overlong options header before UDP",
+            v6_raw(HOP_BY_HOP, &behind(overlong(protocol::UDP))),
+        ),
+        (
+            "an overlong options header before another",
+            v6_raw(DESTINATION_OPTIONS, &behind(overlong(ROUTING))),
+        ),
+        (
+            "an options header before UDP",
+            v6_raw(HOP_BY_HOP, &behind(options_header(protocol::UDP, 1))),
+        ),
+    ] {
+        assert_eq!(reassembler.push(&packet, now), Outcome::Pass, "{name}");
+    }
+    assert_eq!(reassembler.stats(), ReassemblyStats::default());
+
+    for (name, packet) in [
+        ("a cut Fragment header", v6_raw(FRAGMENT, &fragment[..7])),
+        ("no Fragment header", v6_raw(FRAGMENT, &[])),
+        (
+            "a cut Fragment header behind options",
+            v6_raw(
+                HOP_BY_HOP,
+                &[options_header(FRAGMENT, 2), fragment[..4].to_vec()].concat(),
+            ),
+        ),
+        // The options header announces a Fragment header that lies past the payload.
+        (
+            "an overlong options header before a Fragment header",
+            v6_raw(HOP_BY_HOP, &behind(overlong(FRAGMENT))),
+        ),
+    ] {
+        assert_eq!(reassembler.push(&packet, now), Outcome::Dropped, "{name}");
+    }
+    assert_eq!(reassembler.stats().malformed, 4);
+    assert_eq!(reassembler.pending(), 0);
+}
+
+#[test]
+fn ipv6_chain_of_any_length_is_walked() {
+    // No bound on the number of headers: 100 one-unit Destination Options headers.
+    let mut payload = Vec::new();
+    for index in 0..100 {
+        let next = if index == 99 {
+            FRAGMENT
+        } else {
+            DESTINATION_OPTIONS
+        };
+        payload.extend_from_slice(&options_header(next, 1));
+    }
+    payload.extend_from_slice(&fragment_header(protocol::UDP, 0, false, 3));
+    payload.extend_from_slice(&[7; 8]);
+    let fragment = v6_raw(DESTINATION_OPTIONS, &payload);
+    let mut reassembler = Reassembler::new(ReassemblyConfig::default());
+    let packet = reassemble(&mut reassembler, &[fragment], &[0]);
+    assert_eq!(packet.len(), 40 + 800 + 8);
+    assert_eq!(packet[40 + 792], protocol::UDP);
+}
