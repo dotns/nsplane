@@ -126,8 +126,9 @@ unpinned `wintun.dll` beside the executable with a datagram each way through the
 126 000 packets of 1400 bytes, every send `Ok`), and `NotFound` for a `wintun.dll` that is
 only in the current directory and on `PATH`. The crate's 61 unit tests pass there too.
 
-Only compiled, never run:
+Run on a macOS 26 host (arm64) at integration (`tests/darwin_tun.rs`, as root): a datagram
+each way through a created utun device, the same through a utun socket installed in a
+`TunSlot` (the 4-byte header is stripped and added), and a 3500-byte packet read whole
+after the interface MTU was raised behind the source. The workspace's tests pass there.
 
-- macOS and iOS, for lack of a host: the utun detection and framing of `TunSlot` and the
-  three-part `readv` of the plain read (`cargo-zigbuild clippy` for `aarch64-apple-darwin`
-  only).
+Only compiled, never run: the iOS build of the same code.
