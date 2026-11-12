@@ -129,6 +129,7 @@ impl GateAddr for Ipv4Addr {
             flows: &mut shard.flows,
             fragments: &mut shard.fragments,
             peer_flows: &mut shard.peer_flows,
+            peer_fragments: &mut shard.peer_fragments,
         }
     }
 
@@ -213,6 +214,7 @@ impl GateAddr for Ipv6Addr {
             flows: &mut shard.flows6,
             fragments: &mut shard.fragments6,
             peer_flows: &mut shard.peer_flows,
+            peer_fragments: &mut shard.peer_fragments,
         }
     }
 

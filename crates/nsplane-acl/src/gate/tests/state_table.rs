@@ -142,6 +142,114 @@ fn the_fragment_limit_sweeps_every_shard_before_failing_closed() {
 }
 
 #[test]
+fn one_peer_holds_at_most_its_share_of_the_fragment_table() {
+    let peer_2 = peer_in_other_shard();
+    let gate = limited(16, 16, 8);
+    gate.replace(two_peer_policy(peer_2)).unwrap();
+    assert_eq!(gate.fragments_per_peer(), 4, "half of the table");
+    let start = Instant::now();
+    let first = |id, at| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            PEER,
+            &first_fragment(udp(REMOTE, LOCAL, 40_000, 53), id),
+            at,
+        )
+    };
+    // Fresh identifications on one flow: the first opens it, the next ones
+    // match it.
+    assert_eq!(first(1, start), granted("in"));
+    for id in 2..=4 {
+        assert_eq!(first(id, start), valid());
+    }
+    for id in 5..=8 {
+        assert_eq!(first(id, start), denied(GateReason::StateCapacity));
+    }
+    assert_eq!(gate.fragments_per_peer_denied(), 4);
+    assert_eq!(audit(&gate), (1, 4));
+    // A new flow of the same peer is refused the same way and leaves nothing.
+    assert_eq!(
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            PEER,
+            &first_fragment(udp(REMOTE, LOCAL, 40_001, 53), 9),
+            start,
+        ),
+        denied(GateReason::StateCapacity)
+    );
+    assert_eq!(gate.fragments_per_peer_denied(), 5);
+    assert_eq!(audit(&gate), (1, 4));
+
+    // The other peer still has its slots.
+    let other = |id, at| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            peer_2,
+            &first_fragment(udp(REMOTE_2, LOCAL, 40_000, 53), id),
+            at,
+        )
+    };
+    assert_eq!(other(1, start), granted("in"));
+    assert_eq!(
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            peer_2,
+            &later_fragment(REMOTE_2, LOCAL, 17, 1),
+            start,
+        ),
+        valid()
+    );
+    assert_eq!(audit(&gate), (2, 5));
+    assert_eq!(gate.fragments_per_peer_denied(), 5);
+
+    // The peer's expired fragments are reclaimed before its limit is
+    // checked again.
+    let later = start + timeouts().fragment + Duration::from_secs(1);
+    assert_eq!(first(10, later), valid());
+    assert_eq!(
+        audit(&gate),
+        (2, 2),
+        "the new one and the other shard's expired one, not swept"
+    );
+}
+
+#[test]
+fn the_per_peer_fragment_limit_is_configurable() {
+    let peer_2 = peer_in_other_shard();
+    let gate = limited(16, 16, 4);
+    gate.replace(two_peer_policy(peer_2)).unwrap();
+    gate.set_fragments_per_peer(usize::MAX);
+    assert_eq!(gate.fragments_per_peer(), usize::MAX);
+    let start = Instant::now();
+    let first = |peer, remote, id| {
+        gate.evaluate_at(
+            PacketDirection::Inbound,
+            peer,
+            &first_fragment(udp(remote, LOCAL, 40_000, 53), id),
+            start,
+        )
+    };
+    assert_eq!(first(PEER, REMOTE, 1), granted("in"));
+    for id in 2..=4 {
+        assert_eq!(first(PEER, REMOTE, id), valid());
+    }
+    // Only the limit of the whole table is left, and it is not counted as a
+    // per-peer refusal.
+    assert_eq!(
+        first(peer_2, REMOTE_2, 1),
+        denied(GateReason::StateCapacity)
+    );
+    assert_eq!(gate.fragments_per_peer_denied(), 0);
+
+    // Lowering the limit drops nothing and refuses the peer's next one.
+    gate.set_fragments_per_peer(1);
+    assert_eq!(audit(&gate), (1, 4));
+    assert_eq!(first(PEER, REMOTE, 1), valid(), "a remembered fragment");
+    assert_eq!(first(PEER, REMOTE, 5), denied(GateReason::StateCapacity));
+    assert_eq!(gate.fragments_per_peer_denied(), 1);
+}
+
+#[test]
 fn configured_timeouts_drive_expiry() {
     let gate = FlowGate::new(GateConfig {
         timeouts: GateTimeouts {

@@ -230,9 +230,16 @@ fn audit(gate: &FlowGate) -> (usize, usize) {
             assert_eq!(state::shard_index(key.peer), index);
             *per_peer.entry(key.peer).or_default() += 1;
         }
+        let mut fragments_per_peer = HashMap::<PeerId, usize>::new();
         for key in shard.fragments.keys() {
             assert_eq!(state::shard_index(key.peer), index);
+            *fragments_per_peer.entry(key.peer).or_default() += 1;
         }
+        assert_eq!(
+            fragments_per_peer,
+            shard.peer_fragments.clone().into_iter().collect(),
+            "per-peer fragment counts of shard {index}"
+        );
         assert_eq!(
             per_peer,
             shard.peer_flows.clone().into_iter().collect(),
@@ -445,9 +452,16 @@ fn audit_families(gate: &FlowGate) -> (usize, usize) {
             .keys()
             .map(|key| key.peer)
             .chain(shard.fragments6.keys().map(|key| key.peer));
+        let mut fragments_per_peer = HashMap::<PeerId, usize>::new();
         for peer in fragment_peers {
             assert_eq!(state::shard_index(peer), index);
+            *fragments_per_peer.entry(peer).or_default() += 1;
         }
+        assert_eq!(
+            fragments_per_peer,
+            shard.peer_fragments.clone().into_iter().collect(),
+            "per-peer fragment counts of shard {index}"
+        );
         assert_eq!(
             per_peer,
             shard.peer_flows.clone().into_iter().collect(),

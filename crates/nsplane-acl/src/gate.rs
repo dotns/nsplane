@@ -20,7 +20,10 @@
 //!   per-protocol idle timeouts ([`GateTimeouts`]). Replies, later fragments
 //!   and ICMP errors are admitted only through that state; a full table
 //!   fails closed and never evicts a live entry. The limits count the flows
-//!   and fragments of both families together (one budget per peer).
+//!   and fragments of both families together (one budget per peer). One
+//!   peer holds at most half of the fragment table unless
+//!   [`FlowGate::set_fragments_per_peer`] says otherwise, so a peer sending
+//!   first fragments cannot take the slots of the others.
 //! - **Holds** ([`GateHolds`]): packets held fail closed in every mode before
 //!   any scope is consulted.
 //! - **Unbound rules** ([`UnboundRule`]): what happens to inbound packets of
@@ -618,6 +621,43 @@ impl FlowGate {
             }
             found
         })
+    }
+
+    /// Set how many remembered first fragments one peer may hold at a time,
+    /// over both address families. The default is half of
+    /// [`GateLimits::fragments`], rounded up; a value of at least
+    /// [`GateLimits::fragments`] leaves only the limit of the whole table.
+    /// A first fragment beyond it is denied [`GateReason::StateCapacity`]
+    /// after the peer's expired entries were reclaimed, and counted in
+    /// [`fragments_per_peer_denied`](Self::fragments_per_peer_denied).
+    /// Lowering the limit drops nothing: a peer above it gets no new slot
+    /// until enough of its fragments expire.
+    pub fn set_fragments_per_peer(&self, limit: usize) {
+        self.state
+            .counts
+            .peer_fragment_limit
+            .store(limit, Ordering::Relaxed);
+    }
+
+    /// The per-peer limit of remembered first fragments
+    /// ([`set_fragments_per_peer`](Self::set_fragments_per_peer)).
+    #[must_use]
+    pub fn fragments_per_peer(&self) -> usize {
+        self.state
+            .counts
+            .peer_fragment_limit
+            .load(Ordering::Relaxed)
+    }
+
+    /// First fragments refused by the per-peer fragment limit, in every
+    /// mode and for scoped evaluations too. In [`GateMode::Enforce`] each is
+    /// also one of [`GateCounters::state_capacity_denied`].
+    #[must_use]
+    pub fn fragments_per_peer_denied(&self) -> u64 {
+        self.state
+            .counts
+            .peer_fragment_refusals
+            .load(Ordering::Relaxed)
     }
 
     /// The decision counters.

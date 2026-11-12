@@ -6,7 +6,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -181,6 +181,10 @@ pub(super) struct Counts {
     pub(super) global_limit: usize,
     pub(super) peer_limit: usize,
     pub(super) fragment_limit: usize,
+    /// Fragments one peer may hold; set at any time.
+    pub(super) peer_fragment_limit: AtomicUsize,
+    /// Fragments refused by the per-peer limit.
+    pub(super) peer_fragment_refusals: AtomicU64,
     pub(super) timeouts: GateTimeouts,
 }
 
@@ -224,8 +228,8 @@ impl Counts {
 }
 
 /// One shard: the flows and fragments of the remote peers hashed to it, one
-/// map of each per address family, and the flow count of each peer over
-/// both families.
+/// map of each per address family, and the flow and fragment counts of each
+/// peer over both families.
 #[derive(Debug, Default)]
 pub(super) struct Shard {
     /// Epoch of the snapshot this shard's state was last migrated to.
@@ -235,6 +239,7 @@ pub(super) struct Shard {
     pub(super) flows6: FastMap<FlowKey<Ipv6Addr>, FlowState>,
     pub(super) fragments6: FastMap<FragmentKey<Ipv6Addr>, FragmentState>,
     pub(super) peer_flows: FastMap<PeerId, usize>,
+    pub(super) peer_fragments: FastMap<PeerId, usize>,
 }
 
 impl Shard {
@@ -252,8 +257,8 @@ impl Shard {
 
     /// Insert a new flow and, for a first fragment, its fragment authority,
     /// both or neither. `swept` is set once every shard has been swept for
-    /// this packet, so a global limit then fails closed. The per-peer limit
-    /// counts the peer's flows of both families.
+    /// this packet, so a global limit then fails closed. The per-peer limits
+    /// count the peer's flows and fragments of both families.
     pub(super) fn insert_flow_with_fragment<A: GateAddr>(
         &mut self,
         key: FlowKey<A>,
@@ -281,46 +286,47 @@ impl Shard {
         }
 
         let new_flow = !family.flows.contains_key(&key);
-        if new_flow {
-            if family.peer_flow_count(key.peer) >= counts.peer_limit {
-                self.sweep(now, counts);
-                family = self.family::<A>();
-                if family.peer_flow_count(key.peer) >= counts.peer_limit {
-                    return Admission::Full;
-                }
+        let new_fragment = match fragment
+            .as_ref()
+            .map(|fragment| family.fragments.get(fragment))
+        {
+            Some(Some(existing)) if existing.disposition != FragmentDisposition::Allow => {
+                return Admission::Full;
             }
-            if !counts.reserve_flow() {
-                return if swept {
-                    Admission::Full
-                } else {
-                    Admission::SweepAll
-                };
+            Some(existing) => existing.is_none(),
+            None => false,
+        };
+        if new_flow && family.peer_flow_count(key.peer) >= counts.peer_limit {
+            self.sweep(now, counts);
+            if self.family::<A>().peer_flow_count(key.peer) >= counts.peer_limit {
+                return Admission::Full;
             }
         }
-        if let Some(fragment) = &fragment {
-            let admission = match family.fragments.get(fragment) {
-                Some(existing) if existing.disposition != FragmentDisposition::Allow => {
-                    Admission::Full
-                }
-                Some(_) => Admission::Admitted,
-                None if counts.reserve_fragment() => Admission::Admitted,
-                None if swept => Admission::Full,
-                None => Admission::SweepAll,
-            };
-            if admission != Admission::Admitted {
-                if new_flow {
-                    counts.release_flows(1);
-                }
-                return admission;
+        if new_fragment && !self.peer_fragment_room(key.peer, now, counts) {
+            return Admission::Full;
+        }
+        let full = if swept {
+            Admission::Full
+        } else {
+            Admission::SweepAll
+        };
+        if new_flow && !counts.reserve_flow() {
+            return full;
+        }
+        if new_fragment && !counts.reserve_fragment() {
+            if new_flow {
+                counts.release_flows(1);
             }
+            return full;
         }
 
+        let mut family = self.family::<A>();
         if new_flow {
             *family.peer_flows.entry(key.peer).or_default() += 1;
         }
         family.flows.insert(key, state);
         if let Some(fragment) = fragment {
-            family.fragments.insert(
+            family.insert_fragment(
                 fragment,
                 FragmentState {
                     disposition: FragmentDisposition::Allow,
@@ -329,6 +335,27 @@ impl Shard {
             );
         }
         Admission::Admitted
+    }
+
+    /// Whether `peer` may hold one more fragment, after reclaiming the
+    /// shard's expired entries when it is at its limit; a refusal is counted.
+    fn peer_fragment_room(&mut self, peer: PeerId, now: Instant, counts: &Counts) -> bool {
+        let limit = counts.peer_fragment_limit.load(Ordering::Relaxed);
+        if self.peer_fragment_count(peer) < limit {
+            return true;
+        }
+        self.sweep(now, counts);
+        if self.peer_fragment_count(peer) < limit {
+            return true;
+        }
+        counts
+            .peer_fragment_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    fn peer_fragment_count(&self, peer: PeerId) -> usize {
+        self.peer_fragments.get(&peer).copied().unwrap_or(0)
     }
 
     /// Remember a first fragment's disposition for its later fragments.
@@ -346,14 +373,19 @@ impl Shard {
             Some(existing) if existing.disposition != disposition => return Admission::Full,
             _ => {}
         }
-        if !family.fragments.contains_key(&key) && !counts.reserve_fragment() {
-            return if swept {
-                Admission::Full
-            } else {
-                Admission::SweepAll
-            };
+        if !family.fragments.contains_key(&key) {
+            if !self.peer_fragment_room(key.peer, now, counts) {
+                return Admission::Full;
+            }
+            if !counts.reserve_fragment() {
+                return if swept {
+                    Admission::Full
+                } else {
+                    Admission::SweepAll
+                };
+            }
         }
-        family.fragments.insert(
+        self.family::<A>().insert_fragment(
             key,
             FragmentState {
                 disposition,
@@ -365,12 +397,13 @@ impl Shard {
 }
 
 /// The flows and fragments of one family in a shard, with the shard's
-/// per-peer flow counts.
+/// per-peer flow and fragment counts.
 #[derive(Debug)]
 pub(super) struct FamilyShard<'a, A: GateAddr> {
     pub(super) flows: &'a mut FastMap<FlowKey<A>, FlowState>,
     pub(super) fragments: &'a mut FastMap<FragmentKey<A>, FragmentState>,
     pub(super) peer_flows: &'a mut FastMap<PeerId, usize>,
+    pub(super) peer_fragments: &'a mut FastMap<PeerId, usize>,
 }
 
 impl<A: GateAddr> FamilyShard<'_, A> {
@@ -392,7 +425,17 @@ impl<A: GateAddr> FamilyShard<'_, A> {
 
     fn remove_fragment(&mut self, key: &FragmentKey<A>, counts: &Counts) {
         if self.fragments.remove(key).is_some() {
+            forget_peer_entry(self.peer_fragments, key.peer);
             counts.release_fragments(1);
+        }
+    }
+
+    /// Insert or replace the fragment `key`, whose slot the caller reserved
+    /// if it is new.
+    fn insert_fragment(&mut self, key: FragmentKey<A>, state: FragmentState) {
+        let peer = key.peer;
+        if self.fragments.insert(key, state).is_none() {
+            *self.peer_fragments.entry(peer).or_default() += 1;
         }
     }
 
@@ -461,12 +504,29 @@ impl<A: GateAddr> FamilyShard<'_, A> {
         mut keep: impl FnMut(&FragmentKey<A>, &FragmentState) -> bool,
     ) {
         let before = self.fragments.len();
-        self.fragments.retain(|key, state| keep(key, state));
+        let peer_fragments = &mut *self.peer_fragments;
+        self.fragments.retain(|key, state| {
+            let kept = keep(key, state);
+            if !kept {
+                forget_peer_entry(peer_fragments, key.peer);
+            }
+            kept
+        });
         counts.release_fragments(before - self.fragments.len());
     }
 
     fn peer_flow_count(&self, peer: PeerId) -> usize {
         self.peer_flows.get(&peer).copied().unwrap_or(0)
+    }
+}
+
+/// Take one entry of `peer` out of a per-peer count.
+fn forget_peer_entry(counts: &mut FastMap<PeerId, usize>, peer: PeerId) {
+    if let Some(count) = counts.get_mut(&peer) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&peer);
+        }
     }
 }
 
@@ -487,6 +547,10 @@ impl StateTable {
                 global_limit: config.limits.flows,
                 peer_limit: config.limits.flows_per_peer,
                 fragment_limit: config.limits.fragments,
+                peer_fragment_limit: AtomicUsize::new(default_peer_fragment_limit(
+                    config.limits.fragments,
+                )),
+                peer_fragment_refusals: AtomicU64::new(0),
                 timeouts: config.timeouts,
             },
         }
@@ -514,6 +578,12 @@ impl StateTable {
             shard.sweep(now, &self.counts);
         }
     }
+}
+
+/// The default per-peer fragment limit: half of the fragment table, rounded
+/// up.
+pub(super) const fn default_peer_fragment_limit(fragments: usize) -> usize {
+    fragments.div_ceil(2)
 }
 
 /// Shard of a peer: its id multiplied by an odd constant, top bits.

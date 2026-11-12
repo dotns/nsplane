@@ -791,7 +791,7 @@ impl Model {
     fn remember(&mut self, key: ModelFragmentKey, disposition: Disposition, now: Instant) -> bool {
         match self.live_fragment(&key, now) {
             Some(existing) if existing != disposition => return false,
-            None if self.live_fragments(now) >= LIMITS.fragments => return false,
+            None if self.fragments_full(key.peer, now) => return false,
             _ => {}
         }
         self.fragments
@@ -799,11 +799,19 @@ impl Model {
         true
     }
 
-    fn live_fragments(&self, now: Instant) -> usize {
-        self.fragments
-            .values()
-            .filter(|(_, expires)| *expires > now)
-            .count()
+    /// Whether the fragment table or `peer`'s share of it (half, rounded
+    /// up) is full.
+    fn fragments_full(&self, peer: PeerId, now: Instant) -> bool {
+        let live = self
+            .fragments
+            .iter()
+            .filter(|(_, (_, expires))| *expires > now);
+        let (mut all, mut of_peer) = (0, 0);
+        for (key, _) in live {
+            all += 1;
+            of_peer += usize::from(key.peer == peer);
+        }
+        all >= LIMITS.fragments || of_peer >= LIMITS.fragments.div_ceil(2)
     }
 
     fn touch(flow: &mut ModelFlow, protocol: u8, now: Instant) {
@@ -1139,7 +1147,7 @@ impl Model {
             Fragment::First(id) => self
                 .live_fragment(&packet.fragment_key(scope, direction, peer, id), now)
                 .map_or_else(
-                    || self.live_fragments(now) >= LIMITS.fragments,
+                    || self.fragments_full(peer, now),
                     |disposition| disposition != Disposition::Allow,
                 ),
             _ => false,

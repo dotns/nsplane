@@ -306,7 +306,13 @@ and IPv6 packets.
   from the responder; a later fragment without its first is `OrphanFragment`. Limits
   (`GateLimits`, defaults 16,384 flows, 2,048 per peer, 4,096 fragments): a full table
   sweeps expired entries and then fails closed with `StateCapacity`, never evicting a live
-  entry.
+  entry. One peer holds at most half of the fragment table (rounded up; 2,048 by default),
+  over both families, so a peer sending first fragments with new identifications cannot take
+  the slots of the other peers: its next first fragment is `StateCapacity` until some of its
+  own expire. `FlowGate::set_fragments_per_peer(limit)` changes that share at any time
+  (`fragments_per_peer()` reads it; a value of at least `GateLimits::fragments` leaves only
+  the limit of the whole table, as in earlier releases; lowering it drops nothing), and
+  `fragments_per_peer_denied()` counts the first fragments it refused, in every mode.
 - **Echo.** IPv4 types 8/0 and IPv6 types 128/129 require code zero before
   granting or reusing state; nonzero codes are `Malformed`. State admits the
   original request in its initiating direction and the exact reply in the reverse
@@ -493,7 +499,8 @@ returns `EmptySelection` for an empty set; `replace_scopes` returns an
   records nothing.
 - `FlowTracker`: a bounded table of the capacity it is created with.
 - Flow gate: `GateLimits` (defaults 16,384 flows, 2,048 per peer, 4,096 fragments); a full
-  table fails closed with `GateReason::StateCapacity` and never evicts a live entry.
+  table fails closed with `GateReason::StateCapacity` and never evicts a live entry. One peer
+  holds at most half of the fragment table (`FlowGate::set_fragments_per_peer`).
 - IPv6 header walk in the gate: at most 8 extension headers, the Fragment header included.
 - Gate decision events: `GateEventsConfig::capacity` buffered events and a token bucket of
   `burst` tokens refilled at `rate` per second; events beyond them are dropped and counted

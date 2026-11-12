@@ -213,7 +213,10 @@ pub struct GateLimits {
     pub flows: usize,
     /// Flows per peer.
     pub flows_per_peer: usize,
-    /// Remembered first fragments.
+    /// Remembered first fragments. One peer holds at most half of them
+    /// (rounded up) unless
+    /// [`FlowGate::set_fragments_per_peer`](super::FlowGate::set_fragments_per_peer)
+    /// sets another share.
     pub fragments: usize,
 }
 
