@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nsplane-packet: `ExtensionWalker`, `ExtensionHeader` and `Ipv6Fragment` step over a chain of
   IPv6 extension headers, with the header numbers as constants in `protocol`. The flow gate
   and the netstack fragment ownership check use it.
+- New crate `nsplane-sys`: safe wrappers over the OS calls no safe dependency provides,
+  `set_exclusive_address_use` (Windows) and `set_supplementary_groups` (Apple platforms).
 ### Changed
 - `Splitter` drops a packet routed to a gone sink, counts it in `SplitterStats::failed` and
   returns `Ok` while another sink is open; `BrokenPipe` is returned only once every sink is
@@ -132,6 +134,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer section before that line, then fails with `EINVAL`.
 - nsplane-ether: the DHCP server drops a datagram with a wrong IPv4 header checksum or a UDP
   length outside the packet (`drop_malformed`) and reads the message up to the UDP length.
+- `UdpTransport` on Windows binds every socket for exclusive use (`SO_EXCLUSIVEADDRUSE`): no
+  other socket can bind `127.0.0.1:port` or `[::1]:port` next to a wildcard transport, a
+  wildcard bind fails with `AddrInUse` while any socket holds a local address of the port,
+  and two transports no longer share a port on different addresses.
 ### Removed
 - `nsplane_tun::adopt_fd` and `Tun::from_raw_fd`: safe functions that took ownership of a
   descriptor number, which safe code could use to close a descriptor it does not own. Build
@@ -158,8 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before translation stays detectably corrupted instead of leaving with a valid checksum.
 - nsplane-ether: a guest replaced by one with another MAC gets the DHCP lease, and a guest's
   IPv6 default router and DNS servers no longer expire 30 minutes after link-up.
-- nsplane-cli drops root's supplementary groups together with the user and group ID (not on
-  macOS).
+- nsplane-cli drops root's supplementary groups together with the user and group ID.
 - nsplane-uapi: a failed accept is retried after 100 ms instead of at once, and a stalled
   `set` request no longer blocks other requests.
 - A handshake message with a small-order ephemeral key is rejected, and a peer configured with

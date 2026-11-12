@@ -838,10 +838,11 @@ netstack ownership check; the NAT and reassembly walks stay, for speed and for t
 two-byte read), property tests for the parsers of seven crates (two defects found and
 fixed: a UDP super-packet of another IP version, an unchecked IPv6 atomic fragment), the
 batch contract in `pump` and `Splitter`, and two sockets for `[::]` on Windows. Tests for a
-real Wintun adapter and a real utun interface were added and run on the hosts. Left open:
-a same-user bind of a specific local address on Windows and the supplementary GIDs kept on
-macOS (both need `unsafe`). Found on the hosts and fixed: a send marked CE fails on Windows
-(sent as ECT(0)), and macOS binds `[::]:port` while another socket holds the IPv4 port (now
-probed first). The observations of the property tests were settled in
-`20261112-0201-property-test-followups`: six defects fixed, among them a DNS policy bypass
-through a dot inside a label, two kept as deliberate.
+real Wintun adapter and a real utun interface were added and run on the hosts. Found on the
+hosts and fixed: a send marked CE fails on Windows (sent as ECT(0)), and macOS binds
+`[::]:port` while another socket holds the IPv4 port (now probed first). Two gaps needed
+`unsafe`, a same-user bind of a specific local address on Windows and the supplementary
+GIDs kept on macOS: by the owner's decision the new crate `nsplane-sys` holds the two calls
+behind safe functions (`20261112-0202-sys-wrapper-crate`). The observations of the property
+tests were settled in `20261112-0201-property-test-followups`: six defects fixed, among them
+a DNS policy bypass through a dot inside a label, two kept as deliberate.

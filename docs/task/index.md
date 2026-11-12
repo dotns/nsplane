@@ -157,3 +157,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261112-0104-windows-udp-port-ownership A transport on `[::]:port` does not own the IPv4 side of its port on Windows**](20261112-0104-windows-udp-port-ownership.md) `P3`
 
 - [x] [**20261112-0201-property-test-followups Follow-ups of the parser and codec property tests**](20261112-0201-property-test-followups.md) `P3`
+
+- [x] [**20261112-0202-sys-wrapper-crate A crate for `unsafe` OS calls behind safe functions, and the two gaps it closes**](20261112-0202-sys-wrapper-crate.md) `P3`
