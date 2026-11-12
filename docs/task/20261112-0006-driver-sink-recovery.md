@@ -86,9 +86,9 @@ Findings before the fix:
 
 Fix: a call that did not report the close and took nothing out of the batch loses the front
 packet; in the sink task a batch is offered until it is empty. The sink task logs the first
-such packet at warn. These packets are not counted in the drop counters: a drop reason
-lives in `nsplane-core`, out of scope here, and a packet the sink fails by the contract is
-not counted either.
+such packet at warn. These packets are counted under `DROP_SINK_ERROR` (added at
+integration; the sink task reports its drops to the owner task, so that count carries no
+peer). A packet the sink fails by the contract is not counted.
 
 Not changed: `pump` and `Splitter::send_batch_spent` call other sinks under the same
 contract. `pump` offers leftovers again with the next batch (they pile up if the sink never

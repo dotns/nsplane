@@ -281,7 +281,8 @@ never writes either to the wire:
 - A packet that still finds the sink queue full (one injected with a handle call) is
   dropped (`DROP_SINK_FULL`); a closed sink or
   transport drops with `DROP_SINK_CLOSED` / `DROP_TRANSPORT_CLOSED`, and without a transport
-  datagrams are dropped with `DROP_NO_TRANSPORT`.
+  datagrams are dropped with `DROP_NO_TRANSPORT`. A sink that fails a packet, or reports it
+  delivered, and leaves it in the batch loses that packet (`DROP_SINK_ERROR`).
 - An I/O side that reports `BrokenPipe` stops its task; the engine keeps running without it.
   Inline output follows the same rules: a failed inline send counts as a failed send
   (`DROP_TRANSPORT_SEND_ERROR`), `WouldBlock` is not a drop (the rest is queued, and only
@@ -783,7 +784,7 @@ translator grows full-MTU IPv4 in place with offload off too.
 
 The engine counts every dropped packet under a reason (`EngineHandle::drop_counters`) and
 publishes it as `Event::Dropped`: the core's and the filters' reasons plus the engine's own,
-among them `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_TRANSMIT_FULL`,
+among them `DROP_SINK_FULL`, `DROP_SINK_CLOSED`, `DROP_SINK_ERROR`, `DROP_TRANSMIT_FULL`,
 `DROP_TRANSPORT_CLOSED`, `DROP_TRANSPORT_SEND_ERROR`, `DROP_NO_TRANSPORT`,
 `DROP_FRAGMENT_RATE_LIMITED`, `DROP_FRAGMENT_NO_ROUTE`, `DROP_FRAGMENT_OVERSIZE`,
 `DROP_PLAINTEXT_EGRESS_FULL` and `DROP_PLAINTEXT_EGRESS_CLOSED`. A tracked packet's

@@ -337,6 +337,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
     let mtu = *mtu_watch.borrow_and_update();
     let source_taken = Arc::new(SourceTaken::default());
     let receipts = parts.tracked.as_ref().map(|t| Arc::clone(&t.receipts.0));
+    let send_errors = SendErrors::new(signal, receipts.clone());
 
     let mut core = Core::new(parts.core);
     // Starts the core's timer schedule, so the timers run from the start.
@@ -358,7 +359,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
         datagram_tx,
         recycled,
         recycle_bufs: Vec::new(),
-        send_errors: SendErrors::new(signal, receipts.clone()),
+        send_errors: send_errors.clone(),
         send_error_signal,
         deliver,
         transports: BTreeMap::new(),
@@ -383,6 +384,7 @@ pub(crate) fn spawn<Src: PacketSource, Snk: PacketSink>(parts: Parts<Src, Snk>) 
                 Arc::clone(&sink),
                 deliver_rx,
                 Arc::clone(&sink_outstanding),
+                send_errors,
                 suspended.subscribe(),
             )),
         ],
@@ -484,7 +486,7 @@ struct Owner {
     recycle_bufs: Vec<PacketBuf>,
     /// Where transmitted buffers go back; cloned into every transmit task.
     recycle: Recycle,
-    /// Cloned into every transmit task.
+    /// Cloned into every transmit task and the sink task.
     send_errors: SendErrors,
     /// Signalled by [`SendErrors::report`].
     send_error_signal: mpsc::Receiver<()>,

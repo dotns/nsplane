@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::MAX_DATAGRAM;
 use super::queue::{BatchQueue, BatchSender};
-use super::transport::{Datagram, Recycle, Traffic, Unsent};
+use super::transport::{Datagram, Recycle, SendErrors, Traffic, Unsent};
 use crate::events::{DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_SEND_ERROR};
 use crate::io::{PacketSink, PacketSource};
 use crate::transport::{PathMtuReport, Transport};
@@ -225,6 +225,7 @@ pub(super) async fn write_sink<Snk: PacketSink>(
     sink: Arc<Snk>,
     mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>,
     outstanding: Arc<AtomicUsize>,
+    errors: SendErrors,
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
@@ -252,6 +253,8 @@ pub(super) async fn write_sink<Snk: PacketSink>(
             }
             if packets.len() >= offered {
                 packets.pop_front();
+                // The owner counts the drop.
+                errors.report_sink();
                 if !std::mem::replace(&mut stuck, true) {
                     tracing::warn!("Packet sink left a packet it failed or reported delivered");
                 }

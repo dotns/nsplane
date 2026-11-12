@@ -19,7 +19,7 @@ use super::transport::TransportSlot;
 use super::transport::{Datagram, TryDeliver};
 use crate::events::{
     DROP_NO_TRANSPORT, DROP_PLAINTEXT_EGRESS_CLOSED, DROP_PLAINTEXT_EGRESS_FULL, DROP_SINK_CLOSED,
-    DROP_SINK_FULL, DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_SEND_ERROR,
+    DROP_SINK_ERROR, DROP_SINK_FULL, DROP_TRANSPORT_CLOSED, DROP_TRANSPORT_SEND_ERROR,
 };
 use crate::io::PacketSink;
 
@@ -379,9 +379,10 @@ impl Owner {
                 Err(e) => {
                     tracing::warn!(message = "Packet sink error", error = ?e);
                     if packets.len() >= before
-                        && let Some((_, packet)) = packets.pop_front()
+                        && let Some((from, packet)) = packets.pop_front()
                     {
                         self.core.recycle(packet);
+                        self.dropped(Some(from), DROP_SINK_ERROR);
                     }
                 }
             }
@@ -432,8 +433,12 @@ impl Owner {
         self.event(Event::Dropped { peer, reason });
     }
 
-    /// Counts and publishes the failed sends the transmit tasks reported.
+    /// Counts and publishes the failed sends the transmit tasks reported and the packets the
+    /// sink task dropped at a sink that left them in its batch.
     pub(super) fn send_errors(&mut self) {
+        for _ in 0..self.send_errors.take_sink() {
+            self.dropped(None, DROP_SINK_ERROR);
+        }
         for _ in 0..self.send_errors.take() {
             self.dropped(None, DROP_TRANSPORT_SEND_ERROR);
         }

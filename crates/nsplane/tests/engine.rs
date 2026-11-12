@@ -17,7 +17,7 @@ use std::time::Duration;
 use nsplane::x25519::{PublicKey, StaticSecret};
 use nsplane::{
     AllowedIp, BuildError, ChannelSink, ChannelSource, ChannelTransport, DROP_NO_TRANSPORT,
-    DROP_SINK_CLOSED, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED,
+    DROP_SINK_CLOSED, DROP_SINK_ERROR, DROP_SINK_FULL, DROP_TRANSMIT_FULL, DROP_TRANSPORT_REMOVED,
     DROP_TRANSPORT_SEND_ERROR, Ecn, Engine, EngineBuilder, EngineError, EngineHandle, Event,
     PacketBuf, PacketSink, PacketSource, Path, Peer, PeerId, SwapSink, Transport, TransportError,
     TransportId,
@@ -2473,6 +2473,15 @@ async fn sink_that_keeps_packets_does_not_stall_the_sink_task() {
     assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"first"));
     assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"second"));
     exchange(&mut a, &mut b).await;
+    // The sink task reports the three packets it dropped to the owner.
+    timeout(WAIT, async {
+        while b.drops(DROP_SINK_ERROR).await < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(b.drops(DROP_SINK_ERROR).await, 3);
 }
 
 /// A sink that fails a packet in `try_send_batch` without dropping it does not hang the
@@ -2488,6 +2497,8 @@ async fn sink_that_keeps_a_failed_packet_inline_does_not_hang_the_engine() {
     a.send(IP_B, KEPT_FAILED).await;
     a.send(IP_B, b"after").await;
     assert_eq!(b.expect_delivery().await.1, ipv4(IP_A, IP_B, b"after"));
-    assert!(b.handle.drop_counters().await.unwrap().is_empty());
+    let drops = b.handle.drop_counters().await.unwrap();
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops.get(DROP_SINK_ERROR), Some(&1));
     exchange(&mut a, &mut b).await;
 }

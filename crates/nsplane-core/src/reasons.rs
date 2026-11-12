@@ -62,6 +62,9 @@ pub const FILTER_HANDLED: &str = "handled by filter";
 pub const SINK_FULL: &str = "sink full";
 /// Emitted by the driver: a decrypted packet was dropped because the sink has shut down.
 pub const SINK_CLOSED: &str = "sink closed";
+/// Emitted by the driver: a decrypted packet was dropped because the sink failed it, or
+/// reported it delivered, and left it in the batch.
+pub const SINK_ERROR: &str = "sink error";
 /// Emitted by the driver: a datagram was dropped because no transport serves its path.
 pub const NO_TRANSPORT: &str = "no transport";
 /// Emitted by the driver: a datagram caused by a local packet, a received datagram or a timer

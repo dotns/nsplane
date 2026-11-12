@@ -21,6 +21,9 @@ pub use nsplane_core::Event;
 pub const DROP_SINK_FULL: &str = nsplane_core::reasons::SINK_FULL;
 /// A decrypted packet was dropped because the sink has shut down.
 pub const DROP_SINK_CLOSED: &str = nsplane_core::reasons::SINK_CLOSED;
+/// A decrypted packet was dropped because the sink broke the batch contract: it failed the
+/// packet, or reported it delivered, and left it in the batch.
+pub const DROP_SINK_ERROR: &str = nsplane_core::reasons::SINK_ERROR;
 /// A datagram was dropped because no transport with the id its path names is installed:
 /// none was added under that id, or it was removed.
 ///

@@ -181,11 +181,13 @@ impl Recycle {
     }
 }
 
-/// Where transmit tasks report failed sends: a count the owner task takes, and a signal
-/// that wakes it.
+/// Where transmit tasks report failed sends and the sink task the packets it dropped: counts
+/// the owner task takes, and a signal that wakes it.
 #[derive(Clone)]
 pub(super) struct SendErrors {
     pub(super) count: Arc<AtomicUsize>,
+    /// Packets the sink task dropped because the sink left them in its batch.
+    sink: Arc<AtomicUsize>,
     /// The owner keeps a sender, so the signal never closes; a full signal is already
     /// pending.
     pub(super) signal: mpsc::Sender<()>,
@@ -197,6 +199,7 @@ impl SendErrors {
     pub(super) fn new(signal: mpsc::Sender<()>, receipts: Option<Arc<Receipts>>) -> Self {
         Self {
             count: Arc::default(),
+            sink: Arc::default(),
             signal,
             receipts,
         }
@@ -212,6 +215,17 @@ impl SendErrors {
     /// The failed sends since the last take.
     pub(super) fn take(&self) -> usize {
         self.count.swap(0, Ordering::Relaxed)
+    }
+
+    /// Reports a packet the sink task dropped.
+    pub(super) fn report_sink(&self) {
+        self.sink.fetch_add(1, Ordering::Relaxed);
+        let _ = self.signal.try_send(());
+    }
+
+    /// The packets the sink task dropped since the last take.
+    pub(super) fn take_sink(&self) -> usize {
+        self.sink.swap(0, Ordering::Relaxed)
     }
 }
 
