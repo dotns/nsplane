@@ -435,6 +435,16 @@ async fn a_connection_without_valid_frames_is_closed() -> TestResult {
 
 #[tokio::test]
 async fn connections_over_the_cap_are_closed() -> TestResult {
+    // Both ends of every connection are in this process: macOS starts with 256 descriptors.
+    #[cfg(unix)]
+    {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
+        let wanted = (2 * MAX_CONNECTIONS as u64 + 64).min(hard);
+        if soft < wanted {
+            setrlimit(Resource::RLIMIT_NOFILE, wanted, hard)?;
+        }
+    }
     let cert = cert()?;
     let server = Server::start("127.0.0.1:0".parse()?, &cert, Vec::new()).await?;
     // Connections in their handshakes count.
