@@ -81,7 +81,10 @@ and an RFC 4884 extension structure (an MPLS label stack, say; located through t
 attribute of the message, so a truncated quote does not run into it) are accepted and left
 out of the translated error, which is a limitation against RFC 7915 section 4.2 (it asks
 for the extension to be carried over). An IPv6 error whose `peer6`/`local6` addresses are
-only rewritten keeps those bytes. TCP checksum fields of `0x0000` are valid when the sum verifies,
+only rewritten keeps those bytes. The upper layer of a quoted packet is translated as far as
+the quote holds it: a TCP or UDP checksum once the quote reaches the end of that field, the
+type of an echo message from its first byte on (a header cut below four bytes kept the type
+of the other family up to 0.22.2) and its checksum from four bytes on. TCP checksum fields of `0x0000` are valid when the sum verifies,
 including after an incremental update and inside ICMP quotations. IPv4 UDP zero
 means absent and gets computed for IPv6; IPv6 UDP zero is rejected. Only UDP maps
 a computed zero to `0xffff`. A fragmented IPv4 UDP datagram without a checksum is reassembled first, in

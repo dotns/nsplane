@@ -549,11 +549,22 @@ fn check_translated(input: &[u8], output: &[u8], context: &str) -> bool {
     };
     if error {
         let quote = &body[8..];
+        // A quoted echo is of the new version as well, as far as its header is there. The
+        // type is its first byte, so one byte of the header is enough: this check used to
+        // be left out, because a header cut below four bytes kept the type of the other
+        // version until the translator mapped it.
         if v6 {
             assert!(quote.len() >= 40 && quote[0] >> 4 == 6, "{context}");
+            if quote[6] == protocol::ICMPV6 {
+                assert!(!matches!(quote.get(40), Some(0 | 8)), "{context}");
+            }
         } else {
             assert!(quote.len() >= 20 && quote[0] == 0x45, "{context}");
             assert_eq!(internet_checksum(&quote[..20]), 0, "{context}");
+            let offset = u16::from_be_bytes([quote[6], quote[7]]) << 3;
+            if quote[9] == protocol::ICMP && offset == 0 {
+                assert!(!matches!(quote.get(20), Some(128 | 129)), "{context}");
+            }
         }
     }
     v6

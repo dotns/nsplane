@@ -7,6 +7,7 @@ mod icmp_extensions;
 mod nested_lans;
 mod peer6_eam4;
 mod properties;
+mod quoted_transport;
 mod tags;
 mod vectors;
 mod zero_checksum;

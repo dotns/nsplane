@@ -282,8 +282,10 @@ fn quoted_v6_to_v4(bytes: &[u8], table: &TranslationTable, out: &mut Vec<u8>) ->
 }
 
 /// Moves the checksum of a quoted (possibly truncated) TCP, UDP or echo
-/// header to the other family; `to_v6` gives the direction and `upper_len`
-/// the quoted packet's upper-layer length.
+/// header to the other family and maps the echo type; `to_v6` gives the
+/// direction and `upper_len` the quoted packet's upper-layer length. A
+/// header cut before the end of its checksum field keeps the bytes it has
+/// (the echo type is still mapped).
 fn quoted_transport(
     segment: &mut [u8],
     protocol: u8,
@@ -318,7 +320,7 @@ fn quoted_transport(
                 finish(protocol, update_pseudo_header(checksum, old, new)),
             );
         }
-        protocol::ICMP | protocol::ICMPV6 if segment.len() >= 4 => {
+        protocol::ICMP | protocol::ICMPV6 if !segment.is_empty() => {
             let kind = match (to_v6, segment[0]) {
                 (true, 8) => 128,
                 (true, 0) => 129,
@@ -326,6 +328,12 @@ fn quoted_transport(
                 (false, 129) => 0,
                 _ => return Ok(()),
             };
+            if segment.len() < 4 {
+                // Cut before the end of its checksum: the type is all there
+                // is to translate.
+                segment[0] = kind;
+                return Ok(());
+            }
             let pseudo = PseudoHeader::V6 {
                 src: addrs.src6,
                 dst: addrs.dst6,
