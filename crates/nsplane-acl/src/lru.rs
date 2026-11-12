@@ -134,12 +134,14 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
         self.slots[slot].as_mut().map(|node| &mut node.value)
     }
 
-    /// Make `key` the most recent entry.
-    pub(crate) fn touch(&mut self, key: &K) {
-        if let Some(&slot) = self.index.get(key) {
-            self.unlink(slot);
-            self.link_newest(slot);
-        }
+    /// Make `key` the most recent entry; `false` when there is none.
+    pub(crate) fn touch(&mut self, key: &K) -> bool {
+        let Some(&slot) = self.index.get(key) else {
+            return false;
+        };
+        self.unlink(slot);
+        self.link_newest(slot);
+        true
     }
 
     /// Insert or replace `key`'s value; it becomes the most recent entry.
@@ -182,6 +184,16 @@ impl<K: Copy + Eq + Hash, V> LruMap<K, V> {
         let (key, value) = self.release(self.oldest)?;
         self.index.remove(&key);
         Some((key, value))
+    }
+
+    /// The entries, from the least to the most recent one.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        let mut slot = self.oldest;
+        std::iter::from_fn(move || {
+            let node = self.slots.get(slot)?.as_ref()?;
+            slot = node.next;
+            Some((&node.key, &node.value))
+        })
     }
 
     /// Keep only the entries for which `keep` returns `true`. O(len).
