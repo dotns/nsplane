@@ -170,6 +170,9 @@ enum Effect {
     AllowedIp(String),
     /// The request ends here with this `errno`.
     Fail(i32),
+    /// A `public_key` line whose value is not a key: it ends the section before it, which
+    /// is applied, and then the request ends with `EINVAL`.
+    BrokenPeer,
 }
 
 impl Model {
@@ -205,11 +208,21 @@ impl Model {
     /// Applies the lines of a `set` request and returns its `errno`. Interface settings
     /// take effect at their line; a peer section takes effect when the next one starts or
     /// the request ends, so the section a failing line stands in is not applied.
+    ///
+    /// A `public_key` line starts the next section even when its value is not a key: the
+    /// model used to drop the section before such a line, as the implementation did, which
+    /// went against "the settings before a failing one stay applied" for a section that
+    /// was already complete. Its own failure, if any, is the one reported.
     fn set(&mut self, effects: &[Effect]) -> i32 {
         let mut section: Option<SectionModel> = None;
         for effect in effects {
             match (effect.clone(), &mut section) {
                 (Effect::Fail(errno), _) => return errno,
+                (Effect::BrokenPeer, _) => {
+                    return section
+                        .take()
+                        .map_or(EINVAL, |done| self.commit(done).err().unwrap_or(EINVAL));
+                }
                 (Effect::Peer(key), _) => {
                     let started = SectionModel {
                         key,
@@ -476,7 +489,12 @@ fn set_request(rng: &mut Rng, peers: &[[u8; 32]]) -> Vec<(String, Effect)> {
     if rng.chance(15) {
         let (line, errno) = broken_line(rng, peers);
         let at = rng.below(lines.len() + 1);
-        lines.insert(at, (line, Effect::Fail(errno)));
+        let effect = if line.starts_with("public_key=") {
+            Effect::BrokenPeer
+        } else {
+            Effect::Fail(errno)
+        };
+        lines.insert(at, (line, effect));
     }
     lines
 }

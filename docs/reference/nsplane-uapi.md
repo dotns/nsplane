@@ -30,7 +30,11 @@ with `EADDRINUSE` (98) and is logged. `get=1` still reports the listen port.
 
 A `set=1` request is read up to its empty line before any of it is applied, so a client that
 stalls midway does not delay the requests of other connections. Its settings are then applied
-in order, one request at a time; the settings before a failing one stay applied.
+in order, one request at a time; the settings before a failing one stay applied. An interface
+setting takes effect at its line. A peer section takes effect as a whole when the next
+`public_key=` line or the end of the request closes it, so a section closed by a `public_key=`
+line with a malformed value is applied before that line fails, and the section a failing line
+stands in is not applied.
 
 A request line is at most 4096 bytes long, and the settings of one `set=1` request at most
 16 MiB (some 40 000 peers). More fails the read: the connection is closed, after an

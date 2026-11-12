@@ -232,11 +232,14 @@ impl Uapi {
             };
             if key == "public_key" {
                 // Indicates a new peer section. Commit changes for the current peer; every
-                // section starts fresh, so settings never leak into the next peer.
-                let public_key = PublicKey::from(parse_key(val).ok_or(EINVAL)?);
-                if let Some(done) = section.replace(PeerSection::new(public_key)) {
+                // section starts fresh, so settings never leak into the next peer. The
+                // line ends the current section whatever its value, so that section is
+                // applied before the key is read.
+                if let Some(done) = section.take() {
                     self.apply_peer(done).await?;
                 }
+                let public_key = PublicKey::from(parse_key(val).ok_or(EINVAL)?);
+                section = Some(PeerSection::new(public_key));
             } else if let Some(section) = &mut section {
                 section.set(key, val)?;
             } else {
@@ -911,6 +914,25 @@ mod tests {
         // The port and the first peer section were applied before the bad line was met.
         assert_ne!(listen_port(&uapi).await, port);
         assert_eq!(listed_peers(&uapi).await, [hex::encode(key)]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_section_before_a_malformed_public_key_stays_applied() {
+        let (uapi, _engine) = uapi_with_default_peers(&[]).await;
+        let key = PublicKey::from(&StaticSecret::from([2; 32])).to_bytes();
+        for broken in ["xyz", "", &hex::encode(key)[1..]] {
+            let request_body = format!(
+                "set=1\nreplace_peers=true\npublic_key={}\npersistent_keepalive_interval=5\n\
+                 public_key={broken}\n\n",
+                hex::encode(key)
+            );
+            assert_eq!(
+                request(&uapi, &request_body).await,
+                format!("errno={EINVAL}\n\n")
+            );
+            // The section the malformed line ends was complete, so it was applied.
+            assert_eq!(listed_peers(&uapi).await, [hex::encode(key)], "{broken:?}");
+        }
     }
 
     #[test]
