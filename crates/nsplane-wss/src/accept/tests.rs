@@ -4,7 +4,9 @@ use super::*;
 use crate::{WssConfig, WssDialer, WssTls};
 use nsplane::LinkConfig;
 use rustls::RootCertStore;
-use tokio::io::DuplexStream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{DuplexStream, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -407,4 +409,78 @@ async fn unbounded_websockets_are_refused() {
     let ws = WebSocketStream::from_raw_socket(server_ws, Role::Server, None).await;
     let err = acceptor.accept(ws).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// A stream that counts the writes to the stream under it.
+struct CountWrites {
+    inner: DuplexStream,
+    writes: Arc<AtomicU64>,
+}
+
+impl AsyncRead for CountWrites {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CountWrites {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        bump(&self.writes);
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A datagram alone is written at once; datagrams queued together leave in order in a few
+/// writes, not one each.
+#[tokio::test]
+async fn queued_datagrams_are_written_together() {
+    let (transport, acceptor) = server(WssServerConfig::default().ping_interval(None));
+    let (inner, client) = tokio::io::duplex(1 << 20);
+    let writes = Arc::new(AtomicU64::new(0));
+    let stream = CountWrites {
+        inner,
+        writes: Arc::clone(&writes),
+    };
+    let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config())).await;
+    let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let session = acceptor.accept(ws).unwrap();
+
+    let to = path(session.addr());
+    transport.send(b"alone", &to).await.unwrap();
+    assert_eq!(
+        next(&mut client).await,
+        Some(Message::binary(&b"alone"[..]))
+    );
+    assert_eq!(get(&writes), 1);
+
+    // The sends are ready at once, so the session's task runs only after the last one.
+    for i in 0..100u8 {
+        transport.send(&[i; 1200], &to).await.unwrap();
+    }
+    for i in 0..100u8 {
+        assert_eq!(
+            next(&mut client).await,
+            Some(Message::binary(vec![i; 1200]))
+        );
+    }
+    // 64 and 36 datagrams.
+    assert_eq!(get(&writes) - 1, 2);
+    let stats = session.stats();
+    assert_eq!((stats.tx(), stats.tx_bytes()), (101, 120_005));
 }

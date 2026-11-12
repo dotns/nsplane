@@ -15,8 +15,8 @@ use nsplane::{Ecn, PacketBuf, Path, Transport, TransportId};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::config::Pings;
 use crate::connect::{add, bump, get, lock, ws_config};
@@ -24,6 +24,9 @@ use crate::{MAX_DATAGRAM, MAX_MESSAGE};
 
 /// How long a closing session waits to send its close frame.
 const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// The most datagrams a session's writer takes from its queue for one flush.
+const WRITE_BATCH: usize = 64;
 
 /// Settings of a [`WssServerTransport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,8 +326,11 @@ fn session_addr(n: u64) -> SocketAddr {
 /// - **Backpressure**: each session has a queue of [`WssServerConfig::queue`] datagrams,
 ///   drained by its writer. `send` never waits on a slow session: on a full queue it fails
 ///   with [`io::ErrorKind::WouldBlock`] (counted in
-///   [`dropped_queue_full`](WssServerTransportStats::dropped_queue_full)). Received
-///   datagrams of all sessions share a queue of [`WssServerConfig::inbound_queue`];
+///   [`dropped_queue_full`](WssServerTransportStats::dropped_queue_full)). The writer
+///   takes what is queued (at most 64 datagrams, never waiting for more) and flushes once,
+///   so a datagram alone leaves at once and a burst shares its writes; the order is the
+///   queue's. Received datagrams of all sessions share a queue of
+///   [`WssServerConfig::inbound_queue`];
 ///   while it is full the sessions' readers wait, pushing back on their TCP connections.
 /// - **Messages**: text messages and binary ones longer than [`MAX_DATAGRAM`] are dropped
 ///   and counted, as is a datagram longer than [`MAX_DATAGRAM`] sent (the send succeeds).
@@ -671,19 +677,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut pings = Pings::new(shared.config.ping_interval.unwrap_or_default());
+    let mut batch = Vec::with_capacity(WRITE_BATCH);
     loop {
         let message = tokio::select! {
-            datagram = outgoing.recv() => {
-                let Some(datagram) = datagram else {
+            // What is queued now, without waiting for more: one flush for all of it.
+            count = outgoing.recv_many(&mut batch, WRITE_BATCH) => {
+                if count == 0 {
                     return End::Local;
-                };
-                let len = datagram.len();
-                if let Err(e) = sink.send(Message::Binary(datagram)).await {
+                }
+                let len: usize = batch.iter().map(Bytes::len).sum();
+                if let Err(e) = write_batch(sink, &mut batch).await {
                     tracing::debug!(addr = %session.addr, error = %e, "wss session write failed");
                     return End::Error;
                 }
                 shared.count(session, |s| {
-                    bump(&s.tx);
+                    add(&s.tx, count);
                     add(&s.tx_bytes, len);
                 });
                 continue;
@@ -695,6 +703,20 @@ where
             return End::Error;
         }
     }
+}
+
+/// Feeds the datagrams of `batch` to `sink` in order and flushes once; leaves it empty.
+async fn write_batch<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, Message>,
+    batch: &mut Vec<Bytes>,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for datagram in batch.drain(..) {
+        sink.feed(Message::Binary(datagram)).await?;
+    }
+    sink.flush().await
 }
 
 #[cfg(test)]

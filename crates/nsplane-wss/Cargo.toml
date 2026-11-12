@@ -26,3 +26,7 @@ tracing = "0.1.40"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[[bench]]
+name = "throughput"
+harness = false

@@ -74,6 +74,14 @@ message carrying its raw bytes (the wire of the examples' relay); text
 messages and messages above `MAX_DATAGRAM` (65 535) are dropped and counted in
 `WssStats`, a close frame or the end of the stream ends the link.
 
+The link's sender implements `LinkSender::send_batch`: the datagrams `LinkTransport` hands
+it together (those queued at that moment, at most `LinkTransport::SEND_BATCH` = 64) are
+fed to the WebSocket as they are, without a copy, and flushed once, so a burst shares its
+TLS records and write calls while a datagram alone is flushed at once. There is no timer
+and no waiting for more. The order is the queue's; tungstenite writes its buffer out by
+itself above 128 KiB, which bounds what a batch holds in memory. A failed write ends the
+link and loses the batch.
+
 ### Tests
 
 Unit tests next to the code (`connect`, `config`, `dialer`); `nsplane-e2e` `wss_datagram`
@@ -110,9 +118,11 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
 - **Tasks and queues.** One task per session reads, writes and pings. Outbound: a bounded
   queue per session (`queue`, 256; 0 taken as 1) drained by that task; a full queue fails
   `send` at once with `WouldBlock`, as `LinkTransport` does, counted in
-  `dropped_queue_full`. Inbound: one shared bounded channel (`inbound_queue`, 1024) feeds
-  `recv`; a session's reader waits for room, so a slow engine pushes back per session onto
-  TCP. Batch methods are the trait defaults.
+  `dropped_queue_full`. The writer takes what is queued (`recv_many`, at most 64
+  datagrams, never waiting for more), feeds it and flushes once: a datagram alone leaves
+  at once, a burst shares its writes, the order is the queue's. Inbound: one shared
+  bounded channel (`inbound_queue`, 1024) feeds `recv`; a session's reader waits for
+  room, so a slow engine pushes back per session onto TCP. Batch methods are the trait defaults.
 - **Lifecycle.** A close frame or end of stream (peer close), a read or write error, no
   frame for `read_idle` (35 s; pongs count) or `WssSession::close` / dropping the transport
   (local close) ends a session; except after an error it then tries a close frame for at
@@ -129,12 +139,22 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
 - **Tests.** `crates/nsplane-wss/src/accept/tests.rs`: a `WssDialer` link against the
   transport over loopback `ws://`, and sessions over in-memory streams (distinct
   addresses, sends to closed sessions, queue full, read idle and pings, dropped messages,
-  the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
+  queued datagrams written together, the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
   `WssDialer`s against one engine on the transport: several nodes on distinct session
   addresses, a server-side close and redial moving the endpoint, the transport next to a
   `UdpTransport`, no endpoint takeover by garbage or an unknown key on another session,
   and a session that stops reading without holding up the others.
 
+
+### Benchmark
+
+`cargo bench -p nsplane-wss --bench throughput` carries a million datagrams of 1200 bytes
+each way between a `WssDialer` link and the server transport over loopback `ws://`, at most
+128 in flight, and prints datagrams per second and CPU time per datagram (whole process).
+On the development host (7 cores of one CCD, three runs each): with one flush per datagram
+0.47 to 0.51 M/s at 4.6 us from the link to the server and 0.51 to 0.55 M/s at 4.5 to
+4.7 us back; with the batched writes 2.3 to 2.5 M/s at 1.1 to 1.3 us and 1.3 to 1.4 M/s at
+2.1 to 2.3 us.
 
 ## Configuration and defaults
 

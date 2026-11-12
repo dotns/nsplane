@@ -19,11 +19,30 @@ use crate::transport::{BoxFuture, Transport};
 /// The two halves of a link, as [`LinkDialer::dial`] returns them.
 type Link = (Box<dyn LinkSender>, Box<dyn LinkReceiver>);
 
-/// The sending half of a link: hands one message to the link.
+/// The sending half of a link: hands messages to the link.
 pub trait LinkSender: Send + 'static {
     /// Sends `message` as one message. An error ends the link; the transport dials a new
     /// one and `message` is lost.
     fn send(&mut self, message: &[u8]) -> BoxFuture<'_, io::Result<()>>;
+
+    /// Sends `messages` in order, one message each, and leaves the vector empty.
+    ///
+    /// The transport calls this with the datagrams that were queued when it took the
+    /// first of them, at most [`LinkTransport::SEND_BATCH`], and never waits for more: a
+    /// lone datagram comes alone and at once. An error ends the link, and the messages
+    /// of the call are lost.
+    ///
+    /// By default one [`send`](Self::send) per message. A link that buffers its writes
+    /// overrides it to take the messages without copying them and to flush once at the
+    /// end.
+    fn send_batch<'a>(&'a mut self, messages: &'a mut Vec<Bytes>) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            for message in messages.drain(..) {
+                self.send(&message).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// The receiving half of a link: yields one message at a time.
@@ -122,8 +141,11 @@ impl Default for LinkConfig {
 /// - Sent datagrams wait in a queue of [`LinkConfig::queue`] entries, also while no link
 ///   is up. `send` never waits: on a full queue it fails with
 ///   [`io::ErrorKind::WouldBlock`] and the engine counts
-///   [`DROP_TRANSPORT_SEND_ERROR`](crate::DROP_TRANSPORT_SEND_ERROR). A datagram whose
-///   send failed on a lost link is gone; the queued ones go out on the next link.
+///   [`DROP_TRANSPORT_SEND_ERROR`](crate::DROP_TRANSPORT_SEND_ERROR). The task hands the
+///   link the datagrams queued at that moment in one
+///   [`LinkSender::send_batch`], in order, at most [`SEND_BATCH`](Self::SEND_BATCH) at a
+///   time and without waiting for more. The datagrams of a batch whose send failed on a
+///   lost link are gone; the queued ones go out on the next link.
 /// - `recv` keeps waiting while the task redials; it fails only once the task is gone.
 ///
 /// Dropping the transport stops the task and drops its link.
@@ -170,6 +192,9 @@ pub struct LinkTransport {
 }
 
 impl LinkTransport {
+    /// The most datagrams handed to one [`LinkSender::send_batch`].
+    pub const SEND_BATCH: usize = 64;
+
     /// Creates the transport and spawns its task, which starts dialing at once.
     ///
     /// # Panics
@@ -305,11 +330,17 @@ async fn pump(
     idle: Option<Duration>,
 ) -> End {
     let mut send = pin!(async {
-        while let Some(message) = outgoing.recv().await {
-            if let Err(e) = sender.send(&message).await {
+        let mut batch = Vec::with_capacity(LinkTransport::SEND_BATCH);
+        while outgoing
+            .recv_many(&mut batch, LinkTransport::SEND_BATCH)
+            .await
+            > 0
+        {
+            if let Err(e) = sender.send_batch(&mut batch).await {
                 tracing::debug!(message = "Link send failed", error = %e);
                 return End::Lost;
             }
+            batch.clear();
         }
         End::Finished
     });
@@ -543,6 +574,71 @@ mod tests {
         }
         link.send(&[4], &to(peer())).await.unwrap();
         assert_eq!(far.sent.recv().await.unwrap(), &[4][..]);
+    }
+
+    /// A sender that records the sizes of the batches it is handed.
+    struct Batches(mpsc::UnboundedSender<Vec<Bytes>>);
+
+    impl LinkSender for Batches {
+        fn send(&mut self, message: &[u8]) -> BoxFuture<'_, io::Result<()>> {
+            let _ = self.0.send(vec![Bytes::copy_from_slice(message)]);
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn send_batch<'a>(
+            &'a mut self,
+            messages: &'a mut Vec<Bytes>,
+        ) -> BoxFuture<'a, io::Result<()>> {
+            let _ = self.0.send(std::mem::take(messages));
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Dials one link whose sender is a [`Batches`]; the link's receiver never yields.
+    struct BatchDialer {
+        gate: Arc<Notify>,
+        batches: mpsc::UnboundedSender<Vec<Bytes>>,
+    }
+
+    impl LinkDialer for BatchDialer {
+        fn dial(&self) -> BoxFuture<'_, io::Result<Link>> {
+            Box::pin(async move {
+                self.gate.notified().await;
+                let (reply, reply_rx) = mpsc::channel(1);
+                // Keeps the receiving half open.
+                std::mem::forget(reply);
+                let link: Link = (
+                    Box::new(Batches(self.batches.clone())),
+                    Box::new(Rx(reply_rx)),
+                );
+                Ok(link)
+            })
+        }
+    }
+
+    /// The datagrams queued together reach the sender in order, in batches of at most
+    /// [`LinkTransport::SEND_BATCH`]; one alone comes alone.
+    #[tokio::test]
+    async fn queued_datagrams_are_sent_in_batches() {
+        let gate = Arc::new(Notify::new());
+        let (batches, mut sent) = mpsc::unbounded_channel();
+        let dialer = Arc::new(BatchDialer {
+            gate: gate.clone(),
+            batches,
+        });
+        let link = LinkTransport::new(TransportId::new(1), peer(), dialer, LinkConfig::default());
+        for i in 0..100u8 {
+            link.send(&[i], &to(peer())).await.unwrap();
+        }
+        gate.notify_one();
+        let first = sent.recv().await.unwrap();
+        let second = sent.recv().await.unwrap();
+        assert_eq!((first.len(), second.len()), (64, 36));
+        let all: Vec<u8> = first.iter().chain(&second).map(|m| m[0]).collect();
+        assert_eq!(all, (0..100).collect::<Vec<u8>>());
+
+        link.send(b"alone", &to(peer())).await.unwrap();
+        assert_eq!(sent.recv().await.unwrap(), [Bytes::from_static(b"alone")]);
     }
 
     #[tokio::test]

@@ -488,8 +488,12 @@ dropped and count as sent.
 - `LinkConfig::queue` (256) bounds the datagrams waiting for the link, also while none is
   up; `send` never waits, and on a full queue fails with `WouldBlock`, which the engine
   counts under `DROP_TRANSPORT_SEND_ERROR`.
-- A link ends when the receiver yields `None` or an error, a send fails (that datagram is
-  lost; the queued ones go out on the next link) or `LinkConfig::read_idle_timeout`
+- The task takes the datagrams queued at that moment (at most `LinkTransport::SEND_BATCH`,
+  64, never waiting for more) and hands them to `LinkSender::send_batch` in order. Its
+  default sends them one by one with `send`; a link that buffers its writes overrides it
+  to take the messages without a copy and flush once (`nsplane-wss` does).
+- A link ends when the receiver yields `None` or an error, a send fails (the datagrams of
+  that batch are lost; the queued ones go out on the next link) or `LinkConfig::read_idle_timeout`
   (default `None`) passes without a message. The task reports `LinkState::Disconnected`
   to `LinkDialer::on_state` and dials again at once, also after a failed dial; the dialer
   owns the backoff and may sleep in `dial`.

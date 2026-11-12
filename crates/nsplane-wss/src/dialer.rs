@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::MAX_DATAGRAM;
 use crate::config::WssConfig;
-use crate::connect::{Connector, DialCounters, Ws, WssDialEvent, bump, get};
+use crate::connect::{Connector, DialCounters, Ws, WssDialEvent, add, bump, get};
 
 /// The two halves of a link, as [`LinkDialer::dial`] returns them.
 type Link = (Box<dyn LinkSender>, Box<dyn LinkReceiver>);
@@ -244,6 +244,27 @@ impl LinkSender for WssSender {
             Ok(())
         })
     }
+
+    /// Takes the messages as they are and flushes once after the last.
+    fn send_batch<'a>(&'a mut self, messages: &'a mut Vec<Bytes>) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let mut sink = self.sink.lock().await;
+            let mut sent = 0;
+            for message in messages.drain(..) {
+                if message.len() > MAX_DATAGRAM {
+                    bump(&self.stats.dropped_oversized);
+                    continue;
+                }
+                sink.feed(Message::Binary(message))
+                    .await
+                    .map_err(io::Error::other)?;
+                sent += 1;
+            }
+            sink.flush().await.map_err(io::Error::other)?;
+            add(&self.stats.tx, sent);
+            Ok(())
+        })
+    }
 }
 
 /// Yields the payloads of binary messages; counts and skips the rest.
@@ -288,6 +309,36 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A batch goes out in order, without its oversized message, and is counted.
+    #[tokio::test]
+    async fn a_batch_is_sent_in_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = WssConfig::new(
+            format!("ws://{addr}/"),
+            WssTls::Roots(RootCertStore::empty()),
+        )
+        .allow_plaintext(true);
+        let dialer = WssDialer::new(config).unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(tcp).await.unwrap()
+        });
+        let (mut sender, _receiver) = timeout(WAIT, dialer.dial()).await.unwrap().unwrap();
+        let mut peer = peer.await.unwrap();
+
+        let mut batch: Vec<Bytes> = (0..3u8).map(|i| Bytes::from(vec![i; 1200])).collect();
+        batch.insert(1, Bytes::from(vec![9; MAX_DATAGRAM + 1]));
+        sender.send_batch(&mut batch).await.unwrap();
+        assert_eq!(batch, Vec::<Bytes>::new());
+        for i in 0..3u8 {
+            let message = timeout(WAIT, peer.next()).await.unwrap().unwrap().unwrap();
+            assert_eq!(message, Message::binary(vec![i; 1200]));
+        }
+        let stats = dialer.stats();
+        assert_eq!((stats.tx(), stats.dropped_oversized()), (3, 1));
+    }
 
     /// With pings off a link sends no ping over many would-be intervals, and a silent peer
     /// still ends it after the read idle.

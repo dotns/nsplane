@@ -85,6 +85,8 @@
 //! - **Limits**: a bounded queue per session (a full one fails the send at once), one
 //!   shared inbound queue that pushes back on the sessions' readers, keepalive pings, a read
 //!   idle, and at most [`WssServerConfig::max_sessions`] sessions.
+//! - **Writes**: both sides write the datagrams that are queued together (at most 64) with
+//!   one flush, in order, and never wait for more: a datagram alone leaves at once.
 //!
 //! ```no_run
 //! use nsplane::TransportId;
