@@ -3,17 +3,18 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::flow::{FlowState, Target};
 use crate::ownership::Registration;
-use crate::tcp::{Progress, Shared, WriteHalf, lock};
+use crate::tcp::{Dirty, Mark, Progress, Shared, WriteHalf, lock};
 
-use super::{Driver, TCP_IDLE_TIMEOUT};
+use super::{Driver, FULL_PASS_INTERVAL, TCP_IDLE_TIMEOUT};
 
 /// Driver-side state of one connection handed to the application.
 pub(super) struct Conn {
@@ -28,6 +29,34 @@ pub(super) struct Conn {
     pub(super) local_closed: bool,
     pub(super) last_activity_at: SmolInstant,
     pub(super) flow: Arc<FlowState>,
+    /// The connection's request for a bridge pass, shared with the application's side.
+    pub(super) mark: Arc<Mark>,
+    /// Sets `mark`; registered with the socket at every bridge pass, as smoltcp wakes a
+    /// registration once.
+    pub(super) waker: Waker,
+}
+
+/// Which connections a bridge pass visits.
+pub(super) struct Signalled {
+    /// The connections signalled by the application or by smoltcp since their last bridge
+    /// pass; it also wakes the driver for the application.
+    pub(super) dirty: Arc<Dirty>,
+    /// The signalled connections taken from `dirty` for this turn's bridge pass; empty
+    /// between turns.
+    visit: Vec<SocketHandle>,
+    /// When the last bridge pass over every connection ran.
+    full_pass_at: SmolInstant,
+}
+
+impl Signalled {
+    /// An empty work list whose signals wake `driver`.
+    pub(super) fn new(driver: Arc<Notify>) -> Self {
+        Self {
+            dirty: Arc::new(Dirty::new(driver)),
+            visit: Vec::new(),
+            full_pass_at: SmolInstant::ZERO,
+        }
+    }
 }
 
 /// What one bridge pass did.
@@ -48,7 +77,16 @@ impl Conn {
 
     /// Moves bytes between the socket and the application and applies half closes,
     /// filling the socket's send buffer up to `limit` bytes.
+    ///
+    /// Without a send budget the outcome is a fixed point: a second call changes nothing
+    /// until the application signals the connection, smoltcp wakes one of the wakers
+    /// registered here (a state change, received bytes, acknowledged bytes, the RST of an
+    /// abort sent) or a timeout passes.
     fn bridge(&mut self, socket: &mut tcp::Socket<'_>, now: SmolInstant, limit: usize) -> Bridged {
+        // Before anything is read, so that no change falls between the reads and the
+        // registration.
+        socket.register_recv_waker(&self.waker);
+        socket.register_send_waker(&self.waker);
         // Only an acknowledgement shrinks the send queue, except a reset, which empties it
         // and leaves the socket closed.
         if socket.send_queue() < self.queued && socket.state() != tcp::State::Closed {
@@ -137,6 +175,35 @@ impl Conn {
         }
     }
 
+    /// What a bridge pass would do for the connection now, timeouts aside: `None` at the
+    /// fixed point [`bridge`](Self::bridge) leaves behind.
+    #[cfg(test)]
+    fn unbridged(&self, socket: &tcp::Socket<'_>) -> Option<&'static str> {
+        let shared = lock(&self.shared);
+        let terminal = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
+        let closing = shared.write_half == WriteHalf::Shutdown
+            || (shared.app_dropped && shared.write_half == WriteHalf::Open);
+        if shared.write_half == WriteHalf::Aborted {
+            Some("an abort")
+        } else if socket.send_queue() != self.queued {
+            Some("a send queue that moved")
+        } else if socket.can_recv()
+            && (terminal || shared.app_dropped || shared.rx.len() < shared.capacity)
+        {
+            Some("received bytes to move")
+        } else if !shared.rx_eof && !socket.may_recv() && !socket.can_recv() {
+            Some("the end of the stream")
+        } else if !shared.tx.is_empty() && socket.can_send() {
+            Some("written bytes to move")
+        } else if closing && shared.tx.is_empty() {
+            Some("a close")
+        } else if terminal && shared.rx.is_empty() {
+            Some("a release")
+        } else {
+            None
+        }
+    }
+
     /// Tells the application the socket is gone.
     pub(super) fn release(&self) {
         let mut shared = lock(&self.shared);
@@ -213,19 +280,40 @@ impl Driver {
     }
 
     /// Keeps the bytes of terminal sockets before smoltcp's timers discard the socket.
-    pub(super) fn preserve_all(&mut self, now: SmolInstant) {
-        for (&handle, conn) in &mut self.conns {
-            let socket = self.sockets.get_mut::<tcp::Socket<'_>>(handle);
+    ///
+    /// Only signalled connections can hold such bytes: a socket turns terminal with a
+    /// state change, which signals it, and the bridge pass that takes the signal moves
+    /// every byte of a terminal socket.
+    pub(super) fn preserve_signalled(&mut self, now: SmolInstant) {
+        self.signalled.dirty.drain_into(&mut self.signalled.visit);
+        for handle in &self.signalled.visit {
+            let Some(conn) = self.conns.get_mut(handle) else {
+                continue;
+            };
+            let socket = self.sockets.get_mut::<tcp::Socket<'_>>(*handle);
             let mut shared = lock(&conn.shared);
             preserve_terminal_receive(socket, &mut shared, &mut conn.last_activity_at, now);
         }
     }
 
-    /// Bridges every connection and releases terminal ones; `true` if bytes were sent or
-    /// an aborted connection waits for its RST to be sent.
+    /// How long until the next bridge pass over every connection is due.
+    pub(super) fn full_pass_due(&self, now: SmolInstant) -> std::time::Duration {
+        let since = now.total_micros() - self.signalled.full_pass_at.total_micros();
+        full_pass_interval().saturating_sub(std::time::Duration::from_micros(
+            u64::try_from(since).unwrap_or(0),
+        ))
+    }
+
+    /// Bridges the signalled connections, or every connection once
+    /// [`FULL_PASS_INTERVAL`] passed since that was last done and in every turn with
+    /// `tcp_send_budget` (a connection's share of the budget moves with the other
+    /// connections), and releases terminal ones; `true` if bytes were sent or an aborted
+    /// connection waits for its RST to be sent.
     pub(super) fn bridge_all(&mut self, now: SmolInstant) -> bool {
         let mut sent = false;
         let mut released = Vec::new();
+        self.signalled.dirty.drain_into(&mut self.signalled.visit);
+        let full = self.settings.tcp_send_budget.is_some() || self.full_pass_due(now).is_zero();
         // Each sending connection's share of the send budget.
         let limit = self.settings.tcp_send_budget.map_or(usize::MAX, |budget| {
             let senders = self
@@ -237,20 +325,69 @@ impl Driver {
                 .count();
             (budget / senders.max(1)).max(usize::from(self.settings.mtu) - 40)
         });
-        for (&handle, conn) in &mut self.conns {
-            let socket = self.sockets.get_mut::<tcp::Socket<'_>>(handle);
+        let mut bridge = |handle: SocketHandle, conn: &mut Conn, socket: &mut tcp::Socket<'_>| {
             let bridged = conn.bridge(socket, now, limit);
             sent |= bridged.sent;
             if bridged.terminal {
                 released.push(handle);
             } else if bridged.aborting {
+                // Bridged again until its RST left.
+                conn.mark.set();
                 self.aborting.push(handle);
+            }
+        };
+        if full {
+            self.signalled.full_pass_at = now;
+            self.signalled.visit.clear();
+            for (&handle, conn) in &mut self.conns {
+                conn.mark.take();
+                bridge(
+                    handle,
+                    conn,
+                    self.sockets.get_mut::<tcp::Socket<'_>>(handle),
+                );
+            }
+        } else {
+            for handle in self.signalled.visit.drain(..) {
+                // An entry without the request is one a pass over every connection
+                // served, or that of a released connection.
+                if let Some(conn) = self.conns.get_mut(&handle)
+                    && conn.mark.take()
+                {
+                    bridge(
+                        handle,
+                        conn,
+                        self.sockets.get_mut::<tcp::Socket<'_>>(handle),
+                    );
+                }
             }
         }
         for handle in released {
             self.release_conn(handle);
         }
+        #[cfg(test)]
+        self.assert_bridged();
         sent || !self.aborting.is_empty()
+    }
+
+    /// Checks the dirty tracking against the pass over every connection it replaces: a
+    /// connection without a request for a bridge pass has nothing to bridge. Only where
+    /// the application runs on the driver's thread, as elsewhere it may have changed a
+    /// connection and not signalled it yet.
+    #[cfg(test)]
+    fn assert_bridged(&self) {
+        let single = tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::CurrentThread;
+        if !single || self.settings.tcp_send_budget.is_some() {
+            return;
+        }
+        for (&handle, conn) in &self.conns {
+            let work = conn.unbridged(self.sockets.get::<tcp::Socket<'_>>(handle));
+            assert!(
+                conn.mark.is_set() || work.is_none(),
+                "connection {handle} has {work:?} and no request for a bridge pass"
+            );
+        }
     }
 
     /// Releases the aborted connections whose RST the poll after the bridge pass sent (one
@@ -305,6 +442,24 @@ pub(super) fn tcp_idle_timeout_expired(
 ) -> bool {
     !matches!(state, tcp::State::Closed | tcp::State::TimeWait)
         && now >= last_activity_at + idle_timeout()
+}
+
+#[cfg(not(test))]
+const fn full_pass_interval() -> std::time::Duration {
+    FULL_PASS_INTERVAL
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces [`FULL_PASS_INTERVAL`] for the stacks a test drives on its thread.
+    pub(super) static FULL_PASS: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn full_pass_interval() -> std::time::Duration {
+    FULL_PASS
+        .with(std::cell::Cell::get)
+        .unwrap_or(FULL_PASS_INTERVAL)
 }
 
 #[cfg(not(test))]

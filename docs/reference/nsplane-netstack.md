@@ -34,6 +34,20 @@ smoltcp on its own dispatch path. Ingress is taken with `poll_recv_many` (at mos
 per turn, in order), and egress TCP segments and UDP datagrams keep 32 bytes of tail room
 (`device::TAILROOM`), so the engine seals them in place without reallocating.
 
+The bridge pass of a turn visits only the connections signalled since their last pass. The
+application signals its connection with a write, a read that empties the stream buffer or
+takes it out of the full state, a shutdown, a drop and an abort. smoltcp signals through the
+socket's receive and send wakers (the `async` feature of the fork), which fire on a state
+change, on received bytes, on acknowledged bytes and when the RST of an abort left; the
+driver registers both at every pass, as a registration fires once. A pass over every
+connection runs once 50 ms passed since the last one (`FULL_PASS_INTERVAL`): it serves the
+idle timeout, which has no signal, and bounds the delay a missed signal could cause. With
+`NetStackConfig::tcp_send_budget` every turn bridges every connection, as a connection's
+share moves with the others. In tests, `Driver::assert_bridged` checks after each pass that
+no connection without a signal has anything to bridge. smoltcp itself stays linear in the
+sockets: it offers each ingress packet to the sockets in slot order and walks all of them in
+each egress turn and for its next timer.
+
 ### Queues, ports and counters
 
 - Every queue is bounded (ingress, egress, accept and datagram capacities in

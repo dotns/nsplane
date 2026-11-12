@@ -6,11 +6,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+use smoltcp::iface::SocketHandle;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, watch};
 
@@ -113,6 +114,97 @@ impl Progress {
     }
 }
 
+/// The connections of a stack that have work for the driver: those the application
+/// signalled and those whose socket changed in smoltcp, each queued once.
+#[derive(Debug)]
+pub(crate) struct Dirty {
+    queue: Mutex<Vec<SocketHandle>>,
+    driver: Arc<Notify>,
+}
+
+impl Dirty {
+    pub(crate) const fn new(driver: Arc<Notify>) -> Self {
+        Self {
+            queue: Mutex::new(Vec::new()),
+            driver,
+        }
+    }
+
+    /// What wakes the driver.
+    pub(crate) fn driver(&self) -> &Notify {
+        &self.driver
+    }
+
+    /// Moves the queued connections to the end of `visit`.
+    pub(crate) fn drain_into(&self, visit: &mut Vec<SocketHandle>) {
+        visit.append(&mut self.queue.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+}
+
+/// One connection's place in the [`Dirty`] queue of its stack.
+///
+/// The flag is the request for a visit: it is set with the queue entry and taken by the
+/// driver right before it bridges the connection, so a signal that arrives later queues
+/// the connection again, and a queue entry without the flag (left by a pass over every
+/// connection, or of a released connection whose socket slot was reused) is skipped.
+#[derive(Debug)]
+pub(crate) struct Mark {
+    handle: SocketHandle,
+    queued: AtomicBool,
+    dirty: Arc<Dirty>,
+}
+
+impl Mark {
+    pub(crate) const fn new(handle: SocketHandle, dirty: Arc<Dirty>) -> Self {
+        Self {
+            handle,
+            queued: AtomicBool::new(false),
+            dirty,
+        }
+    }
+
+    /// Queues the connection for the driver's next bridge pass, without waking the driver:
+    /// for changes the driver itself observes or causes (smoltcp's socket wakers fire
+    /// inside its poll).
+    pub(crate) fn set(&self) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            self.dirty
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.handle);
+        }
+    }
+
+    /// Takes the request for a visit; whether there was one.
+    pub(crate) fn take(&self) -> bool {
+        self.queued.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a request for a visit is pending.
+    #[cfg(test)]
+    pub(crate) fn is_set(&self) -> bool {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    /// Queues the connection and wakes the driver: the application's side changed. Called
+    /// after the change is visible under the connection's lock, so the visit sees it.
+    fn signal(&self) {
+        self.set();
+        self.dirty.driver.notify_one();
+    }
+}
+
+impl Wake for Mark {
+    fn wake(self: Arc<Self>) {
+        self.set();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.set();
+    }
+}
+
 /// Locks `shared`, ignoring poisoning (the state stays consistent at every unlock).
 pub(crate) fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
@@ -146,7 +238,7 @@ pub(crate) fn revoked() -> io::Error {
 pub struct TcpConnection {
     shared: Arc<Mutex<Shared>>,
     progress: Arc<Progress>,
-    driver: Arc<Notify>,
+    mark: Arc<Mark>,
     local: SocketAddr,
     peer: SocketAddr,
     terminal: watch::Receiver<bool>,
@@ -157,7 +249,7 @@ impl TcpConnection {
     pub(crate) const fn new(
         shared: Arc<Mutex<Shared>>,
         progress: Arc<Progress>,
-        driver: Arc<Notify>,
+        mark: Arc<Mark>,
         local: SocketAddr,
         peer: SocketAddr,
         terminal: watch::Receiver<bool>,
@@ -166,7 +258,7 @@ impl TcpConnection {
         Self {
             shared,
             progress,
-            driver,
+            mark,
             local,
             peer,
             terminal,
@@ -313,7 +405,7 @@ impl AsyncRead for TcpConnection {
         let wake = before >= shared.capacity || shared.rx.is_empty();
         drop(shared);
         if wake {
-            self.driver.notify_one();
+            self.mark.signal();
         }
         Poll::Ready(Ok(()))
     }
@@ -341,7 +433,7 @@ impl AsyncWrite for TcpConnection {
         let n = room.min(buf.len());
         shared.tx.extend(&buf[..n]);
         drop(shared);
-        self.driver.notify_one();
+        self.mark.signal();
         Poll::Ready(Ok(n))
     }
 
@@ -377,7 +469,7 @@ impl AsyncWrite for TcpConnection {
         shared.writer = Some(cx.waker().clone());
         drop(shared);
         if notify {
-            self.driver.notify_one();
+            self.mark.signal();
         }
         Poll::Pending
     }
@@ -389,6 +481,6 @@ impl Drop for TcpConnection {
     fn drop(&mut self) {
         self.flow.undeliver(Undelivered::AcceptQueueGone);
         lock(&self.shared).app_dropped = true;
-        self.driver.notify_one();
+        self.mark.signal();
     }
 }

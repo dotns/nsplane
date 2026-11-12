@@ -33,12 +33,12 @@ fn flags(packet: &PacketBuf) -> u8 {
 }
 
 /// Polls `future` once, so it runs up to its first wait.
-fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+pub(super) fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
     Pin::new(future).poll(&mut Context::from_waker(Waker::noop()))
 }
 
 /// Pumps `peer` until `future` resolves, for at most five seconds.
-async fn pump_while<F: Future + Unpin>(
+pub(super) async fn pump_while<F: Future + Unpin>(
     peer: &mut RawPeer,
     future: &mut F,
 ) -> Result<F::Output, Box<dyn Error>> {

@@ -12,8 +12,8 @@ use nsplane_packet::PacketBuf;
 use nsplane_packet::reassembly::{Reassembler, ReassemblyStats};
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 
 use crate::config::Settings;
@@ -27,7 +27,7 @@ use crate::tcp::TcpConnection;
 use crate::udp::{UdpFlow, UdpOut};
 
 use self::accept::Connecting;
-use self::connections::Conn;
+use self::connections::{Conn, Signalled};
 use self::fragments::Barrier;
 use self::handle::Command;
 use self::labels::Labels;
@@ -61,6 +61,11 @@ const EGRESS_BACKLOG: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// Longest the driver sleeps without a timer from smoltcp.
 const MAX_POLL_DELAY: Duration = Duration::from_millis(50);
+/// Longest a connection goes without a bridge pass while the driver runs: a pass over every
+/// connection follows the last one after this long, for the timeouts of connections
+/// nothing signalled, and as the bound on what a signal the dirty tracking missed could
+/// cost. In between, a turn bridges the signalled connections only.
+const FULL_PASS_INTERVAL: Duration = MAX_POLL_DELAY;
 /// Maximum interval without application payload in either direction of a connection.
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(5 * 60);
 /// How long `connect_tcp` waits for the handshake.
@@ -116,6 +121,9 @@ struct Driver {
     /// more aggregate demand than the pool.
     allocation_cursor: u16,
     conns: HashMap<SocketHandle, Conn>,
+    /// Which connections the bridge pass visits, and what wakes the driver for the
+    /// application.
+    signalled: Signalled,
     /// Aborted connections whose RST the next poll sends; empty between turns.
     aborting: Vec<SocketHandle>,
     /// Connects from a port an aborted connection still holds, retried once it is
@@ -141,7 +149,6 @@ struct Driver {
     /// Accepted connections waiting for room in `accept_tcp`, oldest first; only with
     /// `accept_backpressure`.
     waiting: VecDeque<TcpConnection>,
-    notify: Arc<Notify>,
     stats: Arc<Counters>,
     /// A packet taken while waiting, replayed into the next batch so listener demand is
     /// counted in one place only.
@@ -252,7 +259,7 @@ impl Driver {
         stats::add(&self.stats.syn_refused, refused as u64);
 
         // 2. Drive smoltcp.
-        self.preserve_all(now);
+        self.preserve_signalled(now);
         self.device
             .poll_interface(&mut self.iface, now, &mut self.sockets);
         self.track_inbound(&demand, mark);
@@ -267,7 +274,7 @@ impl Driver {
             let now = self.now();
             self.device
                 .poll_interface(&mut self.iface, now, &mut self.sockets);
-            self.preserve_all(now);
+            self.preserve_signalled(now);
         }
         self.release_aborted();
 
@@ -311,6 +318,9 @@ impl Driver {
                     Duration::from_micros(delay.total_micros()).min(MAX_POLL_DELAY)
                 })
         };
+        if !self.conns.is_empty() {
+            delay = delay.min(self.full_pass_due(now));
+        }
         if let Some(deadline) = self.pending.as_deref_mut().and_then(Pending::next_deadline) {
             delay = delay.min(deadline.saturating_duration_since(Instant::now()));
         }
@@ -341,7 +351,7 @@ impl Driver {
                 }
                 return true;
             }
-            () = self.notify.notified() => return true,
+            () = self.signalled.dirty.driver().notified() => return true,
             () = self.egress.closed() => {
                 tracing::debug!(target: "netstack", "source dropped; stopping");
                 return false;

@@ -53,6 +53,7 @@ mod reassembly;
 mod repeated_syn;
 mod revoke_label;
 mod rto;
+mod signalled;
 mod transparent;
 mod zero_window;
 

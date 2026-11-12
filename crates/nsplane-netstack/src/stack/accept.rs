@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -14,7 +15,7 @@ use tokio::sync::{oneshot, watch};
 use crate::flow::{FlowState, RetirementOutcome, Target, Undelivered};
 use crate::ownership::Registration;
 use crate::stats::{self};
-use crate::tcp::{Progress, Shared, TcpConnection};
+use crate::tcp::{Mark, Progress, Shared, TcpConnection};
 
 use super::connections::Conn;
 use super::listeners::tcp_listener_ready_for_promotion;
@@ -210,9 +211,14 @@ impl Driver {
             self.labels.register(&flow);
             (flow, shared)
         });
+        // Queued from the start: this turn's bridge pass takes the connection up.
+        let mark = Arc::new(Mark::new(handle, Arc::clone(&self.signalled.dirty)));
+        mark.set();
         self.conns.insert(
             handle,
             Conn {
+                waker: Waker::from(Arc::clone(&mark)),
+                mark: Arc::clone(&mark),
                 _registration: registration,
                 shared: Arc::clone(&shared),
                 progress: Arc::clone(&progress),
@@ -223,15 +229,7 @@ impl Driver {
                 flow: Arc::clone(&flow),
             },
         );
-        TcpConnection::new(
-            shared,
-            progress,
-            Arc::clone(&self.notify),
-            local,
-            peer,
-            terminal_rx,
-            flow,
-        )
+        TcpConnection::new(shared, progress, mark, local, peer, terminal_rx, flow)
     }
 
     /// Unregisters listener sockets that left the handshake without being established

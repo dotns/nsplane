@@ -25,6 +25,7 @@ use crate::stats::{self, Counters};
 use crate::udp::UdpOut;
 
 use super::commands::random_ephemeral;
+use super::connections::Signalled;
 use super::handle::NetStackHandle;
 use super::labels::Labels;
 use super::wire::tcp_tuple;
@@ -115,7 +116,7 @@ impl NetStack {
             out,
             accept_tcp,
             accept_udp,
-            notify,
+            signalled: Signalled::new(notify),
             stats: Arc::clone(&stats),
             carried: None,
             next_tcp_port: random_ephemeral(),
