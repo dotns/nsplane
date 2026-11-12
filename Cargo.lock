@@ -1075,6 +1075,7 @@ dependencies = [
  "clap",
  "nix",
  "nsplane",
+ "nsplane-sys",
  "nsplane-tun",
  "nsplane-uapi",
  "tokio",

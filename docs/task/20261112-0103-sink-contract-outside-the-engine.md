@@ -89,6 +89,8 @@ allowed block and must not gain another or a `libc` dependency, so no safe call 
 The gap is stated in `docs/reference/nsplane-cli.md`: on macOS the daemon keeps the
 supplementary GIDs it started with after the drop.
 
+The gap was closed by `20261112-0202-sys-wrapper-crate.md`.
+
 ## Validation
 
 Seen failing before the fixes:

@@ -11,9 +11,9 @@ compile_error!("nsplane-cli is a Linux/macOS development tool; embed the library
 use anyhow::{Context as _, bail};
 use clap::Parser;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use nix::unistd::{Gid, Uid, getgid, getuid, setgid, setuid};
 #[cfg(not(target_vendor = "apple"))]
-use nix::unistd::{geteuid, setgroups};
+use nix::unistd::setgroups;
+use nix::unistd::{Gid, Uid, geteuid, getgid, getuid, setgid, setuid};
 use nsplane::{EngineBuilder, UdpTransport};
 use nsplane_tun::{Tun, TunOptions};
 use nsplane_uapi::{TRANSPORT_ID, Uapi, UapiListener};
@@ -318,8 +318,7 @@ async fn serve(args: &Args, inherited: Inherited) -> anyhow::Result<()> {
 /// pass `--disable-drop-privileges`.
 ///
 /// A root process also replaces its supplementary GIDs with the target GID, so those of root
-/// do not outlive the switch. Not on macOS, where `nix` has no `setgroups`: the supplementary
-/// GIDs are kept there.
+/// do not outlive the switch.
 fn drop_privileges() -> anyhow::Result<()> {
     let id = |name| std::env::var(name).ok()?.parse::<u32>().ok();
     let (uid, gid) = match (id("SUDO_UID"), id("SUDO_GID")) {
@@ -329,9 +328,12 @@ fn drop_privileges() -> anyhow::Result<()> {
 
     // Supplementary groups before the IDs: only root may change them, and neither setgid
     // nor setuid drops them.
-    #[cfg(not(target_vendor = "apple"))]
     if geteuid().is_root() {
+        #[cfg(not(target_vendor = "apple"))]
         setgroups(&[gid]).context("setgroups")?;
+        // `nix` has no `setgroups` on Apple targets.
+        #[cfg(target_vendor = "apple")]
+        nsplane_sys::set_supplementary_groups(&[gid.as_raw()]).context("setgroups")?;
     }
     // Group first: once the user ID is dropped, changing the group is no longer allowed.
     setgid(gid).context("setgid")?;

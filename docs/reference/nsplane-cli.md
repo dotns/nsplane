@@ -18,13 +18,10 @@ supported.
   with `sudo`, that is root, also after the privilege drop: use `sudo wg`. Started
   unprivileged (`setcap cap_net_admin+epi`), the same user runs `wg`.
 - The privilege drop sets the supplementary GIDs to the target GID (`setgroups`), then the
-  GID and the UID, and fails startup if root can be regained. On macOS the first step is
-  missing: the daemon keeps the supplementary GIDs it started with, those of root under
-  `sudo` (`wheel`, `admin` and the like), so after the drop it still passes permission checks
-  made on those GIDs, for example a file readable or writable by `admin`; its UID and GID are
-  the invoking user's. `nix` 0.31 provides neither `setgroups` nor `initgroups` on Apple
-  targets, no other dependency has a safe wrapper, and the crate allows no further `unsafe`
-  block. Where that matters, do not run the daemon as root on macOS.
+  GID and the UID, and fails startup if root can be regained. The supplementary GIDs the
+  daemon started with, those of root under `sudo` (`wheel`, `admin` and the like), do not
+  outlive the drop. `nix` has no `setgroups` on Apple targets, so on macOS that one call
+  goes through `nsplane-sys`.
 - `wg set <name> listen-port <port>` rebinds the UDP socket.
 - `--crypto-workers <N>` enables the crypto worker pool for `N` >= 2.
 - `--no-offload` opens the TUN device and binds the UDP socket without segmentation
