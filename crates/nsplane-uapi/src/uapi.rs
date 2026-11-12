@@ -299,7 +299,8 @@ impl Uapi {
         if self.handle.local_identities().await?.len() == 1 {
             return self.handle.remove_all_peers().await;
         }
-        for peer in self.handle.peers().await? {
+        // From the newest peer down: the core shifts the peers behind a removed one.
+        for peer in self.handle.peers().await?.into_iter().rev() {
             if peer.local_identity == LocalIdentityId::DEFAULT {
                 self.handle.remove_peer(peer.public_key).await?;
             }
