@@ -29,9 +29,14 @@ struct IfReq {
 }
 
 impl IfReq {
-    /// An `ifreq` for the interface `name` (already validated) with the 16 flag bits
-    /// `flags`.
+    /// An `ifreq` for the interface `name` with the 16 flag bits `flags`.
+    ///
+    /// [`io::ErrorKind::InvalidInput`] for a name that does not fit with its terminating
+    /// NUL (more than 15 bytes) or for flags beyond 16 bits.
     fn new(name: &str, flags: c_int) -> io::Result<Self> {
+        if name.len() >= IFNAMSIZ {
+            return Err(invalid_name(name));
+        }
         let bits =
             u16::try_from(flags).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut ifr = Self {
@@ -673,6 +678,20 @@ pub(crate) mod tests {
     fn rejects_bad_names() {
         let err = TapDevice::open("an-interface-name-too-long").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The constructor checks the length itself: the name and its NUL must fit.
+    #[test]
+    fn ifreq_refuses_a_name_that_does_not_fit() {
+        let longest = "a".repeat(IFNAMSIZ - 1);
+        let ifr = IfReq::new(&longest, 0).unwrap();
+        assert_eq!(&ifr.name[..IFNAMSIZ - 1], longest.as_bytes());
+        assert_eq!(ifr.name[IFNAMSIZ - 1], 0);
+        assert_eq!(IfReq::new("", 0).unwrap().name, [0; IFNAMSIZ]);
+        for len in [IFNAMSIZ, IFNAMSIZ + 1, 64] {
+            let err = IfReq::new(&"a".repeat(len), 0).err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{len}");
+        }
     }
 
     #[test]
