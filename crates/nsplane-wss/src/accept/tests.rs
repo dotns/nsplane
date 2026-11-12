@@ -522,3 +522,60 @@ async fn a_flooding_session_takes_turns() {
     // to the emptied queue before the other reader runs with the room it was given.
     assert!(before < 16, "{before}");
 }
+
+/// Messages the session drops (text, oversized) do not keep it open: only datagrams, pings
+/// and pongs restart the read idle.
+#[tokio::test]
+async fn dropped_messages_do_not_keep_a_session_open() {
+    let config = WssServerConfig::default()
+        .ping_interval(None)
+        .read_idle(Duration::from_millis(300));
+    let (transport, acceptor) = server(config);
+    let stats = transport.stats();
+    let (session, mut client) = session(&acceptor).await;
+    assert!(!session.is_closed());
+    let started = Instant::now();
+    // Junk every 50 ms, until the session closes.
+    let closed = timeout(WAIT, async {
+        loop {
+            let junk = [
+                Message::text("junk"),
+                Message::binary(vec![0u8; MAX_DATAGRAM + 1]),
+            ];
+            for message in junk {
+                if client.send(message).await.is_err() {
+                    return;
+                }
+            }
+            if matches!(
+                timeout(Duration::from_millis(50), client.next()).await,
+                Ok(Some(Ok(Message::Close(_))) | None)
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the session stayed open");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    until(|| stats.closed_idle() == 1).await;
+    assert!(session.is_closed());
+    assert!(stats.dropped_text() > 0 && stats.dropped_oversized() > 0);
+}
+
+/// Datagrams less than the read idle apart keep a session open.
+#[tokio::test]
+async fn datagrams_keep_a_session_open() {
+    let config = WssServerConfig::default()
+        .ping_interval(None)
+        .read_idle(Duration::from_millis(200));
+    let (transport, acceptor) = server(config);
+    let (session, mut client) = session(&acceptor).await;
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.send(Message::binary(&b"ok"[..])).await.unwrap();
+        assert_eq!(recv(&transport).await, (session.addr(), b"ok".to_vec()));
+    }
+    assert_eq!(transport.stats().closed_idle(), 0);
+    assert!(!session.is_closed());
+}

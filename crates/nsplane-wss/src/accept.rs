@@ -14,6 +14,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use nsplane::{Ecn, PacketBuf, Path, Transport, TransportId};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -42,8 +43,9 @@ pub struct WssServerConfig {
     /// The interval of each session's keepalive pings; `None` (or zero) sends no pings
     /// ([`read_idle`](Self::read_idle) still applies). 10 s by default.
     pub ping_interval: Option<Duration>,
-    /// Closes a session when no frame at all (pongs included) arrived on it for this long.
-    /// 35 s by default.
+    /// Closes a session when no datagram, ping or pong arrived on it for this long; the
+    /// messages a session drops (text, longer than [`MAX_DATAGRAM`]) do not count. 35 s by
+    /// default.
     pub read_idle: Duration,
     /// The most sessions open at once; [`WssAcceptor::accept`] refuses more. 4096 by
     /// default.
@@ -149,7 +151,8 @@ impl WssServerTransportStats {
         get(&self.refused_closed)
     }
 
-    /// Sessions closed after [`WssServerConfig::read_idle`] without a frame.
+    /// Sessions closed after [`WssServerConfig::read_idle`] without a datagram, ping or
+    /// pong.
     pub fn closed_idle(&self) -> u64 {
         get(&self.closed_idle)
     }
@@ -305,8 +308,9 @@ fn session_addr(n: u64) -> SocketAddr {
 ///
 /// The embedder runs the listener: it accepts the connection, runs the TLS handshake,
 /// checks the request (path, token) and does the WebSocket upgrade, then hands the session
-/// to [`WssAcceptor::accept`]. This crate does no authentication. Each session carries one
-/// datagram per binary message, raw bytes as with [`WssDialer`](crate::WssDialer).
+/// to [`WssAcceptor::accept`]. This crate does no authentication (see **Unauthenticated
+/// sessions** below). Each session carries one datagram per binary message, raw bytes as
+/// with [`WssDialer`](crate::WssDialer).
 ///
 /// - **Endpoints**: each session gets its own address, never reused while the transport
 ///   lives: an IPv6 address in `100::/64` (the RFC 6666 discard-only prefix) whose interface
@@ -336,12 +340,22 @@ fn session_addr(n: u64) -> SocketAddr {
 ///   others by at most about two queues of its datagrams, and cannot shut them out.
 /// - **Messages**: text messages and binary ones longer than [`MAX_DATAGRAM`] are dropped
 ///   and counted, as is a datagram longer than [`MAX_DATAGRAM`] sent (the send succeeds).
-///   A close frame, the end of the stream, an error, or no frame for
-///   [`WssServerConfig::read_idle`] closes the session; it sends pings every
-///   [`WssServerConfig::ping_interval`].
+///   A close frame, the end of the stream, an error, or no datagram, ping or pong for
+///   [`WssServerConfig::read_idle`] closes the session (dropped messages do not keep it
+///   open); it sends pings every [`WssServerConfig::ping_interval`].
 /// - **Lifecycle**: a session lives until it closes as above or by
 ///   [`WssSession::close`]; dropping its [`WssSession`] handle does not close it. Dropping
 ///   the transport closes every session, and [`WssAcceptor::accept`] fails afterwards.
+/// - **Unauthenticated sessions**: the transport cannot tell a WireGuard peer from any
+///   other client: a datagram of valid size is handed to the engine, which authenticates
+///   it, and a client that answers the pings keeps its session, and one of the
+///   [`WssServerConfig::max_sessions`], for as long as it likes. The embedder decides who
+///   holds a session: it authenticates the upgrade before
+///   [`accept`](WssAcceptor::accept), and can keep the [`WssSession`] handles to close
+///   those that never became a peer's endpoint. Every received datagram carries its
+///   session's address ([`WssSession::addr`]) as its path, and so does the endpoint of a
+///   peer that authenticated on it, so an address no peer has as endpoint some time after
+///   the accept belongs to such a session.
 ///
 /// Created (and its sessions accepted) inside a tokio runtime; each session runs in a task
 /// of its own.
@@ -584,6 +598,11 @@ impl WssSession {
         self.session.close.notify_one();
     }
 
+    /// Whether the session has closed, for whatever reason.
+    pub fn is_closed(&self) -> bool {
+        self.session.outgoing.is_closed()
+    }
+
     /// The session's counters.
     pub fn stats(&self) -> Arc<WssSessionStats> {
         Arc::clone(&self.session.stats)
@@ -638,10 +657,12 @@ async fn read<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut idle = Instant::now() + shared.config.read_idle;
     loop {
-        let Ok(message) = tokio::time::timeout(shared.config.read_idle, stream.next()).await else {
+        let Ok(message) = tokio::time::timeout_at(idle, stream.next()).await else {
             return End::Idle;
         };
+        // Only the messages kept below restart the read idle; the dropped ones `continue`.
         match message {
             Some(Ok(Message::Binary(data))) => {
                 if data.len() > MAX_DATAGRAM {
@@ -657,14 +678,19 @@ where
                     add(&s.rx_bytes, len);
                 });
             }
-            Some(Ok(Message::Text(_))) => shared.count(session, |s| bump(&s.dropped_text)),
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+            Some(Ok(Message::Text(_))) => {
+                shared.count(session, |s| bump(&s.dropped_text));
+                continue;
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Frame(_))) => continue,
             Some(Ok(Message::Close(_))) | None => return End::Peer,
             Some(Err(e)) => {
                 tracing::debug!(addr = %session.addr, error = %e, "wss session read failed");
                 return End::Error;
             }
         }
+        idle = Instant::now() + shared.config.read_idle;
     }
 }
 

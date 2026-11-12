@@ -9,7 +9,7 @@ WebSocket over TLS carriers: `WssDialer`, a datagram link for `LinkTransport`, a
 | Part | Entry points | Supporting types |
 |---|---|---|
 | main | `WssDialer` (`new`, `into_transport`, `state`, `stats`, `events`); trait `BearerProvider` | `WssConfig` (`allow_plaintext` for `ws://`, `keepalive`, `ping_interval`, `reconnect_delay`), `WssTls`, `WssDialError` (`MAX_BODY`), `WssDialEvent` (`CAPACITY`), `WssStats`; `MAX_DATAGRAM`, `MAX_MESSAGE` |
-| server transport | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
+| server transport | `WssServerTransport` (`new`, `stats`; a `Transport`), `WssAcceptor` (`accept`, `ws_config`), `WssSession` (`addr`, `close`, `is_closed`, `stats`) | `WssServerConfig` (`queue`, `inbound_queue`, `ping_interval`, `read_idle`, `max_sessions`), `WssServerTransportStats`, `WssSessionStats` |
 
 ## Behavior
 
@@ -132,24 +132,36 @@ binary message per datagram, text and messages above `MAX_DATAGRAM` dropped and 
   at most about two queues of datagrams. Dropping at a full queue instead would let the
   flooding session, which is always first at freed room, starve the others.
 - **Lifecycle.** A close frame or end of stream (peer close), a read or write error, no
-  frame for `read_idle` (35 s; pongs count) or `WssSession::close` / dropping the transport
+  datagram, ping or pong for `read_idle` (35 s; the messages a session drops, text and
+  oversized, do not restart it) or `WssSession::close` / dropping the transport
   (local close) ends a session; except after an error it then tries a close frame for at
-  most 1 s. Pings go out every `ping_interval` (10 s; `None` sends none). Dropping the
-  `WssSession` handle does not close it. `max_sessions` (4096) bounds the open sessions:
+  most 1 s. `WssSession::is_closed` tells a closed session. Pings go out every
+  `ping_interval` (10 s; `None` sends none). Dropping the `WssSession` handle does not close it. `max_sessions` (4096) bounds the open sessions:
   `accept` beyond it fails with `ConnectionRefused` before any task starts, and after the
   transport is dropped with `BrokenPipe`. Worst-case buffered memory is `max_sessions` x
   `queue` x `MAX_DATAGRAM` plus `inbound_queue` x `MAX_DATAGRAM` (64 GiB + 64 MiB at the
   defaults; about 1.5 GiB with WireGuard-sized datagrams).
+- **Unauthenticated sessions.** The crate cannot verify WireGuard authentication: any
+  datagram of valid size goes to the engine, and a client that answers the pings (or
+  sends datagrams the engine rejects) keeps its session and one of the `max_sessions`
+  for as long as it likes. Where the upgrade is not authenticated, such clients can hold
+  all of them. The control is the embedder's: authenticate the upgrade before `accept`
+  (a token, a client certificate), and keep the `WssSession` handles. Every received
+  datagram carries the session's address (`WssSession::addr`) as its `Path`, and a peer
+  that authenticated on a session has that address as its endpoint, so the embedder can
+  `close` the sessions whose address is no peer's endpoint some time after their accept
+  (and forget the handles that report `is_closed`). `max_sessions` can be lowered to the
+  number of peers expected.
 - **Counters.** `WssServerTransportStats`: active, accepted, refused (limit, closed),
   closed by reason (idle, error, peer, local), rx/tx datagrams and bytes, dropped text,
   oversized and queue-full, `sent_to_closed`; `WssSessionStats` per session (rx/tx,
   drops).
 - **Tests.** `crates/nsplane-wss/src/accept/tests.rs`: a `WssDialer` link against the
   transport over loopback `ws://`, and sessions over in-memory streams (distinct
-  addresses, sends to closed sessions, queue full, read idle and pings, dropped messages,
-  queued datagrams written together, a flooding
-  session taking turns, the session limit and dropping the transport). `nsplane-e2e` `wss_server` runs engines on
-  `WssDialer`s against one engine on the transport: several nodes on distinct session
+  addresses, sends to closed sessions, queue full, read idle and pings, dropped messages
+  (which do not keep a session open), queued datagrams written together, a flooding
+  session taking turns, the session limit and dropping the transport). `nsplane-e2e`
+  `wss_server` runs engines on `WssDialer`s against one engine on the transport: several nodes on distinct session
   addresses, a server-side close and redial moving the endpoint, the transport next to a
   `UdpTransport`, no endpoint takeover by garbage or an unknown key on another session,
   and a session that stops reading without holding up the others.

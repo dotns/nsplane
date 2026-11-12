@@ -84,7 +84,9 @@
 //!   datagram on the new session moves its path.
 //! - **Limits**: a bounded queue per session (a full one fails the send at once), one
 //!   shared inbound queue that pushes back on the sessions' readers, keepalive pings, a read
-//!   idle, and at most [`WssServerConfig::max_sessions`] sessions.
+//!   idle, and at most [`WssServerConfig::max_sessions`] sessions. The transport does not
+//!   authenticate: who may hold a session is the embedder's decision, at the upgrade and
+//!   with [`WssSession::close`] (see [`WssServerTransport`]).
 //! - **Writes**: both sides write the datagrams that are queued together (at most 64) with
 //!   one flush, in order, and never wait for more: a datagram alone leaves at once.
 //!
