@@ -45,7 +45,7 @@ impl UdpTransport {
         };
         let transmit = Transmit {
             destination: out.destination,
-            ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
+            ecn: codepoint(to.ecn),
             contents,
             segment_size,
             src_ip: None,
@@ -70,7 +70,7 @@ impl UdpTransport {
         };
         let transmit = Transmit {
             destination: out.destination,
-            ecn: EcnCodepoint::from_bits(to.ecn.to_bits()),
+            ecn: codepoint(to.ecn),
             contents,
             segment_size,
             src_ip: None,
@@ -146,7 +146,7 @@ impl UdpTransport {
         }
         let transmit = Transmit {
             destination,
-            ecn: EcnCodepoint::from_bits(ecn.to_bits()),
+            ecn: codepoint(ecn),
             contents: &train,
             segment_size: run.first().map(|(_, datagram)| datagram.len()),
             src_ip: None,
@@ -221,4 +221,13 @@ pub(super) async fn write_io<R>(
             result => return result,
         }
     }
+}
+
+/// The mark `quinn-udp` sets on a datagram sent with `ecn`. Windows refuses a send marked
+/// CE (`WSAEINVAL`), so there CE leaves as ECT(0): the datagram arrives, without the
+/// congestion mark.
+fn codepoint(ecn: Ecn) -> Option<EcnCodepoint> {
+    #[cfg(windows)]
+    let ecn = if ecn == Ecn::Ce { Ecn::Ect0 } else { ecn };
+    EcnCodepoint::from_bits(ecn.to_bits())
 }

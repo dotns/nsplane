@@ -188,6 +188,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one never delivered.
 - nsplane-packet: a `GSO_UDP_L4` super-packet whose IP version is neither 4 nor 6 is refused
   instead of segmented as IPv4.
+- `UdpTransport` on Windows sends a datagram marked CE as ECT(0); the send failed with
+  `WSAEINVAL` and the datagram was lost.
 
 ## [0.22.2] - 2026-11-10
 

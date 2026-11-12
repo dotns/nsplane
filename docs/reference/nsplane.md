@@ -430,6 +430,9 @@ across the two, and neither family waits behind a backlog of the other. Other pl
 the one dual-stack socket, and where IPv6 is unavailable the fallback to one `0.0.0.0:port`
 socket is unchanged.
 
+Windows refuses a send marked CE (`WSAEINVAL`, measured on Windows 11), so there a datagram
+whose path says `Ecn::Ce` leaves marked ECT(0).
+
 On macOS a dual-stack socket owns the IPv4 side once it is bound, but its bind succeeds while
 another socket already holds `0.0.0.0:port`, and that socket keeps every IPv4 datagram
 (measured on macOS 26). So outside Linux and Windows the port is probed for IPv4 first and a
