@@ -430,6 +430,13 @@ across the two, and neither family waits behind a backlog of the other. Other pl
 the one dual-stack socket, and where IPv6 is unavailable the fallback to one `0.0.0.0:port`
 socket is unchanged.
 
+On macOS a dual-stack socket owns the IPv4 side once it is bound, but its bind succeeds while
+another socket already holds `0.0.0.0:port`, and that socket keeps every IPv4 datagram
+(measured on macOS 26). So outside Linux and Windows the port is probed for IPv4 first and a
+taken one fails with `AddrInUse`; for port 0 a port free for IPv4 is chosen. The probe socket
+is closed before the dual-stack bind, so a bind of the IPv4 port by someone else in between
+is not seen.
+
 What two sockets do not prevent, measured on Windows 11 (build 26100) against a transport on
 `[::]:port`, with the second socket bound by .NET with and without `SO_REUSEADDR`:
 

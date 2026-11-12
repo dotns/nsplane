@@ -117,6 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same port, so nothing else can bind `0.0.0.0:port` and take the IPv4 datagrams. A
   port whose IPv4 side is taken fails with `AddrInUse` (UAPI `listen_port=`: errno 98).
   Arrival order is kept within an address family, not across the two.
+- `UdpTransport` on macOS fails a bind of `[::]:port` with `AddrInUse` when another socket
+  holds `0.0.0.0:port`; the bind used to succeed and receive no IPv4 datagram.
 - `pump` offers a batch until it is empty, and a sink that reports a batch delivered and
   takes nothing loses the front packet.
 - `Splitter::send_batch_spent`: a sink that takes nothing out of its run loses the front

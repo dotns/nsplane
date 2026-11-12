@@ -23,13 +23,55 @@ pub(super) fn target(local: SocketAddr, addr: SocketAddr) -> io::Result<SocketAd
     }
 }
 
-/// Creates a dual-stack IPv6 socket bound to `addr`.
-#[cfg(not(windows))]
+/// Creates a dual-stack IPv6 socket bound to `addr`. Linux refuses the bind while another
+/// socket holds the port for IPv4.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn bind_dual_stack(addr: SocketAddr) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_only_v6(false)?;
     socket.bind(&addr.into())?;
     Ok(socket)
+}
+
+/// Creates a dual-stack IPv6 socket bound to `addr`.
+///
+/// macOS and the BSDs accept the bind while another socket holds the port for IPv4, and
+/// deliver the IPv4 datagrams to that socket only, so the port is first probed for IPv4
+/// ([`free_for_ipv4`]).
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+pub(super) fn bind_dual_stack(addr: SocketAddr) -> io::Result<Socket> {
+    let mut tries = 0;
+    loop {
+        let chosen = SocketAddr::new(addr.ip(), free_for_ipv4(addr.port())?);
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?;
+        match socket.bind(&chosen.into()) {
+            // A port chosen for being free for IPv4 is taken for IPv6: another one.
+            Err(e)
+                if addr.port() == 0
+                    && tries < PAIR_TRIES
+                    && e.kind() == io::ErrorKind::AddrInUse =>
+            {
+                tries += 1;
+            }
+            bound => return bound.map(|()| socket),
+        }
+    }
+}
+
+/// A port no socket holds for IPv4: `port`, or for 0 one the OS chose. The probe socket is
+/// closed again, since the dual-stack socket bound next owns the IPv4 side once it is bound.
+/// [`io::ErrorKind::AddrInUse`] if `port` is taken; a host without IPv4 passes.
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+fn free_for_ipv4(port: u16) -> io::Result<u16> {
+    match bind_socket((std::net::Ipv4Addr::UNSPECIFIED, port).into()) {
+        Ok(probe) => Ok(probe
+            .local_addr()?
+            .as_socket()
+            .map_or(port, |addr| addr.port())),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(e),
+        Err(_) => Ok(port),
+    }
 }
 
 /// Binds the two sockets that stand for `[::]:port` where a dual-stack socket does not own
@@ -68,8 +110,9 @@ pub(super) fn bind_pair(port: u16) -> io::Result<(Socket, Option<Socket>)> {
     }
 }
 
-/// How many more ephemeral ports [`bind_pair`] tries after one that is taken for IPv4.
-#[cfg(any(windows, test))]
+/// How many more ephemeral ports a bind of `[::]:0` tries after one that is taken for the
+/// other address family.
+#[cfg(any(windows, test, not(any(target_os = "linux", target_os = "android"))))]
 const PAIR_TRIES: usize = 16;
 
 /// Creates an IPv6-only socket bound to `[::]:port`.
