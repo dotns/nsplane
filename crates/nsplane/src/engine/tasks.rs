@@ -25,6 +25,37 @@ pub(super) async fn running(suspended: &mut watch::Receiver<bool>) -> bool {
     suspended.wait_for(|suspended| !suspended).await.is_ok()
 }
 
+/// The wait after an I/O error that is not a close, so an error that stays does not spin:
+/// 1 ms doubling up to 64 ms for errors in a row.
+#[derive(Debug, Default)]
+struct ErrorBackoff {
+    /// Errors in a row.
+    errors: u32,
+}
+
+impl ErrorBackoff {
+    /// A call succeeded.
+    const fn reset(&mut self) {
+        self.errors = 0;
+    }
+
+    /// Logs the error `e` of a call to the local side: at warn for the first error in a
+    /// row, at debug for the ones behind it.
+    fn log(&self, message: &'static str, e: &io::Error) {
+        if self.errors == 0 {
+            tracing::warn!(message, error = ?e);
+        } else {
+            tracing::debug!(message, error = ?e);
+        }
+    }
+
+    /// A call failed: waits.
+    async fn wait(&mut self) {
+        tokio::time::sleep(Duration::from_millis(1 << self.errors.min(6))).await;
+        self.errors = self.errors.saturating_add(1);
+    }
+}
+
 /// Forwards every change of the source's MTU watch to the owner until the sender is dropped.
 /// Changes while suspended collapse into the latest value, forwarded after resuming.
 pub(super) async fn watch_mtu(
@@ -113,7 +144,8 @@ impl Drop for Reading {
 /// a read takes are counted before a barrier can read the count. Before each read, hands the transmitted buffers queued in `recycled` to the source
 /// ([`PacketSource::recycle`]), untagged and unmarked, and drops what it leaves. Sets
 /// `declined` when the source takes none of the first buffers, so that later ones go to the
-/// core's pool instead.
+/// core's pool instead. After an error other than the close it waits before the next read
+/// ([`ErrorBackoff`]).
 pub(super) async fn read_source<Src: PacketSource>(
     mut source: Src,
     local: BatchSender<PacketBuf>,
@@ -130,6 +162,7 @@ pub(super) async fn read_source<Src: PacketSource>(
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
     let mut bufs = Vec::new();
     let mut offered = false;
+    let mut backoff = ErrorBackoff::default();
     while running(&mut suspended).await {
         if !recycled.is_empty() {
             recycled.take_all(&mut bufs);
@@ -167,17 +200,22 @@ pub(super) async fn read_source<Src: PacketSource>(
             return;
         }
         match result {
-            Ok(()) => {}
+            Ok(()) => backoff.reset(),
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Packet source closed");
                 return;
             }
-            Err(e) => tracing::warn!(message = "Packet source error", error = ?e),
+            Err(e) => {
+                backoff.log("Packet source error", &e);
+                backoff.wait().await;
+            }
         }
     }
 }
 
 /// Delivers decrypted packets to the sink in batches of what is queued, until it closes.
+/// After an error other than the close it waits before the next delivery
+/// ([`ErrorBackoff`]).
 pub(super) async fn write_sink<Snk: PacketSink>(
     sink: Arc<Snk>,
     mut deliver: mpsc::Receiver<(PeerId, PacketBuf)>,
@@ -185,6 +223,7 @@ pub(super) async fn write_sink<Snk: PacketSink>(
     mut suspended: watch::Receiver<bool>,
 ) {
     let mut packets = VecDeque::with_capacity(MAX_BATCH);
+    let mut backoff = ErrorBackoff::default();
     while let Some(first) = deliver.recv().await {
         packets.push_back(first);
         while packets.len() < MAX_BATCH {
@@ -197,12 +236,18 @@ pub(super) async fn write_sink<Snk: PacketSink>(
         }
         while !packets.is_empty() {
             match sink.send_batch(&mut packets).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    backoff.reset();
+                    break;
+                }
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                     tracing::debug!("Packet sink closed");
                     return;
                 }
-                Err(e) => tracing::warn!(message = "Packet sink error", error = ?e),
+                Err(e) => {
+                    backoff.log("Packet sink error", &e);
+                    backoff.wait().await;
+                }
             }
         }
         // Done with the batch: the owner may deliver itself once nothing else is queued.
@@ -211,8 +256,8 @@ pub(super) async fn write_sink<Snk: PacketSink>(
 }
 
 /// Receives batches of datagrams into the owner's queue until the transport closes, counting
-/// them in `traffic`. After an error other than the close it waits before the next receive,
-/// 1 ms doubling up to 64 ms for errors in a row, so an error that stays does not spin.
+/// them in `traffic`. After an error other than the close it waits before the next receive
+/// ([`ErrorBackoff`]).
 pub(super) async fn receive<T: Transport>(
     transport: Arc<T>,
     datagrams: BatchSender<Datagram>,
@@ -221,8 +266,7 @@ pub(super) async fn receive<T: Transport>(
 ) {
     let mut buf = PacketBuf::with_capacity(MAX_DATAGRAM);
     let mut received = VecDeque::with_capacity(MAX_BATCH);
-    // Errors in a row.
-    let mut errors = 0_u32;
+    let mut backoff = ErrorBackoff::default();
     while running(&mut suspended).await {
         let result = transport.recv_batch(&mut buf, &mut received).await;
         if !received.is_empty() {
@@ -236,15 +280,14 @@ pub(super) async fn receive<T: Transport>(
             return;
         }
         match result {
-            Ok(()) => errors = 0,
+            Ok(()) => backoff.reset(),
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 tracing::debug!("Transport closed for receiving");
                 return;
             }
             Err(e) => {
                 tracing::debug!(message = "Transport receive error", error = ?e);
-                tokio::time::sleep(Duration::from_millis(1 << errors.min(6))).await;
-                errors += 1;
+                backoff.wait().await;
             }
         }
     }

@@ -2293,3 +2293,107 @@ async fn swap_sink_delivers_again_after_its_sink_is_gone() {
     assert_eq!(swap.dropped(), 3);
     assert_eq!(b.drops(DROP_SINK_CLOSED).await, 0);
 }
+
+/// A source whose reads fail at once while `failing` is set, counted in `reads`.
+struct Flaky {
+    inner: ChannelSource,
+    failing: Arc<AtomicBool>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl PacketSource for Flaky {
+    async fn recv(&mut self) -> io::Result<PacketBuf> {
+        if self.failing.load(Ordering::Relaxed) {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other("device not ready"));
+        }
+        self.inner.recv().await
+    }
+
+    fn mtu(&self) -> watch::Receiver<u16> {
+        self.inner.mtu()
+    }
+}
+
+/// A source error that stays is retried at a bounded rate, not in a busy loop, and the
+/// source task goes on once it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasting_source_errors_back_off() {
+    let (ta, tb) = link(64);
+    let failing = Arc::new(AtomicBool::new(true));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let options = Options::default();
+    let mut a = node_with(
+        1,
+        IP_A,
+        addr_a(),
+        TransportId::new(1),
+        ta,
+        &options,
+        |inner| Flaky {
+            inner,
+            failing: Arc::clone(&failing),
+            reads: Arc::clone(&reads),
+        },
+    );
+    let mut b = node(2, IP_B, addr_b(), TransportId::new(2), tb, &options);
+    introduce(&a, &b).await;
+
+    sleep(QUIET).await;
+    let failed = reads.load(Ordering::Relaxed);
+    assert!((2..100).contains(&failed), "{failed} reads failed");
+
+    failing.store(false, Ordering::Relaxed);
+    exchange(&mut a, &mut b).await;
+}
+
+/// A sink whose sends fail at once while `failing` is set, counted in `sends`.
+struct Refusing {
+    inner: ChannelSink,
+    failing: Arc<AtomicBool>,
+    sends: Arc<AtomicUsize>,
+}
+
+impl PacketSink for Refusing {
+    async fn send(&self, packet: PacketBuf, from: PeerId) -> io::Result<()> {
+        if self.failing.load(Ordering::Relaxed) {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other("device not ready"));
+        }
+        self.inner.send(packet, from).await
+    }
+}
+
+/// A sink error that stays is retried at a bounded rate, and the sink task goes on once it
+/// is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasting_sink_errors_back_off() {
+    const PACKETS: usize = 60;
+    let failing = Arc::new(AtomicBool::new(false));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (mut a, mut b) = nodes_with_sink(|inner| Refusing {
+        inner,
+        failing: Arc::clone(&failing),
+        sends: Arc::clone(&sends),
+    });
+    introduce(&a, &b).await;
+    exchange(&mut a, &mut b).await;
+
+    failing.store(true, Ordering::Relaxed);
+    for i in 0..PACKETS {
+        let packet = PacketBuf::from_packet(&numbered(i));
+        a.local.send(packet).await.unwrap();
+    }
+    sleep(QUIET).await;
+    let failed = sends.load(Ordering::Relaxed);
+    assert!((2..PACKETS / 2).contains(&failed), "{failed} sends failed");
+
+    // The packets not tried yet are delivered, in order, then the next ones.
+    failing.store(false, Ordering::Relaxed);
+    a.send(IP_B, b"last").await;
+    let mut delivered = 0;
+    while b.expect_delivery().await.1 != ipv4(IP_A, IP_B, b"last") {
+        delivered += 1;
+    }
+    assert!(delivered > 0 && delivered < PACKETS);
+}
