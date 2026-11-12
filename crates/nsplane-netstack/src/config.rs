@@ -257,6 +257,26 @@ pub struct NetStackConfig {
     /// Default `None`: no limit beyond the [`listener_pool`](Self::listener_pool) and the
     /// accept queue.
     pub max_connections: Option<usize>,
+    /// Most sockets of the [`listener_pool`](Self::listener_pool) one source may hold mid
+    /// handshake (in SYN-RECEIVED) at once. A source is the ingress label of the SYN where
+    /// it has one (see [`NetStackHandle::revoke_label`](crate::NetStackHandle::revoke_label))
+    /// and its source address otherwise.
+    ///
+    /// The pool is shared by all sources, and a handshake holds its socket until it
+    /// completes, is reset, or its peer stayed silent for 60 s: without a share, one
+    /// source that sends SYNs and never completes them holds the whole pool, and every
+    /// other SYN is refused meanwhile. With it, a bare SYN of a source at its share is
+    /// answered with a RST and counted in
+    /// [`syn_refused_source`](crate::NetStackStats::syn_refused_source). A value of 0 is
+    /// taken as 1. Half the pool (16 at the default) leaves room for a second source
+    /// whatever the first does; a stack with one legitimate source gains nothing from a
+    /// share and loses the bursts above it.
+    ///
+    /// Not applied under [`Admission::Decide`], where the application decides each
+    /// connection with its source in hand ([`PendingFlow`](crate::PendingFlow)).
+    ///
+    /// Default `None`: no share, the pool alone bounds the handshakes.
+    pub listener_pool_per_source: Option<usize>,
 }
 
 /// Configuration of transparent mode, see [`NetStackConfig::transparent`].
@@ -395,6 +415,7 @@ impl Default for NetStackConfig {
             admission: Admission::Immediate,
             max_revoked_labels: 65_536,
             max_connections: None,
+            listener_pool_per_source: None,
         }
     }
 }
@@ -426,6 +447,7 @@ pub(crate) struct Settings {
     /// The lower of [`NetStackConfig::max_connections`] and
     /// [`TransparentConfig::max_connections`].
     pub(crate) max_connections: Option<usize>,
+    pub(crate) listener_pool_per_source: Option<usize>,
 }
 
 /// The RTO bounds every TCP socket gets, see [`NetStackConfig::tcp_min_rto`] and
@@ -591,6 +613,7 @@ impl Settings {
             },
             max_revoked_labels: config.max_revoked_labels,
             max_connections,
+            listener_pool_per_source: config.listener_pool_per_source.map(|share| share.max(1)),
         }
     }
 

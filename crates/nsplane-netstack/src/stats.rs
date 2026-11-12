@@ -37,6 +37,10 @@ pub struct NetStackStats {
     pub unsupported: u64,
     /// Bare SYNs beyond the listener pool; the stack answers them with RST.
     pub syn_refused: u64,
+    /// Bare SYNs of a source that held its share of the listener pool
+    /// ([`NetStackConfig::listener_pool_per_source`](crate::NetStackConfig::listener_pool_per_source));
+    /// the stack answers them with RST. Always 0 without a share.
+    pub syn_refused_source: u64,
     /// Accepted TCP connections dropped because `incoming_tcp` was full or not consumed
     /// (without `accept_backpressure`), or gone.
     pub tcp_not_accepted: u64,
@@ -142,6 +146,7 @@ pub(crate) struct Counters {
     pub(crate) no_address: AtomicU64,
     pub(crate) unsupported: AtomicU64,
     pub(crate) syn_refused: AtomicU64,
+    pub(crate) syn_refused_source: AtomicU64,
     pub(crate) tcp_not_accepted: AtomicU64,
     pub(crate) syn_deferred: AtomicU64,
     pub(crate) handshake_failed: AtomicU64,
@@ -186,6 +191,7 @@ impl Counters {
             no_address: get(&self.no_address),
             unsupported: get(&self.unsupported),
             syn_refused: get(&self.syn_refused),
+            syn_refused_source: get(&self.syn_refused_source),
             tcp_not_accepted: get(&self.tcp_not_accepted),
             syn_deferred: get(&self.syn_deferred),
             handshake_failed: get(&self.handshake_failed),

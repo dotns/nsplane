@@ -23,7 +23,8 @@ use crate::stats::{self};
 use crate::throttle::LogLimit;
 use crate::udp::{self, Datagram, UdpFlow, UdpReply};
 
-use super::wire::{tcp_challenges, tcp_dst_port, tcp_is_syn, tcp_tuple};
+use super::labels::SynSource;
+use super::wire::{tcp_challenges, tcp_dst_port, tcp_is_syn, tcp_reset, tcp_tuple};
 use super::{Driver, MAX_INJECT_PER_ITER};
 
 /// How an ingress packet is handled.
@@ -138,6 +139,9 @@ impl Driver {
                     let Some(packet) = self.screen_syn(packet) else {
                         return;
                     };
+                    if self.at_source_share(&packet) {
+                        return self.refuse_source(&packet);
+                    }
                     let packet = if self.settings.transparent.is_some()
                         || self.pending.is_some()
                         || self.settings.max_connections.is_some()
@@ -266,6 +270,41 @@ impl Driver {
             self.emit(&key, FlowEventReason::Admitted);
         }
         Some(packet)
+    }
+
+    /// Whether the source of the new bare SYN `packet` holds its
+    /// `listener_pool_per_source` sockets of the listener pool: its handshakes in
+    /// SYN-RECEIVED and its SYNs of this turn. Never under `Admission::Decide`, and not
+    /// for a SYN of a tuple the stack holds.
+    fn at_source_share(&self, packet: &PacketBuf) -> bool {
+        let Some(share) = self.settings.listener_pool_per_source else {
+            return false;
+        };
+        let Some((remote, local)) = tcp_tuple(packet.as_packet()) else {
+            return false;
+        };
+        if self.pending.is_some() || self.owners.has_tcp(local, remote) {
+            return false;
+        }
+        let source = SynSource::of(packet.tag(), remote.ip());
+        let handshakes = self
+            .inbound
+            .iter()
+            .filter(|&(&handle, inbound)| {
+                let label = self.labels.socket_label(inbound.tuple, handle);
+                SynSource::of(label, inbound.tuple.0.ip()) == source
+            })
+            .count();
+        handshakes + self.labels.turn_syns(source) >= share
+    }
+
+    /// Answers the bare SYN `packet` with RST for `listener_pool_per_source`.
+    fn refuse_source(&mut self, packet: &PacketBuf) {
+        stats::add(&self.stats.syn_refused_source, 1);
+        if let Some(mut reset) = tcp_reset(packet.as_packet()) {
+            reset.set_tag(packet.tag());
+            self.push_reply(reset);
+        }
     }
 
     /// Whether the stack holds `max_connections` TCP connections, counting the connections

@@ -11,7 +11,7 @@ input, per-flow revocation, optional reassembly, and an ownership query for loca
 
 | Part | Entry points | Supporting types |
 |---|---|---|
-| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`, `max_connections`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
+| main | `NetStack` (`new`, `split`), `NetStackHandle` (`incoming_tcp`, `incoming_udp`, `incoming_pending`, `flow_events`, `connect_tcp`, `connect_tcp_from`, `bind_udp`, `connect_udp`, `connect_udp_from`, `discard_fragments`, `revoke_label`, `stats`, `retired_drops`, `owns`) | `Ownership`, `NetStackConfig` (`udp_allow_fragmentation`, `reassembly`, `max_revoked_labels`, `max_connections`, `listener_pool_per_source`), `ReassemblyConfig` (re-export), `NetStackSource` (`tcp_egress_drained`), `NetStackSink`, `TcpConnection` (`AsyncRead` + `AsyncWrite`, `unacked`, `last_ack`, `abort`, `control`, `ingress_label`), `UdpFlow` (`ingress_label`), `UdpReply`, `UdpSocket` (`send`, `peer_addr` for a connected one; each with `control`), `FlowControl` (`revoke`, `is_revoked`, `delivery`, `bind_context`, `context`), `RetirementReceipt` (`outcome`, `wait`), `RetirementOutcome` (`Retired`, `Failed`, `Unknown`), `DeliveryReceipt` (`outcome`, `wait`), `DeliveryOutcome` (`Delivered`, `NotDelivered`), `Undelivered` (`Rejected`, `TimedOut`, `ConnectionLimit`, `NoListener`, `HandshakeFailed`, `AcceptQueueFull`, `AcceptQueueGone`, `FlowLimit`, `Revoked`, `Stopped`), `FlowContext` (`domain`, `instance`), `NetStackStats`, `DEFAULT_MTU`, `MIN_MTU` |
 | admission | `NetStackConfig::admission`, `NetStackHandle::incoming_pending` | `Admission` (`Immediate`, `Decide { timeout, max_pending }`), `PendingFlow` (`protocol`, `peer_addr`, `local_addr`, `ingress_label`, `control`, `accept`, `reject`), `PendingProtocol` (`Tcp`, `Udp`) |
 | transparent mode | `NetStackConfig::transparent`, `NetStackHandle::flow_events` | `TransparentConfig` (`prefixes`, `max_connections`, `events`), `FlowEventsConfig` (`capacity`, `rate`, `burst`), `FlowEvent` (`at`, `protocol`, `src`, `dst`, `allow`, `reason`), `FlowEventReason` (`Admitted`, `Hook`, `Timeout`, `TableFull`, `ConnectionLimit`, `Prefix`) |
 
@@ -141,6 +141,18 @@ stack with none of these sets no timer and takes no turn until it is woken.
   listener pool and is counted in `handshake_failed`. smoltcp retransmits a SYN-ACK without
   an end, so a peer that went away after its SYN would hold one of the pool's sockets for
   good. The timeout is lifted when the connection is established.
+- `NetStackConfig::listener_pool_per_source` (default `None`) bounds the sockets of the
+  listener pool one source holds in SYN-RECEIVED. The source of a SYN is known when it is
+  admitted: its ingress label where the consumer tags packets, its source address
+  otherwise. The driver counts the source's handshakes in progress and its SYNs of the
+  current turn; a bare SYN of a source at its share gets a RST and is counted in
+  `syn_refused_source`, and a retransmitted SYN of a handshake in progress is not counted
+  again. Without a share one source that never completes its handshakes holds the whole
+  pool until the handshake timeout frees it, and the SYNs of every other source are refused
+  (`syn_refused`) meanwhile. The share is opt-in: with one legitimate source it only lowers
+  the burst of simultaneous handshakes the stack accepts. Under `Admission::Decide` it is
+  not applied: the application decides each connection with `PendingFlow::peer_addr` and
+  `ingress_label` in hand.
 - Listener sockets cost nothing while no handshake runs: each turn sizes the pool to the
   SYNs of its batch, a socket and its buffers are created for a SYN in the turn that takes
   it, and a socket left in `Listen` is removed by the next turn. A stack with listening
@@ -720,6 +732,7 @@ too: a `match` on it outside the crate needs a wildcard arm.
 | Later-fragment ownership | on with `NetStackConfig::reassembly`; `owns` reports a datagram's later fragments as its first fragment's `Flow` | off without reassembly (fragments are `None`) | none without reassembly; with it only fragment classification in `owns` takes the memory's lock |
 | Transparent termination | `NetStackConfig::transparent = Some(transparent)` with `transparent.prefixes` assigned on `TransparentConfig::default()` | `None`: the stack terminates its own addresses only | one `Option` check per bare SYN, new UDP flow and packet to a foreign address |
 | Per-flow admission | `NetStackConfig::admission = Admission::Decide { timeout, max_pending }` (every stack), decisions and controls on `NetStackHandle::incoming_pending` | `Admission::Immediate` | none: one `Option` check per bare SYN |
+| Listener pool share | `NetStackConfig::listener_pool_per_source = Some(n)`, for example half of `listener_pool` | `None`: one source may hold the whole pool | one `Option` check per bare SYN |
 | TCP connection limit | `NetStackConfig::max_connections = Some(n)` on any stack, `TransparentConfig::max_connections = Some(n)` in transparent mode; the lower one applies | `None`: listener pool and accept queue only | one `Option` check per bare SYN |
 | Flow events | `TransparentConfig::events = Some(FlowEventsConfig::default())` (1024 buffered, 1000/s, burst 1000), events on `NetStackHandle::flow_events` | `None`: no channel | one `Option` check on the admission and rejection paths |
 | Ingress labels | tag packets before `NetStackSink::send` (`PacketBuf::set_tag`); revoke with `NetStackHandle::revoke_label`; `NetStackConfig::max_revoked_labels` bounds the tombstones | unlabeled: every lifetime has the label `None` | one tag check per ingress packet, one compare per flow datagram, one table entry per inbound connection |
@@ -728,7 +741,7 @@ too: a `match` on it outside the crate needs a wildcard arm.
 ## Errors and drop reasons
 
 Everything the stack discards is counted per reason in `NetStackStats` (malformed, foreign
-and unsupported packets, refused and deferred SYNs, connections and flows not accepted, full
+and unsupported packets, refused and deferred SYNs (`syn_refused`, `syn_refused_source`, `syn_deferred`), connections and flows not accepted, full
 UDP queues, the flow limit, egress over the backlog, ignored ICMP, reassembly timeouts and
 overflows, failed inbound handshakes (`handshake_failed`), the admission outcome: `accepted`
 and `rejected_hook`, `rejected_timeout`, `rejected_table_full`, with a connection limit
@@ -755,6 +768,9 @@ revoked flow) and `BrokenPipe` (the stack stopped).
   for at most `timeout` (at most one day); a held flow queues one datagram. Lifetimes with
   an open delivery: at most twice those the pending table, listener pool, waiting
   connections and accept queues hold.
+- Inbound handshakes: `listener_pool` sockets (32 by default) per destination port and in
+  total, of which one source holds at most `listener_pool_per_source` when set; a handshake
+  without a segment from its peer for 60 s is reset.
 - TCP connections: `NetStackConfig::max_connections` and, in transparent mode,
   `TransparentConfig::max_connections`; without them the listener pool and the accept queue
   only. Each connection holds up to `tcp_rx_buffer + tcp_tx_buffer + 2 * stream_buffer`

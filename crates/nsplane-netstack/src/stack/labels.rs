@@ -129,6 +129,20 @@ struct TcpEntry {
     socket: Option<SocketHandle>,
 }
 
+/// Whom a handshake counts against in the listener pool: the ingress label of its SYN, or
+/// without one the SYN's source address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SynSource {
+    Label(NonZeroU64),
+    Addr(std::net::IpAddr),
+}
+
+impl SynSource {
+    pub(super) fn of(label: Option<NonZeroU64>, remote: std::net::IpAddr) -> Self {
+        label.map_or(Self::Addr(remote), Self::Label)
+    }
+}
+
 /// The driver's label state.
 #[derive(Debug)]
 pub(super) struct Labels {
@@ -262,6 +276,17 @@ impl Labels {
         }
         self.insert(tuple, label, None);
         self.syns.push(tuple);
+    }
+
+    /// How many of the SYNs recorded in this turn came from `source`.
+    pub(super) fn turn_syns(&self, source: SynSource) -> usize {
+        self.syns
+            .iter()
+            .filter(|&tuple| {
+                let label = self.tcp.get(tuple).and_then(|entry| entry.label);
+                SynSource::of(label, tuple.0.ip()) == source
+            })
+            .count()
     }
 
     /// Binds the entry of `tuple` to the listener socket that took its SYN.
