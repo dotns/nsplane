@@ -119,11 +119,15 @@ Without a failing run first:
 - Item 1: `wintun::tests::first_existing_*` (also run on Linux) and
   `windows::tests::system_directory_is_absolute` (wine).
 
+Run on a Windows 11 host at integration (`tests/windows_tun.rs`, cross-built for
+`x86_64-pc-windows-gnu`, Wintun 0.14.1 from the `wintun-bindings` package): loading an
+unpinned `wintun.dll` beside the executable with a datagram each way through the adapter, a
+`netsh` MTU change reaching the watch, the full send ring (one drop counted after about
+126 000 packets of 1400 bytes, every send `Ok`), and `NotFound` for a `wintun.dll` that is
+only in the current directory and on `PATH`. The crate's 61 unit tests pass there too.
+
 Only compiled, never run:
 
-- Windows, for lack of a Wintun driver under wine: loading an unpinned `wintun.dll` that
-  exists, the MTU watcher thread against a real adapter (its loop is tested with a fake
-  query), and the full-ring path through a real session (its error mapping is tested).
 - macOS and iOS, for lack of a host: the utun detection and framing of `TunSlot` and the
   three-part `readv` of the plain read (`cargo-zigbuild clippy` for `aarch64-apple-darwin`
   only).

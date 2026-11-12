@@ -186,10 +186,11 @@ callbacks (iOS `NEPacketTunnelFlow`); it is platform-independent and returns a
   the Wintun loader), each with SAFETY comments.
 - Windows needs `wintun.dll` next to the executable (or in the system directory; the DLL
   search path is not used) and an elevated process. The pure Windows logic runs in Linux unit tests and the pin-before-load path under
-  wine. Adapter creation, the exclusive refusal, orphan replacement, the MTU set and read-back,
-  the driver version query, the Wintun buffer recycling, loading an unpinned `wintun.dll`
-  that exists, the MTU watcher against a real adapter and the full send ring have no
-  automated test; they need a Windows host.
+  wine. `tests/windows_tun.rs` holds the tests for a Windows host, ignored by default: a round
+  trip through a real adapter with an unpinned `wintun.dll`, the MTU watcher, the full send
+  ring, and a `wintun.dll` that only the DLL search order would find. The exclusive refusal,
+  orphan replacement, the MTU set and read-back, the driver version query and the Wintun
+  buffer recycling have no automated test.
 
 ## See also
 
