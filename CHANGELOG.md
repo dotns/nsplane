@@ -5,6 +5,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-18
+
+Fixes from a downstream fault check of 0.23.0 and the smoltcp fork, with the fork rebased on
+the current upstream. Breaking: `TcpConnection` reads end with `ConnectionReset` or `TimedOut`
+instead of `Ok(0)` when the stream ended without the peer's FIN (see Changed).
+
+### Changed
+
+#### Breaking
+- `TcpConnection` reads end with an error, not `Ok(0)`, when the stream ended without the
+  peer's FIN: `io::ErrorKind::ConnectionReset` after the bytes received before the peer's
+  reset, and `io::ErrorKind::TimedOut` when the 5-minute idle timeout reset the connection.
+  A protocol that frames by the end of the stream could take a reset stream for a complete
+  one. Code that treated any end of a read as a close handles the error as well:
+
+  ```rust
+  // Before
+  let n = conn.read(&mut buf).await?; // Ok(0) after a reset
+  // After
+  match conn.read(&mut buf).await {
+      Ok(0) => { /* the peer closed */ }
+      Ok(n) => { /* n bytes */ }
+      Err(e) if e.kind() == io::ErrorKind::ConnectionReset => { /* the peer reset */ }
+      Err(e) => return Err(e),
+  }
+  ```
+
+### Fixed
+- An idle timeout of a connection whose reader had paused no longer delivers the bytes
+  after the unread ones: the unread bytes were discarded and later ones moved in, so the
+  reader got a stream with a hole and then `Ok(0)`. It now gets the bytes before the
+  discarded ones, then `TimedOut`.
+- nsplane-netstack depends on smoltcp fork tag `v0.14.0-nsplane.9`, rebased on the current
+  upstream, which reports a reset by the peer (`Socket::reset_received`) and keeps the tail
+  loss probe on a lost retransmission while duplicate ACKs let new data out. A lost fast
+  retransmission was repaired by the retransmission timeout of at least one second; the
+  probe resends it about two round trips later.
+- nsplane-tun on Windows: an exclusive open right after the previous holder was killed no
+  longer fails with `AdapterExists`. The killed holder's alias stays on a `Down` interface
+  Wintun no longer opens until Wintun removes it shortly after the next call; the open waits
+  up to half a second for it before refusing.
+
 ## [0.23.0] - 2026-11-12
 
 ### Added

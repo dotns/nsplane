@@ -42,7 +42,11 @@ async fn expect_reset(mut conn: TcpConnection) -> TestResult {
         .await
         .map_err(|_| "the reset should release the connection")?;
     let mut buf = [0; 16];
-    assert_eq!(timeout(WAIT, conn.read(&mut buf)).await??, 0);
+    let error = timeout(WAIT, conn.read(&mut buf))
+        .await?
+        .err()
+        .ok_or("a read must fail after a reset")?;
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     let error = conn
         .write_all(b"late")
         .await

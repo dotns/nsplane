@@ -168,6 +168,18 @@ connection stalled for good (a TUN-to-netstack 32 MiB echo stalled in 3 of 78 ru
 with the fix). The rounding up stays: rounding down moves the advertised edge left again.
 smoltcp's tests: 709 library tests with the default features.
 
+Tag `v0.14.0-nsplane.9` (tag object `a05c861406aaf0a33c141ff62ba266507770a9a8`, commit
+`49d6dc94d778ac80c1c08655d696ed65338927ea`, branch `nsplane/upstream-c68ace4`, 2026-11-18)
+rebases the eleven patches of `.8` unchanged (range-diff) on upstream `main` `c68ace4`
+(2026-11-13: a keep-alive timer fix, SLAAC fixes nsplane does not enable) and adds two, from a
+downstream fault check of 0.23.0. `d0d1120` adds `Socket::reset_received`: a socket closed by
+a reset from the remote endpoint kept no trace of it, so a reader could not tell a reset
+from a FIN. `49d6dc9` keeps the tail loss probe armed at the time it was set while `recover`
+is set: every segment sent re-armed it, and in fast recovery each duplicate ACK lets a new
+segment out, so a lost fast retransmission waited for the retransmission timeout (at least
+1 s) instead of the probe two round trips later. smoltcp's tests: 714 library tests with the
+default features, 457 with the features nsplane uses.
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.
