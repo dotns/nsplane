@@ -17,6 +17,7 @@ The package `nsplane-examples` is not published.
 | [`tun_node`](#tun_node) | A node on a TUN device, managed with `wg` | yes |
 | [`netstack_node`](#netstack_node) | A node whose local side is a userspace TCP/IP stack | no |
 | [`netstack_bench`](#netstack_bench) | iperf-like TCP/UDP load on a netstack node, one JSON result line | no |
+| [`net_probe`](#net_probe) | Loss and reordering of a UDP path without a tunnel, one JSON result line | no |
 | [`hybrid`](#hybrid) | A TUN device and a netstack behind one engine (`Splitter`, `MergeSource`) | yes |
 | [`acl_gateway`](#acl_gateway) | A TUN node filtered by a reloadable ACL policy | yes |
 | [`translate_node`](#translate_node) | Local IPv4 to peers reached over IPv6 only (`Translator`, RFC 7915) | yes |
@@ -85,6 +86,26 @@ Flags: node flags, `--address <CIDR>` (repeatable, required), `--mtu <N>` (defau
 
 ```sh
 cargo run -p nsplane-examples --bin netstack_bench -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 client --target 10.0.0.1:5201 --mode tcp --streams 4
+```
+
+### net_probe
+
+What a UDP path between two hosts loses and reorders on its own, as the baseline a tunnel
+measurement over that path is read against. No nsplane API is used. `listen` prints one JSON
+line per run: `sent` (from the sender's end marker), `received`, `lost`, `loss` (fraction),
+`reordered` (arrived after a later datagram), `duplicates`, `loss_runs`,
+`longest_loss_run`, `span_s` and the receive buffer the kernel granted (`recv_buffer`).
+`send` prints `sent`, `send_errors`, `seconds` and `bits_per_second`.
+
+Flags: `listen --bind <IP:PORT>` with `--idle <MS>` (a run without an end marker ends after
+this long without a datagram, default 2000) and `--runs <N>` (exit after N runs, default 0:
+serve until killed); `send --to <IP:PORT>` with `--count <N>` (default 3227), `--size <BYTES>`
+(UDP payload, default 1300) and `--rate <BITS_PER_SEC>` (default 0: as fast as the socket
+takes them).
+
+```sh
+cargo run --release -p nsplane-examples --bin net_probe -- listen --bind 0.0.0.0:5300
+cargo run --release -p nsplane-examples --bin net_probe -- send --to 192.0.2.7:5300 --rate 50000000
 ```
 
 ### hybrid

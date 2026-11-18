@@ -1,6 +1,6 @@
 # 20261117-1556-cross-host-network-perf Performance tests across systems and networks
 
-- **status**: approved
+- **status**: completed
 - **createdAt**: 2026-11-17 15:56
 - **approvedAt**: 2026-11-18
 - **relatedTask**: 20261117-1556-cross-host-network-perf
@@ -199,7 +199,17 @@ filed: late transfers on held or delayed links
 (`docs/task/20261118-0001-probe-timeout-on-held-acks.md`), reordering and `loss5`
 (`docs/task/20261118-0002-reordering-tolerance.md`).
 
-Open: work items 3 (underlay probe binary), 5 (cross-host driver), 6 (TUN rows on macOS
-and Windows) and the cross-host tables of item 7. The cross-host numbers so far were taken
-by hand.
+2026-11-18, both filed tasks are done in smoltcp fork tag `v0.14.0-nsplane.11`: the
+asserted tests of `netstack_held.rs` run, `netstack_jitter.rs` (`JitterTransport`) asserts
+a reordering link, and the Shaped links table was taken again. `loss5` is unchanged and
+has a task of its own (`docs/task/20261118-1832-timeouts-under-heavy-loss.md`).
+
+2026-11-18, work items 3, 5, 6 and 7: `net_probe` (examples), `scripts/bench/cross-host.sh`
+with `just bench-cross`, and `docs/performance.md`, Across hosts and networks, with the
+macOS Wi-Fi and Windows VM tables, the Wi-Fi link with held egress (N4) and the macOS TUN
+row against wireguard-go. All criteria hold except on the Wi-Fi link with the data held
+towards the Mac, where kernel TCP on the same path is five times slower than the netstack:
+the shaping point, not the stack. `netem.sh` gained `held-data300` to show the same shaping
+on a wired link. Not done: a TUN row on Windows, since no TUN node binary exists for it
+(`docs/task/20261118-2040-windows-tun-bench-row.md`), and CPU seconds per GB across hosts.
 

@@ -253,9 +253,8 @@ tail there; 4 MiB ran without drops once the engine and stack queues held 8192 p
 
 ### Shaped links
 
-`scripts/bench/netem.sh` (`scripts/bench/README.md`, Shaped links), 2026-11-18, 0.23.0 with
-smoltcp `v0.14.0-nsplane.8`, slot 0, load 1.4-4.2, one run per cell (kernel TCP in a run
-of its own): 4 MiB from a to b
+`scripts/bench/netem.sh` (`scripts/bench/README.md`, Shaped links), 2026-11-18, 0.24.0 with
+smoltcp `v0.14.0-nsplane.11`, slot 0, load 0.5-2.4, one run per cell: 4 MiB from a to b
 through a router container that shapes with `tc netem`. "Late" opens the connection on the
 unshaped link and applies the shaping before the transfer starts. Kernel TCP is iperf3 on
 the same shaped link without a tunnel; iperf3 reports less than a second as 1 s, and its
@@ -265,36 +264,42 @@ is not done after 90 s is stalled.
 | Profile | netstack | netstack, late | kernel TCP |
 |---|---|---|---|
 | `none` | 0.01 s | 0.01 s | 1 s |
-| `delay20` | 0.62 s | 8.47 s | 1.04 s |
-| `delay100` | 2.81 s | 25.7 s | 2.2 s |
-| `jitter20` | 8.58 s | 8.78 s | 1.04 s |
-| `jitter100` | 43.43 s | 56.02 s | 2.21 s |
-| `loss1` | 0.02 s | 1.02 s | 1 s |
-| `loss5` | 3.46 s | 3.36 s | 1 s |
-| `reorder` | 1.37 s | 1.27 s | 1.01 s |
-| `rate10` | 3.98 s | 6.4 s | 3.66 s |
+| `delay20` | 0.61 s | 0.61 s | 1.04 s |
+| `delay100` | 3.21 s | 2.81 s | 2.2 s |
+| `jitter20` | 0.65 s | 0.67 s | 1.04 s |
+| `jitter100` | 3.2 s | 3.22 s | 2.21 s |
+| `loss1` | 0.02 s | 0.01 s | 1 s |
+| `loss5` | 4.4 s | 3.35 s | 1 s |
+| `reorder` | 0.13 s | 0.11 s | 1.01 s |
+| `rate10` | 3.67 s | 3.69 s | 3.61 s |
 | `burst-queue` | 0.04 s | 0.04 s | 1 s |
-| `held100` | 3.02 s | stalled (> 90 s) | 3.52 s |
-| `held1000` | 42.03 s | stalled (> 90 s) | 37.65 s |
-| `held-ack100` | 1.41 s | 70.26 s | 1.1 s |
-| `held-ack300` | 4.51 s | stalled (> 90 s) | 3.3 s |
-| `held-ack1000` | 20.02 s | stalled (> 90 s) | 10.29 s |
+| `held100` | 3.22 s | 3.02 s | 2.2 s |
+| `held1000` | 40.02 s | 39.92 s | 45.7 s |
+| `held-ack100` | 1.41 s | 1.51 s | 1.1 s |
+| `held-ack300` | 4.51 s | 4.51 s | 3.3 s |
+| `held-ack1000` | 20.02 s | 19.02 s | 10.29 s |
+| `held-data300` | 4.53 s | 4.53 s | 4.18 s |
 
-Three things stand out; the first two have a task each, the third is part of the second:
+Against smoltcp `v0.14.0-nsplane.8` (0.23.0, same script and host):
 
-- Late transfers on a held or delayed link stall or take ten times as long. The sender
-  measured a round trip of well under a millisecond first, so its tail loss probe fires
-  before any acknowledgement can arrive, and the probe is handled as a loss. On a link that
-  is slow from the start the same transfers run close to kernel TCP.
-- Jitter (`delay 20ms 2ms`, `delay 100ms 10ms`) reorders packets. The netstack takes 8 and
-  20 times as long as kernel TCP there, also from the start.
-- `loss5` takes more than three times as long as kernel TCP. The other profiles are within
-  a third of it.
+- Late transfers on a held or delayed link stalled beyond 90 s (`held100`, `held1000`,
+  `held-ack300`, `held-ack1000`) or took ten times as long (`delay20` 8.5 s, `delay100`
+  25.7 s, `held-ack100` 70 s). The sender had measured a round trip of well under a
+  millisecond, so its tail loss probe fired before any acknowledgement could arrive, and the
+  probe was handled as a loss. They now take what the same link takes from the start.
+- Jitter (`delay 20ms 2ms`, `delay 100ms 10ms`) reorders packets: `jitter20` took 8.6 s and
+  `jitter100` 43 s. Three further runs of each now: 0.62 to 0.73 s and 3.2 s.
+- `loss5` is unchanged: 0.2 to 10 s over eight runs, each second of it a retransmission
+  timeout (a lost retransmission whose one probe, or the answer to it, was lost as well).
+  Kernel TCP repairs these from its SACK scoreboard.
 
-`crates/nsplane-e2e/tests/netstack_held.rs` reproduces the first in process: the link
-(`HeldTransport`) passes a connection's first four data messages at once and then releases
-in 100 ms slots. Its two asserted tests fail within their 20 s bound and are ignored until
-the fix.
+`crates/nsplane-e2e/tests/netstack_held.rs` and `netstack_jitter.rs` assert both in process:
+a link (`HeldTransport`) that passes a connection's first four data messages at once and
+then releases in 100 ms slots, and one (`JitterTransport`) of 10 to 14 ms per message. 4 MiB
+complete with at most 6 % more full-size segments than the data needs. Their `report` tests,
+in release: acknowledgements held in 100, 300 and 1000 ms slots 1.1, 3.3 and 11 s (both
+directions held: 2.6, 7.8 and 26 s); 50 ms with up to 10 ms of jitter 1.7 to 2.1 s over six
+runs.
 
 On a Wi-Fi link (macOS 26 on 11ax, 5 GHz, to a wired Linux host, 2026-11-17 and -18,
 `netstack_bench` on both ends): TCP 205 to 441 Mbit/s from the Mac and 532 to 540 Mbit/s
@@ -304,6 +309,88 @@ back to back and, 1 s apart, p50 3.4 ms (max 7.8 ms) from the Mac and p50 8.3 ms
 61.9 ms) towards it. The raw link under the same conditions lost nothing at 10 Mbit/s paced
 and 1.5 % towards the Mac at 50 Mbit/s; a ping every second took 50 ms on average against
 2.8 ms at 20 per second.
+
+## Across hosts and networks
+
+`scripts/bench/cross-host.sh` (`scripts/bench/README.md`, Across hosts), 2026-11-18, 0.24.0
+with smoltcp `v0.14.0-nsplane.11`: `netstack_bench` in a container on the Linux bench host
+and on a second host, and `net_probe` on the same path without a tunnel, taken in the same
+run. "Up" is from the remote host to the Linux host. Median of 3 runs, slot 0, load 0.7-2.2.
+
+Criteria: no tunnel loss at a rate where the raw path loses nothing; a 4 MiB transfer within
+5 s plus 20 round trips of a shaped delay; TUN throughput at least 60 % of the reference
+implementation's in the same run.
+
+macOS 26.5 (arm64) on Wi-Fi (11ax, 5 GHz) to the wired Linux host:
+
+| Measurement | up | down |
+|---|---|---|
+| Raw UDP, 3227 x 1300 B unpaced, loss | 4.5 % | 88 % |
+| Raw UDP, paced at 10, 50 and 200 Mbit/s, loss | 0 % | 0 % |
+| Raw UDP, 200 Mbit/s paced, reordered of 38461 | 25 | 45 |
+| Tunnel TCP, 1 stream, 10 s | 412 Mbit/s | 562 Mbit/s |
+| Tunnel TCP, 4 streams, 10 s | 517 Mbit/s | 594 Mbit/s |
+| Tunnel, 4 MiB at once | 0.13 s | 0.09 s |
+| Tunnel, 64 MiB at once | 1.31 s | 0.99 s |
+| Tunnel UDP, 50 Mbit/s paced, loss | 0 % | 0 % |
+| Tunnel, 1-byte round trip, p50 / p99 | 3.0 / 4.8 ms | 3.1 / 4.8 ms |
+| Tunnel, 1-byte round trip 1 s apart, p50 / max | 3.9 / 7.3 ms | 3.6 / 4.8 ms |
+
+A ping every 50 ms took 2.8 ms on average (max 4.1 ms), one every second 26 ms (max 82 ms):
+the access point holds deliveries to an idle client. The unpaced burst is 4 MiB within about
+30 ms; what it loses is the path's queue and not a loss rate of the link, which loses
+nothing at 200 Mbit/s paced.
+
+Windows 11 (x86-64, a VM on the bench host, behind its NAT, so the raw path is probed
+towards the Linux host only):
+
+| Measurement | up | down |
+|---|---|---|
+| Raw UDP, unpaced and paced at 10, 50 and 200 Mbit/s, loss | 0 % | - |
+| Tunnel TCP, 1 stream, 10 s | 1171 Mbit/s | 611 Mbit/s |
+| Tunnel TCP, 4 streams, 10 s | 1550 Mbit/s | 680 Mbit/s |
+| Tunnel, 4 MiB at once | 0.05 s | 0.12 s |
+| Tunnel, 64 MiB at once | 0.51 s | 1.33 s |
+| Tunnel UDP, 50 Mbit/s paced, loss | 0 % | 0 % |
+| Tunnel, 1-byte round trip, p50 / p99 | 0.8 / 1.3 ms | 0.7 / 1.2 ms |
+| Tunnel, 1-byte round trip 1 s apart, p50 / max | 1.7 / 2.5 ms | 1.7 / 2.4 ms |
+
+The VM's network is virtual: the rows describe the stack on Windows, not a physical NIC.
+
+The Wi-Fi link with the Linux end's egress held in 300 ms slots (`BENCH_NETEM='slot 300ms'`,
+`BENCH_RR_COUNT=20`, median of 2 runs). Up, the Mac sends and its acknowledgements are
+held; down, the data is held and released in bursts towards the access point:
+
+| Measurement | up | down |
+|---|---|---|
+| Raw UDP, paced at 10 / 50 / 200 Mbit/s, loss | 0 / 0 / 0 % | 0 / 41 / 86 % |
+| Tunnel TCP, 1 stream, 10 s | 10 Mbit/s | 1 Mbit/s |
+| Tunnel TCP, 4 streams, 10 s | 28 Mbit/s | 1 Mbit/s |
+| Tunnel, 4 MiB at once | 5.0 s | 39 s |
+| Tunnel, 64 MiB at once | 35 s | not within 120 s |
+| Tunnel, 1-byte round trip, p50 / p99 | 305 / 413 ms | 306 / 412 ms |
+
+Up meets the criterion (5.0 and 5.1 s against 5 s plus 6 s) and matches `held-ack300` of
+Shaped links. Down is the shaping point: netem's queue of 1000 packets drops whatever a slot
+adds beyond it, and each released burst overruns the Wi-Fi path as the unpaced burst above
+does. Kernel TCP (iperf3 from the same container to the Mac, no tunnel) took 212 s for
+4 MiB there and moved 131 KiB in 10 s; with the data held on a wired lab link
+(`netem.sh held-data300`) the netstack took 4.5 s and kernel TCP 4.2 s.
+
+TUN on macOS: `tun_node` (nsplane on a utun device) and wireguard-go 0.0.20250522 on the
+Mac in turn, each against kernel WireGuard in a container on the Linux host over the same
+Wi-Fi link, iperf3 3.19.1 from the Mac for 10 s, three interleaved runs (wireguard-go: two;
+its first start found the utun device of the node before it not yet released):
+
+| Mac side | TCP up | TCP down | 4 streams up | 4 streams down |
+|---|---|---|---|---|
+| nsplane, utun | 589 [586-640] Mbit/s | 769 [767-789] Mbit/s | 578 [566-625] Mbit/s | 786 [784-795] Mbit/s |
+| wireguard-go | 559, 592 Mbit/s | 752, 755 Mbit/s | 583, 596 Mbit/s | 741, 745 Mbit/s |
+
+Neither lost a datagram of 50 Mbit/s UDP in either direction. Both are at what the link
+carries (iperf3 without a tunnel from the container: 804 Mbit/s towards the Mac). No TUN row
+for Windows: the repository has no TUN node binary for it (`nsplane-cli` and `tun_node` are
+Unix programs); Wintun is covered by `nsplane-tun`'s tests on the VM.
 
 ## Netstack ingress labels
 

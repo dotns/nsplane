@@ -14,14 +14,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`drops`) and its stack's counters (`netstack`).
 
 - `scripts/bench/netem.sh`: netstack TCP and kernel TCP over a link shaped with `tc netem`
-  (delay, loss, reordering, rate, held delivery) in three containers.
+  (delay, loss, reordering, rate, held delivery in either or both directions) in three
+  containers.
 
-### Known issues
-- nsplane-netstack: a TCP connection whose first round trips are fast and whose
-  acknowledgements then arrive 100 ms or more late (a Wi-Fi client in power save) takes each
-  late acknowledgement for a loss and sends at a trickle; 4 MiB can take minutes with nothing
-  lost. Reproduced in process by `nsplane-e2e`'s `netstack_held` tests, which stay ignored
-  until the fix.
+- examples: `net_probe`, loss and reordering of a UDP path without a tunnel (paced or
+  unpaced sequence-numbered datagrams, one JSON line per run).
+
+- `scripts/bench/cross-host.sh`: the netstack tunnel between a local container and a remote
+  host over SSH (macOS, Linux, Windows), both directions, next to the path's own loss.
+
+### Fixed
+- nsplane-netstack: a TCP connection no longer takes late or overtaken segments for lost
+  ones (smoltcp fork tag `v0.14.0-nsplane.11`). A connection whose first round trips were
+  fast and whose acknowledgements then arrived 100 ms or more late (a Wi-Fi client in power
+  save, a path whose delay grows) resent segments that were only late, cut its window each
+  time and never measured the real round trip: 4 MiB could take minutes with nothing lost.
+  On a link with jitter every overtaken segment cost a retransmission and a window cut. Now
+  the receiver reports duplicate segments (RFC 2883). Towards a peer that does, the tail
+  loss probe only resends, and the window is cut once the loss shows: a hole above the next
+  acknowledgement, later data acknowledged without a report of the probe, or no report in
+  time. The acknowledgements after a probe are round-trip samples. A cut after a fast
+  retransmit is taken back once every retransmission was reported as a duplicate, and the
+  third duplicate acknowledgement then waits up to one round trip. Slow start counts
+  acknowledged bytes (RFC 3465), and a FIN ahead of missing data no longer waits for its
+  retransmission. 4 MiB with acknowledgements held in 300 ms slots: 3.3 s (was 210 s or
+  stalled); over `delay 100ms 10ms`: 3.2 s (was 43 s).
+
+### Changed
+- nsplane-netstack: a TCP socket keeps up to 256 out-of-order ranges of received data
+  instead of 4, at 4 KiB more memory per socket. On a link that reorders, the receiver
+  dropped every segment that would have opened a fifth hole.
 
 ## [0.24.0] - 2026-11-18
 

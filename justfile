@@ -69,6 +69,11 @@ bench-netem:
     cargo build -p nsplane-examples --release --bin netstack_bench --locked
     scripts/bench/slot.sh scripts/bench/netem.sh
 
+# Netstack tunnel and underlay baseline between a local container and a remote host over SSH (see scripts/bench/README.md).
+bench-cross target os:
+    cargo build -p nsplane-examples --release --bin netstack_bench --bin net_probe --locked
+    scripts/bench/slot.sh scripts/bench/cross-host.sh {{target}} {{os}}
+
 # Library-level e2e: nsplane-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
 e2e-lib:
     scripts/e2e/lib.sh

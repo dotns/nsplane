@@ -153,6 +153,7 @@ acknowledgements). Only the containers have `NET_ADMIN`; nothing on the host cha
 | `burst-queue` | `rate 1gbit limit 256` |
 | `held100`, `held1000` | `slot 100ms`, `slot 1000ms`: packets leave in slots, at once |
 | `held-ack100`, `held-ack300`, `held-ack1000` | the slot on the return direction only |
+| `held-data300` | a 300 ms slot on the forward direction only |
 
 Pairs: `netstack` (`netstack_bench` on a and b, WireGuard over the shaped link) and `kernel`
 (iperf3 over kernel TCP on the shaped link without a tunnel, as what TCP achieves there).
@@ -175,4 +176,56 @@ bytes, and it reports a transfer shorter than a second as 1 s. Other knobs: `BEN
 ```bash
 just bench-netem
 BENCH_PROFILES='none held-ack300' BENCH_LIMIT=60 scripts/bench/slot.sh scripts/bench/netem.sh
+```
+
+## Across hosts
+
+`scripts/bench/cross-host.sh <ssh target> <unix|windows>` measures the netstack tunnel
+between a container on this host and another host, in both directions, next to what the
+path between them loses without a tunnel. It is a manual tool and runs through `slot.sh`
+(`just bench-cross <ssh target> <unix|windows>`). The remote host is used over SSH only:
+its processes run in the foreground of SSH sessions the script holds open (on macOS a
+process detached from its session cannot send to the LAN), and its directory
+(`BENCH_PREFIX` in the login directory) and processes are removed on every exit path.
+
+"up" is remote to local, "down" is local to remote. Per direction, the median of
+`BENCH_REPS` (default 3) runs:
+
+- baseline (`net_probe`, `examples/README.md`): loss of 3227 unpaced 1300-byte datagrams
+  and at 10, 50 and 200 Mbit/s paced, the reordered datagrams and the longest loss run at
+  200 Mbit/s; ping from the local container at 50 ms and 1 s intervals;
+- tunnel (`netstack_bench` on both ends): TCP for 10 s with 1 and 4 streams, 4 MiB and
+  64 MiB written at once, UDP at 50 Mbit/s paced for 5 s, 1-byte round trips back to back
+  and 1 s apart (sparse traffic, which a Wi-Fi access point holds for a client in power
+  save).
+
+A tunnel number is read against the baseline of the same run: loss the path has on its own
+is not the tunnel's.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BENCH_LOCAL_ADDR` | required | address of this host as the remote reaches it, or `container` for the local container's own address (a remote on a docker network of this host) |
+| `BENCH_REMOTE_ADDR` | unset | address of the remote as this host reaches it. Unset for a remote behind NAT: the baseline and ping towards it are left out, and the remote's server restarts for every down run, since a local node without the remote's address waits for the remote's handshake |
+| `BENCH_PORT` | `47920` | tunnel UDP port on both ends; the probe uses the next one |
+| `BENCH_NETWORK` | default bridge | docker network of the local container; on the default bridge both ports are published on this host |
+| `BENCH_SSH`, `BENCH_SCP` | `ssh -o BatchMode=yes`, `scp -q -o BatchMode=yes` | how the remote is reached, e.g. with a key file |
+| `BENCH_REMOTE_BIN` | unset | local directory with `netstack_bench` and `net_probe` built for the remote (`.exe` for `windows`, where it is required). Without it the work tree is copied to the remote and built there with cargo |
+| `BENCH_NETEM` | unset | `tc netem` arguments for the local container's egress, e.g. `slot 300ms`: shapes what the local end sends, which is the data of "down" and the acknowledgements of "up" |
+| `BENCH_LOCK` | unset | a lock file held for the run, for a remote host that other harnesses use |
+| `BENCH_REPS`, `BENCH_LIMIT` | `3`, `120` | runs per measurement; seconds after which a run counts as failed |
+| `BENCH_RR_COUNT` | `1000` | back-to-back round trips per run; fewer on a link shaped with a long delay, or the run exceeds `BENCH_LIMIT` |
+| `NETSTACK_BENCH_BIN`, `NET_PROBE_BIN` | `target/release/...` | the local binaries |
+| `BENCH_OUT`, `BENCH_PREFIX` | `.tmp/bench/cross-host-<UTC timestamp>`, `nsplane-cross-<pid>` | run directory; name of the container and the remote directory |
+
+The run directory holds `results.md` and the JSON of every run. Not recorded by the script:
+the radio state of a Wi-Fi remote (PHY mode, channel, RSSI), which belongs next to its rows.
+
+```bash
+# macOS or Linux on the LAN; the remote builds the binaries itself
+BENCH_LOCAL_ADDR=192.0.2.10 BENCH_REMOTE_ADDR=192.0.2.20 just bench-cross user@192.0.2.20 unix
+
+# Windows guest behind NAT on a docker network of this host, binaries cross-built here
+cargo build --release --locked --target x86_64-pc-windows-gnu -p nsplane-examples --bin netstack_bench --bin net_probe
+BENCH_REMOTE_BIN=target/x86_64-pc-windows-gnu/release BENCH_NETWORK=bench-net BENCH_LOCAL_ADDR=container \
+  just bench-cross user@windows-guest windows
 ```

@@ -897,3 +897,49 @@ TCP 8 to 20 times slower than kernel TCP on a reordering link, filed as
   and never returns; wait for the job's PID.
 - `netem delay` with jitter reorders packets; a pure delay needs no second argument.
 
+
+## 2026-11-18 19:07 [progress]
+
+Tasks `20261118-0001-probe-timeout-on-held-acks` and `20261118-0002-reordering-tolerance`
+done (owner: fix both): smoltcp fork tag `v0.14.0-nsplane.11`, nsplane-netstack on it with
+256 assembler ranges, `netstack_held`'s asserted tests enabled, `netstack_jitter` added.
+Late transfers on held and delayed links take what the link takes from the start instead of
+stalling, `jitter20` 8.6 s to 0.65 s, `jitter100` 43 s to 3.2 s. `loss5` unchanged, filed
+as `20261118-1832-timeouts-under-heavy-loss`.
+
+## 2026-11-18 19:07 [pitfall]
+
+- One lab run per cell hid regressions of the first versions of the fix: a self-feeding
+  RTT sample on lossy links (`loss5` doubled), a lost record of the window before the first
+  of two needless fast retransmits (one run in ten 2 to 5 times slower). Repeat a profile
+  several times and compare with the previous fork tag in process before trusting a number.
+- A timing test that passes alone can fail in `just check`: under the parallel test run
+  the first RTT samples of a connection are a few milliseconds instead of zero, which put
+  the probe timeout just below the held link's delay and exposed a state the quiet run
+  never reached. Run new timing tests under `cargo nextest run -p nsplane-e2e` as well.
+- "Cut the window now, restore it when the peer reports the retransmission as a duplicate"
+  needs the reports to match the retransmissions one to one. They do not when a
+  retransmission starts at SND.UNA after a partial ACK: it straddles the peer's RCV.NXT and
+  is not reported. Waiting for the evidence before the cut needs no count.
+- A report of a duplicate (RFC 2883) needs its ACK number at or above the block's right
+  edge; a block above the ACK is an ordinary SACK block.
+- In zsh `$S:$S:ro` applies history modifiers to `$S`; docker mounts with a `:ro` suffix
+  belong in a bash script.
+
+## 2026-11-18 20:45 [progress]
+
+Plan `20261117-1556-cross-host-network-perf` completed: `net_probe`,
+`scripts/bench/cross-host.sh` (`just bench-cross`), `netem.sh` profile `held-data300`, and
+`docs/performance.md`, Across hosts and networks (macOS on Wi-Fi, the Windows VM, the Wi-Fi
+link with held egress, macOS utun against wireguard-go). The netstack tunnel loses nothing
+where the raw path loses nothing; the reported Wi-Fi loss is the queue's answer to an
+unpaced 4 MiB burst. Open: `20261118-2040-windows-tun-bench-row`.
+
+## 2026-11-18 20:45 [pitfall]
+
+- bash reads a script as it runs: editing `cross-host.sh` during a run ended it with a
+  syntax error at the next line read. Do not edit a bench script while it runs.
+- `netem slot` keeps the default queue of 1000 packets: at 50 Mbit/s a 300 ms slot collects
+  more, and the rest is dropped at the shaping point. A held profile above about 30 Mbit/s
+  needs `limit`.
+- `pgrep -f PATTERN` in an until-loop matches the loop's own shell; bracket one character.

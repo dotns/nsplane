@@ -24,7 +24,7 @@
 #
 # Profiles (BENCH_PROFILES, space separated; default: all):
 #   none  delay20  delay100  jitter20  jitter100  loss1  loss5  reorder  rate10  burst-queue
-#   held100  held1000  held-ack100  held-ack300  held-ack1000
+#   held100  held1000  held-ack100  held-ack300  held-ack1000  held-data300
 #
 # Environment:
 #   BENCH_PROFILES      see above
@@ -39,7 +39,7 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 abs() { case $1 in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
-ALL='none delay20 delay100 jitter20 jitter100 loss1 loss5 reorder rate10 burst-queue held100 held1000 held-ack100 held-ack300 held-ack1000'
+ALL='none delay20 delay100 jitter20 jitter100 loss1 loss5 reorder rate10 burst-queue held100 held1000 held-ack100 held-ack300 held-ack1000 held-data300'
 PROFILES=${BENCH_PROFILES:-$ALL}
 PAIRS=${BENCH_PAIRS:-netstack kernel}
 BYTES=${BENCH_BYTES:-4194304}
@@ -75,6 +75,8 @@ shape() {
     held-ack300:return) echo 'slot 300ms' ;;
     held-ack1000:return) echo 'slot 1000ms' ;;
     held-ack*:forward) ;;
+    held-data300:forward) echo 'slot 300ms' ;;
+    held-data300:return) ;;
     *) echo "unknown profile $1" >&2; return 1 ;;
   esac
 }
