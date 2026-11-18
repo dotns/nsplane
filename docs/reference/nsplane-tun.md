@@ -104,7 +104,10 @@ In order:
    check and load, so it must sit in a directory only administrators can write.
 3. With `exclusive(true)` a live Wintun adapter (`Adapter::open` succeeds; that handle is
    only closed) or any present interface with that alias (`ConvertInterfaceAliasToLuid`) is
-   refused with `WintunError::AdapterExists`.
+   refused with `WintunError::AdapterExists`. An alias `Adapter::open` cannot open is looked
+   at again every 25 ms for up to 500 ms first: after a `taskkill /F` of the holder, its
+   alias stays on an interface that reports `Down` (no adapter, no Plug and Play device) until Wintun
+   removes it 30-80 ms after the next process called into it, which this call just did.
 4. With either setting an orphan is replaced: the name resolves to a LUID whose interface is
    not present (`GetIfEntry2` reports `NotPresent` or has no row), the device of a process
    that died without closing its adapter. The handle is closed, the adapter created, and the

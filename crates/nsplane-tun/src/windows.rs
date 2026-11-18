@@ -55,6 +55,11 @@ const TRANSLATION_SLACK: usize = 28;
 /// Packets queued between the reader thread and the [`TunSource`].
 const QUEUE_DEPTH: usize = 64;
 
+/// How long an exclusive open waits for the alias of a killed holder's adapter to go,
+/// and how often it looks.
+const ORPHAN_SETTLE: Duration = Duration::from_millis(500);
+const ORPHAN_POLL: Duration = Duration::from_millis(25);
+
 /// How often the MTU watcher started by [`Tun::split`] queries the interface MTU.
 pub const MTU_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -129,7 +134,10 @@ impl TunOptions {
     ///
     /// Either way an orphan (the alias resolves but its device is not present, as after a
     /// killed process) is replaced; when Wintun cannot reclaim the alias this fails with
-    /// [`WintunError::OrphanNotReplaced`].
+    /// [`WintunError::OrphanNotReplaced`]. A killed process's adapter can keep its alias on
+    /// an interface that reports `Down` for a moment after this call loads Wintun: before
+    /// refusing an alias Wintun cannot open, the call waits up to half a second for it to
+    /// go.
     #[must_use]
     pub const fn exclusive(mut self, exclusive: bool) -> Self {
         self.exclusive = exclusive;
@@ -205,14 +213,29 @@ impl Tun {
         // to the executable or, failing that, in the system directory, which only someone
         // able to replace the executable or system DLLs can substitute.
         let wintun = unsafe { wintun_bindings::load_from_path(&path) }?;
-        let opened = Adapter::open(&wintun, name).ok();
-        let existing = match existing(name, opened.as_ref().map(|adapter| adapter.get_luid())) {
-            Ok(existing) => existing,
-            // The default path did not query IP Helper before; a failed query keeps its
-            // old outcome (open what Wintun opened, else create).
-            Err(_) if !exclusive => Existing::Live,
-            Err(e) => return Err(e),
+        let probe = || -> io::Result<(Option<Arc<Adapter>>, Existing)> {
+            let opened = Adapter::open(&wintun, name).ok();
+            let existing = match existing(name, opened.as_ref().map(|adapter| adapter.get_luid())) {
+                Ok(existing) => existing,
+                // The default path did not query IP Helper before; a failed query keeps its
+                // old outcome (open what Wintun opened, else create).
+                Err(_) if !exclusive => Existing::Live,
+                Err(e) => return Err(e),
+            };
+            Ok((opened, existing))
         };
+        let (mut opened, mut existing) = probe()?;
+        // The adapter of a killed holder leaves its alias on an interface that reports
+        // `Down` and that Wintun no longer opens, until Wintun removes it shortly after a
+        // process called into it (this one just did). Look again before refusing; a live
+        // adapter Wintun opens is refused at once.
+        let mut waited = Duration::ZERO;
+        while exclusive && opened.is_none() && existing == Existing::Live && waited < ORPHAN_SETTLE
+        {
+            thread::sleep(ORPHAN_POLL);
+            waited += ORPHAN_POLL;
+            (opened, existing) = probe()?;
+        }
         let adapter = match (wintun::plan(existing, opened.is_some(), exclusive), opened) {
             (Plan::Refuse, _) => {
                 return Err(WintunError::AdapterExists {
