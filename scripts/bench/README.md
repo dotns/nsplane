@@ -129,3 +129,50 @@ BENCH_NSPLANE_VARIANTS='default;threads2:WG_THREADS=2' \
 
 To measure another wireguard-go release, change the `WIREGUARD_GO_TAG` default in
 `scripts/bench/wireguard-go/Dockerfile`; the script rebuilds the image on every run.
+
+## Shaped links
+
+`scripts/bench/netem.sh` measures netstack TCP over a link shaped with `tc netem`, next to
+kernel TCP over the same link. It is a manual tool like `wg-compare.sh` and runs through
+`slot.sh` (`just bench-netem`).
+
+Three containers from `ai-agent/nsplane-bench` on one docker network: a (client), b (server)
+and r. a and b have a host route to each other through r, which forwards on its one
+interface. A `prio` qdisc on r sorts by destination into one band per direction, and a
+profile puts a `netem` qdisc on a band: forward is a to b (the data), return is b to a (the
+acknowledgements). Only the containers have `NET_ADMIN`; nothing on the host changes.
+
+| Profile | Forward and return, unless noted |
+|---|---|
+| `none` | unshaped |
+| `delay20`, `delay100` | `delay 20ms`, `delay 100ms` |
+| `jitter20`, `jitter100` | `delay 20ms 2ms`, `delay 100ms 10ms`: the jitter reorders packets |
+| `loss1`, `loss5` | `loss 1%`, `loss 5%` |
+| `reorder` | `delay 5ms reorder 25%` |
+| `rate10` | `rate 10mbit limit 64` |
+| `burst-queue` | `rate 1gbit limit 256` |
+| `held100`, `held1000` | `slot 100ms`, `slot 1000ms`: packets leave in slots, at once |
+| `held-ack100`, `held-ack300`, `held-ack1000` | the slot on the return direction only |
+
+Pairs: `netstack` (`netstack_bench` on a and b, WireGuard over the shaped link) and `kernel`
+(iperf3 over kernel TCP on the shaped link without a tunnel, as what TCP achieves there).
+
+Per profile and pair, from a to b:
+
+- transfer: `BENCH_BYTES` (default 4 MiB) written at once with the shaping in place, in
+  seconds (`netstack_bench --bytes`, `iperf3 -n`);
+- late transfer, netstack only: the connection opens on the unshaped link, the shaping
+  applies one second later and the transfer starts after another (`--start-delay 2000`).
+  The sender has then measured a fast round trip before the link changes.
+
+A run that takes longer than `BENCH_LIMIT` (default 120 s) is reported as stalled. iperf3
+stops when the sender has written the bytes, so its time is scaled by sent over received
+bytes, and it reports a transfer shorter than a second as 1 s. Other knobs: `BENCH_PROFILES`,
+`BENCH_PAIRS`, `BENCH_CPUS_A`/`_B`, `NETSTACK_BENCH_BIN`, `BENCH_OUT`
+(`.tmp/bench/netem-<UTC timestamp>`), `BENCH_PREFIX`. The run directory holds `results.md`,
+`run.log` and the JSON of every run.
+
+```bash
+just bench-netem
+BENCH_PROFILES='none held-ack300' BENCH_LIMIT=60 scripts/bench/slot.sh scripts/bench/netem.sh
+```

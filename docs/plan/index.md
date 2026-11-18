@@ -73,3 +73,5 @@ Each plan is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261106-2327-tcp-zero-checksum Accept zero TCP and ICMP checksums**](20261106-2327-tcp-zero-checksum.md) `2026-11-06`
 - [ ] [**20261118-0340-udp-buffer-grant-visibility Make the granted UDP socket buffer size visible and reachable**](20261118-0340-udp-buffer-grant-visibility.md) `2026-11-18`
+
+- [ ] [**20261117-1556-cross-host-network-perf Performance tests across systems and networks**](20261117-1556-cross-host-network-perf.md) `2026-11-17`

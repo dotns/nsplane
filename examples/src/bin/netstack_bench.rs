@@ -5,10 +5,18 @@
 //! `server` serves repeated runs; a `client` run prints one JSON line on stdout:
 //!
 //! - `tcp`: `--streams` bulk streams for `--duration`; the server counts the bytes it
-//!   received and returns the count once the client's write half closed.
+//!   received and returns the count once the client's write half closed. With `--bytes`,
+//!   one stream writes exactly that many bytes at once instead and the result is the time
+//!   until the server has them, with the longest pause of the writer. `--start-delay`
+//!   keeps the connection idle before the first byte, so the path can change under a
+//!   connection whose first round trip was measured before.
 //! - `udp`: sequence-numbered datagrams paced at `--rate`; afterwards a TCP control
 //!   connection asks the server how many of the flow's datagrams arrived.
-//! - `rr`: `--count` round trips of 1-byte request and 1-byte response on one connection.
+//! - `rr`: `--count` round trips of 1-byte request and 1-byte response on one connection,
+//!   `--interval` apart.
+//!
+//! Every result line also carries the client's nonzero engine drop counters (`drops`) and
+//! its stack's counters (`netstack`), so a loss can be told from a drop on the node.
 //!
 //! Every TCP connection starts with one op byte (`T` bulk, `R` request/response, `U` UDP
 //! result) so one port serves all modes.
@@ -36,6 +44,7 @@ use futures_core::Stream;
 use nsplane::AllowedIp;
 use nsplane_examples::node::{NodeArgs, build_engine, configure_peers, init_logging, parse_cidr};
 use nsplane_examples::out;
+use nsplane_examples::status::netstack_json;
 use nsplane_netstack::{DEFAULT_MTU, NetStack, NetStackConfig, NetStackHandle, TcpConnection};
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -104,6 +113,16 @@ enum Role {
         #[arg(long, value_name = "SECS", default_value_t = 10.0)]
         duration: f64,
 
+        /// Send exactly this many bytes on one stream instead of loading for `--duration`,
+        /// and measure the time until the server has read them (tcp)
+        #[arg(long, value_name = "N", conflicts_with = "streams")]
+        bytes: Option<u64>,
+
+        /// Milliseconds the connected stream stays idle before the transfer (tcp with
+        /// `--bytes`)
+        #[arg(long, value_name = "MS", default_value_t = 0, requires = "bytes")]
+        start_delay: u64,
+
         /// Offered payload rate in bits per second (udp, required)
         #[arg(long, value_name = "BITS_PER_SEC", required_if_eq("mode", "udp"))]
         rate: Option<u64>,
@@ -111,6 +130,10 @@ enum Role {
         /// Round trips (rr)
         #[arg(long, value_name = "N", default_value_t = 1000)]
         count: usize,
+
+        /// Milliseconds between two round trips (rr): an idle path between requests
+        #[arg(long, value_name = "MS", default_value_t = 0)]
+        interval: u64,
     },
 }
 
@@ -266,6 +289,46 @@ async fn run_tcp(
     }))
 }
 
+/// Bytes per write of a fixed transfer: the pauses between two writes are measured.
+const TRANSFER_CHUNK: usize = 16 * 1024;
+
+/// Writes `bytes` bytes on one stream as fast as the connection takes them and waits for
+/// the server's count.
+async fn run_transfer(
+    stack: &NetStackHandle,
+    target: SocketAddr,
+    bytes: u64,
+    start_delay: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let mut conn = connect_retry(stack, target).await?;
+    sleep(start_delay).await;
+    let start = Instant::now();
+    conn.write_u8(OP_BULK).await?;
+    let chunk = vec![0; TRANSFER_CHUNK];
+    let mut left = bytes;
+    let mut last = start;
+    let mut longest = Duration::ZERO;
+    while left > 0 {
+        let n = usize::try_from(left).map_or(TRANSFER_CHUNK, |left| left.min(TRANSFER_CHUNK));
+        conn.write_all(&chunk[..n]).await?;
+        left -= n as u64;
+        let now = Instant::now();
+        longest = longest.max(now - last);
+        last = now;
+    }
+    conn.shutdown().await?;
+    let received = conn.read_u64().await.context("no transfer result")?;
+    let elapsed = start.elapsed().as_secs_f64();
+    Ok(json!({
+        "mode": "tcp",
+        "bytes": bytes,
+        "received": received,
+        "seconds": elapsed,
+        "longest_write_pause_s": longest.as_secs_f64(),
+        "bits_per_second": 8.0 * float(received) / elapsed,
+    }))
+}
+
 async fn run_udp(
     stack: &NetStackHandle,
     target: SocketAddr,
@@ -332,12 +395,16 @@ async fn run_rr(
     stack: &NetStackHandle,
     target: SocketAddr,
     count: usize,
+    interval: Duration,
 ) -> anyhow::Result<serde_json::Value> {
     let mut conn = connect_retry(stack, target).await?;
     conn.write_u8(OP_RR).await?;
     let mut rtts = Vec::with_capacity(count);
     let mut byte = [0];
-    for _ in 0..count {
+    for n in 0..count {
+        if n > 0 && !interval.is_zero() {
+            sleep(interval).await;
+        }
         let start = Instant::now();
         conn.write_all(&byte).await?;
         conn.read_exact(&mut byte).await.context("no response")?;
@@ -348,8 +415,10 @@ async fn run_rr(
     Ok(json!({
         "mode": "rr",
         "count": count,
+        "interval_ms": interval.as_secs_f64() * 1e3,
         "p50_us": percentile(&rtts, 50),
         "p99_us": percentile(&rtts, 99),
+        "max_us": rtts.last().copied().unwrap_or(0.0),
     }))
 }
 
@@ -405,17 +474,28 @@ async fn main() -> anyhow::Result<()> {
             duration,
             rate,
             count,
+            bytes,
+            start_delay,
+            interval,
         } => {
             let duration = Duration::try_from_secs_f64(duration).context("invalid --duration")?;
             let result = tokio::select! {
                 result = async {
                     match mode {
-                        Mode::Tcp => run_tcp(&handle, target, streams.max(1), duration).await,
+                        Mode::Tcp => match bytes {
+                            Some(bytes) => {
+                                let delay = Duration::from_millis(start_delay);
+                                run_transfer(&handle, target, bytes, delay).await
+                            }
+                            None => run_tcp(&handle, target, streams.max(1), duration).await,
+                        },
                         Mode::Udp => {
                             let rate = rate.context("--rate is required for udp")?;
                             run_udp(&handle, target, args.mtu, rate, duration).await
                         }
-                        Mode::Rr => run_rr(&handle, target, count).await,
+                        Mode::Rr => {
+                            run_rr(&handle, target, count, Duration::from_millis(interval)).await
+                        }
                     }
                 } => result?,
                 stopped = &mut wait => {
@@ -423,6 +503,16 @@ async fn main() -> anyhow::Result<()> {
                     bail!("the engine stopped");
                 }
             };
+            let mut result = result;
+            let drops: serde_json::Map<String, serde_json::Value> = engine
+                .drop_counters()
+                .await?
+                .into_iter()
+                .filter(|&(_, n)| n > 0)
+                .map(|(reason, n)| (reason.to_owned(), n.into()))
+                .collect();
+            result["drops"] = drops.into();
+            result["netstack"] = netstack_json(&handle);
             out::line(format_args!("{result}"));
         }
     }

@@ -71,12 +71,17 @@ cargo run -p nsplane-examples --bin netstack_node -- --private-key-file b.key --
 A netstack node with an in-process load generator, to measure the user-space data path. The
 `server` serves repeated runs on `--port` (TCP and UDP) until Ctrl-C; a `client` run prints
 one JSON line on stdout: `tcp` (bulk streams, bytes counted by the server), `udp` (paced
-datagrams, loss from the server's count) or `rr` (1-byte round trips, p50/p99 in µs).
+datagrams, loss from the server's count) or `rr` (1-byte round trips, p50/p99/max in µs).
+`tcp` with `--bytes` writes exactly that many bytes on one stream at once and reports the
+time until the server has them and the writer's longest pause. Every line carries the
+client's nonzero engine drop counters (`drops`) and its stack's counters (`netstack`).
 
 Flags: node flags, `--address <CIDR>` (repeatable, required), `--mtu <N>` (default 1420), then
 `server --port <P>` or `client --target <IP:PORT> --mode tcp|udp|rr` with `--streams <N>`
-(default 1), `--duration <SECS>` (default 10), `--rate <BITS_PER_SEC>` (udp, required) and
-`--count <N>` (rr, default 1000).
+(default 1), `--duration <SECS>` (default 10), `--bytes <N>` (tcp, instead of a duration), `--start-delay <MS>`
+(with `--bytes`: idle time between connect and the first byte, default 0),
+`--rate <BITS_PER_SEC>` (udp, required), `--count <N>` (rr, default 1000) and
+`--interval <MS>` (rr, pause between round trips, default 0).
 
 ```sh
 cargo run -p nsplane-examples --bin netstack_bench -- --private-key-file b.key --listen 127.0.0.1:51821 --address 10.0.0.2/24 --peer <A_PUB>,endpoint=127.0.0.1:51820,allowed-ips=10.0.0.1/32 client --target 10.0.0.1:5201 --mode tcp --streams 4

@@ -860,3 +860,40 @@ Released 0.24.0: fixes from a downstream fault check. A peer reset and the idle 
 longer leaves a hole in a paused reader's stream, a lost fast retransmission is resent by the
 probe, and a Windows exclusive open after a killed holder succeeds. smoltcp fork
 `v0.14.0-nsplane.9`, rebased on the current upstream.
+## 2026-11-18 00:30 [progress]
+
+Plan `20261117-1556-cross-host-network-perf` approved; work items 1 and 2 done. A consumer's
+report of Wi-Fi loss on macOS did not hold (an unpaced-burst artefact; the tunnel ran at 205
+to 540 Mbit/s on that link), but its slow transfer led to a defect: `netstack_held.rs`
+reproduces a TCP sender that takes late acknowledgements for losses once its first round
+trips were fast. Filed as `20261118-0001-probe-timeout-on-held-acks` (smoltcp fork, waits
+for approval); a candidate fix was tried on a copy of the fork.
+
+## 2026-11-18 00:30 [pitfall]
+
+- macOS 26: a process detached from its SSH session (`nohup ... &`) got `EHOSTUNREACH` for
+  every send to a LAN address; the same binary in the session's foreground did not. Remote
+  bench processes must stay in the foreground of an open session.
+- A link wrapper that holds packets must let a connection's first messages pass at once,
+  or the sender's first RTT sample already contains the delay and the defect above stays
+  hidden; with a racy first sample the same test passed in 3.9 s or ran for minutes.
+
+## 2026-11-18 03:00 [progress]
+
+Work item 4 of `20261117-1556-cross-host-network-perf` done: `scripts/bench/netem.sh`
+reproduces the late-acknowledgement stall through real kernel paths and showed that any
+growth of the round trip after the first measurement triggers it. It also found netstack
+TCP 8 to 20 times slower than kernel TCP on a reordering link, filed as
+`20261118-0002-reordering-tolerance`.
+
+## 2026-11-18 03:00 [pitfall]
+
+- A router container between two docker networks forwards nothing: the host's bridge
+  filtering drops it. One network, host routes through a third container and a `prio` qdisc
+  with one band per destination works.
+- `tc netem` on a sender's own interface is no stand-in for a remote queue: TCP small queues
+  keep a kernel sender at a few packets per slot.
+- In bash 5, `wait` without arguments also waits for a `>(tee ...)` process substitution
+  and never returns; wait for the job's PID.
+- `netem delay` with jitter reorders packets; a pure delay needs no second argument.
+

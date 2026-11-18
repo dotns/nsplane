@@ -5,6 +5,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- examples: `netstack_bench` takes `--bytes <N>` with `--mode tcp` (one stream writes exactly
+  that many bytes at once; the result is the time until the server has them and the writer's
+  longest pause), `--start-delay <MS>` with `--bytes` (idle time between connect and the
+  first byte) and `--interval <MS>` with `--mode rr` (a pause between round trips). `rr`
+  results gain `max_us`; every result line carries the client's nonzero engine drop counters
+  (`drops`) and its stack's counters (`netstack`).
+
+- `scripts/bench/netem.sh`: netstack TCP and kernel TCP over a link shaped with `tc netem`
+  (delay, loss, reordering, rate, held delivery) in three containers.
+
+### Known issues
+- nsplane-netstack: a TCP connection whose first round trips are fast and whose
+  acknowledgements then arrive 100 ms or more late (a Wi-Fi client in power save) takes each
+  late acknowledgement for a loss and sends at a trickle; 4 MiB can take minutes with nothing
+  lost. Reproduced in process by `nsplane-e2e`'s `netstack_held` tests, which stay ignored
+  until the fix.
+
 ## [0.24.0] - 2026-11-18
 
 Fixes from a downstream fault check of 0.23.0 and the smoltcp fork, with the fork rebased on

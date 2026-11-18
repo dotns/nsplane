@@ -30,6 +30,8 @@ cargo bench -p nsplane-netstack --bench send_stream
 cargo test --release -p nsplane-e2e --test netstack_lossy -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test netstack_buffers -- --ignored --nocapture
 cargo test --release -p nsplane-e2e --test latency -- --ignored --nocapture
+cargo test --release -p nsplane-e2e --test netstack_held -- --ignored --nocapture
+scripts/bench/slot.sh scripts/bench/netem.sh
 ```
 
 ## WireGuard implementations
@@ -248,6 +250,60 @@ and 0.00 % and 2.62 % with 256; the rest at 3 Gbit/s is the receiving engine's f
 
 A window of more segments than the receiving engine's 1024-packet sink queue holds loses its
 tail there; 4 MiB ran without drops once the engine and stack queues held 8192 packets.
+
+### Shaped links
+
+`scripts/bench/netem.sh` (`scripts/bench/README.md`, Shaped links), 2026-11-18, 0.23.0 with
+smoltcp `v0.14.0-nsplane.8`, slot 0, load 1.4-4.2, one run per cell (kernel TCP in a run
+of its own): 4 MiB from a to b
+through a router container that shapes with `tc netem`. "Late" opens the connection on the
+unshaped link and applies the shaping before the transfer starts. Kernel TCP is iperf3 on
+the same shaped link without a tunnel; iperf3 reports less than a second as 1 s, and its
+time is scaled by sent over received bytes because it stops when the sender has written. A run that
+is not done after 90 s is stalled.
+
+| Profile | netstack | netstack, late | kernel TCP |
+|---|---|---|---|
+| `none` | 0.01 s | 0.01 s | 1 s |
+| `delay20` | 0.62 s | 8.47 s | 1.04 s |
+| `delay100` | 2.81 s | 25.7 s | 2.2 s |
+| `jitter20` | 8.58 s | 8.78 s | 1.04 s |
+| `jitter100` | 43.43 s | 56.02 s | 2.21 s |
+| `loss1` | 0.02 s | 1.02 s | 1 s |
+| `loss5` | 3.46 s | 3.36 s | 1 s |
+| `reorder` | 1.37 s | 1.27 s | 1.01 s |
+| `rate10` | 3.98 s | 6.4 s | 3.66 s |
+| `burst-queue` | 0.04 s | 0.04 s | 1 s |
+| `held100` | 3.02 s | stalled (> 90 s) | 3.52 s |
+| `held1000` | 42.03 s | stalled (> 90 s) | 37.65 s |
+| `held-ack100` | 1.41 s | 70.26 s | 1.1 s |
+| `held-ack300` | 4.51 s | stalled (> 90 s) | 3.3 s |
+| `held-ack1000` | 20.02 s | stalled (> 90 s) | 10.29 s |
+
+Three things stand out; the first two have a task each, the third is part of the second:
+
+- Late transfers on a held or delayed link stall or take ten times as long. The sender
+  measured a round trip of well under a millisecond first, so its tail loss probe fires
+  before any acknowledgement can arrive, and the probe is handled as a loss. On a link that
+  is slow from the start the same transfers run close to kernel TCP.
+- Jitter (`delay 20ms 2ms`, `delay 100ms 10ms`) reorders packets. The netstack takes 8 and
+  20 times as long as kernel TCP there, also from the start.
+- `loss5` takes more than three times as long as kernel TCP. The other profiles are within
+  a third of it.
+
+`crates/nsplane-e2e/tests/netstack_held.rs` reproduces the first in process: the link
+(`HeldTransport`) passes a connection's first four data messages at once and then releases
+in 100 ms slots. Its two asserted tests fail within their 20 s bound and are ignored until
+the fix.
+
+On a Wi-Fi link (macOS 26 on 11ax, 5 GHz, to a wired Linux host, 2026-11-17 and -18,
+`netstack_bench` on both ends): TCP 205 to 441 Mbit/s from the Mac and 532 to 540 Mbit/s
+towards it over 10 s, 4 MiB took 0.12 to 0.15 s and 64 MiB 1.06 to 1.37 s in both
+directions, no UDP loss at 50 and 300 Mbit/s paced, 1-byte round trips p50 2.9 to 3.1 ms
+back to back and, 1 s apart, p50 3.4 ms (max 7.8 ms) from the Mac and p50 8.3 ms (max
+61.9 ms) towards it. The raw link under the same conditions lost nothing at 10 Mbit/s paced
+and 1.5 % towards the Mac at 50 Mbit/s; a ping every second took 50 ms on average against
+2.8 ms at 20 per second.
 
 ## Netstack ingress labels
 

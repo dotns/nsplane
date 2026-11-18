@@ -1045,6 +1045,98 @@ impl<T: Transport> Transport for Bottleneck<T> {
     }
 }
 
+/// A transport whose data messages leave in slots.
+///
+/// A send is held until the next multiple of the slot, then everything held leaves at once
+/// and in order. This is how a Wi-Fi access point delivers to a client in power save.
+///
+/// Handshake messages are not held, and neither are the first data messages: the client
+/// is awake while a connection opens, so the first round trips are fast. With no slot the
+/// transport only counts.
+#[derive(Debug)]
+pub struct HeldTransport<T> {
+    inner: Arc<T>,
+    held: Option<mpsc::UnboundedSender<(Vec<u8>, Path)>>,
+    awake: u64,
+    sent: AtomicU64,
+    full_size: Arc<AtomicU64>,
+}
+
+/// Data messages at least this long count as full-size segments in a [`HeldTransport`].
+const FULL_SIZE: usize = 1000;
+
+impl<T: Transport> HeldTransport<T> {
+    /// Wraps `inner`, releasing its data messages every `slot` (at once with `None`) after
+    /// the first `awake` of them, and counting those of at least 1000 bytes in `full_size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub fn new(inner: T, slot: Option<Duration>, awake: u64, full_size: Arc<AtomicU64>) -> Self {
+        let inner = Arc::new(inner);
+        let held = slot.map(|slot| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<(Vec<u8>, Path)>();
+            let link = Arc::clone(&inner);
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(slot);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticks.tick().await;
+                    loop {
+                        match rx.try_recv() {
+                            Ok((datagram, to)) => {
+                                if link.send(&datagram, &to).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                }
+            });
+            tx
+        });
+        Self {
+            inner,
+            held,
+            awake,
+            sent: AtomicU64::new(0),
+            full_size,
+        }
+    }
+}
+
+impl<T: Transport> Transport for HeldTransport<T> {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        if datagram.first() != Some(&DATA_MESSAGE) {
+            return self.inner.send(datagram, to).await;
+        }
+        if datagram.len() >= FULL_SIZE {
+            self.full_size.fetch_add(1, Ordering::Relaxed);
+        }
+        let held = match &self.held {
+            Some(held) if self.sent.fetch_add(1, Ordering::Relaxed) >= self.awake => Some(held),
+            _ => None,
+        };
+        match held {
+            // A closed queue means the releasing task ended on a send error.
+            Some(held) => held
+                .send((datagram.to_vec(), *to))
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe)),
+            None => self.inner.send(datagram, to).await,
+        }
+    }
+}
+
 /// Two stack nodes (seeds 1 and 2) like [`stack_pair`] over wrapped links and configured
 /// engines.
 ///

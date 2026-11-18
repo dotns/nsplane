@@ -64,6 +64,11 @@ bench-wg:
     if [ -f examples/src/bin/netstack_bench.rs ]; then cargo build -p nsplane-examples --release --bin netstack_bench --locked; fi
     scripts/bench/wg-compare.sh
 
+# Netstack TCP over links shaped with tc netem, next to kernel TCP (needs docker; see scripts/bench/README.md).
+bench-netem:
+    cargo build -p nsplane-examples --release --bin netstack_bench --locked
+    scripts/bench/slot.sh scripts/bench/netem.sh
+
 # Library-level e2e: nsplane-e2e container tests against kernel WireGuard (needs docker and the wireguard module).
 e2e-lib:
     scripts/e2e/lib.sh
