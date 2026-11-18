@@ -72,3 +72,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261105-1420-release-022-metadata Prepare 0.22.0 metadata**](20261105-1420-release-022-metadata.md) `2026-11-05`
 
 - [x] [**20261106-2327-tcp-zero-checksum Accept zero TCP and ICMP checksums**](20261106-2327-tcp-zero-checksum.md) `2026-11-06`
+- [ ] [**20261118-0340-udp-buffer-grant-visibility Make the granted UDP socket buffer size visible and reachable**](20261118-0340-udp-buffer-grant-visibility.md) `2026-11-18`
