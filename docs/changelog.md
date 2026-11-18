@@ -852,3 +852,11 @@ a DNS policy bypass through a dot inside a label, two kept as deliberate.
 Released 0.23.0: the fixes of the audit of `857f34f` in four batches, the new crate
 `nsplane-sys`, and the first runs of the tests on real Windows 11 and macOS hosts. Breaking:
 `nsplane_tun::adopt_fd` and `Tun::from_raw_fd` are removed.
+
+## 2026-11-18 [release]
+
+Released 0.24.0: fixes from a downstream fault check. A peer reset and the idle timeout end a
+`TcpConnection` read with `ConnectionReset` or `TimedOut` (breaking), the idle timeout no
+longer leaves a hole in a paused reader's stream, a lost fast retransmission is resent by the
+probe, and a Windows exclusive open after a killed holder succeeds. smoltcp fork
+`v0.14.0-nsplane.9`, rebased on the current upstream.

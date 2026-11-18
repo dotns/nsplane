@@ -1,6 +1,6 @@
 # 20261118-0900-downstream-fault-check-fixes Fix the faults of the downstream fault check
 
-- **status**: in progress
+- **status**: completed
 - **priority**: P1
 - **owner**: L1 (7f5cstru)
 - **createdAt**: 2026-11-18 09:00
@@ -30,3 +30,16 @@ Fixing the downstream fault check findings.
 
 - **blocked by**: (none)
 - **blocks**: 0.24.0
+
+## Validation
+
+- smoltcp fork `v0.14.0-nsplane.9`: 714 library tests with the default features, 457 with the
+  features nsplane uses; each fix has a regression test that failed before it.
+- F1 and F2: `a_peer_reset_ends_the_read_with_connection_reset` and
+  `the_idle_timeout_ends_a_paused_read_with_an_error_and_no_hole` failed before the fix (EOF
+  after the reset; the first byte read came from past the discarded buffer). Three tests that
+  asserted `Ok(0)` after a reset now assert `ConnectionReset`.
+- c, on the Windows 11 test VM with the consumer's reopen program built against this branch:
+  the 0.23.0 build refused the first open after `taskkill /F` in 5 of 5; this branch opened at
+  the first attempt in 20 of 20 at `kill@0` and 20 of 20 at `kill@2` (200-280 ms), and 20 of 20
+  after a clean exit.

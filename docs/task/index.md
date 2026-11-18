@@ -160,4 +160,4 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261112-0202-sys-wrapper-crate A crate for `unsafe` OS calls behind safe functions, and the two gaps it closes**](20261112-0202-sys-wrapper-crate.md) `P3`
 
-- [ ] [**20261118-0900-downstream-fault-check-fixes Fix the faults of the downstream fault check**](20261118-0900-downstream-fault-check-fixes.md) `P1`
+- [x] [**20261118-0900-downstream-fault-check-fixes Fix the faults of the downstream fault check**](20261118-0900-downstream-fault-check-fixes.md) `P1`

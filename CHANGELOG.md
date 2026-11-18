@@ -5,6 +5,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-18
+
+Fixes from a downstream fault check of 0.23.0 and the smoltcp fork, with the fork rebased on
+the current upstream. Breaking: `TcpConnection` reads end with `ConnectionReset` or `TimedOut`
+instead of `Ok(0)` when the stream ended without the peer's FIN (see Changed).
+
 ### Changed
 
 #### Breaking
