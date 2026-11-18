@@ -1137,6 +1137,68 @@ impl<T: Transport> Transport for HeldTransport<T> {
     }
 }
 
+/// A transport whose data messages take a delay that varies from one to the next.
+///
+/// Each data message leaves after `delay` plus up to `jitter`, a fixed function of its
+/// number, so messages sent within `jitter` of each other overtake one another, like on a
+/// path with jitter. Handshake messages are not delayed.
+#[derive(Debug)]
+pub struct JitterTransport<T> {
+    inner: Arc<T>,
+    delay: Duration,
+    jitter: Duration,
+    sent: AtomicU64,
+    full_size: Arc<AtomicU64>,
+}
+
+impl<T: Transport> JitterTransport<T> {
+    /// Wraps `inner`, delaying each data message by `delay` to `delay + jitter` and
+    /// counting those of at least 1000 bytes in `full_size`.
+    pub fn new(inner: T, delay: Duration, jitter: Duration, full_size: Arc<AtomicU64>) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            delay,
+            jitter,
+            sent: AtomicU64::new(0),
+            full_size,
+        }
+    }
+}
+
+impl<T: Transport + 'static> Transport for JitterTransport<T> {
+    fn id(&self) -> TransportId {
+        self.inner.id()
+    }
+
+    async fn recv(&self, buf: &mut PacketBuf) -> io::Result<(usize, Path)> {
+        self.inner.recv(buf).await
+    }
+
+    async fn send(&self, datagram: &[u8], to: &Path) -> io::Result<()> {
+        if datagram.first() != Some(&DATA_MESSAGE) {
+            return self.inner.send(datagram, to).await;
+        }
+        if datagram.len() >= FULL_SIZE {
+            self.full_size.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = self.sent.fetch_add(1, Ordering::Relaxed);
+        let jitter = u64::try_from(self.jitter.as_micros()).unwrap_or(u64::MAX);
+        let extra = Duration::from_micros(mix(n) % jitter.saturating_add(1));
+        let (link, datagram, to, after) = (
+            Arc::clone(&self.inner),
+            datagram.to_vec(),
+            *to,
+            self.delay + extra,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            // A send error means the link is gone; the test's transfer then fails.
+            let _ = link.send(&datagram, &to).await;
+        });
+        Ok(())
+    }
+}
+
 /// Two stack nodes (seeds 1 and 2) like [`stack_pair`] over wrapped links and configured
 /// engines.
 ///

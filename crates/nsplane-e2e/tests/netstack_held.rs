@@ -5,9 +5,9 @@
 //! With the slot on the return direction only, the data arrives at once and the
 //! acknowledgements late and in clumps.
 //!
-//! The asserted tests are ignored until the sender stops taking late acknowledgements for
-//! losses (a known issue in `CHANGELOG.md`). The ignored `report` test prints the transfer
-//! times and segment counts per slot; run it in release:
+//! A sender that takes each late acknowledgement for a lost segment resends most of the
+//! transfer and needs minutes for it. The ignored `report` test prints the transfer times
+//! and segment counts per slot; run it in release:
 //!
 //! ```text
 //! cargo test --release -p nsplane-e2e --test netstack_held -- --ignored --nocapture
@@ -87,7 +87,6 @@ async fn completes(held: Held) -> TestResult {
 
 /// Both directions held: every round trip takes one to two slots.
 #[tokio::test]
-#[ignore = "known issue: late acknowledgements are taken for losses"]
 async fn bulk_tcp_over_a_held_link() -> TestResult {
     completes(Held::Both).await
 }
@@ -95,7 +94,6 @@ async fn bulk_tcp_over_a_held_link() -> TestResult {
 /// Only the acknowledgements held, after round trips of well under a millisecond: the
 /// sender must not take each late acknowledgement for a lost segment.
 #[tokio::test]
-#[ignore = "known issue: late acknowledgements are taken for losses"]
 async fn bulk_tcp_with_held_acknowledgements() -> TestResult {
     completes(Held::Return).await
 }

@@ -1,8 +1,8 @@
 # 20261118-0001-probe-timeout-on-held-acks A TCP sender stalls when acknowledgements arrive late after fast first round trips
 
-- **status**: pending
+- **status**: completed
 - **priority**: P1
-- **owner**: (unassigned)
+- **owner**: perf-net
 - **createdAt**: 2026-11-18 00:01
 
 ## Description
@@ -68,4 +68,30 @@ Fixing the netstack TCP sender's stall on late acknowledgements.
 
 ## Notes
 
-(none)
+2026-11-18, done in smoltcp fork tag `v0.14.0-nsplane.11` (owner's approval: fix both tasks).
+The design question was settled as: towards a peer that sends SACK the probe only resends
+and the window stays as it is until the loss shows (a SACK block above the next ACK, an ACK
+of data sent after the probe without a report of the probe as a duplicate, or no report by
+the time one was due); the fork's receiver now sends such reports (RFC 2883). The ACKs
+after a probe are RTT samples.
+
+Three versions failed first, each found by repeating runs:
+
+1. Sampling the RTT from the arming of the probe timeout on every ACK after a probe: on a
+   lossy link every such sample is at least the probe timeout, the estimate fed itself and
+   `loss5` doubled its time.
+2. Cutting the window on the ACK after the probe and restoring it on the duplicate report
+   (tag `.10`): passed alone, failed in `just check` (20 s) under the parallel test run.
+   With first RTT samples a little off, the sample from the probe settled at the gap
+   between probe and ACK, a second probe was taken for proof of a loss before the report
+   of the first could arrive, and the partial ACKs resent segments that do not line up
+   with the originals, so the reports never matched the count of retransmissions.
+3. Treating an ACK past the probed segment as proof of a needless probe without looking
+   at earlier duplicate ACKs or SACK blocks: at 3 % loss it skipped fast recovery and the
+   estimate grew until the retransmission timeout.
+
+Acceptance: `netstack_held`'s two asserted tests run in `just check` (1.1 s and 2.1 to
+2.4 s in a debug build under the parallel run, five runs); late transfers in
+`scripts/bench/netem.sh` equal the transfers from the start (`docs/performance.md`, Shaped
+links); `netstack_lossy` passes and its measured times at 1 %, 3 %, 5 % and 10 % loss match
+the previous tag's; fork unit tests `test_tail_loss_probe_*`.

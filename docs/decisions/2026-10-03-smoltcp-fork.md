@@ -180,6 +180,29 @@ segment out, so a lost fast retransmission waited for the retransmission timeout
 1 s) instead of the probe two round trips later. smoltcp's tests: 714 library tests with the
 default features, 457 with the features nsplane uses.
 
+Tag `v0.14.0-nsplane.11` (tag object `06abdad9e77a184e5eccd14fccd748ff733b4e7c`, commit
+`a48690459a707e0fa0429fde4209e956c2056e45`, branch `nsplane/upstream-c68ace4`, 2026-11-18)
+adds three commits on `.9`. `560f8e4` raises the maximum of `ASSEMBLER_MAX_SEGMENT_COUNT`
+from 32 to 256 (nsplane enables 256). `82737d6` and `a486904` stop the sender from taking
+late or overtaken segments for lost ones: a probe fired after two smoothed RTTs and was
+handled as a loss, the retransmissions suppressed every RTT sample, and nothing took a
+needless window cut back, so a connection whose acknowledgements arrived late after fast
+first round trips sent at a trickle (4 MiB in minutes) and one on a reordering link took 8
+to 20 times as long as kernel TCP. The receiver now reports duplicate segments (RFC 2883).
+Towards such a remote a probe only resends, and the window is reduced once the loss shows
+(a SACK block above the next ACK, an ACK of data sent after the probe with no report of the
+probe, or no report by the time one was due); the ACKs after a probe are RTT samples. A
+reduction after a fast retransmit is withdrawn once every retransmission was reported as a
+duplicate (`Controller::on_spurious_loss`, RFC 9438 4.9; `Controller::on_loss_confirmed`
+marks where the count starts), and the third duplicate ACK then waits up to one smoothed
+RTT. Slow start counts acknowledged octets (RFC 3465), and a FIN ahead of missing data is
+kept. Still no SACK scoreboard: the sender reads SACK blocks only to find a duplicate
+report or a hole above the ACK. Tag `.10` (`82737d6`) is the same without `a486904`: it
+reduced the window on the ACK after a probe and withdrew that on the report, which on a
+link that delivers in slots left reductions standing when the first RTT samples were a
+little off (a test that passed alone failed under a parallel test run). smoltcp's tests:
+726 library tests with the default features, 471 with the features nsplane uses.
+
 The commit messages in the fork carry the full analysis and each has a regression test.
 The dependency keeps `version = "0.14.0"` next to `git` and `tag` so `cargo deny` does not
 see a wildcard.

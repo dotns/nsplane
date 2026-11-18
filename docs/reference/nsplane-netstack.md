@@ -295,7 +295,7 @@ stack with none of these sets no timer and takes no turn until it is woken.
 
 ### smoltcp fork
 
-smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.9`, ADR
+smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.11`, ADR
 [2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): upstream smoltcp `main`
 at `c68ace4` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
 retransmission timer when the peer's window closes (RFC 6298 5.1) and arms the zero-window
@@ -333,20 +333,54 @@ Throughput:
 
 Path MTU: `tcp::Socket::reduce_mss` (above).
 
-Tail loss probe, in the manner of RFC 8985 section 7. Next to the retransmission timer runs a probe timeout of two smoothed RTTs plus 10 ms
+Tail loss probe, in the manner of RFC 8985 section 7. Next to the retransmission timer runs a probe timeout of two smoothed RTTs, or one plus four times the RTT variance if that is more, plus 10 ms
 (plus 200 ms for a delayed ACK when one segment is in flight), restarted by every ACK of
 new data and, outside loss recovery, by every segment sent (in recovery each duplicate ACK
 lets a new segment out, which would push the probe past a lost retransmission). When it expires, the first unacknowledged
-segment is resent once, and fast recovery starts unless a recovery is already running;
-the retransmission timer keeps running for a lost probe. The probe is armed only when it
+segment is resent once. Towards a peer without SACK fast recovery starts with the probe,
+unless a recovery is already running; towards a peer with SACK the probe only resends (see
+below).
+The retransmission timer keeps running for a lost probe. The probe is armed only when it
 expires before the retransmission timeout, so with a `tcp_min_rto` below the probe timeout
 the retransmission timer recovers the loss alone. Unlike RFC 8985 the probe
 resends the first unacknowledged segment rather than the last (smoltcp keeps no SACK
 scoreboard, so that is where the loss must be) and also runs in fast recovery and after
-a timeout, where it resends a lost retransmission: the role RACK has in RFC 8985. SACK is not used:
-smoltcp's receiver reports a single SACK block, so a sender scoreboard would see little of
-the holes; the probe needs no state beyond one flag and one timer field and no receiver
-change. A lost probe waits for a retransmission timeout of at least `tcp_min_rto`.
+a timeout, where it resends a lost retransmission: the role RACK has in RFC 8985. There is no SACK
+scoreboard: smoltcp's receiver reports few SACK blocks, so a scoreboard would see little of
+the holes. A lost probe waits for a retransmission timeout of at least `tcp_min_rto`.
+
+Late and overtaken segments. A segment that is late (a link that holds packets, a delay that
+grew after the first RTT samples) or overtaken (jitter) looks like a lost one to the probe
+and to three duplicate ACKs. The stack tells them apart:
+
+- The receiver answers a segment that lies wholly below RCV.NXT with an ACK whose first
+  SACK block names it (a duplicate report, RFC 2883), and keeps up to 256 out-of-order
+  ranges (`assembler-max-segment-count-256`, 4 KiB per socket) so that reordering does not
+  make it drop data.
+- A probe outside of loss recovery, towards a peer with SACK, leaves the window alone until
+  its loss shows: a SACK block above the next ACK, an ACK of data sent after the probe
+  with no report of the probe before it, or no report by the time one was due (twice the
+  delay from the arming of the probe timeout to the ACK after the probe, plus 10 ms). Then
+  the window is cut, and with segments from before the probe outstanding fast recovery
+  starts. A report of the probe as a duplicate settles that nothing was lost; so does an
+  ACK past the probed segment when the peer never reported a hole.
+- The ACKs after a probe are RTT samples: the first one from the probe (never too long),
+  or from the arming of the probe timeout once the probe is known to be needless, and an
+  ACK past the probed segment from the arming, since it answers a segment sent once and by
+  then. Retransmissions suppress every other sample (Karn's rule), and without these an
+  estimate below the path's delay never grew: every flight was probed again.
+- The sender counts the retransmissions since a fast retransmit. Once the peer has
+  reported as many duplicates, none was needed: the congestion window and threshold from
+  before the cut are restored (RFC 9438 4.9) and fast recovery ends. A further fast
+  retransmit while the last retransmission is younger than the retransmission timeout
+  joins the count, and the cuts are restored together or not at all. A retransmission
+  timeout is never taken back.
+- After a fast retransmit that was taken back, the third duplicate ACK waits a quarter of
+  the smoothed RTT (one more quarter per further one, up to the whole) for an ACK of new
+  data before it starts the next.
+- Slow start counts the octets an ACK covers (RFC 3465), up to the threshold, so ACKs that
+  arrive in clumps or cover many segments do not slow it.
+- A FIN that arrives ahead of missing data is kept and applied when the data is complete.
 
 The engine's `DROP_SINK_FULL` is ordinary loss to TCP: a decrypted segment the engine drops
 at the full sink is never acknowledged, the retransmission timer stays armed and smoltcp
