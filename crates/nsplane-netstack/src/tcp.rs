@@ -49,6 +49,9 @@ pub(crate) struct Shared {
     pub(crate) app_dropped: bool,
     /// The driver released the connection: the socket is gone (or the stack stopped).
     pub(crate) released: bool,
+    /// Why the stream ended without the peer's FIN: a reset by the peer or the idle
+    /// timeout. Reads return it once the bytes before it are read.
+    pub(crate) error: Option<io::ErrorKind>,
     pub(crate) capacity: usize,
 }
 
@@ -63,6 +66,7 @@ impl Shared {
             writer: None,
             app_dropped: false,
             released: false,
+            error: None,
             capacity,
         }
     }
@@ -222,7 +226,9 @@ pub(crate) fn revoked() -> io::Error {
 ///
 /// Reads return the bytes the peer sent and then `Ok(0)` once the peer's FIN arrived
 /// (and every byte before it was read); writes keep working after that, so a peer that
-/// half-closed still gets its response. Shutting the write half down
+/// half-closed still gets its response. A stream the peer reset ends with
+/// [`io::ErrorKind::ConnectionReset`] after the bytes received before the reset, and one
+/// the idle timeout reset with [`io::ErrorKind::TimedOut`], never with `Ok(0)`. Shutting the write half down
 /// ([`AsyncWrite::poll_shutdown`], `AsyncWriteExt::shutdown`) sends a FIN once the
 /// buffered bytes are handed to the stack, while reads keep working. Writes fail with
 /// [`io::ErrorKind::BrokenPipe`] after a shutdown, after the connection was reset or
@@ -387,6 +393,9 @@ impl AsyncRead for TcpConnection {
             return Poll::Ready(Err(revoked()));
         }
         if shared.rx.is_empty() {
+            if let Some(kind) = shared.error {
+                return Poll::Ready(Err(io::Error::from(kind)));
+            }
             if shared.rx_eof || shared.released {
                 return Poll::Ready(Ok(()));
             }

@@ -142,6 +142,65 @@ async fn abort_after_the_peer_reset_only_releases() -> TestResult {
     Ok(())
 }
 
+/// Reads `conn` to its end: the bytes, and the error that ended them (`None` for EOF).
+async fn read_to_end(conn: &mut TcpConnection) -> (Vec<u8>, Option<io::ErrorKind>) {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        match timeout(WAIT, conn.read(&mut buf)).await {
+            Ok(Ok(0)) => return (bytes, None),
+            Ok(Ok(n)) => bytes.extend_from_slice(&buf[..n]),
+            Ok(Err(error)) => return (bytes, Some(error.kind())),
+            Err(_) => return (bytes, Some(io::ErrorKind::WouldBlock)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_peer_reset_ends_the_read_with_connection_reset() -> TestResult {
+    let server: SocketAddrV4 = "10.9.15.1:80".parse()?;
+    let client: SocketAddrV4 = "10.9.15.2:49200".parse()?;
+    let (_handle, mut conn, mut peer, socket) = establish(server, client).await?;
+    peer.socket(socket).send_slice(b"before")?;
+    peer.pump(4).await;
+    peer.socket(socket).abort();
+    peer.pump(4).await;
+    let (bytes, end) = read_to_end(&mut conn).await;
+    assert_eq!(bytes, b"before");
+    assert_eq!(end, Some(io::ErrorKind::ConnectionReset));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_idle_timeout_ends_a_paused_read_with_an_error_and_no_hole() -> TestResult {
+    let server: SocketAddrV4 = "10.9.16.1:80".parse()?;
+    let client: SocketAddrV4 = "10.9.16.2:49200".parse()?;
+    let (_handle, mut conn, mut peer, socket) = establish(server, client).await?;
+    // The application reads nothing while the peer fills its buffer and the socket's.
+    let pattern = |offset: usize| u8::try_from(offset % 251).unwrap_or_default();
+    let mut sent = 0;
+    for _ in 0..400 {
+        while peer.socket(socket).can_send() {
+            let chunk: Vec<u8> = (sent..sent + 1024).map(pattern).collect();
+            sent += peer.socket(socket).send_slice(&chunk)?;
+        }
+        peer.pump(2).await;
+    }
+    assert!(conn.buffered() > 0);
+
+    IDLE_TIMEOUT.set(Some(SmolDuration::from_millis(200)));
+    next_rst(&mut peer).await?;
+    let (bytes, end) = read_to_end(&mut conn).await;
+    let hole = bytes
+        .iter()
+        .enumerate()
+        .position(|(offset, &byte)| byte != pattern(offset));
+    assert_eq!(hole, None, "the read skipped bytes: {} read", bytes.len());
+    assert_eq!(end, Some(io::ErrorKind::TimedOut));
+    Ok(())
+}
+
 #[tokio::test]
 async fn aborted_connect_from_frees_its_port_at_once() -> TestResult {
     let local_ip = Ipv4Addr::new(10, 9, 13, 1);

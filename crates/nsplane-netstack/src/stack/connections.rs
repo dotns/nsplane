@@ -1,5 +1,6 @@
 //! Bridging established connections to the application, and their release.
 
+use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -97,6 +98,9 @@ impl Conn {
         if shared.write_half == WriteHalf::Aborted {
             return abort(socket, &mut shared);
         }
+        if socket.reset_received() && shared.error.is_none() {
+            shared.error = Some(io::ErrorKind::ConnectionReset);
+        }
         preserve_terminal_receive(socket, &mut shared, &mut self.last_activity_at, now);
 
         // smoltcp -> application.
@@ -158,8 +162,10 @@ impl Conn {
 
         if tcp_idle_timeout_expired(socket.state(), self.last_activity_at, now) {
             tracing::debug!(target: "netstack", "TCP connection exceeded idle timeout; aborting");
-            // Released like an application abort: once the RST left.
+            // Released like an application abort: once the RST left. The unread bytes are
+            // discarded, so the reader gets an error rather than a shortened stream.
             shared.write_half = WriteHalf::Aborted;
+            shared.error = Some(io::ErrorKind::TimedOut);
             return abort(socket, &mut shared);
         }
         let terminal = tcp_terminal_ready(
@@ -507,7 +513,11 @@ fn preserve_terminal_receive(
     last_activity_at: &mut SmolInstant,
     now: SmolInstant,
 ) {
-    if !matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) || !socket.can_recv() {
+    // An aborted connection's bytes were discarded: moving later ones would leave a hole.
+    if shared.write_half == WriteHalf::Aborted
+        || !matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
+        || !socket.can_recv()
+    {
         return;
     }
     // FIN bounds this transfer to one receive buffer.

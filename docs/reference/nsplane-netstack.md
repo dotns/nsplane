@@ -216,7 +216,10 @@ stack with none of these sets no timer and takes no turn until it is woken.
   after the abort. A connection without traffic for 5 minutes takes the same path, so the
   idle timeout also sends the peer an RST before the release. Unused, the abort costs one
   state compare under the connection's existing lock and two empty-`Vec` takes per driver
-  turn. A reset peer reads `Ok(0)` and writes fail with `BrokenPipe`.
+  turn. After a reset by the peer, reads return the bytes received before it and then fail
+  with `ConnectionReset` (smoltcp fork `Socket::reset_received`); after the idle timeout
+  they fail with `TimedOut`, the unread bytes discarded. Neither ends with `Ok(0)`, which
+  only the peer's FIN gives. Writes fail with `BrokenPipe`.
 ### Connected UDP sockets
 
 - `connect_udp` / `connect_udp_from` open a `UdpSocket` connected to one remote: the local
@@ -292,9 +295,9 @@ stack with none of these sets no timer and takes no turn until it is woken.
 
 ### smoltcp fork
 
-smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.8`, ADR
+smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.9`, ADR
 [2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): upstream smoltcp `main`
-at `24bda3b` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
+at `c68ace4` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
 retransmission timer when the peer's window closes (RFC 6298 5.1) and arms the zero-window
 probe timer when a timeout finds the window closed; it keeps a fast retransmission pending
 until its segment is emitted, also while the egress backlog is full; and it has the
@@ -310,6 +313,8 @@ Recovery when both ends send under loss:
 - With the receive window closed, the ACK and window of an empty segment past it (the peer
   sent into a window rounded up to the scale) are still taken, so a connection whose two
   windows are both closed reopens (RFC 9293 3.10.7.4).
+- A socket closed by the peer's reset says so (`Socket::reset_received`), so a read ends
+  with `ConnectionReset` rather than as after a FIN.
 
 Throughput:
 
@@ -329,8 +334,9 @@ Throughput:
 Path MTU: `tcp::Socket::reduce_mss` (above).
 
 Tail loss probe, in the manner of RFC 8985 section 7. Next to the retransmission timer runs a probe timeout of two smoothed RTTs plus 10 ms
-(plus 200 ms for a delayed ACK when one segment is in flight), restarted by every
-segment sent and every ACK of new data. When it expires, the first unacknowledged
+(plus 200 ms for a delayed ACK when one segment is in flight), restarted by every ACK of
+new data and, outside loss recovery, by every segment sent (in recovery each duplicate ACK
+lets a new segment out, which would push the probe past a lost retransmission). When it expires, the first unacknowledged
 segment is resent once, and fast recovery starts unless a recovery is already running;
 the retransmission timer keeps running for a lost probe. The probe is armed only when it
 expires before the retransmission timeout, so with a `tcp_min_rto` below the probe timeout

@@ -127,8 +127,12 @@ async fn a_peer_reset_ends_the_stream_and_releases() -> TestResult {
         .await?;
     peer.socket(client).abort();
     let mut bytes = Vec::new();
-    pump_while(&mut peer, &mut Box::pin(conn.read_to_end(&mut bytes))).await??;
+    let read = pump_while(&mut peer, &mut Box::pin(conn.read_to_end(&mut bytes))).await?;
     assert_eq!(bytes, b"before");
+    assert_eq!(
+        read.err().map(|error| error.kind()),
+        Some(io::ErrorKind::ConnectionReset)
+    );
     pump_while(&mut peer, &mut Box::pin(conn.terminated())).await?;
     Ok(())
 }
