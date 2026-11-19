@@ -943,3 +943,9 @@ unpaced 4 MiB burst. Open: `20261118-2040-windows-tun-bench-row`.
   more, and the rest is dropped at the shaping point. A held profile above about 30 Mbit/s
   needs `limit`.
 - `pgrep -f PATTERN` in an until-loop matches the loop's own shell; bracket one character.
+
+## 2026-11-19 [release]
+
+Released 0.24.1: the netstack TCP fix for late and overtaken segments (smoltcp fork
+`v0.14.0-nsplane.11`, 256 assembler ranges), with `net_probe`, `scripts/bench/netem.sh` and
+`scripts/bench/cross-host.sh`.

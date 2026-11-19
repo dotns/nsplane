@@ -5,6 +5,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-11-19
+
+A netstack TCP connection no longer takes late or overtaken segments for lost ones (smoltcp
+fork `v0.14.0-nsplane.11`): transfers on links that hold or reorder packets, such as a Wi-Fi
+client in power save, took minutes with nothing lost. With it come the tests and tools that
+found it: shaped links, an underlay probe and a cross-host driver.
+
 ### Added
 - examples: `netstack_bench` takes `--bytes <N>` with `--mode tcp` (one stream writes exactly
   that many bytes at once; the result is the time until the server has them and the writer's
