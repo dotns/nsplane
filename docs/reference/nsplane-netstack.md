@@ -295,7 +295,7 @@ stack with none of these sets no timer and takes no turn until it is woken.
 
 ### smoltcp fork
 
-smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.11`, ADR
+smoltcp is the `dotns/smoltcp` fork (tag `v0.14.0-nsplane.12`, ADR
 [2026-10-03-smoltcp-fork](../decisions/2026-10-03-smoltcp-fork.md)): upstream smoltcp `main`
 at `c68ace4` plus the changes below. Upstream smoltcp itself keeps outstanding data under the
 retransmission timer when the peer's window closes (RFC 6298 5.1) and arms the zero-window
@@ -337,7 +337,11 @@ Tail loss probe, in the manner of RFC 8985 section 7. Next to the retransmission
 (plus 200 ms for a delayed ACK when one segment is in flight), restarted by every ACK of
 new data and, outside loss recovery, by every segment sent (in recovery each duplicate ACK
 lets a new segment out, which would push the probe past a lost retransmission). When it expires, the first unacknowledged
-segment is resent once. Towards a peer without SACK fast recovery starts with the probe,
+segment is resent. The probe is repeated after twice the wait each time: up to three probes
+for one unacknowledged segment where a loss is known (in loss recovery, after a duplicate
+ACK or a SACK block above the ACK: the peer holds everything behind the hole, so the probe
+is the only segment it can answer), and two where none is (the peer may have answered a
+whole flight with one ACK that was lost); the second of those only resends. Towards a peer without SACK fast recovery starts with the probe,
 unless a recovery is already running; towards a peer with SACK the probe only resends (see
 below).
 The retransmission timer keeps running for a lost probe. The probe is armed only when it

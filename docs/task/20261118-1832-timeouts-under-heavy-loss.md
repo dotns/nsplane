@@ -1,6 +1,6 @@
 # 20261118-1832-timeouts-under-heavy-loss Netstack TCP waits for retransmission timeouts at 5 % loss
 
-- **status**: pending
+- **status**: completed
 - **priority**: P3
 - **owner**: (unassigned)
 - **createdAt**: 2026-11-18 18:32
@@ -39,4 +39,12 @@ Finding why a lost retransmission waits for the timeout under heavy loss.
 
 ## Notes
 
-(none)
+2026-11-19: done in smoltcp fork tag `v0.14.0-nsplane.12`. Traces of both ends at 5 % loss
+showed that the description's cause was one of two. The more frequent one: the remote
+answers a whole flight with one ACK, that ACK is lost, nothing shows a loss, and the single
+probe or its duplicate report is lost as well. The probe is now repeated (three where a
+loss is known, two where none is, doubling). `loss5`: 1.0 to 2.9 s, 0.15 to 1.5 s late,
+kernel TCP 1 to 6 s in the same runs; no timeout after the handshake in eight traced runs.
+In process at 5 %: 0.8 to 2.9 s for 16 MiB without a timeout (2.6 to 8.8 s before). What
+remains is NewReno repairing one loss per probe or round trip. The held and jitter reports
+are unchanged.

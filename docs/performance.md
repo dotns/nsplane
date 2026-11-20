@@ -289,9 +289,12 @@ Against smoltcp `v0.14.0-nsplane.8` (0.23.0, same script and host):
   probe was handled as a loss. They now take what the same link takes from the start.
 - Jitter (`delay 20ms 2ms`, `delay 100ms 10ms`) reorders packets: `jitter20` took 8.6 s and
   `jitter100` 43 s. Three further runs of each now: 0.62 to 0.73 s and 3.2 s.
-- `loss5` is unchanged: 0.2 to 10 s over eight runs, each second of it a retransmission
+- `loss5` was unchanged with `.11`: 0.2 to 10 s over eight runs, each second of it a retransmission
   timeout (a lost retransmission whose one probe, or the answer to it, was lost as well).
   Kernel TCP repairs these from its SACK scoreboard.
+  With `v0.14.0-nsplane.12` (2026-11-19, eight runs): 1.0 to 2.9 s (median 1.3 s),
+  and 0.15 to 1.5 s (median 0.54 s) late, where no SYN is lost; kernel TCP in the same runs
+  1 to 6 s. No retransmission timeout fired after the handshake: the probe is repeated.
 
 `crates/nsplane-e2e/tests/netstack_held.rs` and `netstack_jitter.rs` assert both in process:
 a link (`HeldTransport`) that passes a connection's first four data messages at once and

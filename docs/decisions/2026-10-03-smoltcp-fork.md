@@ -236,3 +236,15 @@ Reporting the defects upstream is outward-facing and the user's call (follow-up 
 - The build fetches one git repository; `Cargo.lock` pins the commit.
 - Security advisories are published against crates.io releases of smoltcp; whether one
   applies to the fork is checked by hand when it appears.
+
+Tag `v0.14.0-nsplane.12` (commit `e48a5e43db30a653704ff0fc907d104b7caac3aa`, branch
+`nsplane/upstream-c68ace4`, 2026-11-19) adds `e48a5e4` on `.11`: the probe is repeated.
+One probe was sent per stall, and at 5 % loss in both directions a transfer spent most of
+its time in the retransmission timeouts of at least 1 s that followed. Traces of both ends
+showed two states: the remote had answered a whole flight with one ACK and that ACK was
+lost, so nothing showed a loss and the one probe or its report was lost one time in ten;
+or a hole was known and the probe was the only segment the remote could answer. Up to
+three probes are now sent for one SND.UNA where a loss is known and two where none is, each
+after twice the wait of the one before; the second probe without a sign of loss only
+resends and changes nothing of what the first one recorded. smoltcp's tests: 728 library
+tests with the default features, 762 with both congestion controllers.
