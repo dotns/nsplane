@@ -949,3 +949,27 @@ unpaced 4 MiB burst. Open: `20261118-2040-windows-tun-bench-row`.
 Released 0.24.1: the netstack TCP fix for late and overtaken segments (smoltcp fork
 `v0.14.0-nsplane.11`, 256 assembler ranges), with `net_probe`, `scripts/bench/netem.sh` and
 `scripts/bench/cross-host.sh`.
+
+## 2026-11-19 [progress]
+
+Three open defects fixed (owner: fix them all). `20261118-1832-timeouts-under-heavy-loss`:
+smoltcp fork tag `v0.14.0-nsplane.12` repeats the probe; `loss5` 0.2 to 10 s became 1.0 to
+2.9 s. `20261028-0611-expiry-queued-packets-dropped`: packets queued behind a handshake
+are reported as `reasons::SESSION_EXPIRED` drops when the tunnel expires.
+`20261028-0611-session-age-aborts-fresh-handshake`: the 540 s age limit waits for a
+handshake attempt under way.
+
+## 2026-11-19 [pitfall]
+
+- A stall with no sign of loss is not always a lost tail: smoltcp answers a burst with one
+  ACK, so one lost ACK hides a whole delivered flight. Trace both ends before naming the
+  cause; the sender's state alone suggested lost probes in recovery, which was the rarer
+  case.
+- `netem.sh` discards the containers' stderr; to trace a run, print the lines from
+  `/client.log` and `/server.log` before the pair stops.
+
+## 2026-11-20 [release]
+
+Released 0.24.2: the repeated loss probe (smoltcp fork `v0.14.0-nsplane.12`), the idle
+expiry that waits for a handshake attempt under way, and `reasons::SESSION_EXPIRED` drops
+for the packets an expiry discards.

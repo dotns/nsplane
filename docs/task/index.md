@@ -86,8 +86,8 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261027-0433-peer-expiry-signal Peer-level connection expiry signal (design)**](20261027-0433-peer-expiry-signal.md) `P3`
 - [x] [**20261028-0615-remove-wss-stream-carrier Remove the deprecated WsFrame stream carrier from nsplane-wss**](20261028-0615-remove-wss-stream-carrier.md) `P2`
 - [x] [**20261028-0615-remove-transparent-admission Remove the deprecated TransparentConfig::admission**](20261028-0615-remove-transparent-admission.md) `P2`
-- [ ] [**20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards**](20261028-0611-expiry-queued-packets-dropped.md) `P3`
-- [ ] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`
+- [x] [**20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards**](20261028-0611-expiry-queued-packets-dropped.md) `P3`
+- [x] [**20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it**](20261028-0611-session-age-aborts-fresh-handshake.md) `P3`
 
 - [x] [**20261028-1630-plaintext-ipv4-validation Validate plaintext IPv4 and correct metadata**](20261028-1630-plaintext-ipv4-validation.md) `P2`
 
@@ -167,5 +167,5 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [x] [**20261118-0002-reordering-tolerance Netstack TCP is slow on a link that reorders packets**](20261118-0002-reordering-tolerance.md) `P2`
 
-- [ ] [**20261118-1832-timeouts-under-heavy-loss Netstack TCP waits for retransmission timeouts at 5 % loss**](20261118-1832-timeouts-under-heavy-loss.md) `P3`
+- [x] [**20261118-1832-timeouts-under-heavy-loss Netstack TCP waits for retransmission timeouts at 5 % loss**](20261118-1832-timeouts-under-heavy-loss.md) `P3`
 - [ ] [**20261118-2040-windows-tun-bench-row A TUN throughput row on Windows**](20261118-2040-windows-tun-bench-row.md) `P3`

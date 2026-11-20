@@ -5,6 +5,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-11-20
+
+Three fixes: netstack TCP under heavy loss repeats its loss probe instead of waiting for
+retransmission timeouts (smoltcp fork `v0.14.0-nsplane.12`), the idle expiry leaves a
+handshake attempt under way alone, and packets an expiry discards are reported as drops.
+
+### Added
+- nsplane-core: `reasons::SESSION_EXPIRED` ("session expired"). When a peer's tunnel expires,
+  each packet that was queued behind its handshake is reported as an `Event::Dropped` with
+  this reason, after `Event::SessionExpired`, and counted in `EngineHandle::drop_counters`.
+  These packets were discarded without a trace.
+- nsplane-noise: `Tunn::take_expired_packets`, the queued packets expiries discarded since
+  the last call.
+
+### Fixed
+- nsplane-netstack: a TCP connection on a path with heavy loss (5 % in both directions) no
+  longer waits out retransmission timeouts of at least 1 s (smoltcp fork tag
+  `v0.14.0-nsplane.12`). The one probe sent per stall, or the answer to it, was lost one
+  time in ten; it is now repeated, up to three times where a loss is known and once where
+  the peer's single ACK of a whole flight may have been lost. 4 MiB over a link shaped to
+  5 % loss took 0.2 to 10 s and takes 1.0 to 2.9 s (0.15 to 1.5 s on an open connection).
+- nsplane-noise: the idle expiry after `REJECT_AFTER_TIME * 3` (540 s) no longer ends a
+  handshake that started shortly before it. The attempt keeps its `REKEY_ATTEMPT_TIME` and
+  its queued packets, as with the kernel implementation, and a peer that does not answer is
+  reported as `ExpiryCause::HandshakeTimeout` instead of `SessionAge`.
+
 ## [0.24.1] - 2026-11-19
 
 A netstack TCP connection no longer takes late or overtaken segments for lost ones (smoltcp
