@@ -1,6 +1,6 @@
 # 20261028-0611-session-age-aborts-fresh-handshake Idle expiry aborts a handshake started just before it
 
-- **status**: pending
+- **status**: completed
 - **priority**: P3
 - **owner**: (unassigned)
 - **createdAt**: 2026-10-28 06:11
@@ -30,3 +30,13 @@ implementation, and decide whether an outstanding initiation should defer the id
 ## Notes
 
 Not implemented in 0.21.0.
+
+2026-11-19: done (owner: fix the open defects). The kernel implementation's
+zero-key-material timer clears the handshake state at 540 s, but its retransmit timer goes
+on and its staged packets stay until `REKEY_ATTEMPT_TIME`; here the expiry also discarded
+the queued packets and stopped the retries. `check_expiry` now skips the age limit while an
+initiation is outstanding: the sessions are gone by then anyway (`REJECT_AFTER_TIME` each),
+and the attempt ends with a session or as `HandshakeTimeout`. Behaviour change: such a peer
+reports `HandshakeTimeout` up to 90 s later instead of `SessionAge` at 540 s. Tests:
+`a_handshake_started_before_the_session_age_limit_keeps_its_attempt_time` (noise),
+`a_handshake_started_before_the_session_age_limit_completes` (core, fake clock).

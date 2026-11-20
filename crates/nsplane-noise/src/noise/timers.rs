@@ -54,7 +54,8 @@ use self::TimerName::{
 pub enum ExpiryCause {
     /// No handshake completed for `REJECT_AFTER_TIME * 3` (540 s): the keys were too old to
     /// keep, typically because no traffic needed a rekey. Not a sign that the peer is
-    /// unreachable.
+    /// unreachable. Not raised while a handshake attempt is under way: that attempt ends
+    /// with a new session or as [`ExpiryCause::HandshakeTimeout`].
     SessionAge,
     /// Handshake initiations got no response for `REKEY_ATTEMPT_TIME` (90 s): the peer did
     /// not answer and the retries gave up.
@@ -246,7 +247,9 @@ impl Tunn {
     }
 
     /// Expires the tunnel for `cause`: discards its sessions, queued packets and timers.
+    /// The queued packets are counted for [`Tunn::take_expired_packets`].
     fn expire(&mut self, cause: ExpiryCause) {
+        self.expired_packets = self.expired_packets.saturating_add(self.packet_queue.len());
         self.handshake.set_expired();
         self.clear_all();
         self.timers.expiry_cause = Some(cause);
@@ -267,7 +270,13 @@ impl Tunn {
 
         // All ephemeral private keys and symmetric session keys are zeroed out after
         // (REJECT_AFTER_TIME * 3), or 540 seconds, if no new keys have been exchanged.
-        if now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3 {
+        // A handshake attempt under way is left its REKEY_ATTEMPT_TIME, as in the kernel
+        // implementation, whose retry timer runs on past this limit: the sessions are gone
+        // by then (REJECT_AFTER_TIME each), and the attempt ends below if it gets no
+        // response.
+        if !self.handshake.is_init_sent()
+            && now.saturating_sub(self.timers[TimeSessionEstablished]) >= REJECT_AFTER_TIME * 3
+        {
             tracing::debug!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
             self.expire(ExpiryCause::SessionAge);
             return Err(WireGuardError::ConnectionExpired);

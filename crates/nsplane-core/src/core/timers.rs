@@ -13,6 +13,7 @@ use nsplane_packet::{Ecn, HEADROOM, Path, PeerId};
 use super::send::{Fixed, transmit};
 use super::{BUF_SIZE, Core, RATE_LIMITER_RESET, TICK, handshakes_completed, message_kind};
 use crate::policy::{MessageKind, PathPolicy};
+use crate::reasons;
 use crate::types::{Event, Output};
 
 impl Core {
@@ -42,6 +43,13 @@ impl Core {
                             self.outputs.push_back(Output::Event(Event::SessionExpired {
                                 peer: id,
                                 cause,
+                            }));
+                        }
+                        // The packets that waited for the handshake went with the tunnel.
+                        for _ in 0..peer.take_expired_packets() {
+                            self.outputs.push_back(Output::Event(Event::Dropped {
+                                peer: Some(id),
+                                reason: reasons::SESSION_EXPIRED,
                             }));
                         }
                     } else {

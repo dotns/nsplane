@@ -32,6 +32,9 @@ pub const UNKNOWN_PEER: &str = "unknown peer";
 /// A packet for an explicit path (`Core::inject_outbound_on`) or a tracked local packet
 /// found no current session; neither is queued behind a handshake.
 pub const NO_SESSION: &str = "no session";
+/// A packet queued behind a handshake was discarded when the peer's tunnel expired
+/// (`Event::SessionExpired`): the handshake got no response.
+pub const SESSION_EXPIRED: &str = "session expired";
 /// The peer's tunnel rejected a verified handshake message (bad keys, replayed timestamp,
 /// no matching handshake in flight).
 pub const HANDSHAKE_REJECTED: &str = "handshake rejected";

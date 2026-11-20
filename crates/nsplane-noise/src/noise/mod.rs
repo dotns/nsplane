@@ -89,6 +89,9 @@ pub struct Tunn {
     current: usize,
     /// Queue to store blocked packets
     packet_queue: VecDeque<Vec<u8>>,
+    /// Queued packets discarded by expiries and not yet taken by
+    /// [`Tunn::take_expired_packets`].
+    expired_packets: usize,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
     tx_bytes: usize,
@@ -229,6 +232,11 @@ impl Tunn {
         self.handshake.is_expired()
     }
 
+    /// The packets queued behind a handshake that expiries discarded since the last call.
+    pub const fn take_expired_packets(&mut self) -> usize {
+        std::mem::replace(&mut self.expired_packets, 0)
+    }
+
     /// Why the tunnel expired, while it is expired ([`Tunn::is_expired`]); `None` otherwise.
     ///
     /// The next handshake initiation, which leaves the expired state, clears it.
@@ -278,6 +286,7 @@ impl Tunn {
             rx_bytes: Default::default(),
 
             packet_queue: VecDeque::new(),
+            expired_packets: 0,
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
 
             rate_limiter: rate_limiter.unwrap_or_else(|| {
@@ -2062,6 +2071,53 @@ mod tests {
 
         expect_expiry(&mut my_tun, now + REJECT_AFTER_TIME * 3);
         assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::SessionAge));
+    }
+
+    #[test]
+    fn a_handshake_started_before_the_session_age_limit_keeps_its_attempt_time() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let now = start(&mut [&mut my_tun]);
+        let mut dst = vec![0u8; 2048];
+
+        // One second before the session is three times REJECT_AFTER_TIME old, a packet
+        // starts a handshake.
+        let started = now + (REJECT_AFTER_TIME * 3).saturating_sub(Duration::from_secs(1));
+        let _ = my_tun.update_timers_at(started, &mut dst);
+        let packet = create_ipv4_udp_packet();
+        assert!(is_handshake_init(&my_tun.encapsulate(&packet, &mut dst)));
+
+        // The age limit passes: the attempt goes on, with its packet.
+        let result = my_tun.update_timers_at(started + Duration::from_secs(2), &mut dst);
+        assert!(!matches!(
+            result,
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert!(!my_tun.is_expired());
+        assert_eq!(my_tun.packet_queue.len(), 1);
+
+        // Unanswered, it ends after its own REKEY_ATTEMPT_TIME.
+        expect_expiry(&mut my_tun, started + REKEY_ATTEMPT_TIME);
+        assert_eq!(my_tun.expiry_cause(), Some(ExpiryCause::HandshakeTimeout));
+    }
+
+    #[test]
+    fn an_expiry_counts_the_queued_packets_it_discards() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let now = start(&mut [&mut my_tun]);
+        let mut dst = vec![0u8; 2048];
+        let packet = create_ipv4_udp_packet();
+        assert!(is_handshake_init(&my_tun.encapsulate(&packet, &mut dst)));
+        for _ in 0..2 {
+            assert!(matches!(
+                my_tun.encapsulate(&packet, &mut dst),
+                TunnResult::Done
+            ));
+        }
+        assert_eq!(my_tun.take_expired_packets(), 0);
+
+        expect_expiry(&mut my_tun, now + REKEY_ATTEMPT_TIME);
+        assert_eq!(my_tun.take_expired_packets(), 3);
+        assert_eq!(my_tun.take_expired_packets(), 0);
     }
 
     #[test]

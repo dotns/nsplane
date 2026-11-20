@@ -1,6 +1,6 @@
 # 20261028-0611-expiry-queued-packets-dropped Report packets a tunnel expiry discards
 
-- **status**: pending
+- **status**: completed
 - **priority**: P3
 - **owner**: (unassigned)
 - **createdAt**: 2026-10-28 06:11
@@ -29,3 +29,10 @@ can be queued there at all, and the cost (only on the expiry path).
 ## Notes
 
 Not implemented in 0.21.0.
+
+2026-11-19: done (owner: fix the open defects). `Tunn::take_expired_packets` counts what
+an expiry discards; the core emits one `Event::Dropped` with `reasons::SESSION_EXPIRED` per
+packet after `SessionExpired`. Additive: a new reason and more events on the expiry path
+only, at most 256. A tracked packet is never queued there (`reasons::NO_SESSION`), so no
+`NotSent` is involved. Not covered: a packet refused by the full queue (256) is still not
+reported.

@@ -91,9 +91,15 @@ does a persistent keepalive, one interval after the expiry and after every later
 - `ExpiryCause::SessionAge`: no handshake completed for `REJECT_AFTER_TIME * 3` (540 s), counted
   from the last completed handshake or, without one, from the peer's first timer tick. The
   keys are too old to keep, typically because no traffic needed a rekey; it does not mean
-  the peer is unreachable.
+  the peer is unreachable. A handshake attempt under way at that moment is not cut short: it
+  keeps its `REKEY_ATTEMPT_TIME` and its queued packets, and ends as a `HandshakeTimeout` if
+  it gets no response.
 - `ExpiryCause::HandshakeTimeout`: an initiation got no response for `REKEY_ATTEMPT_TIME`
   (90 s) and the retries gave up: the peer does not answer.
+
+Each packet that was queued behind the handshake is reported as
+`Event::Dropped { reason: reasons::SESSION_EXPIRED }` after the `SessionExpired` event (at
+most 256 per expiry, the tunnel's queue depth).
 
 `Core::handle_timeout` reports an expiry as `Event::SessionExpired { peer, cause }` once: the
 tunnel stays expired, and the next expiry is reported only after the peer sent a handshake

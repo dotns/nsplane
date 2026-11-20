@@ -203,6 +203,11 @@ impl Peer {
         self.tunnel_mut().update_timers_at(now, dst)
     }
 
+    /// The queued packets the tunnel's expiries discarded since the last call.
+    pub(crate) fn take_expired_packets(&mut self) -> usize {
+        self.tunnel_mut().take_expired_packets()
+    }
+
     /// The current path.
     pub(crate) const fn path(&self) -> Option<Path> {
         self.path

@@ -11,7 +11,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Fate, Net, Sent, default_config};
-use nsplane_core::{ConfigChange, CoreConfig, Event, ExpiryCause, PeerId};
+use nsplane_core::{ConfigChange, CoreConfig, Event, ExpiryCause, PeerId, reasons};
 
 const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
@@ -39,6 +39,14 @@ fn handshakes(events: &[Event]) -> usize {
         .iter()
         .filter(|e| matches!(e, Event::HandshakeCompleted { .. }))
         .count()
+}
+
+/// The drop of a packet that was queued behind a handshake that gave up.
+const fn expired_drop(peer: PeerId) -> Event {
+    Event::Dropped {
+        peer: Some(peer),
+        reason: reasons::SESSION_EXPIRED,
+    }
 }
 
 fn expiries(events: &[Event]) -> usize {
@@ -99,6 +107,55 @@ fn handshake_no_resp_rekey_timeout() {
     assert_eq!(inits(&net.take_transmits(0)), 0);
     net.run_for(Duration::from_secs(1));
     assert_eq!(inits(&net.take_transmits(0)), 1);
+}
+
+/// The packets queued behind a handshake that gives up are reported as drops, after the
+/// expiry.
+#[test]
+fn an_expiry_reports_the_packets_queued_behind_the_handshake() {
+    let mut net = Net::new(2);
+    net.set_interceptor(|_| Fate::Drop);
+    let peer = net.peer_id(0, 1);
+    for _ in 0..3 {
+        net.ping4(0, 1, b"queued");
+    }
+    assert_eq!(net.take_events(0), Vec::new());
+
+    net.run_for(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
+    let dropped = expired_drop(peer);
+    assert_eq!(
+        net.take_events(0),
+        [
+            Event::SessionExpired {
+                peer,
+                cause: ExpiryCause::HandshakeTimeout
+            },
+            dropped.clone(),
+            dropped.clone(),
+            dropped,
+        ]
+    );
+}
+
+/// A handshake started just before the session is `REJECT_AFTER_TIME * 3` old is not cut
+/// short by that limit: it completes when the peer answers.
+#[test]
+fn a_handshake_started_before_the_session_age_limit_completes() {
+    let mut net = Net::new(2);
+    net.handshake(0, 1);
+    net.run_for((REJECT_AFTER_TIME * 3).saturating_sub(Duration::from_secs(2)));
+    net.clear_logs();
+
+    // The first initiation and its retries are lost until the limit has passed.
+    net.set_interceptor(|_| Fate::Drop);
+    let packet = net.ping4(0, 1, b"just before the limit");
+    net.run_for(Duration::from_secs(4));
+    assert_eq!(expiries(&net.take_events(0)), 0);
+
+    net.clear_interceptor();
+    net.run_for(REKEY_TIMEOUT + Duration::from_secs(1));
+    assert_eq!(handshakes(&net.take_events(0)), 1);
+    assert_eq!(net.take_delivered(1).last().unwrap().1, packet);
 }
 
 /// The initiator keeps retrying for `REKEY_ATTEMPT_TIME`, then gives up and reports the
@@ -183,7 +240,7 @@ fn persistent_keepalive_starts_a_new_attempt_after_the_handshake_gave_up() {
     };
 
     net.run_for(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
-    assert_eq!(net.take_events(0), std::slice::from_ref(&timed_out));
+    assert_eq!(net.take_events(0), [timed_out.clone(), expired_drop(id)]);
     net.take_transmits(0);
 
     net.run_for(interval.saturating_sub(Duration::from_secs(2)));
@@ -373,10 +430,13 @@ fn a_never_up_peer_reports_handshake_timeout_after_an_unreported_idle_expiry() {
     net.run_for(Duration::from_secs(1));
     assert_eq!(
         net.take_events(0),
-        [Event::SessionExpired {
-            peer,
-            cause: ExpiryCause::HandshakeTimeout
-        }]
+        [
+            Event::SessionExpired {
+                peer,
+                cause: ExpiryCause::HandshakeTimeout
+            },
+            expired_drop(peer)
+        ]
     );
     net.run_for(Duration::from_secs(30));
     assert_eq!(net.take_events(0), Vec::new(), "reported once");
@@ -402,10 +462,13 @@ fn expirations_count_the_reported_expiries() {
     net.run_for(REKEY_ATTEMPT_TIME + Duration::from_secs(1));
     assert_eq!(
         net.take_events(0),
-        [Event::SessionExpired {
-            peer,
-            cause: ExpiryCause::HandshakeTimeout
-        }]
+        [
+            Event::SessionExpired {
+                peer,
+                cause: ExpiryCause::HandshakeTimeout
+            },
+            expired_drop(peer)
+        ]
     );
     assert_eq!(expirations(&net, 0, 1), 2);
     assert_eq!(expirations(&net, 1, 0), 1, "the responder saw nothing");

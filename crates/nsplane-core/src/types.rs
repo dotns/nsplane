@@ -449,7 +449,9 @@ pub enum Event {
         path: Path,
     },
     /// The tunnel with `peer` expired: its sessions and queued packets were discarded and the
-    /// next packet to the peer starts a new handshake.
+    /// next packet to the peer starts a new handshake. An [`Event::Dropped`] with
+    /// [`reasons::SESSION_EXPIRED`](crate::reasons::SESSION_EXPIRED) follows for each
+    /// queued packet.
     ///
     /// Emitted by the timers once per expiry: again only after the peer sent a handshake
     /// initiation or completed a handshake since. An expiry for [`ExpiryCause::SessionAge`] is

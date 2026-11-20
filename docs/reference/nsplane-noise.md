@@ -23,8 +23,10 @@ I/O. `nsplane-core` builds the engine on it; an application can use it alone wit
   - `timers`: the WireGuard timer state machine (rekey, keepalive, expiry). The tunnel
     expires after `REJECT_AFTER_TIME * 3` (540 s) without a new session
     (`ExpiryCause::SessionAge`) or after `REKEY_ATTEMPT_TIME` (90 s) of unanswered
-    initiations (`ExpiryCause::HandshakeTimeout`); `Tunn::expiry_cause` returns the cause
-    while `Tunn::is_expired`, and the next handshake initiation clears both. With a
+    initiations (`ExpiryCause::HandshakeTimeout`); the age limit waits for a handshake attempt
+    under way, and `Tunn::take_expired_packets` counts the queued packets an expiry
+    discarded; `Tunn::expiry_cause` returns the cause while `Tunn::is_expired`, and the next
+    handshake initiation clears both. With a
     persistent keepalive the timers send that initiation one interval after the expiry, so
     an unanswered peer is tried again in cycles for as long as the keepalive is set.
 - `Tunn::stats` returns the time since the last handshake, the data bytes sent and received,
