@@ -135,9 +135,12 @@ impl TunOptions {
     /// Either way an orphan (the alias resolves but its device is not present, as after a
     /// killed process) is replaced; when Wintun cannot reclaim the alias this fails with
     /// [`WintunError::OrphanNotReplaced`]. A killed process's adapter can keep its alias on
-    /// an interface that reports `Down` for a moment after this call loads Wintun: before
-    /// refusing an alias Wintun cannot open, the call waits up to half a second for it to
-    /// go.
+    /// an interface that reports `Down` and that Wintun cannot open, for a moment or for
+    /// minutes after Wintun removed the device: the call waits up to half a second for it
+    /// to go and then replaces it like an orphan. An interface of another kind that is
+    /// down under that alias is not touched: the replacement then fails with
+    /// [`WintunError::OrphanNotReplaced`]. An alias on an interface that is up and that
+    /// Wintun cannot open is refused.
     #[must_use]
     pub const fn exclusive(mut self, exclusive: bool) -> Self {
         self.exclusive = exclusive;
@@ -226,11 +229,15 @@ impl Tun {
         };
         let (mut opened, mut existing) = probe()?;
         // The adapter of a killed holder leaves its alias on an interface that reports
-        // `Down` and that Wintun no longer opens, until Wintun removes it shortly after a
-        // process called into it (this one just did). Look again before refusing; a live
-        // adapter Wintun opens is refused at once.
+        // `Down` and that Wintun no longer opens. Mostly it goes shortly after a process
+        // called into Wintun (this one just did): look again before deciding. What is
+        // still there after that can stay for minutes and is replaced; a live adapter
+        // Wintun opens is refused at once.
         let mut waited = Duration::ZERO;
-        while exclusive && opened.is_none() && existing == Existing::Live && waited < ORPHAN_SETTLE
+        while exclusive
+            && opened.is_none()
+            && matches!(existing, Existing::Live | Existing::Remnant)
+            && waited < ORPHAN_SETTLE
         {
             thread::sleep(ORPHAN_POLL);
             waited += ORPHAN_POLL;
@@ -387,9 +394,9 @@ fn interface_alias_luid(name: &str) -> io::Result<Option<NET_LUID_LH>> {
     }
 }
 
-/// Whether the interface `luid` reports a present device (`GetIfEntry2`); `None` when it
-/// has no interface row.
-fn interface_present(luid: NET_LUID_LH) -> io::Result<Option<bool>> {
+/// The `OperStatus` of the interface `luid` (`GetIfEntry2`); `None` when it has no
+/// interface row.
+fn interface_oper_status(luid: NET_LUID_LH) -> io::Result<Option<i32>> {
     let mut row = MIB_IF_ROW2 {
         InterfaceLuid: luid,
         ..Default::default()
@@ -399,21 +406,25 @@ fn interface_present(luid: NET_LUID_LH) -> io::Result<Option<bool>> {
     // requires; it outlives the call.
     let status = unsafe { GetIfEntry2(&raw mut row) };
     match status {
-        NO_ERROR => Ok(Some(wintun::present(row.OperStatus))),
+        NO_ERROR => Ok(Some(row.OperStatus)),
         ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND => Ok(None),
         code => Err(io::Error::from_raw_os_error(code.cast_signed())),
     }
 }
 
 /// What `name` resolves to: the LUID of the adapter Wintun opened (`opened`), else that
-/// of the interface alias, classified by whether its interface is present.
+/// of the interface alias, classified by the state of its interface.
 fn existing(name: &str, opened: Option<NET_LUID_LH>) -> io::Result<Existing> {
     let luid = match opened {
         Some(luid) => Some(luid),
         None => interface_alias_luid(name)?,
     };
-    let present = luid.map(interface_present).transpose()?.flatten();
-    Ok(wintun::classify(luid.is_some(), present))
+    let oper_status = luid.map(interface_oper_status).transpose()?.flatten();
+    Ok(wintun::classify(
+        luid.is_some(),
+        oper_status,
+        opened.is_some(),
+    ))
 }
 
 /// The `NlMtu` of the IP interface row of `luid` for `family`; `None` when the interface

@@ -103,18 +103,24 @@ In order:
    terminal), a mismatch `WintunError::HashMismatch`. The file can still be replaced between
    check and load, so it must sit in a directory only administrators can write.
 3. With `exclusive(true)` a live Wintun adapter (`Adapter::open` succeeds; that handle is
-   only closed) or any present interface with that alias (`ConvertInterfaceAliasToLuid`) is
-   refused with `WintunError::AdapterExists`. An alias `Adapter::open` cannot open is looked
-   at again every 25 ms for up to 500 ms first: after a `taskkill /F` of the holder, its
-   alias stays on an interface that reports `Down` (no adapter, no Plug and Play device) until Wintun
-   removes it 30-80 ms after the next process called into it, which this call just did.
+   only closed) or an interface with that alias (`ConvertInterfaceAliasToLuid`) that is
+   neither `Down` nor not present is refused with `WintunError::AdapterExists`. An alias
+   `Adapter::open` cannot open is looked at again every 25 ms for up to 500 ms first: after
+   a `taskkill /F` of the holder, its alias stays on an interface that reports `Down` (no
+   adapter, no Plug and Play device). Mostly Wintun removes it 30-80 ms after the next
+   process called into it, which this call just did; at times the row stays for minutes
+   after Wintun logged the removal. What is still `Down` and unopened after the wait is
+   replaced as in step 4. An interface of another kind that is down under that alias is
+   not touched: Wintun then assigns another alias and the call fails with
+   `WintunError::OrphanNotReplaced`.
 4. With either setting an orphan is replaced: the name resolves to a LUID whose interface is
    not present (`GetIfEntry2` reports `NotPresent` or has no row), the device of a process
    that died without closing its adapter. The handle is closed, the adapter created, and the
    assigned alias must equal the name, else the new adapter is removed and
-   `WintunError::OrphanNotReplaced` returned. A present device (any other `OperStatus`,
-   `Down` included) stands for a live owner; on the default path a failed IP Helper query
-   counts as present.
+   `WintunError::OrphanNotReplaced` returned. A present device (any other `OperStatus`)
+   stands for a live owner, a `Down` one only where Wintun opens it; without `exclusive` a
+   `Down` alias Wintun cannot open is left to Wintun's alias choice. On the default path a
+   failed IP Helper query counts as present.
 5. Once the adapter is open, a pinned `driver_version` is compared with the running driver
    (`WintunError::DriverVersionMismatch`; dropping the handle removes an adapter this call
    created), then the session starts.

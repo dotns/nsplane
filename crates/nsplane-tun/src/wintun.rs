@@ -229,6 +229,8 @@ fn remedy(path: &Path, arch: &str) -> String {
 
 /// `IfOperStatusNotPresent`: the `OperStatus` of an interface whose device is not present.
 const IF_OPER_STATUS_NOT_PRESENT: i32 = 6;
+/// `IfOperStatusDown`.
+const IF_OPER_STATUS_DOWN: i32 = 2;
 
 /// What the name resolves to before `Tun::create_with` opens or creates the adapter.
 ///
@@ -242,24 +244,25 @@ pub(crate) enum Existing {
     /// `NotPresent`, or no interface row for that LUID): the device of a process that died
     /// without closing its adapter.
     Orphaned,
-    /// The name resolves and the interface is present (any other `OperStatus`, including
-    /// `Down`: an adapter another process created but has not started yet is live).
+    /// The name resolves to an interface that is `Down` and that Wintun cannot open: what
+    /// Windows can keep of a killed process's adapter for minutes after Wintun removed the
+    /// device, or an interface of another kind that is down. No process holds a Wintun
+    /// adapter there: one that does is opened by Wintun, started or not.
+    Remnant,
+    /// The name resolves and the interface is present (any other case, including a `Down`
+    /// adapter Wintun opens: one another process created but has not started yet is live).
     Live,
 }
 
-/// Whether an interface row's `OperStatus` reports a present device.
-pub(crate) const fn present(oper_status: i32) -> bool {
-    oper_status != IF_OPER_STATUS_NOT_PRESENT
-}
-
 /// Classifies a name by whether it resolves to a LUID (Wintun opened the adapter, or the
-/// interface alias converts) and whether that LUID's interface row reports a present
-/// device (`None`: no row).
-pub(crate) const fn classify(resolves: bool, present: Option<bool>) -> Existing {
-    match (resolves, present) {
-        (false, _) => Existing::Absent,
-        (true, None | Some(false)) => Existing::Orphaned,
-        (true, Some(true)) => Existing::Live,
+/// interface alias converts), the `OperStatus` of that LUID's interface row (`None`: no
+/// row) and whether Wintun opened the adapter.
+pub(crate) const fn classify(resolves: bool, oper_status: Option<i32>, opened: bool) -> Existing {
+    match (resolves, oper_status, opened) {
+        (false, _, _) => Existing::Absent,
+        (true, None | Some(IF_OPER_STATUS_NOT_PRESENT), _) => Existing::Orphaned,
+        (true, Some(IF_OPER_STATUS_DOWN), false) => Existing::Remnant,
+        (true, Some(_), _) => Existing::Live,
     }
 }
 
@@ -280,11 +283,15 @@ pub(crate) enum Plan {
 /// Decides by what the name resolves to, whether Wintun opened it and whether the caller
 /// asked for an exclusive adapter. An orphan is replaced either way (a session on a
 /// non-present device cannot start); a live name that is no Wintun adapter is left to
-/// Wintun's alias choice when not exclusive.
+/// Wintun's alias choice when not exclusive, and so is a remnant. An exclusive caller
+/// replaces a remnant: if another interface really holds the alias, Wintun assigns a
+/// different one and the replacement fails with [`WintunError::OrphanNotReplaced`].
 pub(crate) const fn plan(existing: Existing, opened: bool, exclusive: bool) -> Plan {
     match (existing, opened, exclusive) {
-        (Existing::Absent, _, _) | (Existing::Live, false, false) => Plan::Create,
-        (Existing::Orphaned, _, _) => Plan::Replace,
+        (Existing::Absent, _, _)
+        | (Existing::Live, false, false)
+        | (Existing::Remnant, _, false) => Plan::Create,
+        (Existing::Orphaned, _, _) | (Existing::Remnant, _, true) => Plan::Replace,
         (Existing::Live, _, true) => Plan::Refuse,
         (Existing::Live, true, false) => Plan::Open,
     }
@@ -694,6 +701,11 @@ mod tests {
             row: Some(UP),
             wintun: false,
         },
+        Interface {
+            alias: "remnant",
+            row: Some(DOWN),
+            wintun: false,
+        },
     ];
 
     /// What `Tun::create_with` sees for `name` in the model: the classification and
@@ -702,8 +714,8 @@ mod tests {
         TABLE
             .iter()
             .find(|i| i.alias == name)
-            .map_or((classify(false, None), false), |i| {
-                (classify(true, i.row.map(present)), i.wintun)
+            .map_or((classify(false, None, false), false), |i| {
+                (classify(true, i.row, i.wintun), i.wintun)
             })
     }
 
@@ -721,7 +733,8 @@ mod tests {
         assert_eq!(resolve("ns0"), (Existing::Live, true));
         assert_eq!(resolve("starting"), (Existing::Live, true));
         assert_eq!(resolve("Ethernet"), (Existing::Live, false));
-        assert_eq!(classify(false, Some(true)), Existing::Absent);
+        assert_eq!(resolve("remnant"), (Existing::Remnant, false));
+        assert_eq!(classify(false, Some(UP), false), Existing::Absent);
     }
 
     #[test]
@@ -738,17 +751,22 @@ mod tests {
         assert_eq!(plan_for("starting", false), Plan::Open);
         assert_eq!(plan_for("Ethernet", true), Plan::Refuse);
         assert_eq!(plan_for("Ethernet", false), Plan::Create);
+        // What is left of a killed holder's adapter does not block an exclusive open.
+        assert_eq!(plan_for("remnant", true), Plan::Replace);
+        assert_eq!(plan_for("remnant", false), Plan::Create);
     }
 
     #[test]
     fn plan_truth_table() {
-        use Existing::{Absent, Live, Orphaned};
+        use Existing::{Absent, Live, Orphaned, Remnant};
         for opened in [false, true] {
             for exclusive in [false, true] {
                 assert_eq!(plan(Absent, opened, exclusive), Plan::Create);
                 assert_eq!(plan(Orphaned, opened, exclusive), Plan::Replace);
                 assert_eq!(plan(Live, opened, true), Plan::Refuse);
             }
+            assert_eq!(plan(Remnant, opened, true), Plan::Replace);
+            assert_eq!(plan(Remnant, opened, false), Plan::Create);
         }
         assert_eq!(plan(Live, true, false), Plan::Open);
         assert_eq!(plan(Live, false, false), Plan::Create);
