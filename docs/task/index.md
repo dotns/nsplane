@@ -1,6 +1,6 @@
 # nstun - Task List
 
-> Updated: 2026-11-18
+> Updated: 2026-11-21
 
 ## Usage
 
@@ -44,7 +44,7 @@ Each task is a single line linking to its detail file. All detailed information 
 - [-] [**20261003-2200-ns-local-side Local-side graph, masquerade, Echo reply, host TUNs and the ACL gate for ns**](20261003-2200-ns-local-side.md) `P1`
 - [-] [**20261006-1300-nsgw-requests Data-plane items for the nsgw rebuild, in generic form**](20261006-1300-nsgw-requests.md) `P1`
 - [x] [**20261006-1500-business-agnostic-cleanup Remove product concepts from nsplane**](20261006-1500-business-agnostic-cleanup.md) `P1`
-- [ ] [**20261006-1700-windows-smoke-for-ns Windows TUN smoke scenario for ns (MT-3 addendum)**](20261006-1700-windows-smoke-for-ns.md) `P1`
+- [x] [**20261006-1700-windows-smoke-for-ns Windows TUN smoke scenario for ns (MT-3 addendum)**](20261006-1700-windows-smoke-for-ns.md) `P1`
 - [-] [**20261008-0800-consumer-integration ns and nsgw on nsplane 0.11**](20261008-0800-consumer-integration.md) `P1`
 - [x] [**20261011-0101-local-identities Several local identities per engine**](20261011-0101-local-identities.md) `P1`
 - [-] [**20261012-1700-peer-keyed-gate Peer-keyed, address-family-agnostic flow gate**](20261012-1700-peer-keyed-gate.md) `P1`
@@ -168,4 +168,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261118-0002-reordering-tolerance Netstack TCP is slow on a link that reorders packets**](20261118-0002-reordering-tolerance.md) `P2`
 
 - [x] [**20261118-1832-timeouts-under-heavy-loss Netstack TCP waits for retransmission timeouts at 5 % loss**](20261118-1832-timeouts-under-heavy-loss.md) `P3`
-- [ ] [**20261118-2040-windows-tun-bench-row A TUN throughput row on Windows**](20261118-2040-windows-tun-bench-row.md) `P3`
+- [x] [**20261118-2040-windows-tun-bench-row A TUN throughput row on Windows**](20261118-2040-windows-tun-bench-row.md) `P3`

@@ -1,8 +1,8 @@
 # 20261118-2040-windows-tun-bench-row A TUN throughput row on Windows
 
-- **status**: pending
+- **status**: completed
 - **priority**: P3
-- **owner**: (unassigned)
+- **owner**: roy
 - **createdAt**: 2026-11-18 20:40
 
 ## Description
@@ -20,3 +20,12 @@ without leaving a service on the VM.
 
 Acceptance: a Windows row in `docs/performance.md`, Across hosts and networks, with TCP
 throughput in both directions and UDP loss at 50 Mbit/s.
+
+## Result (2026-11-21)
+
+`tun_node` builds for Windows (Wintun adapter, `netsh` for addresses and routes, no UAPI).
+Row added to `docs/performance.md`, Across hosts and networks: TCP 604 Mbit/s up and
+197 Mbit/s down, 4 streams 556 and 189 Mbit/s, no loss at 50 Mbit/s UDP in either
+direction; three runs against kernel WireGuard in a container. No WireGuard for Windows
+reference (it installs a service). The run was driven by hand, not by
+`scripts/bench/cross-host.sh`.

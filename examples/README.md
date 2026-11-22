@@ -51,6 +51,11 @@ on the kernel stack. Needs root.
 Flags: node, echo and check flags, `--tun-name <NAME>` (default `nsp0`), `--address <CIDR>`
 (repeatable), `--mtu <N>` (default 1420).
 
+On Windows the node runs on a Wintun adapter: `wintun.dll` next to the executable, an
+elevated terminal, addresses and peer routes set with `netsh`, peers from the flags only
+(no UAPI). `--exclusive` refuses an adapter of that name another process holds
+(`TunOptions::exclusive`).
+
 ```sh
 sudo cargo run -p nsplane-examples --bin tun_node -- --private-key-file a.key --address 10.0.0.1/24 --peer <B_PUB>,endpoint=192.0.2.2:51820,allowed-ips=10.0.0.2/32 --echo-port 7
 ```

@@ -391,9 +391,23 @@ its first start found the utun device of the node before it not yet released):
 | wireguard-go | 559, 592 Mbit/s | 752, 755 Mbit/s | 583, 596 Mbit/s | 741, 745 Mbit/s |
 
 Neither lost a datagram of 50 Mbit/s UDP in either direction. Both are at what the link
-carries (iperf3 without a tunnel from the container: 804 Mbit/s towards the Mac). No TUN row
-for Windows: the repository has no TUN node binary for it (`nsplane-cli` and `tun_node` are
-Unix programs); Wintun is covered by `nsplane-tun`'s tests on the VM.
+carries (iperf3 without a tunnel from the container: 804 Mbit/s towards the Mac).
+
+TUN on Windows: `tun_node` (nsplane on a Wintun adapter, the `wintun.dll` of `wintun-bindings` 0.7.40, MTU 1420) in the
+Windows 11 VM against kernel WireGuard in a container on the bench host, iperf3 3.22 from
+the VM for 10 s, 2026-11-21, median of three runs with the range. No WireGuard for Windows
+reference: it installs a service on the VM.
+
+| VM side | TCP up | TCP down | 4 streams up | 4 streams down |
+|---|---|---|---|---|
+| nsplane, Wintun | 604 [493-614] Mbit/s | 197 [194-197] Mbit/s | 556 [525-566] Mbit/s | 189 [188-232] Mbit/s |
+| no tunnel | 161 [158-193] Mbit/s | 733 [729-754] Mbit/s | - | - |
+
+No datagram of 50 Mbit/s UDP was lost in either direction (48 000 per run). The row
+without a tunnel is no ceiling for the tunnel: the VM's NAT carries TCP and the tunnel's
+UDP on different paths, and up the tunnel is faster than plain TCP. Down, the Wintun node
+reaches a third of what the netstack node does on the same VM (611 Mbit/s above); where
+the rest goes was not measured.
 
 ## Netstack ingress labels
 

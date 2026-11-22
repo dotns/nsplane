@@ -5,6 +5,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- examples: `tun_node` builds and runs on Windows, on a Wintun adapter: addresses and peer
+  routes through `netsh`, peers from the flags (no UAPI), `--exclusive` for
+  `TunOptions::exclusive`.
+
+### Fixed
+- nsplane-tun (Windows): `Tun::create_with` with `exclusive(true)` no longer fails with
+  `WintunError::AdapterExists` for minutes after the process that held the adapter was
+  killed. Windows can keep the alias on an interface that reports `Down` and that Wintun
+  cannot open, after Wintun removed the device; the half-second wait did not always
+  outlast it. Such an interface is now replaced like an orphan. An adapter another process
+  holds is refused as before, and an interface of another kind that is down under the name
+  yields `WintunError::OrphanNotReplaced`.
+
 ## [0.24.2] - 2026-11-20
 
 Three fixes: netstack TCP under heavy loss repeats its loss probe instead of waiting for

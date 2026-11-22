@@ -973,3 +973,19 @@ handshake attempt under way.
 Released 0.24.2: the repeated loss probe (smoltcp fork `v0.14.0-nsplane.12`), the idle
 expiry that waits for a handshake attempt under way, and `reasons::SESSION_EXPIRED` drops
 for the packets an expiry discards.
+
+## 2026-11-21 [progress]
+
+`tun_node` runs on Windows (Wintun). With it, `20261006-1700-windows-smoke-for-ns` was run
+on the Windows 11 test VM (steps 1 to 5 pass; step 3 shows no "Not Present" adapter, the
+device is a Plug and Play ghost) and `20261118-2040-windows-tun-bench-row` got its row in
+`docs/performance.md`. The smoke found a defect in the exclusive open: a `Down` interface
+row that outlives the removed adapter was refused as a live holder; it is now replaced.
+
+## 2026-11-21 [pitfall]
+
+- After Wintun logs `Removed orphaned adapter`, the alias can keep converting to an
+  interface row (`OperStatus` Down) for minutes. Whether Wintun opens the name tells a held
+  adapter from that row; `OperStatus` alone does not.
+- On the VM a harness that goes on after a failed first start tracks the wrong process:
+  the "second" start becomes the holder. Abort the scenario when step 1 fails.
