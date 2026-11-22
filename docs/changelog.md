@@ -989,3 +989,8 @@ row that outlives the removed adapter was refused as a live holder; it is now re
   adapter from that row; `OperStatus` alone does not.
 - On the VM a harness that goes on after a failed first start tracks the wrong process:
   the "second" start becomes the holder. Abort the scenario when step 1 fails.
+
+## 2026-11-22 [release]
+
+Released 0.24.3: the exclusive Wintun open replaces the `Down` interface row a removed
+adapter leaves behind, and the `tun_node` example runs on Windows.

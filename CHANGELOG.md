@@ -5,6 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.3] - 2026-11-22
+
+A Windows fix: an exclusive Wintun open no longer refuses what Windows keeps of a killed
+holder's adapter. The `tun_node` example runs on Windows.
+
 ### Added
 - examples: `tun_node` builds and runs on Windows, on a Wintun adapter: addresses and peer
   routes through `netsh`, peers from the flags (no UAPI), `--exclusive` for
